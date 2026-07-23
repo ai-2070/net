@@ -8348,6 +8348,30 @@ impl MeshNode {
         // ArcSwap fields).
         let _install = self.org_install.lock();
 
+        // Kyra amended-verdict closure 2 (cross-authority coalescence): refuse
+        // installing organization authority over an EXPLICIT sensing fleet root
+        // (`config.sensing_owner_root`) configured EQUAL to this org's canonical
+        // sensing commitment. In that configuration a legacy sensing registration
+        // proven under the fleet root and an org-authenticated row derive the SAME
+        // `ProviderInterestKey`, so they would coalesce into one aggregate — a
+        // reachable org→legacy downgrade / authority-laundering path. Runtime
+        // rejection at legacy intake (see `handle_sensing_interest_frame`) cannot
+        // retroactively purge legacy rows accepted BEFORE the authority existed, so
+        // the fail-closed boundary is here: never publish an authority whose org
+        // commitment collides with the immutable local fleet root. This covers both
+        // runtime adoption and configured startup (the startup config-load routes
+        // through this method before networking begins).
+        if self.config.sensing_owner_root.is_some()
+            && self.sensing_local_root
+                == sensing::canonical_org_sensing_commitment(&authority.owner_org())
+        {
+            return Err(
+                super::behavior::org_authority::OrgAuthorityError::SensingFleetRootCollision {
+                    owner_org: authority.owner_org(),
+                },
+            );
+        }
+
         // Review-9 addendum + review-11 P1: pin BOTH the candidate
         // AND the currently-installed store across verification AND
         // publication. Without the candidate pin, a concurrent apply
@@ -16608,10 +16632,11 @@ impl MeshNode {
                 Some(*audience_scope)
             }
             sensing::SensingInterestFrame::Deregister { .. } => None,
-            // Organization-authenticated variants are structurally dark until
-            // the membership authority gate lands (org-auth slice, commit 2):
-            // no scope is derived and the main match below drops them before
-            // any table mutation.
+            // Organization-authenticated variants carry their audience through the
+            // membership authority gate ([`verify_org_sensing_registration`]), not
+            // the legacy session-scope path, so no legacy claimed scope is derived
+            // here. The main match routes `OrgProviderRegistration` to the live org
+            // gate and `OrgCapabilityRegistration` to the dark drop.
             sensing::SensingInterestFrame::OrgCapabilityRegistration { .. }
             | sensing::SensingInterestFrame::OrgProviderRegistration { .. } => None,
         };
@@ -16627,6 +16652,36 @@ impl MeshNode {
         // the remote membership capture is taken against it, so a wall-clock step
         // cannot open a window between the two checks.
         let now_secs = super::behavior::org::current_timestamp();
+
+        // Kyra amended-verdict closure 1 (authority-aware classification at legacy
+        // intake): when this node holds organization authority, a LEGACY
+        // registration whose declared audience is this org's canonical sensing
+        // commitment is authority laundering. `validate_subscriber_scope` proves
+        // every admitted legacy row is keyed under `sensing_local_root`, so a fleet
+        // root configured equal to the org commitment would let such a legacy row
+        // share a `ProviderInterestKey` with an org row (org→legacy downgrade).
+        // Classify by the installed authority and refuse before any leader/table
+        // mutation. `claimed_scope` is `Some` ONLY for the two legacy registration
+        // variants (org variants carry their audience through the membership gate;
+        // Deregister carries none), so this touches exactly the legacy legs. Closure
+        // 2 refuses installing authority over such a fleet root, so this branch is
+        // unreachable in a correctly-configured node — it is the independent second
+        // line at the point of use.
+        if let Some(claimed) = claimed_scope {
+            if let Some(authority) = ctx.node_authority.load_full() {
+                if claimed == sensing::canonical_org_sensing_commitment(&authority.owner_org()) {
+                    ctx.sensing_counters
+                        .protocol_invalid
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        from_node = format!("{:#x}", from_node),
+                        "sensing: legacy registration with organization-derived \
+                         audience refused (authority-aware classification)"
+                    );
+                    return;
+                }
+            }
+        }
 
         match &frame {
             sensing::SensingInterestFrame::CapabilityRegistration {
@@ -17013,11 +17068,10 @@ impl MeshNode {
                     // method docs.
                 }
             }
-            // Structurally dark until the membership authority gate lands
-            // (org-auth slice, commit 2): an organization-authenticated
-            // registration is decoded and can be semantically validated, but
-            // it MUST NOT reach any interest-table, relay, or emitter path
-            // before its membership certificate is verified at this hop.
+            // Live (exact-provider go-live): the organization PROVIDER
+            // re-authoring path. The frame's membership certificate is verified at
+            // this hop by the authority gate before it can reach the interest
+            // table; the CAPABILITY (leader) variant below stays dark.
             sensing::SensingInterestFrame::OrgProviderRegistration { .. } => {
                 // Piece-4 exact-provider go-live (provider leg): the org authority
                 // gate admits the frame to a narrow validated wrapper + a pinned
@@ -17098,11 +17152,17 @@ impl MeshNode {
     /// OLB org-auth (piece 4, exact-provider): the shared PROVIDER re-authoring
     /// operation both the legacy `ProviderRegistration` and the org
     /// `OrgProviderRegistration` intakes funnel into after admission. The Provider
-    /// leg is the sole source of target/interval/ttl. For an ORG admission,
-    /// `org_authority` carries the pinned gate snapshot: the FINAL currency
-    /// recheck happens HERE, immediately before the table register — a floor
-    /// raise, authority swap, or poison after the gate makes the verdict stale and
-    /// creates no row. Registers the downstream row (owner_root =
+    /// leg is the sole source of target/interval/ttl.
+    ///
+    /// The admitted authority is bound EXHAUSTIVELY to the supplied currentness
+    /// evidence (Kyra amended-verdict closure 5): a `Legacy` admission REQUIRES
+    /// `org_authority == None`, an `Org` admission REQUIRES a pinned `Some(..)`
+    /// snapshot, and the mismatched combinations (`Org`+`None`, `Legacy`+`Some`)
+    /// fail closed with no row. For an ORG admission the FINAL currency recheck
+    /// runs under the HELD interest-table guard, immediately before the register
+    /// (closure 4): acquiring the table lock cannot open a post-check window, so a
+    /// floor raise, authority swap, or poison after the gate makes the verdict
+    /// stale and creates no row. Registers the downstream row (owner_root =
     /// `admitted.proven_root()`), feeds the origin when THIS node is the target,
     /// and — for a remote target — authors the upstream continuation through
     /// [`plan_provider_continuation`](sensing::plan_provider_continuation): legacy
@@ -17141,31 +17201,61 @@ impl MeshNode {
         let ttl = soft_state_ttl.min(ctx.sensing_interest_ttl);
         let spec = admitted.spec();
         let key = sensing::ProviderInterestKey::new(spec.key(), target);
-        // FINAL authority-currency recheck IMMEDIATELY before the table mutation
-        // (org only). All preparatory work (leg, bounds, key) is already done, so
-        // nothing intervenes between this recheck and the register: a floor raise,
-        // authority swap, or poison after the gate creates no row.
-        if let Some(snapshot) = org_authority {
-            let Some(current) = sensing::capture_current_sensing_stamp(
-                &ctx.org_install,
-                &ctx.node_authority,
-                &ctx.org_revocation,
-                &ctx.org_install_generation,
-            ) else {
-                return;
-            };
-            if !snapshot.stamp().is_current(&current) {
-                return;
+        // Acquire the interest-table guard FIRST, then bind the admitted authority
+        // to its currentness evidence and — for an org admission — perform the FINAL
+        // currency recheck, all under the SAME held guard, and register without ever
+        // releasing it (Kyra amended-verdict closures 4 + 5).
+        //
+        // Closure 5 (exhaustive authority↔evidence binding): the `Option` shape
+        // alone would silently accept `Org`+`None` (skipping the recheck) or
+        // `Legacy`+`Some` (a spurious recheck on a non-org row). Match both together
+        // so only the two coherent pairings mutate; the rest fail closed with no
+        // row.
+        //
+        // Closure 4 (no post-check window): the recheck ran BEFORE `.lock()`
+        // previously, so table-lock contention could stall between a passing check
+        // and the register while a floor/rotation/poison landed. Holding the guard
+        // across the recheck AND the register closes that window — the successful
+        // check is the admission linearization point and the mutation follows it
+        // atomically. (Lock order: interest-table → org_install; no path takes the
+        // reverse, so this cannot deadlock.)
+        let outcome = {
+            let mut table = ctx.sensing_interest_table.lock();
+            match (admitted.authority(), org_authority) {
+                (sensing::RegistrationAuthority::Legacy { .. }, None) => {}
+                (sensing::RegistrationAuthority::Org { .. }, Some(snapshot)) => {
+                    let Some(current) = sensing::capture_current_sensing_stamp(
+                        &ctx.org_install,
+                        &ctx.node_authority,
+                        &ctx.org_revocation,
+                        &ctx.org_install_generation,
+                    ) else {
+                        return;
+                    };
+                    if !snapshot.stamp().is_current(&current) {
+                        return;
+                    }
+                }
+                // Incoherent authority/evidence pairing — a caller bug; never mutate.
+                (sensing::RegistrationAuthority::Org { .. }, None)
+                | (sensing::RegistrationAuthority::Legacy { .. }, Some(_)) => {
+                    tracing::error!(
+                        from_node = format!("{:#x}", from_node),
+                        "sensing: admitted authority and currentness evidence disagree \
+                         — refusing to register"
+                    );
+                    return;
+                }
             }
-        }
-        let outcome = ctx.sensing_interest_table.lock().register(
-            &key,
-            sensing::DownstreamId::Peer(from_node),
-            requested_sample_interval,
-            ttl,
-            admitted.proven_root(),
-            now,
-        );
+            table.register(
+                &key,
+                sensing::DownstreamId::Peer(from_node),
+                requested_sample_interval,
+                ttl,
+                admitted.proven_root(),
+                now,
+            )
+        };
         match outcome {
             sensing::RegisterOutcome::Registered(action) => {
                 // The target provider itself has no upstream — feed the origin.
@@ -30718,6 +30808,333 @@ mod sensing_authority_witness_tests {
         assert!(
             node.sensing_table_is_empty(),
             "a poison at the mutation boundary creates no row"
+        );
+    }
+
+    // ---- Kyra amended-verdict closures: authority-binding + lock ordering ------
+
+    /// A legacy `ProviderRegistration` frame with the SAME spec `org_provider_frame`
+    /// builds, so an org row and a legacy row for one target share a
+    /// `ProviderInterestKey` iff the legacy audience is admitted — the exact
+    /// coalescence the closures prevent.
+    fn legacy_provider_frame(
+        target: u64,
+        audience: sensing::AudienceScopeCommitment,
+    ) -> sensing::SensingInterestFrame {
+        sensing::SensingInterestFrame::provider_registration(
+            &org_spec(target, audience),
+            target,
+            D,
+            ORG_TTL,
+        )
+    }
+
+    /// A node whose EXPLICIT sensing fleet root is `commitment` (fleet scope on,
+    /// `sensing_local_root == commitment`). No authority is installed.
+    async fn fleet_node(commitment: sensing::AudienceScopeCommitment) -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut config = MeshNodeConfig::new(addr, [0x31u8; 32]);
+        config.sensing_owner_root = Some(commitment);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), config)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    /// Reach the state closure 2 forbids at install (fleet root == org commitment
+    /// AND authority installed) by wiring the authority + its store in DIRECTLY,
+    /// bypassing `install_node_authority`'s collision refusal. Test-only: this
+    /// reconstructs the vulnerable state so closure 1's INDEPENDENT intake
+    /// classification can be exercised as the second line.
+    fn force_install_bypassing_collision_guard(node: &MeshNode, authority: Arc<NodeAuthority>) {
+        node.org_revocation
+            .store(Some(authority.revocation.clone()));
+        node.node_authority.store(Some(authority));
+        node.org_install_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    // C5/C6 — Org admission REQUIRES a pinned snapshot; supplying `None` is an
+    // incoherent pairing that mutates nothing. RED-coupled: the prior
+    // `if let Some(snapshot) = org_authority` shape skipped the recheck for `None`
+    // and registered the org row.
+    #[tokio::test]
+    async fn org_admission_without_snapshot_creates_no_row() {
+        let node = org_node("op11").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, _snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("admitted");
+        MeshNode::apply_provider_registration(&ctx, &admitted, None, FROM_NODE, now, now_secs);
+        assert!(
+            node.sensing_table_is_empty(),
+            "an Org admission with no currentness evidence mutates nothing"
+        );
+    }
+
+    // C5/C6 — Legacy admission REQUIRES no snapshot; supplying `Some(..)` is an
+    // incoherent pairing that mutates nothing. RED-coupled: the prior shape ran a
+    // spurious recheck (which passes on an unchanged view) and registered the
+    // legacy row.
+    #[tokio::test]
+    async fn legacy_admission_with_snapshot_creates_no_row() {
+        let node = org_node("op12").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let snapshot = node.capture_sensing_authority_snapshot().expect("snapshot");
+        // A legacy provider admission proven under this node's sensing_local_root.
+        let admitted = sensing::AdmittedSensingRegistration::from_validated_legacy(
+            org_spec(target, node.sensing_local_root()),
+            sensing::RegistrationLeg::Provider {
+                target,
+                requested_sample_interval: D,
+                soft_state_ttl: ORG_TTL,
+            },
+            node.sensing_local_root(),
+        );
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            now,
+            now_secs,
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "a Legacy admission carrying org currentness evidence mutates nothing"
+        );
+    }
+
+    // C4 — the final org currency check runs UNDER the held interest-table guard,
+    // so table-lock contention cannot open a post-check/pre-register window. Hold
+    // the guard so apply BLOCKS at lock acquisition (strictly before its final
+    // check), raise a floor to stale the pinned snapshot, then release: apply
+    // acquires, rechecks, finds the snapshot stale, and lands NO row. The mutation
+    // is ordered before the check by the lock alone — apply cannot reach the check
+    // until it holds the guard, which it cannot until we drop ours, which we do only
+    // after the floor raise. RED note (verified locally): moving the recheck back
+    // ahead of `.lock()` lets a row land here.
+    #[tokio::test]
+    async fn final_currency_check_runs_under_the_held_table_guard() {
+        let node = org_node("op13").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("admitted");
+
+        let guard = node.sensing_interest_table.lock();
+        std::thread::scope(|s| {
+            let apply_ctx = ctx.clone();
+            let apply_admitted = admitted.clone();
+            let apply_snapshot = &snapshot;
+            let handle = s.spawn(move || {
+                MeshNode::apply_provider_registration(
+                    &apply_ctx,
+                    &apply_admitted,
+                    Some(apply_snapshot),
+                    FROM_NODE,
+                    now,
+                    now_secs,
+                );
+            });
+            // Raise a floor while apply is parked on the guard we hold.
+            let mut floors = BTreeMap::new();
+            floors.insert(EntityId::from_bytes([0xEEu8; 32]), 3u32);
+            let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
+            node.org_revocation_store()
+                .expect("store")
+                .apply_bundle(&bundle)
+                .expect("apply floor");
+            drop(guard);
+            handle.join().expect("apply thread");
+        });
+        assert!(
+            node.sensing_table_is_empty(),
+            "a floor raise while apply is parked on the table guard makes the pinned \
+             snapshot stale at the final check — no row"
+        );
+    }
+
+    // C7 — production dispatch: an encoded valid OrgProviderRegistration flows
+    // through `handle_sensing_interest_frame` and lands the canonical org row.
+    // RED-coupled: removing the live match arm (dark drop) leaves no row.
+    #[tokio::test]
+    async fn dispatched_org_provider_registration_lands_org_row() {
+        let node = org_node("op14").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let key =
+            sensing::ProviderInterestKey::new(org_spec(target, org_commitment()).key(), target);
+        let ctx = node.dispatch_ctx();
+        let bytes = sensing::encode_interest_frame(&org_provider_frame(
+            target,
+            org_commitment(),
+            member_cert(&sender, 1),
+        ))
+        .expect("encode");
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::Peer(FROM_NODE))
+            .expect("org row present via production dispatch");
+        assert_eq!(
+            row.owner_root,
+            org_commitment(),
+            "the dispatched org provider row carries the canonical org commitment"
+        );
+    }
+
+    // C7 — production dispatch: an encoded valid OrgCapabilityRegistration is
+    // structurally dark in the exact-provider release; dispatch mutates nothing.
+    #[tokio::test]
+    async fn dispatched_org_capability_registration_stays_dark() {
+        let node = org_node("op15").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let ctx = node.dispatch_ctx();
+        // consumer == FROM_NODE (routed-origin binding); dropped before the gate.
+        let cap = sensing::SensingInterestFrame::org_capability_registration(
+            &org_spec(node.node_id(), org_commitment()),
+            D,
+            ORG_TTL,
+            FROM_NODE,
+            member_cert(&sender, 1),
+        );
+        let bytes = sensing::encode_interest_frame(&cap).expect("encode");
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
+        assert!(
+            node.sensing_table_is_empty(),
+            "the org capability (leader) variant stays dark — no mutation"
+        );
+    }
+
+    // C2/C3 — the explicit-fleet-root collision closure. With `sensing_owner_root`
+    // configured EQUAL to the org's canonical commitment, installing the org
+    // authority is refused fail-closed. RED-coupled: removing the install guard lets
+    // the authority publish over the colliding fleet root.
+    #[tokio::test]
+    async fn fleet_root_equal_to_org_commitment_refuses_authority_install() {
+        let node = fleet_node(sensing::canonical_org_sensing_commitment(&org().org_id())).await;
+        let err = node
+            .install_node_authority(adopt(&node, &org(), "collide"))
+            .expect_err("install over a colliding fleet root must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::adapter::net::behavior::org_authority::OrgAuthorityError::SensingFleetRootCollision { .. }
+            ),
+            "expected SensingFleetRootCollision, got {err:?}"
+        );
+        assert!(
+            node.node_authority().is_none(),
+            "no authority is installed after the refusal"
+        );
+    }
+
+    // C3 — the dynamic-install-history sequence: start without authority, accept a
+    // legacy row proven under the fleet root, then attempt to install the matching
+    // org authority. The install is refused, so the pre-existing legacy row can
+    // never gain an org sibling on a shared key. (C1's intake classification is
+    // inactive with no authority installed — this is exactly why closure 2 refuses
+    // the install rather than trying to purge the row.)
+    #[tokio::test]
+    async fn dynamic_history_legacy_fleet_row_then_install_refused() {
+        let commitment = sensing::canonical_org_sensing_commitment(&org().org_id());
+        let node = fleet_node(commitment).await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let bytes = sensing::encode_interest_frame(&legacy_provider_frame(target, commitment))
+            .expect("encode");
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
+        assert!(
+            !node.sensing_table_is_empty(),
+            "a legacy provider claiming the fleet root lands a row before any authority"
+        );
+        let err = node
+            .install_node_authority(adopt(&node, &org(), "collide2"))
+            .expect_err("install must be refused so no org row can join the legacy row");
+        assert!(matches!(
+            err,
+            crate::adapter::net::behavior::org_authority::OrgAuthorityError::SensingFleetRootCollision { .. }
+        ));
+    }
+
+    // C1/C3 — the real explicit-root collision witness. Reconstruct the state
+    // closure 2 forbids (fleet root == org commitment AND authority installed) and
+    // prove closure 1's intake classification is the independent second line: a
+    // legacy registration whose admitted audience is the org commitment is REFUSED
+    // (no row), while a valid OrgProviderRegistration for the SAME interest+target
+    // lands its org row — so the two never share an aggregate. RED-coupled: removing
+    // the C1 intake guard lets the legacy frame land a row on the org key, and the
+    // org frame then coalesces into it.
+    #[tokio::test]
+    async fn org_derived_legacy_audience_refused_while_org_row_lands() {
+        let commitment = sensing::canonical_org_sensing_commitment(&org().org_id());
+        let node = fleet_node(commitment).await;
+        force_install_bypassing_collision_guard(&node, adopt(&node, &org(), "c1direct"));
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+
+        // (a) A legacy provider claiming the fleet root (== org commitment): under
+        // fleet admission its scope validation would PASS and key the row under the
+        // org commitment — the exact laundering. C1 refuses it at intake.
+        let legacy_bytes =
+            sensing::encode_interest_frame(&legacy_provider_frame(target, commitment))
+                .expect("encode");
+        MeshNode::handle_sensing_interest_frame(&legacy_bytes, FROM_NODE, &ctx);
+        assert!(
+            node.sensing_table_is_empty(),
+            "C1 refuses the organization-derived legacy audience — no row"
+        );
+
+        // (b) A valid OrgProviderRegistration for the SAME interest + target lands
+        // the org row (and, because (a) landed nothing, it is the only row).
+        let org_bytes = sensing::encode_interest_frame(&org_provider_frame(
+            target,
+            commitment,
+            member_cert(&sender, 1),
+        ))
+        .expect("encode");
+        MeshNode::handle_sensing_interest_frame(&org_bytes, FROM_NODE, &ctx);
+        let key = sensing::ProviderInterestKey::new(org_spec(target, commitment).key(), target);
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::Peer(FROM_NODE))
+            .expect("the org row lands");
+        assert_eq!(row.owner_root, commitment);
+        assert_eq!(
+            node.sensing_downstreams(&key).len(),
+            1,
+            "only the org row exists — no coalesced legacy demand on the shared key"
         );
     }
 }

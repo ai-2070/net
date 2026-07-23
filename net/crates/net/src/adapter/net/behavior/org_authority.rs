@@ -549,6 +549,21 @@ pub enum OrgAuthorityError {
     /// The revocation store failed to initialize or open (its own
     /// loud error, wrapped).
     Revocation(OrgRevocationError),
+    /// The node's EXPLICIT sensing fleet root
+    /// ([`MeshNodeConfig::sensing_owner_root`](crate::adapter::net::MeshNodeConfig::sensing_owner_root))
+    /// equals the canonical organization sensing commitment for this
+    /// authority's owner org. Installing the authority would let a LEGACY
+    /// sensing registration proven under that fleet root coalesce with an
+    /// organization-authenticated row on a shared `ProviderInterestKey` — a
+    /// reachable organization→legacy authority-laundering path (Kyra amended
+    /// verdict, closure 2). Refuse the install fail-closed rather than admit two
+    /// authority modes into one aggregate. Reconfigure (or clear)
+    /// `sensing_owner_root` before adopting this organization.
+    SensingFleetRootCollision {
+        /// The authority's owner organization whose canonical sensing
+        /// commitment the explicit fleet root collides with.
+        owner_org: OrgId,
+    },
 }
 
 impl std::fmt::Display for OrgAuthorityError {
@@ -629,6 +644,14 @@ impl std::fmt::Display for OrgAuthorityError {
             ),
             Self::Io { path, reason } => write!(f, "authority I/O at {path}: {reason}"),
             Self::Revocation(e) => write!(f, "{e}"),
+            Self::SensingFleetRootCollision { owner_org } => write!(
+                f,
+                "explicit sensing fleet root collides with the canonical sensing \
+                 commitment for org {owner_org}; installing this authority would let \
+                 legacy sensing registrations coalesce with organization rows on a \
+                 shared interest key — refusing (clear or reconfigure sensing_owner_root \
+                 before adopting this org)"
+            ),
         }
     }
 }

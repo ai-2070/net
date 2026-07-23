@@ -1774,22 +1774,31 @@ mod tests {
     }
 
     #[test]
-    fn org_and_legacy_specs_cannot_share_a_provider_key() {
-        // Mixed-authority key-separation proof (Kyra option 1): two specs
-        // identical in every predicate field but scoped to an org audience vs an
-        // entity owner-root audience derive DIFFERENT ProviderInterestKeys, so no
-        // aggregate can ever coalesce an org row with a legacy row — hence a
-        // legacy refresh cannot carry an org demand upstream. Cryptographic
-        // separation under BLAKE3/Ed25519 preimage assumptions (both audiences
-        // share one untagged [u8; 32]); authority mode is taken from admitted
-        // evidence, never inferred from these bytes.
+    fn entity_legacy_root_and_org_commitment_are_cryptographically_separated() {
+        // Scoped key-separation proof (Kyra amended verdict). The honest claim:
+        // ENTITY-derived legacy roots and canonical organization commitments are
+        // cryptographically separated — two specs identical in every predicate
+        // field but scoped to an org audience vs an entity owner-root audience
+        // derive DIFFERENT ProviderInterestKeys under BLAKE3/Ed25519 preimage
+        // assumptions (both audiences share one untagged [u8; 32]).
+        //
+        // This does NOT hold for an EXPLICIT operator fleet root
+        // (`MeshNodeConfig::sensing_owner_root`), which is an arbitrary commitment
+        // that can be set equal to a known org commitment by copy — no collision
+        // attack needed. That case is closed at ADMISSION, not by these bytes:
+        // legacy intake rejects an organization-derived audience when authority is
+        // installed, and authority installation is refused over a colliding fleet
+        // root (see the mesh dispatch witnesses
+        // `org_derived_legacy_audience_refused_while_org_row_lands` and
+        // `fleet_root_equal_to_org_commitment_refuses_authority_install`). Authority
+        // mode is taken from admitted evidence, never inferred from these bytes.
         let org_spec = spec_with(org_commit());
         let legacy_spec = spec_with(AudienceScopeCommitment::owner_root(&member()));
         let org_key = ProviderInterestKey::new(org_spec.key(), 0x77);
         let legacy_key = ProviderInterestKey::new(legacy_spec.key(), 0x77);
         assert_ne!(
             org_key, legacy_key,
-            "org and legacy audiences must not collide on the aggregate key"
+            "an entity owner-root audience and an org commitment must not collide on the key"
         );
     }
 
