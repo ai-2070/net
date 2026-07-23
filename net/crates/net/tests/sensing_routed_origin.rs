@@ -264,7 +264,6 @@ async fn routed_frames_authenticate_origin_coalesce_and_fan_back() {
     // `ev.from_node` below is the AEAD-verified end-to-end origin.
     let counters = Arc::new(SensingCounters::default());
     let leader = Arc::new(Mutex::new(SensingLeader::new(
-        owner_root,
         CandidatePolicy::default(),
         3,
         512,

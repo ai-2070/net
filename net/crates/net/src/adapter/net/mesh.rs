@@ -8119,8 +8119,9 @@ impl MeshNode {
         if !self.config.enable_sensing_coalescing {
             return false;
         }
+        // Review §2: the leader carries no owner root — every interest's trust
+        // anchor is its admitted seed's proven root.
         let leader = sensing::SensingLeader::new(
-            self.sensing_local_root,
             sensing::CandidatePolicy::default(),
             self.config.continuity_factor,
             self.config.max_interests_per_peer,
