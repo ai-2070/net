@@ -131,6 +131,13 @@ pub enum ResolutionRefusal {
     /// key-separation proof would surface here as a loud refusal rather than a
     /// silent authority downgrade of the coalesced demand.
     AuthorityMismatch,
+    /// An admitted wrapper reached the leader's CAPABILITY intake carrying a
+    /// non-capability leg (e.g. a provider leg). Refused BEFORE candidate
+    /// resolution, seed insertion, or any table mutation — the leg is the sole,
+    /// immutable source of the registering consumer + timing, so a mismatched leg
+    /// must never be cached as a coalesced interest's seed. A code-level
+    /// invariant (the admitted intake is crate-internal), never honest input.
+    AdmittedLegMismatch,
 }
 
 /// The bounded outcome of one resolution pass.
