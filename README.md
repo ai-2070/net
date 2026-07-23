@@ -1,7 +1,7 @@
 # NET: Network Event Transport
 
 [![codecov](https://codecov.io/gh/ai-2070/net/graph/badge.svg?token=AOBMOF6LE4)](https://codecov.io/gh/ai-2070/net)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **Network Event Transport** — a latency-first encrypted mesh protocol.
 
@@ -692,3 +692,16 @@ Pure-Rust features are nearly free on the cdylib: `nat-traversal` adds **~96 KB*
 `compute` and `groups` aren't core-crate features — they live in the SDK and only ship in the binding cdylibs (`libnet_node.dylib`, the Python module, the npm `.node`), so they don't change the `libnet.dylib` figures above. The `.rlib` and `.a` grow with every feature because they keep all symbols for downstream linkers; only the shipped cdylibs get the full benefit of LTO.
 
 The measurement harness lives in [`net/crates/net/tools/binary-size/`](net/crates/net/tools/binary-size/) — run `./measure_sizes.sh` to refresh these numbers after a dependency or feature change.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option. The MIT arm exists so GPLv2-only projects — the Linux kernel, OpenWrt userspace, BusyBox — can use Net; Apache-2.0's patent-termination and NOTICE clauses are incompatible with GPLv2. Take the Apache-2.0 arm if you want the express patent grant.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project shall be licensed as MIT OR Apache-2.0, at the recipient's option. Contributions are also subject to the [Contributor License Agreement](CONTRIBUTING.md#contributor-license-agreement), which must be signed before a first contribution is merged.

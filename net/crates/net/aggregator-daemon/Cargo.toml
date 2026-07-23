@@ -3,7 +3,7 @@ name = "net-aggregator-daemon"
 version = "0.34.0"
 edition = "2021"
 description = "Long-running daemon that hosts net-mesh AggregatorRegistry + aggregator groups"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/ai-2070/net"
 publish = true
 

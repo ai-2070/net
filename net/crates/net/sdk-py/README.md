@@ -1083,4 +1083,4 @@ PyPI wheels of `net-mesh` ship with every feature enabled; the flags above only 
 
 ## License
 
-Apache-2.0
+MIT OR Apache-2.0

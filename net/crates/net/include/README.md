@@ -1134,4 +1134,4 @@ defined "already shutting down" return.
 
 ## License
 
-Apache-2.0
+MIT OR Apache-2.0

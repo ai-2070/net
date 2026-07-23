@@ -122,4 +122,4 @@ Release tarballs ship these pre-generated under `share/bash-completion/...` and 
 
 ## License
 
-Apache-2.0. See [`LICENSE`](../LICENSE).
+MIT OR Apache-2.0. See [`LICENSE-MIT`](../../../../LICENSE-MIT) and [`LICENSE-APACHE`](../../../../LICENSE-APACHE).

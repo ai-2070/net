@@ -131,4 +131,4 @@ Released 2026-06-27.
 
 ## License
 
-See [LICENSE](../../LICENSE).
+See [LICENSE](../../LICENSE-APACHE).

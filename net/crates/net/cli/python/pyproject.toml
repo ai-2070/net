@@ -12,13 +12,13 @@ name = "net-mesh-cli"
 version = "0.34.0"
 description = "net-mesh — unified command-line interface for the Net mesh"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
 requires-python = ">=3.8"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Topic :: System :: Networking",

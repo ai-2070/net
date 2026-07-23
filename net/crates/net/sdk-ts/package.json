@@ -14,7 +14,7 @@
       "default": "./dist/tool.js"
     }
   },
-  "license": "Apache-2.0",
+  "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ai-2070/net.git"
@@ -30,7 +30,9 @@
     "rust"
   ],
   "files": [
-    "dist"
+    "dist",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
   ],
   "scripts": {
     "prebuild": "node -e \"const fs=require('fs'),cp=require('child_process');if(!fs.existsSync('../bindings/node/index.d.ts')){cp.execSync('npm --prefix ../bindings/node i --ignore-scripts',{stdio:'inherit'});cp.execSync('npm --prefix ../bindings/node run build',{stdio:'inherit'})}\"",

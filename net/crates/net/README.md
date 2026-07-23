@@ -1393,7 +1393,7 @@ Note: handshake relay no longer consumes a subprotocol ID — it rides as a rout
 
 ## License
 
-Apache-2.0
+MIT OR Apache-2.0
 
 ### Third-party license notice
 

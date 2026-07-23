@@ -2,7 +2,7 @@
 name = "net-python"
 version = "0.34.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 description = "Python bindings for Net event bus"
 # Distributed via PyPI as `net-mesh` (see pyproject.toml), not via
 # crates.io. Block accidental `cargo publish`.

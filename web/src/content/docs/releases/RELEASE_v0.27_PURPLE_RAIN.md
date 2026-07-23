@@ -195,4 +195,4 @@ Released 2026-06-04.
 
 ## License
 
-See [LICENSE](../../LICENSE).
+See [LICENSE](../../LICENSE-APACHE).

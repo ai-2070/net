@@ -253,4 +253,4 @@ Released 2026-05-24.
 
 ## License
 
-See [LICENSE](../../LICENSE).
+See [LICENSE](../../LICENSE-APACHE).

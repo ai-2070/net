@@ -161,4 +161,4 @@ Released 2026-05-06.
 
 ## License
 
-See [LICENSE](../../LICENSE).
+See [LICENSE](../../LICENSE-APACHE).

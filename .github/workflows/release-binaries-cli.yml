@@ -16,7 +16,7 @@ name: Release net-cli binaries
 # Layout inside each archive:
 #   net-cli-v<version>-<triple>/
 #     net-mesh[.exe]                         The binary.
-#     LICENSE                                Apache-2.0.
+#     LICENSE-APACHE, LICENSE-MIT            MIT OR Apache-2.0.
 #     README.md                              Top-level crate README.
 #     net-mesh.ps1                           PowerShell completions.
 #     share/bash-completion/completions/net-mesh
@@ -210,7 +210,7 @@ jobs:
           cp -r shared/share "stage/${NAME}/"
           cp shared/net-mesh.ps1 "stage/${NAME}/"
           # License + README from the repo top-level (Apache-2.0).
-          cp LICENSE "stage/${NAME}/"
+          cp LICENSE-APACHE LICENSE-MIT "stage/${NAME}/"
           cp net/crates/net/README.md "stage/${NAME}/"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 

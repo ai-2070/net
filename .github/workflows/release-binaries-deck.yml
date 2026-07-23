@@ -15,7 +15,7 @@ name: Release net-deck binaries
 # Layout inside each archive:
 #   net-deck-v<version>-<triple>/
 #     net-deck[.exe]                         The binary.
-#     LICENSE                                Apache-2.0.
+#     LICENSE-APACHE, LICENSE-MIT            MIT OR Apache-2.0.
 #     README.md                              Top-level crate README.
 #
 # Deck has no clap subcommands (the binary is a TUI), so no shell
@@ -152,7 +152,7 @@ jobs:
           else
             cp "net/crates/net/target/${{ matrix.target }}/release/net-deck" "stage/${NAME}/"
           fi
-          cp LICENSE "stage/${NAME}/"
+          cp LICENSE-APACHE LICENSE-MIT "stage/${NAME}/"
           cp net/crates/net/README.md "stage/${NAME}/"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
