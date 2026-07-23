@@ -360,10 +360,10 @@ impl SensingLeader {
 
     /// Register one consumer's provider-free interest under LEGACY authority
     /// (scope validation happens upstream, §4.10). Builds the legacy admitted
-    /// seed from the session-proven root and delegates to
-    /// [`Self::register_admitted_capability_interest`] — the authority-carrying
-    /// intake both the legacy path and (piece 4) the org path share. Installing a
-    /// node authority never changes this path's legacy behavior.
+    /// seed from the session-proven root and delegates directly to the shared
+    /// coalescing core [`Self::register_capability_interest_inner`] — the intake
+    /// both this legacy path and (piece 4) the org admitted path funnel into.
+    /// Installing a node authority never changes this path's legacy behavior.
     #[allow(clippy::too_many_arguments)]
     pub fn register_capability_interest(
         &mut self,
@@ -409,6 +409,11 @@ impl SensingLeader {
     /// so a caller can never admit one leg then register under a different
     /// downstream or table timing. The seed's authority provenance (org vs legacy)
     /// is preserved into the [`LeaderInterest`].
+    ///
+    /// Piece 4 consumes this method when organization dispatch is lit atomically;
+    /// until then only the in-crate witnesses exercise it, hence the
+    /// `#[allow(dead_code)]`.
+    #[allow(dead_code)]
     pub(crate) fn register_admitted_capability_interest(
         &mut self,
         admitted: &AdmittedSensingRegistration,
