@@ -444,6 +444,35 @@ impl AdmittedSensingRegistration {
     pub(crate) fn authority(&self) -> &RegistrationAuthority {
         &self.authority
     }
+
+    /// Derive a PROVIDER-leg continuation of this admitted registration for the
+    /// upstream `target`, preserving the validated spec AND the admitted
+    /// authority provenance unchanged. This is the ONLY sanctioned way to obtain
+    /// a provider-leg wrapper from a cached capability seed: it re-targets the
+    /// leg but can never desync the spec/authority pairing or fabricate an
+    /// authority the seed was not admitted under — there is deliberately no
+    /// `new(spec, leg, authority)` that would let a caller assemble an arbitrary
+    /// combination. The leader caches the capability seed a consumer's admission
+    /// produced and derives one of these per resolved provider branch, so a
+    /// reconciliation-added or refusal-survivor re-registration authored after
+    /// the original wrapper has left scope still carries the org-vs-legacy mode
+    /// from admitted evidence, never re-inferred from `spec.audience`.
+    pub(crate) fn provider_continuation(
+        &self,
+        target: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+    ) -> Self {
+        Self {
+            spec: self.spec.clone(),
+            leg: RegistrationLeg::Provider {
+                target,
+                requested_sample_interval,
+                soft_state_ttl,
+            },
+            authority: self.authority.clone(),
+        }
+    }
 }
 
 /// A monotonic, allocator-reuse-safe stamp of the node's sensing authority
@@ -1707,6 +1736,50 @@ mod tests {
         assert_ne!(
             org_key, legacy_key,
             "org and legacy audiences must not collide on the aggregate key"
+        );
+    }
+
+    #[test]
+    fn provider_continuation_preserves_spec_and_authority() {
+        // The sanctioned derivation the leader seams will use: re-target the leg
+        // while preserving the validated spec AND the admitted authority
+        // provenance — org stays org, legacy stays legacy, never re-inferred from
+        // the audience bytes.
+        let legacy = legacy_admitted(AudienceScopeCommitment::owner_root(&member()));
+        let legacy_cont = legacy.provider_continuation(0x99, D, TTL);
+        assert_eq!(legacy_cont.spec(), legacy.spec(), "spec preserved");
+        assert_eq!(
+            legacy_cont.proven_root(),
+            legacy.proven_root(),
+            "legacy authority preserved"
+        );
+        assert!(matches!(
+            legacy_cont.authority(),
+            RegistrationAuthority::Legacy { .. }
+        ));
+        assert_eq!(
+            legacy_cont.leg(),
+            RegistrationLeg::Provider {
+                target: 0x99,
+                requested_sample_interval: D,
+                soft_state_ttl: TTL,
+            },
+            "leg re-targeted to the provider"
+        );
+
+        let org = org_admitted(EntityId::from_bytes([0xCCu8; 32]));
+        let org_cont = org.provider_continuation(0x99, D, TTL);
+        assert_eq!(org_cont.spec(), org.spec(), "spec preserved");
+        assert!(matches!(
+            org_cont.authority(),
+            RegistrationAuthority::Org { .. }
+        ));
+        // The org proven root stays the canonical org commitment — derived from
+        // the verified org id, never re-inferred from the audience.
+        assert_eq!(
+            org_cont.proven_root(),
+            canonical_org_sensing_commitment(&org_kp().org_id()),
+            "org authority preserved"
         );
     }
 }
