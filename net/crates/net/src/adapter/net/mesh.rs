@@ -16778,6 +16778,12 @@ impl MeshNode {
                                 .map(|strictest| (*provider, strictest))
                         })
                         .collect();
+                    // Piece-3: the interest's admitted seed carries the authority
+                    // provenance the upstream continuation must preserve. Fetch it
+                    // while the leader lock is held; the deferred emission derives
+                    // its provider continuation from it (never re-inferred from the
+                    // audience).
+                    let seed = leader.interest_seed(&registration.interest);
                     drop(slot);
                     if branch_demands.is_empty() {
                         return;
@@ -16856,22 +16862,32 @@ impl MeshNode {
                         ) {
                             continue;
                         }
-                        let upstream = sensing::SensingInterestFrame::provider_registration(
-                            &spec, provider, strictest, ttl,
-                        );
-                        if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-                            spawn_sensing_frame_send(
-                                &ctx.socket,
-                                &ctx.peers,
-                                &ctx.addr_to_node,
-                                &ctx.router,
-                                &ctx.partition_filter,
-                                ctx.local_node_id,
-                                provider,
-                                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                                sensing::SUBPROTOCOL_SENSING_INTEREST,
-                                bytes,
-                            );
+                        // Piece-3 authority-aware leader continuation: derive the
+                        // provider leg from the interest's admitted seed and let
+                        // `plan_provider_continuation` pick the frame kind by
+                        // authority. Org intake is dark, so the capture is
+                        // fail-closed `|_| None`.
+                        let Some(seed) = &seed else {
+                            continue;
+                        };
+                        let continuation = seed.provider_continuation(provider, strictest, ttl);
+                        if let Some(upstream) =
+                            sensing::plan_provider_continuation(&continuation, |_org| None)
+                        {
+                            if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                                spawn_sensing_frame_send(
+                                    &ctx.socket,
+                                    &ctx.peers,
+                                    &ctx.addr_to_node,
+                                    &ctx.router,
+                                    &ctx.partition_filter,
+                                    ctx.local_node_id,
+                                    provider,
+                                    sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                                    sensing::SUBPROTOCOL_SENSING_INTEREST,
+                                    bytes,
+                                );
+                            }
                         }
                     }
                 }
@@ -18141,10 +18157,19 @@ impl MeshNode {
             }
         }
         for (branch, spec) in reconciliation.added {
-            let strictest = {
+            // Piece-3: fetch the interest's admitted seed with the aggregate under
+            // one leader lock — the reconciliation-added upstream continuation
+            // preserves the ORIGINAL admitted authority even though the seed left
+            // scope when `reconcile_with_snapshot` returned.
+            let (strictest, seed) = {
                 let slot = ctx.sensing_leader.lock();
-                slot.as_ref()
-                    .and_then(|leader| leader.relay.table.aggregate(&branch, now))
+                match slot.as_ref() {
+                    Some(leader) => (
+                        leader.relay.table.aggregate(&branch, now),
+                        leader.interest_seed(&branch.interest),
+                    ),
+                    None => (None, None),
+                }
             };
             let Some(strictest) = strictest else {
                 continue;
@@ -18166,26 +18191,25 @@ impl MeshNode {
                 .update_upstream_interval(&branch, Some(strictest));
             if branch.provider == ctx.local_node_id {
                 Self::feed_sensing_origin(ctx, &branch, &spec, sensing::DownstreamId::Leader, now);
-            } else {
-                let upstream = sensing::SensingInterestFrame::provider_registration(
-                    &spec,
-                    branch.provider,
-                    strictest,
-                    ttl,
-                );
-                if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-                    spawn_sensing_frame_send(
-                        &ctx.socket,
-                        &ctx.peers,
-                        &ctx.addr_to_node,
-                        &ctx.router,
-                        &ctx.partition_filter,
-                        ctx.local_node_id,
-                        branch.provider,
-                        sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                        sensing::SUBPROTOCOL_SENSING_INTEREST,
-                        bytes,
-                    );
+            } else if let Some(seed) = &seed {
+                let continuation = seed.provider_continuation(branch.provider, strictest, ttl);
+                if let Some(upstream) =
+                    sensing::plan_provider_continuation(&continuation, |_org| None)
+                {
+                    if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                        spawn_sensing_frame_send(
+                            &ctx.socket,
+                            &ctx.peers,
+                            &ctx.addr_to_node,
+                            &ctx.router,
+                            &ctx.partition_filter,
+                            ctx.local_node_id,
+                            branch.provider,
+                            sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                            sensing::SUBPROTOCOL_SENSING_INTEREST,
+                            bytes,
+                        );
+                    }
                 }
             }
         }
@@ -18212,10 +18236,18 @@ impl MeshNode {
         signed_refusal: &[u8],
         now: Instant,
     ) {
-        let partition = {
+        let (partition, seed) = {
             let mut slot = ctx.sensing_leader.lock();
             match slot.as_mut() {
-                Some(leader) => leader.on_refusal(branch, minimum_supported, now),
+                Some(leader) => {
+                    let partition = leader.on_refusal(branch, minimum_supported, now);
+                    // Fetch the surviving interest's admitted seed under the SAME
+                    // lock — the survivor re-registration's upstream continuation
+                    // preserves the ORIGINAL admitted authority (a Deregister
+                    // partition removed the interest, so the seed is then `None`).
+                    let seed = leader.interest_seed(&branch.interest);
+                    (partition, seed)
+                }
                 None => return,
             }
         };
@@ -18272,25 +18304,30 @@ impl MeshNode {
         let Some(current) = mesh_aggregate else {
             return;
         };
-        let upstream = sensing::SensingInterestFrame::provider_registration(
-            &spec,
-            branch.provider,
-            current,
-            ttl,
-        );
-        if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-            spawn_sensing_frame_send(
-                &ctx.socket,
-                &ctx.peers,
-                &ctx.addr_to_node,
-                &ctx.router,
-                &ctx.partition_filter,
-                ctx.local_node_id,
-                branch.provider,
-                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                sensing::SUBPROTOCOL_SENSING_INTEREST,
-                bytes,
-            );
+        // Piece-3 authority-aware survivor continuation: derive the provider leg
+        // from the interest's admitted seed and let `plan_provider_continuation`
+        // pick the frame kind by authority. Org intake is dark, so the capture is
+        // fail-closed `|_| None`. If the interest drained after on_refusal, author
+        // nothing (the ordinary soft-state contract) — never a legacy guess.
+        let Some(seed) = seed else {
+            return;
+        };
+        let continuation = seed.provider_continuation(branch.provider, current, ttl);
+        if let Some(upstream) = sensing::plan_provider_continuation(&continuation, |_org| None) {
+            if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                spawn_sensing_frame_send(
+                    &ctx.socket,
+                    &ctx.peers,
+                    &ctx.addr_to_node,
+                    &ctx.router,
+                    &ctx.partition_filter,
+                    ctx.local_node_id,
+                    branch.provider,
+                    sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                    sensing::SUBPROTOCOL_SENSING_INTEREST,
+                    bytes,
+                );
+            }
         }
     }
 

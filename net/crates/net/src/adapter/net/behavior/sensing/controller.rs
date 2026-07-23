@@ -121,6 +121,16 @@ pub enum ResolutionRefusal {
         /// The configured `maximum_fanout`.
         cap: usize,
     },
+    /// A second registration joined an existing coalescing key whose cached
+    /// admitted authority provenance does NOT match this registration's — an
+    /// org-vs-legacy (or cross-org) collision on one `ProviderInterestKey`.
+    /// Computationally unreachable in honest operation (the interest digest
+    /// binds the audience, and the org-commitment and entity-owner-root audience
+    /// families are cryptographically disjoint), so this is a defensive
+    /// invariant: a future digest/scope refactor that silently invalidated the
+    /// key-separation proof would surface here as a loud refusal rather than a
+    /// silent authority downgrade of the coalesced demand.
+    AuthorityMismatch,
 }
 
 /// The bounded outcome of one resolution pass.
