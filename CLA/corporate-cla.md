@@ -6,7 +6,7 @@ Thank you for your interest in Net ("Network Event Transport"), maintained at
 https://github.com/ai-2070/net (the "Project").
 
 This Corporate Contributor License Agreement ("Agreement") documents the rights
-granted by a corporation or other legal entity to **[MAINTAINER LEGAL NAME]**
+granted by a corporation or other legal entity to **Laszlo Attila Vekony**
 ("Maintainer"), the individual who maintains the Project. It covers the case
 where an employee contributes to the Project and the employer — not the employee
 — owns the copyright in that work.
@@ -149,9 +149,10 @@ need not be a party to, or separately consent to, such an assignment.
 
 ## 8. Miscellaneous
 
-**Governing law.** This Agreement is governed by the laws of
-**[GOVERNING LAW JURISDICTION]**, without regard to its conflict-of-law
-provisions.
+**Governing law and venue.** This Agreement is governed by the laws of
+**Hungary**, without regard to its conflict-of-law provisions. The parties
+submit to the exclusive jurisdiction of the competent courts of
+**Sopron, Hungary**.
 
 **Entire agreement.** This Agreement is the entire agreement between You and the
 Maintainer concerning Your Contributions, and supersedes any prior understanding
@@ -170,7 +171,7 @@ licensed under the [Apache License, Version 2.0](../LICENSE).
 
 Unlike the Individual CLA, the Corporate CLA is not signed through the pull
 request bot. To execute this Agreement, email a completed and signed copy —
-including Schedule A — to **[MAINTAINER CONTACT EMAIL]** with the subject line
+including Schedule A — to **makerseven7@gmail.com** with the subject line
 `Net CCLA`.
 
 | Field | Value |

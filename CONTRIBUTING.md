@@ -55,4 +55,4 @@ Go bindings live in `go/` (`go test ./...`), the web docs in `web/`.
 ## Reporting security issues
 
 Please do not open a public issue for a security vulnerability. Report it
-privately to the maintainer contact listed in the CLA documents.
+privately to makerseven7@gmail.com.

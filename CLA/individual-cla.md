@@ -6,7 +6,7 @@ Thank you for your interest in Net ("Network Event Transport"), maintained at
 https://github.com/ai-2070/net (the "Project").
 
 This Individual Contributor License Agreement ("Agreement") documents the rights
-granted by contributors to **[MAINTAINER LEGAL NAME]** ("Maintainer"), the
+granted by contributors to **Laszlo Attila Vekony** ("Maintainer"), the
 individual who maintains the Project. It exists so that the Project has a clear,
 recorded license to everything it ships — nothing more. **You keep full ownership
 of and full rights to your Contributions.** You may use them anywhere else, for
@@ -129,7 +129,7 @@ personally aware, and conspicuously marking the work as
 
 You agree to notify the Maintainer of any facts or circumstances of which You
 become aware that would make the representations in this Agreement inaccurate in
-any respect. Contact: **[MAINTAINER CONTACT EMAIL]**.
+any respect. Contact: **makerseven7@gmail.com**.
 
 ---
 
@@ -145,9 +145,10 @@ need not be a party to, or separately consent to, such an assignment.
 
 ## 9. Miscellaneous
 
-**Governing law.** This Agreement is governed by the laws of
-**[GOVERNING LAW JURISDICTION]**, without regard to its conflict-of-law
-provisions.
+**Governing law and venue.** This Agreement is governed by the laws of
+**Hungary**, without regard to its conflict-of-law provisions. The parties
+submit to the exclusive jurisdiction of the competent courts of
+**Sopron, Hungary**.
 
 **Entire agreement.** This Agreement is the entire agreement between You and the
 Maintainer concerning Your Contributions, and supersedes any prior understanding
@@ -177,4 +178,4 @@ signature. You sign once; the signature covers all of your future Contributions
 to the Project.
 
 If you prefer to sign out of band, email a signed copy of this document to
-**[MAINTAINER CONTACT EMAIL]** with the subject line `Net ICLA`.
+**makerseven7@gmail.com** with the subject line `Net ICLA`.
