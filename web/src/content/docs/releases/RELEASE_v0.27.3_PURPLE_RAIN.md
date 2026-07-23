@@ -107,4 +107,4 @@ Released 2026-06-12.
 
 ## License
 
-See [LICENSE](../../LICENSE). `ring`'s third-party notice (ISC-style, with BoringSSL / OpenSSL-derived portions) applies to distributions bundling compiled crypto objects — see the crate README.
+See [LICENSE](../../LICENSE-APACHE). `ring`'s third-party notice (ISC-style, with BoringSSL / OpenSSL-derived portions) applies to distributions bundling compiled crypto objects — see the crate README.

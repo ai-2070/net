@@ -3,7 +3,7 @@ name = "net-mesh-mcp"
 version = "0.34.0"
 edition = "2021"
 description = "MCP (Model Context Protocol) edge adapter for the Net mesh — net wrap / net mcp serve"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/ai-2070/net"
 
 [lib]

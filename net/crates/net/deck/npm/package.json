@@ -2,7 +2,7 @@
   "name": "@net-mesh/deck",
   "version": "0.34.0",
   "description": "net-deck — operator cyberdeck (terminal UI) for the Net mesh",
-  "license": "Apache-2.0",
+  "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ai-2070/net.git"

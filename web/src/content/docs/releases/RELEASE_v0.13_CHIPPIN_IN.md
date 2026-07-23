@@ -305,4 +305,4 @@ Released 2026-05-11.
 
 ## License
 
-See [LICENSE](../../LICENSE).
+See [LICENSE](../../LICENSE-APACHE).

@@ -157,7 +157,11 @@ remaining provisions remain in full force and effect.
 
 **Relationship to the Project license.** Nothing in this Agreement changes the
 terms under which the Project is distributed to the public. The Project is
-licensed under the [Apache License, Version 2.0](../LICENSE).
+licensed under your choice of the [MIT license](../LICENSE-MIT) or the
+[Apache License, Version 2.0](../LICENSE-APACHE). Both grants are irrevocable
+for code already released: every published version stays available under those
+terms permanently, and a change of license affecting future development cannot
+reach back and withdraw what has already shipped.
 
 ---
 

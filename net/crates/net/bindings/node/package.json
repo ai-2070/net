@@ -47,7 +47,7 @@
       "aarch64-unknown-linux-musl"
     ]
   },
-  "license": "Apache-2.0",
+  "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ai-2070/net.git"

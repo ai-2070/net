@@ -7,14 +7,15 @@ agreement and the basics of getting a change merged.
 
 Net requires every contributor to sign a CLA before their first contribution is
 merged. It records a license to the Project so that Net can be distributed under
-the [Apache License 2.0](LICENSE) without ambiguity about provenance.
+its dual [MIT](LICENSE-MIT) / [Apache-2.0](LICENSE-APACHE) license without
+ambiguity about provenance.
 
 **You keep full copyright ownership of your Contributions.** The CLA is a
 license grant, not an assignment — you may reuse your own work anywhere else,
 for any purpose.
 
-**Code released under Apache-2.0 stays under Apache-2.0, permanently.** That
-grant is irrevocable: every published version remains available under those
+**Released code stays under the license it shipped under, permanently.** Both
+grants are irrevocable: every published version remains available under those
 terms, and anyone may fork from the last released commit at any time. A change
 of license affecting future development could not reach back and withdraw what
 has already shipped.

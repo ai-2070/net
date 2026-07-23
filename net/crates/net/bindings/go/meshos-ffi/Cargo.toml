@@ -2,7 +2,7 @@
 name = "net-meshos-ffi"
 version = "0.34.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 description = "C ABI MeshOS daemon-author SDK for the Go binding of Net"
 # Distributed as a cdylib alongside the Go binding, not via crates.io.
 publish = false

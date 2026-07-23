@@ -8,7 +8,7 @@ edition = "2021"
 # is never mistaken for a bench target — the same regime as `sdk/Cargo.toml`.
 autobenches = false
 description = "x402-native payments layer for the Net mesh: signed envelopes around x402 v2, tiered verification, spend policy, billing events"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/ai-2070/net"
 keywords = ["x402", "payments", "mesh", "caip"]
 categories = ["network-programming", "cryptography"]
