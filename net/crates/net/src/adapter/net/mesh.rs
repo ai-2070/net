@@ -17076,13 +17076,15 @@ impl MeshNode {
                             },
                             proven_root,
                         );
-                        if let Some(upstream) = sensing::plan_provider_continuation(
-                            &admitted,
-                            validated.target,
-                            strictest,
-                            ttl,
-                            |_org| None,
-                        ) {
+                        // Derive the provider continuation at the POST-AGGREGATE
+                        // strictest interval (not the incoming one): the leg — not
+                        // independently supplied fields — is the sole source the
+                        // planner emits target/interval/ttl from.
+                        let continuation =
+                            admitted.provider_continuation(validated.target, strictest, ttl);
+                        if let Some(upstream) =
+                            sensing::plan_provider_continuation(&continuation, |_org| None)
+                        {
                             if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
                                 spawn_sensing_frame_send(
                                     &ctx.socket,

@@ -832,13 +832,19 @@ fn map_self_verify_error(e: OrgAuthorityError) -> RelayMembershipUnavailable {
 }
 
 /// The authority-aware sensing PROVIDER continuation: given an admitted
-/// registration and the resolved upstream `target` + coalesced `strictest`
-/// interval + bounded `ttl`, produce the fresh upstream frame — or `None` (emit
-/// nothing). This is the single place the legacy-vs-org emission split is
-/// decided, and it matches EXHAUSTIVELY on
-/// [`AdmittedSensingRegistration::authority`] with NO wildcard, so adding a
-/// future authority mode breaks compilation here rather than silently defaulting
-/// to a legacy egress.
+/// registration whose leg is a [`RegistrationLeg::Provider`], produce the fresh
+/// upstream frame — or `None` (emit nothing). Every field of the emitted frame
+/// comes from the admitted wrapper: the spec, the authority, AND the target +
+/// interval + ttl (from the leg). A caller cannot admit one leg and then supply
+/// a different target/interval/ttl at planning time — the ONLY way to set the
+/// upstream target and the post-aggregate strictest interval is to derive a
+/// provider leg first via [`AdmittedSensingRegistration::provider_continuation`],
+/// so the leg is the sole, immutable, load-bearing source. A non-provider (e.g.
+/// capability) seed reaching here is a caller error and yields `None`.
+///
+/// The split matches EXHAUSTIVELY on [`AdmittedSensingRegistration::authority`]
+/// with NO wildcard, so adding a future authority mode breaks compilation here
+/// rather than silently defaulting to a legacy egress:
 ///
 /// - Legacy → the existing [`SensingInterestFrame::provider_registration`] shape.
 /// - Org → a FRESH [`SensingInterestFrame::org_provider_registration`] carrying
@@ -865,11 +871,20 @@ fn map_self_verify_error(e: OrgAuthorityError) -> RelayMembershipUnavailable {
 /// never inferred from the audience bytes.
 pub(crate) fn plan_provider_continuation(
     admitted: &AdmittedSensingRegistration,
-    target: u64,
-    strictest: Duration,
-    ttl: Duration,
     capture_membership: impl FnOnce(OrgId) -> Option<LiveOrgRelayMembership>,
 ) -> Option<SensingInterestFrame> {
+    // The upstream target and the post-aggregate strictest interval + ttl are
+    // the admitted PROVIDER leg — never independently supplied. A non-provider
+    // seed cannot be emitted as a provider continuation.
+    let RegistrationLeg::Provider {
+        target,
+        requested_sample_interval: strictest,
+        soft_state_ttl: ttl,
+    } = admitted.leg()
+    else {
+        return None;
+    };
+
     match admitted.authority() {
         RegistrationAuthority::Legacy { .. } => Some(SensingInterestFrame::provider_registration(
             admitted.spec(),
@@ -1655,24 +1670,31 @@ mod tests {
 
     #[test]
     fn legacy_provider_continuation_emits_legacy_frame() {
+        // `legacy_admitted` carries a Provider leg (target 0x77, D, TTL); the
+        // planner emits from that leg, and the fail-closed capture is never
+        // invoked for a legacy admission.
         let admitted = legacy_admitted(AudienceScopeCommitment::owner_root(&member()));
-        // The fail-closed capture is never invoked for a legacy admission.
-        let frame = plan_provider_continuation(&admitted, 0x77, D, TTL, |_| {
+        let frame = plan_provider_continuation(&admitted, |_| {
             panic!("capture must not run for a legacy admission")
         })
         .expect("legacy continuation frame");
-        assert!(matches!(
+        // Exact equality with the established constructor — "legacy frame shape
+        // preserved" is a real witness, not a nearby variant check.
+        assert_eq!(
             frame,
-            SensingInterestFrame::ProviderRegistration { .. }
-        ));
+            SensingInterestFrame::provider_registration(admitted.spec(), 0x77, D, TTL)
+        );
     }
 
     #[test]
     fn org_provider_continuation_carries_the_relays_own_cert() {
         // Cert-source witness: consumer entity C, relay entity R. The emitted org
         // frame's certificate MUST be R's (from the captured membership), never C.
+        // The capability seed passes through the sanctioned provider-leg
+        // derivation first — a capability seed cannot enter the provider planner.
         let consumer = EntityId::from_bytes([0xCCu8; 32]);
-        let admitted = org_admitted(consumer.clone());
+        let seed = org_admitted(consumer.clone());
+        let admitted = seed.provider_continuation(0x77, D, TTL);
         let (relay_entity, authority, store) = adopt_relay("continuation", 1);
         let membership = capture_relay(
             Some(authority),
@@ -1682,7 +1704,7 @@ mod tests {
             now_secs(),
         )
         .expect("relay membership");
-        let frame = plan_provider_continuation(&admitted, 0x77, D, TTL, |org| {
+        let frame = plan_provider_continuation(&admitted, |org| {
             assert_eq!(org, org_kp().org_id(), "captured for the admitted org");
             Some(membership)
         })
@@ -1710,12 +1732,44 @@ mod tests {
     #[test]
     fn org_continuation_without_membership_emits_nothing_and_no_fallback() {
         // Relay membership unavailable → NO frame, and specifically NO legacy
-        // ProviderRegistration fallback.
-        let admitted = org_admitted(EntityId::from_bytes([0xCCu8; 32]));
-        let planned = plan_provider_continuation(&admitted, 0x77, D, TTL, |_| None);
+        // ProviderRegistration fallback. A proper provider leg is derived first,
+        // so the `None` is the membership gate — not the leg guard.
+        let admitted =
+            org_admitted(EntityId::from_bytes([0xCCu8; 32])).provider_continuation(0x77, D, TTL);
+        let planned = plan_provider_continuation(&admitted, |_| None);
         assert!(
             planned.is_none(),
             "an org admission with no live membership emits nothing (no legacy fallback)"
+        );
+    }
+
+    #[test]
+    fn capability_leg_cannot_enter_provider_planner() {
+        // The leg is load-bearing: a capability seed must pass through
+        // `provider_continuation` before it can be a provider continuation.
+        // Passing a capability-leg admission directly emits NOTHING and never
+        // even reaches the capture. This RED-fails a planner that reads
+        // independently supplied fields instead of the admitted leg.
+        let org_cap = org_admitted(EntityId::from_bytes([0xCCu8; 32])); // Capability leg
+        assert!(
+            plan_provider_continuation(&org_cap, |_| {
+                panic!("capture must not run for a non-provider leg")
+            })
+            .is_none(),
+            "an org capability seed is not a provider continuation"
+        );
+        let legacy_cap = AdmittedSensingRegistration::from_validated_legacy(
+            spec_with(AudienceScopeCommitment::owner_root(&member())),
+            RegistrationLeg::Capability {
+                consumer: FROM_NODE,
+                requested_sample_interval: D,
+                soft_state_ttl: TTL,
+            },
+            AudienceScopeCommitment::owner_root(&member()),
+        );
+        assert!(
+            plan_provider_continuation(&legacy_cap, |_| None).is_none(),
+            "a legacy capability seed is not a provider continuation"
         );
     }
 
