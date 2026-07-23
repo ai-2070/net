@@ -184,7 +184,7 @@ jobs:
           mkdir -p "${PKG_DIR}/bin"
           cp "net/crates/net/target/${TARGET}/release/${BIN_NAME}" "${PKG_DIR}/bin/"
           chmod +x "${PKG_DIR}/bin/${BIN_NAME}" || true
-          cp net/crates/net/deck/npm/LICENSE "${PKG_DIR}/"
+          cp net/crates/net/deck/npm/LICENSE LICENSE-APACHE LICENSE-MIT "${PKG_DIR}/"
           cat > "${PKG_DIR}/README.md" <<EOF
           # @net-mesh/deck-${NPM_SUFFIX}
 

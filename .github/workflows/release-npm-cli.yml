@@ -197,7 +197,7 @@ jobs:
           # mode bits but explicit chmod is cheap insurance).
           chmod +x "${PKG_DIR}/bin/${BIN_NAME}" || true
 
-          cp net/crates/net/cli/npm/LICENSE "${PKG_DIR}/"
+          cp net/crates/net/cli/npm/LICENSE LICENSE-APACHE LICENSE-MIT "${PKG_DIR}/"
 
           # Build a minimal README per-platform — links back to the
           # parent for the actual install instructions.

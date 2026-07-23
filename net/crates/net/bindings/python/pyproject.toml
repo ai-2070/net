@@ -10,13 +10,12 @@ name = "net-mesh"
 version = "0.34.0"
 description = "High-performance, schema-agnostic event bus for AI runtime workloads"
 readme = "README.md"
-license = { text = "MIT OR Apache-2.0" }
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

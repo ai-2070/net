@@ -20,7 +20,9 @@
   "files": [
     "bin/net-mesh.js",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
   ],
   "engines": {
     "node": ">=20"

@@ -62,6 +62,8 @@
     "napi"
   ],
   "files": [
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
     "index.js",
     "index.d.ts",
     "errors.js",
