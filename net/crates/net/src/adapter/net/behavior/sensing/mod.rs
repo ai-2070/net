@@ -49,8 +49,11 @@ pub mod frames;
 pub mod identity;
 pub mod incarnation;
 // OLB-0 / S0 §4.3: the node-global sensing-interest lease registry
-// (refcount + cadence aggregation + generation guard). Pure — the node
-// performs the register/deregister the actions describe.
+// (refcount + cadence aggregation). Pure — the node performs the
+// register/deregister the actions describe. Stale/foreign-token releases are
+// no-ops by the node-global monotonic token mint, NOT a receiver-enforced
+// installation-generation guard — that guard is explicitly deferred (see the
+// `sensing_lease_apply_mu` field docs on `MeshNode`).
 pub mod lease;
 pub mod negotiation;
 // OLB org-auth slice (commit 2): the organization-authenticated sensing

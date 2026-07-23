@@ -76,8 +76,8 @@ async fn equivalent_acquires_share_one_registration_and_last_release_deregisters
         .expect("first acquire registers");
     assert!(
         node.sensing_downstreams(&key)
-            .contains(&DownstreamId::Local),
-        "first acquire installs the Local row"
+            .contains(&DownstreamId::LeasedLocal),
+        "first acquire installs the lease-owned LeasedLocal row"
     );
 
     let t2 = node
@@ -85,14 +85,14 @@ async fn equivalent_acquires_share_one_registration_and_last_release_deregisters
         .expect("second acquire shares the lease");
     assert_eq!(
         node.sensing_downstreams(&key),
-        vec![DownstreamId::Local],
+        vec![DownstreamId::LeasedLocal],
         "the equivalent second acquire is still one registration"
     );
 
     node.release_sensing_interest_lease(t1);
     assert!(
         node.sensing_downstreams(&key)
-            .contains(&DownstreamId::Local),
+            .contains(&DownstreamId::LeasedLocal),
         "a surviving holder keeps the registration live"
     );
 
@@ -121,8 +121,18 @@ async fn a_stricter_acquire_keeps_one_local_registration() {
         .expect("strict acquire re-registers tighter");
     assert_eq!(
         node.sensing_downstreams(&key),
-        vec![DownstreamId::Local],
+        vec![DownstreamId::LeasedLocal],
         "tightening the cadence is still one registration"
+    );
+    // §8: assert the tighten actually moved the installed cadence — a silently
+    // swallowed Reregister would leave the row at the loose D and pass the
+    // count-only check above.
+    assert_eq!(
+        node.sensing_downstream_entry(&key, DownstreamId::LeasedLocal)
+            .expect("row present")
+            .requested_sample_interval,
+        STRICT,
+        "the tightened 50 ms cadence is actually installed on the row"
     );
 
     node.release_sensing_interest_lease(strict);
@@ -156,7 +166,7 @@ async fn releasing_one_ticket_leaves_another_key_untouched() {
     assert!(node.sensing_downstreams(&key_a).is_empty(), "A torn down");
     assert!(
         node.sensing_downstreams(&key_b)
-            .contains(&DownstreamId::Local),
+            .contains(&DownstreamId::LeasedLocal),
         "B's registration is untouched by A's release"
     );
 }
@@ -206,7 +216,7 @@ async fn overcap_rolls_back_and_does_not_wedge_the_lease() {
     let key_b_row = ProviderInterestKey::new(spec_b.key(), OTHER_PROVIDER);
     assert!(node
         .sensing_downstreams(&key_b_row)
-        .contains(&DownstreamId::Local));
+        .contains(&DownstreamId::LeasedLocal));
 }
 
 /// A registration refused against a cached provider floor (the distinct
@@ -253,7 +263,7 @@ async fn below_floor_acquire_is_refused_rolled_back_and_recovers() {
         .expect("recovers once the floor relaxes");
     assert!(node
         .sensing_downstreams(&key)
-        .contains(&DownstreamId::Local));
+        .contains(&DownstreamId::LeasedLocal));
     assert!(node.sensing_lease_entry_for_test(&lease_key).is_some());
 }
 
@@ -284,4 +294,156 @@ async fn deregister_is_a_noop_when_the_plane_is_disabled() {
     let spec = spec_for(node.sensing_local_root(), PROVIDER);
     node.deregister_sensing_interest(&spec, PROVIDER);
     assert!(node.sensing_table_is_empty());
+}
+
+/// L1 (review §1): a DIRECT `register_sensing_interest` row is untouched by a
+/// refused lease acquire's rollback. The lease owns a distinct `LeasedLocal`
+/// slot, so a first-holder acquire refused by a cached floor rolls back without
+/// ever removing the direct `Local` row for the same key. RED-coupled: with the
+/// lease sharing the `Local` identity, this rollback tore the direct row down.
+#[tokio::test]
+async fn lease_rollback_leaves_a_direct_local_row_intact() {
+    let node = sensing_node().await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    // A direct application watch installs the node-local `Local` row at 100 ms.
+    node.register_sensing_interest(&spec, PROVIDER, D, Duration::from_secs(30))
+        .expect("direct registration installs the Local row");
+    assert!(
+        node.sensing_downstreams(&key)
+            .contains(&DownstreamId::Local),
+        "the direct Local row is present"
+    );
+
+    // A provider floor of 50 ms is later cached for the key.
+    node.install_sensing_cached_floor_for_test(&spec, PROVIDER, STRICT);
+
+    // A lease acquire BELOW that floor is refused; its first-holder rollback
+    // must not remove the direct row.
+    let below_floor = Duration::from_millis(10);
+    let err = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, below_floor)
+        .expect_err("below the cached floor");
+    assert!(
+        matches!(err, SensingRegistrationError::RefusedByFloor { .. }),
+        "got {err:?}"
+    );
+
+    assert!(
+        node.sensing_downstreams(&key)
+            .contains(&DownstreamId::Local),
+        "the direct Local row SURVIVES the refused lease acquire's rollback"
+    );
+    assert_eq!(
+        node.sensing_downstream_entry(&key, DownstreamId::Local)
+            .expect("direct row still present")
+            .requested_sample_interval,
+        D,
+        "the direct row keeps its own 100 ms cadence, untouched by the lease"
+    );
+    // The refused acquire also wedged nothing in the lease registry.
+    let lease_key = SensingLeaseKey::ExactProvider {
+        audience: spec.audience,
+        interest_digest: spec.interest_digest(),
+        provider: PROVIDER,
+    };
+    assert!(node.sensing_lease_entry_for_test(&lease_key).is_none());
+}
+
+/// L2 (review §3): a STALE ticket release cannot remove a live SUCCESSOR holder
+/// of the same key. acquire t1 → release t1 → acquire t2 (same key) → stale
+/// release t1: t2's row and lease entry survive, no wire Deregister; the final
+/// release t2 cleans up. RED-coupled against any token scheme that recycles or
+/// per-entry-scopes tokens instead of the node-global monotonic mint.
+#[tokio::test]
+async fn stale_ticket_release_cannot_remove_a_live_successor() {
+    let node = sensing_node().await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+    let lease_key = SensingLeaseKey::ExactProvider {
+        audience: spec.audience,
+        interest_digest: spec.interest_digest(),
+        provider: PROVIDER,
+    };
+
+    let t1 = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, D)
+        .expect("acquire t1");
+    node.release_sensing_interest_lease(t1);
+    assert!(node.sensing_table_is_empty(), "t1 released — no rows");
+
+    // A NEW holder for the same key mints a fresh, monotonic token.
+    let t2 = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, D)
+        .expect("acquire t2 (successor)");
+    assert!(
+        node.sensing_downstreams(&key)
+            .contains(&DownstreamId::LeasedLocal),
+        "t2 installed the successor row"
+    );
+
+    // The STALE t1 release must be a pure no-op — it cannot tear down t2.
+    node.release_sensing_interest_lease(t1);
+    assert!(
+        node.sensing_downstreams(&key)
+            .contains(&DownstreamId::LeasedLocal),
+        "the stale t1 release does NOT remove the live successor row"
+    );
+    assert!(
+        node.sensing_lease_entry_for_test(&lease_key).is_some(),
+        "t2's lease entry survives the stale release"
+    );
+
+    // The successor's OWN release is what finally deregisters.
+    node.release_sensing_interest_lease(t2);
+    assert!(
+        node.sensing_table_is_empty(),
+        "t2 release deregisters — no rows remain"
+    );
+    assert!(node.sensing_lease_entry_for_test(&lease_key).is_none());
+}
+
+/// L3 (review §8): a non-first-holder tighten refused by a cached floor rolls
+/// back by RELAXING the installed cadence to the surviving holder's minimum, not
+/// by deregistering. Witnesses the relax-back arithmetic (lease.rs:222-228) at
+/// the node level — existing tests only cover first-holder failures.
+#[tokio::test]
+async fn refused_non_first_holder_tighten_relaxes_back_to_survivor() {
+    let node = sensing_node().await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    // A loose holder installs the row at 100 ms.
+    let loose = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, D)
+        .expect("loose acquire");
+    // A cached floor of 60 ms: the 100 ms row stands, but a 50 ms tighten fails.
+    node.install_sensing_cached_floor_for_test(&spec, PROVIDER, Duration::from_millis(60));
+
+    // A second holder's tighten to 50 ms is refused; the rollback relaxes the
+    // installed cadence back to the survivor's 100 ms rather than deregistering.
+    let err = node
+        .acquire_sensing_interest_lease(&spec, PROVIDER, STRICT)
+        .expect_err("tighten below floor");
+    assert!(
+        matches!(err, SensingRegistrationError::RefusedByFloor { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(
+        node.sensing_downstreams(&key),
+        vec![DownstreamId::LeasedLocal],
+        "the survivor's row remains — the refused tighten did not deregister it"
+    );
+    assert_eq!(
+        node.sensing_downstream_entry(&key, DownstreamId::LeasedLocal)
+            .expect("survivor row present")
+            .requested_sample_interval,
+        D,
+        "the installed cadence relaxed back to the survivor's 100 ms"
+    );
+
+    // The loose holder still cleanly tears down.
+    node.release_sensing_interest_lease(loose);
+    assert!(node.sensing_table_is_empty(), "final release deregisters");
 }

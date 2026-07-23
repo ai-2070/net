@@ -207,6 +207,30 @@ pub struct SensingCounters {
     /// matched more providers than `each_mode_max_providers`.
     pub broad_selector_refusals: AtomicU64,
 
+    // ── Organization-gate refusals by reason (review §4) ──
+    // Security-relevant org-sensing intake refusals, one counter per reason so a
+    // forged-cert flood or revocation-evasion attempt leaves an operator-visible
+    // signal (previously every arm but `Semantic` was silent). Diagnostics only.
+    /// Certificate signature / TTL / validity-window check failed.
+    pub org_cert_invalid: AtomicU64,
+    /// Certificate generation is below the revocation floor (a revoked member
+    /// still sending).
+    pub org_below_floor: AtomicU64,
+    /// The certificate's organization is not this node's owner organization.
+    pub org_foreign_org: AtomicU64,
+    /// The authenticated session sender is not the certificate's member.
+    pub org_sender_member_mismatch: AtomicU64,
+    /// The interest audience is not the canonical commitment for the org.
+    pub org_audience_mismatch: AtomicU64,
+    /// No installed authority/store at gate time (`MissingAuthority`) or the
+    /// dispatch snapshot capture found none — this node cannot verify membership.
+    pub org_authority_unavailable: AtomicU64,
+    /// The pinned authority view went stale before the table mutation (a floor
+    /// raise, authority swap, or A→B→A rotation between gate and register).
+    pub org_stale_stamp: AtomicU64,
+    /// The installed revocation store is poisoned — all org intake fails dark.
+    pub org_store_poisoned: AtomicU64,
+
     // ── Coalescing + delivery lifecycle (SI-7) ──
     /// Consumer capability-registrations admitted at THIS node's
     /// sensing-leader role — the denominator for the local

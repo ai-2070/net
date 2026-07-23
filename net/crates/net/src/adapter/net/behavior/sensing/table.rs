@@ -46,7 +46,20 @@ use super::identity::{AudienceScopeCommitment, Digest256, ProviderInterestKey};
 pub enum DownstreamId {
     /// This node's own application-level interest (the `LOCAL` row
     /// in plan §4.3) — deliveries feed the node's consumer overlay.
+    /// Installed by the DIRECT
+    /// [`register_sensing_interest`](crate::adapter::net::MeshNode::register_sensing_interest)
+    /// API only.
     Local,
+    /// A node-global interest-LEASE row (OLB-0): the coalesced demand of the
+    /// node's lease holders, installed exclusively through
+    /// [`acquire_sensing_interest_lease`](crate::adapter::net::MeshNode::acquire_sensing_interest_lease).
+    /// Behaves identically to [`Self::Local`] for delivery/overlay/refusal —
+    /// it is a node-local interest — but is a DISTINCT table slot so the lease
+    /// lifecycle (acquire / release / acquire-failure rollback) can only ever
+    /// touch lease-owned rows. Without this separation a rolled-back lease
+    /// acquire would deregister a `Local` row a direct registration installed
+    /// for the same `(interest, provider)` (review §1).
+    LeasedLocal,
     /// The node's OWN sensing-leader role's coalesced demand (SI-4
     /// review P0): deliveries feed `SensingLeader::on_attestation`,
     /// which fans the proof to the leader's real consumer rows.

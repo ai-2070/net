@@ -78,11 +78,25 @@ pub fn canonical_org_sensing_commitment(org_id: &OrgId) -> AudienceScopeCommitme
     AudienceScopeCommitment::from_bytes(*hasher.finalize().as_bytes())
 }
 
+/// A zero-size witness that a [`ValidatedOrgSensingRegistration`] was minted by
+/// [`verify_org_sensing_registration`] and nowhere else. Every variant of the
+/// validated object carries one. The type is nameable but its field is PRIVATE
+/// to this module, so a variant cannot be CONSTRUCTED without a `GateProof`,
+/// which no code outside `org_gate` can produce. The validated object is
+/// therefore impossible to fabricate, not merely documented as gate-produced
+/// (review §7). Pattern matches (`from_validated_org`, tests) ignore it via `..`,
+/// and the derived impls read it, so it is not dead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GateProof(());
+
 /// The narrow, validated result of the org-sensing authority gate — the ONLY
 /// value permitted to drive a sensing-table mutation for an org registration.
 /// It carries the re-derived spec and the leg parameters, plus the verified
 /// subscriber/organization identity for attribution; it never lends the caller
-/// a reason to re-read the untrusted frame.
+/// a reason to re-read the untrusted frame. SEALED: each variant carries a
+/// private [`GateProof`], so only [`verify_org_sensing_registration`] (or, under
+/// `#[cfg(test)]`, [`Self::capability_for_test`]) can construct it — a future
+/// leader intake cannot mint an org-authority row by literal-constructing this.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidatedOrgSensingRegistration {
     /// A leader-addressed (provider-free) org registration.
@@ -99,6 +113,8 @@ pub enum ValidatedOrgSensingRegistration {
         subscriber: EntityId,
         /// The verified organization.
         org_id: OrgId,
+        /// Gate-only construction proof (review §7).
+        gate_proof: GateProof,
     },
     /// A provider-addressed org registration (a relay's re-authoring).
     Provider {
@@ -114,7 +130,34 @@ pub enum ValidatedOrgSensingRegistration {
         subscriber: EntityId,
         /// The verified organization.
         org_id: OrgId,
+        /// Gate-only construction proof (review §7).
+        gate_proof: GateProof,
     },
+}
+
+#[cfg(test)]
+impl ValidatedOrgSensingRegistration {
+    /// Test-only sanctioned constructor for a Capability-leg validated object —
+    /// the sole way in-crate tests may fabricate one without running the full
+    /// gate. Not available in production builds, so the seal holds there.
+    pub(crate) fn capability_for_test(
+        spec: InterestSpec,
+        consumer: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+        subscriber: EntityId,
+        org_id: OrgId,
+    ) -> Self {
+        Self::Capability {
+            spec,
+            consumer,
+            requested_sample_interval,
+            soft_state_ttl,
+            subscriber,
+            org_id,
+            gate_proof: GateProof(()),
+        }
+    }
 }
 
 /// Why an org-sensing registration was refused. Every variant is a hard
@@ -151,8 +194,53 @@ pub enum OrgSensingRejection {
 /// stamp (step 9) immediately before the table mutation (step 10) — so a floor
 /// raised or an authority swapped mid-validation cannot admit a stale
 /// registration.
+///
+/// Every refusal bumps a per-reason [`SensingCounters`] tally (review §4) so a
+/// forged-cert flood or revocation-evasion attempt is operator-visible — the
+/// `Semantic` arm is already counted by [`SensingInterestFrame::validated_spec`],
+/// so it is not double-counted here.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_org_sensing_registration(
+    frame: &SensingInterestFrame,
+    from_node: u64,
+    sender_entity: &EntityId,
+    node_authority: Option<OrgAuthorityView>,
+    revocation: &OrgRevocationState,
+    now_secs: u64,
+    counters: &SensingCounters,
+) -> Result<ValidatedOrgSensingRegistration, OrgSensingRejection> {
+    let result = verify_org_sensing_registration_inner(
+        frame,
+        from_node,
+        sender_entity,
+        node_authority,
+        revocation,
+        now_secs,
+        counters,
+    );
+    if let Err(rejection) = &result {
+        // One counter per reason; `Semantic` already counted upstream.
+        let counter = match rejection {
+            OrgSensingRejection::CertInvalid(_) => Some(&counters.org_cert_invalid),
+            OrgSensingRejection::BelowFloor => Some(&counters.org_below_floor),
+            OrgSensingRejection::ForeignOrg => Some(&counters.org_foreign_org),
+            OrgSensingRejection::SenderMemberMismatch => Some(&counters.org_sender_member_mismatch),
+            OrgSensingRejection::AudienceMismatch => Some(&counters.org_audience_mismatch),
+            OrgSensingRejection::MissingAuthority => Some(&counters.org_authority_unavailable),
+            // Routed-origin / frame-shape violations are protocol-invalid input.
+            OrgSensingRejection::ConsumerBindingMismatch
+            | OrgSensingRejection::NotOrgRegistration => Some(&counters.protocol_invalid),
+            OrgSensingRejection::Semantic(_) => None,
+        };
+        if let Some(counter) = counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_org_sensing_registration_inner(
     frame: &SensingInterestFrame,
     from_node: u64,
     sender_entity: &EntityId,
@@ -258,6 +346,7 @@ pub fn verify_org_sensing_registration(
             soft_state_ttl,
             subscriber,
             org_id,
+            gate_proof: GateProof(()),
         },
         Leg::Provider {
             target,
@@ -270,6 +359,7 @@ pub fn verify_org_sensing_registration(
             soft_state_ttl,
             subscriber,
             org_id,
+            gate_proof: GateProof(()),
         },
     })
 }
@@ -1055,6 +1145,82 @@ mod tests {
         ));
     }
 
+    // ---- review §8: org-gate rejection arms without direct witnesses -----
+
+    /// A non-organization frame is refused at step 1 as `NotOrgRegistration`,
+    /// before any membership work.
+    #[test]
+    fn a_non_org_frame_is_refused_as_not_org_registration() {
+        let frame =
+            SensingInterestFrame::provider_registration(&spec_with(org_commit()), 0x77, D, TTL);
+        let err = run(&frame, &member(), Some(authority()), &empty_floors()).unwrap_err();
+        assert!(
+            matches!(err, OrgSensingRejection::NotOrgRegistration),
+            "got {err:?}"
+        );
+    }
+
+    /// A digest-inconsistent AUDIENCE on an ORG frame fails at step 2 (Semantic),
+    /// before the step-8 audience check — the embedded `interest_digest` commits
+    /// to the org-commitment audience, so a swapped `audience_scope` no longer
+    /// reconstructs to that digest. (The `frames.rs` red matrix mutates only the
+    /// legacy leg; this is the org-leg analog.)
+    #[test]
+    fn a_digest_inconsistent_audience_on_an_org_frame_fails_at_step_2() {
+        let mut frame = SensingInterestFrame::org_provider_registration(
+            &spec_with(org_commit()),
+            0x77,
+            D,
+            TTL,
+            cert_gen(5),
+        );
+        if let SensingInterestFrame::OrgProviderRegistration { audience_scope, .. } = &mut frame {
+            *audience_scope = AudienceScopeCommitment::from_bytes([0xABu8; 32]);
+        }
+        let err = run(&frame, &member(), Some(authority()), &empty_floors()).unwrap_err();
+        assert!(
+            matches!(err, OrgSensingRejection::Semantic(_)),
+            "a digest-inconsistent org audience must fail at step 2, got {err:?}"
+        );
+    }
+
+    /// Review §4: an org-gate refusal that was previously silent now bumps its
+    /// per-reason counter.
+    #[test]
+    fn a_foreign_org_refusal_bumps_its_counter() {
+        let counters = SensingCounters::default();
+        let foreign_kp = OrgKeypair::from_bytes([0x99u8; 32]);
+        let foreign_cert =
+            OrgMembershipCert::try_issue(&foreign_kp, member(), 5, ORG_CERT_TTL_SECS_RECOMMENDED)
+                .expect("foreign cert");
+        let frame = SensingInterestFrame::org_provider_registration(
+            &spec_with(canonical_org_sensing_commitment(&foreign_kp.org_id())),
+            0x77,
+            D,
+            TTL,
+            foreign_cert,
+        );
+        let err = verify_org_sensing_registration(
+            &frame,
+            FROM_NODE,
+            &member(),
+            Some(authority()),
+            &empty_floors(),
+            now_secs(),
+            &counters,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, OrgSensingRejection::ForeignOrg),
+            "got {err:?}"
+        );
+        assert_eq!(
+            SensingCounters::get(&counters.org_foreign_org),
+            1,
+            "the foreign-org refusal is counted (previously silent)"
+        );
+    }
+
     // ---- red matrix: each negative varies ONLY its named predicate -----
     #[test]
     fn foreign_organization_is_refused() {
@@ -1181,14 +1347,14 @@ mod tests {
     // ---- admitted wrapper provenance ----------------------------------
     #[test]
     fn org_admitted_wrapper_derives_proven_root_from_org_id() {
-        let validated = ValidatedOrgSensingRegistration::Capability {
-            spec: spec_with(org_commit()),
-            consumer: FROM_NODE,
-            requested_sample_interval: D,
-            soft_state_ttl: TTL,
-            subscriber: member(),
-            org_id: org_kp().org_id(),
-        };
+        let validated = ValidatedOrgSensingRegistration::capability_for_test(
+            spec_with(org_commit()),
+            FROM_NODE,
+            D,
+            TTL,
+            member(),
+            org_kp().org_id(),
+        );
         let admitted = AdmittedSensingRegistration::from_validated_org(validated);
         // Derived from the verified org id, never supplied.
         assert_eq!(
@@ -1659,14 +1825,14 @@ mod tests {
     /// can survive into the continuation.
     fn org_admitted(consumer: EntityId) -> AdmittedSensingRegistration {
         AdmittedSensingRegistration::from_validated_org(
-            ValidatedOrgSensingRegistration::Capability {
-                spec: spec_with(org_commit()),
-                consumer: FROM_NODE,
-                requested_sample_interval: D,
-                soft_state_ttl: TTL,
-                subscriber: consumer,
-                org_id: org_kp().org_id(),
-            },
+            ValidatedOrgSensingRegistration::capability_for_test(
+                spec_with(org_commit()),
+                FROM_NODE,
+                D,
+                TTL,
+                consumer,
+                org_kp().org_id(),
+            ),
         )
     }
 

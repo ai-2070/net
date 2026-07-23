@@ -3832,7 +3832,7 @@ fn dispatch_sensing_leader_deliveries(
                     );
                 }
             }
-            sensing::DownstreamId::Local => {
+            sensing::DownstreamId::Local | sensing::DownstreamId::LeasedLocal => {
                 let interval = wire.promised_cadence;
                 overlay_moved |= observations.lock().feed_consumer_cell(
                     &branch,
@@ -6780,6 +6780,28 @@ impl MeshNode {
         requested_sample_interval: Duration,
         soft_state_ttl: Duration,
     ) -> Result<sensing::RegisterOutcome, SensingRegistrationError> {
+        // The DIRECT registration path owns the node-local `Local` row.
+        self.register_sensing_interest_as(
+            sensing::DownstreamId::Local,
+            spec,
+            provider,
+            requested_sample_interval,
+            soft_state_ttl,
+        )
+    }
+
+    /// The shared node-local registration core, parameterized by the owning
+    /// downstream identity: `Local` for the direct API, `LeasedLocal` for the
+    /// interest-lease path (review §1 — separating the identity keeps a lease
+    /// mutation from ever touching a direct row, and vice versa).
+    fn register_sensing_interest_as(
+        &self,
+        downstream: sensing::DownstreamId,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+    ) -> Result<sensing::RegisterOutcome, SensingRegistrationError> {
         if !self.config.enable_sensing_coalescing {
             return Err(SensingRegistrationError::Disabled);
         }
@@ -6815,7 +6837,7 @@ impl MeshNode {
             let mut table = self.sensing_interest_table.lock();
             let outcome = table.register(
                 &key,
-                sensing::DownstreamId::Local,
+                downstream,
                 requested_sample_interval,
                 ttl,
                 proven_root,
@@ -6860,7 +6882,7 @@ impl MeshNode {
                         let _ = self.sensing_interest_table.lock().deregister(
                             &key.interest.interest_digest,
                             Some(provider),
-                            sensing::DownstreamId::Local,
+                            downstream,
                             now,
                         );
                         return Err(SensingRegistrationError::AtCapacity);
@@ -6914,7 +6936,7 @@ impl MeshNode {
             // provisional.
             {
                 let mut observations = self.sensing_observations.lock();
-                let slot_key = (key.clone(), sensing::DownstreamId::Local);
+                let slot_key = (key.clone(), downstream);
                 if !observations.slots.contains_key(&slot_key) {
                     if let Some(cached) = observations.latest.get(&key).cloned() {
                         observations.slots.insert(
@@ -7013,9 +7035,12 @@ impl MeshNode {
                 .acquire(key, spec, requested_sample_interval);
         let ticket = sensing::SensingLeaseTicket { key, token };
         if let Err(err) = self.apply_sensing_lease_action(key, action) {
-            // Roll the reference back and reconcile the wire to the
-            // post-release view. A non-installed outcome left no row, so the
-            // resulting Deregister is a harmless no-op.
+            // Roll the reference back and reconcile the wire to the post-release
+            // view. The lease owns a DISTINCT `LeasedLocal` row (review §1), so
+            // when the first-holder acquire installed nothing the rollback
+            // Deregister targets an absent lease row and is a true no-op — it can
+            // no longer tear down a `Local` row a direct registration installed
+            // for the same key.
             let rollback = self.sensing_interest_leases.release(ticket);
             let _ = self.apply_sensing_lease_action(key, rollback);
             return Err(err);
@@ -7052,7 +7077,10 @@ impl MeshNode {
         match action {
             sensing::LeaseAction::Register { spec, interval }
             | sensing::LeaseAction::Reregister { spec, interval } => {
-                match self.register_sensing_interest(
+                // The lease owns the `LeasedLocal` slot, never the direct `Local`
+                // row (review §1).
+                match self.register_sensing_interest_as(
+                    sensing::DownstreamId::LeasedLocal,
                     &spec,
                     provider,
                     interval,
@@ -7070,7 +7098,11 @@ impl MeshNode {
                 }
             }
             sensing::LeaseAction::Deregister { spec } => {
-                self.deregister_sensing_interest(&spec, provider);
+                self.deregister_sensing_interest_as(
+                    sensing::DownstreamId::LeasedLocal,
+                    &spec,
+                    provider,
+                );
                 Ok(())
             }
             sensing::LeaseAction::Unchanged => Ok(()),
@@ -7086,6 +7118,20 @@ impl MeshNode {
     /// deregister upstream otherwise. A no-op when the plane is disabled
     /// or no such row exists.
     pub fn deregister_sensing_interest(&self, spec: &sensing::InterestSpec, provider: u64) {
+        // The DIRECT path retires the node-local `Local` row it owns.
+        self.deregister_sensing_interest_as(sensing::DownstreamId::Local, spec, provider);
+    }
+
+    /// The shared node-local deregistration core, parameterized by the owning
+    /// downstream identity (review §1): `Local` for the direct API,
+    /// `LeasedLocal` for the interest lease — a deregistration only ever
+    /// removes the row its own path installed.
+    fn deregister_sensing_interest_as(
+        &self,
+        downstream: sensing::DownstreamId,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+    ) {
         if !self.config.enable_sensing_coalescing {
             return;
         }
@@ -7097,7 +7143,7 @@ impl MeshNode {
         let actions = self.sensing_interest_table.lock().deregister(
             &key.interest.interest_digest,
             Some(provider),
-            sensing::DownstreamId::Local,
+            downstream,
             now,
         );
         for (branch_key, action) in actions {
@@ -11010,15 +11056,19 @@ impl MeshNode {
                         .filter_map(|downstream| match downstream {
                             sensing::DownstreamId::Peer(node) => Some(node),
                             // SI-4 review P1 (self-provider watch):
-                            // the origin's own Local row consumes
-                            // the SAME signed beats below.
-                            sensing::DownstreamId::Local => {
+                            // the origin's own node-local row (direct
+                            // `Local` or leased `LeasedLocal`) consumes
+                            // the SAME signed beats below — take the
+                            // strictest interval across both.
+                            sensing::DownstreamId::Local | sensing::DownstreamId::LeasedLocal => {
+                                let interval = table
+                                    .lock()
+                                    .downstream_entry(&branch, downstream)
+                                    .map(|row| row.requested_sample_interval)
+                                    .unwrap_or(Duration::from_millis(50));
                                 local_interval = Some(
-                                    table
-                                        .lock()
-                                        .downstream_entry(&branch, sensing::DownstreamId::Local)
-                                        .map(|row| row.requested_sample_interval)
-                                        .unwrap_or(Duration::from_millis(50)),
+                                    local_interval
+                                        .map_or(interval, |existing| existing.min(interval)),
                                 );
                                 None
                             }
@@ -14419,8 +14469,10 @@ impl MeshNode {
                                             }
                                             // SI-4b: the local
                                             // consumer's due catch-
-                                            // up feeds its cell.
-                                            sensing::DownstreamId::Local => {
+                                            // up feeds its cell (direct
+                                            // or leased node-local row).
+                                            sensing::DownstreamId::Local
+                                            | sensing::DownstreamId::LeasedLocal => {
                                                 overlay_moved |= observations
                                                     .feed_consumer_cell(
                                                         &branch,
@@ -17126,13 +17178,54 @@ impl MeshNode {
         sensing::AdmittedSensingRegistration,
         sensing::SensingAuthoritySnapshot,
     )> {
-        let snapshot = sensing::capture_sensing_authority_snapshot(
+        // Cheap STRUCTURAL bounds reject BEFORE the Ed25519 verify + the
+        // org_install snapshot capture (review §4): interval/ttl are resource
+        // limits, not authority evidence, so rejecting a garbage-bounded frame
+        // here costs an attacker a signature verify + three org_install
+        // acquisitions less. The authoritative re-check stays in
+        // `apply_provider_registration` (under the held table guard).
+        let (interval, ttl) = match frame {
+            sensing::SensingInterestFrame::OrgProviderRegistration {
+                requested_sample_interval,
+                soft_state_ttl,
+                ..
+            }
+            | sensing::SensingInterestFrame::OrgCapabilityRegistration {
+                requested_sample_interval,
+                soft_state_ttl,
+                ..
+            } => (*requested_sample_interval, *soft_state_ttl),
+            _ => return None,
+        };
+        if !sensing_interval_in_bounds(interval, ctx.sensing_interest_ttl) || ttl.is_zero() {
+            return None;
+        }
+        let snapshot = match sensing::capture_sensing_authority_snapshot(
             &ctx.org_install,
             &ctx.node_authority,
             &ctx.org_revocation,
             &ctx.org_install_generation,
-        )
-        .ok()?;
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(unavailable) => {
+                // Review §4: a missing authority/store or a poisoned store makes
+                // this node silently ignore ALL org intake — count it per reason.
+                match unavailable {
+                    sensing::SensingAuthorityUnavailable::Poisoned => {
+                        ctx.sensing_counters
+                            .org_store_poisoned
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    sensing::SensingAuthorityUnavailable::NoAuthority
+                    | sensing::SensingAuthorityUnavailable::NoStore => {
+                        ctx.sensing_counters
+                            .org_authority_unavailable
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return None;
+            }
+        };
         let validated = sensing::verify_org_sensing_registration(
             frame,
             from_node,
@@ -17224,15 +17317,21 @@ impl MeshNode {
             match (admitted.authority(), org_authority) {
                 (sensing::RegistrationAuthority::Legacy { .. }, None) => {}
                 (sensing::RegistrationAuthority::Org { .. }, Some(snapshot)) => {
-                    let Some(current) = sensing::capture_current_sensing_stamp(
+                    let stale = match sensing::capture_current_sensing_stamp(
                         &ctx.org_install,
                         &ctx.node_authority,
                         &ctx.org_revocation,
                         &ctx.org_install_generation,
-                    ) else {
-                        return;
+                    ) {
+                        None => true,
+                        Some(current) => !snapshot.stamp().is_current(&current),
                     };
-                    if !snapshot.stamp().is_current(&current) {
+                    if stale {
+                        // Review §4: the pinned view went stale between the gate
+                        // and the mutation boundary — count it, then create no row.
+                        ctx.sensing_counters
+                            .org_stale_stamp
+                            .fetch_add(1, Ordering::Relaxed);
                         return;
                     }
                 }
@@ -17506,7 +17605,9 @@ impl MeshNode {
         let signed_refusal = Self::send_sensing_refusal_beat(ctx, beat, {
             partition.refused.into_iter().filter_map(|d| match d {
                 sensing::DownstreamId::Peer(node) => Some(node),
-                sensing::DownstreamId::Local | sensing::DownstreamId::Leader => None,
+                sensing::DownstreamId::Local
+                | sensing::DownstreamId::LeasedLocal
+                | sensing::DownstreamId::Leader => None,
             })
         });
         // SI-4 re-review item 4: a refused Leader row at the LOCAL
@@ -18087,8 +18188,8 @@ impl MeshNode {
                         // consumer — its delivery point feeds the
                         // overlay cell with the hop's OUTGOING
                         // bearing (the same §4.4 rule any peer
-                        // gets).
-                        sensing::DownstreamId::Local => {
+                        // gets) — direct or leased node-local row.
+                        sensing::DownstreamId::Local | sensing::DownstreamId::LeasedLocal => {
                             overlay_moved |= observations.feed_consumer_cell(
                                 branch,
                                 attestation,

@@ -380,7 +380,7 @@ impl SensingLeader {
         // consumer is the registering peer when known, else a placeholder.
         let consumer = match downstream {
             DownstreamId::Peer(node) => node,
-            DownstreamId::Local | DownstreamId::Leader => 0,
+            DownstreamId::Local | DownstreamId::LeasedLocal | DownstreamId::Leader => 0,
         };
         let admitted = AdmittedSensingRegistration::from_validated_legacy(
             spec.clone(),
@@ -2079,7 +2079,7 @@ mod tests {
         let branch = ProviderInterestKey::new(reg_a.interest.clone(), 7);
         let mut downstreams = leader.relay.table.downstreams(&branch, t0);
         downstreams.sort_by_key(|d| match d {
-            DownstreamId::Local | DownstreamId::Leader => 0,
+            DownstreamId::Local | DownstreamId::LeasedLocal | DownstreamId::Leader => 0,
             DownstreamId::Peer(id) => *id,
         });
         assert_eq!(
@@ -2577,14 +2577,14 @@ mod tests {
     /// supplies the registering consumer + interval.
     fn org_seed(consumer: u64, interval: Duration) -> AdmittedSensingRegistration {
         AdmittedSensingRegistration::from_validated_org(
-            ValidatedOrgSensingRegistration::Capability {
-                spec: org_spec(),
+            ValidatedOrgSensingRegistration::capability_for_test(
+                org_spec(),
                 consumer,
-                requested_sample_interval: interval,
-                soft_state_ttl: TTL,
-                subscriber: EntityId::from_bytes([0x24u8; 32]),
-                org_id: org_kp().org_id(),
-            },
+                interval,
+                TTL,
+                EntityId::from_bytes([0x24u8; 32]),
+                org_kp().org_id(),
+            ),
         )
     }
 
