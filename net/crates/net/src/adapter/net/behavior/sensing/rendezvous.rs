@@ -594,8 +594,10 @@ impl SensingLeader {
     /// `session_root` is derived from the authenticated routed
     /// session identity (v1:
     /// [`AudienceScopeCommitment::owner_root`] of the session's
-    /// entity); `local_root` is this leader's own owner root (the
-    /// one it was constructed with).
+    /// entity); `local_root` is the NODE's own sensing root, supplied
+    /// by the intake caller per call — the leader stores no owner
+    /// root of its own (review §2: every row/resolution anchor
+    /// derives from the retained admitted seed).
     #[allow(clippy::too_many_arguments)]
     pub fn register_from_frame(
         &mut self,
@@ -716,16 +718,22 @@ impl SensingLeader {
     /// proof (plan §4.1: the leader never claims a universal
     /// end-to-end result; SI-0 test 30). Returns the promoted
     /// provider and any warm-start.
+    ///
+    /// Review §2: the promoted row's trust anchor is the RETAINED admitted
+    /// seed's proven root — authority is deliberately NOT a parameter, so no
+    /// exploration caller can promote a standby branch under a root the
+    /// interest was not admitted with (the last leader row-creation site to
+    /// become seed-derived).
     pub fn expand_to_standby(
         &mut self,
         key: &CapabilityInterestKey,
         downstream: DownstreamId,
         requested_sample_interval: Duration,
         soft_state_ttl: Duration,
-        proven_root: AudienceScopeCommitment,
         now: Instant,
     ) -> Option<(u64, Option<Delivery>)> {
         let entry = self.interests.get_mut(key)?;
+        let proven_root = entry.admitted_seed.proven_root();
         // Promote the first standby provider that is not ALREADY
         // active. reconcile_with_snapshot keeps active and standby
         // disjoint, so this skip is defence-in-depth against a stale
@@ -1883,7 +1891,7 @@ mod tests {
         // promote — and, crucially, A is never duplicated into active.
         assert!(
             leader
-                .expand_to_standby(&key, c, ms(100), TTL, root(), t0 + ms(20))
+                .expand_to_standby(&key, c, ms(100), TTL, t0 + ms(20))
                 .is_none(),
             "the re-ranked incumbent is not a promotable standby",
         );
@@ -1965,7 +1973,7 @@ mod tests {
         // C requests expansion: the leader promotes the standby and
         // registers C on it; P8's proof makes C viable via P8.
         let (promoted, _warm) = leader
-            .expand_to_standby(&key, c, ms(100), TTL, root(), t0 + ms(150))
+            .expand_to_standby(&key, c, ms(100), TTL, t0 + ms(150))
             .expect("a standby candidate exists");
         assert_eq!(promoted, 8);
         assert_eq!(leader.branches(&key), vec![7, 8]);
@@ -2757,6 +2765,57 @@ mod tests {
             reg.branches,
             vec![0xB1],
             "only the org-commitment-asserted candidate enters the set"
+        );
+    }
+
+    #[test]
+    fn standby_promotion_stamps_the_admitted_seed_root() {
+        // Review §2 (the last leader row-creation site): `expand_to_standby`
+        // derives the promoted row's trust anchor from the RETAINED admitted
+        // seed — authority is not a parameter, so no exploration caller can
+        // promote a standby branch under the leader/entity root when the
+        // interest was admitted under an org commitment. RED coupling: stamping
+        // the promoted row with any non-seed anchor fails the row assertion.
+        let now = Instant::now();
+        // fanout 1 leaves the farther candidate in STANDBY.
+        let policy = CandidatePolicy {
+            initial_fanout: 1,
+            standby_count: 2,
+            maximum_fanout: 1,
+            each_mode_max_providers: 32,
+        };
+        let mut leader = SensingLeader::new(policy, K, 4, TTL);
+        let reg = leader
+            .register_admitted_capability_interest(
+                &org_seed(0xC1, ms(100)),
+                &[provider(0xB1, 5), provider(0xB2, 20)],
+                now,
+            )
+            .expect("org interest admitted");
+        let key = reg.interest.clone();
+        assert_eq!(reg.branches, vec![0xB1], "B1 active, B2 in standby");
+
+        let (promoted, _) = leader
+            .expand_to_standby(&key, DownstreamId::Peer(0xC1), ms(100), TTL, now)
+            .expect("B2 promotes");
+        assert_eq!(promoted, 0xB2);
+        let b2_row = leader
+            .relay
+            .table
+            .downstream_entry(
+                &ProviderInterestKey::new(key, 0xB2),
+                DownstreamId::Peer(0xC1),
+            )
+            .expect("the promoted row is present");
+        assert_eq!(
+            b2_row.owner_root,
+            canonical_org_sensing_commitment(&org_kp().org_id()),
+            "the promoted row's trust anchor is the seed's org commitment"
+        );
+        assert_ne!(
+            b2_row.owner_root,
+            root(),
+            "never the leader's own entity root"
         );
     }
 

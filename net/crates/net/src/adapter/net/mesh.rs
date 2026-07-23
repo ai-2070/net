@@ -8103,8 +8103,10 @@ impl MeshNode {
     /// Install the sensing-leader role on this node (plan §4.1),
     /// enabling the leader-addressed `CapabilityRegistration` intake
     /// on the 0x0C02 dispatch arm. Built from this node's config
-    /// (owner root, `continuity_factor`, `max_interests_per_peer`)
-    /// with the default bounded-exploration policy. Returns `false`
+    /// (`continuity_factor`, `max_interests_per_peer`) with the
+    /// default bounded-exploration policy — the role carries no owner
+    /// root (review §2: authority derives from each interest's
+    /// admitted seed). Returns `false`
     /// (installing nothing) while `enable_sensing_coalescing` is
     /// off; idempotent — re-assuming replaces the role with a fresh
     /// (empty) one, exactly the soft-state re-registration contract
