@@ -70,7 +70,7 @@ getrandom = { version = "0.4", optional = true }
 # URL-safe base64 for the copy-paste / QR invite *string*
 # (`enrollment::InviteToken::encode`). Version-matched to core (`0.22`).
 # Pulled in with the `net` feature (enrollment rides the same surface).
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
