@@ -275,6 +275,12 @@ impl OrgClient {
         let discovered = self.discover_private(capability);
         let considered = discovered.len();
 
+        // Phase 1 — authority construction in DISCOVERY order. Grant matching
+        // (and its `AmbiguousCapabilityGrant` error) must run in this order, so
+        // the first independently-ambiguous discovered candidate is the one that
+        // surfaces, exactly as before the factoring. `direct` is a placeholder
+        // here; it is annotated in phase 3 so reachability is never observed in
+        // discovery order.
         let mut candidates: Vec<AuthorizedOrgCandidate> = Vec::new();
         for candidate in discovered {
             // `provider_owner_org` is derived exactly as the proof needs it: the
@@ -291,25 +297,33 @@ impl OrgClient {
                     None => continue,
                 }
             };
-            // OA2-E0.3 reachability, annotated not filtered: a live direct
-            // session pin for this provider right now.
-            let direct = self
-                .node
-                .peer_entity_id(candidate.provider.node_id())
-                .as_ref()
-                == Some(&candidate.provider);
             candidates.push(AuthorizedOrgCandidate {
                 provider: candidate.provider,
                 provider_owner_org,
                 mode,
-                direct,
+                direct: false,
                 capability: *capability,
             });
         }
-        // Deterministic and load-blind on purpose: a stable choice is
+        // Phase 2 — deterministic, load-blind ordering. A stable choice is
         // debuggable, and spreading load is a policy this stage has no basis to
         // invent — sensed selection arrives above this layer in OLB-3.
         candidates.sort_by(|a, b| a.provider.as_bytes().cmp(b.provider.as_bytes()));
+        // Phase 3 — annotate OA2-E0.3 direct reachability in SORTED order, the
+        // exact order the pre-factoring selection loop queried sessions in.
+        // Discovery order is not provider-EntityId order across the owner and
+        // grant planes, so sampling before the sort could, under concurrent
+        // session churn, observe reachability in a different order and select a
+        // different provider. Reachability is annotated, never a filter: reading
+        // providers after the first direct one cannot change which earlier
+        // candidate `plan` selects.
+        for candidate in &mut candidates {
+            candidate.direct = self
+                .node
+                .peer_entity_id(candidate.provider.node_id())
+                .as_ref()
+                == Some(&candidate.provider);
+        }
         Ok((candidates, considered))
     }
 

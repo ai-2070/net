@@ -116,8 +116,10 @@ findings and four bounded corrections, all applied in this revision:
 6. **The P2C sampler contract is pinned** (seed + nonce; reproducible,
    non-stampeding) (§9).
 
-**Current execution point:** architecture and Option-A OLB-0 are signed. Proceed
-with OLB-1, then stop for the already-required bounded review before OLB-2.
+**Current execution point:** architecture and Option-A OLB-0 are signed; OLB-1
+candidate factoring has landed (see the implementation-status note above). The
+already-required bounded stop-and-review is the active gate; OLB-2 does not begin
+until it signs off.
 
 **The sentence:** organization-aware load balancing is an internal
 composition of private authorized discovery, capability sensing, and
@@ -233,34 +235,37 @@ kind's classification and nothing else (the OSDK-L review rule).
 
 ### 3.1 The org call path
 
-`OrgClient::call` (`sdk/src/org/call.rs:85`) → `call_bytes` (`:115`) →
-`call_bytes_deadline` (`:135`), which calls `plan(service)` (`:142`) and
+`OrgClient::call` (`sdk/src/org/call.rs:109`) → `call_bytes` (`:139`) →
+`call_bytes_deadline` (`:159`), which calls `plan(service)` (`:166`) and
 then issues exactly one `MeshNode::call` to the planned provider
-(`:160`). No retry exists on any path.
+(`:186`). No retry exists on any path.
 
-`plan` today:
+`plan` today (post-OLB-1 factoring):
 
 ```text
 derive CapabilityAuthorityId::for_tag("nrpc:<service>")
-→ discover_private (call.rs:300)
-     SameOrg  → MeshNode::owner_private_capability_providers (call.rs:303)
-     Granted  → MeshNode::granted_capability_providers per DISCOVER
-                grant (call.rs:318)
-→ authorized_targets (call.rs:234)
+→ authorized_candidates (call.rs:262)
+     discover_private (call.rs:275)
+       SameOrg  → MeshNode::owner_private_capability_providers (call.rs:357)
+       Granted  → MeshNode::granted_capability_providers per DISCOVER
+                  grant (call.rs:372)
      classify Candidate { provider, owner_org, same_org } (call.rs:69)
-     into Mode::SameOrg | Mode::Granted(grant) (call.rs:60)
-     via match_invoke_grant (call.rs:346; ambiguity is a typed error)
-→ sort targets by EntityId bytes (call.rs:265 — "load-blind on purpose")
-→ pick the FIRST candidate with a live direct session:
-     peer_entity_id(provider.node_id()) == Some(provider) (call.rs:212)
-→ intent_for → canonical nine-field OrgProofIntent (call.rs:271;
+       into Mode::SameOrg | Mode::Granted(grant) (call.rs:60)
+       via match_invoke_grant (call.rs:400; ambiguity is a typed error),
+       in DISCOVERY order (preserves which ambiguity surfaces)
+     sort AuthorizedOrgCandidate by EntityId bytes (call.rs:311 — "load-blind")
+     annotate direct reachability in SORTED order (call.rs:323):
+       peer_entity_id(provider.node_id()) == Some(provider)
+→ select the first direct candidate (call.rs:235), else
+     ProviderNotDirect (call.rs:239), else NoAuthorizedProvider (call.rs:244)
+→ intent_for → canonical nine-field OrgProofIntent (call.rs:333;
      mesh_rpc.rs:231-253)
 → one exact-target call → coarse 0x0009 denial decode
 ```
 
-That is secure but load-blind. The selection comment in `call.rs:262-264`
-says so explicitly: spreading load was "a policy the facade has no basis
-to invent." Sensing is that basis.
+That is secure but load-blind. The ordering (`call.rs:311`) is deliberately
+load-blind: spreading load was "a policy this stage has no basis to invent."
+Sensing is that basis.
 
 ### 3.2 What sensing already supplies
 
