@@ -10196,22 +10196,12 @@ impl MeshNode {
         self.scoped_discovery.lock().owner_revision()
     }
 
-    /// Drain the capabilities dirtied (owner or grant) since the last call,
-    /// leaving the stream clean. A consumer reconciles exactly the named
-    /// capabilities, or every demanded one on
-    /// [`DirtyCapabilities::RebuildAll`](super::behavior::org_scoped_store::DirtyCapabilities::RebuildAll).
-    pub fn take_private_discovery_delta(
-        &self,
-    ) -> super::behavior::org_scoped_store::DirtyCapabilities {
-        self.scoped_discovery.lock().take_pending_global()
-    }
-
-    /// Drain the OWNER-partition capabilities dirtied since the last call.
-    pub fn take_private_discovery_owner_delta(
-        &self,
-    ) -> super::behavior::org_scoped_store::DirtyCapabilities {
-        self.scoped_discovery.lock().take_pending_owner()
-    }
+    // The DESTRUCTIVE dirty-capability drains are deliberately NOT public
+    // MeshNode API (Kyra OLB-2A.2): they belong to the single node-owned consumer
+    // of each stream. They live on `ScopedDiscoveryState` as the crate-internal
+    // atomic `take_global_change_batch` / `take_owner_change_batch`, which capture
+    // the generation and the delta under one lock; the read-only
+    // `private_discovery_generation` polls above remain safe to expose.
 
     /// Test seam (OA3 closure witness): advance the visibility generation as a
     /// concurrent registration would, so a send fired after a visibility change
@@ -19252,9 +19242,16 @@ impl MeshNode {
         };
         match verify_scoped_ingest(envelope, &audience, &ctx) {
             Ok(verified) => {
-                // A test probe fires in the exact verify→recheck window a
-                // concurrent floor publish / store swap / authority rotation would
-                // land in, proving the recheck below catches it.
+                // Prepare BEFORE the final recheck (Kyra OLB-2A.1 closure): decode
+                // the descriptor's declared capabilities ONCE and bind them to the
+                // verified record, so no bounded descriptor work sits between the
+                // recheck and the insert, and the declarations the index is built
+                // from cannot diverge from the record the store admits.
+                let prepared =
+                    super::behavior::org_scoped_ingest::PreparedScopedCapability::prepare(verified);
+                // The test probe fires AFTER preparation, in the exact
+                // prepare→recheck window a concurrent floor publish / store swap /
+                // authority rotation would land in, proving the recheck catches it.
                 if let Some(probe) = probe {
                     probe();
                 }
@@ -19309,15 +19306,11 @@ impl MeshNode {
                     // that re-announce at the same generation.
                     return ScopedIngestDisposition::Retryable;
                 }
-                // OLB-2A: decode the descriptor's declared capabilities ONCE,
-                // outside the store lock, so the indexed layer buckets the record
-                // by capability without a per-query descriptor decode.
-                let cap_ids = super::behavior::org_scoped_ingest::decode_declared_capabilities(
-                    verified.descriptor(),
-                );
-                let outcome = scoped_discovery
-                    .lock()
-                    .ingest(verified, cap_ids.into(), now_secs);
+                // Immediate lock + mutate — nothing sits between the recheck and
+                // the insert. The store ingests the prepared object, so the row and
+                // the index buckets built from its declarations are bound together
+                // (Kyra OLB-2A.1).
+                let outcome = scoped_discovery.lock().ingest(prepared, now_secs);
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
                     ?outcome,

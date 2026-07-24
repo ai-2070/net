@@ -41,22 +41,32 @@ reachability sampled in sorted order to preserve the pre-factoring selection).
 The mandatory bounded stop-and-review passed, so **OLB-2 is authorized and its
 first slice, OLB-2A, is landing** — the GENERIC transactional indexed
 private-discovery substrate. **OLB-2A.1** (`ScopedDiscoveryState` wraps
-`ScopedDiscoveryStore` with a capability sidecar index — predecode the
-`CapabilitySet` once at ingest; `by_scope_capability` / `declarations_by_record`
-reverse indexes; per-scope live counts) makes the owner-plane capability query an
-indexed bucket lookup with NO per-record descriptor decode, with
-`ingest`/`sweep_expired` returning the visible-set delta the index consumes in
-one transaction. **OLB-2A.2** adds the CHANGE SOURCE: monotone global + owner
-revisions and bounded affected-capability deltas (`RebuildAll` overflow),
-maintained per mutation on the qualifying transitions and polled through
-`MeshNode` accessors (`private_discovery_generation`/`_owner_generation`,
-`take_private_discovery_delta`/`_owner_delta`) — the owner stream is a subset of
-the global stream, so valid grant-audience churn never wakes an owner-private
-consumer. The exact-expiry source (event-driven `next_visible_expiry` + timer)
-and a push/watch wake land with their first consumer (OLB-2A.3 / the reconciler),
-mirroring the crate's existing polled-generation seams. This substrate is shared
-with the provider-free leader track but carries no authority-filtered candidate
-or lifecycle state. The separate
+`ScopedDiscoveryStore`) makes the owner-plane capability query a SINGLE indexed
+bucket lookup (`owner_by_capability[cap]`, no scan of unrelated scopes) with NO
+per-record descriptor decode: the descriptor is decoded once at ingest into an
+opaque `PreparedScopedCapability` — bound to the verified record BEFORE the final
+publication-race recheck, so the row and its index buckets cannot diverge — and a
+per-record declaration budget bounds index associations fail-closed.
+`ingest`/`sweep_expired` return the visible-set delta the index consumes in one
+transaction. **OLB-2A.2** adds the CHANGE SOURCE: monotone global + owner
+mutation/sweep generations and bounded affected-capability deltas (`RebuildAll`
+overflow), maintained per mutation on the qualifying transitions. The generations
+are polled read-only via `MeshNode` (`private_discovery_generation`/
+`_owner_generation`); the DESTRUCTIVE deltas are crate-internal, drained through
+the atomic `ScopedDiscoveryState::take_{global,owner}_change_batch`
+(generation + dirty captured under one lock) reserved for the single node-owned
+consumer of each stream. The owner stream is a subset of the global stream, so
+valid grant-audience churn never wakes an owner-private consumer. These are
+MUTATION/SWEEP generations, not yet complete query-visible-set generations —
+wall-clock expiry and floor raises change results before they advance; that plus
+the exact-expiry source (event-driven `next_visible_expiry` + node timer), the
+push/watch wake, the centralized mutate→publish→wake helper, and floor-raise
+dirtying are **OLB-2A.3**, which must land and be reviewed before any reconciler
+consumes this source. **OLB-2A.4** (named, not dropped): replace the store's
+`entries_in_scope` scan with maintained per-scope counts before the generic
+indexed substrate is called complete. This substrate is shared with the
+provider-free leader track but carries no authority-filtered candidate or
+lifecycle state. The separate
 owner-private provider-free leader design lives in
 [`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md).
 It is NOT an OLB-1..OLB-5 prerequisite and remains unauthorized for build. The

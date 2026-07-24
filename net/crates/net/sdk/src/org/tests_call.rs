@@ -617,13 +617,12 @@ async fn an_expired_membership_refuses_at_call_time() {
 }
 
 /// OLB-2A.2: ingesting an owner capability through the real path advances the
-/// private-discovery change generation and names the capability in the drained
-/// delta — the substrate signal a reconciler polls, wired end-to-end through the
-/// MeshNode accessors.
+/// private-discovery change generations — the read-only poll a reconciler uses to
+/// learn that discovery moved, wired end-to-end through the MeshNode accessors.
+/// (The destructive delta drain is crate-internal per the OLB-2A closure, so the
+/// delta CONTENT is witnessed at the `ScopedDiscoveryState` level in the core.)
 #[tokio::test]
-async fn ingest_advances_the_private_discovery_generation_and_delta() {
-    use net::adapter::net::behavior::org_scoped_store::DirtyCapabilities;
-
+async fn ingest_advances_the_private_discovery_generation() {
     let a = org_a();
     let (mesh, _identity, dir) = mesh_with_authority("pd-generation", Some(&a)).await;
     let provider = EntityKeypair::generate();
@@ -633,18 +632,13 @@ async fn ingest_advances_the_private_discovery_generation_and_delta() {
 
     inject_owner_envelope(&mesh, &a, &provider, &["nrpc:internal.reindex"]);
 
-    assert!(mesh.node().private_discovery_generation() >= 1);
-    assert!(mesh.node().private_discovery_owner_generation() >= 1);
-    match mesh.node().take_private_discovery_delta() {
-        DirtyCapabilities::Caps(caps) => {
-            assert!(caps.contains(&cap("nrpc:internal.reindex")));
-        }
-        other => panic!("expected Caps naming the ingested capability, got {other:?}"),
-    }
-    // The drain left the stream clean.
-    assert_eq!(
-        mesh.node().take_private_discovery_delta(),
-        DirtyCapabilities::Clean
+    assert!(
+        mesh.node().private_discovery_generation() >= 1,
+        "global generation advanced"
+    );
+    assert!(
+        mesh.node().private_discovery_owner_generation() >= 1,
+        "owner generation advanced"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -587,6 +587,44 @@ pub(crate) fn decode_declared_capabilities(descriptor: &[u8]) -> Vec<CapabilityA
         .collect()
 }
 
+/// A verified scoped capability with its declared capability-authority ids
+/// decoded ONCE and bound to it (Kyra OLB-2A.1 closure).
+///
+/// Only this module — which produced the [`VerifiedScopedCapability`] — can
+/// construct one, and the indexed store ingests it as a single object. So the
+/// descriptor decode happens BEFORE the ingest path's final security recheck
+/// (never between the recheck and the insert), and a stored row can never
+/// diverge from the index buckets built from its declarations: there is no way
+/// to hand the store a record and an independently-supplied declaration set.
+pub struct PreparedScopedCapability {
+    verified: VerifiedScopedCapability,
+    declarations: std::sync::Arc<[CapabilityAuthorityId]>,
+}
+
+impl PreparedScopedCapability {
+    /// Decode the verified record's declared capabilities once and bind them to
+    /// the record. This is the bounded descriptor work the ingest path performs
+    /// before its final recheck.
+    pub(crate) fn prepare(verified: VerifiedScopedCapability) -> Self {
+        let declarations = decode_declared_capabilities(verified.descriptor()).into();
+        Self {
+            verified,
+            declarations,
+        }
+    }
+
+    /// Consume into the verified record and its bound declarations, so the
+    /// indexed store installs both in one transaction.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        VerifiedScopedCapability,
+        std::sync::Arc<[CapabilityAuthorityId]>,
+    ) {
+        (self.verified, self.declarations)
+    }
+}
+
 fn descriptor_binds_grant_capability(
     descriptor: &[u8],
     capability: &CapabilityAuthorityId,
