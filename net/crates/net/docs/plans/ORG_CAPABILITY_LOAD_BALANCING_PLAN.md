@@ -59,12 +59,16 @@ consumer of each stream. The owner stream is a subset of the global stream, so
 valid grant-audience churn never wakes an owner-private consumer. These are
 MUTATION/SWEEP generations, not yet complete query-visible-set generations —
 wall-clock expiry and floor raises change results before they advance. **OLB-2A.3**
-closes that and adds the push wake, in bounded sub-slices: **2A.3.1** (landed)
-routes every scoped-store mutation through one centralized
-`publish_scoped_mutation` helper (mutate → publish generation under the lock →
-unlock → coalesced wake) and adds the `private_discovery_changed` watch with
-`subscribe_private_discovery_changes` — the push signal replacing the interim
-poll-only model; **2A.3.2** adds single-consumer ownership of each dirty stream
+closes that and adds the push wake, in bounded sub-slices: **2A.3.1** (landed,
+then closed under review) routes every scoped-store mutation through one
+`ScopedMutationPublication` — a node-global gate bound to the change `watch`.
+Each transaction holds the gate from BEFORE its final currentness recheck (so
+the signed 2A.1 recheck→insert boundary stays closed) through its publication, so
+mutation and publication SERIALIZE node-wide: an older transaction's publication
+can never overwrite a newer one, and only a transaction that advanced the
+generation publishes (a no-op wakes nobody). `subscribe_private_discovery_changes`
+is the read-only push signal, replacing the interim poll-only model. **2A.3.2**
+adds single-consumer ownership of each dirty stream
 plus event-driven `next_visible_expiry` and one node exact-expiry timer;
 **2A.3.3** adds floor-raise dirtying via `subscribe_floors_raised` through the
 reverse-declaration index. All of OLB-2A.3 must land and be reviewed before any

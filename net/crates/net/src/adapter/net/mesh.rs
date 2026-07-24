@@ -1074,9 +1074,9 @@ struct DispatchCtx {
     /// See the matching field doc on `MeshNode`.
     scoped_discovery:
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
-    /// OLB-2A.3: the private-discovery change wake. See the matching `MeshNode`
-    /// field.
-    private_discovery_changed: Arc<tokio::sync::watch::Sender<u64>>,
+    /// OLB-2A.3: the private-discovery publication primitive (gate + wake). See
+    /// the matching `MeshNode` field.
+    scoped_publication: Arc<ScopedMutationPublication>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. See the matching field doc on `MeshNode`.
     scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
@@ -4943,6 +4943,122 @@ impl std::fmt::Display for SensingRegistrationError {
 
 impl std::error::Error for SensingRegistrationError {}
 
+/// The node-global scoped-discovery publication primitive (Kyra OLB-2A.3.1
+/// closure).
+///
+/// Binds the mutation-ordering `gate` to the change-`watch` sender so every
+/// scoped-store mutation and its publication SERIALIZE node-wide: a transaction
+/// holds `gate` from BEFORE its final currentness recheck through its
+/// publication, so publications cannot invert relative to mutation order and the
+/// watch can never regress below [`ScopedDiscoveryState::revision`]. Publishing
+/// only when a transaction actually advanced the generation keeps a no-op from
+/// waking a consumer. Acquiring the gate before the recheck (not between the
+/// recheck and the insert) keeps the signed 2A.1 recheck→insert boundary closed:
+/// the wait happens first, then the security view is validated, then the mutation
+/// runs immediately.
+///
+/// [`ScopedDiscoveryState::revision`]: super::behavior::org_scoped_store::ScopedDiscoveryState::revision
+struct ScopedMutationPublication {
+    gate: parking_lot::Mutex<()>,
+    changed: tokio::sync::watch::Sender<u64>,
+    /// Fixtures-only: fired when a gate acquisition finds the gate HELD, before
+    /// the blocking `lock()` — the deterministic contention signal the concurrent
+    /// publication-ordering witnesses wait on. Absent from production builds.
+    #[cfg(feature = "fixtures")]
+    contention_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fixtures-only: fired after the state unlock and BEFORE publication (with
+    /// the gate still held), so a witness can pause a transaction between its
+    /// mutation and its publish. Absent from production builds.
+    #[cfg(feature = "fixtures")]
+    publish_pause: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl ScopedMutationPublication {
+    fn new() -> Self {
+        Self {
+            gate: parking_lot::Mutex::new(()),
+            changed: tokio::sync::watch::channel(0u64).0,
+            #[cfg(feature = "fixtures")]
+            contention_hook: parking_lot::Mutex::new(None),
+            #[cfg(feature = "fixtures")]
+            publish_pause: parking_lot::Mutex::new(None),
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// Acquire the mutation-ordering gate. Try-then-block, so a witness observes
+    /// contention deterministically: the fixtures hook fires only when the gate
+    /// is already held, immediately before the blocking `lock()`.
+    fn lock_gate(&self) -> parking_lot::MutexGuard<'_, ()> {
+        match self.gate.try_lock() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(feature = "fixtures")]
+                if let Some(hook) = self.contention_hook.lock().clone() {
+                    hook();
+                }
+                self.gate.lock()
+            }
+        }
+    }
+
+    /// Publish `after` — the post-mutation generation — but only if the
+    /// transaction advanced it. MUST be called with the gate held and the state
+    /// lock released; serialized by the gate, so the watch value is monotone and
+    /// converges to [`ScopedDiscoveryState::revision`].
+    ///
+    /// [`ScopedDiscoveryState::revision`]: super::behavior::org_scoped_store::ScopedDiscoveryState::revision
+    fn publish_if_changed(&self, before: u64, after: u64) {
+        #[cfg(feature = "fixtures")]
+        if let Some(hook) = self.publish_pause.lock().clone() {
+            hook();
+        }
+        if before != after {
+            self.changed.send_replace(after);
+        }
+    }
+
+    /// Commit `f` under the state lock — the caller MUST already hold the gate
+    /// ([`Self::lock_gate`]) — capturing the generation before and after, then
+    /// (after releasing the state lock) publishing the new generation if it
+    /// advanced. The inbound ingest path uses this directly because it holds the
+    /// gate across its currentness recheck as well.
+    fn commit<R>(
+        &self,
+        scoped_discovery: &Arc<
+            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
+        >,
+        f: impl FnOnce(&mut super::behavior::org_scoped_store::ScopedDiscoveryState) -> R,
+    ) -> R {
+        let (result, before, after) = {
+            let mut state = scoped_discovery.lock();
+            let before = state.revision();
+            let result = f(&mut state);
+            let after = state.revision();
+            (result, before, after)
+        };
+        self.publish_if_changed(before, after);
+        result
+    }
+
+    /// Acquire the gate, then [`Self::commit`] — for a self-contained mutation
+    /// with no separate pre-mutation recheck to hold the gate across (the GC
+    /// sweep).
+    fn gated_commit<R>(
+        &self,
+        scoped_discovery: &Arc<
+            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
+        >,
+        f: impl FnOnce(&mut super::behavior::org_scoped_store::ScopedDiscoveryState) -> R,
+    ) -> R {
+        let _gate = self.lock_gate();
+        self.commit(scoped_discovery, f)
+    }
+}
+
 /// Multi-peer mesh node.
 ///
 /// Composes `NetSession` (per-peer encryption), `NetRouter` (forwarding),
@@ -5130,13 +5246,14 @@ pub struct MeshNode {
     /// path, with no await held.
     scoped_discovery:
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
-    /// OLB-2A.3: the push wake for the private-discovery change source. Every
-    /// scoped-store mutation (ingest, sweep) runs through one centralized helper
-    /// ([`Self::publish_scoped_mutation`]) that, after the transaction, publishes
-    /// the store's mutation/sweep generation onto this `watch` so a consumer is
-    /// woken without polling. The value carried is the global `revision`; the
-    /// owner generation and the dirty deltas are read from the state on wake.
-    private_discovery_changed: Arc<tokio::sync::watch::Sender<u64>>,
+    /// OLB-2A.3: the private-discovery publication primitive — the mutation
+    /// ordering gate bound to the change-wake sender. Every scoped-store mutation
+    /// (ingest, sweep) runs through `ScopedMutationPublication::commit` /
+    /// `gated_commit`, which holds the gate across the transaction and its
+    /// publication, so the watch carries the latest published global generation
+    /// and can never regress (Kyra OLB-2A.3.1 closure). The owner generation and
+    /// the dirty deltas are read from the state on wake.
+    scoped_publication: Arc<ScopedMutationPublication>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. Shared across the inbound dispatch so a flooded envelope is
     /// forwarded at most once per node; never decrypts or stores anything.
@@ -6622,7 +6739,7 @@ impl MeshNode {
             scoped_discovery: Arc::new(parking_lot::Mutex::new(
                 super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
             )),
-            private_discovery_changed: Arc::new(tokio::sync::watch::channel(0u64).0),
+            scoped_publication: Arc::new(ScopedMutationPublication::new()),
             scoped_relay_gate: Arc::new(
                 super::behavior::org_scoped_relay::ScopedAnnRelayGate::new(),
             ),
@@ -9996,7 +10113,7 @@ impl MeshNode {
             &self.org_revocation,
             &self.consumer_grant_audiences,
             &self.scoped_discovery,
-            &self.private_discovery_changed,
+            &self.scoped_publication,
             &decoded,
             0,
             None,
@@ -10025,7 +10142,7 @@ impl MeshNode {
             &self.org_revocation,
             &self.consumer_grant_audiences,
             &self.scoped_discovery,
-            &self.private_discovery_changed,
+            &self.scoped_publication,
             &decoded,
             0,
             Some(probe),
@@ -10216,7 +10333,7 @@ impl MeshNode {
     /// the dirty deltas is the single node-owned consumer's crate-internal
     /// concern, not exposed here.
     pub fn subscribe_private_discovery_changes(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.private_discovery_changed.subscribe()
+        self.scoped_publication.subscribe()
     }
 
     // The DESTRUCTIVE dirty-capability drains are deliberately NOT public
@@ -11074,7 +11191,7 @@ impl MeshNode {
         // This loop is the right home: same cadence (60 s), same purpose
         // (bounded retention of observation state), already shutdown-aware.
         let scoped = self.scoped_discovery.clone();
-        let private_discovery_changed = self.private_discovery_changed.clone();
+        let scoped_publication = self.scoped_publication.clone();
         let interval = self.config.capability_gc_interval;
         let dedup_retention =
             std::time::Duration::from_secs(2 * u64::from(CapabilityAnnouncement::DEFAULT_TTL_SECS));
@@ -11093,13 +11210,11 @@ impl MeshNode {
                     _ = tick.tick() => {
                         seen.retain(|_, instant| instant.elapsed() < dedup_retention);
                         let now_secs = super::behavior::org::current_timestamp();
-                        // Through the centralized helper so a sweep that drops a
-                        // live record wakes any consumer, not just the poll (OLB-2A.3).
-                        let forgotten = Self::publish_scoped_mutation(
-                            &scoped,
-                            &private_discovery_changed,
-                            |s| s.sweep_expired(now_secs),
-                        );
+                        // Through the centralized gated commit so a sweep that
+                        // drops a live record wakes any consumer, serialized with
+                        // inbound ingest so publications never invert (OLB-2A.3.1).
+                        let forgotten =
+                            scoped_publication.gated_commit(&scoped, |s| s.sweep_expired(now_secs));
                         if forgotten > 0 {
                             tracing::debug!(
                                 forgotten,
@@ -11670,7 +11785,7 @@ impl MeshNode {
             org_revocation: self.org_revocation.clone(),
             node_authority: self.node_authority.clone(),
             scoped_discovery: self.scoped_discovery.clone(),
-            private_discovery_changed: self.private_discovery_changed.clone(),
+            scoped_publication: self.scoped_publication.clone(),
             scoped_relay_gate: self.scoped_relay_gate.clone(),
             consumer_grant_audiences: self.consumer_grant_audiences.clone(),
             #[cfg(feature = "redex")]
@@ -13165,7 +13280,7 @@ impl MeshNode {
                         &ctx.org_revocation,
                         &ctx.consumer_grant_audiences,
                         &ctx.scoped_discovery,
-                        &ctx.private_discovery_changed,
+                        &ctx.scoped_publication,
                         &admit.envelope,
                         from_node,
                         None,
@@ -19135,37 +19250,6 @@ impl MeshNode {
         }
     }
 
-    /// The ONE centralized scoped-store mutation seam (Kyra OLB-2A.3): run `f`
-    /// under the state lock, capture the store's mutation/sweep generation under
-    /// that same lock, then — AFTER unlock — publish that generation onto the
-    /// change `watch`, coalescing into a single wake and only when the generation
-    /// actually advanced. Every scoped-store mutation (`ingest`, `sweep_expired`)
-    /// goes through here, so no visible-set change can advance the store without
-    /// both moving the polled generation and delivering a push wake, and no wake
-    /// fires for a no-op (e.g. a `Stale` ingest).
-    fn publish_scoped_mutation<R>(
-        scoped_discovery: &Arc<
-            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
-        >,
-        private_discovery_changed: &Arc<tokio::sync::watch::Sender<u64>>,
-        f: impl FnOnce(&mut super::behavior::org_scoped_store::ScopedDiscoveryState) -> R,
-    ) -> R {
-        let (result, revision) = {
-            let mut state = scoped_discovery.lock();
-            let result = f(&mut state);
-            (result, state.revision())
-        };
-        private_discovery_changed.send_if_modified(|published| {
-            if *published != revision {
-                *published = revision;
-                true
-            } else {
-                false
-            }
-        });
-        result
-    }
-
     /// OA3-5: open, verify, and store ONE inbound owner-scoped announcement
     /// envelope. Shared by the [`SUBPROTOCOL_SCOPED_CAPABILITY_ANN`] dispatch arm
     /// (parts from [`DispatchCtx`]) and the test seam
@@ -19195,7 +19279,7 @@ impl MeshNode {
         scoped_discovery: &Arc<
             parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
         >,
-        private_discovery_changed: &Arc<tokio::sync::watch::Sender<u64>>,
+        publication: &ScopedMutationPublication,
         envelope: &super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement,
         from_node: u64,
         probe: Option<&dyn Fn()>,
@@ -19317,9 +19401,18 @@ impl MeshNode {
                 // from cannot diverge from the record the store admits.
                 let prepared =
                     super::behavior::org_scoped_ingest::PreparedScopedCapability::prepare(verified);
-                // The test probe fires AFTER preparation, in the exact
-                // prepare→recheck window a concurrent floor publish / store swap /
-                // authority rotation would land in, proving the recheck catches it.
+                // Acquire the publication ordering gate BEFORE the final recheck
+                // (Kyra OLB-2A.3.1): the wait for a concurrent transaction happens
+                // FIRST, so the security view is validated only after it — the
+                // signed recheck→insert boundary stays closed — and this
+                // transaction's mutation and publication serialize node-wide with
+                // every other, so a stale publication can never overwrite a newer
+                // one.
+                let _publication_gate = publication.lock_gate();
+                // The test probe fires AFTER preparation and gate acquisition, in
+                // the exact prepare→recheck window a concurrent floor publish /
+                // store swap / authority rotation would land in, proving the
+                // recheck catches it.
                 if let Some(probe) = probe {
                     probe();
                 }
@@ -19377,14 +19470,11 @@ impl MeshNode {
                 // Immediate lock + mutate — nothing sits between the recheck and
                 // the insert. The store ingests the prepared object, so the row and
                 // the index buckets built from its declarations are bound together
-                // (Kyra OLB-2A.1). The mutation runs through the centralized
-                // helper, which publishes the change generation and wakes any
-                // consumer after unlock (OLB-2A.3).
-                let outcome = Self::publish_scoped_mutation(
-                    scoped_discovery,
-                    private_discovery_changed,
-                    |state| state.ingest(prepared, now_secs),
-                );
+                // (Kyra OLB-2A.1). The gate is already held, so this commits and
+                // publishes under it — serialized with every other mutation
+                // (OLB-2A.3.1).
+                let outcome =
+                    publication.commit(scoped_discovery, |state| state.ingest(prepared, now_secs));
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
                     ?outcome,
@@ -31822,6 +31912,175 @@ mod sensing_authority_witness_tests {
         assert!(
             err.to_string().contains("fleet root"),
             "startup failure must name the fleet-root collision, got: {err}"
+        );
+    }
+}
+
+/// OLB-2A.3.1 closure (Kyra): the node-global publication gate serializes each
+/// scoped-store mutation with its publication, so an older transaction's
+/// publication can never overwrite a newer one, and a concurrent no-op can never
+/// publish another transaction's work. Forced deterministic interleaving via the
+/// fixtures pause/contention hooks — no scheduler-dependent timing.
+#[cfg(all(test, feature = "fixtures"))]
+mod scoped_publication_ordering_tests {
+    use super::ScopedMutationPublication;
+    use crate::adapter::net::behavior::capability::CapabilitySet;
+    use crate::adapter::net::behavior::org::OrgId;
+    use crate::adapter::net::behavior::org_scoped_ingest::{
+        CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
+    };
+    use crate::adapter::net::behavior::org_scoped_store::ScopedDiscoveryState;
+    use crate::adapter::net::identity::EntityId;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// A one-shot condvar flag with a timeout so a bug is a FAILURE, not a hang.
+    #[derive(Default)]
+    struct Flag {
+        set: parking_lot::Mutex<bool>,
+        cv: parking_lot::Condvar,
+    }
+    impl Flag {
+        fn raise(&self) {
+            *self.set.lock() = true;
+            self.cv.notify_all();
+        }
+        fn wait(&self, what: &str) {
+            let mut guard = self.set.lock();
+            while !*guard {
+                if self
+                    .cv
+                    .wait_for(&mut guard, Duration::from_secs(5))
+                    .timed_out()
+                    && !*guard
+                {
+                    panic!("timed out waiting for {what}");
+                }
+            }
+        }
+    }
+
+    /// An owner record declaring one capability, so an insert advances the
+    /// generation.
+    fn prepared_owner(provider_seed: u8, generation: u64) -> PreparedScopedCapability {
+        let descriptor = CapabilitySet::new().add_tag("nrpc:x").to_bytes_compact();
+        PreparedScopedCapability::prepare(VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Owner {
+                org_id: OrgId::from_bytes([1u8; 32]),
+                audience_handle: [0x11u8; 32],
+            },
+            EntityId::from_bytes([provider_seed; 32]),
+            OrgId::from_bytes([1u8; 32]),
+            generation,
+            10_000,
+            5,
+            None,
+            descriptor,
+        ))
+    }
+
+    /// Force the interleaving: transaction A mutates (provider 3, gen 1 → state 1)
+    /// and PAUSES between its mutation and its publication while holding the gate;
+    /// transaction B (its mutation supplied by the caller) then blocks on the
+    /// gate. Only after B is proven blocked is A released. Returns the shared
+    /// publication and state for the caller to assert on.
+    fn run_forced_interleaving(
+        b_mutation: impl FnOnce(&mut ScopedDiscoveryState) + Send + 'static,
+    ) -> (
+        Arc<ScopedMutationPublication>,
+        Arc<parking_lot::Mutex<ScopedDiscoveryState>>,
+    ) {
+        let publication = Arc::new(ScopedMutationPublication::new());
+        let state = Arc::new(parking_lot::Mutex::new(ScopedDiscoveryState::new()));
+
+        let a_paused = Arc::new(Flag::default());
+        let release_a = Arc::new(Flag::default());
+        let b_contended = Arc::new(Flag::default());
+        let paused_once = Arc::new(AtomicBool::new(false));
+
+        // The FIRST transaction to reach the pause (A) waits; later ones (B) pass.
+        {
+            let (a_paused, release_a, paused_once) =
+                (a_paused.clone(), release_a.clone(), paused_once.clone());
+            *publication.publish_pause.lock() = Some(Arc::new(move || {
+                if paused_once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                a_paused.raise();
+                release_a.wait("A to be released");
+            }));
+        }
+        // Fired when B finds the gate held.
+        {
+            let b_contended = b_contended.clone();
+            *publication.contention_hook.lock() = Some(Arc::new(move || b_contended.raise()));
+        }
+
+        let a = {
+            let (publication, state) = (publication.clone(), state.clone());
+            thread::spawn(move || {
+                publication.gated_commit(&state, |s| {
+                    s.ingest(prepared_owner(3, 1), 0);
+                });
+            })
+        };
+        a_paused.wait("A to pause before publishing");
+
+        let b = {
+            let (publication, state) = (publication.clone(), state.clone());
+            thread::spawn(move || {
+                publication.gated_commit(&state, b_mutation);
+            })
+        };
+        // B is now blocked on the gate A holds — the serialization is proven.
+        b_contended.wait("B to block on the publication gate");
+
+        release_a.raise();
+        a.join().expect("A joins");
+        b.join().expect("B joins");
+        (publication, state)
+    }
+
+    /// An older transaction's publication cannot overwrite a newer one: the gate
+    /// forces A to publish generation 1 before B publishes 2, so the watch ends
+    /// at 2 and never regresses to 1.
+    #[test]
+    fn an_older_publication_cannot_overwrite_a_newer_one() {
+        let (publication, state) = run_forced_interleaving(|s| {
+            s.ingest(prepared_owner(4, 1), 0);
+        });
+        assert_eq!(
+            state.lock().revision(),
+            2,
+            "two distinct owners advanced the state"
+        );
+        assert_eq!(
+            *publication.subscribe().borrow(),
+            2,
+            "the watch ends at the newer generation, never overwritten by the older"
+        );
+    }
+
+    /// A concurrent no-op cannot publish another transaction's work: B's stale
+    /// re-ingest changes nothing, so only A's changed transaction publishes and
+    /// both the state and the watch settle at 1.
+    #[test]
+    fn a_concurrent_noop_cannot_publish_delayed_work() {
+        let (publication, state) = run_forced_interleaving(|s| {
+            // Same provider AND generation as A: Stale, no visible change.
+            s.ingest(prepared_owner(3, 1), 0);
+        });
+        assert_eq!(
+            state.lock().revision(),
+            1,
+            "the no-op re-ingest advanced nothing"
+        );
+        assert_eq!(
+            *publication.subscribe().borrow(),
+            1,
+            "only the changed transaction published; the no-op did not"
         );
     }
 }
