@@ -4943,6 +4943,11 @@ impl std::fmt::Display for SensingRegistrationError {
 
 impl std::error::Error for SensingRegistrationError {}
 
+/// Fixtures-only hook carrying the exact-expiry timer's next armed deadline
+/// (`None` when no live record gates a wake).
+#[cfg(feature = "fixtures")]
+type ExpiryArmHook = Arc<dyn Fn(Option<u64>) + Send + Sync>;
+
 /// The node-global scoped-discovery publication primitive (Kyra OLB-2A.3.1
 /// closure).
 ///
@@ -4971,6 +4976,13 @@ struct ScopedMutationPublication {
     /// mutation and its publish. Absent from production builds.
     #[cfg(feature = "fixtures")]
     publish_pause: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fixtures-only: fired by the exact-expiry timer each time it computes its
+    /// next deadline and is about to wait, carrying that deadline (`None` when no
+    /// live record gates a wake). Lets a witness observe the timer's arming and
+    /// advance the clock deterministically instead of racing a real sleep. Absent
+    /// from production builds.
+    #[cfg(feature = "fixtures")]
+    expiry_arm_hook: parking_lot::Mutex<Option<ExpiryArmHook>>,
 }
 
 impl ScopedMutationPublication {
@@ -4982,11 +4994,24 @@ impl ScopedMutationPublication {
             contention_hook: parking_lot::Mutex::new(None),
             #[cfg(feature = "fixtures")]
             publish_pause: parking_lot::Mutex::new(None),
+            #[cfg(feature = "fixtures")]
+            expiry_arm_hook: parking_lot::Mutex::new(None),
         }
     }
 
     fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changed.subscribe()
+    }
+
+    /// Signal (fixtures-only) that the exact-expiry timer has computed `deadline`
+    /// and is about to wait on it. A no-op in production builds.
+    fn signal_expiry_armed(&self, deadline: Option<u64>) {
+        #[cfg(feature = "fixtures")]
+        if let Some(hook) = self.expiry_arm_hook.lock().clone() {
+            hook(deadline);
+        }
+        #[cfg(not(feature = "fixtures"))]
+        let _ = deadline;
     }
 
     /// Acquire the mutation-ordering gate. Try-then-block, so a witness observes
@@ -5056,6 +5081,77 @@ impl ScopedMutationPublication {
     ) -> R {
         let _gate = self.lock_gate();
         self.commit(scoped_discovery, f)
+    }
+}
+
+/// Drive the node's single exact-expiry timer (OLB-2A.3.2).
+///
+/// Reads [`ScopedDiscoveryState::next_visible_expiry`] and arms to exactly that
+/// deadline, so an expired private-discovery record is swept — and its consumers
+/// woken — at its deadline instead of up to 60 s later. Waking is driven by the
+/// SAME change watch the mutation paths publish to: any mutation that advances a
+/// generation (e.g. an insert with an earlier expiry) wakes the timer, which
+/// re-reads `next_visible_expiry` and re-arms to the new, earlier deadline. Reads
+/// are already expiry-safe — the store filters `now < expires_at` at query time,
+/// so a not-yet-swept expiry is invisible to queries regardless — so this governs
+/// promptness and wake latency, NOT a correctness boundary. The 60 s GC stays a
+/// retention backstop, including for inert records that declare no capability and
+/// so advance no generation (they never wake this timer).
+///
+/// The sweep runs through [`ScopedMutationPublication::gated_commit`], so it
+/// serializes with inbound ingest and its publication cannot invert (OLB-2A.3.1).
+/// `now` is injected so a witness can drive a deterministic clock in lockstep with
+/// paused time; production passes the wall clock.
+///
+/// [`ScopedDiscoveryState::next_visible_expiry`]: super::behavior::org_scoped_store::ScopedDiscoveryState::next_visible_expiry
+async fn run_exact_expiry_timer(
+    scoped: Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
+    publication: Arc<ScopedMutationPublication>,
+    mut changed: tokio::sync::watch::Receiver<u64>,
+    now: impl Fn() -> u64 + Send,
+    shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
+) {
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        // Mark the current change version SEEN before reading state: a mutation
+        // that lands between here and the wait is then never missed — if it lands
+        // before the read, the read reflects it; either way `changed()` fires and
+        // we re-arm. (Marking seen AFTER the read could drop a wake for an earlier
+        // deadline.) The timer's own sweep-publish is likewise marked seen here on
+        // the next iteration, so it never self-wakes into a busy loop.
+        changed.borrow_and_update();
+        let next = { scoped.lock().next_visible_expiry() };
+        let now_secs = now();
+        match next {
+            Some(deadline) if now_secs >= deadline => {
+                // Deadline reached (or already past): sweep every currently-expired
+                // record in one pass. The next deadline is then strictly in the
+                // future, or the live set is empty — no immediate re-sweep.
+                let forgotten = publication.gated_commit(&scoped, |s| s.sweep_expired(now_secs));
+                if forgotten > 0 {
+                    tracing::debug!(forgotten, "scoped discovery: exact-expiry swept");
+                }
+            }
+            Some(deadline) => {
+                let wait = Duration::from_secs(deadline.saturating_sub(now_secs));
+                publication.signal_expiry_armed(Some(deadline));
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = changed.changed() => {}
+                    _ = shutdown_notify.notified() => return,
+                }
+            }
+            None => {
+                publication.signal_expiry_armed(None);
+                tokio::select! {
+                    _ = changed.changed() => {}
+                    _ = shutdown_notify.notified() => return,
+                }
+            }
+        }
     }
 }
 
@@ -10915,6 +11011,7 @@ impl MeshNode {
             }
         };
         let capability_gc_handle = self.spawn_capability_gc_loop();
+        let exact_expiry_handle = self.spawn_exact_expiry_timer();
         let capability_reannounce_handle = self.spawn_capability_reannounce_loop();
         let capability_announce_on_change_handle = self.spawn_capability_announce_on_change_loop();
         let fold_generation_gc_handle = self.spawn_fold_generation_gc_loop();
@@ -10990,6 +11087,7 @@ impl MeshNode {
             tasks.push(retransmit_handle);
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
+            tasks.push(exact_expiry_handle);
             tasks.push(capability_reannounce_handle);
             tasks.push(capability_announce_on_change_handle);
             tasks.push(fold_generation_gc_handle);
@@ -11226,6 +11324,29 @@ impl MeshNode {
                 }
             }
         })
+    }
+
+    /// Spawn the node's single exact-expiry timer (OLB-2A.3.2).
+    ///
+    /// Complements the periodic 60 s GC: instead of waiting up to a full interval,
+    /// it sweeps each expired private-discovery record at exactly its deadline and
+    /// wakes consumers promptly, re-arming to any earlier deadline a mutation
+    /// introduces. One per node; it parks harmlessly when no record is live. See
+    /// [`run_exact_expiry_timer`] for the semantics.
+    fn spawn_exact_expiry_timer(&self) -> JoinHandle<()> {
+        let scoped = self.scoped_discovery.clone();
+        let publication = self.scoped_publication.clone();
+        let changed = self.scoped_publication.subscribe();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        tokio::spawn(run_exact_expiry_timer(
+            scoped,
+            publication,
+            changed,
+            super::behavior::org::current_timestamp,
+            shutdown,
+            shutdown_notify,
+        ))
     }
 
     /// Spawn the periodic capability re-announce loop.
@@ -32082,5 +32203,210 @@ mod scoped_publication_ordering_tests {
             1,
             "only the changed transaction published; the no-op did not"
         );
+    }
+}
+
+/// OLB-2A.3.2: the node's single exact-expiry timer arms to the earliest live
+/// deadline, sweeps at it through the gated commit (so consumers wake), and
+/// re-arms to any earlier deadline a mutation introduces. Deterministic — an
+/// injected clock plus the fixtures arm signal remove any dependence on real
+/// sleep timing; paused time is advanced only in lockstep with that clock.
+#[cfg(all(test, feature = "fixtures"))]
+mod exact_expiry_timer_tests {
+    use super::{run_exact_expiry_timer, ScopedMutationPublication};
+    use crate::adapter::net::behavior::capability::CapabilitySet;
+    use crate::adapter::net::behavior::org::OrgId;
+    use crate::adapter::net::behavior::org_scoped_ingest::{
+        CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
+    };
+    use crate::adapter::net::behavior::org_scoped_store::ScopedDiscoveryState;
+    use crate::adapter::net::identity::EntityId;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    /// An owner record declaring one capability, expiring at `expires_at`.
+    fn owner(provider_seed: u8, generation: u64, expires_at: u64) -> PreparedScopedCapability {
+        let descriptor = CapabilitySet::new().add_tag("nrpc:x").to_bytes_compact();
+        PreparedScopedCapability::prepare(VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Owner {
+                org_id: OrgId::from_bytes([1u8; 32]),
+                audience_handle: [0x11u8; 32],
+            },
+            EntityId::from_bytes([provider_seed; 32]),
+            OrgId::from_bytes([1u8; 32]),
+            generation,
+            expires_at,
+            5,
+            None,
+            descriptor,
+        ))
+    }
+
+    /// Shared state + publication, an injectable clock, an arm-signal channel, and
+    /// a spawned timer. The clock is decoupled from tokio's paused clock so a
+    /// witness advances both explicitly and in lockstep.
+    struct Harness {
+        state: Arc<parking_lot::Mutex<ScopedDiscoveryState>>,
+        publication: Arc<ScopedMutationPublication>,
+        clock: Arc<AtomicU64>,
+        watch: tokio::sync::watch::Receiver<u64>,
+        arms: tokio::sync::mpsc::UnboundedReceiver<Option<u64>>,
+        shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
+        timer: tokio::task::JoinHandle<()>,
+    }
+
+    impl Harness {
+        /// Seed the state (directly, before the timer runs, so its first read sees
+        /// the whole seed) then spawn the timer at `clock_start`.
+        fn start(clock_start: u64, seed: impl FnOnce(&mut ScopedDiscoveryState)) -> Self {
+            let state = Arc::new(parking_lot::Mutex::new(ScopedDiscoveryState::new()));
+            seed(&mut state.lock());
+            let publication = Arc::new(ScopedMutationPublication::new());
+            let clock = Arc::new(AtomicU64::new(clock_start));
+            let (arm_tx, arms) = tokio::sync::mpsc::unbounded_channel();
+            *publication.expiry_arm_hook.lock() = Some(Arc::new(move |d| {
+                let _ = arm_tx.send(d);
+            }));
+            let watch = publication.subscribe();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_notify = Arc::new(Notify::new());
+            let timer = {
+                let state_t = state.clone();
+                let pub_t = publication.clone();
+                let clock_t = clock.clone();
+                let shutdown_t = shutdown.clone();
+                let notify_t = shutdown_notify.clone();
+                let changed = publication.subscribe();
+                tokio::spawn(async move {
+                    run_exact_expiry_timer(
+                        state_t,
+                        pub_t,
+                        changed,
+                        move || clock_t.load(Ordering::SeqCst),
+                        shutdown_t,
+                        notify_t,
+                    )
+                    .await
+                })
+            };
+            Harness {
+                state,
+                publication,
+                clock,
+                watch,
+                arms,
+                shutdown,
+                shutdown_notify,
+                timer,
+            }
+        }
+
+        /// Ingest through the publication so the timer wakes on the change.
+        fn ingest(&self, record: PreparedScopedCapability) {
+            let now = self.clock.load(Ordering::SeqCst);
+            self.publication.gated_commit(&self.state, |s| {
+                s.ingest(record, now);
+            });
+        }
+
+        async fn next_arm(&mut self) -> Option<u64> {
+            self.arms.recv().await.expect("timer arm signal")
+        }
+
+        fn set_clock(&self, secs: u64) {
+            self.clock.store(secs, Ordering::SeqCst);
+        }
+
+        async fn stop(self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            self.shutdown_notify.notify_waiters();
+            let _ = self.timer.await;
+        }
+    }
+
+    /// A record already past its deadline is swept the moment the timer reads it —
+    /// through the gated commit, so the change watch advances to the swept
+    /// generation — and the timer then arms to the surviving record's deadline.
+    #[tokio::test(start_paused = true)]
+    async fn sweeps_a_due_record_then_arms_to_the_survivor() {
+        let mut h = Harness::start(100, |s| {
+            s.ingest(owner(3, 1, 50), 0); // due at clock 100
+            s.ingest(owner(4, 1, 200), 0); // survives
+        });
+
+        // First arm is the SURVIVOR's deadline: the due record was swept first,
+        // without arming.
+        assert_eq!(h.next_arm().await, Some(200));
+
+        assert_eq!(h.state.lock().len(), 1, "the due record was swept");
+        assert_eq!(h.state.lock().next_visible_expiry(), Some(200));
+        let revision = h.state.lock().revision();
+        assert_ne!(revision, 0);
+        assert_eq!(
+            *h.watch.borrow(),
+            revision,
+            "the sweep woke consumers at the swept generation"
+        );
+        h.stop().await;
+    }
+
+    /// An earlier record introduced after the timer armed wakes it through the
+    /// change watch; it re-reads and re-arms to the nearer deadline.
+    #[tokio::test(start_paused = true)]
+    async fn rearms_to_an_earlier_deadline() {
+        let mut h = Harness::start(0, |_| {});
+        assert_eq!(
+            h.next_arm().await,
+            None,
+            "an empty live set arms with no deadline"
+        );
+
+        h.ingest(owner(3, 1, 100));
+        assert_eq!(h.next_arm().await, Some(100));
+
+        // A nearer deadline must pull the arm in.
+        h.ingest(owner(4, 1, 10));
+        assert_eq!(
+            h.next_arm().await,
+            Some(10),
+            "the timer re-armed to the earlier deadline"
+        );
+        h.stop().await;
+    }
+
+    /// When the armed deadline elapses the timer fires: advancing the injected
+    /// clock and paused time in lockstep to the deadline sweeps the due record and
+    /// re-arms (here, to an empty live set).
+    #[tokio::test(start_paused = true)]
+    async fn fires_a_sweep_when_the_armed_deadline_elapses() {
+        let mut h = Harness::start(0, |_| {});
+        assert_eq!(h.next_arm().await, None);
+
+        h.ingest(owner(3, 1, 100));
+        assert_eq!(h.next_arm().await, Some(100));
+
+        // Move the clock to the deadline, let the timer register its sleep, then
+        // advance paused time so the sleep elapses.
+        h.set_clock(100);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(100)).await;
+
+        assert_eq!(
+            h.next_arm().await,
+            None,
+            "the live set is empty after the sweep"
+        );
+        assert_eq!(
+            h.state.lock().len(),
+            0,
+            "the record was swept at its deadline"
+        );
+        assert_eq!(h.state.lock().next_visible_expiry(), None);
+        h.stop().await;
     }
 }

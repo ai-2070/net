@@ -59,8 +59,8 @@ consumer of each stream. The owner stream is a subset of the global stream, so
 valid grant-audience churn never wakes an owner-private consumer. These are
 MUTATION/SWEEP generations, not yet complete query-visible-set generations —
 wall-clock expiry and floor raises change results before they advance. **OLB-2A.3**
-closes that and adds the push wake, in bounded sub-slices: **2A.3.1** (landed,
-then closed under review) routes every scoped-store mutation through one
+closes that and adds the push wake, in bounded sub-slices: **2A.3.1** (SIGNED at
+`93f7b03d2`) routes every scoped-store mutation through one
 `ScopedMutationPublication` — a node-global gate bound to the change `watch`.
 Each transaction holds the gate from BEFORE its final currentness recheck (so
 the signed 2A.1 recheck→insert boundary stays closed) through its publication, so
@@ -68,11 +68,18 @@ mutation and publication SERIALIZE node-wide: an older transaction's publication
 can never overwrite a newer one, and only a transaction that advanced the
 generation publishes (a no-op wakes nobody). `subscribe_private_discovery_changes`
 is the read-only push signal, replacing the interim poll-only model. **2A.3.2**
-adds single-consumer ownership of each dirty stream
-plus event-driven `next_visible_expiry` and one node exact-expiry timer;
-**2A.3.3** adds floor-raise dirtying via `subscribe_floors_raised` through the
-reverse-declaration index. All of OLB-2A.3 must land and be reviewed before any
-reconciler consumes this source. **OLB-2A.4** (named, not dropped): replace the store's
+lands in two bounded commits: (part 1, landed) event-driven `next_visible_expiry`
+min-tracking in `ScopedDiscoveryState` (an ordered live-expiry multiset,
+O(log n), tombstones excluded) plus ONE node-owned resettable exact-expiry timer
+(`run_exact_expiry_timer`) that arms to exactly the earliest live deadline,
+sweeps at it through the gated commit (so consumers wake), and re-arms to any
+earlier deadline a mutation introduces via the same change watch — reads stay
+expiry-safe (`now < expires_at` at query time), so this is promptness/wake, not a
+correctness boundary, and the 60 s GC remains a retention backstop for inert
+records that advance no generation; (part 2) single-consumer ownership of each
+dirty stream. **2A.3.3** adds floor-raise dirtying via `subscribe_floors_raised`
+through the reverse-declaration index. All of OLB-2A.3 must land and be reviewed
+before any reconciler consumes this source. **OLB-2A.4** (named, not dropped): replace the store's
 `entries_in_scope` scan with maintained per-scope counts before the generic
 indexed substrate is called complete. This substrate is shared with the
 provider-free leader track but carries no authority-filtered candidate or

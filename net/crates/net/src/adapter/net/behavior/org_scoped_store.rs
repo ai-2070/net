@@ -563,6 +563,19 @@ pub struct ScopedDiscoveryState {
     pending_global: DirtyCapabilities,
     /// Capabilities dirtied in the OWNER partition since the last owner drain.
     pending_owner: DirtyCapabilities,
+    /// Earliest-first live expiries: each expiry deadline mapped to the number of
+    /// LIVE records that expire at it. [`Self::next_visible_expiry`] reads the
+    /// first key in O(log n), so the node's exact-expiry timer arms to exactly
+    /// the next query-visible deadline instead of scanning the store or waiting a
+    /// fixed 60 s. Tombstones are excluded — they are not query-visible, so they
+    /// never gate a wake. Maintained in the SAME transaction as the store, index,
+    /// and revisions (OLB-2A.3.2).
+    live_expiries: BTreeMap<u64, u32>,
+    /// Each LIVE key's current expiry, so an update that moves a record's expiry
+    /// or a sweep/capacity-demotion that drops it can release the record's
+    /// [`Self::live_expiries`] slot without a scan. Its key set is exactly the
+    /// live set's (a tombstone or a never-live key is absent).
+    expiry_by_key: BTreeMap<ScopedKey, u64>,
 }
 
 /// Add the capabilities a live record declared — read from the index BEFORE the
@@ -626,6 +639,10 @@ impl ScopedDiscoveryState {
         }
         let scope = capability.scope().clone();
         let key = (scope.clone(), capability.provider().clone());
+        // Read the stored expiry before the store consumes the record; the store
+        // keys its `StoredEntry` off this exact `expires_at()`, so expiry tracking
+        // and the store agree on every deadline.
+        let expires_at = capability.expires_at();
         let report = self.store.ingest(capability, now_secs);
         let mut global = BTreeSet::new();
         let mut owner = BTreeSet::new();
@@ -634,18 +651,23 @@ impl ScopedDiscoveryState {
         for swept in &report.swept_live {
             note_removed_record(&self.index, swept, &mut global, &mut owner);
             self.index.remove_record(swept);
+            self.forget_live_expiry(swept);
         }
         match report.outcome {
             ScopedStoreOutcome::Inserted => {
                 note_caps(&scope, &cap_ids, &mut global, &mut owner);
-                self.index.insert_record(key, cap_ids);
+                self.index.insert_record(key.clone(), cap_ids);
+                self.track_live_expiry(&key, expires_at);
             }
             ScopedStoreOutcome::Updated => {
                 // Dirty the union of the old and new declarations — the query
                 // trusts the index, so both the vacated and the new buckets moved.
                 note_removed_record(&self.index, &key, &mut global, &mut owner);
                 note_caps(&scope, &cap_ids, &mut global, &mut owner);
-                self.index.replace_record(key, cap_ids);
+                self.index.replace_record(key.clone(), cap_ids);
+                // Move the record onto its (possibly new) expiry; a revival from a
+                // tombstone had no prior slot, an in-place update releases the old.
+                self.track_live_expiry(&key, expires_at);
             }
             // `TooManyDeclarations` is returned early above and never produced by
             // the raw store, so it cannot appear here; listed for exhaustiveness.
@@ -671,6 +693,7 @@ impl ScopedDiscoveryState {
         self.record_change(&global, &owner);
         for key in &removed {
             self.index.remove_record(key);
+            self.forget_live_expiry(key);
         }
         dropped
     }
@@ -694,6 +717,54 @@ impl ScopedDiscoveryState {
             self.owner_revision = self.owner_revision.wrapping_add(1);
             self.pending_owner.mark(owner);
         }
+    }
+
+    /// Record that the LIVE record at `key` now expires at `expires_at`, moving it
+    /// off any prior deadline it held. An in-place update releases its old slot
+    /// (the `insert` returns the prior expiry); a fresh insert or a revival from a
+    /// tombstone has no prior slot. Two `BTreeMap` touches, never a scan.
+    fn track_live_expiry(&mut self, key: &ScopedKey, expires_at: u64) {
+        if let Some(previous) = self.expiry_by_key.insert(key.clone(), expires_at) {
+            self.release_expiry_slot(previous);
+        }
+        *self.live_expiries.entry(expires_at).or_insert(0) += 1;
+    }
+
+    /// Drop the LIVE record at `key` from expiry tracking — a sweep or a
+    /// capacity-demotion moved it out of the live set. A key with no tracked
+    /// expiry (a tombstone, or a record that never went live) is a no-op.
+    fn forget_live_expiry(&mut self, key: &ScopedKey) {
+        if let Some(previous) = self.expiry_by_key.remove(key) {
+            self.release_expiry_slot(previous);
+        }
+    }
+
+    /// Release one live reference to `deadline`, dropping the deadline entirely
+    /// once its last live record leaves — so [`Self::next_visible_expiry`] never
+    /// reports a deadline no live record still holds.
+    fn release_expiry_slot(&mut self, deadline: u64) {
+        if let Some(count) = self.live_expiries.get_mut(&deadline) {
+            *count -= 1;
+            if *count == 0 {
+                self.live_expiries.remove(&deadline);
+            }
+        }
+    }
+
+    /// The earliest expiry among LIVE records, or `None` when the live set is
+    /// empty. The node's exact-expiry timer arms to exactly this deadline; a
+    /// mutation that introduces an earlier one advances a generation and so wakes
+    /// the timer through the change watch, which re-reads this and re-arms. O(log
+    /// n) — never a store scan.
+    ///
+    /// Bound to the mutation/sweep generations, NOT wall-clock: a record whose
+    /// deadline has passed still appears here until a sweep removes it (reads stay
+    /// expiry-safe via the store's read-time `now < expires_at` filter, so a
+    /// not-yet-swept expiry is invisible to queries regardless). A record that
+    /// declares no capability advances no generation, so it does not wake the
+    /// timer; such an inert record is reclaimed by the 60 s GC retention backstop.
+    pub fn next_visible_expiry(&self) -> Option<u64> {
+        self.live_expiries.keys().next().copied()
     }
 
     /// The private-discovery mutation/sweep generation over EITHER partition — a
@@ -1880,5 +1951,117 @@ mod tests {
         );
         assert_eq!(state.take_global_change_batch().dirty, one_cap("nrpc:a"));
         assert_eq!(state.take_owner_change_batch().dirty, one_cap("nrpc:a"));
+    }
+
+    // ----- OLB-2A.3.2: next_visible_expiry min-tracking -----
+
+    /// An empty live set has no next expiry; an insert exposes exactly the
+    /// earliest live deadline, and a later insert never hides it.
+    #[test]
+    fn next_visible_expiry_tracks_the_earliest_live_deadline() {
+        let mut state = ScopedDiscoveryState::new();
+        assert_eq!(
+            state.next_visible_expiry(),
+            None,
+            "empty live set has no deadline"
+        );
+
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 5000, &["nrpc:a"]), 0);
+        assert_eq!(state.next_visible_expiry(), Some(5000));
+
+        // A LATER deadline does not move the minimum.
+        ingest_indexed(&mut state, owner_cap_declaring(4, 1, 9000, &["nrpc:a"]), 0);
+        assert_eq!(state.next_visible_expiry(), Some(5000));
+
+        // An EARLIER deadline does — this is the edge the timer must re-arm to.
+        ingest_indexed(&mut state, owner_cap_declaring(5, 1, 1000, &["nrpc:a"]), 0);
+        assert_eq!(state.next_visible_expiry(), Some(1000));
+    }
+
+    /// An update MOVES a record's expiry contribution: a record that pushes its
+    /// deadline later releases its old, earlier slot, so the minimum rises to the
+    /// next live deadline instead of pinning to a deadline no live record holds.
+    #[test]
+    fn an_update_moves_the_records_expiry_slot() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 1000, &["nrpc:a"]), 0);
+        assert_eq!(state.next_visible_expiry(), Some(1000));
+
+        // Same provider, newer generation, later expiry: an Updated record.
+        assert_eq!(
+            ingest_indexed(&mut state, owner_cap_declaring(3, 2, 5000, &["nrpc:a"]), 0),
+            ScopedStoreOutcome::Updated
+        );
+        assert_eq!(
+            state.next_visible_expiry(),
+            Some(5000),
+            "the update released the vacated 1000 slot"
+        );
+    }
+
+    /// Records sharing a deadline are reference-counted: the shared deadline
+    /// survives until its LAST live holder leaves, so moving one of two records
+    /// off it does not prematurely expose a later deadline.
+    #[test]
+    fn records_sharing_a_deadline_are_reference_counted() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 1000, &["nrpc:a"]), 0);
+        ingest_indexed(&mut state, owner_cap_declaring(4, 1, 1000, &["nrpc:a"]), 0);
+        assert_eq!(state.next_visible_expiry(), Some(1000));
+
+        // Move provider 3 off 1000; provider 4 still holds it.
+        ingest_indexed(&mut state, owner_cap_declaring(3, 2, 5000, &["nrpc:a"]), 0);
+        assert_eq!(
+            state.next_visible_expiry(),
+            Some(1000),
+            "provider 4 still holds the shared deadline"
+        );
+
+        // Move provider 4 off 1000 too; only 5000 remains.
+        ingest_indexed(&mut state, owner_cap_declaring(4, 2, 5000, &["nrpc:a"]), 0);
+        assert_eq!(state.next_visible_expiry(), Some(5000));
+    }
+
+    /// A sweep advances the next expiry to the surviving record: the swept
+    /// deadline is released with the live record it belonged to, and a fully
+    /// emptied live set reports no deadline.
+    #[test]
+    fn a_sweep_advances_next_visible_expiry_to_the_survivor() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 1000, &["nrpc:a"]), 0);
+        ingest_indexed(&mut state, owner_cap_declaring(4, 1, 5000, &["nrpc:a"]), 0);
+        assert_eq!(state.next_visible_expiry(), Some(1000));
+
+        // Sweep at 2000: provider 3 (expiry 1000) is demoted; provider 4 survives.
+        assert_eq!(state.sweep_expired(2000), 1);
+        assert_eq!(
+            state.next_visible_expiry(),
+            Some(5000),
+            "the swept 1000 slot was released with its live record"
+        );
+
+        // Sweep past the survivor: no live record, no deadline.
+        assert_eq!(state.sweep_expired(6000), 1);
+        assert_eq!(state.next_visible_expiry(), None);
+    }
+
+    /// Expiry tracking is partition-agnostic: a GRANT record's deadline gates the
+    /// next expiry exactly as an owner record's does, so the one node timer sweeps
+    /// grant expiries too (the granted plane is not owner-indexed, but it still
+    /// expires).
+    #[test]
+    fn a_grant_records_deadline_also_gates_the_next_expiry() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 2000, &["nrpc:a"]), 0);
+        ingest_indexed(
+            &mut state,
+            grant_cap_declaring([0xAA; 32], 4, 1, 800, "nrpc:g"),
+            0,
+        );
+        assert_eq!(
+            state.next_visible_expiry(),
+            Some(800),
+            "the earlier grant deadline gates the timer"
+        );
     }
 }
