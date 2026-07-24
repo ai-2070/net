@@ -67,19 +67,36 @@ the signed 2A.1 recheck→insert boundary stays closed) through its publication,
 mutation and publication SERIALIZE node-wide: an older transaction's publication
 can never overwrite a newer one, and only a transaction that advanced the
 generation publishes (a no-op wakes nobody). `subscribe_private_discovery_changes`
-is the read-only push signal, replacing the interim poll-only model. **2A.3.2**
-lands in two bounded commits: (part 1, landed) event-driven `next_visible_expiry`
-min-tracking in `ScopedDiscoveryState` (an ordered live-expiry multiset,
-O(log n), tombstones excluded) plus ONE node-owned resettable exact-expiry timer
-(`run_exact_expiry_timer`) that arms to exactly the earliest live deadline,
+is the read-only push signal, replacing the interim poll-only model. **2A.3.2** is
+the EXACT-EXPIRY SOURCE ONLY: event-driven `next_visible_expiry` min-tracking in
+`ScopedDiscoveryState` (an ordered expiry multiset over the records whose expiry
+can change a query result — live AND declaring at least one capability; tombstones
+and inert zero-declaration rows are excluded, since a deadline no wake can follow
+would be a minimum the timer is never re-armed to) plus ONE node-owned resettable
+exact-expiry timer (`run_exact_expiry_timer`) that arms to exactly that deadline,
 sweeps at it through the gated commit (so consumers wake), and re-arms to any
-earlier deadline a mutation introduces via the same change watch — reads stay
-expiry-safe (`now < expires_at` at query time), so this is promptness/wake, not a
-correctness boundary, and the 60 s GC remains a retention backstop for inert
-records that advance no generation; (part 2) single-consumer ownership of each
-dirty stream. **2A.3.3** adds floor-raise dirtying via `subscribe_floors_raised`
+earlier deadline a mutation introduces via the same change watch. The arm is
+derived from the ABSOLUTE deadline against a subsecond wall clock, so it does not
+round up to the next whole second; the timer arms its shutdown wake BEFORE
+observing the shutdown flag, so a `notify_waiters` landing in that window cannot
+strand it (both Kyra OLB-2A.3.2). Reads stay expiry-safe (`now < expires_at` at
+query time), so this is promptness/wake, not a correctness boundary, and the 60 s
+GC remains a retention backstop — including for the inert rows above.
+**2A.3.3** adds floor-raise dirtying via `subscribe_floors_raised`
 through the reverse-declaration index. All of OLB-2A.3 must land and be reviewed
-before any reconciler consumes this source. **OLB-2A.4** (named, not dropped): replace the store's
+before any reconciler consumes this source.
+
+**Exclusive destructive-drain ownership belongs to the OLB-2B actor-entry
+boundary, not to 2A.3** (Kyra, 2026-07-24; a first attempt inside 2A.3.2 was
+reverted). The destructive `take_global_change_batch` /
+`take_owner_change_batch` must gain a single owner BEFORE the reconciler's first
+drain — but the ownership capability has to be established together with its
+consumer, in one slice that also seals the raw takes behind it (they are
+`pub(crate)` today, so a mint alone does not make a second drainer
+unrepresentable), fixes the handle's visibility to the actor's module, and
+defines startup/drop/panic/restart policy for a stranded stream. The invariant
+that stands regardless: no reconciler may consume this source before exclusive
+ownership exists. **OLB-2A.4** (named, not dropped): replace the store's
 `entries_in_scope` scan with maintained per-scope counts before the generic
 indexed substrate is called complete. This substrate is shared with the
 provider-free leader track but carries no authority-filtered candidate or

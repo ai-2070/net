@@ -564,17 +564,25 @@ pub struct ScopedDiscoveryState {
     /// Capabilities dirtied in the OWNER partition since the last owner drain.
     pending_owner: DirtyCapabilities,
     /// Earliest-first live expiries: each expiry deadline mapped to the number of
-    /// LIVE records that expire at it. [`Self::next_visible_expiry`] reads the
+    /// tracked records that expire at it. [`Self::next_visible_expiry`] reads the
     /// first key in O(log n), so the node's exact-expiry timer arms to exactly
     /// the next query-visible deadline instead of scanning the store or waiting a
-    /// fixed 60 s. Tombstones are excluded — they are not query-visible, so they
-    /// never gate a wake. Maintained in the SAME transaction as the store, index,
-    /// and revisions (OLB-2A.3.2).
+    /// fixed 60 s. Maintained in the SAME transaction as the store, index, and
+    /// revisions (OLB-2A.3.2).
+    ///
+    /// Tracks exactly the records whose expiry can CHANGE A QUERY RESULT: live,
+    /// and declaring at least one capability. Tombstones are excluded (not
+    /// query-visible). A live record declaring NOTHING is excluded too, because it
+    /// occupies no capability bucket — its movement advances no generation, dirties
+    /// no capability, and publishes no wake, so reporting its deadline here would
+    /// name a minimum that the timer is never woken to re-arm to (Kyra OLB-2A.3.2).
+    /// Such inert rows are reclaimed by the 60 s GC retention backstop.
     live_expiries: BTreeMap<u64, u32>,
-    /// Each LIVE key's current expiry, so an update that moves a record's expiry
+    /// Each TRACKED key's current expiry, so an update that moves a record's expiry
     /// or a sweep/capacity-demotion that drops it can release the record's
     /// [`Self::live_expiries`] slot without a scan. Its key set is exactly the
-    /// live set's (a tombstone or a never-live key is absent).
+    /// tracked set above (a tombstone, a never-live key, or a live record declaring
+    /// nothing is absent).
     expiry_by_key: BTreeMap<ScopedKey, u64>,
 }
 
@@ -656,18 +664,30 @@ impl ScopedDiscoveryState {
         match report.outcome {
             ScopedStoreOutcome::Inserted => {
                 note_caps(&scope, &cap_ids, &mut global, &mut owner);
+                // Only a record that occupies a capability bucket can change a
+                // query result, so only it gates the exact-expiry timer.
+                let declares = !cap_ids.is_empty();
                 self.index.insert_record(key.clone(), cap_ids);
-                self.track_live_expiry(&key, expires_at);
+                if declares {
+                    self.track_live_expiry(&key, expires_at);
+                }
             }
             ScopedStoreOutcome::Updated => {
                 // Dirty the union of the old and new declarations — the query
                 // trusts the index, so both the vacated and the new buckets moved.
                 note_removed_record(&self.index, &key, &mut global, &mut owner);
                 note_caps(&scope, &cap_ids, &mut global, &mut owner);
+                let declares = !cap_ids.is_empty();
                 self.index.replace_record(key.clone(), cap_ids);
                 // Move the record onto its (possibly new) expiry; a revival from a
                 // tombstone had no prior slot, an in-place update releases the old.
-                self.track_live_expiry(&key, expires_at);
+                // An update that drops the record's last declaration leaves the
+                // tracked set entirely.
+                if declares {
+                    self.track_live_expiry(&key, expires_at);
+                } else {
+                    self.forget_live_expiry(&key);
+                }
             }
             // `TooManyDeclarations` is returned early above and never produced by
             // the raw store, so it cannot appear here; listed for exhaustiveness.
@@ -719,10 +739,11 @@ impl ScopedDiscoveryState {
         }
     }
 
-    /// Record that the LIVE record at `key` now expires at `expires_at`, moving it
-    /// off any prior deadline it held. An in-place update releases its old slot
-    /// (the `insert` returns the prior expiry); a fresh insert or a revival from a
-    /// tombstone has no prior slot. Two `BTreeMap` touches, never a scan.
+    /// Record that the tracked record at `key` now expires at `expires_at`, moving
+    /// it off any prior deadline it held. An in-place update releases its old slot
+    /// (the `insert` returns the prior expiry); a fresh insert, a revival from a
+    /// tombstone, or a record that previously declared nothing has no prior slot.
+    /// Two `BTreeMap` touches, never a scan.
     fn track_live_expiry(&mut self, key: &ScopedKey, expires_at: u64) {
         if let Some(previous) = self.expiry_by_key.insert(key.clone(), expires_at) {
             self.release_expiry_slot(previous);
@@ -730,18 +751,19 @@ impl ScopedDiscoveryState {
         *self.live_expiries.entry(expires_at).or_insert(0) += 1;
     }
 
-    /// Drop the LIVE record at `key` from expiry tracking — a sweep or a
-    /// capacity-demotion moved it out of the live set. A key with no tracked
-    /// expiry (a tombstone, or a record that never went live) is a no-op.
+    /// Drop the record at `key` from expiry tracking — a sweep or capacity-demotion
+    /// moved it out of the live set, or an update dropped its last declaration. A
+    /// key with no tracked expiry (a tombstone, a record that never went live, or
+    /// one that declared nothing) is a no-op.
     fn forget_live_expiry(&mut self, key: &ScopedKey) {
         if let Some(previous) = self.expiry_by_key.remove(key) {
             self.release_expiry_slot(previous);
         }
     }
 
-    /// Release one live reference to `deadline`, dropping the deadline entirely
-    /// once its last live record leaves — so [`Self::next_visible_expiry`] never
-    /// reports a deadline no live record still holds.
+    /// Release one reference to `deadline`, dropping the deadline entirely once its
+    /// last tracked record leaves — so [`Self::next_visible_expiry`] never reports
+    /// a deadline no tracked record still holds.
     fn release_expiry_slot(&mut self, deadline: u64) {
         if let Some(count) = self.live_expiries.get_mut(&deadline) {
             *count -= 1;
@@ -751,18 +773,23 @@ impl ScopedDiscoveryState {
         }
     }
 
-    /// The earliest expiry among LIVE records, or `None` when the live set is
-    /// empty. The node's exact-expiry timer arms to exactly this deadline; a
+    /// The earliest expiry that can change a QUERY RESULT — the minimum over live
+    /// records declaring at least one capability — or `None` when no such record
+    /// exists. The node's exact-expiry timer arms to exactly this deadline; a
     /// mutation that introduces an earlier one advances a generation and so wakes
     /// the timer through the change watch, which re-reads this and re-arms. O(log
     /// n) — never a store scan.
     ///
+    /// Every reported deadline is therefore one the timer is actually woken to
+    /// re-arm to: a live record declaring NOTHING occupies no capability bucket, so
+    /// it advances no generation and publishes no wake — reporting its deadline
+    /// would name a minimum no wake can follow (Kyra OLB-2A.3.2). Such inert rows
+    /// are reclaimed by the 60 s GC retention backstop instead.
+    ///
     /// Bound to the mutation/sweep generations, NOT wall-clock: a record whose
     /// deadline has passed still appears here until a sweep removes it (reads stay
     /// expiry-safe via the store's read-time `now < expires_at` filter, so a
-    /// not-yet-swept expiry is invisible to queries regardless). A record that
-    /// declares no capability advances no generation, so it does not wake the
-    /// timer; such an inert record is reclaimed by the 60 s GC retention backstop.
+    /// not-yet-swept expiry is invisible to queries regardless).
     pub fn next_visible_expiry(&self) -> Option<u64> {
         self.live_expiries.keys().next().copied()
     }
@@ -2043,6 +2070,96 @@ mod tests {
         // Sweep past the survivor: no live record, no deadline.
         assert_eq!(state.sweep_expired(6000), 1);
         assert_eq!(state.next_visible_expiry(), None);
+    }
+
+    /// An owner record whose descriptor declares NO capability, expiring at
+    /// `expires_at`.
+    fn owner_cap_declaring_nothing(
+        provider_seed: u8,
+        generation: u64,
+        expires_at: u64,
+    ) -> VerifiedScopedCapability {
+        VerifiedScopedCapability::for_test(
+            owner_scope(),
+            provider(provider_seed),
+            org(1),
+            generation,
+            expires_at,
+            FIXTURE_CERT_GEN,
+            None,
+            b"not-a-capability-set".to_vec(),
+        )
+    }
+
+    /// A record declaring NO capability never gates the timer: it occupies no
+    /// capability bucket, so it advances no generation and publishes no wake — a
+    /// deadline the timer could never be woken to re-arm to must not be reported
+    /// (Kyra OLB-2A.3.2).
+    #[test]
+    fn a_declaration_empty_insert_does_not_gate_the_next_expiry() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring_nothing(3, 1, 500), 0);
+        assert_eq!(
+            state.next_visible_expiry(),
+            None,
+            "an inert record reports no deadline"
+        );
+
+        // A declaring record installs the only reported deadline, even though the
+        // inert record above expires EARLIER.
+        ingest_indexed(&mut state, owner_cap_declaring(4, 1, 5000, &["nrpc:a"]), 0);
+        assert_eq!(
+            state.next_visible_expiry(),
+            Some(5000),
+            "only the declaring record's deadline is reported"
+        );
+    }
+
+    /// An update that drops a record's last declaration releases its expiry slot:
+    /// the record stops occupying a capability bucket, so it stops gating the timer.
+    #[test]
+    fn an_update_to_no_declarations_releases_the_expiry_slot() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 1000, &["nrpc:a"]), 0);
+        ingest_indexed(&mut state, owner_cap_declaring(4, 1, 5000, &["nrpc:a"]), 0);
+        assert_eq!(state.next_visible_expiry(), Some(1000));
+
+        // Provider 3 re-announces declaring nothing: it leaves the tracked set.
+        assert_eq!(
+            ingest_indexed(&mut state, owner_cap_declaring_nothing(3, 2, 1000), 0),
+            ScopedStoreOutcome::Updated
+        );
+        assert_eq!(
+            state.next_visible_expiry(),
+            Some(5000),
+            "the now-inert record released its deadline"
+        );
+    }
+
+    /// An update that ADDS a first declaration installs the record's expiry slot,
+    /// so a record that becomes query-visible starts gating the timer.
+    #[test]
+    fn an_update_to_declared_installs_the_expiry_slot() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring_nothing(3, 1, 1000), 0);
+        ingest_indexed(&mut state, owner_cap_declaring(4, 1, 5000, &["nrpc:a"]), 0);
+        assert_eq!(
+            state.next_visible_expiry(),
+            Some(5000),
+            "only the declaring record gates it"
+        );
+
+        // Provider 3 re-announces WITH a declaration: its earlier deadline now
+        // gates the timer.
+        assert_eq!(
+            ingest_indexed(&mut state, owner_cap_declaring(3, 2, 1000, &["nrpc:a"]), 0),
+            ScopedStoreOutcome::Updated
+        );
+        assert_eq!(
+            state.next_visible_expiry(),
+            Some(1000),
+            "becoming query-visible installed the earlier deadline"
+        );
     }
 
     /// Expiry tracking is partition-agnostic: a GRANT record's deadline gates the

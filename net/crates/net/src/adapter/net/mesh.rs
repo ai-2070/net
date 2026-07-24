@@ -4983,6 +4983,13 @@ struct ScopedMutationPublication {
     /// from production builds.
     #[cfg(feature = "fixtures")]
     expiry_arm_hook: parking_lot::Mutex<Option<ExpiryArmHook>>,
+    /// Fixtures-only: fired by the exact-expiry timer AFTER it registers its
+    /// shutdown wake and BEFORE it observes the shutdown flag — precisely the
+    /// window in which a `notify_waiters` that retained no permit would strand the
+    /// timer. Lets a witness fire the real shutdown sequence inside that window.
+    /// Absent from production builds.
+    #[cfg(feature = "fixtures")]
+    shutdown_arm_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl ScopedMutationPublication {
@@ -4996,6 +5003,8 @@ impl ScopedMutationPublication {
             publish_pause: parking_lot::Mutex::new(None),
             #[cfg(feature = "fixtures")]
             expiry_arm_hook: parking_lot::Mutex::new(None),
+            #[cfg(feature = "fixtures")]
+            shutdown_arm_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -5012,6 +5021,16 @@ impl ScopedMutationPublication {
         }
         #[cfg(not(feature = "fixtures"))]
         let _ = deadline;
+    }
+
+    /// Signal (fixtures-only) that the exact-expiry timer has REGISTERED its
+    /// shutdown wake and has not yet observed the shutdown flag. A no-op in
+    /// production builds.
+    fn signal_expiry_shutdown_armed(&self) {
+        #[cfg(feature = "fixtures")]
+        if let Some(hook) = self.shutdown_arm_hook.lock().clone() {
+            hook();
+        }
     }
 
     /// Acquire the mutation-ordering gate. Try-then-block, so a witness observes
@@ -5100,19 +5119,37 @@ impl ScopedMutationPublication {
 ///
 /// The sweep runs through [`ScopedMutationPublication::gated_commit`], so it
 /// serializes with inbound ingest and its publication cannot invert (OLB-2A.3.1).
-/// `now` is injected so a witness can drive a deterministic clock in lockstep with
-/// paused time; production passes the wall clock.
+/// `wall_now` is injected so a witness can drive a deterministic clock in lockstep
+/// with paused time; production samples the real wall clock.
 ///
 /// [`ScopedDiscoveryState::next_visible_expiry`]: super::behavior::org_scoped_store::ScopedDiscoveryState::next_visible_expiry
 async fn run_exact_expiry_timer(
     scoped: Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
     publication: Arc<ScopedMutationPublication>,
     mut changed: tokio::sync::watch::Receiver<u64>,
-    now: impl Fn() -> u64 + Send,
+    wall_now: impl Fn() -> Duration + Send,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
 ) {
     loop {
+        // Arm the shutdown wake BEFORE observing the shutdown flag.
+        // `notify_waiters` retains NO permit for a waiter that arrives later, so
+        // checking the flag first loses a shutdown that lands in the gap: the timer
+        // then parks — forever with no live deadline, or until a distant one —
+        // while `MeshNode::shutdown` awaits its tracked handle, hanging shutdown
+        // (Kyra OLB-2A.3.2). That is exactly what an inline `notified()` inside the
+        // `select!` below would do, because a `Notified` captures the
+        // notify-waiters epoch when it is CONSTRUCTED: constructing it after the
+        // notify misses that notify permanently. Constructing (and enabling, so the
+        // waiter is registered rather than merely epoch-stamped) first inverts the
+        // order against the shutdown sequence (`store` then `notify_waiters`):
+        // either the store is visible to the load below, or this waiter was already
+        // armed when the notify ran. Re-armed per iteration, so the same argument
+        // covers every wait.
+        let shutdown_signal = shutdown_notify.notified();
+        tokio::pin!(shutdown_signal);
+        shutdown_signal.as_mut().enable();
+        publication.signal_expiry_shutdown_armed();
         if shutdown.load(Ordering::Acquire) {
             return;
         }
@@ -5124,35 +5161,46 @@ async fn run_exact_expiry_timer(
         // the next iteration, so it never self-wakes into a busy loop.
         changed.borrow_and_update();
         let next = { scoped.lock().next_visible_expiry() };
-        let now_secs = now();
-        match next {
-            Some(deadline) if now_secs >= deadline => {
-                // Deadline reached (or already past): sweep every currently-expired
-                // record in one pass. The next deadline is then strictly in the
-                // future, or the live set is empty — no immediate re-sweep.
-                let forgotten = publication.gated_commit(&scoped, |s| s.sweep_expired(now_secs));
-                if forgotten > 0 {
-                    tracing::debug!(forgotten, "scoped discovery: exact-expiry swept");
-                }
+        let now = wall_now();
+        let Some(deadline) = next else {
+            publication.signal_expiry_armed(None);
+            tokio::select! {
+                _ = changed.changed() => {}
+                _ = &mut shutdown_signal => return,
             }
-            Some(deadline) => {
-                let wait = Duration::from_secs(deadline.saturating_sub(now_secs));
-                publication.signal_expiry_armed(Some(deadline));
-                tokio::select! {
-                    _ = tokio::time::sleep(wait) => {}
-                    _ = changed.changed() => {}
-                    _ = shutdown_notify.notified() => return,
-                }
+            continue;
+        };
+        let wait = exact_expiry_wait(deadline, now);
+        if wait.is_zero() {
+            // Deadline reached (or already past): sweep every currently-expired
+            // record in one pass. The next deadline is then strictly in the
+            // future, or nothing is tracked — no immediate re-sweep.
+            let forgotten = publication.gated_commit(&scoped, |s| s.sweep_expired(now.as_secs()));
+            if forgotten > 0 {
+                tracing::debug!(forgotten, "scoped discovery: exact-expiry swept");
             }
-            None => {
-                publication.signal_expiry_armed(None);
-                tokio::select! {
-                    _ = changed.changed() => {}
-                    _ = shutdown_notify.notified() => return,
-                }
-            }
+            continue;
+        }
+        publication.signal_expiry_armed(Some(deadline));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = changed.changed() => {}
+            _ = &mut shutdown_signal => return,
         }
     }
+}
+
+/// How long the exact-expiry timer waits for `deadline_secs`, given `wall_now` —
+/// the wall clock as a duration since the Unix epoch.
+///
+/// Derived from the ABSOLUTE deadline rather than an integer-second delta, so the
+/// wall clock's SUBSECOND part is not discarded (Kyra OLB-2A.3.2): at wall 99.900 s
+/// a deadline of 100 s is 100 ms away, where a second-truncated delta would sleep a
+/// full second and wake at ~100.900 — publishing the sweep almost a second after
+/// the records became query-invisible. `Duration::ZERO` means the deadline has been
+/// reached: sweep now.
+fn exact_expiry_wait(deadline_secs: u64, wall_now: Duration) -> Duration {
+    Duration::from_secs(deadline_secs).saturating_sub(wall_now)
 }
 
 /// Multi-peer mesh node.
@@ -11343,7 +11391,14 @@ impl MeshNode {
             scoped,
             publication,
             changed,
-            super::behavior::org::current_timestamp,
+            // The FULL wall clock, subsecond part included, so the arm is exact.
+            // `.as_secs()` at the sweep matches `org::current_timestamp`, so the
+            // store's expiry semantics are unchanged.
+            || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+            },
             shutdown,
             shutdown_notify,
         ))
@@ -32244,13 +32299,14 @@ mod exact_expiry_timer_tests {
         ))
     }
 
-    /// Shared state + publication, an injectable clock, an arm-signal channel, and
-    /// a spawned timer. The clock is decoupled from tokio's paused clock so a
-    /// witness advances both explicitly and in lockstep.
+    /// Shared state + publication, an injectable WALL clock (milliseconds since the
+    /// Unix epoch, so subsecond arming is expressible), an arm-signal channel, and a
+    /// spawned timer. The clock is decoupled from tokio's paused clock so a witness
+    /// advances both explicitly and in lockstep.
     struct Harness {
         state: Arc<parking_lot::Mutex<ScopedDiscoveryState>>,
         publication: Arc<ScopedMutationPublication>,
-        clock: Arc<AtomicU64>,
+        clock_ms: Arc<AtomicU64>,
         watch: tokio::sync::watch::Receiver<u64>,
         arms: tokio::sync::mpsc::UnboundedReceiver<Option<u64>>,
         shutdown: Arc<AtomicBool>,
@@ -32260,12 +32316,24 @@ mod exact_expiry_timer_tests {
 
     impl Harness {
         /// Seed the state (directly, before the timer runs, so its first read sees
-        /// the whole seed) then spawn the timer at `clock_start`.
-        fn start(clock_start: u64, seed: impl FnOnce(&mut ScopedDiscoveryState)) -> Self {
+        /// the whole seed) then spawn the timer with the wall clock at
+        /// `clock_start_secs`.
+        fn start(clock_start_secs: u64, seed: impl FnOnce(&mut ScopedDiscoveryState)) -> Self {
+            Self::start_with(clock_start_secs, seed, |_, _, _| {})
+        }
+
+        /// Like [`Self::start`], but `configure` runs BEFORE the timer is spawned —
+        /// so a witness can install a hook the timer's very first iteration must
+        /// already observe.
+        fn start_with(
+            clock_start_secs: u64,
+            seed: impl FnOnce(&mut ScopedDiscoveryState),
+            configure: impl FnOnce(&Arc<ScopedMutationPublication>, &Arc<AtomicBool>, &Arc<Notify>),
+        ) -> Self {
             let state = Arc::new(parking_lot::Mutex::new(ScopedDiscoveryState::new()));
             seed(&mut state.lock());
             let publication = Arc::new(ScopedMutationPublication::new());
-            let clock = Arc::new(AtomicU64::new(clock_start));
+            let clock_ms = Arc::new(AtomicU64::new(clock_start_secs * 1_000));
             let (arm_tx, arms) = tokio::sync::mpsc::unbounded_channel();
             *publication.expiry_arm_hook.lock() = Some(Arc::new(move |d| {
                 let _ = arm_tx.send(d);
@@ -32273,10 +32341,11 @@ mod exact_expiry_timer_tests {
             let watch = publication.subscribe();
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_notify = Arc::new(Notify::new());
+            configure(&publication, &shutdown, &shutdown_notify);
             let timer = {
                 let state_t = state.clone();
                 let pub_t = publication.clone();
-                let clock_t = clock.clone();
+                let clock_t = clock_ms.clone();
                 let shutdown_t = shutdown.clone();
                 let notify_t = shutdown_notify.clone();
                 let changed = publication.subscribe();
@@ -32285,7 +32354,7 @@ mod exact_expiry_timer_tests {
                         state_t,
                         pub_t,
                         changed,
-                        move || clock_t.load(Ordering::SeqCst),
+                        move || Duration::from_millis(clock_t.load(Ordering::SeqCst)),
                         shutdown_t,
                         notify_t,
                     )
@@ -32295,7 +32364,7 @@ mod exact_expiry_timer_tests {
             Harness {
                 state,
                 publication,
-                clock,
+                clock_ms,
                 watch,
                 arms,
                 shutdown,
@@ -32306,7 +32375,7 @@ mod exact_expiry_timer_tests {
 
         /// Ingest through the publication so the timer wakes on the change.
         fn ingest(&self, record: PreparedScopedCapability) {
-            let now = self.clock.load(Ordering::SeqCst);
+            let now = self.clock_ms.load(Ordering::SeqCst) / 1_000;
             self.publication.gated_commit(&self.state, |s| {
                 s.ingest(record, now);
             });
@@ -32317,7 +32386,7 @@ mod exact_expiry_timer_tests {
         }
 
         fn set_clock(&self, secs: u64) {
-            self.clock.store(secs, Ordering::SeqCst);
+            self.clock_ms.store(secs * 1_000, Ordering::SeqCst);
         }
 
         async fn stop(self) {
@@ -32408,5 +32477,68 @@ mod exact_expiry_timer_tests {
         );
         assert_eq!(h.state.lock().next_visible_expiry(), None);
         h.stop().await;
+    }
+
+    /// The wait is derived from the ABSOLUTE deadline, so the wall clock's
+    /// subsecond part is not discarded: a deadline 100 ms away is a 100 ms wait,
+    /// not a full second that would publish the sweep ~900 ms after the records
+    /// became query-invisible (Kyra OLB-2A.3.2).
+    #[test]
+    fn the_arm_keeps_the_wall_clocks_subsecond_part() {
+        assert_eq!(
+            super::exact_expiry_wait(100, Duration::from_millis(99_900)),
+            Duration::from_millis(100),
+            "a deadline 100ms away must not round up to a full second"
+        );
+        // A whole-second wall clock still waits the whole second.
+        assert_eq!(
+            super::exact_expiry_wait(100, Duration::from_secs(99)),
+            Duration::from_secs(1)
+        );
+        // Reached, and passed: sweep now.
+        assert_eq!(
+            super::exact_expiry_wait(100, Duration::from_secs(100)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            super::exact_expiry_wait(100, Duration::from_millis(100_500)),
+            Duration::ZERO
+        );
+    }
+
+    /// A shutdown landing in the window between the timer registering its shutdown
+    /// wake and observing the shutdown flag still stops it. `notify_waiters` keeps
+    /// no permit for a later registrant, so checking the flag first would strand a
+    /// timer with no live deadline forever — hanging `MeshNode::shutdown`, which
+    /// awaits every tracked handle (Kyra OLB-2A.3.2).
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_in_the_registration_window_still_stops_the_timer() {
+        // Empty live set: the timer parks with NO deadline, so a lost notification
+        // is an indefinite hang rather than a bounded delay.
+        let h = Harness::start_with(
+            0,
+            |_| {},
+            |publication, shutdown, notify| {
+                let (shutdown, notify) = (shutdown.clone(), notify.clone());
+                let fired = Arc::new(AtomicBool::new(false));
+                // Fire the REAL shutdown sequence (store then notify_waiters) from
+                // inside the registration window, once.
+                *publication.shutdown_arm_hook.lock() = Some(Arc::new(move || {
+                    if fired.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    shutdown.store(true, Ordering::Release);
+                    notify.notify_waiters();
+                }));
+            },
+        );
+
+        // A hang must be a FAILURE, not a hung test: under paused time the runtime
+        // auto-advances to this deadline as soon as every task is idle.
+        let joined = tokio::time::timeout(Duration::from_secs(5), h.timer).await;
+        assert!(
+            joined.is_ok(),
+            "the timer must exit when shutdown lands in its registration window"
+        );
     }
 }
