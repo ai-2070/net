@@ -82,9 +82,23 @@ observing the shutdown flag, so a `notify_waiters` landing in that window cannot
 strand it (both Kyra OLB-2A.3.2). Reads stay expiry-safe (`now < expires_at` at
 query time), so this is promptness/wake, not a correctness boundary, and the 60 s
 GC remains a retention backstop — including for the inert rows above.
-**2A.3.3** adds floor-raise dirtying via `subscribe_floors_raised`
-through the reverse-declaration index. All of OLB-2A.3 must land and be reviewed
-before any reconciler consumes this source.
+**2A.3.3** (landed) closes the last gap — REVOCATION FLOOR RAISES. A raised floor
+retracts a stored record at query time with no store mutation, so before this it
+advanced no generation and woke nobody: a consumer kept serving a provider the org
+had just revoked until unrelated churn moved the store. The node's existing
+floor-raise subscription (and the install-time reconciliation sweep, for a store
+installed after its floors already rose) now also runs
+`ScopedDiscoveryState::note_floors_raised` through the gated commit. Each raised
+`(org, provider, floor)` reaches exactly that provider's records through a reverse
+provider index — never a live-set scan — and dirties only records that ACTUALLY
+lost visibility, applying the same predicate as the read-time filter against the
+STORED org and membership generation. Store and index membership are deliberately
+unchanged: floors are monotone, so a retracted row can never return, and it is
+reclaimed by the ordinary expiry/GC path — which keeps the signed invariant that
+the index mirrors exactly the store's live set. With 2A.3.2 and 2A.3.3 landed the
+generations are QUERY-VISIBLE-SET generations: expiry and floor movement now
+advance them, closing the OLB-2A.2 caveat above. All of OLB-2A.3 must land and be
+reviewed before any reconciler consumes this source.
 
 **Exclusive destructive-drain ownership belongs to the OLB-2B actor-entry
 boundary, not to 2A.3** (Kyra, 2026-07-24; a first attempt inside 2A.3.2 was

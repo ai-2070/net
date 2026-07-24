@@ -485,11 +485,18 @@ impl ScopedDiscoveryStore {
 /// - `declarations_by_record`: what each live `(scope, provider)` declared —
 ///   owner AND grant — so a record's associations drop on removal without a
 ///   re-decode, and a mutation's dirtied capabilities are computable for either
-///   change stream.
+///   change stream;
+/// - `records_by_provider`: the live records each provider entity announced, so a
+///   revocation-floor raise reaches exactly that provider's records without
+///   scanning the live set (OLB-2A.3.3). Keyed by provider alone: the owning org
+///   is read from the stored record itself at raise time, so the index can never
+///   hold an org that disagrees with the row it points at, and a removal needs
+///   only the key it already has.
 #[derive(Default)]
 struct ScopedCapabilityIndex {
     owner_by_capability: BTreeMap<CapabilityAuthorityId, BTreeSet<ScopedKey>>,
     declarations_by_record: BTreeMap<ScopedKey, Arc<[CapabilityAuthorityId]>>,
+    records_by_provider: BTreeMap<EntityId, BTreeSet<ScopedKey>>,
 }
 
 impl ScopedCapabilityIndex {
@@ -508,6 +515,10 @@ impl ScopedCapabilityIndex {
                     .insert(key.clone());
             }
         }
+        self.records_by_provider
+            .entry(key.1.clone())
+            .or_default()
+            .insert(key.clone());
         self.declarations_by_record.insert(key, cap_ids);
     }
 
@@ -526,6 +537,12 @@ impl ScopedCapabilityIndex {
                         self.owner_by_capability.remove(cap);
                     }
                 }
+            }
+        }
+        if let Some(bucket) = self.records_by_provider.get_mut(&key.1) {
+            bucket.remove(key);
+            if bucket.is_empty() {
+                self.records_by_provider.remove(&key.1);
             }
         }
     }
@@ -716,6 +733,57 @@ impl ScopedDiscoveryState {
             self.forget_live_expiry(key);
         }
         dropped
+    }
+
+    /// Dirty the capabilities whose provider set changed because a
+    /// revocation FLOOR ROSE (OLB-2A.3.3).
+    ///
+    /// A floor raise retracts a stored record the instant it lands — queries
+    /// already apply `is_current` freshly, so a record admitted against a
+    /// membership generation now below its provider's floor stops being returned
+    /// with no re-announce and no sweep. That retraction moved a capability's
+    /// visible provider set WITHOUT any store mutation, so before this it advanced
+    /// no generation, dirtied nothing, and woke nobody: a consumer holding a
+    /// projection kept serving a provider the org had just revoked until something
+    /// unrelated happened to move the store. This closes that last gap between the
+    /// mutation/sweep generations and the QUERY-VISIBLE set.
+    ///
+    /// Each raised `(org, provider, floor)` reaches exactly that provider's records
+    /// through the reverse provider index — never a scan of the live set — and only
+    /// records that ACTUALLY lost visibility are dirtied: the owning org must match
+    /// the raise, and the record's admitted membership generation must now fall
+    /// below the floor. The org and generation are read from the STORED record, so
+    /// this cannot dirty on a stale cached copy. Returns how many records the raise
+    /// retracted.
+    ///
+    /// Store and index membership are deliberately UNCHANGED. Floors are monotone,
+    /// so a retracted record can never become visible again, but it is still a live
+    /// row that the read-time currentness filter hides; it is reclaimed by the
+    /// ordinary expiry/GC path. Keeping membership untouched preserves the signed
+    /// invariant that the index mirrors exactly the store's live set.
+    pub(crate) fn note_floors_raised(&mut self, raised: &[(OrgId, EntityId, u32)]) -> usize {
+        let mut global = BTreeSet::new();
+        let mut owner = BTreeSet::new();
+        let mut retracted = 0usize;
+        for (org, provider, floor) in raised {
+            let Some(keys) = self.index.records_by_provider.get(provider) else {
+                continue;
+            };
+            for key in keys {
+                let Some(record) = self.store.live_record(key) else {
+                    continue;
+                };
+                // Same predicate the query-time filter applies, so exactly the
+                // records that just became invisible are named.
+                if record.owner_org() != org || record.provider_cert_generation() >= *floor {
+                    continue;
+                }
+                retracted += 1;
+                note_removed_record(&self.index, key, &mut global, &mut owner);
+            }
+        }
+        self.record_change(&global, &owner);
+        retracted
     }
 
     /// Advance the change generations and dirty streams for a mutation that
@@ -2160,6 +2228,218 @@ mod tests {
             Some(1000),
             "becoming query-visible installed the earlier deadline"
         );
+    }
+
+    // ----- OLB-2A.3.3: revocation floor-raise dirtying -----
+
+    /// A floor raise dirties EXACTLY the capabilities whose provider set it
+    /// retracted, advances both generations, and leaves every other provider's
+    /// capability alone — the retraction moved the query-visible set with no store
+    /// mutation, so nothing else would have woken a consumer.
+    #[test]
+    fn a_floor_raise_dirties_only_the_retracted_providers_capabilities() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(4, 1, 10_000, &["nrpc:b"]),
+            0,
+        );
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+        let (rev, owner_rev) = (state.revision(), state.owner_revision());
+
+        // Provider 3's floor rises above the generation it was admitted against.
+        let retracted = state.note_floors_raised(&[(org(1), provider(3), FIXTURE_CERT_GEN + 1)]);
+
+        assert_eq!(retracted, 1, "exactly provider 3's record was retracted");
+        assert_eq!(state.revision(), rev + 1, "global generation advanced");
+        assert_eq!(
+            state.owner_revision(),
+            owner_rev + 1,
+            "owner generation advanced"
+        );
+        assert_eq!(
+            state.take_global_change_batch().dirty,
+            one_cap("nrpc:a"),
+            "only the retracted provider's capability is dirty"
+        );
+        assert_eq!(state.take_owner_change_batch().dirty, one_cap("nrpc:a"));
+    }
+
+    /// A floor at or below the admitted generation retracts nothing, so it
+    /// advances no generation and dirties nothing — the same boundary the
+    /// query-time filter applies (`floor <= admitted generation` stays current).
+    #[test]
+    fn a_floor_at_the_admitted_generation_dirties_nothing() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+        let (rev, owner_rev) = (state.revision(), state.owner_revision());
+
+        let retracted = state.note_floors_raised(&[(org(1), provider(3), FIXTURE_CERT_GEN)]);
+
+        assert_eq!(
+            retracted, 0,
+            "a floor at the admitted generation is current"
+        );
+        assert_eq!(state.revision(), rev, "no generation advance");
+        assert_eq!(state.owner_revision(), owner_rev);
+        assert_eq!(
+            state.take_global_change_batch().dirty,
+            DirtyCapabilities::Clean
+        );
+    }
+
+    /// A raise naming a DIFFERENT org leaves the record alone. The reverse index is
+    /// keyed by provider entity alone, so the owning-org check is load-bearing: one
+    /// org must not be able to retract another org's records by raising a floor for
+    /// the same entity id.
+    #[test]
+    fn a_floor_raise_for_another_org_retracts_nothing() {
+        let mut state = ScopedDiscoveryState::new();
+        // Owner fixtures are certified by org(1).
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+        let rev = state.revision();
+
+        let retracted = state.note_floors_raised(&[(org(9), provider(3), FIXTURE_CERT_GEN + 1)]);
+
+        assert_eq!(retracted, 0, "a foreign org's raise retracts nothing");
+        assert_eq!(state.revision(), rev, "no generation advance");
+        assert_eq!(
+            state.take_global_change_batch().dirty,
+            DirtyCapabilities::Clean
+        );
+    }
+
+    /// A raise retracting a GRANT record advances the global stream but never the
+    /// owner stream — the same partition isolation store mutations obey.
+    #[test]
+    fn a_floor_raise_on_a_grant_record_never_advances_the_owner_stream() {
+        let mut state = ScopedDiscoveryState::new();
+        // Grant fixtures are certified by org(2).
+        ingest_indexed(
+            &mut state,
+            grant_cap_declaring([0xAA; 32], 4, 1, 10_000, "nrpc:g"),
+            0,
+        );
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+        let (rev, owner_rev) = (state.revision(), state.owner_revision());
+
+        let retracted = state.note_floors_raised(&[(org(2), provider(4), FIXTURE_CERT_GEN + 1)]);
+
+        assert_eq!(retracted, 1);
+        assert_eq!(state.revision(), rev + 1, "global advances");
+        assert_eq!(state.owner_revision(), owner_rev, "owner does not");
+        assert_eq!(state.take_global_change_batch().dirty, one_cap("nrpc:g"));
+        assert_eq!(
+            state.take_owner_change_batch().dirty,
+            DirtyCapabilities::Clean
+        );
+    }
+
+    /// The reverse provider index is symmetric with the live set: a swept record
+    /// leaves it entirely, so provider churn cannot grow it without bound. Asserted
+    /// directly, because a leaked entry is invisible through the query surface —
+    /// the store lookup simply finds no live record and skips it.
+    #[test]
+    fn the_reverse_provider_index_drops_swept_records() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 1000, &["nrpc:a"]), 0);
+        ingest_indexed(&mut state, owner_cap_declaring(4, 1, 5000, &["nrpc:b"]), 0);
+        assert_eq!(state.index.records_by_provider.len(), 2);
+
+        // Sweep past provider 3 only.
+        state.sweep_expired(2000);
+        assert_eq!(
+            state.index.records_by_provider.keys().collect::<Vec<_>>(),
+            vec![&provider(4)],
+            "the swept provider left the reverse index"
+        );
+
+        // Sweep past the survivor: the reverse index empties.
+        state.sweep_expired(6000);
+        assert!(
+            state.index.records_by_provider.is_empty(),
+            "no provider entry outlives its last live record"
+        );
+    }
+
+    /// The dirtying predicate agrees with the QUERY: the same real signed floor
+    /// that makes the indexed query return nothing is the one that reports the
+    /// record retracted. Pins the source to the read-time filter rather than to a
+    /// separately-drifting rule.
+    #[test]
+    fn floor_raise_dirtying_agrees_with_the_query_time_filter() {
+        let org_kp = OrgKeypair::from_bytes([7u8; 32]);
+        let org_id = org_kp.org_id();
+        let member = EntityId::from_bytes([9u8; 32]);
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            VerifiedScopedCapability::for_test(
+                CapabilityAudienceScope::Owner {
+                    org_id,
+                    audience_handle: [0x11; 32],
+                },
+                member.clone(),
+                org_id,
+                1,
+                10_000,
+                FIXTURE_CERT_GEN,
+                None,
+                descriptor(&["nrpc:a"]),
+            ),
+            0,
+        );
+        let a = cap_id("nrpc:a");
+        let _ = state.take_global_change_batch();
+
+        // A floor AT the admitted generation: still queryable, and not retracted.
+        let floor_at = floor_state(&org_kp, &member, FIXTURE_CERT_GEN);
+        assert_eq!(
+            state
+                .find_owner_private_providers(Some(&a), 0, &floor_at)
+                .len(),
+            1,
+            "still visible at the boundary"
+        );
+        assert_eq!(
+            state.note_floors_raised(&[(org_id, member.clone(), FIXTURE_CERT_GEN)]),
+            0,
+            "and not reported retracted"
+        );
+
+        // One generation higher: invisible to the query, and reported retracted.
+        let floor_above = floor_state(&org_kp, &member, FIXTURE_CERT_GEN + 1);
+        assert!(
+            state
+                .find_owner_private_providers(Some(&a), 0, &floor_above)
+                .is_empty(),
+            "the query retracts it"
+        );
+        assert_eq!(
+            state.note_floors_raised(&[(org_id, member, FIXTURE_CERT_GEN + 1)]),
+            1,
+            "and the source dirties it"
+        );
+        assert_eq!(state.take_global_change_batch().dirty, one_cap("nrpc:a"));
     }
 
     /// Expiry tracking is partition-agnostic: a GRANT record's deadline gates the

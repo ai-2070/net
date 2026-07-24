@@ -8874,6 +8874,10 @@ impl MeshNode {
         let fold = self.capability_fold.clone();
         let slot = self.org_revocation.clone();
         let me = Arc::downgrade(&store);
+        // OLB-2A.3.3: the same raise also retracts scoped-discovery records at
+        // query time, so it must dirty their capabilities and wake consumers.
+        let scoped_discovery = self.scoped_discovery.clone();
+        let scoped_publication = self.scoped_publication.clone();
         // AV-10 / R2-3: liveness is enforced by the subscription's
         // exclusion lease inside `subscribe_floors_raised`, not a separate
         // owner token. Dropping the returned guard on teardown/replacement
@@ -8910,6 +8914,24 @@ impl MeshNode {
                         "revocation floor rise retracted stale ownership projection(s)"
                     );
                 }
+            }
+            // OLB-2A.3.3: the raise ALSO retracted every scoped-discovery record
+            // whose admitted membership generation now falls below its provider's
+            // floor — the read-time currentness filter hides them from this moment
+            // on, with no store mutation to advance a generation. Dirty exactly
+            // those capabilities and publish the wake, so a consumer's projection
+            // cannot keep serving a provider the org just revoked. Through the
+            // node-global gated commit, so this serializes with inbound ingest and
+            // its publication cannot invert (OLB-2A.3.1). Safe to run here: the
+            // store invokes subscribers OUTSIDE its publish/reload locks, and this
+            // callback takes no revocation lock.
+            let retracted = scoped_publication
+                .gated_commit(&scoped_discovery, |s| s.note_floors_raised(raised));
+            if retracted > 0 {
+                tracing::info!(
+                    retracted,
+                    "revocation floor rise retracted scoped-discovery record(s)"
+                );
             }
         });
         // Swap the node's observer slot: drop the guard held on the
@@ -8952,6 +8974,27 @@ impl MeshNode {
                     "store installation reconciled stale ownership projection(s)"
                 );
             }
+        }
+        // The same install-time gap applies to scoped discovery (OLB-2A.3.3): a
+        // store installed after its floors rose fires no raise callback, so the
+        // install itself must dirty the capabilities those floors retract —
+        // otherwise a consumer keeps a projection naming providers the newly
+        // installed authority already revoked. ONE transaction over the whole
+        // snapshot, so this is a single generation advance and a single wake
+        // rather than one per floor; an empty snapshot dirties nothing and wakes
+        // nobody.
+        let raised: Vec<super::behavior::org_revocation::RaisedFloor> = snapshot
+            .iter()
+            .map(|((org, member), floor)| (*org, member.clone(), *floor))
+            .collect();
+        let retracted = self
+            .scoped_publication
+            .gated_commit(&self.scoped_discovery, |s| s.note_floors_raised(&raised));
+        if retracted > 0 {
+            tracing::info!(
+                retracted,
+                "store installation retracted scoped-discovery record(s)"
+            );
         }
         // A visible store publication occurred (None→store or A→B).
         Ok(true)
@@ -31083,6 +31126,80 @@ mod oa34b2_query_currentness_tests {
             c.scoped_granted_providers_for_test(&grant_id, n),
             vec![p_entity],
             "only the G2 record is visible under the replacement authority",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// OLB-2A.3.3 end-to-end: a revocation floor raised through the INSTALLED
+    /// store retracts the scoped-discovery record at query time AND dirties its
+    /// capability — advancing the private-discovery generation and publishing the
+    /// change wake. Without that, the retraction moves the query-visible set with
+    /// no store mutation, so a consumer's projection keeps naming a provider the
+    /// org just revoked until something unrelated happens to move the store.
+    ///
+    /// The floor is raised by the PROVIDER's org (B) over its own member, and
+    /// honoured by the consumer node (adopted into org A) — the real revocation
+    /// path for a granted record.
+    #[tokio::test]
+    async fn a_floor_raise_dirties_scoped_discovery_and_wakes_consumers() {
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+        let p = EntityKeypair::from_bytes([0xB1u8; 32]);
+        let p_entity = p.entity_id().clone();
+        let n = current_timestamp();
+        let exp = n + 600;
+
+        let (g, s) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:svc-a"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p_entity.clone()),
+            3600,
+        )
+        .expect("issue grant");
+        let s = s.expect("secret");
+        let grant_id = g.grant_id;
+
+        let (c, dir) = adopted_consumer(&org_a, "floorwake").await;
+        c.install_consumer_grant_audience(g.clone(), copy_secret(&s))
+            .expect("install grant");
+        c.ingest_scoped_announcement_for_test(&granted_envelope(&p, &org_b, &g, &s, "svc-a", exp));
+        assert_eq!(
+            c.scoped_granted_providers_for_test(&grant_id, n),
+            vec![p_entity.clone()],
+            "the record resolves before the floor rises",
+        );
+
+        // Checkpoint the wake AFTER the ingest, so only the raise can move it.
+        let mut changes = c.subscribe_private_discovery_changes();
+        changes.borrow_and_update();
+        let before = c.private_discovery_generation();
+
+        // Org B revokes its own member P: floor 2 is above the membership
+        // generation 1 the record was admitted against.
+        let mut floors = std::collections::BTreeMap::new();
+        floors.insert(p_entity.clone(), 2u32);
+        let bundle =
+            crate::adapter::net::behavior::org::OrgRevocationBundle::try_issue(&org_b, &floors)
+                .expect("issue bundle");
+        c.org_revocation_store()
+            .expect("installed")
+            .apply_bundle(&bundle)
+            .expect("apply floor 2");
+
+        assert!(
+            c.scoped_granted_providers_for_test(&grant_id, n).is_empty(),
+            "the revoked provider stops resolving",
+        );
+        assert!(
+            c.private_discovery_generation() > before,
+            "the retraction advanced the private-discovery generation",
+        );
+        assert!(
+            changes.has_changed().expect("watch alive"),
+            "and published the change wake",
         );
 
         let _ = std::fs::remove_dir_all(&dir);
