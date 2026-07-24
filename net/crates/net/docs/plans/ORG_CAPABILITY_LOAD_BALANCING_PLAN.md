@@ -58,11 +58,17 @@ the atomic `ScopedDiscoveryState::take_{global,owner}_change_batch`
 consumer of each stream. The owner stream is a subset of the global stream, so
 valid grant-audience churn never wakes an owner-private consumer. These are
 MUTATION/SWEEP generations, not yet complete query-visible-set generations —
-wall-clock expiry and floor raises change results before they advance; that plus
-the exact-expiry source (event-driven `next_visible_expiry` + node timer), the
-push/watch wake, the centralized mutate→publish→wake helper, and floor-raise
-dirtying are **OLB-2A.3**, which must land and be reviewed before any reconciler
-consumes this source. **OLB-2A.4** (named, not dropped): replace the store's
+wall-clock expiry and floor raises change results before they advance. **OLB-2A.3**
+closes that and adds the push wake, in bounded sub-slices: **2A.3.1** (landed)
+routes every scoped-store mutation through one centralized
+`publish_scoped_mutation` helper (mutate → publish generation under the lock →
+unlock → coalesced wake) and adds the `private_discovery_changed` watch with
+`subscribe_private_discovery_changes` — the push signal replacing the interim
+poll-only model; **2A.3.2** adds single-consumer ownership of each dirty stream
+plus event-driven `next_visible_expiry` and one node exact-expiry timer;
+**2A.3.3** adds floor-raise dirtying via `subscribe_floors_raised` through the
+reverse-declaration index. All of OLB-2A.3 must land and be reviewed before any
+reconciler consumes this source. **OLB-2A.4** (named, not dropped): replace the store's
 `entries_in_scope` scan with maintained per-scope counts before the generic
 indexed substrate is called complete. This substrate is shared with the
 provider-free leader track but carries no authority-filtered candidate or

@@ -642,3 +642,32 @@ async fn ingest_advances_the_private_discovery_generation() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// OLB-2A.3: a scoped-store mutation that changes the visible set WAKES the
+/// private-discovery change watch (the push signal a consumer awaits instead of
+/// polling), and a no-op (a stale re-ingest) does NOT — the centralized helper
+/// only publishes when the generation actually advanced.
+#[tokio::test]
+async fn a_visible_mutation_wakes_the_watch_and_a_noop_does_not() {
+    let a = org_a();
+    let (mesh, _identity, dir) = mesh_with_authority("pd-watch", Some(&a)).await;
+    let provider = EntityKeypair::generate();
+
+    let mut rx = mesh.node().subscribe_private_discovery_changes();
+    assert_eq!(*rx.borrow_and_update(), 0);
+
+    inject_owner_envelope(&mesh, &a, &provider, &["nrpc:internal.reindex"]);
+    assert!(
+        rx.has_changed().expect("sender alive"),
+        "a visible-set change wakes the watch"
+    );
+    assert!(*rx.borrow_and_update() >= 1);
+
+    // The same envelope again is a stale re-ingest — no visible change, no wake.
+    inject_owner_envelope(&mesh, &a, &provider, &["nrpc:internal.reindex"]);
+    assert!(
+        !rx.has_changed().expect("sender alive"),
+        "a no-op mutation must not wake the watch"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

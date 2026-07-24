@@ -1074,6 +1074,9 @@ struct DispatchCtx {
     /// See the matching field doc on `MeshNode`.
     scoped_discovery:
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
+    /// OLB-2A.3: the private-discovery change wake. See the matching `MeshNode`
+    /// field.
+    private_discovery_changed: Arc<tokio::sync::watch::Sender<u64>>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. See the matching field doc on `MeshNode`.
     scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
@@ -5127,6 +5130,13 @@ pub struct MeshNode {
     /// path, with no await held.
     scoped_discovery:
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
+    /// OLB-2A.3: the push wake for the private-discovery change source. Every
+    /// scoped-store mutation (ingest, sweep) runs through one centralized helper
+    /// ([`Self::publish_scoped_mutation`]) that, after the transaction, publishes
+    /// the store's mutation/sweep generation onto this `watch` so a consumer is
+    /// woken without polling. The value carried is the global `revision`; the
+    /// owner generation and the dirty deltas are read from the state on wake.
+    private_discovery_changed: Arc<tokio::sync::watch::Sender<u64>>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. Shared across the inbound dispatch so a flooded envelope is
     /// forwarded at most once per node; never decrypts or stores anything.
@@ -6612,6 +6622,7 @@ impl MeshNode {
             scoped_discovery: Arc::new(parking_lot::Mutex::new(
                 super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
             )),
+            private_discovery_changed: Arc::new(tokio::sync::watch::channel(0u64).0),
             scoped_relay_gate: Arc::new(
                 super::behavior::org_scoped_relay::ScopedAnnRelayGate::new(),
             ),
@@ -9985,6 +9996,7 @@ impl MeshNode {
             &self.org_revocation,
             &self.consumer_grant_audiences,
             &self.scoped_discovery,
+            &self.private_discovery_changed,
             &decoded,
             0,
             None,
@@ -10013,6 +10025,7 @@ impl MeshNode {
             &self.org_revocation,
             &self.consumer_grant_audiences,
             &self.scoped_discovery,
+            &self.private_discovery_changed,
             &decoded,
             0,
             Some(probe),
@@ -10194,6 +10207,16 @@ impl MeshNode {
     /// valid grant-audience churn never wakes an owner-private consumer.
     pub fn private_discovery_owner_generation(&self) -> u64 {
         self.scoped_discovery.lock().owner_revision()
+    }
+
+    /// Subscribe to the private-discovery change wake (OLB-2A.3): the receiver is
+    /// woken — carrying the latest published global mutation/sweep generation —
+    /// whenever a scoped-store mutation changes the visible set, and never for a
+    /// no-op. Read-only push signal (the `local_caps_changed` idiom); draining
+    /// the dirty deltas is the single node-owned consumer's crate-internal
+    /// concern, not exposed here.
+    pub fn subscribe_private_discovery_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.private_discovery_changed.subscribe()
     }
 
     // The DESTRUCTIVE dirty-capability drains are deliberately NOT public
@@ -11051,6 +11074,7 @@ impl MeshNode {
         // This loop is the right home: same cadence (60 s), same purpose
         // (bounded retention of observation state), already shutdown-aware.
         let scoped = self.scoped_discovery.clone();
+        let private_discovery_changed = self.private_discovery_changed.clone();
         let interval = self.config.capability_gc_interval;
         let dedup_retention =
             std::time::Duration::from_secs(2 * u64::from(CapabilityAnnouncement::DEFAULT_TTL_SECS));
@@ -11069,7 +11093,13 @@ impl MeshNode {
                     _ = tick.tick() => {
                         seen.retain(|_, instant| instant.elapsed() < dedup_retention);
                         let now_secs = super::behavior::org::current_timestamp();
-                        let forgotten = scoped.lock().sweep_expired(now_secs);
+                        // Through the centralized helper so a sweep that drops a
+                        // live record wakes any consumer, not just the poll (OLB-2A.3).
+                        let forgotten = Self::publish_scoped_mutation(
+                            &scoped,
+                            &private_discovery_changed,
+                            |s| s.sweep_expired(now_secs),
+                        );
                         if forgotten > 0 {
                             tracing::debug!(
                                 forgotten,
@@ -11640,6 +11670,7 @@ impl MeshNode {
             org_revocation: self.org_revocation.clone(),
             node_authority: self.node_authority.clone(),
             scoped_discovery: self.scoped_discovery.clone(),
+            private_discovery_changed: self.private_discovery_changed.clone(),
             scoped_relay_gate: self.scoped_relay_gate.clone(),
             consumer_grant_audiences: self.consumer_grant_audiences.clone(),
             #[cfg(feature = "redex")]
@@ -13134,6 +13165,7 @@ impl MeshNode {
                         &ctx.org_revocation,
                         &ctx.consumer_grant_audiences,
                         &ctx.scoped_discovery,
+                        &ctx.private_discovery_changed,
                         &admit.envelope,
                         from_node,
                         None,
@@ -19103,6 +19135,37 @@ impl MeshNode {
         }
     }
 
+    /// The ONE centralized scoped-store mutation seam (Kyra OLB-2A.3): run `f`
+    /// under the state lock, capture the store's mutation/sweep generation under
+    /// that same lock, then — AFTER unlock — publish that generation onto the
+    /// change `watch`, coalescing into a single wake and only when the generation
+    /// actually advanced. Every scoped-store mutation (`ingest`, `sweep_expired`)
+    /// goes through here, so no visible-set change can advance the store without
+    /// both moving the polled generation and delivering a push wake, and no wake
+    /// fires for a no-op (e.g. a `Stale` ingest).
+    fn publish_scoped_mutation<R>(
+        scoped_discovery: &Arc<
+            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
+        >,
+        private_discovery_changed: &Arc<tokio::sync::watch::Sender<u64>>,
+        f: impl FnOnce(&mut super::behavior::org_scoped_store::ScopedDiscoveryState) -> R,
+    ) -> R {
+        let (result, revision) = {
+            let mut state = scoped_discovery.lock();
+            let result = f(&mut state);
+            (result, state.revision())
+        };
+        private_discovery_changed.send_if_modified(|published| {
+            if *published != revision {
+                *published = revision;
+                true
+            } else {
+                false
+            }
+        });
+        result
+    }
+
     /// OA3-5: open, verify, and store ONE inbound owner-scoped announcement
     /// envelope. Shared by the [`SUBPROTOCOL_SCOPED_CAPABILITY_ANN`] dispatch arm
     /// (parts from [`DispatchCtx`]) and the test seam
@@ -19119,6 +19182,10 @@ impl MeshNode {
     /// `verify_scoped_ingest` re-checks everything against the LIVE revocation
     /// floors; a wrong-audience, expired, floored-provider, wrong-grantee, or
     /// forged envelope is refused and never stored.
+    // A static seam threading the per-node authority/store/change refs the
+    // dispatch arm and the test seams both supply; the change wake (OLB-2A.3)
+    // pushed it one over the arg-count lint.
+    #[allow(clippy::too_many_arguments)]
     fn ingest_scoped_announcement(
         node_authority: &Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
         org_revocation: &Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
@@ -19128,6 +19195,7 @@ impl MeshNode {
         scoped_discovery: &Arc<
             parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
         >,
+        private_discovery_changed: &Arc<tokio::sync::watch::Sender<u64>>,
         envelope: &super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement,
         from_node: u64,
         probe: Option<&dyn Fn()>,
@@ -19309,8 +19377,14 @@ impl MeshNode {
                 // Immediate lock + mutate — nothing sits between the recheck and
                 // the insert. The store ingests the prepared object, so the row and
                 // the index buckets built from its declarations are bound together
-                // (Kyra OLB-2A.1).
-                let outcome = scoped_discovery.lock().ingest(prepared, now_secs);
+                // (Kyra OLB-2A.1). The mutation runs through the centralized
+                // helper, which publishes the change generation and wakes any
+                // consumer after unlock (OLB-2A.3).
+                let outcome = Self::publish_scoped_mutation(
+                    scoped_discovery,
+                    private_discovery_changed,
+                    |state| state.ingest(prepared, now_secs),
+                );
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
                     ?outcome,
