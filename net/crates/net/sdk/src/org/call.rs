@@ -72,6 +72,30 @@ struct Candidate {
     same_org: bool,
 }
 
+/// A discovered provider this credential set is authorized to invoke
+/// `capability` on, carrying the authority relation and current direct
+/// reachability. The whole pre-network authority decision, factored out of
+/// selection (OLB-1) so `plan` — and later the sensed selector — composes over
+/// it rather than re-deriving it.
+///
+/// Internal only; nothing here is re-exported.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthorizedOrgCandidate {
+    /// The provider entity to target.
+    pub(crate) provider: EntityId,
+    /// The provider's owner organization as it rides the proof: the acting org
+    /// for [`Mode::SameOrg`], the grant issuer for [`Mode::Granted`].
+    pub(crate) provider_owner_org: net::adapter::net::behavior::org::OrgId,
+    /// How invoking this provider is authorized.
+    pub(crate) mode: Mode,
+    /// Whether a live direct session to this provider exists right now
+    /// (OA2-E0.3: protected RPC is direct-session-only). Annotated here, never
+    /// a filter on authorization.
+    pub(crate) direct: bool,
+    /// The capability being invoked.
+    pub(crate) capability: CapabilityAuthorityId,
+}
+
 impl OrgClient {
     /// Call a protected service (OSDK §2).
     ///
@@ -201,21 +225,21 @@ impl OrgClient {
     /// provider: `call` is exactly this plus encode → `MeshNode::call` → decode.
     pub(crate) fn plan(&self, service: &str) -> Result<OrgProofIntent, OrgSdkError> {
         let capability = CapabilityAuthorityId::for_tag(&nrpc_tag(service));
-        let (authorized, considered) = self.authorized_targets(&capability)?;
+        let (candidates, considered) = self.authorized_candidates(&capability)?;
 
         // OA2-E0.3: org-protected RPC is direct-session-only. A relayed
-        // protected request is denied at the provider, so an authorized but
-        // indirectly-reachable provider is not eligible — and the caller is told
+        // protected request is denied at the provider, so select the first
+        // authorized provider (deterministic order) with a live direct session;
+        // if some are authorized but none is directly reachable, tell the caller
         // which of the two it hit.
-        let mut indirect: Option<EntityId> = None;
-        for (provider, mode) in authorized {
-            if self.node.peer_entity_id(provider.node_id()).as_ref() == Some(&provider) {
-                return Ok(self.intent_for(capability, provider, mode));
-            }
-            indirect.get_or_insert(provider);
+        if let Some(candidate) = candidates.iter().find(|c| c.direct) {
+            return Ok(self.intent_for(candidate));
         }
-        if let Some(provider) = indirect {
-            return Err(OrgDiscoveryError::ProviderNotDirect { provider }.into());
+        if let Some(candidate) = candidates.first() {
+            return Err(OrgDiscoveryError::ProviderNotDirect {
+                provider: candidate.provider.clone(),
+            }
+            .into());
         }
         Err(OrgDiscoveryError::NoAuthorizedProvider {
             capability: hex_capability(&capability),
@@ -224,17 +248,21 @@ impl OrgClient {
         .into())
     }
 
-    /// The pure authority decision: which discovered providers may this
-    /// credential set invoke `capability` on, in deterministic order.
+    /// The authorized candidate set: which discovered providers this credential
+    /// set may invoke `capability` on, each annotated with its authority
+    /// relation and current direct reachability, in deterministic order.
     ///
-    /// Separated from reachability so the authority logic is exactly what it
-    /// looks like — no transport state can make an unauthorized provider
-    /// eligible or an authorized one ineligible. Returns the ordered targets and
-    /// how many private candidates were considered.
-    pub(crate) fn authorized_targets(
+    /// Authority and reachability stay distinct in meaning even though both now
+    /// ride the candidate: no transport state can make an unauthorized provider
+    /// eligible or an authorized one ineligible — `direct` is annotated here,
+    /// never a filter. Selection (`plan`, and later the sensed selector)
+    /// composes over this set. Returns the ordered candidates and how many
+    /// private candidates were considered (the count `NoAuthorizedProvider`
+    /// reports).
+    pub(crate) fn authorized_candidates(
         &self,
         capability: &CapabilityAuthorityId,
-    ) -> Result<(Vec<(EntityId, Mode)>, usize), OrgSdkError> {
+    ) -> Result<(Vec<AuthorizedOrgCandidate>, usize), OrgSdkError> {
         // Stage 3 of the validity contract: the credentials backing EVERY call.
         self.check_current()?;
         if !self.dispatcher.covers_capability(capability) {
@@ -244,51 +272,63 @@ impl OrgClient {
             .into());
         }
 
-        let candidates = self.discover_private(capability);
-        let considered = candidates.len();
+        let discovered = self.discover_private(capability);
+        let considered = discovered.len();
 
-        let mut targets: Vec<(EntityId, Mode)> = Vec::new();
-        for candidate in candidates {
-            let mode = if candidate.same_org {
-                Mode::SameOrg
+        let mut candidates: Vec<AuthorizedOrgCandidate> = Vec::new();
+        for candidate in discovered {
+            // `provider_owner_org` is derived exactly as the proof needs it: the
+            // acting org for same-org, the grant issuer for granted — never the
+            // raw record's owner org.
+            let (mode, provider_owner_org) = if candidate.same_org {
+                (Mode::SameOrg, self.acting_org)
             } else {
                 match self.match_invoke_grant(capability, &candidate)? {
-                    Some(grant) => Mode::Granted(Box::new(grant)),
+                    Some(grant) => {
+                        let issuer_org = grant.issuer_org;
+                        (Mode::Granted(Box::new(grant)), issuer_org)
+                    }
                     None => continue,
                 }
             };
-            targets.push((candidate.provider, mode));
+            // OA2-E0.3 reachability, annotated not filtered: a live direct
+            // session pin for this provider right now.
+            let direct = self
+                .node
+                .peer_entity_id(candidate.provider.node_id())
+                .as_ref()
+                == Some(&candidate.provider);
+            candidates.push(AuthorizedOrgCandidate {
+                provider: candidate.provider,
+                provider_owner_org,
+                mode,
+                direct,
+                capability: *capability,
+            });
         }
         // Deterministic and load-blind on purpose: a stable choice is
-        // debuggable, and spreading load is a policy the facade has no basis to
-        // invent.
-        targets.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        Ok((targets, considered))
+        // debuggable, and spreading load is a policy this stage has no basis to
+        // invent — sensed selection arrives above this layer in OLB-3.
+        candidates.sort_by(|a, b| a.provider.as_bytes().cmp(b.provider.as_bytes()));
+        Ok((candidates, considered))
     }
 
-    /// Assemble the canonical nine-field proof intent. Pure construction — the
-    /// authority decision already happened.
-    pub(crate) fn intent_for(
-        &self,
-        capability: CapabilityAuthorityId,
-        provider: EntityId,
-        mode: Mode,
-    ) -> OrgProofIntent {
+    /// Assemble the canonical nine-field proof intent for a chosen candidate.
+    /// Pure construction — the authority decision already happened in
+    /// [`authorized_candidates`].
+    pub(crate) fn intent_for(&self, candidate: &AuthorizedOrgCandidate) -> OrgProofIntent {
         OrgProofIntent {
             caller: self.caller.clone(),
             membership: self.membership.clone(),
             dispatcher: self.dispatcher.clone(),
-            capability_grant: match &mode {
+            capability_grant: match &candidate.mode {
                 Mode::SameOrg => None,
                 Mode::Granted(grant) => Some((**grant).clone()),
             },
             acting_org: self.acting_org,
-            provider_owner_org: match &mode {
-                Mode::SameOrg => self.acting_org,
-                Mode::Granted(grant) => grant.issuer_org,
-            },
-            provider,
-            capability,
+            provider_owner_org: candidate.provider_owner_org,
+            provider: candidate.provider.clone(),
+            capability: candidate.capability,
             proof_ttl_secs: DEFAULT_PROOF_TTL_SECS,
         }
     }

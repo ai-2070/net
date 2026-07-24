@@ -34,9 +34,15 @@ pre-leader race closure is signed at
 lifecycle entry condition is signed at
 **`LEADER_ENTRY_CONDITION_HEAD = f2c82e467`**.
 
-These closures complete the practical Option-A OLB-0 substrate. The next OLB
-slice is **OLB-1 candidate factoring**, followed by the required bounded
-stop-and-review; OLB-2 has not started. The separate owner-private
+These closures complete the practical Option-A OLB-0 substrate. **OLB-1
+candidate factoring has landed** (behavior-preserving: `call.rs` now derives an
+internal `AuthorizedOrgCandidate` set — provider, provider owner org, authority
+`Mode`, direct reachability, capability — via `OrgClient::authorized_candidates`,
+and `plan`/`intent_for` compose over it; nothing re-exported). The existing S1
+authority/selection witnesses stay green and a new direct-preference witness
+covers the reachability flag now riding the candidate. The **required bounded
+stop-and-review is the next gate**; OLB-2 has not started and must not begin
+until that review signs off. The separate owner-private
 provider-free leader design lives in
 [`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md).
 It is NOT an OLB-1..OLB-5 prerequisite and remains unauthorized for build. The

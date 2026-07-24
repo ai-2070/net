@@ -96,8 +96,8 @@ async fn converge_discovery(
             .await
             .ok();
         if client
-            .authorized_targets(capability)
-            .map(|(targets, _)| !targets.is_empty())
+            .authorized_candidates(capability)
+            .map(|(candidates, _)| !candidates.is_empty())
             .unwrap_or(false)
         {
             return true;
