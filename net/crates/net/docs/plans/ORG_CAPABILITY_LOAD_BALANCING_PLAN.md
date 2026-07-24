@@ -1,47 +1,59 @@
 # Org Capability Load Balancing Plan (OLB)
 
-**Version:** v0.4 — applies Kyra's re-review verdict (2026-07-22, read
-at master `6e9d686ee`): every architecture dimension **APPROVED**
-(product surface, private-provider sensing path, organization sensing
-authority, node-global lifecycle ownership, cadence aggregation,
-viability semantics, hot-path performance, bounded SameOrg-first
-rollout); three narrow implementation points pinned here —
+**Version:** v0.5 — integrates the parallel owner-private provider-free leader
+design and the 2026-07-24 performance pass while preserving Kyra's approved
+exact-provider-first architecture. Earlier re-review dimensions remain approved
+(product surface, private-provider sensing path, organization sensing authority,
+node-global lifecycle ownership, cadence aggregation, viability semantics,
+hot-path performance, and bounded SameOrg-first rollout). The integrated pins
+are:
 
-13. the registration wire choice is **pinned**: organization-
-    authenticated variants APPENDED to `SensingInterestFrame` under the
-    existing 0x0C02 subprotocol, eight locked requirements (§5.1b;
-    sensing plan S0);
-14. route-set publication is **publish-if-current** over a full
-    `RouteSourceGeneration` source vector — never last-writer-wins
-    (§7);
-15. authority validity edges arm **deadline timers**
-    (`next_authority_deadline` + one reconciler timer per capability),
-    with the per-call temporal recheck retained as defense in depth
-    (§7; OLB-2 witnesses).
+13. organization-authenticated variants remain APPENDED to
+    `SensingInterestFrame` under existing 0x0C02 (§5.1b; sensing plan S0);
+14. route-set publication remains **publish-if-current** over the complete
+    `RouteSourceGeneration`, never last-writer-wins (§7);
+15. authority validity edges use **one clone-family deadline actor**, not one
+    task/timer per capability, while the per-call temporal recheck remains
+    mandatory (§7; OLB-2 witnesses);
+16. OLB and the provider-free leader share only generic node-state source seams
+    (private-discovery revisions/exact expiry and session/topology generations),
+    never candidate or lifecycle state;
+17. one accepted private-discovery revision is snapshotted/decoded once per
+    bounded clone family, not once per each of 64 warmed capabilities.
 
-Per the verdict, once these are confirmed: **OLB-0 → OLB-1 → bounded
-stop-and-review**, with no further architecture review before OLB-0.
+Execution remains **OLB-1 → bounded stop-and-review → OLB-2**; the integrated
+leader design does not reopen OLB-0 or move the stop boundary.
 
-**Implementation status (2026-07-23) — interim Option-A split.** The org
+**Implementation status (2026-07-24) — Option-A exact-provider track.** The org
 sensing go-live ships **exact-provider first**: only the relay re-authoring of
 `OrgProviderRegistration` is live; the `OrgCapabilityRegistration` (leader /
-capability-resolution) path is deliberately **dark** until an owner-private
-candidate substrate exists (scoped-discovery projection, verified-EntityId→node
-mapping, authority-safe Node/Nodes selectors, per-interest resolution via the
-admitted seed's proven root, org-specific reconciliation, org-root in every
-leader/relay row). Kyra signed off the provider slice as
-**`SAFE_PROVIDER_LIVE_HEAD = b76f67284`** (distinct from the reserved global
-`SAFE_LIVE_HEAD`, which stays for the eventual full capability-sensing path).
-The slice closes the explicit-fleet-root cross-authority coalescence class:
-legacy sensing intake rejects an organization-derived audience when authority is
-installed, and authority installation (runtime and configured startup) is
-refused over an explicit fleet root equal to the org's canonical sensing
-commitment. The three-node transport witness (consumer → relay → provider, relay
-emits under its own live cert, no legacy fallback) **landed** as Piece 5
-(`tests/sensing_org_three_node.rs`, `9865aa40e` + CI-integration closure). The
-reserved full-range ultrareview is **ready after Piece 5 review closure**. The
-global `SAFE_LIVE_HEAD` stays reserved because `OrgCapabilityRegistration`
-remains dark.
+capability-resolution) path remains deliberately **dark**. The live provider
+slice is signed at **`SAFE_PROVIDER_LIVE_HEAD = b76f67284`**; its three-node
+transport/CI closure is signed at `e7fce993e`. Node-global local-projection and
+pre-leader race closure is signed at
+**`PRE_LEADER_CLOSURE_HEAD = cdb416a6b`**. The complete seed-derived leader
+lifecycle entry condition is signed at
+**`LEADER_ENTRY_CONDITION_HEAD = f2c82e467`**.
+
+These closures complete the practical Option-A OLB-0 substrate. The next OLB
+slice is **OLB-1 candidate factoring**, followed by the required bounded
+stop-and-review; OLB-2 has not started. The separate owner-private
+provider-free leader design lives in
+[`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md).
+It is NOT an OLB-1..OLB-5 prerequisite and remains unauthorized for build. The
+plans share only generic node-state source seams: global/owner private-discovery
+revisions plus exact-expiry wake, and peer-session/routing/proximity
+generations. Whichever track lands a missing seam first exposes it to both
+reconcilers. The leader index/projection, provider-free leases, and
+`OrgCapabilityRegistration` never enter the exact-provider OLB path.
+
+The live slice also closes the explicit-fleet-root cross-authority coalescence
+class: legacy sensing intake rejects an organization-derived audience when
+authority is installed, and authority installation (runtime and configured
+startup) is refused over an explicit fleet root equal to the org's canonical
+sensing commitment. Global `SAFE_LIVE_HEAD` remains reserved for an eventual,
+separately reviewed provider-free leader lighting; it is not required to ship
+OLB-5.
 
 v0.3 applied Kyra's performance ruling (2026-07-22):
 the public product shape was confirmed simple enough; the
@@ -73,14 +85,16 @@ SameOrg-first rollout, granted-unsensed fallback, and node-global
 ownership doctrine); implementation was **BLOCKED** on two structural
 findings and four bounded corrections, all applied in this revision:
 
-1. **Private providers never entered the sensing producer path** —
-   org-private routing now uses **exact-provider, org-authenticated
-   sensing leases** derived from private authorized discovery, never
-   provider-free rendezvous (§5.1a, §7). The provider-free sensing
-   population deliberately excludes locally private nRPC services (the
-   private-capability existence-oracle guard), so a rendezvous leader
-   can never re-discover what private discovery already authorized;
-   `resolved_population` is a projection-stage clamp, not a producer.
+1. **Private providers never entered the sensing producer path** — this OLB
+   track uses **exact-provider, org-authenticated sensing leases** derived from
+   private authorized discovery, never a generic provider-free rendezvous
+   population (§5.1a, §7). The exact-provider population is therefore fixed
+   upstream by private discovery; `resolved_population` remains a
+   projection-stage clamp, not a producer. A separately reviewed provider-free
+   leader MAY consume an owner-private projection only inside an
+   organization-admitted, audience-isolated interest as specified by
+   `ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`; that parallel path never supplies
+   OLB candidates and never feeds the plaintext fold.
 2. **Organization membership is now authenticated at sensing
    registration** — membership-cert-carrying registration variants,
    validated at every receiving hop; a narrow additive wire extension
@@ -98,9 +112,8 @@ findings and four bounded corrections, all applied in this revision:
 6. **The P2C sampler contract is pinned** (seed + nonce; reproducible,
    non-stampeding) (§9).
 
-**Status: the three re-review pins are applied. Pending Kyra's
-confirmation of them, implementation proceeds OLB-0 → OLB-1 → bounded
-stop-and-review with no further architecture review before OLB-0.**
+**Current execution point:** architecture and Option-A OLB-0 are signed. Proceed
+with OLB-1, then stop for the already-required bounded review before OLB-2.
 
 **The sentence:** organization-aware load balancing is an internal
 composition of private authorized discovery, capability sensing, and
@@ -135,6 +148,9 @@ implemented two-verb facade this composes beneath),
 [`CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`](CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md)
 (the sensing SDK lifecycle this consumes — its S0/S1 are OLB-0's
 prerequisite, including the org-authenticated registration seam),
+[`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md)
+(the parallel provider-free owner-private leader design — shares only generic
+node-state generation/watch + expiry seams and does not gate OLB-1..OLB-5),
 [`ORG_CAPABILITY_AUTH_PLAN.md`](ORG_CAPABILITY_AUTH_PLAN.md) /
 [`OA2E_INTEGRATION_DESIGN.md`](OA2E_INTEGRATION_DESIGN.md) (the closed
 authority substrate — untouched here),
@@ -716,7 +732,7 @@ struct OrgRouteSet {
 }
 
 struct RouteSourceGeneration {
-    private_discovery: u64,
+    private_discovery_global: u64,
     authority: u64,
     sessions: u64,
     sensing: u64,
@@ -728,11 +744,12 @@ struct RouteSourceGeneration {
 The reconciler rebuilds a capability's route set when — and only when —
 an input changes:
 
-- private discovery generation;
+- global private-discovery generation (Owner or Grant), including the shared
+  node-owned exact-expiry wake;
 - membership/dispatcher/grant validity edges;
-- direct-session state;
+- direct-session generation;
 - sensing generation (`subscribe_sensing_overlay_changes`);
-- route topology;
+- routing/proximity generation;
 - capability watch population;
 - the earliest authority validity deadline (a wall-clock timer —
   below).
@@ -759,7 +776,24 @@ routes. `org.call` reads the latest snapshot and never blocks on,
 waits for, or performs a rebuild — a staleness observation on the read
 path may enqueue a rebuild, never perform one inline.
 
-**Authority validity edges arm timers.** Certificate and grant expiry
+**Rebuild once per family/source movement, not once per capability scan.** One
+clone-family reconciler owns the bounded 64-capability population. For each
+accepted global private-discovery revision it captures one narrow owned scoped
+snapshot under the store mutex, releases the mutex, decodes each descriptor at
+most once, and builds an immutable capability multimap off-lock. Every warmed
+capability's authority match and route-set rebuild consumes that shared family
+snapshot; 64 warmed services must not issue 64 full scoped-store scans or
+re-decode the same record 64 times. The family snapshot is NOT the leader's
+owner index and is never an authority cache: it includes only records visible
+to this client's credentials, and final temporal checks remain per call.
+
+The reconciler is one single-flight/coalescing actor per clone family, not one
+task per capability. A global source movement may mark all 64 capabilities
+dirty, but work is processed in bounded batches with a runtime yield between
+batches; calls continue reading prior immutable route sets. Publication remains
+per-capability publish-if-current against the COMPLETE source vector.
+
+**Authority validity edges arm one family timer.** Certificate and grant expiry
 are wall-clock transitions that emit no network or sensing event.
 Without a timer, a route set preferring a grant that expires at T keeps
 preferring it after T: every call selects it, the per-call recheck
@@ -768,13 +802,15 @@ the recheck preserves security but not availability. Each route set
 therefore records `next_authority_deadline`, computed from the earliest
 relevant membership `not_after`, dispatcher `not_after`,
 selected/candidate grant `not_after`, and any other canonical authority
-validity boundary the route set consumed. The reconciler schedules one
-timer per capability for that deadline:
+validity boundary the route set consumed. The clone-family reconciler maintains
+one resettable timer/ordered deadline set across at most 64 warmed capabilities;
+it never spawns one task or timer per capability:
 
 ```text
-deadline reached
-→ enqueue capability rebuild
+earliest family deadline reached
+→ enqueue every capability due at that instant
 → reselect from currently valid candidates
+→ arm the next family deadline
 ```
 
 The per-call temporal recheck remains mandatory as defense in depth;
@@ -1251,8 +1287,10 @@ not wait for it. The minimal org-specific sequence is:
 ```
 
 Generic provider-free sensing, ordinary nRPC sensed routing, compute
-placement, language sensing bindings, and cross-org SENSE land
-separately and do not gate this release.
+placement, language sensing bindings, the owner-private provider-free leader,
+and cross-org SENSE land separately and do not gate this release. The leader
+track may land the shared generic node-state source seams first; those isolated
+revisions/wakes/timers are the only cross-track dependency.
 
 ### OLB-0 — prerequisite: node-global sensing lifecycle + org-authenticated registration
 
@@ -1260,11 +1298,12 @@ This is the **org-required subset** of the sensing plan's S0 + S1
 ([`CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`](CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md)) —
 registration authority, exact-provider leases, deregistration,
 evaluator ownership, and the provider `provide()` lifecycle; **not**
-the generic consumer watch surface. This plan additionally pins it
-because the current tree has none of it: interests have **no public
-deregistration and no refcount anywhere** (TTL soft-state only,
-`mesh.rs:1670-1677`), and the registration frame carries **no
-membership proof**.
+the generic consumer watch surface. The practical Option-A subset is now
+implemented and signed through `cdb416a6b`: node-global lease/refcount/cadence
+ownership and `OrgProviderRegistration` are live. The appended
+`OrgCapabilityRegistration` wire/gate types exist but their dispatch arm stays
+dark and belongs to the separate leader plan; lighting it is not part of
+OLB-0's exit.
 
 Deliver:
 
@@ -1328,12 +1367,21 @@ including `ProviderNotDirect` and considered-count semantics).
 
 For same-org candidates:
 
+- consume the shared generic source seams specified in
+  `ORG_SENSING_LEADER_SUBSTRATE_PLAN.md` §6: global private-discovery revision
+  and exact-expiry wake plus peer-session/routing/proximity generations. If a
+  seam has not landed from the parallel leader track, land only that generic
+  primitive first with its mutation/expiry/stale-build witnesses. OLB-2 does
+  not consume the leader's owner index, capability projection, or
+  reconciliation;
 - add the clone-shared, **bounded** `OrgRoutingState` (§7; bounds
   pinned: 64 warmed capabilities per client state, 32 sensed providers
   per capability, deterministic truncation + metric);
-- add the wake-driven reconciler and immutable `OrgRouteSet`
-  projection (§7): single-flight, generation-stamped, `ArcSwap`
-  published; calls only read;
+- add one clone-family reconciler and immutable `OrgRouteSet` projection (§7):
+  single-flight, generation-stamped, `ArcSwap` published; calls only read;
+  one accepted private-discovery generation captures/decodes the narrow scoped
+  snapshot once for the family rather than once per warmed capability; one
+  family deadline actor covers all authority deadlines;
 - on first call per service, acquire one exact-provider lease per
   authorized same-org provider (enqueued, never awaited); on
   provider-set change, acquire new / release removed; on last client
@@ -1367,6 +1415,13 @@ Exit witnesses:
 - **a warmed call issues no scoped-store query, no observation-map
   scan, no sort, and no registration emission** (instrumented
   witness);
+- 64 warmed capabilities + one accepted private-discovery movement perform one
+  narrow scoped-store snapshot and decode each included descriptor at most once,
+  not 64 store scans/decodes; rebuild work yields between bounded batches while
+  calls continue using prior snapshots;
+- one clone-family deadline actor covers all 64 authority deadlines (no task or
+  timer per capability), and the shared node private-expiry timer advances the
+  global source exactly at record expiry;
 - a burst of change wakes coalesces into one rebuild; calls during a
   rebuild read the prior snapshot;
 - an authorized-set change acquires/releases exactly the delta;
