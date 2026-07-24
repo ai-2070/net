@@ -115,6 +115,59 @@ pub struct ScopedIngestReport {
     pub swept_live: Vec<ScopedKey>,
 }
 
+/// Cap on the number of distinct capability ids a change stream names before it
+/// collapses to [`DirtyCapabilities::RebuildAll`]. Keeps the delta bounded — a
+/// burst wider than this reprojects everything rather than growing an unbounded
+/// journal.
+const MAX_DIRTY_CAPABILITIES: usize = 256;
+
+/// The capabilities whose owner/grant provider set changed since a consumer last
+/// drained this stream (OLB-2A.2), or a `RebuildAll` sentinel once more than
+/// [`MAX_DIRTY_CAPABILITIES`] distinct capabilities were dirtied. A consumer
+/// reconciles exactly the named capabilities, or — on `RebuildAll` — every
+/// capability it has a standing interest in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DirtyCapabilities {
+    /// Nothing dirtied since the last drain.
+    #[default]
+    Clean,
+    /// Exactly these capability ids were dirtied.
+    Caps(BTreeSet<CapabilityAuthorityId>),
+    /// More than the bound were dirtied — reproject everything.
+    RebuildAll,
+}
+
+impl DirtyCapabilities {
+    /// Merge a batch of dirtied capabilities, collapsing to `RebuildAll` past the
+    /// bound. An empty batch is a no-op.
+    fn mark(&mut self, caps: &BTreeSet<CapabilityAuthorityId>) {
+        if caps.is_empty() {
+            return;
+        }
+        match self {
+            DirtyCapabilities::RebuildAll => {}
+            DirtyCapabilities::Clean => {
+                *self = if caps.len() > MAX_DIRTY_CAPABILITIES {
+                    DirtyCapabilities::RebuildAll
+                } else {
+                    DirtyCapabilities::Caps(caps.clone())
+                };
+            }
+            DirtyCapabilities::Caps(existing) => {
+                existing.extend(caps.iter().copied());
+                if existing.len() > MAX_DIRTY_CAPABILITIES {
+                    *self = DirtyCapabilities::RebuildAll;
+                }
+            }
+        }
+    }
+
+    /// Take the accumulated set, leaving the stream `Clean`.
+    fn take(&mut self) -> DirtyCapabilities {
+        std::mem::take(self)
+    }
+}
+
 /// One stored scoped capability plus the freshness/expiry it is ordered by. When
 /// `capability` is `None` the entry is a TOMBSTONE: the live capability was
 /// swept (expired), but the `generation` high-water is retained until
@@ -453,6 +506,49 @@ impl ScopedCapabilityIndex {
 pub struct ScopedDiscoveryState {
     store: ScopedDiscoveryStore,
     index: ScopedCapabilityIndex,
+    /// Monotone generation over the query-visible set of EITHER private partition
+    /// (owner or grant). Advances once per mutation that changes any capability
+    /// bucket; a consumer polls it to detect that private discovery moved.
+    revision: u64,
+    /// Monotone generation over the OWNER partition only, so valid grant-audience
+    /// churn never wakes an owner-private consumer. Advances only when an
+    /// owner-scoped capability bucket changes.
+    owner_revision: u64,
+    /// Capabilities dirtied (owner or grant) since the last global drain.
+    pending_global: DirtyCapabilities,
+    /// Capabilities dirtied in the OWNER partition since the last owner drain.
+    pending_owner: DirtyCapabilities,
+}
+
+/// Add the capabilities a live record declared — read from the index BEFORE the
+/// record is removed — to the affected sets, tagging the owner stream when the
+/// record's scope is `Owner`.
+fn note_removed_record(
+    index: &ScopedCapabilityIndex,
+    key: &ScopedKey,
+    global: &mut BTreeSet<CapabilityAuthorityId>,
+    owner: &mut BTreeSet<CapabilityAuthorityId>,
+) {
+    if let Some(caps) = index.declarations_by_record.get(key) {
+        note_caps(&key.0, caps, global, owner);
+    }
+}
+
+/// Add `caps` to the affected sets, tagging the owner stream when `scope` is
+/// `Owner`.
+fn note_caps(
+    scope: &CapabilityAudienceScope,
+    caps: &[CapabilityAuthorityId],
+    global: &mut BTreeSet<CapabilityAuthorityId>,
+    owner: &mut BTreeSet<CapabilityAuthorityId>,
+) {
+    let is_owner = matches!(scope, CapabilityAudienceScope::Owner { .. });
+    for c in caps {
+        global.insert(*c);
+        if is_owner {
+            owner.insert(*c);
+        }
+    }
 }
 
 impl ScopedDiscoveryState {
@@ -473,20 +569,34 @@ impl ScopedDiscoveryState {
         cap_ids: Arc<[CapabilityAuthorityId]>,
         now_secs: u64,
     ) -> ScopedStoreOutcome {
-        let key = (capability.scope().clone(), capability.provider().clone());
+        let scope = capability.scope().clone();
+        let key = (scope.clone(), capability.provider().clone());
         let report = self.store.ingest(capability, now_secs);
+        let mut global = BTreeSet::new();
+        let mut owner = BTreeSet::new();
         // Demotions from the internal capacity sweep are disjoint from the
-        // incoming key; drop them from the index first.
+        // incoming key; drop them from the index (and dirty their caps) first.
         for swept in &report.swept_live {
+            note_removed_record(&self.index, swept, &mut global, &mut owner);
             self.index.remove_record(swept);
         }
         match report.outcome {
-            ScopedStoreOutcome::Inserted => self.index.insert_record(key, cap_ids),
-            ScopedStoreOutcome::Updated => self.index.replace_record(key, cap_ids),
+            ScopedStoreOutcome::Inserted => {
+                note_caps(&scope, &cap_ids, &mut global, &mut owner);
+                self.index.insert_record(key, cap_ids);
+            }
+            ScopedStoreOutcome::Updated => {
+                // Dirty the union of the old and new declarations — the query
+                // trusts the index, so both the vacated and the new buckets moved.
+                note_removed_record(&self.index, &key, &mut global, &mut owner);
+                note_caps(&scope, &cap_ids, &mut global, &mut owner);
+                self.index.replace_record(key, cap_ids);
+            }
             ScopedStoreOutcome::Stale
             | ScopedStoreOutcome::RejectedPublic
             | ScopedStoreOutcome::AtCapacity => {}
         }
+        self.record_change(&global, &owner);
         report.outcome
     }
 
@@ -495,10 +605,59 @@ impl ScopedDiscoveryState {
     pub fn sweep_expired(&mut self, now_secs: u64) -> usize {
         let removed = self.store.sweep_expired(now_secs);
         let dropped = removed.len();
+        let mut global = BTreeSet::new();
+        let mut owner = BTreeSet::new();
+        for key in &removed {
+            note_removed_record(&self.index, key, &mut global, &mut owner);
+        }
+        self.record_change(&global, &owner);
         for key in &removed {
             self.index.remove_record(key);
         }
         dropped
+    }
+
+    /// Advance the change generations and dirty streams for a mutation that
+    /// touched `global` (and, where owner-scoped, `owner`) capability buckets.
+    /// Empty sets are a no-op — a mutation that changed the store's live set but
+    /// no query-visible capability bucket (e.g. a record declaring nothing)
+    /// advances neither generation. The owner stream is a subset of the global
+    /// stream, so valid grant-audience churn never advances the owner generation.
+    fn record_change(
+        &mut self,
+        global: &BTreeSet<CapabilityAuthorityId>,
+        owner: &BTreeSet<CapabilityAuthorityId>,
+    ) {
+        if !global.is_empty() {
+            self.revision = self.revision.wrapping_add(1);
+            self.pending_global.mark(global);
+        }
+        if !owner.is_empty() {
+            self.owner_revision = self.owner_revision.wrapping_add(1);
+            self.pending_owner.mark(owner);
+        }
+    }
+
+    /// The generation over the query-visible set of EITHER private partition.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The generation over the OWNER partition only.
+    pub fn owner_revision(&self) -> u64 {
+        self.owner_revision
+    }
+
+    /// Take the capabilities dirtied (owner or grant) since the last global
+    /// drain, leaving the stream `Clean`.
+    pub fn take_pending_global(&mut self) -> DirtyCapabilities {
+        self.pending_global.take()
+    }
+
+    /// Take the capabilities dirtied in the OWNER partition since the last owner
+    /// drain, leaving the stream `Clean`.
+    pub fn take_pending_owner(&mut self) -> DirtyCapabilities {
+        self.pending_owner.take()
     }
 
     /// Owner-scoped private providers declaring `capability` (or every owner
@@ -1321,5 +1480,179 @@ mod tests {
             report.swept_live.len(),
             ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE
         );
+    }
+
+    // ----- OLB-2A.2: change generations + affected-capability deltas -----
+
+    fn grant_cap_declaring(
+        grant_id: [u8; 32],
+        provider_seed: u8,
+        generation: u64,
+        expires_at: u64,
+        tag: &str,
+    ) -> VerifiedScopedCapability {
+        VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Grant {
+                grant_id,
+                audience_handle: [0x22; 32],
+            },
+            provider(provider_seed),
+            org(2),
+            generation,
+            expires_at,
+            FIXTURE_CERT_GEN,
+            Some([0x5A; 64]),
+            descriptor(&[tag]),
+        )
+    }
+
+    fn one_cap(tag: &str) -> DirtyCapabilities {
+        DirtyCapabilities::Caps([cap_id(tag)].into_iter().collect())
+    }
+
+    /// An owner ingest that changes a capability's provider set advances BOTH
+    /// generations and names the capability in both delta streams; draining
+    /// leaves each stream clean.
+    #[test]
+    fn an_owner_ingest_advances_both_generations_and_dirties_its_capability() {
+        let mut state = ScopedDiscoveryState::new();
+        assert_eq!(state.revision(), 0);
+        assert_eq!(state.owner_revision(), 0);
+
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        assert_eq!(state.revision(), 1);
+        assert_eq!(state.owner_revision(), 1);
+        assert_eq!(state.take_pending_global(), one_cap("nrpc:a"));
+        assert_eq!(state.take_pending_owner(), one_cap("nrpc:a"));
+
+        // Drained.
+        assert_eq!(state.take_pending_global(), DirtyCapabilities::Clean);
+        assert_eq!(state.take_pending_owner(), DirtyCapabilities::Clean);
+    }
+
+    /// Grant-audience churn advances the GLOBAL stream but NEVER the owner
+    /// stream — an owner-private consumer is not woken by cross-org grant
+    /// movement.
+    #[test]
+    fn grant_churn_never_advances_the_owner_stream() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            grant_cap_declaring([0xAA; 32], 4, 1, 10_000, "nrpc:g"),
+            0,
+        );
+        assert_eq!(state.revision(), 1, "global advances");
+        assert_eq!(state.owner_revision(), 0, "owner does not");
+        assert_eq!(state.take_pending_global(), one_cap("nrpc:g"));
+        assert_eq!(state.take_pending_owner(), DirtyCapabilities::Clean);
+    }
+
+    /// A Stale re-ingest advances no generation and dirties nothing.
+    #[test]
+    fn a_stale_ingest_advances_no_generation() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 2, 10_000, &["nrpc:a"]),
+            0,
+        );
+        let (rev, owner_rev) = (state.revision(), state.owner_revision());
+        let _ = state.take_pending_global();
+        let _ = state.take_pending_owner();
+
+        assert_eq!(
+            ingest_indexed(
+                &mut state,
+                owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+                0
+            ),
+            ScopedStoreOutcome::Stale
+        );
+        assert_eq!(state.revision(), rev, "stale advances nothing");
+        assert_eq!(state.owner_revision(), owner_rev);
+        assert_eq!(state.take_pending_global(), DirtyCapabilities::Clean);
+    }
+
+    /// An update dirties BOTH the vacated and the newly declared capability: the
+    /// query trusts the index, so both buckets moved.
+    #[test]
+    fn an_update_dirties_the_old_and_new_capabilities() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        let _ = state.take_pending_global();
+        let _ = state.take_pending_owner();
+
+        assert_eq!(
+            ingest_indexed(
+                &mut state,
+                owner_cap_declaring(3, 2, 10_000, &["nrpc:b"]),
+                0
+            ),
+            ScopedStoreOutcome::Updated
+        );
+        let expected: std::collections::BTreeSet<_> =
+            [cap_id("nrpc:a"), cap_id("nrpc:b")].into_iter().collect();
+        assert_eq!(
+            state.take_pending_global(),
+            DirtyCapabilities::Caps(expected)
+        );
+    }
+
+    /// Expiring a record via sweep dirties its capability and advances the stream.
+    #[test]
+    fn a_sweep_dirties_the_expired_capability() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 1000, &["nrpc:a"]), 0);
+        let rev = state.revision();
+        let _ = state.take_pending_global();
+        let _ = state.take_pending_owner();
+
+        assert_eq!(state.sweep_expired(2000), 1);
+        assert_eq!(state.revision(), rev + 1);
+        assert_eq!(state.take_pending_global(), one_cap("nrpc:a"));
+    }
+
+    /// Past the bound the delta collapses to `RebuildAll` rather than growing an
+    /// unbounded set.
+    #[test]
+    fn the_delta_collapses_to_rebuild_all_past_the_bound() {
+        let mut state = ScopedDiscoveryState::new();
+        let tags: Vec<String> = (0..=MAX_DIRTY_CAPABILITIES)
+            .map(|i| format!("nrpc:svc{i}"))
+            .collect();
+        let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 10_000, &tag_refs), 0);
+        assert_eq!(state.take_pending_global(), DirtyCapabilities::RebuildAll);
+    }
+
+    /// A record declaring no capability (a non-decoding descriptor) changes the
+    /// store but no query-visible bucket, so it advances no generation.
+    #[test]
+    fn a_record_declaring_no_capability_advances_nothing() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            VerifiedScopedCapability::for_test(
+                owner_scope(),
+                provider(3),
+                org(1),
+                1,
+                10_000,
+                FIXTURE_CERT_GEN,
+                None,
+                b"not-a-capability-set".to_vec(),
+            ),
+            0,
+        );
+        assert_eq!(state.revision(), 0);
+        assert_eq!(state.take_pending_global(), DirtyCapabilities::Clean);
     }
 }

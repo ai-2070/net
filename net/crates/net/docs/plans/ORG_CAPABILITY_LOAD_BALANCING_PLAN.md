@@ -40,15 +40,23 @@ candidate factoring is SIGNED** at `OLB1_SIGNED_HEAD = 4dccb7767`
 reachability sampled in sorted order to preserve the pre-factoring selection).
 The mandatory bounded stop-and-review passed, so **OLB-2 is authorized and its
 first slice, OLB-2A, is landing** — the GENERIC transactional indexed
-private-discovery substrate: `ScopedDiscoveryState` wraps `ScopedDiscoveryStore`
-with a capability sidecar index (predecode the `CapabilitySet` once at ingest;
-`by_scope_capability` / `declarations_by_record` reverse indexes; per-scope live
-counts), so the owner-plane capability query is an indexed bucket lookup with NO
-per-record descriptor decode, and `ingest`/`sweep_expired` return the visible-set
-delta the index consumes in one transaction. Global/owner revisions, bounded
-affected-capability deltas, and the exact-expiry source are the next sub-slice
-(OLB-2A.2). This substrate is shared with the provider-free leader track but
-carries no authority-filtered candidate or lifecycle state. The separate
+private-discovery substrate. **OLB-2A.1** (`ScopedDiscoveryState` wraps
+`ScopedDiscoveryStore` with a capability sidecar index — predecode the
+`CapabilitySet` once at ingest; `by_scope_capability` / `declarations_by_record`
+reverse indexes; per-scope live counts) makes the owner-plane capability query an
+indexed bucket lookup with NO per-record descriptor decode, with
+`ingest`/`sweep_expired` returning the visible-set delta the index consumes in
+one transaction. **OLB-2A.2** adds the CHANGE SOURCE: monotone global + owner
+revisions and bounded affected-capability deltas (`RebuildAll` overflow),
+maintained per mutation on the qualifying transitions and polled through
+`MeshNode` accessors (`private_discovery_generation`/`_owner_generation`,
+`take_private_discovery_delta`/`_owner_delta`) — the owner stream is a subset of
+the global stream, so valid grant-audience churn never wakes an owner-private
+consumer. The exact-expiry source (event-driven `next_visible_expiry` + timer)
+and a push/watch wake land with their first consumer (OLB-2A.3 / the reconciler),
+mirroring the crate's existing polled-generation seams. This substrate is shared
+with the provider-free leader track but carries no authority-filtered candidate
+or lifecycle state. The separate
 owner-private provider-free leader design lives in
 [`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md).
 It is NOT an OLB-1..OLB-5 prerequisite and remains unauthorized for build. The

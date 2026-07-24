@@ -10181,6 +10181,38 @@ impl MeshNode {
             .collect()
     }
 
+    /// The private-discovery change generation over EITHER partition, owner or
+    /// grant (OLB-2A.2). Advances once per ingest/sweep that changes a
+    /// capability's live provider set; a consumer polls it to learn that private
+    /// discovery moved. A `Stale`/refused ingest, or a mutation touching no
+    /// query-visible capability bucket, does not advance it.
+    pub fn private_discovery_generation(&self) -> u64 {
+        self.scoped_discovery.lock().revision()
+    }
+
+    /// The private-discovery change generation over the OWNER partition only, so
+    /// valid grant-audience churn never wakes an owner-private consumer.
+    pub fn private_discovery_owner_generation(&self) -> u64 {
+        self.scoped_discovery.lock().owner_revision()
+    }
+
+    /// Drain the capabilities dirtied (owner or grant) since the last call,
+    /// leaving the stream clean. A consumer reconciles exactly the named
+    /// capabilities, or every demanded one on
+    /// [`DirtyCapabilities::RebuildAll`](super::behavior::org_scoped_store::DirtyCapabilities::RebuildAll).
+    pub fn take_private_discovery_delta(
+        &self,
+    ) -> super::behavior::org_scoped_store::DirtyCapabilities {
+        self.scoped_discovery.lock().take_pending_global()
+    }
+
+    /// Drain the OWNER-partition capabilities dirtied since the last call.
+    pub fn take_private_discovery_owner_delta(
+        &self,
+    ) -> super::behavior::org_scoped_store::DirtyCapabilities {
+        self.scoped_discovery.lock().take_pending_owner()
+    }
+
     /// Test seam (OA3 closure witness): advance the visibility generation as a
     /// concurrent registration would, so a send fired after a visibility change
     /// can be observed rejecting the now-stale emission (the send path skips it
