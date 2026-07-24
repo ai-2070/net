@@ -12,9 +12,10 @@ a prerequisite for the exact-provider-first organization load-balancing
 release. [`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md`](ORG_CAPABILITY_LOAD_BALANCING_PLAN.md)
 continues through OLB-1..OLB-5 by deriving an authorized provider set from
 private discovery and acquiring one exact-provider lease per retained SameOrg
-provider. It never emits `OrgCapabilityRegistration`. The two tracks share only
-generic node-state revisions/wakes/timers (§6), but neither consumes the other's
-candidate projection, leader state, or lifecycle ownership.
+provider. It never emits `OrgCapabilityRegistration`. The tracks share only the
+generic indexed private-discovery storage/source substrate and node-state
+revisions/wakes/timers (§6); neither consumes the other's authority-filtered
+candidate projection, route/leader state, or lifecycle ownership.
 
 **Scope:** the org-scoped candidate projection that lets the sensing leader
 resolve an ORGANIZATION-admitted interest against the owner-private discovery
@@ -76,15 +77,72 @@ the scoped store's only consumers are the SDK org-call queries
 8. **Wire freeze.** No frame changes. The scoped-announcement envelope is
    untouched (it carries no node id — see §4; none is added).
 
-## 3. The substrate: shared immutable owner index + per-capability projection
+## 3. The substrate: indexed private discovery + immutable owner projections
 
-The substrate is deliberately two-stage so `N` standing interests never perform
-`N` full scoped-store scans.
+The substrate is deliberately layered so one mutation never becomes
+`interests × clients × 8192 rows × descriptor decode` work.
 
-**Stage A — one owner snapshot/index per owner-store revision.** Under the scoped
-store mutex, copy one narrow OWNED snapshot of query-visible Owner rows against
-the captured fresh floors, including provider, owner org, generation, expiry,
-and descriptor bytes. Drop the mutex, decode each descriptor ONCE, and build:
+**Stage A — one transactionally maintained scoped capability index.** Keep
+`ScopedDiscoveryStore`'s storage/currentness semantics generic, but place it in a
+single mutex-protected `ScopedDiscoveryState` with an INTERNAL sidecar index:
+
+```rust
+struct ScopedDiscoveryState {
+    store: ScopedDiscoveryStore,
+    index: ScopedCapabilityIndex,
+    revision: u64,
+    owner_revision: u64,
+    next_visible_expiry: Option<u64>,
+}
+
+struct ScopedCapabilityIndex {
+    by_scope_capability: HashMap<(CapabilityAudienceScope, CapabilityId), ProviderBucket>,
+    declarations_by_record: HashMap<(CapabilityAudienceScope, EntityId), Arc<[CapabilityId]>>,
+}
+```
+
+After OA3-5 cryptographic verification and BEFORE taking this mutex, decode the
+canonical `CapabilitySet` once into owned capability IDs (and retain raw
+provider-signed tags only as non-authoritative metadata). An accepted
+insert/update commits the store row, reverse declarations, affected buckets,
+per-scope counts, expiry state, and revisions in ONE transaction. Update dirties
+the union of old/new capability IDs. Sweep returns the exact removed live keys
+so their buckets and reverse declarations are updated in the same transaction.
+Stale/refused input mutates neither store nor index. `entries_in_scope` becomes a
+maintained count rather than a full-map scan on capacity admission.
+
+The transaction emits bounded dirty-capability deltas:
+
+```text
+private_discovery_global: {affected capability IDs from Owner or Grant}
+private_discovery_owner:  {affected capability IDs from Owner only}
+```
+
+Overflow collapses to one `RebuildAll` sentinel; it never allocates an unbounded
+journal. Grant-only movement cannot dirty the owner stream. A floor raise uses
+the reverse declaration index to identify capabilities declared by affected
+providers. If today's floor subscription does not identify providers, compare
+indexed provider generations against the fresh floor snapshot once, WITHOUT
+redecoding descriptors, then emit the resulting capability set.
+
+The locked query is now only:
+
+```text
+indexed bucket lookup
+→ expiry/floor-currentness filter
+→ clone minimal immutable/predecoded records into Arc<[OrgProviderRecord]>
+→ unlock
+```
+
+No descriptor parse, tag interpretation, graph lookup, route lookup, sort, or
+`CandidateProvider` allocation occurs under the scoped-state mutex. This index
+is storage acceleration, not authority and not a candidate projection; every
+snapshot still applies fresh expiry/floor currentness. It remains internal and
+never becomes a public provider-enumeration surface.
+
+**Stage B — one demanded owner snapshot per accepted source vector.** The
+leader consumes only Owner buckets named by currently live org interests (plus
+the incoming capability during initial admission) and `ArcSwap`-publishes:
 
 ```rust
 struct OwnerPrivateCandidateIndex {
@@ -96,56 +154,43 @@ struct OwnerPrivateCandidateIndex {
 }
 ```
 
-The index is internal, immutable, and `ArcSwap`-published with
-publish-if-current discipline. Grant rows never enter it. Before taking the
-store snapshot, the worker captures the distinct capability IDs demanded by
-live org interests (plus the incoming capability during initial admission),
-then releases the leader lock. Descriptor decode inserts only those wanted
-keys. Therefore `by_capability.len() <= live org interests <= 512`; a descriptor
-may name many unrelated capabilities without expanding the cache. One provider
-can appear under several WANTED capability keys without re-decoding its
-descriptor. Interest-population movement invalidates the build exactly like any
-other source generation.
+Therefore `by_capability.len() <= distinct live org capabilities <= 512`; a
+descriptor naming unrelated capabilities cannot expand the leader cache.
+Ordinary store movement rebuilds only dirty demanded buckets. Authority install
+or topology/session movement may conservatively mark all demanded buckets.
+Grant rows never enter this owner snapshot.
 
-**Stage B — one live candidate snapshot per capability/source vector.** For one
-capability, combine the indexed base rows with current reachability and route
-estimates to produce the resolver's existing `CandidateProvider` shape:
+**Stage C — one route-ranked candidate snapshot per capability/source vector.**
+For one capability, combine its indexed base rows with one batched local
+route-distance snapshot for the current topology generation, direct-session
+pins, and reachability to produce:
 
 ```text
 (owner_revision, authority, interest_population,
  sessions, topology, capability)
-→ Arc<[CandidateProvider]>
+→ Arc<OrgCapabilityCandidates> {
+     ranked: Arc<[CandidateProvider]>,
+     by_node: HashMap<NodeId, usize>,
+   }
 ```
 
-Equivalent interests with different selectors/result modes share this snapshot;
-selector evaluation never re-queries or re-decodes the scoped store. Proposed
-home: `sensing/org_candidates.rs`. The conceptual entry point is:
+The route-ranked order and node-membership index are computed ONCE and shared by
+all selectors/result modes for that capability. Every candidate retains its
+scoped record identity/generation and `expires_at`; every admitted leader branch
+retains the selected candidate's deadline/source token for O(1) continuation
+currentness. Candidate projection performs no BFS/path search per provider: the
+topology source supplies one immutable
+local-distance view per generation, then each provider lookup is O(1).
+Org-specific selector filtering preserves this precomputed order and never
+sorts per interest. `Node` uses `by_node`; `Nodes`/`Tags`/`AnyAuthorized` make one
+linear ordered filter; result bounds allocate only the retained active+standby
+rows.
 
-```
-project_org_candidates(
-    owner_index,                 // immutable owner partition only
-    org_id,                      // retained seed RegistrationAuthority::Org
-    capability_id,
-    proximity_graph, router, peers, peer_entity_ids, local_node_id,
-    now_secs,
-) -> Arc<[CandidateProvider]>
-```
-
-The cache is bounded by the v1 node-global org-leader interest cap (§6), evicts
-entries with no standing interest, and never becomes a public query surface.
-
-**Source rows.** Add a narrow owned-snapshot sibling of
-`ScopedDiscoveryStore::find_owner_private_capabilities` that applies the SAME
-expiry and floor-currentness filters (`org_scoped_store.rs:270-287,326-328`)
-but returns the minimal index-build fields, including owned descriptor bytes.
-The index builder decodes each descriptor with the existing
-`descriptor_declares_capability` / `CapabilitySet` semantics
-(`org_scoped_ingest.rs:560-578`) after releasing the store mutex. Only records
-that passed the full OA3-5 ingest chain exist in the store (outer provider
-signature; owner-audience AEAD open; `cert.member == provider`; membership
-signature/window; `generation >= floor` — `org_scoped_ingest.rs:393-460,
-607-623`). Grant-partition records are structurally excluded. Do not call the
-existing per-capability predicate query once per interest.
+Proposed homes: the transactional storage sidecar beside
+`org_scoped_store.rs`; authority-safe candidate interpretation in
+`sensing/org_candidates.rs`. Only records that passed the full OA3-5 ingest
+chain exist in the index (outer provider signature; audience AEAD open;
+`cert.member == provider`; membership signature/window; `generation >= floor`).
 
 **Coherent currentness has two distinct lifetimes.**
 
@@ -176,8 +221,8 @@ existing per-capability predicate query once per interest.
 | `authorized` | `true` — by construction | only ingest-verified, floor-current owner-scope members enter; the projection NEVER emits an unauthorized candidate (the resolver's `authorized` filter keeps working unchanged) |
 | `reachable` | exact direct pin OR routing-table hit | direct requires `peer_entity_ids[node_id] == record.provider`; routed reachability uses the node id derived from that provider; see §4 |
 | `route_estimate` | proximity ladder | same (`snapshot.rs:193-218`; node-id-keyed graph) |
-| `tags` | descriptor tags, `asserted_by = canonical_org_sensing_commitment(org_id)` | composes with §2: an org seed's `proven_root()` IS that commitment, so seed-anchored Tags filtering admits exactly org-asserted tags; extract the existing wire-tag → `TagAssertion` mapper from `sensing/snapshot.rs` for shared use rather than duplicating its parsing |
-| `groups` | empty | as legacy; no org group surface exists |
+| `tags` | empty in org v1 | scoped ingest proves a provider-signed member declaration, not an org-root tag assertion; never relabel provider metadata as org authority |
+| `groups` | empty | no org group surface exists |
 
 **Confidentiality invariant.** The index and projections are owner-private
 state. They are built only after capturing installed owner authority; an
@@ -230,7 +275,14 @@ a wire field.
 
 ## 5. Authority-safe selectors (org-admitted interests)
 
-Resolution semantics against the projection, per selector:
+Resolution semantics against the projection, per selector. This requires a NEW
+org-only entry point, `resolve_org_candidates`, used by BOTH initial
+`register_admitted_capability_interest` and standing reconciliation whenever the
+retained seed authority is `Org`. It must not call the legacy
+`resolve_candidates` `Node` fast path. The org resolver accepts
+`OrgCapabilityCandidates`, and every branch ID—including explicit `Node`—must be
+found in that private snapshot BEFORE any `SensingLeader` mutation. Legacy
+admissions keep the existing resolver byte-for-byte.
 
 - **`AnyAuthorized`** — the whole projection (org members declaring the
   capability, floor-current, ranked by route estimate). Open-world; never
@@ -247,40 +299,43 @@ Resolution semantics against the projection, per selector:
   the consumer's ordinary soft-state refresh may resolve it after later private
   discovery. Externally the observation remains `Unknown`. `Nodes` applies the
   same intersection and may retain any authorized subset.
-- **`Tags(...)`** — already correct by composition: projection tags are
-  asserted by the org commitment and the §2-signed resolver anchors to the
-  seed's proven root (witnessed at `f2c82e467`).
-- **`Group(_)`** — unsupported for org v1. With no org group authority surface
-  and `groups` always empty, it follows the same empty-resolution /
-  `AllBranchesRefused` path. No new refusal enum or externally distinguishable
-  result is introduced.
+- **`Tags(...)` / `Group(_)`** — unsupported for org v1. Scoped ingest proves
+  that a member/provider signed its descriptor; it does NOT prove that the
+  organization commitment asserted arbitrary tag key/value claims. The signed
+  §2 tag witness proves resolver anchoring, not this missing delegation. Until
+  an org-signed/delegated tag-proof surface exists, org projections emit no tags
+  or groups and both selectors follow empty-resolution / `AllBranchesRefused`.
+  No provider assertion is relabeled with the organization commitment, and no
+  new externally distinguishable refusal is introduced.
 - **Result modes** (`Any`/`TopK`/`Quorum`/`Each`) — unchanged resolver bounds,
   including `SelectorTooBroad` → `broad_selector_refusals`.
 
 ## 6. Shared node-state revision, expiry, and wake sources
 
-**Gap being filled:** the scoped store has no change signal
-(`org_scoped_store.rs:110-112` — plain map behind a mutex), and the LB plan §7
-reconciler contract requires `RouteSourceGeneration.private_discovery_global`
-plus session/topology generations that have no complete producer today. These
-are the ONLY implementation primitives shared by the two tracks:
+**Gap being filled:** the scoped store is a scan-only `BTreeMap` with no change
+signal (`org_scoped_store.rs:110-112`), while both consumers need indexed
+private-discovery buckets plus source generations. These are the ONLY
+implementation primitives shared by the tracks:
 
 ```text
-ScopedDiscoveryStore global + owner revisions + exact-expiry wake
+ScopedDiscoveryState
+  transactional scoped-capability index + global/owner revisions
+  bounded affected-capability deltas + exact-expiry wake
 peer-session generation + routing/proximity generation
-→ MeshNode watch source(s)
-├─ exact-provider OLB-2 route-set reconciler
+→ node-owned coalescing scheduler/watch
+├─ exact-provider OLB-2 base-projection/route-set reconciler
 └─ provider-free org-leader reconciler
 ```
 
-Neither consumer shares candidate sets, leases, or reconciler state with the
-other.
+The shared index exposes minimal verified/predecoded storage rows only. Neither
+consumer shares authority-filtered candidate sets, leases, route sets, leader
+state, or lifecycle state with the other.
 
-**Ownership decision.** `ScopedDiscoveryStore` owns monotonic
-`revision: u64` and `owner_revision: u64` values, because only the store can
-observe every effective mutation. `revision` advances for either private
-partition; `owner_revision` advances only when an Owner row's query-visible
-state changes. They increment on:
+**Ownership decision.** `ScopedDiscoveryState` owns monotonic `revision: u64`
+and `owner_revision: u64` values and the atomic store/index transaction, because
+only that wrapper can observe every effective visible-set mutation. `revision`
+advances for either private partition; `owner_revision` advances only when an
+Owner row's query-visible state changes. They increment on:
 
 - `Inserted` and `Updated`;
 - live → tombstone sweep transitions;
@@ -312,22 +367,38 @@ same transaction and carried by one watch payload; they are not separate
 stores or authority planes.
 
 **Expiry is event-driven, not 60-second stale.** The node helper tracks the
-earliest query-visible scoped expiry and owns ONE resettable timer for the
-whole node. At its deadline it runs the store sweep through the same mutation
-helper, advances the appropriate revision(s), emits one wake, and arms the next
-deadline. The existing 60 s GC remains a retention/backstop sweep, not the
-candidate-currentness boundary. No task or timer is created per provider,
-capability, interest, or client.
+earliest query-visible scoped expiry and owns ONE resettable timer for the whole
+node. At its deadline it atomically sweeps store/index, advances revisions/dirty
+IDs, emits one wake, and arms the next deadline. The existing 60 s GC remains a
+retention backstop.
+
+Scheduler latency cannot extend authority: until the dirty capability has been
+reconciled, any provider continuation, refresh, or branch use performs an O(1)
+check of the branch's retained scoped `expires_at`/source token. At or after the
+deadline it emits NOTHING and queues teardown/reconciliation. One node timer
+covers wakeup; no task or timer is created per provider, branch, capability,
+interest, or client.
 
 **Performance contract.**
 
-- One node-owned reconciler consumes the watch. Wakes are coalesced; at most one
-  owner-index build and one reconciliation pass are in flight. A trailing pass
-  is guaranteed when a source moves during the current pass.
-- The reconciler captures the store's narrow owner snapshot under lock, releases
-  that lock, then performs descriptor decode, capability indexing, topology
-  joins, selector evaluation, and sorting off-lock. It never holds the scoped
-  store and leader mutexes together.
+- One long-lived node-owned actor consumes dirty-capability/source wakes. It owns
+  a bounded `HashSet<CapabilityId>` plus `RebuildAll`, one deadline structure,
+  and explicit shutdown cancellation. At most one build/reconciliation cycle is
+  active; movement during it guarantees one coalesced trailing pass. No task or
+  timer exists per provider, capability, interest, or client.
+- A private-discovery mutation performs indexed bucket lookup and ZERO descriptor
+  decodes after ingest. The actor clones only dirty predecoded buckets under the
+  scoped-state lock; all topology joins, candidate assembly, selector planning,
+  and downstream-row planning happen after unlock. Scoped-state and leader locks
+  are never held together.
+- `SensingLeader` adds `capability_id → interest keys` and per-interest/version
+  indexes. Under a SHORT leader lock, reconciliation snapshots only the dirty
+  capability's admitted specs, retained seed handles, branch/downstream metadata,
+  and versions. Off-lock work filters the already route-ranked candidate
+  snapshot, builds branch deltas, and aggregates downstream demand in a hash map
+  (no linear `Vec::find`, `contains`, or unrelated-interest scan). A second short
+  transaction applies the plan only if interest versions and the complete source
+  vector remain current; otherwise it discards and queues one retry.
 - The live per-capability snapshot source vector is:
 
   ```text
@@ -340,44 +411,48 @@ capability, interest, or client.
   monotonic wake seams, not a track-specific duplicate.
 - First-release hard bounds are: existing Owner partition cap `1024`; at most
   `512` live org leader interests node-wide; at most one cached per-capability
-  snapshot per live org interest; existing candidate policy bounds
+  snapshot per distinct demanded capability; existing candidate policy bounds
   `initial=1`, `standby=1`, `maximum_fanout=3`, `Each=32`. A new org interest
   over the node-wide cap is refused before projection/cache allocation; legacy
   leader capacity semantics are unchanged.
-- Org selector resolution does not sort the full authorized population when it
-  needs only bounded active+standby rows. `Any`/`TopK`/`Quorum` use bounded
-  partial selection (`O(P log K)`, `K <= maximum_fanout + standby_count`);
-  `Each` counts only through `each_mode_max_providers + 1` before refusing.
-  Equivalence witnesses pin the exact provider order/tie-break against today's
-  full-sort resolver. This optimization lives in the org-specific resolver and
-  does not silently change legacy resolution.
-- One source pass reconciles only capabilities whose immutable indexed rows
-  changed. Session/topology/authority movement may conservatively mark all live
-  org capabilities dirty. Reconciliation runs in bounded batches of at most
-  `64` interests and yields/requeues between batches so a 512-interest leader
-  cannot monopolize the runtime.
-- No warmed `OrgClient::call` path reads this index or waits for this worker.
-  OLB owns its separate `ArcSwap<OrgRouteSet>` snapshot and preserves the
-  no-scan/no-await request path.
+- The org resolver NEVER sorts per interest. Stage C has already established the
+  deterministic route order. `Any`/`TopK`/`Quorum` retain the first bounded rows
+  in that order; `Node` is indexed O(1); `Nodes` is an ordered filter; `Each`
+  scans only until `each_mode_max_providers + 1` before refusing. Equivalence
+  witnesses pin exact legacy ordering/tie-break where semantics overlap without
+  changing the legacy resolver.
+- One source pass reconciles only indexed dirty capabilities. Session/topology or
+  authority movement may conservatively mark all demanded capabilities dirty.
+  Apply work runs in batches of at most `64` interests and yields/requeues so a
+  512-interest leader cannot monopolize the runtime.
+- No warmed `OrgClient::call` path reads this owner projection or waits for this
+  worker. OLB consumes the shared storage index but owns separate authority-
+  filtered base facts and `ArcSwap<OrgRouteSet>` snapshots.
 
 Required metrics/benchmarks before arm lighting:
 
 ```text
-org_candidate_index_rebuild_total{reason}
-org_candidate_index_rebuild_seconds
-org_candidate_index_rows
+org_scoped_index_bucket_visits_total
+org_scoped_descriptor_decode_total
+org_scoped_state_lock_hold_seconds
+org_candidate_projection_build_total{reason}
+org_candidate_projection_discarded_total{reason}
 org_candidate_projection_cache_entries
+org_leader_dirty_capabilities
 org_leader_reconcile_batch_total
 org_leader_reconcile_requeued_total
-org_leader_reconcile_seconds
+org_leader_plan_seconds
+org_leader_apply_lock_hold_seconds
 org_leader_interest_over_cap_total
 ```
 
 Bench gates use the maximum v1 Owner partition (`1024`) and maximum live org
-interests (`512`): one provider mutation/expiry must decode each owner
-descriptor at most once per accepted rebuild, must not perform 512 store scans,
-and event-loop progress must occur between 64-interest batches. Timing
-thresholds are recorded as environment-qualified evidence, not universal
+interests (`512`): after ingest, one provider mutation/expiry decodes ZERO old
+descriptors and visits only affected capability buckets; one capability among
+many visits no unrelated interests; route planning and selector filtering happen
+outside the leader lock; doubling downstream consumers does not produce
+quadratic aggregation; and event-loop progress occurs between 64-interest
+batches. Timing thresholds are environment-qualified evidence, not universal
 protocol constants.
 
 **Org reconciliation triggers.** Org leader interests reconcile through the
@@ -385,13 +460,14 @@ EXISTING seed-anchored `reconcile_with_snapshot` (§2), fed a FRESH immutable
 per-capability org candidate snapshot, when:
 
 1. **`private_discovery_owner` generation moves** (new/updated/expired
-   owner-scope record) — wake-driven and coalesced; rebuild the owner index once,
-   diff immutable per-capability rows, and reconcile only changed capabilities;
+   owner-scope record) — wake-driven and coalesced; consume its affected
+   capability IDs and rebuild only demanded dirty buckets (or all only on the
+   bounded overflow sentinel);
 2. **Revocation floor rises** — use another `subscribe_floors_raised`
-   subscription (`org_revocation.rs:1464-1494`; the registry supports multiple
-   observers — today's node subscription retracts plaintext-fold ownership,
-   `mesh.rs:8614-8642`). First slice decision: coarsely reproject every standing
-   org interest through one rebuilt index; interest count is node-bounded;
+   subscription. Use provider→declarations reverse indexing to dirty only
+   capabilities of providers made stale. If the event lacks provider identity,
+   compare indexed provider generations against one fresh floor snapshot without
+   descriptor decode; never blindly rescan/redecode every descriptor;
 3. **`org_install_generation` moves** (authority/store install, removal, or
    rotation, `mesh.rs:1072`) — reproject ALL org interests through a fresh
    authority snapshot. If capture fails or the installed owner org differs
@@ -407,29 +483,41 @@ per-capability org candidate snapshot, when:
    store, which advances item 1 immediately. The 60 s scoped-GC tick remains a
    retention backstop and needs no separate candidate trigger.
 
-**Race discipline.** Projection-apply follows the same publish-if-current
-shape the LB plan freezes (`:743-753`) and the L1 linearization enforced for
-the consumer plane:
+**Race and transaction discipline.** Reconciliation becomes plan/apply, not the
+current heavy `reconcile_with_snapshot` call under one global leader mutex:
 
 ```text
-capture fresh authority snapshot +
-(owner revision, org-interest population generation,
- peer-session generation, routing/proximity generation)
-→ verify snapshot.owner_org == retained seed org
-→ build/reuse owner index and capability projection off-lock
-→ acquire the leader mutation guard
-→ recapture current authority stamp + complete source vector
-→ any source moved: discard and enqueue one coalesced trailing rebuild
-→ otherwise reconcile_with_snapshot before releasing the guard
+capture fresh authority + complete source vector
+→ short leader lock: snapshot dirty interest metadata + versions
+→ build OrgCapabilityCandidates and LeaderReconcilePlan off-lock
+→ acquire sensing_interest_table
+→ perform final C4 authority-currentness check
+   (preserves established sensing_interest_table → org_install order)
+→ acquire sensing_leader LAST
+→ recapture interest versions + complete source vector
+→ stale: mutate nothing; release; enqueue one trailing rebuild
+→ current: atomically apply leader deltas and corresponding mesh Leader rows
+→ release sensing_leader before ordinary observation/emitter/send consequences
+→ release table and run deferred consequences
 ```
 
-An authority-unavailable/foreign-owner rebuild uses an empty projection and
-withdraws branches rather than preserving stale private state. No new lock is
-introduced; the reconciler acquires the leader slot, then existing mesh-table
-paths retain the frozen lock order. The implementation plan must list the
-exact acquisition order after source inspection and include a deterministic
-`try_lock() == None` contention witness if it introduces any new nested
-critical section.
+This establishes the additional order
+`sensing_interest_table → org_install/currentness → sensing_leader`; no path may
+hold `sensing_leader` while waiting for the mesh table. The apply phase contains
+no decode, graph search, selector work, sort, or network I/O. It is all-or-none:
+mesh-row refusal or leader-row refusal rolls back every change made by that plan
+before either guard is released, and no partial interest/branch survives.
+Equivalently, implementation may preflight then use an infallible commit, but it
+may not commit leader demand first and discover table failure later. Authority
+movement after the C4 linearization point is handled by the subscribed
+reconciler, as in the signed provider path; authority stale BEFORE it never
+commits.
+
+Initial intake uses the SAME transaction shape after its cold projection. Thus
+`register_admitted_capability_interest` and mesh Leader-row registration either
+both commit under the admitted stamp or neither does. A deterministic lock-order
+witness must hold the table guard, observe a competing apply blocked there, and
+prove it holds no leader guard while blocked.
 
 ## 7. Leader intake wiring plan (LATER slice — not part of the substrate build)
 
@@ -442,10 +530,12 @@ not.
 OrgCapabilityRegistration frame
   → admit_org_registration            (gate + pinned snapshot; consumer binding)
   → project_org_candidates            (SAME pinned floors; §3)
-  → register_admitted_capability_interest   (sealed intake; §2 seed anchoring)
-  → mesh Leader-row registration      (C4-style recheck under the held table
-                                       guard; Org+Some(snapshot) exhaustive
-                                       binding, as apply_provider_registration)
+  → resolve_org_candidates            (org-only; explicit Node must intersect)
+  → prepare admitted leader/table transaction
+                                      (sealed seed; no mutation yet)
+  → C4 recheck + atomic apply          (table → org currentness → leader;
+                                       Org+Some(snapshot) exhaustive binding;
+                                       all-or-none rollback)
   → refusal counters                  (AuthorityMismatch/AdmittedLegMismatch →
                                        protocol_invalid; SelectorTooBroad →
                                        broad_selector_refusals; gate reasons →
@@ -457,36 +547,40 @@ OrgCapabilityRegistration frame
                                        capture ONLY in the lighting slice)
 ```
 
-Warm starts, leader deliveries, refusal partitioning, and the sweep are
-unchanged — they are authority-agnostic post-§2.
+Warm starts, leader deliveries, refusal partitioning, and sweep semantics remain
+authority-agnostic after §2, but LS-4 MUST route reconciliation through the new
+indexed plan/apply transaction rather than the current under-lock
+`reconcile_with_snapshot` implementation.
 
 ## 8. Witness matrix (RED-coupled per house rules)
 
-**Shared private-discovery revision/performance slice:**
+**Shared indexed-discovery/performance slice:**
 
-- Owner `Inserted`, `Updated`, and live→tombstone sweep each advance BOTH global
-  and owner revisions and emit a coalescible node wake; Grant mutations advance
-  only global;
-- `Stale`, refused input, and tombstone-only forgetting advance neither;
+- Owner `Inserted`, `Updated`, and live→tombstone sweep atomically update store,
+  sidecar buckets, reverse declarations, counts, expiry, BOTH revisions, and
+  owner/global dirty IDs; Grant mutations update only global revision/dirty IDs;
+- `Stale`, refused input, and tombstone-only forgetting mutate none of them;
+  update dirties the union of old/new declarations;
 - an ingest-internal sweep that removes a visible row and still returns
-  `AtCapacity` advances the correct revision(s) (RED for wrapper-only outcome
-  switching);
-- ingest, exact-expiry timer, and 60 s sweep have no direct mutation path that
-  bypasses the node publication helper;
-- exact expiry removes candidate visibility at the deadline, not up to 60 s
-  later; one timer covers the node and rearms to the next deadline;
-- 1024 Owner rows × 512 live org interests: one accepted owner rebuild decodes
-  each row at most once, does not run 512 store scans, publishes only if its
-  complete source vector is current, and yields every 64 reconciliations;
-- grant-only churn does not rebuild the owner index;
-- equivalent selectors for one capability share one immutable candidate
-  snapshot; the owner index contains only currently demanded capability IDs and
-  stays at or below the 512-interest cap even when descriptors name unrelated
-  capabilities; interest-population movement invalidates stale builds;
-  bounded partial selection is provider-for-provider equivalent to the current
-  full sort and never exceeds the existing fanout/Each bounds;
-- session loss/gain and route/proximity movement invalidate reachability/ranking
-  through the same single-flight/trailing-pass discipline.
+  `AtCapacity` publishes the exact removal delta; no ingest/timer/60 s sweep path
+  bypasses `ScopedDiscoveryState`;
+- exact expiry removes candidate visibility and its index entries at the
+  deadline, not up to 60 s later; one node timer rearms to the next deadline;
+- with 1,024 Owner rows and one matching provider, an indexed query visits only
+  that capability bucket and performs ZERO descriptor decodes after ingest;
+  pausing route/tag/candidate planning does not block concurrent scoped ingest;
+- a Grant-only mutation causes zero owner projection builds; a floor raise
+  dirties only capabilities declared by providers made stale (or uses one
+  no-decode indexed comparison when the event lacks provider identity);
+- many selectors for one capability share one route-ranked snapshot and one
+  batched route-distance computation; reconciliation does no per-interest sort;
+- reconciling one capability visits no unrelated interests; downstream demand
+  aggregation is hash-based rather than quadratic; pausing off-lock planning
+  does not hold `sensing_leader`;
+- 1,000 wakes for one capability leave one active pass and at most one trailing
+  retry; 64 dirty capabilities keep task count constant; shutdown cancels the
+  actor/timer and emits no post-drop work; sustained churn yields between
+  64-interest batches.
 
 **Dark leader-substrate slice:**
 
@@ -495,22 +589,25 @@ unchanged — they are authority-agnostic post-§2.
 - `node_id` equals `EntityId::node_id()` derivation; a direct peer counts as
   reachable only when its pinned EntityId equals the scoped record's provider;
   an address/bare NodeId/mismatching pin never supplies the reverse mapping;
-- tags carry `asserted_by == canonical_org_sensing_commitment(org)` (RED:
-  legacy/entity root), using the shared tag mapper;
+- org projections emit no tags/groups in v1; provider-signed descriptor tags are
+  never relabeled as organization assertions; `Tags`/`Group` normalize to empty;
 - `authorized` is never false in projection output;
-- org `Node(id)` outside the projection creates no branch, returns only the
-  existing `AllBranchesRefused`, and retains no immortal rowless interest; a
-  later consumer soft-state refresh can resolve after discovery (RED: legacy
-  short-circuit opens the named branch, typed refusal adds a distinguishable
-  authorization claim);
-- `Nodes` intersects; org Tags resolution composes with the §2 witness;
-  unsupported `Group` also normalizes to empty resolution /
-  `AllBranchesRefused` with no new refusal type;
+- production org intake and standing reconciliation BOTH use
+  `resolve_org_candidates`: org `Node(id)` outside the projection creates no
+  branch, returns only existing `AllBranchesRefused`, and retains no immortal
+  rowless interest (RED: legacy short-circuit opens the named branch); `Nodes`
+  intersects with the same projection;
 - the local/self provider is absent in v1 and yields no branch;
 - floor raise → fresh snapshot → revoked provider's branches torn down
   (production-coupled through `subscribe_floors_raised`);
-- new ingest → generation bump → under-filled active set fills through
-  `reconcile_with_snapshot`;
+- new ingest → dirty capability → under-filled active set fills through the
+  indexed off-lock plan/apply path;
+- an interest/source mutation between plan and apply discards the stale plan and
+  coalesces one retry; a mesh-table or leader-row refusal leaves neither a
+  partial leader interest/branch nor a partial mesh Leader row;
+- the lock-order witness blocks an apply on `sensing_interest_table` and proves
+  the blocked path holds no `sensing_leader` guard; consequence processing starts
+  only after that leader guard is released;
 - authority removal, poison, or owner-org rotation reconciles empty and
   withdraws existing branches — no stale projection and no legacy fallback;
 - publish-if-current: a projection captured before concurrent private-store or
@@ -531,33 +628,36 @@ The plans merge by dependency, not by milestone concatenation:
 SIGNED COMMON BASE
   provider-only org sensing + L1 + §2 lifecycle provenance
 
-SHARED SOURCE SEAMS (build once)
-  scoped-store global + owner revisions/watch + exact-expiry timer
-  peer-session + routing/proximity generations/watch
+SHARED INDEXED-DISCOVERY/SOURCE SLICE (build once, by whichever reaches it first)
+  transactional scoped-capability index + reverse declarations/counts
+  global + owner revisions/dirty IDs + exact-expiry timer
+  node dirty actor + peer-session/routing/proximity generations
        ├─────────────────────────────────────────┐
        │                                         │
 EXACT-PROVIDER OLB TRACK                   PROVIDER-FREE LEADER TRACK
-  OLB-1 candidate factoring                 LS-1 immutable owner index
-  OLB-2 route sets consume global sources   LS-2 cached capability projection
-  OLB-3 P2C                                 LS-3 org selector intersection
-  OLB-4 invocation/error closure            LS-4 batched dark reconciliation
+  OLB-1 candidate factoring                 LS-1 owner/capability snapshots
+  OLB-2 node-shared base facts/routes        LS-2 org-only selector resolver
+  OLB-3 P2C                                 LS-3 indexed off-lock leader planner
+  OLB-4 invocation/error closure            LS-4 atomic dark leader/table apply
   OLB-5 private-pool proof                  LS-5 production-coupled dark proof
                                              LS-6 separate arm lighting review
 ```
 
 Rules:
 
-1. OLB-1 does not wait for shared source seams. OLB-2 either lands them first or
-   consumes them if the leader track landed them already.
-2. OLB never consumes the owner index/capability projection, `SensingLeader`,
-   provider-free leases, or `OrgCapabilityRegistration`.
-3. The leader track never consumes `AuthorizedOrgCandidate`, `OrgRoutingState`,
-   `OrgRouteSet`, P2C, or invocation authority.
-4. `EntityId::node_id()` and the generic source generations are shared facts,
-   not shared candidate objects. Each track retains its own narrow projection.
-5. Whichever track lands the source seams first must run the mutation, expiry,
-   coalescing, and stale-build witnesses and expose the stable watch source for
-   the other.
+1. OLB-1 does not wait for the shared indexed-discovery slice. OLB-2 either
+   lands it first or consumes it if the leader track landed it already.
+2. OLB consumes generic predecoded scoped buckets and source deltas, never the
+   leader's authority-filtered owner snapshot, `SensingLeader`, provider-free
+   leases, or `OrgCapabilityRegistration`.
+3. The leader track never consumes `AuthorizedOrgCandidate`, OLB base facts,
+   `OrgRoutingState`, `OrgRouteSet`, P2C, or invocation authority.
+4. The scoped index, `EntityId::node_id()`, and generic source generations are
+   shared storage/routing facts, not shared authorized candidate objects. Each
+   track retains its own authority filtering and narrow projection.
+5. Whichever track lands the shared slice first must run its transaction,
+   index-consistency, expiry, coalescing, lock-scope, and stale-build witnesses
+   and expose the stable internal bucket/source seam to the other.
 6. Completing LS-1..LS-5 still does not authorize arm lighting. LS-6 is a
    separate exact-head review, and global `SAFE_LIVE_HEAD` remains reserved.
 
@@ -570,30 +670,36 @@ Rules:
   grant-visible provider is not an org-sensing candidate).
 - No change to the legacy §4.10 gate, the plaintext fold path, or any live
   legacy behavior; no wire changes.
-- No SDK surface changes. OLB-2 consumes only the shared node-state source
-  seams; it does not consume the leader index or projection.
+- No SDK surface changes. OLB-2 consumes the shared indexed private-discovery
+  buckets/source deltas; it does not consume the leader's owner snapshot,
+  resolver, or lifecycle state.
 - No self-as-candidate projection in v1; same-node provider-free discovery is
   explicitly unsupported rather than claimed to be covered elsewhere.
 - `SAFE_LIVE_HEAD` remains reserved.
 
-## 11. Review decisions (Q1–Q5 resolved)
+## 11. Review decisions (Q1–Q6 resolved)
 
 - **Q1 — explicit selector:** no `ProviderNotAuthorized` or other new refusal.
-  `Node` and `Nodes` intersect with private projection; empty resolution follows
-  existing `AllBranchesRefused`, stores no immortal rowless interest, and the
-  consumer's normal refresh retries later. Unsupported `Group` is normalized
-  the same way.
+  Both initial org intake and reconciliation MUST dispatch to
+  `resolve_org_candidates`; `Node` and `Nodes` intersect with the private
+  projection before leader mutation. Empty resolution follows existing
+  `AllBranchesRefused`, stores no immortal rowless interest, and normal refresh
+  retries later.
 - **Q2 — self candidate:** excluded in v1, documented as unsupported. A future
   self-projection must derive from live local scoped publication plus current
   membership; exact-provider sensing is not a discovery substitute.
-- **Q3 — floor raise:** one off-lock owner-index rebuild, then coarse batched
-  reprojection of all node-bounded standing org interests. Per-capability row
-  diffing handles ordinary discovery movement; add a retained interest reverse
-  index only if measurements justify it.
-- **Q4 — generation ownership:** store-owned global + owner visible-set
-  revisions, node-owned published watch plus one exact-expiry timer. Generic
-  session/topology source generations are shared with OLB. All mutations flow
-  through one node helper.
-- **Q5 — module placement:** `sensing/org_candidates.rs`; keep scoped storage
-  generic. Extract the legacy tag mapper for shared snapshot construction rather
-  than duplicating it.
+- **Q3 — floor/store movement:** maintain predecoded capability buckets and
+  provider→declarations reverse indexing. Dirty only affected demanded
+  capabilities; use `RebuildAll` solely as bounded overflow/authority fallback,
+  never as the ordinary mutation path.
+- **Q4 — generation ownership:** `ScopedDiscoveryState` owns atomic store/index
+  mutation, global + owner visible-set revisions, dirty IDs, counts, and expiry;
+  the node owns publication, one exact-expiry timer, and one dirty-work actor.
+  Generic session/topology generations are shared with OLB.
+- **Q5 — module placement:** generic predecoded storage index beside
+  `org_scoped_store`; authority-safe owner projection/resolver in
+  `sensing/org_candidates.rs`; off-lock plan/apply indexes inside
+  `SensingLeader`. No public discovery or SDK surface.
+- **Q6 — tags:** unsupported/empty in org v1. Provider membership/signature does
+  not elevate provider-authored descriptor tags into org-root assertions. Tags
+  require a future explicit org-signed/delegated proof surface.
