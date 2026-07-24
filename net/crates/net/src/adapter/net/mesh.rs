@@ -5155,90 +5155,6 @@ async fn run_exact_expiry_timer(
     }
 }
 
-/// Which private-discovery change stream a [`PrivateDiscoveryDrain`] owns
-/// (OLB-2A.3.2). The global stream carries every private partition (owner or
-/// grant); the owner stream carries the owner partition only.
-///
-/// The variants are constructed only through [`PrivateDiscoveryDrains::mint`],
-/// which is consumerless until the OLB-2B reconciler; `#[allow(dead_code)]` while
-/// so (Kyra OLB-2A closure).
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PrivateDiscoveryStream {
-    Global,
-    Owner,
-}
-
-/// The single, EXCLUSIVE drain of one private-discovery change stream
-/// (OLB-2A.3.2 part 2).
-///
-/// A drain is DESTRUCTIVE — `take_global_change_batch` / `take_owner_change_batch`
-/// leave the stream `Clean` — so two independent drainers would each observe only
-/// PART of the deltas and silently lose the rest. This handle is minted MINT-ONCE
-/// per stream ([`PrivateDiscoveryDrains::mint`]), so a second consumer of the same
-/// stream is unrepresentable: the node-owned reconciler is the one owner.
-///
-/// Consumerless until the OLB-2B reconciler owns it; `#[allow(dead_code)]` while so
-/// (consumerless seams are acceptable while consumerless — Kyra OLB-2A closure).
-#[allow(dead_code)]
-pub(crate) struct PrivateDiscoveryDrain {
-    state: Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
-    stream: PrivateDiscoveryStream,
-}
-
-impl PrivateDiscoveryDrain {
-    /// Atomically drain this stream's `(generation, dirty)` since the last drain,
-    /// leaving it `Clean`. One locked capture, so a consumer never checkpoints a
-    /// generation and separately misses a delta (Kyra OLB-2A.2).
-    #[allow(dead_code)]
-    fn drain(&mut self) -> super::behavior::org_scoped_store::PrivateDiscoveryChangeBatch {
-        let mut state = self.state.lock();
-        match self.stream {
-            PrivateDiscoveryStream::Global => state.take_global_change_batch(),
-            PrivateDiscoveryStream::Owner => state.take_owner_change_batch(),
-        }
-    }
-}
-
-/// Node-owned mint for the private-discovery change-stream drains (OLB-2A.3.2
-/// part 2): each stream's single exclusive [`PrivateDiscoveryDrain`] is handed out
-/// AT MOST ONCE, so the destructive drains have exactly one owner by construction.
-/// Held once per node, so there is one mint node-wide.
-struct PrivateDiscoveryDrains {
-    state: Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
-    global_minted: AtomicBool,
-    owner_minted: AtomicBool,
-}
-
-impl PrivateDiscoveryDrains {
-    fn new(
-        state: Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
-    ) -> Self {
-        Self {
-            state,
-            global_minted: AtomicBool::new(false),
-            owner_minted: AtomicBool::new(false),
-        }
-    }
-
-    /// Mint `stream`'s exclusive drain, or `None` if it was already minted. The
-    /// two streams mint independently.
-    #[allow(dead_code)]
-    fn mint(&self, stream: PrivateDiscoveryStream) -> Option<PrivateDiscoveryDrain> {
-        let minted = match stream {
-            PrivateDiscoveryStream::Global => &self.global_minted,
-            PrivateDiscoveryStream::Owner => &self.owner_minted,
-        };
-        if minted.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        Some(PrivateDiscoveryDrain {
-            state: self.state.clone(),
-            stream,
-        })
-    }
-}
-
 /// Multi-peer mesh node.
 ///
 /// Composes `NetSession` (per-peer encryption), `NetRouter` (forwarding),
@@ -5434,11 +5350,6 @@ pub struct MeshNode {
     /// and can never regress (Kyra OLB-2A.3.1 closure). The owner generation and
     /// the dirty deltas are read from the state on wake.
     scoped_publication: Arc<ScopedMutationPublication>,
-    /// OLB-2A.3.2: the node's single mint for the private-discovery change-stream
-    /// drains. Each stream's destructive drain is handed out at most once, so the
-    /// OLB-2B reconciler that owns it cannot be duplicated into two drainers that
-    /// split the deltas. One mint per node.
-    private_discovery_drains: Arc<PrivateDiscoveryDrains>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. Shared across the inbound dispatch so a flooded envelope is
     /// forwarded at most once per node; never decrypts or stores anything.
@@ -6879,11 +6790,6 @@ impl MeshNode {
         // forget to. Inbound peer announcements never touch these
         // registries, so the signal is echo-safe by construction.
         let local_caps_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
-        // Hoisted so the private-discovery drains share the ONE scoped-discovery
-        // state the ingest path and exact-expiry timer mutate.
-        let scoped_discovery = Arc::new(parking_lot::Mutex::new(
-            super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
-        ));
 
         let node = Self {
             identity: Arc::new(identity),
@@ -6926,10 +6832,9 @@ impl MeshNode {
             migration_handler: Arc::new(ArcSwapOption::empty()),
             org_revocation: Arc::new(ArcSwapOption::empty()),
             node_authority: Arc::new(ArcSwapOption::empty()),
-            private_discovery_drains: Arc::new(PrivateDiscoveryDrains::new(
-                scoped_discovery.clone(),
+            scoped_discovery: Arc::new(parking_lot::Mutex::new(
+                super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
             )),
-            scoped_discovery,
             scoped_publication: Arc::new(ScopedMutationPublication::new()),
             scoped_relay_gate: Arc::new(
                 super::behavior::org_scoped_relay::ScopedAnnRelayGate::new(),
@@ -10532,22 +10437,7 @@ impl MeshNode {
     // of each stream. They live on `ScopedDiscoveryState` as the crate-internal
     // atomic `take_global_change_batch` / `take_owner_change_batch`, which capture
     // the generation and the delta under one lock; the read-only
-    // `private_discovery_generation` polls above remain safe to expose. Access to
-    // them is now behind the mint-once `PrivateDiscoveryDrain` below.
-
-    /// Mint the single EXCLUSIVE drain of a private-discovery change stream
-    /// (OLB-2A.3.2), or `None` if this node already minted it. Because a drain is
-    /// destructive, minting is once-per-stream: the OLB-2B reconciler that owns a
-    /// stream cannot be duplicated into two drainers that split the deltas.
-    /// Consumerless until that reconciler lands (`#[allow(dead_code)]` while so —
-    /// Kyra OLB-2A closure).
-    #[allow(dead_code)]
-    pub(crate) fn mint_private_discovery_drain(
-        &self,
-        stream: PrivateDiscoveryStream,
-    ) -> Option<PrivateDiscoveryDrain> {
-        self.private_discovery_drains.mint(stream)
-    }
+    // `private_discovery_generation` polls above remain safe to expose.
 
     /// Test seam (OA3 closure witness): advance the visibility generation as a
     /// concurrent registration would, so a send fired after a visibility change
@@ -32518,106 +32408,5 @@ mod exact_expiry_timer_tests {
         );
         assert_eq!(h.state.lock().next_visible_expiry(), None);
         h.stop().await;
-    }
-}
-
-/// OLB-2A.3.2 part 2: each private-discovery change stream's destructive drain is
-/// minted once, so a second consumer of a stream is unrepresentable, and a minted
-/// drain drains exactly its own stream.
-#[cfg(all(test, feature = "fixtures"))]
-mod private_discovery_drain_tests {
-    use super::{PrivateDiscoveryDrains, PrivateDiscoveryStream};
-    use crate::adapter::net::behavior::capability::CapabilitySet;
-    use crate::adapter::net::behavior::org::OrgId;
-    use crate::adapter::net::behavior::org_grant::CapabilityAuthorityId;
-    use crate::adapter::net::behavior::org_scoped_ingest::{
-        CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
-    };
-    use crate::adapter::net::behavior::org_scoped_store::{
-        DirtyCapabilities, ScopedDiscoveryState,
-    };
-    use crate::adapter::net::identity::EntityId;
-    use std::sync::Arc;
-
-    fn owner(seed: u8, tag: &str) -> PreparedScopedCapability {
-        let descriptor = CapabilitySet::new().add_tag(tag).to_bytes_compact();
-        PreparedScopedCapability::prepare(VerifiedScopedCapability::for_test(
-            CapabilityAudienceScope::Owner {
-                org_id: OrgId::from_bytes([1u8; 32]),
-                audience_handle: [0x11u8; 32],
-            },
-            EntityId::from_bytes([seed; 32]),
-            OrgId::from_bytes([1u8; 32]),
-            1,
-            10_000,
-            5,
-            None,
-            descriptor,
-        ))
-    }
-
-    /// Each stream mints exactly once; a second mint of the same stream is `None`,
-    /// and the two streams mint independently.
-    #[test]
-    fn each_stream_mints_its_drain_exactly_once() {
-        let state = Arc::new(parking_lot::Mutex::new(ScopedDiscoveryState::new()));
-        let drains = PrivateDiscoveryDrains::new(state);
-
-        assert!(
-            drains.mint(PrivateDiscoveryStream::Global).is_some(),
-            "first global mint succeeds"
-        );
-        assert!(
-            drains.mint(PrivateDiscoveryStream::Global).is_none(),
-            "second global mint is refused"
-        );
-        assert!(
-            drains.mint(PrivateDiscoveryStream::Owner).is_some(),
-            "the owner stream mints independently"
-        );
-        assert!(
-            drains.mint(PrivateDiscoveryStream::Owner).is_none(),
-            "second owner mint is refused"
-        );
-    }
-
-    /// A minted drain drains ITS stream: an owner ingest dirties both streams, so
-    /// the global drain and the owner drain each report the capability and leave
-    /// their own stream clean. Draining global does not clean owner (they are
-    /// independent), which pins the drain's stream routing.
-    #[test]
-    fn a_minted_drain_drains_its_own_stream() {
-        let state = Arc::new(parking_lot::Mutex::new(ScopedDiscoveryState::new()));
-        state.lock().ingest(owner(3, "nrpc:a"), 0);
-        let drains = PrivateDiscoveryDrains::new(state);
-        let expected = DirtyCapabilities::Caps(
-            [CapabilityAuthorityId::for_tag("nrpc:a")]
-                .into_iter()
-                .collect(),
-        );
-
-        let mut global = drains
-            .mint(PrivateDiscoveryStream::Global)
-            .expect("global drain");
-        assert_eq!(
-            global.drain().dirty,
-            expected,
-            "the global drain reports the dirtied capability"
-        );
-        assert_eq!(
-            global.drain().dirty,
-            DirtyCapabilities::Clean,
-            "and leaves the global stream clean"
-        );
-
-        // The owner stream was untouched by the global drain.
-        let mut owner_drain = drains
-            .mint(PrivateDiscoveryStream::Owner)
-            .expect("owner drain");
-        assert_eq!(
-            owner_drain.drain().dirty,
-            expected,
-            "the owner drain reports its own stream's delta"
-        );
     }
 }

@@ -76,14 +76,9 @@ sweeps at it through the gated commit (so consumers wake), and re-arms to any
 earlier deadline a mutation introduces via the same change watch — reads stay
 expiry-safe (`now < expires_at` at query time), so this is promptness/wake, not a
 correctness boundary, and the 60 s GC remains a retention backstop for inert
-records that advance no generation; (part 2, landed) single-consumer ownership of
-each dirty stream — a node-owned mint hands out each stream's DESTRUCTIVE drain
-(`PrivateDiscoveryDrain`, routing to `take_global_change_batch` /
-`take_owner_change_batch`) at most ONCE, so the OLB-2B reconciler that owns a
-stream cannot be duplicated into two drainers that split the deltas; consumerless
-(and so `#[allow(dead_code)]`) until that reconciler lands. **2A.3.3** adds
-floor-raise dirtying via `subscribe_floors_raised` through the reverse-declaration
-index. All of OLB-2A.3 must land and be reviewed
+records that advance no generation; (part 2) single-consumer ownership of each
+dirty stream. **2A.3.3** adds floor-raise dirtying via `subscribe_floors_raised`
+through the reverse-declaration index. All of OLB-2A.3 must land and be reviewed
 before any reconciler consumes this source. **OLB-2A.4** (named, not dropped): replace the store's
 `entries_in_scope` scan with maintained per-scope counts before the generic
 indexed substrate is called complete. This substrate is shared with the
