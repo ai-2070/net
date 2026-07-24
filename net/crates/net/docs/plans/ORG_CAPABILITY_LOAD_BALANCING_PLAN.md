@@ -35,15 +35,21 @@ lifecycle entry condition is signed at
 **`LEADER_ENTRY_CONDITION_HEAD = f2c82e467`**.
 
 These closures complete the practical Option-A OLB-0 substrate. **OLB-1
-candidate factoring has landed** (behavior-preserving: `call.rs` now derives an
-internal `AuthorizedOrgCandidate` set — provider, provider owner org, authority
-`Mode`, direct reachability, capability — via `OrgClient::authorized_candidates`,
-and `plan`/`intent_for` compose over it; nothing re-exported). The existing S1
-authority/selection witnesses stay green and a new direct-preference witness
-covers the reachability flag now riding the candidate. The **required bounded
-stop-and-review is the next gate**; OLB-2 has not started and must not begin
-until that review signs off. The separate owner-private
-provider-free leader design lives in
+candidate factoring is SIGNED** at `OLB1_SIGNED_HEAD = 4dccb7767`
+(behavior-preserving `AuthorizedOrgCandidate` factoring in `call.rs`, with direct
+reachability sampled in sorted order to preserve the pre-factoring selection).
+The mandatory bounded stop-and-review passed, so **OLB-2 is authorized and its
+first slice, OLB-2A, is landing** — the GENERIC transactional indexed
+private-discovery substrate: `ScopedDiscoveryState` wraps `ScopedDiscoveryStore`
+with a capability sidecar index (predecode the `CapabilitySet` once at ingest;
+`by_scope_capability` / `declarations_by_record` reverse indexes; per-scope live
+counts), so the owner-plane capability query is an indexed bucket lookup with NO
+per-record descriptor decode, and `ingest`/`sweep_expired` return the visible-set
+delta the index consumes in one transaction. Global/owner revisions, bounded
+affected-capability deltas, and the exact-expiry source are the next sub-slice
+(OLB-2A.2). This substrate is shared with the provider-free leader track but
+carries no authority-filtered candidate or lifecycle state. The separate
+owner-private provider-free leader design lives in
 [`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md).
 It is NOT an OLB-1..OLB-5 prerequisite and remains unauthorized for build. The
 plans share only the transactional indexed private-discovery storage/source

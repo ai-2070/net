@@ -557,24 +557,34 @@ fn verify_granted_ingest(
 /// grant is a [`ScopedIngestError::DescriptorOutsideGrant`]. Canonicity is
 /// enforced by requiring the descriptor to equal its own re-encoding, so a
 /// non-canonical framing cannot slip a second logical form past the shape check.
-/// Whether an OWNER descriptor declares `capability` among its tags (OSDK S1).
+/// Decode the full set of capability-authority ids a stored OWNER descriptor
+/// declares, ONCE, so the scoped-discovery index (OLB-2A) can bucket a record by
+/// capability at ingest instead of re-decoding the descriptor on every
+/// owner-plane query.
 ///
-/// Unlike the granted case below, an owner envelope legitimately carries EVERY
-/// owner-scoped tag its provider serves, so a stored owner record is not by
-/// itself an answer about one capability — the query decodes the descriptor and
-/// asks. Read-only over already-ingest-verified bytes: a descriptor that fails
-/// to decode simply declares nothing (it can no longer be a security decision,
-/// having already passed ingest).
-pub(crate) fn descriptor_declares_capability(
-    descriptor: &[u8],
-    capability: &CapabilityAuthorityId,
-) -> bool {
+/// An owner envelope legitimately carries EVERY owner-scoped tag its provider
+/// serves, so a stored owner record is not by itself an answer about one
+/// capability — the descriptor must be decoded and each tag mapped to its
+/// capability-authority id. This is the exact
+/// [`CapabilitySet::from_bytes`] decode and per-tag
+/// [`CapabilityAuthorityId::for_tag`] derivation the owner-plane query performed
+/// per record before OLB-2A, so an indexed bucket lookup admits precisely the
+/// records a per-query descriptor decode would have. Read-only over
+/// already-ingest-verified bytes: a descriptor that fails to decode declares
+/// nothing (owner descriptors are not validated for decodability at ingest —
+/// only granted descriptors are — so this is a "declares nothing" fallback,
+/// never a security decision). The result is deduplicated and returned in a
+/// stable order.
+pub(crate) fn decode_declared_capabilities(descriptor: &[u8]) -> Vec<CapabilityAuthorityId> {
     let Some(caps) = CapabilitySet::from_bytes(descriptor) else {
-        return false;
+        return Vec::new();
     };
     caps.tags
         .iter()
-        .any(|tag| &CapabilityAuthorityId::for_tag(&tag.to_string()) == capability)
+        .map(|tag| CapabilityAuthorityId::for_tag(&tag.to_string()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn descriptor_binds_grant_capability(

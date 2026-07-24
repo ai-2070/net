@@ -20,9 +20,11 @@
 //! layer never decrypts or verifies — it only stores, freshness-orders, expires,
 //! and partitions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use super::org::OrgId;
+use super::org_grant::CapabilityAuthorityId;
 use super::org_revocation::OrgRevocationState;
 use super::org_scoped_ingest::{CapabilityAudienceScope, VerifiedScopedCapability};
 use crate::adapter::net::identity::EntityId;
@@ -87,6 +89,30 @@ pub enum ScopedStoreOutcome {
     /// already-known keys are always permitted, and the provider is re-admitted
     /// once a horizon-passed entry frees a slot.
     AtCapacity,
+}
+
+/// A stored `(scope, provider)` key.
+type ScopedKey = (CapabilityAudienceScope, EntityId);
+
+/// The visible-set change an [`ScopedDiscoveryStore::ingest`] produced, so the
+/// indexed [`ScopedDiscoveryState`] layer can update its sidecar index in the
+/// SAME transaction as the store mutation.
+///
+/// `swept_live` matters because the fail-closed cardinality guard runs an
+/// INTERNAL horizon sweep before refusing a new key: that sweep can demote a
+/// live record to a tombstone even when the final `outcome` is
+/// [`ScopedStoreOutcome::AtCapacity`], and such a record must leave the index
+/// too (the wrapper-only hole the plan flags). The accepted key itself is not
+/// listed — the caller already holds the incoming record and derives it from
+/// `outcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedIngestReport {
+    /// What the store did with the incoming record.
+    pub outcome: ScopedStoreOutcome,
+    /// `(scope, provider)` keys whose LIVE capability the ingest's internal
+    /// capacity sweep demoted out of the live set. Empty unless the cardinality
+    /// guard ran.
+    pub swept_live: Vec<ScopedKey>,
 }
 
 /// One stored scoped capability plus the freshness/expiry it is ordered by. When
@@ -167,9 +193,12 @@ impl ScopedDiscoveryStore {
         &mut self,
         capability: VerifiedScopedCapability,
         now_secs: u64,
-    ) -> ScopedStoreOutcome {
+    ) -> ScopedIngestReport {
         if matches!(capability.scope(), CapabilityAudienceScope::Public) {
-            return ScopedStoreOutcome::RejectedPublic;
+            return ScopedIngestReport {
+                outcome: ScopedStoreOutcome::RejectedPublic,
+                swept_live: Vec::new(),
+            };
         }
         let key = (capability.scope().clone(), capability.provider().clone());
         let generation = capability.generation();
@@ -178,7 +207,10 @@ impl ScopedDiscoveryStore {
             // An older-or-equal generation is Stale even against a TOMBSTONE — the
             // retained high-water blocks reviving a key with a rolled-back
             // generation after a newer one was seen (and swept).
-            Some(existing) if generation <= existing.generation => ScopedStoreOutcome::Stale,
+            Some(existing) if generation <= existing.generation => ScopedIngestReport {
+                outcome: ScopedStoreOutcome::Stale,
+                swept_live: Vec::new(),
+            },
             Some(existing) => {
                 // Newer generation: (re)populate the entry and extend the
                 // tombstone watermark to the max expiry ever seen, so a later
@@ -187,7 +219,10 @@ impl ScopedDiscoveryStore {
                 existing.expires_at = expires_at;
                 existing.tombstone_until = existing.tombstone_until.max(expires_at);
                 existing.capability = Some(capability);
-                ScopedStoreOutcome::Updated
+                ScopedIngestReport {
+                    outcome: ScopedStoreOutcome::Updated,
+                    swept_live: Vec::new(),
+                }
             }
             None => {
                 // Fail-closed cardinality (Kyra OA3-5): reclaim only
@@ -197,10 +232,18 @@ impl ScopedDiscoveryStore {
                 // store is still full of in-horizon entries, refuse the new key;
                 // the provider is re-admitted once a slot frees. (Updates to
                 // already-known keys, handled above, are never capacity-gated.)
+                //
+                // Each internal sweep surfaces the live records it demoted, so the
+                // indexed layer drops them from its index even when this ingest
+                // ultimately refuses the new key (AtCapacity).
+                let mut swept_live = Vec::new();
                 if self.entries.len() >= Self::MAX_ENTRIES {
-                    self.sweep_expired(now_secs);
+                    swept_live.append(&mut self.sweep_expired(now_secs));
                     if self.entries.len() >= Self::MAX_ENTRIES {
-                        return ScopedStoreOutcome::AtCapacity;
+                        return ScopedIngestReport {
+                            outcome: ScopedStoreOutcome::AtCapacity,
+                            swept_live,
+                        };
                     }
                 }
                 // Per-scope share, checked AFTER the global sweep so a
@@ -209,9 +252,12 @@ impl ScopedDiscoveryStore {
                 // so one audience filling its share can never roll back
                 // another audience's freshness — or its own.
                 if self.entries_in_scope(capability.scope()) >= Self::MAX_ENTRIES_PER_SCOPE {
-                    self.sweep_expired(now_secs);
+                    swept_live.append(&mut self.sweep_expired(now_secs));
                     if self.entries_in_scope(capability.scope()) >= Self::MAX_ENTRIES_PER_SCOPE {
-                        return ScopedStoreOutcome::AtCapacity;
+                        return ScopedIngestReport {
+                            outcome: ScopedStoreOutcome::AtCapacity,
+                            swept_live,
+                        };
                     }
                 }
                 self.entries.insert(
@@ -223,7 +269,10 @@ impl ScopedDiscoveryStore {
                         capability: Some(capability),
                     },
                 );
-                ScopedStoreOutcome::Inserted
+                ScopedIngestReport {
+                    outcome: ScopedStoreOutcome::Inserted,
+                    swept_live,
+                }
             }
         }
     }
@@ -288,18 +337,29 @@ impl ScopedDiscoveryStore {
 
     /// Drop the live capability of each expired entry (leaving a generation
     /// tombstone), and fully forget a key once its tombstone watermark has passed
-    /// (no previously-accepted envelope can still be in-window). Returns how many
-    /// LIVE capabilities were dropped this call.
-    pub fn sweep_expired(&mut self, now_secs: u64) -> usize {
-        let mut swept = 0;
-        self.entries.retain(|_, e| {
+    /// (no previously-accepted envelope can still be in-window). Returns the
+    /// `(scope, provider)` keys whose LIVE capability was dropped this call —
+    /// every key that transitioned out of the live set (whether it became a
+    /// tombstone or was demoted and then forgotten in the same pass), so the
+    /// indexed layer can drop exactly those from its index. Pure tombstone
+    /// garbage collection changes no live record and is not reported.
+    pub fn sweep_expired(&mut self, now_secs: u64) -> Vec<ScopedKey> {
+        let mut swept = Vec::new();
+        self.entries.retain(|key, e| {
             if e.capability.is_some() && now_secs >= e.expires_at {
                 e.capability = None; // live -> tombstone (generation high-water kept)
-                swept += 1;
+                swept.push(key.clone());
             }
             now_secs < e.tombstone_until
         });
         swept
+    }
+
+    /// The LIVE record stored under `key`, if any (tombstones read as absent).
+    /// Lets the indexed [`ScopedDiscoveryState`] apply fresh expiry/floor
+    /// currentness to an index bucket hit without exposing the entry map.
+    fn live_record(&self, key: &ScopedKey) -> Option<&VerifiedScopedCapability> {
+        self.entries.get(key).and_then(|e| e.capability.as_ref())
     }
 
     /// Number of LIVE stored scoped capabilities (tombstones excluded).
@@ -313,6 +373,211 @@ impl ScopedDiscoveryStore {
     /// Whether the store holds no LIVE scoped capabilities.
     pub fn is_empty(&self) -> bool {
         !self.entries.values().any(|e| e.capability.is_some())
+    }
+}
+
+/// A sidecar capability index over the LIVE records in a [`ScopedDiscoveryStore`]
+/// (OLB-2A). It is pure storage acceleration — never authority — so it lets an
+/// owner-plane capability query be an indexed bucket lookup instead of a full
+/// store scan with a per-record descriptor decode. It carries no expiry or floor
+/// state: every query still applies fresh expiry and revocation-floor currentness
+/// to each bucket hit against the store.
+///
+/// It maintains, for the LIVE set only:
+/// - `by_scope_capability`: which providers declare each `(scope, capability)`;
+/// - `declarations_by_record`: what each live `(scope, provider)` declared, so a
+///   record's buckets can be dropped on removal without re-decoding it;
+/// - `live_by_scope`: the live-record count per scope, so the owner query can
+///   enumerate the live owner scopes without scanning the store.
+#[derive(Default)]
+struct ScopedCapabilityIndex {
+    by_scope_capability:
+        BTreeMap<(CapabilityAudienceScope, CapabilityAuthorityId), BTreeSet<EntityId>>,
+    declarations_by_record: BTreeMap<ScopedKey, Arc<[CapabilityAuthorityId]>>,
+    live_by_scope: BTreeMap<CapabilityAudienceScope, usize>,
+}
+
+impl ScopedCapabilityIndex {
+    /// Index a newly LIVE record. The key must not already be indexed — an
+    /// `Updated` record goes through [`Self::replace_record`], which removes the
+    /// old declarations first.
+    fn insert_record(&mut self, key: ScopedKey, cap_ids: Arc<[CapabilityAuthorityId]>) {
+        for cap in cap_ids.iter() {
+            self.by_scope_capability
+                .entry((key.0.clone(), *cap))
+                .or_default()
+                .insert(key.1.clone());
+        }
+        *self.live_by_scope.entry(key.0.clone()).or_default() += 1;
+        self.declarations_by_record.insert(key, cap_ids);
+    }
+
+    /// Drop a record that is no longer live from every structure. A key that was
+    /// never indexed (e.g. a record whose descriptor declared nothing, or a
+    /// tombstone GC that touched no live row) is a no-op.
+    fn remove_record(&mut self, key: &ScopedKey) {
+        let Some(cap_ids) = self.declarations_by_record.remove(key) else {
+            return;
+        };
+        for cap in cap_ids.iter() {
+            let bucket_key = (key.0.clone(), *cap);
+            if let Some(bucket) = self.by_scope_capability.get_mut(&bucket_key) {
+                bucket.remove(&key.1);
+                if bucket.is_empty() {
+                    self.by_scope_capability.remove(&bucket_key);
+                }
+            }
+        }
+        if let Some(count) = self.live_by_scope.get_mut(&key.0) {
+            *count -= 1;
+            if *count == 0 {
+                self.live_by_scope.remove(&key.0);
+            }
+        }
+    }
+
+    /// Re-index an `Updated` record: drop the old declarations, then add the new.
+    fn replace_record(&mut self, key: ScopedKey, cap_ids: Arc<[CapabilityAuthorityId]>) {
+        self.remove_record(&key);
+        self.insert_record(key, cap_ids);
+    }
+}
+
+/// A [`ScopedDiscoveryStore`] plus a transactionally-maintained capability index
+/// (OLB-2A). Every mutation updates the store and the index under one call, so
+/// the index's live membership is always exactly the store's live set, and the
+/// owner-plane capability query is served from the index with no descriptor
+/// decode. The store's storage, cardinality, rollback, and currentness semantics
+/// are unchanged — the index is a downstream mirror, never an authority.
+#[derive(Default)]
+pub struct ScopedDiscoveryState {
+    store: ScopedDiscoveryStore,
+    index: ScopedCapabilityIndex,
+}
+
+impl ScopedDiscoveryState {
+    /// A fresh, empty indexed store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ingest a verified scoped capability, maintaining the index in the SAME
+    /// transaction. `cap_ids` is the record's declared capability-authority set,
+    /// decoded ONCE by the caller before the lock (see
+    /// [`decode_declared_capabilities`](super::org_scoped_ingest::decode_declared_capabilities)).
+    /// The internal capacity sweep's demotions leave the index too, even when the
+    /// outcome is [`ScopedStoreOutcome::AtCapacity`].
+    pub fn ingest(
+        &mut self,
+        capability: VerifiedScopedCapability,
+        cap_ids: Arc<[CapabilityAuthorityId]>,
+        now_secs: u64,
+    ) -> ScopedStoreOutcome {
+        let key = (capability.scope().clone(), capability.provider().clone());
+        let report = self.store.ingest(capability, now_secs);
+        // Demotions from the internal capacity sweep are disjoint from the
+        // incoming key; drop them from the index first.
+        for swept in &report.swept_live {
+            self.index.remove_record(swept);
+        }
+        match report.outcome {
+            ScopedStoreOutcome::Inserted => self.index.insert_record(key, cap_ids),
+            ScopedStoreOutcome::Updated => self.index.replace_record(key, cap_ids),
+            ScopedStoreOutcome::Stale
+            | ScopedStoreOutcome::RejectedPublic
+            | ScopedStoreOutcome::AtCapacity => {}
+        }
+        report.outcome
+    }
+
+    /// Sweep expired records, dropping every demoted key from the index. Returns
+    /// how many LIVE capabilities were dropped this call.
+    pub fn sweep_expired(&mut self, now_secs: u64) -> usize {
+        let removed = self.store.sweep_expired(now_secs);
+        let dropped = removed.len();
+        for key in &removed {
+            self.index.remove_record(key);
+        }
+        dropped
+    }
+
+    /// Owner-scoped private providers declaring `capability` (or every owner
+    /// record when `None`), each paired with its provider entity, freshness-
+    /// filtered.
+    ///
+    /// For a specific capability this is an indexed bucket lookup per live owner
+    /// scope, then a fresh expiry and revocation-floor currentness filter on each
+    /// hit — no descriptor decode, and only the matching bucket is visited. The
+    /// `None` path (a test seam) enumerates every owner record via the store
+    /// scan. Results are ordered deterministically (by scope, then provider).
+    pub fn find_owner_private_providers(
+        &self,
+        capability: Option<&CapabilityAuthorityId>,
+        now_secs: u64,
+        floors: &OrgRevocationState,
+    ) -> Vec<(PrivateCapabilityProvider, EntityId)> {
+        let Some(cap) = capability else {
+            return self
+                .store
+                .find_owner_private_capabilities(now_secs, floors, |_| true)
+                .into_iter()
+                .map(|c| {
+                    (
+                        PrivateCapabilityProvider::from_verified(c),
+                        c.provider().clone(),
+                    )
+                })
+                .collect();
+        };
+        let mut out = Vec::new();
+        for scope in self.index.live_by_scope.keys() {
+            if !matches!(scope, CapabilityAudienceScope::Owner { .. }) {
+                continue;
+            }
+            let Some(providers) = self.index.by_scope_capability.get(&(scope.clone(), *cap)) else {
+                continue;
+            };
+            for provider in providers {
+                let key = (scope.clone(), provider.clone());
+                let Some(rec) = self.store.live_record(&key) else {
+                    continue;
+                };
+                if now_secs < rec.expires_at() && is_current(rec, floors) {
+                    out.push((
+                        PrivateCapabilityProvider::from_verified(rec),
+                        rec.provider().clone(),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Grant-scoped providers under `grant_id`, filtered by `predicate`.
+    /// Delegates to the store scan: the granted plane binds its capability at
+    /// ingest, so it is not capability-indexed here.
+    pub fn find_capabilities_for_grant<F>(
+        &self,
+        grant_id: &[u8; 32],
+        now_secs: u64,
+        floors: &OrgRevocationState,
+        predicate: F,
+    ) -> Vec<&VerifiedScopedCapability>
+    where
+        F: FnMut(&VerifiedScopedCapability) -> bool,
+    {
+        self.store
+            .find_capabilities_for_grant(grant_id, now_secs, floors, predicate)
+    }
+
+    /// Number of LIVE stored scoped capabilities (tombstones excluded).
+    pub fn len(&self) -> usize {
+        self.store.len()
+    }
+
+    /// Whether the store holds no LIVE scoped capabilities.
+    pub fn is_empty(&self) -> bool {
+        self.store.is_empty()
     }
 }
 
@@ -449,7 +714,7 @@ mod tests {
         let cap = ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE;
         for index in 0..cap as u64 {
             assert_eq!(
-                store.ingest(owner_cap_n(index, 1, 10_000), 1),
+                store.ingest(owner_cap_n(index, 1, 10_000), 1).outcome,
                 ScopedStoreOutcome::Inserted
             );
         }
@@ -457,13 +722,13 @@ mod tests {
         // A further DISTINCT provider is refused; nothing is evicted (every entry
         // is in-horizon at now=1, so the fail-closed sweep frees no slot).
         assert_eq!(
-            store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 1),
+            store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 1).outcome,
             ScopedStoreOutcome::AtCapacity
         );
         assert_eq!(store.len(), cap);
         // An UPDATE to an already-known key is never capacity-gated.
         assert_eq!(
-            store.ingest(owner_cap_n(0, 2, 10_000), 1),
+            store.ingest(owner_cap_n(0, 2, 10_000), 1).outcome,
             ScopedStoreOutcome::Updated
         );
         assert_eq!(store.len(), cap);
@@ -492,19 +757,23 @@ mod tests {
         // A hostile grantor fills its entire share.
         for index in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
             assert_eq!(
-                store.ingest(scoped_cap_in(hostile.clone(), index, 1, 10_000), 1),
+                store
+                    .ingest(scoped_cap_in(hostile.clone(), index, 1, 10_000), 1)
+                    .outcome,
                 ScopedStoreOutcome::Inserted
             );
         }
         assert_eq!(
-            store.ingest(scoped_cap_in(hostile.clone(), u64::MAX, 1, 10_000), 1),
+            store
+                .ingest(scoped_cap_in(hostile.clone(), u64::MAX, 1, 10_000), 1)
+                .outcome,
             ScopedStoreOutcome::AtCapacity,
             "the hostile scope must be capped at its own share",
         );
 
         // The owner partition is untouched and still admits.
         assert_eq!(
-            store.ingest(owner_cap_n(0, 1, 10_000), 1),
+            store.ingest(owner_cap_n(0, 1, 10_000), 1).outcome,
             ScopedStoreOutcome::Inserted,
             "a flooded grant scope must not deny owner-scoped discovery",
         );
@@ -514,7 +783,7 @@ mod tests {
             audience_handle: [0x0Du8; 32],
         };
         assert_eq!(
-            store.ingest(scoped_cap_in(other, 0, 1, 10_000), 1),
+            store.ingest(scoped_cap_in(other, 0, 1, 10_000), 1).outcome,
             ScopedStoreOutcome::Inserted,
             "a flooded grant scope must not deny an unrelated grant",
         );
@@ -532,7 +801,7 @@ mod tests {
         let mut store = ScopedDiscoveryStore::new();
         // P (index 0) at generation 2, far-future expiry.
         assert_eq!(
-            store.ingest(owner_cap_n(0, 2, 10_000), 1),
+            store.ingest(owner_cap_n(0, 2, 10_000), 1).outcome,
             ScopedStoreOutcome::Inserted
         );
         // Fill this scope's share with distinct providers. The per-scope cap
@@ -544,13 +813,13 @@ mod tests {
         assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE);
         // A brand-new provider is refused rather than evicting P's high-water.
         assert_eq!(
-            store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 1),
+            store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 1).outcome,
             ScopedStoreOutcome::AtCapacity
         );
         // Replay P at the OLDER generation 1: still Stale — the gen-2 high-water
         // was never evicted under capacity pressure.
         assert_eq!(
-            store.ingest(owner_cap_n(0, 1, 10_000), 1),
+            store.ingest(owner_cap_n(0, 1, 10_000), 1).outcome,
             ScopedStoreOutcome::Stale
         );
     }
@@ -559,21 +828,21 @@ mod tests {
     fn ingest_reports_insert_update_and_stale() {
         let mut store = ScopedDiscoveryStore::new();
         assert_eq!(
-            store.ingest(owner_cap(3, 1, 1000), 0),
+            store.ingest(owner_cap(3, 1, 1000), 0).outcome,
             ScopedStoreOutcome::Inserted
         );
         // Newer generation for the same (scope, provider) updates.
         assert_eq!(
-            store.ingest(owner_cap(3, 2, 1000), 0),
+            store.ingest(owner_cap(3, 2, 1000), 0).outcome,
             ScopedStoreOutcome::Updated
         );
         // Older-or-equal generation is stale and ignored.
         assert_eq!(
-            store.ingest(owner_cap(3, 2, 1000), 0),
+            store.ingest(owner_cap(3, 2, 1000), 0).outcome,
             ScopedStoreOutcome::Stale
         );
         assert_eq!(
-            store.ingest(owner_cap(3, 1, 1000), 0),
+            store.ingest(owner_cap(3, 1, 1000), 0).outcome,
             ScopedStoreOutcome::Stale
         );
         assert_eq!(store.len(), 1);
@@ -592,7 +861,10 @@ mod tests {
             None,
             b"x".to_vec(),
         );
-        assert_eq!(store.ingest(public, 0), ScopedStoreOutcome::RejectedPublic);
+        assert_eq!(
+            store.ingest(public, 0).outcome,
+            ScopedStoreOutcome::RejectedPublic
+        );
         assert!(store.is_empty());
     }
 
@@ -660,7 +932,7 @@ mod tests {
         store.ingest(owner_cap(3, 1, 1000), 0); // expires 1000
         store.ingest(grant_cap([0xAA; 32], 4, 1, 5000), 0); // expires 5000
                                                             // At t=2000 the owner entry (expires 1000) is gone; the grant survives.
-        assert_eq!(store.sweep_expired(2000), 1);
+        assert_eq!(store.sweep_expired(2000).len(), 1);
         assert_eq!(store.len(), 1);
         assert!(store
             .find_owner_private_capabilities(2000, &no_floors(), |_| true)
@@ -703,7 +975,7 @@ mod tests {
         let grant = [0xAA; 32];
         store.ingest(grant_cap(grant, 4, 1, 5000), 0); // gen 1, expires 5000
         assert_eq!(
-            store.ingest(grant_cap(grant, 4, 2, 2000), 0), // gen 2, expires 2000
+            store.ingest(grant_cap(grant, 4, 2, 2000), 0).outcome, // gen 2, expires 2000
             ScopedStoreOutcome::Updated
         );
         // Sweep at t=3000: gen 2's live capability (expired at 2000) becomes a
@@ -714,7 +986,7 @@ mod tests {
             .is_empty());
         // Replay the OLDER generation 1 (still unexpired at 3000): refused.
         assert_eq!(
-            store.ingest(grant_cap(grant, 4, 1, 5000), 0),
+            store.ingest(grant_cap(grant, 4, 1, 5000), 0).outcome,
             ScopedStoreOutcome::Stale
         );
         assert!(store
@@ -798,5 +1070,256 @@ mod tests {
         // Retraction is a read-time filter, not an eviction: the entry is still
         // physically present (a fresh higher-generation cert could revive it).
         assert_eq!(store.len(), 1);
+    }
+
+    // ----- OLB-2A: the indexed `ScopedDiscoveryState` -----
+
+    use crate::adapter::net::behavior::capability::CapabilitySet;
+    use crate::adapter::net::behavior::org_scoped_ingest::decode_declared_capabilities;
+
+    /// The single owner scope the owner fixtures live in.
+    fn owner_scope() -> CapabilityAudienceScope {
+        CapabilityAudienceScope::Owner {
+            org_id: org(1),
+            audience_handle: [0x11; 32],
+        }
+    }
+
+    /// The capability-authority id a service tag is indexed under.
+    fn cap_id(tag: &str) -> CapabilityAuthorityId {
+        CapabilityAuthorityId::for_tag(tag)
+    }
+
+    /// A real canonical descriptor declaring `tags`, decoded once at ingest
+    /// exactly as the production path does.
+    fn descriptor(tags: &[&str]) -> Vec<u8> {
+        let mut caps = CapabilitySet::new();
+        for t in tags {
+            caps = caps.add_tag(*t);
+        }
+        caps.to_bytes_compact()
+    }
+
+    fn owner_cap_declaring(
+        provider_seed: u8,
+        generation: u64,
+        expires_at: u64,
+        tags: &[&str],
+    ) -> VerifiedScopedCapability {
+        VerifiedScopedCapability::for_test(
+            owner_scope(),
+            provider(provider_seed),
+            org(1),
+            generation,
+            expires_at,
+            FIXTURE_CERT_GEN,
+            None,
+            descriptor(tags),
+        )
+    }
+
+    /// Ingest through the indexed state as production does: predecode the
+    /// declared capabilities once, outside the store, then ingest.
+    fn ingest_indexed(
+        state: &mut ScopedDiscoveryState,
+        cap: VerifiedScopedCapability,
+        now: u64,
+    ) -> ScopedStoreOutcome {
+        let ids = decode_declared_capabilities(cap.descriptor());
+        state.ingest(cap, ids.into(), now)
+    }
+
+    /// The indexed owner query returns exactly the providers that declared the
+    /// asked-for capability — a bucket lookup with no descriptor decode, across a
+    /// multi-provider store.
+    #[test]
+    fn indexed_owner_query_matches_only_the_declared_capability() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(4, 1, 10_000, &["nrpc:b"]),
+            0,
+        );
+
+        let a = state.find_owner_private_providers(Some(&cap_id("nrpc:a")), 0, &no_floors());
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].0.provider, provider(3));
+
+        let b = state.find_owner_private_providers(Some(&cap_id("nrpc:b")), 0, &no_floors());
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].0.provider, provider(4));
+
+        assert!(state
+            .find_owner_private_providers(Some(&cap_id("nrpc:none")), 0, &no_floors())
+            .is_empty());
+    }
+
+    /// A provider whose descriptor declares several tags is indexed under each.
+    #[test]
+    fn a_multi_tag_owner_record_is_indexed_under_every_capability() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a", "nrpc:b"]),
+            0,
+        );
+        assert_eq!(
+            state
+                .find_owner_private_providers(Some(&cap_id("nrpc:a")), 0, &no_floors())
+                .len(),
+            1
+        );
+        assert_eq!(
+            state
+                .find_owner_private_providers(Some(&cap_id("nrpc:b")), 0, &no_floors())
+                .len(),
+            1
+        );
+    }
+
+    /// The load-bearing index-maintenance witness: because the query trusts the
+    /// index and never re-decodes the descriptor, an `Updated` record that now
+    /// declares a DIFFERENT capability must be re-indexed — the old capability
+    /// must stop returning it, or the query would answer with a provider that no
+    /// longer declares that capability.
+    #[test]
+    fn an_updated_descriptor_reindexes_the_record() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        assert_eq!(
+            state
+                .find_owner_private_providers(Some(&cap_id("nrpc:a")), 0, &no_floors())
+                .len(),
+            1
+        );
+
+        // gen 2 declares nrpc:b instead of nrpc:a.
+        assert_eq!(
+            ingest_indexed(
+                &mut state,
+                owner_cap_declaring(3, 2, 10_000, &["nrpc:b"]),
+                0
+            ),
+            ScopedStoreOutcome::Updated
+        );
+        assert!(
+            state
+                .find_owner_private_providers(Some(&cap_id("nrpc:a")), 0, &no_floors())
+                .is_empty(),
+            "the old capability is re-indexed away"
+        );
+        assert_eq!(
+            state
+                .find_owner_private_providers(Some(&cap_id("nrpc:b")), 0, &no_floors())
+                .len(),
+            1,
+            "the new capability is indexed"
+        );
+    }
+
+    /// The indexed query applies fresh expiry per bucket hit — an expired record
+    /// is excluded even before any sweep touches the index.
+    #[test]
+    fn the_indexed_owner_query_excludes_an_expired_record_before_sweep() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 1000, &["nrpc:a"]), 0);
+        let a = cap_id("nrpc:a");
+        assert_eq!(
+            state
+                .find_owner_private_providers(Some(&a), 500, &no_floors())
+                .len(),
+            1,
+            "visible before expiry"
+        );
+        assert!(
+            state
+                .find_owner_private_providers(Some(&a), 2000, &no_floors())
+                .is_empty(),
+            "excluded past expiry with no sweep"
+        );
+    }
+
+    /// The indexed query applies fresh revocation-floor currentness per bucket
+    /// hit — a floor raised above the admitted generation retracts an indexed
+    /// record at query time, no sweep needed.
+    #[test]
+    fn the_indexed_owner_query_applies_floor_currentness() {
+        let org_kp = OrgKeypair::from_bytes([7u8; 32]);
+        let org_id = org_kp.org_id();
+        let member = EntityId::from_bytes([9u8; 32]);
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            VerifiedScopedCapability::for_test(
+                CapabilityAudienceScope::Owner {
+                    org_id,
+                    audience_handle: [0x11; 32],
+                },
+                member.clone(),
+                org_id,
+                1,
+                10_000,
+                FIXTURE_CERT_GEN,
+                None,
+                descriptor(&["nrpc:a"]),
+            ),
+            0,
+        );
+        let a = cap_id("nrpc:a");
+        assert_eq!(
+            state
+                .find_owner_private_providers(Some(&a), 0, &no_floors())
+                .len(),
+            1
+        );
+        let floor_above = floor_state(&org_kp, &member, FIXTURE_CERT_GEN + 1);
+        assert!(
+            state
+                .find_owner_private_providers(Some(&a), 0, &floor_above)
+                .is_empty(),
+            "a raised floor retracts the indexed record at query time"
+        );
+    }
+
+    /// `sweep_expired` reports every `(scope, provider)` key whose live capability
+    /// it dropped, so the indexed layer updates in the same transaction.
+    #[test]
+    fn sweep_expired_reports_the_demoted_live_keys() {
+        let mut store = ScopedDiscoveryStore::new();
+        store.ingest(owner_cap(3, 1, 1000), 0); // expires 1000
+        store.ingest(grant_cap([0xAA; 32], 4, 1, 5000), 0); // expires 5000
+                                                            // At t=2000 only the owner entry has expired.
+        let removed = store.sweep_expired(2000);
+        assert_eq!(removed, vec![(owner_scope(), provider(3))]);
+    }
+
+    /// The ingest's INTERNAL capacity sweep surfaces the live records it demoted,
+    /// so they leave the index even though this ingest's own outcome is about the
+    /// NEW key — the wrapper-only hole the plan flags.
+    #[test]
+    fn the_internal_capacity_sweep_reports_its_demotions() {
+        let mut store = ScopedDiscoveryStore::new();
+        // Fill the owner scope's share with entries that all expire at 1000.
+        for index in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
+            store.ingest(owner_cap_n(index, 1, 1000), 0);
+        }
+        // At t=2000 a new provider trips the per-scope guard, whose internal sweep
+        // demotes every expired entry; the report lists them and the freed slots
+        // admit the new key.
+        let report = store.ingest(owner_cap_n(u64::MAX, 1, 5000), 2000);
+        assert_eq!(report.outcome, ScopedStoreOutcome::Inserted);
+        assert_eq!(
+            report.swept_live.len(),
+            ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE
+        );
     }
 }

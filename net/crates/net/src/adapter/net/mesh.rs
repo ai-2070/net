@@ -1073,7 +1073,7 @@ struct DispatchCtx {
     /// OA3-5: the private-discovery store verified scoped announcements land in.
     /// See the matching field doc on `MeshNode`.
     scoped_discovery:
-        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>>,
+        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. See the matching field doc on `MeshNode`.
     scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
@@ -5126,7 +5126,7 @@ pub struct MeshNode {
     /// and sweep are short synchronous critical sections on the inbound dispatch
     /// path, with no await held.
     scoped_discovery:
-        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>>,
+        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. Shared across the inbound dispatch so a flooded envelope is
     /// forwarded at most once per node; never decrypts or stores anything.
@@ -6610,7 +6610,7 @@ impl MeshNode {
             org_revocation: Arc::new(ArcSwapOption::empty()),
             node_authority: Arc::new(ArcSwapOption::empty()),
             scoped_discovery: Arc::new(parking_lot::Mutex::new(
-                super::behavior::org_scoped_store::ScopedDiscoveryStore::new(),
+                super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
             )),
             scoped_relay_gate: Arc::new(
                 super::behavior::org_scoped_relay::ScopedAnnRelayGate::new(),
@@ -10070,7 +10070,6 @@ impl MeshNode {
         EntityId,
     )> {
         use super::behavior::org_revocation::OrgRevocationState;
-        use super::behavior::org_scoped_store::PrivateCapabilityProvider;
         // Mirror the ingest path: borrow the LIVE floor snapshot (an un-adopted
         // node with no revocation store queries against an implicit empty floor
         // set), so the currentness filter reflects real node state.
@@ -10078,23 +10077,12 @@ impl MeshNode {
         let empty_floors = OrgRevocationState::empty();
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+        // OLB-2A: a specific capability is served from the sidecar index (no
+        // per-record descriptor decode); the `None` seam still scans. Freshness
+        // (expiry + revocation-floor currentness) is applied per hit inside.
         self.scoped_discovery
             .lock()
-            .find_owner_private_capabilities(now_secs, floors, |c| match capability {
-                None => true,
-                Some(want) => super::behavior::org_scoped_ingest::descriptor_declares_capability(
-                    c.descriptor(),
-                    want,
-                ),
-            })
-            .into_iter()
-            .map(|c| {
-                (
-                    PrivateCapabilityProvider::from_verified(c),
-                    c.provider().clone(),
-                )
-            })
-            .collect()
+            .find_owner_private_providers(capability, now_secs, floors)
     }
 
     #[doc(hidden)]
@@ -19116,7 +19104,7 @@ impl MeshNode {
             arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>,
         >,
         scoped_discovery: &Arc<
-            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>,
+            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
         >,
         envelope: &super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement,
         from_node: u64,
@@ -19289,7 +19277,15 @@ impl MeshNode {
                     // that re-announce at the same generation.
                     return ScopedIngestDisposition::Retryable;
                 }
-                let outcome = scoped_discovery.lock().ingest(verified, now_secs);
+                // OLB-2A: decode the descriptor's declared capabilities ONCE,
+                // outside the store lock, so the indexed layer buckets the record
+                // by capability without a per-query descriptor decode.
+                let cap_ids = super::behavior::org_scoped_ingest::decode_declared_capabilities(
+                    verified.descriptor(),
+                );
+                let outcome = scoped_discovery
+                    .lock()
+                    .ingest(verified, cap_ids.into(), now_secs);
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
                     ?outcome,
