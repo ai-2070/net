@@ -486,17 +486,27 @@ impl ScopedDiscoveryStore {
 ///   owner AND grant — so a record's associations drop on removal without a
 ///   re-decode, and a mutation's dirtied capabilities are computable for either
 ///   change stream;
-/// - `records_by_provider`: the live records each provider entity announced, so a
-///   revocation-floor raise reaches exactly that provider's records without
-///   scanning the live set (OLB-2A.3.3). Keyed by provider alone: the owning org
-///   is read from the stored record itself at raise time, so the index can never
-///   hold an org that disagrees with the row it points at, and a removal needs
-///   only the key it already has.
+/// - `floor_visible_by_provider`: the records each provider entity announced that
+///   are still FLOOR-VISIBLE — admitted, and not yet retracted by a revocation
+///   floor. A floor raise reaches exactly that provider's records without scanning
+///   the live set (OLB-2A.3.3). Keyed by provider alone: the owning org is read
+///   from the stored record itself at raise time, so the index can never hold an
+///   org that disagrees with the row it points at, and a removal needs only the
+///   key it already has.
+///
+///   This set — NOT the live set — is what a currentness transition is measured
+///   against, which is what makes invalidation idempotent (Kyra OLB-2A.3.3): a
+///   record leaves it the once, when a raise first hides it, so a later raise, a
+///   duplicate raise, an install-snapshot replay, or the row's eventual
+///   expiry/demotion finds nothing to retract and emits no second invalidation.
+///   Membership of the authoritative store, `declarations_by_record`, and
+///   `owner_by_capability` is deliberately untouched by that retraction — only
+///   this currentness helper narrows.
 #[derive(Default)]
 struct ScopedCapabilityIndex {
     owner_by_capability: BTreeMap<CapabilityAuthorityId, BTreeSet<ScopedKey>>,
     declarations_by_record: BTreeMap<ScopedKey, Arc<[CapabilityAuthorityId]>>,
-    records_by_provider: BTreeMap<EntityId, BTreeSet<ScopedKey>>,
+    floor_visible_by_provider: BTreeMap<EntityId, BTreeSet<ScopedKey>>,
 }
 
 impl ScopedCapabilityIndex {
@@ -515,7 +525,11 @@ impl ScopedCapabilityIndex {
                     .insert(key.clone());
             }
         }
-        self.records_by_provider
+        // An admitted record passed the ingest currentness gate, so it enters
+        // FLOOR-VISIBLE. A re-announcement carrying a newer certificate generation
+        // arrives here through `replace_record`, which is what restores visibility
+        // to a row an earlier floor had retracted.
+        self.floor_visible_by_provider
             .entry(key.1.clone())
             .or_default()
             .insert(key.clone());
@@ -539,12 +553,32 @@ impl ScopedCapabilityIndex {
                 }
             }
         }
-        if let Some(bucket) = self.records_by_provider.get_mut(&key.1) {
-            bucket.remove(key);
-            if bucket.is_empty() {
-                self.records_by_provider.remove(&key.1);
-            }
+        self.retract_floor_visibility(key);
+    }
+
+    /// Drop `key` from the FLOOR-VISIBLE projection, leaving the authoritative row,
+    /// its declarations, and its owner buckets intact. Returns whether the key was
+    /// still floor-visible — i.e. whether this call is the transition that hid it.
+    /// Every later retraction attempt on the same row returns `false`, which is
+    /// what makes floor invalidation idempotent (Kyra OLB-2A.3.3).
+    fn retract_floor_visibility(&mut self, key: &ScopedKey) -> bool {
+        let Some(bucket) = self.floor_visible_by_provider.get_mut(&key.1) else {
+            return false;
+        };
+        let was_visible = bucket.remove(key);
+        if bucket.is_empty() {
+            self.floor_visible_by_provider.remove(&key.1);
         }
+        was_visible
+    }
+
+    /// Whether `key` is still floor-visible — the guard that keeps an ordinary
+    /// sweep or capacity demotion of an ALREADY-hidden row from emitting a second
+    /// invalidation for a transition that already happened.
+    fn is_floor_visible(&self, key: &ScopedKey) -> bool {
+        self.floor_visible_by_provider
+            .get(&key.1)
+            .is_some_and(|bucket| bucket.contains(key))
     }
 
     /// Re-index an `Updated` record: drop the old declarations, then add the new.
@@ -564,17 +598,20 @@ impl ScopedCapabilityIndex {
 pub struct ScopedDiscoveryState {
     store: ScopedDiscoveryStore,
     index: ScopedCapabilityIndex,
-    /// Monotone private-discovery MUTATION/SWEEP generation over EITHER private
-    /// partition (owner or grant). Advances once per ingest/sweep that changes a
-    /// capability's live provider bucket. It is NOT yet a complete
-    /// query-visible-set generation: a wall-clock expiry crossing or a
-    /// revocation-floor raise can change query results before this advances —
-    /// event-driven expiry and floor-raise dirtying arrive in OLB-2A.3. A consumer
-    /// polls it to detect that a store mutation moved private discovery.
+    /// Monotone private-discovery QUERY-VISIBLE-SET generation over EITHER private
+    /// partition (owner or grant). Advances once per transition that changes a
+    /// capability's visible provider bucket, from all three sources (OLB-2A.3
+    /// complete): a store mutation (ingest/sweep), the exact-expiry timer's
+    /// deadline sweep, and a revocation-floor raise. A consumer polls it — or waits
+    /// on the change watch — to detect that private discovery moved.
+    ///
+    /// Each genuine transition advances it exactly ONCE: a no-op ingest, a repeated
+    /// or incremental floor raise over an already-hidden row, and the later
+    /// expiry/demotion of such a row are all structural no-ops (see
+    /// [`Self::note_floors_raised`]).
     revision: u64,
-    /// The same MUTATION/SWEEP generation restricted to the OWNER partition, so
-    /// valid grant-audience churn never advances it. Same wall-clock/floor caveat
-    /// as `revision`.
+    /// The same QUERY-VISIBLE-SET generation restricted to the OWNER partition, so
+    /// valid grant-audience churn never advances it.
     owner_revision: u64,
     /// Capabilities dirtied (owner or grant) since the last global drain.
     pending_global: DirtyCapabilities,
@@ -603,15 +640,23 @@ pub struct ScopedDiscoveryState {
     expiry_by_key: BTreeMap<ScopedKey, u64>,
 }
 
-/// Add the capabilities a live record declared — read from the index BEFORE the
-/// record is removed — to the affected sets, tagging the owner stream when the
-/// record's scope is `Owner`.
+/// Add the capabilities a record declared — read from the index BEFORE the record
+/// is removed — to the affected sets, tagging the owner stream when the record's
+/// scope is `Owner`.
+///
+/// Dirties ONLY a record that is still FLOOR-VISIBLE. A row already retracted by a
+/// revocation floor left the query-visible set at that raise and was invalidated
+/// then; its eventual expiry, capacity demotion, or replacement is not a second
+/// visible transition, so it is reclaimed silently (Kyra OLB-2A.3.3).
 fn note_removed_record(
     index: &ScopedCapabilityIndex,
     key: &ScopedKey,
     global: &mut BTreeSet<CapabilityAuthorityId>,
     owner: &mut BTreeSet<CapabilityAuthorityId>,
 ) {
+    if !index.is_floor_visible(key) {
+        return;
+    }
     if let Some(caps) = index.declarations_by_record.get(key) {
         note_caps(&key.0, caps, global, owner);
     }
@@ -749,41 +794,66 @@ impl ScopedDiscoveryState {
     /// mutation/sweep generations and the QUERY-VISIBLE set.
     ///
     /// Each raised `(org, provider, floor)` reaches exactly that provider's records
-    /// through the reverse provider index — never a scan of the live set — and only
-    /// records that ACTUALLY lost visibility are dirtied: the owning org must match
-    /// the raise, and the record's admitted membership generation must now fall
-    /// below the floor. The org and generation are read from the STORED record, so
-    /// this cannot dirty on a stale cached copy. Returns how many records the raise
-    /// retracted.
+    /// through the FLOOR-VISIBLE reverse index — never a scan of the live set — and
+    /// a record is dirtied only on the TRANSITION out of visibility: it must still
+    /// be floor-visible, its owning org must match the raise, and its admitted
+    /// membership generation must now fall below the floor. The org and generation
+    /// are read from the STORED record, so this cannot dirty on a stale cached copy.
+    /// Returns how many records this raise retracted.
     ///
-    /// Store and index membership are deliberately UNCHANGED. Floors are monotone,
-    /// so a retracted record can never become visible again, but it is still a live
-    /// row that the read-time currentness filter hides; it is reclaimed by the
-    /// ordinary expiry/GC path. Keeping membership untouched preserves the signed
-    /// invariant that the index mirrors exactly the store's live set.
+    /// Measuring against the floor-visible set — not the live set — is what makes
+    /// this IDEMPOTENT (Kyra OLB-2A.3.3). A record leaves that set the once, when
+    /// the first raise hides it, so each of these is a structural no-op rather than
+    /// a second generation advance and a spurious wake:
+    ///
+    /// - a repeated or equal raise;
+    /// - an INCREMENTAL raise over an already-hidden row (floor 6 then 7 against an
+    ///   admitted generation of 5);
+    /// - an install-snapshot reconciliation replaying floors the callback already
+    ///   applied, in either order, and an equal or dominating store replacement;
+    /// - the row's eventual expiry or capacity demotion (see
+    ///   [`note_removed_record`]).
+    ///
+    /// Store membership, `declarations_by_record`, and `owner_by_capability` are
+    /// deliberately UNCHANGED: the retracted row is still a live row that the
+    /// read-time currentness filter hides, and it is reclaimed by the ordinary
+    /// expiry/GC path — which preserves the signed invariant that the index mirrors
+    /// exactly the store's live set. Only the currentness helpers narrow: the row
+    /// also leaves the exact-expiry wake metadata, because an already-invisible
+    /// row's deadline can no longer produce a visible transition. A later
+    /// re-announcement carrying a current certificate generation is admitted
+    /// normally and reinstalls both through `replace_record`/`track_live_expiry`.
     pub(crate) fn note_floors_raised(&mut self, raised: &[(OrgId, EntityId, u32)]) -> usize {
-        let mut global = BTreeSet::new();
-        let mut owner = BTreeSet::new();
-        let mut retracted = 0usize;
+        // Collect first: the scan borrows the index, the retraction mutates it.
+        // A set, so one raise naming a provider twice retracts it once.
+        let mut retract: BTreeSet<ScopedKey> = BTreeSet::new();
         for (org, provider, floor) in raised {
-            let Some(keys) = self.index.records_by_provider.get(provider) else {
+            let Some(keys) = self.index.floor_visible_by_provider.get(provider) else {
                 continue;
             };
             for key in keys {
                 let Some(record) = self.store.live_record(key) else {
                     continue;
                 };
-                // Same predicate the query-time filter applies, so exactly the
-                // records that just became invisible are named.
+                // The same boundary the query-time filter applies, so the source
+                // and the read agree on exactly which records went invisible.
                 if record.owner_org() != org || record.provider_cert_generation() >= *floor {
                     continue;
                 }
-                retracted += 1;
-                note_removed_record(&self.index, key, &mut global, &mut owner);
+                retract.insert(key.clone());
             }
         }
+        let mut global = BTreeSet::new();
+        let mut owner = BTreeSet::new();
+        for key in &retract {
+            // Still floor-visible here, so this dirties; the retraction below is
+            // what makes every later attempt on the row silent.
+            note_removed_record(&self.index, key, &mut global, &mut owner);
+            self.index.retract_floor_visibility(key);
+            self.forget_live_expiry(key);
+        }
         self.record_change(&global, &owner);
-        retracted
+        retract.len()
     }
 
     /// Advance the change generations and dirty streams for a mutation that
@@ -862,10 +932,10 @@ impl ScopedDiscoveryState {
         self.live_expiries.keys().next().copied()
     }
 
-    /// The private-discovery mutation/sweep generation over EITHER partition — a
+    /// The private-discovery query-visible-set generation over EITHER partition — a
     /// read-only poll, safe to expose, useful for source recapture and
-    /// publish-if-current checks. See [`Self::revision`] for the caveat that it
-    /// does not yet reflect wall-clock expiry or floor raises.
+    /// publish-if-current checks. Reflects store mutations, exact expiry, and
+    /// revocation-floor movement alike (see [`Self::revision`]).
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -2363,12 +2433,16 @@ mod tests {
         let mut state = ScopedDiscoveryState::new();
         ingest_indexed(&mut state, owner_cap_declaring(3, 1, 1000, &["nrpc:a"]), 0);
         ingest_indexed(&mut state, owner_cap_declaring(4, 1, 5000, &["nrpc:b"]), 0);
-        assert_eq!(state.index.records_by_provider.len(), 2);
+        assert_eq!(state.index.floor_visible_by_provider.len(), 2);
 
         // Sweep past provider 3 only.
         state.sweep_expired(2000);
         assert_eq!(
-            state.index.records_by_provider.keys().collect::<Vec<_>>(),
+            state
+                .index
+                .floor_visible_by_provider
+                .keys()
+                .collect::<Vec<_>>(),
             vec![&provider(4)],
             "the swept provider left the reverse index"
         );
@@ -2376,8 +2450,242 @@ mod tests {
         // Sweep past the survivor: the reverse index empties.
         state.sweep_expired(6000);
         assert!(
-            state.index.records_by_provider.is_empty(),
+            state.index.floor_visible_by_provider.is_empty(),
             "no provider entry outlives its last live record"
+        );
+    }
+
+    // ----- OLB-2A.3.3 closure: floor invalidation is IDEMPOTENT (Kyra) -----
+
+    /// An INCREMENTAL raise over an already-hidden row is a structural no-op. The
+    /// transition is measured against the FLOOR-VISIBLE set, not "is it invisible
+    /// under this floor" — otherwise every subsequent raise re-invalidates a record
+    /// that left the query-visible set long ago.
+    #[test]
+    fn an_incremental_raise_over_a_hidden_row_dirties_nothing() {
+        let mut state = ScopedDiscoveryState::new();
+        // Admitted against FIXTURE_CERT_GEN (5).
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+
+        // First raise: a genuine transition.
+        assert_eq!(
+            state.note_floors_raised(&[(org(1), provider(3), FIXTURE_CERT_GEN + 1)]),
+            1
+        );
+        let (rev, owner_rev) = (state.revision(), state.owner_revision());
+        assert_eq!(state.take_global_change_batch().dirty, one_cap("nrpc:a"));
+        assert_eq!(state.take_owner_change_batch().dirty, one_cap("nrpc:a"));
+
+        // Second, HIGHER raise: the record was already invisible.
+        assert_eq!(
+            state.note_floors_raised(&[(org(1), provider(3), FIXTURE_CERT_GEN + 2)]),
+            0,
+            "the record was already invisible below the previous floor"
+        );
+        assert_eq!(state.revision(), rev, "no second generation advance");
+        assert_eq!(state.owner_revision(), owner_rev);
+        assert_eq!(
+            state.take_global_change_batch().dirty,
+            DirtyCapabilities::Clean,
+            "and no second invalidation"
+        );
+    }
+
+    /// Replaying the SAME raise — an install-time snapshot reconciliation after the
+    /// callback already applied it, an equal or dominating store replacement, or a
+    /// duplicate entry within one batch — is a complete no-op.
+    #[test]
+    fn replaying_the_same_raise_is_a_complete_no_op() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+        let raise = [(org(1), provider(3), FIXTURE_CERT_GEN + 1)];
+
+        assert_eq!(state.note_floors_raised(&raise), 1, "the callback's pass");
+        let rev = state.revision();
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+
+        // The install snapshot replays every installed floor, including this one.
+        assert_eq!(state.note_floors_raised(&raise), 0, "the snapshot's pass");
+        assert_eq!(state.revision(), rev);
+        assert_eq!(
+            state.take_global_change_batch().dirty,
+            DirtyCapabilities::Clean
+        );
+
+        // And the same row named twice inside ONE batch retracts once.
+        let mut fresh = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut fresh,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        let _ = fresh.take_global_change_batch();
+        let before = fresh.revision();
+        assert_eq!(
+            fresh.note_floors_raised(&[
+                (org(1), provider(3), FIXTURE_CERT_GEN + 1),
+                (org(1), provider(3), FIXTURE_CERT_GEN + 2),
+            ]),
+            1,
+            "a duplicated provider in one batch retracts once"
+        );
+        assert_eq!(
+            fresh.revision(),
+            before + 1,
+            "exactly one generation advance"
+        );
+    }
+
+    /// A floor-hidden row's eventual EXPIRY is not a second visible transition: it
+    /// left the query-visible set at the raise, so its sweep is silent.
+    #[test]
+    fn the_expiry_of_a_floor_hidden_row_dirties_nothing() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(&mut state, owner_cap_declaring(3, 1, 1000, &["nrpc:a"]), 0);
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+
+        assert_eq!(
+            state.note_floors_raised(&[(org(1), provider(3), FIXTURE_CERT_GEN + 1)]),
+            1
+        );
+        let rev = state.revision();
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+        assert_eq!(
+            state.next_visible_expiry(),
+            None,
+            "a hidden row no longer gates the exact-expiry timer"
+        );
+
+        // The row is still physically live, so the sweep still reclaims it — but
+        // silently.
+        assert_eq!(state.sweep_expired(2000), 1, "the row is still reclaimed");
+        assert_eq!(state.revision(), rev, "no second generation advance");
+        assert_eq!(
+            state.take_global_change_batch().dirty,
+            DirtyCapabilities::Clean
+        );
+    }
+
+    /// A floor-hidden row reclaimed under CAPACITY pressure is likewise silent.
+    #[test]
+    fn the_capacity_demotion_of_a_floor_hidden_row_dirties_nothing() {
+        let mut state = ScopedDiscoveryState::new();
+        // Fill the owner scope with long-watermark / short-expiry rows, exactly as
+        // the capacity-demotion witness does.
+        for index in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
+            ingest_indexed(
+                &mut state,
+                owner_cap_declaring_n(index, 1, 10_000, &["nrpc:a"]),
+                0,
+            );
+            ingest_indexed(
+                &mut state,
+                owner_cap_declaring_n(index, 2, 1000, &["nrpc:a"]),
+                0,
+            );
+        }
+        // Hide every one of them behind a floor raise.
+        let raises: Vec<_> = (0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64)
+            .map(|i| (org(1), provider_n(i), FIXTURE_CERT_GEN + 1))
+            .collect();
+        assert_eq!(
+            state.note_floors_raised(&raises),
+            ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE,
+            "every filler row is hidden"
+        );
+        let rev = state.revision();
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+
+        // A new provider trips the per-scope guard; its internal sweep demotes the
+        // already-hidden fillers.
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring_n(u64::MAX, 1, 20_000, &["nrpc:b"]),
+            2000,
+        );
+        assert_eq!(
+            state.revision(),
+            rev,
+            "reclaiming already-hidden rows is not a visible transition"
+        );
+        assert_eq!(
+            state.take_global_change_batch().dirty,
+            DirtyCapabilities::Clean
+        );
+    }
+
+    /// A CURRENT re-announcement restores a floor-hidden row: a newer certificate
+    /// generation is admitted normally, which reinstalls floor visibility and the
+    /// exact-expiry metadata — so a later raise can retract it again, exactly once.
+    #[test]
+    fn a_current_reannouncement_restores_a_floor_hidden_row() {
+        let mut state = ScopedDiscoveryState::new();
+        ingest_indexed(
+            &mut state,
+            owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]),
+            0,
+        );
+        assert_eq!(
+            state.note_floors_raised(&[(org(1), provider(3), FIXTURE_CERT_GEN + 1)]),
+            1
+        );
+        let _ = state.take_global_change_batch();
+        let _ = state.take_owner_change_batch();
+        assert_eq!(state.next_visible_expiry(), None, "hidden: no deadline");
+
+        // A newer certificate generation, above the floor, is admitted.
+        let restored = VerifiedScopedCapability::for_test(
+            owner_scope(),
+            provider(3),
+            org(1),
+            2,
+            10_000,
+            FIXTURE_CERT_GEN + 1,
+            None,
+            descriptor(&["nrpc:a"]),
+        );
+        assert_eq!(
+            ingest_indexed(&mut state, restored, 0),
+            ScopedStoreOutcome::Updated
+        );
+        assert_eq!(
+            state.next_visible_expiry(),
+            Some(10_000),
+            "the restored row gates the timer again"
+        );
+        assert_eq!(state.take_global_change_batch().dirty, one_cap("nrpc:a"));
+
+        // The old floor no longer retracts it; a higher one does, once.
+        assert_eq!(
+            state.note_floors_raised(&[(org(1), provider(3), FIXTURE_CERT_GEN + 1)]),
+            0,
+            "the restored certificate is current against the old floor"
+        );
+        assert_eq!(
+            state.note_floors_raised(&[(org(1), provider(3), FIXTURE_CERT_GEN + 2)]),
+            1,
+            "a higher floor retracts the restored row exactly once"
+        );
+        assert_eq!(
+            state.note_floors_raised(&[(org(1), provider(3), FIXTURE_CERT_GEN + 3)]),
+            0,
+            "and not again"
         );
     }
 

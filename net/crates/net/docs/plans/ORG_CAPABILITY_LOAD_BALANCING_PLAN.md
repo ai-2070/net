@@ -90,14 +90,28 @@ floor-raise subscription (and the install-time reconciliation sweep, for a store
 installed after its floors already rose) now also runs
 `ScopedDiscoveryState::note_floors_raised` through the gated commit. Each raised
 `(org, provider, floor)` reaches exactly that provider's records through a reverse
-provider index — never a live-set scan — and dirties only records that ACTUALLY
-lost visibility, applying the same predicate as the read-time filter against the
-STORED org and membership generation. Store and index membership are deliberately
-unchanged: floors are monotone, so a retracted row can never return, and it is
-reclaimed by the ordinary expiry/GC path — which keeps the signed invariant that
-the index mirrors exactly the store's live set. With 2A.3.2 and 2A.3.3 landed the
-generations are QUERY-VISIBLE-SET generations: expiry and floor movement now
-advance them, closing the OLB-2A.2 caveat above. All of OLB-2A.3 must land and be
+provider index — never a live-set scan — applying the same predicate as the
+read-time filter against the STORED org and membership generation.
+
+That reverse index holds the FLOOR-VISIBLE records, not every live row, and a
+record leaves it the once, on the raise that first hides it. Measuring the
+transition against that set rather than against "is this row invisible under the
+new floor" is what makes invalidation IDEMPOTENT (Kyra OLB-2A.3.3): a repeated or
+INCREMENTAL raise over an already-hidden row, an install-snapshot replay in either
+order, an equal or dominating store replacement, and the row's eventual expiry or
+capacity demotion are all structural no-ops rather than spurious generation
+advances and wakes. Store membership, the declaration map, and the owner buckets
+are deliberately unchanged — floors are monotone, so a retracted row can never
+return; it stays a live row the read-time filter hides and is reclaimed by the
+ordinary expiry/GC path, which keeps the signed invariant that the index mirrors
+exactly the store's live set. Only the currentness helpers narrow (the row also
+leaves the exact-expiry wake metadata, since an invisible row's deadline can no
+longer produce a visible transition); a later current re-announcement is admitted
+normally and reinstalls both.
+
+With 2A.3.2 and 2A.3.3 landed the generations are QUERY-VISIBLE-SET generations —
+store mutation, exact expiry, and floor movement each advance them, and each
+genuine transition advances them exactly once — closing the OLB-2A.2 caveat above. All of OLB-2A.3 must land and be
 reviewed before any reconciler consumes this source.
 
 **Exclusive destructive-drain ownership belongs to the OLB-2B actor-entry
