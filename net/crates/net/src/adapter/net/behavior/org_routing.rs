@@ -96,9 +96,16 @@ impl ActorFault {
 /// What one application attempt achieved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyOutcome {
-    /// A complete CONDITIONAL INSTALLATION succeeded against the named source
-    /// generation. Only this outcome may advance health.
+    /// A COMPLETE conditional installation succeeded against the named source
+    /// generation: every slot the request covered is now current. Only this
+    /// outcome may advance health.
     Current { source_generation: u64 },
+    /// One bounded quantum completed, but work the request covered REMAINS
+    /// (Kyra OLB-2B-E3b). A full recapture spanning several quanta reports this
+    /// until the last one, so health stays in `Rebuilding` rather than going
+    /// `Healthy` with slots still outstanding. The consumer has re-queued the
+    /// remainder authoritatively and marked, so the actor is woken again.
+    Progress { source_generation: u64 },
     /// The source moved while this attempt was building, so its result was
     /// discarded. Health must NOT advance from an obsolete attempt; the actor
     /// stays in recapture and re-attempts on the next wake.
@@ -175,6 +182,17 @@ pub(crate) trait DirtyApply: Send + Sync + 'static {
     /// Apply one reconciliation pass. Must not hold any lock across scoped-state
     /// access, decoding, sorting, projection, or reconciliation.
     fn apply(&self, incarnation: u64, request: ApplyRequest) -> ApplyOutcome;
+
+    /// This incarnation is now the live one. Called once at incarnation start,
+    /// BEFORE any application, so the consumer can bind its work authority to the
+    /// actual actor lifecycle rather than to a high-water counter (Kyra
+    /// OLB-2B-E3b).
+    fn activate_incarnation(&self, _incarnation: u64) {}
+
+    /// This incarnation is over. Called on EVERY exit path — clean, fault, or
+    /// cancellation — from the actor's own fence guard, so a dead actor loses its
+    /// authority synchronously.
+    fn deactivate_incarnation(&self, _incarnation: u64) {}
 }
 
 /// The shared applier — lock-free at this seam.
@@ -206,11 +224,16 @@ enum ActorExit {
 /// look usable (Kyra OLB-2B-E2).
 struct IncarnationFence {
     health: SharedRoutingHealth,
+    /// Revoked in the same guard, so a dead actor loses its registry work
+    /// authority at exactly the moment its routes stop being trusted.
+    apply: SharedApply,
+    incarnation: u64,
 }
 
 impl Drop for IncarnationFence {
     fn drop(&mut self) {
         self.health.store(Arc::new(RoutingHealth::Fenced));
+        self.apply.deactivate_incarnation(self.incarnation);
     }
 }
 
@@ -278,9 +301,12 @@ struct Incarnation {
 /// - `Clean` — no transition at all;
 /// - `Superseded` — never advances health, because the attempt was obsolete.
 async fn run_incarnation(mut it: Incarnation) -> ActorExit {
-    // Fences on every exit path.
+    // Claim work authority, then fence on every exit path — the guard revokes it.
+    it.apply.activate_incarnation(it.id);
     let _fence = IncarnationFence {
         health: it.health.clone(),
+        apply: it.apply.clone(),
+        incarnation: it.id,
     };
 
     // Set when a full recapture was superseded, so a subsequent WOKEN pass still
@@ -352,6 +378,13 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
                         owed_recapture = false;
                     }
                     // `Caps` leaves global health untouched by design.
+                }
+                ApplyOutcome::Progress { .. } => {
+                    // A bounded quantum finished but the recapture epoch is still
+                    // open. Health must NOT advance — publishing Healthy here would
+                    // advertise a set in which later slots were never rebuilt by
+                    // this incarnation (Kyra OLB-2B-E3b).
+                    owed_recapture = owed_recapture || full;
                 }
                 ApplyOutcome::Superseded => {
                     // Obsolete result: publish nothing, and make sure a recapture
