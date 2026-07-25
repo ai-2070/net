@@ -124,9 +124,16 @@ consumer, in one slice that also seals the raw takes behind it (they are
 unrepresentable), fixes the handle's visibility to the actor's module, and
 defines startup/drop/panic/restart policy for a stranded stream. The invariant
 that stands regardless: no reconciler may consume this source before exclusive
-ownership exists. **OLB-2A.4** (named, not dropped): replace the store's
-`entries_in_scope` scan with maintained per-scope counts before the generic
-indexed substrate is called complete. This substrate is shared with the
+ownership exists. **OLB-2A.4** (landed) replaces the store's `entries_in_scope` scan with a
+maintained per-scope count. The per-scope admission guard consults it on every NEW
+key, so the scan made admission cost grow with total store occupancy — up to two
+passes over 8192 entries per insert, on the inbound dispatch path, paid by every
+scope regardless of its own size. `scope_counts` is maintained in the same
+operation as the entry map whose membership it counts, at the only two sites that
+change that membership (admitting a new key, forgetting one past its tombstone
+horizon); tombstones deliberately keep their slot, which is what stops a demoted
+key from rolling a scope's budget backward. Behavior-preserving: the guard is
+unchanged apart from where it reads the count. This substrate is shared with the
 provider-free leader track but carries no authority-filtered candidate or
 lifecycle state. The separate
 owner-private provider-free leader design lives in

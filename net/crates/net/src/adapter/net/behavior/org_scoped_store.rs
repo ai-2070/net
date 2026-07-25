@@ -234,6 +234,36 @@ struct StoredEntry {
 #[derive(Default)]
 pub struct ScopedDiscoveryStore {
     entries: BTreeMap<(CapabilityAudienceScope, EntityId), StoredEntry>,
+    /// Entries (live AND tombstoned) held per scope — the maintained form of what
+    /// [`Self::entries_in_scope`] used to compute by scanning the whole map
+    /// (OLB-2A.4). The per-scope admission guard consults it on every NEW key, so
+    /// a scan there made admission cost grow with total store occupancy: up to two
+    /// passes over 8192 entries per insert, on the inbound dispatch path, paid by
+    /// every scope regardless of its own size.
+    ///
+    /// Maintained in the same operation as `entries`, whose membership it counts
+    /// exactly. Only two operations change that membership — admitting a NEW key,
+    /// and forgetting one whose tombstone horizon has passed — so a scope's count
+    /// rises with its first entry and the scope's row disappears with its last.
+    /// Tombstones are DELIBERATELY counted: a retained tombstone still occupies a
+    /// slot, which is what stops a demoted-then-forgotten key from being used to
+    /// roll a scope's budget backward.
+    scope_counts: BTreeMap<CapabilityAudienceScope, usize>,
+}
+
+/// Release one entry's slot in `scope`, dropping the scope's row once its last
+/// entry leaves — so a scope that empties cannot leave a stale non-zero count
+/// behind, which would permanently shrink its budget.
+fn release_scope_slot(
+    scope_counts: &mut BTreeMap<CapabilityAudienceScope, usize>,
+    scope: &CapabilityAudienceScope,
+) {
+    if let Some(count) = scope_counts.get_mut(scope) {
+        *count -= 1;
+        if *count == 0 {
+            scope_counts.remove(scope);
+        }
+    }
 }
 
 impl ScopedDiscoveryStore {
@@ -276,9 +306,11 @@ impl ScopedDiscoveryStore {
     /// each get a meaningful share rather than racing for one pool.
     const MAX_ENTRIES_PER_SCOPE: usize = 1024;
 
-    /// Live + tombstoned entries currently held for `scope`.
+    /// Live + tombstoned entries currently held for `scope`. O(log n) against the
+    /// maintained [`Self::scope_counts`] — never a scan of the entry map
+    /// (OLB-2A.4).
     fn entries_in_scope(&self, scope: &CapabilityAudienceScope) -> usize {
-        self.entries.keys().filter(|(s, _)| s == scope).count()
+        self.scope_counts.get(scope).copied().unwrap_or(0)
     }
 
     /// Ingest a verified scoped capability. At most one entry is kept per
@@ -359,6 +391,9 @@ impl ScopedDiscoveryStore {
                         };
                     }
                 }
+                // A NEW key: the only admission that grows a scope's occupancy
+                // (the `Some(existing)` arms above mutate an entry in place).
+                *self.scope_counts.entry(key.0.clone()).or_insert(0) += 1;
                 self.entries.insert(
                     key,
                     StoredEntry {
@@ -444,12 +479,25 @@ impl ScopedDiscoveryStore {
     /// garbage collection changes no live record and is not reported.
     pub fn sweep_expired(&mut self, now_secs: u64) -> Vec<ScopedKey> {
         let mut swept = Vec::new();
-        self.entries.retain(|key, e| {
+        // Split the field borrows so the retain maintains the per-scope counts in
+        // the SAME pass that forgets the entry — the count can never observe a
+        // membership the map does not have (OLB-2A.4).
+        let Self {
+            entries,
+            scope_counts,
+        } = self;
+        entries.retain(|key, e| {
             if e.capability.is_some() && now_secs >= e.expires_at {
                 e.capability = None; // live -> tombstone (generation high-water kept)
                 swept.push(key.clone());
             }
-            now_secs < e.tombstone_until
+            // A demotion to tombstone keeps the entry, and so keeps its slot; only
+            // passing the tombstone horizon frees one.
+            if now_secs < e.tombstone_until {
+                return true;
+            }
+            release_scope_slot(scope_counts, &key.0);
+            false
         });
         swept
     }
@@ -2308,6 +2356,135 @@ mod tests {
             Some(1000),
             "becoming query-visible installed the earlier deadline"
         );
+    }
+
+    // ----- OLB-2A.4: maintained per-scope counts -----
+
+    /// What `entries_in_scope` computed BEFORE OLB-2A.4 — a full scan of the entry
+    /// map. The maintained count must equal this at every observable point; that
+    /// equivalence is the whole correctness claim of the slice.
+    fn scan_entries_in_scope(
+        store: &ScopedDiscoveryStore,
+        scope: &CapabilityAudienceScope,
+    ) -> usize {
+        store.entries.keys().filter(|(s, _)| s == scope).count()
+    }
+
+    /// Assert the maintained count agrees with the scan for every scope the store
+    /// holds, and that no scope carries a stale zero row.
+    fn assert_counts_match_scan(store: &ScopedDiscoveryStore) {
+        let scopes: BTreeSet<CapabilityAudienceScope> =
+            store.entries.keys().map(|(s, _)| s.clone()).collect();
+        for scope in &scopes {
+            assert_eq!(
+                store.entries_in_scope(scope),
+                scan_entries_in_scope(store, scope),
+                "maintained count must equal the scan for {scope:?}"
+            );
+        }
+        assert_eq!(
+            store.scope_counts.len(),
+            scopes.len(),
+            "no scope row may outlive its last entry"
+        );
+        assert!(
+            store.scope_counts.values().all(|c| *c > 0),
+            "no scope row may sit at zero"
+        );
+    }
+
+    /// The maintained per-scope count tracks the scan across every membership
+    /// transition: admission of new keys in several scopes, an UPDATE (which must
+    /// not double-count), a demotion to tombstone (which must KEEP the slot), and
+    /// finally forgetting past the tombstone horizon (which frees it).
+    #[test]
+    fn the_maintained_scope_count_matches_the_scan_across_transitions() {
+        let mut store = ScopedDiscoveryStore::new();
+        let grant = [0xAA; 32];
+
+        // Admissions across two distinct scopes.
+        store.ingest(owner_cap(3, 1, 1000), 0);
+        store.ingest(owner_cap(4, 1, 5000), 0);
+        store.ingest(grant_cap(grant, 5, 1, 1000), 0);
+        assert_counts_match_scan(&store);
+        assert_eq!(store.entries_in_scope(&owner_scope()), 2);
+
+        // An UPDATE to a known key mutates in place — occupancy is unchanged.
+        assert_eq!(
+            store.ingest(owner_cap(3, 2, 1000), 0).outcome,
+            ScopedStoreOutcome::Updated
+        );
+        assert_eq!(
+            store.entries_in_scope(&owner_scope()),
+            2,
+            "an update must not grow the scope's occupancy"
+        );
+        assert_counts_match_scan(&store);
+
+        // At t=2000 the short-lived entries demote to TOMBSTONES. Their watermark
+        // equals their expiry, so this same sweep also forgets them.
+        store.sweep_expired(2000);
+        assert_counts_match_scan(&store);
+        assert_eq!(
+            store.entries_in_scope(&owner_scope()),
+            1,
+            "the forgotten key freed its slot; the survivor keeps its own"
+        );
+
+        // Sweeping past the survivor empties the store — and every scope row goes
+        // with it.
+        store.sweep_expired(6000);
+        assert_counts_match_scan(&store);
+        assert!(
+            store.scope_counts.is_empty(),
+            "an emptied store carries no scope rows"
+        );
+    }
+
+    /// A RETAINED tombstone still occupies its scope slot. That is what stops a
+    /// demoted key from being used to roll a scope's budget backward, so it is the
+    /// property the maintained count must preserve, not merely a scan detail.
+    #[test]
+    fn a_retained_tombstone_still_occupies_its_scope_slot() {
+        let mut store = ScopedDiscoveryStore::new();
+        // Watermark 10_000 (generation 1) but a short current expiry (generation 2).
+        store.ingest(owner_cap(3, 1, 10_000), 0);
+        store.ingest(owner_cap(3, 2, 1000), 0);
+        assert_eq!(store.entries_in_scope(&owner_scope()), 1);
+
+        // At t=2000 it demotes to a tombstone the watermark still retains.
+        store.sweep_expired(2000);
+        assert_eq!(store.len(), 0, "no live capability remains");
+        assert_eq!(
+            store.entries_in_scope(&owner_scope()),
+            1,
+            "the retained tombstone still holds its slot"
+        );
+        assert_counts_match_scan(&store);
+    }
+
+    /// The per-scope guard still admits fail-closed off the MAINTAINED count: a
+    /// scope filled to its share refuses a new key, and the refusal does not
+    /// corrupt the count (a refused admission must not consume a slot).
+    #[test]
+    fn the_maintained_count_drives_the_fail_closed_scope_guard() {
+        let mut store = ScopedDiscoveryStore::new();
+        for index in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
+            store.ingest(owner_cap_n(index, 1, 10_000), 0);
+        }
+        assert_eq!(
+            store.entries_in_scope(&owner_scope()),
+            ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE
+        );
+
+        let refused = store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 0);
+        assert_eq!(refused.outcome, ScopedStoreOutcome::AtCapacity);
+        assert_eq!(
+            store.entries_in_scope(&owner_scope()),
+            ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE,
+            "a refused admission consumes no slot"
+        );
+        assert_counts_match_scan(&store);
     }
 
     // ----- OLB-2A.3.3: revocation floor-raise dirtying -----
