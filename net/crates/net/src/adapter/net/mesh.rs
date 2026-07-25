@@ -10551,9 +10551,10 @@ impl MeshNode {
 
     // The DESTRUCTIVE dirty-capability drains are deliberately NOT public
     // MeshNode API (Kyra OLB-2A.2): they belong to the single node-owned consumer
-    // of each stream. They live on `ScopedDiscoveryState` as the crate-internal
-    // atomic `take_global_change_batch` / `take_owner_change_batch`, which capture
-    // the generation and the delta under one lock; the read-only
+    // of each stream. Since OLB-2B they are MODULE-PRIVATE to `org_scoped_store`
+    // and reachable only through `PrivateDiscoveryDrain`, the unforgeable handle
+    // the node's mint leases out one-at-a-time per stream — so a second concurrent
+    // drainer is unrepresentable rather than merely discouraged. The read-only
     // `private_discovery_generation` polls above remain safe to expose.
 
     /// Test seam (OA3 closure witness): advance the visibility generation as a

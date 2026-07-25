@@ -21,6 +21,7 @@
 //! and partitions.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::org::OrgId;
@@ -185,6 +186,7 @@ impl DirtyCapabilities {
     }
 
     /// Take the accumulated set, leaving the stream `Clean`.
+    #[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
     fn take(&mut self) -> DirtyCapabilities {
         std::mem::take(self)
     }
@@ -1007,11 +1009,16 @@ impl ScopedDiscoveryState {
     /// the capabilities dirtied since the last drain — leaving the stream
     /// `Clean`. One locked operation, so a consumer can never checkpoint a
     /// generation and separately miss a delta that committed between two reads
-    /// (Kyra OLB-2A.2). Crate-internal and DESTRUCTIVE: reserved for the single
-    /// node-owned consumer of this stream (landing in OLB-2A.3), not a general
-    /// public seam. Consumerless — and so `#[allow(dead_code)]` — until then.
-    #[allow(dead_code)]
-    pub(crate) fn take_global_change_batch(&mut self) -> PrivateDiscoveryChangeBatch {
+    /// (Kyra OLB-2A.2).
+    ///
+    /// PRIVATE TO THIS MODULE and DESTRUCTIVE (Kyra OLB-2B): its one production
+    /// caller is [`PrivateDiscoveryDrain::drain`], which is obtainable only from
+    /// the node's mint. Privacy is what stops an external or sibling module from
+    /// opening a second drain of this stream; that exactly ONE production caller
+    /// exists inside this module is a review-enforced invariant, not something
+    /// privacy can prove.
+    #[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
+    fn take_global_change_batch(&mut self) -> PrivateDiscoveryChangeBatch {
         PrivateDiscoveryChangeBatch {
             generation: self.revision,
             dirty: self.pending_global.take(),
@@ -1019,13 +1026,30 @@ impl ScopedDiscoveryState {
     }
 
     /// Atomically capture the OWNER change stream (generation + dirty), leaving
-    /// it `Clean`. Crate-internal and destructive; see
-    /// [`Self::take_global_change_batch`]. Consumerless until OLB-2A.3.
-    #[allow(dead_code)]
-    pub(crate) fn take_owner_change_batch(&mut self) -> PrivateDiscoveryChangeBatch {
+    /// it `Clean`. Module-private and destructive on the same terms as
+    /// [`Self::take_global_change_batch`].
+    #[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
+    fn take_owner_change_batch(&mut self) -> PrivateDiscoveryChangeBatch {
         PrivateDiscoveryChangeBatch {
             generation: self.owner_revision,
             dirty: self.pending_owner.take(),
+        }
+    }
+
+    /// Force a stream to report `RebuildAll` on its next drain.
+    ///
+    /// Committed by the mint, under this state's lock, BEFORE a freshly minted
+    /// drain handle is exposed (Kyra OLB-2B): an actor that drained a batch and
+    /// died before applying it consumed a delta nobody applied, so a successor
+    /// must not be allowed to observe a clean stream and assume it is current.
+    /// Enforcing it at the mint means a successor cannot forget, and it reuses the
+    /// bounded-overflow sentinel that already exists rather than adding recovery
+    /// machinery.
+    #[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
+    fn mark_rebuild_all(&mut self, stream: PrivateDiscoveryStream) {
+        match stream {
+            PrivateDiscoveryStream::Global => self.pending_global = DirtyCapabilities::RebuildAll,
+            PrivateDiscoveryStream::Owner => self.pending_owner = DirtyCapabilities::RebuildAll,
         }
     }
 
@@ -1101,6 +1125,182 @@ impl ScopedDiscoveryState {
     /// Whether the store holds no LIVE scoped capabilities.
     pub fn is_empty(&self) -> bool {
         self.store.is_empty()
+    }
+}
+
+/// Which private-discovery change stream a [`PrivateDiscoveryDrain`] owns. The
+/// global stream carries every private partition (owner or grant); the owner
+/// stream carries the owner partition only.
+///
+/// OLB consumes the GLOBAL stream; the owner stream stays unclaimed for the
+/// provider-free leader track (Kyra OLB-2B, Q4).
+//
+// `dead_code` for the OLB-2B-E1 commit ONLY: the ownership types land before the
+// supervisor (E2) and registry consumer (E3) that use them, and the three commits
+// form ONE review unit. These allows are REMOVED in E3, where the actor becomes
+// the real consumer — a leftover allow here would mean the consumer never landed.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrivateDiscoveryStream {
+    Global,
+    Owner,
+}
+
+/// The single, EXCLUSIVE drain of one private-discovery change stream (OLB-2B).
+///
+/// A drain is DESTRUCTIVE — it leaves the stream `Clean` — so two live drainers
+/// would each observe only PART of the deltas and silently lose the rest. This
+/// handle is the capability that makes a second one unrepresentable:
+///
+/// - it has PRIVATE fields and no public constructor, so it cannot be forged —
+///   [`PrivateDiscoveryDrains::mint`] is the only source;
+/// - it is NOT `Clone`, so an owner cannot duplicate its own;
+/// - it holds the stream's lease for as long as it lives, and releases it on drop.
+///
+/// It is a LEASE rather than a one-shot burn (Kyra OLB-2B, Q1/Q3). This source is
+/// how a consumer learns a provider was REVOKED, so permanently stranding the
+/// stream when an actor panics would turn a recoverable fault into a node that
+/// never reconciles a revocation again — failing open on the very path OLB-2A.3.3
+/// closed. Releasing on drop keeps the real invariant (never two concurrent
+/// drainers) while letting a supervisor recover.
+#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
+pub(crate) struct PrivateDiscoveryDrain {
+    state: Arc<parking_lot::Mutex<ScopedDiscoveryState>>,
+    stream: PrivateDiscoveryStream,
+    /// The stream's claim flag, released by [`Drop`]. Shared with the mint.
+    lease: Arc<AtomicBool>,
+}
+
+#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
+impl PrivateDiscoveryDrain {
+    /// Which stream this handle owns.
+    #[allow(dead_code)]
+    pub(crate) fn stream(&self) -> PrivateDiscoveryStream {
+        self.stream
+    }
+
+    /// Atomically drain this stream's `(generation, dirty)` since the last drain,
+    /// leaving it `Clean`. The ONE production caller of the module-private
+    /// destructive takes.
+    pub(crate) fn drain(&mut self) -> PrivateDiscoveryChangeBatch {
+        let mut state = self.state.lock();
+        match self.stream {
+            PrivateDiscoveryStream::Global => state.take_global_change_batch(),
+            PrivateDiscoveryStream::Owner => state.take_owner_change_batch(),
+        }
+    }
+}
+
+impl Drop for PrivateDiscoveryDrain {
+    fn drop(&mut self) {
+        // Release the lease so a supervisor can mint a successor. `Release` pairs
+        // with the mint's `Acquire` claim, so a successor observes everything this
+        // owner did before dropping.
+        self.lease.store(false, Ordering::Release);
+    }
+}
+
+/// Releases a claimed lease unless disarmed — so a mint that claims the stream and
+/// then fails (or unwinds) before publishing its handle cannot strand the stream
+/// (Kyra OLB-2B rollback guard).
+#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
+struct LeaseRollback<'a> {
+    lease: &'a AtomicBool,
+    armed: bool,
+}
+
+#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
+impl LeaseRollback<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LeaseRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.lease.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// The node's mint for the private-discovery change-stream drains (OLB-2B).
+///
+/// Each stream has at most one live [`PrivateDiscoveryDrain`] at a time, so the
+/// destructive drains have exactly one owner by construction. One mint per node,
+/// and ONE supervisor is its only caller — nothing else mints.
+///
+/// The lease state machine:
+///
+/// ```text
+/// Vacant
+///   │  CAS claim (Acquire on success)
+///   ▼
+/// Minting
+///   │  commit RebuildAll for the stream UNDER the state lock
+///   │  construct the !Clone handle
+///   │  (failure/unwind here: the rollback guard releases -> Vacant)
+///   ▼
+/// Held
+///   │  handle dropped (normal exit or task death) -> release (Release)
+///   ▼
+/// Vacant
+/// ```
+///
+/// A leaked handle (`mem::forget`) never runs `Drop`, so it strands its stream
+/// permanently. That is the SAFE direction and is deliberate: the alternative —
+/// reclaiming a lease whose owner may still be alive — is exactly the double-drain
+/// this type exists to prevent. A supervisor observes the strand as a refused mint
+/// and fences routing health rather than proceeding.
+#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
+pub(crate) struct PrivateDiscoveryDrains {
+    state: Arc<parking_lot::Mutex<ScopedDiscoveryState>>,
+    global_lease: Arc<AtomicBool>,
+    owner_lease: Arc<AtomicBool>,
+}
+
+#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
+impl PrivateDiscoveryDrains {
+    /// A mint over `state` — the SAME state the ingest path, exact-expiry timer,
+    /// and floor-raise callback mutate.
+    pub(crate) fn new(state: Arc<parking_lot::Mutex<ScopedDiscoveryState>>) -> Self {
+        Self {
+            state,
+            global_lease: Arc::new(AtomicBool::new(false)),
+            owner_lease: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn lease_for(&self, stream: PrivateDiscoveryStream) -> &Arc<AtomicBool> {
+        match stream {
+            PrivateDiscoveryStream::Global => &self.global_lease,
+            PrivateDiscoveryStream::Owner => &self.owner_lease,
+        }
+    }
+
+    /// Claim `stream`'s exclusive drain, or `None` if it is already held (or
+    /// stranded by a leak). The two streams claim independently.
+    ///
+    /// A successful claim commits `RebuildAll` for the stream BEFORE the handle
+    /// exists, so the successor's first drain is unconditionally a complete
+    /// recapture and no delta consumed by a dead predecessor is silently lost.
+    pub(crate) fn mint(&self, stream: PrivateDiscoveryStream) -> Option<PrivateDiscoveryDrain> {
+        let lease = self.lease_for(stream);
+        // Vacant -> Minting. `Acquire` on success pairs with a predecessor's
+        // `Release` on drop.
+        lease
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        let rollback = LeaseRollback { lease, armed: true };
+        // Committed under the state lock, and before the handle is exposed.
+        self.state.lock().mark_rebuild_all(stream);
+        let drain = PrivateDiscoveryDrain {
+            state: self.state.clone(),
+            stream,
+            lease: lease.clone(),
+        };
+        rollback.disarm();
+        Some(drain)
     }
 }
 
@@ -2355,6 +2555,195 @@ mod tests {
             state.next_visible_expiry(),
             Some(1000),
             "becoming query-visible installed the earlier deadline"
+        );
+    }
+
+    // ----- OLB-2B-E1: exclusive drain ownership + rollback-safe lease -----
+
+    /// A state seeded with one dirtying owner record, wrapped for the mint.
+    fn leased_state() -> Arc<parking_lot::Mutex<ScopedDiscoveryState>> {
+        let state = Arc::new(parking_lot::Mutex::new(ScopedDiscoveryState::new()));
+        {
+            let mut s = state.lock();
+            let prepared =
+                PreparedScopedCapability::prepare(owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]));
+            s.ingest(prepared, 0);
+        }
+        state
+    }
+
+    /// Each stream leases to at most ONE live holder, and the two streams claim
+    /// independently. A second claim while held is refused — that refusal is what
+    /// makes a second concurrent drainer unrepresentable.
+    #[test]
+    fn a_stream_leases_to_one_holder_at_a_time() {
+        let drains = PrivateDiscoveryDrains::new(leased_state());
+
+        let global = drains
+            .mint(PrivateDiscoveryStream::Global)
+            .expect("first global claim");
+        assert!(
+            drains.mint(PrivateDiscoveryStream::Global).is_none(),
+            "a second live claim on a held stream is refused"
+        );
+        assert_eq!(global.stream(), PrivateDiscoveryStream::Global);
+
+        // The owner stream is independent — OLB leaves it unclaimed, but the mint
+        // must not couple the two.
+        let owner = drains
+            .mint(PrivateDiscoveryStream::Owner)
+            .expect("owner claims independently");
+        assert!(drains.mint(PrivateDiscoveryStream::Owner).is_none());
+        drop((global, owner));
+    }
+
+    /// Dropping the handle RELEASES the lease, so a supervisor can mint a
+    /// successor. This is the property that keeps an actor panic recoverable
+    /// instead of stranding the revocation path for the node's lifetime.
+    #[test]
+    fn dropping_the_handle_releases_the_lease() {
+        let drains = PrivateDiscoveryDrains::new(leased_state());
+
+        let first = drains
+            .mint(PrivateDiscoveryStream::Global)
+            .expect("first claim");
+        assert!(drains.mint(PrivateDiscoveryStream::Global).is_none());
+
+        drop(first);
+        assert!(
+            drains.mint(PrivateDiscoveryStream::Global).is_some(),
+            "the released lease can be reclaimed by a successor"
+        );
+    }
+
+    /// A newly minted drain's FIRST batch is `RebuildAll`, committed before the
+    /// handle exists. A predecessor that drained a delta and died without applying
+    /// it must not leave a successor observing a clean stream and assuming it is
+    /// current.
+    #[test]
+    fn a_minted_drain_starts_from_rebuild_all() {
+        let state = leased_state();
+        let drains = PrivateDiscoveryDrains::new(state.clone());
+
+        // A predecessor drains the real delta, then dies without applying it.
+        let mut predecessor = drains
+            .mint(PrivateDiscoveryStream::Global)
+            .expect("first claim");
+        assert_eq!(
+            predecessor.drain().dirty,
+            DirtyCapabilities::RebuildAll,
+            "even the first ever mint starts from a complete recapture"
+        );
+        // Its own next drain would be clean — the delta is consumed.
+        assert_eq!(predecessor.drain().dirty, DirtyCapabilities::Clean);
+        drop(predecessor);
+
+        // The successor must NOT inherit that clean stream.
+        let mut successor = drains
+            .mint(PrivateDiscoveryStream::Global)
+            .expect("successor claims");
+        assert_eq!(
+            successor.drain().dirty,
+            DirtyCapabilities::RebuildAll,
+            "a successor recaptures completely; no consumed delta is silently lost"
+        );
+    }
+
+    /// The rollback guard releases a claimed lease if minting does not reach the
+    /// handle — including on unwind — so a failed mint never strands the stream.
+    /// A disarmed guard (the success path) leaves the claim standing.
+    #[test]
+    fn the_rollback_guard_releases_an_unpublished_claim() {
+        // Armed and dropped == the mint failed or unwound after claiming.
+        let lease = AtomicBool::new(true);
+        drop(LeaseRollback {
+            lease: &lease,
+            armed: true,
+        });
+        assert!(
+            !lease.load(Ordering::Acquire),
+            "an armed guard releases the claim it was protecting"
+        );
+
+        // Disarmed == the handle was published and now owns the lease.
+        let lease = AtomicBool::new(true);
+        LeaseRollback {
+            lease: &lease,
+            armed: true,
+        }
+        .disarm();
+        assert!(
+            lease.load(Ordering::Acquire),
+            "a disarmed guard leaves the successful claim in place"
+        );
+
+        // Unwinding through the guard releases too — the case the guard exists for.
+        let lease = Arc::new(AtomicBool::new(true));
+        let unwound = {
+            let lease = lease.clone();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _rollback = LeaseRollback {
+                    lease: &lease,
+                    armed: true,
+                };
+                panic!("mint failed after claiming");
+            }))
+        };
+        assert!(unwound.is_err(), "the mint unwound");
+        assert!(
+            !lease.load(Ordering::Acquire),
+            "an unwinding mint releases its claim rather than stranding the stream"
+        );
+    }
+
+    /// A leaked handle strands its stream — deliberately. Reclaiming a lease whose
+    /// owner may still be alive is the double-drain this type exists to prevent, so
+    /// stranding is the safe direction; a supervisor sees the refused mint.
+    #[test]
+    fn a_leaked_handle_strands_its_stream_rather_than_double_draining() {
+        let drains = PrivateDiscoveryDrains::new(leased_state());
+        let leaked = drains
+            .mint(PrivateDiscoveryStream::Global)
+            .expect("first claim");
+        std::mem::forget(leaked);
+        assert!(
+            drains.mint(PrivateDiscoveryStream::Global).is_none(),
+            "a leaked lease is never silently reclaimed into a second drainer"
+        );
+    }
+
+    /// A drain routes to ITS stream: an owner ingest dirties both, so each handle
+    /// reports the capability and leaves only its own stream clean.
+    #[test]
+    fn a_drain_routes_to_its_own_stream() {
+        let state = leased_state();
+        let drains = PrivateDiscoveryDrains::new(state);
+        let expected = one_cap("nrpc:a");
+
+        let mut global = drains
+            .mint(PrivateDiscoveryStream::Global)
+            .expect("global claim");
+        // The mint forced RebuildAll; drain it away, then dirty afresh so the
+        // routing assertion is about the stream and not the recapture.
+        let _ = global.drain();
+        {
+            let mut s = global.state.lock();
+            let prepared =
+                PreparedScopedCapability::prepare(owner_cap_declaring(4, 1, 10_000, &["nrpc:a"]));
+            s.ingest(prepared, 0);
+        }
+        assert_eq!(global.drain().dirty, expected, "global reports its delta");
+        assert_eq!(global.drain().dirty, DirtyCapabilities::Clean);
+
+        // The owner stream was untouched by the global drain and still carries the
+        // mint's RebuildAll plus the owner delta.
+        let mut owner = drains
+            .mint(PrivateDiscoveryStream::Owner)
+            .expect("owner claim");
+        assert_eq!(
+            owner.drain().dirty,
+            DirtyCapabilities::RebuildAll,
+            "draining global did not clean owner"
         );
     }
 
