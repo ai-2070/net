@@ -28,11 +28,6 @@
 //! sorting or projection; and no registry method a source implementation could
 //! re-enter takes the commit pin.
 
-// E3b-ONLY: the node wiring that consumes this lands in E3c, which also removes
-// this allow and those in `org_routing`/`org_scoped_store`. A leftover allow there
-// means the real consumer never landed.
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -72,6 +67,7 @@ pub(crate) struct PrivateAudienceScope(CapabilityAudienceScope);
 
 impl PrivateAudienceScope {
     /// `None` for `Public` — the only rejection.
+    #[allow(dead_code)] // demand surface; see the note above `RoutingFamily`.
     pub(crate) fn new(scope: CapabilityAudienceScope) -> Option<Self> {
         match scope {
             CapabilityAudienceScope::Public => None,
@@ -101,9 +97,11 @@ pub(crate) struct SlotKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DemandRefused {
     /// This family already holds `MAX_HANDLES_PER_FAMILY` handles.
+    #[allow(dead_code)]
     FamilyAtCapacity,
     /// The node already retains `MAX_NODE_SLOTS` distinct slots. A live slot is
     /// NEVER evicted to satisfy new demand.
+    #[allow(dead_code)]
     NodeAtCapacity,
     /// The monotone identity space backing slot incarnations and family identities
     /// is exhausted. Refusing is the only safe answer: wrapping would let a stale
@@ -119,7 +117,7 @@ pub(crate) enum DemandRefused {
 /// it was built for, and the source generation it was built from.
 #[derive(Clone, Debug)]
 pub(crate) struct SlotBaseFacts {
-    pub key: SlotKey,
+    #[allow(dead_code)] // read by the warmed-call consumer.
     pub providers: Arc<[PrivateCapabilityProvider]>,
     pub source_generation: u64,
     pub actor_incarnation: u64,
@@ -181,6 +179,7 @@ struct Slot {
     /// for a previous incarnation can never resurrect it.
     incarnation: u64,
     /// Live demand handles across ALL families.
+    #[allow(dead_code)]
     refs: usize,
     /// `None` until a recapture installs facts, and cleared the moment anything
     /// invalidates them. `None` IS the deterministic cold outcome.
@@ -195,6 +194,7 @@ struct RegistryInner {
     slots_by_capability: BTreeMap<CapabilityAuthorityId, BTreeSet<SlotKey>>,
     /// Per family, its handle count per key. Bounds HANDLES, not distinct keys, so
     /// duplicate demand cannot bypass the bound.
+    #[allow(dead_code)]
     families: BTreeMap<FamilyId, BTreeMap<SlotKey, usize>>,
     /// AUTHORITATIVE pending slot identities — the work queue proper.
     pending: BTreeSet<SlotKey>,
@@ -215,6 +215,7 @@ struct RegistryInner {
 }
 
 impl RegistryInner {
+    #[allow(dead_code)]
     fn family_handles(&self, family: FamilyId) -> usize {
         self.families
             .get(&family)
@@ -330,12 +331,26 @@ pub(crate) struct NodeOrgRoutingRegistry {
 /// not a caller-supplied integer. Independent families are minted by
 /// [`NodeOrgRoutingRegistry::new_family`] and can neither name nor spend one
 /// another's budget.
+// ---------------------------------------------------------------------------
+// The DEMAND surface.
+//
+// Everything below has no in-crate production caller, and that is a reviewed
+// SCOPE decision rather than a missing consumer: the path that holds demand
+// handles is the warmed-call consumer, which is deliberately outside the OLB-2B
+// entry boundary (Kyra). The registry's REAL consumer — the supervised actor
+// driving `DirtyApply` — is fully live and node-wired in E3c.
+//
+// These allows are therefore permanent-until-warmed-calls and item-scoped. They
+// are NOT the E1/E2/E3a/E3b module-wide allowances, which are gone.
+// ---------------------------------------------------------------------------
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct RoutingFamily {
     registry: Arc<NodeOrgRoutingRegistry>,
     id: FamilyId,
 }
 
+#[allow(dead_code)]
 impl RoutingFamily {
     /// Register demand for `key` under THIS family's budget.
     pub(crate) fn demand(&self, key: SlotKey) -> Result<DemandHandle, DemandRefused> {
@@ -350,6 +365,7 @@ impl RoutingFamily {
 
 /// A live demand for one authority-scoped key, held by one family. Releases on
 /// drop; the LAST reference retires the slot.
+#[allow(dead_code)]
 pub(crate) struct DemandHandle {
     registry: Arc<NodeOrgRoutingRegistry>,
     family: FamilyId,
@@ -405,6 +421,7 @@ impl NodeOrgRoutingRegistry {
     ///
     /// A duplicate demand from the same family is a distinct handle: it shares the
     /// slot and counts toward the family bound, so re-demanding cannot bypass it.
+    #[allow(dead_code)]
     fn demand(
         self: &Arc<Self>,
         family: FamilyId,
@@ -475,6 +492,7 @@ impl NodeOrgRoutingRegistry {
 
     /// Release one handle. The LAST reference retires the slot; a re-demand then
     /// allocates a FRESH incarnation, so work in flight cannot resurrect it.
+    #[allow(dead_code)]
     fn release(&self, family: FamilyId, key: &SlotKey) {
         let mut inner = self.inner.lock();
         if let Some(keys) = inner.families.get_mut(&family) {
@@ -775,7 +793,6 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     continue;
                 }
                 slot.facts = Some(Arc::new(SlotBaseFacts {
-                    key: key.clone(),
                     providers: providers.into(),
                     source_generation: generation,
                     actor_incarnation: incarnation,

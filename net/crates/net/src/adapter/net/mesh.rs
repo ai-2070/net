@@ -5103,6 +5103,150 @@ impl ScopedMutationPublication {
     }
 }
 
+/// The production [`SlotSource`] — the routing registry's binding to real
+/// private discovery (OLB-2B-E3c).
+///
+/// Implements the signed E3b seam literally, and the split is the whole point:
+///
+/// - [`SlotSource::snapshot`] takes the STATE lock only, briefly, and returns
+///   fully owned rows. It does NOT take the publication gate, so a mutation can
+///   commit the instant the capture ends;
+/// - reconstruction runs on the returned material with no source lock, no
+///   registry lock, no await;
+/// - [`SlotSource::pin_if_current`] takes the publication GATE — the thing that
+///   serializes every ingest, sweep, floor retraction and publication — and holds
+///   it only across the conditional installation.
+///
+/// Holding that gate across reconstruction instead would block all private
+/// discovery behind a whole quantum of store queries (Kyra OLB-2B-E3b).
+///
+/// # Why the gate makes the pin sound
+///
+/// A mutation holds the gate from before its currentness recheck through its
+/// publication. So while the pin holds the gate, no mutation can commit; and if
+/// one committed between the snapshot and the pin, the revision read under the
+/// gate differs from the expected one and the pin refuses. A snapshot that raced
+/// a mutation's state-lock section but preceded its publication still reads the
+/// post-mutation revision, and the pin then blocks until that publication is
+/// ordered — so the wake the discarded attempt relies on is already queued.
+struct ScopedSlotSource {
+    scoped_discovery:
+        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
+    publication: Arc<ScopedMutationPublication>,
+    org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+    /// Slots asked for under a scope this source does not serve. Counted rather
+    /// than silently answered with "no providers".
+    unserved_scope: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Owned, bounded material for ONE quantum: the exact rows for the exact keys the
+/// registry selected, captured at `generation`.
+struct ScopedSourceSnapshot {
+    generation: u64,
+    rows: std::collections::BTreeMap<
+        super::behavior::org_routing_registry::SlotKey,
+        Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider>,
+    >,
+}
+
+impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnapshot {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn providers(
+        &self,
+        key: &super::behavior::org_routing_registry::SlotKey,
+    ) -> Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider> {
+        // Reconstruction proper: no lock of any kind, no await. Ordering is
+        // imposed HERE rather than at capture, so the deterministic projection is
+        // off-lock work.
+        let mut providers = self.rows.get(key).cloned().unwrap_or_default();
+        providers.sort_by(|a, b| {
+            a.provider
+                .cmp(&b.provider)
+                .then_with(|| a.generation.cmp(&b.generation))
+        });
+        providers.dedup_by(|a, b| a.provider == b.provider);
+        providers
+    }
+}
+
+/// Holds the publication gate across the conditional installation, and nothing
+/// more.
+struct ScopedCommitPin<'a> {
+    _gate: parking_lot::MutexGuard<'a, ()>,
+    generation: u64,
+}
+
+impl super::behavior::org_routing_registry::SourceCommitPin for ScopedCommitPin<'_> {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
+    fn snapshot(
+        &self,
+        keys: &[super::behavior::org_routing_registry::SlotKey],
+    ) -> Box<dyn super::behavior::org_routing_registry::SourceSnapshot> {
+        use super::behavior::org_revocation::OrgRevocationState;
+        let now_secs = super::behavior::org::current_timestamp();
+        // Borrow the LIVE floor snapshot BEFORE the state lock, exactly as the
+        // ingest and owner-query paths do.
+        let store = self.org_revocation.load_full();
+        let empty_floors = OrgRevocationState::empty();
+        let floors_snapshot = store.as_ref().map(|s| s.snapshot());
+        let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+
+        let mut unserved = 0u64;
+        let (generation, rows) = {
+            let state = self.scoped_discovery.lock();
+            let generation = state.revision();
+            let mut rows = std::collections::BTreeMap::new();
+            for key in keys {
+                let scope = key.scope.scope();
+                if !matches!(
+                    scope,
+                    super::behavior::org_scoped_ingest::CapabilityAudienceScope::Owner { .. }
+                ) {
+                    unserved += 1;
+                }
+                rows.insert(
+                    key.clone(),
+                    state.find_scope_exact_private_providers(
+                        scope,
+                        &key.capability,
+                        now_secs,
+                        floors,
+                    ),
+                );
+            }
+            (generation, rows)
+        };
+        if unserved > 0 {
+            self.unserved_scope
+                .fetch_add(unserved, std::sync::atomic::Ordering::AcqRel);
+        }
+        Box::new(ScopedSourceSnapshot { generation, rows })
+    }
+
+    fn pin_if_current(
+        &self,
+        expected_generation: u64,
+    ) -> Option<Box<dyn super::behavior::org_routing_registry::SourceCommitPin + '_>> {
+        let gate = self.publication.lock_gate();
+        let generation = self.scoped_discovery.lock().revision();
+        if generation != expected_generation {
+            return None;
+        }
+        Some(Box::new(ScopedCommitPin {
+            _gate: gate,
+            generation,
+        }))
+    }
+}
+
 /// Drive the node's single exact-expiry timer (OLB-2A.3.2).
 ///
 /// Reads [`ScopedDiscoveryState::next_visible_expiry`] and arms to exactly that
@@ -5398,6 +5542,39 @@ pub struct MeshNode {
     /// and can never regress (Kyra OLB-2A.3.1 closure). The owner generation and
     /// the dirty deltas are read from the state on wake.
     scoped_publication: Arc<ScopedMutationPublication>,
+    /// OLB-2B-E3c: the node's ONE bounded routing registry — the real consumer of
+    /// the private-discovery dirty stream, and the `DirtyApply` the supervised
+    /// actor drives. Constructed here so its retained slots outlive any single
+    /// actor incarnation; the actor's authority over it is claimed and revoked by
+    /// the incarnation lifecycle, not by construction.
+    routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
+    /// OLB-2B-E3a: the registry-work wake — the second source in the actor's wait
+    /// set, for the transitions private-discovery movement cannot signal (first
+    /// demand, slot lifecycle).
+    routing_work: Arc<super::behavior::org_routing::RegistryWork>,
+    /// OLB-2B-E2: the live routing health view. `Fenced` until an incarnation
+    /// completes a recapture, and fenced again the moment one dies.
+    routing_health: super::behavior::org_routing::SharedRoutingHealth,
+    /// OLB-2B-E2/E3b: supervision and registry counters.
+    routing_metrics: Arc<super::behavior::org_routing::RoutingMetrics>,
+    routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics>,
+    /// OLB-2B-E3c: slots whose audience scope the production source does not
+    /// serve (the grant plane). Counted, never silently answered as "no
+    /// providers".
+    routing_unserved_scope: Arc<std::sync::atomic::AtomicU64>,
+    /// OLB-2B-E3c: the supervisor task, held for a DETERMINISTIC join.
+    ///
+    /// Kept in its own slot rather than the shared `tasks` vector because that
+    /// vector is populated from a spawned task, so a fast shutdown can miss it.
+    /// The routing task must be joined — awaiting it is the proof that the actor
+    /// fenced and the exclusive drain dropped, and therefore the only thing that
+    /// makes a successor mint possible.
+    routing_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    /// OLB-2B-E3c: guards the SINGLE production supervisor construction path.
+    routing_started: Arc<AtomicBool>,
+    /// Fixtures-only actor observation points, threaded into the supervisor.
+    #[cfg(feature = "fixtures")]
+    routing_hooks: Arc<super::behavior::org_routing::ActorHooks>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. Shared across the inbound dispatch so a flooded envelope is
     /// forwarded at most once per node; never decrypts or stores anything.
@@ -6839,6 +7016,34 @@ impl MeshNode {
         // registries, so the signal is echo-safe by construction.
         let local_caps_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
 
+        // OLB-2B-E3c: the routing plane. Built here, before the node literal, so
+        // the registry binds to the very same scoped state, publication gate and
+        // revocation slot the ingest paths use — one source of truth, not a
+        // parallel copy. The SUPERVISOR is deliberately NOT built here: it owns the
+        // exclusive destructive drain, and its single production construction path
+        // is `spawn_org_routing_supervisor`, reached only from `start`.
+        let scoped_discovery = Arc::new(parking_lot::Mutex::new(
+            super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
+        ));
+        let scoped_publication = Arc::new(ScopedMutationPublication::new());
+        let org_revocation: Arc<
+            ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
+        > = Arc::new(ArcSwapOption::empty());
+        let routing_work: Arc<super::behavior::org_routing::RegistryWork> = Arc::default();
+        let routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics> =
+            Arc::default();
+        let routing_unserved_scope = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let routing_registry = super::behavior::org_routing_registry::NodeOrgRoutingRegistry::new(
+            Arc::new(ScopedSlotSource {
+                scoped_discovery: scoped_discovery.clone(),
+                publication: scoped_publication.clone(),
+                org_revocation: org_revocation.clone(),
+                unserved_scope: routing_unserved_scope.clone(),
+            }),
+            routing_work.clone(),
+            routing_registry_metrics.clone(),
+        );
+
         let node = Self {
             identity: Arc::new(identity),
             static_keypair,
@@ -6878,12 +7083,20 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             cancel_registry: Arc::new(crate::adapter::net::cancel_registry::CancelRegistry::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
-            org_revocation: Arc::new(ArcSwapOption::empty()),
+            org_revocation,
             node_authority: Arc::new(ArcSwapOption::empty()),
-            scoped_discovery: Arc::new(parking_lot::Mutex::new(
-                super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
-            )),
-            scoped_publication: Arc::new(ScopedMutationPublication::new()),
+            scoped_discovery,
+            scoped_publication,
+            routing_registry,
+            routing_work,
+            routing_health: super::behavior::org_routing::new_routing_health(),
+            routing_metrics: Arc::default(),
+            routing_registry_metrics,
+            routing_unserved_scope,
+            routing_task: parking_lot::Mutex::new(None),
+            routing_started: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "fixtures")]
+            routing_hooks: Arc::default(),
             scoped_relay_gate: Arc::new(
                 super::behavior::org_scoped_relay::ScopedAnnRelayGate::new(),
             ),
@@ -11130,6 +11343,10 @@ impl MeshNode {
         };
         let capability_gc_handle = self.spawn_capability_gc_loop();
         let exact_expiry_handle = self.spawn_exact_expiry_timer();
+        // OLB-2B-E3c. Its handle goes to `routing_task`, NOT the shared `tasks`
+        // vector: that vector is filled from a spawned task, so a fast shutdown
+        // can miss it, and this task must be joined deterministically.
+        self.start_org_routing_supervisor();
         let capability_reannounce_handle = self.spawn_capability_reannounce_loop();
         let capability_announce_on_change_handle = self.spawn_capability_announce_on_change_loop();
         let fold_generation_gc_handle = self.spawn_fold_generation_gc_loop();
@@ -11243,6 +11460,174 @@ impl MeshNode {
         // `shutdown_notify`.
         #[cfg(feature = "nat-traversal")]
         let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
+    }
+
+    /// The ONE production path that constructs a [`RoutingSupervisor`] and
+    /// therefore the ONE that mints the exclusive global destructive drain
+    /// (OLB-2B-E3c).
+    ///
+    /// Everything the supervisor needs is node-owned and already built; all this
+    /// does is hand it the mint and run it. Two properties matter:
+    ///
+    /// - **exactly one mint.** `PrivateDiscoveryDrains::new` is called nowhere else
+    ///   in production, and the `routing_started` latch refuses a second start even
+    ///   if `start` is called twice. The drain's own lease would refuse the second
+    ///   claim regardless — this makes the refusal loud instead of a fenced actor;
+    /// - **the OWNER stream is never claimed.** The supervisor mints
+    ///   `PrivateDiscoveryStream::Global` only; the owner stream stays available for
+    ///   the provider-free leader track (Kyra OLB-2B, Q4).
+    fn start_org_routing_supervisor(&self) {
+        if self.routing_started.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                "org routing: the supervisor is already running; ignoring the \
+                 duplicate start. The global private-discovery drain is minted \
+                 exactly once per node."
+            );
+            return;
+        }
+
+        let supervisor = super::behavior::org_routing::RoutingSupervisor::new(
+            super::behavior::org_scoped_store::PrivateDiscoveryDrains::new(
+                self.scoped_discovery.clone(),
+            ),
+            self.routing_health.clone(),
+            self.routing_metrics.clone(),
+        );
+        let changed = self.scoped_publication.subscribe();
+        let apply: super::behavior::org_routing::SharedApply = self.routing_registry.clone();
+        let work = self.routing_work.clone();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        #[cfg(feature = "fixtures")]
+        let hooks = self.routing_hooks.clone();
+
+        let handle = tokio::spawn(async move {
+            supervisor
+                .run(
+                    changed,
+                    apply,
+                    work,
+                    shutdown,
+                    shutdown_notify,
+                    #[cfg(feature = "fixtures")]
+                    hooks,
+                )
+                .await;
+        });
+        *self.routing_task.lock() = Some(handle);
+    }
+
+    /// Signal-and-join the routing supervisor.
+    ///
+    /// Awaiting the task is the proof the caller needs: the supervisor future owns
+    /// the incarnation future, which owns the fence guard and the exclusive drain,
+    /// so the task resolving means health is fenced and the drain lease is
+    /// released. Only then can a successor mint succeed (OLB-2B-E3c).
+    ///
+    /// The shutdown flag and notification must already have been issued.
+    async fn join_org_routing_supervisor(&self) {
+        let handle = self.routing_task.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
+    /// Whether the routing plane is currently usable — a live incarnation has
+    /// completed a recapture. `false` while rebuilding and whenever fenced
+    /// (OLB-2B-E2).
+    pub fn org_routing_ready(&self) -> bool {
+        matches!(
+            **self.routing_health.load(),
+            super::behavior::org_routing::RoutingHealth::Healthy { .. }
+        )
+    }
+
+    /// Actor incarnations started, and abnormal source-closure exits
+    /// (OLB-2B-E2). A nonzero second value is loud: invalidations stopped while
+    /// discovery can still change.
+    pub fn org_routing_supervision_counts(&self) -> (u64, u64) {
+        (
+            self.routing_metrics.incarnations_started(),
+            self.routing_metrics.source_closed_unexpected(),
+        )
+    }
+
+    /// Retained routing slots and the work owed over them (OLB-2B-E3b).
+    pub fn org_routing_slots(&self) -> (usize, usize) {
+        (
+            self.routing_registry.retained_slots(),
+            self.routing_registry.pending_slots(),
+        )
+    }
+
+    /// Deterministic routing refusals: family-at-capacity, node-at-capacity,
+    /// identity-space-exhausted (OLB-2B-E3b). Each means a caller took the
+    /// current-authority cold path rather than a live slot being evicted.
+    pub fn org_routing_refusals(&self) -> (u64, u64, u64) {
+        (
+            self.routing_registry_metrics.refused_family_at_capacity(),
+            self.routing_registry_metrics.refused_node_at_capacity(),
+            self.routing_registry_metrics.refused_id_space_exhausted(),
+        )
+    }
+
+    /// Routing reconciliation counters: installs, slots retired, facts
+    /// invalidated, obsolete artifacts discarded, stale-actor rejections,
+    /// recaptures restarted (OLB-2B-E3b).
+    pub fn org_routing_reconciliation_counts(&self) -> [u64; 6] {
+        [
+            self.routing_registry_metrics.installs(),
+            self.routing_registry_metrics.slots_retired(),
+            self.routing_registry_metrics.facts_invalidated(),
+            self.routing_registry_metrics.discarded_obsolete(),
+            self.routing_registry_metrics.stale_actor_rejections(),
+            self.routing_registry_metrics.recaptures_restarted(),
+        ]
+    }
+
+    /// Slots asked for under an audience scope the production source does not
+    /// serve — the grant plane, which is not capability-indexed. Never silently
+    /// answered as "no providers" (OLB-2B-E3c).
+    pub fn org_routing_unserved_scope_count(&self) -> u64 {
+        self.routing_unserved_scope
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mint a routing clone family over this node's registry.
+    ///
+    /// The consumer that will hold demand handles is the WARMED-CALL path, which
+    /// is deliberately outside the OLB-2B entry boundary (Kyra) — so this seam has
+    /// no in-crate production caller yet, and that is the reviewed scope decision
+    /// rather than a missing consumer. The allow is scoped to exactly these two
+    /// methods; it is NOT a module-wide or per-slice allowance.
+    #[allow(dead_code)]
+    pub(crate) fn org_routing_family(
+        &self,
+    ) -> Result<
+        super::behavior::org_routing_registry::RoutingFamily,
+        super::behavior::org_routing_registry::DemandRefused,
+    > {
+        self.routing_registry.new_family()
+    }
+
+    /// The registry's base facts for `key`, if a slot is retained, currently
+    /// holds valid facts, AND the live health still allows the incarnation that
+    /// built them.
+    ///
+    /// Health is not source currentness — that is what the generation stamp is
+    /// for — but it IS the fence: an incarnation that died after installing must
+    /// not keep serving through its artifacts. `None` is the deterministic cold
+    /// outcome for every one of those reasons.
+    #[allow(dead_code)]
+    pub(crate) fn org_routing_base_facts(
+        &self,
+        key: &super::behavior::org_routing_registry::SlotKey,
+    ) -> Option<Arc<super::behavior::org_routing_registry::SlotBaseFacts>> {
+        let facts = self.routing_registry.base_facts(key)?;
+        self.routing_health
+            .load()
+            .allows(facts.actor_incarnation)
+            .then_some(facts)
     }
 
     /// Spawn the NAT classification loop. Waits until at least 2
@@ -26940,6 +27325,12 @@ impl Adapter for MeshNode {
         self.shutdown_notify.notify_waiters();
         self.router.stop();
 
+        // OLB-2B-E3c: join the routing supervisor BEFORE the general task drain.
+        // Awaiting it proves the actor fenced and released the exclusive
+        // private-discovery drain, so no incarnation survives this call and a
+        // successor node can mint.
+        self.join_org_routing_supervisor().await;
+
         // Deactivate all sessions
         for entry in self.peers.iter() {
             entry.value().session.deactivate();
@@ -32686,3 +33077,7 @@ mod exact_expiry_timer_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "org_routing_wiring_tests.rs"]
+mod org_routing_wiring_tests;

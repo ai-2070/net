@@ -20,13 +20,6 @@
 //! currentness: no in-process caller survives the abort, and the external restart
 //! constructs a fresh actor whose mint forces a complete `RebuildAll` recapture.
 
-// E2-ONLY. Exercised by the witnesses below but not yet spawned by `MeshNode`:
-// per Kyra's Q2 the production node must not run a lifecycle-only counter sink, so
-// the node wiring lands in E3 together with the bounded routing registry that is
-// the real consumer. THIS ALLOW IS REMOVED IN E3 — if it is still here, the real
-// consumer never landed.
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,14 +78,6 @@ pub(crate) struct ActorFault {
     pub reason: String,
 }
 
-impl ActorFault {
-    pub(crate) fn new(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-        }
-    }
-}
-
 /// What one application attempt achieved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyOutcome {
@@ -121,6 +106,12 @@ pub(crate) enum ApplyOutcome {
     Superseded,
     /// A recoverable failure: the actor exits through the synchronous fence and
     /// the supervisor applies its restart policy.
+    ///
+    /// Never constructed by the bounded routing registry, whose every refusal is
+    /// deterministic and non-fatal — but the actor must still handle it, because
+    /// the `DirtyApply` contract admits implementors that CAN fail recoverably.
+    /// Deleting it would delete the restart policy's only trigger.
+    #[allow(dead_code)]
     Fault(ActorFault),
 }
 
@@ -509,11 +500,6 @@ impl RoutingSupervisor {
             health,
             metrics,
         }
-    }
-
-    /// The live health view, for the node and for witnesses.
-    pub(crate) fn health(&self) -> SharedRoutingHealth {
-        self.health.clone()
     }
 
     /// Run the supervision loop until shutdown, an abnormal terminal failure, or
@@ -1016,7 +1002,9 @@ mod tests {
         let h = harness();
         let apply = h.applier(Box::new(|inc, r| {
             if inc == 1 {
-                ApplyOutcome::Fault(ActorFault::new("injected"))
+                ApplyOutcome::Fault(ActorFault {
+                    reason: ("injected").into(),
+                })
             } else {
                 ApplyOutcome::Current {
                     source_generation: r.batch.generation,
@@ -1052,7 +1040,9 @@ mod tests {
     async fn an_abnormal_exit_fences_synchronously_during_backoff() {
         let h = harness();
         let apply = h.applier(Box::new(|_, _| {
-            ApplyOutcome::Fault(ActorFault::new("injected"))
+            ApplyOutcome::Fault(ActorFault {
+                reason: ("injected").into(),
+            })
         }));
         let run = h.spawn(h.supervisor(), apply);
         settle().await;
@@ -1172,7 +1162,9 @@ mod tests {
         let h = harness();
         let apply = h.applier(Box::new(|inc, r| {
             if inc == 1 {
-                ApplyOutcome::Fault(ActorFault::new("injected"))
+                ApplyOutcome::Fault(ActorFault {
+                    reason: ("injected").into(),
+                })
             } else {
                 ApplyOutcome::Current {
                     source_generation: r.batch.generation,
@@ -1200,7 +1192,9 @@ mod tests {
     async fn a_deterministic_fault_exhausts_the_restart_budget_and_stays_fenced() {
         let h = harness();
         let apply = h.applier(Box::new(|_, _| {
-            ApplyOutcome::Fault(ActorFault::new("deterministic"))
+            ApplyOutcome::Fault(ActorFault {
+                reason: ("deterministic").into(),
+            })
         }));
         let run = h.spawn(h.supervisor(), apply);
 

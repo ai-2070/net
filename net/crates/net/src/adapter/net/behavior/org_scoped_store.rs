@@ -186,7 +186,6 @@ impl DirtyCapabilities {
     }
 
     /// Take the accumulated set, leaving the stream `Clean`.
-    #[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
     fn take(&mut self) -> DirtyCapabilities {
         std::mem::take(self)
     }
@@ -202,11 +201,8 @@ impl DirtyCapabilities {
 /// hints that something moved, while the generation and dirty set here say what
 /// a consumer must reconcile.
 ///
-/// Consumerless in 2A.2 (allowed while consumerless per the OLB-2A closure): its
-/// single owner is the node-owned reconciler whose exclusive drain ownership is
-/// the OLB-2B actor-entry prerequisite. Exercised by the change-stream witnesses
-/// today.
-#[allow(dead_code)]
+/// Its single owner is the node-owned routing actor, which drains it through the
+/// exclusive global lease (OLB-2B-E3c).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrivateDiscoveryChangeBatch {
     /// The query-visible change generation at the drain instant — advanced by a
@@ -929,6 +925,28 @@ impl ScopedDiscoveryState {
         retract.len()
     }
 
+    /// Test-only: advance the query-visible generation and dirty `capability`
+    /// exactly as a real mutation would, without constructing one.
+    ///
+    /// The witnesses that need a mutation to LAND between a routing snapshot and
+    /// its commit pin care about the publication transition, not about which row
+    /// moved — and they still drive it through the real
+    /// `ScopedMutationPublication::gated_commit`, so the gate, the ordering and
+    /// the watch publication are all production paths.
+    ///
+    /// `cfg(test)` rather than `feature = "fixtures"`: its only callers are
+    /// in-crate units, and CI's gating `--lib` job does NOT enable `fixtures`, so
+    /// a fixtures gate would silently drop those witnesses out of CI.
+    #[cfg(test)]
+    pub(crate) fn advance_query_visible_generation_for_test(
+        &mut self,
+        capability: CapabilityAuthorityId,
+    ) {
+        let mut global = BTreeSet::new();
+        global.insert(capability);
+        self.record_change(&global, &BTreeSet::new());
+    }
+
     /// Advance the change generations and dirty streams for a mutation that
     /// touched `global` (and, where owner-scoped, `owner`) capability buckets.
     /// Empty sets are a no-op — a mutation that changed the store's live set but
@@ -1034,7 +1052,6 @@ impl ScopedDiscoveryState {
     /// opening a second drain of this stream; that exactly ONE production caller
     /// exists inside this module is a review-enforced invariant, not something
     /// privacy can prove.
-    #[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
     fn take_global_change_batch(&mut self) -> PrivateDiscoveryChangeBatch {
         PrivateDiscoveryChangeBatch {
             generation: self.revision,
@@ -1045,7 +1062,6 @@ impl ScopedDiscoveryState {
     /// Atomically capture the OWNER change stream (generation + dirty), leaving
     /// it `Clean`. Module-private and destructive on the same terms as
     /// [`Self::take_global_change_batch`].
-    #[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
     fn take_owner_change_batch(&mut self) -> PrivateDiscoveryChangeBatch {
         PrivateDiscoveryChangeBatch {
             generation: self.owner_revision,
@@ -1062,7 +1078,6 @@ impl ScopedDiscoveryState {
     /// Enforcing it at the mint means a successor cannot forget, and it reuses the
     /// bounded-overflow sentinel that already exists rather than adding recovery
     /// machinery.
-    #[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
     fn mark_rebuild_all(&mut self, stream: PrivateDiscoveryStream) {
         match stream {
             PrivateDiscoveryStream::Global => self.pending_global = DirtyCapabilities::RebuildAll,
@@ -1117,6 +1132,45 @@ impl ScopedDiscoveryState {
         out
     }
 
+    /// Providers for EXACTLY one authority scope and capability (OLB-2B-E3c).
+    ///
+    /// Strictly NARROWER than [`Self::find_owner_private_providers`], which
+    /// answers "every owner-private record declaring this capability" across every
+    /// owner scope this node holds. The routing registry retains one slot per
+    /// `(scope, capability)`, so its source must not return rows from a scope the
+    /// slot was not keyed under — sharing rows across scopes is precisely the
+    /// authority broadening the scoped slot key exists to prevent.
+    ///
+    /// Served from `owner_by_capability` with a scope equality filter, so there is
+    /// no per-record descriptor decode and no scan of the grant plane. Freshness
+    /// (expiry + revocation-floor currentness) is applied per hit, as everywhere.
+    ///
+    /// The GRANT plane is deliberately not served here: it binds its capability at
+    /// ingest and is not capability-indexed, so answering it would mean a scan.
+    /// A grant-scoped caller gets an empty result — the registry's deterministic
+    /// cold outcome — and the caller counts it rather than silently treating
+    /// "unserved" as "no providers".
+    pub(crate) fn find_scope_exact_private_providers(
+        &self,
+        scope: &CapabilityAudienceScope,
+        capability: &CapabilityAuthorityId,
+        now_secs: u64,
+        floors: &OrgRevocationState,
+    ) -> Vec<PrivateCapabilityProvider> {
+        if !matches!(scope, CapabilityAudienceScope::Owner { .. }) {
+            return Vec::new();
+        }
+        let Some(keys) = self.index.owner_by_capability.get(capability) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter(|(key_scope, _)| key_scope == scope)
+            .filter_map(|key| self.store.live_record(key))
+            .filter(|rec| now_secs < rec.expires_at() && is_current(rec, floors))
+            .map(PrivateCapabilityProvider::from_verified)
+            .collect()
+    }
+
     /// Grant-scoped providers under `grant_id`, filtered by `predicate`.
     /// Delegates to the store scan: the granted plane binds its capability at
     /// ingest, so it is not capability-indexed here.
@@ -1151,15 +1205,15 @@ impl ScopedDiscoveryState {
 ///
 /// OLB consumes the GLOBAL stream; the owner stream stays unclaimed for the
 /// provider-free leader track (Kyra OLB-2B, Q4).
-//
-// `dead_code` for the OLB-2B-E1 commit ONLY: the ownership types land before the
-// supervisor (E2) and registry consumer (E3) that use them, and the three commits
-// form ONE review unit. These allows are REMOVED in E3, where the actor becomes
-// the real consumer — a leftover allow here would mean the consumer never landed.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrivateDiscoveryStream {
     Global,
+    /// RESERVED, deliberately unclaimed. Not a pending-consumer allowance: the
+    /// owner stream exists so the provider-free leader track can take an
+    /// independent lease WITHOUT competing with OLB for the global one, and the
+    /// variant must stay nameable for `lease_for` to be exhaustive over both
+    /// streams. Removing it would erase the reservation the lease split encodes.
+    #[allow(dead_code)]
     Owner,
 }
 
@@ -1180,7 +1234,6 @@ pub(crate) enum PrivateDiscoveryStream {
 /// never reconciles a revocation again — failing open on the very path OLB-2A.3.3
 /// closed. Releasing on drop keeps the real invariant (never two concurrent
 /// drainers) while letting a supervisor recover.
-#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
 pub(crate) struct PrivateDiscoveryDrain {
     state: Arc<parking_lot::Mutex<ScopedDiscoveryState>>,
     stream: PrivateDiscoveryStream,
@@ -1188,14 +1241,7 @@ pub(crate) struct PrivateDiscoveryDrain {
     lease: Arc<AtomicBool>,
 }
 
-#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
 impl PrivateDiscoveryDrain {
-    /// Which stream this handle owns.
-    #[allow(dead_code)]
-    pub(crate) fn stream(&self) -> PrivateDiscoveryStream {
-        self.stream
-    }
-
     /// Atomically drain this stream's `(generation, dirty)` since the last drain,
     /// leaving it `Clean`. The ONE production caller of the module-private
     /// destructive takes.
@@ -1220,13 +1266,11 @@ impl Drop for PrivateDiscoveryDrain {
 /// Releases a claimed lease unless disarmed — so a mint that claims the stream and
 /// then fails (or unwinds) before publishing its handle cannot strand the stream
 /// (Kyra OLB-2B rollback guard).
-#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
 struct LeaseRollback<'a> {
     lease: &'a AtomicBool,
     armed: bool,
 }
 
-#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
 impl LeaseRollback<'_> {
     fn disarm(mut self) {
         self.armed = false;
@@ -1269,14 +1313,12 @@ impl Drop for LeaseRollback<'_> {
 /// reclaiming a lease whose owner may still be alive — is exactly the double-drain
 /// this type exists to prevent. A supervisor observes the strand as a refused mint
 /// and fences routing health rather than proceeding.
-#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
 pub(crate) struct PrivateDiscoveryDrains {
     state: Arc<parking_lot::Mutex<ScopedDiscoveryState>>,
     global_lease: Arc<AtomicBool>,
     owner_lease: Arc<AtomicBool>,
 }
 
-#[allow(dead_code)] // E1-only; see PrivateDiscoveryStream.
 impl PrivateDiscoveryDrains {
     /// A mint over `state` — the SAME state the ingest path, exact-expiry timer,
     /// and floor-raise callback mutate.
@@ -2619,7 +2661,6 @@ mod tests {
             drains.mint(PrivateDiscoveryStream::Global).is_none(),
             "a second live claim on a held stream is refused"
         );
-        assert_eq!(global.stream(), PrivateDiscoveryStream::Global);
 
         // The owner stream is independent — OLB leaves it unclaimed, but the mint
         // must not couple the two.
