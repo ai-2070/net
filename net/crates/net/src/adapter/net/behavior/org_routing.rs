@@ -12,8 +12,9 @@
 //! `[profile.release]` sets `panic = "abort"`. A real panic in a release build
 //! therefore kills the process: tokio returns no panic `JoinError`, no `Drop`
 //! guard runs, and no in-process supervisor restarts anything. Supervision here is
-//! consequently built on EXPLICIT [`ActorFault`] returns, which unwind normally,
-//! run the fence guard, join, back off, and restart (Kyra OLB-2B-E2).
+//! consequently built on EXPLICIT [`ActorFault`] returns, which return normally
+//! through the fence guard, resolve the inline incarnation future, back off, and
+//! restart (Kyra OLB-2B-E2).
 //!
 //! A true panic remains process-fatal by design, and that is safe for route
 //! currentness: no in-process caller survives the abort, and the external restart
@@ -100,7 +101,16 @@ pub(crate) enum ApplyOutcome {
     Current { source_generation: u64 },
     /// The source moved while this attempt was building, so its result was
     /// discarded. Health must NOT advance from an obsolete attempt; the actor
-    /// re-enters/stays in recapture and drains the trailing movement.
+    /// stays in recapture and re-attempts on the next wake.
+    ///
+    /// CONTRACT: reporting `Superseded` asserts that a corresponding wake is
+    /// pending or eventual — the source movement that invalidated the attempt must
+    /// itself have advanced the change watch. The actor parks after every
+    /// application (never spins), so an implementation that returns `Superseded`
+    /// with no accompanying wake strands its own recapture. OLB-2B-E3 will need an
+    /// internal registry-work wake in the actor's wait set for demand insertion and
+    /// slot-incarnation movement, neither of which advances the private-discovery
+    /// watch.
     Superseded,
     /// A recoverable failure: the actor exits through the synchronous fence and
     /// the supervisor applies its restart policy.
@@ -187,9 +197,10 @@ impl ActorHooks {
     }
 }
 
-/// Everything one incarnation needs. Owned, so the whole set moves into the task
-/// and drops with it — which is what makes awaiting the join handle sufficient
-/// proof that the drain has been released.
+/// Everything one incarnation needs. Owned, so the whole set moves into the
+/// incarnation FUTURE and drops when that future resolves or is dropped — which is
+/// what makes the future resolving sufficient proof that the drain was released,
+/// and what makes cancelling the supervisor release it too.
 struct Incarnation {
     drain: PrivateDiscoveryDrain,
     changed: tokio::sync::watch::Receiver<u64>,
@@ -247,8 +258,16 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
         #[cfg(feature = "fixtures")]
         it.hooks.fire_drained(it.id, &batch);
 
-        // A quiet pass that still owes a recapture performs one.
-        if owed_recapture && matches!(batch.dirty, DirtyCapabilities::Clean) {
+        // An owed complete recapture SUBSUMES whatever this pass drained, whether
+        // that is `Clean` or a `Caps` delta (Kyra OLB-2B-E2).
+        //
+        // Promoting only on `Clean` loses the recapture in the normal case: an
+        // attempt is superseded precisely BECAUSE the source moved during it, and
+        // that movement dirties capabilities, so the waking batch is `Caps(..)`.
+        // Applying it as `Caps` would report `Current`, leave the recapture still
+        // owed, and — with no further movement to wake anything — strand the actor
+        // in `Rebuilding` indefinitely.
+        if owed_recapture {
             batch.dirty = DirtyCapabilities::RebuildAll;
         }
 
@@ -757,6 +776,57 @@ mod tests {
 
         h.stop();
         let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    }
+
+    /// An owed recapture SURVIVES the `Caps` wake that superseded it.
+    ///
+    /// This is the realistic supersede path, not a contrived one: an attempt is
+    /// superseded precisely BECAUSE the source moved during it, and that movement
+    /// dirties capabilities — so the batch that wakes the actor is `Caps(..)`, not
+    /// `Clean`. Promoting only on `Clean` would apply that delta, report `Current`,
+    /// leave the recapture owed, and strand the actor in `Rebuilding` forever with
+    /// nothing left to wake it.
+    #[tokio::test(start_paused = true)]
+    async fn an_owed_recapture_survives_the_caps_wake_that_superseded_it() {
+        let h = harness();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let apply = {
+            let (attempts, state, tx) = (attempts.clone(), h.state.clone(), h.tx.clone());
+            h.applier(Box::new(move |_, b| {
+                if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                    // The source moves DURING the recapture — which is WHY it is
+                    // superseded — dirtying a capability and waking the actor.
+                    state.lock().ingest(owner_record(4), 0);
+                    let _ = tx.send(1);
+                    ApplyOutcome::Superseded
+                } else {
+                    ApplyOutcome::Current {
+                        source_generation: b.generation,
+                    }
+                }
+            }))
+        };
+        let run = h.spawn(h.supervisor(), apply);
+        settle().await;
+
+        assert_eq!(
+            h.seen.lock().as_slice(),
+            &[
+                (1, DirtyCapabilities::RebuildAll),
+                (1, DirtyCapabilities::RebuildAll)
+            ],
+            "the second attempt must receive RebuildAll — the owed recapture \
+             subsumes the Caps delta that woke the actor"
+        );
+        assert_eq!(
+            h.health(),
+            RoutingHealth::Healthy { incarnation: 1 },
+            "the recapture completed and health recovered"
+        );
+        assert_eq!(attempts.load(Ordering::Acquire), 2, "exactly two attempts");
+
+        h.stop();
+        run.await.expect("supervisor joins");
     }
 
     /// Ordinary `Caps` movement does NOT toggle global health: fencing every warmed
