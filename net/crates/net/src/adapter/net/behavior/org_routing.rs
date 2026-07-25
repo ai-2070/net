@@ -7,23 +7,23 @@
 //! is exactly the arrangement OLB-2B-E1's `pub(crate) drain()` exists to permit:
 //! the capability is unforgeable outside its home module, yet consumable here.
 //!
-//! What this slice owns:
+//! # Faults are explicit, because production aborts on panic
 //!
-//! - **Sole mint authority.** The supervisor holds the node's
-//!   [`PrivateDiscoveryDrains`]. Nothing else mints, and an actor cannot exist
-//!   without the capability because the drain is moved into it.
-//! - **Incarnation fencing.** Every actor run has a monotonic incarnation id, and
-//!   its exit — clean OR abnormal — fences routing health SYNCHRONOUSLY, before a
-//!   successor can exist, so work from a dead incarnation is never trusted.
-//! - **Restart policy.** Supervised automatic restart with capped exponential
-//!   backoff and bounded attempts in a rolling window, terminating in a
-//!   fail-closed crash-loop state (Kyra OLB-2B, Q1).
+//! `[profile.release]` sets `panic = "abort"`. A real panic in a release build
+//! therefore kills the process: tokio returns no panic `JoinError`, no `Drop`
+//! guard runs, and no in-process supervisor restarts anything. Supervision here is
+//! consequently built on EXPLICIT [`ActorFault`] returns, which unwind normally,
+//! run the fence guard, join, back off, and restart (Kyra OLB-2B-E2).
+//!
+//! A true panic remains process-fatal by design, and that is safe for route
+//! currentness: no in-process caller survives the abort, and the external restart
+//! constructs a fresh actor whose mint forces a complete `RebuildAll` recapture.
 
-// E2-ONLY. This module is exercised by its witnesses but not yet spawned by
-// `MeshNode`: per Kyra's Q2 the production node must not run a lifecycle-only
-// counter sink, so the node wiring lands in E3 together with the bounded routing
-// registry that is the real consumer. THIS ALLOW IS REMOVED IN E3 — if it is
-// still here, the real consumer never landed.
+// E2-ONLY. Exercised by the witnesses below but not yet spawned by `MeshNode`:
+// per Kyra's Q2 the production node must not run a lifecycle-only counter sink, so
+// the node wiring lands in E3 together with the bounded routing registry that is
+// the real consumer. THIS ALLOW IS REMOVED IN E3 — if it is still here, the real
+// consumer never landed.
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,27 +39,30 @@ use super::org_scoped_store::{
 
 /// Whether cached routing state may be trusted.
 ///
-/// Consulted by every warmed call once route consumption lands (OLB-2B.3). Until
-/// then it is published and witnessed here, which is where the fence is DEFINED:
-/// a later slice must not have to invent it while also wiring the call path.
+/// Health is a coarse, GLOBAL signal. It is never sufficient on its own: every
+/// retained artifact must additionally carry its actor incarnation, its slot
+/// incarnation, and the private-discovery source generation it was built from.
+/// Health says "this actor is in a usable posture", not "this route is current".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RoutingHealth {
     /// Routes built by this incarnation are usable.
     Healthy { incarnation: u64 },
-    /// A recapture is in progress; routes from this incarnation are not complete.
+    /// A COMPLETE recapture is in progress: no route from this incarnation is
+    /// trustworthy yet. Entered only for a full rebuild, never for ordinary
+    /// per-capability movement.
     Rebuilding { incarnation: u64 },
     /// NO cached route is usable — before the first incarnation, between
-    /// incarnations, and permanently after crash-loop exhaustion. A call must take
-    /// the fresh current-authority cold path, or fail locally before proof/send.
+    /// incarnations, and permanently after crash-loop exhaustion or an abnormal
+    /// terminal failure. A call must take the fresh current-authority cold path,
+    /// or fail locally before proof/send.
     Fenced,
 }
 
 impl RoutingHealth {
     /// Whether a cached route stamped by `incarnation` may be used. Fenced and
-    /// mid-rebuild states are unusable, and so is a route from any incarnation
+    /// mid-recapture states are unusable, and so is a route from any incarnation
     /// other than the live one — which is what stops detached work from a dead run
     /// being trusted after a successor starts.
-    #[allow(dead_code)] // Consumed by OLB-2B.3's warmed-call path.
     pub(crate) fn allows(&self, incarnation: u64) -> bool {
         matches!(self, RoutingHealth::Healthy { incarnation: live } if *live == incarnation)
     }
@@ -73,36 +76,79 @@ pub(crate) fn new_routing_health() -> SharedRoutingHealth {
     Arc::new(arc_swap::ArcSwap::from_pointee(RoutingHealth::Fenced))
 }
 
-/// Applies a drained change batch. Implemented by the bounded routing registry in
-/// OLB-2B-E3; the actor is written against this seam so the supervisor and the
-/// registry can be reviewed apart.
-pub(crate) trait DirtyApply: Send + 'static {
-    /// Apply one drained batch. Runs OFF the scoped-state lock.
-    fn apply(&mut self, incarnation: u64, batch: PrivateDiscoveryChangeBatch);
+/// A RECOVERABLE actor failure, reported explicitly rather than by panicking —
+/// see the module docs on `panic = "abort"`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActorFault {
+    /// Operator-facing cause.
+    pub reason: String,
 }
 
-/// The shared applier. Held across incarnations so a successor continues against
-/// the same registry rather than a fresh one.
-pub(crate) type SharedApply = Arc<parking_lot::Mutex<Box<dyn DirtyApply>>>;
+impl ActorFault {
+    pub(crate) fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// What one application attempt achieved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ApplyOutcome {
+    /// A complete CONDITIONAL INSTALLATION succeeded against the named source
+    /// generation. Only this outcome may advance health.
+    Current { source_generation: u64 },
+    /// The source moved while this attempt was building, so its result was
+    /// discarded. Health must NOT advance from an obsolete attempt; the actor
+    /// re-enters/stays in recapture and drains the trailing movement.
+    Superseded,
+    /// A recoverable failure: the actor exits through the synchronous fence and
+    /// the supervisor applies its restart policy.
+    Fault(ActorFault),
+}
+
+/// Applies a drained change batch. Implemented by the bounded routing registry in
+/// OLB-2B-E3.
+///
+/// Takes `&self`, NOT `&mut self`, and the shared handle carries no outer mutex
+/// (Kyra OLB-2B-E2): the implementation owns its own bounded synchronization, so
+/// it can snapshot retained slot identities, RELEASE its registry lock, query the
+/// scoped source, decode/build/sort entirely off-lock, then reacquire and
+/// conditionally install. An outer mutex spanning that work would hold a lock
+/// across scoped-state access and heavy reconstruction.
+pub(crate) trait DirtyApply: Send + Sync + 'static {
+    /// Apply one drained batch. Must not hold any lock across scoped-state
+    /// access, decoding, sorting, projection, or reconciliation.
+    fn apply(&self, incarnation: u64, batch: PrivateDiscoveryChangeBatch) -> ApplyOutcome;
+}
+
+/// The shared applier — lock-free at this seam.
+pub(crate) type SharedApply = Arc<dyn DirtyApply>;
 
 /// Why an actor incarnation stopped.
 #[derive(Debug, PartialEq, Eq)]
 enum ActorExit {
     /// The node is shutting down — do not restart.
     Shutdown,
-    /// The change watch closed: the scoped-discovery source is gone (the node is
-    /// being torn down). Terminal, and NOT a fault — restarting would spin against
-    /// a source that no longer exists.
-    SourceGone,
+    /// The change watch closed WITHOUT a shutdown in progress.
+    ///
+    /// This is abnormal, not teardown. The authoritative state is still alive —
+    /// the actor still holds `Arc<Mutex<ScopedDiscoveryState>>` — so all this
+    /// proves is that the publication SENDER disappeared. Invalidations have
+    /// stopped while discovery can still change, which is a silent-staleness
+    /// hazard and must be loud.
+    SourceClosedUnexpected,
+    /// A recoverable failure; the supervisor applies its restart policy.
+    Fault(ActorFault),
 }
 
-/// Fences routing health when an incarnation ends, on EVERY exit path including a
-/// panic unwind.
+/// Fences routing health when an incarnation ends, on EVERY exit path — an
+/// ordinary return, a fault return, or (where the profile unwinds) a panic.
 ///
 /// Fencing lives in the actor's own stack rather than in the supervisor's
 /// observation of the join handle, so it is SYNCHRONOUS with the incarnation's
-/// death: there is no window in which the task is dead but its routes still look
-/// usable (Kyra OLB-2B-E2).
+/// death: there is no window in which the actor is finished but its routes still
+/// look usable (Kyra OLB-2B-E2).
 struct IncarnationFence {
     health: SharedRoutingHealth,
 }
@@ -122,7 +168,7 @@ const MAX_RESTARTS_IN_WINDOW: usize = 5;
 /// The rolling window the restart budget is counted over.
 const RESTART_WINDOW: Duration = Duration::from_secs(300);
 
-/// Fixtures-only observation points for the deterministic supervisor witnesses.
+/// Fixtures-only observation points for the deterministic witnesses.
 #[cfg(feature = "fixtures")]
 #[derive(Default)]
 pub(crate) struct ActorHooks {
@@ -130,11 +176,6 @@ pub(crate) struct ActorHooks {
     #[allow(clippy::type_complexity)]
     pub(crate) drained:
         parking_lot::Mutex<Option<Arc<dyn Fn(u64, &PrivateDiscoveryChangeBatch) + Send + Sync>>>,
-    /// Fired once per incarnation at start-up. Returning `true` panics that
-    /// incarnation, which is how the restart/fencing witnesses inject faults.
-    #[allow(clippy::type_complexity)]
-    pub(crate) panic_incarnation:
-        parking_lot::Mutex<Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>>,
 }
 
 #[cfg(feature = "fixtures")]
@@ -143,13 +184,6 @@ impl ActorHooks {
         if let Some(hook) = self.drained.lock().clone() {
             hook(incarnation, batch);
         }
-    }
-
-    fn should_panic(&self, incarnation: u64) -> bool {
-        self.panic_incarnation
-            .lock()
-            .clone()
-            .is_some_and(|hook| hook(incarnation))
     }
 }
 
@@ -175,16 +209,26 @@ struct Incarnation {
 /// checking the shutdown flag before constructing it loses a shutdown landing in
 /// the gap and parks the task forever (Kyra OLB-2A.3.2). Constructed and enabled
 /// BEFORE the flag load, re-armed every iteration.
+///
+/// Health transitions are deliberately NARROW:
+///
+/// - `RebuildAll` — a complete recapture, so publish global `Rebuilding` and
+///   advance to `Healthy` only once a current installation succeeded;
+/// - `Caps(set)` — ordinary movement, so global health is left ALONE. Fencing
+///   every warmed route because one unrelated capability moved would make routine
+///   churn globally disruptive; invalidating the matching retained slots is the
+///   registry's job;
+/// - `Clean` — no transition at all;
+/// - `Superseded` — never advances health, because the attempt was obsolete.
 async fn run_incarnation(mut it: Incarnation) -> ActorExit {
-    // Fences on every exit path, including a panic unwind.
+    // Fences on every exit path.
     let _fence = IncarnationFence {
         health: it.health.clone(),
     };
 
-    #[cfg(feature = "fixtures")]
-    if it.hooks.should_panic(it.id) {
-        panic!("injected routing-actor fault (incarnation {})", it.id);
-    }
+    // Set when a full recapture was superseded, so a subsequent quiet pass still
+    // completes one rather than leaving health stuck in `Rebuilding`.
+    let mut owed_recapture = false;
 
     loop {
         let shutdown_signal = it.shutdown_notify.notified();
@@ -199,32 +243,64 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
         // batch or leaves `changed()` ready for the trailing pass.
         it.changed.borrow_and_update();
 
-        it.health
-            .store(Arc::new(RoutingHealth::Rebuilding { incarnation: it.id }));
-        let batch = it.drain.drain();
+        let mut batch = it.drain.drain();
         #[cfg(feature = "fixtures")]
         it.hooks.fire_drained(it.id, &batch);
-        let idle = matches!(batch.dirty, DirtyCapabilities::Clean);
-        if !idle {
-            // Off the scoped-state lock: `drain` released it before returning.
-            it.apply.lock().apply(it.id, batch);
-        }
-        it.health
-            .store(Arc::new(RoutingHealth::Healthy { incarnation: it.id }));
 
-        if !idle {
-            // Coalesced trailing pass: movement during the apply left the watch
-            // ready, so loop straight back rather than sleeping on it.
-            continue;
+        // A quiet pass that still owes a recapture performs one.
+        if owed_recapture && matches!(batch.dirty, DirtyCapabilities::Clean) {
+            batch.dirty = DirtyCapabilities::RebuildAll;
         }
 
+        let full = matches!(batch.dirty, DirtyCapabilities::RebuildAll);
+        let quiet = matches!(batch.dirty, DirtyCapabilities::Clean);
+
+        if !quiet {
+            if full {
+                // A complete recapture: nothing from this incarnation is
+                // trustworthy until it finishes.
+                it.health
+                    .store(Arc::new(RoutingHealth::Rebuilding { incarnation: it.id }));
+            }
+            match it.apply.apply(it.id, batch) {
+                ApplyOutcome::Current { .. } => {
+                    if full {
+                        it.health
+                            .store(Arc::new(RoutingHealth::Healthy { incarnation: it.id }));
+                        owed_recapture = false;
+                    }
+                    // `Caps` leaves global health untouched by design.
+                }
+                ApplyOutcome::Superseded => {
+                    // Obsolete result: publish nothing, and make sure a recapture
+                    // still completes.
+                    owed_recapture = owed_recapture || full;
+                }
+                ApplyOutcome::Fault(fault) => return ActorExit::Fault(fault),
+            }
+        }
+
+        // ALWAYS park here, including after an application. The trailing pass is
+        // preserved without looping: `borrow_and_update` ran BEFORE the drain, so
+        // movement during the drain or the apply leaves `changed()` already ready
+        // and this returns immediately.
+        //
+        // Looping directly instead would busy-spin whenever an applier reports
+        // `Superseded` persistently — each pass would synthesize another
+        // `RebuildAll` and never yield. Parking makes the retry rate the rate of
+        // actual source movement, which is exactly what `Superseded` reports.
         tokio::select! {
             changed_result = it.changed.changed() => {
                 if changed_result.is_err() {
-                    // The publication sender is gone: the scoped-discovery source
-                    // no longer exists. Terminal, and not a fault — restarting
-                    // would spin against nothing.
-                    return ActorExit::SourceGone;
+                    // The sender is gone. Only teardown if a shutdown is actually
+                    // in progress; otherwise this is abnormal — the authoritative
+                    // state is still alive and can still change while nothing
+                    // invalidates.
+                    return if it.shutdown.load(Ordering::Acquire) {
+                        ActorExit::Shutdown
+                    } else {
+                        ActorExit::SourceClosedUnexpected
+                    };
                 }
             }
             _ = &mut shutdown_signal => return ActorExit::Shutdown,
@@ -232,53 +308,125 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
     }
 }
 
-/// The node-owned supervisor: the ONLY mint authority for the global
-/// private-discovery stream, and the only thing that starts an incarnation.
-pub(crate) struct RoutingSupervisor {
-    mint: PrivateDiscoveryDrains,
-    health: SharedRoutingHealth,
+/// Observable supervisor counters, shared with the node so metrics survive the
+/// supervisor being consumed by [`RoutingSupervisor::run`].
+#[derive(Default)]
+pub(crate) struct RoutingMetrics {
     incarnations: AtomicU64,
+    source_closed_unexpected: AtomicU64,
 }
 
-impl RoutingSupervisor {
-    pub(crate) fn new(mint: PrivateDiscoveryDrains, health: SharedRoutingHealth) -> Self {
-        Self {
-            mint,
-            health,
-            incarnations: AtomicU64::new(0),
-        }
-    }
-
-    /// The live health view, for the node and for witnesses.
-    #[allow(dead_code)] // Consumed by OLB-2B.3's warmed-call path.
-    pub(crate) fn health(&self) -> SharedRoutingHealth {
-        self.health.clone()
-    }
-
-    /// How many incarnations have been started. Observability for the witnesses
-    /// and, later, the restart counter.
-    #[allow(dead_code)]
+impl RoutingMetrics {
+    /// How many incarnations have been started.
     pub(crate) fn incarnations_started(&self) -> u64 {
         self.incarnations.load(Ordering::Acquire)
     }
 
-    /// Run the supervision loop until shutdown, the source disappearing, or
+    /// How many times the change source closed abnormally, with no shutdown in
+    /// progress.
+    pub(crate) fn source_closed_unexpected(&self) -> u64 {
+        self.source_closed_unexpected.load(Ordering::Acquire)
+    }
+
+    /// Allocate the next incarnation id, or `None` on overflow. Checked, because
+    /// reusing an identifier would let a stale artifact pass the fence test.
+    fn next_incarnation(&self) -> Option<u64> {
+        let mut current = self.incarnations.load(Ordering::Acquire);
+        loop {
+            let next = current.checked_add(1)?;
+            match self.incarnations.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(next),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Test seam: preset the counter to exercise overflow.
+    #[cfg(test)]
+    fn set_incarnations_for_test(&self, value: u64) {
+        self.incarnations.store(value, Ordering::Release);
+    }
+}
+
+/// The node-owned supervisor: the ONLY mint authority for the global
+/// private-discovery stream, and the only thing that starts an incarnation.
+///
+/// NOT `Clone`, and [`Self::run`] CONSUMES it, so duplicate execution of one
+/// supervisor is unrepresentable rather than merely refused — a re-entrant `run`
+/// could otherwise bypass backoff and the terminal crash-loop posture (Kyra
+/// OLB-2B-E2). Recovery from the terminal state is a node restart, which
+/// constructs a new supervisor through the single audited node-owned path.
+pub(crate) struct RoutingSupervisor {
+    mint: PrivateDiscoveryDrains,
+    health: SharedRoutingHealth,
+    metrics: Arc<RoutingMetrics>,
+}
+
+impl RoutingSupervisor {
+    pub(crate) fn new(
+        mint: PrivateDiscoveryDrains,
+        health: SharedRoutingHealth,
+        metrics: Arc<RoutingMetrics>,
+    ) -> Self {
+        Self {
+            mint,
+            health,
+            metrics,
+        }
+    }
+
+    /// The live health view, for the node and for witnesses.
+    pub(crate) fn health(&self) -> SharedRoutingHealth {
+        self.health.clone()
+    }
+
+    /// Run the supervision loop until shutdown, an abnormal terminal failure, or
     /// crash-loop exhaustion.
     ///
     /// Restart discipline, in order:
     ///
     /// 1. mint the drain — refusing LOUDLY and fencing if the stream is held or
     ///    stranded, rather than running a drainless actor;
-    /// 2. spawn ONE incarnation and await its join handle, so a successor is
-    ///    minted only after the predecessor task has fully resolved and, with it,
-    ///    its drain has dropped and released the lease;
-    /// 3. on a fault, apply capped backoff within a bounded rolling window;
+    /// 2. run ONE incarnation INLINE, so the supervisor future structurally owns
+    ///    it;
+    /// 3. on an explicit [`ActorFault`], apply capped backoff within a bounded
+    ///    rolling window;
     /// 4. on exhaustion, stay `Fenced` permanently rather than spinning.
     ///
-    /// The shutdown flag is checked before AND after every mint, so a panic racing
-    /// shutdown cannot spawn a replacement that outlives the node.
+    /// # Why inline rather than a spawned task
+    ///
+    /// A `tokio::spawn`ed incarnation is DETACHED when its `JoinHandle` drops, so
+    /// cancelling or dropping the supervisor would leave the actor alive — still
+    /// holding the exclusive drain, still applying, still publishing health, and
+    /// outliving the node-owned supervisor (Kyra OLB-2B-E2). Awaiting the handle
+    /// only covers cancellation of the CHILD, never of the parent.
+    ///
+    /// Running inline makes ownership structural:
+    ///
+    /// ```text
+    /// supervisor future owns the incarnation future
+    ///   → which owns the drain and the fence guard
+    ///   → so dropping/cancelling the supervisor drops the incarnation
+    ///   → the fence runs and the drain releases its lease
+    ///   → no detached child survives
+    /// ```
+    ///
+    /// It also makes the join handle unnecessary for predecessor completion:
+    /// `run_incarnation` resolving IS the proof, after which its locals drop, the
+    /// fence fires, and the lease frees before any successor is minted. Explicit
+    /// [`ActorFault`] supervision is what removes the original reason to spawn —
+    /// there is no panic to isolate that a release build would not turn into an
+    /// abort anyway.
+    ///
+    /// The shutdown flag is checked before AND after every mint and interrupts the
+    /// backoff, so a fault racing shutdown cannot spawn a replacement.
     pub(crate) async fn run(
-        &self,
+        self,
         changed: tokio::sync::watch::Receiver<u64>,
         apply: SharedApply,
         shutdown: Arc<AtomicBool>,
@@ -304,7 +452,16 @@ impl RoutingSupervisor {
                 return;
             };
 
-            let id = self.incarnations.fetch_add(1, Ordering::AcqRel) + 1;
+            let Some(id) = self.metrics.next_incarnation() else {
+                drop(drain);
+                self.fence();
+                tracing::error!(
+                    "org routing: incarnation counter exhausted; routing stays fenced \
+                     rather than reusing an identifier"
+                );
+                return;
+            };
+
             // Re-checked AFTER the mint: the flag may have been set while claiming,
             // and a replacement must not outlive the node.
             if shutdown.load(Ordering::Acquire) {
@@ -313,7 +470,10 @@ impl RoutingSupervisor {
                 return;
             }
 
-            let handle = tokio::spawn(run_incarnation(Incarnation {
+            // INLINE: the supervisor future owns this one. Resolving is itself the
+            // proof the predecessor finished — its locals drop here, firing the
+            // fence and releasing the lease before any successor is minted.
+            let exit = run_incarnation(Incarnation {
                 drain,
                 changed: changed.clone(),
                 health: self.health.clone(),
@@ -323,59 +483,71 @@ impl RoutingSupervisor {
                 shutdown_notify: shutdown_notify.clone(),
                 #[cfg(feature = "fixtures")]
                 hooks: hooks.clone(),
-            }));
+            })
+            .await;
 
-            // Join before any re-mint: when this resolves the task is finished and
-            // its drain has dropped, so the lease is free for a successor.
-            match handle.await {
-                Ok(ActorExit::Shutdown) | Ok(ActorExit::SourceGone) => {
+            let fault = match exit {
+                ActorExit::Shutdown => {
                     self.fence();
                     return;
                 }
-                Err(join_error) if join_error.is_cancelled() => {
-                    // Aborted (node teardown): not a fault to retry.
+                ActorExit::SourceClosedUnexpected => {
+                    // Abnormal and terminal: cloning the same closed receiver
+                    // cannot recover, so this consumes no restart budget — but it
+                    // is NOT normal teardown and must be loud.
+                    self.metrics
+                        .source_closed_unexpected
+                        .fetch_add(1, Ordering::AcqRel);
                     self.fence();
-                    return;
-                }
-                Err(_panicked) => {
-                    let now = tokio::time::Instant::now();
-                    faults.retain(|at| now.duration_since(*at) < RESTART_WINDOW);
-                    faults.push(now);
-                    if faults.len() > MAX_RESTARTS_IN_WINDOW {
-                        // Crash loop: a deterministic fault. Stay fenced rather
-                        // than retry; recovery needs operator action.
-                        self.fence();
-                        tracing::error!(
-                            faults = faults.len(),
-                            "org routing: actor crash-loop budget exhausted; routing \
-                             stays fenced until the node is restarted"
-                        );
-                        return;
-                    }
-                    let shift = u32::try_from(faults.len()).unwrap_or(u32::MAX).min(16);
-                    let backoff = RESTART_BACKOFF_CAP
-                        .min(RESTART_BACKOFF_BASE.saturating_mul(1u32 << (shift - 1)));
-                    tracing::warn!(
+                    tracing::error!(
                         incarnation = id,
-                        ?backoff,
-                        "org routing: actor incarnation faulted; restarting after backoff"
+                        "org routing: the private-discovery change source closed with no \
+                         shutdown in progress; invalidations have stopped while discovery \
+                         can still change. Routing stays fenced."
                     );
-                    // Backoff stays interruptible by shutdown, on the same
-                    // arm-before-check discipline.
-                    let shutdown_signal = shutdown_notify.notified();
-                    tokio::pin!(shutdown_signal);
-                    shutdown_signal.as_mut().enable();
-                    if shutdown.load(Ordering::Acquire) {
-                        self.fence();
-                        return;
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
-                        _ = &mut shutdown_signal => {
-                            self.fence();
-                            return;
-                        }
-                    }
+                    return;
+                }
+                ActorExit::Fault(fault) => fault,
+            };
+
+            let now = tokio::time::Instant::now();
+            faults.retain(|at| now.duration_since(*at) < RESTART_WINDOW);
+            faults.push(now);
+            if faults.len() > MAX_RESTARTS_IN_WINDOW {
+                // Crash loop: a deterministic fault. Stay fenced rather than retry;
+                // recovery needs operator action or a node restart.
+                self.fence();
+                tracing::error!(
+                    faults = faults.len(),
+                    reason = %fault.reason,
+                    "org routing: actor crash-loop budget exhausted; routing stays \
+                     fenced until the node is restarted"
+                );
+                return;
+            }
+            let shift = u32::try_from(faults.len()).unwrap_or(u32::MAX).min(16);
+            let backoff =
+                RESTART_BACKOFF_CAP.min(RESTART_BACKOFF_BASE.saturating_mul(1u32 << (shift - 1)));
+            tracing::warn!(
+                incarnation = id,
+                ?backoff,
+                reason = %fault.reason,
+                "org routing: actor incarnation faulted; restarting after backoff"
+            );
+            // Backoff stays interruptible by shutdown, on the same
+            // arm-before-check discipline.
+            let shutdown_signal = shutdown_notify.notified();
+            tokio::pin!(shutdown_signal);
+            shutdown_signal.as_mut().enable();
+            if shutdown.load(Ordering::Acquire) {
+                self.fence();
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = &mut shutdown_signal => {
+                    self.fence();
+                    return;
                 }
             }
         }
@@ -386,9 +558,11 @@ impl RoutingSupervisor {
     }
 }
 
-/// OLB-2B-E2 witnesses: sole-mint authority, synchronous incarnation fencing on
-/// abnormal exit, join-before-remint, shutdown during wait and during backoff,
-/// closed-watch handling, and deterministic crash-loop exhaustion.
+/// OLB-2B-E2 witnesses.
+///
+/// Restart/crash-loop claims are driven by EXPLICIT [`ActorFault`], never by
+/// panics — release builds abort, so a panic-based witness would prove nothing
+/// about production (Kyra OLB-2B-E2).
 #[cfg(all(test, feature = "fixtures"))]
 mod tests {
     use super::*;
@@ -401,15 +575,19 @@ mod tests {
     use crate::adapter::net::identity::EntityId;
 
     type Applied = Arc<parking_lot::Mutex<Vec<(u64, DirtyCapabilities)>>>;
+    type Decide = Box<dyn Fn(u64, &PrivateDiscoveryChangeBatch) -> ApplyOutcome + Send + Sync>;
 
-    /// Records every applied batch with the incarnation that applied it.
-    struct RecordingApply {
+    /// Records every applied batch and returns a scripted outcome. Note the
+    /// `&self` seam: no outer mutex spans the application.
+    struct ScriptedApply {
         seen: Applied,
+        decide: Decide,
     }
 
-    impl DirtyApply for RecordingApply {
-        fn apply(&mut self, incarnation: u64, batch: PrivateDiscoveryChangeBatch) {
-            self.seen.lock().push((incarnation, batch.dirty));
+    impl DirtyApply for ScriptedApply {
+        fn apply(&self, incarnation: u64, batch: PrivateDiscoveryChangeBatch) -> ApplyOutcome {
+            self.seen.lock().push((incarnation, batch.dirty.clone()));
+            (self.decide)(incarnation, &batch)
         }
     }
 
@@ -433,8 +611,8 @@ mod tests {
     struct Harness {
         state: Arc<parking_lot::Mutex<ScopedDiscoveryState>>,
         health: SharedRoutingHealth,
+        metrics: Arc<RoutingMetrics>,
         seen: Applied,
-        apply: SharedApply,
         shutdown: Arc<AtomicBool>,
         notify: Arc<Notify>,
         hooks: Arc<ActorHooks>,
@@ -445,16 +623,12 @@ mod tests {
     fn harness() -> Harness {
         let state = Arc::new(parking_lot::Mutex::new(ScopedDiscoveryState::new()));
         state.lock().ingest(owner_record(3), 0);
-        let seen: Applied = Arc::default();
-        let apply: SharedApply = Arc::new(parking_lot::Mutex::new(Box::new(RecordingApply {
-            seen: seen.clone(),
-        })));
         let (tx, rx) = tokio::sync::watch::channel(0u64);
         Harness {
             state,
             health: new_routing_health(),
-            seen,
-            apply,
+            metrics: Arc::default(),
+            seen: Arc::default(),
             shutdown: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
             hooks: Arc::default(),
@@ -468,13 +642,27 @@ mod tests {
             RoutingSupervisor::new(
                 PrivateDiscoveryDrains::new(self.state.clone()),
                 self.health.clone(),
+                self.metrics.clone(),
             )
         }
 
-        fn spawn(&self, sup: Arc<RoutingSupervisor>) -> tokio::task::JoinHandle<()> {
-            let (rx, apply, shutdown, notify, hooks) = (
+        fn applier(&self, decide: Decide) -> SharedApply {
+            Arc::new(ScriptedApply {
+                seen: self.seen.clone(),
+                decide,
+            })
+        }
+
+        /// Always-current applier.
+        fn ok_applier(&self) -> SharedApply {
+            self.applier(Box::new(|_, b| ApplyOutcome::Current {
+                source_generation: b.generation,
+            }))
+        }
+
+        fn spawn(&self, sup: RoutingSupervisor, apply: SharedApply) -> tokio::task::JoinHandle<()> {
+            let (rx, shutdown, notify, hooks) = (
                 self.rx.clone(),
-                self.apply.clone(),
                 self.shutdown.clone(),
                 self.notify.clone(),
                 self.hooks.clone(),
@@ -490,6 +678,13 @@ mod tests {
         fn health(&self) -> RoutingHealth {
             **self.health.load()
         }
+
+        /// Whether the global drain lease is currently free.
+        fn lease_free(&self) -> bool {
+            PrivateDiscoveryDrains::new(self.state.clone())
+                .mint(PrivateDiscoveryStream::Global)
+                .is_some()
+        }
     }
 
     async fn settle() {
@@ -499,13 +694,11 @@ mod tests {
     }
 
     /// The supervisor is the SOLE mint authority: if the global stream is already
-    /// held, it refuses to start an actor and fences, rather than running a
-    /// drainless one that would silently never reconcile.
+    /// held, it fences and starts no actor, rather than running a drainless one.
     #[tokio::test(start_paused = true)]
     async fn a_held_stream_fences_instead_of_starting_a_drainless_actor() {
         let h = harness();
-        // Start from a NON-fenced state so the fence below is load-bearing rather
-        // than trivially already true.
+        // Start NON-fenced so the fence below is load-bearing.
         h.health
             .store(Arc::new(RoutingHealth::Healthy { incarnation: 99 }));
         let squatter = PrivateDiscoveryDrains::new(h.state.clone());
@@ -513,34 +706,29 @@ mod tests {
             .mint(PrivateDiscoveryStream::Global)
             .expect("squatter holds it");
 
-        let sup = h.supervisor();
-        sup.run(
-            h.rx.clone(),
-            h.apply.clone(),
-            h.shutdown.clone(),
-            h.notify.clone(),
-            h.hooks.clone(),
-        )
-        .await;
+        h.supervisor()
+            .run(
+                h.rx.clone(),
+                h.ok_applier(),
+                h.shutdown.clone(),
+                h.notify.clone(),
+                h.hooks.clone(),
+            )
+            .await;
 
-        assert_eq!(sup.incarnations_started(), 0, "no actor was started");
+        assert_eq!(h.metrics.incarnations_started(), 0, "no actor was started");
         assert_eq!(h.health(), RoutingHealth::Fenced);
     }
 
-    /// Ordinary operation: the incarnation drains, applies, and publishes Healthy —
-    /// and its first batch is the mint's RebuildAll recapture.
+    /// A full recapture publishes `Rebuilding` then `Healthy` only after a CURRENT
+    /// installation.
     #[tokio::test(start_paused = true)]
-    async fn an_incarnation_applies_its_recapture_and_reports_healthy() {
+    async fn a_recapture_reports_healthy_only_after_current_installation() {
         let h = harness();
-        let sup = Arc::new(h.supervisor());
-        let run = h.spawn(sup.clone());
+        let run = h.spawn(h.supervisor(), h.ok_applier());
         settle().await;
 
-        assert_eq!(
-            h.health(),
-            RoutingHealth::Healthy { incarnation: 1 },
-            "a settled incarnation publishes Healthy"
-        );
+        assert_eq!(h.health(), RoutingHealth::Healthy { incarnation: 1 });
         assert_eq!(
             h.seen.lock().as_slice(),
             &[(1, DirtyCapabilities::RebuildAll)],
@@ -552,57 +740,222 @@ mod tests {
         assert_eq!(h.health(), RoutingHealth::Fenced, "exit fences");
     }
 
-    /// A panicking incarnation fences health, and the supervisor mints a SUCCESSOR
-    /// only after the predecessor task resolved — proving the lease was released by
-    /// the join. The successor recaptures completely, so the delta the dead
-    /// incarnation consumed is not lost.
+    /// A SUPERSEDED attempt never publishes `Healthy` — the reconstruction was
+    /// obsolete, so health must not advance from it.
     #[tokio::test(start_paused = true)]
-    async fn a_panicked_incarnation_fences_then_a_successor_recaptures() {
+    async fn a_superseded_recapture_never_publishes_healthy() {
         let h = harness();
-        *h.hooks.panic_incarnation.lock() = Some(Arc::new(|id| id == 1));
-
-        let sup = Arc::new(h.supervisor());
-        let run = h.spawn(sup.clone());
-        settle().await;
-        tokio::time::advance(Duration::from_secs(1)).await;
+        let apply = h.applier(Box::new(|_, _| ApplyOutcome::Superseded));
+        let run = h.spawn(h.supervisor(), apply);
         settle().await;
 
-        assert_eq!(sup.incarnations_started(), 2, "exactly one successor");
         assert_eq!(
             h.health(),
-            RoutingHealth::Healthy { incarnation: 2 },
-            "the successor is live and healthy"
+            RoutingHealth::Rebuilding { incarnation: 1 },
+            "an obsolete attempt leaves the actor in recapture, never Healthy"
         );
+
+        h.stop();
+        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    }
+
+    /// Ordinary `Caps` movement does NOT toggle global health: fencing every warmed
+    /// route because one unrelated capability moved would make routine churn
+    /// globally disruptive. Per-slot invalidation is the registry's job (E3).
+    #[tokio::test(start_paused = true)]
+    async fn caps_movement_leaves_global_health_alone() {
+        let h = harness();
+        // Sample health DURING each application: asserting only the final state
+        // would pass even if `Caps` toggled Rebuilding->Healthy around the work.
+        let during: Arc<parking_lot::Mutex<Vec<(DirtyCapabilities, RoutingHealth)>>> =
+            Arc::default();
+        let apply = {
+            let (during, health) = (during.clone(), h.health.clone());
+            h.applier(Box::new(move |_, b| {
+                during.lock().push((b.dirty.clone(), **health.load()));
+                ApplyOutcome::Current {
+                    source_generation: b.generation,
+                }
+            }))
+        };
+        let run = h.spawn(h.supervisor(), apply);
+        settle().await;
+        assert_eq!(h.health(), RoutingHealth::Healthy { incarnation: 1 });
+
+        // Ordinary movement: a second provider dirties one capability.
+        h.state.lock().ingest(owner_record(4), 0);
+        let _ = h.tx.send(1);
+        settle().await;
+
+        let during = during.lock().clone();
+        let caps_health = during
+            .iter()
+            .find(|(d, _)| matches!(d, DirtyCapabilities::Caps(_)))
+            .map(|(_, health)| *health)
+            .expect("a Caps batch was applied");
         assert_eq!(
-            h.seen.lock().as_slice(),
-            &[(2, DirtyCapabilities::RebuildAll)],
-            "the successor recaptured completely; incarnation 1 applied nothing"
+            caps_health,
+            RoutingHealth::Healthy { incarnation: 1 },
+            "ordinary Caps movement must not globally fence warmed routes while it \
+             rebuilds — per-slot invalidation is the registry's job"
+        );
+        // And the full recapture DID enter Rebuilding, so the distinction is real.
+        let full_health = during
+            .iter()
+            .find(|(d, _)| matches!(d, DirtyCapabilities::RebuildAll))
+            .map(|(_, health)| *health)
+            .expect("a RebuildAll batch was applied");
+        assert_eq!(
+            full_health,
+            RoutingHealth::Rebuilding { incarnation: 1 },
+            "a complete recapture DOES publish global Rebuilding"
         );
 
         h.stop();
         run.await.expect("supervisor joins");
     }
 
-    /// A CLOSED watch means the scoped-discovery source is gone. That is terminal
-    /// and NOT a fault: the supervisor stops fenced instead of restarting against a
-    /// source that no longer exists, which would spin.
+    /// An explicit fault fences, and the supervisor runs a SUCCESSOR only after the
+    /// predecessor resolved — the successor recaptures completely, so the delta the
+    /// dead incarnation consumed is not lost.
     #[tokio::test(start_paused = true)]
-    async fn a_closed_watch_stops_the_supervisor_without_restarting() {
-        let mut h = harness();
-        let sup = Arc::new(h.supervisor());
-        let run = h.spawn(sup.clone());
+    async fn a_fault_fences_then_a_successor_recaptures() {
+        let h = harness();
+        let apply = h.applier(Box::new(|inc, b| {
+            if inc == 1 {
+                ApplyOutcome::Fault(ActorFault::new("injected"))
+            } else {
+                ApplyOutcome::Current {
+                    source_generation: b.generation,
+                }
+            }
+        }));
+        let run = h.spawn(h.supervisor(), apply);
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
 
-        // Close the channel: drop the sender and every receiver.
+        assert_eq!(h.metrics.incarnations_started(), 2, "exactly one successor");
+        assert_eq!(h.health(), RoutingHealth::Healthy { incarnation: 2 });
+        assert_eq!(
+            h.seen.lock().as_slice(),
+            &[
+                (1, DirtyCapabilities::RebuildAll),
+                (2, DirtyCapabilities::RebuildAll)
+            ],
+            "the successor recaptured completely"
+        );
+
+        h.stop();
+        run.await.expect("supervisor joins");
+    }
+
+    /// Fencing is SYNCHRONOUS with an abnormal exit: throughout the restart
+    /// backoff — before any successor exists — health is already `Fenced`.
+    ///
+    /// Load-bearing because the incarnation reaches `Rebuilding` before it faults,
+    /// so without the actor-stack fence health would still read `Rebuilding{1}`.
+    #[tokio::test(start_paused = true)]
+    async fn an_abnormal_exit_fences_synchronously_during_backoff() {
+        let h = harness();
+        let apply = h.applier(Box::new(|_, _| {
+            ApplyOutcome::Fault(ActorFault::new("injected"))
+        }));
+        let run = h.spawn(h.supervisor(), apply);
+        settle().await;
+
+        assert_eq!(
+            h.health(),
+            RoutingHealth::Fenced,
+            "a dead incarnation fences immediately, before any successor"
+        );
+        assert_eq!(h.metrics.incarnations_started(), 1, "still in backoff");
+
+        h.stop();
+        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    }
+
+    /// Cancelling the SUPERVISOR drops the incarnation with it: the fence runs and
+    /// the exclusive drain lease is released.
+    ///
+    /// This is the detached-child hazard: a spawned incarnation whose `JoinHandle`
+    /// is dropped keeps running, holding the drain and publishing health while
+    /// outliving its supervisor. Inline ownership makes that unrepresentable.
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_the_supervisor_drops_the_incarnation_and_frees_the_lease() {
+        let h = harness();
+        let run = h.spawn(h.supervisor(), h.ok_applier());
+        settle().await;
+        assert_eq!(h.health(), RoutingHealth::Healthy { incarnation: 1 });
+        assert!(!h.lease_free(), "the live incarnation holds the lease");
+
+        run.abort();
+        let _ = run.await;
+        settle().await;
+
+        assert_eq!(
+            h.health(),
+            RoutingHealth::Fenced,
+            "cancelling the supervisor fences: no orphan keeps routes usable"
+        );
+        assert!(
+            h.lease_free(),
+            "the orphaned incarnation did not survive holding the exclusive drain"
+        );
+    }
+
+    /// A closed watch with NO shutdown in progress is abnormal, not teardown: the
+    /// authoritative state is still alive, so invalidations have stopped while
+    /// discovery can still change. Loud, terminal, one incarnation, no spin.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_watch_without_shutdown_is_loud_and_terminal() {
+        let mut h = harness();
+        let run = h.spawn(h.supervisor(), h.ok_applier());
+        settle().await;
+
+        // Close the channel while shutdown is still FALSE.
         let (tx, rx) = tokio::sync::watch::channel(0u64);
-        let dead_tx = std::mem::replace(&mut h.tx, tx);
-        let dead_rx = std::mem::replace(&mut h.rx, rx);
-        drop(dead_tx);
-        drop(dead_rx);
+        drop(std::mem::replace(&mut h.tx, tx));
+        drop(std::mem::replace(&mut h.rx, rx));
 
         let joined = tokio::time::timeout(Duration::from_secs(5), run).await;
-        assert!(joined.is_ok(), "the supervisor must stop, not spin");
-        assert_eq!(sup.incarnations_started(), 1, "no restart on a gone source");
+        assert!(joined.is_ok(), "terminal, and no busy loop");
+        assert!(
+            !h.shutdown.load(Ordering::Acquire),
+            "this was NOT a shutdown"
+        );
+        assert_eq!(
+            h.metrics.source_closed_unexpected(),
+            1,
+            "the abnormal closure is observable"
+        );
+        assert_eq!(
+            h.metrics.incarnations_started(),
+            1,
+            "no restart against a permanently closed receiver"
+        );
+        assert_eq!(h.health(), RoutingHealth::Fenced);
+    }
+
+    /// The same closure DURING shutdown is ordinary teardown: no abnormal counter.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_watch_during_shutdown_is_normal_teardown() {
+        let mut h = harness();
+        let run = h.spawn(h.supervisor(), h.ok_applier());
+        settle().await;
+
+        h.shutdown.store(true, Ordering::Release);
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        drop(std::mem::replace(&mut h.tx, tx));
+        drop(std::mem::replace(&mut h.rx, rx));
+
+        let joined = tokio::time::timeout(Duration::from_secs(5), run).await;
+        assert!(joined.is_ok());
+        assert_eq!(
+            h.metrics.source_closed_unexpected(),
+            0,
+            "teardown is not an abnormal closure"
+        );
         assert_eq!(h.health(), RoutingHealth::Fenced);
     }
 
@@ -610,49 +963,53 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_while_parked_stops_and_fences() {
         let h = harness();
-        let sup = Arc::new(h.supervisor());
-        let run = h.spawn(sup.clone());
+        let run = h.spawn(h.supervisor(), h.ok_applier());
         settle().await;
 
         h.stop();
         let joined = tokio::time::timeout(Duration::from_secs(5), run).await;
         assert!(joined.is_ok(), "a parked actor still observes shutdown");
-        assert_eq!(sup.incarnations_started(), 1);
+        assert_eq!(h.metrics.incarnations_started(), 1);
         assert_eq!(h.health(), RoutingHealth::Fenced);
     }
 
-    /// Shutdown landing DURING restart backoff spawns no replacement — a panic
-    /// racing shutdown must not leave an actor outliving the node.
+    /// Shutdown landing DURING restart backoff starts no replacement.
     #[tokio::test(start_paused = true)]
-    async fn shutdown_during_backoff_spawns_no_replacement() {
+    async fn shutdown_during_backoff_starts_no_replacement() {
         let h = harness();
-        *h.hooks.panic_incarnation.lock() = Some(Arc::new(|id| id == 1));
-
-        let sup = Arc::new(h.supervisor());
-        let run = h.spawn(sup.clone());
+        let apply = h.applier(Box::new(|inc, b| {
+            if inc == 1 {
+                ApplyOutcome::Fault(ActorFault::new("injected"))
+            } else {
+                ApplyOutcome::Current {
+                    source_generation: b.generation,
+                }
+            }
+        }));
+        let run = h.spawn(h.supervisor(), apply);
         settle().await;
         h.stop();
 
         let joined = tokio::time::timeout(Duration::from_secs(5), run).await;
         assert!(joined.is_ok(), "backoff is interruptible by shutdown");
         assert_eq!(
-            sup.incarnations_started(),
+            h.metrics.incarnations_started(),
             1,
-            "no replacement was spawned after shutdown"
+            "no replacement after shutdown"
         );
         assert_eq!(h.health(), RoutingHealth::Fenced);
     }
 
     /// A deterministic fault exhausts the bounded restart budget and lands in the
-    /// terminal crash-loop state: permanently fenced, no further incarnations, and
-    /// no tight retry loop.
+    /// terminal crash-loop state: permanently fenced, no further incarnations, no
+    /// tight retry loop.
     #[tokio::test(start_paused = true)]
     async fn a_deterministic_fault_exhausts_the_restart_budget_and_stays_fenced() {
         let h = harness();
-        *h.hooks.panic_incarnation.lock() = Some(Arc::new(|_| true));
-
-        let sup = Arc::new(h.supervisor());
-        let run = h.spawn(sup.clone());
+        let apply = h.applier(Box::new(|_, _| {
+            ApplyOutcome::Fault(ActorFault::new("deterministic"))
+        }));
+        let run = h.spawn(h.supervisor(), apply);
 
         let joined = tokio::time::timeout(Duration::from_secs(600), run).await;
         assert!(
@@ -660,7 +1017,7 @@ mod tests {
             "the supervisor gives up rather than spinning"
         );
         assert_eq!(
-            sup.incarnations_started() as usize,
+            h.metrics.incarnations_started() as usize,
             MAX_RESTARTS_IN_WINDOW + 1,
             "exactly the budgeted attempts, then stop"
         );
@@ -671,55 +1028,32 @@ mod tests {
         );
     }
 
-    /// Fencing is SYNCHRONOUS with an abnormal exit, not deferred to the
-    /// supervisor's observation of the join handle. An incarnation that dies
-    /// mid-cycle leaves health `Fenced` immediately — including throughout the
-    /// restart backoff, BEFORE any successor exists — so a warmed call in that
-    /// window can never find a usable-looking route from a dead run.
-    ///
-    /// Load-bearing: the incarnation reaches `Rebuilding` before it dies, so
-    /// without the actor-side fence health would still read `Rebuilding{1}` here
-    /// (the supervisor's own fence does not run on the fault path — it goes to
-    /// backoff).
+    /// Incarnation ids are CHECKED: exhaustion fences and terminates rather than
+    /// wrapping and reusing an identifier a stale artifact could match.
     #[tokio::test(start_paused = true)]
-    async fn an_abnormal_exit_fences_synchronously_during_backoff() {
+    async fn incarnation_overflow_fences_rather_than_reusing_an_id() {
         let h = harness();
-        // Die mid-cycle, after the drain and after publishing Rebuilding.
-        *h.hooks.drained.lock() = Some(Arc::new(|id, _| {
-            if id == 1 {
-                panic!("injected mid-cycle fault");
-            }
-        }));
-        // Freeze the successor at its start so we observe the between-incarnations
-        // window rather than a recovered state.
-        *h.hooks.panic_incarnation.lock() = Some(Arc::new(|id| {
-            if id == 2 {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            false
-        }));
+        h.metrics.set_incarnations_for_test(u64::MAX);
+        h.health
+            .store(Arc::new(RoutingHealth::Healthy { incarnation: 7 }));
 
-        let sup = Arc::new(h.supervisor());
-        let run = h.spawn(sup.clone());
-        settle().await;
+        h.supervisor()
+            .run(
+                h.rx.clone(),
+                h.ok_applier(),
+                h.shutdown.clone(),
+                h.notify.clone(),
+                h.hooks.clone(),
+            )
+            .await;
 
-        assert_eq!(
-            h.health(),
-            RoutingHealth::Fenced,
-            "a dead incarnation fences immediately, before any successor"
-        );
-        assert_eq!(
-            sup.incarnations_started(),
-            1,
-            "still in backoff — no successor yet"
-        );
-
-        h.stop();
-        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+        assert_eq!(h.health(), RoutingHealth::Fenced);
+        assert!(h.lease_free(), "the refused mint released its claim");
     }
 
     /// `allows` is the fence contract the warmed-call path will consult: only the
-    /// LIVE incarnation's routes are usable.
+    /// LIVE incarnation's routes are usable, and health alone is never
+    /// source-currentness.
     #[test]
     fn only_the_live_incarnations_routes_are_usable() {
         assert!(RoutingHealth::Healthy { incarnation: 7 }.allows(7));
@@ -729,5 +1063,33 @@ mod tests {
         );
         assert!(!RoutingHealth::Rebuilding { incarnation: 7 }.allows(7));
         assert!(!RoutingHealth::Fenced.allows(7));
+    }
+
+    /// UNWIND-ONLY. Release builds set `panic = "abort"`, so this proves nothing
+    /// about production supervision — it only pins that the fence guard also covers
+    /// an unwinding panic where the profile permits one. Production restart is
+    /// driven by [`ActorFault`], witnessed above.
+    #[cfg(panic = "unwind")]
+    #[tokio::test(start_paused = true)]
+    async fn unwind_only_a_panicking_apply_still_runs_the_fence_guard() {
+        let h = harness();
+        let apply = h.applier(Box::new(|_, _| panic!("unwind-only fault")));
+        let health = h.health.clone();
+        let (rx, shutdown, notify, hooks) = (
+            h.rx.clone(),
+            h.shutdown.clone(),
+            h.notify.clone(),
+            h.hooks.clone(),
+        );
+        let sup = h.supervisor();
+        let run = tokio::spawn(async move { sup.run(rx, apply, shutdown, notify, hooks).await });
+        let outcome = run.await;
+
+        assert!(outcome.is_err(), "the panic propagated (unwind profile)");
+        assert_eq!(
+            **health.load(),
+            RoutingHealth::Fenced,
+            "the actor-stack fence ran during the unwind"
+        );
     }
 }
