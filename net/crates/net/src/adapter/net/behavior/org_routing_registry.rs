@@ -5,11 +5,26 @@
 //! in bounded quanta. It implements [`DirtyApply`], so the supervised actor from
 //! E2 drives it and nothing else does.
 //!
-//! Two authoritative structures, deliberately separate (Kyra OLB-2B-E3a):
+//! Three authoritative structures, deliberately separate:
 //!
-//! - [`RegistryWork`] answers only "is SOME work owed?" — a coalescing wake hint;
-//! - [`RegistryInner::pending`] holds the exact slot identities that owe work. The
-//!   Boolean must never become the work queue.
+//! - [`RegistryWork`] answers only "is SOME work owed?" — a coalescing wake hint
+//!   (Kyra OLB-2B-E3a). The Boolean must never become the work queue;
+//! - [`RegistryInner::pending`] holds the exact slot identities that owe work;
+//! - [`RegistryInner::live_actor`] holds the ONE incarnation currently permitted
+//!   to consume that work. It is bound to the actor LIFECYCLE via
+//!   [`DirtyApply::activate_incarnation`] / [`DirtyApply::deactivate_incarnation`],
+//!   never to a high-water counter: a high-water mark cannot distinguish "a newer
+//!   actor took over" from "no actor is live", so a stale attempt could consume
+//!   pending identities, be rejected at installation, and still report success.
+//!
+//! ## Frozen lock order
+//!
+//! `source currentness pin` → `registry lock`.
+//!
+//! The pin is acquired at the very top of [`NodeOrgRoutingRegistry::apply`], before
+//! the registry lock is ever taken, and is released only after the installation
+//! completes. No source method is called while the registry lock is held, and no
+//! registry method that a source implementation could re-enter takes the pin.
 
 // E3b-ONLY: the node wiring that consumes this lands in E3c, which also removes
 // this allow and those in `org_routing`/`org_scoped_store`. A leftover allow there
@@ -34,10 +49,38 @@ const MAX_NODE_SLOTS: usize = 256;
 /// yielding quanta rather than one unbroken burst.
 const APPLY_QUANTUM: usize = 64;
 
-/// A clone family. Independent families share node slots but hold their own
-/// handles and their own bound.
+/// A clone family's identity.
+///
+/// Deliberately UNCONSTRUCTIBLE outside this module: it is minted only by
+/// [`NodeOrgRoutingRegistry::new_family`] and reaches callers wrapped in a
+/// [`RoutingFamily`]. A caller cannot name another family's id, so it cannot spend
+/// another family's handle budget or forge membership in one (Kyra OLB-2B-E3b).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct FamilyId(pub u64);
+struct FamilyId(u64);
+
+/// An audience scope in the PRIVATE partition.
+///
+/// `CapabilityAudienceScope::Public` is unrepresentable here: this registry is the
+/// owner-private routing consumer, and a public scope reaching a retained slot
+/// would mean the private plane retained a plaintext, globally-discoverable row
+/// under private-authority facts. Rejecting it at construction makes that
+/// structurally impossible rather than a filter someone can forget.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PrivateAudienceScope(CapabilityAudienceScope);
+
+impl PrivateAudienceScope {
+    /// `None` for `Public` — the only rejection.
+    pub(crate) fn new(scope: CapabilityAudienceScope) -> Option<Self> {
+        match scope {
+            CapabilityAudienceScope::Public => None,
+            private => Some(Self(private)),
+        }
+    }
+
+    pub(crate) fn scope(&self) -> &CapabilityAudienceScope {
+        &self.0
+    }
+}
 
 /// The AUTHORITY-SCOPED identity of a retained slot.
 ///
@@ -47,7 +90,7 @@ pub(crate) struct FamilyId(pub u64);
 /// authority, which no amount of downstream filtering can undo.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SlotKey {
-    pub scope: CapabilityAudienceScope,
+    pub scope: PrivateAudienceScope,
     pub capability: CapabilityAuthorityId,
 }
 
@@ -60,6 +103,11 @@ pub(crate) enum DemandRefused {
     /// The node already retains `MAX_NODE_SLOTS` distinct slots. A live slot is
     /// NEVER evicted to satisfy new demand.
     NodeAtCapacity,
+    /// The monotone identity space backing slot incarnations and family identities
+    /// is exhausted. Refusing is the only safe answer: wrapping would let a stale
+    /// artifact match a live slot's incarnation and resurrect it, and aborting
+    /// would take the process down over a bookkeeping limit.
+    IdSpaceExhausted,
 }
 
 /// The authority-scoped base facts for one retained slot.
@@ -76,25 +124,45 @@ pub(crate) struct SlotBaseFacts {
     pub slot_incarnation: u64,
 }
 
-/// Supplies authority-scoped provider facts. Implemented in E3c over the scoped
-/// state plus the live floor view; a seam here so the registry can be reviewed
-/// without the node's authority plumbing, and so "no registry lock across the
-/// source query" is structurally checkable.
-pub(crate) trait SlotSource: Send + Sync + 'static {
+/// A HELD source-currentness pin.
+///
+/// While one is held the source's query-visible set cannot advance, so the
+/// generation every artifact is stamped with is still the generation those facts
+/// are installed against. A two-sample before/after comparison cannot give that:
+/// it leaves a window between the second read and the installation in which the
+/// source may move, and facts installed in that window are stale while carrying a
+/// generation that says otherwise (Kyra OLB-2B-E3b).
+///
+/// E3c binds this to the scoped mutation-publication gate plus the query-visible
+/// revision check; the trait keeps that plumbing out of the registry's review.
+pub(crate) trait SourceCurrentness {
+    /// The query-visible generation this pin holds still.
+    fn generation(&self) -> u64;
+
     /// Authority-scoped providers for `key`. Called with NO registry lock held.
     fn providers(&self, key: &SlotKey) -> Vec<PrivateCapabilityProvider>;
-    /// The source's current query-visible generation.
-    fn source_generation(&self) -> u64;
+}
+
+/// Supplies authority-scoped provider facts, only through a held pin.
+///
+/// There is deliberately no un-pinned query: a caller cannot read providers
+/// without first establishing the currentness it will stamp them with.
+pub(crate) trait SlotSource: Send + Sync + 'static {
+    /// Acquire the currentness pin. ALWAYS called before the registry lock is
+    /// taken, never while holding it — see the module's frozen lock order.
+    fn pin(&self) -> Box<dyn SourceCurrentness + '_>;
 }
 
 #[derive(Debug)]
 struct Slot {
-    /// Replaced whenever the slot is retired, so work in flight for a previous
-    /// incarnation can never resurrect it.
+    /// Allocated fresh from the node-wide monotone id space at creation, so a
+    /// retired-and-re-demanded slot never reuses an identity and work in flight
+    /// for a previous incarnation can never resurrect it.
     incarnation: u64,
     /// Live demand handles across ALL families.
     refs: usize,
-    /// `None` until a recapture installs facts.
+    /// `None` until a recapture installs facts, and cleared the moment anything
+    /// invalidates them. `None` IS the deterministic cold outcome.
     facts: Option<Arc<SlotBaseFacts>>,
 }
 
@@ -109,7 +177,21 @@ struct RegistryInner {
     families: BTreeMap<FamilyId, BTreeMap<SlotKey, usize>>,
     /// AUTHORITATIVE pending slot identities — the work queue proper.
     pending: BTreeSet<SlotKey>,
-    next_incarnation: u64,
+    /// Monotone allocator shared by slot incarnations and family identities. Never
+    /// reused, never wrapped.
+    next_id: u64,
+    /// The ONE actor incarnation permitted to consume pending work and install
+    /// facts, or `None` when no actor is live.
+    live_actor: Option<u64>,
+    /// The source generation an OPEN recapture epoch was expanded at.
+    ///
+    /// `Some(g)` means "a complete recapture is under way against generation `g`;
+    /// its remaining set is `pending`". A later `RebuildAll` at the SAME generation
+    /// must not re-expand — re-expanding would re-select the first quantum forever
+    /// and the recapture would never terminate. A `RebuildAll` at a DIFFERENT
+    /// generation restarts the epoch, because slots built against the old one are
+    /// no longer part of one coherent recapture.
+    recapture: Option<u64>,
 }
 
 impl RegistryInner {
@@ -118,6 +200,52 @@ impl RegistryInner {
             .get(&family)
             .map_or(0, |keys| keys.values().sum())
     }
+
+    /// Allocate the next identity, or `None` when the space is exhausted.
+    fn allocate_id(&mut self) -> Option<u64> {
+        let next = self.next_id.checked_add(1)?;
+        self.next_id = next;
+        Some(next)
+    }
+
+    /// Drop `key`'s facts, reporting whether anything was actually invalidated.
+    fn invalidate(&mut self, key: &SlotKey) -> bool {
+        self.slots
+            .get_mut(key)
+            .is_some_and(|slot| slot.facts.take().is_some())
+    }
+
+    /// Queue every retained slot and drop every fact — the expansion step of a
+    /// recapture epoch and of a fresh actor incarnation.
+    fn invalidate_and_queue_all(&mut self) -> u64 {
+        let keys: Vec<SlotKey> = self.slots.keys().cloned().collect();
+        let mut invalidated = 0;
+        for key in keys {
+            if self.invalidate(&key) {
+                invalidated += 1;
+            }
+            self.pending.insert(key);
+        }
+        invalidated
+    }
+
+    /// Has THIS pass produced a complete, coherent installation?
+    ///
+    /// Kyra's completion condition: no work is owed AND every currently retained
+    /// slot carries facts stamped with the live actor incarnation, that slot's
+    /// current incarnation, and ONE current source generation. Anything weaker
+    /// would let `Current` — the only outcome that may advance health — publish a
+    /// route set in which some slot was never rebuilt by this incarnation.
+    fn is_complete(&self, incarnation: u64, generation: u64) -> bool {
+        self.pending.is_empty()
+            && self.slots.values().all(|slot| {
+                slot.facts.as_ref().is_some_and(|facts| {
+                    facts.actor_incarnation == incarnation
+                        && facts.slot_incarnation == slot.incarnation
+                        && facts.source_generation == generation
+                })
+            })
+    }
 }
 
 /// Observable registry counters.
@@ -125,9 +253,13 @@ impl RegistryInner {
 pub(crate) struct RegistryMetrics {
     refused_family_at_capacity: AtomicU64,
     refused_node_at_capacity: AtomicU64,
+    refused_id_space_exhausted: AtomicU64,
     slots_retired: AtomicU64,
     installs: AtomicU64,
     discarded_obsolete: AtomicU64,
+    facts_invalidated: AtomicU64,
+    stale_actor_rejections: AtomicU64,
+    recaptures_restarted: AtomicU64,
 }
 
 impl RegistryMetrics {
@@ -136,6 +268,9 @@ impl RegistryMetrics {
     }
     pub(crate) fn refused_node_at_capacity(&self) -> u64 {
         self.refused_node_at_capacity.load(Ordering::Acquire)
+    }
+    pub(crate) fn refused_id_space_exhausted(&self) -> u64 {
+        self.refused_id_space_exhausted.load(Ordering::Acquire)
     }
     pub(crate) fn slots_retired(&self) -> u64 {
         self.slots_retired.load(Ordering::Acquire)
@@ -146,6 +281,15 @@ impl RegistryMetrics {
     pub(crate) fn discarded_obsolete(&self) -> u64 {
         self.discarded_obsolete.load(Ordering::Acquire)
     }
+    pub(crate) fn facts_invalidated(&self) -> u64 {
+        self.facts_invalidated.load(Ordering::Acquire)
+    }
+    pub(crate) fn stale_actor_rejections(&self) -> u64 {
+        self.stale_actor_rejections.load(Ordering::Acquire)
+    }
+    pub(crate) fn recaptures_restarted(&self) -> u64 {
+        self.recaptures_restarted.load(Ordering::Acquire)
+    }
 }
 
 /// The node's bounded routing registry.
@@ -154,9 +298,30 @@ pub(crate) struct NodeOrgRoutingRegistry {
     source: Arc<dyn SlotSource>,
     work: Arc<RegistryWork>,
     metrics: Arc<RegistryMetrics>,
-    /// Highest actor incarnation seen. An install from an older incarnation is
-    /// obsolete by definition.
-    live_actor: AtomicU64,
+}
+
+/// A clone family: one private identity and one shared 64-handle budget.
+///
+/// Cloning shares the identity — that is the point, and it is why the identity is
+/// not a caller-supplied integer. Independent families are minted by
+/// [`NodeOrgRoutingRegistry::new_family`] and can neither name nor spend one
+/// another's budget.
+#[derive(Clone)]
+pub(crate) struct RoutingFamily {
+    registry: Arc<NodeOrgRoutingRegistry>,
+    id: FamilyId,
+}
+
+impl RoutingFamily {
+    /// Register demand for `key` under THIS family's budget.
+    pub(crate) fn demand(&self, key: SlotKey) -> Result<DemandHandle, DemandRefused> {
+        self.registry.demand(self.id, key)
+    }
+
+    /// Handles this family currently holds.
+    pub(crate) fn handles(&self) -> usize {
+        self.registry.inner.lock().family_handles(self.id)
+    }
 }
 
 /// A live demand for one authority-scoped key, held by one family. Releases on
@@ -184,8 +349,27 @@ impl NodeOrgRoutingRegistry {
             source,
             work,
             metrics,
-            live_actor: AtomicU64::new(0),
         })
+    }
+
+    /// Mint a new clone family with its own private identity and handle budget.
+    pub(crate) fn new_family(self: &Arc<Self>) -> Result<RoutingFamily, DemandRefused> {
+        let id = {
+            let mut inner = self.inner.lock();
+            inner.allocate_id()
+        };
+        match id {
+            Some(id) => Ok(RoutingFamily {
+                registry: self.clone(),
+                id: FamilyId(id),
+            }),
+            None => {
+                self.metrics
+                    .refused_id_space_exhausted
+                    .fetch_add(1, Ordering::AcqRel);
+                Err(DemandRefused::IdSpaceExhausted)
+            }
+        }
     }
 
     /// Register demand for `key` from `family`.
@@ -197,7 +381,7 @@ impl NodeOrgRoutingRegistry {
     ///
     /// A duplicate demand from the same family is a distinct handle: it shares the
     /// slot and counts toward the family bound, so re-demanding cannot bypass it.
-    pub(crate) fn demand(
+    fn demand(
         self: &Arc<Self>,
         family: FamilyId,
         key: SlotKey,
@@ -220,8 +404,13 @@ impl NodeOrgRoutingRegistry {
                 return Err(DemandRefused::NodeAtCapacity);
             }
             if new_slot {
-                inner.next_incarnation += 1;
-                let incarnation = inner.next_incarnation;
+                // Allocate BEFORE mutating anything, so exhaustion retains nothing.
+                let Some(incarnation) = inner.allocate_id() else {
+                    self.metrics
+                        .refused_id_space_exhausted
+                        .fetch_add(1, Ordering::AcqRel);
+                    return Err(DemandRefused::IdSpaceExhausted);
+                };
                 inner.slots.insert(
                     key.clone(),
                     Slot {
@@ -260,8 +449,8 @@ impl NodeOrgRoutingRegistry {
         })
     }
 
-    /// Release one handle. The LAST reference retires the slot and REPLACES its
-    /// incarnation, so work in flight cannot resurrect it.
+    /// Release one handle. The LAST reference retires the slot; a re-demand then
+    /// allocates a FRESH incarnation, so work in flight cannot resurrect it.
     fn release(&self, family: FamilyId, key: &SlotKey) {
         let mut inner = self.inner.lock();
         if let Some(keys) = inner.families.get_mut(&family) {
@@ -283,7 +472,6 @@ impl NodeOrgRoutingRegistry {
             None => false,
         };
         if retire {
-            inner.next_incarnation += 1;
             inner.slots.remove(key);
             inner.pending.remove(key);
             if let Some(bucket) = inner.slots_by_capability.get_mut(&key.capability) {
@@ -296,8 +484,8 @@ impl NodeOrgRoutingRegistry {
         }
     }
 
-    /// The retained base facts for `key`, if the slot exists AND has been built.
-    /// `None` is the deterministic UNRETAINED/cold outcome.
+    /// The retained base facts for `key`, if the slot exists AND currently holds
+    /// valid facts. `None` is the deterministic UNRETAINED/cold outcome.
     pub(crate) fn base_facts(&self, key: &SlotKey) -> Option<Arc<SlotBaseFacts>> {
         self.inner.lock().slots.get(key)?.facts.clone()
     }
@@ -312,106 +500,180 @@ impl NodeOrgRoutingRegistry {
 }
 
 impl DirtyApply for NodeOrgRoutingRegistry {
+    /// A fresh incarnation claims work authority and invalidates EVERYTHING.
+    ///
+    /// Nothing a dead incarnation built is trustworthy, so rather than leaving
+    /// stale facts readable until the first recapture lands, this drops them and
+    /// queues every retained slot. `SlotBaseFacts::actor_incarnation` therefore
+    /// records which live actor built a fact rather than merely enabling a check
+    /// for one that no longer is.
+    fn activate_incarnation(&self, incarnation: u64) {
+        let owed = {
+            let mut inner = self.inner.lock();
+            inner.live_actor = Some(incarnation);
+            inner.recapture = None;
+            let invalidated = inner.invalidate_and_queue_all();
+            self.metrics
+                .facts_invalidated
+                .fetch_add(invalidated, Ordering::AcqRel);
+            !inner.pending.is_empty()
+        };
+        if owed {
+            self.work.mark();
+        }
+    }
+
+    /// This incarnation is over. Revoking authority here — from the actor's own
+    /// fence — is what makes "stale actor" a state rather than a comparison
+    /// against a high-water mark.
+    fn deactivate_incarnation(&self, incarnation: u64) {
+        let mut inner = self.inner.lock();
+        if inner.live_actor == Some(incarnation) {
+            inner.live_actor = None;
+        }
+    }
+
     /// One bounded reconciliation quantum.
     ///
-    /// The three phases exist for the lock discipline: the registry lock is held
-    /// ONLY to select targets and later to install. The source query, decoding,
-    /// sorting and projection all happen with NO lock held.
+    /// The phases exist for the lock discipline: the registry lock is held ONLY to
+    /// select/invalidate and later to install. The source query, decoding, sorting
+    /// and projection all happen with NO registry lock held — while the source
+    /// currentness pin, acquired BEFORE the registry lock, is held throughout.
     fn apply(&self, incarnation: u64, request: ApplyRequest) -> ApplyOutcome {
-        self.live_actor.fetch_max(incarnation, Ordering::AcqRel);
+        // The pin comes FIRST and outlives the installation: it is a local of this
+        // function, and the registry lock is only ever taken beneath it.
+        let pin = self.source.pin();
+        let generation = pin.generation();
 
-        // --- phase 1: select under the lock, bounded to one quantum ---
+        // --- phase 1: invalidate + select under the lock, bounded to one quantum ---
         let selected: Vec<(SlotKey, u64)> = {
             let mut inner = self.inner.lock();
 
-            let mut targets: BTreeSet<SlotKey> = BTreeSet::new();
+            if inner.live_actor != Some(incarnation) {
+                // Stale or absent authority. Consume NOTHING: taking pending
+                // identities here and then failing at installation is exactly how
+                // authoritative work gets lost while the caller is told it
+                // succeeded (Kyra OLB-2B-E3b).
+                self.metrics
+                    .stale_actor_rejections
+                    .fetch_add(1, Ordering::AcqRel);
+                drop(inner);
+                // Re-arm so the LIVE incarnation still sees the work that woke us.
+                self.work.mark();
+                return ApplyOutcome::Superseded;
+            }
+
+            // Slots this request names, invalidated under THIS lock — before any
+            // rebuild starts and including slots beyond the quantum. Leaving stale
+            // facts readable while their capability is known to have moved is a
+            // silent-staleness hazard that no later install can undo (Kyra
+            // OLB-2B-E3b): `Caps` deliberately leaves global health alone, so
+            // per-slot invalidation is the ONLY thing fencing those routes.
+            let mut invalidated = 0u64;
+            let mut named: BTreeSet<SlotKey> = BTreeSet::new();
             match &request.batch.dirty {
-                // Every retained slot — bounded by MAX_NODE_SLOTS.
-                DirtyCapabilities::RebuildAll => targets.extend(inner.slots.keys().cloned()),
-                // ONLY the capability-indexed buckets.
-                DirtyCapabilities::Caps(caps) => {
-                    for capability in caps {
-                        if let Some(bucket) = inner.slots_by_capability.get(capability) {
-                            targets.extend(bucket.iter().cloned());
+                DirtyCapabilities::RebuildAll => {
+                    if inner.recapture != Some(generation) {
+                        if inner.recapture.is_some() {
+                            self.metrics
+                                .recaptures_restarted
+                                .fetch_add(1, Ordering::AcqRel);
                         }
+                        inner.recapture = Some(generation);
+                        invalidated += inner.invalidate_and_queue_all();
+                    }
+                    // An epoch already open at THIS generation keeps its remaining
+                    // set in `pending`; re-expanding would re-select the first
+                    // quantum forever.
+                    named = inner.pending.clone();
+                }
+                DirtyCapabilities::Caps(caps) => {
+                    let affected: Vec<SlotKey> = caps
+                        .iter()
+                        .filter_map(|capability| inner.slots_by_capability.get(capability))
+                        .flat_map(|bucket| bucket.iter().cloned())
+                        .collect();
+                    for key in affected {
+                        if inner.invalidate(&key) {
+                            invalidated += 1;
+                        }
+                        inner.pending.insert(key.clone());
+                        named.insert(key);
                     }
                 }
                 DirtyCapabilities::Clean => {}
             }
             if request.registry_work {
-                // The registry's OWN authoritative pending identities. Union with
-                // the source selection; the set dedups by slot identity.
-                targets.extend(inner.pending.iter().cloned());
+                named.extend(inner.pending.iter().cloned());
             }
+            self.metrics
+                .facts_invalidated
+                .fetch_add(invalidated, Ordering::AcqRel);
 
-            let mut selected = Vec::with_capacity(targets.len().min(APPLY_QUANTUM));
-            let mut overflow = Vec::new();
-            for (index, key) in targets.into_iter().enumerate() {
-                if index < APPLY_QUANTUM {
-                    if let Some(slot) = inner.slots.get(&key) {
-                        selected.push((key, slot.incarnation));
-                    }
-                } else {
-                    overflow.push(key);
+            let mut selected = Vec::with_capacity(named.len().min(APPLY_QUANTUM));
+            for key in named.into_iter().take(APPLY_QUANTUM) {
+                // Consuming the identity is safe now: authority was verified under
+                // THIS lock, and phase 3 re-queues anything it cannot install.
+                inner.pending.remove(&key);
+                if let Some(slot) = inner.slots.get(&key) {
+                    selected.push((key, slot.incarnation));
                 }
             }
-            for (key, _) in &selected {
-                inner.pending.remove(key);
-            }
-            // The remainder stays AUTHORITATIVE here, not in the wake flag.
-            for key in overflow {
-                inner.pending.insert(key);
+            // Everything beyond the quantum stays AUTHORITATIVE in `pending`, not
+            // in the wake flag.
+
+            if selected.is_empty() {
+                // Nothing to build. Re-marking here would spin, because another
+                // identical pass would select nothing again.
+                let outcome = settle(&inner, incarnation, generation);
+                if matches!(outcome, ApplyOutcome::Current { .. }) {
+                    inner.recapture = None;
+                }
+                return outcome;
             }
             selected
         };
 
-        if selected.is_empty() {
-            return ApplyOutcome::Current {
-                source_generation: self.source.source_generation(),
-            };
-        }
-
-        // --- phase 2: build OFF-LOCK ---
-        let before = self.source.source_generation();
+        // --- phase 2: build OFF-LOCK, under the held pin ---
         let built: Vec<(SlotKey, u64, Vec<PrivateCapabilityProvider>)> = selected
             .iter()
-            .map(|(key, slot_incarnation)| {
-                (key.clone(), *slot_incarnation, self.source.providers(key))
-            })
+            .map(|(key, slot_incarnation)| (key.clone(), *slot_incarnation, pin.providers(key)))
             .collect();
-        let after = self.source.source_generation();
-        if before != after {
-            // The source moved under this build. Re-queue and wake: the
-            // `Superseded` contract requires a pending or eventual wake, and here
-            // the private-discovery movement supplies one as well.
-            {
-                let mut inner = self.inner.lock();
-                for (key, _) in &selected {
-                    if inner.slots.contains_key(key) {
+
+        // --- phase 3: reacquire and install CONDITIONALLY ---
+        // The source cannot have moved: the pin is still held. What can still have
+        // changed is the actor's authority and the slots themselves.
+        let mut slot_moved = false;
+        let outcome = {
+            let mut inner = self.inner.lock();
+
+            if inner.live_actor != Some(incarnation) {
+                // Authority was revoked while we built. Every still-live slot we
+                // selected still owes work — requeue it rather than dropping it,
+                // and never report a current installation.
+                for (key, slot_incarnation, _) in &built {
+                    if inner
+                        .slots
+                        .get(key)
+                        .is_some_and(|slot| slot.incarnation == *slot_incarnation)
+                    {
                         inner.pending.insert(key.clone());
                     }
                 }
+                self.metrics
+                    .stale_actor_rejections
+                    .fetch_add(1, Ordering::AcqRel);
+                self.metrics
+                    .discarded_obsolete
+                    .fetch_add(built.len() as u64, Ordering::AcqRel);
+                drop(inner);
+                self.work.mark();
+                return ApplyOutcome::Superseded;
             }
-            self.work.mark();
-            return ApplyOutcome::Superseded;
-        }
 
-        // --- phase 3: reacquire and install CONDITIONALLY ---
-        // All four conditions must hold: the actor incarnation is still live, the
-        // slot is still retained, its incarnation is unchanged, and the source
-        // generation is still the one we built from.
-        let mut slot_moved = false;
-        let remaining = {
-            let mut inner = self.inner.lock();
-            let actor_live = self.live_actor.load(Ordering::Acquire) == incarnation;
+            let RegistryInner { slots, pending, .. } = &mut *inner;
             for (key, slot_incarnation, providers) in built {
-                if !actor_live {
-                    self.metrics
-                        .discarded_obsolete
-                        .fetch_add(1, Ordering::AcqRel);
-                    continue;
-                }
-                let Some(slot) = inner.slots.get_mut(&key) else {
+                let Some(slot) = slots.get_mut(&key) else {
                     // Retired while we built: do NOT resurrect it.
                     self.metrics
                         .discarded_obsolete
@@ -424,33 +686,58 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     self.metrics
                         .discarded_obsolete
                         .fetch_add(1, Ordering::AcqRel);
-                    inner.pending.insert(key);
+                    pending.insert(key);
                     slot_moved = true;
                     continue;
                 }
                 slot.facts = Some(Arc::new(SlotBaseFacts {
                     key: key.clone(),
                     providers: providers.into(),
-                    source_generation: after,
+                    source_generation: generation,
                     actor_incarnation: incarnation,
                     slot_incarnation,
                 }));
                 self.metrics.installs.fetch_add(1, Ordering::AcqRel);
             }
-            inner.pending.len()
+
+            let owed = !inner.pending.is_empty();
+            let outcome = if slot_moved {
+                // Slot/demand-origin rejection: its wake is OURS to provide.
+                ApplyOutcome::Superseded
+            } else {
+                let outcome = settle(&inner, incarnation, generation);
+                if matches!(outcome, ApplyOutcome::Current { .. }) {
+                    inner.recapture = None;
+                }
+                outcome
+            };
+            drop(inner);
+            if owed {
+                // More quanta owed, or slot movement re-queued work: re-arm rather
+                // than looping inside this synchronous call.
+                self.work.mark();
+            }
+            outcome
         };
 
-        if remaining > 0 {
-            // More quanta owed, or slot movement re-queued work: re-arm rather
-            // than looping inside this synchronous call.
-            self.work.mark();
-        }
-        if slot_moved {
-            // Slot/demand-origin rejection: its wake is OURS to provide.
-            return ApplyOutcome::Superseded;
-        }
+        // `pin` drops HERE — after the installation, never before it.
+        outcome
+    }
+}
+
+/// `Current` only for a COMPLETE, coherent installation; `Progress` otherwise.
+///
+/// `Current` is the only outcome that may advance routing health, so a bounded
+/// quantum that left work owed must not claim it: publishing `Healthy` with slots
+/// this incarnation never rebuilt advertises routes nobody verified.
+fn settle(inner: &RegistryInner, incarnation: u64, generation: u64) -> ApplyOutcome {
+    if inner.is_complete(incarnation, generation) {
         ApplyOutcome::Current {
-            source_generation: after,
+            source_generation: generation,
+        }
+    } else {
+        ApplyOutcome::Progress {
+            source_generation: generation,
         }
     }
 }
@@ -461,11 +748,12 @@ mod tests {
     use crate::adapter::net::behavior::org::OrgId;
     use std::sync::atomic::AtomicBool;
 
-    fn scope(seed: u8) -> CapabilityAudienceScope {
-        CapabilityAudienceScope::Owner {
+    fn scope(seed: u8) -> PrivateAudienceScope {
+        PrivateAudienceScope::new(CapabilityAudienceScope::Owner {
             org_id: OrgId::from_bytes([seed; 32]),
             audience_handle: [seed; 32],
-        }
+        })
+        .expect("owner scopes are private")
     }
 
     fn key(seed: u8, tag: &str) -> SlotKey {
@@ -475,15 +763,20 @@ mod tests {
         }
     }
 
-    /// A source the witnesses drive, which asserts it is never queried while the
-    /// registry lock is held.
+    type Hook = Box<dyn Fn() + Send + Sync>;
+    type SharedHook = Arc<dyn Fn() + Send + Sync>;
+
+    /// A source the witnesses drive.
+    ///
+    /// Its currentness pin is a real mutex over the query-visible generation, so
+    /// "pinned" is observable: nothing can advance the generation while a pin is
+    /// out, exactly as the scoped mutation-publication gate will behave in E3c.
     struct TestSource {
-        generation: AtomicU64,
-        /// Bumps the generation DURING a query, forcing a source supersede.
-        move_during_query: AtomicBool,
-        /// Runs during a query, so a witness can retire a slot mid-build.
-        #[allow(clippy::type_complexity)]
-        during_query: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        gate: parking_lot::Mutex<u64>,
+        /// Runs during a query, so a witness can move the world mid-build.
+        during_query: parking_lot::Mutex<Option<Hook>>,
+        /// Runs when the pin is RELEASED — i.e. strictly after installation.
+        on_release: parking_lot::Mutex<Option<SharedHook>>,
         queried: parking_lot::Mutex<Vec<SlotKey>>,
         registry: parking_lot::Mutex<Option<Arc<NodeOrgRoutingRegistry>>>,
     }
@@ -491,9 +784,9 @@ mod tests {
     impl TestSource {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                generation: AtomicU64::new(1),
-                move_during_query: AtomicBool::new(false),
+                gate: parking_lot::Mutex::new(1),
                 during_query: parking_lot::Mutex::new(None),
+                on_release: parking_lot::Mutex::new(None),
                 queried: parking_lot::Mutex::new(Vec::new()),
                 registry: parking_lot::Mutex::new(None),
             })
@@ -504,28 +797,56 @@ mod tests {
         fn reset(&self) {
             self.queried.lock().clear();
         }
+        /// Advance the query-visible generation. BLOCKS while a pin is held.
+        fn advance(&self) {
+            *self.gate.lock() += 1;
+        }
+        fn assert_no_registry_lock(&self, context: &str) {
+            if let Some(registry) = self.registry.lock().clone() {
+                assert!(registry.inner.try_lock().is_some(), "{context}");
+            }
+        }
     }
 
-    impl SlotSource for TestSource {
+    struct TestPin<'a> {
+        source: &'a TestSource,
+        generation: parking_lot::MutexGuard<'a, u64>,
+    }
+
+    impl SourceCurrentness for TestPin<'_> {
+        fn generation(&self) -> u64 {
+            *self.generation
+        }
         fn providers(&self, key: &SlotKey) -> Vec<PrivateCapabilityProvider> {
-            self.queried.lock().push(key.clone());
-            // The registry lock MUST NOT be held here.
-            if let Some(registry) = self.registry.lock().clone() {
-                assert!(
-                    registry.inner.try_lock().is_some(),
-                    "no registry lock may be held across the source query"
-                );
-            }
-            if let Some(hook) = self.during_query.lock().take() {
+            self.source.queried.lock().push(key.clone());
+            self.source
+                .assert_no_registry_lock("no registry lock may be held across the source query");
+            let hook = self.source.during_query.lock().take();
+            if let Some(hook) = hook {
                 hook();
-            }
-            if self.move_during_query.load(Ordering::Acquire) {
-                self.generation.fetch_add(1, Ordering::AcqRel);
             }
             Vec::new()
         }
-        fn source_generation(&self) -> u64 {
-            self.generation.load(Ordering::Acquire)
+    }
+
+    impl Drop for TestPin<'_> {
+        fn drop(&mut self) {
+            let hook = self.source.on_release.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    impl SlotSource for TestSource {
+        fn pin(&self) -> Box<dyn SourceCurrentness + '_> {
+            self.assert_no_registry_lock(
+                "the source pin must be acquired BEFORE the registry lock",
+            );
+            Box::new(TestPin {
+                source: self,
+                generation: self.gate.lock(),
+            })
         }
     }
 
@@ -535,11 +856,20 @@ mod tests {
         metrics: Arc<RegistryMetrics>,
     }
 
+    impl Fixture {
+        fn family(&self) -> RoutingFamily {
+            self.registry.new_family().expect("family")
+        }
+    }
+
+    /// Builds a registry with actor incarnation 1 already live — the state
+    /// `RoutingSupervisor` establishes before it applies anything.
     fn fixture() -> Fixture {
         let source = TestSource::new();
         let metrics: Arc<RegistryMetrics> = Arc::default();
         let registry = NodeOrgRoutingRegistry::new(source.clone(), Arc::default(), metrics.clone());
         *source.registry.lock() = Some(registry.clone());
+        registry.activate_incarnation(1);
         Fixture {
             registry,
             source,
@@ -557,6 +887,67 @@ mod tests {
         }
     }
 
+    fn caps(tags: &[&str]) -> DirtyCapabilities {
+        DirtyCapabilities::Caps(
+            tags.iter()
+                .map(|t| CapabilityAuthorityId::for_tag(t))
+                .collect(),
+        )
+    }
+
+    // ---------------------------------------------------------------- identity
+
+    /// The public partition cannot form a routing slot key at all.
+    #[test]
+    fn the_public_scope_cannot_form_a_slot_key() {
+        assert!(
+            PrivateAudienceScope::new(CapabilityAudienceScope::Public).is_none(),
+            "this is the PRIVATE routing consumer"
+        );
+        assert!(PrivateAudienceScope::new(CapabilityAudienceScope::Owner {
+            org_id: OrgId::from_bytes([7; 32]),
+            audience_handle: [7; 32],
+        })
+        .is_some());
+    }
+
+    /// Clones of ONE family share its identity and its 64-handle budget; an
+    /// independently minted family gets its own.
+    #[test]
+    fn a_clone_family_shares_one_identity_and_one_budget() {
+        let f = fixture();
+        let family = f.family();
+        let clone = family.clone();
+        let independent = f.family();
+
+        let _a = family.demand(key(1, "nrpc:a")).expect("a");
+        let _b = clone.demand(key(1, "nrpc:b")).expect("b");
+        assert_eq!(family.handles(), 2, "the clone spends the SAME budget");
+        assert_eq!(clone.handles(), 2);
+        assert_eq!(independent.handles(), 0, "a distinct family is unaffected");
+
+        // Exhaust the shared budget through the clone; the original is exhausted too.
+        let mut held = Vec::new();
+        for index in 0..(MAX_HANDLES_PER_FAMILY - 2) {
+            held.push(
+                clone
+                    .demand(key(1, &format!("nrpc:s{index}")))
+                    .expect("within the shared bound"),
+            );
+        }
+        assert_eq!(
+            family.demand(key(1, "nrpc:over")).err(),
+            Some(DemandRefused::FamilyAtCapacity),
+            "the original clone is bounded by what its clone spent"
+        );
+        assert!(
+            independent.demand(key(1, "nrpc:own")).is_ok(),
+            "an independent family still has its own budget"
+        );
+    }
+
+    // ------------------------------------------------------------- recapture
+
     /// First demand gets a full CURRENT recapture even when earlier source deltas
     /// were already destructively drained — the slot's own pending identity is what
     /// drives it, not any surviving source delta.
@@ -568,17 +959,17 @@ mod tests {
             .apply(1, request(false, DirtyCapabilities::RebuildAll));
         f.source.reset();
 
-        let _held = f
-            .registry
-            .demand(FamilyId(1), key(1, "nrpc:a"))
-            .expect("demand");
+        let family = f.family();
+        let _held = family.demand(key(1, "nrpc:a")).expect("demand");
         assert_eq!(f.registry.pending_slots(), 1);
 
         // A CLEAN source pass still rebuilds it, from registry work alone.
-        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
         assert_eq!(f.source.queries(), vec![key(1, "nrpc:a")]);
+        assert!(matches!(outcome, ApplyOutcome::Current { .. }));
         let facts = f.registry.base_facts(&key(1, "nrpc:a")).expect("built");
-        assert_eq!(facts.slot_incarnation, 1);
+        assert_eq!(facts.slot_incarnation, 2, "family 1, then this slot");
+        assert_eq!(facts.actor_incarnation, 1);
         assert_eq!(f.registry.pending_slots(), 0);
     }
 
@@ -586,8 +977,8 @@ mod tests {
     #[test]
     fn two_families_share_one_slot_and_one_reconstruction() {
         let f = fixture();
-        let a = f.registry.demand(FamilyId(1), key(1, "nrpc:a")).expect("a");
-        let b = f.registry.demand(FamilyId(2), key(1, "nrpc:a")).expect("b");
+        let a = f.family().demand(key(1, "nrpc:a")).expect("a");
+        let b = f.family().demand(key(1, "nrpc:a")).expect("b");
         assert_eq!(f.registry.retained_slots(), 1, "one shared node slot");
 
         f.source.reset();
@@ -605,8 +996,9 @@ mod tests {
     #[test]
     fn a_different_audience_scope_is_a_different_slot() {
         let f = fixture();
-        let _a = f.registry.demand(FamilyId(1), key(1, "nrpc:a")).expect("a");
-        let _b = f.registry.demand(FamilyId(1), key(2, "nrpc:a")).expect("b");
+        let family = f.family();
+        let _a = family.demand(key(1, "nrpc:a")).expect("a");
+        let _b = family.demand(key(2, "nrpc:a")).expect("b");
         assert_eq!(
             f.registry.retained_slots(),
             2,
@@ -614,17 +1006,7 @@ mod tests {
         );
 
         f.source.reset();
-        f.registry.apply(
-            1,
-            request(
-                false,
-                DirtyCapabilities::Caps(
-                    [CapabilityAuthorityId::for_tag("nrpc:a")]
-                        .into_iter()
-                        .collect(),
-                ),
-            ),
-        );
+        f.registry.apply(1, request(false, caps(&["nrpc:a"])));
         let mut queried = f.source.queries();
         queried.sort();
         let mut expected = vec![key(1, "nrpc:a"), key(2, "nrpc:a")];
@@ -635,26 +1017,29 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------- bounds
+
     /// The 65th family handle is refused without corrupting the first 64, and a
     /// DUPLICATE demand counts toward the bound rather than bypassing it.
     #[test]
     fn the_sixty_fifth_family_handle_is_refused_without_corrupting_the_first_64() {
         let f = fixture();
+        let family = f.family();
         let mut held = Vec::new();
         for index in 0..MAX_HANDLES_PER_FAMILY {
             held.push(
-                f.registry
-                    .demand(FamilyId(1), key(1, &format!("nrpc:f{index}")))
+                family
+                    .demand(key(1, &format!("nrpc:f{index}")))
                     .expect("within the bound"),
             );
         }
         assert_eq!(
-            f.registry.demand(FamilyId(1), key(1, "nrpc:over")).err(),
+            family.demand(key(1, "nrpc:over")).err(),
             Some(DemandRefused::FamilyAtCapacity)
         );
         // A duplicate of an EXISTING key is still a handle, so it is refused too.
         assert_eq!(
-            f.registry.demand(FamilyId(1), key(1, "nrpc:f0")).err(),
+            family.demand(key(1, "nrpc:f0")).err(),
             Some(DemandRefused::FamilyAtCapacity),
             "duplicate demand cannot bypass the handle bound"
         );
@@ -673,22 +1058,22 @@ mod tests {
     fn the_two_hundred_fifty_seventh_slot_is_deterministically_unretained() {
         let f = fixture();
         let mut held = Vec::new();
-        let mut family = 1u64;
+        let mut family = f.family();
         for index in 0..MAX_NODE_SLOTS {
+            if index > 0 && index % MAX_HANDLES_PER_FAMILY == 0 {
+                family = f.family();
+            }
             held.push(
-                f.registry
-                    .demand(FamilyId(family), key(1, &format!("nrpc:n{index}")))
+                family
+                    .demand(key(1, &format!("nrpc:n{index}")))
                     .expect("within the node bound"),
             );
-            if held.len() % MAX_HANDLES_PER_FAMILY == 0 {
-                family += 1;
-            }
         }
         assert_eq!(f.registry.retained_slots(), MAX_NODE_SLOTS);
 
         let beyond = key(1, "nrpc:beyond");
         assert_eq!(
-            f.registry.demand(FamilyId(9999), beyond.clone()).err(),
+            f.family().demand(beyond.clone()).err(),
             Some(DemandRefused::NodeAtCapacity)
         );
         assert_eq!(f.metrics.refused_node_at_capacity(), 1);
@@ -703,13 +1088,54 @@ mod tests {
         );
     }
 
+    /// An exhausted identity space refuses deterministically: no slot retained, no
+    /// wrap, no panic — and no family minted either.
+    #[test]
+    fn an_exhausted_identity_space_refuses_deterministically() {
+        let f = fixture();
+        let family = f.family();
+        let _live = family.demand(key(1, "nrpc:a")).expect("a");
+        let retained = f.registry.retained_slots();
+
+        f.registry.inner.lock().next_id = u64::MAX;
+
+        assert_eq!(
+            family.demand(key(1, "nrpc:fresh")).err(),
+            Some(DemandRefused::IdSpaceExhausted),
+            "a NEW slot needs a fresh incarnation and cannot have one"
+        );
+        assert_eq!(
+            f.registry.retained_slots(),
+            retained,
+            "the refusal retained nothing"
+        );
+        assert_eq!(
+            f.registry.inner.lock().next_id,
+            u64::MAX,
+            "and mutated no counter"
+        );
+        assert_eq!(
+            f.registry.new_family().err(),
+            Some(DemandRefused::IdSpaceExhausted)
+        );
+        assert_eq!(f.metrics.refused_id_space_exhausted(), 2);
+
+        // A duplicate demand for an EXISTING slot needs no new identity.
+        assert!(
+            family.demand(key(1, "nrpc:a")).is_ok(),
+            "sharing a retained slot allocates nothing"
+        );
+    }
+
+    // -------------------------------------------------------------- lifecycle
+
     /// Dropping one of several references preserves the slot; dropping the LAST
     /// retires it.
     #[test]
     fn only_the_last_reference_retires_the_slot() {
         let f = fixture();
-        let a = f.registry.demand(FamilyId(1), key(1, "nrpc:a")).expect("a");
-        let b = f.registry.demand(FamilyId(2), key(1, "nrpc:a")).expect("b");
+        let a = f.family().demand(key(1, "nrpc:a")).expect("a");
+        let b = f.family().demand(key(1, "nrpc:a")).expect("b");
         f.registry.apply(1, request(true, DirtyCapabilities::Clean));
         assert!(f.registry.base_facts(&key(1, "nrpc:a")).is_some());
 
@@ -728,31 +1154,43 @@ mod tests {
     }
 
     /// A build in flight cannot resurrect a slot retired and re-demanded beneath
-    /// it: the install is discarded, the LIVE incarnation is re-queued, and the
-    /// pass reports `Superseded` so its wake is owed.
+    /// it — driven through the REAL lifecycle: `DemandHandle::drop` retires the
+    /// slot and a real family owner re-demands it, both from inside the source
+    /// query. The stale artifact is discarded, the recreated slot stays indexed and
+    /// pending, and the pass reports `Superseded` so its wake is owed.
     #[test]
     fn a_late_build_cannot_resurrect_a_replaced_slot_incarnation() {
         let f = fixture();
         let target = key(1, "nrpc:a");
-        let held = f.registry.demand(FamilyId(1), target.clone()).expect("a");
+        let original = f.family();
+        let successor = f.family();
 
-        // Mid-build: retire and immediately re-demand, replacing the incarnation.
-        let registry = f.registry.clone();
-        let retarget = target.clone();
-        *f.source.during_query.lock() = Some(Box::new(move || {
-            drop(std::mem::take(&mut *registry.inner.lock()));
-            // Rebuild the slot under a NEW incarnation, as retire+re-demand would.
-            let mut inner = registry.inner.lock();
-            inner.next_incarnation = 99;
-            inner.slots.insert(
-                retarget.clone(),
-                Slot {
-                    incarnation: 99,
-                    refs: 1,
-                    facts: None,
-                },
-            );
-        }));
+        let held: Arc<parking_lot::Mutex<Option<DemandHandle>>> = Arc::new(
+            parking_lot::Mutex::new(Some(original.demand(target.clone()).expect("first demand"))),
+        );
+        let first_incarnation = f
+            .registry
+            .inner
+            .lock()
+            .slots
+            .get(&target)
+            .expect("retained")
+            .incarnation;
+
+        let recreated: Arc<parking_lot::Mutex<Option<DemandHandle>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        {
+            let held = held.clone();
+            let recreated = recreated.clone();
+            let successor = successor.clone();
+            let target = target.clone();
+            *f.source.during_query.lock() = Some(Box::new(move || {
+                // The real RAII release: last reference retires the slot.
+                drop(held.lock().take());
+                // A real family owner re-demands it — a FRESH incarnation.
+                *recreated.lock() = Some(successor.demand(target.clone()).expect("re-demand"));
+            }));
+        }
 
         let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
         assert_eq!(
@@ -765,33 +1203,227 @@ mod tests {
             "the artifact for the dead incarnation was discarded, not installed"
         );
         assert_eq!(f.metrics.discarded_obsolete(), 1);
+        assert_eq!(f.metrics.installs(), 0);
+        assert_eq!(f.metrics.slots_retired(), 1);
+
+        let inner = f.registry.inner.lock();
+        let slot = inner.slots.get(&target).expect("recreated slot retained");
+        assert_ne!(
+            slot.incarnation, first_incarnation,
+            "the recreated slot has a FRESH identity"
+        );
+        assert!(
+            inner
+                .slots_by_capability
+                .get(&target.capability)
+                .is_some_and(|bucket| bucket.contains(&target)),
+            "and is still indexed by capability"
+        );
+        assert!(
+            inner.pending.contains(&target),
+            "the live incarnation still owes work, queued authoritatively"
+        );
+        drop(inner);
+        assert!(recreated.lock().is_some());
+    }
+
+    /// A brand-new actor incarnation invalidates everything the previous one built
+    /// and queues every retained slot.
+    #[test]
+    fn a_new_incarnation_invalidates_every_retained_slot() {
+        let f = fixture();
+        let family = f.family();
+        let _a = family.demand(key(1, "nrpc:a")).expect("a");
+        let _b = family.demand(key(1, "nrpc:b")).expect("b");
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(f.registry.base_facts(&key(1, "nrpc:a")).is_some());
+        assert_eq!(f.registry.pending_slots(), 0);
+
+        f.registry.deactivate_incarnation(1);
+        f.registry.activate_incarnation(2);
+
+        assert!(
+            f.registry.base_facts(&key(1, "nrpc:a")).is_none(),
+            "nothing a dead incarnation built stays readable"
+        );
+        assert_eq!(
+            f.registry.pending_slots(),
+            2,
+            "every retained slot re-queued"
+        );
+    }
+
+    // ---------------------------------------------------------- authority
+
+    /// An application from an actor that is NOT the live one consumes no pending
+    /// work, installs nothing, and never reports `Current`.
+    #[test]
+    fn a_stale_actor_neither_consumes_pending_work_nor_reports_current() {
+        let f = fixture();
+        let _held = f.family().demand(key(1, "nrpc:a")).expect("a");
+        assert_eq!(f.registry.pending_slots(), 1);
+
+        f.source.reset();
+        let outcome = f
+            .registry
+            .apply(2, request(true, DirtyCapabilities::RebuildAll));
+        assert_eq!(outcome, ApplyOutcome::Superseded);
+        assert!(
+            f.source.queries().is_empty(),
+            "a stale actor never even queries the source"
+        );
         assert_eq!(
             f.registry.pending_slots(),
             1,
-            "the live incarnation still owes work, queued authoritatively"
+            "the authoritative work is still owed"
         );
-        drop(held);
+        assert_eq!(f.metrics.stale_actor_rejections(), 1);
+
+        // With NO actor live, the same holds.
+        f.registry.deactivate_incarnation(1);
+        assert_eq!(
+            f.registry.apply(1, request(true, DirtyCapabilities::Clean)),
+            ApplyOutcome::Superseded
+        );
+        assert_eq!(f.registry.pending_slots(), 1);
+        assert_eq!(f.metrics.stale_actor_rejections(), 2);
+
+        // The live successor finds the work intact.
+        f.registry.activate_incarnation(3);
+        let outcome = f.registry.apply(3, request(true, DirtyCapabilities::Clean));
+        assert!(matches!(outcome, ApplyOutcome::Current { .. }));
+        assert_eq!(f.source.queries(), vec![key(1, "nrpc:a")]);
     }
 
-    /// An install from a SUPERSEDED actor incarnation is discarded.
+    /// Authority revoked DURING the build: every still-live selected slot is
+    /// requeued, nothing is installed, and the outcome is never `Current`.
     #[test]
-    fn an_install_from_a_dead_actor_incarnation_is_discarded() {
+    fn authority_revoked_during_a_build_requeues_every_live_slot() {
         let f = fixture();
-        let target = key(1, "nrpc:a");
-        let _held = f.registry.demand(FamilyId(1), target.clone()).expect("a");
+        let family = f.family();
+        let a = key(1, "nrpc:a");
+        let b = key(1, "nrpc:b");
+        let _ha = family.demand(a.clone()).expect("a");
+        let hb = family.demand(b.clone()).expect("b");
 
-        // A newer actor takes over while the old one is building.
         let registry = f.registry.clone();
-        *f.source.during_query.lock() = Some(Box::new(move || {
-            registry.live_actor.store(2, Ordering::Release);
-        }));
+        let hb_cell: Arc<parking_lot::Mutex<Option<DemandHandle>>> =
+            Arc::new(parking_lot::Mutex::new(Some(hb)));
+        {
+            let hb_cell = hb_cell.clone();
+            *f.source.during_query.lock() = Some(Box::new(move || {
+                // The actor's fence fires mid-build, and one slot also retires —
+                // that one must NOT be requeued, because it no longer exists.
+                registry.deactivate_incarnation(1);
+                drop(hb_cell.lock().take());
+            }));
+        }
 
-        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
-        assert!(
-            f.registry.base_facts(&target).is_none(),
-            "a dead incarnation's work is never installed"
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert_eq!(outcome, ApplyOutcome::Superseded);
+        assert_eq!(
+            f.metrics.installs(),
+            0,
+            "nothing from a revoked actor lands"
         );
-        assert_eq!(f.metrics.discarded_obsolete(), 1);
+        assert_eq!(f.metrics.stale_actor_rejections(), 1);
+
+        let inner = f.registry.inner.lock();
+        assert!(inner.pending.contains(&a), "the live slot still owes work");
+        assert!(
+            !inner.pending.contains(&b),
+            "a retired slot is not resurrected into the queue"
+        );
+    }
+
+    // ------------------------------------------------------------ invalidation
+
+    /// A `Caps` delta invalidates the affected slot's facts UNDER THE PHASE-1 LOCK,
+    /// before any rebuild begins — asserted from inside the source query, while the
+    /// rebuild is still in flight. An unrelated slot keeps its facts.
+    #[test]
+    fn a_caps_delta_invalidates_affected_facts_before_the_rebuild_begins() {
+        let f = fixture();
+        let family = f.family();
+        let c = key(1, "nrpc:c");
+        let d = key(1, "nrpc:d");
+        let _hc = family.demand(c.clone()).expect("c");
+        let _hd = family.demand(d.clone()).expect("d");
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(f.registry.base_facts(&c).is_some());
+        assert!(f.registry.base_facts(&d).is_some());
+
+        let observed = Arc::new(AtomicBool::new(false));
+        {
+            let registry = f.registry.clone();
+            let observed = observed.clone();
+            let c = c.clone();
+            let d = d.clone();
+            *f.source.during_query.lock() = Some(Box::new(move || {
+                assert!(
+                    registry.base_facts(&c).is_none(),
+                    "C's stale facts must already be gone while C rebuilds"
+                );
+                assert!(
+                    registry.base_facts(&d).is_some(),
+                    "D was not named by the delta and keeps its facts"
+                );
+                observed.store(true, Ordering::Release);
+            }));
+        }
+
+        f.source.reset();
+        f.registry.apply(1, request(false, caps(&["nrpc:c"])));
+        assert!(observed.load(Ordering::Acquire), "the hook must have run");
+        assert_eq!(f.source.queries(), vec![c.clone()]);
+        assert!(f.registry.base_facts(&c).is_some(), "and is rebuilt after");
+    }
+
+    /// Caps invalidation covers slots BEYOND the quantum: a slot that will not be
+    /// rebuilt for several passes must not keep serving stale facts in the meantime.
+    #[test]
+    fn caps_invalidates_affected_slots_beyond_the_quantum() {
+        let f = fixture();
+        let mut family = f.family();
+        let mut keys = Vec::new();
+        let mut held = Vec::new();
+        for index in 0..(APPLY_QUANTUM + 8) {
+            if index > 0 && index % MAX_HANDLES_PER_FAMILY == 0 {
+                family = f.family();
+            }
+            let k = key(1, &format!("nrpc:q{index}"));
+            held.push(family.demand(k.clone()).expect("demanded"));
+            keys.push(k);
+        }
+        // Two passes to build them all.
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(keys.iter().all(|k| f.registry.base_facts(k).is_some()));
+
+        let tags: Vec<String> = (0..(APPLY_QUANTUM + 8))
+            .map(|index| format!("nrpc:q{index}"))
+            .collect();
+        let all: Vec<&str> = tags.iter().map(String::as_str).collect();
+
+        f.source.reset();
+        let outcome = f.registry.apply(1, request(false, caps(&all)));
+        assert_eq!(
+            f.source.queries().len(),
+            APPLY_QUANTUM,
+            "only one quantum is rebuilt"
+        );
+        assert!(
+            matches!(outcome, ApplyOutcome::Progress { .. }),
+            "work remains, so this is not a complete installation"
+        );
+        assert_eq!(
+            keys.iter()
+                .filter(|k| f.registry.base_facts(k).is_some())
+                .count(),
+            APPLY_QUANTUM,
+            "EVERY affected slot was invalidated; only the quantum was rebuilt"
+        );
+        assert_eq!(f.registry.pending_slots(), 8);
     }
 
     /// `Caps(C)` touches only C's indexed slots; `RebuildAll` touches every
@@ -799,22 +1431,13 @@ mod tests {
     #[test]
     fn caps_touches_only_its_bucket_and_rebuild_all_touches_every_slot() {
         let f = fixture();
-        let _a = f.registry.demand(FamilyId(1), key(1, "nrpc:a")).expect("a");
-        let _b = f.registry.demand(FamilyId(1), key(1, "nrpc:b")).expect("b");
+        let family = f.family();
+        let _a = family.demand(key(1, "nrpc:a")).expect("a");
+        let _b = family.demand(key(1, "nrpc:b")).expect("b");
         f.registry.apply(1, request(true, DirtyCapabilities::Clean));
 
         f.source.reset();
-        f.registry.apply(
-            1,
-            request(
-                false,
-                DirtyCapabilities::Caps(
-                    [CapabilityAuthorityId::for_tag("nrpc:b")]
-                        .into_iter()
-                        .collect(),
-                ),
-            ),
-        );
+        f.registry.apply(1, request(false, caps(&["nrpc:b"])));
         assert_eq!(f.source.queries(), vec![key(1, "nrpc:b")]);
 
         f.source.reset();
@@ -823,17 +1446,7 @@ mod tests {
         assert_eq!(f.source.queries().len(), 2, "every retained slot");
 
         f.source.reset();
-        f.registry.apply(
-            1,
-            request(
-                false,
-                DirtyCapabilities::Caps(
-                    [CapabilityAuthorityId::for_tag("nrpc:absent")]
-                        .into_iter()
-                        .collect(),
-                ),
-            ),
-        );
+        f.registry.apply(1, request(false, caps(&["nrpc:absent"])));
         assert!(
             f.source.queries().is_empty(),
             "an undemanded capability is never projected"
@@ -846,7 +1459,7 @@ mod tests {
     fn combined_source_and_registry_work_deduplicates_a_slot() {
         let f = fixture();
         let target = key(1, "nrpc:a");
-        let _held = f.registry.demand(FamilyId(1), target.clone()).expect("a");
+        let _held = f.family().demand(target.clone()).expect("a");
         assert_eq!(
             f.registry.pending_slots(),
             1,
@@ -854,17 +1467,7 @@ mod tests {
         );
 
         f.source.reset();
-        f.registry.apply(
-            1,
-            request(
-                true,
-                DirtyCapabilities::Caps(
-                    [CapabilityAuthorityId::for_tag("nrpc:a")]
-                        .into_iter()
-                        .collect(),
-                ),
-            ),
-        );
+        f.registry.apply(1, request(true, caps(&["nrpc:a"])));
         assert_eq!(
             f.source.queries(),
             vec![target],
@@ -872,51 +1475,38 @@ mod tests {
         );
     }
 
-    /// Source movement during the build rejects the stale installation and
-    /// re-queues.
+    // ------------------------------------------------------------ completion
+
+    /// A multi-quantum recapture reports `Progress` until the LAST quantum, keeps
+    /// the epoch's remaining set authoritative, and only then reports `Current`
+    /// with every retained slot coherently stamped.
     #[test]
-    fn source_movement_during_a_build_rejects_the_stale_installation() {
+    fn a_multi_quantum_recapture_reports_progress_until_it_completes() {
         let f = fixture();
-        let target = key(1, "nrpc:a");
-        let _held = f.registry.demand(FamilyId(1), target.clone()).expect("a");
-        f.source.move_during_query.store(true, Ordering::Release);
-
-        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
-        assert_eq!(outcome, ApplyOutcome::Superseded);
-        assert!(f.registry.base_facts(&target).is_none());
-        assert_eq!(f.registry.pending_slots(), 1, "re-queued authoritatively");
-
-        f.source.move_during_query.store(false, Ordering::Release);
-        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
-        assert!(matches!(outcome, ApplyOutcome::Current { .. }));
-        assert!(f.registry.base_facts(&target).is_some());
-    }
-
-    /// One quantum leaves the remainder queued AUTHORITATIVELY, and a further pass
-    /// finishes it.
-    #[test]
-    fn one_quantum_leaves_the_remainder_queued() {
-        let f = fixture();
+        let mut family = f.family();
+        let mut keys = Vec::new();
         let mut held = Vec::new();
-        let mut family = 1u64;
         for index in 0..(APPLY_QUANTUM + 10) {
-            held.push(
-                f.registry
-                    .demand(FamilyId(family), key(1, &format!("nrpc:q{index}")))
-                    .expect("demanded"),
-            );
-            if held.len() % MAX_HANDLES_PER_FAMILY == 0 {
-                family += 1;
+            if index > 0 && index % MAX_HANDLES_PER_FAMILY == 0 {
+                family = f.family();
             }
+            let k = key(1, &format!("nrpc:q{index}"));
+            held.push(family.demand(k.clone()).expect("demanded"));
+            keys.push(k);
         }
 
         f.source.reset();
-        f.registry
+        let first = f
+            .registry
             .apply(1, request(false, DirtyCapabilities::RebuildAll));
         assert_eq!(
             f.source.queries().len(),
             APPLY_QUANTUM,
             "at most one quantum per synchronous application"
+        );
+        assert!(
+            matches!(first, ApplyOutcome::Progress { .. }),
+            "an incomplete recapture must NOT claim a current installation"
         );
         assert_eq!(
             f.registry.pending_slots(),
@@ -924,18 +1514,177 @@ mod tests {
             "the remainder lives in the registry, not in the wake flag"
         );
 
+        // The actor promotes the next wake to RebuildAll while a recapture is
+        // owed. That must CONTINUE the epoch, not re-expand it.
         f.source.reset();
-        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
-        assert_eq!(f.source.queries().len(), 10);
+        let second = f
+            .registry
+            .apply(1, request(true, DirtyCapabilities::RebuildAll));
+        assert_eq!(
+            f.source.queries().len(),
+            10,
+            "the epoch resumed where it left off"
+        );
+        assert!(
+            matches!(second, ApplyOutcome::Current { .. }),
+            "the final quantum completes the recapture"
+        );
         assert_eq!(f.registry.pending_slots(), 0);
+
+        let generation = *f.source.gate.lock();
+        for k in &keys {
+            let facts = f.registry.base_facts(k).expect("built");
+            assert_eq!(facts.actor_incarnation, 1);
+            assert_eq!(facts.source_generation, generation);
+        }
+        assert!(
+            f.registry.inner.lock().recapture.is_none(),
+            "the epoch closed"
+        );
+    }
+
+    /// A recapture whose source generation moved between quanta RESTARTS, so
+    /// `Current` is never reported over a set built against two generations.
+    #[test]
+    fn a_recapture_restarts_when_the_source_generation_moves_between_quanta() {
+        let f = fixture();
+        let mut family = f.family();
+        let mut held = Vec::new();
+        for index in 0..(APPLY_QUANTUM + 4) {
+            if index > 0 && index % MAX_HANDLES_PER_FAMILY == 0 {
+                family = f.family();
+            }
+            held.push(
+                family
+                    .demand(key(1, &format!("nrpc:q{index}")))
+                    .expect("demanded"),
+            );
+        }
+
+        let first = f
+            .registry
+            .apply(1, request(false, DirtyCapabilities::RebuildAll));
+        assert!(matches!(first, ApplyOutcome::Progress { .. }));
+        assert_eq!(f.registry.pending_slots(), 4);
+
+        // The source moves between quanta — nothing is pinned right now.
+        f.source.advance();
+
+        let second = f
+            .registry
+            .apply(1, request(true, DirtyCapabilities::RebuildAll));
+        assert!(
+            matches!(second, ApplyOutcome::Progress { .. }),
+            "the restart cannot complete in one quantum"
+        );
+        assert_eq!(f.metrics.recaptures_restarted(), 1);
+        assert_eq!(
+            f.registry.pending_slots(),
+            4,
+            "all 68 slots re-queued, one quantum consumed"
+        );
+
+        let third = f
+            .registry
+            .apply(1, request(true, DirtyCapabilities::RebuildAll));
+        assert!(matches!(third, ApplyOutcome::Current { .. }));
+        let generation = *f.source.gate.lock();
+        assert!(
+            f.registry.inner.lock().slots.values().all(|slot| slot
+                .facts
+                .as_ref()
+                .is_some_and(|facts| facts.source_generation == generation)),
+            "ONE coherent source generation across the whole retained set"
+        );
+    }
+
+    // ------------------------------------------------------------- currentness
+
+    /// The source currentness pin is acquired BEFORE the registry lock, is still
+    /// held across the query/build, and is released only AFTER installation.
+    ///
+    /// The first two are asserted from inside `pin()` and `providers()`, which
+    /// would deadlock or fail if a registry lock were held. The third is asserted
+    /// from the pin's own `Drop`: it observes the installation already done.
+    #[test]
+    fn the_source_pin_outlives_the_installation() {
+        let f = fixture();
+        let target = key(1, "nrpc:a");
+        let _held = f.family().demand(target.clone()).expect("a");
+
+        let observed = Arc::new(AtomicBool::new(false));
+        {
+            let registry = f.registry.clone();
+            let metrics = f.metrics.clone();
+            let observed = observed.clone();
+            let target = target.clone();
+            *f.source.on_release.lock() = Some(Arc::new(move || {
+                assert_eq!(
+                    metrics.installs(),
+                    1,
+                    "the pin must still be held when the facts are installed"
+                );
+                assert!(registry.base_facts(&target).is_some());
+                observed.store(true, Ordering::Release);
+            }));
+        }
+
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(
+            observed.load(Ordering::Acquire),
+            "the pin must have dropped"
+        );
+        let generation = *f.source.gate.lock();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Current {
+                source_generation: generation
+            }
+        );
+        assert_eq!(
+            f.registry
+                .base_facts(&target)
+                .expect("built")
+                .source_generation,
+            generation,
+            "facts carry exactly the generation that was pinned"
+        );
+    }
+
+    /// The source cannot advance while an application holds the pin — asserted
+    /// from inside the query, where the pin is provably still out.
+    #[test]
+    fn the_source_cannot_advance_while_an_application_is_pinned() {
+        let f = fixture();
+        let _held = f.family().demand(key(1, "nrpc:a")).expect("a");
+
+        let observed = Arc::new(AtomicBool::new(false));
+        {
+            let source = f.source.clone();
+            let observed = observed.clone();
+            *f.source.during_query.lock() = Some(Box::new(move || {
+                assert!(
+                    source.gate.try_lock().is_none(),
+                    "the query-visible generation is pinned for the whole application"
+                );
+                observed.store(true, Ordering::Release);
+            }));
+        }
+
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(observed.load(Ordering::Acquire));
+        assert!(
+            f.source.gate.try_lock().is_some(),
+            "and released once the application returns"
+        );
     }
 
     /// No registry lock is held while the source query/build seam executes —
-    /// asserted from inside the query, which would deadlock if one were.
+    /// asserted from inside the query, which would fail if one were.
     #[test]
     fn no_registry_lock_is_held_across_the_source_query() {
         let f = fixture();
-        let _held = f.registry.demand(FamilyId(1), key(1, "nrpc:a")).expect("a");
+        let _held = f.family().demand(key(1, "nrpc:a")).expect("a");
         f.registry.apply(1, request(true, DirtyCapabilities::Clean));
         assert_eq!(f.source.queries(), vec![key(1, "nrpc:a")]);
     }
