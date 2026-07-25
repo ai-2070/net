@@ -117,7 +117,52 @@ pub(crate) enum ApplyOutcome {
     Fault(ActorFault),
 }
 
-/// Applies a drained change batch. Implemented by the bounded routing registry in
+/// Pending REGISTRY work, independent of private-discovery movement (OLB-2B-E3).
+///
+/// Private-discovery movement is not sufficient to wake everything the actor must
+/// reconcile: first demand insertion, slot-incarnation movement, last-reference
+/// retirement, and other retained-work invalidation change what must be built
+/// WITHOUT advancing the private-discovery watch. This is the second source in the
+/// actor's wait set.
+///
+/// `pending` is AUTHORITATIVE and the notification is only a hint. That split is
+/// what makes it correct under coalescing and under a wake that arrives BEFORE the
+/// actor parks: many marks collapse into one flag, and the actor consumes the flag
+/// rather than trusting that it saw a notification.
+#[derive(Default)]
+pub(crate) struct RegistryWork {
+    pending: AtomicBool,
+    notify: Notify,
+}
+
+impl RegistryWork {
+    /// Record that reconciliation is owed and hint the actor. Coalescing is the
+    /// point: a burst of demand insertions is one pending flag.
+    pub(crate) fn mark(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Consume the pending flag, reporting whether work was owed.
+    fn take(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// What woke this application attempt. Carries BOTH trigger domains, so a demand
+/// wake with a clean source batch still reconciles rather than being skipped, and
+/// first demand does not have to masquerade as a node-wide `RebuildAll`
+/// (Kyra OLB-2B-E3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ApplyRequest {
+    /// The drained private-discovery delta. May be `Clean` when only registry work
+    /// is owed.
+    pub batch: PrivateDiscoveryChangeBatch,
+    /// Whether registry work was pending for this pass.
+    pub registry_work: bool,
+}
+
+/// Applies one reconciliation pass. Implemented by the bounded routing registry in
 /// OLB-2B-E3.
 ///
 /// Takes `&self`, NOT `&mut self`, and the shared handle carries no outer mutex
@@ -127,9 +172,9 @@ pub(crate) enum ApplyOutcome {
 /// conditionally install. An outer mutex spanning that work would hold a lock
 /// across scoped-state access and heavy reconstruction.
 pub(crate) trait DirtyApply: Send + Sync + 'static {
-    /// Apply one drained batch. Must not hold any lock across scoped-state
+    /// Apply one reconciliation pass. Must not hold any lock across scoped-state
     /// access, decoding, sorting, projection, or reconciliation.
-    fn apply(&self, incarnation: u64, batch: PrivateDiscoveryChangeBatch) -> ApplyOutcome;
+    fn apply(&self, incarnation: u64, request: ApplyRequest) -> ApplyOutcome;
 }
 
 /// The shared applier — lock-free at this seam.
@@ -207,6 +252,7 @@ struct Incarnation {
     health: SharedRoutingHealth,
     id: u64,
     apply: SharedApply,
+    work: Arc<RegistryWork>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     #[cfg(feature = "fixtures")]
@@ -237,7 +283,7 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
         health: it.health.clone(),
     };
 
-    // Set when a full recapture was superseded, so a subsequent quiet pass still
+    // Set when a full recapture was superseded, so a subsequent WOKEN pass still
     // completes one rather than leaving health stuck in `Rebuilding`.
     let mut owed_recapture = false;
 
@@ -248,6 +294,14 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
         if it.shutdown.load(Ordering::Acquire) {
             return ActorExit::Shutdown;
         }
+
+        // Arm the registry-work wake BEFORE consuming its flag, on the same
+        // discipline as shutdown: a `mark` landing in the gap is then either
+        // observed by the `take` below or leaves this signal ready.
+        let work_signal = it.work.notify.notified();
+        tokio::pin!(work_signal);
+        work_signal.as_mut().enable();
+        let registry_work = it.work.take();
 
         // Mark the current version seen BEFORE draining, so a mutation landing
         // during the drain or the apply is never missed — it either lands in this
@@ -272,7 +326,10 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
         }
 
         let full = matches!(batch.dirty, DirtyCapabilities::RebuildAll);
-        let quiet = matches!(batch.dirty, DirtyCapabilities::Clean);
+        // A pass is quiet only when NEITHER trigger domain has anything owed. A
+        // registry-work wake with a clean source batch must still reconcile —
+        // first demand and slot lifecycle move nothing in private discovery.
+        let quiet = matches!(batch.dirty, DirtyCapabilities::Clean) && !registry_work;
 
         if !quiet {
             if full {
@@ -281,7 +338,13 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
                 it.health
                     .store(Arc::new(RoutingHealth::Rebuilding { incarnation: it.id }));
             }
-            match it.apply.apply(it.id, batch) {
+            match it.apply.apply(
+                it.id,
+                ApplyRequest {
+                    batch,
+                    registry_work,
+                },
+            ) {
                 ApplyOutcome::Current { .. } => {
                     if full {
                         it.health
@@ -292,7 +355,10 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
                 }
                 ApplyOutcome::Superseded => {
                     // Obsolete result: publish nothing, and make sure a recapture
-                    // still completes.
+                    // still completes. Per the `Superseded` contract the wake that
+                    // invalidated this attempt — source movement OR registry work —
+                    // is pending or eventual, so the retry is driven by real
+                    // movement rather than by spinning.
                     owed_recapture = owed_recapture || full;
                 }
                 ApplyOutcome::Fault(fault) => return ActorExit::Fault(fault),
@@ -309,6 +375,7 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
         // `RebuildAll` and never yield. Parking makes the retry rate the rate of
         // actual source movement, which is exactly what `Superseded` reports.
         tokio::select! {
+            _ = &mut work_signal => {}
             changed_result = it.changed.changed() => {
                 if changed_result.is_err() {
                     // The sender is gone. Only teardown if a shutdown is actually
@@ -448,6 +515,7 @@ impl RoutingSupervisor {
         self,
         changed: tokio::sync::watch::Receiver<u64>,
         apply: SharedApply,
+        work: Arc<RegistryWork>,
         shutdown: Arc<AtomicBool>,
         shutdown_notify: Arc<Notify>,
         #[cfg(feature = "fixtures")] hooks: Arc<ActorHooks>,
@@ -498,6 +566,7 @@ impl RoutingSupervisor {
                 health: self.health.clone(),
                 id,
                 apply: apply.clone(),
+                work: work.clone(),
                 shutdown: shutdown.clone(),
                 shutdown_notify: shutdown_notify.clone(),
                 #[cfg(feature = "fixtures")]
@@ -593,20 +662,25 @@ mod tests {
     use crate::adapter::net::behavior::org_scoped_store::ScopedDiscoveryState;
     use crate::adapter::net::identity::EntityId;
 
-    type Applied = Arc<parking_lot::Mutex<Vec<(u64, DirtyCapabilities)>>>;
-    type Decide = Box<dyn Fn(u64, &PrivateDiscoveryChangeBatch) -> ApplyOutcome + Send + Sync>;
+    /// `(incarnation, source delta, registry-work flag)` per application.
+    type Applied = Arc<parking_lot::Mutex<Vec<(u64, DirtyCapabilities, bool)>>>;
+    type Decide = Box<dyn Fn(u64, &ApplyRequest) -> ApplyOutcome + Send + Sync>;
 
-    /// Records every applied batch and returns a scripted outcome. Note the
-    /// `&self` seam: no outer mutex spans the application.
+    /// Records every application and returns a scripted outcome. Note the `&self`
+    /// seam: no outer mutex spans the application.
     struct ScriptedApply {
         seen: Applied,
         decide: Decide,
     }
 
     impl DirtyApply for ScriptedApply {
-        fn apply(&self, incarnation: u64, batch: PrivateDiscoveryChangeBatch) -> ApplyOutcome {
-            self.seen.lock().push((incarnation, batch.dirty.clone()));
-            (self.decide)(incarnation, &batch)
+        fn apply(&self, incarnation: u64, request: ApplyRequest) -> ApplyOutcome {
+            self.seen.lock().push((
+                incarnation,
+                request.batch.dirty.clone(),
+                request.registry_work,
+            ));
+            (self.decide)(incarnation, &request)
         }
     }
 
@@ -632,6 +706,7 @@ mod tests {
         health: SharedRoutingHealth,
         metrics: Arc<RoutingMetrics>,
         seen: Applied,
+        work: Arc<RegistryWork>,
         shutdown: Arc<AtomicBool>,
         notify: Arc<Notify>,
         hooks: Arc<ActorHooks>,
@@ -648,6 +723,7 @@ mod tests {
             health: new_routing_health(),
             metrics: Arc::default(),
             seen: Arc::default(),
+            work: Arc::default(),
             shutdown: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
             hooks: Arc::default(),
@@ -674,19 +750,20 @@ mod tests {
 
         /// Always-current applier.
         fn ok_applier(&self) -> SharedApply {
-            self.applier(Box::new(|_, b| ApplyOutcome::Current {
-                source_generation: b.generation,
+            self.applier(Box::new(|_, r| ApplyOutcome::Current {
+                source_generation: r.batch.generation,
             }))
         }
 
         fn spawn(&self, sup: RoutingSupervisor, apply: SharedApply) -> tokio::task::JoinHandle<()> {
-            let (rx, shutdown, notify, hooks) = (
+            let (rx, work, shutdown, notify, hooks) = (
                 self.rx.clone(),
+                self.work.clone(),
                 self.shutdown.clone(),
                 self.notify.clone(),
                 self.hooks.clone(),
             );
-            tokio::spawn(async move { sup.run(rx, apply, shutdown, notify, hooks).await })
+            tokio::spawn(async move { sup.run(rx, apply, work, shutdown, notify, hooks).await })
         }
 
         fn stop(&self) {
@@ -729,6 +806,7 @@ mod tests {
             .run(
                 h.rx.clone(),
                 h.ok_applier(),
+                h.work.clone(),
                 h.shutdown.clone(),
                 h.notify.clone(),
                 h.hooks.clone(),
@@ -750,7 +828,7 @@ mod tests {
         assert_eq!(h.health(), RoutingHealth::Healthy { incarnation: 1 });
         assert_eq!(
             h.seen.lock().as_slice(),
-            &[(1, DirtyCapabilities::RebuildAll)],
+            &[(1, DirtyCapabilities::RebuildAll, false)],
             "the first batch is the mint's complete recapture"
         );
 
@@ -792,7 +870,7 @@ mod tests {
         let attempts = Arc::new(AtomicU64::new(0));
         let apply = {
             let (attempts, state, tx) = (attempts.clone(), h.state.clone(), h.tx.clone());
-            h.applier(Box::new(move |_, b| {
+            h.applier(Box::new(move |_, r| {
                 if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
                     // The source moves DURING the recapture — which is WHY it is
                     // superseded — dirtying a capability and waking the actor.
@@ -801,7 +879,7 @@ mod tests {
                     ApplyOutcome::Superseded
                 } else {
                     ApplyOutcome::Current {
-                        source_generation: b.generation,
+                        source_generation: r.batch.generation,
                     }
                 }
             }))
@@ -812,8 +890,8 @@ mod tests {
         assert_eq!(
             h.seen.lock().as_slice(),
             &[
-                (1, DirtyCapabilities::RebuildAll),
-                (1, DirtyCapabilities::RebuildAll)
+                (1, DirtyCapabilities::RebuildAll, false),
+                (1, DirtyCapabilities::RebuildAll, false)
             ],
             "the second attempt must receive RebuildAll — the owed recapture \
              subsumes the Caps delta that woke the actor"
@@ -841,10 +919,10 @@ mod tests {
             Arc::default();
         let apply = {
             let (during, health) = (during.clone(), h.health.clone());
-            h.applier(Box::new(move |_, b| {
-                during.lock().push((b.dirty.clone(), **health.load()));
+            h.applier(Box::new(move |_, r| {
+                during.lock().push((r.batch.dirty.clone(), **health.load()));
                 ApplyOutcome::Current {
-                    source_generation: b.generation,
+                    source_generation: r.batch.generation,
                 }
             }))
         };
@@ -891,12 +969,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_fault_fences_then_a_successor_recaptures() {
         let h = harness();
-        let apply = h.applier(Box::new(|inc, b| {
+        let apply = h.applier(Box::new(|inc, r| {
             if inc == 1 {
                 ApplyOutcome::Fault(ActorFault::new("injected"))
             } else {
                 ApplyOutcome::Current {
-                    source_generation: b.generation,
+                    source_generation: r.batch.generation,
                 }
             }
         }));
@@ -910,8 +988,8 @@ mod tests {
         assert_eq!(
             h.seen.lock().as_slice(),
             &[
-                (1, DirtyCapabilities::RebuildAll),
-                (2, DirtyCapabilities::RebuildAll)
+                (1, DirtyCapabilities::RebuildAll, false),
+                (2, DirtyCapabilities::RebuildAll, false)
             ],
             "the successor recaptured completely"
         );
@@ -1047,12 +1125,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_during_backoff_starts_no_replacement() {
         let h = harness();
-        let apply = h.applier(Box::new(|inc, b| {
+        let apply = h.applier(Box::new(|inc, r| {
             if inc == 1 {
                 ApplyOutcome::Fault(ActorFault::new("injected"))
             } else {
                 ApplyOutcome::Current {
-                    source_generation: b.generation,
+                    source_generation: r.batch.generation,
                 }
             }
         }));
@@ -1111,6 +1189,7 @@ mod tests {
             .run(
                 h.rx.clone(),
                 h.ok_applier(),
+                h.work.clone(),
                 h.shutdown.clone(),
                 h.notify.clone(),
                 h.hooks.clone(),
@@ -1119,6 +1198,111 @@ mod tests {
 
         assert_eq!(h.health(), RoutingHealth::Fenced);
         assert!(h.lease_free(), "the refused mint released its claim");
+    }
+
+    // ----- OLB-2B-E3a: the registry-work wake seam -----
+
+    /// A registry-work wake with a CLEAN source batch still reconciles.
+    ///
+    /// First demand insertion, slot-incarnation movement, and last-reference
+    /// retirement change what must be built without moving private discovery at
+    /// all. Skipping such a pass as "quiet" would strand first demand until some
+    /// unrelated source movement happened to wake the actor.
+    #[tokio::test(start_paused = true)]
+    async fn registry_work_reconciles_even_with_a_clean_source_batch() {
+        let h = harness();
+        let run = h.spawn(h.supervisor(), h.ok_applier());
+        settle().await;
+        let after_recapture = h.seen.lock().len();
+
+        // No source movement whatsoever — only registry work.
+        h.work.mark();
+        settle().await;
+
+        let seen = h.seen.lock().clone();
+        assert_eq!(
+            seen.len(),
+            after_recapture + 1,
+            "the registry-work wake produced exactly one reconciliation pass"
+        );
+        let (_, dirty, work) = seen.last().expect("a pass").clone();
+        assert_eq!(
+            dirty,
+            DirtyCapabilities::Clean,
+            "the source really was clean — this pass is work-driven only"
+        );
+        assert!(work, "and the pass carries the registry-work trigger");
+
+        h.stop();
+        run.await.expect("supervisor joins");
+    }
+
+    /// The pending flag is AUTHORITATIVE, not the notification: a burst of marks
+    /// coalesces into ONE reconciliation, and a mark landing before the actor parks
+    /// is still observed rather than lost.
+    #[tokio::test(start_paused = true)]
+    async fn registry_work_coalesces_and_is_never_lost() {
+        let h = harness();
+        let run = h.spawn(h.supervisor(), h.ok_applier());
+        settle().await;
+        let baseline = h.seen.lock().len();
+
+        // A burst: many marks, no awaits between them.
+        for _ in 0..8 {
+            h.work.mark();
+        }
+        settle().await;
+
+        let seen = h.seen.lock().clone();
+        assert_eq!(
+            seen.len(),
+            baseline + 1,
+            "eight marks coalesce into one pass, not eight: {seen:?}"
+        );
+        assert!(
+            seen.last().expect("a pass").2,
+            "the coalesced pass carries the work trigger"
+        );
+
+        // The flag was consumed, so a quiet actor stays quiet.
+        settle().await;
+        assert_eq!(
+            h.seen.lock().len(),
+            baseline + 1,
+            "a consumed flag does not re-trigger"
+        );
+
+        h.stop();
+        run.await.expect("supervisor joins");
+    }
+
+    /// A registry-work pass does NOT masquerade as a node-wide rebuild: the source
+    /// delta it carries is whatever was really drained, and global health is not
+    /// disturbed.
+    #[tokio::test(start_paused = true)]
+    async fn registry_work_neither_fakes_a_rebuild_nor_fences() {
+        let h = harness();
+        let run = h.spawn(h.supervisor(), h.ok_applier());
+        settle().await;
+        assert_eq!(h.health(), RoutingHealth::Healthy { incarnation: 1 });
+
+        h.work.mark();
+        settle().await;
+
+        let (_, dirty, _) = h.seen.lock().last().expect("a pass").clone();
+        assert_ne!(
+            dirty,
+            DirtyCapabilities::RebuildAll,
+            "first demand must not be synthesized into a node-wide RebuildAll"
+        );
+        assert_eq!(
+            h.health(),
+            RoutingHealth::Healthy { incarnation: 1 },
+            "registry work does not globally fence warmed routes"
+        );
+
+        h.stop();
+        run.await.expect("supervisor joins");
     }
 
     /// `allows` is the fence contract the warmed-call path will consult: only the
@@ -1145,14 +1329,16 @@ mod tests {
         let h = harness();
         let apply = h.applier(Box::new(|_, _| panic!("unwind-only fault")));
         let health = h.health.clone();
-        let (rx, shutdown, notify, hooks) = (
+        let (rx, work, shutdown, notify, hooks) = (
             h.rx.clone(),
+            h.work.clone(),
             h.shutdown.clone(),
             h.notify.clone(),
             h.hooks.clone(),
         );
         let sup = h.supervisor();
-        let run = tokio::spawn(async move { sup.run(rx, apply, shutdown, notify, hooks).await });
+        let run =
+            tokio::spawn(async move { sup.run(rx, apply, work, shutdown, notify, hooks).await });
         let outcome = run.await;
 
         assert!(outcome.is_err(), "the panic propagated (unwind profile)");
