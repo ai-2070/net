@@ -365,6 +365,18 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
             }
         }
 
+        if !quiet {
+            // A REAL cooperative yield between quanta (Kyra OLB-2B-E3b).
+            // `DirtyApply::apply` is synchronous and bounded, so a hot demand
+            // family replenishes its pending work and marks again; the select
+            // below would then be immediately ready every iteration. An
+            // already-ready `Notify` inside `select!` is not by itself a
+            // guaranteed scheduler yield, so without this a continuously-ready
+            // quantum chain could starve shutdown, starve source movement, and let
+            // one family monopolize the actor.
+            tokio::task::yield_now().await;
+        }
+
         // ALWAYS park here, including after an application. The trailing pass is
         // preserved without looping: `borrow_and_update` ran BEFORE the drain, so
         // movement during the drain or the apply leaves `changed()` already ready
@@ -1270,6 +1282,77 @@ mod tests {
             h.seen.lock().len(),
             baseline + 1,
             "a consumed flag does not re-trigger"
+        );
+
+        h.stop();
+        run.await.expect("supervisor joins");
+    }
+
+    /// Registry work marked BEFORE the supervisor starts is not lost.
+    ///
+    /// `notify_waiters` retains no permit, so the notification itself is gone by
+    /// the time an actor exists. The authoritative pending flag is what survives,
+    /// and the first pass consumes it — arriving alongside the mint's RebuildAll.
+    #[tokio::test(start_paused = true)]
+    async fn registry_work_marked_before_start_is_not_lost() {
+        let h = harness();
+        // Marked with NO actor in existence: the notification cannot be delivered.
+        h.work.mark();
+
+        let run = h.spawn(h.supervisor(), h.ok_applier());
+        settle().await;
+
+        let seen = h.seen.lock().clone();
+        assert_eq!(
+            seen.first().expect("a first pass"),
+            &(1, DirtyCapabilities::RebuildAll, true),
+            "the first pass carries the mint's RebuildAll AND the pre-start work \
+             flag: {seen:?}"
+        );
+
+        h.stop();
+        run.await.expect("supervisor joins");
+    }
+
+    /// Work marked DURING an application is consumed by a later pass, exactly once.
+    ///
+    /// The mark lands after this pass already took the flag, so it must not be
+    /// folded into the in-flight application (which never saw it) nor dropped.
+    #[tokio::test(start_paused = true)]
+    async fn registry_work_marked_during_an_application_is_consumed_exactly_once() {
+        let h = harness();
+        let marked = Arc::new(AtomicBool::new(false));
+        let apply = {
+            let (marked, work) = (marked.clone(), h.work.clone());
+            h.applier(Box::new(move |_, r| {
+                // During the FIRST application only, a registry mutation queues
+                // bounded work and wakes the actor.
+                if !marked.swap(true, Ordering::AcqRel) {
+                    work.mark();
+                }
+                ApplyOutcome::Current {
+                    source_generation: r.batch.generation,
+                }
+            }))
+        };
+        let run = h.spawn(h.supervisor(), apply);
+        settle().await;
+
+        let seen = h.seen.lock().clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "exactly one follow-up pass for the queued work: {seen:?}"
+        );
+        assert_eq!(
+            seen[0],
+            (1, DirtyCapabilities::RebuildAll, false),
+            "the in-flight pass never saw the mark it had already passed"
+        );
+        assert_eq!(
+            seen[1],
+            (1, DirtyCapabilities::Clean, true),
+            "the queued work is consumed by a later pass, with a clean source"
         );
 
         h.stop();
