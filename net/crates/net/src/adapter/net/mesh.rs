@@ -10520,7 +10520,15 @@ impl MeshNode {
 
     /// The private-discovery query-visible change generation over the OWNER
     /// partition only — the same three sources restricted to owner records, so
-    /// valid grant-audience churn never wakes an owner-private consumer.
+    /// valid grant-audience churn never ADVANCES it.
+    ///
+    /// That is a statement about this generation, NOT about wakeups. The change
+    /// watch ([`Self::subscribe_private_discovery_changes`]) carries the GLOBAL
+    /// generation, so grant-only movement can still wake a receiver that only
+    /// cares about the owner partition; such a consumer observes this generation
+    /// unmoved and goes back to sleep. Only a distinct owner-filtered watch would
+    /// make grant churn invisible to it, and none exists today (Kyra OLB-2B
+    /// design review).
     pub fn private_discovery_owner_generation(&self) -> u64 {
         self.scoped_discovery.lock().owner_revision()
     }

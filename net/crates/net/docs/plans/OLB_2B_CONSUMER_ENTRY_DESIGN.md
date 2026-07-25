@@ -1,189 +1,313 @@
-# OLB-2B consumer entry — design for review (drain ownership + actor lifecycle)
+# OLB-2B consumer entry — design for review (revision 2)
 
-**Status: DESIGN FOR REVIEW. Not authorization to build, and not a request to
-light anything.** OLB-2A composed is SIGNED at `65b9fe903`; Kyra's signature
-explicitly does not authorize this phase. This draft exists so the OLB-2B entry
-boundary can be reviewed *before* code, the same way the substrate design was
-reviewed before OLB-2A.
+**Status: DESIGN FOR REVIEW, revision 2.** Revision 1 (`84080310f`) was HELD:
+core direction approved, implementation NOT authorized. This revision adopts every
+refinement from that review and records the Q1–Q4 decisions as settled. It remains
+a design artifact — no source implementation until this combined boundary is
+re-reviewed.
 
-Kyra named the boundary as:
+OLB-2A composed is SIGNED at `65b9fe903`; that signature does not authorize this
+phase.
 
-> node-owned routing lifecycle plus actual exclusive destructive-drain consumer
-> ownership, including startup/drop/panic/restart policy before the first
-> reconciler drain.
+## 0. What changed in revision 2
 
-§1–§4 below propose the **entry slice (2B.1)** that closes exactly that boundary.
-§5 maps the remainder of OLB-2B into bounded slices so the entry slice can be
-authorized without implying the rest.
-
----
+1. **The containment claim was overstated and is corrected** (§2). Revision 1 said
+   module privacy makes the compiler reject "any second caller". That is false:
+   privacy stops *external and sibling* callers, but code added *inside*
+   `org_scoped_store` could still call a raw take. The real contract is a compiler
+   half plus a review-enforced static invariant, and the implementation gate now
+   names the audit that enforces it.
+2. **An explicit lease state machine** replaces the informal "release on Drop"
+   (§3), including rollback, ordering, join-before-remint, shutdown races, and
+   leak behaviour.
+3. **Panic recovery is specified as a full recapture + fencing chain** (§4), not
+   just "re-mint forces RebuildAll". No detached work from a dead incarnation may
+   publish after its successor starts.
+4. **Restart policy refined** to supervised auto-restart with capped backoff,
+   bounded attempts, and a terminal crash-loop state that fences warmed routes
+   (§4.2) — automatic recovery preferred, but deterministic crash loops gated and
+   fail-closed.
+5. **The owner-watch wording is corrected** (§6): grant churn cannot advance the
+   owner generation, but it *can* spuriously wake a consumer sharing the
+   global-valued watch. The same overclaim was live in shipped docs and is
+   corrected there in the same change as this revision.
+6. **The entry boundary is enlarged per the review**: no lifecycle-only counter
+   sink. Ownership lands together with the minimum real registry consumer (§5).
 
 ## 1. What the reverted attempt got wrong
 
-The mint-once scaffold in `04e4ba471` (reverted at `ae6d8d679`, deferred here by
-Kyra) failed for three reasons. This design must close all three, or it is not an
-improvement over deferring again:
+The mint-once scaffold in `04e4ba471` (reverted at `ae6d8d679`) failed on three
+counts, all of which this design must close:
 
-1. **The mint did not seal the raw API.**
-   `ScopedDiscoveryState::take_global_change_batch` /
-   `take_owner_change_batch` were `pub(crate)`. The mint prevented two handles
-   from being *minted*, but any other crate-internal path could still call the
-   underlying destructive take. "A second consumer is unrepresentable" was a
-   convention, not a property.
-2. **The minted handle was not consumable by its intended owner.**
-   `drain()` was private to `mesh.rs`, so a reconciler in a sibling module could
-   hold the handle and not use it. The tests lived in `mesh.rs`, which is why
-   this did not surface.
-3. **Lifecycle was frozen without its consumer.**
-   The per-stream `AtomicBool` never reset, so a dropped handle stranded the
-   stream for the node's lifetime — a policy that may be right, but only decidable
-   alongside actor startup, shutdown, panic, and restart.
+1. **The mint did not seal the raw API** — the takes were `pub(crate)`, so
+   exclusivity was a convention beside an unsealed door.
+2. **The handle was not consumable by its intended owner** — `drain()` was private
+   to `mesh.rs`, so a reconciler in a sibling module could hold it and not use it.
+3. **Lifecycle was frozen without its consumer** — the flag never reset, stranding
+   the stream permanently.
 
-## 2. Ownership: unforgeable capability, enforced by module privacy
+## 2. Containment model (corrected)
 
-**Place the drain types with `ScopedDiscoveryState`** (`org_scoped_store.rs`), not
-in `mesh.rs`. That is what lets privacy do the work:
+Move the drain types **next to `ScopedDiscoveryState`** in `org_scoped_store.rs`,
+and demote the raw takes to module-private:
 
 ```text
 take_global_change_batch  ->  private to org_scoped_store   (was pub(crate))
 take_owner_change_batch   ->  private to org_scoped_store   (was pub(crate))
 
-PrivateDiscoveryDrain     ->  pub(crate) type, PRIVATE fields
-  ::drain()               ->  pub(crate)   — the ONLY caller of the raw takes
+PrivateDiscoveryDrain     ->  pub(crate), PRIVATE fields, !Clone, no public ctor
+  ::drain()               ->  pub(crate) — the one production caller of a raw take
 
-PrivateDiscoveryDrains    ->  the node-held mint; only source of a Drain
+PrivateDiscoveryDrains    ->  node-held mint; the only source of a Drain
 ```
 
-This closes (1) by construction rather than by convention: the raw takes are
-private to the module, so the compiler — not a reviewer — rejects any second
-caller. It closes (2) because `drain()` is `pub(crate)`, so the reconciler may
-live in whatever module suits it while remaining unable to *manufacture* the
-capability: `PrivateDiscoveryDrain` has private fields and no public constructor,
-so the mint is the only way to obtain one.
+**What the compiler guarantees:**
 
-Exclusivity is therefore two independent properties, which is the point:
+- no external or sibling-module call to a raw take;
+- no forged handle — private fields plus no public constructor mean the mint is
+  the only way to obtain one;
+- no duplication — `PrivateDiscoveryDrain` is `!Clone`.
 
-- **Unforgeable** — you cannot build a `PrivateDiscoveryDrain` except via the mint
-  (private fields, module-private raw takes).
-- **Exclusive** — the mint hands out at most one live handle per stream at a time
-  (§3).
+**What review must guarantee** (privacy cannot):
 
-## 3. Lifecycle: an exclusive LEASE, not a permanent burn
+- exactly ONE non-test caller of each raw take, namely
+  `PrivateDiscoveryDrain::drain`.
 
-**Proposed: `PrivateDiscoveryDrain` implements `Drop`, which releases its
-per-stream flag.** Mint-once-*at-a-time*, not mint-once-*ever*.
+### 2.1 Implementation gate for §2
 
-The reverted version burned the flag permanently. That is the wrong default here,
-and the reason is a security argument rather than an ergonomic one: the private
-discovery source is how a consumer learns that a provider was **revoked**. If the
-actor task panics, permanent stranding silently converts a recoverable fault into
-*a node that never again reconciles a revocation* — failing open on the exact
-path 2A.3.3 was built to close. A lease keeps the real invariant (never two
-concurrent drainers splitting deltas) while letting a supervisor recover.
+- compile-fail evidence that an external module cannot call a raw take or
+  construct a handle;
+- a source-level audit asserting each raw take has exactly one production caller;
+- no broadly accessible mint constructor;
+- no general crate-internal accessor exposing the mint or the drain's mutable
+  internals.
 
-### 3.1 The restart hazard, and the rule that closes it
-
-A lease introduces a hazard the permanent burn did not have: an actor that drains
-a batch and dies before applying it **loses that delta**, and a successor minting
-a fresh drain would see a clean stream and never learn what it missed.
-
-**Rule: minting marks the stream `RebuildAll`.** The mint calls a state method
-that sets the stream's pending delta to the overflow sentinel, so a newly minted
-drain's first batch is `RebuildAll` regardless of what the previous owner
-consumed. Enforced at the mint, not by consumer cooperation, so a successor
-cannot forget.
-
-This trades precision for correctness on a rare path (one full rebuild after a
-restart) and is the conservative direction: the bounded-overflow `RebuildAll`
-path already exists and is already exercised, so this adds no new machinery.
-
-### 3.2 Startup, shutdown, panic, restart — stated explicitly
-
-| Event | Policy |
-|---|---|
-| **Startup** | The node mints at spawn and passes the drain to the actor **as a constructor argument**, so an actor cannot exist without the capability. |
-| **Duplicate spawn** | The mint returns `None`; the spawn is **refused loudly** (error log, no second actor). A second actor must never run drainless and silently idle. |
-| **Shutdown** | The actor exits its loop and drops the drain; the lease is released. Shutdown must use the **`Notified`-armed-before-flag-check** discipline from OLB-2A.3.2 — the same lost-notification hang applies verbatim to a new task, and the fix is already proven in `run_exact_expiry_timer`. |
-| **Panic** | Tokio isolates the panic to the task; the handle resolves `Err`. The drain drops, releasing the lease. No other stream is affected. |
-| **Restart** | A supervisor re-mints; §3.1 forces `RebuildAll`, so no delta is silently lost across the gap. |
-
-**Open question for review (Q1):** should a panicked actor auto-restart, or stay
-down loudly until an operator acts? Auto-restart maximizes availability of the
-revocation path; staying down avoids a crash-loop masking a deterministic bug.
-My recommendation is **bounded auto-restart with a loud counter**
-(`org_routing_actor_restarts_total`), because a permanently-down consumer is the
-fail-open mode described above — but this is a policy call I should not freeze
-unilaterally.
-
-## 4. Actor shape (2B.1)
-
-Deliberately minimal — ownership and lifecycle only, no routing projection yet:
+## 3. The lease state machine
 
 ```text
-OrgRoutingActor::new(drain, changed_watch, shutdown, shutdown_notify)
+Vacant
+  │  acquire: CAS claim (Acquire on success)
+  ▼
+Minting
+  │  commit RebuildAll for the stream UNDER the scoped-state lock
+  │  construct the !Clone handle
+  │  (failure anywhere here: rollback guard releases the claim -> Vacant)
+  ▼
+Held(incarnation N)
+  │  handle dropped (normal exit, or task death) -> release (Release ordering)
+  ▼
+Vacant   — successor may mint only after the predecessor JoinHandle RESOLVED
+```
+
+Pinned details:
+
+- **`PrivateDiscoveryDrain: !Clone`**, private fields, no public constructor.
+- **One supervisor is the only restart authority.** Nothing else mints.
+- **`RebuildAll` is committed before the handle is exposed**, so a successor's
+  first drain is unconditionally a complete recapture and cannot be raced by the
+  handle escaping first.
+- **Rollback guard**: if mint construction cannot complete after the claim
+  succeeds, the guard releases the lease; a failed mint never strands the stream.
+- **Join before re-mint**: the successor mints only after the predecessor's
+  `JoinHandle` resolves *and* its drain has dropped — never on a timer or a guess.
+- **Shutdown is checked before AND after a re-mint**, so a panic racing shutdown
+  cannot spawn a replacement that outlives the node.
+- **Atomic ordering baseline**: acquire/CAS on claim, release on drop; ordering for
+  the pending-batch state is supplied by the scoped-state lock, which is where
+  `RebuildAll` is committed.
+- **Leak behaviour**: a `mem::forget`/leaked drain **strands the lease loudly** —
+  a counter plus an error log, and routing health is fenced (§4.1). It must never
+  produce a second drainer. Stranding is the safe direction for a leak precisely
+  because the alternative (reclaiming a lease whose owner may still be alive) is
+  the double-drain this design exists to prevent.
+
+## 4. Supervisor, incarnation fencing, restart
+
+### 4.1 Health fence and incarnations
+
+Each actor run is an **incarnation** with a monotonic id. The node publishes a
+routing-health state that later slices' warmed calls MUST consult:
+
+```text
+Healthy(incarnation N)   — routes built by N are usable
+Rebuilding(incarnation N)— recapture in progress
+Fenced                   — no cached route is usable
+```
+
+When an incarnation dies, its routes become unusable **immediately**, before any
+successor exists. Detached work from a dead incarnation must never publish: every
+publication is stamped with its incarnation id and is dropped if that id is no
+longer current (the publish-if-current discipline already used for the scoped
+publication gate).
+
+### 4.2 Restart policy (Q1 decided)
+
+```text
+supervised automatic restart
+  + capped exponential backoff
+  + bounded attempts in a rolling window
+  + crash-loop state after exhaustion
+  + warmed-route health fence throughout
+```
+
+Throughout restart and crash-loop state:
+
+- a cached warmed route is **unusable**;
+- a call takes the fresh current-authority deterministic cold path;
+- if current authority cannot be established, the call **fails locally before
+  proof/send** — never a stale-authority send.
+
+Leaving crash-loop state requires node restart / operator action, or a
+deliberately specified long cooldown. It must never retry in a tight loop, and it
+must never leave old cached routes usable. This refines rather than reverses
+revision 1's "indefinite capped restart": automatic recovery is preferred, but a
+deterministic crash loop needs a bounded gate and a fail-closed terminal state.
+
+### 4.3 Panic recovery chain (the required witness)
+
+```text
+drain generation G
+→ panic before/during application
+→ predecessor JoinHandle resolves; drain drops
+→ incarnation declared unhealthy; its warmed routes become unusable
+→ successor mint forces RebuildAll (committed under the state lock)
+→ complete current-source recapture
+→ publish only if still current
+→ all retained slots converge
+```
+
+## 5. The entry boundary (Q2 decided: ownership lands with a real consumer)
+
+No lifecycle-only counter sink. The revised first implementation boundary is:
+
+```text
+exclusive GLOBAL drain
++ unique rollback-safe lease
++ one node-owned supervisor
++ actor health/incarnation fencing
++ minimal bounded NodeOrgRoutingRegistry
++ actual Caps/RebuildAll application
++ 64 family / 256 node bounds
++ deterministic current-authority cold degradation
+```
+
+Explicitly EXCLUDED from this boundary:
+
+```text
+ArcSwap route publication        warmed-call route consumption
+active sensing                   exact-provider sensing leases
+classification / scoring         P2C
+OrgCapabilityRegistration        provider-free leader activation
+```
+
+### 5.1 Actor shape
+
+```text
+OrgRoutingActor::new(global_drain, changed_watch, registry, health, shutdown, notify)
 
 loop {
-    arm shutdown wake       (Notified constructed + enabled BEFORE the flag load)
-    check shutdown flag     -> exit, dropping the drain
+    arm shutdown wake      (Notified constructed + ENABLED before the flag load —
+                            the OLB-2A.3.2 discipline; the identical lost-wake
+                            hang applies verbatim to this task)
+    check shutdown flag    -> exit, dropping the drain
     mark the change watch seen
-    batch = drain.drain()   -> (generation, dirty)
-    if nothing to do        -> wait on {changed, shutdown}
-    else                    -> off-lock work, then loop again (trailing pass)
+    batch = drain.drain()  -> (generation, dirty)
+    apply:
+       Clean        -> wait on {changed, shutdown}
+       Caps(set)    -> rebuild only retained slots whose capability is in `set`
+       RebuildAll   -> rebuild every retained slot
+    loop again             (coalesced trailing pass)
 }
 ```
 
-Single-flight and the coalesced trailing pass come free from there being exactly
-one actor task: movement during a cycle fires the watch, so the next iteration
-drains again. No task or timer per provider, capability, interest, or client —
-the substrate plan's performance contract.
+Single-flight and the trailing pass follow from there being exactly one actor
+task: movement during a cycle fires the watch, so the next iteration drains again.
+No task or timer per provider, capability, interest, or client.
 
-In 2B.1 the "off-lock work" is a **no-op with an observable counter**, so the
-slice is fully consumed and testable without pulling routing state in. Whether
-that is acceptable or whether the actor should land together with its first real
-consumer is **Q2** — I lean toward landing lifecycle alone, because it is the
-piece Kyra named as the boundary and it is far easier to review in isolation.
+### 5.2 Minimal registry
 
-### 4.1 Witness matrix (all RED-coupled)
+`NodeOrgRoutingRegistry` retains bounded route slots and is the actor's real
+consumer — the thing `Caps`/`RebuildAll` is applied *to*:
 
-1. Second mint of a held stream returns `None`; the two streams mint independently.
-2. Dropping the handle releases the lease — a re-mint then succeeds.
-3. A re-minted drain's first batch is `RebuildAll` (no silent delta loss on restart).
-4. `drain()` routes to its own stream (global vs owner), leaving only its own clean.
-5. Duplicate spawn is refused, and the running actor keeps draining.
-6. Shutdown landing in the registration window still stops the actor and joins —
-   the 2A.3.2 witness shape, reused verbatim.
-7. Actor panic releases the lease; a successor mints and rebuilds all.
-8. Movement during a cycle yields exactly one coalesced trailing pass.
-9. Compile-level: the raw takes are unreachable outside `org_scoped_store`
-   (module privacy; RED-verified by attempting an external call).
+- node cap **256** route slots; per-family cap **64**;
+- demand is created through a crate-internal API in this slice (warmed-call wiring
+  is 2B.3), so the consumer is real and exercised without lighting the call path;
+- at either cap, a new demand is **refused deterministically**, retains no extra
+  state, and increments its capacity counter — the deterministic
+  current-authority cold degradation, observable here even before calls consume it.
 
-## 5. Remainder of OLB-2B — sub-slice map (not proposed for authorization)
+## 6. The owner stream stays unclaimed (Q4 decided)
 
-Listed so the entry slice can be authorized without implying these, and so
-nothing named in the OLB-2 plan section is dropped:
+OLB mints the **global** drain only. The owner stream remains unclaimed for the
+LS / provider-free leader track, per the plans' fork.
+
+**Wording correction.** Grant-only movement does not advance the owner generation
+and does not dirty the owner stream. It does NOT follow that grant churn can never
+wake an owner-private consumer: the change watch carries the GLOBAL generation, so
+a consumer sharing it can be woken by grant churn, must drain, will observe no
+owner movement, and returns to sleep. The stronger claim would require a distinct
+owner-filtered watch, which does not exist. The same overclaim was live at
+`mesh.rs` (`private_discovery_owner_generation`) and in the OLB plan; both are
+corrected in the same change as this revision.
+
+## 7. Witness matrix (all RED-coupled)
+
+Ownership and lease:
+
+1. Second mint of a held stream returns `None`; streams mint independently.
+2. Dropping the handle releases the lease; a re-mint then succeeds.
+3. A re-minted drain's first batch is `RebuildAll` — committed before the handle is
+   exposed.
+4. A mint that fails after claiming rolls back to `Vacant` (no stranding).
+5. A leaked/`mem::forget` drain strands loudly and fences health — and never
+   yields a second drainer.
+6. `drain()` routes to its own stream, leaving only that stream clean.
+7. Compile-fail: an external module can neither call a raw take nor construct a
+   handle. Plus the source audit: one production caller per raw take.
+
+Supervisor and lifecycle:
+
+8. Duplicate spawn is refused; the running actor keeps draining.
+9. Shutdown landing in the registration window still stops the actor and joins
+   (the 2A.3.2 witness shape, reused).
+10. Panic recovery chain end-to-end (§4.3), including that detached work from the
+    dead incarnation publishes nothing after the successor starts.
+11. A panic racing shutdown spawns no replacement.
+12. Backoff/bounded attempts reach crash-loop state; health stays `Fenced`; no
+    tight retry loop.
+
+Application and bounds:
+
+13. `Caps(set)` rebuilds only the named slots; unrelated retained slots are
+    untouched.
+14. `RebuildAll` rebuilds every retained slot.
+15. Movement during a cycle yields exactly one coalesced trailing pass.
+16. At the 256-node / 64-family caps, new demand is refused deterministically,
+    retains no state, and increments the capacity counter.
+
+## 8. Remaining sub-slices (not proposed for authorization)
 
 | Slice | Content |
 |---|---|
-| **2B.1** | This document: drain ownership + actor lifecycle. |
-| **2B.2** | `NodeOrgRoutingRegistry` + clone-shared bounded route slots (64 family / 256 node) + deterministic unsensed degradation at either cap. |
-| **2B.3** | Coherent `OrgAuthorityEpoch` publication + mandatory per-call comparison before proof/send. |
-| **2B.4** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current rebuild. |
-| **2B.5** | Exact-provider lease acquire/release on route-slot lifecycle + the node-global ttl/2 refresh owner (first holder arms, last disarms). |
-| **2B.6** | `sensed_candidates` join + §8 classification + granted-candidates-Unknown, inside the actor, never on the request path. |
+| **2B-entry** | §5 boundary: drain ownership + lease + supervisor + fencing + minimal registry + bounded application. |
+| **2B.2** | Coherent `OrgAuthorityEpoch` publication + mandatory per-call comparison before proof/send. |
+| **2B.3** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current + warmed-call consumption. |
+| **2B.4** | Exact-provider lease acquire/release on route-slot lifecycle + node-global ttl/2 refresh owner (first holder arms, last disarms). |
+| **2B.5** | `sensed_candidates` join + §8 classification + granted-candidates-Unknown, inside the actor, never on the request path. |
 
 The OLB-2 exit witnesses (warmed-call instrumentation, 1024-row bucket isolation,
-33+ provider truncation, epoch mismatch matrix, convergence/ghost-demand) attach
-to the slices that introduce their machinery, not to 2B.1.
+33+ provider truncation, epoch mismatch matrix, convergence/ghost-demand) attach to
+the slices that introduce their machinery.
 
-## 6. Questions for review
+## 9. Decisions recorded
 
-- **Q1** — panic policy: bounded auto-restart with a loud counter (my
-  recommendation), or stay down until an operator intervenes?
-- **Q2** — should 2B.1 land lifecycle-only with a counter-instrumented no-op
-  consumer, or wait and land together with 2B.2's first real routing consumer?
-- **Q3** — is `RebuildAll`-on-mint the right restart posture, or should a
-  successor instead be handed the predecessor's undrained state (which would
-  require the actor to acknowledge application, a materially larger design)?
-- **Q4** — should the owner stream get its own drain in 2B.1 at all, given OLB
-  consumes the *global* stream? Minting only what is consumed would keep the
-  owner stream unclaimed for the LS track, which is the plan's intent.
+| Q | Decision |
+|---|---|
+| **Q1** | Supervised automatic restart with capped backoff; crash-loop exhaustion fences warmed routes and fails closed. |
+| **Q2** | No lifecycle-only counter sink; ownership lands with the minimum real registry consumer. |
+| **Q3** | `RebuildAll`-on-mint, committed before handle publication; unconditional first drain and complete recapture. |
+| **Q4** | OLB mints global only; owner remains unclaimed for the LS / provider-free track. |
+
+No open questions remain from revision 1. This revision is submitted for
+re-review of the combined real-consumer entry boundary; no OLB-2B source
+implementation begins before that review.

@@ -56,7 +56,12 @@ are polled read-only via `MeshNode` (`private_discovery_generation`/
 the atomic `ScopedDiscoveryState::take_{global,owner}_change_batch`
 (generation + dirty captured under one lock) reserved for the single node-owned
 consumer of each stream. The owner stream is a subset of the global stream, so
-valid grant-audience churn never wakes an owner-private consumer. These are
+valid grant-audience churn never ADVANCES the owner generation — a claim about
+that generation, not about wakeups: the change watch carries the GLOBAL
+generation, so grant-only movement can still wake an owner-only consumer, which
+then observes its generation unmoved and sleeps again. Only a distinct
+owner-filtered watch would make grant churn invisible to it, and none exists
+today. These are
 MUTATION/SWEEP generations, not yet complete query-visible-set generations —
 wall-clock expiry and floor raises change results before they advance. **OLB-2A.3**
 closes that and adds the push wake, in bounded sub-slices: **2A.3.1** (SIGNED at
