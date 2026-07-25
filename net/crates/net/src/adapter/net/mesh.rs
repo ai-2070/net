@@ -10498,27 +10498,45 @@ impl MeshNode {
             .collect()
     }
 
-    /// The private-discovery change generation over EITHER partition, owner or
-    /// grant (OLB-2A.2). Advances once per ingest/sweep that changes a
-    /// capability's live provider set; a consumer polls it to learn that private
-    /// discovery moved. A `Stale`/refused ingest, or a mutation touching no
-    /// query-visible capability bucket, does not advance it.
+    /// The private-discovery QUERY-VISIBLE change generation over EITHER partition,
+    /// owner or grant (OLB-2A.3 complete). Advances once per transition that
+    /// changes a capability's query-visible provider bucket, from ALL THREE
+    /// sources:
+    ///
+    /// - a store mutation (an accepted ingest, or a sweep dropping a live record);
+    /// - EXACT EXPIRY — the node timer's sweep at a record's deadline;
+    /// - REVOCATION-FLOOR movement — a raised floor retracting a record, which
+    ///   changes query results with no store mutation at all.
+    ///
+    /// A consumer polls it to learn that private discovery moved. It is a
+    /// COALESCED invalidation/checkpoint value, not a count of events: a
+    /// `Stale`/refused ingest, a mutation touching no query-visible capability
+    /// bucket, and a REPLAYED transition (a repeated or incremental floor raise
+    /// over an already-retracted record, or that record's later expiry or capacity
+    /// demotion) all leave it unchanged.
     pub fn private_discovery_generation(&self) -> u64 {
         self.scoped_discovery.lock().revision()
     }
 
-    /// The private-discovery change generation over the OWNER partition only, so
+    /// The private-discovery query-visible change generation over the OWNER
+    /// partition only — the same three sources restricted to owner records, so
     /// valid grant-audience churn never wakes an owner-private consumer.
     pub fn private_discovery_owner_generation(&self) -> u64 {
         self.scoped_discovery.lock().owner_revision()
     }
 
-    /// Subscribe to the private-discovery change wake (OLB-2A.3): the receiver is
-    /// woken — carrying the latest published global mutation/sweep generation —
-    /// whenever a scoped-store mutation changes the visible set, and never for a
-    /// no-op. Read-only push signal (the `local_caps_changed` idiom); draining
-    /// the dirty deltas is the single node-owned consumer's crate-internal
-    /// concern, not exposed here.
+    /// Subscribe to the private-discovery change wake (OLB-2A.3): the receiver
+    /// carries the latest published GLOBAL query-visible generation
+    /// ([`Self::private_discovery_generation`]), republished after any qualifying
+    /// source — store mutation, exact expiry, or revocation-floor retraction —
+    /// commits through the node-global publication gate. A no-op or replayed
+    /// transition publishes nothing.
+    ///
+    /// The watch is only a WAKE HINT: it coalesces, so a woken consumer must read
+    /// the authoritative generation and drain the dirty batch rather than infer
+    /// what moved from the value itself. Read-only push signal (the
+    /// `local_caps_changed` idiom); draining the dirty deltas is the single
+    /// node-owned consumer's crate-internal concern, not exposed here.
     pub fn subscribe_private_discovery_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.scoped_publication.subscribe()
     }

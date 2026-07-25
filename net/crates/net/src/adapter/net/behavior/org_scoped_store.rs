@@ -191,19 +191,24 @@ impl DirtyCapabilities {
 }
 
 /// One atomic capture of a private-discovery change stream (Kyra OLB-2A.2): the
-/// mutation/sweep generation at the drain instant paired with the capabilities
-/// dirtied since the previous drain. Captured under the state lock in ONE
-/// operation, so a consumer can never checkpoint a generation and separately
-/// miss a delta that committed between two reads. Crate-internal.
+/// QUERY-VISIBLE change generation at the drain instant paired with the
+/// capabilities invalidated since the previous drain. Captured under the state
+/// lock in ONE operation, so a consumer can never checkpoint a generation and
+/// separately miss a delta that committed between two reads. Crate-internal.
+///
+/// This pair — not the change watch — is the SOURCE OF TRUTH: the watch only
+/// hints that something moved, while the generation and dirty set here say what
+/// a consumer must reconcile.
 ///
 /// Consumerless in 2A.2 (allowed while consumerless per the OLB-2A closure): its
-/// single owner is the node-owned reconciler that lands with the centralized
-/// mutate→publish→wake helper in OLB-2A.3. Exercised by the change-stream
-/// witnesses today.
+/// single owner is the node-owned reconciler whose exclusive drain ownership is
+/// the OLB-2B actor-entry prerequisite. Exercised by the change-stream witnesses
+/// today.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrivateDiscoveryChangeBatch {
-    /// The mutation/sweep generation at the drain instant.
+    /// The query-visible change generation at the drain instant — advanced by a
+    /// store mutation, an exact expiry, or a revocation-floor retraction.
     pub generation: u64,
     /// The capabilities dirtied since the previous drain.
     pub dirty: DirtyCapabilities,
@@ -786,12 +791,13 @@ impl ScopedDiscoveryState {
     /// A floor raise retracts a stored record the instant it lands — queries
     /// already apply `is_current` freshly, so a record admitted against a
     /// membership generation now below its provider's floor stops being returned
-    /// with no re-announce and no sweep. That retraction moved a capability's
-    /// visible provider set WITHOUT any store mutation, so before this it advanced
-    /// no generation, dirtied nothing, and woke nobody: a consumer holding a
-    /// projection kept serving a provider the org had just revoked until something
-    /// unrelated happened to move the store. This closes that last gap between the
-    /// mutation/sweep generations and the QUERY-VISIBLE set.
+    /// with no re-announce and no sweep. That retraction moves a capability's
+    /// visible provider set WITHOUT any store mutation, so until this landed it
+    /// advanced no generation, dirtied nothing, and woke nobody: a consumer holding
+    /// a projection kept serving a provider the org had just revoked until
+    /// something unrelated happened to move the store. Handling it here is the
+    /// third and last source that makes the generations track the QUERY-VISIBLE
+    /// set, alongside store mutation and exact expiry.
     ///
     /// Each raised `(org, provider, floor)` reaches exactly that provider's records
     /// through the FLOOR-VISIBLE reverse index — never a scan of the live set — and
@@ -924,10 +930,12 @@ impl ScopedDiscoveryState {
     /// would name a minimum no wake can follow (Kyra OLB-2A.3.2). Such inert rows
     /// are reclaimed by the 60 s GC retention backstop instead.
     ///
-    /// Bound to the mutation/sweep generations, NOT wall-clock: a record whose
-    /// deadline has passed still appears here until a sweep removes it (reads stay
+    /// This is TRACKED STATE, not a wall-clock evaluation: a record whose deadline
+    /// has passed still appears here until a sweep removes it (reads stay
     /// expiry-safe via the store's read-time `now < expires_at` filter, so a
-    /// not-yet-swept expiry is invisible to queries regardless).
+    /// not-yet-swept expiry is invisible to queries regardless). A record
+    /// retracted by a revocation floor leaves this set immediately, since an
+    /// already-invisible row's deadline can no longer produce a visible transition.
     pub fn next_visible_expiry(&self) -> Option<u64> {
         self.live_expiries.keys().next().copied()
     }
@@ -940,7 +948,9 @@ impl ScopedDiscoveryState {
         self.revision
     }
 
-    /// The mutation/sweep generation restricted to the OWNER partition.
+    /// The query-visible change generation restricted to the OWNER partition — the
+    /// same three sources (store mutation, exact expiry, revocation-floor
+    /// retraction) counted only over owner records.
     pub fn owner_revision(&self) -> u64 {
         self.owner_revision
     }
