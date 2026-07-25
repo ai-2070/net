@@ -693,6 +693,23 @@ pub struct ScopedDiscoveryState {
     /// tracked set above (a tombstone, a never-live key, or a live record declaring
     /// nothing is absent).
     expiry_by_key: BTreeMap<ScopedKey, u64>,
+    /// The drain leases for THIS source (OLB-2B-E1 closure, Kyra).
+    ///
+    /// Lease identity lives with the source rather than with a mint façade, so
+    /// exclusivity is structural: every [`PrivateDiscoveryDrains`] built over this
+    /// state takes these same words, and a second façade therefore cannot hand out
+    /// a live drain of a stream another façade already holds. Holding them here
+    /// also means an accidental extra façade shares the namespace instead of
+    /// opening a private one.
+    drain_leases: PrivateDiscoveryLeaseState,
+}
+
+/// The per-source drain lease words. One pair per [`ScopedDiscoveryState`], shared
+/// by every mint façade over it.
+#[derive(Default)]
+struct PrivateDiscoveryLeaseState {
+    global: Arc<AtomicBool>,
+    owner: Arc<AtomicBool>,
 }
 
 /// Add the capabilities a record declared — read from the index BEFORE the record
@@ -1263,11 +1280,27 @@ pub(crate) struct PrivateDiscoveryDrains {
 impl PrivateDiscoveryDrains {
     /// A mint over `state` — the SAME state the ingest path, exact-expiry timer,
     /// and floor-raise callback mutate.
+    ///
+    /// The lease words are taken FROM the state, never created here (Kyra
+    /// OLB-2B-E1 closure). Lease identity belongs to the SOURCE, not to the mint
+    /// façade: constructing a second `PrivateDiscoveryDrains` over the same state
+    /// yields a façade sharing the same flags, so it cannot hand out a second live
+    /// drain of a stream one façade already holds. Minting fresh flags per façade
+    /// would have made exclusivity a property of "only one mint is ever built" —
+    /// a convention, not a structure — while both façades destructively drained
+    /// one `pending_global`.
     pub(crate) fn new(state: Arc<parking_lot::Mutex<ScopedDiscoveryState>>) -> Self {
+        let (global_lease, owner_lease) = {
+            let held = state.lock();
+            (
+                held.drain_leases.global.clone(),
+                held.drain_leases.owner.clone(),
+            )
+        };
         Self {
             state,
-            global_lease: Arc::new(AtomicBool::new(false)),
-            owner_lease: Arc::new(AtomicBool::new(false)),
+            global_lease,
+            owner_lease,
         }
     }
 
@@ -2595,6 +2628,49 @@ mod tests {
             .expect("owner claims independently");
         assert!(drains.mint(PrivateDiscoveryStream::Owner).is_none());
         drop((global, owner));
+    }
+
+    /// Two mint FAÇADES over one source cannot split a stream. Lease identity
+    /// belongs to the source, not to the mint object, so exclusivity does not
+    /// depend on "only one mint is ever constructed" — which would be a convention,
+    /// not a structure (Kyra OLB-2B-E1 closure). Under the pre-closure code both
+    /// mints succeeded while destructively draining the SAME `pending_global`.
+    #[test]
+    fn two_mint_facades_over_one_source_cannot_split_the_global_stream() {
+        let state = leased_state();
+
+        let a = PrivateDiscoveryDrains::new(state.clone());
+        let b = PrivateDiscoveryDrains::new(state);
+
+        let _held = a.mint(PrivateDiscoveryStream::Global).expect("first mint");
+
+        assert!(
+            b.mint(PrivateDiscoveryStream::Global).is_none(),
+            "lease identity must belong to the source, not the mint façade"
+        );
+    }
+
+    /// The same for the OWNER stream — and releasing through one façade makes the
+    /// stream mintable through the OTHER, proving the two share one lease word
+    /// rather than merely both being locked.
+    #[test]
+    fn mint_facades_share_one_lease_per_stream_including_release() {
+        let state = leased_state();
+        let a = PrivateDiscoveryDrains::new(state.clone());
+        let b = PrivateDiscoveryDrains::new(state);
+
+        let held = a.mint(PrivateDiscoveryStream::Owner).expect("first mint");
+        assert!(
+            b.mint(PrivateDiscoveryStream::Owner).is_none(),
+            "the owner stream is exclusive across façades too"
+        );
+
+        drop(held);
+        assert!(
+            b.mint(PrivateDiscoveryStream::Owner).is_some(),
+            "releasing through one façade frees the stream for the other — one \
+             shared lease word, not two coincidentally-held ones"
+        );
     }
 
     /// Dropping the handle RELEASES the lease, so a supervisor can mint a
