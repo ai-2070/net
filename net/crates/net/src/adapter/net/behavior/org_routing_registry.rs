@@ -651,6 +651,26 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             };
             let generation = commit.generation();
             let mut inner = self.inner.lock();
+
+            // Authority is revalidated HERE too, not only on the installing path
+            // (Kyra OLB-2B-E3b). The phase-1 check is stale by now: the snapshot
+            // above ran off-lock, and the actor can be fenced in that window.
+            // Installing nothing is not sufficient grounds to settle — `Current`
+            // on a full request is what lets the supervisor publish `Healthy`, so
+            // a revoked actor reporting it advertises routes on the authority of
+            // an incarnation that no longer exists.
+            if inner.live_actor != Some(incarnation) {
+                self.metrics
+                    .stale_actor_rejections
+                    .fetch_add(1, Ordering::AcqRel);
+                let owed = !inner.pending.is_empty();
+                drop(inner);
+                if owed {
+                    self.work.mark();
+                }
+                return ApplyOutcome::Superseded;
+            }
+
             let outcome = settle(&mut inner, incarnation, generation, &self.metrics);
             let owed = !inner.pending.is_empty();
             drop(inner);
@@ -878,6 +898,9 @@ mod tests {
         gate: parking_lot::Mutex<u64>,
         /// Runs during reconstruction, so a witness can move the world mid-build.
         during_build: parking_lot::Mutex<Option<Hook>>,
+        /// Runs inside the off-lock snapshot — the window in which the phase-1
+        /// authority check goes stale.
+        on_snapshot: parking_lot::Mutex<Option<Hook>>,
         /// Runs when the COMMIT pin is released — i.e. strictly after installation.
         on_commit_release: parking_lot::Mutex<Option<SharedHook>>,
         queried: parking_lot::Mutex<Vec<SlotKey>>,
@@ -890,6 +913,7 @@ mod tests {
             Arc::new(Self {
                 gate: parking_lot::Mutex::new(1),
                 during_build: parking_lot::Mutex::new(None),
+                on_snapshot: parking_lot::Mutex::new(None),
                 on_commit_release: parking_lot::Mutex::new(None),
                 queried: parking_lot::Mutex::new(Vec::new()),
                 snapshots: AtomicU64::new(0),
@@ -972,6 +996,10 @@ mod tests {
             // Brief: the gate guard is released before this returns.
             let generation = *self.0.gate.lock();
             self.0.snapshots.fetch_add(1, Ordering::AcqRel);
+            let hook = self.0.on_snapshot.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
             Box::new(TestSnapshot {
                 state: self.0.clone(),
                 generation,
@@ -1444,6 +1472,63 @@ mod tests {
         let outcome = f.registry.apply(3, request(true, DirtyCapabilities::Clean));
         assert!(matches!(outcome, ApplyOutcome::Current { .. }));
         assert_eq!(f.source.queries(), vec![key(1, "nrpc:a")]);
+    }
+
+    /// The EMPTY-SELECTION settlement path revalidates authority too.
+    ///
+    /// Nothing is installed on that path, which is exactly why it is easy to miss —
+    /// but `Current` on a full request is what lets the supervisor publish
+    /// `Healthy`, so an actor revoked after phase 1 must not reach it. The
+    /// revocation lands during the off-lock snapshot, the window in which the
+    /// phase-1 check goes stale (Kyra OLB-2B-E3b).
+    #[test]
+    fn an_actor_revoked_after_selection_cannot_settle_an_empty_pass_as_current() {
+        // Baseline: with the actor live, this exact pass settles Current.
+        let f = fixture();
+        assert_eq!(
+            f.registry
+                .apply(1, request(false, DirtyCapabilities::RebuildAll)),
+            ApplyOutcome::Current {
+                source_generation: f.source.generation()
+            },
+            "a full request over no retained slots completes"
+        );
+
+        // The same pass, with the actor fenced inside the off-lock snapshot.
+        let f = fixture();
+        {
+            let registry = f.registry.clone();
+            *f.source.on_snapshot.lock() = Some(Box::new(move || {
+                registry.deactivate_incarnation(1);
+            }));
+        }
+        let outcome = f
+            .registry
+            .apply(1, request(false, DirtyCapabilities::RebuildAll));
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Superseded,
+            "an actor revoked after phase 1 cannot settle Current"
+        );
+        assert_eq!(f.metrics.stale_actor_rejections(), 1);
+
+        // And the same holds for an ordinary quiet registry-work pass.
+        let f = fixture();
+        let target = key(1, "nrpc:a");
+        let _held = f.family().demand(target.clone()).expect("a");
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert_eq!(f.registry.pending_slots(), 0, "nothing left to select");
+        {
+            let registry = f.registry.clone();
+            *f.source.on_snapshot.lock() = Some(Box::new(move || {
+                registry.deactivate_incarnation(1);
+            }));
+        }
+        assert_eq!(
+            f.registry.apply(1, request(true, DirtyCapabilities::Clean)),
+            ApplyOutcome::Superseded
+        );
+        assert_eq!(f.metrics.stale_actor_rejections(), 1);
     }
 
     /// Authority revoked DURING the build: every still-live selected slot is
