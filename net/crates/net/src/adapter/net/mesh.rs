@@ -5142,33 +5142,106 @@ struct ScopedSlotSource {
 /// Owned, bounded material for ONE quantum: the exact rows for the exact keys the
 /// registry selected, captured at `generation`.
 struct ScopedSourceSnapshot {
-    generation: u64,
+    token: super::behavior::org_routing_registry::SourceToken,
+    /// ONLY the keys this source can actually speak for. A key absent here
+    /// reconstructs as `SourceFacts::Unserved`, never as an empty provider set.
     rows: std::collections::BTreeMap<
         super::behavior::org_routing_registry::SlotKey,
         Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider>,
     >,
 }
 
+/// The live revocation authority a snapshot was taken under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RevocationAuthority {
+    /// Address of the installed store `Arc`, or 0 when un-adopted. Compared only
+    /// while both `Arc`s are held, so the identity cannot be recycled.
+    identity: usize,
+    generation: u64,
+    poisoned: bool,
+}
+
+impl ScopedSlotSource {
+    /// Capture the live revocation authority: which store is installed, its
+    /// barriered generation, and whether it is poisoned.
+    ///
+    /// Returned WITH the `Arc` so the identity cannot be recycled underneath the
+    /// comparison, and so the floor snapshot used for filtering comes from
+    /// exactly the store the token names.
+    fn revocation_authority(
+        &self,
+    ) -> (
+        RevocationAuthority,
+        Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
+    ) {
+        let store = self.org_revocation.load_full();
+        let authority = match store.as_ref() {
+            Some(store) => RevocationAuthority {
+                identity: Arc::as_ptr(store) as usize,
+                generation: store.barriered_generation(),
+                poisoned: store.is_poisoned(),
+            },
+            // Un-adopted: no store, implicit floor 0. Still an authority STATE,
+            // and adopting one must invalidate anything built without it.
+            None => RevocationAuthority {
+                identity: 0,
+                generation: 0,
+                poisoned: false,
+            },
+        };
+        (authority, store)
+    }
+
+    /// Every authority input reconstruction depends on, as one comparable token.
+    ///
+    /// Revocation is in here because it is not merely an input to filtering — it
+    /// IS authority. A floor becomes live BEFORE the floor-raise subscriber
+    /// retracts the scoped rows it invalidates, so there is a window in which the
+    /// scoped revision is unchanged while rows the source would serve are already
+    /// unauthorized. A scoped-only token installs facts inside that window and
+    /// lets the callback retract them a moment later (Kyra OLB-2B-E3c). Store
+    /// replacement has the same shape between publishing the new identity and
+    /// completing scoped reconciliation.
+    fn token(
+        &self,
+        scoped_revision: u64,
+        revocation: &RevocationAuthority,
+    ) -> super::behavior::org_routing_registry::SourceToken {
+        super::behavior::org_routing_registry::SourceToken::new(vec![
+            scoped_revision,
+            revocation.identity as u64,
+            revocation.generation,
+            u64::from(revocation.poisoned),
+        ])
+    }
+}
+
 impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnapshot {
-    fn generation(&self) -> u64 {
-        self.generation
+    fn token(&self) -> super::behavior::org_routing_registry::SourceToken {
+        self.token.clone()
     }
 
     fn providers(
         &self,
         key: &super::behavior::org_routing_registry::SlotKey,
-    ) -> Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider> {
+    ) -> super::behavior::org_routing_registry::SourceFacts {
+        use super::behavior::org_routing_registry::SourceFacts;
         // Reconstruction proper: no lock of any kind, no await. Ordering is
         // imposed HERE rather than at capture, so the deterministic projection is
         // off-lock work.
-        let mut providers = self.rows.get(key).cloned().unwrap_or_default();
+        let Some(rows) = self.rows.get(key) else {
+            // Not captured => this source cannot speak for the scope at all.
+            // Deliberately NOT an empty provider set: see `SourceFacts`.
+            return SourceFacts::Unserved;
+        };
+        let mut providers = rows.clone();
         providers.sort_by(|a, b| {
             a.provider
                 .cmp(&b.provider)
                 .then_with(|| a.generation.cmp(&b.generation))
         });
         providers.dedup_by(|a, b| a.provider == b.provider);
-        providers
+        SourceFacts::Served(providers.into())
     }
 }
 
@@ -5192,9 +5265,12 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
     ) -> Box<dyn super::behavior::org_routing_registry::SourceSnapshot> {
         use super::behavior::org_revocation::OrgRevocationState;
         let now_secs = super::behavior::org::current_timestamp();
-        // Borrow the LIVE floor snapshot BEFORE the state lock, exactly as the
-        // ingest and owner-query paths do.
-        let store = self.org_revocation.load_full();
+
+        // Revocation authority FIRST, and the floors come from exactly the store
+        // the token names. Capturing it before the scoped rows means any floor
+        // movement that could invalidate those rows is either inside the token or
+        // caught by the commit pin.
+        let (revocation, store) = self.revocation_authority();
         let empty_floors = OrgRevocationState::empty();
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
@@ -5209,8 +5285,14 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
                 if !matches!(
                     scope,
                     super::behavior::org_scoped_ingest::CapabilityAudienceScope::Owner { .. }
-                ) {
+                ) || revocation.poisoned
+                {
+                    // Absent from `rows` => reconstructed as `Unserved`. A
+                    // POISONED revocation authority makes every scope unserved:
+                    // there is no usable floor view to filter against, and
+                    // serving unfiltered rows is worse than serving none.
                     unserved += 1;
+                    continue;
                 }
                 rows.insert(
                     key.clone(),
@@ -5228,16 +5310,20 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             self.unserved_scope
                 .fetch_add(unserved, std::sync::atomic::Ordering::AcqRel);
         }
-        Box::new(ScopedSourceSnapshot { generation, rows })
+        let token = self.token(generation, &revocation);
+        Box::new(ScopedSourceSnapshot { token, rows })
     }
 
     fn pin_if_current(
         &self,
-        expected_generation: u64,
+        expected: &super::behavior::org_routing_registry::SourceToken,
     ) -> Option<Box<dyn super::behavior::org_routing_registry::SourceCommitPin + '_>> {
         let gate = self.publication.lock_gate();
+        // Recomputed UNDER the gate: no scoped mutation can commit while it is
+        // held, and any revocation movement since the snapshot shows up here.
+        let (revocation, _store) = self.revocation_authority();
         let generation = self.scoped_discovery.lock().revision();
-        if generation != expected_generation {
+        if self.token(generation, &revocation) != *expected {
             return None;
         }
         Some(Box::new(ScopedCommitPin {
@@ -5572,6 +5658,9 @@ pub struct MeshNode {
     routing_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
     /// OLB-2B-E3c: guards the SINGLE production supervisor construction path.
     routing_started: Arc<AtomicBool>,
+    /// Test-only: fires between the supervisor spawn and the handle publication.
+    #[cfg(test)]
+    routing_spawn_pause_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Fixtures-only actor observation points, threaded into the supervisor.
     #[cfg(feature = "fixtures")]
     routing_hooks: Arc<super::behavior::org_routing::ActorHooks>,
@@ -7095,6 +7184,8 @@ impl MeshNode {
             routing_unserved_scope,
             routing_task: parking_lot::Mutex::new(None),
             routing_started: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            routing_spawn_pause_hook: parking_lot::Mutex::new(None),
             #[cfg(feature = "fixtures")]
             routing_hooks: Arc::default(),
             scoped_relay_gate: Arc::new(
@@ -11486,6 +11577,22 @@ impl MeshNode {
             return;
         }
 
+        // The slot lock is held across the shutdown check, the spawn AND the
+        // handle publication, and `join_org_routing_supervisor` takes the same
+        // lock. Without that, a shutdown landing between `tokio::spawn` and the
+        // store would take `None`, return without joining, and leave an unjoined
+        // supervisor alive after teardown completed (Kyra OLB-2B-E3c). The latch
+        // above does not close this: it admits one starter, it does not order the
+        // starter against shutdown.
+        //
+        // Nothing here awaits, so the guard never spans a suspension point.
+        let mut task_slot = self.routing_task.lock();
+        if self.shutdown.load(Ordering::Acquire) {
+            // Shutdown won the slot. Stay fenced rather than spawning an actor
+            // nobody will ever join.
+            return;
+        }
+
         let supervisor = super::behavior::org_routing::RoutingSupervisor::new(
             super::behavior::org_scoped_store::PrivateDiscoveryDrains::new(
                 self.scoped_discovery.clone(),
@@ -11514,7 +11621,26 @@ impl MeshNode {
                 )
                 .await;
         });
-        *self.routing_task.lock() = Some(handle);
+        #[cfg(test)]
+        self.routing_spawn_pause();
+        *task_slot = Some(handle);
+    }
+
+    /// Test-only: raise the shutdown flag exactly as `shutdown()` does, without
+    /// tearing anything down — so a witness can prove startup observes it.
+    #[cfg(test)]
+    fn shutdown_flag_for_test(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Test-only pause between the spawn and the handle publication — the exact
+    /// window a shutdown must not be able to slip through.
+    #[cfg(test)]
+    fn routing_spawn_pause(&self) {
+        let hook = self.routing_spawn_pause_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Signal-and-join the routing supervisor.
@@ -11526,6 +11652,11 @@ impl MeshNode {
     ///
     /// The shutdown flag and notification must already have been issued.
     async fn join_org_routing_supervisor(&self) {
+        // Taking the slot is what serializes against `start_org_routing_supervisor`:
+        // either startup published the handle before releasing the slot (so this
+        // takes it), or this ran first and startup then observes the shutdown flag
+        // under the same lock and spawns nothing. The guard is dropped BEFORE the
+        // await — no lock spans a suspension point.
         let handle = self.routing_task.lock().take();
         if let Some(handle) = handle {
             let _ = handle.await;
@@ -11624,6 +11755,24 @@ impl MeshNode {
         key: &super::behavior::org_routing_registry::SlotKey,
     ) -> Option<Arc<super::behavior::org_routing_registry::SlotBaseFacts>> {
         let facts = self.routing_registry.base_facts(key)?;
+        // A scope this source cannot speak for has NO evidence, so it must read
+        // cold rather than as a proven-empty provider set (Kyra OLB-2B-E3c).
+        if matches!(
+            facts.providers,
+            super::behavior::org_routing_registry::SourceFacts::Unserved
+        ) {
+            return None;
+        }
+        // Expiry is enforced HERE, against the wall clock, not merely at capture.
+        // Reconstruction and the commit can both cross a deadline, and the
+        // exact-expiry timer is asynchronous — it may be waiting on the very
+        // publication gate the commit pin holds. The scoped store's uncached
+        // reads are expiry-safe by filtering at query time; a cache is only
+        // expiry-safe if its read seam does the same, so the timer governs
+        // promptness rather than correctness.
+        if super::behavior::org::current_timestamp() >= facts.earliest_expiry {
+            return None;
+        }
         self.routing_health
             .load()
             .allows(facts.actor_incarnation)
@@ -27397,6 +27546,19 @@ impl Drop for MeshNode {
         self.shutdown.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
         self.router.stop();
+        // OLB-2B-E3c: `shutdown().await` is the deterministic JOINED teardown.
+        // This is the best-effort path, and blocking on a Tokio task from a
+        // destructor is not safe — but silently dropping the `JoinHandle` merely
+        // DETACHES the supervisor, leaving it applying and republishing health
+        // over a node that is gone. So fence synchronously and abort the task:
+        // cancelling the supervisor future drops the incarnation it owns inline,
+        // which drops the fence guard and releases the exclusive global drain.
+        self.routing_health.store(Arc::new(
+            super::behavior::org_routing::RoutingHealth::Fenced,
+        ));
+        if let Some(handle) = self.routing_task.lock().take() {
+            handle.abort();
+        }
         // Review-11 P2: unsubscribe this node's raise callback from
         // its installed store. Without this, the callback the
         // shared `StoreCore` retains captures the node's

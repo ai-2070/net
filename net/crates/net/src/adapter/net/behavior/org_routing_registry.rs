@@ -118,33 +118,82 @@ pub(crate) enum DemandRefused {
 #[derive(Clone, Debug)]
 pub(crate) struct SlotBaseFacts {
     #[allow(dead_code)] // read by the warmed-call consumer.
-    pub providers: Arc<[PrivateCapabilityProvider]>,
+    pub providers: SourceFacts,
     pub source_generation: u64,
     pub actor_incarnation: u64,
     pub slot_incarnation: u64,
+    /// The earliest `expires_at` across the retained providers, or `u64::MAX`
+    /// when nothing here can expire.
+    ///
+    /// Expiry filtering at capture is not enough: reconstruction and the commit
+    /// can both cross a deadline, and the exact-expiry timer is asynchronous and
+    /// may itself be waiting on the publication gate. Carrying the bound lets the
+    /// READ seam reject the whole object the moment it is crossed, so the timer
+    /// governs promptness rather than correctness — which is what the scoped
+    /// store's uncached reads already guarantee (Kyra OLB-2B-E3c).
+    pub earliest_expiry: u64,
+}
+
+/// An opaque, comparable summary of EVERY authority input a snapshot was taken
+/// under.
+///
+/// The registry never interprets it — it only carries it from the snapshot to
+/// the commit pin and lets the SOURCE decide whether anything moved. That is
+/// deliberate: a source's authority is not just its own state. The production
+/// source's routing material is filtered by revocation floors, so its token
+/// covers the scoped revision AND the revocation store's identity, barriered
+/// generation and poison state. A scoped-revision-only check would miss a floor
+/// that became authoritative before its retraction reached scoped state, and
+/// install facts the very next callback invalidates (Kyra OLB-2B-E3c).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceToken(Vec<u64>);
+
+impl SourceToken {
+    pub(crate) fn new(words: Vec<u64>) -> Self {
+        Self(words)
+    }
+}
+
+/// Whether the source can speak for a slot's authority scope AT ALL.
+///
+/// `Unserved` is NOT "zero providers". A source that cannot serve a scope has no
+/// evidence about it, and an empty provider list is exact fresh negative
+/// evidence — conflating them would let an unsupported scope masquerade as a
+/// proven-empty one and drive a caller to a NonViable decision it never earned
+/// (Kyra OLB-2B-E3c). A slot with `Unserved` facts is fully reconciled (it owes
+/// no work) but reads COLD.
+#[derive(Clone, Debug)]
+pub(crate) enum SourceFacts {
+    Served(Arc<[PrivateCapabilityProvider]>),
+    Unserved,
 }
 
 /// Bounded material captured from the source for ONE quantum.
 ///
 /// Owns everything reconstruction needs, so decode, sort and projection run with
-/// NO source lock and NO registry lock held. That is the whole point of the split:
-/// the source-side capture is brief, and the expensive part of a quantum blocks
-/// nothing (Kyra OLB-2B-E3b).
+/// NO source lock and NO registry lock held. That is the whole point of the
+/// split: the source-side capture is brief, and the expensive part of a quantum
+/// blocks nothing (Kyra OLB-2B-E3b).
 pub(crate) trait SourceSnapshot {
-    /// The query-visible generation this material was captured at.
-    fn generation(&self) -> u64;
+    /// The full authority token this material was captured under.
+    ///
+    /// There is deliberately no separate generation accessor: the generation
+    /// facts are STAMPED with comes from the commit pin, which is the only thing
+    /// that proved it current.
+    fn token(&self) -> SourceToken;
 
-    /// Reconstruct `key`'s authority-scoped providers from the captured material.
-    fn providers(&self, key: &SlotKey) -> Vec<PrivateCapabilityProvider>;
+    /// Reconstruct `key`'s authority-scoped facts from the captured material.
+    fn providers(&self, key: &SlotKey) -> SourceFacts;
 }
 
 /// A SHORT currentness pin, held only across final validation and installation.
 ///
-/// Its existence proves the source has not moved since the snapshot, which is what
-/// makes a conditional install safe without a two-sample before/after comparison —
-/// that comparison leaves a window between the second read and the installation in
-/// which the source may move, and facts installed in that window are stale while
-/// carrying a generation that says otherwise.
+/// Its existence proves NO authority input covered by the token has moved since
+/// the snapshot, which is what makes a conditional install safe without a
+/// two-sample before/after comparison — that comparison leaves a window between
+/// the second read and the installation in which the source may move, and facts
+/// installed in that window are stale while carrying a generation that says
+/// otherwise.
 pub(crate) trait SourceCommitPin {
     /// The generation this pin proves is still current.
     fn generation(&self) -> u64;
@@ -152,24 +201,25 @@ pub(crate) trait SourceCommitPin {
 
 /// Supplies authority-scoped provider facts.
 ///
-/// E3c binds this to the scoped discovery state and the mutation-publication gate.
-/// The two-method shape is deliberate: it makes "the gate is a COMMIT pin, never a
-/// reconstruction lock" a property of the seam rather than a rule an implementation
-/// has to remember. Holding the publication gate across a quantum would block all
-/// private-discovery ingest, expiry sweeps and floor mutation behind up to
-/// [`APPLY_QUANTUM`] authority-scoped store queries plus their decoding.
+/// E3c binds this to the scoped discovery state, the mutation-publication gate
+/// and the revocation authority. The two-method shape is deliberate: it makes
+/// "the gate is a COMMIT pin, never a reconstruction lock" a property of the seam
+/// rather than a rule an implementation has to remember. Holding the publication
+/// gate across a quantum would block all private-discovery ingest, expiry sweeps
+/// and floor mutation behind up to [`APPLY_QUANTUM`] authority-scoped store
+/// queries plus their decoding.
 pub(crate) trait SlotSource: Send + Sync + 'static {
     /// Briefly capture the exact authority-scoped material for `keys`, plus the
-    /// generation it was captured at. Every source-side lock is released before
+    /// token it was captured under. Every source-side lock is released before
     /// this returns. Called with NO registry lock held.
     fn snapshot(&self, keys: &[SlotKey]) -> Box<dyn SourceSnapshot>;
 
-    /// Acquire the commit pin IF the source is still at `expected_generation`.
+    /// Acquire the commit pin IF every authority input still matches `expected`.
     ///
-    /// `None` means the source moved while this quantum was rebuilding, and the
+    /// `None` means something the reconstruction depended on moved, and the
     /// caller must install nothing. ALWAYS called before the registry lock is
     /// taken, never while holding it — see the module's frozen lock order.
-    fn pin_if_current(&self, expected_generation: u64) -> Option<Box<dyn SourceCommitPin + '_>>;
+    fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>>;
 }
 
 #[derive(Debug)]
@@ -532,6 +582,22 @@ impl NodeOrgRoutingRegistry {
         self.inner.lock().slots.get(key)?.facts.clone()
     }
 
+    /// Test-only: install `facts` for `key`, creating the slot if needed.
+    ///
+    /// Lets a witness reproduce a quantum that raced a deadline — facts valid at
+    /// capture, expired by the time they are read — without having to win that
+    /// race against the wall clock.
+    #[cfg(test)]
+    pub(crate) fn install_facts_for_test(&self, key: SlotKey, facts: Arc<SlotBaseFacts>) {
+        let mut inner = self.inner.lock();
+        let slot = inner.slots.entry(key).or_insert(Slot {
+            incarnation: 1,
+            refs: 1,
+            facts: None,
+        });
+        slot.facts = Some(facts);
+    }
+
     pub(crate) fn retained_slots(&self) -> usize {
         self.inner.lock().slots.len()
     }
@@ -663,8 +729,10 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         // become complete, or may owe a coherence re-queue. It takes the same
         // commit pin, so `Current` is never reported over an unverified generation.
         if selected.is_empty() {
-            let generation = self.source.snapshot(&[]).generation();
-            let Some(commit) = self.source.pin_if_current(generation) else {
+            let probe = self.source.snapshot(&[]);
+            let token = probe.token();
+            drop(probe);
+            let Some(commit) = self.source.pin_if_current(&token) else {
                 return ApplyOutcome::Superseded;
             };
             let generation = commit.generation();
@@ -701,14 +769,14 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         // --- phase 2: BRIEF source capture, no registry lock held ---
         let keys: Vec<SlotKey> = selected.iter().map(|(key, _)| key.clone()).collect();
         let snapshot = self.source.snapshot(&keys);
-        let snapshot_generation = snapshot.generation();
+        let snapshot_token = snapshot.token();
 
         // --- phase 3: reconstruct holding NOTHING ---
         // Not the registry lock, and not the source's publication gate: this is the
         // expensive part of a quantum, and blocking private-discovery ingest,
         // expiry and floor mutation behind it is exactly what the snapshot/commit
         // split exists to prevent (Kyra OLB-2B-E3b).
-        let built: Vec<(SlotKey, u64, Vec<PrivateCapabilityProvider>)> = selected
+        let built: Vec<(SlotKey, u64, SourceFacts)> = selected
             .iter()
             .map(|(key, slot_incarnation)| {
                 (key.clone(), *slot_incarnation, snapshot.providers(key))
@@ -717,7 +785,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         drop(snapshot);
 
         // --- phase 4: the COMMIT pin, before the registry lock ---
-        let Some(commit) = self.source.pin_if_current(snapshot_generation) else {
+        let Some(commit) = self.source.pin_if_current(&snapshot_token) else {
             // The source moved while we rebuilt. Install nothing, and put every
             // still-live selected slot back.
             let mut inner = self.inner.lock();
@@ -774,7 +842,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             }
 
             let RegistryInner { slots, pending, .. } = &mut *inner;
-            for (key, slot_incarnation, providers) in built {
+            for (key, slot_incarnation, facts) in built {
                 let Some(slot) = slots.get_mut(&key) else {
                     // Retired while we built: do NOT resurrect it.
                     self.metrics
@@ -792,11 +860,21 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     slot_moved = true;
                     continue;
                 }
+                let earliest_expiry = match &facts {
+                    SourceFacts::Served(providers) => providers
+                        .iter()
+                        .map(|p| p.expires_at)
+                        .min()
+                        .unwrap_or(u64::MAX),
+                    // Cold at every read anyway; nothing to bound.
+                    SourceFacts::Unserved => u64::MAX,
+                };
                 slot.facts = Some(Arc::new(SlotBaseFacts {
-                    providers: providers.into(),
+                    providers: facts,
                     source_generation: generation,
                     actor_incarnation: incarnation,
                     slot_incarnation,
+                    earliest_expiry,
                 }));
                 self.metrics.installs.fetch_add(1, Ordering::AcqRel);
             }
@@ -967,10 +1045,10 @@ mod tests {
     }
 
     impl SourceSnapshot for TestSnapshot {
-        fn generation(&self) -> u64 {
-            self.generation
+        fn token(&self) -> SourceToken {
+            SourceToken::new(vec![self.generation])
         }
-        fn providers(&self, key: &SlotKey) -> Vec<PrivateCapabilityProvider> {
+        fn providers(&self, key: &SlotKey) -> SourceFacts {
             self.state.queried.lock().push(key.clone());
             self.state
                 .assert_no_registry_lock("no registry lock may be held across reconstruction");
@@ -982,7 +1060,7 @@ mod tests {
             if let Some(hook) = hook {
                 hook();
             }
-            Vec::new()
+            SourceFacts::Served(Arc::from(Vec::new()))
         }
     }
 
@@ -1024,15 +1102,12 @@ mod tests {
             })
         }
 
-        fn pin_if_current(
-            &self,
-            expected_generation: u64,
-        ) -> Option<Box<dyn SourceCommitPin + '_>> {
+        fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>> {
             self.0.assert_no_registry_lock(
                 "the commit pin must be acquired BEFORE the registry lock",
             );
             let generation = self.0.gate.lock();
-            if *generation != expected_generation {
+            if SourceToken::new(vec![*generation]) != *expected {
                 return None;
             }
             Some(Box::new(TestCommitPin {

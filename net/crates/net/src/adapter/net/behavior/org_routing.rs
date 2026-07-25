@@ -363,6 +363,16 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
                 },
             ) {
                 ApplyOutcome::Current { .. } => {
+                    // Recheck shutdown BEFORE publishing. `apply` is synchronous
+                    // and can be long; a shutdown landing inside it would
+                    // otherwise be followed by this incarnation resurrecting
+                    // `Healthy` over a node that is tearing down, and the fence
+                    // only lands once the loop reaches its next park (Kyra
+                    // OLB-2B-E3c). Health must never move forward after shutdown
+                    // has been observed, on the explicit path or under Drop.
+                    if it.shutdown.load(Ordering::Acquire) {
+                        return ActorExit::Shutdown;
+                    }
                     if full {
                         it.health
                             .store(Arc::new(RoutingHealth::Healthy { incarnation: it.id }));

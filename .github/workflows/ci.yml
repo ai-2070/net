@@ -76,7 +76,12 @@ jobs:
       # proof that ONE global drain is minted, that the dirty stream reaches the
       # real registry, that shutdown joins the routing task before returning, and
       # that the publication gate is a commit pin rather than a reconstruction
-      # lock. Losing them silently would be worse than losing them loudly.
+      # lock -- plus, since the E3c closure, that shutdown cannot slip between the
+      # supervisor spawn and its handle publication, that revocation authority is
+      # inside the currentness token, that an unserved scope reads cold rather
+      # than authoritatively empty, that cached facts crossing their expiry read
+      # cold, and that Drop fences rather than detaching. Losing any of them
+      # silently would be worse than losing them loudly.
       #
       # NOTE: they are gated `#[cfg(test)]`, NOT `feature = "fixtures"` —
       # `$UNIT_FEATURES` deliberately excludes `fixtures`, so a fixtures gate
@@ -85,7 +90,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=5
+          MIN=10
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
