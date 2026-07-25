@@ -19,12 +19,14 @@
 //!
 //! ## Frozen lock order
 //!
-//! `source currentness pin` → `registry lock`.
+//! `source commit pin` → `registry lock`.
 //!
-//! The pin is acquired at the very top of [`NodeOrgRoutingRegistry::apply`], before
-//! the registry lock is ever taken, and is released only after the installation
-//! completes. No source method is called while the registry lock is held, and no
-//! registry method that a source implementation could re-enter takes the pin.
+//! A quantum runs as: select/invalidate under the registry lock → release → brief
+//! source snapshot → reconstruct entirely off-lock → acquire the commit pin →
+//! registry lock beneath it → install → release both. No source method is called
+//! while the registry lock is held; no source-side lock is held across decoding,
+//! sorting or projection; and no registry method a source implementation could
+//! re-enter takes the commit pin.
 
 // E3b-ONLY: the node wiring that consumes this lands in E3c, which also removes
 // this allow and those in `org_routing`/`org_scoped_store`. A leftover allow there
@@ -124,33 +126,52 @@ pub(crate) struct SlotBaseFacts {
     pub slot_incarnation: u64,
 }
 
-/// A HELD source-currentness pin.
+/// Bounded material captured from the source for ONE quantum.
 ///
-/// While one is held the source's query-visible set cannot advance, so the
-/// generation every artifact is stamped with is still the generation those facts
-/// are installed against. A two-sample before/after comparison cannot give that:
-/// it leaves a window between the second read and the installation in which the
-/// source may move, and facts installed in that window are stale while carrying a
-/// generation that says otherwise (Kyra OLB-2B-E3b).
-///
-/// E3c binds this to the scoped mutation-publication gate plus the query-visible
-/// revision check; the trait keeps that plumbing out of the registry's review.
-pub(crate) trait SourceCurrentness {
-    /// The query-visible generation this pin holds still.
+/// Owns everything reconstruction needs, so decode, sort and projection run with
+/// NO source lock and NO registry lock held. That is the whole point of the split:
+/// the source-side capture is brief, and the expensive part of a quantum blocks
+/// nothing (Kyra OLB-2B-E3b).
+pub(crate) trait SourceSnapshot {
+    /// The query-visible generation this material was captured at.
     fn generation(&self) -> u64;
 
-    /// Authority-scoped providers for `key`. Called with NO registry lock held.
+    /// Reconstruct `key`'s authority-scoped providers from the captured material.
     fn providers(&self, key: &SlotKey) -> Vec<PrivateCapabilityProvider>;
 }
 
-/// Supplies authority-scoped provider facts, only through a held pin.
+/// A SHORT currentness pin, held only across final validation and installation.
 ///
-/// There is deliberately no un-pinned query: a caller cannot read providers
-/// without first establishing the currentness it will stamp them with.
+/// Its existence proves the source has not moved since the snapshot, which is what
+/// makes a conditional install safe without a two-sample before/after comparison —
+/// that comparison leaves a window between the second read and the installation in
+/// which the source may move, and facts installed in that window are stale while
+/// carrying a generation that says otherwise.
+pub(crate) trait SourceCommitPin {
+    /// The generation this pin proves is still current.
+    fn generation(&self) -> u64;
+}
+
+/// Supplies authority-scoped provider facts.
+///
+/// E3c binds this to the scoped discovery state and the mutation-publication gate.
+/// The two-method shape is deliberate: it makes "the gate is a COMMIT pin, never a
+/// reconstruction lock" a property of the seam rather than a rule an implementation
+/// has to remember. Holding the publication gate across a quantum would block all
+/// private-discovery ingest, expiry sweeps and floor mutation behind up to
+/// [`APPLY_QUANTUM`] authority-scoped store queries plus their decoding.
 pub(crate) trait SlotSource: Send + Sync + 'static {
-    /// Acquire the currentness pin. ALWAYS called before the registry lock is
+    /// Briefly capture the exact authority-scoped material for `keys`, plus the
+    /// generation it was captured at. Every source-side lock is released before
+    /// this returns. Called with NO registry lock held.
+    fn snapshot(&self, keys: &[SlotKey]) -> Box<dyn SourceSnapshot>;
+
+    /// Acquire the commit pin IF the source is still at `expected_generation`.
+    ///
+    /// `None` means the source moved while this quantum was rebuilding, and the
+    /// caller must install nothing. ALWAYS called before the registry lock is
     /// taken, never while holding it — see the module's frozen lock order.
-    fn pin(&self) -> Box<dyn SourceCurrentness + '_>;
+    fn pin_if_current(&self, expected_generation: u64) -> Option<Box<dyn SourceCommitPin + '_>>;
 }
 
 #[derive(Debug)]
@@ -183,15 +204,14 @@ struct RegistryInner {
     /// The ONE actor incarnation permitted to consume pending work and install
     /// facts, or `None` when no actor is live.
     live_actor: Option<u64>,
-    /// The source generation an OPEN recapture epoch was expanded at.
+    /// Whether a COMPLETE recapture is under way.
     ///
-    /// `Some(g)` means "a complete recapture is under way against generation `g`;
-    /// its remaining set is `pending`". A later `RebuildAll` at the SAME generation
-    /// must not re-expand — re-expanding would re-select the first quantum forever
-    /// and the recapture would never terminate. A `RebuildAll` at a DIFFERENT
-    /// generation restarts the epoch, because slots built against the old one are
-    /// no longer part of one coherent recapture.
-    recapture: Option<u64>,
+    /// While open, its remaining set is `pending`, and settlement additionally
+    /// re-queues every retained slot that is not coherent with the commit — which
+    /// is how a source generation that moved between quanta restarts the epoch. A
+    /// later `RebuildAll` must NOT re-expand while it is open: re-expanding would
+    /// re-select the first quantum forever and the recapture would never terminate.
+    recapture_open: bool,
 }
 
 impl RegistryInner {
@@ -229,22 +249,26 @@ impl RegistryInner {
         invalidated
     }
 
-    /// Has THIS pass produced a complete, coherent installation?
+    /// Retained slots NOT coherent with this commit.
     ///
-    /// Kyra's completion condition: no work is owed AND every currently retained
-    /// slot carries facts stamped with the live actor incarnation, that slot's
-    /// current incarnation, and ONE current source generation. Anything weaker
-    /// would let `Current` — the only outcome that may advance health — publish a
-    /// route set in which some slot was never rebuilt by this incarnation.
-    fn is_complete(&self, incarnation: u64, generation: u64) -> bool {
-        self.pending.is_empty()
-            && self.slots.values().all(|slot| {
-                slot.facts.as_ref().is_some_and(|facts| {
+    /// Coherent means: facts present, stamped by the live actor incarnation, for
+    /// the slot's current incarnation, from this source generation. Used ONLY
+    /// while a complete-recapture epoch is open — ordinary `Caps` and first-demand
+    /// work deliberately leaves unrelated slots at older generations, and demanding
+    /// global coherence there would report `Progress` for a pass that finished
+    /// everything it was asked to do.
+    fn incoherent_with(&self, incarnation: u64, generation: u64) -> Vec<SlotKey> {
+        self.slots
+            .iter()
+            .filter(|(_, slot)| {
+                !slot.facts.as_ref().is_some_and(|facts| {
                     facts.actor_incarnation == incarnation
                         && facts.slot_incarnation == slot.incarnation
                         && facts.source_generation == generation
                 })
             })
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 }
 
@@ -511,7 +535,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         let owed = {
             let mut inner = self.inner.lock();
             inner.live_actor = Some(incarnation);
-            inner.recapture = None;
+            inner.recapture_open = false;
             let invalidated = inner.invalidate_and_queue_all();
             self.metrics
                 .facts_invalidated
@@ -535,16 +559,12 @@ impl DirtyApply for NodeOrgRoutingRegistry {
 
     /// One bounded reconciliation quantum.
     ///
-    /// The phases exist for the lock discipline: the registry lock is held ONLY to
-    /// select/invalidate and later to install. The source query, decoding, sorting
-    /// and projection all happen with NO registry lock held — while the source
-    /// currentness pin, acquired BEFORE the registry lock, is held throughout.
+    /// The phases exist for the lock discipline. The registry lock is held ONLY to
+    /// select/invalidate and later to install. The source is touched twice, both
+    /// times briefly: once to snapshot the material for this quantum, and once to
+    /// pin currentness across the installation. Decoding, sorting and projection
+    /// happen between those, holding NOTHING.
     fn apply(&self, incarnation: u64, request: ApplyRequest) -> ApplyOutcome {
-        // The pin comes FIRST and outlives the installation: it is a local of this
-        // function, and the registry lock is only ever taken beneath it.
-        let pin = self.source.pin();
-        let generation = pin.generation();
-
         // --- phase 1: invalidate + select under the lock, bounded to one quantum ---
         let selected: Vec<(SlotKey, u64)> = {
             let mut inner = self.inner.lock();
@@ -573,18 +593,14 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             let mut named: BTreeSet<SlotKey> = BTreeSet::new();
             match &request.batch.dirty {
                 DirtyCapabilities::RebuildAll => {
-                    if inner.recapture != Some(generation) {
-                        if inner.recapture.is_some() {
-                            self.metrics
-                                .recaptures_restarted
-                                .fetch_add(1, Ordering::AcqRel);
-                        }
-                        inner.recapture = Some(generation);
+                    if !inner.recapture_open {
+                        inner.recapture_open = true;
                         invalidated += inner.invalidate_and_queue_all();
                     }
-                    // An epoch already open at THIS generation keeps its remaining
-                    // set in `pending`; re-expanding would re-select the first
-                    // quantum forever.
+                    // An already-open epoch keeps its remaining set in `pending`;
+                    // re-expanding would re-select the first quantum forever. A
+                    // source generation that moves mid-epoch restarts it from
+                    // `settle`, where the COMMITTED generation is known.
                     named = inner.pending.clone();
                 }
                 DirtyCapabilities::Caps(caps) => {
@@ -613,7 +629,8 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             let mut selected = Vec::with_capacity(named.len().min(APPLY_QUANTUM));
             for key in named.into_iter().take(APPLY_QUANTUM) {
                 // Consuming the identity is safe now: authority was verified under
-                // THIS lock, and phase 3 re-queues anything it cannot install.
+                // THIS lock, and the install phase re-queues anything it cannot
+                // install.
                 inner.pending.remove(&key);
                 if let Some(slot) = inner.slots.get(&key) {
                     selected.push((key, slot.incarnation));
@@ -621,27 +638,74 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             }
             // Everything beyond the quantum stays AUTHORITATIVE in `pending`, not
             // in the wake flag.
-
-            if selected.is_empty() {
-                // Nothing to build. Re-marking here would spin, because another
-                // identical pass would select nothing again.
-                let outcome = settle(&inner, incarnation, generation);
-                if matches!(outcome, ApplyOutcome::Current { .. }) {
-                    inner.recapture = None;
-                }
-                return outcome;
-            }
             selected
         };
 
-        // --- phase 2: build OFF-LOCK, under the held pin ---
+        // A pass with nothing to build still has to settle — an epoch may have
+        // become complete, or may owe a coherence re-queue. It takes the same
+        // commit pin, so `Current` is never reported over an unverified generation.
+        if selected.is_empty() {
+            let generation = self.source.snapshot(&[]).generation();
+            let Some(commit) = self.source.pin_if_current(generation) else {
+                return ApplyOutcome::Superseded;
+            };
+            let generation = commit.generation();
+            let mut inner = self.inner.lock();
+            let outcome = settle(&mut inner, incarnation, generation, &self.metrics);
+            let owed = !inner.pending.is_empty();
+            drop(inner);
+            if owed {
+                self.work.mark();
+            }
+            return outcome;
+        }
+
+        // --- phase 2: BRIEF source capture, no registry lock held ---
+        let keys: Vec<SlotKey> = selected.iter().map(|(key, _)| key.clone()).collect();
+        let snapshot = self.source.snapshot(&keys);
+        let snapshot_generation = snapshot.generation();
+
+        // --- phase 3: reconstruct holding NOTHING ---
+        // Not the registry lock, and not the source's publication gate: this is the
+        // expensive part of a quantum, and blocking private-discovery ingest,
+        // expiry and floor mutation behind it is exactly what the snapshot/commit
+        // split exists to prevent (Kyra OLB-2B-E3b).
         let built: Vec<(SlotKey, u64, Vec<PrivateCapabilityProvider>)> = selected
             .iter()
-            .map(|(key, slot_incarnation)| (key.clone(), *slot_incarnation, pin.providers(key)))
+            .map(|(key, slot_incarnation)| {
+                (key.clone(), *slot_incarnation, snapshot.providers(key))
+            })
             .collect();
+        drop(snapshot);
 
-        // --- phase 3: reacquire and install CONDITIONALLY ---
-        // The source cannot have moved: the pin is still held. What can still have
+        // --- phase 4: the COMMIT pin, before the registry lock ---
+        let Some(commit) = self.source.pin_if_current(snapshot_generation) else {
+            // The source moved while we rebuilt. Install nothing, and put every
+            // still-live selected slot back.
+            let mut inner = self.inner.lock();
+            for (key, slot_incarnation, _) in &built {
+                if inner
+                    .slots
+                    .get(key)
+                    .is_some_and(|slot| slot.incarnation == *slot_incarnation)
+                {
+                    inner.pending.insert(key.clone());
+                }
+            }
+            self.metrics
+                .discarded_obsolete
+                .fetch_add(built.len() as u64, Ordering::AcqRel);
+            drop(inner);
+            // The movement itself owns a source-watch wake, but that wake alone
+            // carries no `registry_work` flag — and without it the requeued
+            // identities would not be unioned into the next pass's targets. Mark.
+            self.work.mark();
+            return ApplyOutcome::Superseded;
+        };
+        let generation = commit.generation();
+
+        // --- phase 5: registry lock BENEATH the commit pin; install ---
+        // The source cannot move while `commit` is held. What can still have
         // changed is the actor's authority and the slots themselves.
         let mut slot_moved = false;
         let outcome = {
@@ -700,38 +764,75 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 self.metrics.installs.fetch_add(1, Ordering::AcqRel);
             }
 
+            let settled = settle(&mut inner, incarnation, generation, &self.metrics);
             let owed = !inner.pending.is_empty();
-            let outcome = if slot_moved {
-                // Slot/demand-origin rejection: its wake is OURS to provide.
-                ApplyOutcome::Superseded
-            } else {
-                let outcome = settle(&inner, incarnation, generation);
-                if matches!(outcome, ApplyOutcome::Current { .. }) {
-                    inner.recapture = None;
-                }
-                outcome
-            };
             drop(inner);
             if owed {
                 // More quanta owed, or slot movement re-queued work: re-arm rather
                 // than looping inside this synchronous call.
                 self.work.mark();
             }
-            outcome
+            if slot_moved {
+                // Slot/demand-origin rejection: its wake is OURS to provide, and
+                // the re-queue above made `owed` true, so it was.
+                ApplyOutcome::Superseded
+            } else {
+                settled
+            }
         };
 
-        // `pin` drops HERE — after the installation, never before it.
+        // `commit` drops HERE — after the installation, never before it.
+        drop(commit);
         outcome
     }
 }
 
-/// `Current` only for a COMPLETE, coherent installation; `Progress` otherwise.
+/// Settle the pass: `Current` only when no work is owed.
 ///
-/// `Current` is the only outcome that may advance routing health, so a bounded
-/// quantum that left work owed must not claim it: publishing `Healthy` with slots
-/// this incarnation never rebuilt advertises routes nobody verified.
-fn settle(inner: &RegistryInner, incarnation: u64, generation: u64) -> ApplyOutcome {
-    if inner.is_complete(incarnation, generation) {
+/// `Current` is the only outcome that may advance routing health, so a pass that
+/// left work owed must not claim it.
+///
+/// Global coherence across every retained slot is required ONLY while a complete
+/// recapture epoch is open, and it is enforced by RE-QUEUEING the slots that are
+/// not coherent rather than by refusing to settle. Two consequences, both load
+/// bearing:
+///
+/// - ordinary `Caps` and first-demand work no longer reports `Progress` merely
+///   because unrelated slots legitimately sit at older generations — a pass that
+///   rebuilt everything it was asked to rebuild is complete (Kyra OLB-2B-E3b);
+/// - `Progress` now IMPLIES `pending` is non-empty, so the caller always marks.
+///   `Progress` with no owed work and no wake — which strands the actor — is
+///   unrepresentable rather than merely avoided.
+///
+/// Re-queueing is also what restarts a recapture whose source generation moved
+/// between quanta: the slots built against the older generation stop being
+/// coherent, so they go back on the queue and are rebuilt against this one.
+fn settle(
+    inner: &mut RegistryInner,
+    incarnation: u64,
+    generation: u64,
+    metrics: &RegistryMetrics,
+) -> ApplyOutcome {
+    if inner.recapture_open {
+        let mut displaced = 0;
+        for key in inner.incoherent_with(incarnation, generation) {
+            if inner.invalidate(&key) {
+                displaced += 1;
+            }
+            inner.pending.insert(key);
+        }
+        if displaced > 0 {
+            // Slots that WERE installed are no longer coherent with this commit:
+            // the source moved mid-epoch and the recapture restarts over them.
+            metrics
+                .facts_invalidated
+                .fetch_add(displaced, Ordering::AcqRel);
+            metrics.recaptures_restarted.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    if inner.pending.is_empty() {
+        inner.recapture_open = false;
         ApplyOutcome::Current {
             source_generation: generation,
         }
@@ -766,28 +867,32 @@ mod tests {
     type Hook = Box<dyn Fn() + Send + Sync>;
     type SharedHook = Arc<dyn Fn() + Send + Sync>;
 
-    /// A source the witnesses drive.
+    /// The observable state of the source the witnesses drive.
     ///
-    /// Its currentness pin is a real mutex over the query-visible generation, so
-    /// "pinned" is observable: nothing can advance the generation while a pin is
-    /// out, exactly as the scoped mutation-publication gate will behave in E3c.
-    struct TestSource {
+    /// `gate` stands in for BOTH the query-visible generation and the scoped
+    /// mutation-publication gate E3c will bind here: taking it is what a mutation
+    /// must do to advance. That makes "the gate is not held across reconstruction"
+    /// directly assertable — a rival mutation on another thread must be able to
+    /// take it mid-build.
+    struct SourceState {
         gate: parking_lot::Mutex<u64>,
-        /// Runs during a query, so a witness can move the world mid-build.
-        during_query: parking_lot::Mutex<Option<Hook>>,
-        /// Runs when the pin is RELEASED — i.e. strictly after installation.
-        on_release: parking_lot::Mutex<Option<SharedHook>>,
+        /// Runs during reconstruction, so a witness can move the world mid-build.
+        during_build: parking_lot::Mutex<Option<Hook>>,
+        /// Runs when the COMMIT pin is released — i.e. strictly after installation.
+        on_commit_release: parking_lot::Mutex<Option<SharedHook>>,
         queried: parking_lot::Mutex<Vec<SlotKey>>,
+        snapshots: AtomicU64,
         registry: parking_lot::Mutex<Option<Arc<NodeOrgRoutingRegistry>>>,
     }
 
-    impl TestSource {
+    impl SourceState {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 gate: parking_lot::Mutex::new(1),
-                during_query: parking_lot::Mutex::new(None),
-                on_release: parking_lot::Mutex::new(None),
+                during_build: parking_lot::Mutex::new(None),
+                on_commit_release: parking_lot::Mutex::new(None),
                 queried: parking_lot::Mutex::new(Vec::new()),
+                snapshots: AtomicU64::new(0),
                 registry: parking_lot::Mutex::new(None),
             })
         }
@@ -797,7 +902,10 @@ mod tests {
         fn reset(&self) {
             self.queried.lock().clear();
         }
-        /// Advance the query-visible generation. BLOCKS while a pin is held.
+        fn generation(&self) -> u64 {
+            *self.gate.lock()
+        }
+        /// Advance the query-visible generation, as a mutation+publication would.
         fn advance(&self) {
             *self.gate.lock() += 1;
         }
@@ -808,20 +916,28 @@ mod tests {
         }
     }
 
-    struct TestPin<'a> {
-        source: &'a TestSource,
-        generation: parking_lot::MutexGuard<'a, u64>,
+    struct TestSource(Arc<SourceState>);
+
+    /// Owns its bounded material: reconstruction touches no source lock.
+    struct TestSnapshot {
+        state: Arc<SourceState>,
+        generation: u64,
+        _captured: Vec<SlotKey>,
     }
 
-    impl SourceCurrentness for TestPin<'_> {
+    impl SourceSnapshot for TestSnapshot {
         fn generation(&self) -> u64 {
-            *self.generation
+            self.generation
         }
         fn providers(&self, key: &SlotKey) -> Vec<PrivateCapabilityProvider> {
-            self.source.queried.lock().push(key.clone());
-            self.source
-                .assert_no_registry_lock("no registry lock may be held across the source query");
-            let hook = self.source.during_query.lock().take();
+            self.state.queried.lock().push(key.clone());
+            self.state
+                .assert_no_registry_lock("no registry lock may be held across reconstruction");
+            assert!(
+                self.state.gate.try_lock().is_some(),
+                "no source/publication lock may be held across decode, sort or projection"
+            );
+            let hook = self.state.during_build.lock().take();
             if let Some(hook) = hook {
                 hook();
             }
@@ -829,9 +945,20 @@ mod tests {
         }
     }
 
-    impl Drop for TestPin<'_> {
+    struct TestCommitPin<'a> {
+        state: Arc<SourceState>,
+        generation: parking_lot::MutexGuard<'a, u64>,
+    }
+
+    impl SourceCommitPin for TestCommitPin<'_> {
+        fn generation(&self) -> u64 {
+            *self.generation
+        }
+    }
+
+    impl Drop for TestCommitPin<'_> {
         fn drop(&mut self) {
-            let hook = self.source.on_release.lock().clone();
+            let hook = self.state.on_commit_release.lock().clone();
             if let Some(hook) = hook {
                 hook();
             }
@@ -839,20 +966,40 @@ mod tests {
     }
 
     impl SlotSource for TestSource {
-        fn pin(&self) -> Box<dyn SourceCurrentness + '_> {
-            self.assert_no_registry_lock(
-                "the source pin must be acquired BEFORE the registry lock",
-            );
-            Box::new(TestPin {
-                source: self,
-                generation: self.gate.lock(),
+        fn snapshot(&self, keys: &[SlotKey]) -> Box<dyn SourceSnapshot> {
+            self.0
+                .assert_no_registry_lock("no registry lock may be held across the source snapshot");
+            // Brief: the gate guard is released before this returns.
+            let generation = *self.0.gate.lock();
+            self.0.snapshots.fetch_add(1, Ordering::AcqRel);
+            Box::new(TestSnapshot {
+                state: self.0.clone(),
+                generation,
+                _captured: keys.to_vec(),
             })
+        }
+
+        fn pin_if_current(
+            &self,
+            expected_generation: u64,
+        ) -> Option<Box<dyn SourceCommitPin + '_>> {
+            self.0.assert_no_registry_lock(
+                "the commit pin must be acquired BEFORE the registry lock",
+            );
+            let generation = self.0.gate.lock();
+            if *generation != expected_generation {
+                return None;
+            }
+            Some(Box::new(TestCommitPin {
+                state: self.0.clone(),
+                generation,
+            }))
         }
     }
 
     struct Fixture {
         registry: Arc<NodeOrgRoutingRegistry>,
-        source: Arc<TestSource>,
+        source: Arc<SourceState>,
         metrics: Arc<RegistryMetrics>,
     }
 
@@ -865,9 +1012,13 @@ mod tests {
     /// Builds a registry with actor incarnation 1 already live — the state
     /// `RoutingSupervisor` establishes before it applies anything.
     fn fixture() -> Fixture {
-        let source = TestSource::new();
+        let source = SourceState::new();
         let metrics: Arc<RegistryMetrics> = Arc::default();
-        let registry = NodeOrgRoutingRegistry::new(source.clone(), Arc::default(), metrics.clone());
+        let registry = NodeOrgRoutingRegistry::new(
+            Arc::new(TestSource(source.clone())),
+            Arc::default(),
+            metrics.clone(),
+        );
         *source.registry.lock() = Some(registry.clone());
         registry.activate_incarnation(1);
         Fixture {
@@ -1184,7 +1335,7 @@ mod tests {
             let recreated = recreated.clone();
             let successor = successor.clone();
             let target = target.clone();
-            *f.source.during_query.lock() = Some(Box::new(move || {
+            *f.source.during_build.lock() = Some(Box::new(move || {
                 // The real RAII release: last reference retires the slot.
                 drop(held.lock().take());
                 // A real family owner re-demands it — a FRESH incarnation.
@@ -1311,7 +1462,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(Some(hb)));
         {
             let hb_cell = hb_cell.clone();
-            *f.source.during_query.lock() = Some(Box::new(move || {
+            *f.source.during_build.lock() = Some(Box::new(move || {
                 // The actor's fence fires mid-build, and one slot also retires —
                 // that one must NOT be requeued, because it no longer exists.
                 registry.deactivate_incarnation(1);
@@ -1359,7 +1510,7 @@ mod tests {
             let observed = observed.clone();
             let c = c.clone();
             let d = d.clone();
-            *f.source.during_query.lock() = Some(Box::new(move || {
+            *f.source.during_build.lock() = Some(Box::new(move || {
                 assert!(
                     registry.base_facts(&c).is_none(),
                     "C's stale facts must already be gone while C rebuilds"
@@ -1531,16 +1682,13 @@ mod tests {
         );
         assert_eq!(f.registry.pending_slots(), 0);
 
-        let generation = *f.source.gate.lock();
+        let generation = f.source.generation();
         for k in &keys {
             let facts = f.registry.base_facts(k).expect("built");
             assert_eq!(facts.actor_incarnation, 1);
             assert_eq!(facts.source_generation, generation);
         }
-        assert!(
-            f.registry.inner.lock().recapture.is_none(),
-            "the epoch closed"
-        );
+        assert!(!f.registry.inner.lock().recapture_open, "the epoch closed");
     }
 
     /// A recapture whose source generation moved between quanta RESTARTS, so
@@ -1580,15 +1728,15 @@ mod tests {
         assert_eq!(f.metrics.recaptures_restarted(), 1);
         assert_eq!(
             f.registry.pending_slots(),
-            4,
-            "all 68 slots re-queued, one quantum consumed"
+            APPLY_QUANTUM,
+            "the 64 slots built against the OLD generation went back on the queue"
         );
 
         let third = f
             .registry
             .apply(1, request(true, DirtyCapabilities::RebuildAll));
         assert!(matches!(third, ApplyOutcome::Current { .. }));
-        let generation = *f.source.gate.lock();
+        let generation = f.source.generation();
         assert!(
             f.registry.inner.lock().slots.values().all(|slot| slot
                 .facts
@@ -1598,16 +1746,192 @@ mod tests {
         );
     }
 
+    /// Ordinary `Caps` work at a NEWER generation is COMPLETE.
+    ///
+    /// Rebuilding C at G+1 leaves unrelated D legitimately stamped at G. Demanding
+    /// global coherence outside a recapture epoch would report `Progress` for a
+    /// pass that finished everything it was asked to do — and with `pending` empty
+    /// there is nothing to mark, so the actor would park owing a recapture that
+    /// nothing will ever wake (Kyra OLB-2B-E3b).
+    #[test]
+    fn ordinary_caps_at_a_newer_generation_reports_current() {
+        let f = fixture();
+        let family = f.family();
+        let c = key(1, "nrpc:c");
+        let d = key(1, "nrpc:d");
+        let _hc = family.demand(c.clone()).expect("c");
+        let _hd = family.demand(d.clone()).expect("d");
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        let first = f.source.generation();
+
+        // The source moves, dirtying ONLY c.
+        f.source.advance();
+        let outcome = f.registry.apply(1, request(false, caps(&["nrpc:c"])));
+
+        let second = f.source.generation();
+        assert_ne!(first, second);
+        assert_eq!(
+            f.registry
+                .base_facts(&c)
+                .expect("c rebuilt")
+                .source_generation,
+            second
+        );
+        assert_eq!(
+            f.registry
+                .base_facts(&d)
+                .expect("d untouched")
+                .source_generation,
+            first,
+            "an unrelated slot legitimately keeps its older stamp"
+        );
+        assert_eq!(f.registry.pending_slots(), 0, "no work is owed");
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Current {
+                source_generation: second
+            },
+            "the pass rebuilt everything it was asked to; that IS complete"
+        );
+    }
+
+    /// First-demand work at a NEWER generation is likewise complete.
+    #[test]
+    fn first_demand_at_a_newer_generation_reports_current() {
+        let f = fixture();
+        let family = f.family();
+        let established = key(1, "nrpc:a");
+        let _ha = family.demand(established.clone()).expect("a");
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        let first = f.source.generation();
+
+        f.source.advance();
+        let fresh = key(1, "nrpc:b");
+        let _hb = family.demand(fresh.clone()).expect("b");
+
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        let second = f.source.generation();
+        assert_eq!(
+            f.registry
+                .base_facts(&fresh)
+                .expect("built")
+                .source_generation,
+            second
+        );
+        assert_eq!(
+            f.registry
+                .base_facts(&established)
+                .expect("retained")
+                .source_generation,
+            first,
+            "the unrelated retained slot was not rebuilt and did not need to be"
+        );
+        assert_eq!(f.registry.pending_slots(), 0);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Current {
+                source_generation: second
+            }
+        );
+    }
+
+    /// Structural: `Progress` is never returned with an empty queue, so it always
+    /// carries the wake its contract promises.
+    #[test]
+    fn progress_always_implies_owed_work() {
+        let f = fixture();
+        let mut family = f.family();
+        let mut held = Vec::new();
+        for index in 0..(APPLY_QUANTUM + 3) {
+            if index > 0 && index % MAX_HANDLES_PER_FAMILY == 0 {
+                family = f.family();
+            }
+            held.push(
+                family
+                    .demand(key(1, &format!("nrpc:q{index}")))
+                    .expect("demanded"),
+            );
+        }
+
+        for pass in 0..4 {
+            let outcome = f
+                .registry
+                .apply(1, request(true, DirtyCapabilities::RebuildAll));
+            let owed = f.registry.pending_slots();
+            match outcome {
+                ApplyOutcome::Progress { .. } => assert!(
+                    owed > 0,
+                    "pass {pass}: Progress with nothing owed strands the actor"
+                ),
+                ApplyOutcome::Current { .. } => assert_eq!(owed, 0, "pass {pass}"),
+                other => panic!("pass {pass}: unexpected {other:?}"),
+            }
+        }
+    }
+
     // ------------------------------------------------------------- currentness
 
-    /// The source currentness pin is acquired BEFORE the registry lock, is still
-    /// held across the query/build, and is released only AFTER installation.
+    /// A concurrent mutation lands DURING reconstruction — without waiting for it —
+    /// and the commit pin for the snapshot's generation then fails. Nothing stale
+    /// installs, and every still-live selected slot goes back on the queue.
     ///
-    /// The first two are asserted from inside `pin()` and `providers()`, which
-    /// would deadlock or fail if a registry lock were held. The third is asserted
-    /// from the pin's own `Drop`: it observes the installation already done.
+    /// This is the transition the snapshot/commit split exists for: the rival
+    /// mutation is performed from another thread with `try_lock`, so it FAILS
+    /// outright if reconstruction were holding the publication gate.
     #[test]
-    fn the_source_pin_outlives_the_installation() {
+    fn a_mutation_during_reconstruction_defeats_the_commit_pin_without_waiting() {
+        let f = fixture();
+        let target = key(1, "nrpc:a");
+        let _held = f.family().demand(target.clone()).expect("a");
+
+        let moved = Arc::new(AtomicBool::new(false));
+        {
+            let source = f.source.clone();
+            let moved = moved.clone();
+            *f.source.during_build.lock() = Some(Box::new(move || {
+                let source = source.clone();
+                let advanced = std::thread::spawn(move || match source.gate.try_lock() {
+                    Some(mut generation) => {
+                        *generation += 1;
+                        true
+                    }
+                    None => false,
+                })
+                .join()
+                .expect("mutation thread");
+                assert!(
+                    advanced,
+                    "a rival mutation must not have to wait on reconstruction"
+                );
+                moved.store(true, Ordering::Release);
+            }));
+        }
+
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(moved.load(Ordering::Acquire), "the mutation must have run");
+        assert_eq!(outcome, ApplyOutcome::Superseded);
+        assert_eq!(f.metrics.installs(), 0, "nothing stale installed");
+        assert!(f.registry.base_facts(&target).is_none());
+        assert_eq!(
+            f.registry.pending_slots(),
+            1,
+            "the live slot re-entered the authoritative queue"
+        );
+
+        // And the next pass, against the settled generation, completes.
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Current {
+                source_generation: f.source.generation()
+            }
+        );
+    }
+
+    /// The commit pin is acquired BEFORE the registry lock and is still held when
+    /// the facts land: its `Drop` observes the installation already done.
+    #[test]
+    fn the_commit_pin_outlives_the_installation() {
         let f = fixture();
         let target = key(1, "nrpc:a");
         let _held = f.family().demand(target.clone()).expect("a");
@@ -1618,11 +1942,11 @@ mod tests {
             let metrics = f.metrics.clone();
             let observed = observed.clone();
             let target = target.clone();
-            *f.source.on_release.lock() = Some(Arc::new(move || {
+            *f.source.on_commit_release.lock() = Some(Arc::new(move || {
                 assert_eq!(
                     metrics.installs(),
                     1,
-                    "the pin must still be held when the facts are installed"
+                    "the commit pin must still be held when the facts are installed"
                 );
                 assert!(registry.base_facts(&target).is_some());
                 observed.store(true, Ordering::Release);
@@ -1632,9 +1956,9 @@ mod tests {
         let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
         assert!(
             observed.load(Ordering::Acquire),
-            "the pin must have dropped"
+            "the commit pin must have dropped"
         );
-        let generation = *f.source.gate.lock();
+        let generation = f.source.generation();
         assert_eq!(
             outcome,
             ApplyOutcome::Current {
@@ -1647,45 +1971,23 @@ mod tests {
                 .expect("built")
                 .source_generation,
             generation,
-            "facts carry exactly the generation that was pinned"
+            "facts carry exactly the generation the commit pin proved current"
         );
     }
 
-    /// The source cannot advance while an application holds the pin — asserted
-    /// from inside the query, where the pin is provably still out.
+    /// No registry lock is held across the source snapshot or reconstruction, and
+    /// no source/publication lock is held across reconstruction — all asserted from
+    /// inside the seams themselves, which fail if either is held.
     #[test]
-    fn the_source_cannot_advance_while_an_application_is_pinned() {
-        let f = fixture();
-        let _held = f.family().demand(key(1, "nrpc:a")).expect("a");
-
-        let observed = Arc::new(AtomicBool::new(false));
-        {
-            let source = f.source.clone();
-            let observed = observed.clone();
-            *f.source.during_query.lock() = Some(Box::new(move || {
-                assert!(
-                    source.gate.try_lock().is_none(),
-                    "the query-visible generation is pinned for the whole application"
-                );
-                observed.store(true, Ordering::Release);
-            }));
-        }
-
-        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
-        assert!(observed.load(Ordering::Acquire));
-        assert!(
-            f.source.gate.try_lock().is_some(),
-            "and released once the application returns"
-        );
-    }
-
-    /// No registry lock is held while the source query/build seam executes —
-    /// asserted from inside the query, which would fail if one were.
-    #[test]
-    fn no_registry_lock_is_held_across_the_source_query() {
+    fn neither_lock_is_held_across_the_snapshot_or_reconstruction() {
         let f = fixture();
         let _held = f.family().demand(key(1, "nrpc:a")).expect("a");
         f.registry.apply(1, request(true, DirtyCapabilities::Clean));
         assert_eq!(f.source.queries(), vec![key(1, "nrpc:a")]);
+        assert_eq!(
+            f.source.snapshots.load(Ordering::Acquire),
+            1,
+            "one brief capture per quantum"
+        );
     }
 }
