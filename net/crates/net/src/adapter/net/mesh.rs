@@ -12305,7 +12305,7 @@ impl MeshNode {
         &self,
         key: &super::behavior::org_routing_registry::SlotKey,
     ) -> Option<Arc<super::behavior::org_routing_registry::SlotBaseFacts>> {
-        let facts = self.routing_registry.base_facts(key)?;
+        let facts = self.routing_registry.base_facts_unvalidated(key)?;
         // Revalidate the AUTHORITY these facts were built under against the live
         // one. Checking authority only when something happens to rebuild the slot
         // is not enough: a store that poisons AFTER installation moves no epoch

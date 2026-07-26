@@ -335,7 +335,7 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
         "the stale snapshot's commit pin must refuse"
     );
     assert!(
-        registry.base_facts(&key).is_none(),
+        registry.base_facts_unvalidated(&key).is_none(),
         "nothing from the stale snapshot installed"
     );
     assert_eq!(
@@ -361,7 +361,7 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
     );
     assert_eq!(
         registry
-            .base_facts(&key)
+            .base_facts_unvalidated(&key)
             .expect("installed")
             .epoch
             .generation,
@@ -1101,7 +1101,7 @@ async fn terminal_exhaustion_retires_max_stamped_facts_and_fences_readiness() {
         registry.apply(1, request.clone()),
         ApplyOutcome::Current { .. }
     ));
-    let warm = registry.base_facts(&key).expect("reconciled");
+    let warm = registry.base_facts_unvalidated(&key).expect("reconciled");
     assert_eq!(
         warm.epoch.authority,
         u64::MAX,
@@ -1126,7 +1126,7 @@ async fn terminal_exhaustion_retires_max_stamped_facts_and_fences_readiness() {
         "no identity was reused"
     );
     assert!(
-        registry.base_facts(&key).is_none(),
+        registry.base_facts_unvalidated(&key).is_none(),
         "the MAX-stamped fact was retired SYNCHRONOUSLY — no reader involved"
     );
     assert_eq!(
@@ -1166,7 +1166,7 @@ async fn terminal_exhaustion_retires_max_stamped_facts_and_fences_readiness() {
         0,
         "and the pass DISCARDS rather than re-queues — no terminal spin"
     );
-    assert!(registry.base_facts(&late).is_none());
+    assert!(registry.base_facts_unvalidated(&late).is_none());
 }
 
 /// (11c4) The STORE-GENERATION arm of the exhaustion fence (review-pass-3 §1):
@@ -1492,7 +1492,7 @@ async fn a_delayed_reader_does_not_delete_a_newer_artifact() {
 
     let live = node
         .routing_registry
-        .base_facts(&key)
+        .base_facts_unvalidated(&key)
         .expect("the current artifact survives");
     assert!(
         Arc::ptr_eq(&live, &current),
@@ -1503,6 +1503,74 @@ async fn a_delayed_reader_does_not_delete_a_newer_artifact() {
         0,
         "and must not re-queue work that was already done"
     );
+}
+
+/// (11e) The INCARNATION FENCE at the node read seam (review-pass-3 §5).
+///
+/// This is the headline "incarnation fencing" property and nothing witnessed it:
+/// replacing `.allows(facts.actor_incarnation).then_some(facts)` with
+/// `Some(facts)` left every test in `org_routing.rs`, `org_routing_registry.rs`
+/// and this module green. It matters because the registry genuinely still HOLDS
+/// a dead incarnation's facts — `deactivate_incarnation` clears `live_actor`
+/// only, and invalidation waits for a successor — so during restart backoff and
+/// both terminal fenced states this check is the only thing between those
+/// artifacts and a caller.
+///
+/// Everything else about the facts is deliberately CURRENT here: same authority
+/// epoch, same floors, not `Unserved`, not expired. The health fence is the sole
+/// variable.
+#[tokio::test]
+async fn the_read_seam_fences_a_dead_incarnations_facts() {
+    use crate::adapter::net::behavior::org_routing::RoutingHealth;
+    use crate::adapter::net::behavior::org_routing_registry::{
+        SlotBaseFacts, SourceEpoch, SourceFacts,
+    };
+
+    let node = node().await;
+    let key = slot(29, "nrpc:incarnation-fence");
+    let facts = Arc::new(SlotBaseFacts {
+        providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
+        epoch: SourceEpoch {
+            generation: node.scoped_discovery.lock().revision(),
+            authority: node.routing_authority.epoch(),
+            floor_generation: 0,
+            poisoned: false,
+        },
+        actor_incarnation: 1,
+        slot_incarnation: 1,
+        earliest_expiry: u64::MAX,
+    });
+    node.routing_registry
+        .install_facts_for_test(key.clone(), facts.clone());
+
+    node.routing_health
+        .store(Arc::new(RoutingHealth::Healthy { incarnation: 1 }));
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "precondition: under its OWN live incarnation the artifact serves"
+    );
+
+    for (health, why) in [
+        (
+            RoutingHealth::Fenced,
+            "a fenced plane must serve nothing, however current the artifact is",
+        ),
+        (
+            RoutingHealth::Rebuilding { incarnation: 1 },
+            "nor may a rebuilding one serve what its own incarnation already built",
+        ),
+        (
+            RoutingHealth::Healthy { incarnation: 2 },
+            "and a SUCCESSOR incarnation does not inherit its predecessor's artifacts",
+        ),
+    ] {
+        node.routing_health.store(Arc::new(health));
+        assert!(node.org_routing_base_facts(&key).is_none(), "{why}");
+        assert!(
+            node.routing_registry.base_facts_unvalidated(&key).is_some(),
+            "…and the raw accessor still returns it, which is why the SEAM has to fence"
+        );
+    }
 }
 
 /// (12) Poisoning revocation authority COLDS already-cached facts and re-queues
@@ -1620,7 +1688,7 @@ async fn authority_only_movement_invalidates_and_requeues_everything() {
     // movement" from "invalidated the first time someone happened to look".
     // Blocker 2 is specifically about the actor learning WITHOUT a read.
     assert!(
-        node.routing_registry.base_facts(&key).is_none(),
+        node.routing_registry.base_facts_unvalidated(&key).is_none(),
         "authority movement must SYNCHRONOUSLY invalidate every retained fact"
     );
     assert_eq!(
@@ -1737,7 +1805,11 @@ async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
     let live = node.routing_authority.epoch();
     for key in &keys {
         assert_eq!(
-            registry.base_facts(key).expect("built").epoch.authority,
+            registry
+                .base_facts_unvalidated(key)
+                .expect("built")
+                .epoch
+                .authority,
             live,
             "one authority across the whole retained set"
         );
@@ -2058,12 +2130,14 @@ async fn authority_invalidation_spares_successor_facts() {
     node.routing_registry.invalidate_authority_older_than(live);
 
     assert!(
-        node.routing_registry.base_facts(&stale_key).is_none(),
+        node.routing_registry
+            .base_facts_unvalidated(&stale_key)
+            .is_none(),
         "the retired-authority facts are invalidated"
     );
     let survivor = node
         .routing_registry
-        .base_facts(&fresh_key)
+        .base_facts_unvalidated(&fresh_key)
         .expect("successor facts survive");
     assert!(
         Arc::ptr_eq(&survivor, &successor),
@@ -2451,7 +2525,7 @@ async fn steady_poison_settles_current_over_an_unserved_source() {
     );
     assert_eq!(registry.pending_slots(), 0, "nothing is owed");
     let facts = registry
-        .base_facts(&key)
+        .base_facts_unvalidated(&key)
         .expect("the slot IS reconciled — with unusable-source facts");
     assert!(
         matches!(
@@ -2601,7 +2675,7 @@ async fn a_poison_recovery_retires_the_unserved_reconstruction_it_left() {
         ),
         "steady poison converges (Option A)"
     );
-    let stranded = registry.base_facts(&key).expect("reconciled");
+    let stranded = registry.base_facts_unvalidated(&key).expect("reconciled");
     assert!(
         matches!(stranded.providers, SourceFacts::Unserved),
         "precondition: the reconstruction serves nothing"
@@ -2641,7 +2715,7 @@ async fn a_poison_recovery_retires_the_unserved_reconstruction_it_left() {
          floor"
     );
     assert!(
-        registry.base_facts(&key).is_none(),
+        registry.base_facts_unvalidated(&key).is_none(),
         "and it must RETIRE the Unserved reconstruction, not leave it reconciled"
     );
     assert_eq!(
@@ -2656,7 +2730,9 @@ async fn a_poison_recovery_retires_the_unserved_reconstruction_it_left() {
         matches!(registry.apply(1, request), ApplyOutcome::Current { .. }),
         "the successor quantum settles"
     );
-    let successor = registry.base_facts(&key).expect("reconciled again");
+    let successor = registry
+        .base_facts_unvalidated(&key)
+        .expect("reconciled again");
     assert!(
         !successor.epoch.poisoned,
         "the successor is stamped against the RECOVERED authority"
@@ -2784,7 +2860,7 @@ async fn a_poison_mark_that_raises_no_floor_wakes_routing_without_a_reader() {
         registry.apply(1, request.clone()),
         ApplyOutcome::Current { .. }
     ));
-    let warm = registry.base_facts(&key).expect("reconciled");
+    let warm = registry.base_facts_unvalidated(&key).expect("reconciled");
     assert!(
         !warm.epoch.poisoned,
         "precondition: warm again, stamped against the recovered authority"
@@ -2818,7 +2894,7 @@ async fn a_poison_mark_that_raises_no_floor_wakes_routing_without_a_reader() {
         "an empty-raise MARK owes the same wake as the recovery clear"
     );
     assert!(
-        registry.base_facts(&key).is_none(),
+        registry.base_facts_unvalidated(&key).is_none(),
         "the pre-poison reconstruction was RETIRED, not left reconciled"
     );
     assert_eq!(registry.pending_slots(), 1, "re-queuing the exact slot");
@@ -2828,7 +2904,9 @@ async fn a_poison_mark_that_raises_no_floor_wakes_routing_without_a_reader() {
         registry.apply(1, request),
         ApplyOutcome::Current { .. }
     ));
-    let successor = registry.base_facts(&key).expect("reconciled again");
+    let successor = registry
+        .base_facts_unvalidated(&key)
+        .expect("reconciled again");
     assert!(
         matches!(successor.providers, SourceFacts::Unserved),
         "Current over an Unserved source"
@@ -2919,7 +2997,9 @@ async fn a_reader_retires_unserved_facts_once_their_poison_clears() {
         "the obsolete reconstruction still reads cold"
     );
     assert!(
-        node.routing_registry.base_facts(&key_a).is_none(),
+        node.routing_registry
+            .base_facts_unvalidated(&key_a)
+            .is_none(),
         "but the reader RETIRED it rather than leaving it reconciled forever"
     );
     assert_eq!(node.org_routing_slots().1, 1, "re-queuing the exact slot");
@@ -2931,7 +3011,9 @@ async fn a_reader_retires_unserved_facts_once_their_poison_clears() {
         .install_facts_for_test(key_b.clone(), poisoned_facts(recovered_floor));
     assert!(node.org_routing_base_facts(&key_b).is_none());
     assert!(
-        node.routing_registry.base_facts(&key_b).is_none(),
+        node.routing_registry
+            .base_facts_unvalidated(&key_b)
+            .is_none(),
         "a fact differing from the live authority ONLY in the poison bit must \
          still be retired"
     );

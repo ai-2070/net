@@ -702,9 +702,23 @@ impl NodeOrgRoutingRegistry {
         }
     }
 
-    /// The retained base facts for `key`, if the slot exists AND currently holds
-    /// valid facts. `None` is the deterministic UNRETAINED/cold outcome.
-    pub(crate) fn base_facts(&self, key: &SlotKey) -> Option<Arc<SlotBaseFacts>> {
+    /// The RAW retained base facts for `key` — retention only, with NO
+    /// revalidation whatsoever. `None` is the deterministic UNRETAINED outcome.
+    ///
+    /// **Not a read seam. Production callers want `MeshNode::org_routing_base_facts`**
+    /// (`mesh.rs`), which is the validated twin: it re-checks the live authority
+    /// epoch, the revocation floor generation, the poison bit, terminal
+    /// exhaustion, `Unserved`, wall-clock expiry and the incarnation fence, and
+    /// retires the artifact when any of them says no. NONE of that lives here.
+    ///
+    /// Named for what it is rather than left as the more discoverable of two
+    /// similarly-named accessors (review-pass-3 §7): the code that holds a
+    /// registry handle would otherwise reach for this one by default, and every
+    /// check above is a security property the warmed-call consumer must not be
+    /// able to skip by accident. Crate-private, and its remaining callers are
+    /// witnesses asserting on RETENTION specifically — several of them precisely
+    /// to prove that the seam fences something the registry still holds.
+    pub(crate) fn base_facts_unvalidated(&self, key: &SlotKey) -> Option<Arc<SlotBaseFacts>> {
         self.inner.lock().slots.get(key)?.facts.clone()
     }
 
@@ -1589,7 +1603,10 @@ mod tests {
         let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
         assert_eq!(f.source.queries(), vec![key(1, "nrpc:a")]);
         assert!(matches!(outcome, ApplyOutcome::Current { .. }));
-        let facts = f.registry.base_facts(&key(1, "nrpc:a")).expect("built");
+        let facts = f
+            .registry
+            .base_facts_unvalidated(&key(1, "nrpc:a"))
+            .expect("built");
         assert_eq!(facts.slot_incarnation, 2, "family 1, then this slot");
         assert_eq!(facts.actor_incarnation, 1);
         assert_eq!(f.registry.pending_slots(), 0);
@@ -1705,7 +1722,7 @@ mod tests {
             "no live slot was evicted to make room"
         );
         assert!(
-            f.registry.base_facts(&beyond).is_none(),
+            f.registry.base_facts_unvalidated(&beyond).is_none(),
             "the refused key is cold/unretained"
         );
     }
@@ -1759,11 +1776,17 @@ mod tests {
         let a = f.family().demand(key(1, "nrpc:a")).expect("a");
         let b = f.family().demand(key(1, "nrpc:a")).expect("b");
         f.registry.apply(1, request(true, DirtyCapabilities::Clean));
-        assert!(f.registry.base_facts(&key(1, "nrpc:a")).is_some());
+        assert!(f
+            .registry
+            .base_facts_unvalidated(&key(1, "nrpc:a"))
+            .is_some());
 
         drop(a);
         assert_eq!(f.registry.retained_slots(), 1, "one reference remains");
-        assert!(f.registry.base_facts(&key(1, "nrpc:a")).is_some());
+        assert!(f
+            .registry
+            .base_facts_unvalidated(&key(1, "nrpc:a"))
+            .is_some());
 
         drop(b);
         assert_eq!(
@@ -1772,7 +1795,10 @@ mod tests {
             "the last reference retired it"
         );
         assert_eq!(f.metrics.slots_retired(), 1);
-        assert!(f.registry.base_facts(&key(1, "nrpc:a")).is_none());
+        assert!(f
+            .registry
+            .base_facts_unvalidated(&key(1, "nrpc:a"))
+            .is_none());
     }
 
     /// A build in flight cannot resurrect a slot retired and re-demanded beneath
@@ -1821,7 +1847,7 @@ mod tests {
             "slot movement supersedes the attempt"
         );
         assert!(
-            f.registry.base_facts(&target).is_none(),
+            f.registry.base_facts_unvalidated(&target).is_none(),
             "the artifact for the dead incarnation was discarded, not installed"
         );
         assert_eq!(f.metrics.discarded_obsolete(), 1);
@@ -1858,14 +1884,19 @@ mod tests {
         let _a = family.demand(key(1, "nrpc:a")).expect("a");
         let _b = family.demand(key(1, "nrpc:b")).expect("b");
         f.registry.apply(1, request(true, DirtyCapabilities::Clean));
-        assert!(f.registry.base_facts(&key(1, "nrpc:a")).is_some());
+        assert!(f
+            .registry
+            .base_facts_unvalidated(&key(1, "nrpc:a"))
+            .is_some());
         assert_eq!(f.registry.pending_slots(), 0);
 
         f.registry.deactivate_incarnation(1);
         f.registry.activate_incarnation(2);
 
         assert!(
-            f.registry.base_facts(&key(1, "nrpc:a")).is_none(),
+            f.registry
+                .base_facts_unvalidated(&key(1, "nrpc:a"))
+                .is_none(),
             "nothing a dead incarnation built stays readable"
         );
         assert_eq!(
@@ -2029,8 +2060,8 @@ mod tests {
         let _hc = family.demand(c.clone()).expect("c");
         let _hd = family.demand(d.clone()).expect("d");
         f.registry.apply(1, request(true, DirtyCapabilities::Clean));
-        assert!(f.registry.base_facts(&c).is_some());
-        assert!(f.registry.base_facts(&d).is_some());
+        assert!(f.registry.base_facts_unvalidated(&c).is_some());
+        assert!(f.registry.base_facts_unvalidated(&d).is_some());
 
         let observed = Arc::new(AtomicBool::new(false));
         {
@@ -2040,11 +2071,11 @@ mod tests {
             let d = d.clone();
             *f.source.during_build.lock() = Some(Box::new(move || {
                 assert!(
-                    registry.base_facts(&c).is_none(),
+                    registry.base_facts_unvalidated(&c).is_none(),
                     "C's stale facts must already be gone while C rebuilds"
                 );
                 assert!(
-                    registry.base_facts(&d).is_some(),
+                    registry.base_facts_unvalidated(&d).is_some(),
                     "D was not named by the delta and keeps its facts"
                 );
                 observed.store(true, Ordering::Release);
@@ -2055,7 +2086,10 @@ mod tests {
         f.registry.apply(1, request(false, caps(&["nrpc:c"])));
         assert!(observed.load(Ordering::Acquire), "the hook must have run");
         assert_eq!(f.source.queries(), vec![c.clone()]);
-        assert!(f.registry.base_facts(&c).is_some(), "and is rebuilt after");
+        assert!(
+            f.registry.base_facts_unvalidated(&c).is_some(),
+            "and is rebuilt after"
+        );
     }
 
     /// Caps invalidation covers slots BEYOND the quantum: a slot that will not be
@@ -2077,7 +2111,9 @@ mod tests {
         // Two passes to build them all.
         f.registry.apply(1, request(true, DirtyCapabilities::Clean));
         f.registry.apply(1, request(true, DirtyCapabilities::Clean));
-        assert!(keys.iter().all(|k| f.registry.base_facts(k).is_some()));
+        assert!(keys
+            .iter()
+            .all(|k| f.registry.base_facts_unvalidated(k).is_some()));
 
         let tags: Vec<String> = (0..(APPLY_QUANTUM + 8))
             .map(|index| format!("nrpc:q{index}"))
@@ -2097,7 +2133,7 @@ mod tests {
         );
         assert_eq!(
             keys.iter()
-                .filter(|k| f.registry.base_facts(k).is_some())
+                .filter(|k| f.registry.base_facts_unvalidated(k).is_some())
                 .count(),
             APPLY_QUANTUM,
             "EVERY affected slot was invalidated; only the quantum was rebuilt"
@@ -2212,7 +2248,7 @@ mod tests {
 
         let generation = f.source.generation();
         for k in &keys {
-            let facts = f.registry.base_facts(k).expect("built");
+            let facts = f.registry.base_facts_unvalidated(k).expect("built");
             assert_eq!(facts.actor_incarnation, 1);
             assert_eq!(facts.epoch.generation, generation);
         }
@@ -2300,7 +2336,7 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(
             f.registry
-                .base_facts(&c)
+                .base_facts_unvalidated(&c)
                 .expect("c rebuilt")
                 .epoch
                 .generation,
@@ -2308,7 +2344,7 @@ mod tests {
         );
         assert_eq!(
             f.registry
-                .base_facts(&d)
+                .base_facts_unvalidated(&d)
                 .expect("d untouched")
                 .epoch
                 .generation,
@@ -2343,7 +2379,7 @@ mod tests {
         let second = f.source.generation();
         assert_eq!(
             f.registry
-                .base_facts(&fresh)
+                .base_facts_unvalidated(&fresh)
                 .expect("built")
                 .epoch
                 .generation,
@@ -2351,7 +2387,7 @@ mod tests {
         );
         assert_eq!(
             f.registry
-                .base_facts(&established)
+                .base_facts_unvalidated(&established)
                 .expect("retained")
                 .epoch
                 .generation,
@@ -2443,7 +2479,7 @@ mod tests {
         assert!(moved.load(Ordering::Acquire), "the mutation must have run");
         assert_eq!(outcome, ApplyOutcome::Superseded);
         assert_eq!(f.metrics.installs(), 0, "nothing stale installed");
-        assert!(f.registry.base_facts(&target).is_none());
+        assert!(f.registry.base_facts_unvalidated(&target).is_none());
         assert_eq!(
             f.registry.pending_slots(),
             1,
@@ -2480,7 +2516,7 @@ mod tests {
                     1,
                     "the commit pin must still be held when the facts are installed"
                 );
-                assert!(registry.base_facts(&target).is_some());
+                assert!(registry.base_facts_unvalidated(&target).is_some());
                 observed.store(true, Ordering::Release);
             }));
         }
@@ -2499,7 +2535,7 @@ mod tests {
         );
         assert_eq!(
             f.registry
-                .base_facts(&target)
+                .base_facts_unvalidated(&target)
                 .expect("built")
                 .epoch
                 .generation,
