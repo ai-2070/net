@@ -388,6 +388,10 @@ struct RegistryInner {
     /// later `RebuildAll` must NOT re-expand while it is open: re-expanding would
     /// re-select the first quantum forever and the recapture would never terminate.
     recapture_open: bool,
+    /// The last slot identity a quantum served, so the next one resumes strictly
+    /// after it and wraps (review-pass-3 §9). Fair rotation over `pending`
+    /// rather than "the first `APPLY_QUANTUM` in key order, every pass".
+    select_cursor: Option<SlotKey>,
 }
 
 impl RegistryInner {
@@ -986,8 +990,38 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 .facts_invalidated
                 .fetch_add(invalidated, Ordering::AcqRel);
 
-            let mut selected = Vec::with_capacity(named.len().min(APPLY_QUANTUM));
-            for key in named.into_iter().take(APPLY_QUANTUM) {
+            // ROTATED, not key-ordered (review-pass-3 §9). Taking the first
+            // `APPLY_QUANTUM` in `(scope, capability)` order every pass starves a
+            // subset under sustained churn: if each pass re-dirties at least a
+            // quantum's worth of slots whose keys sort BELOW a victim's, the
+            // victim is re-outsorted every pass and never rebuilds — cold reads
+            // and permanent `pending` occupancy for as long as the churn lasts,
+            // even though every pass settles. Distinct from the whole-recapture
+            // starvation in review-pass-2 §2, which is why the epoch fix does not
+            // cover it.
+            //
+            // The cursor resumes strictly AFTER the last key served, wrapping
+            // once. That is fair by construction — a slot the cursor has passed
+            // cannot be re-served until it comes round again — and it costs
+            // nothing on the common path, where `named` fits in one quantum.
+            let rotated: Vec<SlotKey> = match &inner.select_cursor {
+                Some(cursor) => named
+                    .range((
+                        std::ops::Bound::Excluded(cursor.clone()),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .chain(named.range((
+                        std::ops::Bound::Unbounded,
+                        std::ops::Bound::Included(cursor.clone()),
+                    )))
+                    .take(APPLY_QUANTUM)
+                    .cloned()
+                    .collect(),
+                None => named.iter().take(APPLY_QUANTUM).cloned().collect(),
+            };
+            inner.select_cursor = rotated.last().cloned().or(inner.select_cursor.take());
+            let mut selected = Vec::with_capacity(rotated.len());
+            for key in rotated {
                 // Consuming the identity is safe now: authority was verified under
                 // THIS lock, and the install phase re-queues anything it cannot
                 // install.
@@ -2139,6 +2173,69 @@ mod tests {
             "EVERY affected slot was invalidated; only the quantum was rebuilt"
         );
         assert_eq!(f.registry.pending_slots(), 8);
+    }
+
+    /// review-pass-3 §9 — sustained low-sorting churn must not starve a
+    /// high-sorting pending slot.
+    ///
+    /// Selection used to take the first `APPLY_QUANTUM` in `(scope, capability)`
+    /// order on EVERY pass, with no cursor, FIFO or aging. So if each pass
+    /// re-dirties a full quantum of slots whose keys sort below a victim's, the
+    /// victim is re-outsorted every pass and never rebuilds — cold reads and
+    /// permanent `pending` occupancy for as long as the churn lasts. This is not
+    /// review-pass-2 §2's whole-recapture starvation: every pass here settles,
+    /// and the loss is confined to a subset.
+    #[test]
+    fn sustained_low_sorting_churn_cannot_starve_a_high_sorting_slot() {
+        let f = fixture();
+        let mut family = f.family();
+        let mut held = Vec::new();
+        let mut entries: Vec<(SlotKey, String)> = Vec::new();
+        for index in 0..=APPLY_QUANTUM {
+            if index > 0 && index % MAX_HANDLES_PER_FAMILY == 0 {
+                family = f.family();
+            }
+            let tag = format!("nrpc:q{index:03}");
+            let slot = key(1, &tag);
+            held.push(family.demand(slot.clone()).expect("demanded"));
+            entries.push((slot, tag));
+        }
+        // Capability ids are hashes, so SELECTION order is not tag order — pick
+        // the victim by the order the registry actually sorts in.
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let victim = entries.last().expect("victim").0.clone();
+        let churning: Vec<&str> = entries[..APPLY_QUANTUM]
+            .iter()
+            .map(|(_, tag)| tag.as_str())
+            .collect();
+
+        // Warm everything, then cold the victim so it is the one identity owed
+        // besides the churn.
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(f.registry.base_facts_unvalidated(&victim).is_some());
+        f.registry.invalidate_for_test(&victim);
+
+        let mut served_on = None;
+        for pass in 0..4 {
+            f.source.reset();
+            f.registry.apply(1, request(true, caps(&churning)));
+            assert_eq!(
+                f.source.queries().len(),
+                APPLY_QUANTUM,
+                "pass {pass}: the quantum is saturated, so this is genuine contention \
+                 rather than a pass with room to spare"
+            );
+            if f.registry.base_facts_unvalidated(&victim).is_some() {
+                served_on = Some(pass);
+                break;
+            }
+        }
+        assert!(
+            served_on.is_some(),
+            "the highest-sorting slot must come round: without rotation the churn \
+             below it wins every pass, forever"
+        );
     }
 
     /// `Caps(C)` touches only C's indexed slots; `RebuildAll` touches every
