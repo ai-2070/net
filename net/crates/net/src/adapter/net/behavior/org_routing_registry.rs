@@ -162,6 +162,18 @@ pub(crate) struct SourceEpoch {
     /// facts built against floors F0 are detectably stale once F1 is live, even
     /// during that notification gap (Kyra OLB-2B-E3c).
     pub floor_generation: u64,
+    /// Whether the revocation authority was DURABILITY-POISONED when the facts
+    /// were built.
+    ///
+    /// Carried rather than re-read live, because both directions matter and only
+    /// the comparison distinguishes them. Poison rising invalidates facts built
+    /// without it. Poison CLEARING invalidates facts built with it — a recovery
+    /// republishes the same durable view, so it raises no floor, and facts
+    /// reconstructed as `Unserved` under poison would otherwise stay reconciled
+    /// forever. Reading live poison as an unconditional staleness trigger would
+    /// instead churn every read under STEADY poison, which is why it is an
+    /// epoch field and not a predicate (Kyra OLB-2B-E3c closure).
+    pub poisoned: bool,
 }
 
 /// An opaque, comparable summary of EVERY authority input a snapshot was taken
@@ -1259,6 +1271,7 @@ mod tests {
                 generation: *self.generation,
                 authority: 0,
                 floor_generation: 0,
+                poisoned: false,
             }
         }
     }

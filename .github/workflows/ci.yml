@@ -83,8 +83,13 @@ jobs:
       # cold, that Drop fences rather than detaching, that a concurrent shutdown
       # cannot return while routing registration is unresolved, that revocation
       # authority is pinned through installation and revalidated at read, and that
-      # authority-only movement invalidates and requeues. Losing any of them
-      # silently would be worse than losing them loudly.
+      # authority-only movement invalidates and requeues -- plus, since the
+      # poison closure, that a durability POISON is immobile through settlement
+      # in BOTH directions (a production recovery clear cannot land under a live
+      # publication pin), and that leaving steady poison is observable: the
+      # recovery wakes routing proactively AND a reader retires the stranded
+      # `Unserved` reconstruction on its own. Losing any of them silently would be
+      # worse than losing them loudly.
       #
       # NOTE: they are gated `#[cfg(test)]`, NOT `feature = "fixtures"` —
       # `$UNIT_FEATURES` deliberately excludes `fixtures`, so a fixtures gate
@@ -93,7 +98,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=28
+          MIN=31
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -113,6 +118,9 @@ jobs:
           a_snapshot_cannot_straddle_a_store_publication
           a_publication_cannot_occupy_the_gap_between_validation_and_settlement
           poison_cannot_occupy_the_gap_between_validation_and_settlement
+          a_recovery_poison_clear_cannot_land_under_a_publication_pin
+          a_poison_recovery_retires_the_unserved_reconstruction_it_left
+          a_reader_retires_unserved_facts_once_their_poison_clears
           an_exhausted_store_generation_stops_certified_emission
           an_exhausted_authority_epoch_fences_rather_than_aliasing
           an_unserved_scope_reads_cold_rather_than_authoritatively_empty"

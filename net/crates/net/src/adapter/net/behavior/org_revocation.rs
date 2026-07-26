@@ -508,12 +508,24 @@ struct StoreCore {
     /// FROZEN ORDER: `poison_gate` → `live`. Every poison transition on a live
     /// core takes this before any later `live.write()`, and every pin takes it
     /// before `live.read()`, so no cycle is reachable.
+    ///
+    /// BOTH directions. A recovery CLEAR is as load-bearing as a mark: a pin
+    /// that validated `poisoned == true` and then watched the clear land mid
+    /// settlement reports `Current` for an authority that is already gone. Every
+    /// live-core transition therefore goes through [`StoreCore::mark_poisoned`]
+    /// / [`StoreCore::clear_poison`], never the raw path-registry helpers
+    /// (Kyra OLB-2B-E3c closure).
     poison_gate: Mutex<()>,
     /// Test-only: fired immediately before a publish attempts `live.write()`, so
     /// a witness can acknowledge that a publisher REACHED the blocked
     /// acquisition instead of inferring it from elapsed time.
     #[cfg(test)]
     publish_blocking_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: the same acknowledgment for `poison_gate` — fired immediately
+    /// before a poison transition attempts the lock. Elapsed time is not
+    /// evidence that a contender reached the gate.
+    #[cfg(test)]
+    poison_blocking_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Raise subscribers, each with a removable token. A REGISTRY,
     /// not a single slot (review-9 addendum): registering a second
     /// observer must never silently steal the first one's
@@ -664,6 +676,71 @@ impl StoreCore {
         }
     }
 
+    /// Wake every subscriber for an authority change that raised NO floor.
+    ///
+    /// [`Self::notify`] returns immediately on an empty raise set, which is
+    /// right for a publication that changed nothing. A POISON CLEAR is not that:
+    /// recovery republishes the same durable view, so it raises no floor, yet
+    /// what this node is permitted to serve just went from "nothing" back to the
+    /// real material. Without an explicit wake the routing registry stays
+    /// reconciled to obsolete `Unserved` facts until some reader happens to trip
+    /// the lazy epoch check (Kyra OLB-2B-E3c closure).
+    ///
+    /// Callers MUST invoke this with no file lock, reload guard, `poison_gate`
+    /// or `live` guard held — a subscriber takes the routing authority gate, and
+    /// a routing settlement holding that gate takes `poison_gate` + `live.read`.
+    fn notify_authority_changed(&self) {
+        let subscribers: Vec<FloorsRaisedCallback> = self
+            .subscribers
+            .read()
+            .iter()
+            .map(|(_, callback)| callback.clone())
+            .collect();
+        for callback in subscribers {
+            callback(&[]);
+        }
+    }
+
+    /// Mark this live core's path poisoned, under `poison_gate`.
+    ///
+    /// The ONLY way production marks a path that has a live core. Calling the
+    /// raw path-registry helper instead would let the mark land inside a
+    /// [`PublicationPin`]'s validate-then-settle window.
+    fn mark_poisoned(&self) {
+        self.run_poison_blocking_hook();
+        let _gate = self.poison_gate.lock();
+        mark_poisoned(&self.backing_id, &self.path);
+    }
+
+    /// Clear this live core's path poison, under `poison_gate`.
+    ///
+    /// The inverse of [`Self::mark_poisoned`] and exactly as load-bearing: a pin
+    /// that validated `poisoned == true` and then watched a raw clear land would
+    /// settle `Current` over a reconstruction built for an authority that no
+    /// longer exists (Kyra OLB-2B-E3c closure).
+    ///
+    /// Deliberately does NOT notify: every caller still holds the interprocess
+    /// file lock here. The wake is [`Self::notify_authority_changed`], invoked
+    /// once the caller has released everything.
+    fn clear_poison(&self) {
+        self.run_poison_blocking_hook();
+        let _gate = self.poison_gate.lock();
+        clear_poison(&self.backing_id, &self.path);
+    }
+
+    /// Fire the poison-gate acknowledgment hook if a test installed one. Runs
+    /// immediately BEFORE the blocking acquisition, so a witness proves a
+    /// contender reached the gate rather than inferring it from elapsed time.
+    fn run_poison_blocking_hook(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.poison_blocking_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
     /// Remove the subscriber registered under `token`. Unknown tokens
     /// are a no-op. Called by [`RaiseSubscription`]'s Drop through a
     /// `Weak<StoreCore>` (R2-2), so a subscription is retired
@@ -671,6 +748,29 @@ impl StoreCore {
     /// facade `Drop` a capture cycle could keep from running.
     fn remove_subscriber(&self, token: u64) {
         self.subscribers.write().retain(|(t, _)| *t != token);
+    }
+}
+
+/// Run `mutate` with the POISON GATE of the live core backing `id`, if one
+/// exists.
+///
+/// The construction paths can poison a path BEFORE they have joined its core —
+/// but a sibling handle may already hold one, with pins running against it. This
+/// finds that core through the registry, drops the registry lock (so the gate is
+/// never taken beneath it), and holds only the gate across the mutation. No live
+/// core means no pin can exist, so the raw mutation is already exclusive.
+fn with_live_poison_gate<R>(id: &BackingId, mutate: impl FnOnce() -> R) -> R {
+    let existing = {
+        let guard = core_registry().lock();
+        guard.cores.get(id).and_then(std::sync::Weak::upgrade)
+    };
+    match existing {
+        Some(core) => {
+            core.run_poison_blocking_hook();
+            let _gate = core.poison_gate.lock();
+            mutate()
+        }
+        None => mutate(),
     }
 }
 
@@ -1058,6 +1158,8 @@ fn join_or_create_core(
         poison_gate: Mutex::new(()),
         #[cfg(test)]
         publish_blocking_hook: Mutex::new(None),
+        #[cfg(test)]
+        poison_blocking_hook: Mutex::new(None),
         subscribers: RwLock::new(Vec::new()),
         next_subscriber: AtomicU64::new(0),
         #[cfg(any(test, feature = "fixtures"))]
@@ -1351,7 +1453,11 @@ impl OrgRevocationStore {
                         })
                     }
                     Err(WritePhase::PostRename(reason)) => {
-                        mark_poisoned(&backing_id, &path);
+                        // No core joined yet, but a same-path sibling may hold
+                        // one: gate against ITS pins (Kyra OLB-2B-E3c closure).
+                        with_live_poison_gate(&backing_id, || {
+                            mark_poisoned(&backing_id, &path);
+                        });
                         return Err(OrgRevocationError::DurabilityUncertain {
                             path: path.display().to_string(),
                             reason,
@@ -1369,11 +1475,18 @@ impl OrgRevocationStore {
         };
         let (core, raised) = join_or_create_core(backing_id.clone(), &path, state)?;
         if was_poisoned {
-            clear_poison(&backing_id, &path);
+            // Through the CORE, under its poison gate: a sibling handle's
+            // routing pin may be mid-settlement against `poisoned == true`.
+            core.clear_poison();
         }
         drop(lock);
         let store = Self { core };
         store.core.notify(&raised);
+        if was_poisoned {
+            // Recovery raises no floor, so `notify` alone is silent — yet the
+            // authority just moved from "unusable" back to usable.
+            store.core.notify_authority_changed();
+        }
         Ok(store)
     }
 
@@ -1422,11 +1535,14 @@ impl OrgRevocationStore {
         })?;
         let (core, raised) = join_or_create_core(backing_id.clone(), &path, state)?;
         if was_poisoned {
-            clear_poison(&backing_id, &path);
+            core.clear_poison();
         }
         drop(lock);
         let store = Self { core };
         store.core.notify(&raised);
+        if was_poisoned {
+            store.core.notify_authority_changed();
+        }
         Ok(store)
     }
 
@@ -1507,8 +1623,17 @@ impl OrgRevocationStore {
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
     pub fn mark_poisoned_for_test(&self) {
-        let _gate = self.core.poison_gate.lock();
-        mark_poisoned(&self.core.backing_id, &self.core.path);
+        self.core.mark_poisoned();
+    }
+
+    /// Test-only: arm the pre-`poison_gate` acknowledgment hook, so a witness
+    /// can prove a poison transition REACHED the blocked acquisition rather
+    /// than inferring it from elapsed time. Fires for marks AND clears,
+    /// including the ones the production recovery paths perform.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn arm_poison_blocking_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.core.poison_blocking_hook.lock() = Some(hook);
     }
 
     /// `true` iff `other` is backed by the same normalized path —
@@ -1670,6 +1795,12 @@ impl OrgRevocationStore {
     /// retires the subscription — draining any in-flight callback and
     /// removing it from the core through a `Weak<StoreCore>` (R2-2), so
     /// cleanup never depends on this facade's own drop.
+    ///
+    /// The callback may also be invoked with an EMPTY slice, meaning "this
+    /// path's revocation AUTHORITY moved without raising any floor" — the poison
+    /// recovery case. A subscriber that only iterates `raised` sees a harmless
+    /// no-op; one that tracks authority (the routing registry) must treat it as
+    /// a change (Kyra OLB-2B-E3c closure).
     #[must_use = "dropping the returned guard immediately unsubscribes the callback"]
     pub fn subscribe_floors_raised(
         &self,
@@ -1743,7 +1874,9 @@ impl OrgRevocationStore {
         // have dropped — a callback that re-enters `apply_bundle`
         // on the same store must not deadlock (review-9).
         enum LockedOutcome {
-            Applied(Vec<RaisedFloor>),
+            /// Raised floors, plus whether this apply RECOVERED the path from
+            /// poison — which owes an authority wake even when nothing rose.
+            Applied(Vec<RaisedFloor>, bool),
             DurabilityUncertain(Vec<RaisedFloor>, String),
         }
 
@@ -1839,12 +1972,9 @@ impl OrgRevocationStore {
                         // instance may pretend disk and memory are
                         // synchronized until recovery proves the
                         // entry durable.
-                        {
-                            // Ordered BEFORE the publish below, matching the
-                            // frozen `poison_gate` → `live` order.
-                            let _gate = self.core.poison_gate.lock();
-                            mark_poisoned(&self.core.backing_id, path);
-                        }
+                        // Ordered BEFORE the publish below, matching the frozen
+                        // `poison_gate` → `live` order.
+                        self.core.mark_poisoned();
                         durability_uncertain = Some(reason);
                     }
                 }
@@ -1856,19 +1986,27 @@ impl OrgRevocationStore {
             //    recovered poison and release the lock;
             //    notification happens outside.
             let raised = self.core.publish(merged);
-            if was_poisoned && durability_uncertain.is_none() {
-                clear_poison(&self.core.backing_id, path);
+            let recovered = was_poisoned && durability_uncertain.is_none();
+            if recovered {
+                // Through the CORE: the clear is exactly as load-bearing as the
+                // mark, and the file lock is still held here — the wake for it
+                // happens below, outside every guard.
+                self.core.clear_poison();
             }
             drop(lock);
             match durability_uncertain {
-                None => LockedOutcome::Applied(raised),
+                None => LockedOutcome::Applied(raised, recovered),
                 Some(reason) => LockedOutcome::DurabilityUncertain(raised, reason),
             }
         };
 
         match outcome {
-            LockedOutcome::Applied(raised) => {
+            LockedOutcome::Applied(raised, recovered) => {
                 self.core.notify(&raised);
+                if recovered {
+                    // A recovery that raised nothing still moved authority.
+                    self.core.notify_authority_changed();
+                }
                 Ok(raised)
             }
             LockedOutcome::DurabilityUncertain(raised, reason) => {

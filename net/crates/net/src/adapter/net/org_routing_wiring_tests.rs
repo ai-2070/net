@@ -672,6 +672,7 @@ async fn cached_facts_that_crossed_their_expiry_read_cold() {
             generation: node.scoped_discovery.lock().revision(),
             authority: node.routing_authority.epoch(),
             floor_generation: 0,
+            poisoned: false,
         },
         actor_incarnation: 1,
         slot_incarnation: 1,
@@ -901,6 +902,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
                 generation: node.scoped_discovery.lock().revision(),
                 authority: node.routing_authority.epoch(),
                 floor_generation: live_floor,
+                poisoned: false,
             },
             actor_incarnation: 1,
             slot_incarnation: 1,
@@ -921,6 +923,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
                 generation: node.scoped_discovery.lock().revision(),
                 authority: node.routing_authority.epoch(),
                 floor_generation: live_floor.wrapping_sub(1),
+                poisoned: false,
             },
             actor_incarnation: 1,
             slot_incarnation: 1,
@@ -1048,6 +1051,7 @@ async fn a_delayed_reader_does_not_delete_a_newer_artifact() {
                 generation: node.scoped_discovery.lock().revision(),
                 authority,
                 floor_generation: 0,
+                poisoned: false,
             },
             actor_incarnation: 1,
             slot_incarnation: 1,
@@ -1124,6 +1128,7 @@ async fn poisoning_authority_colds_already_cached_facts() {
                 generation: node.scoped_discovery.lock().revision(),
                 authority: node.routing_authority.epoch(),
                 floor_generation: 0,
+                poisoned: false,
             },
             actor_incarnation: 1,
             slot_incarnation: 1,
@@ -1175,6 +1180,7 @@ async fn authority_only_movement_invalidates_and_requeues_everything() {
                 generation: scoped_before,
                 authority: node.routing_authority.epoch(),
                 floor_generation: 0,
+                poisoned: false,
             },
             actor_incarnation: 1,
             slot_incarnation: 1,
@@ -1444,6 +1450,7 @@ async fn the_epoch_advances_before_the_store_becomes_visible() {
                 generation: node.scoped_discovery.lock().revision(),
                 authority: retired,
                 floor_generation: 0,
+                poisoned: false,
             },
             actor_incarnation: 1,
             slot_incarnation: 1,
@@ -1615,6 +1622,7 @@ async fn authority_invalidation_spares_successor_facts() {
                 generation: node.scoped_discovery.lock().revision(),
                 authority,
                 floor_generation: 0,
+                poisoned: false,
             },
             actor_incarnation: 1,
             slot_incarnation: 1,
@@ -1684,6 +1692,9 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
     let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
     // `Receiver` is Send but not Sync, and the gap hook is an `Fn`.
     let reached = Arc::new(parking_lot::Mutex::new(reached_rx));
+    // Bounded completion signal, so neither the negative assertion below nor the
+    // join afterwards can hang the suite instead of failing it.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     store.arm_publish_blocking_hook(Arc::new(move || {
         let _ = reached_tx.try_send(());
     }));
@@ -1697,9 +1708,11 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
             entered.store(true, Ordering::Release);
             let store = store.clone();
             let landed = published.clone();
+            let done = done_tx.clone();
             *publisher.lock() = Some(std::thread::spawn(move || {
                 store.republish_for_test();
                 landed.store(true, Ordering::Release);
+                let _ = done.send(());
             }));
             // Wait for the publisher to REACH the blocked `live.write()`, not for
             // an interval — elapsed time also "passes" on a scheduler that never
@@ -1737,6 +1750,9 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
         entered.load(Ordering::Acquire),
         "the gap must have been entered"
     );
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the publication must land once the barrier is released");
     if let Some(handle) = publisher.lock().take() {
         handle.join().expect("publisher");
     }
@@ -1786,26 +1802,50 @@ async fn poison_cannot_occupy_the_gap_between_validation_and_settlement() {
     let poisoned = Arc::new(AtomicBool::new(false));
     let entered = Arc::new(AtomicBool::new(false));
     let contender: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+    // Fired by the store itself, immediately BEFORE the blocking `poison_gate`
+    // acquisition — so this acknowledges that the contender actually reached the
+    // gate, not merely that it was spawned (Kyra OLB-2B-E3c closure). The old
+    // form acknowledged before the call and then slept, which a slow scheduler
+    // could satisfy without the contender ever getting there.
+    let (at_gate_tx, at_gate_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let at_gate = Arc::new(parking_lot::Mutex::new(at_gate_rx));
+    store.arm_poison_blocking_hook(Arc::new(move || {
+        let _ = at_gate_tx.try_send(());
+    }));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let done_rx = Arc::new(parking_lot::Mutex::new(done_rx));
     {
         let store = store.clone();
         let poisoned = poisoned.clone();
         let entered = entered.clone();
         let contender = contender.clone();
+        let at_gate = at_gate.clone();
+        let done_rx = done_rx.clone();
         *source.settle_gap_hook.lock() = Some(Arc::new(move || {
             entered.store(true, Ordering::Release);
             let store = store.clone();
             let landed = poisoned.clone();
-            let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+            let done = done_tx.clone();
             *contender.lock() = Some(std::thread::spawn(move || {
-                // Acknowledge immediately BEFORE contending for the poison gate.
-                let _ = started_tx.send(());
                 store.mark_poisoned_for_test();
                 landed.store(true, Ordering::Release);
+                let _ = done.send(());
             }));
-            started_rx
+            at_gate
+                .lock()
                 .recv_timeout(Duration::from_secs(10))
-                .expect("the contender must reach the poison gate");
-            std::thread::sleep(Duration::from_millis(120));
+                .expect("the contender must REACH the blocked poison gate");
+            // Bounded completion signal rather than a bare sleep: the contender
+            // is at the gate, so an ungated transition would land inside this
+            // window.
+            assert!(
+                done_rx
+                    .lock()
+                    .recv_timeout(Duration::from_millis(250))
+                    .is_err(),
+                "poison landed between the validation and the settlement — they \
+                 are separately interleavable"
+            );
             assert!(
                 !poisoned.load(Ordering::Acquire),
                 "poison landed between the validation and the settlement — they \
@@ -1836,6 +1876,10 @@ async fn poison_cannot_occupy_the_gap_between_validation_and_settlement() {
         entered.load(Ordering::Acquire),
         "the gap must have been entered"
     );
+    done_rx
+        .lock()
+        .recv_timeout(Duration::from_secs(10))
+        .expect("poison must land once the pin is released");
     if let Some(handle) = contender.lock().take() {
         handle.join().expect("contender");
     }
@@ -1934,10 +1978,7 @@ async fn poison_before_the_validation_is_detected() {
 /// forever under steady poison, which is why it is not the design.
 #[tokio::test]
 async fn steady_poison_settles_current_over_an_unserved_source() {
-    use crate::adapter::net::behavior::org_routing::{
-        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
-    };
-    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_routing::{ApplyOutcome, ApplyRequest, DirtyApply};
     use crate::adapter::net::behavior::org_scoped_store::{
         DirtyCapabilities, PrivateDiscoveryChangeBatch,
     };
@@ -1949,19 +1990,14 @@ async fn steady_poison_settles_current_over_an_unserved_source() {
         .expect("install");
     store.mark_poisoned_for_test();
 
-    let work: Arc<RegistryWork> = Arc::default();
-    let registry = NodeOrgRoutingRegistry::new(
-        Arc::new(ScopedSlotSource {
-            scoped_discovery: node.scoped_discovery.clone(),
-            publication: node.scoped_publication.clone(),
-            org_revocation: node.org_revocation.clone(),
-            authority: node.routing_authority.clone(),
-            settle_gap_hook: parking_lot::Mutex::new(None),
-            unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        }),
-        work.clone(),
-        Arc::default(),
-    );
+    // The NODE's own registry, not a look-alike built beside it: the cold-read
+    // assertion below goes through `node.org_routing_base_facts`, which reads
+    // `node.routing_registry`. Driving a separate registry would make that
+    // assertion pass because the node's registry never heard of the slot.
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+    let registry = node.routing_registry.clone();
     registry.activate_incarnation(1);
 
     let family = registry.new_family().expect("family");
@@ -1983,14 +2019,296 @@ async fn steady_poison_settles_current_over_an_unserved_source() {
         "steady poison must CONVERGE, not retry forever: {outcome:?}"
     );
     assert_eq!(registry.pending_slots(), 0, "nothing is owed");
+    let facts = registry
+        .base_facts(&key)
+        .expect("the slot IS reconciled — with unusable-source facts");
     assert!(
-        registry.base_facts(&key).is_some(),
-        "the slot IS reconciled — with unusable-source facts"
+        matches!(
+            facts.providers,
+            crate::adapter::net::behavior::org_routing_registry::SourceFacts::Unserved
+        ),
+        "a poisoned authority can speak for no scope"
+    );
+    assert!(
+        facts.epoch.poisoned,
+        "and the facts are STAMPED with the poisoned authority, so a later \
+         recovery is detectable"
     );
     assert!(
         node.org_routing_base_facts(&key).is_none(),
         "but it reads COLD: reconciled is not usable"
     );
+    assert_eq!(
+        registry.pending_slots(),
+        0,
+        "and a cold read under STEADY poison re-queues nothing — the epoch \
+         comparison catches transitions, not the steady state"
+    );
+}
+
+/// (27) A PRODUCTION poison clear cannot land inside a live [`PublicationPin`].
+///
+/// The mirror of (25), and the half that was missing. The recovery paths used to
+/// call the raw path-registry helper, so a pin that had validated
+/// `poisoned == true` could watch the clear land between its validation and its
+/// settlement and report `Current` for an authority that was already gone.
+///
+/// The schedule is the reachable one, not a synthetic one: recovery publishes
+/// the durable view FIRST (nothing is pinned yet, so it lands), and only then
+/// reaches the clear. The pin is taken in exactly that window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_poison_clear_cannot_land_under_a_publication_pin() {
+    use crate::adapter::net::behavior::org_revocation::OrgRevocationStore;
+
+    let node = node().await;
+    let scratch = Scratch::new("poison-clear", &node);
+    let store = scratch.store();
+    store.mark_poisoned_for_test();
+    assert!(store.is_poisoned(), "precondition: the path is poisoned");
+
+    // Fired immediately before `poison_gate.lock()` — i.e. after the recovery's
+    // republish has already landed. The hook rendezvouses so the pin is taken
+    // BEFORE the acquisition is attempted.
+    let (at_gate_tx, at_gate_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (pinned_tx, pinned_rx) = std::sync::mpsc::channel::<()>();
+    let pinned_rx = parking_lot::Mutex::new(pinned_rx);
+    store.arm_poison_blocking_hook(Arc::new(move || {
+        let _ = at_gate_tx.try_send(());
+        let _ = pinned_rx.lock().recv_timeout(Duration::from_secs(10));
+    }));
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+    let path = scratch.path().join("revocation.json");
+    let recovery = std::thread::spawn(move || {
+        let recovered = OrgRevocationStore::open_existing(&path);
+        let _ = done_tx.send(recovered.is_ok());
+    });
+
+    at_gate_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the recovery must REACH the poison gate");
+    // The republish has landed; take the pin the way a settlement does.
+    let pin = store.pin_publication();
+    let _ = pinned_tx.send(());
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+        "a production recovery cleared poison while a publication pin was alive \
+         — the clear bypasses the poison gate"
+    );
+    assert!(
+        store.is_poisoned(),
+        "poison must be held immobile in BOTH directions under the pin"
+    );
+    drop(pin);
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the clear must land once the pin drops"),
+        "the recovery itself must succeed"
+    );
+    assert!(!store.is_poisoned(), "recovery clears the poison");
+    recovery.join().expect("recovery thread");
+}
+
+/// (28) A real recovery RETIRES the `Unserved` reconstruction it left behind,
+/// wakes routing without waiting for a reader, and lets the successor serve.
+///
+/// This is the other half of Option A. `Current` over an unusable source is only
+/// an acceptable steady state if leaving it is observable. A recovery
+/// republishes the same durable view, so it raises no floor and
+/// `StoreCore::notify` is silent — without an explicit authority wake the
+/// registry stays reconciled to obsolete `Unserved` facts indefinitely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_poison_recovery_retires_the_unserved_reconstruction_it_left() {
+    use crate::adapter::net::behavior::org_revocation::OrgRevocationStore;
+    use crate::adapter::net::behavior::org_routing::{ApplyOutcome, ApplyRequest, DirtyApply};
+    use crate::adapter::net::behavior::org_routing_registry::SourceFacts;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("poison-recover", &node);
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+    store.mark_poisoned_for_test();
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+
+    let registry = node.routing_registry.clone();
+    registry.activate_incarnation(1);
+    let family = registry.new_family().expect("family");
+    let key = slot(23, "nrpc:poison-recover");
+    let _held = family.demand(key.clone()).expect("demand");
+    let request = ApplyRequest {
+        batch: PrivateDiscoveryChangeBatch {
+            generation: 0,
+            dirty: DirtyCapabilities::Clean,
+        },
+        registry_work: true,
+    };
+
+    assert!(
+        matches!(
+            registry.apply(1, request.clone()),
+            ApplyOutcome::Current { .. }
+        ),
+        "steady poison converges (Option A)"
+    );
+    let stranded = registry.base_facts(&key).expect("reconciled");
+    assert!(
+        matches!(stranded.providers, SourceFacts::Unserved),
+        "precondition: the reconstruction serves nothing"
+    );
+    assert!(stranded.epoch.poisoned, "precondition: stamped as poisoned");
+    assert!(
+        node.org_routing_base_facts(&key).is_none(),
+        "precondition: it reads cold"
+    );
+    let authority_before = node.routing_authority.epoch();
+
+    // REAL recovery through the production open path: prove the entry durable,
+    // republish through the shared core, clear the poison.
+    let path = scratch.path().join("revocation.json");
+    let recovered = tokio::task::spawn_blocking(move || OrgRevocationStore::open_existing(&path))
+        .await
+        .expect("join")
+        .expect("recovery must succeed");
+    assert!(!store.is_poisoned(), "recovery clears the poison");
+    assert!(
+        recovered.shares_core_with(&store),
+        "and it recovers the SAME live core the node installed"
+    );
+
+    // The proactive wake: a recovery raises no floor, so this is the only signal
+    // routing gets — and it must not depend on anyone reading first.
+    assert!(
+        node.routing_authority.epoch() > authority_before,
+        "a poison recovery must move routing authority even though it raised no \
+         floor"
+    );
+    assert!(
+        registry.base_facts(&key).is_none(),
+        "and it must RETIRE the Unserved reconstruction, not leave it reconciled"
+    );
+    assert_eq!(
+        registry.pending_slots(),
+        1,
+        "re-queuing the exact slot, so the actor rebuilds rather than leaving a \
+         hole"
+    );
+
+    // And the successor reconciliation is built over the recovered authority.
+    assert!(
+        matches!(registry.apply(1, request), ApplyOutcome::Current { .. }),
+        "the successor quantum settles"
+    );
+    let successor = registry.base_facts(&key).expect("reconciled again");
+    assert!(
+        !successor.epoch.poisoned,
+        "the successor is stamped against the RECOVERED authority"
+    );
+    assert!(
+        matches!(successor.providers, SourceFacts::Served(_)),
+        "and the source speaks for the scope again"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "so the slot reads warm — recovery is observable end to end"
+    );
+}
+
+/// (29) The LAZY half, isolated: a READER retires an `Unserved` reconstruction
+/// whose poisoned authority has recovered, with no wake involved at all — and
+/// re-queues nothing while the poison is steady.
+///
+/// The store is placed in the node's slot WITHOUT a raise subscription, so the
+/// proactive wake (28) cannot be what repairs this. And the second artifact
+/// differs from the live authority in the POISON BIT ALONE — same authority
+/// epoch, same floor generation — so the retirement is attributable to the epoch
+/// comparison and nothing else.
+#[tokio::test]
+async fn a_reader_retires_unserved_facts_once_their_poison_clears() {
+    use crate::adapter::net::behavior::org_revocation::OrgRevocationStore;
+    use crate::adapter::net::behavior::org_routing_registry::{
+        SlotBaseFacts, SourceEpoch, SourceFacts,
+    };
+
+    let node = node().await;
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+    let scratch = Scratch::new("poison-lazy", &node);
+    let store = scratch.store();
+    // Deliberately NOT `install_org_revocation_store`: no raise subscription, so
+    // nothing can wake routing and only the read seam can repair this.
+    node.org_revocation.store(Some(store.clone()));
+    store.mark_poisoned_for_test();
+
+    let poisoned_facts = |floor_generation: u64| {
+        Arc::new(SlotBaseFacts {
+            providers: SourceFacts::Unserved,
+            epoch: SourceEpoch {
+                generation: node.scoped_discovery.lock().revision(),
+                authority: node.routing_authority.epoch(),
+                floor_generation,
+                poisoned: true,
+            },
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            earliest_expiry: u64::MAX,
+        })
+    };
+
+    let key_a = slot(24, "nrpc:poison-lazy-steady");
+    let live_floor = store.barriered_generation().expect("not exhausted").get();
+    node.routing_registry
+        .install_facts_for_test(key_a.clone(), poisoned_facts(live_floor));
+    assert!(
+        node.org_routing_base_facts(&key_a).is_none(),
+        "an unusable source reads cold"
+    );
+    assert_eq!(
+        node.org_routing_slots().1,
+        0,
+        "and STEADY poison re-queues nothing: reading live poison as a staleness \
+         predicate would churn this slot on every read, forever"
+    );
+
+    // Real recovery through the production open path.
+    let path = scratch.path().join("revocation.json");
+    let _recovered = tokio::task::spawn_blocking(move || OrgRevocationStore::open_existing(&path))
+        .await
+        .expect("join")
+        .expect("recovery must succeed");
+    assert!(!store.is_poisoned(), "recovery clears the poison");
+
+    assert!(
+        node.org_routing_base_facts(&key_a).is_none(),
+        "the obsolete reconstruction still reads cold"
+    );
+    assert!(
+        node.routing_registry.base_facts(&key_a).is_none(),
+        "but the reader RETIRED it rather than leaving it reconciled forever"
+    );
+    assert_eq!(node.org_routing_slots().1, 1, "re-queuing the exact slot");
+
+    // Poison bit ALONE: same authority epoch, same (recovered) floor generation.
+    let key_b = slot(24, "nrpc:poison-lazy-isolated");
+    let recovered_floor = store.barriered_generation().expect("not exhausted").get();
+    node.routing_registry
+        .install_facts_for_test(key_b.clone(), poisoned_facts(recovered_floor));
+    assert!(node.org_routing_base_facts(&key_b).is_none());
+    assert!(
+        node.routing_registry.base_facts(&key_b).is_none(),
+        "a fact differing from the live authority ONLY in the poison bit must \
+         still be retired"
+    );
+    assert_eq!(node.org_routing_slots().1, 2, "and re-queued");
+
+    node.org_revocation.store(None);
 }
 
 /// (26) A terminally exhausted publication generation stops owner-certified

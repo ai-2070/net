@@ -5399,20 +5399,21 @@ impl ScopedSlotSource {
     /// replacement has the same shape between publishing the new identity and
     /// completing scoped reconciliation.
     ///
-    /// `poisoned` and the barriered floor generation are here as well as the
-    /// authority epoch because they can move WITHOUT a node-mediated install —
-    /// the epoch covers what the node serializes, these cover the rest.
+    /// Poison and the barriered floor generation are inside the EPOCH as well as
+    /// the authority number because they can move WITHOUT a node-mediated
+    /// install — the authority epoch covers what the node serializes, these
+    /// cover the rest. The token is derived from the epoch so the two can never
+    /// disagree about what a fact was built under.
     fn token(
         &self,
         epoch: super::behavior::org_routing_registry::SourceEpoch,
-        poisoned: bool,
         exhausted: bool,
     ) -> super::behavior::org_routing_registry::SourceToken {
         super::behavior::org_routing_registry::SourceToken::new(vec![
             epoch.generation,
             epoch.authority,
             epoch.floor_generation,
-            u64::from(poisoned),
+            u64::from(epoch.poisoned),
             u64::from(exhausted),
         ])
     }
@@ -5466,7 +5467,6 @@ struct ScopedCommitPin<'a> {
     /// The installed store, so settlement can take its publication barrier.
     store: Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
     epoch: super::behavior::org_routing_registry::SourceEpoch,
-    poisoned: bool,
     #[cfg(test)]
     settle_gap_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -5476,15 +5476,15 @@ impl ScopedCommitPin<'_> {
     ///
     /// Floors are compared through the held barrier. Poison is a separate
     /// path-registry write the barrier does not block, so it is genuinely
-    /// re-sampled — but in the real durability path a poison mark is always
-    /// followed by a publication, which the barrier blocks, so the view it would
-    /// have installed cannot land either.
+    /// re-sampled — but the pin holds the store's POISON GATE across this check
+    /// and the settlement beneath it, in BOTH directions: a mark and a recovery
+    /// clear are equally capable of making a settled `Current` false.
     fn matches(&self, pinned: &super::behavior::org_revocation::PublicationPin<'_>) -> bool {
         let Ok(generation) = pinned.generation() else {
             // Terminal exhaustion: currentness can no longer be witnessed.
             return false;
         };
-        pinned.poisoned() == self.poisoned && generation.get() == self.epoch.floor_generation
+        pinned.poisoned() == self.epoch.poisoned && generation.get() == self.epoch.floor_generation
     }
 }
 
@@ -5595,9 +5595,9 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             generation,
             authority,
             floor_generation,
+            poisoned,
         };
-        let token = self.token(epoch, poisoned, exhausted);
-        let _ = epoch;
+        let token = self.token(epoch, exhausted);
         Box::new(ScopedSourceSnapshot { token, rows })
     }
 
@@ -5622,8 +5622,9 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             generation: self.scoped_discovery.lock().revision(),
             authority: self.authority.epoch(),
             floor_generation,
+            poisoned,
         };
-        if exhausted || self.token(epoch, poisoned, exhausted) != *expected {
+        if exhausted || self.token(epoch, exhausted) != *expected {
             return None;
         }
         Some(Box::new(ScopedCommitPin {
@@ -5631,7 +5632,6 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             _publication_gate: publication_gate,
             store,
             epoch,
-            poisoned,
             #[cfg(test)]
             settle_gap_hook: self.settle_gap_hook.lock().clone(),
         }))
@@ -9559,6 +9559,15 @@ impl MeshNode {
             // routing source is allowed to serve, and it advances no scoped
             // revision — so routing must learn about it from the epoch, not from
             // the scoped wake.
+            //
+            // This is also the proactive wake for a POISON RECOVERY, which
+            // invokes subscribers with an EMPTY `raised` slice: it raises no
+            // floor and retracts nothing, but it moves the authority from
+            // "unusable, everything Unserved" back to usable. The epoch bump
+            // invalidates every retained fact and re-queues the slots, so health
+            // converges without waiting for a reader to trip the lazy check
+            // (Kyra OLB-2B-E3c closure). The two loops below are no-ops on an
+            // empty slice, which is exactly right.
             move_routing_authority(&routing_authority, &routing_registry, || {});
             let retracted = scoped_publication
                 .gated_commit(&scoped_discovery, |s| s.note_floors_raised(raised));
@@ -12145,34 +12154,47 @@ impl MeshNode {
         key: &super::behavior::org_routing_registry::SlotKey,
     ) -> Option<Arc<super::behavior::org_routing_registry::SlotBaseFacts>> {
         let facts = self.routing_registry.base_facts(key)?;
-        // A scope this source cannot speak for has NO evidence, so it must read
-        // cold rather than as a proven-empty provider set (Kyra OLB-2B-E3c).
-        if matches!(
-            facts.providers,
-            super::behavior::org_routing_registry::SourceFacts::Unserved
-        ) {
-            return None;
-        }
         // Revalidate the AUTHORITY these facts were built under against the live
         // one. Checking authority only when something happens to rebuild the slot
         // is not enough: a store that poisons AFTER installation moves no epoch
         // and retracts no scoped row, so the cached facts would stay readable
         // indefinitely (Kyra OLB-2B-E3c). A mismatch drops them and re-queues the
         // exact slot, so the actor rebuilds it rather than leaving a hole.
+        //
+        // BEFORE the `Unserved` cold return below, not after. `Unserved` facts
+        // are exactly the ones a poison recovery must retire: they were built
+        // under a poisoned authority, the recovery republishes the same durable
+        // view so it raises no floor, and returning cold first would leave the
+        // registry reconciled to that obsolete reconstruction indefinitely
+        // (Kyra OLB-2B-E3c closure).
         let (poisoned, floor_generation, _store) =
             ScopedSlotSource::revocation_view_of(&self.org_revocation);
-        let stale = poisoned
-            || self.routing_authority.is_exhausted()
+        let stale = self.routing_authority.is_exhausted()
             || facts.epoch.authority != self.routing_authority.epoch()
             // The floor generation moves INDEPENDENTLY of the authority epoch:
             // a floor publication is authoritative inside the revocation store
             // before the subscriber that advances the epoch is even notified. So
             // it is checked on its own (Kyra OLB-2B-E3c).
-            || facts.epoch.floor_generation != floor_generation;
+            || facts.epoch.floor_generation != floor_generation
+            // COMPARED, not read as a predicate. Live poison alone would make
+            // every read under steady poison stale, re-queue the slot, and churn
+            // forever against a source that will keep reconstructing `Unserved`.
+            // The comparison catches both transitions and neither steady state.
+            || facts.epoch.poisoned != poisoned;
         if stale {
             // Conditional on the EXACT artifact read above: a delayed reader must
             // not delete a current replacement installed in the meantime.
             self.routing_registry.invalidate_if_stale(key, &facts);
+            return None;
+        }
+        // A scope this source cannot speak for has NO evidence, so it must read
+        // cold rather than as a proven-empty provider set (Kyra OLB-2B-E3c).
+        // Reconciled is not usable: this is where Option A's `Current` over an
+        // unusable source stays honest at the read boundary.
+        if matches!(
+            facts.providers,
+            super::behavior::org_routing_registry::SourceFacts::Unserved
+        ) {
             return None;
         }
         // Expiry is enforced HERE, against the wall clock, not merely at capture.
