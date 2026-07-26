@@ -141,6 +141,24 @@ Spawn two processes via `std::process::Command` / `subprocess` / `child_process`
 
 For both, **avoid hard-coded ports** — assign port 0 and read back the bound address, or use a port reservation helper. CI runners share ports across parallel jobs.
 
+### Org-protected services
+
+Don't hand-roll org fixtures. The SDK ships two generators behind the `fixtures` Cargo feature — deliberately off by default so they never compile into a release binding library:
+
+```bash
+# A full cross-org scenario: adopted authorities, credential bytes,
+# 0600 audience-secret files, and a manifest.json a harness in ANY
+# language loads. Builds no mesh.
+cargo run -p net-mesh-sdk --features net,fixtures --example gen_org_scenario
+
+# The canonical `org:` error-vocabulary fixture every binding parses.
+cargo run -p net-mesh-sdk --features net,cortex,fixtures --example gen_org_error_fixtures
+```
+
+Test the **error domain**, not the message. `org:<domain>:<kind>[: <detail>]` is frozen and fixture-pinned; the detail is human-facing and will change. Asserting on it is the org equivalent of asserting on a timestamp.
+
+Two setup mistakes produce a confusing "service not found" rather than an auth error, so check them first: a `Granted` provider that never called `install_provider_grant_audience` registers fine but stays encrypted and undiscoverable, and a mesh built without an explicit identity seed is refused at bind with `persistent_identity_required`. Full model: `org.md`.
+
 ## CI-specific gotchas
 
 - **No NAT in CI.** Disable the `nat-traversal` feature in test builds — its probes add latency and may emit warnings.

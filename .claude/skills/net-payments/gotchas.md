@@ -93,6 +93,19 @@ they go red (`testing.md`).
 - **Spend counters:** the locked-store RMW is correct at v1 rates. Don't reach
   for a daemon backend until contention actually demands it — and when you do,
   it goes *behind* the same `SpendPolicyEngine` API, invisible to callers.
+- **Don't promise throughput from logical independence.** Benchmarks show
+  fully-independent traffic (different assets, no shared counter) performing
+  *identically* to maximum same-counter contention — the global file lock is
+  the coupling, not accounting authority. Sharding by asset or capability
+  changes nothing today. Numbers and the atomicity-domain classification:
+  `spend-policy.md`.
+- **Adding a durable write to a read-only branch is a DoS regression.** Denials
+  deliberately skip the store write (`mutate_json_if_changed`); a denial that
+  fsyncs lets a caller spraying quote ids force one global-lock + fsync per
+  attempt. If you touch `redeem_for_invocation`, `accept_payment`'s claim
+  transaction, or `check_and_reserve`, keep the dirty flag derived from the
+  same branch that mutated — and note the two traps (housekeeping pruning makes
+  a nominal denial dirty; a re-requested identical pending approval is clean).
 
 ## Language reality checks (before you promise a flow)
 

@@ -129,3 +129,46 @@ Spend counters are a lock-held RMW on the shared store — honest and correct at
 v1 rates. Rolling budgets are the first legitimate case for a shared-daemon
 backend; it would migrate **behind this same API**, invisible to callers. Do
 not reach for a daemon before contention demands it.
+
+### Read-only decisions no longer rewrite the store
+
+A denial that changes nothing durable now **skips the write entirely**
+(`store::mutate_json_if_changed`: the closure returns `(verdict, dirty)` and
+the store is serialized + fsync'd + renamed only when `dirty`). Load, decision,
+and conditional save stay under the **same advisory lock**, so the
+check-and-set is still atomic and at-most-once is unchanged.
+
+This started as a real DoS surface, not a micro-optimization: every redemption
+*denial* used to pay a full durable write, so a caller spraying quote ids
+forced one global-lock + fsync per attempt and collapsed throughput to ~20/s
+under concurrency. The same audit then extended to `accept_payment`'s claim
+transaction and to `check_and_reserve`.
+
+The dirty determination is per-branch, and two of the cases are subtle enough
+to be worth knowing if you touch this code:
+
+- **A "clean" denial can still be dirty.** Housekeeping prunes counters past
+  the retention horizon *inside* the same transaction — if retention removed
+  anything, the transaction must persist even though the verdict was a denial.
+- **An identical already-pending approval is a no-op.** `require` sets dirty
+  only when it actually *inserts* a new pending record; re-requesting approval
+  for the same quote id changes nothing.
+
+Writes that remain unconditional: completion, `release_claim`, and billing
+republish are separate calls, so a `verify_rejected` still persists **both**
+its claim and its release — both are semantically real.
+
+### What the contention benchmarks actually found
+
+Measured, not designed: the atomic accounting unit is the
+**`(day, network, asset)` counter row**. Distinct capabilities sharing one
+`(day, asset)` counter genuinely contend on it; different assets have no shared
+counter at all. Approvals are a separate quote-keyed state machine.
+
+But **logical independence buys you nothing today.** Fully independent traffic
+(different assets, no shared counter) benchmarks *identically* to maximum
+same-counter contention — ~26 ops/s and ~235 ms tail at concurrency 16, ~20/s
+and ~3.1 s at 128. The coupling is the **global file lock**, not accounting
+authority. So: don't promise a customer that sharding by asset or capability
+will scale spend checks, and don't design around per-capability parallelism
+until the store backend changes. No partitioned engine is authorized yet.

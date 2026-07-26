@@ -52,6 +52,20 @@ Default TTL is 5 minutes. Override with `announce_capabilities_with(caps, ttl, s
 
 **Announcements are bound to the signer.** The capability fold binds an announcement's wire `node_id` to the verified signing key, so a peer cannot announce capabilities *as* another node. A forged `node_id` (one that doesn't match the signer) is rejected with `WireError::NodeIdMismatch` rather than silently folded in.
 
+### Public vs private announcements
+
+Everything above describes the **plaintext** plane: `CapabilityVisibility::Public`, readable by any peer that receives the announcement. There are two **encrypted-only** forms, selected implicitly when you register a service with `serve_org`:
+
+| Visibility | Who can decrypt the announcement | Selected by |
+|---|---|---|
+| `Public` | any peer | `announce_capabilities`, `serve_rpc`, … |
+| `OwnerScoped` | members of the announcing node's own org | `OrgAccess::SameOrg` |
+| `GrantedAudience` | orgs holding a DISCOVER capability grant | `OrgAccess::Granted` |
+
+A node outside the audience does not see a capability it may not use — it sees **nothing at all**. This is why `find_nodes` returning an empty set is the *expected* result for an unauthorized caller, and why "the service is registered but nobody can find it" usually means the provider's grant audience was never installed rather than that the query is wrong.
+
+Access implies visibility: there is no separate knob, and the two are never mismatched. See `org.md`.
+
 ---
 
 ## Querying — three shapes
@@ -304,6 +318,8 @@ To advertise as scoped, add the reserved tag on the announcing side. Rust: `Capa
 
 `scope:*` is a **discovery filter, not a routing gate.** Wire format and forwarders are unchanged. To deny packets across boundaries, see `concepts.md` § Subnets.
 
+**`scope:*` is also not an authorization boundary.** A `Tenant("acme")` scope narrows *your own* query; it does not stop a peer from querying without it. If tenants must not be able to *see or call* each other's services, scopes are the wrong tool — use org capability auth (`org.md`), where the announcement itself is encrypted to an audience.
+
 ---
 
 ## GPU vendor normalization
@@ -345,3 +361,4 @@ Capability routing is for **placement** (pick a node), not **delivery** (the bus
 - `concepts.md` § Subnets — how subnet policies (a *routing* gate) differ from `scope:*` tags (a *discovery* filter).
 - `patterns.md` § "I want per-tenant capability discovery without standing up subnets" — the recipe-level summary that links here.
 - `filter-dsl.md` — the **bus-side** equality filter for narrowing *event payloads*, as opposed to the `Predicate` AST here for selecting *nodes*. The two compose (capability predicate targets receivers, filter narrows the response).
+- `org.md` — encrypted, audience-scoped announcements (`OwnerScoped` / `GrantedAudience`) and the per-call admission proof behind them. Reach for it when discovery must be an authorization boundary rather than a filter.
