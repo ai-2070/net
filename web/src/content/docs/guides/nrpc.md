@@ -322,6 +322,14 @@ for tool in tools {
 
 `list_tools` is synchronous and takes an `Option<&TagMatcher>` (pass `None` for "any", or a matcher to scope by tag / region / subnet). `watch_tools` is the streaming sibling — it emits `ToolListChange` events as tools appear, disappear, or change publisher count. Subnet visibility, capability auth, and region filtering all inherit from the existing fold and `TagMatcher` plumbing.
 
+**Watching another node's view.** `watch_tools` reads your own node's fold. The `tool.watch` service is the remote form: a server-streaming nRPC subscription that relays another node's fold deltas to you. Every `serve_tool*` call auto-installs it, so you rarely install it by hand — `serve_tool_watch()` exists for the one case that isn't covered, a node acting as a pure discovery relay that serves no tools of its own.
+
+The protocol is one JSON `WatchToolsRequest` (`{ matcher?, interval_ms? }`) in, one `ToolWatchFrame` per chunk out, opened with `call_streaming_typed`. `interval_ms` is a debounce *ceiling*, not a poll interval; omit it for pure event-driven delivery.
+
+The part worth designing around is the resync contract. Deltas ride a bounded per-subscriber buffer, and a subscriber that falls behind has its queued deltas **dropped** and receives a single `Resync` frame instead. A delta is never lost silently, but it is lost — on `Resync` you must discard your accumulated view and re-baseline from your own local `list_tools`, because the capability fold is mesh-replicated and there is no remote list service to call. Frames after a resync resume normal delta semantics, and a delta already reflected in your fresh baseline is expected, so **make your apply idempotent**.
+
+The binding surfaces are all event-driven: TypeScript's `watchTools` returns an `AsyncIterable<ToolListChange>`, and the Python, Go, and C equivalents mirror the Rust shape. Authorization rides the ordinary callee-side capability gate on `nrpc:tool.watch`.
+
 **Calling a tool.**
 
 ```rust

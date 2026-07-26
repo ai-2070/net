@@ -30,6 +30,37 @@ The per-day counter is a **lock-held read-modify-write** on the shared store:
 coarse and correct beats clever and racy, so two processes hammering the cap can
 never overspend.
 
+### What the store does, and doesn't, write
+
+A decision that changes nothing durable **skips the write entirely**. Load,
+decision, and conditional save all stay under the same advisory lock, so the
+check-and-set is still atomic and at-most-once behavior is unchanged — only the
+serialize-fsync-rename is skipped.
+
+This is a security property, not a micro-optimization. Every redemption *denial*
+used to pay a full durable write, which meant a caller spraying quote ids could
+force one global-lock acquisition plus one fsync per attempt and collapse
+throughput. Denials are cheap now, and if you extend the engine, keep them that
+way: a durable write on a read-only branch is a denial-of-service regression.
+
+Two edges are worth knowing if you touch this code. A nominally "clean" denial is
+still dirty when housekeeping pruned an expired counter inside the same
+transaction. And re-requesting approval for a quote that already has an identical
+pending record changes nothing, so it stays clean. Completion, claim release, and
+billing republish are separate calls and remain unconditional.
+
+### Don't promise throughput from logical independence
+
+Contention benchmarks put the atomic accounting unit at the
+`(day, network, asset)` counter row — distinct capabilities sharing one counter
+genuinely contend, different assets share nothing, and approvals are a separate
+quote-keyed state machine.
+
+But logically independent traffic currently benchmarks *identically* to maximum
+same-counter contention. The coupling is the global file lock, not accounting
+authority. Sharding by asset or capability buys nothing today, so don't design
+around per-capability parallelism until the store backend changes.
+
 ## Fail-closed by default
 
 - **Real networks deny by default.** A real network spends only when explicitly

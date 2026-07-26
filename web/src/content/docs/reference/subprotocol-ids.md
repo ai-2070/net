@@ -27,6 +27,9 @@ The space is 16 bits — 65,536 IDs. The substrate has carved out the first `0x2
 | `0x0B03`           | Stream ACK — SACK-range acknowledgements for retransmit pruning |
 | `0x0C00`           | Capability announcement                                    |
 | `0x0C01`           | Route withdrawal — poison-reverse; a node floods "destination unreachable *via me*" on peer failure (0.32) |
+| `0x0C02`           | Sensing interest — capability-sensing interest registration; never emitted unless `enable_sensing_coalescing` is on (0.33) |
+| `0x0C03`           | Readiness attestation — the provider-signed reply to a sensing interest; same flag gate as `0x0C02` (0.33) |
+| `0x0C04`           | Scoped capability announcement — the **encrypted** owner-scoped / granted-audience form of `0x0C00` (0.34) |
 | `0x0D00`           | NAT-traversal reflex                                       |
 | `0x0D01`           | NAT-traversal rendezvous                                   |
 | `0x0E00`           | RedEX distributed replication                              |
@@ -36,6 +39,8 @@ The space is 16 bits — 65,536 IDs. The substrate has carved out the first `0x2
 | `0x1200..=0x21FF`  | Reserved for future substrate subprotocols                 |
 | `0x2200..=0xEFFF`  | Vendor / third-party                                       |
 | `0xF000..=0xFFFF`  | Experimental / ephemeral                                   |
+
+Three of the `0x0C` family are conditional, and a mesh that never enables them is byte-for-byte identical on the wire to one that has never heard of them. `0x0C02` and `0x0C03` are inert unless `enable_sensing_coalescing` is set (it defaults to off). `0x0C04` is emitted only by a node serving an org-protected capability: a confidential service is advertised on that id **and never inside a plaintext `0x0C00` payload**, so a peer without the audience key cannot open it, and a peer that has never heard of the id drops the packet at the dispatch loop's unknown-subprotocol guard. In all three cases mixed-version degradation is the same as `0x0C01`: an un-upgraded peer falls back to previous behavior rather than to anything wrong.
 
 ## The opaque-forwarding guarantee
 

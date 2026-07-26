@@ -49,6 +49,18 @@ Two properties fall out of this design that are worth holding onto.
 
 **Aggregation scales the model up.** When a mesh grows large enough that every node holding every other node's capability set becomes wasteful, aggregator daemons in a parent subnet subscribe to a source subnet's detail channels, summarize what they see, and publish summaries upward at a coarser granularity. The substrate provides the framework; deployments decide where to place aggregators and what summarization granularity to use.
 
+### Announcements are not always public
+
+Everything above describes the plaintext plane, where any peer that receives an announcement can read it. There are two encrypted-only alternatives, and a capability is announced in exactly one of the three forms:
+
+- **Public** — the default. Readable by every peer that receives it.
+- **Owner-scoped** — readable only by members of the announcing node's own organization.
+- **Granted-audience** — readable only by organizations holding a discovery grant for that capability.
+
+The two encrypted forms ride a separate subprotocol id (`0x0C04`) and never appear inside a plaintext announcement payload. The consequence is the point: a node outside the audience does not discover a capability it may not use and get refused when it calls — it never learns the capability exists. Discovery becomes an authorization boundary rather than a filter.
+
+This matters for how you reason about an empty result. A `find_nodes` query returning nothing is the *correct and expected* outcome for an unauthorized caller, and it is indistinguishable from "nobody serves that." See [Organizations](/docs/concepts/organizations).
+
 ## Where capabilities show up
 
 Capabilities are an input to almost every decision in Net beyond the bus itself.
