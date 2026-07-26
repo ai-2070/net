@@ -17,7 +17,8 @@ not guess forward. That's the difference between a brief and a tutorial: a brief
 Before running a brief, install the **Net Claude Code skill** — the standing,
 always-loaded reference an agent uses while building against Net:
 
-> **[github.com/ai-2070/net-claude-skill](https://github.com/ai-2070/net-claude-skill)**
+> **[github.com/ai-2070/net-claude-skill](https://github.com/ai-2070/net-claude-skill)** —
+> setup steps in [Claude Skills](/docs/start/claude-skills)
 
 The skill is the *reference* (the mental model, the per-SDK API templates, the
 migration gotchas, the event-representation doctrine); a brief here is a *one-shot

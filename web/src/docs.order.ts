@@ -91,7 +91,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "failure-schematic",
       "billing",
     ],
-    start: ["what-is-net", "quickstart", "install"],
+    start: ["what-is-net", "quickstart", "install", "claude-skills"],
     concepts: [
       "architecture",
       "channels",
@@ -207,6 +207,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "start/what-is-net": "What is Net?",
     "start/quickstart": "Quickstart",
     "start/install": "Install",
+    "start/claude-skills": "Claude Skills",
 
     // Concepts
     "concepts/architecture": "Architecture",
