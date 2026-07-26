@@ -237,8 +237,14 @@ const MAX_RESTARTS_IN_WINDOW: usize = 5;
 /// The rolling window the restart budget is counted over.
 const RESTART_WINDOW: Duration = Duration::from_secs(300);
 
-/// Fixtures-only observation points for the deterministic witnesses.
-#[cfg(feature = "fixtures")]
+/// Observation points for the deterministic actor witnesses.
+///
+/// Gated `any(test, fixtures)`, NOT `fixtures` alone. The supervisor witnesses
+/// need these hooks, and CI's gating `--lib` job does not enable `fixtures` — so
+/// a fixtures-only gate silently drops every one of them out of the job that
+/// gates in-source units, while leaving `#[cfg(test)]` seams they use looking
+/// dead (Kyra OLB-2B-E3c).
+#[cfg(any(test, feature = "fixtures"))]
 #[derive(Default)]
 pub(crate) struct ActorHooks {
     /// Fired after each drain, with the batch the incarnation observed.
@@ -247,7 +253,7 @@ pub(crate) struct ActorHooks {
         parking_lot::Mutex<Option<Arc<dyn Fn(u64, &PrivateDiscoveryChangeBatch) + Send + Sync>>>,
 }
 
-#[cfg(feature = "fixtures")]
+#[cfg(any(test, feature = "fixtures"))]
 impl ActorHooks {
     fn fire_drained(&self, incarnation: u64, batch: &PrivateDiscoveryChangeBatch) {
         if let Some(hook) = self.drained.lock().clone() {
@@ -269,7 +275,7 @@ struct Incarnation {
     work: Arc<RegistryWork>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
-    #[cfg(feature = "fixtures")]
+    #[cfg(any(test, feature = "fixtures"))]
     hooks: Arc<ActorHooks>,
 }
 
@@ -326,7 +332,7 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
         it.changed.borrow_and_update();
 
         let mut batch = it.drain.drain();
-        #[cfg(feature = "fixtures")]
+        #[cfg(any(test, feature = "fixtures"))]
         it.hooks.fire_drained(it.id, &batch);
 
         // An owed complete recapture SUBSUMES whatever this pass drained, whether
@@ -559,7 +565,7 @@ impl RoutingSupervisor {
         work: Arc<RegistryWork>,
         shutdown: Arc<AtomicBool>,
         shutdown_notify: Arc<Notify>,
-        #[cfg(feature = "fixtures")] hooks: Arc<ActorHooks>,
+        #[cfg(any(test, feature = "fixtures"))] hooks: Arc<ActorHooks>,
     ) {
         let mut faults: Vec<tokio::time::Instant> = Vec::new();
 
@@ -610,7 +616,7 @@ impl RoutingSupervisor {
                 work: work.clone(),
                 shutdown: shutdown.clone(),
                 shutdown_notify: shutdown_notify.clone(),
-                #[cfg(feature = "fixtures")]
+                #[cfg(any(test, feature = "fixtures"))]
                 hooks: hooks.clone(),
             })
             .await;
@@ -692,7 +698,7 @@ impl RoutingSupervisor {
 /// Restart/crash-loop claims are driven by EXPLICIT [`ActorFault`], never by
 /// panics — release builds abort, so a panic-based witness would prove nothing
 /// about production (Kyra OLB-2B-E2).
-#[cfg(all(test, feature = "fixtures"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::CapabilitySet;

@@ -5661,8 +5661,9 @@ pub struct MeshNode {
     /// Test-only: fires between the supervisor spawn and the handle publication.
     #[cfg(test)]
     routing_spawn_pause_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Fixtures-only actor observation points, threaded into the supervisor.
-    #[cfg(feature = "fixtures")]
+    /// Actor observation points, threaded into the supervisor. See `ActorHooks`
+    /// for why this is `any(test, fixtures)` rather than fixtures alone.
+    #[cfg(any(test, feature = "fixtures"))]
     routing_hooks: Arc<super::behavior::org_routing::ActorHooks>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. Shared across the inbound dispatch so a flooded envelope is
@@ -7186,7 +7187,7 @@ impl MeshNode {
             routing_started: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             routing_spawn_pause_hook: parking_lot::Mutex::new(None),
-            #[cfg(feature = "fixtures")]
+            #[cfg(any(test, feature = "fixtures"))]
             routing_hooks: Arc::default(),
             scoped_relay_gate: Arc::new(
                 super::behavior::org_scoped_relay::ScopedAnnRelayGate::new(),
@@ -11605,7 +11606,7 @@ impl MeshNode {
         let work = self.routing_work.clone();
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
-        #[cfg(feature = "fixtures")]
+        #[cfg(any(test, feature = "fixtures"))]
         let hooks = self.routing_hooks.clone();
 
         let handle = tokio::spawn(async move {
@@ -11616,7 +11617,7 @@ impl MeshNode {
                     work,
                     shutdown,
                     shutdown_notify,
-                    #[cfg(feature = "fixtures")]
+                    #[cfg(any(test, feature = "fixtures"))]
                     hooks,
                 )
                 .await;
