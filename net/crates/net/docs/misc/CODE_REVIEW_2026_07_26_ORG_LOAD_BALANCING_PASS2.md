@@ -31,6 +31,13 @@ new test code and the ~1.8k lines of plan/design docs were read only where a
 finding depended on them. No test battery was run for this pass; the branch
 was verified to type-check (`cargo check --lib --features cortex`, clean).
 
+> **STATUS: all seven findings closed or explicitly accepted.** See
+> [Disposition](#disposition). §2 was later fixed ahead of OLB-3 rather than left
+> deferred; §7 stands as a non-finding. Two claims made below were subsequently
+> found to be too strong and are corrected in place — the §7 prior-pass closure
+> note immediately after this paragraph, and the accepted-by-design `Superseded`
+> paragraph at the end of [Checked clean](#checked-clean).
+
 **Verdict: no P1s.** The routing-plane concurrency design holds up under
 adversarial reading — see [Checked clean](#checked-clean), which is the
 substantive half of this review. Two P2s: one is a shipped-in-release test
@@ -48,6 +55,17 @@ from `org_gate.rs:221-238`; §7 closed structurally by the private
 `GateProof(())` field (`org_gate.rs:90`); §8's non-first-holder rollback gap
 closed by `tests/sensing_lease.rs:412
 refused_non_first_holder_tighten_relaxes_back_to_survivor`.
+
+**Correction to the §7 claim above.** "Closed structurally by the private
+`GateProof(())` field" was too strong, and pass 3 was right to keep §7 on its
+residual list. The private field made a validated variant impossible to
+CONSTRUCT from nothing; it did not stop code legitimately holding one from
+DESTRUCTURING it — enum variant fields are as public as the enum — keeping the
+proof and re-assembling a variant around a different spec, which `GateProof:
+Clone` made free and repeatable. Genuinely closed at `5e9798f60`, by sealing the
+payload behind a module-private newtype field and dropping `Clone` from the
+proof. Recorded here rather than only in pass 3, because this is the paragraph a
+future reader would otherwise trust.
 
 ---
 
@@ -425,13 +443,33 @@ itself advanced a watch. That holds for source movement and, via the explicit
 `work.mark()`, for registry movement — which is what §2's compounding half is
 about. The contract is met; the retry *rate* is the open question.
 
+**Correction.** "The contract is met" was true of the paths this pass traced and
+false in general, as pass-3 §2 showed by direct read: the two EMPTY-SELECTION
+`Superseded` returns marked nothing, and the compensator that covers the
+non-empty paths — `invalidate_authority_older_than`, which marks only when
+`pending` ends non-empty — is a guaranteed no-op with zero retained slots. Since
+every production node retains zero slots while the demand consumer is dark, that
+was the common path rather than the corner, and an authority-only movement could
+strand cold-start health in `Rebuilding` indefinitely. Closed at `d2e7c7733`; the
+retry-rate question, which this paragraph correctly identified as the open one,
+closed separately at `8995099d6`. Both are recorded in pass 3.
+
 ---
 
 ## Disposition
 
 Triaged with Kyra 2026-07-26 and worked in that order. Every finding has a
-resolution here; the two that were NOT changed say why, so neither reads as
+resolution here; the one that was NOT changed says why, so it does not read as
 overlooked.
+
+**All seven findings are now closed or explicitly accepted.** §2 was originally
+deferred by decision as an OLB-3 activation prerequisite; it was subsequently
+fixed ahead of that phase — the reasoning is in
+[§2 — amendment](#2--amendment-closed-at-8995099d6-ahead-of-olb-3), and the
+paragraph it amends is kept above it so the decision and its reversal both stay
+on the record. §7 remains a non-finding and is unchanged, though the
+cross-plane ordering witness added for pass-3 §17 now pins the property the
+factoring exists to preserve.
 
 | # | Sev | Disposition | Where |
 |---|-----|-------------|-------|

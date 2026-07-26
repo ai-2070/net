@@ -1,5 +1,21 @@
 # CODE REVIEW 2026-07-26 — Org Capability Load Balancing, pass 3 (`load-balancing`)
 
+> **STATUS: all findings ADDRESSED; the closure RUN is incomplete.**
+>
+> Every finding in this document and in pass 2 has a landed fix and a witness —
+> see [Closure](#closure--every-finding-in-this-document-and-pass-2-is-now-addressed),
+> which maps each one to its commit. That includes the four **Fix now** gate
+> items and the two pass-2 items previously deferred by decision.
+>
+> This is NOT a sign-off. The adjudication below requires an exact-head closure
+> run before E3c / composed OLB-2B is signed, and three parts of it have not been
+> executed: the fourth clippy gate (`--all-features --all-targets`), the full
+> serial nextest matrices, and `cfg(unix)` verification under the Docker harness.
+> The mid-document
+> [Disposition](#disposition--corrective-descendant-of-2026-07-26-ceb88ed47--87aa71960--52c667d62)
+> section is historical and superseded; it is kept for the sequence, not the
+> state.
+
 **Scope:** the full branch diff `master..f472edca4` (merge base `0b9afc7a3`),
 same head as
 [pass 2](CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS2.md). This document
@@ -564,6 +580,14 @@ valid-immediately assertion too.
 
 ## Disposition — corrective descendant of 2026-07-26 (`ceb88ed47` → `87aa71960` → `52c667d62`)
 
+> **SUPERSEDED — historical.** This section records the state after the FIRST
+> corrective round, when items 2 (store-generation arm) and 3 were still open. It
+> is kept because its "Item 2 — store-generation arm OPEN" analysis is what the
+> eventual fix was built from, and because a gate record that quietly rewrites
+> its own history is worth less than one that shows the sequence. For the current
+> state read [Closure](#closure--every-finding-in-this-document-and-pass-2-is-now-addressed)
+> at the end of this document: every item below is now closed.
+
 Worked against the **Fix now** gate above. Marked exactly: closed is closed,
 partial is partial. The gate is NOT yet satisfied — two residuals remain, and
 E3c / composed OLB-2B stays HELD until they land.
@@ -779,18 +803,41 @@ tracked elsewhere.
 
 ### Test evidence (this closure; Windows host)
 
+Run at the closure head, after the last finding landed.
+
+**Green:**
+
 - `cargo test --lib` under the exact `$UNIT_FEATURES` matrix: **5,443 passed, 0
   failed, 1 ignored**.
-- Wiring gate command: **41** witnesses (MIN raised 34 → 41, seven added:
-  11c4, 28c, 11e, 11f, 11g, 11h, 11i, each name-pinned where it carries a
-  security property).
-- New supervisor gate command: **24** witnesses (MIN 24, nine names pinned).
+- Wiring gate, under the exact CI command: **41** witnesses. MIN raised 34 → 41
+  for the seven added here (11c4, 28c, 11e, 11f, 11g, 11h, 11i), each name-pinned
+  where it carries a security property.
+- New supervisor gate (§18), under its exact CI command: **24** witnesses,
+  MIN 24, nine names pinned.
 - `--features "cortex tool fixtures"`: `sensing_lease` 18, `sensing_lease_wire` 2,
   `sensing_org_three_node` 1, `sensing_origin_emitter` 12, `org_admission_gate` 9,
   `org_ownership` 32.
 - SDK `--lib`: 231 passed.
-- `cargo clippy --lib` clean; `cargo fmt --check` clean on both crates;
-  `cargo test --doc` clean.
+- `cargo test --doc` clean. `cargo fmt --check` clean on both crates.
+- The "every `tests/*.rs` is pinned to a step" guard, run locally against the
+  edited `ci.yml`: 126 test files, none missing, none stale.
+- Clippy, three of the four production gates verified at the closure head:
+  `--all-features --lib --bins -D warnings`, `--lib --bins -D warnings`, and
+  `--no-default-features --lib --bins -D warnings` — all clean.
+
+**NOT verified on this host — do not read the above as covering it:**
+
+- **`cargo clippy --all-features --all-targets`** (the fourth gate, which lints
+  the TEST surface with the four panic-hygiene lints `-A`'d). The host ran out of
+  disk part-way through — the C: volume hit 0 bytes free, which also produced one
+  spurious `link.exe` exit 1318 earlier in the session. Clearing the 17 GB
+  incremental cache recovered 15 GB, but the gate was not re-run to completion.
+  Since this closure added test code to eight files, this gate is the one most
+  likely to have something to say, and it must pass before the closure run is
+  considered complete.
+- `cfg(unix)` verification, as in the pass itself — the Docker harness owns it.
+- The serial broad nextest matrices in full; only the sensing/org groups named
+  above were run.
 
 **RED probes**, each reverted after failing at its coupled assertion: self-wake
 under the store-generation fence; queue dropped under `Fenced`; empty-selection
@@ -798,6 +845,13 @@ mark suppressed; empty-selection mark made unconditional; seqlock re-check
 removed; rotation cursor pinned to `None`; backoff disabled; §14(c) min removed;
 the SDK candidate sort deleted. The backoff probe is worth noting — on a paused
 clock it HUNG rather than failed, because the defect is an actor that is never
-idle, which is why that witness runs on the real clock.
+idle. That is why that witness alone runs on the real clock: a regression must
+fail the job, not wedge it.
 
-`cfg(unix)` verification remains with the Docker harness, as in the pass itself.
+### What is still owed before E3c / composed OLB-2B can be signed
+
+The findings are closed; the CLOSURE RUN is not. Per the adjudication above, the
+signature needs an exact-head run with independent RED mutations, the serial
+broad matrices, the clippy/fmt/diff checks and a clean worktree. Outstanding from
+that list: the fourth clippy gate, the full serial matrices, and the `cfg(unix)`
+harness. The worktree is clean and the diff/fmt checks pass.
