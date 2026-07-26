@@ -17,18 +17,111 @@ the consolidating reviewer, including adjudicating one case where two slice
 reviews contradicted each other (§2 — resolved by direct read). Unlike pass 2,
 this pass ran the suites (see Test evidence).
 
-**Relationship to pass 2's verdict:** unchanged — **no P1s; nothing below is
-reachable on a live production path today.** All four P2s are in the
-established "latent today, on the seam the next phase consumes" class.
-Pass 2's closure confirmations for the 2026-07-23 findings were independently
-re-derived here and agree (§1/§2/§3/§7-core/§8 closed with red-coupled
-witnesses; §4 largely closed — residuals in §11 below; §5/§6 unchanged as
-accepted/tracked).
+**Relationship to pass 2's verdict:** **no P1s**, but the original blanket
+statement that nothing below is reachable on a live production path today was
+too broad. §1 is terminal-only without test seams, but §2's empty registry is
+the common production state while the demand consumer remains dark, and §3's
+global scoped-store composition is reachable whenever enough consumer grants
+are installed. The findings therefore have different phase dispositions rather
+than one shared "latent until the next phase" disposition; the adjudicated gate
+below is normative. Pass 2's closure confirmations for the 2026-07-23 findings
+were independently re-derived here and otherwise agree (§1/§2/§3/§7-core/§8
+closed with red-coupled witnesses; §4 largely closed — residuals in §11 below;
+§5/§6 unchanged as accepted/tracked).
 
 **One adjudication in pass 2 accepted here:** pass-2 §6's non-finding note is
 correct and RETIRES the 2026-07-23 §7 residual about `acquire` not comparing
 specs — `interest_digest` hashes every spec field, so an equal lease key
 implies an equal spec. That residual should be considered closed.
+
+---
+
+## Post-review adjudication and phase gate
+
+This section records the disposition after the pass-2/pass-3 findings were
+composed with the frozen E3c authority invariants. It is the execution order,
+not a re-ranking of the raw findings.
+
+### Fix now: E3c / composed OLB-2B remains held
+
+The next corrective descendant must close all of the following before E3c or
+composed OLB-2B is signed:
+
+1. A `false → true` poison transition whose publication raises no new live
+   floor must still publish an empty-slice authority-change notification after
+   every file/reload/poison/live guard is released. Lazy cold reads are not a
+   substitute for proactively reconciling untouched slots.
+2. Terminal store-generation and routing-authority exhaustion must enter a
+   quiescent terminal fence: retire every retained fact (including facts
+   stamped at `u64::MAX`), suppress impossible pending work/self-marks, make
+   readiness fail closed, and refuse every later pin without retry spin.
+3. Both empty-selection `Superseded` returns in §2 must mark authoritative
+   `RegistryWork`, so an authority-only movement cannot strand cold-start
+   health in `Rebuilding`.
+4. The poison mark/clear contention witnesses must acknowledge only after
+   `try_lock` observes the held `poison_gate`; recovery witnesses must signal
+   bounded completion before join/await; CI must name-pin the repaired steady
+   poison witness and the new terminal/empty-selection witnesses.
+
+Exhaustion deliberately does **not** adopt poison's Option A. The frozen
+invariant is that two exhausted samples never compare equal-and-current:
+exhaustion means the identity space can no longer name future movement, not a
+temporarily unusable authority that may later recover. Consequently §1's
+suggested "settle `Current` over exhausted `Unserved`" alternative is rejected;
+the accepted shape is terminal, cold and quiescent rather than terminal and
+self-waking.
+
+Required RED-coupled production witnesses cover: empty-floor poison marking;
+store-generation exhaustion; routing-authority exhaustion with equal-MAX
+facts; repeated terminal application with no spin or resurrection; and an
+empty registry whose authority moves inside the probe-to-settle window and is
+redriven to a successor terminal/converged state as appropriate.
+
+### Fix before OLB-2C is authorized
+
+- §3: reserve the owner partition structurally from the global scoped-store
+  budget and purge a consumer-grant audience's stored rows when that grant is
+  removed. Multiple granted scopes filling their aggregate allowance must not
+  deny a new owner key.
+- §5: red-couple incarnation fencing at the node read seam.
+- §6: freeze the load-bearing floors-before-epoch read discipline, preferably
+  with an epoch/floors/epoch seqlock-style sample and a deterministic witness.
+- §7: remove the unchecked-accessor trap before the warmed consumer is written;
+  at minimum rename it `base_facts_unvalidated`, keep it crate-private and point
+  production callers at the validated node seam, preferably with a proof token.
+- §12: replace wrapping scoped revisions and every other stamp identity used by
+  currentness with checked, terminal, non-aliasing state, and audit all terminal
+  consumers rather than allowing `None == None`.
+- §15: make `ScopedMutationPublication::commit` require a guard/proof token so
+  publication-gate ownership is compiler-enforced.
+
+After these corrections, run an exact-head closure with independent RED
+mutations, the serial broad matrices, clippy/fmt/diff checks, and a clean
+worktree. Only then may E3c and composed OLB-2B be signed and OLB-2C authorized.
+
+### OLB-3 prerequisites, not OLB-2C blockers
+
+- Pass-2 §2: bound consecutive `Superseded` retries with backoff and expose a
+  restart-streak/degraded signal; do not weaken exact authority epochs casually.
+- §4: loudly refuse org-commitment audiences on the lease API until the lease
+  wire leg emits authority-aware frames.
+- §9: add fair rotation/FIFO/aging before live demand can starve high-sorting
+  pending slots.
+- §17: add a cross-plane/cross-scope witness proving global candidate order and
+  sorted reachability sampling.
+
+### Before branch merge, but separable from phase authorization
+
+Close the release-surface and robustness findings without mixing them into the
+terminal-authority patch: pass-2 §1 and §3–§6; this pass §8, §10–§11, §13–§14,
+§16 and §18–§22. §14's sensing-projection transaction races remain production
+correctness-adjacent and must be closed before merge even though they do not
+authorize OLB-2C. §7 of pass 2 remains an observation unless OLB-3 changes the
+candidate-set economics.
+
+Once this finite list is closed, broad branch rescanning stops. Subsequent
+review is phase-scoped and mutation-driven so closure does not become unbounded
+review churn.
 
 ---
 
@@ -67,13 +160,13 @@ implies an equal spec. That residual should be considered closed.
   commits); reaching either fence takes 2^64 events without the test seams —
   hence P2, not P1. Note pass-2 §2's fix (b) (monotone epoch floor) does NOT
   cover this case: `matches()` refuses on `Err` regardless of any floor.
-- **Fix direction:** carry the exhaustion latch in `SourceEpoch` exactly as
-  `poisoned` is carried, so an exhausted source settles `Current` over
-  all-`Unserved` and quiesces (reads already go cold at the seam via
-  `is_exhausted` / the epoch compare). Alternatively suppress the self-mark
-  when the refused token is identical to the live one, or route persistent
-  settle-refusal into the fault/backoff path. Either way add the
-  steady-exhaustion convergence witness mirroring 25c.
+- **Adjudicated fix direction:** exhaustion is not poison Option A. On first
+  exhaustion, retire every retained fact (including equal-MAX facts), suppress
+  terminally impossible pending work and self-marks, make readiness fail closed,
+  and refuse every later pin without requeueing. Add terminal witnesses proving
+  cold service, no alias/resurrection and no retry spin for both store-generation
+  and routing-authority exhaustion. Two exhausted samples must never compare
+  equal-and-current.
 
 ### §2 — The two empty-selection `Superseded` returns mark nothing: authority-only movement strands routing health in `Rebuilding` with no wake — pass 2's accepted-by-design paragraph does not hold on the empty registry
 
