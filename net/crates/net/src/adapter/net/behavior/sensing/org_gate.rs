@@ -37,7 +37,7 @@
 
 use super::super::org::{OrgError, OrgId, OrgMembershipCert};
 use super::super::org_authority::{NodeAuthority, OrgAuthorityError};
-use super::super::org_revocation::{OrgRevocationState, OrgRevocationStore};
+use super::super::org_revocation::{BarrieredGeneration, OrgRevocationState, OrgRevocationStore};
 use super::frames::{FrameSpecError, SensingInterestFrame};
 use super::identity::{AudienceScopeCommitment, InterestSpec};
 use super::SensingCounters;
@@ -575,7 +575,10 @@ impl AdmittedSensingRegistration {
 pub(crate) struct SensingAuthorityStamp {
     authority_ptr: usize,
     store_ptr: usize,
-    store_generation: u64,
+    /// `None` once the publication generation space is EXHAUSTED — a frozen
+    /// counter can no longer witness that a view is still live, so it never
+    /// compares current (Kyra OLB-2B-E3c).
+    store_generation: Option<BarrieredGeneration>,
     installation_generation: u64,
     poisoned: bool,
 }
@@ -632,6 +635,9 @@ pub(crate) enum SensingAuthorityUnavailable {
     NoStore,
     /// The installed store is poisoned.
     Poisoned,
+    /// The store's publication generation space is exhausted, so its currentness
+    /// can no longer be witnessed — unusable authority, exactly like poison.
+    GenerationExhausted,
 }
 
 /// Capture a coherent, pinned snapshot of the sensing authority view under the
@@ -654,8 +660,12 @@ pub(crate) fn capture_sensing_authority_snapshot(
     if store.is_poisoned() {
         return Err(SensingAuthorityUnavailable::Poisoned);
     }
-    // Coherent floors + barriered store generation as one pair.
-    let (floors, store_generation) = store.snapshot_with_generation();
+    // Coherent floors + barriered store generation as one pair. An exhausted
+    // generation is unusable authority, exactly like poison.
+    let (floors, store_generation) = store
+        .snapshot_with_generation()
+        .map_err(|_| SensingAuthorityUnavailable::GenerationExhausted)?;
+    let store_generation = Some(store_generation);
     let stamp = SensingAuthorityStamp {
         authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
         store_ptr: Arc::as_ptr(&store) as *const () as usize,
@@ -692,7 +702,7 @@ pub(crate) fn capture_current_sensing_stamp(
     Some(SensingAuthorityStamp {
         authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
         store_ptr: Arc::as_ptr(&store) as *const () as usize,
-        store_generation: store.barriered_generation(),
+        store_generation: store.barriered_generation().ok(),
         installation_generation: org_install_generation.load(Ordering::Acquire),
         poisoned: store.is_poisoned(),
     })
@@ -770,6 +780,10 @@ pub(crate) enum RelayMembershipUnavailable {
     NoStore,
     /// The installed store is poisoned.
     Poisoned,
+    /// The store's publication generation space is exhausted, so a floor raise
+    /// between the snapshot and the linearization point can no longer be
+    /// detected — refuse rather than vouch against an unwitnessable view.
+    GenerationExhausted,
     /// The incoming registration's organization is not this node's owner
     /// organization — a relay only re-authors within its OWN organization. This
     /// is also the late-bound guard against the authority having rotated to a
@@ -877,7 +891,9 @@ fn capture_live_org_relay_membership_seamed(
     // Capture a coherent floor snapshot paired with its publication generation,
     // then run the membership self-verify WITHOUT holding any store publish guard
     // across the signature check.
-    let (floors, captured_generation) = store.snapshot_with_generation();
+    let (floors, captured_generation) = store
+        .snapshot_with_generation()
+        .map_err(|_| RelayMembershipUnavailable::GenerationExhausted)?;
     after_floor_snapshot();
     let verification = authority
         .config
@@ -891,7 +907,9 @@ fn capture_live_org_relay_membership_seamed(
     // membership — or a specific floor verdict — proven against a floor view that
     // is no longer live. An early `?` on `verification` would bypass this, so the
     // Result is held, not propagated, until currency is established.
-    let current_generation = store.barriered_generation();
+    let current_generation = store
+        .barriered_generation()
+        .map_err(|_| RelayMembershipUnavailable::GenerationExhausted)?;
     if store.is_poisoned() {
         return Err(RelayMembershipUnavailable::Poisoned);
     }
@@ -1402,7 +1420,7 @@ mod tests {
         SensingAuthorityStamp {
             authority_ptr,
             store_ptr,
-            store_generation,
+            store_generation: Some(BarrieredGeneration::from_raw_for_test(store_generation)),
             installation_generation,
             poisoned,
         }

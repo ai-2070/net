@@ -2805,7 +2805,10 @@ struct SendStamp {
     store_ptr: usize,
     /// The installed store's publish generation (bumped on every
     /// floor publish, under the reload lock).
-    store_generation: u64,
+    /// `None` once the publication generation space is EXHAUSTED — a frozen
+    /// counter cannot witness that the view is still live, so the stamp never
+    /// compares current (Kyra OLB-2B-E3c).
+    store_generation: Option<super::behavior::org_revocation::BarrieredGeneration>,
     /// `Arc::as_ptr` of the installed node authority (0 = none).
     authority_ptr: usize,
     /// Bumped by [`MeshNode::set_owner_cert_emission`] — a toggle
@@ -5324,10 +5327,14 @@ impl ScopedSlotSource {
             // same reason poison is: the generation can no longer distinguish
             // floor views, so it can no longer witness currentness. Folded into
             // the same fail-closed flag (Kyra OLB-2B-E3c).
-            Some(store) => (
-                store.is_poisoned() || store.is_generation_exhausted(),
-                store.barriered_generation(),
-            ),
+            // An EXHAUSTED publication generation is unusable authority for the
+            // same reason poison is: the generation can no longer distinguish
+            // floor views, so it can no longer witness currentness. Sampled
+            // COHERENTLY with the generation it qualifies (Kyra OLB-2B-E3c).
+            Some(store) => match store.barriered_generation() {
+                Ok(generation) => (store.is_poisoned(), generation.get()),
+                Err(_) => (true, 0),
+            },
             // Un-adopted: no store, implicit floor 0.
             None => (false, 0),
         };
@@ -10454,7 +10461,10 @@ impl MeshNode {
             store_ptr: store
                 .as_ref()
                 .map_or(0, |s| Arc::as_ptr(s) as *const () as usize),
-            store_generation: store.as_ref().map_or(0, |s| s.barriered_generation()),
+            // `None` once exhausted: a frozen counter would make a publication
+            // after exhaustion read as "unchanged", so the stamp must never
+            // compare current (Kyra OLB-2B-E3c).
+            store_generation: store.as_ref().and_then(|s| s.barriered_generation().ok()),
             authority_ptr: authority
                 .as_ref()
                 .map_or(0, |a| Arc::as_ptr(a) as *const () as usize),
@@ -18775,7 +18785,8 @@ impl MeshNode {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     sensing::SensingAuthorityUnavailable::NoAuthority
-                    | sensing::SensingAuthorityUnavailable::NoStore => {
+                    | sensing::SensingAuthorityUnavailable::NoStore
+                    | sensing::SensingAuthorityUnavailable::GenerationExhausted => {
                         ctx.sensing_counters
                             .org_authority_unavailable
                             .fetch_add(1, Ordering::Relaxed);
@@ -20367,12 +20378,28 @@ impl MeshNode {
             .as_ref()
             .map_or(0, |s| Arc::as_ptr(s) as *const () as usize);
         let empty_floors = OrgRevocationState::empty();
-        let pinned = store.as_ref().map(|s| s.snapshot_with_generation());
+        // `Err` => the store's currentness can no longer be witnessed. Treat it
+        // as unusable authority: `None` floors would silently fall back to the
+        // EMPTY floor set, which is the permissive direction (Kyra OLB-2B-E3c).
+        let pinned = match store.as_ref().map(|s| s.snapshot_with_generation()) {
+            None => None,
+            Some(Ok(pair)) => Some(pair),
+            Some(Err(_)) => {
+                tracing::error!(
+                    from_node = format!("{:#x}", from_node),
+                    "scoped-ann: revocation publication generation exhausted;                      ingest refused — the floor view's currentness can no longer                      be witnessed"
+                );
+                // FINAL, not Retryable: unlike poison, exhaustion is terminal, so
+                // releasing the dedup identity would only invite the same refusal
+                // on every redelivery for the whole retention horizon.
+                return ScopedIngestDisposition::Final;
+            }
+        };
         let floors: &OrgRevocationState = pinned
             .as_ref()
             .map(|(f, _)| f.as_ref())
             .unwrap_or(&empty_floors);
-        let pinned_generation = pinned.as_ref().map_or(0, |(_, g)| *g);
+        let pinned_generation = pinned.as_ref().map(|(_, g)| *g);
         let now_secs = super::behavior::org::current_timestamp();
         let ctx = ScopedIngestContext {
             local_owner_org: owner_org,
@@ -20470,9 +20497,11 @@ impl MeshNode {
                 let store_ptr_now = current_store
                     .as_ref()
                     .map_or(0, |s| Arc::as_ptr(s) as *const () as usize);
+                // `None` on exhaustion, which never equals the pinned `Some`, so
+                // the recheck below fails closed.
                 let generation_now = current_store
                     .as_ref()
-                    .map_or(0, |s| s.barriered_generation());
+                    .and_then(|s| s.barriered_generation().ok());
                 let poisoned_now = current_store
                     .as_ref()
                     .map(|s| s.is_poisoned())

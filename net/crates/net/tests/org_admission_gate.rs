@@ -152,7 +152,7 @@ async fn authority_dark_node_cannot_admit() {
     let stamp = capture_admission_stamp(&node);
     assert_eq!(stamp.authority_ptr, 0);
     assert_eq!(stamp.store_ptr, 0);
-    assert_eq!(stamp.store_generation, 0);
+    assert_eq!(stamp.store_generation, None);
     assert!(!stamp.poisoned);
 }
 

@@ -869,7 +869,9 @@ async fn facts_built_against_superseded_floors_read_cold() {
         .load()
         .as_ref()
         .expect("store")
-        .barriered_generation();
+        .barriered_generation()
+        .expect("not exhausted")
+        .get();
 
     node.routing_registry.install_facts_for_test(
         key.clone(),
@@ -991,7 +993,10 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
 
     store.saturate_generation_for_test();
     store.republish_for_test();
-    assert!(store.is_generation_exhausted());
+    assert_eq!(
+        store.barriered_generation().err(),
+        Some(crate::adapter::net::behavior::org_revocation::GenerationExhausted)
+    );
 
     let snapshot = source.snapshot(std::slice::from_ref(&key));
     assert!(

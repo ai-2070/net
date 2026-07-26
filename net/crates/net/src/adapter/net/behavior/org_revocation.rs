@@ -1086,6 +1086,50 @@ pub(crate) fn publish_guard_pair<'a>(
         _guards: vec![g1, g2],
     }
 }
+/// A publication generation sampled coherently with its terminal state.
+///
+/// Deliberately opaque. The raw `u64` is only meaningful next to the exhaustion
+/// latch it was sampled with, so handing out a bare integer invites exactly the
+/// aliasing this type exists to prevent — a consumer comparing frozen values and
+/// concluding "unchanged". Compare these, do not unwrap them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BarrieredGeneration(u64);
+
+impl BarrieredGeneration {
+    /// The raw value. For stamping and logging only — a currentness DECISION
+    /// must compare `BarrieredGeneration`s, so the exhaustion latch they were
+    /// sampled with cannot be dropped on the floor.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Test-only: fabricate a generation for stamp-comparison unit tests that
+    /// never touch a real store.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn from_raw_for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+/// The publication generation space is exhausted: the counter is frozen, so it
+/// can no longer distinguish floor views.
+///
+/// TERMINAL and fail-closed. Every consumer that uses the generation as a
+/// currentness discriminator must refuse rather than proceed — a frozen counter
+/// makes a post-exhaustion publication look identical to no publication at all
+/// (Kyra OLB-2B-E3c). Returned as an `Err` precisely so no consumer can ignore
+/// it by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenerationExhausted;
+
+impl std::fmt::Display for GenerationExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("org revocation publication generation space is exhausted")
+    }
+}
+
+impl std::error::Error for GenerationExhausted {}
 
 /// The node-local persisted revocation maxima plus its published
 /// live view. See the module docs for the locked reload order and
@@ -1363,10 +1407,13 @@ impl OrgRevocationStore {
 
     /// Whether the publication generation space is exhausted.
     ///
-    /// Terminal. A consumer that uses [`Self::barriered_generation`] as a
-    /// currentness discriminator MUST treat this as unusable authority: the
-    /// generation no longer advances, so it can no longer distinguish views.
-    pub fn is_generation_exhausted(&self) -> bool {
+    /// OBSERVABILITY ONLY. Never use this to decide currentness: read
+    /// independently of the generation it qualifies, it races the very
+    /// publication that exhausts the space. Currentness decisions must take the
+    /// coherent [`Result`] from [`Self::barriered_generation`] or
+    /// [`Self::snapshot_with_generation`], which sample both under one barrier
+    /// (Kyra OLB-2B-E3c).
+    pub fn generation_exhausted_for_metrics(&self) -> bool {
         self.core.generation_exhausted.load(Ordering::Acquire)
     }
 
@@ -1430,9 +1477,23 @@ impl OrgRevocationStore {
     /// already installed — the interleaving that would let a stale
     /// admission stamp compare "unchanged" and admit against a floor
     /// that has actually risen.
-    pub fn barriered_generation(&self) -> u64 {
+    pub fn barriered_generation(&self) -> Result<BarrieredGeneration, GenerationExhausted> {
         let _live = self.core.live.read();
-        self.core.generation.load(Ordering::Acquire)
+        Self::sample_generation(&self.core)
+    }
+
+    /// Sample the generation and its terminal state under ONE `live.read()`.
+    ///
+    /// The caller must already hold that guard. Sampling them with two
+    /// independent calls is itself raceable: the publication that exhausts the
+    /// space sets the latch and freezes the counter, so a reader can observe the
+    /// frozen counter with the pre-exhaustion latch and conclude "unchanged"
+    /// (Kyra OLB-2B-E3c).
+    fn sample_generation(core: &StoreCore) -> Result<BarrieredGeneration, GenerationExhausted> {
+        if core.generation_exhausted.load(Ordering::Acquire) {
+            return Err(GenerationExhausted);
+        }
+        Ok(BarrieredGeneration(core.generation.load(Ordering::Acquire)))
     }
 
     /// A floor snapshot together with the exact generation it
@@ -1440,10 +1501,12 @@ impl OrgRevocationStore {
     /// Kyra review). Publication-barriered like
     /// [`Self::barriered_generation`], so the `(snapshot, generation)`
     /// pair is always consistent — no seqlock retry needed.
-    pub fn snapshot_with_generation(&self) -> (Arc<OrgRevocationState>, u64) {
+    pub fn snapshot_with_generation(
+        &self,
+    ) -> Result<(Arc<OrgRevocationState>, BarrieredGeneration), GenerationExhausted> {
         let live = self.core.live.read();
-        let generation = self.core.generation.load(Ordering::Acquire);
-        (live.clone(), generation)
+        let generation = Self::sample_generation(&self.core)?;
+        Ok((live.clone(), generation))
     }
 
     /// Test-only (`#[doc(hidden)]`, mirroring the review-11
@@ -4189,7 +4252,7 @@ mod tests {
             OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
                 .expect("init"),
         );
-        let g0 = store.barriered_generation();
+        let g0 = store.barriered_generation().expect("not exhausted").get();
 
         // Arm the one-shot pause, then raise a floor on another thread:
         // it swaps the live view and blocks BEFORE bumping the
@@ -4218,8 +4281,8 @@ mod tests {
         let reader = {
             let store = store.clone();
             std::thread::spawn(move || {
-                let g = store.barriered_generation();
-                let _ = reader_tx.send(g);
+                let g = store.barriered_generation().expect("not exhausted");
+                let _ = reader_tx.send(g.get());
             })
         };
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -4240,7 +4303,10 @@ mod tests {
             g0 + 1,
             "the barriered read returned the NEW generation, never the stale one",
         );
-        assert_eq!(store.barriered_generation(), g0 + 1);
+        assert_eq!(
+            store.barriered_generation().expect("not exhausted").get(),
+            g0 + 1
+        );
         assert!(store.floor_for(&org().org_id(), &member()) >= 9);
     }
 
@@ -4258,25 +4324,32 @@ mod tests {
             OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
                 .expect("init");
 
-        assert!(!store.is_generation_exhausted());
+        assert!(store.barriered_generation().is_ok());
         store.saturate_generation_for_test();
-        assert_eq!(store.barriered_generation(), u64::MAX);
+        assert_eq!(
+            store
+                .barriered_generation()
+                .expect("not yet exhausted")
+                .get(),
+            u64::MAX
+        );
 
         store.republish_for_test();
 
         assert_eq!(
             store.barriered_generation(),
-            u64::MAX,
-            "the generation must FREEZE, never wrap to a reused identity"
+            Err(GenerationExhausted),
+            "the exhausted space must be reported as an ERROR the caller cannot              ignore, not as a frozen integer that reads as unchanged"
         );
-        assert!(
-            store.is_generation_exhausted(),
-            "and the latch must be set so consumers fail closed"
+        assert_eq!(
+            store.snapshot_with_generation().err(),
+            Some(GenerationExhausted),
+            "the coherent snapshot sampler fails closed the same way"
         );
+        assert!(store.generation_exhausted_for_metrics());
 
         // Terminal: a further publication does not clear it.
         store.republish_for_test();
-        assert!(store.is_generation_exhausted());
-        assert_eq!(store.barriered_generation(), u64::MAX);
+        assert_eq!(store.barriered_generation(), Err(GenerationExhausted));
     }
 }
