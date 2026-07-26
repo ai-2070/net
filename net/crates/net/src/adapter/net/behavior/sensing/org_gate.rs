@@ -590,7 +590,22 @@ impl SensingAuthorityStamp {
     /// transition makes the stamp non-current even with every numeric field
     /// equal.
     pub(crate) fn is_current(&self, current: &SensingAuthorityStamp) -> bool {
-        self == current && !current.poisoned
+        // An exhausted generation is unusable authority on EITHER side, exactly
+        // as in `AdmissionStamp::is_current`: two `None` stamps would otherwise
+        // compare equal-and-current, and a frozen counter can witness neither
+        // that the captured view is still live nor that the live view moved.
+        //
+        // Unreachable through the current caller —
+        // `capture_sensing_authority_snapshot` refuses with
+        // `SensingAuthorityUnavailable::GenerationExhausted` before it builds a
+        // stamp, so the captured side is always `Some`. That invariant lives in
+        // a DIFFERENT function from this check, so it is made structural here
+        // rather than left as a property a future capture path could break
+        // silently (review-pass-2 §4).
+        self.store_generation.is_some()
+            && current.store_generation.is_some()
+            && self == current
+            && !current.poisoned
     }
 }
 
@@ -1460,6 +1475,31 @@ mod tests {
         // A store may poison without changing any pointer or generation.
         let captured = stamp(1, 2, 3, 4, false);
         assert!(!captured.is_current(&stamp(1, 2, 3, 4, true)));
+    }
+
+    /// The mirror of `admission_stamp_currency`'s exhaustion cell
+    /// (review-pass-2 §4). `capture_sensing_authority_snapshot` refuses before
+    /// it ever builds an exhausted stamp, so this is currently unreachable
+    /// through the production caller — which is exactly why the guard belongs in
+    /// the type rather than in that one function.
+    #[test]
+    fn an_exhausted_generation_is_never_current_in_either_position() {
+        let base = stamp(1, 2, 3, 4, false);
+        let mut exhausted = base;
+        exhausted.store_generation = None;
+
+        assert!(
+            !base.is_current(&exhausted),
+            "a live view whose generation is exhausted cannot be shown current"
+        );
+        assert!(
+            !exhausted.is_current(&base),
+            "a captured view sampled at exhaustion cannot be shown still live"
+        );
+        assert!(
+            !exhausted.is_current(&exhausted),
+            "and two exhausted samples must NOT compare equal-and-current"
+        );
     }
 
     // ---- piece-2: live relay re-authoring membership ------------------

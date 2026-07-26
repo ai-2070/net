@@ -2394,3 +2394,48 @@ async fn an_exhausted_store_generation_stops_certified_emission() {
         "an exhausted send stamp must never compare current, even against itself"
     );
 }
+
+/// (30) The defensive per-provider dedup keeps the NEWEST generation.
+///
+/// `Vec::dedup_by` passes elements in reverse slice order and removes its first
+/// argument, so the FIRST of each run survives. With the tiebreak sorted
+/// ascending that was the OLDEST announcement — a silently-stale route rather
+/// than a refused one. Unreachable through
+/// `find_scope_exact_private_providers`, which keys on `(scope, provider)` under
+/// exact scope equality and so yields one row per provider; this drives the
+/// snapshot directly so the defense is actually exercised (review-pass-2 §5).
+#[tokio::test]
+async fn duplicate_provider_rows_collapse_to_the_newest_generation() {
+    let node = node().await;
+    let key = slot(25, "nrpc:dedup");
+    let provider = node.entity_id().clone();
+    let org = crate::adapter::net::behavior::org::OrgId::from_bytes([25u8; 32]);
+    let row = |generation: u64, expires_at: u64| PrivateCapabilityProvider {
+        provider: provider.clone(),
+        owner_org: org,
+        expires_at,
+        generation,
+    };
+
+    // Deliberately supplied OUT of order, so the assertion cannot pass merely
+    // because the input happened to be sorted the right way.
+    let snapshot = ScopedSourceSnapshot {
+        token: SourceToken::default(),
+        rows: [(key.clone(), vec![row(3, 300), row(9, 900), row(5, 500)])]
+            .into_iter()
+            .collect(),
+    };
+
+    let SourceFacts::Served(providers) = snapshot.providers(&key) else {
+        panic!("a captured scope must reconstruct as Served");
+    };
+    assert_eq!(providers.len(), 1, "one row per provider survives");
+    assert_eq!(
+        providers[0].generation, 9,
+        "the dedup must keep the NEWEST announcement, not the oldest"
+    );
+    assert_eq!(
+        providers[0].expires_at, 900,
+        "and the surviving row must be that announcement's, not a mix"
+    );
+}

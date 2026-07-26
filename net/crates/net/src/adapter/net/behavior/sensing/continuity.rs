@@ -362,7 +362,9 @@ impl ObservationCell {
     /// to). Crate-internal observability seam (used by the `MeshNode`
     /// consumer-cell-interval test accessor) — the shared local-consumer cell
     /// must carry the derived local aggregate (review L1 follow-up); kept
-    /// `pub(crate)` so it does not widen the public sensing API.
+    /// `pub(crate)` so it does not widen the public sensing API — and gated with
+    /// its only caller now that that accessor is test-only (review-pass-2 §1).
+    #[cfg(any(test, feature = "fixtures"))]
     pub(crate) fn own_interval(&self) -> Duration {
         self.own_interval
     }

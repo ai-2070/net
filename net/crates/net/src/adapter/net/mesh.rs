@@ -5438,10 +5438,19 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
             return SourceFacts::Unserved;
         };
         let mut providers = rows.clone();
+        // Provider ascending (the deterministic projection order), generation
+        // DESCENDING within a provider. `Vec::dedup_by` passes elements in
+        // reverse slice order and removes the first argument, so the FIRST of
+        // each run survives — with an ascending tiebreak this defensive dedup
+        // would keep the OLDEST generation. The rows are one-per-provider by
+        // construction today (`find_scope_exact_private_providers` keys on
+        // `(scope, provider)` under exact scope equality), so the dedup is a
+        // no-op; it is kept as the defense it was meant to be, pointed the right
+        // way (review-pass-2 §5).
         providers.sort_by(|a, b| {
             a.provider
                 .cmp(&b.provider)
-                .then_with(|| a.generation.cmp(&b.generation))
+                .then_with(|| b.generation.cmp(&a.generation))
         });
         providers.dedup_by(|a, b| a.provider == b.provider);
         SourceFacts::Served(providers.into())
@@ -8883,7 +8892,12 @@ impl MeshNode {
     /// Test seam (OLB-0 §4.3): the node-global sensing-interest lease's
     /// live holder count and installed interval for one key — `None` when
     /// no holder references it (e.g. after a rolled-back acquisition).
+    ///
+    /// §19 / review-pass-2 §1: compiled out of consumer builds. Read-only, so it
+    /// is gated for consistency with its mutating siblings rather than for
+    /// availability — a test seam is not release surface.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn sensing_lease_entry_for_test(
         &self,
         key: &sensing::SensingLeaseKey,
@@ -8896,7 +8910,16 @@ impl MeshNode {
     /// the floor is refused with
     /// [`sensing::RegisterOutcome::RefusedByCachedFloor`] without driving the
     /// refusal protocol.
+    ///
+    /// §19 / review-pass-2 §1 — GATED, and this is the load-bearing one. This
+    /// takes `&self` on a live node and writes an arbitrary `refused_minimum`
+    /// into the live `sensing_interest_table`, after which every genuine
+    /// registration for that `(interest, provider)` returns
+    /// [`sensing::RegisterOutcome::RefusedByCachedFloor`] indefinitely. Left
+    /// ungated it is an unauthenticated off-switch for that branch's sensing
+    /// plane, reachable by anything linked against this crate.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn install_sensing_cached_floor_for_test(
         &self,
         spec: &sensing::InterestSpec,
@@ -8910,8 +8933,10 @@ impl MeshNode {
     }
 
     /// Test seam (OLB-0 §4.3): clear a cached provider floor for an exact
-    /// interest (as a floor relaxation would).
+    /// interest (as a floor relaxation would). Gated with its installing
+    /// sibling (review-pass-2 §1).
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn clear_sensing_cached_floor_for_test(&self, spec: &sensing::InterestSpec, provider: u64) {
         let key = sensing::ProviderInterestKey::new(spec.key(), provider);
         self.sensing_interest_table
@@ -8923,8 +8948,10 @@ impl MeshNode {
     /// current interval for a branch — the derived local aggregate (min across
     /// the direct `Local` and leased `LeasedLocal` rows). `None` when no consumer
     /// cell exists for the branch. Lets the coexistence witness assert the
-    /// aggregate-derived cadence without racing behavioral timing.
+    /// aggregate-derived cadence without racing behavioral timing. Read-only;
+    /// gated with the rest of the group (review-pass-2 §1).
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn sensing_consumer_cell_interval_for_test(
         &self,
         key: &sensing::ProviderInterestKey,
@@ -8941,7 +8968,12 @@ impl MeshNode {
     /// cell-lifecycle pass, in isolation. Witnesses drive lease-only survival and
     /// expiry relax-back deterministically by passing a synthetic `now` past a
     /// row's expiry, without racing the real maintenance cadence.
+    ///
+    /// GATED (review-pass-2 §1): it takes `&self` on a live node and drives a
+    /// real maintenance transaction at a CALLER-CHOSEN `now`, so an arbitrary
+    /// future instant expires live rows from outside.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn run_sensing_consumer_cell_sweep_for_test(&self, now: Instant) {
         self.run_sensing_consumer_cell_sweep_inner(now, None);
     }
@@ -8974,6 +9006,12 @@ impl MeshNode {
         *self.sensing_projection_contention_hook.lock() = hook;
     }
 
+    /// The shared body of the two sweep seams above. Test-only with them: the
+    /// PRODUCTION maintenance loop calls
+    /// [`reconcile_materialized_consumer_cells`] directly with its own live
+    /// interest set, so this wrapper exists solely to let a witness drive one
+    /// pass at a synthetic `now` (review-pass-2 §1).
+    #[cfg(any(test, feature = "fixtures"))]
     fn run_sensing_consumer_cell_sweep_inner(
         &self,
         now: Instant,
@@ -12012,14 +12050,6 @@ impl MeshNode {
         }
     }
 
-    /// Signal-and-join the routing supervisor.
-    ///
-    /// Awaiting the task is the proof the caller needs: the supervisor future owns
-    /// the incarnation future, which owns the fence guard and the exclusive drain,
-    /// so the task resolving means health is fenced and the drain lease is
-    /// released. Only then can a successor mint succeed (OLB-2B-E3c).
-    ///
-    /// The shutdown flag and notification must already have been issued.
     /// Test-only: whether a joiner is currently BLOCKED on the routing-task slot.
     ///
     /// Lets the concurrent-registration witness wait on the real contention
@@ -12030,6 +12060,16 @@ impl MeshNode {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Signal-and-join the routing supervisor.
+    ///
+    /// Awaiting the task is the proof the caller needs: the supervisor future owns
+    /// the incarnation future, which owns the fence guard and the exclusive drain,
+    /// so the task resolving means health is fenced and the drain lease is
+    /// released. Only then can a successor mint succeed (OLB-2B-E3c).
+    ///
+    /// PRECONDITION: the shutdown flag and notification must already have been
+    /// issued. Awaiting a supervisor that has not been told to stop blocks until
+    /// its source closes.
     async fn join_org_routing_supervisor(&self) {
         // Taking the slot is what serializes against `start_org_routing_supervisor`:
         // either startup published the handle before releasing the slot (so this

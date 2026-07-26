@@ -233,19 +233,24 @@ impl SensingInterestLeases {
     }
 
     /// Test seam: how many distinct interest keys are currently referenced.
+    /// Gated with the rest of the sensing seam group (review-pass-2 §1) — a
+    /// test seam is not release surface even when it only reads.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn len(&self) -> usize {
         self.entries.lock().len()
     }
 
     /// Whether no interest is referenced.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Test seam: the live holder count and installed interval for one key.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn entry_for_test(&self, key: &SensingLeaseKey) -> Option<(usize, Duration)> {
         self.entries
             .lock()

@@ -490,7 +490,12 @@ impl InterestTable {
     /// so a late joiner below `floor` is refused
     /// ([`RegisterOutcome::RefusedByCachedFloor`]) without driving the real
     /// provider-refusal protocol.
+    ///
+    /// GATED (review-pass-2 §1): writing a `refused_minimum` from outside
+    /// switches off registration for that `(interest, provider)` with no
+    /// authority check and nothing in the logs. Not release surface.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn set_cached_floor_for_test(&mut self, key: &ProviderInterestKey, floor: Duration) {
         self.entries
             .entry(key.clone())
@@ -505,7 +510,9 @@ impl InterestTable {
 
     /// Test seam: clear a cached provider floor for `key` (as a floor
     /// relaxation / provider incarnation change would), leaving the entry.
+    /// Gated with its installing sibling (review-pass-2 §1).
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn clear_cached_floor_for_test(&mut self, key: &ProviderInterestKey) {
         if let Some(entry) = self.entries.get_mut(key) {
             entry.refused_minimum = None;
