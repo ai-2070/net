@@ -5173,13 +5173,25 @@ fn move_routing_authority<R>(
     registry: &super::behavior::org_routing_registry::NodeOrgRoutingRegistry,
     publish: impl FnOnce() -> R,
 ) -> R {
-    let result = {
+    let (result, live) = {
         let _gate = authority.lock_gate();
-        let result = publish();
+        // Epoch FIRST, publication second. `org_routing_base_facts` reads
+        // lock-free, so it never sees this gate; publishing the new store before
+        // the epoch that names it leaves a window where a reader observes store B
+        // with epoch R and serves A-derived facts as B-authoritative. Advancing
+        // first makes the transition conservatively COLD instead: a reader sees
+        // either (A, R) or (B, R+1), and facts stamped R stop matching the moment
+        // the epoch moves (Kyra OLB-2B-E3c).
         authority.advance();
-        result
+        let live = authority.epoch();
+        let result = publish();
+        (result, live)
     };
-    registry.invalidate_for_authority_movement();
+    // Outside the gate: the registry takes its own lock, and the frozen order is
+    // authority gate -> publication gate, never authority gate -> registry lock.
+    // CONDITIONAL on `live`, so a reconciliation that installed valid successor
+    // facts in this window is not wiped.
+    registry.invalidate_authority_older_than(live);
     result
 }
 
@@ -5406,11 +5418,26 @@ struct ScopedCommitPin<'a> {
     _authority_gate: parking_lot::MutexGuard<'a, ()>,
     _publication_gate: parking_lot::MutexGuard<'a, ()>,
     epoch: super::behavior::org_routing_registry::SourceEpoch,
+    /// The revocation slot, so the pin can re-verify the one authority it cannot
+    /// exclude.
+    org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+    poisoned: bool,
 }
 
 impl super::behavior::org_routing_registry::SourceCommitPin for ScopedCommitPin<'_> {
     fn epoch(&self) -> super::behavior::org_routing_registry::SourceEpoch {
         self.epoch
+    }
+
+    /// The gates exclude scoped mutation and node-mediated authority movement.
+    /// They do NOT exclude the revocation store's own publication — floors and
+    /// poison publish through `StoreCore`'s internal synchronization, which no
+    /// routing gate reaches. So the pin completes its guarantee by RE-VERIFYING
+    /// them (Kyra OLB-2B-E3c).
+    fn still_current(&self) -> bool {
+        let (poisoned, floor_generation, _store) =
+            ScopedSlotSource::revocation_view_of(&self.org_revocation);
+        poisoned == self.poisoned && floor_generation == self.epoch.floor_generation
     }
 }
 
@@ -5426,9 +5453,23 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         // the token names. Capturing it before the scoped rows means any floor
         // movement that could invalidate those rows is either inside the token or
         // caught by the commit pin.
-        let (poisoned, floor_generation, store) = self.revocation_view();
-        let authority = self.authority.epoch();
-        let exhausted = self.authority.is_exhausted();
+        // Store view and routing epoch sampled as ONE coherent unit under the
+        // authority gate. Off-gate they can straddle a publication: store A with
+        // epoch R+1, whose token then compares equal to live store B if A and B
+        // happen to share a floor generation — installing A-derived rows as
+        // B-authoritative (Kyra OLB-2B-E3c). Released immediately; the rows below
+        // are covered by the scoped revision in the same token.
+        let (poisoned, floor_generation, store, authority, exhausted) = {
+            let _gate = self.authority.lock_gate();
+            let (poisoned, floor_generation, store) = self.revocation_view();
+            (
+                poisoned,
+                floor_generation,
+                store,
+                self.authority.epoch(),
+                self.authority.is_exhausted(),
+            )
+        };
         let empty_floors = OrgRevocationState::empty();
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
@@ -5508,6 +5549,8 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             _authority_gate: authority_gate,
             _publication_gate: publication_gate,
             epoch,
+            org_revocation: self.org_revocation.clone(),
+            poisoned,
         }))
     }
 }

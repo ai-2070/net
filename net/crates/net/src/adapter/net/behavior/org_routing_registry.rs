@@ -228,6 +228,19 @@ pub(crate) trait SourceCommitPin {
     /// The epoch this pin proves is still current, and holds still through the
     /// conditional installation beneath it.
     fn epoch(&self) -> SourceEpoch;
+
+    /// Re-verify EVERY authority input this pin claims to hold still.
+    ///
+    /// The pin excludes what the node serializes, but a source may have
+    /// authority it publishes through its own synchronization — the production
+    /// source's revocation floors and poison publish inside the revocation
+    /// store, which no routing gate can exclude. So the pin's guarantee is
+    /// completed here rather than assumed: called under the registry lock after
+    /// the conditional installation and BEFORE settlement, so an authority that
+    /// moved underneath cannot produce a `Current` (Kyra OLB-2B-E3c).
+    ///
+    /// `false` means something moved; the caller must not settle.
+    fn still_current(&self) -> bool;
 }
 
 /// Supplies authority-scoped provider facts.
@@ -613,17 +626,41 @@ impl NodeOrgRoutingRegistry {
         self.inner.lock().slots.get(key)?.facts.clone()
     }
 
-    /// Authority moved: drop EVERY retained fact, re-queue every slot and wake.
+    /// Authority moved to `live`: drop every fact stamped with an OLDER
+    /// authority, re-queue those slots and wake.
     ///
     /// Called by the node when revocation authority changes. Authority movement
     /// need not touch scoped state at all — a store swap that retracts nothing
     /// advances no scoped revision and publishes no scoped wake — so without this
     /// the actor would never learn that everything it holds was built under an
     /// authority that no longer applies (Kyra OLB-2B-E3c).
-    pub(crate) fn invalidate_for_authority_movement(&self) {
+    ///
+    /// CONDITIONAL on the stamped epoch rather than unconditional. The publisher
+    /// releases the authority gate before calling this, so a reconciliation under
+    /// the NEW authority can install valid facts in between; wiping everything
+    /// would delete them and re-queue work that was already done, turning a
+    /// returned `Current` into immediately-owed work. Epochs are monotone, so
+    /// `< live` is exact and cannot match a successor.
+    pub(crate) fn invalidate_authority_older_than(&self, live: u64) {
         let owed = {
             let mut inner = self.inner.lock();
-            let invalidated = inner.invalidate_and_queue_all();
+            let stale: Vec<SlotKey> = inner
+                .slots
+                .iter()
+                .filter(|(_, slot)| {
+                    slot.facts
+                        .as_ref()
+                        .is_some_and(|facts| facts.epoch.authority < live)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            let mut invalidated = 0;
+            for key in stale {
+                if inner.invalidate(&key) {
+                    invalidated += 1;
+                }
+                inner.pending.insert(key);
+            }
             self.metrics
                 .facts_invalidated
                 .fetch_add(invalidated, Ordering::AcqRel);
@@ -666,6 +703,15 @@ impl NodeOrgRoutingRegistry {
         if owed {
             self.work.mark();
         }
+    }
+
+    /// Test-only: drop `key`'s facts and re-queue it, so a witness can drive
+    /// another quantum over the same slot.
+    #[cfg(test)]
+    pub(crate) fn invalidate_for_test(&self, key: &SlotKey) {
+        let mut inner = self.inner.lock();
+        inner.invalidate(key);
+        inner.pending.insert(key.clone());
     }
 
     /// Test-only: install `facts` for `key`, creating the slot if needed.
@@ -843,6 +889,10 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 return ApplyOutcome::Superseded;
             }
 
+            if !commit.still_current() {
+                drop(inner);
+                return ApplyOutcome::Superseded;
+            }
             let outcome = settle(&mut inner, incarnation, epoch, &self.metrics);
             let owed = !inner.pending.is_empty();
             drop(inner);
@@ -965,6 +1015,32 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 self.metrics.installs.fetch_add(1, Ordering::AcqRel);
             }
 
+            // FINAL complete-vector validation, still under the pin and the
+            // registry lock. Authority the source publishes through its own
+            // synchronization (revocation floors, poison) can move underneath a
+            // held pin, and the facts just written would then be stale. They are
+            // already unreadable — the read seam compares the whole stamped
+            // epoch — but `Current` is itself load-bearing: it is what lets the
+            // supervisor publish `Healthy`. So settle only if nothing moved
+            // (Kyra OLB-2B-E3c).
+            if !commit.still_current() {
+                for (key, slot_incarnation) in &selected {
+                    if inner
+                        .slots
+                        .get(key)
+                        .is_some_and(|slot| slot.incarnation == *slot_incarnation)
+                    {
+                        inner.pending.insert(key.clone());
+                    }
+                }
+                self.metrics
+                    .stale_actor_rejections
+                    .fetch_add(1, Ordering::AcqRel);
+                drop(inner);
+                self.work.mark();
+                return ApplyOutcome::Superseded;
+            }
+
             let settled = settle(&mut inner, incarnation, epoch, &self.metrics);
             let owed = !inner.pending.is_empty();
             drop(inner);
@@ -1077,6 +1153,9 @@ mod tests {
     /// take it mid-build.
     struct SourceState {
         gate: parking_lot::Mutex<u64>,
+        /// Set to make a HELD commit pin report that authority moved underneath
+        /// it — the transition no gate can exclude.
+        authority_moved: AtomicBool,
         /// Runs during reconstruction, so a witness can move the world mid-build.
         during_build: parking_lot::Mutex<Option<Hook>>,
         /// Runs inside the off-lock snapshot — the window in which the phase-1
@@ -1093,6 +1172,7 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 gate: parking_lot::Mutex::new(1),
+                authority_moved: AtomicBool::new(false),
                 during_build: parking_lot::Mutex::new(None),
                 on_snapshot: parking_lot::Mutex::new(None),
                 on_commit_release: parking_lot::Mutex::new(None),
@@ -1156,6 +1236,9 @@ mod tests {
     }
 
     impl SourceCommitPin for TestCommitPin<'_> {
+        fn still_current(&self) -> bool {
+            !self.state.authority_moved.load(Ordering::Acquire)
+        }
         fn epoch(&self) -> SourceEpoch {
             SourceEpoch {
                 generation: *self.generation,

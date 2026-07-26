@@ -195,6 +195,10 @@ type BuildHook = Box<dyn Fn() + Send + Sync>;
 struct PausingSource {
     inner: ScopedSlotSource,
     during_build: Arc<parking_lot::Mutex<Option<BuildHook>>>,
+    /// Fires once the COMMIT PIN is already held — the window no routing gate can
+    /// exclude, where the revocation store publishes through its own
+    /// synchronization.
+    after_pin: Arc<parking_lot::Mutex<Option<BuildHook>>>,
 }
 
 struct PausingSnapshot {
@@ -223,7 +227,12 @@ impl SlotSource for PausingSource {
         })
     }
     fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>> {
-        self.inner.pin_if_current(expected)
+        let pin = self.inner.pin_if_current(expected)?;
+        let hook = self.after_pin.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        Some(pin)
     }
 }
 
@@ -259,6 +268,7 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
             during_build: during_build.clone(),
+            after_pin: Arc::default(),
         }),
         work.clone(),
         Arc::default(),
@@ -818,7 +828,7 @@ async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
     };
 
     // Wait for the rival to REACH the blocked acquisition, not for a timeout.
-    tokio::task::spawn_blocking(move || blocked.recv())
+    tokio::task::spawn_blocking(move || blocked.recv_timeout(Duration::from_secs(10)))
         .await
         .expect("join")
         .expect("the installer must block on the authority gate");
@@ -1294,4 +1304,325 @@ async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
             "one authority across the whole retained set"
         );
     }
+}
+
+/// (20) Store A sampled before a swap can never be combined with store B's
+/// routing epoch.
+///
+/// Off-gate, `snapshot()` could read the epoch after a publisher advanced it but
+/// the store before the swap landed — producing A's floors under B's epoch. If A
+/// and B happen to share a floor generation the token then compares equal to live
+/// B, and A-derived rows install as B-authoritative. Sampling both under the
+/// authority gate is what forecloses it: the snapshot blocks for the whole
+/// publication rather than straddling it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_cannot_straddle_a_store_publication() {
+    let node = node().await;
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
+        unserved_scope: node.routing_unserved_scope.clone(),
+    };
+    let key = slot(15, "nrpc:straddle");
+    let scratch = Scratch::new("straddle", &node);
+
+    // Hold the authority gate, then race a snapshot against it: the snapshot must
+    // BLOCK rather than sample half of the transition.
+    let blocked = arm_authority_contention(&node);
+    // Held on a BLOCKING thread, not across an await: the guard is not Send and
+    // holding it across a suspension point would be a real defect, not a lint.
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let epoch_before = node.routing_authority.epoch();
+    let holder = {
+        let node = node.clone();
+        let store = scratch.store();
+        tokio::task::spawn_blocking(move || {
+            let _held = node.routing_authority.lock_gate();
+            let _ = done_tx.send(());
+            let _ = release_rx.recv();
+            // Complete the transition under the held gate, exactly as the
+            // publisher does: epoch first, then the store.
+            node.routing_authority.advance();
+            node.org_revocation.store(Some(store));
+        })
+    };
+    tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .expect("join")
+        .expect("the holder must take the gate");
+
+    let sampled = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let sampled = sampled.clone();
+        let source_epoch = Arc::new(parking_lot::Mutex::new(None));
+        let out = source_epoch.clone();
+        let node = node.clone();
+        let key = key.clone();
+        (
+            tokio::task::spawn_blocking(move || {
+                let src = ScopedSlotSource {
+                    scoped_discovery: node.scoped_discovery.clone(),
+                    publication: node.scoped_publication.clone(),
+                    org_revocation: node.org_revocation.clone(),
+                    authority: node.routing_authority.clone(),
+                    unserved_scope: node.routing_unserved_scope.clone(),
+                };
+                let snap = src.snapshot(std::slice::from_ref(&key));
+                *out.lock() = Some(snap.token());
+                sampled.store(true, Ordering::Release);
+            }),
+            source_epoch,
+        )
+    };
+
+    // BOUNDED: a missing contention signal must FAIL the witness, not hang it.
+    tokio::task::spawn_blocking(move || blocked.recv_timeout(Duration::from_secs(10)))
+        .await
+        .expect("join")
+        .expect("the snapshot must block on the authority gate");
+    assert!(
+        !sampled.load(Ordering::Acquire),
+        "a snapshot sampled authority while a publication held the gate"
+    );
+
+    let _ = release_tx.send(());
+    holder.await.expect("holder");
+    assert_ne!(epoch_before, node.routing_authority.epoch());
+
+    sampler.0.await.expect("sampler");
+    let token = sampler.1.lock().clone().expect("token");
+
+    // Whatever it sampled is COHERENT: it commits against the live authority.
+    assert!(
+        source.pin_if_current(&token).is_some(),
+        "the snapshot must have sampled one side of the transition, not a mix"
+    );
+}
+
+/// (21) A lock-free cached read never observes the replacement store with the
+/// retired epoch.
+///
+/// The publisher advances the epoch BEFORE publishing the store, so the window is
+/// conservatively cold rather than permissively stale: a reader sees (A, R) or
+/// (B, R+1), never (B, R).
+#[tokio::test]
+async fn the_epoch_advances_before_the_store_becomes_visible() {
+    use crate::adapter::net::behavior::org_routing_registry::{
+        SlotBaseFacts, SourceEpoch, SourceFacts,
+    };
+
+    let node = node().await;
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+    let key = slot(16, "nrpc:epoch-first");
+    let retired = node.routing_authority.epoch();
+
+    node.routing_registry.install_facts_for_test(
+        key.clone(),
+        Arc::new(SlotBaseFacts {
+            providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
+            epoch: SourceEpoch {
+                generation: node.scoped_discovery.lock().revision(),
+                authority: retired,
+                floor_generation: 0,
+            },
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            earliest_expiry: u64::MAX,
+        }),
+    );
+    assert!(node.org_routing_base_facts(&key).is_some());
+
+    // Observe the ordering directly: inside the publish closure the epoch has
+    // ALREADY moved, so no reader can pair the new store with the retired epoch.
+    let scratch = Scratch::new("epoch-first", &node);
+    let store = scratch.store();
+    let observed = Arc::new(AtomicBool::new(false));
+    {
+        let node2 = node.clone();
+        let observed = observed.clone();
+        let store = store.clone();
+        move_routing_authority(&node.routing_authority, &node.routing_registry, || {
+            assert_ne!(
+                node2.routing_authority.epoch(),
+                retired,
+                "the epoch must advance BEFORE the store becomes visible"
+            );
+            assert!(
+                node2.org_revocation.load().is_none(),
+                "precondition: the store is not visible yet"
+            );
+            node2.org_revocation.store(Some(store));
+            observed.store(true, Ordering::Release);
+        });
+    }
+    assert!(observed.load(Ordering::Acquire));
+    assert!(
+        node.org_routing_base_facts(&key).is_none(),
+        "facts stamped with the retired epoch read cold across the transition"
+    );
+}
+
+/// (22) In-place floor publication underneath a live commit pin cannot settle
+/// `Current`.
+///
+/// The gates exclude scoped mutation and node-mediated authority movement; they
+/// cannot exclude the revocation store's own publication. The pin therefore
+/// re-verifies floors and poison before settlement, so a quantum whose authority
+/// moved reports `Superseded` and re-queues instead of publishing a completed
+/// recapture.
+#[tokio::test]
+async fn a_floor_publication_under_the_pin_cannot_settle_current() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("pin-floor", &node);
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+
+    let during_build: Arc<parking_lot::Mutex<Option<BuildHook>>> = Arc::default();
+    let after_pin: Arc<parking_lot::Mutex<Option<BuildHook>>> = Arc::default();
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(
+        Arc::new(PausingSource {
+            inner: ScopedSlotSource {
+                scoped_discovery: node.scoped_discovery.clone(),
+                publication: node.scoped_publication.clone(),
+                org_revocation: node.org_revocation.clone(),
+                authority: node.routing_authority.clone(),
+                unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+            during_build: during_build.clone(),
+            after_pin: after_pin.clone(),
+        }),
+        work.clone(),
+        Arc::default(),
+    );
+    registry.activate_incarnation(1);
+
+    let family = registry.new_family().expect("family");
+    let key = slot(17, "nrpc:pin-floor");
+    let _held = family.demand(key.clone()).expect("demand");
+
+    let request = ApplyRequest {
+        batch: PrivateDiscoveryChangeBatch {
+            generation: 0,
+            dirty: DirtyCapabilities::Clean,
+        },
+        registry_work: true,
+    };
+
+    // Baseline: with authority still, this settles Current.
+    assert!(matches!(
+        registry.apply(1, request.clone()),
+        ApplyOutcome::Current { .. }
+    ));
+
+    // Publish a floor THROUGH THE REAL STORE while the COMMIT PIN IS ALREADY
+    // HELD. Publishing earlier would be caught by `pin_if_current`'s token check
+    // and would prove nothing about the pin's own guarantee — this is the window
+    // Kyra's schedule names, and only the final complete-vector validation closes
+    // it.
+    registry.invalidate_for_test(&key);
+    let published = Arc::new(AtomicBool::new(false));
+    {
+        let store = store.clone();
+        let published = published.clone();
+        *after_pin.lock() = Some(Box::new(move || {
+            store.republish_for_test();
+            published.store(true, Ordering::Release);
+        }));
+    }
+
+    let outcome = registry.apply(1, request.clone());
+    assert!(
+        published.load(Ordering::Acquire),
+        "the floor must have moved"
+    );
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Superseded,
+        "a quantum whose floor authority moved must NOT settle Current"
+    );
+    assert_eq!(registry.pending_slots(), 1, "and must re-queue");
+
+    // Settled again once nothing is moving.
+    assert!(matches!(
+        registry.apply(1, request),
+        ApplyOutcome::Current { .. }
+    ));
+}
+
+/// (23) Authority invalidation cannot delete facts installed under the SUCCESSOR
+/// authority.
+///
+/// The publisher releases the authority gate before invalidating, so a
+/// reconciliation under the new authority can land in between. Unconditional
+/// invalidation would delete that work and re-queue it, turning a just-returned
+/// `Current` into immediately-owed work.
+#[tokio::test]
+async fn authority_invalidation_spares_successor_facts() {
+    use crate::adapter::net::behavior::org_routing_registry::{
+        SlotBaseFacts, SourceEpoch, SourceFacts,
+    };
+
+    let node = node().await;
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+    let stale_key = slot(18, "nrpc:retired");
+    let fresh_key = slot(18, "nrpc:successor");
+
+    let retired = node.routing_authority.epoch();
+    {
+        let _gate = node.routing_authority.lock_gate();
+        node.routing_authority.advance();
+    }
+    let live = node.routing_authority.epoch();
+    assert_ne!(retired, live);
+
+    let facts = |authority: u64| {
+        Arc::new(SlotBaseFacts {
+            providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
+            epoch: SourceEpoch {
+                generation: node.scoped_discovery.lock().revision(),
+                authority,
+                floor_generation: 0,
+            },
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            earliest_expiry: u64::MAX,
+        })
+    };
+    node.routing_registry
+        .install_facts_for_test(stale_key.clone(), facts(retired));
+    let successor = facts(live);
+    node.routing_registry
+        .install_facts_for_test(fresh_key.clone(), successor.clone());
+
+    node.routing_registry.invalidate_authority_older_than(live);
+
+    assert!(
+        node.routing_registry.base_facts(&stale_key).is_none(),
+        "the retired-authority facts are invalidated"
+    );
+    let survivor = node
+        .routing_registry
+        .base_facts(&fresh_key)
+        .expect("successor facts survive");
+    assert!(
+        Arc::ptr_eq(&survivor, &successor),
+        "invalidation must not delete work done under the SUCCESSOR authority"
+    );
 }
