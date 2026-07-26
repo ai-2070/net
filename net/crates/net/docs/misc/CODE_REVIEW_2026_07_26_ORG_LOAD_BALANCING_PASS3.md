@@ -691,3 +691,107 @@ suite 34 under the exact CI gate command; `org_admission_gate` 9,
 `org_ownership` 32, `sensing_org_three_node` 1 under `cortex tool fixtures`;
 three clippy gates, fmt and diff-check clean. Six RED probes total, each
 reverted after failing at its coupled assertion.
+
+---
+
+## Closure — every finding in this document and pass 2 is now addressed
+
+Worked as one pass over the full adjudicated list rather than tier by tier, so
+the tier headings above record the ORIGINAL priority, not the landing order. Each
+finding is a separate commit whose message states the defect, the fix and the
+witness. Nothing is deferred; the two pass-2 items that were previously deferred
+by decision (§2, §7) are resolved below.
+
+### Fix now — the E3c gate
+
+| Gate item | Status | Where |
+|---|---|---|
+| 1 — empty-raise poison MARK publishes the authority-change notification | Closed | `87aa71960` (prior round) |
+| 2 — quiescent terminal fence on exhaustion, BOTH arms | **Closed** | `ceb88ed47` (routing authority) + `e5717fe21` (store generation) |
+| 3 — empty-selection `Superseded` returns mark authoritative `RegistryWork` | **Closed** | `d2e7c7733` |
+| 4 — contention-observed acks, bounded recovery witnesses, CI name-pins | **Closed** | `52c667d62` + the pins added with each witness below |
+
+Item 2's store-generation arm needed a distinction the first round did not have:
+`SlotSource::terminal() -> bool` became `liveness() -> SourceLiveness`, separating
+`Terminal` (the authority epoch — no successor identity, discard the queue) from
+`Fenced` (an exhausted store publication generation — recoverable by a
+replacement install, so KEEP the queue and suppress only the self-wake). Item 3's
+marks are conditioned on that same signal, which is the composition constraint
+this document required.
+
+### Before OLB-2C
+
+| § | Status | Where |
+|---|---|---|
+| §3 — owner partition reserved; grant rows purged on removal | Closed | `4509f4820` |
+| §5 — incarnation fence red-coupled | Closed | `3162b2e00` |
+| §6 — floors-before-epoch read order frozen (seqlock sample) | Closed | `871908fb4` |
+| §7 — `base_facts_unvalidated`, crate-private, doc-pointed | Closed | `3162b2e00` |
+| §12 — remaining wrapping identity counters fenced | Closed | `b8bbf72b9`, `d8d6603e5` |
+| §15 — `commit` requires the gate guard | Closed | `0952f43dd` |
+
+### OLB-3 prerequisites — landed early
+
+| § | Status | Where |
+|---|---|---|
+| pass-2 §2 — bounded backoff + degraded signal | Closed | `8995099d6` |
+| §4 — org-commitment audiences refused at the lease API | Closed | `e0fb6b8e5` |
+| §9 — fair rotation for quantum selection | Closed | `bdad5284d` |
+| §17 — cross-plane candidate-sort witness | Closed | `683ff8b4b` |
+
+§4 closes with a stated limit: a commitment is a one-way derivation, so the guard
+recognises only the org THIS node holds authority for. A fleet root configured
+equal to a FOREIGN org's commitment is undetectable locally; that residual closes
+with the wire leg, not the guard.
+
+### Merge tier
+
+| § | Status | Where |
+|---|---|---|
+| §8 — settlement-refusal counter on both paths | Closed | `237b4b1e8` |
+| §10 — per-outcome scoped-store counters + capacity warn | Closed | `f8d79ac61` |
+| §11 — org intake bounds reject counted; auth throttling extended | Closed | `96075e5d3` |
+| §13 — exhaustion metrics surface wired; mid-verify exhaustion `Final` | Closed | `b919250f3` |
+| §14 — three sensing-projection mutations linearized | Closed | `0759e3c83` |
+| §16 — task handles published synchronously | Closed | `7abbc4628` |
+| §18 — CI count/name floor over the supervisor witnesses | Closed | `c12f78ee2` |
+| §19 — plan-doc status reconciled; 2B entry outcome recorded | Closed | `a924163f0` |
+| §20 — comment/doc drift (a, c, d, e, f, g) | Closed | `fa17eac0f` |
+| §21 — fixtures health-transition log bounded | Closed | `9aeddb0ca` |
+| §22 — expired-cert issue window widened | Closed | `b6c1ffca2` |
+
+Pass-2 §7 (`plan` probing every candidate's session) remains a NON-finding and is
+unchanged, as that review concluded; §17's new cross-plane witness now pins the
+ordering property that factoring exists to preserve, so the observation is at
+least witnessed even though the code is unchanged.
+
+### Prior-review residuals
+
+The three items under "Prior-review residuals still open" belong to the
+2026-07-23 review and are restated here, not re-opened: they are unchanged by
+this closure and remain tracked there.
+
+### Test evidence (this closure; Windows host)
+
+- `cargo test --lib` under the exact `$UNIT_FEATURES` matrix: **5,443 passed, 0
+  failed, 1 ignored**.
+- Wiring gate command: **41** witnesses (MIN raised 34 → 41, seven added:
+  11c4, 28c, 11e, 11f, 11g, 11h, 11i, each name-pinned where it carries a
+  security property).
+- New supervisor gate command: **24** witnesses (MIN 24, nine names pinned).
+- `--features "cortex tool fixtures"`: `sensing_lease` 18, `sensing_lease_wire` 2,
+  `sensing_org_three_node` 1, `sensing_origin_emitter` 12, `org_admission_gate` 9,
+  `org_ownership` 32.
+- SDK `--lib`: 231 passed.
+- `cargo clippy --lib` clean; `cargo fmt --check` clean on both crates;
+  `cargo test --doc` clean.
+
+**RED probes**, each reverted after failing at its coupled assertion: self-wake
+under the store-generation fence; queue dropped under `Fenced`; empty-selection
+mark suppressed; empty-selection mark made unconditional; seqlock re-check
+removed; rotation cursor pinned to `None`; backoff disabled; §14(c) min removed;
+the SDK candidate sort deleted. The backoff probe is worth noting — on a paused
+clock it HUNG rather than failed, because the defect is an actor that is never
+idle, which is why that witness runs on the real clock.
+
+`cfg(unix)` verification remains with the Docker harness, as in the pass itself.

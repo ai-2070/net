@@ -436,7 +436,7 @@ overlooked.
 | # | Sev | Disposition | Where |
 |---|-----|-------------|-------|
 | §1 | P2 | **Fixed** — five mutating seams + the read-only siblings gated `#[cfg(any(test, feature = "fixtures"))]`; two now-unreachable internals gated with them | `e3a5da509` |
-| §2 | P2 | **Deferred by decision** — recorded as an OLB-3 activation prerequisite (below), NOT general debt | this document |
+| §2 | P2 | **Fixed** — all four prerequisite items landed ahead of OLB-3 (see the amendment below) | `8995099d6` |
 | §3 | P3 | **Fixed** — doc block restored to `join_org_routing_supervisor`, precondition restated as one | `e3a5da509` |
 | §4 | P3 | **Fixed** — exhaustion guard made structural in `SensingAuthorityStamp::is_current` + mirror witness | `e3a5da509` |
 | §5 | P3 | **Fixed** — generation tiebreak sorted descending so the defensive dedup keeps the newest; witness (30) exercises the branch | `e3a5da509` |
@@ -466,6 +466,33 @@ something to improvise during an authority-protocol closure.
 Multi-quantum epoch semantics (fix direction (b)) are to be reconsidered ONLY
 if that witness shows backoff alone is insufficient. Exact epochs are the
 current guarantee and are not to be relaxed speculatively.
+
+### §2 — amendment: closed at `8995099d6`, ahead of OLB-3
+
+Landed early rather than at OLB-3 activation, because the pass-3 closure was
+already reworking the same refusal paths and leaving a known spin armed next to
+them was the worse option. All four required items, in the order listed above:
+
+1. **Backoff** — `run_incarnation` tracks a consecutive-`Superseded` streak and,
+   past `SUPERSEDED_BACKOFF_AFTER` (3), sleeps with a doubling delay from 2 ms to
+   a 250 ms cap before parking. Raced against the shutdown signal, and free below
+   the threshold so ordinary churn pays nothing. The `work.mark()` stays, exactly
+   as this section required.
+2. **The restart-streak metric is a health signal** — `RoutingMetrics` carries
+   the live streak, its high-water and a degraded-entry count, read through
+   `MeshNode::org_routing_convergence()`.
+3. **Explicit degraded/cold behaviour** — at `SUPERSEDED_DEGRADED_AT` (8) health
+   is forced to `Rebuilding` and a recapture is owed, so an unbounded rebuild
+   loop cannot look healthy from outside and recovery republishes `Healthy`
+   through the ordinary `Current` path.
+4. **Both witnesses** —
+   `a_sustained_superseded_streak_backs_off_and_reports_degraded` (the real
+   actor; measured elapsed backoff, the metrics, cold health, clean recovery) and
+   `sustained_source_movement_across_a_multi_quantum_recapture_loses_no_identity`
+   (65 retained slots, source advancing mid-build every pass, no identity lost, no
+   hole under the eventual `Current`).
+
+Fix direction (b) was NOT taken: exact epochs are untouched.
 
 ### §7 — no corrective work
 
