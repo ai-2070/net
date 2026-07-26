@@ -277,6 +277,14 @@ const SUPERSEDED_DEGRADED_AT: u32 = 8;
 /// a fixtures-only gate silently drops every one of them out of the job that
 /// gates in-source units, while leaving `#[cfg(test)]` seams they use looking
 /// dead (Kyra OLB-2B-E3c).
+/// Cap on the recorded health-transition log (review-pass-3 §21).
+///
+/// Generous relative to what any witness inspects — the longest asserts over a
+/// single incarnation's `Rebuilding -> Healthy -> Fenced` — and small enough that
+/// a long-running `fixtures` node cannot grow it without bound.
+#[cfg(any(test, feature = "fixtures"))]
+const MAX_RECORDED_HEALTH_TRANSITIONS: usize = 256;
+
 #[cfg(any(test, feature = "fixtures"))]
 #[derive(Default)]
 pub(crate) struct ActorHooks {
@@ -286,6 +294,12 @@ pub(crate) struct ActorHooks {
     /// shutdown" from "published Healthy and then fenced a microsecond later" —
     /// the states are identical afterwards. Recording the transitions is the only
     /// way to witness the ABSENCE of a transient publication (Kyra OLB-2B-E3c).
+    /// Bounded at [`MAX_RECORDED_HEALTH_TRANSITIONS`]: the hooks are deliberately
+    /// compiled into the PRODUCTION supervisor under `feature = "fixtures"`, and
+    /// a never-drained `Vec` there leaks two entries per recapture for the life
+    /// of the node (review-pass-3 §21). Oldest-first eviction, so the witnesses —
+    /// which assert over a handful of transitions immediately after driving them
+    /// — see exactly what they saw before.
     pub(crate) health_transitions: parking_lot::Mutex<Vec<RoutingHealth>>,
     /// Fired after each drain, with the batch the incarnation observed.
     #[allow(clippy::type_complexity)]
@@ -296,7 +310,11 @@ pub(crate) struct ActorHooks {
 #[cfg(any(test, feature = "fixtures"))]
 impl ActorHooks {
     fn note_health(&self, state: &RoutingHealth) {
-        self.health_transitions.lock().push(*state);
+        let mut transitions = self.health_transitions.lock();
+        if transitions.len() >= MAX_RECORDED_HEALTH_TRANSITIONS {
+            transitions.remove(0);
+        }
+        transitions.push(*state);
     }
 
     fn fire_drained(&self, incarnation: u64, batch: &PrivateDiscoveryChangeBatch) {
@@ -1011,6 +1029,33 @@ mod tests {
 
         assert_eq!(h.metrics.incarnations_started(), 0, "no actor was started");
         assert_eq!(h.health(), RoutingHealth::Fenced);
+    }
+
+    /// review-pass-3 §21 — the health-transition log is BOUNDED.
+    ///
+    /// These hooks are deliberately compiled into the production supervisor under
+    /// `feature = "fixtures"`, and the log was a never-drained `Vec`: two entries
+    /// per recapture, for the life of the node. Oldest-first eviction keeps the
+    /// property every witness relies on — the most recent transitions, in order.
+    #[test]
+    fn the_health_transition_log_is_bounded_and_keeps_the_newest() {
+        let hooks = ActorHooks::default();
+        for incarnation in 0..(MAX_RECORDED_HEALTH_TRANSITIONS as u64 * 3) {
+            hooks.note_health(&RoutingHealth::Healthy { incarnation });
+        }
+        let log = hooks.health_transitions.lock().clone();
+        assert_eq!(
+            log.len(),
+            MAX_RECORDED_HEALTH_TRANSITIONS,
+            "a fixtures-build node cannot grow this without bound"
+        );
+        assert_eq!(
+            log.last(),
+            Some(&RoutingHealth::Healthy {
+                incarnation: MAX_RECORDED_HEALTH_TRANSITIONS as u64 * 3 - 1
+            }),
+            "and the NEWEST transition survives — the witnesses read the tail"
+        );
     }
 
     /// review-pass-2 §2 — a SUSTAINED superseded streak backs off, declares
