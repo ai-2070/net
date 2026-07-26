@@ -86,7 +86,7 @@ pub fn canonical_org_sensing_commitment(org_id: &OrgId) -> AudienceScopeCommitme
 /// therefore impossible to fabricate, not merely documented as gate-produced
 /// (review §7). Pattern matches (`from_validated_org`, tests) ignore it via `..`,
 /// and the derived impls read it, so it is not dead.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct GateProof(());
 
 /// The narrow, validated result of the org-sensing authority gate — the ONLY
@@ -97,8 +97,8 @@ pub struct GateProof(());
 /// private [`GateProof`], so only [`verify_org_sensing_registration`] (or, under
 /// `#[cfg(test)]`, [`Self::capability_for_test`]) can construct it — a future
 /// leader intake cannot mint an org-authority row by literal-constructing this.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ValidatedOrgSensingRegistration {
+#[derive(Debug, PartialEq, Eq)]
+enum ValidatedInner {
     /// A leader-addressed (provider-free) org registration.
     Capability {
         /// The re-derived, digest-validated interest spec.
@@ -135,6 +135,68 @@ pub enum ValidatedOrgSensingRegistration {
     },
 }
 
+/// The SEALED validated object (2026-07-23 §7 residual).
+///
+/// A newtype whose field is PRIVATE to this module, wrapping the variant data.
+/// The `GateProof` inside made a variant impossible to CONSTRUCT from nothing;
+/// it did not stop code that legitimately holds a validated object from
+/// DESTRUCTURING it, keeping the proof, and re-assembling a variant around a
+/// different spec or leg — and `GateProof: Clone` made that free and repeatable
+/// rather than costing the original.
+///
+/// With the payload behind a private field, neither is expressible outside
+/// `org_gate`: a holder can move the value and hand it to
+/// [`AdmittedSensingRegistration::from_validated_org`], and nothing else. The
+/// proof and the non-`Clone` bound remain as defence in depth for code inside
+/// this module.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ValidatedOrgSensingRegistration(ValidatedInner);
+
+impl Clone for ValidatedOrgSensingRegistration {
+    /// Hand-written because `GateProof` is deliberately NOT `Clone`: only this
+    /// module may mint one, so only this module may duplicate a validated
+    /// object. A derived impl would have required making the proof cloneable,
+    /// which is exactly the residual being closed.
+    fn clone(&self) -> Self {
+        Self(match &self.0 {
+            ValidatedInner::Capability {
+                spec,
+                consumer,
+                requested_sample_interval,
+                soft_state_ttl,
+                subscriber,
+                org_id,
+                ..
+            } => ValidatedInner::Capability {
+                spec: spec.clone(),
+                consumer: *consumer,
+                requested_sample_interval: *requested_sample_interval,
+                soft_state_ttl: *soft_state_ttl,
+                subscriber: subscriber.clone(),
+                org_id: *org_id,
+                gate_proof: GateProof(()),
+            },
+            ValidatedInner::Provider {
+                spec,
+                target,
+                requested_sample_interval,
+                soft_state_ttl,
+                subscriber,
+                org_id,
+                ..
+            } => ValidatedInner::Provider {
+                spec: spec.clone(),
+                target: *target,
+                requested_sample_interval: *requested_sample_interval,
+                soft_state_ttl: *soft_state_ttl,
+                subscriber: subscriber.clone(),
+                org_id: *org_id,
+                gate_proof: GateProof(()),
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 impl ValidatedOrgSensingRegistration {
     /// Test-only sanctioned constructor for a Capability-leg validated object —
@@ -148,7 +210,7 @@ impl ValidatedOrgSensingRegistration {
         subscriber: EntityId,
         org_id: OrgId,
     ) -> Self {
-        Self::Capability {
+        Self(ValidatedInner::Capability {
             spec,
             consumer,
             requested_sample_interval,
@@ -156,7 +218,7 @@ impl ValidatedOrgSensingRegistration {
             subscriber,
             org_id,
             gate_proof: GateProof(()),
-        }
+        })
     }
 }
 
@@ -334,12 +396,12 @@ fn verify_org_sensing_registration_inner(
     // Steps 9 (stability recheck) and 10 (mutation) are the dispatch layer's.
     let subscriber = membership.member.clone();
     let org_id = membership.org_id;
-    Ok(match leg {
+    Ok(ValidatedOrgSensingRegistration(match leg {
         Leg::Capability {
             consumer,
             requested_sample_interval,
             soft_state_ttl,
-        } => ValidatedOrgSensingRegistration::Capability {
+        } => ValidatedInner::Capability {
             spec,
             consumer,
             requested_sample_interval,
@@ -352,7 +414,7 @@ fn verify_org_sensing_registration_inner(
             target,
             requested_sample_interval,
             soft_state_ttl,
-        } => ValidatedOrgSensingRegistration::Provider {
+        } => ValidatedInner::Provider {
             spec,
             target,
             requested_sample_interval,
@@ -361,7 +423,7 @@ fn verify_org_sensing_registration_inner(
             org_id,
             gate_proof: GateProof(()),
         },
-    })
+    }))
 }
 
 /// The leg-specific parameters extracted from the frame once (step 1).
@@ -452,13 +514,27 @@ pub(crate) enum RegistrationLeg {
 #[allow(dead_code)]
 impl AdmittedSensingRegistration {
     /// Admit a legacy registration (the legacy dispatch validated + converted
-    /// it once). The proven root is the session-proven root the legacy path
-    /// already computed.
-    pub(crate) fn from_validated_legacy(
-        spec: InterestSpec,
-        leg: RegistrationLeg,
-        proven_root: AudienceScopeCommitment,
-    ) -> Self {
+    /// it once).
+    ///
+    /// The proven root is DERIVED from the spec, not accepted beside it
+    /// (2026-07-23 §7 residual). The old signature took an arbitrary
+    /// `(spec, proven_root)` pair, so nothing in the type stopped a caller from
+    /// admitting one interest's spec under a different interest's proven root —
+    /// the pairing was correct only because every caller happened to be passing
+    /// the value `validate_subscriber_scope` had just returned FOR THAT SPEC.
+    ///
+    /// That correctness is now structural, and it costs nothing, because
+    /// `validate_subscriber_scope` only ever returns `Ok` when
+    /// `interest_audience == session_root == local_root`. Its `Ok` value IS
+    /// `spec.audience`; taking it as a parameter was re-stating a value the spec
+    /// already carried. This mirrors `from_validated_org`, which has always
+    /// derived its root rather than borrowing one.
+    ///
+    /// The caller must still have validated the scope — that is what makes the
+    /// audience PROVEN rather than merely claimed. What can no longer happen is
+    /// the two halves disagreeing.
+    pub(crate) fn from_validated_legacy(spec: InterestSpec, leg: RegistrationLeg) -> Self {
+        let proven_root = spec.audience;
         Self {
             spec,
             leg,
@@ -471,8 +547,8 @@ impl AdmittedSensingRegistration {
     /// organization id, so an org registration can never borrow a foreign or
     /// entity root.
     pub(crate) fn from_validated_org(value: ValidatedOrgSensingRegistration) -> Self {
-        match value {
-            ValidatedOrgSensingRegistration::Capability {
+        match value.0 {
+            ValidatedInner::Capability {
                 spec,
                 consumer,
                 requested_sample_interval,
@@ -488,7 +564,7 @@ impl AdmittedSensingRegistration {
                 },
                 authority: RegistrationAuthority::Org { org_id },
             },
-            ValidatedOrgSensingRegistration::Provider {
+            ValidatedInner::Provider {
                 spec,
                 target,
                 requested_sample_interval,
@@ -1155,8 +1231,8 @@ mod tests {
         let frame = cap_frame_with(cert_gen(5), org_commit());
         let validated =
             run(&frame, &member(), Some(authority()), &empty_floors()).expect("admitted");
-        match validated {
-            ValidatedOrgSensingRegistration::Capability {
+        match validated.0 {
+            ValidatedInner::Capability {
                 consumer,
                 subscriber,
                 org_id,
@@ -1182,8 +1258,8 @@ mod tests {
         let validated =
             run(&frame, &member(), Some(authority()), &empty_floors()).expect("admitted");
         assert!(matches!(
-            validated,
-            ValidatedOrgSensingRegistration::Provider { target: 0x77, .. }
+            validated.0,
+            ValidatedInner::Provider { target: 0x77, .. }
         ));
     }
 
@@ -1414,8 +1490,12 @@ mod tests {
         ));
     }
 
+    /// 2026-07-23 §7 residual: the legacy wrapper DERIVES its proven root from
+    /// the spec it admits, so an admission cannot pair one interest's spec with
+    /// another interest's proven root. The old signature took the two
+    /// independently and nothing in the type related them.
     #[test]
-    fn legacy_admitted_wrapper_keeps_the_supplied_proven_root() {
+    fn legacy_admitted_wrapper_derives_the_proven_root_from_its_own_spec() {
         let root = AudienceScopeCommitment::owner_root(&member());
         let admitted = AdmittedSensingRegistration::from_validated_legacy(
             spec_with(root),
@@ -1424,9 +1504,17 @@ mod tests {
                 requested_sample_interval: D,
                 soft_state_ttl: TTL,
             },
-            root,
         );
-        assert_eq!(admitted.proven_root(), root);
+        assert_eq!(
+            admitted.proven_root(),
+            root,
+            "the admitted root is the admitted spec's audience, by construction"
+        );
+        assert_eq!(
+            admitted.proven_root(),
+            admitted.spec().audience,
+            "and they cannot diverge — there is no second parameter to disagree with"
+        );
         assert!(matches!(
             admitted.authority(),
             RegistrationAuthority::Legacy { .. }
@@ -1882,7 +1970,6 @@ mod tests {
                 requested_sample_interval: D,
                 soft_state_ttl: TTL,
             },
-            audience,
         )
     }
 
@@ -2000,7 +2087,6 @@ mod tests {
                 requested_sample_interval: D,
                 soft_state_ttl: TTL,
             },
-            AudienceScopeCommitment::owner_root(&member()),
         );
         assert!(
             plan_provider_continuation(&legacy_cap, |_| None).is_none(),

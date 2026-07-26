@@ -386,6 +386,16 @@ impl SensingLeader {
             DownstreamId::Peer(node) => node,
             DownstreamId::Local | DownstreamId::LeasedLocal | DownstreamId::Leader => 0,
         };
+        // 2026-07-23 §7 residual: `from_validated_legacy` DERIVES the proven root
+        // from the spec now, so the two halves can no longer disagree. This is
+        // the one seam still carrying both, and the invariant that makes them
+        // interchangeable is `validate_subscriber_scope`'s: it returns `Ok` only
+        // when `interest_audience == session_root`, so its result IS
+        // `spec.audience`. Asserted rather than assumed.
+        debug_assert_eq!(
+            proven_root, spec.audience,
+            "the proven root must be the one scope validation returned for THIS spec"
+        );
         let admitted = AdmittedSensingRegistration::from_validated_legacy(
             spec.clone(),
             RegistrationLeg::Capability {
@@ -393,7 +403,6 @@ impl SensingLeader {
                 requested_sample_interval,
                 soft_state_ttl,
             },
-            proven_root,
         );
         self.register_capability_interest_inner(
             &admitted,
@@ -2866,7 +2875,6 @@ mod tests {
                 requested_sample_interval: ms(100),
                 soft_state_ttl: TTL,
             },
-            canonical_org_sensing_commitment(&org_kp().org_id()),
         );
         assert!(matches!(
             leader.register_admitted_capability_interest(&legacy_same_key, &snapshot, now),

@@ -93,6 +93,17 @@ pub enum LeaseRefused {
 struct LeaseMetrics {
     refused_node_at_capacity: AtomicU64,
     refused_interest_at_capacity: AtomicU64,
+    /// Wire reconciliations that FAILED after the registry had already committed
+    /// its side (2026-07-23 §6 residual).
+    ///
+    /// The rollback and release legs cannot propagate an error — the registry
+    /// mutation is already done and the caller is either returning the original
+    /// failure or nothing at all — so the failure used to be discarded with
+    /// `let _ =`. It is not harmless: it is precisely the state where the lease
+    /// registry and the wire disagree, and the plane then behaves as if a row
+    /// exists that does not (or vice versa) until something else reconciles it.
+    /// Counted so the divergence is observable instead of silent.
+    reconcile_failures: AtomicU64,
 }
 
 /// Opaque per-holder token. [`SensingInterestLeases::acquire`] returns one;
@@ -265,6 +276,20 @@ impl SensingInterestLeases {
                 }
             }
         }
+    }
+
+    /// Record a wire reconciliation that failed after the registry committed —
+    /// the registry/wire divergence window (2026-07-23 §6 residual).
+    pub fn note_reconcile_failure(&self) {
+        self.metrics
+            .reconcile_failures
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// How many wire reconciliations failed after the registry had committed.
+    /// Nonzero means the lease registry and the wire may disagree.
+    pub fn reconcile_failures(&self) -> u64 {
+        self.metrics.reconcile_failures.load(Ordering::Acquire)
     }
 
     /// Refusal counters: `(node at capacity, interest at capacity)`.

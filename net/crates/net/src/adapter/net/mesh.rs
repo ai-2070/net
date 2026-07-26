@@ -8506,7 +8506,19 @@ impl MeshNode {
             // no longer tear down a `Local` row a direct registration installed
             // for the same key.
             let rollback = self.sensing_interest_leases.release(ticket);
-            let _ = self.apply_sensing_lease_action(key, rollback);
+            // 2026-07-23 §6 residual: the rollback cannot propagate its own
+            // error — we are already returning the original failure — but
+            // discarding it silently is what leaves the lease registry and the
+            // wire disagreeing with nothing to say so. Counted and warned.
+            if let Err(rollback_err) = self.apply_sensing_lease_action(key, rollback) {
+                self.sensing_interest_leases.note_reconcile_failure();
+                tracing::warn!(
+                    provider = format!("{:#x}", provider),
+                    error = %rollback_err,
+                    "sensing lease: rollback could not reconcile the wire; the lease \
+                     registry and the wire may disagree until the next mutation"
+                );
+            }
             return Err(err);
         }
         Ok(ticket)
@@ -8535,7 +8547,18 @@ impl MeshNode {
     pub fn release_sensing_interest_lease(&self, ticket: sensing::SensingLeaseTicket) {
         let _apply = self.sensing_lease_apply_mu.lock();
         let action = self.sensing_interest_leases.release(ticket);
-        let _ = self.apply_sensing_lease_action(ticket.key, action);
+        // 2026-07-23 §6 residual: release has no error channel — the holder is
+        // dropping its reference either way — so a failed wire reconciliation
+        // here is exactly the silent registry/wire divergence that residual
+        // names. Counted and warned rather than swallowed.
+        if let Err(err) = self.apply_sensing_lease_action(ticket.key, action) {
+            self.sensing_interest_leases.note_reconcile_failure();
+            tracing::warn!(
+                error = %err,
+                "sensing lease: release could not reconcile the wire; the lease registry \
+                 and the wire may disagree until the next mutation"
+            );
+        }
     }
 
     /// Execute the wire transition a lease mutation calls for. Called only
@@ -12554,6 +12577,17 @@ impl MeshNode {
     /// refused a lease rather than a live holder being displaced.
     pub fn sensing_lease_refusals(&self) -> (u64, u64) {
         self.sensing_interest_leases.refusals()
+    }
+
+    /// Lease wire reconciliations that FAILED after the registry had already
+    /// committed its side (2026-07-23 §6 residual).
+    ///
+    /// The rollback and release legs have no error channel — the caller is
+    /// returning the original failure, or nothing at all — so these used to be
+    /// discarded. Nonzero means the lease registry and the wire may disagree for
+    /// that interest until some later mutation reconciles them.
+    pub fn sensing_lease_reconcile_failures(&self) -> u64 {
+        self.sensing_interest_leases.reconcile_failures()
     }
 
     /// Deterministic routing refusals: family-at-capacity, node-at-capacity,
@@ -19349,6 +19383,16 @@ impl MeshNode {
                 // semantic operation, carrying the session-proven root as legacy
                 // authority evidence (no org snapshot); clamp, table register, and
                 // the authority-aware emission live there.
+                // 2026-07-23 §7 residual: the proven root is DERIVED from the
+                // spec inside `from_validated_legacy` now, so an admission can no
+                // longer pair one interest's spec with another's proven root.
+                // `validate_subscriber_scope` above returned `Ok` only because
+                // `validated.spec.audience == session_root`, so the two are the
+                // same value; asserted rather than assumed.
+                debug_assert_eq!(
+                    proven_root, validated.spec.audience,
+                    "the proven root must be the one scope validation returned for THIS spec"
+                );
                 let admitted = sensing::AdmittedSensingRegistration::from_validated_legacy(
                     validated.spec.clone(),
                     sensing::RegistrationLeg::Provider {
@@ -19356,7 +19400,6 @@ impl MeshNode {
                         requested_sample_interval: validated.requested_sample_interval,
                         soft_state_ttl: validated.soft_state_ttl,
                     },
-                    proven_root,
                 );
                 Self::apply_provider_registration(ctx, &admitted, None, from_node, now, now_secs);
             }
@@ -33604,7 +33647,6 @@ mod sensing_authority_witness_tests {
                 requested_sample_interval: D,
                 soft_state_ttl: ORG_TTL,
             },
-            node.sensing_local_root(),
         );
         MeshNode::apply_provider_registration(
             &ctx,
