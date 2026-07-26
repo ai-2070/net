@@ -34,6 +34,21 @@
 //! ticket can never be released against a different key or spec. The soft-state
 //! ttl is a single node-owned policy (not a per-holder input), so there is no
 //! second aggregation to keep consistent.
+//!
+//! # Bounded in both dimensions
+//!
+//! Distinct interest keys and holders-per-key both carry an explicit cap with a
+//! deterministic fail-closed refusal, matching every other registry this branch
+//! adds (`MAX_NODE_SLOTS` / `MAX_HANDLES_PER_FAMILY`, `MAX_ENTRIES` /
+//! `MAX_ENTRIES_PER_SCOPE`). Holders here are local SDK/binding callers rather
+//! than remote peers, so this is the branch's bounded-state doctrine rather than
+//! a remote-DoS boundary — but "bounds correct in isolation that do not compose"
+//! is exactly why every sibling has one (review-pass-2 §6).
+//!
+//! There is no dead-entry reclamation to attempt before refusing: an entry is
+//! removed synchronously by the release that empties it ([`Self::release`]), and
+//! this registry has no expiry of its own, so a refusal always reflects live
+//! holders and is never spurious.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -46,6 +61,39 @@ use parking_lot::Mutex;
 use super::identity::{
     strictest_sample_interval, AudienceScopeCommitment, Digest256, InterestSpec,
 };
+
+/// Max distinct sensing-interest keys one node will lease at once.
+///
+/// Sized with `MAX_NODE_SLOTS`: both answer "how many distinct interest
+/// identities may this node retain node-global state for" (review-pass-2 §6).
+const MAX_LEASED_INTERESTS: usize = 256;
+
+/// Max live holders of ONE interest key.
+///
+/// Sized with `MAX_HANDLES_PER_FAMILY`: both answer "how many independent local
+/// wrappers may share one identity" — and, as there, a DUPLICATE acquisition by
+/// an existing holder spends budget rather than bypassing it, because each
+/// acquisition mints its own token.
+const MAX_HOLDERS_PER_INTEREST: usize = 64;
+
+/// Why a lease acquisition was refused. Deterministic and state-free: a refused
+/// acquisition mints no token and mutates nothing, so the caller sees exactly
+/// the pre-call registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseRefused {
+    /// The node already leases [`MAX_LEASED_INTERESTS`] distinct interests. A
+    /// live interest is never evicted to make room.
+    NodeAtCapacity,
+    /// This interest already has [`MAX_HOLDERS_PER_INTEREST`] live holders.
+    InterestAtCapacity,
+}
+
+/// Refusal counters for [`SensingInterestLeases`].
+#[derive(Default)]
+struct LeaseMetrics {
+    refused_node_at_capacity: AtomicU64,
+    refused_interest_at_capacity: AtomicU64,
+}
 
 /// Opaque per-holder token. [`SensingInterestLeases::acquire`] returns one;
 /// [`SensingInterestLeases::release`] consumes it via the ticket. Node-local;
@@ -138,6 +186,7 @@ struct LeaseEntry {
 pub struct SensingInterestLeases {
     entries: Mutex<HashMap<SensingLeaseKey, LeaseEntry>>,
     next_token: AtomicU64,
+    metrics: LeaseMetrics,
 }
 
 impl SensingInterestLeases {
@@ -153,16 +202,31 @@ impl SensingInterestLeases {
     /// is packaged into a [`SensingLeaseTicket`] and handed back to
     /// [`release`](Self::release) exactly once. `spec` is stored on the first
     /// acquisition and reused for every later action for this key.
+    ///
+    /// Refuses fail-closed at either bound (review-pass-2 §6). A refusal is
+    /// TOTAL: no token is minted, no registration is recorded, the installed
+    /// cadence does not move even for a would-be-stricter holder, and no live
+    /// interest is evicted to make room. The caller therefore has nothing to
+    /// roll back.
     pub fn acquire(
         &self,
         key: SensingLeaseKey,
         spec: &InterestSpec,
         interval: Duration,
-    ) -> (LeaseToken, LeaseAction) {
-        let token = self.mint_token();
+    ) -> Result<(LeaseToken, LeaseAction), LeaseRefused> {
         let mut entries = self.entries.lock();
+        // Checked BEFORE `entry()` and before the token mint, so a refused
+        // acquisition is indistinguishable from never having been attempted —
+        // and only a NEW key spends node budget.
+        if !entries.contains_key(&key) && entries.len() >= MAX_LEASED_INTERESTS {
+            self.metrics
+                .refused_node_at_capacity
+                .fetch_add(1, Ordering::AcqRel);
+            return Err(LeaseRefused::NodeAtCapacity);
+        }
         match entries.entry(key) {
             Entry::Vacant(v) => {
+                let token = self.mint_token();
                 let spec = Arc::new(spec.clone());
                 let mut registrations = HashMap::new();
                 registrations.insert(token, interval);
@@ -171,10 +235,17 @@ impl SensingInterestLeases {
                     registrations,
                     installed_interval: interval,
                 });
-                (token, LeaseAction::Register { spec, interval })
+                Ok((token, LeaseAction::Register { spec, interval }))
             }
             Entry::Occupied(mut o) => {
                 let entry = o.get_mut();
+                if entry.registrations.len() >= MAX_HOLDERS_PER_INTEREST {
+                    self.metrics
+                        .refused_interest_at_capacity
+                        .fetch_add(1, Ordering::AcqRel);
+                    return Err(LeaseRefused::InterestAtCapacity);
+                }
+                let token = self.mint_token();
                 entry.registrations.insert(token, interval);
                 // `installed_interval` is maintained as the exact minimum of all
                 // live registrations, so the new minimum is just this holder's
@@ -182,18 +253,30 @@ impl SensingInterestLeases {
                 let new_min = interval.min(entry.installed_interval);
                 if new_min < entry.installed_interval {
                     entry.installed_interval = new_min;
-                    (
+                    Ok((
                         token,
                         LeaseAction::Reregister {
                             spec: Arc::clone(&entry.spec),
                             interval: new_min,
                         },
-                    )
+                    ))
                 } else {
-                    (token, LeaseAction::Unchanged)
+                    Ok((token, LeaseAction::Unchanged))
                 }
             }
         }
+    }
+
+    /// Refusal counters: `(node at capacity, interest at capacity)`.
+    pub fn refusals(&self) -> (u64, u64) {
+        (
+            self.metrics
+                .refused_node_at_capacity
+                .load(Ordering::Acquire),
+            self.metrics
+                .refused_interest_at_capacity
+                .load(Ordering::Acquire),
+        )
     }
 
     /// Release a reference held under `ticket`.
@@ -299,12 +382,95 @@ mod tests {
         Duration::from_millis(n)
     }
 
+    // ---- review-pass-2 §6: cardinality bounds ------------------------
+
+    /// The 257th DISTINCT interest is refused, the first 256 are untouched, and
+    /// the refusal is counted. A live interest is never evicted to make room.
+    #[test]
+    fn the_two_hundred_and_fifty_seventh_interest_is_refused_without_evicting_any() {
+        let leases = SensingInterestLeases::default();
+        let s = spec("gpu.infer");
+        let mut held = Vec::new();
+        for provider in 0..MAX_LEASED_INTERESTS as u64 {
+            let key = key_for(&s, provider);
+            let (token, action) = leases.acquire(key, &s, ms(100)).expect("within capacity");
+            assert!(matches!(action, LeaseAction::Register { .. }));
+            held.push(ticket(key, token));
+        }
+        assert_eq!(leases.len(), MAX_LEASED_INTERESTS);
+
+        let overflow = key_for(&s, MAX_LEASED_INTERESTS as u64);
+        assert_eq!(
+            leases.acquire(overflow, &s, ms(100)),
+            Err(LeaseRefused::NodeAtCapacity)
+        );
+        assert_eq!(
+            leases.entry_for_test(&overflow),
+            None,
+            "a refused acquisition records nothing"
+        );
+        assert_eq!(
+            leases.len(),
+            MAX_LEASED_INTERESTS,
+            "and evicts nothing — the first 256 are intact"
+        );
+        assert_eq!(leases.refusals(), (1, 0));
+
+        // An EXISTING key still acquires at node capacity: only a new key spends
+        // the node budget.
+        let existing = held[0].key;
+        let (_t, action) = leases
+            .acquire(existing, &s, ms(500))
+            .expect("an existing interest is not node-bounded");
+        assert_eq!(action, LeaseAction::Unchanged);
+
+        // Releasing frees exactly one interest of budget.
+        assert!(matches!(
+            leases.release(held.pop().expect("held")),
+            LeaseAction::Deregister { .. }
+        ));
+        assert!(leases.acquire(overflow, &s, ms(100)).is_ok());
+    }
+
+    /// The 65th HOLDER of one interest is refused, and — the load-bearing half —
+    /// a refused holder that would have been STRICTER does not move the
+    /// installed cadence.
+    #[test]
+    fn the_sixty_fifth_holder_is_refused_and_cannot_tighten_the_cadence() {
+        let leases = SensingInterestLeases::default();
+        let s = spec("gpu.infer");
+        let key = key_for(&s, 7);
+        for _ in 0..MAX_HOLDERS_PER_INTEREST {
+            leases.acquire(key, &s, ms(100)).expect("within capacity");
+        }
+        assert_eq!(
+            leases.entry_for_test(&key),
+            Some((MAX_HOLDERS_PER_INTEREST, ms(100)))
+        );
+
+        assert_eq!(
+            leases.acquire(key, &s, ms(10)),
+            Err(LeaseRefused::InterestAtCapacity)
+        );
+        assert_eq!(
+            leases.entry_for_test(&key),
+            Some((MAX_HOLDERS_PER_INTEREST, ms(100))),
+            "a refused holder neither joins nor tightens the installed cadence"
+        );
+        assert_eq!(leases.refusals(), (0, 1));
+        assert_eq!(
+            leases.len(),
+            1,
+            "and the refusal creates no second interest"
+        );
+    }
+
     #[test]
     fn first_acquire_registers_the_spec_at_its_interval() {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        let (_t, action) = leases.acquire(key, &s, ms(100));
+        let (_t, action) = leases.acquire(key, &s, ms(100)).expect("within capacity");
         match action {
             LeaseAction::Register { spec, interval } => {
                 assert_eq!(*spec, s);
@@ -320,8 +486,8 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        leases.acquire(key, &s, ms(100));
-        let (_t, action) = leases.acquire(key, &s, ms(500));
+        leases.acquire(key, &s, ms(100)).expect("within capacity");
+        let (_t, action) = leases.acquire(key, &s, ms(500)).expect("within capacity");
         assert_eq!(action, LeaseAction::Unchanged);
         assert_eq!(leases.entry_for_test(&key), Some((2, ms(100))));
     }
@@ -331,8 +497,8 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        leases.acquire(key, &s, ms(500));
-        let (_t, action) = leases.acquire(key, &s, ms(100));
+        leases.acquire(key, &s, ms(500)).expect("within capacity");
+        let (_t, action) = leases.acquire(key, &s, ms(100)).expect("within capacity");
         match action {
             LeaseAction::Reregister { spec, interval } => {
                 assert_eq!(*spec, s);
@@ -347,8 +513,8 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        let (strict, _) = leases.acquire(key, &s, ms(100));
-        let (loose, _) = leases.acquire(key, &s, ms(500));
+        let (strict, _) = leases.acquire(key, &s, ms(100)).expect("within capacity");
+        let (loose, _) = leases.acquire(key, &s, ms(500)).expect("within capacity");
         let _ = strict;
         let action = leases.release(ticket(key, loose));
         assert_eq!(action, LeaseAction::Unchanged);
@@ -360,8 +526,8 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        let (strict, _) = leases.acquire(key, &s, ms(100));
-        leases.acquire(key, &s, ms(500));
+        let (strict, _) = leases.acquire(key, &s, ms(100)).expect("within capacity");
+        leases.acquire(key, &s, ms(500)).expect("within capacity");
         match leases.release(ticket(key, strict)) {
             LeaseAction::Reregister { spec, interval } => {
                 assert_eq!(*spec, s);
@@ -377,7 +543,7 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        let (only, _) = leases.acquire(key, &s, ms(100));
+        let (only, _) = leases.acquire(key, &s, ms(100)).expect("within capacity");
         match leases.release(ticket(key, only)) {
             LeaseAction::Deregister { spec } => assert_eq!(*spec, s),
             other => panic!("expected Deregister, got {other:?}"),
@@ -390,8 +556,8 @@ mod tests {
         let leases = SensingInterestLeases::default();
         let s = spec("gpu.infer");
         let key = key_for(&s, 7);
-        let (a, first) = leases.acquire(key, &s, ms(100));
-        let (b, second) = leases.acquire(key, &s, ms(100));
+        let (a, first) = leases.acquire(key, &s, ms(100)).expect("within capacity");
+        let (b, second) = leases.acquire(key, &s, ms(100)).expect("within capacity");
         assert!(matches!(first, LeaseAction::Register { .. }));
         assert_eq!(second, LeaseAction::Unchanged);
         assert_eq!(leases.release(ticket(key, a)), LeaseAction::Unchanged);
@@ -412,9 +578,9 @@ mod tests {
             interest_digest: s.interest_digest(),
             provider: 9,
         };
-        let (k1_tok, _) = leases.acquire(key, &s, ms(100));
+        let (k1_tok, _) = leases.acquire(key, &s, ms(100)).expect("within capacity");
         // A real token, but issued for a DIFFERENT key — unknown to key's entry.
-        let (k2_tok, _) = leases.acquire(k2, &s, ms(100));
+        let (k2_tok, _) = leases.acquire(k2, &s, ms(100)).expect("within capacity");
         assert_eq!(leases.release(ticket(key, k2_tok)), LeaseAction::Unchanged);
         assert_eq!(leases.entry_for_test(&key), Some((1, ms(100))));
         // Double release of key's token: first deregisters, second is a noop.
@@ -435,8 +601,8 @@ mod tests {
             interest_digest: s.interest_digest(),
             provider: 8,
         };
-        leases.acquire(k1, &s, ms(100));
-        leases.acquire(k2, &s, ms(100));
+        leases.acquire(k1, &s, ms(100)).expect("within capacity");
+        leases.acquire(k2, &s, ms(100)).expect("within capacity");
         assert_eq!(leases.len(), 2);
         assert_eq!(leases.entry_for_test(&k1), Some((1, ms(100))));
         assert_eq!(leases.entry_for_test(&k2), Some((1, ms(100))));

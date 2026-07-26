@@ -4948,6 +4948,11 @@ pub enum SensingRegistrationError {
         /// The cached minimum sample interval the request fell below.
         minimum_supported: Duration,
     },
+    /// Review-pass-2 §6: the node-global sensing-interest LEASE registry is at
+    /// one of its cardinality bounds — too many distinct leased interests, or
+    /// too many live holders of this one. Nothing was minted, recorded or sent,
+    /// so there is nothing to roll back; retry after a holder releases.
+    LeaseAtCapacity(sensing::LeaseRefused),
 }
 
 impl std::fmt::Display for SensingRegistrationError {
@@ -4969,6 +4974,12 @@ impl std::fmt::Display for SensingRegistrationError {
             Self::RefusedByFloor { minimum_supported } => write!(
                 f,
                 "sensing registration refused against cached floor (min {minimum_supported:?}) — lease acquisition rolled back"
+            ),
+            Self::LeaseAtCapacity(sensing::LeaseRefused::NodeAtCapacity) => f.write_str(
+                "node at its distinct sensing-interest lease bound — nothing acquired",
+            ),
+            Self::LeaseAtCapacity(sensing::LeaseRefused::InterestAtCapacity) => f.write_str(
+                "sensing interest at its live-holder bound — nothing acquired",
             ),
         }
     }
@@ -8196,9 +8207,13 @@ impl MeshNode {
         // packet's stream sequence (see `sensing_lease_apply_mu` for the exact
         // ordering guarantee and its limits).
         let _apply = self.sensing_lease_apply_mu.lock();
-        let (token, action) =
-            self.sensing_interest_leases
-                .acquire(key, spec, requested_sample_interval);
+        // Review-pass-2 §6: a bounded registry. A capacity refusal mints nothing
+        // and records nothing, so — unlike the wire-failure path below — there
+        // is no reference to roll back.
+        let (token, action) = self
+            .sensing_interest_leases
+            .acquire(key, spec, requested_sample_interval)
+            .map_err(SensingRegistrationError::LeaseAtCapacity)?;
         let ticket = sensing::SensingLeaseTicket { key, token };
         if let Err(err) = self.apply_sensing_lease_action(key, action) {
             // Roll the reference back and reconcile the wire to the post-release
@@ -12128,6 +12143,13 @@ impl MeshNode {
             self.routing_registry.retained_slots(),
             self.routing_registry.pending_slots(),
         )
+    }
+
+    /// Sensing-interest lease refusals: `(node at capacity, interest at
+    /// capacity)` (review-pass-2 §6). Each means a caller was deterministically
+    /// refused a lease rather than a live holder being displaced.
+    pub fn sensing_lease_refusals(&self) -> (u64, u64) {
+        self.sensing_interest_leases.refusals()
     }
 
     /// Deterministic routing refusals: family-at-capacity, node-at-capacity,

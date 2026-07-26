@@ -75,7 +75,8 @@ pub mod wire;
 
 pub use frames::{FrameSpecError, SensingInterestFrame, ValidatedProviderRegistration};
 pub use lease::{
-    LeaseAction, LeaseToken, SensingInterestLeases, SensingLeaseKey, SensingLeaseTicket,
+    LeaseAction, LeaseRefused, LeaseToken, SensingInterestLeases, SensingLeaseKey,
+    SensingLeaseTicket,
 };
 pub use negotiation::{select_sensing_path, SensingPath, SENSING_CAPABILITY_TAG};
 pub use org_gate::{
