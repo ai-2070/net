@@ -152,6 +152,55 @@ jobs:
           done
           echo "routing-plane wiring witnesses: $n passed (min $MIN); all named security witnesses present"
 
+      # OLB-2B-E2/E3c: the SUPERVISOR/incarnation/crash-loop witnesses
+      # (`behavior::org_routing::tests`), gated on the same count+name pattern as
+      # the wiring witnesses above.
+      #
+      # review-pass-3 §18: this module runs in the gating `--lib` step only
+      # because a2509d8a3 widened its cfg from `all(test, feature = "fixtures")`
+      # to plain `test` — the exact regression that already happened once on this
+      # branch. The wiring witnesses got a floor and pinned names; these got
+      # nothing, so a future "clean up the fixtures seams" re-gating would drop
+      # the incarnation fence, the crash-loop budget, the shutdown-ordering
+      # proofs and the non-convergence backoff out of every gating job in
+      # silence. Same reasoning as the note below: `$UNIT_FEATURES` excludes
+      # `fixtures`, so a fixtures gate compiles this module to a silent 0-test
+      # no-op here.
+      - name: Gate OLB-2B routing supervisor witnesses
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          MIN=23
+          out=$(cargo test --lib --features "$UNIT_FEATURES" \
+                  behavior::org_routing:: 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" \
+                | grep -oE 'test result: ok\. [0-9]+ passed' \
+                | grep -oE '[0-9]+' | head -1)
+          if [ -z "$n" ] || [ "$n" -lt "$MIN" ]; then
+            echo "::error::expected >= $MIN routing supervisor witnesses, ran ${n:-0}."
+            echo "The module is the #[cfg(test)] mod tests in"
+            echo "src/adapter/net/behavior/org_routing.rs. If it was re-gated to"
+            echo "feature = \"fixtures\", it compiles to a silent no-op in this job —"
+            echo "that is the regression this floor exists to catch."
+            exit 1
+          fi
+          REQUIRED="a_held_stream_fences_instead_of_starting_a_drainless_actor
+          only_the_live_incarnations_routes_are_usable
+          incarnation_overflow_fences_rather_than_reusing_an_id
+          a_deterministic_fault_exhausts_the_restart_budget_and_stays_fenced
+          unwind_only_a_panicking_apply_still_runs_the_fence_guard
+          shutdown_inside_apply_is_never_followed_by_healthy
+          cancelling_the_supervisor_drops_the_incarnation_and_frees_the_lease
+          a_closed_watch_without_shutdown_is_loud_and_terminal
+          a_sustained_superseded_streak_backs_off_and_reports_degraded"
+          for required in $REQUIRED; do
+            if ! printf "%s" "$out" | grep -q "$required"; then
+              echo "::error::required routing supervisor witness missing: $required"
+              exit 1
+            fi
+          done
+          echo "routing supervisor witnesses: $n passed (min $MIN); all named security witnesses present"
+
       # Doctests live in `///` comment blocks across `src/` and `sdk/src/`.
       # `cargo test --lib` does not execute them — they need a separate
       # `cargo test --doc` invocation. Same broad feature set so doc
