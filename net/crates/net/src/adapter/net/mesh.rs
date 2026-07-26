@@ -18766,6 +18766,22 @@ impl MeshNode {
     ///   needs the full spec; the stale stricter D upstream is
     ///   conservative and the next downstream refresh repairs it).
     fn handle_sensing_interest_frame(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        // review-pass-3 §11(b): a peer that has spent its rolling auth-failure
+        // budget is dropped BEFORE the decode, so a forged-cert flood stops buying
+        // an Ed25519 verify per frame. Checked here rather than inside the org
+        // admission because the point is to refuse the work, not to account for
+        // it afterwards. The same window and thresholds the channel-membership
+        // plane uses; `max_auth_failures_per_window == u16::MAX` disables it.
+        if Self::is_auth_throttled(from_node, ctx) {
+            ctx.sensing_counters
+                .protocol_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                "sensing: peer is auth-throttled; frame dropped before decode"
+            );
+            return;
+        }
         // Strict decode (wire.rs, 4 KiB cap, trailing bytes
         // rejected): a failure is malformed protocol input — count
         // and drop silently, like the unknown-subprotocol drop.
@@ -19320,6 +19336,20 @@ impl MeshNode {
             _ => return None,
         };
         if !sensing_interval_in_bounds(interval, ctx.sensing_interest_ttl) || ttl.is_zero() {
+            // review-pass-3 §11(a): counted AND traced. This was the one refused
+            // sensing input that was completely invisible — no counter and no
+            // trace — while all three legacy analogs at least `trace!`. A peer
+            // sending malformed bounds is a protocol fault like any other, and an
+            // operator seeing org intake vanish had nothing to look at.
+            ctx.sensing_counters
+                .protocol_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                ?interval,
+                ?ttl,
+                "sensing: org registration rejected on interval/ttl bounds"
+            );
             return None;
         }
         let snapshot = match sensing::capture_sensing_authority_snapshot(
@@ -19349,7 +19379,7 @@ impl MeshNode {
                 return None;
             }
         };
-        let validated = sensing::verify_org_sensing_registration(
+        let validated = match sensing::verify_org_sensing_registration(
             frame,
             from_node,
             sender_entity,
@@ -19357,8 +19387,29 @@ impl MeshNode {
             snapshot.floors(),
             now_secs,
             &ctx.sensing_counters,
-        )
-        .ok()?;
+        ) {
+            Ok(validated) => validated,
+            Err(rejection) => {
+                // review-pass-3 §11(b): the org sensing path now feeds the SAME
+                // rolling auth-failure window the channel-membership plane uses.
+                // A refused org registration is an authority rejection — a forged
+                // or revoked cert, a wrong audience, a floor-retracted membership
+                // — and every one of them cost this node an Ed25519 verify plus
+                // three `org_install` acquisitions. Without throttling, a
+                // forged-cert flood buys that work per frame indefinitely.
+                Self::record_auth_failure(from_node, ctx);
+                tracing::trace!(
+                    from_node = format!("{:#x}", from_node),
+                    ?rejection,
+                    "sensing: org registration refused; counted toward the auth-failure window"
+                );
+                return None;
+            }
+        };
+        // An admitted registration clears the window, so an honest peer that
+        // occasionally fails (a cert renewal race, a floor moving mid-flight) does
+        // not accumulate toward the throttle.
+        Self::clear_auth_failures(from_node, ctx);
         Some((
             sensing::AdmittedSensingRegistration::from_validated_org(validated),
             snapshot,
@@ -33556,6 +33607,69 @@ mod sensing_authority_witness_tests {
             err,
             crate::adapter::net::behavior::org_authority::OrgAuthorityError::SensingFleetRootCollision { .. }
         ));
+    }
+
+    // review-pass-3 §11 — the two 2026-07-23 §4 residuals on the org intake.
+    //
+    // (a) The interval/ttl pre-gate reject returned `None` with NO counter and NO
+    // trace — the one refused sensing input that was completely invisible, while
+    // all three legacy analogs at least `trace!`.
+    //
+    // (b) The org sensing path was not subject to `max_auth_failures_per_window`:
+    // the only throttle sites were the channel-membership plane, so a forged-cert
+    // flood bought an Ed25519 verify plus three `org_install` acquisitions per
+    // frame, indefinitely.
+    #[tokio::test]
+    async fn org_intake_counts_bounds_rejects_and_throttles_a_refused_flood() {
+        let node = org_node("intake-residuals").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+
+        // (a) a zero soft-state ttl is refused at the cheap structural pre-gate.
+        let before = sensing::SensingCounters::get(&node.sensing_counters.protocol_invalid);
+        let bad = sensing::SensingInterestFrame::org_provider_registration(
+            &org_spec(target, org_commitment()),
+            target,
+            D,
+            Duration::ZERO,
+            member_cert(&sender, 1),
+        );
+        let bytes = sensing::encode_interest_frame(&bad).expect("encode");
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
+        assert!(
+            sensing::SensingCounters::get(&node.sensing_counters.protocol_invalid) > before,
+            "an out-of-bounds org registration must be COUNTED, not silently dropped"
+        );
+        assert!(node.sensing_table_is_empty(), "and must install nothing");
+
+        // (b) a flood of registrations whose cert names a different member is an
+        // authority refusal, and spends the peer's rolling budget.
+        let impostor = EntityKeypair::generate().entity_id().clone();
+        let forged = sensing::SensingInterestFrame::org_provider_registration(
+            &org_spec(target, org_commitment()),
+            target,
+            D,
+            ORG_TTL,
+            member_cert(&impostor, 1),
+        );
+        let forged = sensing::encode_interest_frame(&forged).expect("encode");
+        assert!(
+            !MeshNode::is_auth_throttled(FROM_NODE, &ctx),
+            "precondition: the peer starts with a full budget"
+        );
+        for _ in 0..=node.config.max_auth_failures_per_window {
+            MeshNode::handle_sensing_interest_frame(&forged, FROM_NODE, &ctx);
+        }
+        assert!(
+            MeshNode::is_auth_throttled(FROM_NODE, &ctx),
+            "a sustained refused-cert flood must exhaust the auth-failure window"
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "and no row was ever created by any of it"
+        );
     }
 
     // review-pass-3 §4 — an ORG-audience sensing lease is refused LOUDLY rather
