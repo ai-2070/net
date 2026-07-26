@@ -98,8 +98,10 @@ jobs:
       # the pin ACCEPTS and only the settlement refuses) parks the actor without
       # spinning and without losing its queue, and that an EMPTY registry whose
       # authority moves inside the probe->settle window is re-driven rather than
-      # stranded at `Rebuilding`. Losing any of them silently would be worse than
-      # losing them loudly.
+      # stranded at `Rebuilding`, that the read seam fences a DEAD incarnation's
+      # still-retained facts, and that its authority sample cannot straddle a
+      # store install. Losing any of them silently would be worse than losing
+      # them loudly.
       #
       # NOTE: they are gated `#[cfg(test)]`, NOT `feature = "fixtures"` —
       # `$UNIT_FEATURES` deliberately excludes `fixtures`, so a fixtures gate
@@ -108,7 +110,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=36
+          MIN=38
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -138,6 +140,8 @@ jobs:
           terminal_exhaustion_retires_max_stamped_facts_and_fences_readiness
           an_exhausted_store_generation_parks_apply_without_spinning_and_recovers
           an_empty_registry_whose_authority_moves_under_the_probe_is_redriven
+          the_read_seam_fences_a_dead_incarnations_facts
+          the_read_seams_authority_sample_cannot_straddle_a_store_install
           an_unserved_scope_reads_cold_rather_than_authoritatively_empty"
           for required in $REQUIRED; do
             if ! printf "%s" "$out" | grep -q "$required"; then

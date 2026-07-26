@@ -1573,6 +1573,85 @@ async fn the_read_seam_fences_a_dead_incarnations_facts() {
     }
 }
 
+/// (11f) The read seam's authority sample is COHERENT, not merely well-ordered
+/// (review-pass-3 §6).
+///
+/// The `None -> store` install is the case that bites, because the two sides of
+/// the sample are indistinguishable across it: with no store the view is
+/// `(poisoned = false, floor_generation = 0)`, and a freshly installed store
+/// publishes at generation 0 too — the NORMAL first-install values, not a
+/// coincidence. So a sample that loaded the epoch BEFORE the advance and the
+/// floors AFTER the publish would find facts stamped `(R, 0, false)` matching
+/// live store B in every compared field, and serve A-era facts as
+/// B-authoritative.
+///
+/// Pass 2 verified the WRITE side and concluded `(B, R)` is unobservable, which
+/// is true — but only because the read side happened to sample floors first. No
+/// comment marked that order as load-bearing and no test could catch it being
+/// swapped. The seqlock re-check removes the ordering from the argument: the
+/// install lands inside the sample here, and it is the RE-CHECK that catches it.
+#[tokio::test]
+async fn the_read_seams_authority_sample_cannot_straddle_a_store_install() {
+    use crate::adapter::net::behavior::org_routing_registry::{
+        SlotBaseFacts, SourceEpoch, SourceFacts,
+    };
+
+    let node = node().await;
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+    // No store installed: the live view is (false, 0) — the value a fresh store
+    // also publishes.
+    assert!(node.org_revocation.load().is_none());
+    let key = slot(30, "nrpc:coherent-sample");
+    let facts = Arc::new(SlotBaseFacts {
+        providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
+        epoch: SourceEpoch {
+            generation: node.scoped_discovery.lock().revision(),
+            authority: node.routing_authority.epoch(),
+            floor_generation: 0,
+            poisoned: false,
+        },
+        actor_incarnation: 1,
+        slot_incarnation: 1,
+        earliest_expiry: u64::MAX,
+    });
+    node.routing_registry
+        .install_facts_for_test(key.clone(), facts.clone());
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "precondition: warm under the pre-install authority"
+    );
+
+    // The production movement, landing INSIDE the sample: epoch first, store
+    // second, both under the authority gate.
+    let scratch = Scratch::new("coherent-sample", &node);
+    let landed = Arc::new(AtomicBool::new(false));
+    {
+        let inner = node.clone();
+        let store = scratch.store();
+        let landed = landed.clone();
+        *node.routing_sample_gap_hook.lock() = Some(Arc::new(move || {
+            inner
+                .install_org_revocation_store(store.clone())
+                .expect("install");
+            landed.store(true, Ordering::Release);
+        }));
+    }
+
+    let served = node.org_routing_base_facts(&key);
+    assert!(landed.load(Ordering::Acquire), "the install did land");
+    assert!(
+        served.is_none(),
+        "a sample straddling the install must never serve A-era facts as B-authoritative"
+    );
+    assert_ne!(
+        facts.epoch.authority,
+        node.routing_authority.epoch(),
+        "and the movement really did change the identity the facts were stamped with"
+    );
+}
+
 /// (12) Poisoning revocation authority COLDS already-cached facts and re-queues
 /// the exact slot.
 ///

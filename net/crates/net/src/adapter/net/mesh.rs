@@ -6064,6 +6064,11 @@ pub struct MeshNode {
     /// Test-only: fires between the supervisor spawn and the handle publication.
     #[cfg(test)]
     routing_spawn_pause_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: fires inside the read seam's authority sample, between the
+    /// revocation view and the epoch RE-CHECK — the window a store install must
+    /// not be able to occupy undetected (review-pass-3 §6).
+    #[cfg(test)]
+    routing_sample_gap_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Actor observation points, threaded into the supervisor. See `ActorHooks`
     /// for why this is `any(test, fixtures)` rather than fixtures alone.
     #[cfg(any(test, feature = "fixtures"))]
@@ -7597,6 +7602,8 @@ impl MeshNode {
             routing_join_waiting: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             routing_spawn_pause_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            routing_sample_gap_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "fixtures"))]
             routing_hooks: Arc::default(),
             scoped_relay_gate: Arc::new(
@@ -12292,6 +12299,51 @@ impl MeshNode {
         self.routing_registry.new_family()
     }
 
+    /// A COHERENT sample of the routing authority epoch and the revocation view
+    /// it qualifies: `(authority, poisoned, floor_generation)`, or `None` if the
+    /// two could not be observed under one unchanging identity (review-pass-3
+    /// §6).
+    ///
+    /// Seqlock-style — epoch, floors, RE-CHECK epoch — because the read seam's
+    /// safety used to rest on an unmarked ORDERING and nothing else. The write
+    /// side advances the epoch BEFORE publishing the store, so sampling floors
+    /// first and the epoch second is the conservative direction and `(B, R)` is
+    /// unobservable. Sampling them the other way round — a natural "cheap compare
+    /// first" refactor — admits loading epoch `R` before the advance and floors
+    /// from store `B` after the publish. On a `None -> store` install BOTH sides
+    /// read `floor_generation == 0, poisoned == false`, which are the NORMAL
+    /// first-install values rather than a coincidence, so facts stamped
+    /// `(R, 0, false)` under no store would compare EQUAL under store `B` and be
+    /// served as `B`-authoritative.
+    ///
+    /// Re-checking the epoch removes the ordering from the argument entirely: any
+    /// interleaving that could produce a mixed sample also moves the epoch, and a
+    /// moved epoch fails the re-check. Bounded rather than a retry loop — this is
+    /// a lock-free read path, and authority movement is node-mediated and rare,
+    /// so exhausting the attempts means something is genuinely churning and the
+    /// honest answer is a cold read.
+    fn sample_routing_authority(&self) -> Option<(u64, bool, u64)> {
+        const ATTEMPTS: usize = 4;
+        for _ in 0..ATTEMPTS {
+            let before = self.routing_authority.epoch();
+            let (poisoned, floor_generation, _store) =
+                ScopedSlotSource::revocation_view_of(&self.org_revocation);
+            // Test-only: the exact window a store install must not be able to
+            // occupy undetected.
+            #[cfg(test)]
+            {
+                let hook = self.routing_sample_gap_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            if self.routing_authority.epoch() == before {
+                return Some((before, poisoned, floor_generation));
+            }
+        }
+        None
+    }
+
     /// The registry's base facts for `key`, if a slot is retained, currently
     /// holds valid facts, AND the live health still allows the incarnation that
     /// built them.
@@ -12319,10 +12371,14 @@ impl MeshNode {
         // view so it raises no floor, and returning cold first would leave the
         // registry reconciled to that obsolete reconstruction indefinitely
         // (Kyra OLB-2B-E3c closure).
-        let (poisoned, floor_generation, _store) =
-            ScopedSlotSource::revocation_view_of(&self.org_revocation);
+        let Some((authority, poisoned, floor_generation)) = self.sample_routing_authority() else {
+            // The sample could not be taken coherently. Cold, and NOT stale: we
+            // do not know that these facts are wrong, so retiring them would
+            // discard valid work.
+            return None;
+        };
         let stale = self.routing_authority.is_exhausted()
-            || facts.epoch.authority != self.routing_authority.epoch()
+            || facts.epoch.authority != authority
             // The floor generation moves INDEPENDENTLY of the authority epoch:
             // a floor publication is authoritative inside the revocation store
             // before the subscriber that advances the epoch is even notified. So
