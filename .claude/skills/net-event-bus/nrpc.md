@@ -44,6 +44,8 @@ The reply-channel-per-caller convention keeps subscriptions cheap: a server hold
 
 If both ends are in your control AND you want a return value, pick nRPC. The bus has no return-value mechanism — folding it in via "two channels + correlation id" is exactly what nRPC does, except already implemented with deadlines, cancellation, and resilience helpers.
 
+**If only certain organizations may call the service**, you want `serve_org` / `mesh.org(..).call(..)` rather than `serve_rpc` plus a hand-rolled gate — same nRPC transport, but with an offline-issued per-call admission proof and an announcement encrypted to an audience. Read `org.md` before writing that yourself.
+
 ---
 
 ## Status codes + error model
@@ -293,6 +295,20 @@ nRPC throughput is bounded by the shared mesh receive loop, not the handler. Two
 
 ---
 
+## Watching tool discovery remotely — `tool.watch`
+
+Local tool discovery is `list_tools(matcher)` (snapshot) and `watch_tools(matcher, interval)` (event-driven deltas off the node's own mesh-replicated capability fold). **`tool.watch` is the remote form**: a server-streaming nRPC service that relays another node's fold deltas to you.
+
+- **You almost never install it explicitly.** Every `serve_tool*` path auto-installs it, idempotently, for the lifetime of the `Mesh`. `Mesh::serve_tool_watch()` exists for the one case that isn't covered: a node acting as a pure **discovery relay** — it serves no tools of its own but lets remote subscribers stream deltas diffed from its fold.
+- **Protocol.** Send one JSON `WatchToolsRequest` (`{ matcher?, interval_ms? }`), receive one JSON `ToolWatchFrame` per chunk. Open it with `call_streaming_typed::<WatchToolsRequest, ToolWatchFrame>`. `matcher: None` watches every tool the serving node sees; `interval_ms` is a debounce *ceiling*, not a poll — omit it for pure event-driven.
+- **Frames** are `{"type": "added"|"removed"|"node_count_changed"|"resync"}`, the same JSON shape the FFI bindings already use for `ToolListChange`.
+- **The resync contract is the part that bites.** Deltas ride a bounded per-subscriber buffer (`TOOL_WATCH_SUBSCRIBER_BUFFER = 64`). A subscriber that falls behind has its queued deltas **dropped** and gets one `Resync` frame instead — a delta is never lost *silently*, but it is lost. On `Resync` you must discard your accumulated view and re-baseline from your **own local `list_tools`** (the fold is mesh-replicated; there is no remote list service to call). Frames after a resync resume normal delta semantics, and a delta already reflected in your fresh baseline is expected — **make your apply idempotent**.
+- **Auth** rides the ordinary callee-side nRPC capability gate on `nrpc:tool.watch`.
+
+Binding surfaces mirror the Rust `Mesh::watch_tools(matcher, interval)`: TS `watchTools(mesh, options)` (an `AsyncIterable<ToolListChange>` — `for await (const change of watchTools(mesh))`), Python `watch_tools`, Go `WatchTools`, FFI `net_rpc_watch_tools`. **All are event-driven** — the Go binding's old 1 s poll is gone. A sub-millisecond `WatchOptions.Interval` in Go rounds up to 1 ms rather than truncating to 0 (which would have meant "no staleness ceiling").
+
+---
+
 ## Typed bindings from discovered tools — `net-mesh typegen`
 
 nRPC has no IDL and needs none — the wire is schemaless JSON and each side ships its own typed serializer. An **optional** codegen path covers the AI-tool case: `net-mesh typegen` walks the capability fold for `ai-tool:*` tags, fetches each matching descriptor's metadata, and emits typed bindings so a caller gets compile-time types for a tool it discovered at runtime. Codegen is a convenience over the same wire RPC — a generated call lands identically to a hand-written `call_typed`.
@@ -351,4 +367,6 @@ True subprocess-based interop tests (Node caller → Rust server, Python caller 
 - **Python binding** — `net/crates/net/bindings/python/src/mesh_rpc.rs` (PyO3 cdylib), `net/crates/net/bindings/python/python/net/mesh_rpc.py` (Python wrapper).
 - **Go C-ABI** — `net/crates/net/bindings/go/rpc-ffi/src/lib.rs` (cdylib), `net/crates/net/bindings/go/net/mesh_rpc.go` (reference cgo wrapper), `net/crates/net/bindings/go/net/resilience.go` (pure-Go resilience helpers).
 - **Cross-binding contract** — `net/crates/net/tests/cross_lang_nrpc/golden_vectors.json` (shared fixture), the three binding compat tests (paths above).
+- **Tool discovery + `tool.watch`** — `net/crates/net/sdk/src/tool.rs` (`list_tools` / `watch_tools` / `serve_tool_watch`), `net/crates/net/src/adapter/net/cortex/tool.rs` (`TOOL_WATCH_SERVICE`, `WatchToolsRequest`, `ToolWatchFrame`).
+- **Org-protected calls** — `net_sdk::mesh_rpc::OrgProofIntent` on `CallOptions` is the low-level seam under `mesh.org(..).call(..)`; use it when you need an exact provider, a specific grant, or an unusual proof TTL. See `org.md`.
 - **READMEs** — `net/crates/net/README.md` § nRPC (top-level concept + cross-binding spec); per-binding READMEs each have an `## nRPC` section with language-idiomatic examples.

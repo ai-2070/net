@@ -176,6 +176,18 @@ A step that needs an *exclusive* capability must obtain it through the gang matc
 
 ---
 
+## Sensed candidate pruning (Rust core only, off by default)
+
+`MeshNode` has sensed siblings of the two match verbs: `match_islands_sensed(criteria, spec, budget, resolved_population)` and `claim_island_sensed(.., until_unix_us)`. They join **capability-sensing** readiness — the mesh-wide "can any authorized provider currently satisfy this under constraints C and latency envelope L?" plane — into candidate selection at the same seam as the liveness gate.
+
+Semantics worth knowing before you reach for them:
+
+- **Absence of evidence never prunes.** Only providers sensed *explicitly* NotReady for **this** interest are dropped, and only from **this** match — never suspended in the fold, and no other match is affected. Unsensed and `Unknown` hosts are untouched. Both sensed inputs empty ⇒ byte-identical to plain `match_islands`.
+- **Viable providers are re-ranked to the front, stably.** Islands within one band, and every island of an unsensed host, keep the selection policy's order. This is what makes the *first* successful claim target the selected provider.
+- **The sensed verdict is advisory input to a decision it does not make.** The claim still targets the selected provider under its own authoritative admission recheck. A `Ready` from the sensing plane is a materialized view to act on *subject to final admission*, never authorization to skip it — treating it as authorization in a physical or safety-critical integration is a bug on par with a wrong API signature.
+
+**Caveats as of 0.34:** this is the **Rust core surface only** (`MeshNode`, not the flat `Mesh` SDK), the whole sensing plane ships dark behind `enable_sensing_coalescing = false`, the rendezvous-leader role additionally needs the `redex` build feature, and there is **no TS / Python / Go binding**. If a user asks for sensed scheduling in another language, the honest answer is that it isn't exposed yet. Config knobs: `mesh.md`.
+
 ## Gotchas
 
 - **A match is advisory; the CAS is the arbiter.** Two nodes can both match the same island. Exactly one wins the `reserve`/`claim` CAS; the loser gets `"lost"` / walks to the next candidate. Don't gate exclusivity on the match.

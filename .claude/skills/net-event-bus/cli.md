@@ -16,7 +16,9 @@ cargo build --release --features cli   # → target/release/net-mesh
 
 Every command runs against a **live `MeshNode`** resolved through the standard `CliContext` — the same connection-and-keypair plumbing the SDK uses. Target a remote daemon with `--node-addr <ip:port> --node-pubkey <hex>` (live-discovery commands also take `--node-id`, `--psk-hex`), or omit them to attach to the local node in the surrounding environment.
 
-Two command groups: **`transfer`** (blob/dir transport) and **`typegen`** (typed bindings from discovered AI tools).
+Three command groups covered here: **`transfer`** (blob/dir transport), **`typegen`** (typed bindings from discovered AI tools), and **`org` / `node adopt`** (organization capability-auth issuance and node ownership).
+
+**Colour.** `--no-color` is global. `$NO_COLOR` is also honoured *per the convention* — colour is off when the variable is **present and non-empty**, whatever the value (`NO_COLOR=1`, `NO_COLOR=x`, and `NO_COLOR=false` all disable it; only absent or empty leaves it on).
 
 ## `net-mesh transfer`
 
@@ -88,6 +90,28 @@ net-mesh typegen diff --from <PATH> --to <PATH> [--exit-code] [--output json|yam
 ```
 Lists added/removed tools, version bumps, and schema deltas (added/removed/changed request/response fields) with `[BREAKING]` markers. Exits `0` by default; **`--exit-code` exits `14` when any BREAKING change is detected** — use it to gate CI. `--output json`/`yaml` for the structured report.
 
+## `net-mesh org` — organization capability auth (issuance)
+
+Offline authoring against an **org root key**. Unlike `transfer` / `typegen`, these commands are *ceremonies over files* — `keygen`, `issue-cert`, `issue-floors`, `grant-dispatcher`, and `grant-capability` need no live node. Only `net-mesh node adopt` touches a node's authority directory. Conceptual model, and what each artifact does *not* authorize: `org.md`.
+
+| Command | Produces |
+|---|---|
+| `net-mesh org keygen --out <path> [--note <s>] [--force]` | a fresh org root keypair. Default path `$XDG_CONFIG_HOME/net-mesh/orgs/org-<id>.toml`. |
+| `net-mesh org issue-cert --org-key <path> --member <hex> [--generation N] [--ttl-secs N] --out <path>` | a membership cert ("node X belongs to this org"). TTL defaults to the recommended ~1 year, hard-capped at 2. |
+| `net-mesh org issue-floors --org-key <path> --floor <MEMBER=GEN> [--floor …] --out <path>` | a signed revocation-floor bundle. Certs for `<member>` below the floor generation are revoked on every node that merges it. |
+| `net-mesh org grant-dispatcher --org-key <path> --dispatcher <hex> (--capability <tag> \| --any-capability) [--ttl-secs N] --out <path>` | "entity X may act **for** this org." A→S. |
+| `net-mesh org grant-capability --org-key <path> --grantee-org <hex> --capability <tag> [--invoke] [--discover --audience-out <path>] (--target-node <hex> \| --target-any-owned-by <hex>) [--ttl-secs N] --out <path>` | "org A holds these rights on capability C over target T." B→A, signed by the *provider* org. |
+
+`net-mesh node adopt --cert <path> (--identity <path> \| --entity <hex>) [--authority-dir <dir>] [--bundle <path>] [--skew-secs N]` installs ownership on a node: `owner-membership.json`, `owner-audience.key`, and `revocation-state.json` under `$XDG_CONFIG_HOME/net-mesh/authority` by default. Optionally merges a revocation bundle during adoption. Clock-skew tolerance is **strict by default** and hard-capped at the token ceiling (300 s) — larger values are rejected before anything is written.
+
+Things that will bite:
+
+- **Grant TTLs default to 7 days and hard-cap at 30**, rejected at issue *and* at every verifier. Renewal in v1 is re-issue + `issue-floors`, not extension.
+- **`--force` is refused on both grant commands.** Grant artifacts are published no-clobber: the grant + audience-secret pair is not crash-atomic, and on a case-insensitive filesystem an aliased `--out` could destroy the org key. Write to fresh paths or remove the old files explicitly. (`keygen` / `issue-cert` / `issue-floors` do accept `--force`.)
+- **`--discover` requires `--audience-out`** and is rejected without it. The minted audience secret is written owner-only — 0600 on Unix. **On Windows the mode is unenforceable**: the file inherits its parent directory's NTFS DACL, and a loud warning fires unless `--accept-windows-dacl`. Point it at an owner-only parent.
+- **`--accept-windows-dacl` and `--insecure-permissions` are deliberately separate flags.** The first suppresses a warning about a freshly written **output** secret; the second relaxes a mode check on an **input** you already control (e.g. an org key checked out of git at 0644). Sharing one flag meant operators carried a Linux-motivated `--insecure-permissions` onto Windows and silently killed the only warning that platform has.
+- **No default falls back to the CWD.** If the platform config directory can't be resolved, `keygen` and `adopt` refuse and tell you to pass an explicit path rather than writing key material wherever you happened to be standing.
+
 ## Exit codes (all subcommands)
 
 | Code | Meaning |
@@ -114,3 +138,4 @@ Subcommands may also emit a JSON `{"error": …, "detail": …}` line to **stder
 - `dataforts.md` — the blob/dir model behind `transfer` (`BlobRef`, content-addressing, `store_dir`/`fetch_dir`, gravity).
 - `nrpc.md` — the discovered-tool / typed-call surface `typegen` generates against.
 - `capabilities.md` — the `ai-tool:*` capability tags `typegen` discovers.
+- `org.md` — what the `net-mesh org` artifacts mean, the startup-side `install_org_authority` / `install_provider_grant_audience` calls that consume them, and the `org:<domain>:<kind>` errors.

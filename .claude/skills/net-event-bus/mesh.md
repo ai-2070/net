@@ -292,6 +292,26 @@ A publish from A reaches B and C if both have `subscribe_channel(a_node_id, &cha
 
 ---
 
+## Capability sensing — leave it off
+
+A whole plane exists for the existential question *"can **any** authorized provider currently satisfy capability Y under constraints C and latency envelope L?"* — asked once per distinct interest instead of once per watcher, coalesced locally and again at a rendezvous leader.
+
+**As of 0.34 you should almost certainly not turn it on.** It ships dark: `enable_sensing_coalescing = false` by default, the rendezvous-leader role additionally gated behind the `redex` build feature, and there is **no TS / Python / Go SDK surface** — Rust core only. A mesh that leaves the flag off is byte-for-byte the previous release on the wire; its two frames (`0x0C02` `SensingInterestFrame`, `0x0C03` `ReadinessAttestation`) are never emitted.
+
+The knobs, all defaulted inert, so you recognize them in a config diff: `enable_sensing_coalescing` (`false`), `sensing_interest_ttl` (30 s), `max_interests_per_peer` (512), `max_constraint_bytes` (1 KiB), `attestation_cadence_floor` (50 ms), `continuity_factor` (3), and the candidate-exploration bounds `candidate_initial_fanout` (1), `candidate_standby_count` (1), `candidate_max_fanout` (3), `each_mode_max_providers` (32).
+
+If you do evaluate it: **everything the plane reports is advisory.** Proofs are soft state, origin-signed, converging by expiry, and always defer the final yes/no to the admission path below. Follow a `Ready` with your own admission recheck — never treat it as authorization to proceed. Its first consumer is the gang scheduler's candidate pruning (`scheduler.md`). Operator surface: `net/crates/net/docs/SENSING.md`.
+
+---
+
+## Route churn — nothing to configure
+
+Control-plane hardening landed on by default and needs no action; it matters only when you're reading logs and wondering why a route moved. Pingwaves pass an admission gate (dedup) **before** touching the proximity graph or routing table, so a replayed pingwave can't reinstall a just-withdrawn route. A direct peer transitioning to `Failed` **always** floods a route withdrawal and drops the dead edge, regardless of what a stale graph still shows a path for. Alternate-path promotion looks past the shortest path, so a reroute can still succeed when the shortest path starts with the peer being withdrawn. Withdraw floods are damped per `(destination, exclude)` recipient rather than globally.
+
+All of it degrades cleanly against un-upgraded peers.
+
+---
+
 ## Production checklist
 
 - **PSK is a shared secret.** Distribute over a secure channel (k8s secret, vault). Rotate via a dual-PSK overlap if your fleet allows it; otherwise plan a short outage.

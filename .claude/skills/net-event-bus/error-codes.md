@@ -100,6 +100,29 @@ From `call_typed`, `call_streaming_typed`, `call_client_stream_typed`, `call_dup
 
 `RpcAppError` is **wire-stable across languages** — codes like `NRPC_TYPED_BAD_REQUEST` / `NRPC_TYPED_HANDLER_ERROR` are part of the cross-language fixture; each binding's typed wrapper maps `Codec*` to an idiomatic native error. Full surface + retries/hedging in `nrpc.md`.
 
+### Org capability auth — the `org:<domain>:<kind>` wire vocabulary
+
+From `mesh.org(..)`, `OrgClient::call`, and every binding's equivalent. Unlike the rest of this file, this is a **frozen cross-language string vocabulary** — single-sourced from Rust's `OrgSdkError::to_wire`, pinned by `net/crates/net/tests/cross_lang_org/error_vectors.json`, and re-parsed identically by Node, Python, Go, and C.
+
+Shape: `org:<domain>:<kind>[: <detail>]`. **The detail is human-facing and must never be parsed for semantics.**
+
+| Domain | `is_local` | Meaning | Retry? |
+|---|---|---|---|
+| `credentials` | **true** | your wallet couldn't authorize the call — **nothing was sent** | no; fix credentials |
+| `discovery` | **true** | no provider you're authorized to call was found — **nothing was sent** | maybe; provider may not have announced yet |
+| `admission_denied` | false | a provider's admission engine evaluated and refused | no |
+| `rpc` | false | transport, or a server error that is *not* an admission denial | per the `RpcError` kind |
+| `unknown` | false | parser/ABI fallback — this binding's vocabulary disagrees with the build | no; it's version skew |
+
+**Branch on the domain, not the message.** `is_local` is the one question that matters — did anything leave the process? Use the provided helper (`domain.is_local()`, `ParsedOrgError.is_local`, Go `OrgError.IsLocal()`, or the distinct C return codes) rather than re-parsing.
+
+Two rules the design enforces and your code should respect:
+
+- **Never report `admission_denied` for a string you couldn't parse.** That asserts a request reached a provider and its engine ran. `unknown` exists precisely so a binding meeting an unfamiliar kind never impersonates one of the four.
+- **Remote denials are coarse on purpose** — `denied` / `not_supported` / `unavailable`, with no detail at all. A precise remote reason would be a credential oracle. Don't write caller logic that branches on a finer reason; it doesn't exist.
+
+`org:rpc:` reuses the frozen nRPC kind vocabulary (`timeout`, `no_route`, `cancelled`, `server_error`, `transport`, `codec_encode`, `codec_decode`, `capability_denied`) instead of minting second names. Per-kind meanings and the full local-kind list: `org.md` § Errors.
+
 ### Per-peer stream — `StreamError` (from the stream API on `MeshNode`)
 
 | Variant | When it fires |
@@ -125,3 +148,4 @@ Adapter constructors and their `Debug` impls **scrub `user:password@` from conne
 - `streams.md` — reliable per-peer streams and `StreamError` in context.
 - `filter-dsl.md` — what produces `ConsumerError::InvalidFilter`.
 - `concepts.md` § Identity — token chains behind `TokenError`.
+- `org.md` — the org credential/admission model behind the `org:` vocabulary, and the local kinds worth recognizing on sight.
