@@ -213,11 +213,20 @@ async fn provider_below_its_own_floor_cannot_admit() {
 async fn provider_with_expired_cert_cannot_admit() {
     let node = build_node().await;
     let dir = scratch_dir("expired");
-    // Valid for 2 seconds, zero skew. (A 1s window is too tight
-    // against the second-granularity clock — a boundary crossing
-    // during adopt could expire it before the first assertion.)
-    let cert =
-        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 2).expect("issue cert");
+    // review-pass-3 §22 — the ISSUE window costs nothing, so stop making it
+    // tight. This was 2 seconds, and §T9's own reasoning applies to it: under a
+    // cold-build parallel run the adopt-time fsync work consumed the whole window
+    // before adopt's internal verify, and the test panicked in its own SETUP with
+    // `adopt: CertInvalid(Expired)` — a flake in a security suite that
+    // `.config/nextest.toml` runs with `retries = 0`.
+    //
+    // The window's size is not what this witness is about: the expiry assertion
+    // below advances a SUPPLIED clock sample rather than sleeping, so any window
+    // shorter than that advance proves exactly the same thing. Five minutes is
+    // far past any plausible fsync stall while staying an hour short of the
+    // sample.
+    let cert = OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 300)
+        .expect("issue cert");
     let authority = NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("adopt");
     node.install_node_authority(Arc::new(authority))
         .expect("install");
@@ -241,7 +250,7 @@ async fn provider_with_expired_cert_cannot_admit() {
     let expired_sample = ClockSample {
         wall_ns: ClockSample::now()
             .wall_ns
-            .saturating_add(10 * 1_000_000_000),
+            .saturating_add(3_600 * 1_000_000_000),
         monotonic: std::time::Instant::now(),
     };
     assert_eq!(
