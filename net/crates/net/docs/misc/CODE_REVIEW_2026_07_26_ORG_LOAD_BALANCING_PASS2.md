@@ -424,3 +424,52 @@ across three modules, and the interesting question was whether they compose.
 itself advanced a watch. That holds for source movement and, via the explicit
 `work.mark()`, for registry movement — which is what §2's compounding half is
 about. The contract is met; the retry *rate* is the open question.
+
+---
+
+## Disposition
+
+Triaged with Kyra 2026-07-26 and worked in that order. Every finding has a
+resolution here; the two that were NOT changed say why, so neither reads as
+overlooked.
+
+| # | Sev | Disposition | Where |
+|---|-----|-------------|-------|
+| §1 | P2 | **Fixed** — five mutating seams + the read-only siblings gated `#[cfg(any(test, feature = "fixtures"))]`; two now-unreachable internals gated with them | `e3a5da509` |
+| §2 | P2 | **Deferred by decision** — recorded as an OLB-3 activation prerequisite (below), NOT general debt | this document |
+| §3 | P3 | **Fixed** — doc block restored to `join_org_routing_supervisor`, precondition restated as one | `e3a5da509` |
+| §4 | P3 | **Fixed** — exhaustion guard made structural in `SensingAuthorityStamp::is_current` + mirror witness | `e3a5da509` |
+| §5 | P3 | **Fixed** — generation tiebreak sorted descending so the defensive dedup keeps the newest; witness (30) exercises the branch | `e3a5da509` |
+| §6 | P3 | **Fixed** — `MAX_LEASED_INTERESTS` / `MAX_HOLDERS_PER_INTEREST` + total fail-closed refusal + counters + two witnesses | `f384b6664` |
+| §7 | P3 | **No change** — an observation, not a defect (below) | — |
+
+### §2 — recorded as an OLB-3 activation prerequisite
+
+Not fixed now, deliberately. No in-crate production path holds a `DemandHandle`
+today, so with zero retained slots the settle-only path always reports
+`Current` and the starvation is dormant; and the "monotone epoch floor" fix
+direction risks weakening exact-authority reconciliation, which is not
+something to improvise during an authority-protocol closure.
+
+**Before OLB-3 makes `DemandHandle` live, the following must land together:**
+
+1. bounded exponential/jittered backoff after consecutive `Superseded`, so a
+   hot source degrades to a slower reconcile rather than a yield-paced spin.
+   The `work.mark()` itself must stay — a requeued identity is only unioned
+   into `named` when `request.registry_work` is set;
+2. a restart-streak metric promoted to a health signal. `recaptures_restarted`
+   already counts the displacement; nothing reads it;
+3. explicit degraded/cold behaviour rather than an unbounded rebuild loop;
+4. a production witness with MORE than `APPLY_QUANTUM` (64) retained slots
+   under sustained source movement.
+
+Multi-quantum epoch semantics (fix direction (b)) are to be reconsidered ONLY
+if that witness shows backoff alone is insufficient. Exact epochs are the
+current guarantee and are not to be relaxed speculatively.
+
+### §7 — no corrective work
+
+Candidate sets are bounded and small at this layer, and the phase-3 ordering is
+what makes selection deterministic under session churn — which is the property
+`4dccb7767` was written to restore. Re-evaluate when OLB-3 introduces sensed
+selection above this layer and the candidate set stops being small.
