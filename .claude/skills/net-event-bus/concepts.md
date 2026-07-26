@@ -36,6 +36,24 @@ Consequences:
 - **Channels cost nothing when idle.** A channel with zero subscribers consumes zero resources mesh-wide. There's no metadata to maintain.
 - **Channels with thousands of subscribers work.** They just fan out more packets. The cost is linear in subscriber count, paid by the publisher node.
 
+### Naming rules (validated at construction, so get them right)
+
+`ChannelName::new` validates; there is no `From<&str>` escape hatch. Names are hierarchical paths:
+
+- **Max 255 bytes** (`MAX_NAME_LEN`).
+- Valid characters: alphanumeric plus `-`, `_`, `.`, `/`.
+- Must not be empty, must not start or end with `/`, must not contain `//`.
+- **Matched case-sensitively.** `Sensors/Temp` and `sensors/temp` are different channels — this is the #1 "why is my subscriber silent" cause after transport mismatch.
+
+Prefix matching is first-class: a subscriber to `sensors/lidar` receives `sensors/lidar/front` and `sensors/lidar/rear` alike (subject to capabilities).
+
+**Two hashes, and conflating them is a security bug.** A channel name derives *both*:
+
+- **canonical `ChannelHash` (u64, xxh3_64)** — the substrate-wide key for auth (`AuthGuard`, `PermissionToken`), config, storage (`RedexFile`), and metrics. Full 64-bit keyspace; a targeted second-preimage needs ~2^64 work even though xxh3 isn't cryptographic.
+- **wire `u16`** — the fast-path hint stamped on every packet header for wire-speed filtering by forwarders. 65 K buckets, so it has **routine collisions at mesh scale**.
+
+Wire collisions are benign because they only cost filter precision. ACL, config, and storage decisions key on the canonical u64. (This split exists because the canonical key *used* to be a u32 truncation, which let ~2^32 of grinding produce a token issued for one channel that passed the token-cache fast path for an unrelated victim channel.) If you're writing a relay or reading a capture: the header's 16-bit `channel_hash` tells you where a packet is probably going, never what it's allowed to do.
+
 The named-channel API exists in TS and Python (`node.channel("name")`). The other SDKs do not have it, and they don't all replace it the same way:
 
 - **Rust** has a typed firehose: `node.emit(&MyType)` and `node.subscribe_typed::<T>()`. Consumers receive every event of that type and filter on payload content.
@@ -61,7 +79,9 @@ When a publisher emits, the call returns a `Receipt` (or null/error under backpr
 
 In TCP, backpressure is negotiated. The receiver advertises a window, the sender respects it, congestion control slows everyone down. Round trips are involved.
 
-In Net, backpressure is **immediate and unilateral**. A node that can't keep up stops processing. Its ring buffer is full, so new data either evicts the oldest entry (`DropOldest`, default) or gets dropped at the boundary (`DropNewest`), or the producer's emit call fails (`FailProducer`). The slow node does not tell anyone — it just goes silent on that stream.
+In Net, backpressure is **immediate and unilateral**. A node that can't keep up stops processing. Its ring buffer is full, so new data either evicts the oldest entry (`DropOldest`, default) or gets dropped at the boundary (`DropNewest`), or the producer's emit call fails (`FailProducer`), or — the fourth mode people forget — it's decimated by `Sample { rate }`, which keeps 1 event in every `rate` and drops the rest (surfacing as `IngestionError::Sampled`, not `Backpressure`). The slow node does not tell anyone — it just goes silent on that stream.
+
+**There is no `Block` mode.** `FailProducer` — not `DropNewest` — is the one variant that surfaces an error to the producer; nothing in the bus ever applies TCP-style back-off to slow you down.
 
 Silence propagates through the proximity graph. Neighbors observe the missed heartbeat within a heartbeat interval, mark the node as degraded, open the circuit breaker, and **route new traffic to other capable nodes**. The sender does not slow down. The mesh has other nodes.
 

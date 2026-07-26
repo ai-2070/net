@@ -141,6 +141,35 @@ What to do: version your event types in the payload (`{ "v": 2, "data": ... }`).
 
 What to do: configure the bind address on the node (`mesh_bind` parameter or equivalent). Open the UDP port in the firewall. NAT traversal is opt-in (feature flag).
 
+## "Should I be using Net for this at all?"
+
+Ask it early — the honest "no" is cheaper than a migration. The value of Net shows up precisely when the world is **distributed, changing, and stateful**; reaching for a discovery mesh when one HTTP call would do is the same mistake as standing up Kafka to move ten messages a day.
+
+**Net earns its keep when:**
+
+- capabilities must be **discovered at runtime** — the set of tools / models / services changes and isn't a fixed config;
+- the work lives **across machines or organizations**, not on the box you're running on;
+- **credentials must stay local** — the node holding a secret should run the work, and the caller should never see it;
+- **peers coordinate**, not just one app calling one API;
+- callers need **typed schemas discovered at runtime**;
+- work has **live state** — failures, retries, artifacts, streams that a status code can't express;
+- **provider availability changes** (the GPU is busy, the model unloads, the service moves);
+- resources like GPUs should be **matched by what they can do**, not addressed by hostname;
+- workflows need **visibility and recovery** — which step failed, replayable — rather than reconciliation tomorrow.
+
+**Say no when:**
+
+- **one API call solves it.** No discovery, no work state → no mesh.
+- **a single server and database are enough.** No distribution, no presence.
+- **HTTP/gRPC request-response is sufficient** — nothing live to model.
+- **MCP alone is enough** because the tools are hand-wired and local. If nothing needs *discovering*, MCP is simpler (`mcp.md`).
+- **a normal queue or job runner already matches the workflow** — fixed producer, fixed consumer, a broker you're happy operating. Net's discovery and presence buy nothing there.
+- **none of "discovery, presence, policy, artifacts, streams, recovery" describes the problem.** Then Net is overhead.
+
+The two-question test: *does anything need to be discovered at runtime, and does the work have state I have to observe or recover?* Two nos means they don't need Net yet — say so. One yes is worth the conversation.
+
+Related framing, worth having ready: **REST/webhooks are the dirty edge, not the model.** They're the right integration surface for legacy SaaS, browser-only apps, and dashboards — a thin adapter that speaks HTTP on one side and announces a capability (or publishes/consumes events) on the other. Modeling the mesh *internally* as REST is the mistake that makes people mistake Net for an API gateway. Note there is **no first-class REST adapter shipped** today (unlike MCP, Redis, and JetStream) — an edge adapter is code the user writes.
+
 ## "Can I use Net as a drop-in replacement for [my broker]?"
 
 **No.** The mental model is different enough that direct drop-in usually produces working-but-wrong code (e.g. assuming durability that isn't there, expecting consumer groups, depending on broker-side ordering). 

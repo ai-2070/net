@@ -76,6 +76,103 @@ Each binding ships a `classifyError(e)` / `classify_error(e)` helper that maps a
 
 ---
 
+## The four call shapes
+
+One wire, one typed surface, four shapes. The skill's examples below are unary; the other three layer on the same primitive and ship across Rust, Node, Python (sync + async), and Go with the same wire contract.
+
+| Shape | Serve | Call | When |
+|---|---|---|---|
+| **Unary** | `serve_rpc_typed` | `call_typed` / `call_service_typed` | one request, one reply. The default. |
+| **Server-streaming** | `serve_rpc_streaming_typed` — handler gets a `ResponseSinkTyped<Resp>`, pushes chunks with `sink.send(&chunk)?`, returns `Ok(())` to close cleanly or `Err(msg)` to fail the stream | `call_streaming_typed::<Req, Resp>` → an async `Stream` | token streaming, download-with-progress, log tails. |
+| **Client-streaming** | handler receives a `RequestStreamTyped<Req>` and returns one terminal `Resp` once the stream closes | `call_client_stream_typed::<Req, Resp>` → `call.send(&chunk).await?` × N, then `call.finish().await?` | uploads, batch submit. |
+| **Duplex** | both directions stream independently | `call_duplex_typed::<Req, Resp>` → `call.into_split()` gives `(sink, stream)`; `sink.finish_sending().await` closes the request direction | interactive sessions, long-running coordination. |
+
+A request chunk that fails to decode terminates a client-streaming/duplex stream with an `RpcError::Codec` item — it does not silently skip. `stream_window_initial` on `CallOptions` bounds the response direction; its request-direction mirror bounds the upload direction. Without a window, the server pumps as fast as the publish path takes it.
+
+## Picking a target — `RoutingPolicy`
+
+`call_typed` addresses one node id. `call_service_typed` consults the local capability index for nodes advertising `nrpc:<service>` and picks one per `opts.raw.routing_policy` (`src/adapter/net/mesh_rpc.rs`):
+
+| Variant | Behavior |
+|---|---|
+| `RoundRobin` | **Default.** Round-robin via the per-`Mesh` `call_id` counter. Even distribution, load-blind. |
+| `Random` | Stateless per-call random pick. |
+| `Sticky { key: u64 }` | Consistent-hash to a target by `key` — same key hits the same node while the candidate set is stable. Session / shard / conversation affinity. |
+| lowest-latency | Picks the smallest measured `latency_us` from the local `ProximityGraph`. Candidates with no proximity data sort to the bottom (better a known-fast node than a gamble), with a deterministic fallback to the first sorted candidate when nobody has data. |
+
+If no node advertises the service, the call fails `RpcError::NoRoute` — which the default retry predicate deliberately does **not** retry.
+
+## Capability-targeted calls — the `net-where:` predicate
+
+You can require more than "any server for this service": ship a capability predicate alongside the call and let the *receiver* evaluate it against its own capability set. A mismatched receiver refuses without invoking the handler.
+
+```rust
+use net_sdk::capabilities::{p, tag_key};
+use net_sdk::mesh_rpc::{CallOptionsExt, CallOptionsTyped};
+
+let predicate = p.and(&[
+    p.exists(&tag_key("hardware", "gpu")),
+    p.semver_compatible(&tag_key("software", "cuda_version"), "12.0.0"),
+]);
+let opts = CallOptionsTyped::default().with_where(&predicate)?;
+
+let reply: InferenceReply =
+    mesh.call_service_typed("inference.run", &args, opts).await?;
+```
+
+`with_where` encodes the predicate to JSON and pushes it into `CallOptions::request_headers` under `net-where`. Servers that opt into predicate-pushdown read it back via `RpcContextExt::where_predicate()`. A refusal surfaces as `RpcError::CapabilityDenied` (terminal — the default retry predicate skips it, because only a new announcement from the target can change the verdict); a call that matches no serving node is `RpcError::NoRoute`.
+
+This is the "route this call to a node with these capabilities" primitive — no sidecar, no separate service-discovery layer, no second auth step. Predicate grammar is in `capabilities.md`.
+
+## Cancellation
+
+Cancellation is a substrate primitive, honored uniformly by all four call shapes. Reserve a token from the node handle, pair it with the call via `CallOptions::cancel_token`, and cancel from any thread:
+
+```rust
+let node = mesh.node_arc();
+let token = node.reserve_cancel_token();
+
+let opts = CallOptionsTyped {
+    raw: CallOptions { cancel_token: Some(token), ..Default::default() },
+    ..Default::default()
+};
+// … spawn the call with `opts` …
+node.cancel(token);   // from anywhere → caller sees RpcError::Cancelled, CANCEL goes on the wire
+```
+
+**The race is handled for you.** A cancel that arrives in the gap between `reserve_cancel_token` and call construction is latched on an orphan entry; when the call registers it observes the flag and short-circuits to `RpcError::Cancelled` **without ever publishing the REQUEST**. Unused reservations age out on an orphan TTL.
+
+Idiomatic per-binding wrappers all lower to the same token, so a TS client cancelling a Python server is wire-equivalent to any other pairing:
+
+- **Node** — `AbortSignal`: pass `signal` in the call options, `signal.abort()`.
+- **Python** — a cancel handle passed via `cancel=`, tripped with `.cancel()`.
+- **Go** — `context.Context`: pass `ctx`, call `cancel()`.
+
+`Cancelled` is terminal for retry purposes — you asked it to stop.
+
+## Observers and per-service metrics
+
+```rust
+use net_sdk::mesh_rpc::{RpcCallEvent, RpcObserver};
+
+struct MetricsSink;
+impl RpcObserver for MetricsSink {
+    fn on_call(&self, evt: RpcCallEvent) { record(&evt.method, evt.latency_ms, &evt.status); }
+}
+mesh.set_rpc_observer(Some(Arc::new(MetricsSink)));
+
+let snap = mesh.rpc_metrics_snapshot();
+for svc in &snap.services { println!("{}: {} calls", svc.service, svc.calls_total); }
+```
+
+`RpcCallEvent` carries the method name, caller/callee node ids, request/response byte counts, `latency_ms`, a `direction` (`Outbound` / `Inbound` — **v1 fires `Outbound` only**, so don't build a server-side dashboard on it), and a `status` tagged enum (`Ok` / `Error(message)` / `Timeout` / `Canceled`). Observer swap is atomic mid-call, so an exporter can be installed and torn down without disturbing in-flight work.
+
+**The trap: `on_call` runs inline on the dispatch thread.** A native Rust observer that writes to disk or blocks on a network export *pins the dispatch thread* and throttles every call on the node. Push into your own bounded channel or lock-free ring instead. Every language binding already ships the trampoline that does this — `ObserverChannel` `try_send`s each event onto a 1024-slot bounded mpsc drained by a worker task; when it's full the event is **dropped** and the process-global `observer_dropped_total` counter increments. Alert on that counter: a rising `observer_dropped_total` means your observer is too slow, not that traffic fell.
+
+Same shape in every binding: `setObserver` / `set_observer` / `SetObserver` plus `metricsSnapshot` / `metrics_snapshot` / `MetricsSnapshot`. Go additionally exposes `net_rpc_observer_dropped_total() -> u64` as an FFI symbol (and an `observer_dropped_total` field on the JSON snapshot) so monitoring doesn't pay the snapshot decode cost.
+
+Server-side handler panics are caught, counted on `ServiceMetrics::handler_panics_total`, and surfaced to the caller as a server error — a panicking handler does not crash the node.
+
 ## Per-binding API
 
 The typed surface ships in the **native binding**, not the SDK wrapper. Each language has the same five methods (`serve` / `call` / `callService` / `callStreaming` / `findServiceNodes`) plus the resilience helpers (`RetryPolicy` + `callWithRetry`, `HedgePolicy` + `callWithHedge`, `CircuitBreaker`).
@@ -84,9 +181,9 @@ The typed surface ships in the **native binding**, not the SDK wrapper. Each lan
 
 ```rust
 use net_sdk::mesh::{Mesh, MeshBuilder};
-use net_sdk::mesh_rpc::CallOptions;
+use net_sdk::mesh_rpc::{CallOptions, CallOptionsTyped, Codec};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize)]
 struct EchoSumRequest { text: String, numbers: Vec<i64> }
@@ -101,8 +198,10 @@ let client = MeshBuilder::new("127.0.0.1:9000", &[0x42u8; 32])?.build().await?;
 // Server side: register a typed handler. Returns a ServeHandle.
 // On Drop the handle unregisters AND lets in-flight handlers
 // complete (no abort).
+// NOTE the `Codec` argument — `serve_rpc_typed` is (service, codec, handler).
 let _handle = server.serve_rpc_typed(
     "echo_sum",
+    Codec::Json,
     |req: EchoSumRequest| async move {
         Ok::<_, String>(EchoSumResponse {
             echo: req.text,
@@ -112,7 +211,15 @@ let _handle = server.serve_rpc_typed(
 )?;
 
 // Client side: typed call with a 200ms deadline.
-let opts = CallOptions::default().with_deadline(Duration::from_millis(200));
+// `call_typed` takes `CallOptionsTyped { raw: CallOptions, codec: Codec }` —
+// the deadline lives on `.raw` and is an ABSOLUTE `Instant`, not a duration.
+let opts = CallOptionsTyped {
+    raw: CallOptions {
+        deadline: Some(Instant::now() + Duration::from_millis(200)),
+        ..Default::default()
+    },
+    ..Default::default()   // codec: Codec::Json
+};
 let resp: EchoSumResponse = client.call_typed(
     server.inner().node_id(),
     "echo_sum",
@@ -122,6 +229,10 @@ let resp: EchoSumResponse = client.call_typed(
 # Ok(())
 # }
 ```
+
+**`Codec`** is `Json` (default) or `JsonPretty` (same wire format, indented — for human inspection of recorded traffic). Caller and server must agree out of band; there is no negotiation.
+
+**`CallOptions` fields worth knowing** beyond `deadline`: `routing_policy` (below), `filter_unhealthy` (default `true` — skips candidates the `ProximityGraph` reports unhealthy; candidates with *no* proximity entry are **kept**, so a freshly-announced service isn't filtered out before pingwaves propagate), `trace_context` (`Some(TraceContext)` propagates W3C `traceparent` / `tracestate` to the server's `RpcContext::trace_context` — nRPC is transport-only here; both sides read/write via their own tracing backend), `stream_window_initial` / the request-direction mirror for flow control, and `cancel_token` (see § Cancellation).
 
 Resilience helpers live in `net_sdk::mesh_rpc_resilience`: `RetryPolicy::default()` + `Mesh::call_with_retry`, `HedgePolicy::default()` + the per-target hedge helpers, `CircuitBreaker::new(CircuitBreakerConfig)`.
 
@@ -274,11 +385,28 @@ The C SDK at `net.h` does **not** expose the nRPC surface. The C ABI lives in a 
 
 | Helper            | Use when                                                                          |
 | ----------------- | --------------------------------------------------------------------------------- |
-| `call_with_retry` | Transient network blips / target restarts. Default predicate retries `no_route` + `transport`; skips terminal `server_error` / `codec_*`. |
+| `call_with_retry` | Transient network blips / target restarts. See the exact default predicate below — it is **not** "retry `no_route`". |
 | `call_with_hedge` | p99 latency tail matters more than wasted bandwidth. Fires N parallel attempts on a delay; first success wins. |
 | `CircuitBreaker`  | Repeatedly-failing target should be skipped without cost. Closed → open after threshold; half-open probe after cooldown. |
 
 Stack them: `breaker.call(() => callWithRetry(...))` is the typical "give up fast on a wedged target, but tolerate single retries" combo.
+
+### The default retry predicate (verbatim from source)
+
+`RetryPolicy::default()` is 3 attempts, 50 ms initial backoff, ×2 growth, 1 s cap, full jitter on (`[0.5, 1.0]` multiplier, to decorrelate retry storms). The predicate is `default_retryable` (`sdk/src/mesh_rpc_resilience.rs`):
+
+| `RpcError` | Retried? | Why |
+|---|---|---|
+| `Timeout` | ✅ | transient |
+| `Transport(_)` | ✅ | transient |
+| `ServerError { status }` where status ∈ {`Internal`, `Backpressure`, `Timeout`} | ✅ | server-side transient |
+| `NoRoute` | ❌ | nobody serves it; retrying the same instant won't change that |
+| `Codec { .. }` | ❌ | caller-fixable local bug (wrong codec, schema drift) |
+| `ServerError` for `Application` / `NotFound` / `Unauthorized` / `UnknownVersion` | ❌ | terminal or caller-fixable |
+| `CapabilityDenied { .. }` | ❌ | the target's signed policy denies you; only a new announcement changes it |
+| `Cancelled` | ❌ | you asked it to stop |
+
+Override with `RetryPolicy::with_retryable(|e| ...)` when you genuinely want a different classification (e.g. retry a specific application status). **`opts.raw.deadline` is an absolute `Instant` and does not advance across retries** — total wall-clock is bounded by the initial deadline plus the sum of backoffs, so a tight deadline silently caps `max_attempts`.
 
 **Don't** wrap `call_with_retry` around itself. **Don't** retry `codec_*` errors — they're caller bugs, not transient. **Don't** install a breaker that opens on `no_route` alone — `no_route` fires before any handshake, so a flapping breaker on it just blocks legitimate retries.
 
@@ -294,6 +422,74 @@ nRPC throughput is bounded by the shared mesh receive loop, not the handler. Two
 **The scaling wall is the recv pipeline.** `nrpc_qps` scales `c1 → c16` at ~4×, not 16× — the bottleneck is the single-consumer `recv → AEAD decrypt → bridge task → fold mutex` chain, not the send path or the handler. Batching shaves syscall overhead but does not move this wall (the ack-piggyback protocol that does is a future release). Don't promise linear QPS scaling from raising concurrency alone.
 
 ---
+
+## AI tool calling — one identifier, one source of truth
+
+Any typed nRPC service can also expose itself as an **LLM-callable tool**. The identity collapse is the design: a tool registered as `web_search` **is** the nRPC service at `web_search` **is** the announcement carrying the `ai-tool:web_search` and `nrpc:web_search` capability tags. One identifier, no separate tool registry to keep in sync.
+
+### Declaring a tool
+
+```rust
+use net_sdk::macros::tool;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(JsonSchema, Deserialize, Serialize)]
+struct WebSearchArgs { query: String }
+#[derive(JsonSchema, Deserialize, Serialize)]
+struct WebSearchReply { hits: Vec<String> }
+
+#[tool(name = "web_search", description = "Search the web.", tag = "web")]
+async fn web_search(args: WebSearchArgs) -> Result<WebSearchReply, String> {
+    Ok(WebSearchReply { hits: run_query(&args.query).await.map_err(|e| e.to_string())? })
+}
+
+let handle = web_search_register(&mesh)?;   // generated alongside the fn
+```
+
+`net_sdk::macros` is **feature-gated on `macros`** — without that feature the attribute doesn't exist and you build the descriptor by hand (below). It's a separate feature because it drags in the proc-macro2 / syn / quote build cost.
+
+The `#[tool]` attribute expects `async fn <name>(<req>: Req) -> Result<Resp, _>`; **both `Req` and `Resp` must implement `schemars::JsonSchema`** so the macro can derive the input/output schemas. It generates a sibling `<fn_name>_descriptor()` returning a `ToolDescriptor` and `<fn_name>_register(mesh)` that calls `mesh.serve_tool(..)`. Attribute surface: `name`, `description`, `version`, `stateless`, `estimated_time_ms`, `tags`. Without the macro, build the descriptor by hand with `metadata_for::<Req, Resp>("name")` + the builder.
+
+**Registration is atomic.** The descriptor insert into the capability fold, the `nrpc:<tool>` service registration, the `ai-tool:<tool>` discovery tag, and the lazily auto-installed `tool.metadata.fetch` RPC (for fetching oversized JSON Schemas that don't fit an announcement) all succeed together or none do. Dropping the handle reverses the descriptor insert and the handler registration the same way.
+
+### Discovering and calling
+
+```rust
+let tools = mesh.list_tools(None);            // sync — reads the local fold, no RPC fan-out
+let reply: WebSearchReply = mesh.call_tool("web_search", &args).await?;
+```
+
+`list_tools(Option<&TagMatcher>)` is **synchronous** — the capability fold already aggregates every node's announcements, so discovery is an in-memory read, not a query. `watch_tools` is the streaming sibling; `tool.watch` is its remote form (next section).
+
+### Streaming tools — the `ToolEvent` envelope
+
+Serve with `serve_tool_streaming` (handler returns a `Stream<Item = ToolEvent>`), call with `call_tool_streaming`. The envelope is a tagged enum, `#[serde(tag = "type", rename_all = "snake_case")]`:
+
+| Variant | Payload | Meaning |
+|---|---|---|
+| `start` | `tool_id`, optional `call_id`, optional `metadata` | fires once on stream open; `call_id` correlates when an agent has several tool calls in flight |
+| `progress` | optional `pct` (`0.0..=100.0`), optional `message` | coarse progress for spinner UIs |
+| `delta` | `data` (tool-defined JSON; `{"token": …}` / `{"chunk": "<base64>"}` are the conventions) | partial output |
+| `result` | `data` | **terminal** success |
+| `error` | `code`, `message` | **terminal** failure |
+
+**Exactly one terminal envelope per stream** — `result` OR `error`, never both. A handler that ends without one gets `ToolEvent::Error { code: "missing_terminal", .. }` synthesized by the SDK, so callers can rely on every stream terminating properly. Unary tools synthesize a single `result` under the hood, which is what lets one adapter handle both.
+
+### Format translators — descriptor → provider schema
+
+`net_sdk::tool::formats` (Rust), `@net-mesh/core/tool` (Node), `net.tool` (Python), plus the Go equivalent, ship **pure-function** translators in both directions:
+
+- `to_<provider>_tool(&ToolDescriptor) -> Value` — descriptor → the provider's tool-definition shape, to populate the `tools` array on a request (`openai::to_openai_tool`, `anthropic::to_anthropic_tool`).
+- `lower_<provider>_tool_call(&Value) -> Result<ToolCallSpec, _>` — parse the provider's reply (OpenAI `tool_calls[]`, Anthropic `tool_use` block) into a `ToolCallSpec` you hand straight to `mesh.call_tool(spec.name, &spec.arguments)`.
+
+```ts
+import { openai, listTools } from "@net-mesh/core/tool";
+const openaiTools = listTools(mesh).map(openai.toOpenaiTool);
+// model replies → openai.lowerOpenaiToolCall(call) → mesh.callTool(spec.name, args)
+```
+
+**No transitive dependency on any provider SDK** — translators emit plain JSON and you wire it into your own model client. A descriptor with no `input_schema` lowers to an empty-object schema (`{"type":"object","properties":{}}`) rather than `null`, because provider strict-mode validators reject a null parameter schema but accept empty-properties as "no arguments." Cross-language byte-equality is pinned by golden vectors in CI.
 
 ## Watching tool discovery remotely — `tool.watch`
 

@@ -121,6 +121,53 @@ it that way.
    a prompt-injected agent can at worst ask for a signature on a logged,
    typed operation.
 
+## The data boundary — "commercial facts" is a bounded term
+
+The category line says Net signs *commercial facts*. That phrase is a
+**closed list**, not a vibe. Commercial facts are: references, commitments,
+signatures, quotes, verification results, policy decisions, and billing
+events. They are **not** customer PII, tax records, KYB files, invoices,
+shipping data, or provider account records. If a provider needs commercial
+identity, Net carries an **opaque reference plus a commitment** — never the
+record itself.
+
+This holds **by construction**, not by policy, and it's worth knowing *why*
+so you don't propose a field that breaks it:
+
+- identities on the wire are public keys (`EntityId`) — `BillingEvent.payer` /
+  `.payee` are `EntityId`, not names or account numbers;
+- the invocation input is carried as a **hash** (`PaymentQuote.input_hash`),
+  so a quote binds an invocation without carrying its arguments;
+- amounts are opaque atomic-unit integers (`AtomicAmount`), no currency
+  rendering, no line items;
+- **there is no PII field on any of the five envelopes.** Check
+  `core/billing_event.rs` / `core/quote.rs` if you doubt it.
+
+Provider and customer records live in provider or partner systems. **Terms
+acceptance**, where a deployment needs it, means a *signed acceptance
+commitment plus a terms hash/ID* — Net does not host terms text, validate
+legal authority, store customer identity, or adjudicate enforceability.
+(There is no terms-acceptance object in the crate today; if you're asked to
+add one, that shape is the ceiling, not a starting point.)
+
+A refusal is subject to the same boundary: `net.payment.failure@1` reports a
+**payment verdict**, not an eligibility judgment. Nothing in payments
+implies Net performs KYB, tax, sanctions, identity, invoicing, or
+fulfillment.
+
+## No HTTP endpoint is required to get paid
+
+Worth saying plainly, because the x402 name drags HTTP in with it: a
+**Net-native paid capability needs no web server.** It is announced through
+the ordinary capability announcement and invoked over nRPC; the x402 payment
+material rides as opaque preserved bytes inside the invocation / admission
+envelope (`serve_payments` over the mesh — `provider.md`).
+
+HTTP `402` is an **adapter path for web APIs, not a requirement for a Net
+provider** — and today only the *outbound* direction ships (paying an
+external x402 API; `http402.md`). It's the same objects either way: the
+two-way door, not a second stack.
+
 ## Verification is a tier, not a boolean
 
 Verification confidence is a **fixed protocol enum**, canonical across all
