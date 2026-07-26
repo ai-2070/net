@@ -139,9 +139,8 @@ export default function DocsRootPage() {
 
           {tree.folders.length === 0 && tree.rootFiles.length === 0 && (
             <p className="text-ink-dim text-[13px]">
-              No docs found. Run{" "}
-              <code className="font-mono text-accent">npm run copy-docs</code>{" "}
-              to mirror them from the source tree.
+              No docs found. Pages are authored as markdown under{" "}
+              <code className="font-mono text-accent">src/content/docs</code>.
             </p>
           )}
         </div>

@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "copy-docs": "node scripts/copy-docs.mjs",
     "build": "npx next build",
     "build:vercel": "timeout 15m npm run build",
     "dev": "npx next dev --turbo",
