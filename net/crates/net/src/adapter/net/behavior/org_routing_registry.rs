@@ -465,6 +465,12 @@ pub(crate) struct RegistryMetrics {
     facts_invalidated: AtomicU64,
     stale_actor_rejections: AtomicU64,
     recaptures_restarted: AtomicU64,
+    /// Passes whose commit pin was held by a LIVE actor and whose settlement was
+    /// still refused, because the source's own publication moved underneath it
+    /// (review-pass-3 §8). Distinct from `stale_actor_rejections`, which is actor
+    /// LIFECYCLE churn: conflating them steers an operator at supervisor restarts
+    /// during what is actually revocation-publication pressure.
+    settlements_refused: AtomicU64,
 }
 
 impl RegistryMetrics {
@@ -494,6 +500,9 @@ impl RegistryMetrics {
     }
     pub(crate) fn recaptures_restarted(&self) -> u64 {
         self.recaptures_restarted.load(Ordering::Acquire)
+    }
+    pub(crate) fn settlements_refused(&self) -> u64 {
+        self.settlements_refused.load(Ordering::Acquire)
     }
 }
 
@@ -1085,6 +1094,12 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 .settle_if_current(&mut || settle(&mut inner, incarnation, epoch, &self.metrics))
             else {
                 drop(inner);
+                // Counted, and counted as what it IS (review-pass-3 §8): a
+                // settlement refused because the source's own publication moved
+                // under the pin. This path used to count nothing at all.
+                self.metrics
+                    .settlements_refused
+                    .fetch_add(1, Ordering::AcqRel);
                 // Same obligation as the pin refusal above: authority moved
                 // inside the probe→settle window, and with no retained slot the
                 // movement's own invalidation cannot wake anyone.
@@ -1254,8 +1269,13 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                         }
                     }
                 }
+                // NOT `stale_actor_rejections` (review-pass-3 §8). This branch is
+                // reachable only with a LIVE actor — revalidated a few lines above
+                // under this same lock — so attributing it to actor lifecycle
+                // churn steered operators at supervisor restarts during what is
+                // really revocation-publication pressure.
                 self.metrics
-                    .stale_actor_rejections
+                    .settlements_refused
                     .fetch_add(1, Ordering::AcqRel);
                 drop(inner);
                 if liveness.may_self_wake() {

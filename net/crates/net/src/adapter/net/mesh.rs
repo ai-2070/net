@@ -12404,8 +12404,15 @@ impl MeshNode {
 
     /// Routing reconciliation counters: installs, slots retired, facts
     /// invalidated, obsolete artifacts discarded, stale-actor rejections,
-    /// recaptures restarted (OLB-2B-E3b).
-    pub fn org_routing_reconciliation_counts(&self) -> [u64; 6] {
+    /// recaptures restarted, settlements refused (OLB-2B-E3b, review-pass-3 §8).
+    ///
+    /// The last two answer different operator questions and used to be conflated.
+    /// `stale_actor_rejections` is actor LIFECYCLE churn — supervisor restarts,
+    /// fencing, incarnation movement. `settlements_refused` is AUTHORITY movement
+    /// under a held commit pin: the actor was live and the pass was valid, but the
+    /// revocation store published underneath it. Heavy floor churn shows up in the
+    /// second and says nothing about the first.
+    pub fn org_routing_reconciliation_counts(&self) -> [u64; 7] {
         [
             self.routing_registry_metrics.installs(),
             self.routing_registry_metrics.slots_retired(),
@@ -12413,6 +12420,7 @@ impl MeshNode {
             self.routing_registry_metrics.discarded_obsolete(),
             self.routing_registry_metrics.stale_actor_rejections(),
             self.routing_registry_metrics.recaptures_restarted(),
+            self.routing_registry_metrics.settlements_refused(),
         ]
     }
 

@@ -2160,6 +2160,8 @@ async fn a_floor_publication_under_the_pin_cannot_settle_current() {
     let during_build: Arc<parking_lot::Mutex<Option<BuildHook>>> = Arc::default();
     let after_pin: Arc<parking_lot::Mutex<Option<BuildHook>>> = Arc::default();
     let work: Arc<RegistryWork> = Arc::default();
+    let metrics: Arc<crate::adapter::net::behavior::org_routing_registry::RegistryMetrics> =
+        Arc::default();
     let registry = NodeOrgRoutingRegistry::new(
         Arc::new(PausingSource {
             inner: ScopedSlotSource {
@@ -2175,7 +2177,7 @@ async fn a_floor_publication_under_the_pin_cannot_settle_current() {
             before_pin: Arc::default(),
         }),
         work.clone(),
-        Arc::default(),
+        metrics.clone(),
     );
     registry.activate_incarnation(1);
 
@@ -2224,6 +2226,20 @@ async fn a_floor_publication_under_the_pin_cannot_settle_current() {
         "a quantum whose floor authority moved must NOT settle Current"
     );
     assert_eq!(registry.pending_slots(), 1, "and must re-queue");
+    // review-pass-3 §8: counted as AUTHORITY movement under the pin, not as
+    // actor-lifecycle churn. The actor was live throughout — attributing this to
+    // `stale_actor_rejections` steered operators at supervisor restarts during
+    // what is really revocation-publication pressure.
+    assert_eq!(
+        metrics.settlements_refused(),
+        1,
+        "the refusal is counted, and counted as a settlement refusal"
+    );
+    assert_eq!(
+        metrics.stale_actor_rejections(),
+        0,
+        "and NOT as actor-lifecycle churn"
+    );
 
     // Settled again once nothing is moving.
     assert!(matches!(
