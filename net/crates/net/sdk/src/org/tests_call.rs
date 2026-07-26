@@ -671,3 +671,70 @@ async fn a_visible_mutation_wakes_the_watch_and_a_noop_does_not() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// review-pass-3 §17 — candidate order is GLOBAL, not per-plane.
+///
+/// The OLB-1 sort was red-coupled to nothing: the discovery source
+/// (`owner_by_capability: BTreeMap<_, BTreeSet<ScopedKey>>`) already yields
+/// ascending-EntityId order WITHIN one scope, and both determinism witnesses put
+/// both providers in the SAME owner scope — so deleting the sort left every test
+/// passing deterministically. It is load-bearing only ACROSS planes or scopes,
+/// which no test constructed; the phase-3 sorted-order reachability sampling was
+/// likewise unobservable in any single-threaded test.
+///
+/// Both relative orderings are driven, so the assertion cannot pass vacuously
+/// whichever plane discovery happens to enumerate first: with the sort removed,
+/// one of the two arrangements must come back out of order.
+#[tokio::test]
+async fn candidate_order_is_global_across_the_owner_and_grant_planes() {
+    for grant_provider_sorts_lower in [true, false] {
+        let (a, b) = (org_a(), org_b());
+        let label = if grant_provider_sorts_lower {
+            "plan-cross-plane-grant-lo"
+        } else {
+            "plan-cross-plane-owner-lo"
+        };
+        let (mesh, identity, dir) = mesh_with_authority(label, Some(&a)).await;
+        let tag = "nrpc:customer.read";
+
+        // Pick the pair so the required plane holds the LOWER EntityId.
+        let (owner_provider, grant_provider) = loop {
+            let owner = EntityKeypair::generate();
+            let granted = EntityKeypair::generate();
+            if (granted.entity_id() < owner.entity_id()) == grant_provider_sorts_lower {
+                break (owner, granted);
+            }
+        };
+
+        let (grant, secret) = discover_grant(&b, a.org_id(), cap(tag), 3600);
+        let secret_copy = copy_secret(&secret);
+        let client = bind(&mesh, &a, &identity, vec![(grant.clone(), Some(secret))]);
+        inject_owner_envelope(&mesh, &a, &owner_provider, &[tag]);
+        inject_granted_envelope(&mesh, &b, &grant_provider, &grant, &secret_copy, tag);
+
+        let (candidates, _) = client
+            .authorized_candidates(&cap(tag))
+            .expect("authority decision");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "{label}: one candidate from each plane"
+        );
+        assert!(
+            candidates.iter().any(|c| matches!(c.mode, Mode::SameOrg)),
+            "{label}: the owner plane really is represented"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| matches!(c.mode, Mode::Granted(_))),
+            "{label}: and so is the grant plane"
+        );
+        assert!(
+            candidates[0].provider.as_bytes() < candidates[1].provider.as_bytes(),
+            "{label}: candidates must be in GLOBAL ascending EntityId order — \
+             per-plane discovery order is not a total order",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
