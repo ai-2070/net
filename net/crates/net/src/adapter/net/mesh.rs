@@ -2799,22 +2799,52 @@ const SECURITY_CORRECTIVE_ATTEMPTS: u8 = 3;
 /// open. Certificate wall-clock expiry is handled separately (the
 /// send path re-derives the desired cert every time, which checks
 /// temporal validity), since expiry changes no generation.
+/// The revocation store's publication state, as the send seqlock sees it.
+///
+/// Three states, NOT `Option<generation>`. Collapsing "no store installed" and
+/// "installed store exhausted" into one `None` makes them compare EQUAL, so an
+/// exhausted stamp compares current against itself and the send path keeps
+/// emitting the cached owner certificate — exactly the alias the `Result` was
+/// introduced to remove (Kyra OLB-2B-E3c). `Exhausted` is a distinct, terminal
+/// state that [`SendStamp::is_current`] refuses on either side.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendStoreStamp {
+    /// No store installed.
+    Absent,
+    /// Installed and usable, at this barriered generation.
+    Live {
+        store_ptr: usize,
+        generation: super::behavior::org_revocation::BarrieredGeneration,
+    },
+    /// Installed, but its publication generation space is exhausted, so its
+    /// currentness can no longer be witnessed. TERMINAL.
+    Exhausted { store_ptr: usize },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SendStamp {
-    /// `Arc::as_ptr` of the installed revocation store (0 = none).
-    store_ptr: usize,
-    /// The installed store's publish generation (bumped on every
-    /// floor publish, under the reload lock).
-    /// `None` once the publication generation space is EXHAUSTED — a frozen
-    /// counter cannot witness that the view is still live, so the stamp never
-    /// compares current (Kyra OLB-2B-E3c).
-    store_generation: Option<super::behavior::org_revocation::BarrieredGeneration>,
+    /// The installed store's publication state.
+    store: SendStoreStamp,
     /// `Arc::as_ptr` of the installed node authority (0 = none).
     authority_ptr: usize,
     /// Bumped by [`MeshNode::set_owner_cert_emission`] — a toggle
     /// on the SAME authority/store changes no pointer or
     /// generation, so it needs its own counter.
     emission_generation: u64,
+}
+
+impl SendStamp {
+    /// `true` iff the captured view is still live AND usable.
+    ///
+    /// SEMANTIC, not raw equality. `Exhausted` on either side is terminal
+    /// unusable authority: two exhausted stamps are equal, so a bare `==` would
+    /// let the send path keep emitting a cached owner certificate after the
+    /// generation froze (Kyra OLB-2B-E3c).
+    fn is_current(&self, current: &SendStamp) -> bool {
+        !matches!(self.store, SendStoreStamp::Exhausted { .. })
+            && !matches!(current.store, SendStoreStamp::Exhausted { .. })
+            && self == current
+    }
 }
 
 /// A [`SendStamp`] plus the exact authority/store `Arc`s it
@@ -5138,6 +5168,11 @@ struct ScopedSlotSource {
     publication: Arc<ScopedMutationPublication>,
     org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
     authority: Arc<RoutingAuthority>,
+    /// Test-only: fires INSIDE `settle_if_current`, after the validation has
+    /// succeeded and before the settlement — the exact gap a publication must not
+    /// be able to occupy.
+    #[cfg(test)]
+    settle_gap_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Slots asked for under a scope this source does not serve. Counted rather
     /// than silently answered with "no providers".
     unserved_scope: Arc<std::sync::atomic::AtomicU64>,
@@ -5414,14 +5449,43 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
 
 /// Holds the publication gate across the conditional installation, and nothing
 /// more.
+/// Holds every authority input still, through the conditional installation AND
+/// the settlement beneath it.
+///
+/// Three guards, and the third is the one that matters most. Scoped mutation and
+/// node-mediated authority movement are excluded by the two gates. Revocation
+/// FLOOR publication is excluded by holding the store's publication barrier —
+/// `StoreCore::publish` needs `live.write()`, so it cannot land while this pin
+/// lives. Sampling floors and then settling would not be enough: `Current` is
+/// what causes the supervisor to publish `Healthy`, so a publication landing
+/// between the sample and the settlement makes that claim false with nothing left
+/// to detect it (Kyra OLB-2B-E3c).
 struct ScopedCommitPin<'a> {
     _authority_gate: parking_lot::MutexGuard<'a, ()>,
     _publication_gate: parking_lot::MutexGuard<'a, ()>,
+    /// The installed store, so settlement can take its publication barrier.
+    store: Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
     epoch: super::behavior::org_routing_registry::SourceEpoch,
-    /// The revocation slot, so the pin can re-verify the one authority it cannot
-    /// exclude.
-    org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
     poisoned: bool,
+    #[cfg(test)]
+    settle_gap_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl ScopedCommitPin<'_> {
+    /// Does the pinned view still match what this pin was minted against?
+    ///
+    /// Floors are compared through the held barrier. Poison is a separate
+    /// path-registry write the barrier does not block, so it is genuinely
+    /// re-sampled — but in the real durability path a poison mark is always
+    /// followed by a publication, which the barrier blocks, so the view it would
+    /// have installed cannot land either.
+    fn matches(&self, pinned: &super::behavior::org_revocation::PublicationPin<'_>) -> bool {
+        let Ok(generation) = pinned.generation() else {
+            // Terminal exhaustion: currentness can no longer be witnessed.
+            return false;
+        };
+        pinned.poisoned() == self.poisoned && generation.get() == self.epoch.floor_generation
+    }
 }
 
 impl super::behavior::org_routing_registry::SourceCommitPin for ScopedCommitPin<'_> {
@@ -5434,10 +5498,27 @@ impl super::behavior::org_routing_registry::SourceCommitPin for ScopedCommitPin<
     /// poison publish through `StoreCore`'s internal synchronization, which no
     /// routing gate reaches. So the pin completes its guarantee by RE-VERIFYING
     /// them (Kyra OLB-2B-E3c).
-    fn still_current(&self) -> bool {
-        let (poisoned, floor_generation, _store) =
-            ScopedSlotSource::revocation_view_of(&self.org_revocation);
-        poisoned == self.poisoned && floor_generation == self.epoch.floor_generation
+    /// The check and the settlement happen under ONE held publication barrier, so
+    /// no floor publication can interleave between them. `StoreCore::publish`
+    /// needs `live.write()`; this holds `live.read()` across both.
+    fn settle_if_current(
+        &self,
+        settle: &mut dyn FnMut() -> super::behavior::org_routing::ApplyOutcome,
+    ) -> Option<super::behavior::org_routing::ApplyOutcome> {
+        let Some(store) = self.store.as_ref() else {
+            // No store installed: there is nothing that can publish.
+            return Some(settle());
+        };
+        let pinned = store.pin_publication();
+        if !self.matches(&pinned) {
+            return None;
+        }
+        // Still under the barrier — a publication cannot land here.
+        #[cfg(test)]
+        if let Some(hook) = self.settle_gap_hook.as_ref() {
+            hook();
+        }
+        Some(settle())
     }
 }
 
@@ -5535,7 +5616,7 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         // mutation takes only the authority gate, so no inversion is reachable.
         let authority_gate = self.authority.lock_gate();
         let publication_gate = self.publication.lock_gate();
-        let (poisoned, floor_generation, _store) = self.revocation_view();
+        let (poisoned, floor_generation, store) = self.revocation_view();
         let exhausted = self.authority.is_exhausted();
         let epoch = super::behavior::org_routing_registry::SourceEpoch {
             generation: self.scoped_discovery.lock().revision(),
@@ -5548,9 +5629,11 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         Some(Box::new(ScopedCommitPin {
             _authority_gate: authority_gate,
             _publication_gate: publication_gate,
+            store,
             epoch,
-            org_revocation: self.org_revocation.clone(),
             poisoned,
+            #[cfg(test)]
+            settle_gap_hook: self.settle_gap_hook.lock().clone(),
         }))
     }
 }
@@ -7359,6 +7442,8 @@ impl MeshNode {
                 publication: scoped_publication.clone(),
                 org_revocation: org_revocation.clone(),
                 authority: routing_authority.clone(),
+                #[cfg(test)]
+                settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: routing_unserved_scope.clone(),
             }),
             routing_work.clone(),
@@ -10462,7 +10547,18 @@ impl MeshNode {
             return None;
         }
         if let Some(store) = self.org_revocation.load_full() {
-            let floor = store.floor_for(&cert.org_id, &cert.member);
+            // Fail closed on terminal exhaustion at CONSTRUCTION, not only at the
+            // send seqlock: the floor comparison below is meaningful only if the
+            // view it reads can still be shown current, and a cert built here is
+            // CACHED for reuse (Kyra OLB-2B-E3c).
+            let Ok((floors, _generation)) = store.snapshot_with_generation() else {
+                tracing::error!(
+                    org = %cert.org_id,
+                    "owner-cert emission dark: revocation publication generation                      exhausted — the floor view's currentness can no longer be                      witnessed"
+                );
+                return None;
+            };
+            let floor = floors.floor_for(&cert.org_id, &cert.member);
             if cert.generation < floor {
                 tracing::warn!(
                     org = %cert.org_id,
@@ -10501,13 +10597,19 @@ impl MeshNode {
         let store = self.org_revocation.load_full();
         let authority = self.node_authority.load_full();
         let stamp = SendStamp {
-            store_ptr: store
-                .as_ref()
-                .map_or(0, |s| Arc::as_ptr(s) as *const () as usize),
-            // `None` once exhausted: a frozen counter would make a publication
-            // after exhaustion read as "unchanged", so the stamp must never
-            // compare current (Kyra OLB-2B-E3c).
-            store_generation: store.as_ref().and_then(|s| s.barriered_generation().ok()),
+            store: match store.as_ref() {
+                None => SendStoreStamp::Absent,
+                Some(s) => {
+                    let store_ptr = Arc::as_ptr(s) as *const () as usize;
+                    match s.barriered_generation() {
+                        Ok(generation) => SendStoreStamp::Live {
+                            store_ptr,
+                            generation,
+                        },
+                        Err(_) => SendStoreStamp::Exhausted { store_ptr },
+                    }
+                }
+            },
             authority_ptr: authority
                 .as_ref()
                 .map_or(0, |a| Arc::as_ptr(a) as *const () as usize),
@@ -10636,7 +10738,7 @@ impl MeshNode {
                 // AND the sealing provider snapshot all still hold. The pinned
                 // `snapshot` Arcs are still alive for this comparison, so a
                 // swapped-away authority/store cannot reuse the captured addresses.
-                if self.security_stamp() == stamp
+                if stamp.is_current(&self.security_stamp())
                     && visibility_stable
                     && authority_stable
                     && provider_grants_stable

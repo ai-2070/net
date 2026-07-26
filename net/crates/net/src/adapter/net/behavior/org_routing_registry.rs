@@ -239,8 +239,18 @@ pub(crate) trait SourceCommitPin {
     /// the conditional installation and BEFORE settlement, so an authority that
     /// moved underneath cannot produce a `Current` (Kyra OLB-2B-E3c).
     ///
-    /// `false` means something moved; the caller must not settle.
-    fn still_current(&self) -> bool;
+    /// Run `settle` IF every authority input is still current, as ONE operation
+    /// relative to source publication.
+    ///
+    /// Checking and then settling are two independently interleavable steps: a
+    /// publication landing between them makes the settlement false with nothing
+    /// left to detect it. That matters here specifically because `Current` is not
+    /// a historical observation — it is what causes the supervisor to publish
+    /// `Healthy` (Kyra OLB-2B-E3c). The implementation holds the source's
+    /// publication barrier across both, so no publication can interleave.
+    ///
+    /// `None` means authority moved and nothing was settled.
+    fn settle_if_current(&self, settle: &mut dyn FnMut() -> ApplyOutcome) -> Option<ApplyOutcome>;
 }
 
 /// Supplies authority-scoped provider facts.
@@ -889,11 +899,12 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 return ApplyOutcome::Superseded;
             }
 
-            if !commit.still_current() {
+            let Some(outcome) = commit
+                .settle_if_current(&mut || settle(&mut inner, incarnation, epoch, &self.metrics))
+            else {
                 drop(inner);
                 return ApplyOutcome::Superseded;
-            }
-            let outcome = settle(&mut inner, incarnation, epoch, &self.metrics);
+            };
             let owed = !inner.pending.is_empty();
             drop(inner);
             if owed {
@@ -1023,7 +1034,9 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             // epoch — but `Current` is itself load-bearing: it is what lets the
             // supervisor publish `Healthy`. So settle only if nothing moved
             // (Kyra OLB-2B-E3c).
-            if !commit.still_current() {
+            let settled = commit
+                .settle_if_current(&mut || settle(&mut inner, incarnation, epoch, &self.metrics));
+            let Some(settled) = settled else {
                 for (key, slot_incarnation) in &selected {
                     if inner
                         .slots
@@ -1039,9 +1052,8 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 drop(inner);
                 self.work.mark();
                 return ApplyOutcome::Superseded;
-            }
+            };
 
-            let settled = settle(&mut inner, incarnation, epoch, &self.metrics);
             let owed = !inner.pending.is_empty();
             drop(inner);
             if owed {
@@ -1236,8 +1248,11 @@ mod tests {
     }
 
     impl SourceCommitPin for TestCommitPin<'_> {
-        fn still_current(&self) -> bool {
-            !self.state.authority_moved.load(Ordering::Acquire)
+        fn settle_if_current(
+            &self,
+            settle: &mut dyn FnMut() -> ApplyOutcome,
+        ) -> Option<ApplyOutcome> {
+            (!self.state.authority_moved.load(Ordering::Acquire)).then(settle)
         }
         fn epoch(&self) -> SourceEpoch {
             SourceEpoch {

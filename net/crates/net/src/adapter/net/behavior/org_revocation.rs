@@ -1086,6 +1086,30 @@ pub(crate) fn publish_guard_pair<'a>(
         _guards: vec![g1, g2],
     }
 }
+/// Holds the store's publication barrier open.
+///
+/// While alive, floor publication is BLOCKED. Poison can still be marked (it is a
+/// separate path-registry write), so it is re-sampled through the guard rather
+/// than assumed frozen — but in the real durability path a poison mark is always
+/// followed by a publication, which this guard blocks, so the accompanying view
+/// change cannot land either.
+pub struct PublicationPin<'a> {
+    core: &'a StoreCore,
+    _live: parking_lot::RwLockReadGuard<'a, Arc<OrgRevocationState>>,
+}
+
+impl PublicationPin<'_> {
+    /// The generation this pin is holding still, or `Err` if exhausted.
+    pub fn generation(&self) -> Result<BarrieredGeneration, GenerationExhausted> {
+        OrgRevocationStore::sample_generation(self.core)
+    }
+
+    /// Live poison, re-read through the guard.
+    pub fn poisoned(&self) -> bool {
+        is_poisoned(&self.core.backing_id, &self.core.path)
+    }
+}
+
 /// A publication generation sampled coherently with its terminal state.
 ///
 /// Deliberately opaque. The raw `u64` is only meaningful next to the exhaustion
@@ -1480,6 +1504,27 @@ impl OrgRevocationStore {
     pub fn barriered_generation(&self) -> Result<BarrieredGeneration, GenerationExhausted> {
         let _live = self.core.live.read();
         Self::sample_generation(&self.core)
+    }
+
+    /// Hold the publication barrier: while this guard lives, NO floor
+    /// publication can land, because [`StoreCore::publish`] needs `live.write()`.
+    ///
+    /// This is real EXCLUSION, not observation. A consumer whose decision is
+    /// itself load-bearing — the routing commit pin, whose `Current` causes the
+    /// supervisor to publish `Healthy` — cannot be made sound by sampling and
+    /// then acting: a publication landing between the sample and the decision
+    /// makes the decision false with nothing to detect it (Kyra OLB-2B-E3c).
+    /// Holding the barrier through the decision closes that gap by construction.
+    ///
+    /// Subscribers are invoked OUTSIDE the publish locks, so a blocked publisher
+    /// cannot deadlock against a callback that takes the routing authority gate.
+    /// Hold it briefly and never across an await.
+    pub fn pin_publication(&self) -> PublicationPin<'_> {
+        let live = self.core.live.read();
+        PublicationPin {
+            core: &self.core,
+            _live: live,
+        }
     }
 
     /// Sample the generation and its terminal state under ONE `live.read()`.

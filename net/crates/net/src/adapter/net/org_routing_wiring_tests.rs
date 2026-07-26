@@ -265,6 +265,7 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
                 publication: publication.clone(),
                 org_revocation: node.org_revocation.clone(),
                 authority: node.routing_authority.clone(),
+                settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
             during_build: during_build.clone(),
@@ -368,6 +369,7 @@ async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
     };
 
@@ -537,6 +539,7 @@ async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
     };
     let key = slot(4, "nrpc:floored");
@@ -745,12 +748,11 @@ async fn drop_fences_and_aborts_rather_than_detaching_the_supervisor() {
 struct Scratch(std::path::PathBuf);
 
 impl Scratch {
-    fn new(tag: &str, node: &MeshNode) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "net-olb2b-e3c-{tag}-{}-{}",
-            std::process::id(),
-            node.entity_id()
-        ));
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+    fn new(tag: &str, _node: &MeshNode) -> Self {
+        let path = std::env::temp_dir().join(format!("olb-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("scratch dir");
         Self(path)
@@ -802,6 +804,7 @@ async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
     };
     let key = slot(7, "nrpc:pinned-authority");
@@ -937,6 +940,7 @@ async fn an_exhausted_authority_epoch_fences_rather_than_aliasing() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
     };
     let key = slot(12, "nrpc:exhausted");
@@ -989,6 +993,7 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
     };
     let key = slot(14, "nrpc:gen-exhausted");
@@ -1220,6 +1225,7 @@ async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
             publication: node.scoped_publication.clone(),
             org_revocation: node.org_revocation.clone(),
             authority: node.routing_authority.clone(),
+            settle_gap_hook: parking_lot::Mutex::new(None),
             unserved_scope: node.routing_unserved_scope.clone(),
         }),
         work.clone(),
@@ -1323,6 +1329,7 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
     };
     let key = slot(15, "nrpc:straddle");
@@ -1368,6 +1375,7 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
                     publication: node.scoped_publication.clone(),
                     org_revocation: node.org_revocation.clone(),
                     authority: node.routing_authority.clone(),
+                    settle_gap_hook: parking_lot::Mutex::new(None),
                     unserved_scope: node.routing_unserved_scope.clone(),
                 };
                 let snap = src.snapshot(std::slice::from_ref(&key));
@@ -1501,6 +1509,7 @@ async fn a_floor_publication_under_the_pin_cannot_settle_current() {
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
                 authority: node.routing_authority.clone(),
+                settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
             during_build: during_build.clone(),
@@ -1624,5 +1633,257 @@ async fn authority_invalidation_spares_successor_facts() {
     assert!(
         Arc::ptr_eq(&survivor, &successor),
         "invalidation must not delete work done under the SUCCESSOR authority"
+    );
+}
+
+/// (24) A floor publication cannot occupy the gap between the final validation
+/// and the settlement.
+///
+/// The earlier floor witness publishes BEFORE the validation, which only proves
+/// that completed movement is detected. This one occupies the gap Kyra named: the
+/// hook fires INSIDE `settle_if_current`, after the validation has succeeded and
+/// before the settlement runs. A publication launched there must not be able to
+/// land, because `Current` is what causes the supervisor to publish `Healthy` —
+/// sampling and then settling as two steps would make that claim false with
+/// nothing left to detect it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("settle-gap", &node);
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
+        unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    };
+
+    let published = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let publisher: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+    {
+        let store = store.clone();
+        let published = published.clone();
+        let entered = entered.clone();
+        let publisher = publisher.clone();
+        *source.settle_gap_hook.lock() = Some(Arc::new(move || {
+            entered.store(true, Ordering::Release);
+            let store = store.clone();
+            let landed = published.clone();
+            *publisher.lock() = Some(std::thread::spawn(move || {
+                store.republish_for_test();
+                landed.store(true, Ordering::Release);
+            }));
+            // Give the publisher every chance to win. It cannot: the barrier is
+            // held across the validation AND the settlement, and
+            // `StoreCore::publish` needs `live.write()`.
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(
+                !published.load(Ordering::Acquire),
+                "a floor publication landed between the validation and the                  settlement — they are separately interleavable"
+            );
+        }));
+    }
+
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(Arc::new(source), work.clone(), Arc::default());
+    registry.activate_incarnation(1);
+
+    let family = registry.new_family().expect("family");
+    let key = slot(19, "nrpc:settle-gap");
+    let _held = family.demand(key.clone()).expect("demand");
+    let outcome = registry.apply(
+        1,
+        ApplyRequest {
+            batch: PrivateDiscoveryChangeBatch {
+                generation: 0,
+                dirty: DirtyCapabilities::Clean,
+            },
+            registry_work: true,
+        },
+    );
+
+    assert!(
+        entered.load(Ordering::Acquire),
+        "the gap must have been entered"
+    );
+    if let Some(handle) = publisher.lock().take() {
+        handle.join().expect("publisher");
+    }
+    assert!(
+        published.load(Ordering::Acquire),
+        "the publication must land once the barrier is released"
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Current { .. }),
+        "the settlement was protected, so it is sound: {outcome:?}"
+    );
+}
+
+/// (25) Poison moving after the pin is taken cannot produce a stale `Current`.
+///
+/// The symmetric case to the floor witness. Poison is a separate path-registry
+/// write the publication barrier does not block, so it is genuinely re-sampled
+/// as part of the same guarded operation.
+#[tokio::test]
+async fn poison_after_the_pin_cannot_settle_current() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("settle-poison", &node);
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+
+    let after_pin: Arc<parking_lot::Mutex<Option<BuildHook>>> = Arc::default();
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(
+        Arc::new(PausingSource {
+            inner: ScopedSlotSource {
+                scoped_discovery: node.scoped_discovery.clone(),
+                publication: node.scoped_publication.clone(),
+                org_revocation: node.org_revocation.clone(),
+                authority: node.routing_authority.clone(),
+                settle_gap_hook: parking_lot::Mutex::new(None),
+                unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+            during_build: Arc::default(),
+            after_pin: after_pin.clone(),
+        }),
+        work.clone(),
+        Arc::default(),
+    );
+    registry.activate_incarnation(1);
+
+    let family = registry.new_family().expect("family");
+    let key = slot(20, "nrpc:settle-poison");
+    let _held = family.demand(key.clone()).expect("demand");
+    let request = ApplyRequest {
+        batch: PrivateDiscoveryChangeBatch {
+            generation: 0,
+            dirty: DirtyCapabilities::Clean,
+        },
+        registry_work: true,
+    };
+    assert!(matches!(
+        registry.apply(1, request.clone()),
+        ApplyOutcome::Current { .. }
+    ));
+    registry.invalidate_for_test(&key);
+
+    let poisoned = Arc::new(AtomicBool::new(false));
+    {
+        let store = store.clone();
+        let poisoned = poisoned.clone();
+        *after_pin.lock() = Some(Box::new(move || {
+            store.mark_poisoned_for_test();
+            poisoned.store(true, Ordering::Release);
+        }));
+    }
+
+    let outcome = registry.apply(1, request);
+    assert!(poisoned.load(Ordering::Acquire), "poison must have landed");
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Superseded,
+        "poison moving under the pin must NOT settle Current"
+    );
+    assert_eq!(registry.pending_slots(), 1, "and must re-queue");
+}
+
+/// (26) A terminally exhausted publication generation stops owner-certified
+/// emission entirely — no owner certificate AND no scoped envelope.
+///
+/// Representing "no store" and "store exhausted" as one `None` made them compare
+/// EQUAL, so the seqlock's raw equality passed and the cached certified
+/// announcement kept shipping.
+#[tokio::test]
+async fn an_exhausted_store_generation_stops_certified_emission() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::generate();
+    let entity = node.entity_id().clone();
+    let cert = crate::adapter::net::behavior::org::OrgMembershipCert::try_issue(
+        &org,
+        entity.clone(),
+        1,
+        3600,
+    )
+    .expect("cert");
+    let scratch = Scratch::new("send-exhausted", &node);
+    let authority = crate::adapter::net::behavior::org_authority::NodeAuthority::adopt(
+        scratch.path(),
+        cert,
+        &entity,
+        0,
+        None,
+    )
+    .expect("adopt");
+    node.install_node_authority(Arc::new(authority))
+        .expect("install authority");
+    let _ = node.set_owner_cert_emission(true);
+
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install store");
+
+    // There must BE an announcement for the send path to certify.
+    node.announce_capabilities(crate::adapter::net::behavior::capability::CapabilitySet::default())
+        .await
+        .expect("announce");
+
+    let now = crate::adapter::net::behavior::org::current_timestamp();
+    let live_authority = node.node_authority().expect("authority installed");
+    assert!(
+        node.owner_cert_under(&live_authority, now).is_some(),
+        "precondition: the send path would certify this announcement"
+    );
+    assert!(
+        node.announcement_bytes_for_send_for_test().is_some(),
+        "precondition: there is something to send"
+    );
+
+    store.saturate_generation_for_test();
+    store.republish_for_test();
+    assert!(
+        store.barriered_generation().is_err(),
+        "terminally exhausted"
+    );
+
+    // Either acceptable terminal behaviour: suppress the send, or emit only the
+    // public cert-free form. Never a certificate, never a scoped envelope.
+    assert!(
+        node.owner_cert_under(&live_authority, now).is_none(),
+        "terminal exhaustion must not construct an owner certificate — the floor          comparison it rests on can no longer be shown current"
+    );
+    assert!(
+        node.announcement_scoped_for_send_for_test().is_empty(),
+        "terminal exhaustion must not emit owner/grant-scoped envelopes"
+    );
+
+    // And the seqlock alias itself: two exhausted stamps must not compare equal
+    // -and-current, which is what kept the CACHED certified announcement shipping.
+    let exhausted_stamp = node.security_stamp();
+    assert!(
+        !exhausted_stamp.is_current(&exhausted_stamp),
+        "an exhausted send stamp must never compare current, even against itself"
     );
 }
