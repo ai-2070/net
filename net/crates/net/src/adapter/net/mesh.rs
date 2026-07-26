@@ -5109,13 +5109,23 @@ impl ScopedMutationPublication {
         }
     }
 
-    /// Commit `f` under the state lock — the caller MUST already hold the gate
-    /// ([`Self::lock_gate`]) — capturing the generation before and after, then
-    /// (after releasing the state lock) publishing the new generation if it
-    /// advanced. The inbound ingest path uses this directly because it holds the
-    /// gate across its currentness recheck as well.
+    /// Commit `f` under the state lock, capturing the generation before and
+    /// after, then (after releasing the state lock) publishing the new generation
+    /// if it advanced. The inbound ingest path uses this directly because it
+    /// holds the gate across its currentness recheck as well.
+    ///
+    /// Gate ownership is COMPILER-ENFORCED, not documented (review-pass-3 §15):
+    /// the caller hands over its live [`Self::lock_gate`] guard, so there is no
+    /// way to reach this without one. It used to be a convention with no
+    /// assertion, no guard parameter and no proof token behind it, and a future
+    /// gateless caller would have compiled silently — re-opening the OLB-2A.3.1
+    /// publication inversion with every existing test green.
+    ///
+    /// The guard is borrowed rather than consumed so a caller can keep holding it
+    /// across work that follows the commit, which the ingest path does.
     fn commit<R>(
         &self,
+        _gate: &parking_lot::MutexGuard<'_, ()>,
         scoped_discovery: &Arc<
             parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
         >,
@@ -5142,8 +5152,8 @@ impl ScopedMutationPublication {
         >,
         f: impl FnOnce(&mut super::behavior::org_scoped_store::ScopedDiscoveryState) -> R,
     ) -> R {
-        let _gate = self.lock_gate();
-        self.commit(scoped_discovery, f)
+        let gate = self.lock_gate();
+        self.commit(&gate, scoped_discovery, f)
     }
 }
 
@@ -20847,7 +20857,7 @@ impl MeshNode {
                 // transaction's mutation and publication serialize node-wide with
                 // every other, so a stale publication can never overwrite a newer
                 // one.
-                let _publication_gate = publication.lock_gate();
+                let publication_gate = publication.lock_gate();
                 // The test probe fires AFTER preparation and gate acquisition, in
                 // the exact prepare→recheck window a concurrent floor publish /
                 // store swap / authority rotation would land in, proving the
@@ -20914,8 +20924,9 @@ impl MeshNode {
                 // (Kyra OLB-2A.1). The gate is already held, so this commits and
                 // publishes under it — serialized with every other mutation
                 // (OLB-2A.3.1).
-                let outcome =
-                    publication.commit(scoped_discovery, |state| state.ingest(prepared, now_secs));
+                let outcome = publication.commit(&publication_gate, scoped_discovery, |state| {
+                    state.ingest(prepared, now_secs)
+                });
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
                     ?outcome,
