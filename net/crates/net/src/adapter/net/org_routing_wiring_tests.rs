@@ -199,6 +199,9 @@ struct PausingSource {
     /// exclude, where the revocation store publishes through its own
     /// synchronization.
     after_pin: Arc<parking_lot::Mutex<Option<BuildHook>>>,
+    /// Fires BEFORE the pin is attempted — the probe→settle window of a pass
+    /// that selected nothing, which has no reconstruction to pause inside.
+    before_pin: Arc<parking_lot::Mutex<Option<BuildHook>>>,
 }
 
 struct PausingSnapshot {
@@ -227,6 +230,10 @@ impl SlotSource for PausingSource {
         })
     }
     fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>> {
+        let hook = self.before_pin.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         let pin = self.inner.pin_if_current(expected)?;
         let hook = self.after_pin.lock().take();
         if let Some(hook) = hook {
@@ -273,6 +280,7 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
             },
             during_build: during_build.clone(),
             after_pin: Arc::default(),
+            before_pin: Arc::default(),
         }),
         work.clone(),
         Arc::default(),
@@ -1291,6 +1299,160 @@ async fn an_exhausted_store_generation_parks_apply_without_spinning_and_recovers
     );
 }
 
+/// (28c) An EMPTY registry whose authority moves inside the probe→settle window
+/// is re-driven rather than stranded (E3c blockers §3, review-pass-3 §2).
+///
+/// The empty-selection pass is the COMMON production path, not a corner: every
+/// node retains zero routing slots until the warmed-call consumer lands. Its two
+/// `Superseded` returns used to mark nothing, and the compensator that covers the
+/// non-empty paths — `invalidate_authority_older_than`, which marks only when
+/// `pending` ends non-empty — is a guaranteed no-op with zero retained slots. An
+/// authority-only movement advances no scoped watch either, so the actor set
+/// `owed_recapture`, parked, and left health at `Rebuilding` indefinitely.
+///
+/// Three legs, because the fix has to hold on both refusal sites AND must not
+/// re-open the exhaustion livelock the fences just closed.
+#[tokio::test]
+async fn an_empty_registry_whose_authority_moves_under_the_probe_is_redriven() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("empty-selection", &node);
+    node.install_org_revocation_store(scratch.store())
+        .expect("install");
+
+    let before_pin: Arc<parking_lot::Mutex<Option<BuildHook>>> = Arc::default();
+    let after_pin: Arc<parking_lot::Mutex<Option<BuildHook>>> = Arc::default();
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(
+        Arc::new(PausingSource {
+            inner: ScopedSlotSource {
+                scoped_discovery: node.scoped_discovery.clone(),
+                publication: node.scoped_publication.clone(),
+                org_revocation: node.org_revocation.clone(),
+                authority: node.routing_authority.clone(),
+                settle_gap_hook: parking_lot::Mutex::new(None),
+                unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+            during_build: Arc::default(),
+            after_pin: after_pin.clone(),
+            before_pin: before_pin.clone(),
+        }),
+        work.clone(),
+        Arc::default(),
+    );
+    registry.activate_incarnation(1);
+
+    // NO demand: zero retained slots, zero pending. Every pass below takes the
+    // empty-selection branch.
+    assert_eq!(registry.retained_slots(), 0);
+    assert_eq!(registry.pending_slots(), 0);
+    let request = ApplyRequest {
+        batch: PrivateDiscoveryChangeBatch {
+            generation: 0,
+            dirty: DirtyCapabilities::Clean,
+        },
+        registry_work: true,
+    };
+    assert!(
+        matches!(
+            registry.apply(1, request.clone()),
+            ApplyOutcome::Current { .. }
+        ),
+        "baseline: an undisturbed empty pass settles Current"
+    );
+
+    // --- leg 1: movement between the probe token and the pin ---
+    let replacement = Scratch::new("empty-selection-b", &node);
+    let replacement_store = replacement.store();
+    let moved = Arc::new(AtomicBool::new(false));
+    {
+        let node = node.clone();
+        let replacement_store = replacement_store.clone();
+        let moved = moved.clone();
+        *before_pin.lock() = Some(Box::new(move || {
+            // The production movement: a store install advances the routing
+            // epoch. It retracts nothing scoped, so it advances no scoped watch,
+            // and with zero retained slots its own invalidation marks nothing.
+            node.install_org_revocation_store(replacement_store.clone())
+                .expect("replacement install");
+            moved.store(true, Ordering::Release);
+        }));
+    }
+    work.take_for_test();
+    assert_eq!(
+        registry.apply(1, request.clone()),
+        ApplyOutcome::Superseded,
+        "the pin must refuse a token minted under the retired authority"
+    );
+    assert!(moved.load(Ordering::Acquire), "the authority did move");
+    assert!(
+        work.take_for_test(),
+        "the empty-selection PIN refusal must mark: nothing else will wake this actor"
+    );
+    assert!(
+        matches!(
+            registry.apply(1, request.clone()),
+            ApplyOutcome::Current { .. }
+        ),
+        "and the re-driven pass settles — which is what lets the supervisor publish Healthy"
+    );
+
+    // --- leg 2: movement between the pin and the settlement ---
+    // Floors publish through the store's own synchronization, which no routing
+    // gate excludes, so this is the one window a held pin cannot close by itself.
+    let published = Arc::new(AtomicBool::new(false));
+    {
+        let replacement_store = replacement_store.clone();
+        let published = published.clone();
+        *after_pin.lock() = Some(Box::new(move || {
+            replacement_store.republish_for_test();
+            published.store(true, Ordering::Release);
+        }));
+    }
+    work.take_for_test();
+    assert_eq!(
+        registry.apply(1, request.clone()),
+        ApplyOutcome::Superseded,
+        "a floor publication under the pin must not settle an empty pass either"
+    );
+    assert!(published.load(Ordering::Acquire), "the floor did move");
+    assert!(
+        work.take_for_test(),
+        "the empty-selection SETTLE refusal must mark for the same reason"
+    );
+    assert!(matches!(
+        registry.apply(1, request.clone()),
+        ApplyOutcome::Current { .. }
+    ));
+
+    // --- leg 3: the composition constraint ---
+    // The marks above are conditioned on MOVEMENT. Against an unsettleable
+    // source nothing has moved and nothing will, so marking would reproduce
+    // exactly the probe→refuse→mark→probe spin the exhaustion fences close —
+    // on an empty registry, forever.
+    replacement_store.saturate_generation_for_test();
+    replacement_store.republish_for_test();
+    work.take_for_test();
+    for pass in 0..3 {
+        assert_eq!(
+            registry.apply(1, request.clone()),
+            ApplyOutcome::Superseded,
+            "pass {pass}: an exhausted publication generation cannot settle"
+        );
+        assert!(
+            !work.take_for_test(),
+            "pass {pass}: and must NOT self-wake — the empty path spins hardest of all"
+        );
+    }
+}
+
 /// (11d) A delayed reader that finds ITS artifact stale must not delete a newer
 /// one installed in the meantime.
 #[tokio::test]
@@ -1785,6 +1947,7 @@ async fn a_floor_publication_under_the_pin_cannot_settle_current() {
             },
             during_build: during_build.clone(),
             after_pin: after_pin.clone(),
+            before_pin: Arc::default(),
         }),
         work.clone(),
         Arc::default(),
@@ -2192,6 +2355,7 @@ async fn poison_before_the_validation_is_detected() {
             },
             during_build: Arc::default(),
             after_pin: after_pin.clone(),
+            before_pin: Arc::default(),
         }),
         work.clone(),
         Arc::default(),

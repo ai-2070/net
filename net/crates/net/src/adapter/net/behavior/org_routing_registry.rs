@@ -853,6 +853,22 @@ impl NodeOrgRoutingRegistry {
     }
 }
 
+impl NodeOrgRoutingRegistry {
+    /// Re-arm the actor for a refusal that was genuine source MOVEMENT, and only
+    /// then (E3c blockers §3, review-pass-3 §2).
+    ///
+    /// The suppression is not an optimisation. A `Fenced` or `Terminal` source
+    /// refuses without anything having moved and will refuse the next pass
+    /// identically, so marking against it is a self-sustaining wake — the exact
+    /// livelock the exhaustion fences exist to prevent. Movement, by contrast,
+    /// is finite and the pass that follows it can succeed.
+    fn mark_if_movement(&self) {
+        if self.source.liveness().may_self_wake() {
+            self.work.mark();
+        }
+    }
+}
+
 impl DirtyApply for NodeOrgRoutingRegistry {
     /// A fresh incarnation claims work authority and invalidates EVERYTHING.
     ///
@@ -979,6 +995,20 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             let token = probe.token();
             drop(probe);
             let Some(commit) = self.source.pin_if_current(&token) else {
+                // The refusal is REGISTRY-visible movement, exactly as it is on
+                // the non-empty path, and it must be marked for exactly the same
+                // reason (E3c blockers §3, review-pass-3 §2). What makes the
+                // EMPTY path the dangerous one is that its usual compensator is
+                // structurally absent: `invalidate_authority_older_than` marks
+                // only when `pending` ends non-empty, which is a guaranteed
+                // no-op with zero retained slots — and every production node
+                // retains zero slots until the warmed-call consumer lands. An
+                // authority-only movement (a store install that retracts
+                // nothing, a floor publication raising no scoped floor, a poison
+                // mark) advances no scoped watch either, so without this mark the
+                // actor parks with `owed_recapture` set and health strands at
+                // `Rebuilding` indefinitely on an otherwise idle node.
+                self.mark_if_movement();
                 return ApplyOutcome::Superseded;
             };
             let epoch = commit.epoch();
@@ -1007,6 +1037,10 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 .settle_if_current(&mut || settle(&mut inner, incarnation, epoch, &self.metrics))
             else {
                 drop(inner);
+                // Same obligation as the pin refusal above: authority moved
+                // inside the probe→settle window, and with no retained slot the
+                // movement's own invalidation cannot wake anyone.
+                self.mark_if_movement();
                 return ApplyOutcome::Superseded;
             };
             let owed = !inner.pending.is_empty();
