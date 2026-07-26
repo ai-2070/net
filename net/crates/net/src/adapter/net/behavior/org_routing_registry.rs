@@ -151,8 +151,17 @@ pub(crate) struct SourceEpoch {
     /// The scoped query-visible revision.
     pub generation: u64,
     /// The routing AUTHORITY epoch — monotone across revocation store installs
-    /// and floor movement. Never reused, so it cannot alias a previous authority.
+    /// and floor movement, allocated by the node under its authority gate. Never
+    /// reused, so it cannot alias a previous authority.
     pub authority: u64,
+    /// The revocation store's barriered floor generation.
+    ///
+    /// Separate from `authority` because it moves INDEPENDENTLY: a floor
+    /// publication becomes authoritative inside the revocation store before the
+    /// subscriber that advances `authority` is even notified. Retaining it means
+    /// facts built against floors F0 are detectably stale once F1 is live, even
+    /// during that notification gap (Kyra OLB-2B-E3c).
+    pub floor_generation: u64,
 }
 
 /// An opaque, comparable summary of EVERY authority input a snapshot was taken
@@ -625,21 +634,34 @@ impl NodeOrgRoutingRegistry {
         }
     }
 
-    /// One slot proved unusable at READ time: drop its facts, re-queue it, wake.
-    pub(crate) fn invalidate_one(&self, key: &SlotKey) {
+    /// One slot proved unusable at READ time: drop THOSE facts, re-queue, wake.
+    ///
+    /// Conditional on the exact artifact the reader observed. A reader can be
+    /// arbitrarily delayed between loading facts and deciding they are stale, and
+    /// reconciliation may have installed a current replacement in the meantime —
+    /// an unconditional removal would delete that replacement and re-queue work
+    /// that was already done (Kyra OLB-2B-E3c). `Arc::ptr_eq` is exact here
+    /// because installation always allocates a fresh `Arc`.
+    pub(crate) fn invalidate_if_stale(&self, key: &SlotKey, observed: &Arc<SlotBaseFacts>) {
         let owed = {
             let mut inner = self.inner.lock();
-            if inner.invalidate(key) {
-                self.metrics
-                    .facts_invalidated
-                    .fetch_add(1, Ordering::AcqRel);
+            let Some(slot) = inner.slots.get_mut(key) else {
+                return;
+            };
+            let still_observed = slot
+                .facts
+                .as_ref()
+                .is_some_and(|live| Arc::ptr_eq(live, observed));
+            if !still_observed {
+                // Someone installed a newer artifact. Leave it alone.
+                return;
             }
-            if inner.slots.contains_key(key) {
-                inner.pending.insert(key.clone());
-                true
-            } else {
-                false
-            }
+            slot.facts = None;
+            self.metrics
+                .facts_invalidated
+                .fetch_add(1, Ordering::AcqRel);
+            inner.pending.insert(key.clone());
+            true
         };
         if owed {
             self.work.mark();
@@ -1138,6 +1160,7 @@ mod tests {
             SourceEpoch {
                 generation: *self.generation,
                 authority: 0,
+                floor_generation: 0,
             }
         }
     }

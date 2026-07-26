@@ -5152,6 +5152,53 @@ struct ScopedSourceSnapshot {
     >,
 }
 
+/// Publish an authority change and advance the routing epoch as ONE ordered unit
+/// (OLB-2B-E3c).
+///
+/// `publish` runs INSIDE the authority gate, so the new authority cannot become
+/// query-visible before the epoch that names it. Publishing first and bumping
+/// afterwards leaves a window in which routing still stamps, commits and serves
+/// under the old authority — and a live commit pin holding this gate would hold
+/// that window open for as long as it liked.
+///
+/// The registry invalidation runs OUTSIDE the gate: the registry takes its own
+/// lock, and the frozen order is authority gate -> publication gate, never
+/// authority gate -> registry lock. It is not optional — authority movement need
+/// not touch scoped state at all, so there may be no other wake.
+fn move_routing_authority<R>(
+    authority: &RoutingAuthority,
+    registry: &super::behavior::org_routing_registry::NodeOrgRoutingRegistry,
+    publish: impl FnOnce() -> R,
+) -> R {
+    let result = {
+        let _gate = authority.lock_gate();
+        let result = publish();
+        authority.advance();
+        result
+    };
+    registry.invalidate_for_authority_movement();
+    result
+}
+
+/// Test-only RAII flag: set while a joiner waits on the routing-task slot.
+#[cfg(test)]
+struct RoutingJoinWaiting<'a>(&'a AtomicBool);
+
+#[cfg(test)]
+impl<'a> RoutingJoinWaiting<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+#[cfg(test)]
+impl Drop for RoutingJoinWaiting<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// The node-owned routing authority (OLB-2B-E3c).
 ///
 /// Two jobs, and they are why routing authority is node-owned rather than read
@@ -5168,6 +5215,14 @@ struct ScopedSourceSnapshot {
 struct RoutingAuthority {
     gate: parking_lot::Mutex<()>,
     epoch: AtomicU64,
+    /// Set once the epoch space is exhausted. Terminal: routing serves nothing
+    /// and commits nothing from then on.
+    exhausted: AtomicBool,
+    /// Test-only: fired when a gate acquisition finds the gate HELD, immediately
+    /// before the blocking `lock()`. The deterministic contention signal the
+    /// witnesses wait on instead of inferring from elapsed time.
+    #[cfg(test)]
+    contention_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl RoutingAuthority {
@@ -5175,6 +5230,26 @@ impl RoutingAuthority {
         Self {
             gate: parking_lot::Mutex::new(()),
             epoch: AtomicU64::new(1),
+            exhausted: AtomicBool::new(false),
+            #[cfg(test)]
+            contention_hook: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Acquire the authority gate, try-then-block, signalling contention.
+    fn lock_gate(&self) -> parking_lot::MutexGuard<'_, ()> {
+        match self.gate.try_lock() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(test)]
+                {
+                    let hook = self.contention_hook.lock().clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                self.gate.lock()
+            }
         }
     }
 
@@ -5182,21 +5257,36 @@ impl RoutingAuthority {
         self.epoch.load(Ordering::Acquire)
     }
 
-    /// Advance the authority epoch. Returns the new value.
+    fn is_exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::Acquire)
+    }
+
+    /// Advance the authority epoch, or FENCE routing if the space is exhausted.
     ///
-    /// Saturating rather than wrapping: reusing an epoch would let facts built
-    /// under a retired authority compare equal to the live one.
-    fn advance(&self) -> u64 {
+    /// Neither saturating nor wrapping. Saturation is not a safe ceiling: at
+    /// `u64::MAX` every subsequent authority receives the SAME identity, so a
+    /// token minted under one store commits under an unrelated replacement —
+    /// exactly the aliasing the monotone counter exists to prevent (Kyra
+    /// OLB-2B-E3c). Exhaustion is terminal and fail-closed: `is_exhausted`
+    /// makes every scope unserved and refuses every commit pin.
+    fn advance(&self) {
         let mut current = self.epoch.load(Ordering::Acquire);
         loop {
-            let next = current.saturating_add(1);
+            let Some(next) = current.checked_add(1) else {
+                self.exhausted.store(true, Ordering::Release);
+                tracing::error!(
+                    "org routing: authority epoch space exhausted; routing is \
+                     fenced rather than reusing an authority identity"
+                );
+                return;
+            };
             match self.epoch.compare_exchange_weak(
                 current,
                 next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return next,
+                Ok(_) => return,
                 Err(actual) => current = actual,
             }
         }
@@ -5216,7 +5306,19 @@ impl ScopedSlotSource {
         u64,
         Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
     ) {
-        let store = self.org_revocation.load_full();
+        Self::revocation_view_of(&self.org_revocation)
+    }
+
+    /// The same sampling the snapshot uses, shared with the cached-read seam so
+    /// both compare like with like.
+    fn revocation_view_of(
+        slot: &ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
+    ) -> (
+        bool,
+        u64,
+        Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
+    ) {
+        let store = slot.load_full();
         let (poisoned, floor_generation) = match store.as_ref() {
             Some(store) => (store.is_poisoned(), store.barriered_generation()),
             // Un-adopted: no store, implicit floor 0.
@@ -5243,13 +5345,14 @@ impl ScopedSlotSource {
         &self,
         epoch: super::behavior::org_routing_registry::SourceEpoch,
         poisoned: bool,
-        floor_generation: u64,
+        exhausted: bool,
     ) -> super::behavior::org_routing_registry::SourceToken {
         super::behavior::org_routing_registry::SourceToken::new(vec![
             epoch.generation,
             epoch.authority,
-            floor_generation,
+            epoch.floor_generation,
             u64::from(poisoned),
+            u64::from(exhausted),
         ])
     }
 }
@@ -5311,6 +5414,7 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         // caught by the commit pin.
         let (poisoned, floor_generation, store) = self.revocation_view();
         let authority = self.authority.epoch();
+        let exhausted = self.authority.is_exhausted();
         let empty_floors = OrgRevocationState::empty();
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
@@ -5326,6 +5430,7 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
                     scope,
                     super::behavior::org_scoped_ingest::CapabilityAudienceScope::Owner { .. }
                 ) || poisoned
+                    || exhausted
                 {
                     // Absent from `rows` => reconstructed as `Unserved`. A
                     // POISONED revocation authority makes every scope unserved:
@@ -5353,8 +5458,10 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         let epoch = super::behavior::org_routing_registry::SourceEpoch {
             generation,
             authority,
+            floor_generation,
         };
-        let token = self.token(epoch, poisoned, floor_generation);
+        let token = self.token(epoch, poisoned, exhausted);
+        let _ = epoch;
         Box::new(ScopedSourceSnapshot { token, rows })
     }
 
@@ -5371,14 +5478,16 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         //
         // Order is fixed: authority gate, then publication gate. Every authority
         // mutation takes only the authority gate, so no inversion is reachable.
-        let authority_gate = self.authority.gate.lock();
+        let authority_gate = self.authority.lock_gate();
         let publication_gate = self.publication.lock_gate();
         let (poisoned, floor_generation, _store) = self.revocation_view();
+        let exhausted = self.authority.is_exhausted();
         let epoch = super::behavior::org_routing_registry::SourceEpoch {
             generation: self.scoped_discovery.lock().revision(),
             authority: self.authority.epoch(),
+            floor_generation,
         };
-        if self.token(epoch, poisoned, floor_generation) != *expected {
+        if exhausted || self.token(epoch, poisoned, exhausted) != *expected {
             return None;
         }
         Some(Box::new(ScopedCommitPin {
@@ -5718,6 +5827,9 @@ pub struct MeshNode {
     routing_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
     /// OLB-2B-E3c: guards the SINGLE production supervisor construction path.
     routing_started: Arc<AtomicBool>,
+    /// Test-only: set while a joiner is waiting on the routing-task slot.
+    #[cfg(test)]
+    routing_join_waiting: Arc<AtomicBool>,
     /// Test-only: fires between the supervisor spawn and the handle publication.
     #[cfg(test)]
     routing_spawn_pause_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -7248,6 +7360,8 @@ impl MeshNode {
             routing_authority,
             routing_task: parking_lot::Mutex::new(None),
             routing_started: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            routing_join_waiting: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             routing_spawn_pause_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "fixtures"))]
@@ -9303,13 +9417,9 @@ impl MeshNode {
             // routing source is allowed to serve, and it advances no scoped
             // revision — so routing must learn about it from the epoch, not from
             // the scoped wake.
-            {
-                let _gate = routing_authority.gate.lock();
-                routing_authority.advance();
-            }
+            move_routing_authority(&routing_authority, &routing_registry, || {});
             let retracted = scoped_publication
                 .gated_commit(&scoped_discovery, |s| s.note_floors_raised(raised));
-            routing_registry.invalidate_for_authority_movement();
             if retracted > 0 {
                 tracing::info!(
                     retracted,
@@ -9327,14 +9437,17 @@ impl MeshNode {
             slot.take();
             *slot = Some(subscription);
         }
-        self.org_revocation.store(Some(store.clone()));
+        // OLB-2B-E3c: the swap and the routing-authority bump are ONE ordered
+        // unit under the authority gate. Publishing the store first and bumping
+        // after leaves a window in which the new store is already query-visible
+        // while routing still stamps, commits and serves under the old authority
+        // — and a live commit pin holding this gate would hold that window open
+        // for as long as it liked (Kyra OLB-2B-E3c). Taking the gate FIRST means
+        // an install cannot become visible while a pin is alive.
+        move_routing_authority(&self.routing_authority, &self.routing_registry, || {
+            self.org_revocation.store(Some(store.clone()));
+        });
         drop(_pin);
-
-        // OLB-2B-E3c: a new store is new ROUTING AUTHORITY, even when its floors
-        // retract nothing. Bumped HERE — the single swap site — so every install
-        // path is covered, and so routing can never be left stamped with an
-        // authority that is no longer installed.
-        self.note_routing_authority_moved();
 
         // No epoch bump: the installed store's IDENTITY changed, and
         // the send-path [`SendStamp`] captures store identity
@@ -11736,13 +11849,27 @@ impl MeshNode {
     /// released. Only then can a successor mint succeed (OLB-2B-E3c).
     ///
     /// The shutdown flag and notification must already have been issued.
+    /// Test-only: whether a joiner is currently BLOCKED on the routing-task slot.
+    ///
+    /// Lets the concurrent-registration witness wait on the real contention
+    /// rather than on elapsed time.
+    #[cfg(test)]
+    fn routing_join_blocked_for_test(&self) -> bool {
+        self.routing_join_waiting
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     async fn join_org_routing_supervisor(&self) {
         // Taking the slot is what serializes against `start_org_routing_supervisor`:
         // either startup published the handle before releasing the slot (so this
         // takes it), or this ran first and startup then observes the shutdown flag
         // under the same lock and spawns nothing. The guard is dropped BEFORE the
         // await — no lock spans a suspension point.
-        let handle = self.routing_task.lock().take();
+        let handle = {
+            #[cfg(test)]
+            let _waiting = RoutingJoinWaiting::new(&self.routing_join_waiting);
+            self.routing_task.lock().take()
+        };
         if let Some(handle) = handle {
             let _ = handle.await;
         }
@@ -11764,17 +11891,6 @@ impl MeshNode {
     /// revision and publishes no scoped wake — so without an explicit
     /// invalidation the actor would never learn that everything it holds was
     /// built under an authority that no longer applies (Kyra OLB-2B-E3c).
-    fn note_routing_authority_moved(&self) {
-        {
-            let _gate = self.routing_authority.gate.lock();
-            self.routing_authority.advance();
-        }
-        // OUTSIDE the authority gate: the registry takes its own lock, and the
-        // frozen order is authority gate -> publication gate, never authority
-        // gate -> registry lock.
-        self.routing_registry.invalidate_for_authority_movement();
-    }
-
     /// Whether the routing plane is currently usable — a live incarnation has
     /// completed a recapture. `false` while rebuilding and whenever fenced
     /// (OLB-2B-E2).
@@ -11881,13 +11997,20 @@ impl MeshNode {
         // and retracts no scoped row, so the cached facts would stay readable
         // indefinitely (Kyra OLB-2B-E3c). A mismatch drops them and re-queues the
         // exact slot, so the actor rebuilds it rather than leaving a hole.
-        let poisoned = self
-            .org_revocation
-            .load()
-            .as_ref()
-            .is_some_and(|store| store.is_poisoned());
-        if poisoned || facts.epoch.authority != self.routing_authority.epoch() {
-            self.routing_registry.invalidate_one(key);
+        let (poisoned, floor_generation, _store) =
+            ScopedSlotSource::revocation_view_of(&self.org_revocation);
+        let stale = poisoned
+            || self.routing_authority.is_exhausted()
+            || facts.epoch.authority != self.routing_authority.epoch()
+            // The floor generation moves INDEPENDENTLY of the authority epoch:
+            // a floor publication is authoritative inside the revocation store
+            // before the subscriber that advances the epoch is even notified. So
+            // it is checked on its own (Kyra OLB-2B-E3c).
+            || facts.epoch.floor_generation != floor_generation;
+        if stale {
+            // Conditional on the EXACT artifact read above: a delayed reader must
+            // not delete a current replacement installed in the meantime.
+            self.routing_registry.invalidate_if_stale(key, &facts);
             return None;
         }
         // Expiry is enforced HERE, against the wall clock, not merely at capture.

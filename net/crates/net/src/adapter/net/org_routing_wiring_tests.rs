@@ -446,8 +446,24 @@ async fn shutdown_overlapping_registration_cannot_return_unresolved() {
         })
     };
 
-    // While registration is unresolved, shutdown must not have returned.
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    // Wait until shutdown has provably REACHED the routing-task slot and found
+    // it held — not for an elapsed interval, which would also "pass" on a
+    // scheduler that never got there (Kyra OLB-2B-E3c).
+    let blocked = {
+        let node = node.clone();
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..20_000 {
+                if node.routing_join_blocked_for_test() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            false
+        })
+    }
+    .await
+    .expect("join");
+    assert!(blocked, "shutdown never reached the routing-task slot");
     assert!(
         !shutdown_returned.load(Ordering::Acquire),
         "shutdown returned while routing registration was still unresolved"
@@ -642,6 +658,7 @@ async fn cached_facts_that_crossed_their_expiry_read_cold() {
         epoch: crate::adapter::net::behavior::org_routing_registry::SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
             authority: node.routing_authority.epoch(),
+            floor_generation: 0,
         },
         actor_incarnation: 1,
         slot_incarnation: 1,
@@ -714,14 +731,61 @@ async fn drop_fences_and_aborts_rather_than_detaching_the_supervisor() {
     );
 }
 
-/// (11) Authority cannot move while the commit pin is alive.
+/// A scratch directory that cleans itself up.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(tag: &str, node: &MeshNode) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "net-olb2b-e3c-{tag}-{}-{}",
+            std::process::id(),
+            node.entity_id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("scratch dir");
+        Self(path)
+    }
+    fn store(&self) -> Arc<crate::adapter::net::behavior::org_revocation::OrgRevocationStore> {
+        Arc::new(
+            crate::adapter::net::behavior::org_revocation::OrgRevocationStore::init(
+                self.0.join("revocation.json"),
+                crate::adapter::net::behavior::org_revocation::ProvisioningExpectation::MayBeFresh,
+            )
+            .expect("init revocation store"),
+        )
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Arm the authority gate's contention signal and return a receiver that fires
+/// the instant a rival is ABOUT to block on it.
 ///
-/// The pin holds the authority gate as well as the publication gate, and holds
-/// BOTH through the conditional installation. Asserted from a rival thread while
-/// a pin is out: a node-mediated authority move must block, and must succeed the
-/// moment the pin drops.
+/// Deterministic by construction: the hook runs only when `try_lock` found the
+/// gate held, immediately before the blocking acquisition. Inferring contention
+/// from elapsed time would pass on a slow scheduler that never reached the lock
+/// at all (Kyra OLB-2B-E3c).
+fn arm_authority_contention(node: &MeshNode) -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(4);
+    *node.routing_authority.contention_hook.lock() = Some(Arc::new(move || {
+        let _ = tx.try_send(());
+    }));
+    rx
+}
+
+/// (11) The PRODUCTION store swap cannot become visible while a commit pin is
+/// alive.
+///
+/// Not the helper — `install_org_revocation_store`, the real path. Publishing the
+/// store first and bumping routing authority afterwards would let the new store
+/// be query-visible while routing still serves the old authority, for as long as
+/// a pin is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn authority_cannot_move_while_the_commit_pin_is_alive() {
+async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
     let node = node().await;
     let source = ScopedSlotSource {
         scoped_discovery: node.scoped_discovery.clone(),
@@ -732,35 +796,217 @@ async fn authority_cannot_move_while_the_commit_pin_is_alive() {
     };
     let key = slot(7, "nrpc:pinned-authority");
 
+    let scratch = Scratch::new("swap", &node);
+    let store = scratch.store();
+    let blocked = arm_authority_contention(&node);
+
     let snapshot = source.snapshot(std::slice::from_ref(&key));
     let pin = source
         .pin_if_current(&snapshot.token())
         .expect("nothing has moved");
 
-    let moved = Arc::new(AtomicBool::new(false));
+    let installed = Arc::new(AtomicBool::new(false));
     let rival = {
         let node = node.clone();
-        let moved = moved.clone();
+        let installed = installed.clone();
+        let store = store.clone();
         tokio::task::spawn_blocking(move || {
-            node.note_routing_authority_moved();
-            moved.store(true, Ordering::Release);
+            node.install_org_revocation_store(store)
+                .expect("install revocation store");
+            installed.store(true, Ordering::Release);
         })
     };
 
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    // Wait for the rival to REACH the blocked acquisition, not for a timeout.
+    tokio::task::spawn_blocking(move || blocked.recv())
+        .await
+        .expect("join")
+        .expect("the installer must block on the authority gate");
+
     assert!(
-        !moved.load(Ordering::Acquire),
-        "authority moved while a commit pin was alive"
+        !installed.load(Ordering::Acquire),
+        "the production install completed while a commit pin was alive"
+    );
+    assert!(
+        node.org_revocation.load().is_none(),
+        "and the new store must NOT be query-visible yet"
     );
 
     drop(pin);
     rival.await.expect("rival");
-    assert!(moved.load(Ordering::Acquire));
+    assert!(installed.load(Ordering::Acquire));
+    assert!(node.org_revocation.load().is_some());
 
-    // And the snapshot taken under the old authority can no longer commit.
     assert!(
         source.pin_if_current(&snapshot.token()).is_none(),
         "a token from the retired authority must be refused"
+    );
+}
+
+/// (11b) A floor publication that has become authoritative but whose subscriber
+/// has not run yet still colds facts built against the previous floors.
+///
+/// The floor generation moves INSIDE the revocation store, before the subscriber
+/// that advances the routing epoch is notified. Retaining it in the stamped epoch
+/// is what closes that gap.
+#[tokio::test]
+async fn facts_built_against_superseded_floors_read_cold() {
+    use crate::adapter::net::behavior::org_routing_registry::{
+        SlotBaseFacts, SourceEpoch, SourceFacts,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("floors", &node);
+    node.install_org_revocation_store(scratch.store())
+        .expect("install");
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+
+    let key = slot(11, "nrpc:floored-read");
+    let live_floor = node
+        .org_revocation
+        .load()
+        .as_ref()
+        .expect("store")
+        .barriered_generation();
+
+    node.routing_registry.install_facts_for_test(
+        key.clone(),
+        Arc::new(SlotBaseFacts {
+            providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
+            epoch: SourceEpoch {
+                generation: node.scoped_discovery.lock().revision(),
+                authority: node.routing_authority.epoch(),
+                floor_generation: live_floor,
+            },
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            earliest_expiry: u64::MAX,
+        }),
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "precondition: coherent facts are served"
+    );
+
+    // Same authority epoch, same scoped revision — only the floors moved.
+    node.routing_registry.install_facts_for_test(
+        key.clone(),
+        Arc::new(SlotBaseFacts {
+            providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
+            epoch: SourceEpoch {
+                generation: node.scoped_discovery.lock().revision(),
+                authority: node.routing_authority.epoch(),
+                floor_generation: live_floor.wrapping_sub(1),
+            },
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            earliest_expiry: u64::MAX,
+        }),
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_none(),
+        "facts built against superseded floors must read COLD even though the \
+         authority epoch and scoped revision are unchanged"
+    );
+    assert_eq!(node.org_routing_slots().1, 1, "and the slot is re-queued");
+}
+
+/// (11c) An exhausted authority epoch FENCES routing rather than aliasing.
+///
+/// At saturation every later authority would receive the same identity, so a
+/// token minted under one store would commit under an unrelated replacement.
+#[tokio::test]
+async fn an_exhausted_authority_epoch_fences_rather_than_aliasing() {
+    let node = node().await;
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
+        unserved_scope: node.routing_unserved_scope.clone(),
+    };
+    let key = slot(12, "nrpc:exhausted");
+
+    node.routing_authority
+        .epoch
+        .store(u64::MAX, Ordering::Release);
+    assert!(!node.routing_authority.is_exhausted());
+
+    {
+        let _gate = node.routing_authority.lock_gate();
+        node.routing_authority.advance();
+    }
+    assert!(
+        node.routing_authority.is_exhausted(),
+        "advancing past the ceiling must FENCE, not saturate"
+    );
+    assert_eq!(
+        node.routing_authority.epoch(),
+        u64::MAX,
+        "and must not have handed out a reused identity"
+    );
+
+    let snapshot = source.snapshot(std::slice::from_ref(&key));
+    assert!(
+        matches!(snapshot.providers(&key), SourceFacts::Unserved),
+        "an exhausted authority serves nothing"
+    );
+    assert!(
+        source.pin_if_current(&snapshot.token()).is_none(),
+        "and commits nothing"
+    );
+}
+
+/// (11d) A delayed reader that finds ITS artifact stale must not delete a newer
+/// one installed in the meantime.
+#[tokio::test]
+async fn a_delayed_reader_does_not_delete_a_newer_artifact() {
+    use crate::adapter::net::behavior::org_routing_registry::{
+        SlotBaseFacts, SourceEpoch, SourceFacts,
+    };
+
+    let node = node().await;
+    let key = slot(13, "nrpc:delayed-reader");
+    let facts = |authority: u64| {
+        Arc::new(SlotBaseFacts {
+            providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
+            epoch: SourceEpoch {
+                generation: node.scoped_discovery.lock().revision(),
+                authority,
+                floor_generation: 0,
+            },
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            earliest_expiry: u64::MAX,
+        })
+    };
+
+    let stale = facts(node.routing_authority.epoch().wrapping_sub(1));
+    node.routing_registry
+        .install_facts_for_test(key.clone(), stale.clone());
+
+    // Reconciliation installs a CURRENT artifact before the delayed reader acts.
+    let current = facts(node.routing_authority.epoch());
+    node.routing_registry
+        .install_facts_for_test(key.clone(), current.clone());
+
+    // The delayed reader now acts on the artifact IT observed.
+    node.routing_registry.invalidate_if_stale(&key, &stale);
+
+    let live = node
+        .routing_registry
+        .base_facts(&key)
+        .expect("the current artifact survives");
+    assert!(
+        Arc::ptr_eq(&live, &current),
+        "a delayed reader must not delete a newer artifact"
+    );
+    assert_eq!(
+        node.org_routing_slots().1,
+        0,
+        "and must not re-queue work that was already done"
     );
 }
 
@@ -805,6 +1051,7 @@ async fn poisoning_authority_colds_already_cached_facts() {
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
                 authority: node.routing_authority.epoch(),
+                floor_generation: 0,
             },
             actor_incarnation: 1,
             slot_incarnation: 1,
@@ -855,6 +1102,7 @@ async fn authority_only_movement_invalidates_and_requeues_everything() {
             epoch: SourceEpoch {
                 generation: scoped_before,
                 authority: node.routing_authority.epoch(),
+                floor_generation: 0,
             },
             actor_incarnation: 1,
             slot_incarnation: 1,
@@ -863,7 +1111,7 @@ async fn authority_only_movement_invalidates_and_requeues_everything() {
     );
     assert!(node.org_routing_base_facts(&key).is_some());
 
-    node.note_routing_authority_moved();
+    move_routing_authority(&node.routing_authority, &node.routing_registry, || {});
 
     assert_eq!(
         node.scoped_discovery.lock().revision(),
@@ -889,62 +1137,111 @@ async fn authority_only_movement_invalidates_and_requeues_everything() {
     );
 }
 
-/// (14) A recapture spanning two authority epochs never settles `Current` over
-/// mixed-authority facts.
+/// (14) A recapture spanning two authority epochs never settles `Current`.
 ///
-/// The facts installed in quantum 1 carry the old authority; the epoch stamped on
-/// facts covers authority as well as scoped revision, so the coherence check
-/// re-queues them instead of accepting two epochs as equal.
+/// Driven through a real `apply()`: quantum 1 installs under authority A, the
+/// authority moves with NO scoped movement, and the next pass must not report a
+/// complete installation over the mixed set.
 #[tokio::test]
 async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
-    use crate::adapter::net::behavior::org_routing_registry::{
-        SlotBaseFacts, SourceEpoch, SourceFacts,
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
     };
 
     let node = node().await;
-    let key = slot(10, "nrpc:mixed-epoch");
-    let scoped = node.scoped_discovery.lock().revision();
-    let stale_authority = node.routing_authority.epoch();
-
-    node.routing_registry.install_facts_for_test(
-        key.clone(),
-        Arc::new(SlotBaseFacts {
-            providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
-            epoch: SourceEpoch {
-                generation: scoped,
-                authority: stale_authority,
-            },
-            actor_incarnation: 1,
-            slot_incarnation: 1,
-            earliest_expiry: u64::MAX,
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(
+        Arc::new(ScopedSlotSource {
+            scoped_discovery: node.scoped_discovery.clone(),
+            publication: node.scoped_publication.clone(),
+            org_revocation: node.org_revocation.clone(),
+            authority: node.routing_authority.clone(),
+            unserved_scope: node.routing_unserved_scope.clone(),
         }),
+        work.clone(),
+        Arc::default(),
     );
+    registry.activate_incarnation(1);
 
-    // Authority moves with no scoped movement at all.
+    // More than one quantum, so the recapture epoch stays OPEN across passes.
+    // That is where mixed-authority settlement is actually reachable: outside an
+    // epoch, ordinary work legitimately leaves unrelated slots at older epochs
+    // and must still settle Current (the narrow-settlement rule).
+    let mut family = registry.new_family().expect("family");
+    let mut held = Vec::new();
+    let mut keys = Vec::new();
+    for index in 0..70 {
+        if index > 0 && index % 64 == 0 {
+            family = registry.new_family().expect("family");
+        }
+        let key = slot(10, &format!("nrpc:epoch-{index}"));
+        held.push(family.demand(key.clone()).expect("demand"));
+        keys.push(key);
+    }
+
+    let request = |dirty| ApplyRequest {
+        batch: PrivateDiscoveryChangeBatch {
+            generation: 0,
+            dirty,
+        },
+        registry_work: true,
+    };
+
+    // Quantum 1 under authority A: incomplete, so the epoch stays open.
+    let outcome = registry.apply(1, request(DirtyCapabilities::RebuildAll));
+    assert!(
+        matches!(outcome, ApplyOutcome::Progress { .. }),
+        "one quantum cannot finish 70 slots: {outcome:?}"
+    );
+    let authority_a = node.routing_authority.epoch();
+    let scoped = node.scoped_discovery.lock().revision();
+
+    // Authority moves MID-EPOCH. No scoped movement whatsoever.
     {
-        let _gate = node.routing_authority.gate.lock();
+        let _gate = node.routing_authority.lock_gate();
         node.routing_authority.advance();
     }
     assert_eq!(
         node.scoped_discovery.lock().revision(),
         scoped,
-        "scoped revision is identical across the two authority epochs"
+        "scoped revision is IDENTICAL across the two authority epochs"
     );
-    assert_ne!(node.routing_authority.epoch(), stale_authority);
+    assert_ne!(node.routing_authority.epoch(), authority_a);
 
-    // A fact stamped with the OLD authority is not coherent with the live epoch,
-    // so it can never be part of a completed recapture.
-    let facts = node
-        .routing_registry
-        .base_facts(&key)
-        .expect("still retained");
-    assert_ne!(
-        facts.epoch.authority,
-        node.routing_authority.epoch(),
-        "the stamp carries the whole source epoch, not just the scoped revision"
+    // The next quantum finishes the remainder under authority B — but the epoch
+    // must NOT settle, because the first quantum's facts carry authority A.
+    let outcome = registry.apply(1, request(DirtyCapabilities::RebuildAll));
+    assert!(
+        matches!(outcome, ApplyOutcome::Progress { .. }),
+        "a recapture must not settle Current over mixed-authority facts:          {outcome:?}"
     );
     assert!(
-        node.org_routing_base_facts(&key).is_none(),
-        "and it reads cold rather than as current evidence"
+        registry.pending_slots() > 0,
+        "the authority-A slots are re-queued"
     );
+
+    // Draining the rest completes it under ONE authority.
+    let mut outcome = registry.apply(1, request(DirtyCapabilities::RebuildAll));
+    for _ in 0..4 {
+        if matches!(outcome, ApplyOutcome::Current { .. }) {
+            break;
+        }
+        outcome = registry.apply(1, request(DirtyCapabilities::RebuildAll));
+    }
+    assert!(
+        matches!(outcome, ApplyOutcome::Current { .. }),
+        "and completes once every slot shares one authority: {outcome:?}"
+    );
+    let live = node.routing_authority.epoch();
+    for key in &keys {
+        assert_eq!(
+            registry.base_facts(key).expect("built").epoch.authority,
+            live,
+            "one authority across the whole retained set"
+        );
+    }
 }
