@@ -1571,6 +1571,43 @@ async fn terminal_exhaustion_is_visible_on_a_metrics_surface() {
     );
 }
 
+/// (11i) `start` publishes EVERY background task handle before it returns
+/// (review-pass-3 §16).
+///
+/// The handles used to be pushed from inside a `tokio::spawn`, which is the exact
+/// pattern the routing supervisor's own comment names as unsafe for
+/// deterministic teardown — and which was closed for the routing task alone. A
+/// fast shutdown could observe an empty vector and return while the exact-expiry
+/// timer was still free to run one more `gated_commit` sweep and watch
+/// publication. Benign for state, since everything is `Arc`-held and
+/// self-terminating and the shutdown wake is armed before the flag check, but it
+/// made every shutdown-ordering witness racy.
+///
+/// Asserted with NO intervening await, which is what makes it a witness: the
+/// spawned-push version passes any test that yields first.
+#[tokio::test]
+async fn start_publishes_every_background_handle_before_returning() {
+    let node = node().await;
+    assert!(
+        node.tasks.lock().is_empty(),
+        "precondition: an unstarted node owns no background tasks"
+    );
+
+    node.start();
+    let published = node.tasks.lock().len();
+    assert!(
+        published >= 10,
+        "every background handle must be joinable the instant `start` returns, \
+         with no scheduler round-trip in between (published {published})"
+    );
+
+    let _ = node.shutdown().await;
+    assert!(
+        node.tasks.lock().is_empty(),
+        "and shutdown consumed exactly the handles start published"
+    );
+}
+
 /// (11d) A delayed reader that finds ITS artifact stale must not delete a newer
 /// one installed in the meantime.
 #[tokio::test]

@@ -6964,8 +6964,19 @@ pub struct MeshNode {
     /// the cap-filter + ed25519 verify path. Successful subscribes
     /// clear the counter for that peer.
     auth_failures: Arc<DashMap<u64, AuthFailureState>>,
-    /// Background tasks
-    tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
+    /// Background tasks.
+    ///
+    /// A SYNCHRONOUS mutex, deliberately (review-pass-3 §16): `start` is not
+    /// async, so an async mutex here forced the handles to be published from a
+    /// spawned task — the exact pattern the routing supervisor's own comment
+    /// names as unsafe for deterministic teardown, and closed for the routing
+    /// task alone. A fast shutdown could miss the push and leave the expiry timer
+    /// free to run one more `gated_commit` sweep and watch publication after
+    /// `shutdown()` returned. Benign for state (everything is `Arc`-held and
+    /// self-terminating, and the shutdown wake is armed before the flag check),
+    /// but it made every shutdown-ordering witness racy. It is only ever held
+    /// across a `Vec` push or a `mem::take`, never across an await.
+    tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
     shutdown: Arc<AtomicBool>,
     /// Shutdown notifier
@@ -7948,7 +7959,7 @@ impl MeshNode {
             published_chains: Arc::new(DashMap::new()),
             auth_guard: Arc::new(AuthGuard::new()),
             auth_failures: Arc::new(DashMap::new()),
-            tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             pending_stream_grants: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -12265,10 +12276,12 @@ impl MeshNode {
             None
         };
 
-        // Store handles — can't block here, but we need them for shutdown
-        let tasks = self.tasks.clone();
-        tokio::spawn(async move {
-            let mut tasks = tasks.lock().await;
+        // Store handles SYNCHRONOUSLY, before `start` returns (review-pass-3
+        // §16). Publishing them from a spawned task let a fast shutdown observe an
+        // empty vector and return while these were still running — the same race
+        // the routing supervisor's handle slot was rewritten to close.
+        {
+            let mut tasks = self.tasks.lock();
             tasks.push(recv_handle);
             tasks.push(heartbeat_handle);
             tasks.push(stream_grant_drainer_handle);
@@ -12287,7 +12300,7 @@ impl MeshNode {
             if let Some(h) = port_mapping_handle {
                 tasks.push(h);
             }
-        });
+        }
     }
 
     /// Start the node through its `Arc`, enabling the periodic capability
@@ -28557,8 +28570,9 @@ impl Adapter for MeshNode {
             entry.value().session.deactivate();
         }
 
-        // Wait for background tasks
-        let tasks = std::mem::take(&mut *self.tasks.lock().await);
+        // Wait for background tasks. Taken under the synchronous lock in its own
+        // scope so the guard is released before the first await.
+        let tasks = { std::mem::take(&mut *self.tasks.lock()) };
         for handle in tasks {
             let _ = handle.await;
         }
