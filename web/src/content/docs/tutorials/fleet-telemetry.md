@@ -46,13 +46,19 @@ Internal vehicle channels (e.g. `vehicles/v-001/internal/diagnostics`) are confi
 use net::adapter::net::channel::{ChannelConfig, ChannelName, Visibility};
 use net::adapter::net::behavior::capability::CapabilityFilter;
 
+// The fleet's root of trust: the entity whose signature every vehicle's and
+// operator's token chain must ultimately root at. In a real deployment this
+// is a long-lived offline key, distributed to nodes as a public EntityId.
+let fleet_root_entity_id = fleet_root_keypair.entity_id().clone();
+
 let telemetry_cfg = ChannelConfig::new(ChannelName::new("vehicles/v-001/telemetry/imu")?.id())
     .with_visibility(Visibility::Exported)
     .with_publish_caps(CapabilityFilter::new().require_tag("role.vehicle"))
     .with_subscribe_caps(
         CapabilityFilter::new().require_tag("role.operator").require_tag("tier.production"),
     )
-    .with_require_token(true)
+    // Anchors the root of trust AND turns on token enforcement.
+    .with_token_roots(vec![fleet_root_entity_id])
     .with_priority(4)
     .with_reliable(false)
     .with_rate_limit(100);
@@ -60,7 +66,11 @@ let telemetry_cfg = ChannelConfig::new(ChannelName::new("vehicles/v-001/telemetr
 mesh.register_channel(telemetry_cfg);   // synchronous; no await
 ```
 
-The capability filter on `publish_caps` ensures only nodes advertising `role.vehicle` can publish; the filter on `subscribe_caps` ensures only operator nodes can subscribe. Permission tokens layer on top — each vehicle holds a token scoped to its own telemetry channels, and the operations cluster holds tokens scoped to the export destinations.
+The capability filters are **routing, not enforcement**. `publish_caps` and `subscribe_caps` match a node's *self-advertised* capabilities, so a peer that wants past them can just advertise `role.vehicle` — they express which nodes this channel is *for*, not which nodes are *allowed* ([Channels](/docs/concepts/channels#capability-filters-are-advisory-tokens-are-the-boundary)).
+
+What actually restricts the channel is the token gate. Each vehicle holds a token, rooted at the fleet root, scoped to its own telemetry channels; the operations cluster holds tokens scoped to the export destinations. A presented chain must root at `fleet_root_entity_id`, bind at its leaf to the presenting entity, and authorize the action at every link.
+
+> **Don't call `with_require_token(true)` without also setting `token_roots`.** That combination is a valid fail-closed state — and therefore not an error — but with no root to anchor against, *nothing* can satisfy the gate and every publish and subscribe is denied. It's almost always a typo for `with_token_roots(...)`, which sets `require_token` for you. The substrate logs a warning at channel registration when it sees this; if telemetry goes silent right after you add auth, check for it.
 
 ## Configuring subnets
 
