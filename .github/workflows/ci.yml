@@ -110,7 +110,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=42
+          MIN=41
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -170,7 +170,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=23
+          MIN=24
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   behavior::org_routing:: 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
