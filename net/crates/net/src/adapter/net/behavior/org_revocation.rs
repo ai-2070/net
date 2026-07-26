@@ -1728,7 +1728,7 @@ impl OrgRevocationStore {
     /// OLD generation. Admission stamping must use
     /// [`Self::barriered_generation`] / [`Self::snapshot_with_generation`]
     /// instead — see their docs (OA2-E1 Kyra review).
-    pub fn publish_generation(&self) -> u64 {
+    pub(crate) fn publish_generation(&self) -> u64 {
         self.core.generation.load(Ordering::Acquire)
     }
 

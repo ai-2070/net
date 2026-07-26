@@ -736,6 +736,10 @@ pub struct ScopedDiscoveryState {
     /// The same QUERY-VISIBLE-SET generation restricted to the OWNER partition, so
     /// valid grant-audience churn never advances it.
     owner_revision: u64,
+    /// Latched once either generation reached its terminal `u64::MAX` sentinel.
+    /// Terminal: a frozen generation can no longer witness that state moved, so
+    /// the routing source fences on it (review-pass-3 §12).
+    generations_exhausted: bool,
     /// Capabilities dirtied (owner or grant) since the last global drain.
     pending_global: DirtyCapabilities,
     /// Capabilities dirtied in the OWNER partition since the last owner drain.
@@ -1055,13 +1059,59 @@ impl ScopedDiscoveryState {
         owner: &BTreeSet<CapabilityAuthorityId>,
     ) {
         if !global.is_empty() {
-            self.revision = self.revision.wrapping_add(1);
+            self.revision = self.advance_revision(self.revision);
             self.pending_global.mark(global);
         }
         if !owner.is_empty() {
-            self.owner_revision = self.owner_revision.wrapping_add(1);
+            self.owner_revision = self.advance_revision(self.owner_revision);
             self.pending_owner.mark(owner);
         }
+    }
+
+    /// Advance a change generation, LATCHING terminally rather than wrapping
+    /// (review-pass-3 §12).
+    ///
+    /// These two are `SourceEpoch::generation` — the routing plane's coherence
+    /// token — and they are the only counters in the identity set a remote peer
+    /// influences at all: every accepted scoped ingest advances one. `wrapping_add`
+    /// therefore promised the one property the whole stamp discipline rests on
+    /// (two different states never share an identity) and did not deliver it.
+    ///
+    /// Latching at `u64::MAX` makes the ceiling terminal and detectable rather
+    /// than silent: `generations_exhausted` fences the routing source, so no pin
+    /// can settle against a generation that can no longer distinguish states.
+    /// Per-slot invalidation is unaffected — it rides the dirty streams, not the
+    /// counter — so movement still colds the slots it touches; what stops is the
+    /// installation of anything new, which is the fail-closed direction.
+    fn advance_revision(&mut self, current: u64) -> u64 {
+        match current.checked_add(1) {
+            Some(next) if next != u64::MAX => next,
+            _ => {
+                if !self.generations_exhausted {
+                    self.generations_exhausted = true;
+                    tracing::error!(
+                        "org scoped discovery: change-generation space exhausted; private \
+                         discovery is fenced rather than reusing a generation identity"
+                    );
+                }
+                u64::MAX
+            }
+        }
+    }
+
+    /// Whether either change generation has terminally latched, so a generation
+    /// can no longer witness that private-discovery state moved
+    /// (review-pass-3 §12).
+    pub fn generations_exhausted(&self) -> bool {
+        self.generations_exhausted
+    }
+
+    /// Test-only: park both change generations one advance below the ceiling, so
+    /// a witness can drive the terminal transition without 2^64 ingests.
+    #[cfg(test)]
+    pub(crate) fn park_revisions_at_ceiling_for_test(&mut self) {
+        self.revision = u64::MAX - 1;
+        self.owner_revision = u64::MAX - 1;
     }
 
     /// Record that the tracked record at `key` now expires at `expires_at`, moving

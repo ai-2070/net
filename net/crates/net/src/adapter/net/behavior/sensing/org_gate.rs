@@ -602,8 +602,17 @@ impl SensingAuthorityStamp {
         // a DIFFERENT function from this check, so it is made structural here
         // rather than left as a property a future capture path could break
         // silently (review-pass-2 §4).
+        // The INSTALLATION generation is fenced on the same principle
+        // (review-pass-3 §12). It is advanced `checked`-ly and LATCHES at
+        // `u64::MAX` rather than wrapping, so the ceiling is a terminal sentinel:
+        // past it every installation would receive the same identity and an
+        // `A -> B -> A` rotation — the exact case this field exists to catch —
+        // would compare unchanged. Refused on both sides for the same reason the
+        // store generation is.
         self.store_generation.is_some()
             && current.store_generation.is_some()
+            && self.installation_generation != u64::MAX
+            && current.installation_generation != u64::MAX
             && self == current
             && !current.poisoned
     }

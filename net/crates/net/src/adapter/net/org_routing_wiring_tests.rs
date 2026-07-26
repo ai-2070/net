@@ -1453,6 +1453,80 @@ async fn an_empty_registry_whose_authority_moves_under_the_probe_is_redriven() {
     }
 }
 
+/// (11g) The scoped CHANGE GENERATION latches terminally instead of wrapping
+/// (review-pass-3 §12).
+///
+/// `SourceEpoch::generation` is the routing plane's coherence token, and it is
+/// the only counter in the identity set a remote peer influences at all — every
+/// accepted scoped ingest advances one. It used to `wrapping_add`, which promised
+/// the single property the whole stamp discipline rests on (two different states
+/// never share an identity) and did not deliver it.
+#[tokio::test]
+async fn an_exhausted_scoped_generation_fences_the_routing_source() {
+    use crate::adapter::net::behavior::org_routing_registry::SourceLiveness;
+
+    let node = node().await;
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
+        unserved_scope: node.routing_unserved_scope.clone(),
+    };
+    let key = slot(31, "nrpc:generation-ceiling");
+
+    let healthy = source.snapshot(std::slice::from_ref(&key));
+    let healthy_token = healthy.token();
+    assert!(
+        matches!(healthy.providers(&key), SourceFacts::Served(_)),
+        "precondition: a usable generation serves the scope"
+    );
+    drop(healthy);
+    assert_eq!(source.liveness(), SourceLiveness::Live);
+
+    // Park one advance below the ceiling and drive a real mutation over it.
+    node.scoped_publication
+        .gated_commit(&node.scoped_discovery, |state| {
+            state.park_revisions_at_ceiling_for_test();
+            state.advance_query_visible_generation_for_test(CapabilityAuthorityId::for_tag(
+                "nrpc:generation-ceiling",
+            ));
+        });
+
+    assert!(
+        node.scoped_discovery.lock().generations_exhausted(),
+        "the advance past the ceiling LATCHES rather than wrapping to 0"
+    );
+    assert_eq!(
+        node.scoped_discovery.lock().revision(),
+        u64::MAX,
+        "and parks on the terminal sentinel"
+    );
+    assert_eq!(
+        source.liveness(),
+        SourceLiveness::Terminal,
+        "a generation that can no longer distinguish states is terminal authority"
+    );
+
+    let fenced = source.snapshot(std::slice::from_ref(&key));
+    assert!(
+        matches!(fenced.providers(&key), SourceFacts::Unserved),
+        "an exhausted change generation serves NOTHING"
+    );
+    let fenced_token = fenced.token();
+    drop(fenced);
+    assert!(
+        source.pin_if_current(&healthy_token).is_none(),
+        "a token minted under the usable generation no longer commits"
+    );
+    assert!(
+        source.pin_if_current(&fenced_token).is_none(),
+        "and neither does one minted UNDER the exhaustion — two exhausted samples \
+         must never compare equal-and-current"
+    );
+}
+
 /// (11d) A delayed reader that finds ITS artifact stale must not delete a newer
 /// one installed in the meantime.
 #[tokio::test]

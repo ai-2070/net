@@ -2843,6 +2843,15 @@ impl SendStamp {
     fn is_current(&self, current: &SendStamp) -> bool {
         !matches!(self.store, SendStoreStamp::Exhausted { .. })
             && !matches!(current.store, SendStoreStamp::Exhausted { .. })
+            // The emission counter is fenced on the same principle
+            // (review-pass-3 §12): it LATCHES at `u64::MAX` rather than wrapping,
+            // so the ceiling is a terminal sentinel. Past it every toggle would
+            // receive the same identity, and the counter exists precisely because
+            // a toggle changes no other observable field — so a frozen one would
+            // let the send path keep emitting a cached owner certificate across a
+            // disable.
+            && self.emission_generation != u64::MAX
+            && current.emission_generation != u64::MAX
             && self == current
     }
 }
@@ -5157,6 +5166,43 @@ impl ScopedMutationPublication {
     }
 }
 
+/// Advance a node-local identity counter without ever ALIASING a previous value
+/// (review-pass-3 §12).
+///
+/// The house rule the branch already applies to the routing epoch and the store's
+/// publication generation — "never wrap, latch and fail closed" — stated for the
+/// remaining counters that participate in stamp equality. Neither wrapping nor
+/// saturating is safe on its own: both hand a later state an identity a previous
+/// state already used, and every consumer of these counters compares them for
+/// EQUALITY to decide "nothing moved".
+///
+/// `u64::MAX` is the terminal sentinel. The counter latches there, and every
+/// `is_current` that reads it refuses on that value from either side, so an
+/// exhausted identity can never compare current — with itself or with anything
+/// else. Reaching it takes 2^64 node-local operations; the point is that the
+/// claim in the docs is now true of the code.
+fn advance_fenced_generation(counter: &std::sync::atomic::AtomicU64, what: &'static str) {
+    let outcome = counter.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |current| current.checked_add(1).filter(|next| *next != u64::MAX),
+    );
+    if outcome.is_err() {
+        // Latched: report the TRANSITION once rather than on every later call.
+        if counter
+            .swap(u64::MAX, std::sync::atomic::Ordering::AcqRel)
+            .checked_add(1)
+            .is_some()
+        {
+            tracing::error!(
+                counter = what,
+                "org authority: identity counter space exhausted; every stamp \
+                 reading it now fails closed rather than reusing an identity"
+            );
+        }
+    }
+}
+
 /// The production [`SlotSource`] — the routing registry's binding to real
 /// private discovery (OLB-2B-E3c).
 ///
@@ -5625,9 +5671,14 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
 
         let mut unserved = 0u64;
-        let (generation, rows) = {
+        let (generation, rows, generations_exhausted) = {
             let state = self.scoped_discovery.lock();
             let generation = state.revision();
+            // Sampled under the SAME lock as the generation it qualifies: read
+            // separately it races the very mutation that latches it
+            // (review-pass-3 §12).
+            let generations_exhausted = state.generations_exhausted();
+            let exhausted = exhausted || generations_exhausted;
             let mut rows = std::collections::BTreeMap::new();
             for key in keys {
                 let scope = key.scope.scope();
@@ -5654,7 +5705,7 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
                     ),
                 );
             }
-            (generation, rows)
+            (generation, rows, generations_exhausted)
         };
         if unserved > 0 {
             self.unserved_scope
@@ -5666,7 +5717,7 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             floor_generation,
             poisoned,
         };
-        let token = self.token(epoch, exhausted);
+        let token = self.token(epoch, exhausted || generations_exhausted);
         Box::new(ScopedSourceSnapshot { token, rows })
     }
 
@@ -5686,9 +5737,16 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         let authority_gate = self.authority.lock_gate();
         let publication_gate = self.publication.lock_gate();
         let (poisoned, floor_generation, store) = self.revocation_view();
-        let exhausted = self.authority.is_exhausted();
+        let (generation, generations_exhausted) = {
+            let state = self.scoped_discovery.lock();
+            (state.revision(), state.generations_exhausted())
+        };
+        // Either identity space latching is terminal: a frozen counter cannot
+        // witness that the view is still the one the token names, so it must not
+        // be able to authorize an installation (review-pass-3 §12).
+        let exhausted = self.authority.is_exhausted() || generations_exhausted;
         let epoch = super::behavior::org_routing_registry::SourceEpoch {
-            generation: self.scoped_discovery.lock().revision(),
+            generation,
             authority: self.authority.epoch(),
             floor_generation,
             poisoned,
@@ -5708,9 +5766,13 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
 
     fn liveness(&self) -> super::behavior::org_routing_registry::SourceLiveness {
         use super::behavior::org_routing_registry::SourceLiveness;
-        // Only the authority-epoch latch is TERMINAL: it is node-owned, monotone
-        // and has no successor identity to move to. Nothing can retire it.
-        if self.authority.is_exhausted() {
+        // Two TERMINAL latches: the node-owned authority epoch and the scoped
+        // change generation. Both are monotone in-memory identity spaces with no
+        // successor to move to, so nothing can retire either (review-pass-3 §12
+        // folds the second one in — it is `SourceEpoch::generation`, the plane's
+        // coherence token, and the only counter in the set a remote peer
+        // influences at all).
+        if self.authority.is_exhausted() || self.scoped_discovery.lock().generations_exhausted() {
             return SourceLiveness::Terminal;
         }
         // The installed store's publication generation is the OTHER way a
@@ -9506,8 +9568,7 @@ impl MeshNode {
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
         if self.install_org_revocation_store_locked(store, false, None)? {
-            self.org_install_generation
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            advance_fenced_generation(&self.org_install_generation, "org_install_generation");
         }
         Ok(())
     }
@@ -9526,8 +9587,7 @@ impl MeshNode {
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
         if self.install_org_revocation_store_locked(store, false, Some(pause))? {
-            self.org_install_generation
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            advance_fenced_generation(&self.org_install_generation, "org_install_generation");
         }
         Ok(())
     }
@@ -9962,8 +10022,7 @@ impl MeshNode {
         // One generation transition for the COMPLETE authority+store
         // transaction (never one for the store then one for the authority).
         if authority_changed || store_changed {
-            self.org_install_generation
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            advance_fenced_generation(&self.org_install_generation, "org_install_generation");
         }
         // No epoch bump: the installed authority's IDENTITY changed,
         // captured directly by the send-path [`SendStamp`]
@@ -10508,7 +10567,7 @@ impl MeshNode {
         // the send-path [`SendStamp`] cannot observe indirectly —
         // bump its dedicated counter so a cached announcement
         // re-validates before its next send (review-11 P1).
-        self.emission_generation.fetch_add(1, Ordering::AcqRel);
+        advance_fenced_generation(&self.emission_generation, "emission_generation");
         Ok(())
     }
 
@@ -33133,8 +33192,7 @@ mod sensing_authority_witness_tests {
         node.org_revocation
             .store(Some(authority.revocation.clone()));
         node.node_authority.store(Some(authority));
-        node.org_install_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        advance_fenced_generation(&node.org_install_generation, "org_install_generation");
     }
 
     // C5/C6 — Org admission REQUIRES a pinned snapshot; supplying `None` is an
