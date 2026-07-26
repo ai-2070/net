@@ -11,9 +11,19 @@
 //! than of every existing fold query remembering to filter a scope dimension. A
 //! confidentiality leak would otherwise be one forgotten `WHERE scope = public`
 //! away; here an unscoped query physically cannot reach a scoped entry because
-//! it queries a different structure. The two named query surfaces
-//! ([`ScopedDiscoveryStore::find_capabilities_for_grant`] and
-//! [`ScopedDiscoveryStore::find_owner_private_capabilities`]) are the only way in.
+//! it queries a different structure.
+//!
+//! The way in is the SCOPE-FILTERED query surface of this module, and nothing
+//! else. It has grown past the original pair, so it is described by its property
+//! rather than enumerated (review-pass-3 §20g — the enumeration had gone stale
+//! and a stale enumeration of a security boundary is worse than none): every
+//! reader — [`ScopedDiscoveryStore::find_capabilities_for_grant`],
+//! [`ScopedDiscoveryStore::find_owner_private_capabilities`],
+//! [`ScopedDiscoveryState::find_owner_private_providers`] and
+//! [`ScopedDiscoveryState::find_scope_exact_private_providers`] — filters on the
+//! audience scope BEFORE returning anything, so no surface here can hand a
+//! caller an entry from a scope it did not name. Anything added later must keep
+//! that property; it is the whole of the partition.
 //!
 //! Entries arrive already verified and decrypted from the OA3-3 ingest authority
 //! ([`verify_scoped_ingest`](super::org_scoped_ingest::verify_scoped_ingest)); this

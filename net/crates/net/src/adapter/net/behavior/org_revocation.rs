@@ -1647,9 +1647,6 @@ impl OrgRevocationStore {
         self.core.generation.store(u64::MAX, Ordering::Release);
     }
 
-    /// Test-only: force one publication of the current view.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "fixtures"))]
     /// Test-only: arm the pre-`live.write()` acknowledgment hook, so a witness
     /// can prove a publisher REACHED the blocked acquisition rather than
     /// inferring it from elapsed time.

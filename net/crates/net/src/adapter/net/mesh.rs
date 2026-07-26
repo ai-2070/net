@@ -5565,11 +5565,8 @@ impl ScopedSlotSource {
             // An EXHAUSTED publication generation is unusable authority for the
             // same reason poison is: the generation can no longer distinguish
             // floor views, so it can no longer witness currentness. Folded into
-            // the same fail-closed flag (Kyra OLB-2B-E3c).
-            // An EXHAUSTED publication generation is unusable authority for the
-            // same reason poison is: the generation can no longer distinguish
-            // floor views, so it can no longer witness currentness. Sampled
-            // COHERENTLY with the generation it qualifies (Kyra OLB-2B-E3c).
+            // the same fail-closed flag, and sampled COHERENTLY with the
+            // generation it qualifies (Kyra OLB-2B-E3c).
             Some(store) => match store.barriered_generation() {
                 Ok(generation) => (store.is_poisoned(), generation.get()),
                 Err(_) => (true, 0),
@@ -5649,8 +5646,6 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
     }
 }
 
-/// Holds the publication gate across the conditional installation, and nothing
-/// more.
 /// Holds every authority input still, through the conditional installation AND
 /// the settlement beneath it.
 ///
@@ -10965,7 +10960,7 @@ impl MeshNode {
             let Ok((floors, _generation)) = store.snapshot_with_generation() else {
                 tracing::error!(
                     org = %cert.org_id,
-                    "owner-cert emission dark: revocation publication generation                      exhausted — the floor view's currentness can no longer be                      witnessed"
+                    "owner-cert emission dark: revocation publication generation \n                     exhausted — the floor view's currentness can no longer be \n                     witnessed"
                 );
                 return None;
             };
@@ -12454,9 +12449,18 @@ impl MeshNode {
         }
     }
 
-    /// Whether the routing plane is currently usable — a live incarnation has
-    /// completed a recapture. `false` while rebuilding and whenever fenced
-    /// (OLB-2B-E2).
+    /// Whether the routing plane has CONVERGED — a live incarnation completed a
+    /// recapture and the authority it built under can still prove currentness.
+    /// `false` while rebuilding and whenever fenced (OLB-2B-E2).
+    ///
+    /// Converged is not the same as serving (review-pass-3 §20a). Under steady
+    /// poison the design deliberately settles `Current` over an all-`Unserved`
+    /// reconstruction — witnessed by (25c) — so this reads `true` while every
+    /// warm read is cold at the seam. That is the intended shape: reconciliation
+    /// has caught up with an authority that currently serves nothing, which is a
+    /// different claim from "routes are available". Callers that need the second
+    /// one must read [`Self::org_authority_exhaustion`] and the seam's own
+    /// `None`, not this flag.
     ///
     /// Terminal authority exhaustion is checked INDEPENDENTLY of supervisor
     /// health (E3c blockers §2): the terminal advance restarts nothing, so a
@@ -21154,7 +21158,7 @@ impl MeshNode {
             Some(Err(_)) => {
                 tracing::error!(
                     from_node = format!("{:#x}", from_node),
-                    "scoped-ann: revocation publication generation exhausted;                      ingest refused — the floor view's currentness can no longer                      be witnessed"
+                    "scoped-ann: revocation publication generation exhausted; \n                     ingest refused — the floor view's currentness can no longer \n                     be witnessed"
                 );
                 // FINAL, not Retryable: unlike poison, exhaustion is terminal, so
                 // releasing the dedup identity would only invite the same refusal

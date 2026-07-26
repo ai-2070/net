@@ -225,8 +225,8 @@ async fn provider_with_expired_cert_cannot_admit() {
     // shorter than that advance proves exactly the same thing. Five minutes is
     // far past any plausible fsync stall while staying an hour short of the
     // sample.
-    let cert = OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 300)
-        .expect("issue cert");
+    let cert =
+        OrgMembershipCert::try_issue(&org(), node.entity_id().clone(), 1, 300).expect("issue cert");
     let authority = NodeAuthority::adopt(&dir, cert, node.entity_id(), 0, None).expect("adopt");
     node.install_node_authority(Arc::new(authority))
         .expect("install");
