@@ -234,8 +234,8 @@ impl SlotSource for PausingSource {
         }
         Some(pin)
     }
-    fn terminal(&self) -> bool {
-        self.inner.terminal()
+    fn liveness(&self) -> crate::adapter::net::behavior::org_routing_registry::SourceLiveness {
+        self.inner.liveness()
     }
 }
 
@@ -1159,6 +1159,136 @@ async fn terminal_exhaustion_retires_max_stamped_facts_and_fences_readiness() {
         "and the pass DISCARDS rather than re-queues — no terminal spin"
     );
     assert!(registry.base_facts(&late).is_none());
+}
+
+/// (11c4) The STORE-GENERATION arm of the exhaustion fence (review-pass-3 §1):
+/// an exhausted publication generation makes settlement impossible, so the pass
+/// must park rather than spin — and because the condition is RECOVERABLE, it must
+/// park without losing the queue.
+///
+/// This arm is not the authority arm and cannot be fenced by it. The folded
+/// `(poisoned = true, floor_generation = 0)` view is SELF-CONSISTENT across
+/// passes, so `pin_if_current` ACCEPTS every time; only `ScopedCommitPin::matches`
+/// refuses, at the phase-5 settlement. Before this closure that branch re-queued
+/// AND re-marked, so the actor re-snapshotted, re-built, re-pinned and re-failed
+/// at `yield_now` rate forever, with no source movement required at all.
+#[tokio::test]
+async fn an_exhausted_store_generation_parks_apply_without_spinning_and_recovers() {
+    use crate::adapter::net::behavior::org_routing::{ApplyOutcome, ApplyRequest, DirtyApply};
+    use crate::adapter::net::behavior::org_routing_registry::SourceLiveness;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("store-generation-fence", &node);
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+    let registry = node.routing_registry.clone();
+    registry.activate_incarnation(1);
+
+    let family = registry.new_family().expect("family");
+    let key = slot(27, "nrpc:store-generation-fence");
+    let _held = family.demand(key.clone()).expect("demand");
+    let request = ApplyRequest {
+        batch: PrivateDiscoveryChangeBatch {
+            generation: 0,
+            dirty: DirtyCapabilities::Clean,
+        },
+        registry_work: true,
+    };
+    assert!(matches!(
+        registry.apply(1, request.clone()),
+        ApplyOutcome::Current { .. }
+    ));
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "precondition: the slot is warm through the production seam"
+    );
+
+    // Park the store's publication generation at the ceiling and republish, so
+    // the LIVE view is the exhausted one.
+    store.saturate_generation_for_test();
+    store.republish_for_test();
+    assert_eq!(
+        store.barriered_generation().err(),
+        Some(crate::adapter::net::behavior::org_revocation::GenerationExhausted)
+    );
+
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
+        unserved_scope: node.routing_unserved_scope.clone(),
+    };
+    assert_eq!(
+        source.liveness(),
+        SourceLiveness::Fenced,
+        "recoverable, not terminal: a replacement install retires it"
+    );
+    assert!(
+        !node.routing_authority.is_exhausted(),
+        "and the AUTHORITY latch is untouched — this is the other arm"
+    );
+
+    // Re-queue the slot and clear the wake flag, so what the pass does to it is
+    // the only thing the assertions below can be reading.
+    registry.invalidate_for_test(&key);
+    node.routing_work.take_for_test();
+
+    for pass in 0..3 {
+        assert_eq!(
+            registry.apply(1, request.clone()),
+            ApplyOutcome::Superseded,
+            "pass {pass}: nothing settles against an exhausted publication generation"
+        );
+        assert_eq!(
+            registry.pending_slots(),
+            1,
+            "pass {pass}: the identity stays OWED — the fence is recoverable"
+        );
+        assert!(
+            !node.routing_work.take_for_test(),
+            "pass {pass}: and the pass must NOT re-arm itself — that is the livelock"
+        );
+    }
+    assert!(
+        node.org_routing_base_facts(&key).is_none(),
+        "service is cold while the fence holds"
+    );
+
+    // RECOVERY: a replacement store install swaps the store and advances the
+    // routing epoch as one movement. That movement owns the wake.
+    let replacement = Scratch::new("store-generation-fence-b", &node);
+    node.install_org_revocation_store(replacement.store())
+        .expect("replacement install");
+    assert_eq!(
+        source.liveness(),
+        SourceLiveness::Live,
+        "the fence lifts with the store that raised it"
+    );
+    assert!(
+        node.routing_work.take_for_test(),
+        "and the movement supplied the wake the parked pass deliberately did not"
+    );
+
+    assert!(
+        matches!(
+            registry.apply(1, request),
+            ApplyOutcome::Current { .. } | ApplyOutcome::Progress { .. }
+        ),
+        "the preserved queue is what lets the successor pass rebuild"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "and service is warm again — the fence cost promptness, not the slot"
+    );
 }
 
 /// (11d) A delayed reader that finds ITS artifact stale must not delete a newer

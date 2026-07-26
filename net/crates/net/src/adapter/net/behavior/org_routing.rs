@@ -145,6 +145,14 @@ impl RegistryWork {
     fn take(&self) -> bool {
         self.pending.swap(false, Ordering::AcqRel)
     }
+
+    /// Test-only: consume the pending flag from OUTSIDE the actor loop, so a
+    /// witness can assert that a following `apply` did or did not re-arm it.
+    /// Observing "no spin" needs the flag to start clear.
+    #[cfg(test)]
+    pub(crate) fn take_for_test(&self) -> bool {
+        self.take()
+    }
 }
 
 /// What woke this application attempt. Carries BOTH trigger domains, so a demand

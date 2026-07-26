@@ -287,16 +287,64 @@ pub(crate) trait SlotSource: Send + Sync + 'static {
     /// taken, never while holding it — see the module's frozen lock order.
     fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>>;
 
-    /// Whether this source's authority is TERMINALLY unusable — no future
-    /// snapshot of it can ever pin again (E3c blockers §2).
+    /// Whether this source can still settle a commit, and if it cannot, whether
+    /// that is recoverable (E3c blockers §2, review-pass-3 §1).
     ///
-    /// `false` for every recoverable refusal: poison, floor movement and store
-    /// swaps all own a later wake, so a failed pin correctly re-queues against
-    /// them. A terminal authority owns no wake — re-queueing against it is a
-    /// promise of work that can never complete, and the mark that re-arms the
-    /// actor turns that promise into a spin.
-    fn terminal(&self) -> bool {
-        false
+    /// [`SourceLiveness::Live`] for every ORDINARY refusal: poison, floor
+    /// movement and store swaps all own a later wake, so a failed pin correctly
+    /// re-queues AND re-marks against them.
+    fn liveness(&self) -> SourceLiveness {
+        SourceLiveness::Live
+    }
+}
+
+/// Whether a [`SlotSource`] can settle, and — when it cannot — who owns the wake
+/// that ends the condition (E3c blockers §2, review-pass-3 §1).
+///
+/// The distinction exists because the two unsettleable states differ in exactly
+/// one way that matters to the work queue: whether a re-queued identity is a
+/// promise that can eventually be kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceLiveness {
+    /// Ordinary operation. A pin can be taken and a settlement can succeed; a
+    /// refusal is movement, and movement owns a wake.
+    Live,
+    /// No pin can settle until an EXTERNAL authority movement retires the
+    /// condition — the exhausted publication generation of an installed
+    /// revocation store, which a replacement install retires by swapping the
+    /// store and advancing the routing epoch.
+    ///
+    /// Retained work stays OWED in `pending`, because the movement that clears
+    /// the condition can and will complete it. Nothing is marked: the actor
+    /// parks, and that same movement supplies the wake. Marking here instead is
+    /// precisely the yield-paced livelock review-pass-3 §1 names — the folded
+    /// `(poisoned, floor_generation)` view is STABLE under exhaustion, so the
+    /// pin succeeds on every pass and the settlement refuses on every pass, with
+    /// no source movement required at all.
+    Fenced,
+    /// The identity space itself is spent: no future pin can EVER settle.
+    ///
+    /// Queued work is a promise that cannot be kept, so it is discarded rather
+    /// than re-queued, and the retained facts were already retired at the
+    /// transition by [`NodeOrgRoutingRegistry::retire_terminal`].
+    Terminal,
+}
+
+impl SourceLiveness {
+    /// May a refusal against this source re-arm the actor?
+    ///
+    /// Only ordinary movement owns a wake. Both unsettleable states must park.
+    fn may_self_wake(self) -> bool {
+        matches!(self, Self::Live)
+    }
+
+    /// May a refusal against this source keep the selected identities owed?
+    ///
+    /// `Fenced` is recoverable, so the queue is preserved across it — losing it
+    /// would leave the slots cold with nothing left to rebuild them once the
+    /// replacement store lands.
+    fn may_requeue(self) -> bool {
+        !matches!(self, Self::Terminal)
     }
 }
 
@@ -989,37 +1037,38 @@ impl DirtyApply for NodeOrgRoutingRegistry {
 
         // --- phase 4: the COMMIT pin, before the registry lock ---
         let Some(commit) = self.source.pin_if_current(&snapshot_token) else {
-            // TERMINAL refusal is not movement (E3c blockers §2): no future pin
-            // over this source can ever succeed, so a re-queue is unkeepable
-            // and the mark below would spin the actor on `Superseded` until
-            // shutdown. Discard the build and park; `retire_terminal` already
-            // cleared everything retained at the transition.
-            if self.source.terminal() {
-                self.metrics
-                    .discarded_obsolete
-                    .fetch_add(built.len() as u64, Ordering::AcqRel);
-                return ApplyOutcome::Superseded;
-            }
-            // The source moved while we rebuilt. Install nothing, and put every
-            // still-live selected slot back.
+            // An UNSETTLEABLE refusal is not movement (E3c blockers §2,
+            // review-pass-3 §1): the mark below would spin the actor on
+            // `Superseded` until shutdown, because nothing has to move for the
+            // next pass to refuse identically. `Terminal` additionally discards
+            // the queue — a rebuild could never install again, and
+            // `retire_terminal` already cleared everything retained at the
+            // transition.
+            let liveness = self.source.liveness();
             let mut inner = self.inner.lock();
-            for (key, slot_incarnation, _) in &built {
-                if inner
-                    .slots
-                    .get(key)
-                    .is_some_and(|slot| slot.incarnation == *slot_incarnation)
-                {
-                    inner.pending.insert(key.clone());
+            if liveness.may_requeue() {
+                // Install nothing, and put every still-live selected slot back.
+                for (key, slot_incarnation, _) in &built {
+                    if inner
+                        .slots
+                        .get(key)
+                        .is_some_and(|slot| slot.incarnation == *slot_incarnation)
+                    {
+                        inner.pending.insert(key.clone());
+                    }
                 }
             }
             self.metrics
                 .discarded_obsolete
                 .fetch_add(built.len() as u64, Ordering::AcqRel);
             drop(inner);
-            // The movement itself owns a source-watch wake, but that wake alone
-            // carries no `registry_work` flag — and without it the requeued
-            // identities would not be unioned into the next pass's targets. Mark.
-            self.work.mark();
+            if liveness.may_self_wake() {
+                // The movement itself owns a source-watch wake, but that wake
+                // alone carries no `registry_work` flag — and without it the
+                // requeued identities would not be unioned into the next pass's
+                // targets. Mark.
+                self.work.mark();
+            }
             return ApplyOutcome::Superseded;
         };
         let epoch = commit.epoch();
@@ -1104,20 +1153,32 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             let settled = commit
                 .settle_if_current(&mut || settle(&mut inner, incarnation, epoch, &self.metrics));
             let Some(settled) = settled else {
-                for (key, slot_incarnation) in &selected {
-                    if inner
-                        .slots
-                        .get(key)
-                        .is_some_and(|slot| slot.incarnation == *slot_incarnation)
-                    {
-                        inner.pending.insert(key.clone());
+                // The settlement — not the pin — is where an exhausted store
+                // publication generation refuses (review-pass-3 §1). The folded
+                // `(poisoned = true, floor_generation = 0)` view is SELF-CONSISTENT
+                // across passes, so `pin_if_current` accepts every time and only
+                // `matches()` can say no. Re-queueing plus a mark here is therefore
+                // a spin that requires no source movement at all: park instead, and
+                // let the replacement store install supply the wake.
+                let liveness = self.source.liveness();
+                if liveness.may_requeue() {
+                    for (key, slot_incarnation) in &selected {
+                        if inner
+                            .slots
+                            .get(key)
+                            .is_some_and(|slot| slot.incarnation == *slot_incarnation)
+                        {
+                            inner.pending.insert(key.clone());
+                        }
                     }
                 }
                 self.metrics
                     .stale_actor_rejections
                     .fetch_add(1, Ordering::AcqRel);
                 drop(inner);
-                self.work.mark();
+                if liveness.may_self_wake() {
+                    self.work.mark();
+                }
                 return ApplyOutcome::Superseded;
             };
 

@@ -5696,12 +5696,36 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         }))
     }
 
-    fn terminal(&self) -> bool {
-        // Only the authority-epoch latch is terminal. Poison, floor movement
-        // and store swaps all own a later wake; generation exhaustion is store
-        // state a replacement install can retire. This latch alone can never
-        // be left.
-        self.authority.is_exhausted()
+    fn liveness(&self) -> super::behavior::org_routing_registry::SourceLiveness {
+        use super::behavior::org_routing_registry::SourceLiveness;
+        // Only the authority-epoch latch is TERMINAL: it is node-owned, monotone
+        // and has no successor identity to move to. Nothing can retire it.
+        if self.authority.is_exhausted() {
+            return SourceLiveness::Terminal;
+        }
+        // The installed store's publication generation is the OTHER way a
+        // settlement becomes impossible, and it is the one review-pass-3 §1
+        // names: `revocation_view_of` folds exhaustion into the STABLE
+        // `(poisoned = true, floor_generation = 0)` view, so the token compares
+        // equal pass after pass and `pin_if_current` ACCEPTS — while
+        // `ScopedCommitPin::matches` refuses on `Err(GenerationExhausted)`
+        // forever. Without this signal the actor re-snapshots, re-pins, re-fails
+        // and re-marks itself awake at `yield_now` rate, with no source movement
+        // required at all.
+        //
+        // FENCED, not terminal: this is store state, and a replacement install
+        // both swaps the store and advances the routing epoch, after which this
+        // reads `Live` again and the invalidation that movement performs supplies
+        // the wake. So the queue is kept and only the self-wake is suppressed.
+        if self
+            .org_revocation
+            .load()
+            .as_ref()
+            .is_some_and(|store| store.barriered_generation().is_err())
+        {
+            return SourceLiveness::Fenced;
+        }
+        SourceLiveness::Live
     }
 }
 

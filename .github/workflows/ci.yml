@@ -93,8 +93,11 @@ jobs:
       # source rather than retrying forever, that an empty-raise poison MARK
       # wakes routing as proactively as the clear does, and that terminal
       # authority exhaustion retires its MAX-stamped facts and fences readiness
-      # independently of supervisor health. Losing any of them silently would be
-      # worse than losing them loudly.
+      # independently of supervisor health -- plus, since review-pass-3, that the
+      # OTHER exhaustion arm (an exhausted store publication generation, which
+      # the pin ACCEPTS and only the settlement refuses) parks the actor without
+      # spinning and without losing its queue. Losing any of them silently would
+      # be worse than losing them loudly.
       #
       # NOTE: they are gated `#[cfg(test)]`, NOT `feature = "fixtures"` —
       # `$UNIT_FEATURES` deliberately excludes `fixtures`, so a fixtures gate
@@ -103,7 +106,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=34
+          MIN=35
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -131,6 +134,7 @@ jobs:
           an_exhausted_store_generation_stops_certified_emission
           an_exhausted_authority_epoch_fences_rather_than_aliasing
           terminal_exhaustion_retires_max_stamped_facts_and_fences_readiness
+          an_exhausted_store_generation_parks_apply_without_spinning_and_recovers
           an_unserved_scope_reads_cold_rather_than_authoritatively_empty"
           for required in $REQUIRED; do
             if ! printf "%s" "$out" | grep -q "$required"; then
