@@ -1728,6 +1728,14 @@ impl OrgRevocationStore {
     /// OLD generation. Admission stamping must use
     /// [`Self::barriered_generation`] / [`Self::snapshot_with_generation`]
     /// instead — see their docs (OA2-E1 Kyra review).
+    ///
+    /// Demoted from `pub` and marked dead-code-tolerant rather than deleted
+    /// (review-pass-3 §12): it has no production caller — which is exactly why it
+    /// was dangerous to export, since the only use a caller could invent for a
+    /// bare unbarriered `u64` with no exhaustion signal is the currentness
+    /// decision the paragraph above forbids. It survives as the contrast case the
+    /// barrier witnesses assert against.
+    #[allow(dead_code)]
     pub(crate) fn publish_generation(&self) -> u64 {
         self.core.generation.load(Ordering::Acquire)
     }
