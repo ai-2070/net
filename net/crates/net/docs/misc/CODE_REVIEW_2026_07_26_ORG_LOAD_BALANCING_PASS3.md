@@ -559,3 +559,135 @@ valid-immediately assertion too.
   223/223 `sensing::` lib unit tests.
 - `org_admission_gate`: 8/8 in isolation; one setup flake under cold parallel
   load (§22).
+
+---
+
+## Disposition — corrective descendant of 2026-07-26 (`ceb88ed47` → `87aa71960` → `52c667d62`)
+
+Worked against the **Fix now** gate above. Marked exactly: closed is closed,
+partial is partial. The gate is NOT yet satisfied — two residuals remain, and
+E3c / composed OLB-2B stays HELD until they land.
+
+| Gate item | Status | Where |
+|---|---|---|
+| 1 — empty-raise poison MARK publishes the authority-change notification | **Closed** | `87aa71960` |
+| 2 — quiescent terminal fence on exhaustion | **Closed for ROUTING-AUTHORITY exhaustion; OPEN for STORE-GENERATION exhaustion** | `ceb88ed47` / — |
+| 3 — empty-selection `Superseded` returns mark authoritative `RegistryWork` (§2) | **OPEN** | — |
+| 4 — contention-observed acks, bounded recovery witnesses, CI name-pins | **Closed** for everything that exists; the empty-selection witness pin lands with item 3 | `52c667d62` |
+
+### Item 1 (and §2's poison-mark trigger) — closed at `87aa71960`
+
+`mark_poisoned` (path registry and core) now returns the false→true
+transition, computed under the poison-registry lock; `apply_bundle`'s
+`DurabilityUncertain` arm calls `notify_authority_changed()` iff
+`newly && raised.is_empty()`, after every guard is released. Both guards are
+witnessed: the raising-mark leg asserts the epoch moved by EXACTLY one (no
+double bump), and a re-mark of an already-poisoned path reports no
+transition. Injection is a one-shot `#[cfg(test)]`
+`arm_forced_post_rename_for_test` seam that reports `PostRename` while
+leaving the file at its prior bytes — required on Windows, where the phase is
+production-unreachable (write-through rename, §13), and it models the
+entry-rollback uncertainty exactly. Witness (28b)
+`a_poison_mark_that_raises_no_floor_wakes_routing_without_a_reader` is
+otherwise all production paths (raising mark → steady-poison convergence →
+real `open_existing` recovery, proving the live view never weakens across a
+reread of older disk bytes → the empty-raise mark → retire/re-queue with no
+reader → successor `Current`-over-`Unserved`). RED: wake disabled → fails at
+the wake assert. The init-create `PostRename` path deliberately stays
+wake-free, documented at the site (no subscribers exist there; a live
+same-path sibling is repaired by the read-time epoch comparison).
+
+Note for §2: this removes only the POISON-MARK member of §2's
+authority-only-movement family. On an empty registry the wake still ends at
+`invalidate_authority_older_than`'s empty-pending no-op — §2's strand stands.
+
+### Item 2 — routing-authority arm closed at `ceb88ed47`; store-generation arm OPEN
+
+Closed, for the routing-epoch latch:
+`advance() -> AuthorityAdvance::{Advanced, NewlyExhausted, AlreadyExhausted}`
+(`#[must_use]`; latch by `swap`, so the transition is reported to exactly one
+caller). `NewlyExhausted` → `NodeOrgRoutingRegistry::retire_terminal()`:
+drops every retained fact UNCONDITIONALLY on the stamped epoch (the
+equal-MAX stamps are precisely what `invalidate_authority_older_than(MAX)`
+structurally spares), clears `pending`, closes any open recapture, marks
+nothing. `SlotSource::terminal()` (default `false`; production =
+`authority.is_exhausted()`) lets apply's failed-pin path DISCARD without
+re-queue or mark, so work queued after the transition parks rather than
+spinning — the self-waking half of §1's livelock, for this arm.
+`org_routing_ready()` requires `!is_exhausted()` independently of supervisor
+health. Witness (11c3)
+`terminal_exhaustion_retires_max_stamped_facts_and_fences_readiness` drives
+the transition through a production store install at the parked ceiling;
+three RED probes (old invalidation, readiness gate removed, terminal branch
+disabled) each fail at their coupled assert. (11c) additionally pins the
+once-only transition report.
+
+**OPEN — the STORE-GENERATION arm of §1 is untouched.** Its livelock
+mechanism is different and `terminal()` never sees it: the folded
+`(poisoned = true, floor_generation = 0)` view is stable, so the PIN
+SUCCEEDS every pass, `ScopedCommitPin::matches` refuses on
+`Err(GenerationExhausted)`, and the phase-5 settle-`None` branch
+(`org_routing_registry.rs`, requeue + `work.mark()`) re-arms the actor
+indefinitely. Fix shape for the next descendant, to adjudicate against the
+frozen invariants: fold the live store's generation-exhaustion latch into
+the source's terminal signal (still recoverable — a replacement store
+install advances the epoch and swaps the store, after which `terminal()`
+reads false and the actor resumes), and give the phase-5 settle-`None`
+branch the same terminal discard-don't-requeue treatment the phase-4 pin
+refusal got. The required store-generation actor witness (drive
+`registry.apply` against a generation-exhausted source; no spin, no
+resurrection, cold service) does not exist yet.
+
+### Item 3 (§2) — OPEN, with a composition constraint the next descendant must honor
+
+Not started. One new constraint from this round: the empty-selection marks
+must be SUPPRESSED when the source is terminal (`terminal()` true), or item
+3 re-opens the exact self-waking spin item 2's fence just closed — on a
+terminal empty registry, probe → pin refused → mark → wake → probe forever.
+Whoever lands §2's fix must keep (11c3) green and add the adjudicated
+witness: empty registry, authority moved inside the probe→settle window,
+re-driven pass settles and health reaches `Healthy`.
+
+### Item 4 — closed at `52c667d62`, with one strengthening beyond the ask
+
+`lock_poison_gate` is try-then-block with two distinct test hooks: the
+BLOCKING hook keeps its pre-attempt position (the placement rendezvous (27)
+needs to stage its pin), and a new CONTENDED hook fires only when the try
+OBSERVED the gate held. (25)/(27) sequence on the contended ack, and both
+250ms negative waits became deterministic `try_recv`s.
+
+Beyond the ask: RED-probing the new shape surfaced that (25)'s observables
+(`done`, `poisoned`) flip when the contender RETURNS — which still waits for
+the gate even when the registry mutation itself is moved outside it — so an
+ungated mark landing inside the settle gap PASSED the witness (and would
+have passed the pre-rework witness for the same reason). (25) now asserts
+the FACT (`!store.is_poisoned()`) inside the gap. RED: registry mutation
+hoisted before the gate in mark → (25) fails at the fact assert; in clear →
+(27) fails at the immobility assert.
+
+(28)/(29)/(28b) recovery opens run under 10 s `tokio::time::timeout`. CI:
+MIN 32→34; REQUIRED now pins
+`steady_poison_settles_current_over_an_unserved_source` (25c), (28b) and
+(11c3). The empty-selection witness pin is owed with item 3.
+
+### Incidental closures in this round
+
+- §20(b) — the orphaned "Record that routing authority moved…" block above
+  `org_routing_ready` was removed at `ceb88ed47` (its replacement documents
+  the health-independent exhaustion fence). The REST of §20 — including (a),
+  whose "currently usable" complaint applies to the rewritten doc too — is
+  untouched.
+
+### Everything else
+
+Unchanged by this round, per the adjudication's tiers: §3/§5/§6/§7/§12/§15
+(before OLB-2C), pass-2 §2/§4/§9/§17 (OLB-3 prerequisites), and the
+§8/§10–§11/§13–§14/§16/§18–§22 merge-tier items.
+
+### Test evidence (this round; Windows host)
+
+All-features lib 5,483 / 1 ignored; `$UNIT_FEATURES` lib 5,426 / 1; wiring
+suite 34 under the exact CI gate command; `org_admission_gate` 9,
+`org_ownership` 32, `sensing_org_three_node` 1 under `cortex tool fixtures`;
+three clippy gates, fmt and diff-check clean. Six RED probes total, each
+reverted after failing at its coupled assertion.
