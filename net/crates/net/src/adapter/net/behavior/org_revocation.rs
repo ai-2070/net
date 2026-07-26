@@ -496,6 +496,24 @@ struct StoreCore {
     /// cleared by a successful locked reread. Exhaustion is not recoverable
     /// in-process: clearing it would hand out an identity already in use.
     generation_exhausted: AtomicBool,
+    /// Serializes POISON transitions on this core against readers that must hold
+    /// poison immobile.
+    ///
+    /// Poison is a path-registry write, not a view publication, so `live` does
+    /// not order it. A consumer whose decision is itself load-bearing — the
+    /// routing commit pin, whose `Current` causes `Healthy` — must be able to
+    /// hold poison still across its validation AND its settlement, or the two
+    /// remain independently interleavable (Kyra OLB-2B-E3c).
+    ///
+    /// FROZEN ORDER: `poison_gate` → `live`. Every poison transition on a live
+    /// core takes this before any later `live.write()`, and every pin takes it
+    /// before `live.read()`, so no cycle is reachable.
+    poison_gate: Mutex<()>,
+    /// Test-only: fired immediately before a publish attempts `live.write()`, so
+    /// a witness can acknowledge that a publisher REACHED the blocked
+    /// acquisition instead of inferring it from elapsed time.
+    #[cfg(test)]
+    publish_blocking_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Raise subscribers, each with a removable token. A REGISTRY,
     /// not a single slot (review-9 addendum): registering a second
     /// observer must never silently steal the first one's
@@ -542,6 +560,13 @@ impl StoreCore {
     /// the per-key max with the outgoing view makes "an installed
     /// floor never lowers" structural rather than assumed.
     fn publish(&self, mut next: OrgRevocationState) -> Vec<RaisedFloor> {
+        #[cfg(test)]
+        {
+            let hook = self.publish_blocking_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let mut live = self.live.write();
         // §15 — the per-key max keeps the LIVE view safe, but silently
         // absorbing a weaker incoming state hides the fact that DISK is now
@@ -1030,6 +1055,9 @@ fn join_or_create_core(
         live: RwLock::new(Arc::new(disk)),
         generation: AtomicU64::new(0),
         generation_exhausted: AtomicBool::new(false),
+        poison_gate: Mutex::new(()),
+        #[cfg(test)]
+        publish_blocking_hook: Mutex::new(None),
         subscribers: RwLock::new(Vec::new()),
         next_subscriber: AtomicU64::new(0),
         #[cfg(any(test, feature = "fixtures"))]
@@ -1086,15 +1114,15 @@ pub(crate) fn publish_guard_pair<'a>(
         _guards: vec![g1, g2],
     }
 }
-/// Holds the store's publication barrier open.
+/// Holds this store's authority IMMOBILE.
 ///
-/// While alive, floor publication is BLOCKED. Poison can still be marked (it is a
-/// separate path-registry write), so it is re-sampled through the guard rather
-/// than assumed frozen — but in the real durability path a poison mark is always
-/// followed by a publication, which this guard blocks, so the accompanying view
-/// change cannot land either.
+/// While alive, both floor publication and poison transitions are blocked:
+/// publication needs `live.write()`, and every poison transition on a live core
+/// takes `poison_gate`. That is what lets a consumer validate and then act as ONE
+/// operation rather than two interleavable steps (Kyra OLB-2B-E3c).
 pub struct PublicationPin<'a> {
     core: &'a StoreCore,
+    _poison: parking_lot::MutexGuard<'a, ()>,
     _live: parking_lot::RwLockReadGuard<'a, Arc<OrgRevocationState>>,
 }
 
@@ -1452,6 +1480,18 @@ impl OrgRevocationStore {
     /// Test-only: force one publication of the current view.
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
+    /// Test-only: arm the pre-`live.write()` acknowledgment hook, so a witness
+    /// can prove a publisher REACHED the blocked acquisition rather than
+    /// inferring it from elapsed time.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn arm_publish_blocking_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.core.publish_blocking_hook.lock() = Some(hook);
+    }
+
+    /// Test-only: force one publication of the current view.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn republish_for_test(&self) {
         let current = (*self.core.live.read()).as_ref().clone();
         self.core.publish(current);
@@ -1467,6 +1507,7 @@ impl OrgRevocationStore {
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
     pub fn mark_poisoned_for_test(&self) {
+        let _gate = self.core.poison_gate.lock();
         mark_poisoned(&self.core.backing_id, &self.core.path);
     }
 
@@ -1520,9 +1561,13 @@ impl OrgRevocationStore {
     /// cannot deadlock against a callback that takes the routing authority gate.
     /// Hold it briefly and never across an await.
     pub fn pin_publication(&self) -> PublicationPin<'_> {
+        // Poison gate BEFORE the view barrier: `apply_bundle` marks poison and
+        // only then publishes, so the reverse order would deadlock against it.
+        let poison = self.core.poison_gate.lock();
         let live = self.core.live.read();
         PublicationPin {
             core: &self.core,
+            _poison: poison,
             _live: live,
         }
     }
@@ -1794,7 +1839,12 @@ impl OrgRevocationStore {
                         // instance may pretend disk and memory are
                         // synchronized until recovery proves the
                         // entry durable.
-                        mark_poisoned(&self.core.backing_id, path);
+                        {
+                            // Ordered BEFORE the publish below, matching the
+                            // frozen `poison_gate` → `live` order.
+                            let _gate = self.core.poison_gate.lock();
+                            mark_poisoned(&self.core.backing_id, path);
+                        }
                         durability_uncertain = Some(reason);
                     }
                 }

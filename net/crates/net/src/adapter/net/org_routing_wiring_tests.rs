@@ -751,8 +751,15 @@ impl Scratch {
     fn path(&self) -> &std::path::Path {
         &self.0
     }
-    fn new(tag: &str, _node: &MeshNode) -> Self {
-        let path = std::env::temp_dir().join(format!("olb-{tag}-{}", std::process::id()));
+    fn new(tag: &str, node: &MeshNode) -> Self {
+        // Entity component restored for collision isolation; truncated because
+        // the full id pushes the authority `.lock` path past the Windows limit.
+        let entity = format!("{}", node.entity_id());
+        let path = std::env::temp_dir().join(format!(
+            "olb-{tag}-{}-{}",
+            std::process::id(),
+            &entity[..entity.len().min(8)]
+        ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("scratch dir");
         Self(path)
@@ -1674,11 +1681,18 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
     let published = Arc::new(AtomicBool::new(false));
     let entered = Arc::new(AtomicBool::new(false));
     let publisher: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    // `Receiver` is Send but not Sync, and the gap hook is an `Fn`.
+    let reached = Arc::new(parking_lot::Mutex::new(reached_rx));
+    store.arm_publish_blocking_hook(Arc::new(move || {
+        let _ = reached_tx.try_send(());
+    }));
     {
         let store = store.clone();
         let published = published.clone();
         let entered = entered.clone();
         let publisher = publisher.clone();
+        let reached = reached.clone();
         *source.settle_gap_hook.lock() = Some(Arc::new(move || {
             entered.store(true, Ordering::Release);
             let store = store.clone();
@@ -1687,10 +1701,13 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
                 store.republish_for_test();
                 landed.store(true, Ordering::Release);
             }));
-            // Give the publisher every chance to win. It cannot: the barrier is
-            // held across the validation AND the settlement, and
-            // `StoreCore::publish` needs `live.write()`.
-            std::thread::sleep(Duration::from_millis(150));
+            // Wait for the publisher to REACH the blocked `live.write()`, not for
+            // an interval — elapsed time also "passes" on a scheduler that never
+            // got there (Kyra OLB-2B-E3c).
+            reached
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the publisher must reach the blocked live.write()");
             assert!(
                 !published.load(Ordering::Acquire),
                 "a floor publication landed between the validation and the                  settlement — they are separately interleavable"
@@ -1733,13 +1750,16 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
     );
 }
 
-/// (25) Poison moving after the pin is taken cannot produce a stale `Current`.
+/// (25) Poison cannot occupy the gap between the final validation and the
+/// settlement.
 ///
-/// The symmetric case to the floor witness. Poison is a separate path-registry
-/// write the publication barrier does not block, so it is genuinely re-sampled
-/// as part of the same guarded operation.
-#[tokio::test]
-async fn poison_after_the_pin_cannot_settle_current() {
+/// Poison is a path-registry write that `live` does not order, so the
+/// publication barrier alone leaves the validation and the settlement
+/// independently interleavable. The pin therefore holds the store's POISON GATE
+/// too, and a poison transition launched inside the gap must block — `Current` is
+/// what causes the supervisor to publish `Healthy` (Kyra OLB-2B-E3c).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn poison_cannot_occupy_the_gap_between_validation_and_settlement() {
     use crate::adapter::net::behavior::org_routing::{
         ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
     };
@@ -1750,6 +1770,99 @@ async fn poison_after_the_pin_cannot_settle_current() {
 
     let node = node().await;
     let scratch = Scratch::new("settle-poison", &node);
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
+        unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    };
+
+    let poisoned = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let contender: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+    {
+        let store = store.clone();
+        let poisoned = poisoned.clone();
+        let entered = entered.clone();
+        let contender = contender.clone();
+        *source.settle_gap_hook.lock() = Some(Arc::new(move || {
+            entered.store(true, Ordering::Release);
+            let store = store.clone();
+            let landed = poisoned.clone();
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+            *contender.lock() = Some(std::thread::spawn(move || {
+                // Acknowledge immediately BEFORE contending for the poison gate.
+                let _ = started_tx.send(());
+                store.mark_poisoned_for_test();
+                landed.store(true, Ordering::Release);
+            }));
+            started_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the contender must reach the poison gate");
+            std::thread::sleep(Duration::from_millis(120));
+            assert!(
+                !poisoned.load(Ordering::Acquire),
+                "poison landed between the validation and the settlement — they \
+                 are separately interleavable"
+            );
+        }));
+    }
+
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(Arc::new(source), work.clone(), Arc::default());
+    registry.activate_incarnation(1);
+
+    let family = registry.new_family().expect("family");
+    let key = slot(20, "nrpc:settle-poison");
+    let _held = family.demand(key.clone()).expect("demand");
+    let outcome = registry.apply(
+        1,
+        ApplyRequest {
+            batch: PrivateDiscoveryChangeBatch {
+                generation: 0,
+                dirty: DirtyCapabilities::Clean,
+            },
+            registry_work: true,
+        },
+    );
+
+    assert!(
+        entered.load(Ordering::Acquire),
+        "the gap must have been entered"
+    );
+    if let Some(handle) = contender.lock().take() {
+        handle.join().expect("contender");
+    }
+    assert!(
+        poisoned.load(Ordering::Acquire),
+        "poison must land once the pin is released"
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Current { .. }),
+        "the settlement was protected, so it is sound: {outcome:?}"
+    );
+}
+
+/// (25b) Poison completing BEFORE the validation is detected: the pass reports
+/// `Superseded` and re-queues rather than settling.
+#[tokio::test]
+async fn poison_before_the_validation_is_detected() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("poison-early", &node);
     let store = scratch.store();
     node.install_org_revocation_store(store.clone())
         .expect("install");
@@ -1775,7 +1888,7 @@ async fn poison_after_the_pin_cannot_settle_current() {
     registry.activate_incarnation(1);
 
     let family = registry.new_family().expect("family");
-    let key = slot(20, "nrpc:settle-poison");
+    let key = slot(21, "nrpc:poison-early");
     let _held = family.demand(key.clone()).expect("demand");
     let request = ApplyRequest {
         batch: PrivateDiscoveryChangeBatch {
@@ -1790,24 +1903,94 @@ async fn poison_after_the_pin_cannot_settle_current() {
     ));
     registry.invalidate_for_test(&key);
 
-    let poisoned = Arc::new(AtomicBool::new(false));
+    let landed = Arc::new(AtomicBool::new(false));
     {
         let store = store.clone();
-        let poisoned = poisoned.clone();
+        let landed = landed.clone();
         *after_pin.lock() = Some(Box::new(move || {
             store.mark_poisoned_for_test();
-            poisoned.store(true, Ordering::Release);
+            landed.store(true, Ordering::Release);
         }));
     }
 
     let outcome = registry.apply(1, request);
-    assert!(poisoned.load(Ordering::Acquire), "poison must have landed");
+    assert!(landed.load(Ordering::Acquire), "poison must have landed");
     assert_eq!(
         outcome,
         ApplyOutcome::Superseded,
-        "poison moving under the pin must NOT settle Current"
+        "poison completing before the validation must NOT settle Current"
     );
     assert_eq!(registry.pending_slots(), 1, "and must re-queue");
+}
+
+/// (25c) Under STEADY poison, a retry settles `Current` over an entirely
+/// `Unserved` source — and every slot reads cold.
+///
+/// This pins the contract deliberately (Kyra's Option A). `Current` means "the
+/// registry has completely reconciled the CURRENT source state", including an
+/// unusable one; it does not mean routes are usable. Usability is per-slot and
+/// lives in `org_routing_base_facts`, which returns cold for `Unserved`. The
+/// alternative — treating poison as a fence that can never settle — would retry
+/// forever under steady poison, which is why it is not the design.
+#[tokio::test]
+async fn steady_poison_settles_current_over_an_unserved_source() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("poison-steady", &node);
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+    store.mark_poisoned_for_test();
+
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(
+        Arc::new(ScopedSlotSource {
+            scoped_discovery: node.scoped_discovery.clone(),
+            publication: node.scoped_publication.clone(),
+            org_revocation: node.org_revocation.clone(),
+            authority: node.routing_authority.clone(),
+            settle_gap_hook: parking_lot::Mutex::new(None),
+            unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }),
+        work.clone(),
+        Arc::default(),
+    );
+    registry.activate_incarnation(1);
+
+    let family = registry.new_family().expect("family");
+    let key = slot(22, "nrpc:poison-steady");
+    let _held = family.demand(key.clone()).expect("demand");
+
+    let outcome = registry.apply(
+        1,
+        ApplyRequest {
+            batch: PrivateDiscoveryChangeBatch {
+                generation: 0,
+                dirty: DirtyCapabilities::Clean,
+            },
+            registry_work: true,
+        },
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Current { .. }),
+        "steady poison must CONVERGE, not retry forever: {outcome:?}"
+    );
+    assert_eq!(registry.pending_slots(), 0, "nothing is owed");
+    assert!(
+        registry.base_facts(&key).is_some(),
+        "the slot IS reconciled — with unusable-source facts"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_none(),
+        "but it reads COLD: reconciled is not usable"
+    );
 }
 
 /// (26) A terminally exhausted publication generation stops owner-certified
@@ -1874,6 +2057,12 @@ async fn an_exhausted_store_generation_stops_certified_emission() {
         node.owner_cert_under(&live_authority, now).is_none(),
         "terminal exhaustion must not construct an owner certificate — the floor          comparison it rests on can no longer be shown current"
     );
+    // WEAK, and deliberately labelled so: this node establishes no owner-scoped
+    // service, so the set is empty before exhaustion too. It is a regression
+    // guard against exhaustion ever ADDING envelopes, not a proof that existing
+    // ones are suppressed. Proving that needs an owner-audience credential and a
+    // scoped service, which belongs with the scoped-emission witnesses rather
+    // than here — recorded as a known evidence gap.
     assert!(
         node.announcement_scoped_for_send_for_test().is_empty(),
         "terminal exhaustion must not emit owner/grant-scoped envelopes"

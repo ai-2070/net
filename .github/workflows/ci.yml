@@ -93,7 +93,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=26
+          MIN=28
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -106,7 +106,23 @@ jobs:
             echo "this step in the same commit — do not let the gate pass vacuously."
             exit 1
           fi
-          echo "routing-plane wiring witnesses: $n passed (minimum $MIN)"
+          # Cardinality alone cannot tell WHICH witness vanished, so pin the
+          # names of the ones that carry a security property outright.
+          REQUIRED="shutdown_overlapping_registration_cannot_return_unresolved
+          a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive
+          a_snapshot_cannot_straddle_a_store_publication
+          a_publication_cannot_occupy_the_gap_between_validation_and_settlement
+          poison_cannot_occupy_the_gap_between_validation_and_settlement
+          an_exhausted_store_generation_stops_certified_emission
+          an_exhausted_authority_epoch_fences_rather_than_aliasing
+          an_unserved_scope_reads_cold_rather_than_authoritatively_empty"
+          for required in $REQUIRED; do
+            if ! printf "%s" "$out" | grep -q "$required"; then
+              echo "::error::required routing witness missing: $required"
+              exit 1
+            fi
+          done
+          echo "routing-plane wiring witnesses: $n passed (min $MIN); all named security witnesses present"
 
       # Doctests live in `///` comment blocks across `src/` and `sdk/src/`.
       # `cargo test --lib` does not execute them — they need a separate
