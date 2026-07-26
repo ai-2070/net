@@ -21,7 +21,7 @@
 //! and partitions.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::org::OrgId;
@@ -590,6 +590,75 @@ impl ScopedDiscoveryStore {
     /// Whether the store holds no LIVE scoped capabilities.
     pub fn is_empty(&self) -> bool {
         !self.entries.values().any(|e| e.capability.is_some())
+    }
+}
+
+/// Per-outcome counters for the private-discovery intake (review-pass-3 §10).
+///
+/// Every `ScopedStoreOutcome` and every pre-store refusal used to be `debug!` or
+/// `trace!` and nothing else — the same observability gap the 2026-07-23 review
+/// flagged on the sensing gate, reproduced on the new plane. A capacity wedge, a
+/// forged-envelope storm, or a persistent publication-race refusal produced ZERO
+/// signal above debug level, which is exactly the condition under which an
+/// operator most needs one.
+#[derive(Default)]
+pub struct ScopedIngestCounters {
+    inserted: AtomicU64,
+    updated: AtomicU64,
+    stale: AtomicU64,
+    rejected_public: AtomicU64,
+    at_capacity: AtomicU64,
+    too_many_declarations: AtomicU64,
+    /// The envelope failed `verify_scoped_ingest` — signature, membership,
+    /// audience or floor. A forged-envelope storm lives here.
+    verify_refused: AtomicU64,
+    /// The security view moved between verify and the pre-insert recheck, so a
+    /// valid envelope was refused rather than landing against a stale view.
+    race_refused: AtomicU64,
+}
+
+impl ScopedIngestCounters {
+    /// Record a store outcome, reporting whether the caller should WARN about
+    /// capacity: on the first refusal, and on every 1024th after it, so a wedge
+    /// is both announced and shown to be sustained without flooding the log.
+    pub fn note_outcome(&self, outcome: ScopedStoreOutcome) -> bool {
+        let counter = match outcome {
+            ScopedStoreOutcome::Inserted => &self.inserted,
+            ScopedStoreOutcome::Updated => &self.updated,
+            ScopedStoreOutcome::Stale => &self.stale,
+            ScopedStoreOutcome::RejectedPublic => &self.rejected_public,
+            ScopedStoreOutcome::TooManyDeclarations => &self.too_many_declarations,
+            ScopedStoreOutcome::AtCapacity => &self.at_capacity,
+        };
+        let previous = counter.fetch_add(1, Ordering::AcqRel);
+        matches!(outcome, ScopedStoreOutcome::AtCapacity) && previous % 1024 == 0
+    }
+
+    /// Record an envelope refused by `verify_scoped_ingest` — signature,
+    /// membership, audience or floor.
+    pub fn note_verify_refused(&self) {
+        self.verify_refused.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Record an envelope refused because the security view moved between the
+    /// verify and the pre-insert recheck.
+    pub fn note_race_refused(&self) {
+        self.race_refused.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// `[inserted, updated, stale, rejected_public, at_capacity,
+    /// too_many_declarations, verify_refused, race_refused]`.
+    pub fn snapshot(&self) -> [u64; 8] {
+        [
+            self.inserted.load(Ordering::Acquire),
+            self.updated.load(Ordering::Acquire),
+            self.stale.load(Ordering::Acquire),
+            self.rejected_public.load(Ordering::Acquire),
+            self.at_capacity.load(Ordering::Acquire),
+            self.too_many_declarations.load(Ordering::Acquire),
+            self.verify_refused.load(Ordering::Acquire),
+            self.race_refused.load(Ordering::Acquire),
+        ]
     }
 }
 
@@ -1735,6 +1804,45 @@ mod tests {
         // And the global cap is nowhere near reached — proving the per-scope
         // share, not the global bound, is what stopped the flood.
         assert!(store.len() < ScopedDiscoveryStore::MAX_ENTRIES);
+    }
+
+    /// review-pass-3 §10 — every intake outcome is counted, and a capacity wedge
+    /// warns on the FIRST refusal rather than only once it is 1024 deep.
+    #[test]
+    fn intake_counters_separate_the_outcomes_and_announce_the_first_wedge() {
+        let counters = ScopedIngestCounters::default();
+        assert!(
+            counters.note_outcome(ScopedStoreOutcome::AtCapacity),
+            "the first capacity refusal must warn — a wedge announced late is a \
+             wedge an operator learns about from its consequences"
+        );
+        for _ in 1..1024 {
+            assert!(!counters.note_outcome(ScopedStoreOutcome::AtCapacity));
+        }
+        assert!(
+            counters.note_outcome(ScopedStoreOutcome::AtCapacity),
+            "and a SUSTAINED wedge re-announces rather than going quiet"
+        );
+
+        counters.note_outcome(ScopedStoreOutcome::Inserted);
+        counters.note_outcome(ScopedStoreOutcome::TooManyDeclarations);
+        counters.note_verify_refused();
+        counters.note_verify_refused();
+        counters.note_race_refused();
+
+        let counts = counters.snapshot();
+        assert_eq!(counts[0], 1, "inserted");
+        assert_eq!(counts[4], 1025, "at_capacity");
+        assert_eq!(counts[5], 1, "too_many_declarations");
+        assert_eq!(
+            counts[6], 2,
+            "verify_refused — a forged-envelope storm reads as a rate here"
+        );
+        assert_eq!(
+            counts[7], 1,
+            "race_refused — a persistent one means valid announcements never land"
+        );
+        assert_eq!(counts[1] + counts[2] + counts[3], 0, "and nothing bled");
     }
 
     /// review-pass-3 §3 — the per-scope share does not compose either.

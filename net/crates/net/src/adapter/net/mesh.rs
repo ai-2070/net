@@ -1077,6 +1077,9 @@ struct DispatchCtx {
     /// OLB-2A.3: the private-discovery publication primitive (gate + wake). See
     /// the matching `MeshNode` field.
     scoped_publication: Arc<ScopedMutationPublication>,
+    /// review-pass-3 §10: per-outcome private-discovery intake counters. See the
+    /// matching `MeshNode` field.
+    scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. See the matching field doc on `MeshNode`.
     scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
@@ -6117,6 +6120,11 @@ pub struct MeshNode {
     /// and can never regress (Kyra OLB-2A.3.1 closure). The owner generation and
     /// the dirty deltas are read from the state on wake.
     scoped_publication: Arc<ScopedMutationPublication>,
+    /// review-pass-3 §10: per-outcome counters for the private-discovery intake.
+    /// Every refusal used to be `debug!`/`trace!` and nothing else, so a capacity
+    /// wedge, a forged-envelope storm and a persistent publication-race refusal
+    /// were all indistinguishable from silence at any normal log level.
+    scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters>,
     /// OLB-2B-E3c: the node's ONE bounded routing registry — the real consumer of
     /// the private-discovery dirty stream, and the `DirtyApply` the supervised
     /// actor drives. Constructed here so its retained slots outlive any single
@@ -7617,6 +7625,8 @@ impl MeshNode {
             super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
         ));
         let scoped_publication = Arc::new(ScopedMutationPublication::new());
+        let scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters> =
+            Arc::default();
         let org_revocation: Arc<
             ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
         > = Arc::new(ArcSwapOption::empty());
@@ -7682,6 +7692,7 @@ impl MeshNode {
             node_authority: Arc::new(ArcSwapOption::empty()),
             scoped_discovery,
             scoped_publication,
+            scoped_ingest_counters,
             routing_registry,
             routing_work,
             routing_health: super::behavior::org_routing::new_routing_health(),
@@ -11261,6 +11272,7 @@ impl MeshNode {
             &self.consumer_grant_audiences,
             &self.scoped_discovery,
             &self.scoped_publication,
+            &self.scoped_ingest_counters,
             &decoded,
             0,
             None,
@@ -11290,6 +11302,7 @@ impl MeshNode {
             &self.consumer_grant_audiences,
             &self.scoped_discovery,
             &self.scoped_publication,
+            &self.scoped_ingest_counters,
             &decoded,
             0,
             Some(probe),
@@ -12362,6 +12375,20 @@ impl MeshNode {
         )
     }
 
+    /// Private-discovery intake outcomes (review-pass-3 §10):
+    /// `[inserted, updated, stale, rejected_public, at_capacity,
+    /// too_many_declarations, verify_refused, race_refused]`.
+    ///
+    /// Every one of these used to be `debug!` or `trace!` and nothing else, so
+    /// the three that matter operationally were invisible: a capacity wedge
+    /// (`at_capacity`), a forged-envelope storm (`verify_refused`), and a
+    /// persistent publication-race refusal (`race_refused`) each look exactly
+    /// like a quiet node above debug level. `at_capacity` additionally warns on
+    /// its first refusal and every 1024th after it.
+    pub fn org_scoped_ingest_counts(&self) -> [u64; 8] {
+        self.scoped_ingest_counters.snapshot()
+    }
+
     /// Routing NON-CONVERGENCE: `(current superseded streak, high-water streak,
     /// degraded entries)` (review-pass-2 §2).
     ///
@@ -13358,6 +13385,7 @@ impl MeshNode {
             node_authority: self.node_authority.clone(),
             scoped_discovery: self.scoped_discovery.clone(),
             scoped_publication: self.scoped_publication.clone(),
+            scoped_ingest_counters: self.scoped_ingest_counters.clone(),
             scoped_relay_gate: self.scoped_relay_gate.clone(),
             consumer_grant_audiences: self.consumer_grant_audiences.clone(),
             #[cfg(feature = "redex")]
@@ -14853,6 +14881,7 @@ impl MeshNode {
                         &ctx.consumer_grant_audiences,
                         &ctx.scoped_discovery,
                         &ctx.scoped_publication,
+                        &ctx.scoped_ingest_counters,
                         &admit.envelope,
                         from_node,
                         None,
@@ -20853,6 +20882,7 @@ impl MeshNode {
             parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
         >,
         publication: &ScopedMutationPublication,
+        counters: &super::behavior::org_scoped_store::ScopedIngestCounters,
         envelope: &super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement,
         from_node: u64,
         probe: Option<&dyn Fn()>,
@@ -21048,6 +21078,10 @@ impl MeshNode {
                     }
                 };
                 if !authority_stable || !store_stable || !consumer_stable {
+                    // review-pass-3 §10: a PERSISTENT publication-race refusal
+                    // means valid announcements are never landing, which is
+                    // indistinguishable from silence at `trace`.
+                    counters.note_race_refused();
                     tracing::trace!(
                         from_node = format!("{:#x}", from_node),
                         "scoped-ann: security view moved during verify; ingest refused \
@@ -21067,6 +21101,19 @@ impl MeshNode {
                 let outcome = publication.commit(&publication_gate, scoped_discovery, |state| {
                     state.ingest(prepared, now_secs)
                 });
+                // review-pass-3 §10: every outcome is COUNTED, not merely logged
+                // at debug. A capacity wedge additionally warns on its first
+                // refusal and every 1024th after it, so it is both announced and
+                // shown to be sustained.
+                if counters.note_outcome(outcome) {
+                    tracing::warn!(
+                        from_node = format!("{:#x}", from_node),
+                        refusals = counters.snapshot()[4],
+                        "scoped-ann: private-discovery store AT CAPACITY; new provider keys \
+                         are being refused. The store is in-memory, so occupied slots free \
+                         only on expiry, grant removal, or restart."
+                    );
+                }
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
                     ?outcome,
@@ -21086,6 +21133,9 @@ impl MeshNode {
                 }
             }
             Err(e) => {
+                // review-pass-3 §10: a forged-envelope storm is now visible above
+                // `trace`, as a rate rather than as individual lines.
+                counters.note_verify_refused();
                 tracing::trace!(
                     from_node = format!("{:#x}", from_node),
                     error = %e,
