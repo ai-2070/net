@@ -286,6 +286,18 @@ pub(crate) trait SlotSource: Send + Sync + 'static {
     /// caller must install nothing. ALWAYS called before the registry lock is
     /// taken, never while holding it — see the module's frozen lock order.
     fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>>;
+
+    /// Whether this source's authority is TERMINALLY unusable — no future
+    /// snapshot of it can ever pin again (E3c blockers §2).
+    ///
+    /// `false` for every recoverable refusal: poison, floor movement and store
+    /// swaps all own a later wake, so a failed pin correctly re-queues against
+    /// them. A terminal authority owns no wake — re-queueing against it is a
+    /// promise of work that can never complete, and the mark that re-arms the
+    /// actor turns that promise into a spin.
+    fn terminal(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -727,6 +739,38 @@ impl NodeOrgRoutingRegistry {
         }
     }
 
+    /// The authority epoch space is terminally exhausted: retire every retained
+    /// fact and every queued identity, and do NOT wake the actor (E3c blockers
+    /// §2). Called exactly once, at the `NewlyExhausted` transition.
+    ///
+    /// Two ways this deliberately differs from
+    /// [`Self::invalidate_authority_older_than`]:
+    ///
+    /// - it is UNCONDITIONAL on the stamped epoch. Facts stamped
+    ///   `authority == u64::MAX` are exactly the ones a strictly-older
+    ///   comparison structurally spares — yet their stamp is the identity that
+    ///   just became unable to prove currentness, so leaving them retained
+    ///   keeps them readable for as long as no reader happens by;
+    /// - NOTHING is re-queued and no work is marked. The source refuses every
+    ///   commit pin from now on, so a rebuilt fact could never be installed —
+    ///   a re-queue is a promise of work that cannot complete, and the wake
+    ///   that re-arms the actor would have it spin on `Superseded` until
+    ///   shutdown.
+    pub(crate) fn retire_terminal(&self) {
+        let mut inner = self.inner.lock();
+        let mut invalidated = 0u64;
+        for slot in inner.slots.values_mut() {
+            if slot.facts.take().is_some() {
+                invalidated += 1;
+            }
+        }
+        inner.pending.clear();
+        inner.recapture_open = false;
+        self.metrics
+            .facts_invalidated
+            .fetch_add(invalidated, Ordering::AcqRel);
+    }
+
     /// Test-only: drop `key`'s facts and re-queue it, so a witness can drive
     /// another quantum over the same slot.
     #[cfg(test)]
@@ -945,6 +989,17 @@ impl DirtyApply for NodeOrgRoutingRegistry {
 
         // --- phase 4: the COMMIT pin, before the registry lock ---
         let Some(commit) = self.source.pin_if_current(&snapshot_token) else {
+            // TERMINAL refusal is not movement (E3c blockers §2): no future pin
+            // over this source can ever succeed, so a re-queue is unkeepable
+            // and the mark below would spin the actor on `Superseded` until
+            // shutdown. Discard the build and park; `retire_terminal` already
+            // cleared everything retained at the transition.
+            if self.source.terminal() {
+                self.metrics
+                    .discarded_obsolete
+                    .fetch_add(built.len() as u64, Ordering::AcqRel);
+                return ApplyOutcome::Superseded;
+            }
             // The source moved while we rebuilt. Install nothing, and put every
             // still-live selected slot back.
             let mut inner = self.inner.lock();

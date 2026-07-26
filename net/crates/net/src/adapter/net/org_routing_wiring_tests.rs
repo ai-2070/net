@@ -234,6 +234,9 @@ impl SlotSource for PausingSource {
         }
         Some(pin)
     }
+    fn terminal(&self) -> bool {
+        self.inner.terminal()
+    }
 }
 
 /// (4) Production snapshot discipline, driven through the REAL
@@ -962,7 +965,16 @@ async fn an_exhausted_authority_epoch_fences_rather_than_aliasing() {
 
     {
         let _gate = node.routing_authority.lock_gate();
-        node.routing_authority.advance();
+        assert_eq!(
+            node.routing_authority.advance(),
+            AuthorityAdvance::NewlyExhausted,
+            "the terminal transition is reported to exactly one caller"
+        );
+        assert_eq!(
+            node.routing_authority.advance(),
+            AuthorityAdvance::AlreadyExhausted,
+            "and never a second time"
+        );
     }
     assert!(
         node.routing_authority.is_exhausted(),
@@ -1032,6 +1044,121 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
         source.pin_if_current(&healthy_token).is_none(),
         "and a token minted under the usable authority no longer commits"
     );
+}
+
+/// (11c3) The TRANSITION to terminal authority exhaustion, driven through the
+/// production movement path: it retires every retained fact — including the
+/// `authority == u64::MAX` stamps that `invalidate_authority_older_than(MAX)`
+/// structurally spares — clears the queue instead of promising unfulfillable
+/// work, and fences `org_routing_ready` INDEPENDENTLY of supervisor health
+/// (E3c blockers §2).
+///
+/// Before this closure, `advance()` latched silently: the movement invalidated
+/// nothing (nothing is older than MAX), health stayed `Healthy`, readiness
+/// stayed true, and any queued slot re-queued + re-marked itself through the
+/// refused commit pin forever.
+#[tokio::test]
+async fn terminal_exhaustion_retires_max_stamped_facts_and_fences_readiness() {
+    use crate::adapter::net::behavior::org_routing::{ApplyOutcome, ApplyRequest, DirtyApply};
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("authority-terminal", &node);
+    node.install_org_revocation_store(scratch.store())
+        .expect("install");
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+    let registry = node.routing_registry.clone();
+    registry.activate_incarnation(1);
+
+    // Park the epoch at the ceiling, then warm a slot: its facts carry the
+    // `authority == u64::MAX` stamp no strictly-older invalidation can name.
+    node.routing_authority
+        .epoch
+        .store(u64::MAX, Ordering::Release);
+    let family = registry.new_family().expect("family");
+    let key = slot(26, "nrpc:authority-terminal");
+    let _held = family.demand(key.clone()).expect("demand");
+    let request = ApplyRequest {
+        batch: PrivateDiscoveryChangeBatch {
+            generation: 0,
+            dirty: DirtyCapabilities::Clean,
+        },
+        registry_work: true,
+    };
+    assert!(matches!(
+        registry.apply(1, request.clone()),
+        ApplyOutcome::Current { .. }
+    ));
+    let warm = registry.base_facts(&key).expect("reconciled");
+    assert_eq!(
+        warm.epoch.authority,
+        u64::MAX,
+        "precondition: MAX-stamped facts are retained"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "precondition: and warm"
+    );
+    assert!(node.org_routing_ready(), "precondition: ready");
+
+    // The PRODUCTION movement: a store install advances routing authority; at
+    // the ceiling that movement IS the terminal transition.
+    let replacement = Scratch::new("authority-terminal-b", &node);
+    node.install_org_revocation_store(replacement.store())
+        .expect("replacement install");
+
+    assert!(node.routing_authority.is_exhausted(), "terminally fenced");
+    assert_eq!(
+        node.routing_authority.epoch(),
+        u64::MAX,
+        "no identity was reused"
+    );
+    assert!(
+        registry.base_facts(&key).is_none(),
+        "the MAX-stamped fact was retired SYNCHRONOUSLY — no reader involved"
+    );
+    assert_eq!(
+        registry.pending_slots(),
+        0,
+        "and nothing was re-queued: a rebuild could never install again"
+    );
+    assert!(
+        matches!(
+            **node.routing_health.load(),
+            crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { .. }
+        ),
+        "supervisor health alone still says Healthy…"
+    );
+    assert!(
+        !node.org_routing_ready(),
+        "…so readiness must fence on exhaustion INDEPENDENTLY of health"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_none(),
+        "reads are cold"
+    );
+
+    // Work demanded AFTER the transition parks instead of spinning: the failed
+    // commit pin is TERMINAL, so the pass discards without re-queueing or
+    // re-marking itself awake.
+    let late = slot(26, "nrpc:authority-terminal-late");
+    let _late_held = family.demand(late.clone()).expect("late demand");
+    assert_eq!(registry.pending_slots(), 1, "the late demand queues once");
+    assert_eq!(
+        registry.apply(1, request),
+        ApplyOutcome::Superseded,
+        "nothing settles under a terminal authority"
+    );
+    assert_eq!(
+        registry.pending_slots(),
+        0,
+        "and the pass DISCARDS rather than re-queues — no terminal spin"
+    );
+    assert!(registry.base_facts(&late).is_none());
 }
 
 /// (11d) A delayed reader that finds ITS artifact stale must not delete a newer
@@ -1282,7 +1409,7 @@ async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
     // Authority moves MID-EPOCH. No scoped movement whatsoever.
     {
         let _gate = node.routing_authority.lock_gate();
-        node.routing_authority.advance();
+        let _ = node.routing_authority.advance();
     }
     assert_eq!(
         node.scoped_discovery.lock().revision(),
@@ -1365,7 +1492,7 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
             let _ = release_rx.recv();
             // Complete the transition under the held gate, exactly as the
             // publisher does: epoch first, then the store.
-            node.routing_authority.advance();
+            let _ = node.routing_authority.advance();
             node.org_revocation.store(Some(store));
         })
     };
@@ -1610,7 +1737,7 @@ async fn authority_invalidation_spares_successor_facts() {
     let retired = node.routing_authority.epoch();
     {
         let _gate = node.routing_authority.lock_gate();
-        node.routing_authority.advance();
+        let _ = node.routing_authority.advance();
     }
     let live = node.routing_authority.epoch();
     assert_ne!(retired, live);

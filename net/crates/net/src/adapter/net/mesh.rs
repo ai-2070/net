@@ -5214,12 +5214,18 @@ struct ScopedSourceSnapshot {
 /// lock, and the frozen order is authority gate -> publication gate, never
 /// authority gate -> registry lock. It is not optional — authority movement need
 /// not touch scoped state at all, so there may be no other wake.
+///
+/// A movement that EXHAUSTS the epoch space takes the terminal branch instead:
+/// facts stamped `u64::MAX` are exactly the ones a strictly-older invalidation
+/// can never name, so the transition retires everything itself — once, without
+/// re-queueing, because rebuilt facts could never be installed again (E3c
+/// blockers §2).
 fn move_routing_authority<R>(
     authority: &RoutingAuthority,
     registry: &super::behavior::org_routing_registry::NodeOrgRoutingRegistry,
     publish: impl FnOnce() -> R,
 ) -> R {
-    let (result, live) = {
+    let (result, live, advance) = {
         let _gate = authority.lock_gate();
         // Epoch FIRST, publication second. `org_routing_base_facts` reads
         // lock-free, so it never sees this gate; publishing the new store before
@@ -5228,16 +5234,27 @@ fn move_routing_authority<R>(
         // first makes the transition conservatively COLD instead: a reader sees
         // either (A, R) or (B, R+1), and facts stamped R stop matching the moment
         // the epoch moves (Kyra OLB-2B-E3c).
-        authority.advance();
+        let advance = authority.advance();
         let live = authority.epoch();
         let result = publish();
-        (result, live)
+        (result, live, advance)
     };
     // Outside the gate: the registry takes its own lock, and the frozen order is
     // authority gate -> publication gate, never authority gate -> registry lock.
-    // CONDITIONAL on `live`, so a reconciliation that installed valid successor
-    // facts in this window is not wiped.
-    registry.invalidate_authority_older_than(live);
+    match advance {
+        // CONDITIONAL on `live`, so a reconciliation that installed valid
+        // successor facts in this window is not wiped.
+        AuthorityAdvance::Advanced => registry.invalidate_authority_older_than(live),
+        // The one transition `invalidate_authority_older_than` cannot express:
+        // `live` froze at `u64::MAX`, and `< u64::MAX` structurally spares the
+        // MAX-stamped facts whose identity is the very thing now unable to
+        // prove currentness (E3c blockers §2).
+        AuthorityAdvance::NewlyExhausted => registry.retire_terminal(),
+        // Retirement already ran at the transition; there is nothing retained
+        // to fence, and re-queueing anything here would be a promise of work
+        // that can never complete.
+        AuthorityAdvance::AlreadyExhausted => {}
+    }
     result
 }
 
@@ -5258,6 +5275,24 @@ impl Drop for RoutingJoinWaiting<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
+}
+
+/// What one [`RoutingAuthority::advance`] did (E3c blockers §2).
+///
+/// `NewlyExhausted` is reported EXACTLY ONCE, at the transition, and it is the
+/// caller's one chance to retire retained routing state: every fact already
+/// stamped `u64::MAX` survives `invalidate_authority_older_than(u64::MAX)` —
+/// strictly-older cannot name the ceiling itself — so nothing later can fence
+/// what this call does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "NewlyExhausted obligates the caller to retire retained routing state"]
+enum AuthorityAdvance {
+    /// The epoch moved to a fresh identity.
+    Advanced,
+    /// THIS call crossed the ceiling: the terminal latch was just set.
+    NewlyExhausted,
+    /// The space was already terminal before this call.
+    AlreadyExhausted,
 }
 
 /// The node-owned routing authority (OLB-2B-E3c).
@@ -5330,16 +5365,20 @@ impl RoutingAuthority {
     /// exactly the aliasing the monotone counter exists to prevent (Kyra
     /// OLB-2B-E3c). Exhaustion is terminal and fail-closed: `is_exhausted`
     /// makes every scope unserved and refuses every commit pin.
-    fn advance(&self) {
+    fn advance(&self) -> AuthorityAdvance {
         let mut current = self.epoch.load(Ordering::Acquire);
         loop {
             let Some(next) = current.checked_add(1) else {
-                self.exhausted.store(true, Ordering::Release);
+                // `swap`, not `store`: the false→true TRANSITION is reported to
+                // exactly one caller, which owes the terminal retirement.
+                if self.exhausted.swap(true, Ordering::AcqRel) {
+                    return AuthorityAdvance::AlreadyExhausted;
+                }
                 tracing::error!(
                     "org routing: authority epoch space exhausted; routing is \
                      fenced rather than reusing an authority identity"
                 );
-                return;
+                return AuthorityAdvance::NewlyExhausted;
             };
             match self.epoch.compare_exchange_weak(
                 current,
@@ -5347,7 +5386,7 @@ impl RoutingAuthority {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => return AuthorityAdvance::Advanced,
                 Err(actual) => current = actual,
             }
         }
@@ -5655,6 +5694,14 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             #[cfg(test)]
             settle_gap_hook: self.settle_gap_hook.lock().clone(),
         }))
+    }
+
+    fn terminal(&self) -> bool {
+        // Only the authority-epoch latch is terminal. Poison, floor movement
+        // and store swaps all own a later wake; generation exhaustion is store
+        // state a replacement install can retire. This latch alone can never
+        // be left.
+        self.authority.is_exhausted()
     }
 }
 
@@ -12101,30 +12148,21 @@ impl MeshNode {
         }
     }
 
-    /// Record that routing authority moved, and make every retained routing fact
-    /// unusable (OLB-2B-E3c).
-    ///
-    /// The ONE production path for authority movement. Two things happen:
-    ///
-    /// 1. the monotone epoch advances under the authority gate, so a snapshot
-    ///    taken under the previous authority can no longer produce a matching
-    ///    commit token, and any fact already stamped with it is detectably stale;
-    /// 2. the registry drops every retained fact, re-queues every slot and marks
-    ///    registry work.
-    ///
-    /// Step 2 is not redundant. Authority movement need not touch scoped state at
-    /// all — a store swap whose floors retract nothing advances no scoped
-    /// revision and publishes no scoped wake — so without an explicit
-    /// invalidation the actor would never learn that everything it holds was
-    /// built under an authority that no longer applies (Kyra OLB-2B-E3c).
     /// Whether the routing plane is currently usable — a live incarnation has
     /// completed a recapture. `false` while rebuilding and whenever fenced
     /// (OLB-2B-E2).
+    ///
+    /// Terminal authority exhaustion is checked INDEPENDENTLY of supervisor
+    /// health (E3c blockers §2): the terminal advance restarts nothing, so a
+    /// `Healthy` published before it survives it — and `Healthy` is exactly
+    /// what an authority that can no longer prove currentness must not be able
+    /// to keep saying.
     pub fn org_routing_ready(&self) -> bool {
-        matches!(
-            **self.routing_health.load(),
-            super::behavior::org_routing::RoutingHealth::Healthy { .. }
-        )
+        !self.routing_authority.is_exhausted()
+            && matches!(
+                **self.routing_health.load(),
+                super::behavior::org_routing::RoutingHealth::Healthy { .. }
+            )
     }
 
     /// Actor incarnations started, and abnormal source-closure exits
