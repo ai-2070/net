@@ -959,6 +959,51 @@ async fn an_exhausted_authority_epoch_fences_rather_than_aliasing() {
     );
 }
 
+/// (11c2) An exhausted revocation publication generation is unusable authority.
+///
+/// The store's generation can no longer distinguish floor views, so it can no
+/// longer witness currentness — routing must fail closed on it exactly as it does
+/// on poison, rather than trusting a frozen discriminator.
+#[tokio::test]
+async fn an_exhausted_store_generation_makes_every_scope_unserved() {
+    let node = node().await;
+    let scratch = Scratch::new("gen-exhausted", &node);
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
+        unserved_scope: node.routing_unserved_scope.clone(),
+    };
+    let key = slot(14, "nrpc:gen-exhausted");
+
+    let healthy = source.snapshot(std::slice::from_ref(&key));
+    assert!(
+        matches!(healthy.providers(&key), SourceFacts::Served(_)),
+        "precondition: a usable authority serves the scope"
+    );
+    let healthy_token = healthy.token();
+    assert!(source.pin_if_current(&healthy_token).is_some());
+
+    store.saturate_generation_for_test();
+    store.republish_for_test();
+    assert!(store.is_generation_exhausted());
+
+    let snapshot = source.snapshot(std::slice::from_ref(&key));
+    assert!(
+        matches!(snapshot.providers(&key), SourceFacts::Unserved),
+        "an exhausted publication generation serves NOTHING"
+    );
+    assert!(
+        source.pin_if_current(&healthy_token).is_none(),
+        "and a token minted under the usable authority no longer commits"
+    );
+}
+
 /// (11d) A delayed reader that finds ITS artifact stale must not delete a newer
 /// one installed in the meantime.
 #[tokio::test]

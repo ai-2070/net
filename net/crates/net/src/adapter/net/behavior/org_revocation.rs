@@ -66,7 +66,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -479,7 +479,23 @@ struct StoreCore {
     /// Never ahead of the durably persisted state.
     live: RwLock<Arc<OrgRevocationState>>,
     /// Bumped on every publish; lets callers order publications.
+    ///
+    /// Advanced with `checked_add`, NEVER wrapping — see
+    /// [`StoreCore::generation_exhausted`].
     generation: AtomicU64,
+    /// Terminal: the publication generation space is exhausted.
+    ///
+    /// A wrapping counter is not a currentness signal. Once it wraps, a NEW
+    /// floor view carries a generation a consumer has already seen, so evidence
+    /// built against the OLD view compares equal to the new one. Rather than
+    /// wrap, the generation freezes and this latches, and every consumer that
+    /// uses the generation for currentness must fail closed on it (Kyra
+    /// OLB-2B-E3c).
+    ///
+    /// Distinct from POISON, which means "durability uncertain" and can be
+    /// cleared by a successful locked reread. Exhaustion is not recoverable
+    /// in-process: clearing it would hand out an identity already in use.
+    generation_exhausted: AtomicBool,
     /// Raise subscribers, each with a removable token. A REGISTRY,
     /// not a single slot (review-9 addendum): registering a second
     /// observer must never silently steal the first one's
@@ -576,7 +592,22 @@ impl StoreCore {
         // (one uncontended `Mutex::take`) unless a test armed the hook.
         #[cfg(any(test, feature = "fixtures"))]
         self.run_publish_pause_hook();
-        self.generation.fetch_add(1, Ordering::Release);
+        // CHECKED, never wrapping: at the ceiling the generation freezes and the
+        // exhaustion latch is set, so a consumer comparing generations for
+        // currentness fails closed instead of matching a reused identity.
+        let current = self.generation.load(Ordering::Acquire);
+        match current.checked_add(1) {
+            Some(next) => self.generation.store(next, Ordering::Release),
+            None => {
+                if !self.generation_exhausted.swap(true, Ordering::AcqRel) {
+                    tracing::error!(
+                        "org revocation: publication generation space exhausted; \
+                         the generation is frozen and every generation-based \
+                         currentness check must now fail closed"
+                    );
+                }
+            }
+        }
         raised
     }
 
@@ -998,6 +1029,7 @@ fn join_or_create_core(
         reload: Mutex::new(()),
         live: RwLock::new(Arc::new(disk)),
         generation: AtomicU64::new(0),
+        generation_exhausted: AtomicBool::new(false),
         subscribers: RwLock::new(Vec::new()),
         next_subscriber: AtomicU64::new(0),
         #[cfg(any(test, feature = "fixtures"))]
@@ -1327,6 +1359,31 @@ impl OrgRevocationStore {
     /// [`Self::apply_bundle`].
     pub fn is_poisoned(&self) -> bool {
         is_poisoned(&self.core.backing_id, &self.core.path)
+    }
+
+    /// Whether the publication generation space is exhausted.
+    ///
+    /// Terminal. A consumer that uses [`Self::barriered_generation`] as a
+    /// currentness discriminator MUST treat this as unusable authority: the
+    /// generation no longer advances, so it can no longer distinguish views.
+    pub fn is_generation_exhausted(&self) -> bool {
+        self.core.generation_exhausted.load(Ordering::Acquire)
+    }
+
+    /// Test-only: drive the publication generation to its ceiling, so a witness
+    /// can exercise the exhaustion branch without 2^64 real publications.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn saturate_generation_for_test(&self) {
+        self.core.generation.store(u64::MAX, Ordering::Release);
+    }
+
+    /// Test-only: force one publication of the current view.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn republish_for_test(&self) {
+        let current = (*self.core.live.read()).as_ref().clone();
+        self.core.publish(current);
     }
 
     /// Test-only: mark this store's backing path poisoned so
@@ -4185,5 +4242,41 @@ mod tests {
         );
         assert_eq!(store.barriered_generation(), g0 + 1);
         assert!(store.floor_for(&org().org_id(), &member()) >= 9);
+    }
+
+    /// The publication generation NEVER wraps: at the ceiling it freezes and
+    /// latches.
+    ///
+    /// Wrapping is not a bounded-counter inconvenience, it is an aliasing bug: a
+    /// consumer using the generation as a currentness discriminator would accept
+    /// evidence built against the OLD view as current against the NEW one (Kyra
+    /// OLB-2B-E3c).
+    #[test]
+    fn an_exhausted_publication_generation_freezes_rather_than_wrapping() {
+        let scratch = Scratch::new();
+        let store =
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init");
+
+        assert!(!store.is_generation_exhausted());
+        store.saturate_generation_for_test();
+        assert_eq!(store.barriered_generation(), u64::MAX);
+
+        store.republish_for_test();
+
+        assert_eq!(
+            store.barriered_generation(),
+            u64::MAX,
+            "the generation must FREEZE, never wrap to a reused identity"
+        );
+        assert!(
+            store.is_generation_exhausted(),
+            "and the latch must be set so consumers fail closed"
+        );
+
+        // Terminal: a further publication does not clear it.
+        store.republish_for_test();
+        assert!(store.is_generation_exhausted());
+        assert_eq!(store.barriered_generation(), u64::MAX);
     }
 }

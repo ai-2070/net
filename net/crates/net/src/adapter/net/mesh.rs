@@ -5320,7 +5320,14 @@ impl ScopedSlotSource {
     ) {
         let store = slot.load_full();
         let (poisoned, floor_generation) = match store.as_ref() {
-            Some(store) => (store.is_poisoned(), store.barriered_generation()),
+            // An EXHAUSTED publication generation is unusable authority for the
+            // same reason poison is: the generation can no longer distinguish
+            // floor views, so it can no longer witness currentness. Folded into
+            // the same fail-closed flag (Kyra OLB-2B-E3c).
+            Some(store) => (
+                store.is_poisoned() || store.is_generation_exhausted(),
+                store.barriered_generation(),
+            ),
             // Un-adopted: no store, implicit floor 0.
             None => (false, 0),
         };
