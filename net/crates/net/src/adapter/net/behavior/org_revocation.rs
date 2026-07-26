@@ -533,6 +533,12 @@ struct StoreCore {
     /// wake (E3c blockers §1) has no other witness route there.
     #[cfg(test)]
     force_post_rename: AtomicBool,
+    /// Test-only: fired by [`StoreCore::lock_poison_gate`] ONLY when its try
+    /// OBSERVED the gate held, immediately before blocking (E3c blockers §3).
+    /// Contrast [`StoreCore::poison_blocking_hook`], which fires before the
+    /// attempt regardless of contention.
+    #[cfg(test)]
+    poison_contended_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Raise subscribers, each with a removable token. A REGISTRY,
     /// not a single slot (review-9 addendum): registering a second
     /// observer must never silently steal the first one's
@@ -736,10 +742,34 @@ impl StoreCore {
 
     /// Acquire `poison_gate` for a poison TRANSITION (mark or clear) — never
     /// used by [`PublicationPin`], whose acquisition is the thing transitions
-    /// contend with.
+    /// contend with. Try-then-block, with two distinct test acknowledgements
+    /// (E3c blockers §3):
+    ///
+    /// - the BLOCKING hook fires before the acquisition is attempted — the
+    ///   placement rendezvous a witness uses to hold a transition at the gate
+    ///   while it stages a pin;
+    /// - the CONTENDED hook fires ONLY when the try observed the gate held,
+    ///   immediately before blocking. It is the acknowledgement the gap
+    ///   witnesses wait on: an ack that fires regardless of contention proves
+    ///   only that the contender was scheduled, and a negative assertion
+    ///   sequenced after it can pass vacuously under a slow scheduler with the
+    ///   protection broken. An ack that required `try_lock` to FAIL proves the
+    ///   exclusion was actually met.
     fn lock_poison_gate(&self) -> MutexGuard<'_, ()> {
         self.run_poison_blocking_hook();
-        self.poison_gate.lock()
+        match self.poison_gate.try_lock() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(test)]
+                {
+                    let hook = self.poison_contended_hook.lock().clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                self.poison_gate.lock()
+            }
+        }
     }
 
     /// Fire the poison-gate acknowledgment hook if a test installed one. Runs
@@ -1175,6 +1205,8 @@ fn join_or_create_core(
         poison_blocking_hook: Mutex::new(None),
         #[cfg(test)]
         force_post_rename: AtomicBool::new(false),
+        #[cfg(test)]
+        poison_contended_hook: Mutex::new(None),
         subscribers: RwLock::new(Vec::new()),
         next_subscriber: AtomicU64::new(0),
         #[cfg(any(test, feature = "fixtures"))]
@@ -1648,14 +1680,26 @@ impl OrgRevocationStore {
         self.core.mark_poisoned();
     }
 
-    /// Test-only: arm the pre-`poison_gate` acknowledgment hook, so a witness
-    /// can prove a poison transition REACHED the blocked acquisition rather
-    /// than inferring it from elapsed time. Fires for marks AND clears,
-    /// including the ones the production recovery paths perform.
+    /// Test-only: arm the pre-`poison_gate` PLACEMENT hook — fired before a
+    /// poison transition attempts the acquisition, whether or not the gate is
+    /// held. Fires for marks AND clears, including the ones the production
+    /// recovery paths perform. A rendezvous point, NOT contention evidence:
+    /// for that, arm [`Self::arm_poison_contended_hook`] (E3c blockers §3).
     #[doc(hidden)]
     #[cfg(test)]
     pub(crate) fn arm_poison_blocking_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.core.poison_blocking_hook.lock() = Some(hook);
+    }
+
+    /// Test-only: arm the poison-gate CONTENTION acknowledgment — fired only
+    /// when a transition's `try_lock` observed the gate held, immediately
+    /// before it blocks (E3c blockers §3). This is the ack the gap witnesses
+    /// sequence their negative assertions after: it proves the exclusion was
+    /// met, not merely that the contender got scheduled.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn arm_poison_contended_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.core.poison_contended_hook.lock() = Some(hook);
     }
 
     /// Test-only, one-shot: force the next `apply_bundle` state write to report

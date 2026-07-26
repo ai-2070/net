@@ -1929,14 +1929,17 @@ async fn poison_cannot_occupy_the_gap_between_validation_and_settlement() {
     let poisoned = Arc::new(AtomicBool::new(false));
     let entered = Arc::new(AtomicBool::new(false));
     let contender: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
-    // Fired by the store itself, immediately BEFORE the blocking `poison_gate`
-    // acquisition — so this acknowledges that the contender actually reached the
-    // gate, not merely that it was spawned (Kyra OLB-2B-E3c closure). The old
-    // form acknowledged before the call and then slept, which a slow scheduler
-    // could satisfy without the contender ever getting there.
+    // Fired by the store itself ONLY when the contender's `try_lock` OBSERVED
+    // the poison gate held — i.e. it actually met the pin's exclusion (E3c
+    // blockers §3). The previous form acknowledged before the acquisition was
+    // even attempted, so it proved only that the contender was scheduled: a
+    // slow scheduler could satisfy the wait and leave the negative assertion
+    // below to pass vacuously with the gate protection broken. If the mark
+    // ever stops taking the gate — or the pin stops holding it — this ack
+    // never fires and the wait fails loudly.
     let (at_gate_tx, at_gate_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let at_gate = Arc::new(parking_lot::Mutex::new(at_gate_rx));
-    store.arm_poison_blocking_hook(Arc::new(move || {
+    store.arm_poison_contended_hook(Arc::new(move || {
         let _ = at_gate_tx.try_send(());
     }));
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -1950,26 +1953,24 @@ async fn poison_cannot_occupy_the_gap_between_validation_and_settlement() {
         let done_rx = done_rx.clone();
         *source.settle_gap_hook.lock() = Some(Arc::new(move || {
             entered.store(true, Ordering::Release);
-            let store = store.clone();
+            let contender_store = store.clone();
             let landed = poisoned.clone();
             let done = done_tx.clone();
             *contender.lock() = Some(std::thread::spawn(move || {
-                store.mark_poisoned_for_test();
+                contender_store.mark_poisoned_for_test();
                 landed.store(true, Ordering::Release);
                 let _ = done.send(());
             }));
             at_gate
                 .lock()
                 .recv_timeout(Duration::from_secs(10))
-                .expect("the contender must REACH the blocked poison gate");
-            // Bounded completion signal rather than a bare sleep: the contender
-            // is at the gate, so an ungated transition would land inside this
-            // window.
+                .expect("the contender must OBSERVE the poison gate held");
+            // Deterministic rather than time-bounded: the ack above proves the
+            // contender was blocked at the HELD gate, and the gate cannot drop
+            // before this hook returns — so any ungated route to completion
+            // would already have been taken.
             assert!(
-                done_rx
-                    .lock()
-                    .recv_timeout(Duration::from_millis(250))
-                    .is_err(),
+                done_rx.lock().try_recv().is_err(),
                 "poison landed between the validation and the settlement — they \
                  are separately interleavable"
             );
@@ -1977,6 +1978,15 @@ async fn poison_cannot_occupy_the_gap_between_validation_and_settlement() {
                 !poisoned.load(Ordering::Acquire),
                 "poison landed between the validation and the settlement — they \
                  are separately interleavable"
+            );
+            // The FACT itself, not the contender's return: a mark that mutated
+            // the registry before taking the gate would leave `done` unsent
+            // (still blocked) while the poison is already live inside the gap
+            // — exactly what the two proxies above cannot see.
+            assert!(
+                !store.is_poisoned(),
+                "the poison FACT landed inside the validation-settlement gap — \
+                 the mark mutated the registry before taking the gate"
             );
         }));
     }
@@ -2193,15 +2203,22 @@ async fn a_recovery_poison_clear_cannot_land_under_a_publication_pin() {
     store.mark_poisoned_for_test();
     assert!(store.is_poisoned(), "precondition: the path is poisoned");
 
-    // Fired immediately before `poison_gate.lock()` — i.e. after the recovery's
-    // republish has already landed. The hook rendezvouses so the pin is taken
-    // BEFORE the acquisition is attempted.
+    // PLACEMENT hook: fired before the clear attempts the acquisition — i.e.
+    // after the recovery's republish has already landed. It rendezvouses so
+    // the pin is taken BEFORE the acquisition is attempted. Placement is not
+    // contention evidence; that is the CONTENDED ack below (E3c blockers §3).
     let (at_gate_tx, at_gate_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let (pinned_tx, pinned_rx) = std::sync::mpsc::channel::<()>();
     let pinned_rx = parking_lot::Mutex::new(pinned_rx);
     store.arm_poison_blocking_hook(Arc::new(move || {
         let _ = at_gate_tx.try_send(());
         let _ = pinned_rx.lock().recv_timeout(Duration::from_secs(10));
+    }));
+    // Fired ONLY when the clear's `try_lock` observed the pin's gate hold —
+    // the acknowledgement the negative assertion below is sequenced after.
+    let (contended_tx, contended_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    store.arm_poison_contended_hook(Arc::new(move || {
+        let _ = contended_tx.try_send(());
     }));
 
     let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
@@ -2217,8 +2234,14 @@ async fn a_recovery_poison_clear_cannot_land_under_a_publication_pin() {
     // The republish has landed; take the pin the way a settlement does.
     let pin = store.pin_publication();
     let _ = pinned_tx.send(());
+    // Only after the clear OBSERVED the pin's gate hold is there a contention
+    // to assert about (E3c blockers §3): the previous 250ms bounded wait could
+    // pass vacuously with the recovery still unscheduled, protection broken.
+    contended_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the recovery's clear must OBSERVE the pin's poison-gate hold");
     assert!(
-        done_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+        done_rx.try_recv().is_err(),
         "a production recovery cleared poison while a publication pin was alive \
          — the clear bypasses the poison gate"
     );
@@ -2297,12 +2320,19 @@ async fn a_poison_recovery_retires_the_unserved_reconstruction_it_left() {
     let authority_before = node.routing_authority.epoch();
 
     // REAL recovery through the production open path: prove the entry durable,
-    // republish through the shared core, clear the poison.
+    // republish through the shared core, clear the poison. BOUNDED (E3c
+    // blockers §4): the open serializes behind the interprocess lock and the
+    // poison gate, so a regression that wedges either would otherwise hang
+    // this witness rather than fail it.
     let path = scratch.path().join("revocation.json");
-    let recovered = tokio::task::spawn_blocking(move || OrgRevocationStore::open_existing(&path))
-        .await
-        .expect("join")
-        .expect("recovery must succeed");
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || OrgRevocationStore::open_existing(&path)),
+    )
+    .await
+    .expect("bounded: the recovery open must complete")
+    .expect("join")
+    .expect("recovery must succeed");
     assert!(!store.is_poisoned(), "recovery clears the poison");
     assert!(
         recovered.shares_core_with(&store),
@@ -2577,12 +2607,17 @@ async fn a_reader_retires_unserved_facts_once_their_poison_clears() {
          predicate would churn this slot on every read, forever"
     );
 
-    // Real recovery through the production open path.
+    // Real recovery through the production open path, bounded like (28)'s
+    // (E3c blockers §4).
     let path = scratch.path().join("revocation.json");
-    let _recovered = tokio::task::spawn_blocking(move || OrgRevocationStore::open_existing(&path))
-        .await
-        .expect("join")
-        .expect("recovery must succeed");
+    let _recovered = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || OrgRevocationStore::open_existing(&path)),
+    )
+    .await
+    .expect("bounded: the recovery open must complete")
+    .expect("join")
+    .expect("recovery must succeed");
     assert!(!store.is_poisoned(), "recovery clears the poison");
 
     assert!(
