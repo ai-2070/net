@@ -12375,6 +12375,34 @@ impl MeshNode {
         )
     }
 
+    /// Terminal identity exhaustion across the org authority planes, as one
+    /// operator-facing reading (review-pass-3 §13(a)):
+    /// `(revocation publication generation, routing authority epoch,
+    /// scoped change generation)`.
+    ///
+    /// Each is a monotone in-memory identity space that LATCHES rather than
+    /// wrapping, and each latch is terminal — the plane it names fails closed
+    /// from then on. Production observability used to be a single
+    /// `tracing::error!` at latch time, and
+    /// `OrgRevocationStore::generation_exhausted_for_metrics` — written for
+    /// exactly this — was wired to no metrics surface at all, its only reference
+    /// being its own unit test. This is that surface.
+    ///
+    /// The revocation reading is OBSERVABILITY ONLY, as its accessor's doc
+    /// requires: it is a bare atomic load that does not cross the live-view lock,
+    /// so it must never be used to decide currentness. Every currentness decision
+    /// takes the barriered `Result` instead.
+    pub fn org_authority_exhaustion(&self) -> (bool, bool, bool) {
+        (
+            self.org_revocation
+                .load()
+                .as_ref()
+                .is_some_and(|store| store.generation_exhausted_for_metrics()),
+            self.routing_authority.is_exhausted(),
+            self.scoped_discovery.lock().generations_exhausted(),
+        )
+    }
+
     /// Private-discovery intake outcomes (review-pass-3 §10):
     /// `[inserted, updated, stale, rejected_public, at_capacity,
     /// too_many_declarations, verify_refused, race_refused]`.
@@ -21138,6 +21166,17 @@ impl MeshNode {
                         "scoped-ann: security view moved during verify; ingest refused \
                          (publication race)"
                     );
+                    // review-pass-3 §13(b): exhaustion that lands MID-VERIFY is
+                    // the same terminal condition the pin-time check already
+                    // classifies `Final`, and it must classify the same way here.
+                    // Recognised by its exact shape — the store did not move
+                    // (`store_ptr` unchanged) and its generation is now `None` —
+                    // which no recoverable race can produce. Retrying it wasted a
+                    // full redelivery cycle to reach the identical verdict, since
+                    // "exhaustion never clears".
+                    if store_ptr_now == store_ptr && generation_now.is_none() {
+                        return ScopedIngestDisposition::Final;
+                    }
                     // §24 — RETRYABLE: the view settles and the sender
                     // re-announces, but the dedup gate would have suppressed
                     // that re-announce at the same generation.

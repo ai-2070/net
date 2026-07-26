@@ -1527,6 +1527,50 @@ async fn an_exhausted_scoped_generation_fences_the_routing_source() {
     );
 }
 
+/// (11h) The three terminal exhaustion latches reach ONE operator-facing surface
+/// (review-pass-3 §13(a)).
+///
+/// `generation_exhausted_for_metrics` was written for exactly this and wired to
+/// nothing — its only reference was its own unit test — so production
+/// observability for a terminal latch was a single `tracing::error!` at the
+/// moment it happened, and a node inspected afterwards showed nothing at all.
+#[tokio::test]
+async fn terminal_exhaustion_is_visible_on_a_metrics_surface() {
+    let node = node().await;
+    let scratch = Scratch::new("exhaustion-surface", &node);
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+    assert_eq!(
+        node.org_authority_exhaustion(),
+        (false, false, false),
+        "precondition: nothing is exhausted"
+    );
+
+    store.saturate_generation_for_test();
+    store.republish_for_test();
+    assert!(
+        node.org_authority_exhaustion().0,
+        "the revocation publication generation latch is readable after the fact"
+    );
+
+    node.routing_authority
+        .exhausted
+        .store(true, Ordering::Release);
+    node.scoped_publication
+        .gated_commit(&node.scoped_discovery, |state| {
+            state.park_revisions_at_ceiling_for_test();
+            state.advance_query_visible_generation_for_test(CapabilityAuthorityId::for_tag(
+                "nrpc:exhaustion-surface",
+            ));
+        });
+    assert_eq!(
+        node.org_authority_exhaustion(),
+        (true, true, true),
+        "and each plane reports its OWN latch — they are separate identity spaces"
+    );
+}
+
 /// (11d) A delayed reader that finds ITS artifact stale must not delete a newer
 /// one installed in the meantime.
 #[tokio::test]
