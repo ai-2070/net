@@ -1,10 +1,12 @@
 # CLI Reference
 
-The `net-mesh` binary exposes the substrate's operator surface. Its command groups include `daemon` (run stateful daemons), `transfer` (move blobs and directories between nodes), `wrap` and `mcp` (the MCP bridge — wrap a stdio MCP server as mesh capabilities, or serve the mesh to a local MCP host), `forwarding` (credential-forwarding config), and `typegen` (generate typed bindings from discovered AI tools).
+The `net-mesh` binary exposes the substrate's operator surface. Its command groups include `daemon` (run stateful daemons), `transfer` (move blobs and directories between nodes), `wrap` and `mcp` (the MCP bridge — wrap a stdio MCP server as mesh capabilities, or serve the mesh to a local MCP host), `forwarding` (credential-forwarding config), `typegen` (generate typed bindings from discovered AI tools), and `org` plus `node adopt` (organization capability-auth issuance and node ownership).
 
 The `net-mesh` binary is produced by the `net-cli` crate (kept separate so library consumers don't pay the `clap` build cost). Install it with `cargo install net-cli`, or build from source with `cargo build --release -p net-cli` and run from `target/release/net-mesh`.
 
-All commands operate against a live `MeshNode` resolved through the standard `CliContext` — the same connection-and-keypair plumbing the SDK uses. Pass `--node-addr <ip:port> --node-pubkey <hex>` to target a remote daemon, or omit them to connect to the local node started by the surrounding environment.
+Most commands operate against a live `MeshNode` resolved through the standard `CliContext` — the same connection-and-keypair plumbing the SDK uses. Pass `--node-addr <ip:port> --node-pubkey <hex>` to target a remote daemon, or omit them to connect to the local node started by the surrounding environment. The `org` group is the exception: it authors signed files offline and never touches a node.
+
+`--no-color` is global. `$NO_COLOR` is honored per [the convention](https://no-color.org): color is disabled when the variable is **present and non-empty**, whatever its value — `NO_COLOR=1`, `NO_COLOR=x`, and `NO_COLOR=false` all disable it, and only absent or empty leaves it on.
 
 ## `net-mesh transfer`
 
@@ -164,6 +166,87 @@ net-mesh typegen diff --from <PATH> --to <PATH> [--exit-code]
 ```
 
 Output lists added tools, removed tools, version bumps, and schema deltas (added/removed/changed fields on requests and responses), with `[BREAKING]` markers. By default the command exits `0`; pass `--exit-code` to exit `14` when any BREAKING change is detected (for gating CI). The structured report is available under `--output json` / `yaml`.
+
+## `net-mesh org`
+
+Offline authoring of organization capability-auth credentials against an org root key. Unlike every other group on this page, these commands are ceremonies over files — they need no live node, and none of them connects to the mesh. The conceptual model is in [Organizations](/docs/concepts/organizations); the end-to-end flow is in [Private capabilities](/docs/guides/private-capabilities).
+
+### `keygen`
+
+Generate a fresh org root keypair. This is the key everything else is signed with; it belongs offline, never on a node.
+
+```
+net-mesh org keygen [--out <PATH>] [--note <TEXT>] [--force]
+```
+
+Defaults to `$XDG_CONFIG_HOME/net-mesh/orgs/org-<id>.toml`. If the platform config directory cannot be resolved the command **refuses** rather than falling back to the working directory — this file holds a private key, and silently writing it wherever the operator happened to be standing (a git checkout, a CI workspace) is the failure mode worth an error message.
+
+### `issue-cert`
+
+Issue a membership certificate: "this node belongs to this org."
+
+```
+net-mesh org issue-cert --org-key <PATH> --member <HEX> --out <PATH>
+                        [--generation <N>] [--ttl-secs <N>] [--force]
+```
+
+`--member` is a 32-byte ed25519 public key as 64 hex chars (a leading `0x` is accepted). TTL defaults to the recommended ~1 year and is hard-capped at 2 years — rejected at issue *and* at every verifier. `--generation` stamps a revocation generation into the certificate; issue at a generation at or above the org's current floor for that member.
+
+### `issue-floors`
+
+Issue a signed revocation-floor bundle. Every certificate issued to a listed member below its floor generation is revoked.
+
+```
+net-mesh org issue-floors --org-key <PATH> --floor <MEMBER=GEN> [--floor …] --out <PATH>
+```
+
+`--floor` is repeatable and required. Nodes merge bundles **monotonically**: a lower floor never rolls back a higher one, including across a restart. This is the revocation mechanism — v1 renewal is re-issue plus a raised floor, not extension in place.
+
+### `grant-dispatcher`
+
+Issue a dispatcher grant: "this entity may act **for** this org," over one capability or all of them.
+
+```
+net-mesh org grant-dispatcher --org-key <PATH> --dispatcher <HEX> --out <PATH>
+                              (--capability <TAG> | --any-capability) [--ttl-secs <N>]
+```
+
+Signed by the org the dispatcher acts for. The caller carries it inside the per-call admission proof. Holding one is never invocation authority on its own.
+
+### `grant-capability`
+
+Issue a capability grant: "org A holds these rights on this capability over this target," signed by the *provider* org.
+
+```
+net-mesh org grant-capability --org-key <PATH> --grantee-org <HEX> --capability <TAG> --out <PATH>
+                              [--invoke] [--discover --audience-out <PATH>]
+                              (--target-node <HEX> | --target-any-owned-by <HEX>) [--ttl-secs <N>]
+```
+
+`--discover` mints a fresh audience secret and **requires** `--audience-out`; only the secret's 32-byte commitment rides inside the signed grant, so the raw discovery key never touches the wire.
+
+Both grant commands default to a 7-day TTL, hard-capped at 30 days and rejected at issue and at every verifier.
+
+Three behaviors of these two commands surprise people:
+
+- **`--force` is refused.** Grant artifacts are published no-clobber. The grant and its audience secret are written as a pair and the write is not crash-atomic, and on a case-insensitive filesystem an aliased `--out` (`ORG.TOML` vs `org.toml`) could destroy the org key itself. Write to fresh paths, or remove the old files explicitly. (`keygen`, `issue-cert`, and `issue-floors` do accept `--force`.)
+- **On Windows the audience secret's 0600 mode is unenforceable.** The file inherits its parent directory's NTFS DACL, and a loud warning fires unless you pass `--accept-windows-dacl`. Point `--audience-out` at an owner-only parent directory.
+- **`--accept-windows-dacl` and `--insecure-permissions` are separate flags on purpose.** The first suppresses a warning about a freshly written *output* secret; the second relaxes a mode check on an *input* you already control, such as an org key checked out of git at 0644. They were one flag once, and operators who added it on Linux carried it to Windows and silently killed the only warning that platform has.
+
+## `net-mesh node`
+
+### `adopt`
+
+Install org ownership on a node. This is the one org-adjacent command that writes to a node's authority directory.
+
+```
+net-mesh node adopt --cert <PATH> (--identity <PATH> | --entity <HEX>)
+                    [--authority-dir <DIR>] [--bundle <PATH>] [--skew-secs <N>]
+```
+
+Adoption writes three separately versioned files — `owner-membership.json`, `owner-audience.key`, and `revocation-state.json` — under `$XDG_CONFIG_HOME/net-mesh/authority` by default. `--bundle` optionally merges a revocation-floor bundle during adoption. `--skew-secs` is the clock-skew tolerance for the certificate window check: **strict by default**, and hard-capped at the token module's 300-second ceiling, with larger values rejected before anything is written.
+
+Like `keygen`, this command refuses rather than falling back to the working directory when the config directory cannot be resolved — the authority directory holds `owner-audience.key`, the raw owner discovery key.
 
 ## Exit codes
 

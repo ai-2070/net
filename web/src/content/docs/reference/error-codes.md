@@ -146,6 +146,30 @@ Returned from `call_typed`, `call_streaming_typed`, `call_client_stream_typed`, 
 
 There is no `NoServer` / `NoMatchingServer` / `Panic` variant — a handler that panics or returns a typed application error surfaces as `ServerError { status, message, headers }`, carrying the wire-stable status codes `NRPC_TYPED_BAD_REQUEST` / `NRPC_TYPED_HANDLER_ERROR` (part of the cross-language fixture). The binding-native typed wrappers (TS / Python / Go) re-raise these as idiomatic exceptions.
 
+### Organization errors (the `org:` vocabulary)
+
+Returned from `mesh.org(..)` and `OrgClient::call` — see [Private capabilities](/docs/guides/private-capabilities). Unlike every other error on this page, this one is a **string vocabulary rather than a Rust enum**, because it has to survive four FFI boundaries unchanged. It is single-sourced from `OrgSdkError::to_wire`, pinned by `net/crates/net/tests/cross_lang_org/error_vectors.json`, and re-parsed identically by the Node, Python, Go, and C bindings.
+
+The shape is `org:<domain>:<kind>[: <detail>]`. The detail is human-facing and **must not be parsed for semantics**.
+
+| Domain             | Local? | Meaning                                                                    |
+|--------------------|--------|----------------------------------------------------------------------------|
+| `credentials`      | yes    | The local credential set could not authorize this call. Nothing was sent    |
+| `discovery`        | yes    | No provider this credential set is authorized to call was found. Nothing was sent |
+| `admission_denied` | no     | A provider's admission engine evaluated the call and refused it              |
+| `rpc`              | no     | Transport, or a server error that is not an admission denial                |
+| `unknown`          | no     | Parser / ABI fallback — this binding's vocabulary disagrees with the build   |
+
+The domain is the load-bearing fact, and `is_local` is the question it exists to answer: *did anything leave this process?* Every binding exposes it directly — `domain.is_local()` in Rust, `ParsedOrgError.is_local` in Python, `OrgError.IsLocal()` in Go, and distinct negative return codes in C — so you never have to re-parse the message to find out.
+
+Two properties of this vocabulary are deliberate and worth understanding before you write code against it.
+
+**A binding that cannot classify a string reports `unknown`, never one of the four canonical domains.** Reporting `admission_denied` for an unparsed string would assert that a request reached a provider and that provider's admission engine ran — a claim the binding is in no position to make. `unknown` appearing in your logs means a version skew between a binding and the build it is talking to, not an authorization problem.
+
+**Remote denials are coarse on purpose.** `admission_denied` carries exactly one of `denied`, `not_supported`, or `unavailable`, with no detail at all. A precise remote reason would be a credential oracle — an attacker could walk it to learn which part of a credential set was wrong. The detailed reason is recorded provider-side for audit and never crosses the wire. Do not write caller logic that branches on a finer remote reason; there isn't one.
+
+The `org:rpc:` kinds reuse the `RpcError` vocabulary above (`timeout`, `no_route`, `cancelled`, `server_error`, `transport`, `codec_encode`, `codec_decode`, `capability_denied`) rather than minting second names for the same conditions.
+
 ### Per-peer stream errors (`StreamError`)
 
 Returned from the per-peer stream API on `MeshNode`.
