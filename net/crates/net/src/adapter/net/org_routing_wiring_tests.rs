@@ -2347,6 +2347,179 @@ async fn a_poison_recovery_retires_the_unserved_reconstruction_it_left() {
     );
 }
 
+/// (28b) The MARK counterpart of (28): a durability poison that raises NO floor
+/// still wakes routing — proactively, with no reader involved — and the
+/// untouched slots converge to `Current` over an `Unserved` source.
+///
+/// The schedule is the reachable one, all on production paths. A post-rename
+/// failure leaves the LIVE view ahead of what disk can prove (the directory
+/// entry may resolve to the old bytes — that rollback is the uncertainty
+/// PostRename names). Recovery clears the poison but only rereads; disk stays
+/// behind. A bundle that then raises the DISK state to a level the live view
+/// already enforces post-rename-fails with an EMPTY raise set: `notify` is
+/// silent, and before this closure the mark produced no wake at all — unlike
+/// the recovery clear, which always did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_poison_mark_that_raises_no_floor_wakes_routing_without_a_reader() {
+    use crate::adapter::net::behavior::org::{OrgId, OrgKeypair, OrgRevocationBundle};
+    use crate::adapter::net::behavior::org_revocation::{OrgRevocationError, OrgRevocationStore};
+    use crate::adapter::net::behavior::org_routing::{ApplyOutcome, ApplyRequest, DirtyApply};
+    use crate::adapter::net::behavior::org_routing_registry::SourceFacts;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("poison-mark", &node);
+    let store = scratch.store();
+    node.install_org_revocation_store(store.clone())
+        .expect("install");
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+    let registry = node.routing_registry.clone();
+    registry.activate_incarnation(1);
+    let family = registry.new_family().expect("family");
+    let key = slot(27, "nrpc:poison-mark");
+    let _held = family.demand(key.clone()).expect("demand");
+    let request = ApplyRequest {
+        batch: PrivateDiscoveryChangeBatch {
+            generation: 0,
+            dirty: DirtyCapabilities::Clean,
+        },
+        registry_work: true,
+    };
+    assert!(matches!(
+        registry.apply(1, request.clone()),
+        ApplyOutcome::Current { .. }
+    ));
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "precondition: warm over a healthy authority"
+    );
+
+    let floor_org = OrgKeypair::from_bytes([0x42u8; 32]);
+    let floor_member = EntityId::from_bytes([0x24u8; 32]);
+    let org_id: OrgId = floor_org.org_id();
+    let bundle = |floor: u32| {
+        let mut floors = std::collections::BTreeMap::new();
+        floors.insert(floor_member.clone(), floor);
+        OrgRevocationBundle::try_issue(&floor_org, &floors).expect("issue")
+    };
+
+    // A post-rename failure whose bundle DOES raise: the live view advances,
+    // disk keeps the old bytes, the path poisons — and the non-empty raise
+    // wakes routing through `notify` alone, exactly once (no double bump).
+    let epoch_before = node.routing_authority.epoch();
+    let err = {
+        store.arm_forced_post_rename_for_test();
+        store
+            .apply_bundle(&bundle(5))
+            .expect_err("durability must be uncertain")
+    };
+    assert!(matches!(
+        err,
+        OrgRevocationError::DurabilityUncertain { .. }
+    ));
+    assert!(store.is_poisoned(), "the raising mark poisoned the path");
+    assert_eq!(
+        node.routing_authority.epoch(),
+        epoch_before + 1,
+        "a RAISING mark wakes through `notify` — and exactly once"
+    );
+    assert_eq!(
+        store.floor_for(&org_id, &floor_member),
+        5,
+        "the live view is ahead of what disk can prove"
+    );
+    assert!(matches!(
+        registry.apply(1, request.clone()),
+        ApplyOutcome::Current { .. }
+    ));
+
+    // REAL recovery through the production open path: poison clears, the
+    // locked reread republishes DISK's older state — and the live view must
+    // not weaken (per-key max), so disk remains behind it.
+    let path = scratch.path().join("revocation.json");
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || OrgRevocationStore::open_existing(&path)),
+    )
+    .await
+    .expect("bounded: the recovery open must complete")
+    .expect("join")
+    .expect("recovery must succeed");
+    assert!(recovered.shares_core_with(&store), "same live core");
+    assert!(!store.is_poisoned(), "recovery clears the poison");
+    assert_eq!(
+        store.floor_for(&org_id, &floor_member),
+        5,
+        "recovery rereads older disk bytes but never weakens the live view"
+    );
+    assert!(matches!(
+        registry.apply(1, request.clone()),
+        ApplyOutcome::Current { .. }
+    ));
+    let warm = registry.base_facts(&key).expect("reconciled");
+    assert!(
+        !warm.epoch.poisoned,
+        "precondition: warm again, stamped against the recovered authority"
+    );
+
+    // THE mark under witness: the bundle raises disk (0 → 3) but not the
+    // already-ahead live view (5), so `raised` is EMPTY and `notify` says
+    // nothing.
+    let authority_before = node.routing_authority.epoch();
+    let err = {
+        store.arm_forced_post_rename_for_test();
+        store
+            .apply_bundle(&bundle(3))
+            .expect_err("durability must be uncertain again")
+    };
+    assert!(matches!(
+        err,
+        OrgRevocationError::DurabilityUncertain { .. }
+    ));
+    assert!(store.is_poisoned(), "the empty-raise mark landed");
+    assert_eq!(
+        store.floor_for(&org_id, &floor_member),
+        5,
+        "and raised no floor"
+    );
+
+    // The proactive wake, with NO reader involved:
+    assert_eq!(
+        node.routing_authority.epoch(),
+        authority_before + 1,
+        "an empty-raise MARK owes the same wake as the recovery clear"
+    );
+    assert!(
+        registry.base_facts(&key).is_none(),
+        "the pre-poison reconstruction was RETIRED, not left reconciled"
+    );
+    assert_eq!(registry.pending_slots(), 1, "re-queuing the exact slot");
+
+    // And the successor converges to Option A's steady state.
+    assert!(matches!(
+        registry.apply(1, request),
+        ApplyOutcome::Current { .. }
+    ));
+    let successor = registry.base_facts(&key).expect("reconciled again");
+    assert!(
+        matches!(successor.providers, SourceFacts::Unserved),
+        "Current over an Unserved source"
+    );
+    assert!(
+        successor.epoch.poisoned,
+        "stamped against the poisoned authority, so a later recovery is \
+         detectable"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_none(),
+        "and reads cold"
+    );
+}
+
 /// (29) The LAZY half, isolated: a READER retires an `Unserved` reconstruction
 /// whose poisoned authority has recovered, with no wake involved at all — and
 /// re-queues nothing while the poison is steady.

@@ -69,7 +69,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use serde::{Deserialize, Serialize};
 
 use super::org::{OrgError, OrgId, OrgRevocationBundle};
@@ -526,6 +526,13 @@ struct StoreCore {
     /// evidence that a contender reached the gate.
     #[cfg(test)]
     poison_blocking_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only, one-shot: force `apply_bundle`'s next state write to report a
+    /// POST-rename durability failure while leaving the file at its prior
+    /// bytes — the exact uncertainty PostRename names. On Windows the phase is
+    /// otherwise unreachable (write-through rename, §13), so the poison-mark
+    /// wake (E3c blockers §1) has no other witness route there.
+    #[cfg(test)]
+    force_post_rename: AtomicBool,
     /// Raise subscribers, each with a removable token. A REGISTRY,
     /// not a single slot (review-9 addendum): registering a second
     /// observer must never silently steal the first one's
@@ -701,15 +708,15 @@ impl StoreCore {
         }
     }
 
-    /// Mark this live core's path poisoned, under `poison_gate`.
+    /// Mark this live core's path poisoned, under `poison_gate`, returning
+    /// whether this was the false→true TRANSITION (E3c blockers §1).
     ///
     /// The ONLY way production marks a path that has a live core. Calling the
     /// raw path-registry helper instead would let the mark land inside a
     /// [`PublicationPin`]'s validate-then-settle window.
-    fn mark_poisoned(&self) {
-        self.run_poison_blocking_hook();
-        let _gate = self.poison_gate.lock();
-        mark_poisoned(&self.backing_id, &self.path);
+    fn mark_poisoned(&self) -> bool {
+        let _gate = self.lock_poison_gate();
+        mark_poisoned(&self.backing_id, &self.path)
     }
 
     /// Clear this live core's path poison, under `poison_gate`.
@@ -723,9 +730,16 @@ impl StoreCore {
     /// file lock here. The wake is [`Self::notify_authority_changed`], invoked
     /// once the caller has released everything.
     fn clear_poison(&self) {
-        self.run_poison_blocking_hook();
-        let _gate = self.poison_gate.lock();
+        let _gate = self.lock_poison_gate();
         clear_poison(&self.backing_id, &self.path);
+    }
+
+    /// Acquire `poison_gate` for a poison TRANSITION (mark or clear) — never
+    /// used by [`PublicationPin`], whose acquisition is the thing transitions
+    /// contend with.
+    fn lock_poison_gate(&self) -> MutexGuard<'_, ()> {
+        self.run_poison_blocking_hook();
+        self.poison_gate.lock()
     }
 
     /// Fire the poison-gate acknowledgment hook if a test installed one. Runs
@@ -766,8 +780,7 @@ fn with_live_poison_gate<R>(id: &BackingId, mutate: impl FnOnce() -> R) -> R {
     };
     match existing {
         Some(core) => {
-            core.run_poison_blocking_hook();
-            let _gate = core.poison_gate.lock();
+            let _gate = core.lock_poison_gate();
             mutate()
         }
         None => mutate(),
@@ -1160,6 +1173,8 @@ fn join_or_create_core(
         publish_blocking_hook: Mutex::new(None),
         #[cfg(test)]
         poison_blocking_hook: Mutex::new(None),
+        #[cfg(test)]
+        force_post_rename: AtomicBool::new(false),
         subscribers: RwLock::new(Vec::new()),
         next_subscriber: AtomicU64::new(0),
         #[cfg(any(test, feature = "fixtures"))]
@@ -1455,8 +1470,15 @@ impl OrgRevocationStore {
                     Err(WritePhase::PostRename(reason)) => {
                         // No core joined yet, but a same-path sibling may hold
                         // one: gate against ITS pins (Kyra OLB-2B-E3c closure).
+                        // No authority wake here, deliberately (contrast
+                        // `apply_bundle`, E3c blockers §1): this store failed
+                        // to initialize, so it has no subscribers, and the
+                        // interprocess lock is still held — a sibling core's
+                        // routing facts are repaired by the lazy read-time
+                        // epoch comparison, which is the accepted coverage for
+                        // this create-over-a-live-sibling corner.
                         with_live_poison_gate(&backing_id, || {
-                            mark_poisoned(&backing_id, &path);
+                            let _ = mark_poisoned(&backing_id, &path);
                         });
                         return Err(OrgRevocationError::DurabilityUncertain {
                             path: path.display().to_string(),
@@ -1634,6 +1656,15 @@ impl OrgRevocationStore {
     #[cfg(test)]
     pub(crate) fn arm_poison_blocking_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.core.poison_blocking_hook.lock() = Some(hook);
+    }
+
+    /// Test-only, one-shot: force the next `apply_bundle` state write to report
+    /// a POST-rename durability failure without touching the file (E3c
+    /// blockers §1). See the [`StoreCore::force_post_rename`] field.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn arm_forced_post_rename_for_test(&self) {
+        self.core.force_post_rename.store(true, Ordering::Release);
     }
 
     /// `true` iff `other` is backed by the same normalized path —
@@ -1877,7 +1908,10 @@ impl OrgRevocationStore {
             /// Raised floors, plus whether this apply RECOVERED the path from
             /// poison — which owes an authority wake even when nothing rose.
             Applied(Vec<RaisedFloor>, bool),
-            DurabilityUncertain(Vec<RaisedFloor>, String),
+            /// Raised floors, the reason, and whether the mark was the
+            /// false→true TRANSITION — which owes the same wake the recovery
+            /// does when nothing rose (E3c blockers §1).
+            DurabilityUncertain(Vec<RaisedFloor>, String, bool),
         }
 
         // 1. Verify the incoming bundle's signature + canonical
@@ -1949,9 +1983,25 @@ impl OrgRevocationStore {
 
             // 5. Persist iff the disk state changed; the write must
             //    complete before anything is published.
-            let mut durability_uncertain: Option<String> = None;
+            let mut durability_uncertain: Option<(String, bool)> = None;
             if raised_on_disk > 0 {
-                match write_atomic_phased(path, &merged.to_file_bytes()?) {
+                // Test seam: report a post-rename durability failure while
+                // leaving the file at its PRIOR bytes — the exact uncertainty
+                // PostRename names (the entry may resolve to the old state).
+                // On Windows the phase is otherwise unreachable in production
+                // (write-through rename, §13), so the mark path has no other
+                // witness route there.
+                #[cfg(test)]
+                let write = if self.core.force_post_rename.swap(false, Ordering::AcqRel) {
+                    Err(WritePhase::PostRename(
+                        "forced post-rename failure (test seam)".to_string(),
+                    ))
+                } else {
+                    write_atomic_phased(path, &merged.to_file_bytes()?)
+                };
+                #[cfg(not(test))]
+                let write = write_atomic_phased(path, &merged.to_file_bytes()?);
+                match write {
                     Ok(()) => {}
                     Err(WritePhase::PreRename(reason)) => {
                         // Old file (rename never happened) and old
@@ -1974,8 +2024,8 @@ impl OrgRevocationStore {
                         // entry durable.
                         // Ordered BEFORE the publish below, matching the frozen
                         // `poison_gate` → `live` order.
-                        self.core.mark_poisoned();
-                        durability_uncertain = Some(reason);
+                        let newly_poisoned = self.core.mark_poisoned();
+                        durability_uncertain = Some((reason, newly_poisoned));
                     }
                 }
             }
@@ -1996,7 +2046,7 @@ impl OrgRevocationStore {
             drop(lock);
             match durability_uncertain {
                 None => LockedOutcome::Applied(raised, recovered),
-                Some(reason) => LockedOutcome::DurabilityUncertain(raised, reason),
+                Some((reason, newly)) => LockedOutcome::DurabilityUncertain(raised, reason, newly),
             }
         };
 
@@ -2009,13 +2059,32 @@ impl OrgRevocationStore {
                 }
                 Ok(raised)
             }
-            LockedOutcome::DurabilityUncertain(raised, reason) => {
+            LockedOutcome::DurabilityUncertain(raised, reason, newly_poisoned) => {
                 let err = OrgRevocationError::DurabilityUncertain {
                     path: path.display().to_string(),
                     reason,
                 };
                 tracing::error!("{err}");
                 self.core.notify(&raised);
+                if newly_poisoned && raised.is_empty() {
+                    // The MARK owes the same wake the CLEAR does (E3c blockers
+                    // §1): what this node may serve just went from the real
+                    // material to NOTHING, yet `notify` is silent on an empty
+                    // raise set — which is exactly what a mark produces
+                    // whenever the live view was already ahead of what disk
+                    // can prove (the rollback case PostRename models). Without
+                    // this, the registry stays reconciled to pre-poison facts
+                    // until a reader happens to trip the lazy epoch check.
+                    //
+                    // Guarded on BOTH conditions: a non-empty `raised` already
+                    // woke every subscriber above — authority-tracking
+                    // subscribers treat any invocation as movement, so waking
+                    // again would double-bump the epoch for one transition —
+                    // and a re-mark of an already-poisoned path has no
+                    // transition to report; routing facts are already stamped
+                    // `poisoned == true`.
+                    self.core.notify_authority_changed();
+                }
                 Err(err)
             }
         }
@@ -2172,11 +2241,17 @@ fn poison_path_key(normalized_path: &Path) -> PathBuf {
 
 /// Poison `normalized_path` under BOTH indexes (R3-2), recording `id` in the
 /// path's id set so recovery can retire every id ever poisoned here.
-fn mark_poisoned(id: &BackingId, normalized_path: &Path) {
+/// Returns whether the path was NEWLY poisoned — neither index held it before.
+/// The transition signal `apply_bundle` uses to decide whether a mark that
+/// raised no floor still owes an authority wake (E3c blockers §1). Computed
+/// under the registry lock, so it cannot race a concurrent mark or clear.
+fn mark_poisoned(id: &BackingId, normalized_path: &Path) -> bool {
     let key = poison_path_key(normalized_path);
     let mut reg = poison_registry().lock();
+    let newly = !reg.by_id.contains(id) && !reg.by_path.contains_key(&key);
     reg.by_id.insert(id.clone());
     reg.by_path.entry(key).or_default().insert(id.clone());
+    newly
 }
 
 /// Poisoned iff EITHER the live sidecar identity OR the canonical state
