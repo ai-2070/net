@@ -869,3 +869,49 @@ async fn sweep_transaction_cannot_erase_a_concurrently_refreshed_lease_cell() {
         "the refreshed consumer cell exists at the refreshed cadence"
     );
 }
+
+/// review-pass-3 §14(c): a branch carrying BOTH a digest watch and a direct
+/// node-local row must keep the STRICTEST cadence.
+///
+/// `update_consumer_intervals` re-anchored every matching cell to the watch
+/// expectation's own interval, without min-ing `local_consumer_interval`. That
+/// contradicts the invariant `sensing/table.rs` states for this cell — it must
+/// re-anchor to the strictest across every live node-local row, never to the
+/// latest mutating row's interval — and it silently RELAXED a consumer that had
+/// asked for a tighter cadence through the direct API.
+#[tokio::test]
+async fn a_digest_watch_refresh_cannot_relax_a_stricter_direct_row() {
+    let node = sensing_node().await;
+    let spec = spec_for(node.sensing_local_root(), PROVIDER);
+    let key = ProviderInterestKey::new(spec.key(), PROVIDER);
+
+    // A direct local row at the STRICT cadence establishes the consumer cell.
+    node.register_sensing_interest(&spec, PROVIDER, STRICT, Duration::from_secs(30))
+        .expect("direct registration");
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(STRICT),
+        "precondition: the cell carries the direct row's cadence"
+    );
+
+    // A digest watch over the SAME interest, at a LOOSER cadence. It is one
+    // demand on the cell, not the whole of it.
+    node.register_capability_interest(&spec, PROVIDER, D, Duration::from_secs(30))
+        .expect("capability interest");
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(STRICT),
+        "a looser watch must not relax a stricter live node-local row"
+    );
+
+    // And a watch STRICTER than the direct row still tightens it, so the min is
+    // a genuine aggregate rather than "ignore the watch".
+    let tighter = Duration::from_millis(20);
+    node.register_capability_interest(&spec, PROVIDER, tighter, Duration::from_secs(30))
+        .expect("tighter capability interest");
+    assert_eq!(
+        node.sensing_consumer_cell_interval_for_test(&key),
+        Some(tighter),
+        "a stricter watch still tightens the shared cadence"
+    );
+}

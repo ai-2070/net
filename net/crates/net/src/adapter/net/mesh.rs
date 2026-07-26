@@ -4274,12 +4274,39 @@ impl SensingObservations {
         &mut self,
         interest: &sensing::CapabilityInterestKey,
         interval: Duration,
+        local_aggregates: &std::collections::HashMap<sensing::ProviderInterestKey, Duration>,
     ) {
         for (key, cell) in self.consumer_cells.iter_mut() {
             if &key.interest == interest {
-                cell.update_interval(interval);
+                // review-pass-3 §14c: the digest-watch expectation is ONE demand
+                // on this cell, not the whole of it. A branch carrying BOTH a
+                // watch and a direct node-local row re-anchored to the watch's
+                // interval alone, which loses to `local_consumer_interval` — the
+                // invariant `table.rs` states for this cell: it must re-anchor to
+                // the strictest across every live node-local row, never to the
+                // latest mutating row's own interval.
+                let effective = local_aggregates
+                    .get(key)
+                    .map_or(interval, |local| (*local).min(interval));
+                cell.update_interval(effective);
             }
         }
+    }
+
+    /// The branches whose consumer cell is keyed under `interest`, so a caller
+    /// can resolve each one's local aggregate under the TABLE lock before taking
+    /// the observations lock (review-pass-3 §14c). Split this way deliberately:
+    /// nesting observations -> table would introduce a lock order this file does
+    /// not otherwise use.
+    fn consumer_branches_for(
+        &self,
+        interest: &sensing::CapabilityInterestKey,
+    ) -> Vec<sensing::ProviderInterestKey> {
+        self.consumer_cells
+            .keys()
+            .filter(|key| &key.interest == interest)
+            .cloned()
+            .collect()
     }
 }
 
@@ -4388,7 +4415,36 @@ fn disrupt_sensing_provider(
 /// branch's continuity window immediately (the upstream re-send
 /// rides the next refresh — no spec cache at this hop).
 #[allow(clippy::too_many_arguments)]
+/// Reclaim a dead branch's projection state, under the projection transaction
+/// and only if it is STILL dead (review-pass-3 §14a).
+///
+/// The 0494a7620 linearization covered intake, sweep and attestation; the
+/// branch-death consequences were left outside it. Between the table mutation
+/// that decided this branch had no downstreams and this reclaim, a registration
+/// can complete — its table row survives, but `reclaim_branch` erases the
+/// consumer cell it just anchored and the warm start it just took, and nothing
+/// restores them until the next origin beat.
+///
+/// The re-check mirrors the one the attestation-refusal path already performs for
+/// exactly this race: hold the projection mutex, confirm the branch is still
+/// unclaimed, and only then reclaim.
+fn reclaim_dead_sensing_branch(
+    projection_mu: &parking_lot::Mutex<()>,
+    table: &parking_lot::Mutex<sensing::InterestTable>,
+    observations: &parking_lot::Mutex<SensingObservations>,
+    key: &sensing::ProviderInterestKey,
+) {
+    let _projection = projection_mu.lock();
+    if !table.lock().downstreams(key, Instant::now()).is_empty() {
+        return;
+    }
+    observations.lock().reclaim_branch(key);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_sensing_removal_action(
+    projection_mu: &parking_lot::Mutex<()>,
+    table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &parking_lot::Mutex<SensingObservations>,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
     emitter_stamp: Option<u64>,
@@ -4403,7 +4459,7 @@ fn apply_sensing_removal_action(
 ) {
     match action {
         sensing::UpstreamAction::Deregister => {
-            observations.lock().reclaim_branch(key);
+            reclaim_dead_sensing_branch(projection_mu, table, observations, key);
             if key.provider == local_node_id {
                 if let (Some(emitter), Some(stamp)) = (emitter.lock().as_mut(), emitter_stamp) {
                     emitter.retire_if_stale(&key.interest.interest_digest, stamp);
@@ -4444,6 +4500,7 @@ fn apply_sensing_removal_action(
 /// last interest — never waiting for the ttl sweep.
 #[allow(clippy::too_many_arguments)]
 fn remove_sensing_downstream(
+    projection_mu: &parking_lot::Mutex<()>,
     table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &parking_lot::Mutex<SensingObservations>,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
@@ -4464,6 +4521,8 @@ fn remove_sensing_downstream(
         .remove_downstream(sensing::DownstreamId::Peer(failed), now);
     for (key, action) in actions {
         apply_sensing_removal_action(
+            projection_mu,
+            table,
             observations,
             emitter,
             emitter_stamp,
@@ -4489,6 +4548,7 @@ fn remove_sensing_downstream(
 #[cfg(feature = "redex")]
 #[allow(clippy::too_many_arguments)]
 fn remove_sensing_leader_consumer(
+    projection_mu: &parking_lot::Mutex<()>,
     leader: &parking_lot::Mutex<Option<sensing::SensingLeader>>,
     table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &parking_lot::Mutex<SensingObservations>,
@@ -4526,6 +4586,8 @@ fn remove_sensing_leader_consumer(
                 );
                 for (key, mesh_action) in mesh_actions {
                     apply_sensing_removal_action(
+                        projection_mu,
+                        table,
                         observations,
                         emitter,
                         emitter_stamp,
@@ -7314,6 +7376,12 @@ impl MeshNode {
         #[cfg(feature = "redex")]
         let sensing_leader: Arc<parking_lot::Mutex<Option<sensing::SensingLeader>>> =
             Arc::new(parking_lot::Mutex::new(None));
+        // Hoisted out of the struct literal so the peer-failure handler can hold
+        // it: branch-death reclaim runs under the projection transaction like
+        // every other projection mutation (review-pass-3 §14a).
+        let sensing_local_projection_mu: Arc<parking_lot::Mutex<()>> =
+            Arc::new(parking_lot::Mutex::new(()));
+        let sensing_projection_mu_failure = sensing_local_projection_mu.clone();
         let sensing_table_failure = sensing_interest_table.clone();
         let sensing_observations_failure = sensing_observations.clone();
         let sensing_overlay_failure = sensing_overlay_changed.clone();
@@ -7437,6 +7505,7 @@ impl MeshNode {
                 // local emission streams retire with their last
                 // interest — event-driven, never the ttl sweep.
                 remove_sensing_downstream(
+                    &sensing_projection_mu_failure,
                     &sensing_table_failure,
                     &sensing_observations_failure,
                     &sensing_emitter_failure,
@@ -7451,6 +7520,7 @@ impl MeshNode {
                 );
                 #[cfg(feature = "redex")]
                 remove_sensing_leader_consumer(
+                    &sensing_projection_mu_failure,
                     &sensing_leader_failure,
                     &sensing_table_failure,
                     &sensing_observations_failure,
@@ -7726,7 +7796,7 @@ impl MeshNode {
             ),
             sensing_interest_leases: sensing::SensingInterestLeases::default(),
             sensing_lease_apply_mu: parking_lot::Mutex::new(()),
-            sensing_local_projection_mu: Arc::new(parking_lot::Mutex::new(())),
+            sensing_local_projection_mu,
             #[cfg(feature = "fixtures")]
             sensing_projection_contention_hook: parking_lot::Mutex::new(None),
             consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
@@ -8695,9 +8765,32 @@ impl MeshNode {
         // SI-4 re-review item 5: a refreshed expectation can change
         // the consumer's D — every overlay cell under the digest
         // re-anchors immediately, never at the next beat.
-        self.sensing_observations
-            .lock()
-            .update_consumer_intervals(&key, requested_sample_interval);
+        //
+        // review-pass-3 §14c: as ONE projection transaction, and MIN-ed against
+        // each branch's live node-local aggregate. Read under the table lock and
+        // applied under the observations lock, never nested, so no new lock order
+        // is introduced.
+        {
+            let _projection = self.sensing_local_projection_mu.lock();
+            let branches = self.sensing_observations.lock().consumer_branches_for(&key);
+            let now = Instant::now();
+            let local_aggregates: std::collections::HashMap<_, _> = {
+                let table = self.sensing_interest_table.lock();
+                branches
+                    .into_iter()
+                    .filter_map(|branch| {
+                        table
+                            .local_consumer_interval(&branch, now)
+                            .map(|interval| (branch, interval))
+                    })
+                    .collect()
+            };
+            self.sensing_observations.lock().update_consumer_intervals(
+                &key,
+                requested_sample_interval,
+                &local_aggregates,
+            );
+        }
         if sensing_upstream_damper_admits(
             &self.sensing_upstream_damper,
             leader,
@@ -13137,6 +13230,7 @@ impl MeshNode {
         let partition_filter = self.partition_filter.clone();
         let local_node_id = self.node_id;
         let observations = self.sensing_observations.clone();
+        let projection_mu = self.sensing_local_projection_mu.clone();
         let overlay = self.sensing_overlay_changed.clone();
         let factor = self.config.continuity_factor;
         let counters = self.sensing_counters.clone();
@@ -13261,16 +13355,30 @@ impl MeshNode {
                             .latest
                             .insert(branch.clone(), signed.clone());
                     }
-                    if let Some(interval) = local_interval {
-                        let moved = {
-                            let mut observations = observations.lock();
-                            observations
-                                .feed_consumer_cell(&branch, &signed, true, interval, factor, now)
-                        };
-                        if moved {
-                            overlay.send_modify(|generation| {
-                                *generation = generation.wrapping_add(1);
-                            });
+                    if local_interval.is_some() {
+                        // review-pass-3 §14b: the aggregate read and the cell
+                        // apply are ONE projection transaction. The
+                        // `local_interval` above was derived before the signature
+                        // — long enough for a lease tighten to commit in between,
+                        // which would re-anchor the shared cell to the stale
+                        // LOOSER cadence until the next beat or tick. Re-derived
+                        // under the mutex, so the value applied is the one that
+                        // was live when it was applied, matching the field's own
+                        // "changes OR applies" contract.
+                        let _projection = projection_mu.lock();
+                        let interval = { table.lock().local_consumer_interval(&branch, now) };
+                        if let Some(interval) = interval {
+                            let moved = {
+                                let mut observations = observations.lock();
+                                observations.feed_consumer_cell(
+                                    &branch, &signed, true, interval, factor, now,
+                                )
+                            };
+                            if moved {
+                                overlay.send_modify(|generation| {
+                                    *generation = generation.wrapping_add(1);
+                                });
+                            }
                         }
                     }
                     // SI-4 re-review P0: locally signed beats
@@ -19250,9 +19358,19 @@ impl MeshNode {
                 );
                 for (key, action) in actions {
                     // Closure item 6: a dead branch reclaims its
-                    // observations with the table.
+                    // observations with the table. review-pass-3 §14a:
+                    // under the projection transaction, and only if the
+                    // branch is STILL dead — a registration completing in
+                    // this window keeps its table row, so an unguarded
+                    // reclaim would erase the consumer cell and warm start
+                    // it just anchored.
                     if action == sensing::UpstreamAction::Deregister {
-                        ctx.sensing_observations.lock().reclaim_branch(&key);
+                        reclaim_dead_sensing_branch(
+                            &ctx.sensing_local_projection_mu,
+                            &ctx.sensing_interest_table,
+                            &ctx.sensing_observations,
+                            &key,
+                        );
                     }
                     // SI-4 re-review item 5: a loosened aggregate
                     // re-anchors the surviving branch's continuity
@@ -20715,6 +20833,8 @@ impl MeshNode {
             );
             for (key, action) in mesh_actions {
                 apply_sensing_removal_action(
+                    &ctx.sensing_local_projection_mu,
+                    &ctx.sensing_interest_table,
                     &ctx.sensing_observations,
                     &ctx.sensing_emitter,
                     emitter_stamp,
