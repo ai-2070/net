@@ -767,9 +767,15 @@ least witnessed even though the code is unchanged.
 
 ### Prior-review residuals
 
-The three items under "Prior-review residuals still open" belong to the
-2026-07-23 review and are restated here, not re-opened: they are unchanged by
-this closure and remain tracked there.
+Restated from 2026-07-23, and two of the three are now closed rather than left
+tracked elsewhere.
+
+| Residual | Status | Where |
+|---|---|---|
+| §6 — `let _ =` swallows on the lease rollback/release wire ops | **Closed** — counted + warned; `sensing_lease_reconcile_failures()` | `5e9798f60` |
+| §6 — the ttl/2 refresh consumer is not in-tree | **Open, by scope** — a missing phase consumer, not a defect in landed code | — |
+| §7 — `GateProof` is `Clone`; `from_validated_legacy` takes an arbitrary `(spec, proven_root)` pair | **Closed** — validated object sealed behind a private field; proof no longer `Clone`; the legacy root is DERIVED from its own spec | `5e9798f60` |
+| §5 — fsync coupling on the receive loop | **Unchanged** — accepted posture, restated as such by this pass | — |
 
 ### Test evidence (this closure; Windows host)
 
