@@ -65,7 +65,7 @@ This matters for how you reason about an empty result. A `find_nodes` query retu
 
 Capabilities are an input to almost every decision in Net beyond the bus itself.
 
-**Channel authorization.** Channels can require that publishers and subscribers match a capability filter — "you must have `hardware.gpu`," or "you must be on `tier.production` and have `software.cuda >= 12`." The check happens at subscription time, the result is cached in the auth guard, and the per-packet path stays at single-digit nanoseconds.
+**Channel routing and authorization.** Channels can require that publishers and subscribers match a capability filter — "you must have `hardware.gpu`," or "you must be on `tier.production` and have `software.cuda >= 12`." The check happens at subscription time, the result is cached in the auth guard, and the per-packet path stays at single-digit nanoseconds. Note that a capability filter is **matchmaking, not an access boundary** — it matches self-advertised capabilities, so a channel that must genuinely restrict who participates needs permission tokens ([Channels](/docs/concepts/channels#capability-filters-are-advisory-tokens-are-the-boundary)).
 
 **Placement.** When a daemon needs to run somewhere, the placement layer scores candidate nodes against the daemon's capability requirements and picks the best match. Placement filters can be hard (the daemon must have a GPU; no GPU, no placement) or soft (prefer GPUs, fall back to CPU); they can be composed across multiple axes, and they can be extended with custom scoring logic registered through a process-global callback registry.
 

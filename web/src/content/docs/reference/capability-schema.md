@@ -88,6 +88,16 @@ Blob storage capabilities and heat counters used by the data-gravity layer.
 | `dataforts.persistent_gb`             | `number` (u64)  | Persistent blob storage in GB                              |
 | `dataforts.erasure_coded`             | `bool`          | Whether persistent tier uses Reed-Solomon encoding         |
 
+## Encoding caveats
+
+Two properties of the typed-struct ↔ tag-set codec aren't visible from the tables above, and both surface as confusing round-trips rather than errors.
+
+**Zero, empty, and `None` fields are omitted from emission.** A default `HardwareCapabilities` round-trips through an *empty* tag set. The consequence is that "the key is absent from the announcement" and "the value is zero" are indistinguishable on the wire — so don't encode a meaningful zero and expect a peer to read it back. If zero is a real state you need to distinguish from unset, carry it as a string value or a separate presence marker.
+
+**Multi-GPU and accelerators are not encoded.** `HardwareCapabilities::additional_gpus` and `accelerators: Vec<AcceleratorInfo>` are dropped by the current codec; the bijection is exact only for the single-GPU, no-accelerator case. An indexed scheme (`hardware.gpu.0.*` / `hardware.gpu.1.*`) is the intended shape when it lands. Until then, if you need to route on a second GPU, ride a free-form tag rather than expecting the typed field to survive the wire.
+
+Decoding is deliberately lenient in the other direction: an axis-prefixed tag whose key the local binary doesn't recognize is **skipped, not rejected**. That's the forward-compat ride-through that lets a newer peer emit keys an older one has never heard of.
+
 ## Reserved cross-axis prefixes
 
 A handful of prefixes carry specific meaning to the substrate, outside the four canonical axes:

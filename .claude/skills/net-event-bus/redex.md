@@ -250,7 +250,72 @@ let file = redex.open_file(
 )?;
 ```
 
-Replication is a deep topic; this skill stays focused on the local log. For the wire codec, election rules, failover semantics, bandwidth budgets, and per-channel Prometheus metrics, point at `net/README.md` § Replication.
+Two things must happen. `enable_replication(mesh)` installs the per-`Redex` router on the mesh's `SUBPROTOCOL_REDEX` dispatch (`0x0E00`) — idempotent, safe from multiple call sites. Then each `open_file` with `replication: Some(_)` spawns **one Tokio task per channel** (the coordinator: election, heartbeats, sync). Use the *same* `RedexFileConfig` on every node hosting a replica.
+
+### `ReplicationConfig` fields — ranges, defaults, and what they cost
+
+| Field | Range | Default | Notes |
+|---|---|---|---|
+| `factor: u8` | `[1, 16]` | `3` | Replicas *including* the leader. `1` collapses to single-node-with-coordinator (useful for testing the daemon lifecycle without peers). The `16` ceiling is conservative — heartbeat fanout makes overhead superlinear above ~8. **When `placement = Pinned(nodes)`, `nodes.len()` wins over `factor`.** |
+| `placement: PlacementStrategy` | — | `Standard` | `Standard` scores candidates on `metadata.intent`, `metadata.colocate-with`, `scope:` tags, proximity, and resource availability. `Pinned(Vec<NodeId>)` is manual. `ColocationStrict` requires every replica to sit on a node already holding the chain named by `metadata.colocate-with-strict`, refusing insufficient-coverage nodes. |
+| `heartbeat_ms: u64` | `>= 100` | `500` | **Failure detection is `3 × heartbeat_ms`** (three-missed hysteresis) — so the default declares a silent leader dead in ~1.5 s. Don't go below 100 ms; heartbeat traffic starts dominating the channel's throughput. |
+| `leader_pinned: Option<NodeId>` | — | `None` | `None` = the deterministic nearest-RTT election picks the lowest-RTT healthy replica. `Some(node)` favors `node` whenever it's healthy. If `placement = Pinned(set)`, the pinned leader **must** be in `set` or validation rejects. |
+| `on_under_capacity: UnderCapacity` | — | `Withdraw` | See below. |
+| `replication_budget_fraction: f32` | `(0.0, 1.0]` | `0.5` | Fraction of measured NIC peak that sync I/O may consume, as a token bucket. Leaders reject `SyncRequest` with a `Backpressure` NACK when the bucket empties; replicas back off and retry the same request. (The denominator is a 1 Gbps placeholder today — the proximity-graph throughput probe wires the real measured peak in a follow-up.) |
+| `default_bandwidth_class` | — | `Foreground` | Per-channel default `BandwidthClass` stamped on emitted `SyncRequest`s. Receivers honor a per-request override in preference to this. |
+| `background_fraction: f32` | `[0.0, 1.0)` | `0.3` | Admission gate: a `Background` request is admitted only when `available >= (1 - background_fraction) * capacity`. Hot channels set it low (more Foreground headroom); archival channels set it high. `1.0` is **rejected** — it would deny every Background request unconditionally. An anti-starvation hatch one-shot bypasses the gate after 60 s of starving regardless. |
+
+`validate()` runs the whole invariant set; call it before handing a config to `Redex` so a malformed one can't reach the coordinator.
+
+**`UnderCapacity`** decides what a replica does when its local file rejects an append under disk pressure:
+
+- **`Withdraw`** (default) — drop the replica role. The coordinator goes `Idle`, the `causal:<hex>` capability tag is withdrawn, and peers re-resolve to a healthy replica via `find_chain_holders`. Reads re-route automatically.
+- **`EvictOldest`** — sweep retention to free space, keep the role, retry on the next chunk. **Requires `retention_max_*` on the same `RedexFileConfig`** — without retention caps the sweep is a no-op and the next apply fails again. This is the most common misconfiguration of the pair.
+
+Either branch increments `under_capacity_total`, so the operator metric reflects every disk-pressure event regardless of policy.
+
+### Lifecycle
+
+`Idle` → (placement selects this node) → `Replica` (advertises `causal:<hex>`) → (leader silent for `3 × heartbeat_ms`) → `Candidate` → `elect()` → `Leader` / back to `Replica` / stay `Candidate` and retry. `close_file` returns it to `Idle` and unregisters the router. In the steady state the leader heartbeats, replicas observe its `tail_seq`, and a behind replica pulls with `SyncRequest` → `SyncResponse`.
+
+**There is no leader-election message on the wire.** Election is a deterministic function over each node's locally-known state (proximity-graph RTT, replica-set membership, `NodeId` ordering); what peers actually observe is the capability tag being announced or withdrawn by the resulting `transition_to`. That's why the replication subprotocol has no `LeaderElection` dispatch code.
+
+### `SyncNack` — the four typed rejections and their retry policy
+
+When a leader refuses a `SyncRequest` it answers with a typed code, and the replica's remediation differs per code. Don't collapse them into a generic retry:
+
+| Code | Meaning | Replica does |
+|---|---|---|
+| `1` `NotLeader` | you asked the wrong node | re-resolve the leader via `Mesh::find_chain_holders`, retry |
+| `2` `BadRange` | requested range no longer retained | trim local tail, retry from the leader's first available `seq` (this is what bumps `skip_ahead_total`) |
+| `3` `Backpressure` | leader's bandwidth bucket is empty | exponential backoff, retry **the same** request |
+| `4` `ChannelClosed` | the leader closed the channel | withdraw the replica role, emit the metric |
+
+### Observability + failure modes
+
+Per-channel counters via `ReplicationMetricsRegistry::snapshot().prometheus_text()`: `dataforts_replication_lag_seconds{channel,role}` (gauge), `..._sync_bytes_total`, `dataforts_leader_changes_total`, `..._under_capacity_total`, `..._skip_ahead_total`, `..._election_thrash_total`, `..._witness_withdrawals_total` (reserved for a future witness phase), and `..._announce_divergence_total`.
+
+That last one is easy to miss and worth an alert: it bumps when a `* → Idle` transition's withdraw-chain call **fails after the state cell already flipped to `Idle`**. While it's non-zero, the mesh may still be advertising this node as a chain holder for a channel it no longer replicates — readers get routed to a node that will not serve them. Recovery is opportunistic on the next `transition_to`, so a stuck non-zero value is a real problem, not a blip.
+
+The registry is bounded by `MAX_TRACKED_CHANNELS`; channels past the cap fold into a shared `__overflow__` bucket. If you see `__overflow__` in a scrape, per-channel attribution is already lost for some channels — that's a cardinality signal, not a channel name.
+
+| Symptom | Likely cause | Move |
+|---|---|---|
+| `lag_seconds` climbing | leader's bandwidth budget exhausted, or the replica's mesh path is saturated | raise `replication_budget_fraction`; check the proximity-graph throughput probe |
+| `leader_changes_total` bumping often | `heartbeat_ms` too aggressive for the link's RTT variance | raise `heartbeat_ms`, or `leader_pinned` |
+| `under_capacity_total > 0` + a replica vanished | `Withdraw` fired | free disk, or switch to `EvictOldest` (**and add retention caps**) |
+| `skip_ahead_total > 0` | replica fell past the leader's retained range | accept the loss or raise the leader's retention caps |
+| `election_thrash_total` rising (> 1 per 30 s) | two replicas oscillating under flaky connectivity | investigate the proximity graph; the partition detector should fire if it's partition-shaped |
+
+Per-channel introspection (current role, manual transition for recovery) is `Redex::replication_coordinator_for(channel_name)` → `Arc<ReplicationCoordinator>`.
+
+### Limits and non-goals
+
+- **One writer per channel.** The leader is the single writer; RedEX is append-only and monotonic on `seq`. Multi-writer topologies are out of scope — don't design around one.
+- **The replication factor is a hard guarantee; individual replicas are best-effort under pressure**, falling back to their `UnderCapacity` policy when local storage saturates.
+- **Skip-ahead is heap-only.** When the leader trims past a replica's local tail, in-memory replicas can `skip_to(first_seq)` and retry; **persistent files reject `skip_to` with a typed error** and fall back to NACK + heartbeat-cycle recovery while the persistent-tier rebuild path is still in development.
+
+For the wire codec and the full election rules, see `net/README.md` § Replication and `src/adapter/net/redex/`.
 
 ---
 

@@ -8,9 +8,15 @@ A channel name looks like a path: `sensors/lidar/front`, `chat/lobby`, `metrics/
 
 Channel names are slash-separated paths, up to 255 bytes, drawn from `a-z`, `A-Z`, `0-9`, and the characters `-`, `_`, `.`, `/`. They can't start or end with a slash, can't contain a double slash, and are matched case-sensitively.
 
-Every channel name is also reduced to a 16-bit `channel_hash` that lives in the packet header. The hash is what forwarders look at on the hot path; the full name only matters at registration, authorization, and subscription time. This is why Net can route a packet without decrypting it — the hash is enough to find the channel's policy in the local registry.
+Every channel name is reduced to *two* hashes, and the distinction matters.
 
-Names are hierarchical, and prefix matching is a first-class operation. A subscriber to `sensors/lidar` receives events from `sensors/lidar/front` and `sensors/lidar/rear` alike — provided it has the right capabilities.
+The **canonical `ChannelHash`** is a 64-bit xxh3 of the name. It's the substrate-wide key for authorization, channel config, storage, and metrics — the full keyspace, so a targeted second-preimage costs about 2^64 work even though xxh3 isn't a cryptographic hash.
+
+The **wire `channel_hash`** is a 16-bit value carried in the packet header. It's a fast-path filter hint that lets a forwarder make a routing decision without decrypting anything. Sixteen bits is 65,536 buckets, so at mesh scale it collides as a matter of routine.
+
+Those collisions are harmless precisely because the wire hint decides nothing that matters: access control, config lookup, and storage all key on the canonical 64-bit hash. Keep the two apart when you're writing a relay or reading a capture — the header's `channel_hash` tells you where a packet is probably headed, never what it's allowed to do. (The split is deliberate. The canonical key used to be a 32-bit truncation, which meant roughly 2^32 of grinding could produce a token issued for one channel that satisfied the token cache's fast path for an unrelated victim channel that landed in the same bucket.)
+
+Names are hierarchical, and prefix matching is a first-class operation. A subscriber to `sensors/lidar` receives events from `sensors/lidar/front` and `sensors/lidar/rear` alike — provided it's authorized on them.
 
 ## Visibility
 
@@ -27,13 +33,15 @@ Subnet gateways enforce these scopes at the boundary by reading the packet heade
 
 ## Authorization
 
-A channel can optionally require capability matching and a permission token before allowing a node to publish or subscribe. Both checks are configured on the channel itself, not at the call site:
+A channel can optionally require capability matching and a permission token before allowing a node to publish or subscribe. Both checks are configured on the channel itself, not at the call site — but they are **not** two flavors of the same thing, and the difference is the most important paragraph on this page. Read the next section before you rely on either.
 
 ```rust
 ChannelConfig::new(channel_id)
     .with_visibility(Visibility::Exported)
+    // Advisory: matched against self-advertised capabilities. Routing, not access control.
     .with_publish_caps(CapabilityFilter::new().require_gpu().require_tag("software.cuda"))
     .with_subscribe_caps(CapabilityFilter::new().require_tag("tier.production"))
+    // The actual access boundary:
     .with_require_token(true)
     .with_token_roots(vec![issuer_entity_id])   // entities allowed to issue this channel's tokens
     .with_priority(4)
@@ -42,6 +50,16 @@ ChannelConfig::new(channel_id)
 ```
 
 The flow at subscription time is straightforward. The node's announced capabilities are matched against the channel's filter. If the channel requires a token, the node's token is verified for the appropriate scope (publish, subscribe, admin, delegate) and time validity. If both pass, the channel is added to the node's authorization set and the relevant bits are cached in the per-channel auth guard.
+
+### Capability filters are advisory; tokens are the boundary
+
+`publish_caps` and `subscribe_caps` match against a node's **self-advertised** capability set. A peer declares its own capabilities, in its own signed announcement — so any peer that wants to satisfy a capability filter can simply advertise the tag it requires. Self-asserting `role:admin` is not a hard thing to do.
+
+The signature on an announcement proves *who said it*. It proves nothing about whether the claim is true. So:
+
+> Capability filters are matchmaking and intent-routing. They are **not** an access-control boundary, and a capability filter alone restricts nothing.
+
+The actual boundary is `require_token` plus `token_roots`. A presented `TokenChain` is honored only if it roots at one of the entities the channel explicitly trusts, and every link in the chain is signature-verified up to that root — which is what makes it unforgeable, and what a self-advertised tag can never be. **Any channel that must restrict who publishes or subscribes needs token enforcement.** Reach for a capability filter to route work to the right kind of node; reach for a token to decide who is allowed at all.
 
 After that, the per-packet check is constant-time and lock-free. The auth guard is a bloom filter sized to fit in L1 cache plus a verified-positive cache for confirmed pairs. A header carrying an authorized `(origin_hash, channel_hash)` clears the guard in single-digit nanoseconds; a header carrying anything else is dropped.
 

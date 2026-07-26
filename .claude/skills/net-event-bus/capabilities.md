@@ -42,6 +42,70 @@ The builders haven't changed — `CapabilitySet::new().with_hardware(...).add_mo
 
 ---
 
+## The canonical schema — wire keys and value types
+
+The wire format is opaque to the substrate (tags + metadata), so the schema is a **local** convention that bindings codegen from for auto-completion, type-checking, and validation. You need it when you're writing tags by hand, reading a packet capture, or emitting a set from a binding that has no typed builder.
+
+**Value-type vocabulary:**
+
+| Type | Wire form | Example |
+|---|---|---|
+| `presence` | `<axis>.<key>` (no value) | `hardware.gpu` |
+| `number` | `<axis>.<key>=<integer>` | `hardware.memory_gb=64` |
+| `string` | `<axis>.<key>=<string>` | `hardware.gpu.model=H100` |
+| `enum<T>` | `<axis>.<key>=<value-in-T>` | `hardware.gpu.vendor=nvidia` |
+| `bool` | `<axis>.<key>=true|false` | `software.tool.0.stateless=true` |
+| `csv` | `<axis>.<key>=v1,v2,v3` | `software.tool.0.requires=python:3.11,sqlite` |
+| `indexed<T>` | `<axis>.<key>.<i>.<sub>=<v>` (numeric index) | `software.model.0.id=llama` |
+| `keyed<T>` | `<axis>.<key>.<name>=<v>` (string key) | `software.runtime.python=3.11` |
+
+Numeric fields carry a documented integer width (u8 / u16 / u32 / u64) so cross-binding codegen produces the right signed/unsigned shape.
+
+**`hardware`** — `cpu_cores` (u16, physical), `cpu_threads` (u16, SMT-aware), `memory_gb` (u32), `gpu` (presence), `gpu.vendor` (`nvidia|amd|intel|apple|qualcomm|unknown`), `gpu.model` (free-form string), `gpu.vram_gb` (u32), `gpu.compute_units` (u16, SM/CU), `gpu.tensor_cores` (u16), `gpu.fp16_tflops_x10` (u32 — `825` = 82.5 TFLOPS), `storage_gb` (u64), `network_gbps` (u32), and the limits family `limits.max_concurrent_requests` / `max_tokens_per_request` / `rate_limit_rpm` / `max_batch_size` / `max_input_bytes` / `max_output_bytes` (all u32).
+
+**`software`** — `os` (lowercase `linux|darwin|windows`), `os_version`, `cuda_version` (`<major>.<minor>`), `runtime.<name>` / `framework.<name>` / `driver.<name>` (keyed, value = version), the indexed model family `model.<i>.{id,family,parameters_b_x10,context_length,quantization,modalities,tokens_per_sec,loaded}`, and the indexed tool family `tool.<i>.{id,stateless,requires}`.
+
+**`devices`** — `devices.<kind>=<model>` (keyed, e.g. `devices.lidar=ouster-os1`), `devices.camera.count` (u8), `devices.imu` (presence).
+
+**`dataforts`** — `cache_gb` (u32), `persistent_gb` (u64), `erasure_coded` (bool — whether the persistent tier is Reed-Solomon encoded).
+
+### Reserved cross-axis prefixes
+
+Outside the four axes, these prefixes mean something specific to the substrate. **Don't emit them from application code** — `Tag::parse_user` rejects reserved prefixes from user input, and the ones marked *automatic* are populated for you:
+
+| Prefix | Meaning |
+|---|---|
+| `causal:` | position in the causal graph. Blob transfer rides it too: a node holding a chunk advertises `causal:<blake3-hex>` and requesters consult the fold to find peers. |
+| `fork-of:` | marks a node as a fork / replica of another entity. |
+| `heat:` | data-gravity counters (read / write frequency) — Dataforts and CortEX bias placement and caching on these. |
+| `scope:` | visibility scope for cross-subnet capability propagation (see § Scopes). |
+| `ai-tool:` | node serves the named LLM-callable tool. **Automatic** — added by `serve_tool`. |
+| `subprotocol:` | wire subprotocols the node handles, as `subprotocol:0x<id>`. **Automatic** — added by the subprotocol registry via `enrich_capabilities()`. |
+| `nat:` | NAT classification piggybacked on the signed announcement: `nat:open` / `nat:cone` / `nat:symmetric` / `nat:unknown`. Stripped and refreshed on every broadcast. |
+| `nrpc:` | services served over nRPC, as `nrpc:<service>`. **Automatic** — added by `serve_rpc`. |
+
+`subprotocol:` is the one worth remembering as a *query* target: `SubprotocolRegistry::capability_filter_for(0x0500)` gives you "nodes that handle daemon migration" without a separate discovery mechanism.
+
+### Reserved metadata keys
+
+| Key | Used by | Purpose |
+|---|---|---|
+| `intent` | placement, RedEX | what the node intends to do with the capability |
+| `colocate-with` | RedEX placement | hint to co-locate this channel's replicas with another |
+| `colocate-with-strict` | RedEX placement | hard requirement — only colocate, else refuse |
+| `region` | subnet assignment | logical region label |
+| `tier` | placement scoring | operational tier (`production`, `staging`, …) |
+
+### Encoding caveats worth knowing before you debug a round-trip
+
+These come from the tag codec itself (`src/adapter/net/behavior/tag_codec.rs`), not from the schema doc:
+
+- **Zero / empty / `None` fields are omitted from emission.** A default `HardwareCapabilities` round-trips through an *empty* tag set — so "the key isn't in the announcement" and "the value is 0" are indistinguishable on the wire. Don't encode a meaningful zero.
+- **Multi-GPU and accelerators are not encoded.** `HardwareCapabilities::additional_gpus` and `accelerators: Vec<AcceleratorInfo>` are dropped by the current tag codec; the bijection is exact only for the single-GPU / no-accelerator case. If you need to route on a second GPU today, ride a plain `Tag::Legacy` tag.
+- **Unrecognized axis keys are skipped on decode**, not rejected — that's the forward-compat ride-through for a newer peer emitting a key your binary doesn't know. Adding a key under an existing axis is *not* a wire break; it's a binding-version concern. Schemas are local validation, never a protocol contract.
+
+---
+
 ## Announcing
 
 `announce_capabilities(caps)` pushes the set to every directly-connected peer over subprotocol `0x0C00` (`net/crates/net/src/adapter/net/behavior/broadcast.rs:12`). The announcer self-indexes too, so single-node tests round-trip. Multi-hop propagation is deferred — peers more than one hop away will not see the announcement today.
@@ -61,6 +125,8 @@ Everything above describes the **plaintext** plane: `CapabilityVisibility::Publi
 | `Public` | any peer | `announce_capabilities`, `serve_rpc`, … |
 | `OwnerScoped` | members of the announcing node's own org | `OrgAccess::SameOrg` |
 | `GrantedAudience` | orgs holding a DISCOVER capability grant | `OrgAccess::Granted` |
+
+The two encrypted forms ride a **separate subprotocol id** — `SUBPROTOCOL_SCOPED_CAPABILITY_ANN = 0x0C04`, vs `0x0C00` for the plaintext plane — and **never appear inside a plaintext `0x0C00` payload**. A peer without the audience key cannot open the packet; a peer too old to know the id drops it at the dispatch loop's unknown-subprotocol guard. That's why discovery is an authorization boundary here rather than a filter applied after the fact.
 
 A node outside the audience does not see a capability it may not use — it sees **nothing at all**. This is why `find_nodes` returning an empty set is the *expected* result for an unauthorized caller, and why "the service is registered but nobody can find it" usually means the provider's grant audience was never installed rather than that the query is wrong.
 

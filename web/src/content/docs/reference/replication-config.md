@@ -112,6 +112,25 @@ The bandwidth budget is a token bucket; leaders reject `SyncRequest`s with `Sync
 
 The denominator is currently a 1 Gbps placeholder; the proximity-graph throughput probe wires the measured peak in a follow-up.
 
+### `default_bandwidth_class: BandwidthClass`
+
+The per-channel default class the runtime stamps on every emitted `SyncRequest`, unless the caller overrides it explicitly.
+
+- **Default:** `Foreground`
+
+Receivers honor a per-request value in preference to this default, so this is the fallback rather than a cap.
+
+### `background_fraction: f32`
+
+The admission-gate parameter that keeps `Background` sync from crowding out `Foreground` sync. A `Background` request is admitted only when `available >= (1 - background_fraction) * capacity`.
+
+- **Range:** `[0.0, 1.0)`
+- **Default:** `0.3`
+
+Tune it per channel against what the channel is for: hot channels set it low (a tight bound on Background, more Foreground headroom), archival channels set it high (give Background room to make progress).
+
+`1.0` is rejected at validation — it would deny every `Background` request unconditionally, which is never what anyone means. Note also that a starved request gets a one-shot bypass of the gate after 60 seconds regardless of the configured value, so a low fraction throttles Background traffic without wedging it permanently.
+
 ## Lifecycle
 
 ```
@@ -170,8 +189,13 @@ Per-channel atomic counters exposed via the `ReplicationMetricsRegistry`. Promet
 | `dataforts_replication_skip_ahead_total{channel}` | counter | `BadRange` NACKs received (replica fell more than `skip_threshold` behind).               |
 | `dataforts_replication_election_thrash_total{channel}` | counter | `MissedHeartbeats` transitions. > 1 per 30 s indicates instability.                  |
 | `dataforts_replication_witness_withdrawals_total{channel}` | counter | Reserved for future witness-coordination phase.                                  |
+| `dataforts_replication_announce_divergence_total{channel}` | counter | A `* → Idle` transition's withdraw-chain call failed *after* the state cell already flipped. See below. |
 
 Render via `ReplicationMetricsRegistry::snapshot().prometheus_text()`.
+
+`announce_divergence_total` is the one to put an alert on. While it's non-zero, the mesh may still be advertising this node as a holder of a chain it no longer replicates — readers get routed to a node that won't serve them. Recovery is opportunistic on the next `transition_to`, so a brief blip is expected during churn but a value that stays stuck is a real problem.
+
+The registry is bounded by `MAX_TRACKED_CHANNELS`; channels past the cap fold into a shared `__overflow__` bucket. If `__overflow__` shows up in a scrape, per-channel attribution has already been lost for some channels — treat it as a cardinality signal, not a channel name.
 
 For per-channel introspection (current role, manual transition for recovery), use `Redex::replication_coordinator_for(channel_name)` to obtain an `Arc<ReplicationCoordinator>` handle.
 

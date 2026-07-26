@@ -304,6 +304,48 @@ If you do evaluate it: **everything the plane reports is advisory.** Proofs are 
 
 ---
 
+## Subnets — the spatial boundary on top of the mesh
+
+Subnets are how you answer "which nodes can see what" once the deploy is bigger than one trust domain: keeping one fleet's telemetry out of another's, keeping a vehicle's internal channels internal on a public mesh, keeping tenants honest. They are a **scope** mechanism, not an encryption or consensus one — two nodes in the same subnet still use end-to-end encrypted sessions, and a subnet elects nothing and shares no state.
+
+**The hierarchy is four 8-bit levels packed into one `u32`** (`SubnetId`), 256 children per level. The conventional read is region → fleet → vehicle → subsystem, but nothing in Net imposes that — the structure is fixed, the labels are yours. `SubnetId::new(&[3])` is a level-0 subnet; `SubnetId::new(&[3, 7, 1, 4])` is fully qualified; `SubnetId::GLOBAL` (all-zero) is the unrestricted root. Parent / child / sibling / distance all resolve with bitwise ops at wire speed.
+
+**Assignment is data-driven, from capability tags.** A `SubnetPolicy` is a list of `SubnetRule { tag_prefix, level, values }` — each rule maps a capability-tag *prefix* to a hierarchy level (0–3) and a tag-value → byte map:
+
+```rust
+let policy = SubnetPolicy::new()
+    .add_rule(SubnetRule::new("region:", 0).map("us-west", 1).map("eu-central", 2))
+    .add_rule(SubnetRule::new("fleet:",  1).map("alpha", 7));
+// a node tagged region:us-west, fleet:alpha  ->  SubnetId::new(&[1, 7])
+```
+
+Rules combine across levels to fill the id; **any level no rule fills stays `0` — i.e. unrestricted.** There is no separate "default subnet," and a node whose tags match nothing lands on `GLOBAL`. The consequence worth internalizing: subnet membership *changes as capabilities change*. Add a `fleet:` tag and the node moves; the matching gateway picks it up; the matching channel scopes start applying. No separate config push, and no way for a node's claimed subnet to disagree with its capability set. (`add_rule` panics on `level >= 4`; use `try_add_rule` for config-file / FFI / JSON input.)
+
+**Gateways enforce channel `Visibility` at the boundary, header-only:**
+
+| `Visibility` | Decision at a subnet boundary |
+|---|---|
+| `SubnetLocal` | always dropped |
+| `ParentVisible` | forwarded only toward ancestor subnets |
+| `Exported` | forwarded only to subnets in the channel's export table |
+| `Global` | always forwarded (**the default**) |
+
+The gateway reads `channel_hash` + `subnet_id` from the header and consults its `ChannelConfigRegistry` — **it never decrypts.** So a `SubnetLocal` channel cannot leak across a gateway by construction, not by convention. Gateways also enforce a hop TTL so a mesh loop can't burn forever, and track drop reasons in atomic counters (visibility vs TTL vs unknown-subnet — the last usually means config drift).
+
+## Channel authorization — cap filters are advisory; tokens are the boundary
+
+This is the trap in `ChannelConfig`, and it's stated verbatim in the source (`channel/config.rs`):
+
+> `publish_caps` / `subscribe_caps` match against a node's **self-advertised** `CapabilitySet`. A peer declares its own capabilities in its own signed announcement, so **any peer can satisfy a cap-filter simply by advertising the required tag** (e.g. self-asserting `role:admin`).
+
+Treat capability filters as **matchmaking / intent routing, not a security boundary.** The signature proves *who announced it*, never that the claim is true.
+
+The actual boundary is `require_token` + `token_roots`: a root-anchored `TokenChain` can't be forged, because every link is signature-verified up to a root the channel explicitly trusts. **Any channel that must restrict who publishes or subscribes needs token enforcement — a cap-filter alone restricts nothing.** See `concepts.md` § Permission tokens for the chain rules (root-anchor, leaf-binding, per-link scope).
+
+Both checks run at subscription time; on success `(origin_hash, channel_hash)` lands in the `AuthGuard` and the per-packet path is a constant-time bloom probe thereafter. That caching is also why revocation is checked at session/subscription time rather than per packet.
+
+---
+
 ## Route churn — nothing to configure
 
 Control-plane hardening landed on by default and needs no action; it matters only when you're reading logs and wondering why a route moved. Pingwaves pass an admission gate (dedup) **before** touching the proximity graph or routing table, so a replayed pingwave can't reinstall a just-withdrawn route. A direct peer transitioning to `Failed` **always** floods a route withdrawal and drops the dead edge, regardless of what a stale graph still shows a path for. Alternate-path promotion looks past the shortest path, so a reroute can still succeed when the shortest path starts with the peer being withdrawn. Withdraw floods are damped per `(destination, exclude)` recipient rather than globally.

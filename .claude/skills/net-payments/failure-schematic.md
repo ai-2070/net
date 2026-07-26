@@ -89,6 +89,30 @@ these names): `insufficient_funds`, `no_wallet_configured`,
 `checker_unavailable`, `facilitator_rejected`. Reserved freeze subreasons:
 `quote_frozen_{replay,wrong_chain,reorg,amount}`.
 
+## Scope: payment failures only
+
+`code` is `"payment"` (`failure_vocab::CODE_PAYMENT`) and **v1 ships only
+that value.** The object is produced solely from payment-gate denials — the
+`ERR_PAYMENT` (0x8006) family. So:
+
+- **Terms, profile, eligibility, and other non-payment admission failures do
+  NOT ride this object.** If a refusal isn't a payment refusal, it carries the
+  human error alone. Don't reach for the schematic to carry them, and don't
+  read an absent schematic as "the payment was fine."
+- The `code` family is *designed* to generalize (`policy` / `approval` /
+  `delegation` are the intended siblings) — but a broader admission-failure
+  vocabulary is **future work, not something to shoehorn into the payment
+  schematic.** Adding a non-payment `code` today means designing that
+  vocabulary, not widening this one by reflex.
+- Nothing here implies Net performs KYB, tax, sanctions, identity,
+  invoicing, or fulfillment. A refusal reports a payment verdict, not an
+  eligibility judgment (`concepts.md` § The data boundary).
+
+**Reserved `stage` values** (documented in `failure_vocab`, no v1 producer —
+future surfaces must use these names rather than invent their own): `quote`,
+`claim`, `verify`, `settle`, `completion` on the pay path; `authoring`,
+`caller_policy` on the demand side.
+
 ## The discipline rule (both halves)
 
 - **Producers** emit **exactly one** schematic header, raw JSON bytes,
