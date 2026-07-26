@@ -2175,6 +2175,82 @@ mod tests {
         assert_eq!(f.registry.pending_slots(), 8);
     }
 
+    /// review-pass-2 §2 (the >`APPLY_QUANTUM` witness its disposition required) —
+    /// a multi-quantum recapture under SUSTAINED source movement loses no
+    /// identity, and converges the moment the source settles.
+    ///
+    /// With more than one quantum's worth of retained slots, a complete recapture
+    /// needs ceil(N/64) CONSECUTIVE quanta at one epoch, and a single ingest,
+    /// expiry sweep or floor raise between them re-queues what was already built.
+    /// The failure this must exclude is not the retrying — that is the design —
+    /// but SILENT LOSS: an identity dropped by a refused pass would leave its slot
+    /// cold with nothing owed to rebuild it, and the recapture would report
+    /// completion over a hole. The actor-side rate control for the same scenario
+    /// is `a_sustained_superseded_streak_backs_off_and_reports_degraded`.
+    #[test]
+    fn sustained_source_movement_across_a_multi_quantum_recapture_loses_no_identity() {
+        let f = fixture();
+        let mut family = f.family();
+        let mut held = Vec::new();
+        let mut keys = Vec::new();
+        let total = APPLY_QUANTUM + 1;
+        for index in 0..total {
+            if index > 0 && index % MAX_HANDLES_PER_FAMILY == 0 {
+                family = f.family();
+            }
+            let slot = key(1, &format!("nrpc:m{index:03}"));
+            held.push(family.demand(slot.clone()).expect("demanded"));
+            keys.push(slot);
+        }
+        assert_eq!(f.registry.pending_slots(), total);
+
+        // Sustained movement: every pass has the source advance mid-build, so
+        // every commit pin refuses.
+        for pass in 0..6 {
+            let state = f.source.clone();
+            *f.source.during_build.lock() = Some(Box::new(move || state.advance()));
+            assert_eq!(
+                f.registry
+                    .apply(1, request(true, DirtyCapabilities::RebuildAll)),
+                ApplyOutcome::Superseded,
+                "pass {pass}: a pin that refused installs nothing"
+            );
+            assert_eq!(
+                f.registry.pending_slots(),
+                total,
+                "pass {pass}: EVERY identity stays owed — a dropped one would leave \
+                 its slot cold with nothing to rebuild it"
+            );
+            assert!(
+                keys.iter()
+                    .all(|k| f.registry.base_facts_unvalidated(k).is_none()),
+                "pass {pass}: and nothing obsolete was installed"
+            );
+        }
+
+        // The source settles: the preserved queue is what lets the recapture
+        // finish, across as many quanta as it takes.
+        let mut outcome = ApplyOutcome::Superseded;
+        for _ in 0..8 {
+            outcome = f
+                .registry
+                .apply(1, request(true, DirtyCapabilities::RebuildAll));
+            if matches!(outcome, ApplyOutcome::Current { .. }) {
+                break;
+            }
+        }
+        assert!(
+            matches!(outcome, ApplyOutcome::Current { .. }),
+            "a settled source converges (last outcome {outcome:?})"
+        );
+        assert_eq!(f.registry.pending_slots(), 0);
+        assert!(
+            keys.iter()
+                .all(|k| f.registry.base_facts_unvalidated(k).is_some()),
+            "and every slot the recapture covered is warm — no hole under a Current"
+        );
+    }
+
     /// review-pass-3 §9 — sustained low-sorting churn must not starve a
     /// high-sorting pending slot.
     ///

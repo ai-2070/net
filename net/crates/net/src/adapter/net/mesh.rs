@@ -12362,6 +12362,20 @@ impl MeshNode {
         )
     }
 
+    /// Routing NON-CONVERGENCE: `(current superseded streak, high-water streak,
+    /// degraded entries)` (review-pass-2 §2).
+    ///
+    /// A sustained streak means the private-discovery source is moving faster
+    /// than one bounded quantum can close, so the recapture never settles.
+    /// Nonzero current = retrying now (and, past the threshold, backing off);
+    /// the high-water survives recovery so a node can be diagnosed after the
+    /// fact; `degraded_entries` counts the transitions into the explicit
+    /// cold-and-loud state, where health is forced to `Rebuilding` rather than
+    /// letting an unbounded rebuild loop look healthy from outside.
+    pub fn org_routing_convergence(&self) -> (u64, u64, u64) {
+        self.routing_metrics.superseded_streaks()
+    }
+
     /// Retained routing slots and the work owed over them (OLB-2B-E3b).
     pub fn org_routing_slots(&self) -> (usize, usize) {
         (

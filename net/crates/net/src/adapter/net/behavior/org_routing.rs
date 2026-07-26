@@ -245,6 +245,31 @@ const MAX_RESTARTS_IN_WINDOW: usize = 5;
 /// The rolling window the restart budget is counted over.
 const RESTART_WINDOW: Duration = Duration::from_secs(300);
 
+/// Consecutive `Superseded` outcomes served at full rate before the actor starts
+/// backing off (review-pass-2 §2).
+///
+/// A few in a row are ordinary: a busy org's providers re-announce, and the pin
+/// correctly refuses an attempt built against the view they moved. What must not
+/// happen is the sustained case — a source moving faster than one quantum turns
+/// "retry on real movement" into a `yield_now`-paced rebuild of up to
+/// [`APPLY_QUANTUM`] slots per iteration, indefinitely, with health pinned at
+/// `Rebuilding` and every warm read cold.
+///
+/// [`APPLY_QUANTUM`]: super::org_routing_registry::APPLY_QUANTUM
+const SUPERSEDED_BACKOFF_AFTER: u32 = 3;
+/// First backoff step past [`SUPERSEDED_BACKOFF_AFTER`], doubled per additional
+/// consecutive supersession.
+const SUPERSEDED_BACKOFF_BASE: Duration = Duration::from_millis(2);
+/// Ceiling for that backoff. Bounded because the source WILL settle, and a
+/// reconcile that has degraded to minutes is worse than one that reconciles
+/// slowly.
+const SUPERSEDED_BACKOFF_CAP: Duration = Duration::from_millis(250);
+/// Consecutive supersessions after which the plane declares itself DEGRADED:
+/// health goes `Rebuilding` (so every read is cold rather than quietly stale) and
+/// a complete recapture is owed, so recovery republishes `Healthy` through the
+/// ordinary path rather than needing a special case.
+const SUPERSEDED_DEGRADED_AT: u32 = 8;
+
 /// Observation points for the deterministic actor witnesses.
 ///
 /// Gated `any(test, fixtures)`, NOT `fixtures` alone. The supervisor witnesses
@@ -294,6 +319,9 @@ struct Incarnation {
     work: Arc<RegistryWork>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
+    /// Shared with the node, so the superseded-streak signal survives this
+    /// incarnation (review-pass-2 §2).
+    metrics: Arc<RoutingMetrics>,
     #[cfg(any(test, feature = "fixtures"))]
     hooks: Arc<ActorHooks>,
 }
@@ -328,6 +356,9 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
     // Set when a full recapture was superseded, so a subsequent WOKEN pass still
     // completes one rather than leaving health stuck in `Rebuilding`.
     let mut owed_recapture = false;
+    // Consecutive `Superseded` outcomes. Drives the backoff and the degraded
+    // signal; any settled pass clears it (review-pass-2 §2).
+    let mut superseded_streak: u32 = 0;
 
     loop {
         let shutdown_signal = it.shutdown_notify.notified();
@@ -408,6 +439,8 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
                         owed_recapture = false;
                     }
                     // `Caps` leaves global health untouched by design.
+                    superseded_streak = 0;
+                    it.metrics.clear_superseded_streak();
                 }
                 ApplyOutcome::Progress { .. } => {
                     // A bounded quantum finished but the recapture epoch is still
@@ -415,6 +448,10 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
                     // advertise a set in which later slots were never rebuilt by
                     // this incarnation (Kyra OLB-2B-E3b).
                     owed_recapture = owed_recapture || full;
+                    // A quantum that INSTALLED is progress, not supersession: the
+                    // streak measures failure to converge, not distance from done.
+                    superseded_streak = 0;
+                    it.metrics.clear_superseded_streak();
                 }
                 ApplyOutcome::Superseded => {
                     // Obsolete result: publish nothing, and make sure a recapture
@@ -423,8 +460,55 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
                     // is pending or eventual, so the retry is driven by real
                     // movement rather than by spinning.
                     owed_recapture = owed_recapture || full;
+                    superseded_streak = superseded_streak.saturating_add(1);
+                    it.metrics.note_superseded_streak(superseded_streak);
+                    if superseded_streak == SUPERSEDED_DEGRADED_AT {
+                        // Explicit DEGRADED, rather than an unbounded rebuild loop
+                        // that looks healthy from outside (review-pass-2 §2). The
+                        // source is moving faster than a quantum can close, so
+                        // every read must be cold and an operator must be able to
+                        // see why. Owing a recapture is what lets recovery
+                        // republish `Healthy` through the ordinary `Current` path
+                        // instead of a special case.
+                        owed_recapture = true;
+                        let state = RoutingHealth::Rebuilding { incarnation: it.id };
+                        #[cfg(any(test, feature = "fixtures"))]
+                        it.hooks.note_health(&state);
+                        it.health.store(Arc::new(state));
+                        it.metrics.note_degraded();
+                        tracing::warn!(
+                            incarnation = it.id,
+                            streak = superseded_streak,
+                            "org routing: reconciliation is not converging; the source is \
+                             moving faster than a quantum can close. Routing reads are cold \
+                             until it settles."
+                        );
+                    }
                 }
                 ApplyOutcome::Fault(fault) => return ActorExit::Fault(fault),
+            }
+        }
+
+        // Bounded backoff on a SUSTAINED superseded streak (review-pass-2 §2).
+        //
+        // The `work.mark()` the registry's requeue paths perform stays — a
+        // requeued identity is only unioned into `named` when `registry_work` is
+        // set, so removing it would lose the work. What that mark makes true is
+        // that the park below is immediately ready, which turns "retry at the rate
+        // of actual source movement" into "retry at `yield_now` rate" whenever the
+        // source is hot. The delay is what restores the intent: a hot source
+        // degrades to a slower reconcile instead of a spin.
+        //
+        // Raced against shutdown so backing off never delays teardown, and skipped
+        // entirely below the threshold so ordinary churn pays nothing.
+        if superseded_streak > SUPERSEDED_BACKOFF_AFTER {
+            let steps = superseded_streak - SUPERSEDED_BACKOFF_AFTER - 1;
+            let delay = SUPERSEDED_BACKOFF_BASE
+                .saturating_mul(1u32 << steps.min(16))
+                .min(SUPERSEDED_BACKOFF_CAP);
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = &mut shutdown_signal => return ActorExit::Shutdown,
             }
         }
 
@@ -475,6 +559,16 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
 pub(crate) struct RoutingMetrics {
     incarnations: AtomicU64,
     source_closed_unexpected: AtomicU64,
+    /// The CURRENT consecutive-`Superseded` streak, cleared by any settled pass.
+    /// Nonzero means reconciliation is retrying; above
+    /// [`SUPERSEDED_BACKOFF_AFTER`] it is also backing off (review-pass-2 §2).
+    superseded_streak: AtomicU64,
+    /// High-water of the above, so a streak that has since recovered is still
+    /// visible to an operator looking at a node after the fact.
+    max_superseded_streak: AtomicU64,
+    /// How many times the plane entered the DEGRADED state — the signal
+    /// `recaptures_restarted` counted the displacement for but nothing read.
+    degraded_entries: AtomicU64,
 }
 
 impl RoutingMetrics {
@@ -487,6 +581,37 @@ impl RoutingMetrics {
     /// progress.
     pub(crate) fn source_closed_unexpected(&self) -> u64 {
         self.source_closed_unexpected.load(Ordering::Acquire)
+    }
+
+    /// `(current streak, high-water streak, degraded entries)` — the
+    /// non-convergence signal (review-pass-2 §2).
+    ///
+    /// `recaptures_restarted` already counted the displacement and nothing read
+    /// it as health. This is the reading: a nonzero CURRENT streak means
+    /// reconciliation is retrying right now, the high-water survives recovery so
+    /// a node can be diagnosed after the fact, and `degraded_entries` counts the
+    /// transitions into cold-and-loud.
+    pub(crate) fn superseded_streaks(&self) -> (u64, u64, u64) {
+        (
+            self.superseded_streak.load(Ordering::Acquire),
+            self.max_superseded_streak.load(Ordering::Acquire),
+            self.degraded_entries.load(Ordering::Acquire),
+        )
+    }
+
+    fn note_superseded_streak(&self, streak: u32) {
+        let streak = u64::from(streak);
+        self.superseded_streak.store(streak, Ordering::Release);
+        self.max_superseded_streak
+            .fetch_max(streak, Ordering::AcqRel);
+    }
+
+    fn clear_superseded_streak(&self) {
+        self.superseded_streak.store(0, Ordering::Release);
+    }
+
+    fn note_degraded(&self) {
+        self.degraded_entries.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Allocate the next incarnation id, or `None` on overflow. Checked, because
@@ -639,6 +764,7 @@ impl RoutingSupervisor {
                 work: work.clone(),
                 shutdown: shutdown.clone(),
                 shutdown_notify: shutdown_notify.clone(),
+                metrics: self.metrics.clone(),
                 #[cfg(any(test, feature = "fixtures"))]
                 hooks: hooks.clone(),
             })
@@ -885,6 +1011,104 @@ mod tests {
 
         assert_eq!(h.metrics.incarnations_started(), 0, "no actor was started");
         assert_eq!(h.health(), RoutingHealth::Fenced);
+    }
+
+    /// review-pass-2 §2 — a SUSTAINED superseded streak backs off, declares
+    /// itself degraded, and recovers through the ordinary path.
+    ///
+    /// The registry's requeue paths call `work.mark()` unconditionally, and that
+    /// mark is NECESSARY — a requeued identity is only unioned into `named` when
+    /// `registry_work` is set. What it also does is make the park below the apply
+    /// immediately ready, so a source moving faster than one quantum turns "retry
+    /// at the rate of actual source movement" into a `yield_now`-paced rebuild of
+    /// up to `APPLY_QUANTUM` slots per iteration, forever, while `Superseded` is
+    /// not a `Fault` so no restart backoff or crash-loop posture ever engages.
+    ///
+    /// Deliberately on the REAL clock, unlike its neighbours. A paused clock only
+    /// auto-advances when every task is idle, and the defect under test is an
+    /// actor that is never idle — so a regression would HANG the witness instead
+    /// of failing it. On the real clock the elapsed assertion measures the backoff
+    /// directly and reads ~zero without it, and the bounded wait turns a
+    /// regression into a failure. ~150 ms.
+    #[tokio::test]
+    async fn a_sustained_superseded_streak_backs_off_and_reports_degraded() {
+        let h = harness();
+        let settled = Arc::new(AtomicBool::new(false));
+        let applier = {
+            let work = h.work.clone();
+            let settled = settled.clone();
+            h.applier(Box::new(move |_, r| {
+                if settled.load(Ordering::Acquire) {
+                    return ApplyOutcome::Current {
+                        source_generation: r.batch.generation,
+                    };
+                }
+                // Exactly what the registry does on a refused pin: re-queue the
+                // identities and re-arm the actor.
+                work.mark();
+                ApplyOutcome::Superseded
+            }))
+        };
+        let run = h.spawn(h.supervisor(), applier);
+
+        // Ten applications means streaks 4..=9 each paid their step:
+        // 2 + 4 + 8 + 16 + 32 + 64 ms of mandatory delay.
+        let start = tokio::time::Instant::now();
+        for _ in 0..2_000 {
+            if h.seen.lock().len() >= 10 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            h.seen.lock().len() >= 10,
+            "the actor must keep retrying — backing off is not giving up"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(60),
+            "ten consecutive supersessions must have cost real backoff, not a \
+             yield-paced spin (elapsed {elapsed:?})"
+        );
+
+        let (current, high_water, degraded) = h.metrics.superseded_streaks();
+        assert!(
+            current >= u64::from(SUPERSEDED_DEGRADED_AT),
+            "the current streak is the live non-convergence signal (was {current})"
+        );
+        assert!(high_water >= current, "and the high-water tracks it");
+        assert_eq!(degraded, 1, "the plane entered DEGRADED exactly once");
+        assert!(
+            matches!(h.health(), RoutingHealth::Rebuilding { .. }),
+            "degraded is COLD: an unbounded rebuild loop must not look healthy \
+             from outside (health {:?})",
+            h.health()
+        );
+
+        // Recovery runs through the ordinary path: entering degraded owed a
+        // recapture, so the next settled pass is `full` and republishes `Healthy`.
+        settled.store(true, Ordering::Release);
+        h.work.mark();
+        for _ in 0..2_000 {
+            if matches!(h.health(), RoutingHealth::Healthy { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            matches!(h.health(), RoutingHealth::Healthy { .. }),
+            "a settled source recovers without a special case (health {:?})",
+            h.health()
+        );
+        assert_eq!(
+            h.metrics.superseded_streaks().0,
+            0,
+            "and the live streak clears, while the high-water survives for diagnosis"
+        );
+        assert!(h.metrics.superseded_streaks().1 >= u64::from(SUPERSEDED_DEGRADED_AT));
+
+        h.stop();
+        let _ = run.await;
     }
 
     /// Shutdown landing INSIDE a synchronous apply is never followed by a
