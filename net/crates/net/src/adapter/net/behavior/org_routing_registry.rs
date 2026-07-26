@@ -119,7 +119,8 @@ pub(crate) enum DemandRefused {
 pub(crate) struct SlotBaseFacts {
     #[allow(dead_code)] // read by the warmed-call consumer.
     pub providers: SourceFacts,
-    pub source_generation: u64,
+    /// The WHOLE source epoch these facts were built and committed under.
+    pub epoch: SourceEpoch,
     pub actor_incarnation: u64,
     pub slot_incarnation: u64,
     /// The earliest `expires_at` across the retained providers, or `u64::MAX`
@@ -132,6 +133,26 @@ pub(crate) struct SlotBaseFacts {
     /// governs promptness rather than correctness — which is what the scoped
     /// store's uncached reads already guarantee (Kyra OLB-2B-E3c).
     pub earliest_expiry: u64,
+}
+
+/// The whole authoritative source epoch a fact was built under.
+///
+/// NOT merely the scoped revision. Routing material is filtered by revocation
+/// authority, so two facts built under different revocation authorities are from
+/// different epochs even when the scoped revision is identical — a store swap
+/// that retracts nothing moves no scoped revision at all. Stamping only the
+/// scoped half let a multi-quantum recapture combine facts from two authorities
+/// and settle `Current` over them (Kyra OLB-2B-E3c).
+///
+/// Every use of "generation" in this module means THIS: what facts are stamped
+/// with, what recapture coherence compares, and what settlement reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceEpoch {
+    /// The scoped query-visible revision.
+    pub generation: u64,
+    /// The routing AUTHORITY epoch — monotone across revocation store installs
+    /// and floor movement. Never reused, so it cannot alias a previous authority.
+    pub authority: u64,
 }
 
 /// An opaque, comparable summary of EVERY authority input a snapshot was taken
@@ -195,8 +216,9 @@ pub(crate) trait SourceSnapshot {
 /// installed in that window are stale while carrying a generation that says
 /// otherwise.
 pub(crate) trait SourceCommitPin {
-    /// The generation this pin proves is still current.
-    fn generation(&self) -> u64;
+    /// The epoch this pin proves is still current, and holds still through the
+    /// conditional installation beneath it.
+    fn epoch(&self) -> SourceEpoch;
 }
 
 /// Supplies authority-scoped provider facts.
@@ -308,14 +330,14 @@ impl RegistryInner {
     /// work deliberately leaves unrelated slots at older generations, and demanding
     /// global coherence there would report `Progress` for a pass that finished
     /// everything it was asked to do.
-    fn incoherent_with(&self, incarnation: u64, generation: u64) -> Vec<SlotKey> {
+    fn incoherent_with(&self, incarnation: u64, epoch: SourceEpoch) -> Vec<SlotKey> {
         self.slots
             .iter()
             .filter(|(_, slot)| {
                 !slot.facts.as_ref().is_some_and(|facts| {
                     facts.actor_incarnation == incarnation
                         && facts.slot_incarnation == slot.incarnation
-                        && facts.source_generation == generation
+                        && facts.epoch == epoch
                 })
             })
             .map(|(key, _)| key.clone())
@@ -582,6 +604,48 @@ impl NodeOrgRoutingRegistry {
         self.inner.lock().slots.get(key)?.facts.clone()
     }
 
+    /// Authority moved: drop EVERY retained fact, re-queue every slot and wake.
+    ///
+    /// Called by the node when revocation authority changes. Authority movement
+    /// need not touch scoped state at all — a store swap that retracts nothing
+    /// advances no scoped revision and publishes no scoped wake — so without this
+    /// the actor would never learn that everything it holds was built under an
+    /// authority that no longer applies (Kyra OLB-2B-E3c).
+    pub(crate) fn invalidate_for_authority_movement(&self) {
+        let owed = {
+            let mut inner = self.inner.lock();
+            let invalidated = inner.invalidate_and_queue_all();
+            self.metrics
+                .facts_invalidated
+                .fetch_add(invalidated, Ordering::AcqRel);
+            !inner.pending.is_empty()
+        };
+        if owed {
+            self.work.mark();
+        }
+    }
+
+    /// One slot proved unusable at READ time: drop its facts, re-queue it, wake.
+    pub(crate) fn invalidate_one(&self, key: &SlotKey) {
+        let owed = {
+            let mut inner = self.inner.lock();
+            if inner.invalidate(key) {
+                self.metrics
+                    .facts_invalidated
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            if inner.slots.contains_key(key) {
+                inner.pending.insert(key.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if owed {
+            self.work.mark();
+        }
+    }
+
     /// Test-only: install `facts` for `key`, creating the slot if needed.
     ///
     /// Lets a witness reproduce a quantum that raced a deadline — facts valid at
@@ -735,7 +799,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             let Some(commit) = self.source.pin_if_current(&token) else {
                 return ApplyOutcome::Superseded;
             };
-            let generation = commit.generation();
+            let epoch = commit.epoch();
             let mut inner = self.inner.lock();
 
             // Authority is revalidated HERE too, not only on the installing path
@@ -757,7 +821,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 return ApplyOutcome::Superseded;
             }
 
-            let outcome = settle(&mut inner, incarnation, generation, &self.metrics);
+            let outcome = settle(&mut inner, incarnation, epoch, &self.metrics);
             let owed = !inner.pending.is_empty();
             drop(inner);
             if owed {
@@ -808,7 +872,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             self.work.mark();
             return ApplyOutcome::Superseded;
         };
-        let generation = commit.generation();
+        let epoch = commit.epoch();
 
         // --- phase 5: registry lock BENEATH the commit pin; install ---
         // The source cannot move while `commit` is held. What can still have
@@ -871,7 +935,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 };
                 slot.facts = Some(Arc::new(SlotBaseFacts {
                     providers: facts,
-                    source_generation: generation,
+                    epoch,
                     actor_incarnation: incarnation,
                     slot_incarnation,
                     earliest_expiry,
@@ -879,7 +943,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 self.metrics.installs.fetch_add(1, Ordering::AcqRel);
             }
 
-            let settled = settle(&mut inner, incarnation, generation, &self.metrics);
+            let settled = settle(&mut inner, incarnation, epoch, &self.metrics);
             let owed = !inner.pending.is_empty();
             drop(inner);
             if owed {
@@ -925,12 +989,12 @@ impl DirtyApply for NodeOrgRoutingRegistry {
 fn settle(
     inner: &mut RegistryInner,
     incarnation: u64,
-    generation: u64,
+    epoch: SourceEpoch,
     metrics: &RegistryMetrics,
 ) -> ApplyOutcome {
     if inner.recapture_open {
         let mut displaced = 0;
-        for key in inner.incoherent_with(incarnation, generation) {
+        for key in inner.incoherent_with(incarnation, epoch) {
             if inner.invalidate(&key) {
                 displaced += 1;
             }
@@ -949,11 +1013,11 @@ fn settle(
     if inner.pending.is_empty() {
         inner.recapture_open = false;
         ApplyOutcome::Current {
-            source_generation: generation,
+            source_generation: epoch.generation,
         }
     } else {
         ApplyOutcome::Progress {
-            source_generation: generation,
+            source_generation: epoch.generation,
         }
     }
 }
@@ -1070,8 +1134,11 @@ mod tests {
     }
 
     impl SourceCommitPin for TestCommitPin<'_> {
-        fn generation(&self) -> u64 {
-            *self.generation
+        fn epoch(&self) -> SourceEpoch {
+            SourceEpoch {
+                generation: *self.generation,
+                authority: 0,
+            }
         }
     }
 
@@ -1863,7 +1930,7 @@ mod tests {
         for k in &keys {
             let facts = f.registry.base_facts(k).expect("built");
             assert_eq!(facts.actor_incarnation, 1);
-            assert_eq!(facts.source_generation, generation);
+            assert_eq!(facts.epoch.generation, generation);
         }
         assert!(!f.registry.inner.lock().recapture_open, "the epoch closed");
     }
@@ -1918,7 +1985,7 @@ mod tests {
             f.registry.inner.lock().slots.values().all(|slot| slot
                 .facts
                 .as_ref()
-                .is_some_and(|facts| facts.source_generation == generation)),
+                .is_some_and(|facts| facts.epoch.generation == generation)),
             "ONE coherent source generation across the whole retained set"
         );
     }
@@ -1951,14 +2018,16 @@ mod tests {
             f.registry
                 .base_facts(&c)
                 .expect("c rebuilt")
-                .source_generation,
+                .epoch
+                .generation,
             second
         );
         assert_eq!(
             f.registry
                 .base_facts(&d)
                 .expect("d untouched")
-                .source_generation,
+                .epoch
+                .generation,
             first,
             "an unrelated slot legitimately keeps its older stamp"
         );
@@ -1992,14 +2061,16 @@ mod tests {
             f.registry
                 .base_facts(&fresh)
                 .expect("built")
-                .source_generation,
+                .epoch
+                .generation,
             second
         );
         assert_eq!(
             f.registry
                 .base_facts(&established)
                 .expect("retained")
-                .source_generation,
+                .epoch
+                .generation,
             first,
             "the unrelated retained slot was not rebuilt and did not need to be"
         );
@@ -2146,7 +2217,8 @@ mod tests {
             f.registry
                 .base_facts(&target)
                 .expect("built")
-                .source_generation,
+                .epoch
+                .generation,
             generation,
             "facts carry exactly the generation the commit pin proved current"
         );

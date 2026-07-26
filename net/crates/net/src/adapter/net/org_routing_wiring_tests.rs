@@ -40,11 +40,6 @@ fn slot(seed: u8, tag: &str) -> SlotKey {
     }
 }
 
-/// A node that has never been started.
-async fn node_unstarted() -> Arc<MeshNode> {
-    node().await
-}
-
 /// Poll until `f` holds, yielding to the runtime between attempts.
 async fn until(mut f: impl FnMut() -> bool) -> bool {
     for _ in 0..2000 {
@@ -144,7 +139,7 @@ async fn the_dirty_stream_reaches_the_real_registry() {
         .org_routing_base_facts(&key)
         .expect("rebuilt through the production source");
     assert_eq!(
-        facts.source_generation,
+        facts.epoch.generation,
         node.scoped_discovery.lock().revision(),
         "facts carry the query-visible generation they were committed against"
     );
@@ -260,6 +255,7 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
                 scoped_discovery: scoped.clone(),
                 publication: publication.clone(),
                 org_revocation: node.org_revocation.clone(),
+                authority: node.routing_authority.clone(),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
             during_build: during_build.clone(),
@@ -345,7 +341,8 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
         registry
             .base_facts(&key)
             .expect("installed")
-            .source_generation,
+            .epoch
+            .generation,
         current,
         "at the CURRENT generation"
     );
@@ -360,6 +357,7 @@ async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
         unserved_scope: node.routing_unserved_scope.clone(),
     };
 
@@ -402,73 +400,95 @@ async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
     );
 }
 
-/// (6) Shutdown cannot slip between the supervisor spawn and the publication of
-/// its handle.
+/// (6) Shutdown genuinely OVERLAPS registration and cannot return while it is
+/// unresolved.
 ///
-/// The one-start latch does NOT close this: it admits a single starter, it does
-/// not order that starter against shutdown. Without the slot lock spanning the
-/// shutdown check, the spawn and the publication, shutdown takes `None`, returns,
-/// and an unjoined supervisor outlives teardown.
-/// (6) Shutdown cannot slip between the supervisor spawn and the publication of
-/// its handle.
-///
-/// The one-start latch does NOT close this: it admits a single starter, it does
-/// not order that starter against shutdown. Without the slot lock spanning the
-/// shutdown check, the spawn AND the publication, a shutdown landing in that gap
-/// takes `None`, returns, and leaves an unjoined supervisor alive after teardown
-/// completed (Kyra OLB-2B-E3c).
-///
-/// Asserted from INSIDE the window, which is what makes it deterministic: the
-/// slot is provably held there, so any joiner must block rather than observe an
-/// empty slot. A `try_lock` that succeeded would be exactly the race.
-#[tokio::test]
-async fn shutdown_cannot_pass_between_routing_spawn_and_handle_publication() {
+/// The one-start latch admits a single starter but does not ORDER it against
+/// shutdown. This runs the real schedule: startup is parked after `tokio::spawn`
+/// and before the handle is published, a concurrent shutdown attempts the same
+/// slot, and shutdown must NOT be able to return until registration resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_overlapping_registration_cannot_return_unresolved() {
     let node = node().await;
 
-    let observed = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
     {
-        let node_ref = node.clone();
-        let observed = observed.clone();
+        let release = release.clone();
         *node.routing_spawn_pause_hook.lock() = Some(Arc::new(move || {
-            assert!(
-                node_ref.routing_task.try_lock().is_none(),
-                "the routing-task slot must be HELD across spawn -> publication; \
-                 a joiner that could take it here would take None and return \
-                 without joining a live supervisor"
-            );
-            observed.store(true, Ordering::Release);
+            let _ = entered_tx.try_send(());
+            let (lock, cv) = &*release;
+            let mut go = lock.lock();
+            while !*go {
+                cv.wait(&mut go);
+            }
         }));
     }
 
-    node.start_org_routing_supervisor();
+    // Startup runs on a blocking thread and parks inside the window.
+    let starter = {
+        let node = node.clone();
+        tokio::task::spawn_blocking(move || node.start_org_routing_supervisor())
+    };
+    tokio::task::spawn_blocking(move || entered_rx.recv())
+        .await
+        .expect("join")
+        .expect("startup must reach the spawn/publication window");
+
+    // Concurrent shutdown, racing for the same slot.
+    let shutdown_returned = Arc::new(AtomicBool::new(false));
+    let shutting = {
+        let node = node.clone();
+        let flag = shutdown_returned.clone();
+        tokio::spawn(async move {
+            let _ = node.shutdown().await;
+            flag.store(true, Ordering::Release);
+        })
+    };
+
+    // While registration is unresolved, shutdown must not have returned.
+    tokio::time::sleep(Duration::from_millis(60)).await;
     assert!(
-        observed.load(Ordering::Acquire),
-        "the spawn/publication window must have been entered"
-    );
-    assert!(
-        node.routing_task.lock().is_some(),
-        "the handle is published before the slot is released"
+        !shutdown_returned.load(Ordering::Acquire),
+        "shutdown returned while routing registration was still unresolved"
     );
 
-    // And the other order: shutdown wins the slot first, so startup spawns
-    // nothing rather than leaving an unjoined supervisor behind.
-    let fresh = node_unstarted().await;
-    fresh.shutdown_flag_for_test();
-    fresh.start_org_routing_supervisor();
+    // Resolve registration; shutdown may now proceed.
+    {
+        let (lock, cv) = &*release;
+        *lock.lock() = true;
+        cv.notify_all();
+    }
+    starter.await.expect("starter");
+    shutting.await.expect("shutdown task");
+
+    assert!(shutdown_returned.load(Ordering::Acquire));
     assert!(
-        fresh.routing_task.lock().is_none(),
+        node.routing_task.lock().is_none(),
+        "shutdown took and joined the exact handle"
+    );
+    assert!(!node.org_routing_ready(), "health is fenced");
+    let rival = PrivateDiscoveryDrains::new(node.scoped_discovery.clone());
+    assert!(
+        rival.mint(PrivateDiscoveryStream::Global).is_some(),
+        "no post-shutdown incarnation survives holding the drain"
+    );
+}
+
+/// The other order: shutdown wins the slot first, so startup spawns nothing.
+#[tokio::test]
+async fn startup_that_loses_to_shutdown_spawns_nothing() {
+    let node = node().await;
+    node.shutdown_flag_for_test();
+    node.start_org_routing_supervisor();
+    assert!(
+        node.routing_task.lock().is_none(),
         "startup that observes shutdown under the slot lock must spawn nothing"
     );
-    let rival = PrivateDiscoveryDrains::new(fresh.scoped_discovery.clone());
+    let rival = PrivateDiscoveryDrains::new(node.scoped_discovery.clone());
     assert!(
         rival.mint(PrivateDiscoveryStream::Global).is_some(),
         "and must not have claimed the exclusive drain"
-    );
-
-    let _ = node.shutdown().await;
-    assert!(
-        node.routing_task.lock().is_none(),
-        "no unjoined routing handle may exist once shutdown has returned"
     );
 }
 
@@ -490,6 +510,7 @@ async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
         unserved_scope: node.routing_unserved_scope.clone(),
     };
     let key = slot(4, "nrpc:floored");
@@ -519,7 +540,10 @@ async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
         )
         .expect("init revocation store"),
     );
-    node.org_revocation.store(Some(store.clone()));
+    // Through the PRODUCTION install path — the single swap site, which is what
+    // advances routing authority.
+    node.install_org_revocation_store(store.clone())
+        .expect("install revocation store");
     assert_eq!(
         node.scoped_discovery.lock().revision(),
         scoped_before,
@@ -615,7 +639,10 @@ async fn cached_facts_that_crossed_their_expiry_read_cold() {
     // them: valid at capture, expired by the time they are read.
     let expired = Arc::new(SlotBaseFacts {
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
-        source_generation: node.scoped_discovery.lock().revision(),
+        epoch: crate::adapter::net::behavior::org_routing_registry::SourceEpoch {
+            generation: node.scoped_discovery.lock().revision(),
+            authority: node.routing_authority.epoch(),
+        },
         actor_incarnation: 1,
         slot_incarnation: 1,
         earliest_expiry: now,
@@ -684,5 +711,240 @@ async fn drop_fences_and_aborts_rather_than_detaching_the_supervisor() {
         })
         .await,
         "an aborted supervisor must release the exclusive global drain"
+    );
+}
+
+/// (11) Authority cannot move while the commit pin is alive.
+///
+/// The pin holds the authority gate as well as the publication gate, and holds
+/// BOTH through the conditional installation. Asserted from a rival thread while
+/// a pin is out: a node-mediated authority move must block, and must succeed the
+/// moment the pin drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authority_cannot_move_while_the_commit_pin_is_alive() {
+    let node = node().await;
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
+        unserved_scope: node.routing_unserved_scope.clone(),
+    };
+    let key = slot(7, "nrpc:pinned-authority");
+
+    let snapshot = source.snapshot(std::slice::from_ref(&key));
+    let pin = source
+        .pin_if_current(&snapshot.token())
+        .expect("nothing has moved");
+
+    let moved = Arc::new(AtomicBool::new(false));
+    let rival = {
+        let node = node.clone();
+        let moved = moved.clone();
+        tokio::task::spawn_blocking(move || {
+            node.note_routing_authority_moved();
+            moved.store(true, Ordering::Release);
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(
+        !moved.load(Ordering::Acquire),
+        "authority moved while a commit pin was alive"
+    );
+
+    drop(pin);
+    rival.await.expect("rival");
+    assert!(moved.load(Ordering::Acquire));
+
+    // And the snapshot taken under the old authority can no longer commit.
+    assert!(
+        source.pin_if_current(&snapshot.token()).is_none(),
+        "a token from the retired authority must be refused"
+    );
+}
+
+/// (12) Poisoning revocation authority COLDS already-cached facts and re-queues
+/// the exact slot.
+///
+/// Poison after installation moves no epoch and retracts no scoped row, so
+/// nothing would rebuild the slot on its own. The read seam is what must catch
+/// it.
+#[tokio::test]
+async fn poisoning_authority_colds_already_cached_facts() {
+    use crate::adapter::net::behavior::org_routing_registry::{
+        SlotBaseFacts, SourceEpoch, SourceFacts,
+    };
+
+    let node = node().await;
+    let key = slot(8, "nrpc:poisoned");
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+
+    let scratch = std::env::temp_dir().join(format!(
+        "net-olb2b-e3c-poison-{}-{}",
+        std::process::id(),
+        node.entity_id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let store = Arc::new(
+        crate::adapter::net::behavior::org_revocation::OrgRevocationStore::init(
+            scratch.join("revocation.json"),
+            crate::adapter::net::behavior::org_revocation::ProvisioningExpectation::MayBeFresh,
+        )
+        .expect("init revocation store"),
+    );
+    node.org_revocation.store(Some(store.clone()));
+
+    node.routing_registry.install_facts_for_test(
+        key.clone(),
+        Arc::new(SlotBaseFacts {
+            providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
+            epoch: SourceEpoch {
+                generation: node.scoped_discovery.lock().revision(),
+                authority: node.routing_authority.epoch(),
+            },
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            earliest_expiry: u64::MAX,
+        }),
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_some(),
+        "precondition: the cached facts are served"
+    );
+
+    store.mark_poisoned_for_test();
+
+    assert!(
+        node.org_routing_base_facts(&key).is_none(),
+        "poisoned authority must COLD already-cached facts"
+    );
+    assert_eq!(
+        node.org_routing_slots().1,
+        1,
+        "and re-queue the exact slot so the actor rebuilds it"
+    );
+
+    node.org_revocation.store(None);
+    drop(store);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// (13) Authority-only movement invalidates every retained fact and wakes the
+/// registry, even though it touches no scoped state.
+#[tokio::test]
+async fn authority_only_movement_invalidates_and_requeues_everything() {
+    use crate::adapter::net::behavior::org_routing_registry::{
+        SlotBaseFacts, SourceEpoch, SourceFacts,
+    };
+
+    let node = node().await;
+    node.routing_health.store(Arc::new(
+        crate::adapter::net::behavior::org_routing::RoutingHealth::Healthy { incarnation: 1 },
+    ));
+    let key = slot(9, "nrpc:authority-move");
+    let scoped_before = node.scoped_discovery.lock().revision();
+
+    node.routing_registry.install_facts_for_test(
+        key.clone(),
+        Arc::new(SlotBaseFacts {
+            providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
+            epoch: SourceEpoch {
+                generation: scoped_before,
+                authority: node.routing_authority.epoch(),
+            },
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            earliest_expiry: u64::MAX,
+        }),
+    );
+    assert!(node.org_routing_base_facts(&key).is_some());
+
+    node.note_routing_authority_moved();
+
+    assert_eq!(
+        node.scoped_discovery.lock().revision(),
+        scoped_before,
+        "authority movement touched NO scoped state - there is no scoped wake"
+    );
+    // Read the RAW registry, not the node read seam: the read seam would cold
+    // this lazily on its own, which cannot distinguish "invalidated by the
+    // movement" from "invalidated the first time someone happened to look".
+    // Blocker 2 is specifically about the actor learning WITHOUT a read.
+    assert!(
+        node.routing_registry.base_facts(&key).is_none(),
+        "authority movement must SYNCHRONOUSLY invalidate every retained fact"
+    );
+    assert_eq!(
+        node.org_routing_slots().1,
+        1,
+        "and re-queue it, so the actor rebuilds without waiting for a reader"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_none(),
+        "and it reads cold"
+    );
+}
+
+/// (14) A recapture spanning two authority epochs never settles `Current` over
+/// mixed-authority facts.
+///
+/// The facts installed in quantum 1 carry the old authority; the epoch stamped on
+/// facts covers authority as well as scoped revision, so the coherence check
+/// re-queues them instead of accepting two epochs as equal.
+#[tokio::test]
+async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
+    use crate::adapter::net::behavior::org_routing_registry::{
+        SlotBaseFacts, SourceEpoch, SourceFacts,
+    };
+
+    let node = node().await;
+    let key = slot(10, "nrpc:mixed-epoch");
+    let scoped = node.scoped_discovery.lock().revision();
+    let stale_authority = node.routing_authority.epoch();
+
+    node.routing_registry.install_facts_for_test(
+        key.clone(),
+        Arc::new(SlotBaseFacts {
+            providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
+            epoch: SourceEpoch {
+                generation: scoped,
+                authority: stale_authority,
+            },
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            earliest_expiry: u64::MAX,
+        }),
+    );
+
+    // Authority moves with no scoped movement at all.
+    {
+        let _gate = node.routing_authority.gate.lock();
+        node.routing_authority.advance();
+    }
+    assert_eq!(
+        node.scoped_discovery.lock().revision(),
+        scoped,
+        "scoped revision is identical across the two authority epochs"
+    );
+    assert_ne!(node.routing_authority.epoch(), stale_authority);
+
+    // A fact stamped with the OLD authority is not coherent with the live epoch,
+    // so it can never be part of a completed recapture.
+    let facts = node
+        .routing_registry
+        .base_facts(&key)
+        .expect("still retained");
+    assert_ne!(
+        facts.epoch.authority,
+        node.routing_authority.epoch(),
+        "the stamp carries the whole source epoch, not just the scoped revision"
+    );
+    assert!(
+        node.org_routing_base_facts(&key).is_none(),
+        "and it reads cold rather than as current evidence"
     );
 }

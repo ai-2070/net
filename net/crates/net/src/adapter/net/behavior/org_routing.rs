@@ -247,6 +247,13 @@ const RESTART_WINDOW: Duration = Duration::from_secs(300);
 #[cfg(any(test, feature = "fixtures"))]
 #[derive(Default)]
 pub(crate) struct ActorHooks {
+    /// EVERY health publication, in order.
+    ///
+    /// A final `Fenced` cannot distinguish "never published Healthy after
+    /// shutdown" from "published Healthy and then fenced a microsecond later" —
+    /// the states are identical afterwards. Recording the transitions is the only
+    /// way to witness the ABSENCE of a transient publication (Kyra OLB-2B-E3c).
+    pub(crate) health_transitions: parking_lot::Mutex<Vec<RoutingHealth>>,
     /// Fired after each drain, with the batch the incarnation observed.
     #[allow(clippy::type_complexity)]
     pub(crate) drained:
@@ -255,6 +262,10 @@ pub(crate) struct ActorHooks {
 
 #[cfg(any(test, feature = "fixtures"))]
 impl ActorHooks {
+    fn note_health(&self, state: &RoutingHealth) {
+        self.health_transitions.lock().push(*state);
+    }
+
     fn fire_drained(&self, incarnation: u64, batch: &PrivateDiscoveryChangeBatch) {
         if let Some(hook) = self.drained.lock().clone() {
             hook(incarnation, batch);
@@ -358,8 +369,10 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
             if full {
                 // A complete recapture: nothing from this incarnation is
                 // trustworthy until it finishes.
-                it.health
-                    .store(Arc::new(RoutingHealth::Rebuilding { incarnation: it.id }));
+                let state = RoutingHealth::Rebuilding { incarnation: it.id };
+                #[cfg(any(test, feature = "fixtures"))]
+                it.hooks.note_health(&state);
+                it.health.store(Arc::new(state));
             }
             match it.apply.apply(
                 it.id,
@@ -380,8 +393,10 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
                         return ActorExit::Shutdown;
                     }
                     if full {
-                        it.health
-                            .store(Arc::new(RoutingHealth::Healthy { incarnation: it.id }));
+                        let state = RoutingHealth::Healthy { incarnation: it.id };
+                        #[cfg(any(test, feature = "fixtures"))]
+                        it.hooks.note_health(&state);
+                        it.health.store(Arc::new(state));
                         owed_recapture = false;
                     }
                     // `Caps` leaves global health untouched by design.
@@ -862,6 +877,48 @@ mod tests {
 
         assert_eq!(h.metrics.incarnations_started(), 0, "no actor was started");
         assert_eq!(h.health(), RoutingHealth::Fenced);
+    }
+
+    /// Shutdown landing INSIDE a synchronous apply is never followed by a
+    /// `Healthy` publication.
+    ///
+    /// `apply` is synchronous and can be long, so a shutdown can land in the
+    /// middle of one that goes on to report `Current`. Publishing `Healthy` from
+    /// that pass resurrects health over a node that is tearing down, and the
+    /// fence only lands once the loop reaches its next park.
+    ///
+    /// Asserted on the TRANSITION LOG, not the final state: a final `Fenced` is
+    /// identical whether or not a transient `Healthy` was published in between,
+    /// so only the recorded sequence can witness its absence (Kyra OLB-2B-E3c).
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_inside_apply_is_never_followed_by_healthy() {
+        let h = harness();
+        let shutdown = h.shutdown.clone();
+        let notify = h.notify.clone();
+        // The mint drives a full RebuildAll; shutdown lands inside that apply.
+        let applier = h.applier(Box::new(move |_, r| {
+            shutdown.store(true, Ordering::Release);
+            notify.notify_waiters();
+            ApplyOutcome::Current {
+                source_generation: r.batch.generation,
+            }
+        }));
+        let run = h.spawn(h.supervisor(), applier);
+        settle().await;
+        run.await.expect("supervisor joins");
+
+        let transitions = h.hooks.health_transitions.lock().clone();
+        assert!(
+            transitions.contains(&RoutingHealth::Rebuilding { incarnation: 1 }),
+            "the recapture still announced itself: {transitions:?}"
+        );
+        assert!(
+            !transitions
+                .iter()
+                .any(|state| matches!(state, RoutingHealth::Healthy { .. })),
+            "Healthy must NEVER be published after shutdown was observed:              {transitions:?}"
+        );
+        assert_eq!(h.health(), RoutingHealth::Fenced, "and the exit fences");
     }
 
     /// A full recapture publishes `Rebuilding` then `Healthy` only after a CURRENT

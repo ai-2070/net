@@ -5134,6 +5134,7 @@ struct ScopedSlotSource {
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
     publication: Arc<ScopedMutationPublication>,
     org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+    authority: Arc<RoutingAuthority>,
     /// Slots asked for under a scope this source does not serve. Counted rather
     /// than silently answered with "no providers".
     unserved_scope: Arc<std::sync::atomic::AtomicU64>,
@@ -5151,45 +5152,77 @@ struct ScopedSourceSnapshot {
     >,
 }
 
-/// The live revocation authority a snapshot was taken under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RevocationAuthority {
-    /// Address of the installed store `Arc`, or 0 when un-adopted. Compared only
-    /// while both `Arc`s are held, so the identity cannot be recycled.
-    identity: usize,
-    generation: u64,
-    poisoned: bool,
+/// The node-owned routing authority (OLB-2B-E3c).
+///
+/// Two jobs, and they are why routing authority is node-owned rather than read
+/// straight off the revocation slot:
+///
+/// - `epoch` is a MONOTONE identity for the current authority. A raw `Arc`
+///   address is not: a store can be replaced, freed, and a new one allocated at
+///   the same address with the same barriered generation, so pointer identity is
+///   ABA-vulnerable. A counter that only ever increases cannot alias a previous
+///   authority (Kyra OLB-2B-E3c);
+/// - `gate` serializes authority movement against the routing COMMIT PIN, so an
+///   install cannot land between the pin accepting a token and the registry
+///   finishing its conditional installation beneath it.
+struct RoutingAuthority {
+    gate: parking_lot::Mutex<()>,
+    epoch: AtomicU64,
+}
+
+impl RoutingAuthority {
+    fn new() -> Self {
+        Self {
+            gate: parking_lot::Mutex::new(()),
+            epoch: AtomicU64::new(1),
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Advance the authority epoch. Returns the new value.
+    ///
+    /// Saturating rather than wrapping: reusing an epoch would let facts built
+    /// under a retired authority compare equal to the live one.
+    fn advance(&self) -> u64 {
+        let mut current = self.epoch.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_add(1);
+            match self.epoch.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => current = actual,
+            }
+        }
+    }
 }
 
 impl ScopedSlotSource {
-    /// Capture the live revocation authority: which store is installed, its
-    /// barriered generation, and whether it is poisoned.
+    /// The live revocation floor view, plus whether the authority is usable.
     ///
-    /// Returned WITH the `Arc` so the identity cannot be recycled underneath the
-    /// comparison, and so the floor snapshot used for filtering comes from
-    /// exactly the store the token names.
-    fn revocation_authority(
+    /// The floors come from exactly the store this reads, and the `Arc` is
+    /// returned with them so the snapshot filters against the same view it
+    /// reports.
+    fn revocation_view(
         &self,
     ) -> (
-        RevocationAuthority,
+        bool,
+        u64,
         Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
     ) {
         let store = self.org_revocation.load_full();
-        let authority = match store.as_ref() {
-            Some(store) => RevocationAuthority {
-                identity: Arc::as_ptr(store) as usize,
-                generation: store.barriered_generation(),
-                poisoned: store.is_poisoned(),
-            },
-            // Un-adopted: no store, implicit floor 0. Still an authority STATE,
-            // and adopting one must invalidate anything built without it.
-            None => RevocationAuthority {
-                identity: 0,
-                generation: 0,
-                poisoned: false,
-            },
+        let (poisoned, floor_generation) = match store.as_ref() {
+            Some(store) => (store.is_poisoned(), store.barriered_generation()),
+            // Un-adopted: no store, implicit floor 0.
+            None => (false, 0),
         };
-        (authority, store)
+        (poisoned, floor_generation, store)
     }
 
     /// Every authority input reconstruction depends on, as one comparable token.
@@ -5202,16 +5235,21 @@ impl ScopedSlotSource {
     /// lets the callback retract them a moment later (Kyra OLB-2B-E3c). Store
     /// replacement has the same shape between publishing the new identity and
     /// completing scoped reconciliation.
+    ///
+    /// `poisoned` and the barriered floor generation are here as well as the
+    /// authority epoch because they can move WITHOUT a node-mediated install —
+    /// the epoch covers what the node serializes, these cover the rest.
     fn token(
         &self,
-        scoped_revision: u64,
-        revocation: &RevocationAuthority,
+        epoch: super::behavior::org_routing_registry::SourceEpoch,
+        poisoned: bool,
+        floor_generation: u64,
     ) -> super::behavior::org_routing_registry::SourceToken {
         super::behavior::org_routing_registry::SourceToken::new(vec![
-            scoped_revision,
-            revocation.identity as u64,
-            revocation.generation,
-            u64::from(revocation.poisoned),
+            epoch.generation,
+            epoch.authority,
+            floor_generation,
+            u64::from(poisoned),
         ])
     }
 }
@@ -5248,13 +5286,14 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
 /// Holds the publication gate across the conditional installation, and nothing
 /// more.
 struct ScopedCommitPin<'a> {
-    _gate: parking_lot::MutexGuard<'a, ()>,
-    generation: u64,
+    _authority_gate: parking_lot::MutexGuard<'a, ()>,
+    _publication_gate: parking_lot::MutexGuard<'a, ()>,
+    epoch: super::behavior::org_routing_registry::SourceEpoch,
 }
 
 impl super::behavior::org_routing_registry::SourceCommitPin for ScopedCommitPin<'_> {
-    fn generation(&self) -> u64 {
-        self.generation
+    fn epoch(&self) -> super::behavior::org_routing_registry::SourceEpoch {
+        self.epoch
     }
 }
 
@@ -5270,7 +5309,8 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         // the token names. Capturing it before the scoped rows means any floor
         // movement that could invalidate those rows is either inside the token or
         // caught by the commit pin.
-        let (revocation, store) = self.revocation_authority();
+        let (poisoned, floor_generation, store) = self.revocation_view();
+        let authority = self.authority.epoch();
         let empty_floors = OrgRevocationState::empty();
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
@@ -5285,7 +5325,7 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
                 if !matches!(
                     scope,
                     super::behavior::org_scoped_ingest::CapabilityAudienceScope::Owner { .. }
-                ) || revocation.poisoned
+                ) || poisoned
                 {
                     // Absent from `rows` => reconstructed as `Unserved`. A
                     // POISONED revocation authority makes every scope unserved:
@@ -5310,7 +5350,11 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             self.unserved_scope
                 .fetch_add(unserved, std::sync::atomic::Ordering::AcqRel);
         }
-        let token = self.token(generation, &revocation);
+        let epoch = super::behavior::org_routing_registry::SourceEpoch {
+            generation,
+            authority,
+        };
+        let token = self.token(epoch, poisoned, floor_generation);
         Box::new(ScopedSourceSnapshot { token, rows })
     }
 
@@ -5318,17 +5362,29 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         &self,
         expected: &super::behavior::org_routing_registry::SourceToken,
     ) -> Option<Box<dyn super::behavior::org_routing_registry::SourceCommitPin + '_>> {
-        let gate = self.publication.lock_gate();
-        // Recomputed UNDER the gate: no scoped mutation can commit while it is
-        // held, and any revocation movement since the snapshot shows up here.
-        let (revocation, _store) = self.revocation_authority();
-        let generation = self.scoped_discovery.lock().revision();
-        if self.token(generation, &revocation) != *expected {
+        // BOTH gates, and both are held through the conditional installation
+        // beneath this pin. The publication gate stops scoped mutation; the
+        // authority gate stops revocation installs and floor movement. Verifying
+        // the token and then holding only the scoped gate would leave authority
+        // free to move between acceptance and installation — the install would
+        // land against an authority that is already gone (Kyra OLB-2B-E3c).
+        //
+        // Order is fixed: authority gate, then publication gate. Every authority
+        // mutation takes only the authority gate, so no inversion is reachable.
+        let authority_gate = self.authority.gate.lock();
+        let publication_gate = self.publication.lock_gate();
+        let (poisoned, floor_generation, _store) = self.revocation_view();
+        let epoch = super::behavior::org_routing_registry::SourceEpoch {
+            generation: self.scoped_discovery.lock().revision(),
+            authority: self.authority.epoch(),
+        };
+        if self.token(epoch, poisoned, floor_generation) != *expected {
             return None;
         }
         Some(Box::new(ScopedCommitPin {
-            _gate: gate,
-            generation,
+            _authority_gate: authority_gate,
+            _publication_gate: publication_gate,
+            epoch,
         }))
     }
 }
@@ -5648,6 +5704,10 @@ pub struct MeshNode {
     /// serve (the grant plane). Counted, never silently answered as "no
     /// providers".
     routing_unserved_scope: Arc<std::sync::atomic::AtomicU64>,
+    /// OLB-2B-E3c: the node-owned routing authority — the monotone epoch every
+    /// routing fact is stamped with, and the gate that serializes authority
+    /// movement against the routing commit pin.
+    routing_authority: Arc<RoutingAuthority>,
     /// OLB-2B-E3c: the supervisor task, held for a DETERMINISTIC join.
     ///
     /// Kept in its own slot rather than the shared `tasks` vector because that
@@ -7123,11 +7183,13 @@ impl MeshNode {
         let routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics> =
             Arc::default();
         let routing_unserved_scope = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let routing_authority = Arc::new(RoutingAuthority::new());
         let routing_registry = super::behavior::org_routing_registry::NodeOrgRoutingRegistry::new(
             Arc::new(ScopedSlotSource {
                 scoped_discovery: scoped_discovery.clone(),
                 publication: scoped_publication.clone(),
                 org_revocation: org_revocation.clone(),
+                authority: routing_authority.clone(),
                 unserved_scope: routing_unserved_scope.clone(),
             }),
             routing_work.clone(),
@@ -7183,6 +7245,7 @@ impl MeshNode {
             routing_metrics: Arc::default(),
             routing_registry_metrics,
             routing_unserved_scope,
+            routing_authority,
             routing_task: parking_lot::Mutex::new(None),
             routing_started: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -9183,6 +9246,11 @@ impl MeshNode {
         // query time, so it must dirty their capabilities and wake consumers.
         let scoped_discovery = self.scoped_discovery.clone();
         let scoped_publication = self.scoped_publication.clone();
+        // OLB-2B-E3c: a floor rise moves ROUTING AUTHORITY, whether or not it
+        // retracts any scoped row. Captured so the callback can advance the
+        // routing epoch and invalidate retained routing facts.
+        let routing_authority = self.routing_authority.clone();
+        let routing_registry = self.routing_registry.clone();
         // AV-10 / R2-3: liveness is enforced by the subscription's
         // exclusion lease inside `subscribe_floors_raised`, not a separate
         // owner token. Dropping the returned guard on teardown/replacement
@@ -9230,8 +9298,18 @@ impl MeshNode {
             // its publication cannot invert (OLB-2A.3.1). Safe to run here: the
             // store invokes subscribers OUTSIDE its publish/reload locks, and this
             // callback takes no revocation lock.
+            // OLB-2B-E3c: advance routing authority BEFORE the scoped retraction
+            // publishes. A rise that retracts nothing still changes what the
+            // routing source is allowed to serve, and it advances no scoped
+            // revision — so routing must learn about it from the epoch, not from
+            // the scoped wake.
+            {
+                let _gate = routing_authority.gate.lock();
+                routing_authority.advance();
+            }
             let retracted = scoped_publication
                 .gated_commit(&scoped_discovery, |s| s.note_floors_raised(raised));
+            routing_registry.invalidate_for_authority_movement();
             if retracted > 0 {
                 tracing::info!(
                     retracted,
@@ -9251,6 +9329,12 @@ impl MeshNode {
         }
         self.org_revocation.store(Some(store.clone()));
         drop(_pin);
+
+        // OLB-2B-E3c: a new store is new ROUTING AUTHORITY, even when its floors
+        // retract nothing. Bumped HERE — the single swap site — so every install
+        // path is covered, and so routing can never be left stamped with an
+        // authority that is no longer installed.
+        self.note_routing_authority_moved();
 
         // No epoch bump: the installed store's IDENTITY changed, and
         // the send-path [`SendStamp`] captures store identity
@@ -11664,6 +11748,33 @@ impl MeshNode {
         }
     }
 
+    /// Record that routing authority moved, and make every retained routing fact
+    /// unusable (OLB-2B-E3c).
+    ///
+    /// The ONE production path for authority movement. Two things happen:
+    ///
+    /// 1. the monotone epoch advances under the authority gate, so a snapshot
+    ///    taken under the previous authority can no longer produce a matching
+    ///    commit token, and any fact already stamped with it is detectably stale;
+    /// 2. the registry drops every retained fact, re-queues every slot and marks
+    ///    registry work.
+    ///
+    /// Step 2 is not redundant. Authority movement need not touch scoped state at
+    /// all — a store swap whose floors retract nothing advances no scoped
+    /// revision and publishes no scoped wake — so without an explicit
+    /// invalidation the actor would never learn that everything it holds was
+    /// built under an authority that no longer applies (Kyra OLB-2B-E3c).
+    fn note_routing_authority_moved(&self) {
+        {
+            let _gate = self.routing_authority.gate.lock();
+            self.routing_authority.advance();
+        }
+        // OUTSIDE the authority gate: the registry takes its own lock, and the
+        // frozen order is authority gate -> publication gate, never authority
+        // gate -> registry lock.
+        self.routing_registry.invalidate_for_authority_movement();
+    }
+
     /// Whether the routing plane is currently usable — a live incarnation has
     /// completed a recapture. `false` while rebuilding and whenever fenced
     /// (OLB-2B-E2).
@@ -11762,6 +11873,21 @@ impl MeshNode {
             facts.providers,
             super::behavior::org_routing_registry::SourceFacts::Unserved
         ) {
+            return None;
+        }
+        // Revalidate the AUTHORITY these facts were built under against the live
+        // one. Checking authority only when something happens to rebuild the slot
+        // is not enough: a store that poisons AFTER installation moves no epoch
+        // and retracts no scoped row, so the cached facts would stay readable
+        // indefinitely (Kyra OLB-2B-E3c). A mismatch drops them and re-queues the
+        // exact slot, so the actor rebuilds it rather than leaving a hole.
+        let poisoned = self
+            .org_revocation
+            .load()
+            .as_ref()
+            .is_some_and(|store| store.is_poisoned());
+        if poisoned || facts.epoch.authority != self.routing_authority.epoch() {
+            self.routing_registry.invalidate_one(key);
             return None;
         }
         // Expiry is enforced HERE, against the wall clock, not merely at capture.
