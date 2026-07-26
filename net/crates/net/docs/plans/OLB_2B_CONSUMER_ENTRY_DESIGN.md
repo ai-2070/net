@@ -1,10 +1,28 @@
 # OLB-2B consumer entry — design for review (revision 2)
 
-**Status: DESIGN FOR REVIEW, revision 2.** Revision 1 (`84080310f`) was HELD:
-core direction approved, implementation NOT authorized. This revision adopts every
-refinement from that review and records the Q1–Q4 decisions as settled. It remains
-a design artifact — no source implementation until this combined boundary is
-re-reviewed.
+**Status: ENTRY REVIEWED AND AUTHORIZED; E3a–E3c LANDED; phase sign-off HELD
+pending the review-pass-2/pass-3 closure.**
+
+Revision 1 (`84080310f`) was HELD: core direction approved, implementation NOT
+authorized. Revision 2 adopted every refinement from that review and recorded the
+Q1–Q4 decisions as settled (below), and it is the revision the combined
+entry-boundary re-review was run against.
+
+**Entry-boundary review outcome (recorded here per review-pass-3 §19).** The
+re-review this document asked for was held and PASSED, and implementation of the
+E-slices was authorized on that basis; the E1 entry landed at `5bf661f2f` and
+E3a–E3c are landed at HEAD of the `load-balancing` branch. The audit trail
+previously had a hole here: the document still read "no OLB-2B source
+implementation begins before that review" while the source it forbids was fully
+landed, and no in-tree record of the outcome existed.
+
+**What is still held.** Landing is not signing. Three adversarial branch reviews
+followed the implementation —
+[2026-07-23](../misc/CODE_REVIEW_2026_07_23_ORG_LOAD_BALANCING.md),
+[pass 2](../misc/CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS2.md) and
+[pass 3](../misc/CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS3.md) — and E3c /
+composed OLB-2B stays HELD until their adjudicated gate is closed and an
+exact-head closure run is recorded. OLB-2C is not authorized before that.
 
 OLB-2A composed is SIGNED at `65b9fe903`; that signature does not authorize this
 phase.
@@ -308,6 +326,7 @@ the slices that introduce their machinery.
 | **Q3** | `RebuildAll`-on-mint, committed before handle publication; unconditional first drain and complete recapture. |
 | **Q4** | OLB mints global only; owner remains unclaimed for the LS / provider-free track. |
 
-No open questions remain from revision 1. This revision is submitted for
-re-review of the combined real-consumer entry boundary; no OLB-2B source
-implementation begins before that review.
+No open questions remain from revision 1. This revision was submitted for
+re-review of the combined real-consumer entry boundary; that review PASSED and
+authorized the E-slices, which are landed (see the status block at the top of
+this document for the outcome, the landed heads, and what remains held).

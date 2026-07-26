@@ -215,9 +215,20 @@ findings and four bounded corrections, all applied in this revision:
    non-stampeding) (§9).
 
 **Current execution point:** architecture and Option-A OLB-0 are signed; OLB-1
-candidate factoring has landed (see the implementation-status note above). The
-already-required bounded stop-and-review is the active gate; OLB-2 does not begin
-until it signs off.
+candidate factoring is signed at `4dccb7767`. The bounded stop-and-review that
+gated OLB-2 has PASSED — see the implementation-status note above, which records
+the authorization and the OLB-2A slices that followed it. OLB-2A composed is
+signed at `65b9fe903`. OLB-2B (the supervised node-owned routing actor and its
+bounded registry) is LANDED on the `load-balancing` branch and is HELD pending
+the pass-2/pass-3 review closure recorded in
+[`OLB_2B_CONSUMER_ENTRY_DESIGN.md`](OLB_2B_CONSUMER_ENTRY_DESIGN.md); OLB-2C is
+not authorized until that closure signs.
+
+*(review-pass-3 §19: this paragraph previously still said "OLB-2 does not begin
+until it signs off", contradicting the implementation-status note above it, which
+had said the opposite since `4dccb7767`. For a plan whose process leans this hard
+on recorded gates, a self-contradicting status is a hole in the audit trail, not
+a typo.)*
 
 **The sentence:** organization-aware load balancing is an internal
 composition of private authorized discovery, capability sensing, and
