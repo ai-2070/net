@@ -22,24 +22,40 @@ Both crates pin to the same version. The SDK depends on the core crate by versio
 
 The core crate's default feature set compiles the full stack:
 
-| Feature        | What it adds                                                                 | On by default |
-|----------------|------------------------------------------------------------------------------|---------------|
-| `net`          | Mesh transport — Noise handshakes, ChaCha20-Poly1305, ed25519 identities     | yes           |
-| `nat-traversal`| Reflex probes, classification, rendezvous punch                              | yes           |
-| `cortex`       | Folded-state driver + RedEX append-only logs                                 | yes           |
-| `meshdb`       | Federated query layer (time-travel, lineage, cross-chain joins)              | yes           |
-| `meshos`       | Cluster behavior engine, daemon supervision                                  | yes           |
-| `dataforts`    | Content-addressed blob storage, greedy-LRU cache, gravity-based placement    | yes           |
-| `port-mapping` | UPnP-IGD / NAT-PMP for opportunistic port mapping                            | no            |
-| `redis`        | Redis Streams adapter                                                        | no            |
-| `jetstream`    | NATS JetStream adapter                                                       | no            |
-| `cli`          | The `net-blob` operator CLI                                                  | no            |
+| Feature           | What it adds                                                              | On by default |
+| ----------------- | ------------------------------------------------------------------------- | ------------- |
+| `net`             | Mesh transport — Noise handshakes, ChaCha20-Poly1305, ed25519 identities   | yes           |
+| `nat-traversal`   | Reflex probes, classification, rendezvous punch                            | yes           |
+| `cortex`          | Folded-state driver (pulls in `redex`)                                     | yes           |
+| `meshdb`          | Federated query layer (time-travel, lineage, cross-chain joins)            | yes           |
+| `meshos`          | Cluster behavior engine, daemon supervision                                | yes           |
+| `dataforts`       | Content-addressed blob storage, greedy-LRU cache, gravity-based placement  | yes           |
+| `redex`           | RedEX append-only logs — implied by `cortex`                               | via `cortex`  |
+| `redex-disk`      | Disk-backed RedEX segments rather than memory-only                         | no            |
+| `netdb`           | NetDB query surface over folded state                                      | no            |
+| `tool`            | `ToolDescriptor` + tool-metadata RPC (requires `cortex`)                   | no            |
+| `regex`           | Regex predicates in the filter DSL — without it, patterns match nothing    | no            |
+| `batched-ingress` | Batched receive path on the Net adapter                                    | no            |
+| `port-mapping`    | UPnP-IGD / NAT-PMP for opportunistic port mapping                          | no            |
+| `redis`           | Redis Streams adapter                                                      | no            |
+| `jetstream`       | NATS JetStream adapter                                                     | no            |
+| `cli`             | The `net-blob` operator CLI                                                | no            |
+| `ffi`             | C ABI surface — enabled by the `cdylib`/`staticlib` builds                 | no            |
+
+Features compose rather than stand alone: `cortex` implies `redex`, and
+`meshdb`, `netdb` and `tool` each imply `cortex`. Turning on `netdb` therefore
+also pulls in the fold driver and the log underneath it.
+
+One flag is worth calling out because it fails quietly: without `regex`, a peer
+can still *send* you a regex pattern, but your node matches it closed — the
+pattern matches nothing rather than erroring. If you rely on regex predicates in
+filters, enable it explicitly.
 
 If you want a minimal build — just the in-memory bus, no mesh, no persistence — disable defaults:
 
 ```toml
 [dependencies]
-net-mesh = { version = "0.32", default-features = false }
+net-mesh = { version = "0.34", default-features = false }
 ```
 
 ## Node
