@@ -8201,6 +8201,45 @@ impl MeshNode {
                     .remove_if(&source, |_, (expected, _)| ka.sender_node_id == *expected)
                 {
                     let _ = tx.send(ka);
+                } else {
+                    // Diagnose the miss. Both failure modes used to
+                    // return silently here, which makes "the peer's
+                    // train arrived but we ignored it" indistinguishable
+                    // from "no train ever arrived" — the punch just
+                    // times out either way, and the only artifact is a
+                    // `punch_timeouts` bump with no cause attached.
+                    //
+                    // `remove_if` returns `None` for both "no observer
+                    // at this source addr" and "observer present, sender
+                    // id mismatched", so re-read the map to tell them
+                    // apart. Diagnostic only — a concurrent arm/disarm
+                    // between the two lookups just changes which line is
+                    // logged, and this runs only on the miss path during
+                    // an active punch window.
+                    match ctx.punch_observers.get(&source) {
+                        Some(entry) => tracing::debug!(
+                            source = %source,
+                            expected_sender = entry.value().0,
+                            claimed_sender = ka.sender_node_id,
+                            "rendezvous: keep-alive from an armed source but the \
+                             sender id does not match the awaited counterpart; \
+                             observer left armed"
+                        ),
+                        None => tracing::debug!(
+                            source = %source,
+                            claimed_sender = ka.sender_node_id,
+                            armed = ctx.punch_observers.len(),
+                            armed_addrs = ?ctx
+                                .punch_observers
+                                .iter()
+                                .map(|e| *e.key())
+                                .take(4)
+                                .collect::<Vec<_>>(),
+                            "rendezvous: keep-alive arrived with no observer armed \
+                             for its source address — the train landed from an addr \
+                             other than the reflex the coordinator named"
+                        ),
+                    }
                 }
                 return;
             }

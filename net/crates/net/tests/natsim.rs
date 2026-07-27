@@ -46,12 +46,87 @@ fn natsim_node_bin() -> std::path::PathBuf {
     p
 }
 
+/// A completed scenario: the initiator's outcome JSON plus the state
+/// directory holding every helper's log and stats snapshot.
+///
+/// Derefs to the outcome, so assertions read exactly as they did when
+/// `scenario()` returned a bare `Value`. The reason it exists is
+/// [`Drop`]: on a failed assertion it dumps the other nodes' artifacts
+/// into the test output.
+///
+/// Without that, a failing scenario reports only the initiator's
+/// verdict — e.g. `punch_timeouts: 1` — and the responder's and
+/// coordinator's logs are torn down unread, because `run_scenario.sh`
+/// prints helper logs only on the *timeout* path (no outcome file at
+/// all). A punch that fails while still producing a verdict left no
+/// evidence of which side dropped it.
+struct ScenarioRun {
+    outcome: serde_json::Value,
+    state: std::path::PathBuf,
+}
+
+impl std::ops::Deref for ScenarioRun {
+    type Target = serde_json::Value;
+    fn deref(&self) -> &serde_json::Value {
+        &self.outcome
+    }
+}
+
+impl std::fmt::Display for ScenarioRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Delegates so the existing `{v:#}` assertion messages keep
+        // rendering the outcome JSON.
+        std::fmt::Display::fmt(&self.outcome, f)
+    }
+}
+
+impl Drop for ScenarioRun {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        eprintln!("\n=== natsim artifacts ({}) ===", self.state.display());
+        let Ok(entries) = std::fs::read_dir(&self.state) else {
+            eprintln!("(state dir unreadable — was it torn down?)");
+            return;
+        };
+        let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            // Logs and the per-node stats snapshots; skip the identity
+            // and marker files, which carry no diagnostic signal.
+            let is_stats = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.ends_with("_stats.json") || f.ends_with("_outcome.json"));
+            if ext != "log" && !is_stats {
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(body) => {
+                    eprintln!("\n--- {} ---", path.display());
+                    // Logs can be long; the tail is where the punch
+                    // window lives.
+                    let lines: Vec<&str> = body.lines().collect();
+                    let start = lines.len().saturating_sub(80);
+                    for line in &lines[start..] {
+                        eprintln!("{line}");
+                    }
+                }
+                Err(e) => eprintln!("\n--- {} (unreadable: {e}) ---", path.display()),
+            }
+        }
+        eprintln!("=== end natsim artifacts ===\n");
+    }
+}
+
 /// Run one scenario script and return the initiator's outcome JSON.
 /// The script prints the outcome path on a `NATSIM_OUTCOME_PATH=`
 /// marker line (a bare "last line" is unsafe: the JSON body it
 /// follows ends without a trailing newline, so the path would glue
 /// onto the closing brace).
-fn scenario(name: &str) -> serde_json::Value {
+fn scenario(name: &str) -> ScenarioRun {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/natsim/run_scenario.sh");
     // Thread the profile-resolved helper path through sudo (which
     // strips the environment by default) so the script exercises the
@@ -79,7 +154,15 @@ fn scenario(name: &str) -> serde_json::Value {
         .map(str::trim)
         .expect("NATSIM_OUTCOME_PATH= marker on scenario stdout");
     let bytes = std::fs::read(path).expect("read outcome json");
-    serde_json::from_slice(&bytes).expect("parse outcome json")
+    let outcome = serde_json::from_slice(&bytes).expect("parse outcome json");
+    // The script leaves its state dir in place (a mktemp under /tmp);
+    // the outcome file sits directly inside it, so the parent is where
+    // every helper's log and stats snapshot live.
+    let state = std::path::Path::new(path)
+        .parent()
+        .expect("outcome path has a parent state dir")
+        .to_path_buf();
+    ScenarioRun { outcome, state }
 }
 
 fn stat(v: &serde_json::Value, key: &str) -> u64 {

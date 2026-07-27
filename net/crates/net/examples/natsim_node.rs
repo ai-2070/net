@@ -188,9 +188,29 @@ mod natsim {
         })
     }
 
-    async fn serve_forever() -> ! {
+    /// Park for the rest of the scenario, republishing this node's
+    /// traversal stats to `<name>_stats.json` once a second.
+    ///
+    /// Only the initiator writes an `outcome.json`, so every other
+    /// node's view of the punch used to be invisible: when A reports
+    /// `punch_timeouts: 1` there was no way to tell whether the
+    /// responder ever received the introduce, armed an observer, or
+    /// emitted an ack. These snapshots make the responder's and
+    /// coordinator's counters readable after the fact, which is what
+    /// separates "R never fanned out" from "B dropped the introduce"
+    /// from "B's observer never fired".
+    async fn serve_forever_publishing_stats(
+        node: Arc<MeshNode>,
+        state: PathBuf,
+        name: String,
+    ) -> ! {
+        let path = state.join(format!("{name}_stats.json"));
         loop {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            write_atomic(
+                &path,
+                &serde_json::to_vec_pretty(&stats_json(&node)).unwrap(),
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -271,7 +291,7 @@ mod natsim {
             .await
             .expect("public announce");
         write_marker(&state, &format!("{name}_started"));
-        serve_forever().await
+        serve_forever_publishing_stats(node, state, name).await
     }
 
     async fn run_joiner(flags: HashMap<String, String>) {
@@ -372,8 +392,9 @@ mod natsim {
         write_marker(&state, &format!("{name}_ready"));
 
         let Some(target) = target else {
-            // Responder: serve until the script kills us.
-            serve_forever().await;
+            // Responder: serve until the script kills us. Its stats are
+            // the ones that say whether the introduce ever landed.
+            serve_forever_publishing_stats(node, state, name).await;
         };
 
         // Initiator: wait for the target's identity + readiness, then
@@ -475,7 +496,30 @@ mod natsim {
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
+    /// Install a `RUST_LOG`-driven subscriber writing to **stderr**.
+    ///
+    /// Without this the crate's `tracing` calls go nowhere, so the
+    /// rendezvous drop paths — the coordinator's fan-out checks and the
+    /// responder's `unsolicited_introduce_permitted` gate, all of which
+    /// drop silently by design — are invisible no matter what `RUST_LOG`
+    /// says. They are the difference between "R never introduced B" and
+    /// "B refused the introduce".
+    ///
+    /// stderr specifically: `keygen` prints its JSON to stdout and
+    /// `run_scenario.sh` parses that with `sed`, so log lines must not
+    /// share the stream.
+    fn init_tracing() {
+        use tracing_subscriber::{fmt, EnvFilter};
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+        let _ = fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_target(true)
+            .try_init();
+    }
+
     pub fn main() {
+        init_tracing();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
