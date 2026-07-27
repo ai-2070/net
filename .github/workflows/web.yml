@@ -1,0 +1,93 @@
+name: Web
+
+# The docs site had no CI at all: 85 broken links shipped to production
+# because nothing enumerated them, and `web/` could stop compiling without
+# a single job going red. This gates the site the way `ci.yml` gates the
+# crates.
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "web/**"
+      - ".github/workflows/web.yml"
+  pull_request:
+    paths:
+      - "web/**"
+      - ".github/workflows/web.yml"
+
+jobs:
+  check:
+    name: Lint, links, types
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # Cheapest and highest-signal check — runs first so a dead link
+      # fails the job in seconds rather than after a full Next build.
+      - name: Check doc links
+        run: npm run check:docs
+
+      # The site's release notes are generated from the crate's copy. If
+      # someone edits one and not the other, this is what says so.
+      - name: Check release notes are in sync
+        run: npm run check:releases
+
+      - name: Typecheck
+        run: npm run check:types
+
+      # No lint or format step, and both omissions are deliberate:
+      #
+      #   - ESLint is currently broken repo-wide. `eslint-plugin-react`
+      #     (via eslint-config-next) crashes under ESLint 10 with
+      #     "contextOrFilename.getFilename is not a function" on every
+      #     file. `next lint` is also gone in Next 16.
+      #   - `prettier --check` fails on 119 files under web/, source and
+      #     content alike; `npm run prettier` exists but has never been
+      #     enforced.
+      #
+      # Both are worth fixing, and both mean touching files far outside
+      # the docs — so they're their own change, not a silent side effect
+      # of the first workflow to cover this directory. Adding a step that
+      # fails every run would just train people to ignore it.
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: check
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # Every docs page is statically generated, so a build failure is the
+      # only thing that catches an MDX page that parses but won't render.
+      - name: Build
+        run: npm run build
+        env:
+          # The homepage pulls the GitHub release list at build time; without
+          # a token the unauthenticated rate limit makes builds flaky.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

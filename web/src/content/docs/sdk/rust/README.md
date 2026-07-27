@@ -1,3 +1,7 @@
+---
+title: Rust
+description: The Rust SDK (net-mesh-sdk, imported as netsdk) is the canonical binding — every other language wraps the same core.
+---
 # Rust SDK
 
 The Rust SDK (`net-mesh-sdk`, imported as `net_sdk`) is the canonical binding —

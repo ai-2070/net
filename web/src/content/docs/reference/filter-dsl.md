@@ -1,3 +1,7 @@
+---
+title: Filter DSL
+description: The filter DSL is the predicate language for event consumption.
+---
 # Filter DSL
 
 The filter DSL is the predicate language for event consumption. Filters are JSON predicates evaluated against event payloads after retrieval from the adapter, and they're the primary way you narrow down what a consumer sees on a busy channel.

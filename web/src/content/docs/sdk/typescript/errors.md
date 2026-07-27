@@ -1,3 +1,7 @@
+---
+title: Errors
+description: "The TypeScript SDK's error taxonomy: failure is a typed outcome you can branch on, never a silence."
+---
 # TypeScript — Errors and Recovery
 
 Failure is a typed outcome, not a silence. The golden rule matches every binding:

@@ -1,3 +1,7 @@
+---
+title: v0.22 — All Along the Watchtower
+description: "Release notes for Net v0.22 — All Along the Watchtower — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.22 — "All Along the Watchtower"
 
 *Named after Bob Dylan's 1967 cut from John Wesley Harding — the one Jimi Hendrix took six months later and turned into his own song so completely that Dylan started covering Hendrix's arrangement instead of his own ("he found things in the song that I didn't realize were there"). Twelve lines, three verses, no chorus: the joker tells the thief there must be some way out of here, the thief replies that the hour is getting late, and the camera pulls back to a watchtower where princes watch the women come and go and two riders are approaching from outside the frame. The whole song is built around the vantage point — somebody up on the parapet, looking down at the territory below, naming what they see. v0.22 puts that vantage point in the substrate. An aggregator daemon sits one tier up from a source subnet, subscribes to that subnet's detail channels through the existing gateway, summarizes what it sees, and publishes the summary to channels visible at the parent or peer tier. The mesh already had four-level hierarchical `SubnetId` on every packet, a gateway that enforced visibility at subnet boundaries by reading header fields only, label-based subnet assignment, and replica groups for any daemon role. v0.21 was about shrinking the gap between call and arrival on the hot path; v0.22 is about giving every tier a watchtower without inventing a parallel scoping mechanism. One generic state-aggregation framework replaces three would-be-separate fold implementations. One aggregator daemon role, deployed via the existing replica-group infrastructure, bridges tiers — N watchers per subnet, all publishing independently, subscribers picking the freshest by generation. One RPC surface lets operators spawn, scale, and query those watchers from any node, any language, any process. And one Deck retab puts the whole topology on the cyberdeck so the operator has the same vantage point the substrate just built.*
@@ -253,4 +257,4 @@ Released 2026-05-24.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

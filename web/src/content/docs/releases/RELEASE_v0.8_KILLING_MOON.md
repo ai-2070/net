@@ -1,3 +1,7 @@
+---
+title: v0.8 — Killing Moon
+description: "Release notes for Net v0.8 — Killing Moon — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.8 — "Killing Moon"
 
 Net is a mesh runtime. Identity is cryptographic, channels are hierarchical, state is causal, and compute moves. There is no broker, no leader, no central directory. Every node is its own keypair. Every event is signed into a chain you can verify without trusting the network underneath. The network is the substrate; the entities are what matter.
@@ -44,4 +48,4 @@ The release ships when it's ready, not when it's convenient. It happens to ship 
 
 ## License
 
-See [LICENSE](../../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/LICENSE-APACHE).

@@ -1,3 +1,7 @@
+---
+title: REST vs Net
+description: "REST and webhooks are not the enemy, and they're not the model."
+---
 # REST vs Net
 
 REST and webhooks are not the enemy, and they're not the model. They're the

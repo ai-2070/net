@@ -7,8 +7,9 @@ import type { DocsOrderConfig } from "@/lib/docs";
 //   folders mixed). Missing ones append alpha after.
 // - `hide` removes entries from the sidebar entirely. Folders cascade —
 //   hiding `misc` also makes everything under `misc/` unreachable.
-// - `labels` overrides the auto-titleized name for any entry, shown in
-//   the sidebar, breadcrumbs, and folder/page headers.
+// - `labels` names entries that have no file to carry frontmatter (a
+//   folder with no README). A page's own `title:` frontmatter wins over
+//   this map; the fallback is the titleized filename.
 //
 // Slug paths use lowercased filenames-without-`.md` and lowercased folder
 // names, joined by `/`: `"releases"`, `"plans/nested"`,
@@ -101,6 +102,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "organizations",
       "subnets",
       "storage-stack",
+      "security-model",
     ],
     guides: [
       "wrap-mcp-server",
@@ -116,8 +118,12 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "netdb-queries",
       "dataforts",
       "daemons-and-placement",
+      "gang-scheduler",
+      "task-lifecycle",
       "continuity-and-migration",
       "nat-and-traversal",
+      "production-deployment",
+      "troubleshooting",
     ],
     reference: [
       "eventbus-api",
@@ -130,6 +136,9 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "error-codes",
       "mcp-bridge",
       "cli",
+      "deck",
+      "glossary",
+      "versioning",
     ],
     tutorials: [
       "fleet-telemetry",
@@ -175,168 +184,15 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "release-v0.8-killing-moon",
     ],
   },
+  // Titles live in each page's frontmatter (`title:`), which `lib/docs.ts`
+  // reads while walking the tree. This map used to carry one hand-written
+  // label per page — 144 of them — duplicating what the page already knew
+  // and silently going stale whenever someone added a doc and forgot the
+  // second file. Only entries with no file of their own need one now:
+  // folders that have no README to carry frontmatter.
   labels: {
-    // Sections
-    worldview: "Worldview",
-    start: "Start",
-    concepts: "Concepts",
-    payments: "Payments",
-    guides: "Guides",
-    reference: "Reference",
-    tutorials: "Tutorials",
     releases: "Releases",
-
-    // Worldview
-    "worldview/agentic-mesh": "The Agentic Mesh",
-    "worldview/right-and-wrong-use-cases": "When to Use Net",
-    "worldview/mcp-vs-net": "MCP vs Net",
-    "worldview/rest-vs-net": "REST vs Net",
-
-    // Payments
-    "payments/what-net-payments-is": "What It Is (and Is Not)",
-    "payments/x402-and-net": "x402 and Net",
-    "payments/the-lifecycle": "The Lifecycle",
-    "payments/verification-tiers": "Verification Tiers",
-    "payments/spend-policy-and-approvals": "Spend Policy & Approvals",
-    "payments/non-custodial-signing": "Non-Custodial Signing",
-    "payments/networks": "Networks",
-    "payments/failure-schematic": "The Failure Schematic",
-    "payments/billing": "Billing",
-
-    // Start
-    "start/what-is-net": "What is Net?",
-    "start/quickstart": "Quickstart",
-    "start/install": "Install",
-    "start/claude-skills": "Claude Skills",
-
-    // Concepts
-    "concepts/architecture": "Architecture",
-    "concepts/channels": "Channels",
-    "concepts/events-and-causality": "Events and Causality",
-    "concepts/identity": "Identity",
-    "concepts/capabilities": "Capabilities",
-    "concepts/organizations": "Organizations",
-    "concepts/subnets": "Subnets",
-    "concepts/storage-stack": "The Storage Stack",
-
-    // Guides
-    "guides/wrap-mcp-server": "Wrap an MCP Server",
-    "guides/expose-net-as-mcp": "Expose Net as MCP",
-    "guides/discover-and-invoke": "Discover and Invoke",
-    "guides/recover-failed-workflow": "Recover a Failed Workflow",
-    "guides/submitted-is-not-completed": "Submitted Is Not Completed",
-    "guides/event-bus": "Using the Event Bus",
-    "guides/nrpc": "Typed RPC with nRPC",
-    "guides/private-capabilities": "Private Capabilities",
-    "guides/durable-logs": "Durable Logs (RedEX)",
-    "guides/cortex-folds": "Folded State (CortEX)",
-    "guides/netdb-queries": "Querying with NetDB",
-    "guides/dataforts": "Blob Storage (Dataforts)",
-    "guides/daemons-and-placement": "Daemons and Placement",
-    "guides/continuity-and-migration": "Continuity and Migration",
-    "guides/nat-and-traversal": "NAT and Traversal",
-
-    // Reference
-    "reference/eventbus-api": "EventBus API",
-    "reference/adapter-trait": "Adapter Trait",
-    "reference/filter-dsl": "Filter DSL",
-    "reference/subprotocol-ids": "Subprotocol Registry",
-    "reference/capability-schema": "Capability Schema",
-    "reference/wire-format": "Wire Format",
-    "reference/replication-config": "Replication Configuration",
-    "reference/error-codes": "Error Codes",
-    "reference/mcp-bridge": "MCP Bridge",
-    "reference/cli": "CLI Reference",
-
-    // SDKs
     sdk: "SDKs",
-    "sdk/rust": "Rust",
-    "sdk/rust/quickstart": "Quickstart",
-    "sdk/rust/announce": "Announce",
-    "sdk/rust/discover": "Discover",
-    "sdk/rust/invoke": "Invoke",
-    "sdk/rust/watch": "Watch",
-    "sdk/rust/artifacts": "Artifacts",
-    "sdk/rust/errors": "Errors",
-    "sdk/typescript": "TypeScript",
-    "sdk/typescript/quickstart": "Quickstart",
-    "sdk/typescript/announce": "Announce",
-    "sdk/typescript/discover": "Discover",
-    "sdk/typescript/invoke": "Invoke",
-    "sdk/typescript/watch": "Watch",
-    "sdk/typescript/artifacts": "Artifacts",
-    "sdk/typescript/errors": "Errors",
-    "sdk/python": "Python",
-    "sdk/python/quickstart": "Quickstart",
-    "sdk/python/announce": "Announce",
-    "sdk/python/discover": "Discover",
-    "sdk/python/invoke": "Invoke",
-    "sdk/python/watch": "Watch",
-    "sdk/python/artifacts": "Artifacts",
-    "sdk/python/errors": "Errors",
-    "sdk/go": "Go",
-    "sdk/go/quickstart": "Quickstart",
-    "sdk/go/announce": "Announce",
-    "sdk/go/discover": "Discover",
-    "sdk/go/invoke": "Invoke",
-    "sdk/go/watch": "Watch",
-    "sdk/go/artifacts": "Artifacts",
-    "sdk/go/errors": "Errors",
-    "sdk/c": "C",
-    "sdk/c/quickstart": "Quickstart",
-    "sdk/c/errors": "Errors",
-
-    // Agent briefs
-    "agent-briefs": "Agent Briefs",
-    "agent-briefs/wrap-and-use-an-mcp-server": "Wrap and Use an MCP Server",
-    "agent-briefs/build-a-recoverable-capability":
-      "Build a Recoverable Capability",
-    "agent-briefs/generate-typed-tool-bindings": "Generate Typed Tool Bindings",
-
-    // Tutorials
-    "tutorials/fleet-telemetry": "Fleet Telemetry",
-    "tutorials/distributed-daemon": "Daemon With Failover",
-    "tutorials/event-sourced-service": "Event-Sourced Service",
-
-    // Releases
-    "releases/RELEASE_v0.33_CIRCUS_MAXIMUS": "v0.33.0 — Circus Maximus",
-    "releases/RELEASE_v0.32_SUMMER_MADNESS": "v0.32.0 — Summer Madness",
-    "releases/RELEASE_v0.31_HOLD_THE_LINE": "v0.31.0 — Hold the Line",
-    "releases/RELEASE_v0.30_FINAL_COUNTDOWN": "v0.30.0 — Final Countdown",
-    "releases/RELEASE_v0.29.1_SUMMER_OF_69": "v0.29.1 — Summer of '69",
-    "releases/RELEASE_v0.29_SUMMER_OF_69": "v0.29.0 — Summer of '69",
-    "releases/RELEASE_v0.28_ROUND_AND_ROUND": "v0.28.0 — Round and Round",
-    "releases/RELEASE_v0.27.7_PURPLE_RAIN": "v0.27.7 — Purple Rain",
-    "releases/RELEASE_v0.27.6_PURPLE_RAIN": "v0.27.6 — Purple Rain",
-    "releases/RELEASE_v0.27.5_PURPLE_RAIN": "v0.27.5 — Purple Rain",
-    "releases/RELEASE_v0.27.4_PURPLE_RAIN": "v0.27.4 — Purple Rain",
-    "releases/RELEASE_v0.27.3_PURPLE_RAIN": "v0.27.3 — Purple Rain",
-    "releases/RELEASE_v0.27.2_PURPLE_RAIN": "v0.27.2 — Purple Rain",
-    "releases/RELEASE_v0.27.1_PURPLE_RAIN": "v0.27.1 — Purple Rain",
-    "releases/RELEASE_v0.27_PURPLE_RAIN": "v0.27 — Purple Rain",
-    "releases/RELEASE_v0.26_MONKEY_BUSINESS": "v0.26 — Monkey Business",
-    "releases/RELEASE_v0.25_SHOCK_TO_THE_SYSTEM": "v0.25 — Shock To The System",
-    "releases/RELEASE_v0.24_MONEY_FOR_NOTHING": "v0.24 — Money For Nothing",
-    "releases/RELEASE_v0.23_GIMME_SHELTER": "v0.23 — Gimme Shelter",
-    "releases/RELEASE_v0.22_ALL_ALONG_THE_WATCHTOWER":
-      "v0.22 — All Along the Watchtower",
-    "releases/RELEASE_v0.21_RADAR_LOVE": "v0.21 — Radar Love",
-    "releases/release-v0.20.2": "v0.20.2 — Smoke on the Water",
-    "releases/release-v0.20-smoke-on-the-water": "v0.20 — Smoke on the Water",
-    "releases/release-v0.19-push-it-to-the-limit":
-      "v0.19 — Push It to the Limit",
-    "releases/release-v0.18-welcome-to-the-jungle":
-      "v0.18 — Welcome to the Jungle",
-    "releases/release-v0.17-atomic-playboys": "v0.17 — Atomic Playboys",
-    "releases/release-v0.16-eye-of-the-tiger": "v0.16 — Eye of the Tiger",
-    "releases/release-v0.15-rebel-yell": "v0.15 — Rebel Yell",
-    "releases/release-v0.14-the-warriors": "v0.14 — The Warriors",
-    "releases/release-v0.13-chippin-in": "v0.13 — Chippin' In",
-    "releases/release-v0.12-firestarter": "v0.12 — Firestarter",
-    "releases/release-v0.11-black-diamond": "v0.11 — Black Diamond",
-    "releases/release-v0.10-hex": "v0.10 — Hex",
-    "releases/release-v0.9-first-blood": "v0.9 — First Blood",
-    "releases/release-v0.8-killing-moon": "v0.8 — Killing Moon",
   },
   languages: {
     // Each SDK spine is visible under its language pill. Rust is the default.

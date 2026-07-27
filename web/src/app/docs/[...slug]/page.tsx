@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
@@ -11,10 +12,7 @@ import {
 } from "@/lib/docs";
 import { DocsContent } from "@/components/DocsContent";
 import { DocsToc } from "@/components/DocsToc";
-import {
-  DocsPrevNextTop,
-  DocsPrevNextBottom,
-} from "@/components/DocsPrevNext";
+import { DocsPrevNextTop, DocsPrevNextBottom } from "@/components/DocsPrevNext";
 
 interface PageProps {
   params: Promise<{ slug: string[] }>;
@@ -31,13 +29,40 @@ export function generateStaticParams(): Array<{ slug: string[] }> {
   return getAllSlugs().map((slug) => ({ slug }));
 }
 
-export async function generateMetadata({ params }: PageProps) {
+// Every docs page used to ship the same social and search preview: a title
+// and nothing else, so 143 pages were indistinguishable to a crawler or a
+// link unfurl. Titles and descriptions both come from the page's own
+// frontmatter now, which is why this can be per-page without a second
+// registry to maintain.
+export async function generateMetadata({
+  params,
+}: PageProps): Promise<Metadata> {
   const { slug } = await params;
   const resolved = resolveDoc(slug);
   if (!resolved) return { title: "Not Found · Docs · Net" };
-  const title =
-    resolved.kind === "file" ? resolved.file.title : resolved.folder.title;
-  return { title: `${title} · Docs · Net` };
+
+  const node = resolved.kind === "file" ? resolved.file : resolved.folder;
+  const title = `${node.title} · Docs · Net`;
+  const description = node.description;
+  const path = `/docs${slug.length ? `/${slug.join("/")}` : ""}`;
+
+  return {
+    title,
+    description,
+    alternates: { canonical: path },
+    openGraph: {
+      type: "article",
+      siteName: "Net",
+      title,
+      description,
+      url: path,
+    },
+    twitter: {
+      card: "summary",
+      title,
+      description,
+    },
+  };
 }
 
 function TocRail({ entries }: { entries: readonly TocEntry[] }) {
@@ -261,7 +286,11 @@ export default async function DocPage({ params }: PageProps) {
           })}
         </div>
         <DocsPrevNextTop prev={prev} next={next} />
-        <DocsContent source={source} format={resolved.file.ext} />
+        <DocsContent
+          source={source}
+          format={resolved.file.ext}
+          baseDir={resolved.file.slug.slice(0, -1)}
+        />
         <DocsPrevNextBottom prev={prev} next={next} />
       </main>
       <TocRail entries={toc} />

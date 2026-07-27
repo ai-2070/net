@@ -1,3 +1,7 @@
+---
+title: v0.9 — First Blood
+description: "Release notes for Net v0.9 — First Blood — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.9 — "Killing Moon" Phase II
 
 v0.9 is a hardening release. No new features, no new transports, no new SDK surfaces — every commit on this branch is a bug fix, a regression test, or a documentation tightening. The conviction we shipped under v0.8 ("Killing Moon") was that distributed compute should not be a control-plane problem. v0.9 is the version where we stand behind that conviction by walking it through audit after audit and tightening every seam we found.
@@ -251,4 +255,4 @@ Released 2026-05-02.
 
 ## License
 
-See [LICENSE](../../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/LICENSE-APACHE).

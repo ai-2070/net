@@ -1,3 +1,7 @@
+---
+title: What It Is (and Is Not)
+description: "An agent that invokes a capability needs to answer commercial questions the transport layer can't: what does this cost?"
+---
 # What Net Payments is (and is not)
 
 An agent that invokes a capability needs to answer commercial questions the
@@ -33,17 +37,17 @@ compliance check, it's wrong.
    structures — they never replace, translate, or re-encode them.
 2. **Byte-preservation is law.** x402 documents ride as base64 of their original
    bytes; Net never re-serializes a received x402 doc. See [x402 and
-   Net](./x402-and-net).
+   Net](/docs/payments/x402-and-net).
 3. **Non-custodial by construction.** Identity keys are not settlement keys, and
    there is no raw-bytes signing path. See [Non-custodial
-   signing](./non-custodial-signing).
+   signing](/docs/payments/non-custodial-signing).
 4. **Verification is a tier, not a boolean.** A facilitator receipt is
    `observed`; depth and finality come from an independent on-chain check. See
-   [Verification tiers](./verification-tiers).
+   [Verification tiers](/docs/payments/verification-tiers).
 5. **The policy engine decides, not the model.** Spend policy runs before money
    leaves; handlers never see an unpaid call. See [Spend policy &
-   approvals](./spend-policy-and-approvals).
-6. **Enabling a network is config, not code.** See [Networks](./networks).
+   approvals](/docs/payments/spend-policy-and-approvals).
+6. **Enabling a network is config, not code.** See [Networks](/docs/payments/networks).
 
 ## The data boundary
 
@@ -54,6 +58,30 @@ records. This holds *by construction*: identities on the wire are public keys
 (entity IDs), the invocation input is carried as a **hash**, amounts are opaque
 atomic-unit integers, and there is no PII field on any envelope. Provider and
 customer records live in provider or partner systems.
+
+You can read the boundary straight off the type. Here is every field on a
+`net.payment.quote@1`:
+
+```rust
+pub struct PaymentQuote {
+    pub object: String,             // the version tag
+    pub quote_id: String,           // content-derived, hex
+    pub provider: EntityId,         // a public key
+    pub caller: EntityId,           // a public key
+    pub capability: String,         // "provider/capability"
+    pub input_hash: Option<String>, // a blake3 hash — never the arguments
+    pub requirements: X402Carry<PaymentRequirements>, // opaque x402 bytes
+    pub asset_registry: RegistryRef,// the revision, never "latest"
+    pub issued_at_ns: u64,
+    pub expires_at_ns: u64,
+    // … binding hash + signature
+}
+```
+
+There is no name, no address, no account, and no argument payload — the price
+binds to an invocation through `input_hash` without the quote ever carrying what
+was invoked. That's what "by construction" means here: the field simply doesn't
+exist to be populated.
 
 **Terms acceptance**, where used, means a **signed acceptance commitment plus a
 terms hash/ID** — Net does not host terms text, validate legal authority, store

@@ -1,3 +1,7 @@
+---
+title: Watch
+description: Invoking gets you one result; watching gets you the ongoing facts — what lets an agent recover from a partial failure instead of trusting a single return value (Submitted Is Not Completed).
+---
 # Python — Watch the Event Stream
 
 Invoking gets you one result; watching gets you the ongoing facts — what lets an

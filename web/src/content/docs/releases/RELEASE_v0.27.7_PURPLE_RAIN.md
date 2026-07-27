@@ -1,8 +1,12 @@
+---
+title: v0.27.7 — Purple Rain
+description: "Release notes for Net v0.27.7 — Purple Rain — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.27.7 — "Purple Rain"
 
 A **NAT-traversal & port-discovery security-hardening release.** Two focused code reviews — the rendezvous/hole-punch runtime (`adapter/net/traversal/**` + `mesh.rs`) and the port-discovery surfaces (UPnP-IGD + the NAT-classification reflex sweep) — surfaced **13 findings**; **11 landed** across 17 commits and three review rounds, with the remaining 2 deliberately deferred. The headline fix closes an unauthenticated UDP-reflection vector on the rendezvous coordinator; the rest harden the NAT-classification sweep against flapping and tighten the discovery surfaces.
 
-**No wire-format change, no C-ABI change, no public API change.** Drop-in against honest v0.27.6 and earlier peers. Full audits: [`docs/misc/CODE_REVIEW_2026_06_21_NAT_TRAVERSAL.md`](../misc/CODE_REVIEW_2026_06_21_NAT_TRAVERSAL.md) and [`docs/misc/CODE_REVIEW_2026_06_21_PORT_SCANNING.md`](../misc/CODE_REVIEW_2026_06_21_PORT_SCANNING.md).
+**No wire-format change, no C-ABI change, no public API change.** Drop-in against honest v0.27.6 and earlier peers. Full audits: [`docs/misc/CODE_REVIEW_2026_06_21_NAT_TRAVERSAL.md`](https://github.com/ai-2070/net/blob/master/net/crates/net/docs/misc/CODE_REVIEW_2026_06_21_NAT_TRAVERSAL.md) and [`docs/misc/CODE_REVIEW_2026_06_21_PORT_SCANNING.md`](https://github.com/ai-2070/net/blob/master/net/crates/net/docs/misc/CODE_REVIEW_2026_06_21_PORT_SCANNING.md).
 
 > [!IMPORTANT]
 > **NAT traversal is an optimization, not a correctness contract — and that held under review.** Every finding below falls back to the routed handshake; none of them can corrupt or block a session. The fixes matter most to nodes that hole-punch through a public rendezvous coordinator: the reflector was reachable by an authenticated mesh peer, with the value to an attacker being source obfuscation rather than amplification.

@@ -1,3 +1,7 @@
+---
+title: Invoke
+description: Call a discovered tool with calltool — it finds a provider for the named tool, makes a typed request, and returns the result.
+---
 # Python — Invoke a Capability
 
 Call a discovered tool with `call_tool` — it finds a provider for the named tool,

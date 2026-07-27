@@ -1,6 +1,10 @@
+---
+title: "v0.29.1 — Summer of '69"
+description: "Release notes for Net v0.29.1 — Summer of '69 — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.29.1 — "Summer of '69"
 
-*Same Bryan Adams first-real-six-string as [v0.29](RELEASE_v0.29_SUMMER_OF_69.md) — one more coat of wax on the guitar, not a new song. A maintenance patch: version hygiene, a dependency refresh, one SDK rename, and comment/doc cleanup. No new mesh behavior.*
+*Same Bryan Adams first-real-six-string as [v0.29](/docs/releases/release-v0.29-summer-of-69) — one more coat of wax on the guitar, not a new song. A maintenance patch: version hygiene, a dependency refresh, one SDK rename, and comment/doc cleanup. No new mesh behavior.*
 
 ## What's in it
 
@@ -29,7 +33,7 @@ v0.29.1 is a **patch release with no functional change to the scheduler or any m
 ## Docs & comments
 
 - Dropped the stale *"in Phase 2"* future-tense framing from the drift-scorer comments in `event_loop.rs` / `scheduler.rs` — cadence + dirty-bit gating already shipped in v0.29, so the deferral wording was wrong. Comment-only; the code is unchanged.
-- Synced the `LocalScheduler` / `ScoreHistory` / `ScoreSnapshot` sketch in [`MESH_SCHEDULER_IMPL_PLAN.md`](../plans/MESH_SCHEDULER_IMPL_PLAN.md) to the as-built types.
+- Synced the `LocalScheduler` / `ScoreHistory` / `ScoreSnapshot` sketch in [`MESH_SCHEDULER_IMPL_PLAN.md`](https://github.com/ai-2070/net/blob/master/net/crates/net/docs/plans/MESH_SCHEDULER_IMPL_PLAN.md) to the as-built types.
 
 ---
 
@@ -56,4 +60,4 @@ Released 2026-06-30.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

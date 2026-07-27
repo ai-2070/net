@@ -1,10 +1,14 @@
+---
+title: Claude Skills
+description: "If you're building against Net with a coding agent, install the Net Claude skills first."
+---
 # Claude Skills
 
 If you're building against Net with a coding agent, install the Net Claude skills first. They're the reason the generated code is right instead of merely plausible.
 
 Net looks like Kafka, NATS, or Redis Streams from the outside, and Net Payments looks like a dozen payment SDKs. The models underneath are different — no broker, hot subscribers, backpressure expressed as silence, every node a peer; payments that are non-custodial and never move money, only sign the commercial facts around an invocation. An agent working from surface familiarity will write integration code that compiles, runs, and is quietly wrong. The skills load the correct mental model and per-SDK templates before the agent writes a line.
 
-> These are skills *about* Net. They don't install the library — that's [Install](./install).
+> These are skills *about* Net. They don't install the library — that's [Install](/docs/start/install).
 
 ## The two skills
 

@@ -1,3 +1,7 @@
+---
+title: Event-Sourced Service
+description: "This tutorial walks through building a complete event-sourced service: a small order-tracking system where every state change is an immutable event in a durable log, the queryable"
+---
 # An Event-Sourced Service
 
 This tutorial walks through building a complete event-sourced service: a small order-tracking system where every state change is an immutable event in a durable log, the queryable view is a fold materialized from the log, snapshots handle restarts without replaying from genesis, and the whole thing survives a node going away.

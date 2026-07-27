@@ -1,3 +1,7 @@
+---
+title: Channels
+description: A channel is a named endpoint that carries events through the mesh.
+---
 # Channels
 
 A channel is a named endpoint that carries events through the mesh. Channels are the primary thing you program against: you publish to a channel, you subscribe to a channel, and everything else Net does — durable logs, materialized views, RPC, distributed daemons — is expressed in terms of one channel or another.

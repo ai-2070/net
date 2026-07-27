@@ -1,8 +1,12 @@
+---
+title: v0.27.6 — Purple Rain
+description: "Release notes for Net v0.27.6 — Purple Rain — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.27.6 — "Purple Rain"
 
 A **bindings & integration bug-fix release.** A full-workspace bug hunt across the `net` crate (~100k LOC Rust) plus the Go / Python / FFI binding layers landed **34 of 37 findings** across 47 commits and three review rounds. Every concrete first-pass bug lived at the **language-binding / FFI edge** — including three use-after-free races in the shipped Go module that are reachable by ordinary context cancellation.
 
-**No wire-format change, no C-ABI change, no public API change.** Drop-in against honest v0.27.5 and earlier peers. Full audit: [`docs/misc/BUG_AUDIT_2026_06_18_BINDINGS.md`](../misc/BUG_AUDIT_2026_06_18_BINDINGS.md).
+**No wire-format change, no C-ABI change, no public API change.** Drop-in against honest v0.27.5 and earlier peers. Full audit: [`docs/misc/BUG_AUDIT_2026_06_18_BINDINGS.md`](https://github.com/ai-2070/net/blob/master/net/crates/net/docs/misc/BUG_AUDIT_2026_06_18_BINDINGS.md).
 
 > [!IMPORTANT]
 > **Go module users should upgrade promptly.** The three use-after-free races are reachable on routine `ctx` cancellation of a streaming call — not an exotic double-close.

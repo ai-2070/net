@@ -1,3 +1,7 @@
+---
+title: "v0.13 — Chippin' In"
+description: "Release notes for Net v0.13 — Chippin' In — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.13 — "Chippin' In"
 
 *Named after the two "Chippin' In" tracks: Samurai's original Chippin' In, and the Cyberpunk 2077 soundtrack rendition by Damian Ukeje, P.T. Adamczyk, and Kerry Eurodyne.*
@@ -305,4 +309,4 @@ Released 2026-05-11.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

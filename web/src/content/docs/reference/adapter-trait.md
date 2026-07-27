@@ -1,3 +1,7 @@
+---
+title: Adapter Trait
+description: Adapters are the persistence and transport plug-in for the event bus.
+---
 # Adapter Trait
 
 Adapters are the persistence and transport plug-in for the event bus. The bus's ingestion pipeline batches events per shard and hands the batches to an adapter; the adapter is responsible for getting them to durable storage (or to the mesh, or to another broker). The trait is small on purpose — most of the bus's complexity lives in the bus itself, leaving adapters as a focused integration point.

@@ -1,3 +1,7 @@
+---
+title: Errors
+description: "The Python SDK's error taxonomy: failure is a typed outcome you can branch on, never a silence."
+---
 # Python — Errors and Recovery
 
 Failure is a typed outcome, not a silence. The rule matches every binding: **only

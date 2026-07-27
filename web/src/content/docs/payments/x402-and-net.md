@@ -1,3 +1,7 @@
+---
+title: x402 and Net
+description: "x402 is the payment wire; Net wraps it in signed envelopes and carries the original bytes unchanged so signatures survive the trip."
+---
 # x402 and Net
 
 x402 is the payment wire: an HTTP-native protocol for demanding and settling a
@@ -23,7 +27,32 @@ API), but on the mesh the payment travels inside the ordinary typed invocation.
 
 An x402 document — a `PaymentRequirements`, a `PaymentPayload`, a settlement
 response — is carried as **base64 of its original bytes** (an `X402Carry`), never
-re-serialized through a Net type. Re-encoding a received x402 doc through a
+re-serialized through a Net type.
+
+`X402Carry` is the type that enforces it. You *author* a document once, and from
+then on you only *view* it:
+
+```rust
+use net_payments::x402::requirements::PaymentRequirements;
+use net_payments::x402::X402Carry;
+
+let carry = X402Carry::author(&PaymentRequirements {
+    scheme: "exact".into(),
+    network: "eip155:8453".into(),
+    amount: "2500".into(),          // atomic units, as a string — never a float
+    asset: "0x…".into(),
+    pay_to: "0x…".into(),
+    max_timeout_seconds: 60,
+    extra: None,
+})?;
+
+let parsed: &PaymentRequirements = carry.view();  // read; the bytes don't move
+```
+
+`view()` hands you the parsed struct for inspection and comparison; it is not a
+round-trip. The original bytes are what travel and what signatures are computed
+over, so a document authored in Rust, forwarded through a Node caller and checked
+by a Go provider still verifies. Re-encoding a received x402 doc through a
 language-native struct ("envelope drift") is a defect: a signature computed over
 the original bytes must still verify after the doc has crossed the mesh and a
 language boundary. The cross-language golden vectors exist to prove this holds in
@@ -48,9 +77,9 @@ around it:
 - **`net.settlement.ref@1`** — a reference to the settled on-chain transaction
   (the x402 settlement response, carried opaquely) plus the network and
   facilitator.
-- **`net.payment.verification@1`** — a [tiered](./verification-tiers)
+- **`net.payment.verification@1`** — a [tiered](/docs/payments/verification-tiers)
   verification result.
-- **`net.billing.event@1`** — an immutable [billing](./billing) record.
+- **`net.billing.event@1`** — an immutable [billing](/docs/payments/billing) record.
 
 Every envelope has exactly one **canonical byte encoding** (sorted keys, compact,
 integers only, floats rejected) and is signed by an entity's ed25519 key over

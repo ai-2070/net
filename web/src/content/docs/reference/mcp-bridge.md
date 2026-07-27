@@ -1,3 +1,7 @@
+---
+title: MCP Bridge
+description: Reference for the Net ↔ MCP edge adapter (net-mesh-mcp).
+---
 # MCP Bridge
 
 Reference for the Net ↔ MCP edge adapter (`net-mesh-mcp`). The bridge lives

@@ -1,3 +1,7 @@
+---
+title: Fleet Telemetry
+description: "This tutorial walks through a complete deployment: a fleet of edge nodes (think delivery vehicles, sensor stations, kiosks) publishing telemetry to a central operations cluster, wi"
+---
 # Fleet Telemetry
 
 This tutorial walks through a complete deployment: a fleet of edge nodes (think delivery vehicles, sensor stations, kiosks) publishing telemetry to a central operations cluster, with subnet boundaries keeping each vehicle's internal traffic isolated from every other vehicle, and a fold in the operations cluster materializing aggregate metrics for an operator dashboard.

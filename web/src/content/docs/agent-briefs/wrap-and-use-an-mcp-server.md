@@ -1,3 +1,7 @@
+---
+title: Wrap and Use an MCP Server
+description: "Wrap an existing MCP server as discoverable Net capabilities and invoke one from a local MCP host, end to end."
+---
 # Brief: Wrap and Use an MCP Server
 
 **Goal.** Take an existing stdio MCP server, put its tools on a Net mesh as

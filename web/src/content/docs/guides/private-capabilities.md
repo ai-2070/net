@@ -1,3 +1,7 @@
+---
+title: Private Capabilities
+description: You have a service that only some organizations may call — a partner-only inference endpoint, a tenant-private data API, a billing service that must not even be visible to the rest of the mesh.
+---
 # Private Capabilities Across Organizations
 
 You have a service that only some organizations may call — a partner-only inference endpoint, a tenant-private data API, a billing service that must not even be *visible* to the rest of the mesh. This guide walks the whole path: issuing credentials offline, provisioning a node, serving a protected capability, and calling one.

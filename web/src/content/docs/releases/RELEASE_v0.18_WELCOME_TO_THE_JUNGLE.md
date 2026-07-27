@@ -1,3 +1,7 @@
+---
+title: v0.18 — Welcome to the Jungle
+description: "Release notes for Net v0.18 — Welcome to the Jungle — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.18 — "Welcome to the Jungle"
 
 *Named after Guns N' Roses's 1987 Appetite for Destruction opener. v0.15 stood up the Dataforts data plane. v0.16 stacked the MeshDB query plane on top. v0.17 stacked the MeshOS behavior plane on both. v0.18 is the operator plane — the TUI cyberdeck, the command-line surface, and the daemon-author / operator SDKs across five languages — that turns the substrate the prior releases built into something a human can see, command, and break-glass.*
@@ -274,4 +278,4 @@ Released 2026-05-17.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

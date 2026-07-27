@@ -1,3 +1,7 @@
+---
+title: Announce
+description: In Python the ergonomic way to put a discoverable, callable capability on the mesh is the tool API.
+---
 # Python — Announce a Capability
 
 In Python the ergonomic way to put a discoverable, callable capability on the mesh

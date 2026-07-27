@@ -1,3 +1,7 @@
+---
+title: Durable Logs (RedEX)
+description: RedEX turns a channel into a durable, append-only log.
+---
 # Durable Logs with RedEX
 
 RedEX turns a channel into a durable, append-only log. Once a channel is opened as a RedEX file, every event published on it is appended in causal order, persisted to disk if you ask for it, and made available to consumers as a tail subscription. RedEX is the foundation that everything else in the storage stack — folded state, queries, replication — composes against.
@@ -128,7 +132,7 @@ let file = redex.open_file(&ChannelName::new("sensors/lidar/front")?, cfg)?;
 
 `enable_replication` installs the per-`Redex` router on the mesh's replication subprotocol. After that, opening a channel with `replication: Some(_)` spawns a per-channel replication coordinator: leader election (deterministic by RTT and health), heartbeat-based liveness, and sync requests that bring replicas up to date.
 
-Replication is a deep enough topic that it gets its own [reference page](../reference/replication-config) with the full list of knobs (placement strategies, bandwidth budgets, failure modes). The short version: turn it on per channel, set a replication factor, and the runtime handles the rest.
+Replication is a deep enough topic that it gets its own [reference page](/docs/reference/replication-config) with the full list of knobs (placement strategies, bandwidth budgets, failure modes). The short version: turn it on per channel, set a replication factor, and the runtime handles the rest.
 
 ## When to reach for RedEX directly
 

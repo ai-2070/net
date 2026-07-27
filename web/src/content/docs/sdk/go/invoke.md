@@ -1,3 +1,7 @@
+---
+title: Invoke
+description: "Call a discovered tool with the generic net.CallTool, which is typed on the request and response:"
+---
 # Go — Invoke a Capability
 
 Call a discovered tool with the generic `net.CallTool`, which is typed on the

@@ -1,3 +1,7 @@
+---
+title: Discover
+description: "Query the mesh by what you need. Two surfaces: filter nodes by capability, or list tools."
+---
 # TypeScript — Discover Capabilities
 
 Query the mesh by what you need. Two surfaces: filter nodes by capability, or list

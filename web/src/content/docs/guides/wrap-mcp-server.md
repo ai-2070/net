@@ -1,3 +1,7 @@
+---
+title: Wrap an MCP Server
+description: The fastest way to put a capability on the mesh is to wrap a tool you already have.
+---
 # Wrap an MCP Server
 
 The fastest way to put a capability on the mesh is to wrap a tool you already

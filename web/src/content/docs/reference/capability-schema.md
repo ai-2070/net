@@ -1,3 +1,7 @@
+---
+title: Capability Schema
+description: "Capabilities are the typed description of a node's properties — its hardware, its installed software, its devices, its operational role."
+---
 # Capability Schema
 
 Capabilities are the typed description of a node's properties — its hardware, its installed software, its devices, its operational role. The wire format is intentionally opaque (`tags: HashSet<Tag>` plus `metadata: BTreeMap<String, String>`), and the substrate routes whatever you put there. This page is the canonical schema that bindings codegen from: which axes exist, which keys live under each axis, and what value type each key carries.

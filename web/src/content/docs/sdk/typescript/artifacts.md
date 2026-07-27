@@ -1,3 +1,7 @@
+---
+title: Artifacts
+description: The bus is a coordination layer, not a file transfer.
+---
 # TypeScript — Move Artifacts
 
 The bus is a coordination layer, not a file transfer. When work produces something

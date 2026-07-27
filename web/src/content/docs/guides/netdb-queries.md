@@ -1,3 +1,7 @@
+---
+title: Querying with NetDB
+description: "NetDB is the query layer over CortEX folds — how to ask questions of materialized state."
+---
 # Querying with NetDB
 
 NetDB is the query layer on top of CortEX. Where CortEX gives you one fold over one log with one state, NetDB bundles many folds under one handle, federates queries across them, and gives you a single snapshot/restore surface that covers your whole materialized state in one operation.
@@ -25,7 +29,7 @@ db.tasks().state().read().count_where(&filter);
 db.memories().watch().where_tag("important").stream();
 ```
 
-The builder ships exactly these two models. A custom fold isn't registered through the builder — you drive it with a `CortexAdapter` directly (see the [CortEX guide](./cortex-folds)) and manage its handle alongside the NetDB.
+The builder ships exactly these two models. A custom fold isn't registered through the builder — you drive it with a `CortexAdapter` directly (see the [CortEX guide](/docs/guides/cortex-folds)) and manage its handle alongside the NetDB.
 
 ## Queries
 

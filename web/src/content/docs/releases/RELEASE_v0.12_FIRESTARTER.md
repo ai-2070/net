@@ -1,3 +1,7 @@
+---
+title: v0.12 — Firestarter
+description: "Release notes for Net v0.12 — Firestarter — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.12 — "Firestarter"
 
 v0.12 breaks the "Black Diamond" hardening line. After two consecutive releases of pure bug-fix + audit closure (v0.10 / v0.11), Firestarter is the first feature release on the line: it ships a **complete request/response RPC surface (nRPC)** on top of the v0.11 mesh, plus the **four-language binding pipeline** that consumes it (Node, Python, Go, plus the existing Rust SDK), plus a **TypeScript migration of the Node binding's hand-written modules**. The hardening posture is intact — every new surface has the same handle-lifetime, panic-safety, and FFI-soundness guarantees v0.11 established for the existing surfaces — but this release is about adding capability, not just polishing the existing one.
@@ -161,4 +165,4 @@ Released 2026-05-06.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).
