@@ -731,9 +731,9 @@ is one helper per consumer thread.
 The mesh layer surfaces the same identity / capabilities / subnets /
 channel-auth story that the Rust SDK and the TypeScript / Node SDKs
 ship. Full staging and rationale:
-[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../../docs/SDK_SECURITY_SURFACE_PLAN.md).
+[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../../../../../docs/internal/plans/SDK_SECURITY_SURFACE_PLAN.md).
 Python-binding parity details:
-[`docs/SDK_PYTHON_PARITY_PLAN.md`](../../docs/SDK_PYTHON_PARITY_PLAN.md).
+[`docs/SDK_PYTHON_PARITY_PLAN.md`](../../../../../docs/internal/plans/SDK_PYTHON_PARITY_PLAN.md).
 
 ### Identity + permission tokens
 
@@ -823,13 +823,13 @@ tags: `scope:subnet-local` (visible only under `same_subnet`),
 `scope:tenant:<id>`, `scope:region:<name>` — strictest scope
 wins. Untagged peers resolve to `Global` and stay visible under
 permissive queries. Full design:
-[`docs/SCOPED_CAPABILITIES_PLAN.md`](../../docs/SCOPED_CAPABILITIES_PLAN.md).
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../../../../../docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md).
 
 Capability propagation is multi-hop, bounded by
 `MAX_CAPABILITY_HOPS = 16` with `(origin, version)` dedup on every
 forwarder. `capability_gc_interval_ms` controls both the index TTL
 sweep and the dedup cache eviction. See
-[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../../docs/MULTIHOP_CAPABILITY_PLAN.md).
+[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../../../../../docs/internal/plans/MULTIHOP_CAPABILITY_PLAN.md).
 
 ### Subnets
 
@@ -1012,7 +1012,7 @@ forwards it.
 Build the native module with the `compute` feature (maturin picks
 it up on the default build) and import from `net`. Full design
 notes:
-[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../../docs/SDK_COMPUTE_SURFACE_PLAN.md).
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../../../../../docs/internal/plans/SDK_COMPUTE_SURFACE_PLAN.md).
 
 ```python
 from net import DaemonRuntime, NetMesh, Identity, CausalEvent
@@ -1200,7 +1200,7 @@ except GroupError as e:
 ```
 
 Full staging, wire formats, and rationale:
-[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../../docs/SDK_GROUPS_SURFACE_PLAN.md).
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../../../../../docs/internal/plans/SDK_GROUPS_SURFACE_PLAN.md).
 Core semantics live in the main
 [`README.md#daemons`](../../README.md#daemons).
 

@@ -4,7 +4,7 @@ One header, one shared library. This is the entire C SDK.
 
 Unlocks every language that can call C: C++, Zig, Nim, Lua, Ruby, Java, C#, Dart, Swift, Kotlin, Haskell, Erlang, PHP.
 
-Latest release: [v0.10 — "Killing Moon" Phase III](../docs/RELEASE_v0.10_KILLING_MOON_PHASE_III.md) is a hardening release. The FFI surface picked up several behavior changes that affect any C consumer; see [Behavior changes in v0.10 (FFI)](#behavior-changes-in-v010-ffi) below for the per-call summary.
+Latest release: [v0.10 — "Killing Moon" Phase III](../docs/releases/RELEASE_v0.10_HEX.md) is a hardening release. The FFI surface picked up several behavior changes that affect any C consumer; see [Behavior changes in v0.10 (FFI)](#behavior-changes-in-v010-ffi) below for the per-call summary.
 
 ## Files
 
@@ -363,7 +363,7 @@ hit (with `*out_node_id` populated) or `0` on miss. The boolean
 disambiguates from `node_id == 0`, which is a valid id.
 
 Full design + cross-SDK rationale:
-[`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/SCOPED_CAPABILITIES_PLAN.md).
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../../../../docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md).
 
 ### Daemon capability authoring (Phase 6)
 
@@ -782,7 +782,7 @@ Malformed JSON / unknown scope token → `NET_ERR_*` from the
 `InvalidJson` family.
 
 Blob-specific error codes are in the `-110..` band — see
-[`bindings/go/net/blob.go`](../bindings/go/net/blob.go) for the
+[`bindings/go/net/blob.go`](../../../../go/blob.go) for the
 Go wrapper that consumes this surface; the same `extern`
 declarations work from any C / C++ consumer.
 

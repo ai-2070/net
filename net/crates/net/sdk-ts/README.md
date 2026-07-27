@@ -443,7 +443,7 @@ wins. Helpers `withTenantScope`, `withRegionScope`,
 `withSubnetLocalScope` build the tag list idempotently.
 Untagged peers resolve to `Global` and stay visible under
 permissive queries. Full design:
-[`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/SCOPED_CAPABILITIES_PLAN.md).
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../../../../docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md).
 
 Propagation is multi-hop, bounded by `MAX_CAPABILITY_HOPS = 16`.
 Forwarders re-broadcast every received announcement to their other
@@ -452,7 +452,7 @@ points, and `hop_count` sits outside the signed envelope so the
 origin's signature verifies at every hop.
 `capabilityGcIntervalMs` + TTL-driven eviction are configurable on
 `MeshNode.create`. See
-[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../docs/MULTIHOP_CAPABILITY_PLAN.md).
+[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../../../../docs/internal/plans/MULTIHOP_CAPABILITY_PLAN.md).
 
 #### Capability enhancements (typed taxonomy + predicates + validation)
 
@@ -640,9 +640,9 @@ single-threaded). Expired tokens evict within the publisher's
 failures from the same peer throttle via `RateLimited` acks so
 bad-token storms never tie up ed25519 verification. Cross-SDK
 behaviour is fixed by the Rust integration suite — see
-[`SDK_SECURITY_SURFACE_PLAN.md`](../docs/SDK_SECURITY_SURFACE_PLAN.md)
+[`SDK_SECURITY_SURFACE_PLAN.md`](../../../../docs/internal/plans/SDK_SECURITY_SURFACE_PLAN.md)
 and
-[`CHANNEL_AUTH_GUARD_PLAN.md`](../docs/CHANNEL_AUTH_GUARD_PLAN.md)
+[`CHANNEL_AUTH_GUARD_PLAN.md`](../../../../docs/internal/plans/CHANNEL_AUTH_GUARD_PLAN.md)
 for the full contract.
 
 ## Channels (distributed pub/sub)
@@ -1430,7 +1430,7 @@ Build the `@net-mesh/core` NAPI module with `--features compute`
 (auto-enabled in the default `local` bundle) to expose the
 surface; everything below is re-exported from `@net-mesh/sdk`.
 Full design notes:
-[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../docs/SDK_COMPUTE_SURFACE_PLAN.md).
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../../../../docs/internal/plans/SDK_COMPUTE_SURFACE_PLAN.md).
 
 ```typescript
 import {
@@ -1604,7 +1604,7 @@ try {
 ```
 
 Full staging, wire formats, and rationale:
-[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../docs/SDK_GROUPS_SURFACE_PLAN.md).
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../../../../docs/internal/plans/SDK_GROUPS_SURFACE_PLAN.md).
 Core semantics (placement spread, health aggregation, failure
 domains): [`../README.md#daemons`](../README.md#daemons).
 

@@ -363,18 +363,18 @@ oem_nodes = mesh.find_nodes_scoped(
 `scope:subnet-local` dominates tenant/region tags on the same set.
 Untagged peers resolve to `Global` and stay visible under
 permissive queries (matches the v1 default). Full design:
-[`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/SCOPED_CAPABILITIES_PLAN.md).
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../../../../docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md).
 
 Full surface + runnable examples:
 [`bindings/python/README.md`](../bindings/python/README.md#security-surface-stage-ae).
 Cross-SDK contract + rationale:
-[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../docs/SDK_SECURITY_SURFACE_PLAN.md).
+[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../../../../docs/internal/plans/SDK_SECURITY_SURFACE_PLAN.md).
 
 > **Note.** The `net_sdk` wrapper (generators / typed channels /
 > Pydantic) doesn't yet re-export the security types — use `net`
 > directly for the identity / capability / subnet / channel-auth
 > paths. Follow-up work to proxy them through `net_sdk` is tracked
-> in [`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md).
+> in [`SDK_PYTHON_PARITY_PLAN.md`](../../../../docs/internal/plans/SDK_PYTHON_PARITY_PLAN.md).
 
 ## nRPC (request / response over the mesh)
 
@@ -498,7 +498,7 @@ compat test — lives in [`../README.md#nrpc`](../README.md#nrpc).
 > **Note.** The `net_sdk` wrapper doesn't yet re-export
 > `TypedMeshRpc` — use the native `net` package directly. Same
 > follow-up plan as the security surface
-> ([`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md)).
+> ([`SDK_PYTHON_PARITY_PLAN.md`](../../../../docs/internal/plans/SDK_PYTHON_PARITY_PLAN.md)).
 
 ## MeshDB (federated query layer)
 
@@ -675,13 +675,13 @@ failures raise `MigrationError` with a stable `kind` parseable by
 `migration_error_kind(e)`. Full surface + runnable examples:
 [`bindings/python/README.md`](../bindings/python/README.md#compute-daemons--migration).
 Cross-SDK contract + rationale:
-[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../docs/SDK_COMPUTE_SURFACE_PLAN.md).
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../../../../docs/internal/plans/SDK_COMPUTE_SURFACE_PLAN.md).
 
 > **Note.** Like the security types, the `net_sdk` wrapper doesn't
 > yet re-export `DaemonRuntime` / `MigrationHandle` — use the
 > native `net` package directly. Proxying these through `net_sdk`
 > is tracked in
-> [`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md).
+> [`SDK_PYTHON_PARITY_PLAN.md`](../../../../docs/internal/plans/SDK_PYTHON_PARITY_PLAN.md).
 
 ## Groups (replica / fork / standby)
 
@@ -769,7 +769,7 @@ except GroupError as e:
 Full surface + runnable examples:
 [`bindings/python/README.md`](../bindings/python/README.md#compute-groups-replica--fork--standby).
 Cross-SDK contract + rationale:
-[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../docs/SDK_GROUPS_SURFACE_PLAN.md).
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../../../../docs/internal/plans/SDK_GROUPS_SURFACE_PLAN.md).
 
 > **Note.** `net_sdk` does not yet proxy the groups surface; use the
 > native `net` package directly, the same way as the security types.

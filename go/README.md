@@ -689,9 +689,9 @@ A `runtime.SetFinalizer` is wired up as a backstop, but explicit
 The Go bindings ship the same identity / capabilities / subnets /
 channel-auth story as the Rust SDK and the TS / Python SDKs. Full
 staging and rationale:
-[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../net/crates/net/docs/SDK_SECURITY_SURFACE_PLAN.md).
+[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../docs/internal/plans/SDK_SECURITY_SURFACE_PLAN.md).
 Go-binding parity details:
-[`docs/SDK_GO_PARITY_PLAN.md`](../net/crates/net/docs/SDK_GO_PARITY_PLAN.md).
+[`docs/SDK_GO_PARITY_PLAN.md`](../docs/internal/plans/SDK_GO_PARITY_PLAN.md).
 
 ### Identity + permission tokens
 
@@ -784,7 +784,7 @@ oemNodes, _ := mesh.FindNodesScoped(
 `Regions`). Strictest scope wins — `scope:subnet-local` dominates
 tenant/region tags on the same set. Untagged peers resolve to
 `Global` and stay visible under permissive queries. Full design:
-[`docs/SCOPED_CAPABILITIES_PLAN.md`](../net/crates/net/docs/SCOPED_CAPABILITIES_PLAN.md).
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md).
 
 #### Scored placement (`FindBestNode`)
 
@@ -830,7 +830,7 @@ Capability propagation is multi-hop, bounded by
 `MAX_CAPABILITY_HOPS = 16` with `(origin, version)` dedup on every
 forwarder. `CapabilityGCIntervalMs` controls both the index TTL
 sweep and the dedup cache eviction. See
-[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../net/crates/net/docs/MULTIHOP_CAPABILITY_PLAN.md).
+[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../docs/internal/plans/MULTIHOP_CAPABILITY_PLAN.md).
 
 ### Subnets
 
@@ -920,7 +920,7 @@ runtime registry without releasing ownership of the Go pointer.
 Build the cdylib with `--features compute` (already on when you
 use the `netdb redex-disk net compute` bundle) and import from
 `net`. Full design notes:
-[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../net/crates/net/docs/SDK_COMPUTE_SURFACE_PLAN.md).
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../docs/internal/plans/SDK_COMPUTE_SURFACE_PLAN.md).
 
 ```go
 package main
@@ -1130,7 +1130,7 @@ reaches the underlying daemon-level error for callers that only
 care about the broader type.
 
 Full staging, wire formats, and rationale:
-[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../net/crates/net/docs/SDK_GROUPS_SURFACE_PLAN.md).
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../docs/internal/plans/SDK_GROUPS_SURFACE_PLAN.md).
 Core semantics:
 [`../../README.md#daemons`](../net/crates/net/README.md#daemons).
 

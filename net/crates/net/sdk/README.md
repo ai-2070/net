@@ -275,7 +275,7 @@ let stats = node.stream_stats(peer_node_id, 0x42);
 retries or buffers on its own behalf. `StreamStats.backpressure_events`
 counts cumulative rejections for observability. See
 [`docs/TRANSPORT.md`](../docs/TRANSPORT.md) for the full contract and
-[`docs/STREAM_BACKPRESSURE_PLAN.md`](../docs/STREAM_BACKPRESSURE_PLAN.md)
+[`docs/STREAM_BACKPRESSURE_PLAN.md`](../../../../docs/internal/plans/STREAM_BACKPRESSURE_PLAN.md)
 for the design.
 
 ## Security (identity, tokens, capabilities, subnets)
@@ -415,7 +415,7 @@ Reserved tag forms: `scope:subnet-local` (visible only under
 Untagged peers resolve to `Global` and stay visible under
 permissive queries (matches the v1 default; you opt *in* to
 narrowing, never out by accident). Full design:
-[`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/SCOPED_CAPABILITIES_PLAN.md).
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../../../../docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md).
 
 **Scope today:**
 
@@ -426,7 +426,7 @@ narrowing, never out by accident). Full design:
   signature keeps verifying end-to-end. Dedup on
   `(origin, version)` drops duplicates at diamond-topology
   converge points. See
-  [`docs/MULTIHOP_CAPABILITY_PLAN.md`](../docs/MULTIHOP_CAPABILITY_PLAN.md).
+  [`docs/MULTIHOP_CAPABILITY_PLAN.md`](../../../../docs/internal/plans/MULTIHOP_CAPABILITY_PLAN.md).
 - Origin-side rate limiting: `min_announce_interval` (default 10s)
   coalesces rapid `announce_capabilities` calls into a single
   broadcast, preventing a busy-loop announcer from flooding the
@@ -441,7 +441,7 @@ narrowing, never out by accident). Full design:
   a `node_id → entity_id` binding that lands with channel auth.
 
 Wire-level details and the subprotocol layout live in
-[`docs/CAPABILITY_BROADCAST_PLAN.md`](../docs/CAPABILITY_BROADCAST_PLAN.md).
+[`docs/CAPABILITY_BROADCAST_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_BROADCAST_PLAN.md).
 
 #### Capability enhancements (typed taxonomy + predicates + validation)
 
@@ -612,7 +612,7 @@ node.shutdown().await?;
   header) is a follow-up.
 
 Wire-level details and the enforcement matrix live in
-[`docs/SUBNET_ENFORCEMENT_PLAN.md`](../docs/SUBNET_ENFORCEMENT_PLAN.md).
+[`docs/SUBNET_ENFORCEMENT_PLAN.md`](../../../../docs/internal/plans/SUBNET_ENFORCEMENT_PLAN.md).
 
 ### Channel authentication
 
@@ -713,9 +713,9 @@ subscriber
   subnet-failed) are not split yet.
 
 Wire-format details and the token presentation flow live in
-[`docs/CHANNEL_AUTH_PLAN.md`](../docs/CHANNEL_AUTH_PLAN.md); the
+[`docs/CHANNEL_AUTH_PLAN.md`](../../../../docs/internal/plans/CHANNEL_AUTH_PLAN.md); the
 fast-path / sweep / rate-limit design lives in
-[`docs/CHANNEL_AUTH_GUARD_PLAN.md`](../docs/CHANNEL_AUTH_GUARD_PLAN.md).
+[`docs/CHANNEL_AUTH_GUARD_PLAN.md`](../../../../docs/internal/plans/CHANNEL_AUTH_GUARD_PLAN.md).
 
 ## Channels (distributed pub/sub)
 
@@ -1345,9 +1345,9 @@ causal chain; `DaemonRuntime` owns the factory table, the per-
 daemon hosts, the lifecycle gate (`Registering → Ready →
 ShuttingDown`), and the migration subprotocol plumbing. The full
 staging and design notes live in
-[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../docs/SDK_COMPUTE_SURFACE_PLAN.md);
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../../../../docs/internal/plans/SDK_COMPUTE_SURFACE_PLAN.md);
 the runtime readiness fence in
-[`docs/DAEMON_RUNTIME_READINESS_PLAN.md`](../docs/DAEMON_RUNTIME_READINESS_PLAN.md).
+[`docs/DAEMON_RUNTIME_READINESS_PLAN.md`](../../../../docs/internal/plans/DAEMON_RUNTIME_READINESS_PLAN.md).
 
 ```rust
 use std::sync::Arc;
@@ -1552,7 +1552,7 @@ dispatch — the wire form through the FFI is
 language bindings.
 
 Full staging, wire formats, and rationale:
-[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../docs/SDK_GROUPS_SURFACE_PLAN.md).
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../../../../docs/internal/plans/SDK_GROUPS_SURFACE_PLAN.md).
 Core semantics (placement spread, health aggregation, failure
 domains) live in [`../README.md#daemons`](../README.md#daemons).
 
