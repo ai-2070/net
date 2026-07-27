@@ -95,6 +95,29 @@ cargo bench --all-features
 
 See [`BENCHMARKS.md`](BENCHMARKS.md) for published numbers and methodology.
 
+## Building with Claude Code
+
+Net looks like Kafka or NATS from the outside, and the model underneath is
+different enough that an agent working from surface familiarity will write
+integration code that runs and is quietly wrong. Install the skills first:
+
+```bash
+git clone https://github.com/ai-2070/net-claude-skill.git /tmp/net-claude-skill
+mkdir -p ~/.claude/skills
+cp -R /tmp/net-claude-skill/net-event-bus /tmp/net-claude-skill/net-payments ~/.claude/skills/
+```
+
+Restart Claude Code and run `/skills` — **net-event-bus** and **net-payments**
+should be listed. Full install options — project-scoped, symlinked to stay
+current — in [Claude Skills](https://ai2070.net/docs/start/claude-skills).
+
+## Links
+
+[Docs](https://ai2070.net/docs) ·
+[Concepts](https://ai2070.net/docs/concepts/architecture) ·
+[API reference](https://docs.rs/net-mesh) ·
+[GitHub](https://github.com/ai-2070/net)
+
 ## License
 
 MIT OR Apache-2.0
