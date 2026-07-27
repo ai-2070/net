@@ -1,5 +1,5 @@
 ---
-title: v0.25 — Shock To The System
+title: "v0.25 — Shock To The System"
 description: "Release notes for Net v0.25 — Shock To The System — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.25 — "Shock To The System"

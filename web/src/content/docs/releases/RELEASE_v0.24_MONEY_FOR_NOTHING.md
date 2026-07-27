@@ -1,5 +1,5 @@
 ---
-title: v0.24 — Money For Nothing
+title: "v0.24 — Money For Nothing"
 description: "Release notes for Net v0.24 — Money For Nothing — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.24 — "Money For Nothing"

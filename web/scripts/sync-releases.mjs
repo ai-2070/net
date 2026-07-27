@@ -56,10 +56,59 @@ const LEGACY = [
   ],
 ];
 
-const FRONTMATTER = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/;
+// Curated display titles, keyed by source filename. These are the sidebar
+// and <title> text, and they are NOT derivable from the filename:
+// `CHIPPIN_IN` is "Chippin' In", `EYE_OF_THE_TIGER` is "Eye of the Tiger"
+// (small words stay lowercase), and `RELEASE_v0.20.2.md` carries no codename
+// at all yet is "v0.20.2 — Smoke on the Water".
+//
+// They live here rather than in the generated files because the generated
+// files are output: previously the script read titles back out of its own
+// destination, so the source of truth was the artifact. A from-scratch
+// regeneration silently degraded 14 of 35 titles. Add a line here when you
+// add a release; `deriveTitle` is the fallback, not the mechanism.
+const TITLES = {
+  "RELEASE_v0.10_HEX.md": "v0.10 — Hex",
+  "RELEASE_v0.11_BLACK_DIAMOND.md": "v0.11 — Black Diamond",
+  "RELEASE_v0.12_FIRESTARTER.md": "v0.12 — Firestarter",
+  "RELEASE_v0.13_CHIPPIN_IN.md": "v0.13 — Chippin' In",
+  "RELEASE_v0.14_THE_WARRIORS.md": "v0.14 — The Warriors",
+  "RELEASE_v0.15_REBEL_YELL.md": "v0.15 — Rebel Yell",
+  "RELEASE_v0.16_EYE_OF_THE_TIGER.md": "v0.16 — Eye of the Tiger",
+  "RELEASE_v0.17_ATOMIC_PLAYBOYS.md": "v0.17 — Atomic Playboys",
+  "RELEASE_v0.18_WELCOME_TO_THE_JUNGLE.md": "v0.18 — Welcome to the Jungle",
+  "RELEASE_v0.19_PUSH_IT_TO_THE_LIMIT.md": "v0.19 — Push It to the Limit",
+  "RELEASE_v0.20.2.md": "v0.20.2 — Smoke on the Water",
+  "RELEASE_v0.20_SMOKE_ON_THE_WATER.md": "v0.20 — Smoke on the Water",
+  "RELEASE_v0.21_RADAR_LOVE.md": "v0.21 — Radar Love",
+  "RELEASE_v0.22_ALL_ALONG_THE_WATCHTOWER.md":
+    "v0.22 — All Along the Watchtower",
+  "RELEASE_v0.23_GIMME_SHELTER.md": "v0.23 — Gimme Shelter",
+  "RELEASE_v0.24_MONEY_FOR_NOTHING.md": "v0.24 — Money For Nothing",
+  "RELEASE_v0.25_SHOCK_TO_THE_SYSTEM.md": "v0.25 — Shock To The System",
+  "RELEASE_v0.26_MONKEY_BUSINESS.md": "v0.26 — Monkey Business",
+  "RELEASE_v0.27.1_PURPLE_RAIN.md": "v0.27.1 — Purple Rain",
+  "RELEASE_v0.27.2_PURPLE_RAIN.md": "v0.27.2 — Purple Rain",
+  "RELEASE_v0.27.3_PURPLE_RAIN.md": "v0.27.3 — Purple Rain",
+  "RELEASE_v0.27.4_PURPLE_RAIN.md": "v0.27.4 — Purple Rain",
+  "RELEASE_v0.27.5_PURPLE_RAIN.md": "v0.27.5 — Purple Rain",
+  "RELEASE_v0.27.6_PURPLE_RAIN.md": "v0.27.6 — Purple Rain",
+  "RELEASE_v0.27.7_PURPLE_RAIN.md": "v0.27.7 — Purple Rain",
+  "RELEASE_v0.27_PURPLE_RAIN.md": "v0.27 — Purple Rain",
+  "RELEASE_v0.28_ROUND_AND_ROUND.md": "v0.28.0 — Round and Round",
+  "RELEASE_v0.29.1_SUMMER_OF_69.md": "v0.29.1 — Summer of '69",
+  "RELEASE_v0.29_SUMMER_OF_69.md": "v0.29.0 — Summer of '69",
+  "RELEASE_v0.30_FINAL_COUNTDOWN.md": "v0.30.0 — Final Countdown",
+  "RELEASE_v0.31_HOLD_THE_LINE.md": "v0.31.0 — Hold the Line",
+  "RELEASE_v0.32_SUMMER_MADNESS.md": "v0.32.0 — Summer Madness",
+  "RELEASE_v0.33_CIRCUS_MAXIMUS.md": "v0.33.0 — Circus Maximus",
+  "RELEASE_v0.8_KILLING_MOON.md": "v0.8 — Killing Moon",
+  "RELEASE_v0.9_FIRST_BLOOD.md": "v0.9 — First Blood",
+};
 
-// `RELEASE_v0.27_PURPLE_RAIN` → `v0.27 — Purple Rain`. Only used for files
-// that don't already have a curated title on the site.
+// `RELEASE_v0.27_PURPLE_RAIN` → `v0.27 — Purple Rain`. Fallback for a
+// release with no entry in TITLES — correct for simple codenames, wrong for
+// anything with an apostrophe or a small word, so prefer an explicit entry.
 function deriveTitle(filename) {
   const m = /^RELEASE_v([\d.]+)_(.+)\.md$/i.exec(filename);
   if (!m) return filename.replace(/\.md$/, "");
@@ -125,19 +174,13 @@ for (const name of readdirSync(SRC).sort()) {
   const body = rewriteLinks(readFileSync(join(SRC, name), "utf8"), published);
   const destPath = join(DEST, name);
 
-  // Preserve curated frontmatter; generate it only for a new release.
-  let frontmatter;
-  if (existsSync(destPath)) {
-    const existing = readFileSync(destPath, "utf8");
-    frontmatter = FRONTMATTER.exec(existing)?.[0];
-  }
-  if (!frontmatter) {
-    const title = deriveTitle(name);
-    frontmatter =
-      `---\ntitle: "${title}"\n` +
-      `description: "Release notes for Net ${title} — what shipped, what changed, ` +
-      `and what it means for compatibility."\n---\n`;
-  }
+  // Generated wholly from TITLES — never read back from the destination, so
+  // the output is a pure function of the source plus this script.
+  const title = TITLES[name] ?? deriveTitle(name);
+  const frontmatter =
+    `---\ntitle: "${title}"\n` +
+    `description: "Release notes for Net ${title} — what shipped, what changed, ` +
+    `and what it means for compatibility."\n---\n`;
 
   const next = frontmatter + body;
   const current = existsSync(destPath) ? readFileSync(destPath, "utf8") : null;

@@ -1,5 +1,5 @@
 ---
-title: v0.22 — All Along the Watchtower
+title: "v0.22 — All Along the Watchtower"
 description: "Release notes for Net v0.22 — All Along the Watchtower — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.22 — "All Along the Watchtower"

@@ -1,5 +1,5 @@
 ---
-title: v0.11 — Black Diamond
+title: "v0.11 — Black Diamond"
 description: "Release notes for Net v0.11 — Black Diamond — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.11 — "Killing Moon" Phase IV

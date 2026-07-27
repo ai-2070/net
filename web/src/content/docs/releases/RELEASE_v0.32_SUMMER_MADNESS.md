@@ -1,5 +1,5 @@
 ---
-title: v0.32.0 — Summer Madness
+title: "v0.32.0 — Summer Madness"
 description: "Release notes for Net v0.32.0 — Summer Madness — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.32 — "Summer Madness"

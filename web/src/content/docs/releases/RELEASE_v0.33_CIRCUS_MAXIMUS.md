@@ -1,5 +1,5 @@
 ---
-title: v0.33.0 — Circus Maximus
+title: "v0.33.0 — Circus Maximus"
 description: "Release notes for Net v0.33.0 — Circus Maximus — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.33 — "Circus Maximus"

@@ -1,5 +1,5 @@
 ---
-title: v0.19 — Push It to the Limit
+title: "v0.19 — Push It to the Limit"
 description: "Release notes for Net v0.19 — Push It to the Limit — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.19 — "Push It To The Limit"
