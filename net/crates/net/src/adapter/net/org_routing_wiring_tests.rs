@@ -3400,3 +3400,170 @@ async fn duplicate_provider_rows_collapse_to_the_newest_generation() {
         "and the surviving row must be that announcement's, not a mix"
     );
 }
+
+// ---- OLB-2C: the org authority swap is published INSIDE the routing epoch ----
+
+/// A distinct `NodeAuthority` `Arc` for this node under `org`, via the real
+/// adoption ceremony into a fresh tempdir.
+fn adopt_authority(
+    node: &MeshNode,
+    org: &crate::adapter::net::behavior::org::OrgKeypair,
+    tag: &str,
+) -> Arc<crate::adapter::net::behavior::org_authority::NodeAuthority> {
+    use crate::adapter::net::behavior::org::OrgMembershipCert;
+    use crate::adapter::net::behavior::org_authority::NodeAuthority;
+    let entity = node.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("issue cert");
+    // Deliberately SHORT: the ceremony writes `<dir>/authority.lock`, and a
+    // full entity id in the path overruns the Windows path limit — the failure
+    // surfaces as a bare "cannot find the path specified", not as a length
+    // error. A process-scoped sequence keeps it unique without the length.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("net-olb2c-{tag}-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    Arc::new(NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt authority"))
+}
+
+/// OLB-2C. The load-bearing one: at the instant the routing epoch's publication
+/// completes — still under the authority gate — the node authority the
+/// transaction installs is ALREADY visible.
+///
+/// Before OLB-2C, `install_node_authority_inner` published `node_authority`
+/// after `install_org_revocation_store_locked` had returned, which means after
+/// the authority gate was released. The epoch therefore advanced, and the store
+/// became query-visible, while the authority half of the very same transaction
+/// was still the old object. That is the same defect class E3c closed for the
+/// store itself, and it is invisible from outside the gate because the window is
+/// a few instructions wide — hence the observation runs INSIDE it.
+#[tokio::test]
+async fn an_authority_install_publishes_the_authority_under_its_own_epoch() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x2cu8; 32]);
+
+    // First install establishes a baseline authority so the transition under
+    // test is a genuine A -> B replacement rather than None -> A.
+    node.install_node_authority(adopt_authority(&node, &org, "a"))
+        .expect("install A");
+    let a = node.node_authority().expect("A is installed");
+
+    let next = adopt_authority(&node, &org, "b");
+
+    // Sample the authority the node exposes at the publication instant.
+    let observed: Arc<parking_lot::Mutex<Vec<(u64, bool)>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    {
+        let sink = observed.clone();
+        let weak = Arc::downgrade(&node);
+        // The expected authority is captured as the `Arc` itself, not as a raw
+        // pointer: a `*const` is not `Sync`, and `Arc::ptr_eq` is the identity
+        // comparison the install path itself uses.
+        let expected = next.clone();
+        *node.routing_authority.post_publish_hook.lock() = Some(Arc::new(move |epoch| {
+            let Some(node) = weak.upgrade() else {
+                return;
+            };
+            let live_is_next = node
+                .node_authority()
+                .is_some_and(|live| Arc::ptr_eq(&live, &expected));
+            sink.lock().push((epoch, live_is_next));
+        }));
+    }
+
+    node.install_node_authority(next.clone())
+        .expect("install B");
+    *node.routing_authority.post_publish_hook.lock() = None;
+
+    let observed = observed.lock().clone();
+    assert_eq!(
+        observed.len(),
+        1,
+        "the complete authority+store transaction must publish under exactly ONE \
+         epoch advance, not one per half"
+    );
+    assert!(
+        observed[0].1,
+        "at the publication instant the new authority must already be live; \
+         observing the OLD one here means the authority swap escaped the epoch \
+         that names it"
+    );
+    assert!(
+        !Arc::ptr_eq(&a, &node.node_authority().expect("B is installed")),
+        "the transition under test must actually have replaced the authority"
+    );
+}
+
+/// OLB-2C, the other half: the transaction is ONE authority movement, so it
+/// advances the routing epoch exactly once and retires facts stamped before it.
+///
+/// A cached routing artifact built under authority A must not survive into B.
+/// Routing does not read the authority object today — it filters by revocation
+/// floors — so this asserts the epoch/retirement protocol rather than a change
+/// in which providers are served, which is exactly the property 2B.3's warmed
+/// proof path will depend on.
+#[tokio::test]
+async fn an_authority_install_advances_the_routing_epoch_exactly_once() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x2du8; 32]);
+
+    node.install_node_authority(adopt_authority(&node, &org, "c"))
+        .expect("install A");
+    let before = node.routing_authority.epoch();
+
+    let advances: Arc<std::sync::atomic::AtomicU64> =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let counter = advances.clone();
+        *node.routing_authority.post_publish_hook.lock() = Some(Arc::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }));
+    }
+    node.install_node_authority(adopt_authority(&node, &org, "d"))
+        .expect("install B");
+    *node.routing_authority.post_publish_hook.lock() = None;
+
+    assert_eq!(
+        advances.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "an authority+store install is ONE authority movement; a second advance \
+         means the two halves were published as separate ordered units"
+    );
+    let after = node.routing_authority.epoch();
+    assert!(
+        after > before,
+        "the routing epoch must move: {before} -> {after}"
+    );
+}
+
+/// OLB-2C. A REFUSED install publishes neither half.
+///
+/// The one-owner preflight rejects a foreign org before any publication, so the
+/// authority must not move and the epoch must not advance — a failed
+/// transaction that still bumped the epoch would retire every retained routing
+/// fact for nothing.
+#[tokio::test]
+async fn a_refused_authority_install_publishes_neither_half() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x2eu8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, "e"))
+        .expect("install A");
+    let installed = node.node_authority().expect("A is installed");
+    let before = node.routing_authority.epoch();
+
+    let foreign = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x9fu8; 32]);
+    node.install_node_authority(adopt_authority(&node, &foreign, "f"))
+        .expect_err("a foreign owner org must be refused at the one-owner preflight");
+
+    assert!(
+        Arc::ptr_eq(
+            &installed,
+            &node.node_authority().expect("A is still installed")
+        ),
+        "a refused install must not publish its authority"
+    );
+    assert_eq!(
+        node.routing_authority.epoch(),
+        before,
+        "a refused install must not advance the routing epoch"
+    );
+}

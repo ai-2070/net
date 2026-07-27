@@ -325,10 +325,48 @@ Application and bounds:
 | Slice | Content |
 |---|---|
 | **2B-entry** | §5 boundary: drain ownership + lease + supervisor + fencing + minimal registry + bounded application. |
-| **2B.2** | Coherent `OrgAuthorityEpoch` publication + mandatory per-call comparison before proof/send. |
+| **2B.2** | Coherent `OrgAuthorityEpoch` publication + mandatory per-call comparison before proof/send. **Publication half LANDED as OLB-2C** (see below); the per-call comparison waits on 2B.3's warmed route set, which is the thing there would be to compare. |
 | **2B.3** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current + warmed-call consumption. |
 | **2B.4** | Exact-provider lease acquire/release on route-slot lifecycle + node-global ttl/2 refresh owner (first holder arms, last disarms). |
 | **2B.5** | `sensed_candidates` join + §8 classification + granted-candidates-Unknown, inside the actor, never on the request path. |
+
+**OLB-2C (2B.2 publication half) — landed at the user's direction while E3c is
+unsigned.** `install_node_authority_inner` published `node_authority` after
+`install_org_revocation_store_locked` had already released the authority gate. So
+an authority+store install advanced the routing epoch and made the new store
+query-visible while the authority half of the SAME transaction was still the old
+object, and an authority rotation over an unchanged store advanced no routing
+epoch at all. That is the defect class E3c closed for the store itself —
+publication outside the epoch's synchronization — reappearing on the authority
+half.
+
+The authority publication is now threaded into the store install and runs inside
+the very same `move_routing_authority`: one gate, one epoch advance for the
+complete transaction, on both the swap path and the no-visible-store-change path.
+It is threaded in rather than wrapped by the caller because `move_routing_authority`
+takes the non-reentrant authority gate, so a caller-side wrapper would deadlock.
+
+**Reachability, stated honestly.** Routing does not read the authority object
+today — `ScopedSlotSource` filters by revocation floors, not by the installed
+cert — so this is a protocol correction, not a live serving bug. It is landed
+with the protocol rather than with its consumer because the consumer is 2B.3's
+warmed proof path, which builds `OrgProofIntent` FROM the authority: an epoch
+that does not cover the authority is exactly what would let a cached route set
+produce a proof under a rotated key. The `also_publish` no-store-change path is
+likewise fail-closed rather than currently reachable — a `NodeAuthority` owns its
+revocation store 1:1, so `authority_changed` and `store_changed` move together in
+practice.
+
+Witnesses (wiring gate 41 → 44, one new pinned name):
+`an_authority_install_publishes_the_authority_under_its_own_epoch` is the
+load-bearing one and observes from INSIDE the gate through a new
+`post_publish_hook`, because the window it tests is a few instructions wide and
+is not observable from outside. RED-verified: restoring the pre-OLB-2C ordering
+fails it at exactly its coupled assertion. The other two —
+`..._advances_the_routing_epoch_exactly_once` and
+`a_refused_authority_install_publishes_neither_half` — are regression guards, not
+RED-coupled to this change: the old ordering satisfied both, and they exist to
+catch a future split of the two publications into separate ordered units.
 
 The OLB-2 exit witnesses (warmed-call instrumentation, 1024-row bucket isolation,
 33+ provider truncation, epoch mismatch matrix, convergence/ghost-demand) attach to

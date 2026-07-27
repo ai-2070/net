@@ -5379,6 +5379,20 @@ fn move_routing_authority<R>(
         let advance = authority.advance();
         let live = authority.epoch();
         let result = publish();
+        // Test-only, fired STILL UNDER THE GATE and after the whole publication:
+        // the one instant at which "everything this epoch names is visible" must
+        // already be true. An observer here that can still see a stale half has
+        // found a publication outside the epoch's synchronization — which is
+        // precisely how the node-authority swap escaped before OLB-2C, and it is
+        // not observable from outside the gate because the window closes a few
+        // instructions later.
+        #[cfg(test)]
+        {
+            let hook = authority.post_publish_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(live);
+            }
+        }
         (result, live, advance)
     };
     // Outside the gate: the registry takes its own lock, and the frozen order is
@@ -5461,7 +5475,16 @@ struct RoutingAuthority {
     /// witnesses wait on instead of inferring from elapsed time.
     #[cfg(test)]
     contention_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: fired inside [`move_routing_authority`] with the gate still
+    /// HELD, immediately after the publication closure returns. Receives the
+    /// epoch the publication was made under (OLB-2C).
+    #[cfg(test)]
+    post_publish_hook: parking_lot::Mutex<Option<PostPublishHook>>,
 }
+
+/// Test-only observer of a completed authority publication, still under the gate.
+#[cfg(test)]
+type PostPublishHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 impl RoutingAuthority {
     fn new() -> Self {
@@ -5471,6 +5494,8 @@ impl RoutingAuthority {
             exhausted: AtomicBool::new(false),
             #[cfg(test)]
             contention_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            post_publish_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -9759,7 +9784,7 @@ impl MeshNode {
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
-        if self.install_org_revocation_store_locked(store, false, None)? {
+        if self.install_org_revocation_store_locked(store, false, None, None)? {
             advance_fenced_generation(&self.org_install_generation, "org_install_generation");
         }
         Ok(())
@@ -9778,7 +9803,7 @@ impl MeshNode {
         pause: &(dyn Fn() + Sync),
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
-        if self.install_org_revocation_store_locked(store, false, Some(pause))? {
+        if self.install_org_revocation_store_locked(store, false, Some(pause), None)? {
             advance_fenced_generation(&self.org_install_generation, "org_install_generation");
         }
         Ok(())
@@ -9802,11 +9827,26 @@ impl MeshNode {
     /// `org_install_generation` bump at the complete transaction boundary — the
     /// helper never bumps, so an authority+store transaction publishes one
     /// generation change, not an intermediate store bump then an authority bump.
+    ///
+    /// `also_publish` (OLB-2C) is a SECOND publication belonging to the same
+    /// authority transaction — in practice the node-authority swap. It runs
+    /// inside the very same [`move_routing_authority`] as the store swap, so the
+    /// complete transaction becomes visible under exactly ONE routing epoch
+    /// advance. It is threaded in here rather than performed by the caller
+    /// because the caller cannot compose: [`move_routing_authority`] takes the
+    /// non-reentrant authority gate, so a caller-side wrapper around this call
+    /// would deadlock against the store swap's own.
+    ///
+    /// It runs on BOTH publication paths, including the `Ok(false)` no-visible-
+    /// store-change return — an authority rotation over an unchanged store is
+    /// still an authority movement, and skipping the bump there is exactly the
+    /// hole this parameter exists to close.
     fn install_org_revocation_store_locked(
         &self,
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
         pin_held: bool,
         pause_before_swap: Option<&(dyn Fn() + Sync)>,
+        also_publish: Option<&(dyn Fn() + Sync)>,
     ) -> Result<bool, super::behavior::org_revocation::OrgRevocationError> {
         // Fast poison reject (rechecked UNDER the pin below — a
         // candidate can be poisoned between here and the swap).
@@ -9820,7 +9860,17 @@ impl MeshNode {
         let current = self.org_revocation.load_full();
         if let Some(cur) = &current {
             if Arc::ptr_eq(cur, &store) {
-                // Exact same installed store — no visible change, no bump.
+                // Exact same installed store — no visible STORE change, so no
+                // store bump. But a companion publication in the same
+                // transaction (the node-authority swap) is still an authority
+                // movement, and it must not become visible outside the epoch
+                // that names it just because the store half was a no-op
+                // (OLB-2C).
+                if let Some(publish) = also_publish {
+                    move_routing_authority(&self.routing_authority, &self.routing_registry, || {
+                        publish();
+                    });
+                }
                 return Ok(false);
             }
         }
@@ -9990,12 +10040,20 @@ impl MeshNode {
         // an install cannot become visible while a pin is alive.
         move_routing_authority(&self.routing_authority, &self.routing_registry, || {
             self.org_revocation.store(Some(store.clone()));
+            // Same gate, same epoch advance: an authority+store transaction is
+            // ONE authority movement, so the node authority must not be
+            // published in a separate ordered unit that routing would see as a
+            // second, later epoch — or worse, as no epoch at all (OLB-2C).
+            if let Some(publish) = also_publish {
+                publish();
+            }
         });
         drop(_pin);
 
-        // No epoch bump: the installed store's IDENTITY changed, and
-        // the send-path [`SendStamp`] captures store identity
-        // directly (review-11 P1).
+        // No `org_install_generation` bump: the installed store's IDENTITY
+        // changed, and the send-path [`SendStamp`] captures store identity
+        // directly (review-11 P1). The ROUTING epoch above is a different
+        // question and is advanced unconditionally by the swap.
 
         // Reconcile the candidate's floors against projections that
         // already exist in the fold: a store installed AFTER its
@@ -10204,13 +10262,44 @@ impl MeshNode {
             .as_ref()
             .map(|current| !Arc::ptr_eq(current, &authority))
             .unwrap_or(true);
+        // OLB-2C: the authority publication is handed to the store install so
+        // BOTH halves land inside one `move_routing_authority` — one gate, one
+        // epoch advance, and the new authority cannot be query-visible under an
+        // epoch that predates it.
+        //
+        // Before this, `node_authority.store` ran here, after the store install
+        // had already released the authority gate. That is the same defect class
+        // E3c closed for the revocation store itself ("publication outside the
+        // epoch's synchronization"): an authority-only rotation advanced NO
+        // routing epoch at all, and a combined authority+store install published
+        // the authority in a window the epoch did not cover.
+        //
+        // Routing does not read the authority object today — the source filters
+        // by revocation floors, not by the installed cert — so this is a
+        // protocol correction rather than a live serving bug. It is landed with
+        // the protocol rather than with its consumer because the consumer is the
+        // warmed proof path (2B.3), which builds `OrgProofIntent` FROM the
+        // authority: an epoch that does not cover the authority is exactly what
+        // would let a cached route set produce a proof under a rotated key.
+        //
+        // `Fn`, not `FnOnce`: the callee takes `&dyn Fn` so it can sit on either
+        // publication path. It is invoked at most once on each.
+        let publish_authority = authority_changed.then(|| {
+            let authority = authority.clone();
+            let slot = &self.node_authority;
+            move || slot.store(Some(authority.clone()))
+        });
         // The pin is already held over both cores → `pin_held = true`.
         let store_changed = self
-            .install_org_revocation_store_locked(candidate_store.clone(), true, None)
+            .install_org_revocation_store_locked(
+                candidate_store.clone(),
+                true,
+                None,
+                publish_authority
+                    .as_ref()
+                    .map(|publish| publish as &(dyn Fn() + Sync)),
+            )
             .map_err(super::behavior::org_authority::OrgAuthorityError::Revocation)?;
-        if authority_changed {
-            self.node_authority.store(Some(authority));
-        }
         // One generation transition for the COMPLETE authority+store
         // transaction (never one for the store then one for the authority).
         if authority_changed || store_changed {

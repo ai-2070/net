@@ -235,6 +235,13 @@ independent RED mutations, and reading the CI conclusion for the merged head
 (this host has no `gh`, and its Windows runs cannot stand in for the `cfg(unix)`
 and serial-matrix coverage that only the Linux CI jobs provide).
 
+**OLB-2C entered at the user's explicit direction (2026-07-27) WITHOUT waiting
+for that signature**, after the hold was stated. Its first slice — the coherent
+authority publication half of 2B.2 — is landed and is recorded in
+[`OLB_2B_CONSUMER_ENTRY_DESIGN.md`](OLB_2B_CONSUMER_ENTRY_DESIGN.md) §8. It
+rests on the E1–E3c substrate, so an independent RED pass that invalidates a
+witness there also reaches this slice.
+
 *(review-pass-3 §19: this paragraph previously still said "OLB-2 does not begin
 until it signs off", contradicting the implementation-status note above it, which
 had said the opposite since `4dccb7767`. For a plan whose process leans this hard
