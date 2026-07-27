@@ -168,6 +168,34 @@ CortEX comes with two reference folds: tasks and memories. Tasks model long-runn
 
 You don't have to use them. They live alongside any folds you write yourself; CortEX is happy to drive multiple folds against the same RedEX log, or different folds against different logs, and the NetDB facade composes them all under one query surface.
 
+### The adapter types, by binding
+
+Both models ship as adapters you can open standalone against a `Redex`, or
+reach through a `NetDb` that composes them.
+
+| | Rust | TypeScript | Python | Go |
+|---|---|---|---|---|
+| Log manager | `cortex::Redex::new()`, `::with_persistent_dir(path)` | `new Redex(opts)` | `Redex(...)` | `NewRedex(...)` |
+| Open tasks | `cortex::TasksAdapter::open(redex, origin)` | `TasksAdapter` | `TasksAdapter.open(...)` | `OpenTasks(redex, originHash, persistent)` |
+| Open memories | `cortex::MemoriesAdapter::open(redex, origin)` | `MemoriesAdapter` | `MemoriesAdapter` | `OpenMemories(...)` |
+| Compose both | `cortex::NetDb::builder(redex)` | `NetDb.open(config)` | `NetDb` builder | `OpenNetDb(redex, cfg)` |
+| Typed handles | `db.tasks()` / `db.memories()` | same | same | `db.Tasks()` / `db.Memories()` |
+| Initial result + deltas | `adapter.snapshot_and_watch(watcher)` | `snapshotAndWatch` | `snapshot_and_watch_tasks` / `..._memories` | `SnapshotAndWatch` |
+| Persist | `db.snapshot()` → `NetDbSnapshot` | `snapshot()` | `snapshot()` | `db.Snapshot()` → `[]byte` |
+| Restore | `NetDbBuilder::build_from_snapshot(&bundle)` | `NetDb.openFromSnapshot(...)` | `build_from_snapshot` | `OpenNetDbFromSnapshot(redex, cfg, bundle)` |
+
+Python also exposes context managers that open an adapter and close it on scope
+exit, so you don't leak a handle on an exception path. Go returns
+`(*TasksAdapter, error)` from `OpenTasks` and requires an explicit `Close()`;
+its mutation methods (`Create`, `Rename`, `Complete`, `Delete`) each return the
+sequence number of the event they appended, which is what you pass to
+`WaitForSeq` for read-your-writes.
+
+`snapshot_and_watch` is the important one: it hands back the current state *and*
+the delta stream as one atomic operation, so nothing lands between your initial
+read and the start of watching. Reaching for a separate list-then-subscribe is
+the bug it exists to prevent.
+
 ## Failure handling
 
 Folds can fail. An event with a bad payload, a logic bug in the fold, an underflow on a counter — all of these manifest as an `Err` from `apply()`. The runtime's response is configurable:
