@@ -4,6 +4,11 @@ The pages in this section are end-to-end builds. Each one starts from an empty p
 
 Tutorials are longer than guides because they cover the whole arc. You'll read about why each piece is shaped the way it is, not just what it is. If you're new to Net, picking one tutorial that's close to what you're building and working through it end-to-end is the fastest way to internalize the patterns.
 
+All three are written in Rust. The patterns port directly — the call shapes match
+across bindings — but the code does not, so if you're building in TypeScript,
+Python, or Go, expect to translate as you read. Your language's
+[SDK spine](/docs/sdk) is the reference for the idioms.
+
 The three tutorials here cover different parts of the surface:
 
 - **[Fleet telemetry](/docs/tutorials/fleet-telemetry)** — edge devices publishing to a hierarchical channel namespace, gateways scoping by subnet, a fold materializing aggregate metrics for an operator dashboard. Hits channels, subnets, capabilities, folds.

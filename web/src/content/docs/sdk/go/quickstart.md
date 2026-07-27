@@ -41,7 +41,10 @@ func main() {
         fmt.Println("event", string(ev))
     }
 
-    stats := bus.Stats()
+    stats, err := bus.Stats()
+    if err != nil {
+        log.Fatal(err)
+    }
     fmt.Printf("%d ingested, %d dropped\n", stats.EventsIngested, stats.EventsDropped)
 }
 ```
@@ -49,7 +52,11 @@ func main() {
 `Ingest` returns once the event is accepted into the local ring buffer —
 acceptance, not delivery (see
 [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)). Under
-backpressure events can drop; check `Stats().EventsDropped`.
+backpressure events can drop; check the `EventsDropped` counter.
+
+`Stats()` returns `(*Stats, error)` — it crosses the cgo boundary and can fail
+once the handle is shut down, so it doesn't fit the one-value shape you might
+expect from a counter read.
 
 `Poll(limit, cursor)` returns a `*PollResponse` with `Events []json.RawMessage` and
 a `NextID` cursor — pass `NextID` back to `Poll` to page forward. This is the Go

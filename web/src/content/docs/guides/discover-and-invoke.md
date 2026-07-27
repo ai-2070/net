@@ -76,6 +76,53 @@ let resp: SummarizeResp = caller.call_typed(
 The call is typed on both ends, deadlined, and cancellable; there is no separate
 RPC broker, sidecar, or IDL step.
 
+### Discovering tools from other languages
+
+The discovery half of the loop has a first-class surface in every binding. Same
+fold underneath, same advisory semantics — a snapshot plus a change stream:
+
+```typescript
+import { listTools, watchTools, callTool } from "@net-mesh/sdk";
+
+for (const t of await listTools(rpc)) {
+  console.log(t.toolId, t.tags);
+}
+
+for await (const change of watchTools(rpc)) {
+  console.log("fold changed:", change);
+}
+```
+
+```python
+from net_sdk import list_tools, watch_tools
+
+for t in list_tools(node):                 # baseline snapshot
+    print(t.tool_id, t.tags)
+
+async for change in watch_tools(node):     # pushed on fold mutation
+    print(change)
+```
+
+```go
+tools, err := rpc.ListTools()
+if err != nil {
+    log.Fatal(err)
+}
+for _, t := range tools {
+    fmt.Println(t.ToolID, t.Tags)
+}
+```
+
+`watchTools` / `watch_tools` are **event-driven off the capability fold's change
+signal**, not polls — an idle mesh costs nothing, and a change arrives the moment
+the fold mutates. Where these APIs take an `interval`, it's a staleness ceiling
+(a safety-net re-diff), not a poll rate.
+
+Go has no watch iterator; it lists and re-lists. Python's capability-*filter*
+node discovery (`find_nodes`, "GPU nodes with ≥24 GB VRAM") is reachable only
+through the native handle rather than a clean `MeshNode` method — the tool API
+above is the path for most Python agent code.
+
 ## A complete, runnable two-node loop today
 
 The end-to-end wrap → discover → invoke loop across two nodes — including the

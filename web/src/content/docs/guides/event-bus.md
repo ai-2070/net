@@ -4,6 +4,14 @@ The event bus is the surface you'll spend most of your time at. This guide goes 
 
 The API is small. You'll mostly be composing four operations — construct, ingest, poll, shutdown — into the shape your workload needs.
 
+> **A note on languages.** The detailed sections below are in Rust, because the
+> core crate is Rust and the tuning knobs (shards, batching, backpressure,
+> adapters) are exposed most directly there. The same four operations exist in
+> every binding — [The same loop, four ways](#the-same-loop-four-ways) at the end
+> of this guide shows them side by side, and each language's SDK spine
+> ([TypeScript](/docs/sdk/typescript/quickstart), [Python](/docs/sdk/python/quickstart),
+> [Go](/docs/sdk/go/quickstart)) covers its own idioms in full.
+
 ## Constructing a bus
 
 A bus is built from an `EventBusConfig`. The default config gives you a single-node, in-memory bus with sensible shard counts and batch settings. You'll replace pieces of it as your deployment grows.
@@ -186,3 +194,83 @@ Three patterns cover most of what you'll write:
 **Both**, where a single bus instance both ingests and consumes — typical for daemons that read events, transform them, and emit derived events. Most application code lives here.
 
 The single primitive shapes all three. The bus doesn't care which role you're playing.
+
+## The same loop, four ways
+
+Construct, ingest, read, shut down — in each binding's own idiom. The call
+shapes match; the ergonomics don't, and pretending otherwise is how people get
+stuck.
+
+**Rust** — the core crate, with every knob reachable:
+
+```rust
+use net::{ConsumeRequest, Event, EventBus, EventBusConfig};
+
+let bus = EventBus::new(EventBusConfig::default()).await?;
+bus.ingest(Event::from_str(r#"{"sensor": "lidar"}"#)?)?;
+bus.flush().await?;
+
+let response = bus.poll(ConsumeRequest::new(100)).await?;
+bus.shutdown().await?;
+```
+
+**TypeScript** — `emit` is synchronous, everything else awaits, and shutdown is
+explicit because Node finalizers are not deterministic:
+
+```typescript
+import { NetNode } from "@net-mesh/sdk";
+
+const node = await NetNode.create({ shards: 4 });
+node.emit({ sensor: "lidar" });
+await node.flush();
+
+for await (const event of node.subscribe({ limit: 100 })) {
+  console.log(event);
+}
+await node.shutdown();
+```
+
+**Python** — the context manager owns the drain, so there's no shutdown call to
+forget:
+
+```python
+from net_sdk import NetNode
+
+with NetNode(shards=4) as node:
+    node.emit({"sensor": "lidar"})
+
+    for event in node.subscribe(limit=100, timeout=5.0):
+        print(event)
+```
+
+**Go** — cursor pagination rather than an iterator; there is no async subscribe:
+
+```go
+bus, err := net.New(nil)
+if err != nil {
+    log.Fatal(err)
+}
+defer bus.Shutdown()
+
+if err := bus.IngestRaw(`{"sensor": "lidar"}`); err != nil {
+    log.Fatal(err)
+}
+
+resp, err := bus.Poll(100, "")   // "" = from the earliest buffered event
+if err != nil {
+    log.Fatal(err)
+}
+for _, ev := range resp.Events {
+    fmt.Println(string(ev))
+}
+```
+
+Two differences are worth internalizing rather than discovering. Go has **no
+subscribe iterator** — you page with `Poll(limit, cursor)` and carry `NextID`
+forward yourself. And Python's `subscribe` takes a `timeout`, so a consumer that
+never sees another event returns rather than blocking forever.
+
+Everything above the bus — capabilities, nRPC, folds — has the same
+four-language parity. What varies is which knobs are surfaced: the shard,
+batch, and backpressure tuning in this guide is Rust-first, and the bindings
+expose the subset that makes sense as constructor arguments.
