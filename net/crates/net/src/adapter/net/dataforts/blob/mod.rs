@@ -4,7 +4,7 @@
 //! custom) behind a uniform [`BlobAdapter`] trait so the substrate
 //! can ship event payloads larger than the inline-threshold via a
 //! [`BlobRef`] pointer + a separate fetch path. Phase 3 of
-//! `docs/misc/DATAFORTS_PLAN.md`.
+//! `docs/internal/misc/DATAFORTS_PLAN.md`.
 //!
 //! The substrate owns hash verification (BLAKE3) and the
 //! discriminator byte that distinguishes inline vs blob-ref event

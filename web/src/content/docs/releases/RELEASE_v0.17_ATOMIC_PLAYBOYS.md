@@ -362,7 +362,7 @@ impl Drop for MeshOsRuntime {
 
 ## SDK plan
 
-The MeshOS SDK plan covering Rust / Python / Node / Go / C ships as a design document at `docs/plans/MESHOS_SDK_PLAN.md`. The Rust SDK is the canonical surface — `MeshOsDaemonHandle` + `daemon_main!` macro + integration tests against `MeshOsRuntime` with `LoggingDispatcher`. Python (pyo3, sync-first), Node (napi-rs, AsyncIterable control events), Go (cgo + `context.Context`-aware control channels), and C (vtable + last-error surface mirroring MeshDB's FFI pattern) land in dependency order per consumer demand. A new `sdk` workspace member at `crates/net/sdk/` opens the slot.
+The MeshOS SDK plan covering Rust / Python / Node / Go / C ships as a design document at `docs/internal/plans/MESHOS_SDK_PLAN.md`. The Rust SDK is the canonical surface — `MeshOsDaemonHandle` + `daemon_main!` macro + integration tests against `MeshOsRuntime` with `LoggingDispatcher`. Python (pyo3, sync-first), Node (napi-rs, AsyncIterable control events), Go (cgo + `context.Context`-aware control channels), and C (vtable + last-error surface mirroring MeshDB's FFI pattern) land in dependency order per consumer demand. A new `sdk` workspace member at `crates/net/sdk/` opens the slot.
 
 The plan locks in ten decisions, most importantly the non-goals: no placement APIs in any binding, no admin-event issuance, no MeshOS-control surfaces. The SDK is **the daemon contract**, exposed in five languages. Operator tooling, federated interactions, and MeshDB queries belong to separate SDKs.
 

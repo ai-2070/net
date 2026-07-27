@@ -469,7 +469,7 @@ pub struct ShardMapper {
     /// Pre-computed routable-shard snapshot. Updated whenever the shard
     /// list or weights change; read lock-free by [`Self::select_shard`].
     ///
-    /// Pre-fix [perf #2 in `docs/performance/net-perf-analysis.md`],
+    /// Pre-fix [perf #2 in `docs/internal/performance/net-perf-analysis.md`],
     /// `select_shard` did this work on every event: two `Vec` allocs +
     /// an `RwLock::read` + min-weight scan + tolerance filter. At 10M
     /// ev/s that's 20M allocs/sec plus a parking_lot acquire each time.

@@ -26,7 +26,7 @@
 //! - **`start_arc()`, not `start()`** (D1) — installs the weak
 //!   self-reference the change-driven announcer + deferred flush need.
 //!
-//! See `docs/plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md`.
+//! See `docs/internal/plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md`.
 
 #![allow(dead_code)]
 

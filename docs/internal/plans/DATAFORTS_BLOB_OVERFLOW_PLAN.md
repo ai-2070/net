@@ -676,6 +676,6 @@ If the workload lives in a deployment where every node is identically sized and 
 ## See also
 
 - [`DATAFORTS_BLOB_STORAGE_PLAN.md`](DATAFORTS_BLOB_STORAGE_PLAN.md) — the v0.2 mesh-native blob track; § G-3 documents the pull-only posture this plan extends.
-- [`DATAFORTS_PLAN.md`](../misc/DATAFORTS_PLAN.md) — the seven-phase Dataforts roadmap; overflow rides Phase 3.5.
+- [`DATAFORTS_PLAN.md`](DATAFORTS_PLAN.md) — the seven-phase Dataforts roadmap; overflow rides Phase 3.5.
 - [`REDEX_DISTRIBUTED_PLAN.md`](REDEX_DISTRIBUTED_PLAN.md) — the v0.14 replication runtime overflow pushes ride on. No replication-side changes needed for v0.3.
-- [`RELEASE_v0.15_REBEL_YELL.md`](../releases/RELEASE_v0.15_REBEL_YELL.md) § Mesh-native blob storage — what shipped as v0.2 and what this plan extends.
+- [`RELEASE_v0.15_REBEL_YELL.md`](../../../web/src/content/docs/releases/RELEASE_v0.15_REBEL_YELL.md) § Mesh-native blob storage — what shipped as v0.2 and what this plan extends.

@@ -637,5 +637,5 @@ Any of these activates Phase A; phases B-F follow as needed by the specific work
 - [`CAPABILITY_SYSTEM_PLAN.md`](CAPABILITY_SYSTEM_PLAN.md) — Warriors phase; provides the primitives MeshDB composes
 - [`CORTEX_ADAPTER_PLAN.md`](CORTEX_ADAPTER_PLAN.md) — local fold layer that MeshDB streams through
 - [`NETDB_PLAN.md`](NETDB_PLAN.md) — local query façade above CortEX; MeshDB is the federated counterpart
-- [`../misc/DATAFORTS_PLAN.md`](../misc/DATAFORTS_PLAN.md) — original deferral context: Phase 6 was MeshDB; this doc is the implementation detail when Atomic Playboys activates
+- [`../misc/DATAFORTS_PLAN.md`](DATAFORTS_PLAN.md) — original deferral context: Phase 6 was MeshDB; this doc is the implementation detail when Atomic Playboys activates
 - `RELEASE_ROADMAP.md` — Atomic Playboys release context

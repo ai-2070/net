@@ -1,6 +1,6 @@
 //! Pure-logic admission + migration decision helpers for the
 //! Dataforts integration rules G-1..G-3 + G-6 (see
-//! `docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md` § G-1 / G-2 / G-3 / G-6).
+//! `docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md` § G-1 / G-2 / G-3 / G-6).
 //!
 //! The decisions live as standalone functions over typed inputs so
 //! the greedy + gravity runtimes can call them without taking the
@@ -242,7 +242,7 @@ pub enum MigrateBlobReject {
 /// stale-rejected pushes is preferable to accepting bytes
 /// from a peer that no longer claims to participate).
 ///
-/// [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`]: ../../../../../docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
+/// [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`]: ../../../../../docs/internal/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
 pub fn should_accept_overflow_from(
     local_caps: &CapabilitySet,
     sender_caps: &CapabilitySet,

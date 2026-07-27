@@ -1519,7 +1519,7 @@ impl PaymentEngine {
         // check-and-set atomic under the same lock (at-most-once is
         // unchanged). The `bool` in each returned tuple is `dirty`: it is
         // `true` on exactly the one arm that mutated. See
-        // `docs/performance/payments-redeem-write-amplification.md`.
+        // `docs/internal/performance/payments-redeem-write-amplification.md`.
         let decision = mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
             let Some(rec) = s.quotes.get_mut(&quote_id) else {
                 return (

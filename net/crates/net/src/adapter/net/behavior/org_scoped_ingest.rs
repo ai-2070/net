@@ -1,4 +1,4 @@
-//! OA-3 §3.3 of `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md` — the ingest AUTHORITY
+//! OA-3 §3.3 of `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md` — the ingest AUTHORITY
 //! for grant-scoped private discovery: verify a decoded, outer-signature-
 //! authenticated [`ScopedCapabilityAnnouncement`] against the local node's
 //! audience material and, on success, produce a verified, decrypted descriptor

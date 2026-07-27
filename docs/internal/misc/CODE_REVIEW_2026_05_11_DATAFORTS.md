@@ -1,7 +1,7 @@
 # Code Review — `dataforts-feature` vs `master` (2026-05-11)
 
 Review pass on the `dataforts-feature` branch (50 files, +10,984 / −33). The
-branch implements the Rebel Yell phases of [`DATAFORTS_PLAN.md`](DATAFORTS_PLAN.md):
+branch implements the Rebel Yell phases of [`DATAFORTS_PLAN.md`](../plans/DATAFORTS_PLAN.md):
 greedy-LRU dataforts (Phase 1), data-gravity heat counters (Phase 4),
 read-your-writes (Phase 5), and the BlobRef + BlobAdapter foundation (Phase 3),
 across Rust core + Python + Node + Go + C FFI.

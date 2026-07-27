@@ -1,4 +1,4 @@
-//! OA-3 §3.1 of `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md` — the
+//! OA-3 §3.1 of `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md` — the
 //! cryptographic foundation of grant-scoped private discovery.
 //!
 //! A [`ScopedCapabilityAnnouncement`] (the wire object itself lands in a later

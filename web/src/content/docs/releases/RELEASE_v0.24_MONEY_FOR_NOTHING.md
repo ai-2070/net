@@ -118,7 +118,7 @@ Operators who hit the new variant in production logs are getting a hard signal t
 
 ## Test hygiene
 
-- **Perf-audit doc shipped in tree.** `docs/plans/NRPC_FLAMEGRAPH.md` lands alongside the perf wins — the flame-graph methodology, the 14900K bench rig config, and the before/after numbers are pinned in the repo so the next perf pass starts from a known reference frame.
+- **Perf-audit doc shipped in tree.** `docs/internal/plans/NRPC_FLAMEGRAPH.md` lands alongside the perf wins — the flame-graph methodology, the 14900K bench rig config, and the before/after numbers are pinned in the repo so the next perf pass starts from a known reference frame.
 - **The previously-failing backpressure test now passes.** `sdk/tests/mesh_stream_backpressure.rs::test_sdk_send_with_retry_succeeds_through_backpressure` was deadlocked under the v1 threshold-coalesce approach (small-window sender + receiver's default 64 KiB stream → no grant ever fired). The drainer pattern has no threshold, so the test passes.
 - **`cargo clippy --features meshos,deck,aggregator --all-features --all-targets -- -D warnings` clean.** Strict floor from v0.20.2 stays armed across the feature-flagged regex split.
 - **`cargo doc --features meshos,deck,aggregator --no-deps` clean under `RUSTDOCFLAGS="-D warnings"`.** Intra-doc links across the new `TagMatcherError`, `validate()`, and `compile()` panic docs all resolved.

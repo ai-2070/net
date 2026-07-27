@@ -24,7 +24,7 @@
 //! storage struct, no wire-format break with v0.15 nodes that
 //! don't know these tags (unknown axis-prefixed tags pass through
 //! as `Tag::Legacy`). See
-//! `docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md` § 7 for the
+//! `docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md` § 7 for the
 //! full design rationale.
 //!
 //! # Tag schema
@@ -144,7 +144,7 @@ pub struct BlobCapability {
     /// See [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`] for the v0.3
     /// design that lights this up.
     ///
-    /// [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`]: ../../../../../docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
+    /// [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`]: ../../../../../docs/internal/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
     pub overflow_enabled: bool,
 }
 

@@ -7,8 +7,8 @@
 //! tests; failure of either fixture against any binding signals a
 //! cross-binding wire-format drift.
 //!
-//! Phase 5.B + 1 of `docs/plans/CAPABILITY_ENHANCEMENTS_PLAN.md`.
-//! Surfaced through Phase 9 of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+//! Phase 5.B + 1 of `docs/internal/plans/CAPABILITY_ENHANCEMENTS_PLAN.md`.
+//! Surfaced through Phase 9 of `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
 //!
 //! Run: `cargo test --features net,cortex,fixtures --test cross_lang_capability_fixtures`
 

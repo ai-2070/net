@@ -45,7 +45,7 @@ default = []
 # flag is the single supported "show me real cluster
 # telemetry" path.
 #
-# See `crates/net/docs/plans/DECK_DEMO_PLAN.md`. Dev-only; never
+# See `docs/internal/plans/DECK_DEMO_PLAN.md`. Dev-only; never
 # ship to crates.io as a default feature.
 #
 #   cargo run -p net-deck --features demo

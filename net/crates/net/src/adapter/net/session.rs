@@ -110,7 +110,7 @@ pub struct NetSession {
     /// Per-session cache of the resolved peer `NodeId`.
     ///
     /// Pre-fix [discovery-routing perf #108 in
-    /// `docs/performance/net-discovery-routing-analysis.md`] the
+    /// `docs/internal/performance/net-discovery-routing-analysis.md`] the
     /// inbound dispatcher's RPC hook ran the
     /// `addr_to_node → peers.get → session_id-match → fallback
     /// O(N) peer scan` resolution chain on **every** inbound RPC
@@ -423,7 +423,7 @@ impl NetSession {
             None => return TxAdmit::StreamClosed,
             Some(state) => {
                 // Cache `epoch` once — pre-fix [perf #42 in
-                // `docs/performance/net-perf-analysis.md`] the field
+                // `docs/internal/performance/net-perf-analysis.md`] the field
                 // was read twice through the `Ref`, once for the
                 // epoch-mismatch check and once on the return tuple.
                 // Trivial field access today but the cache also makes

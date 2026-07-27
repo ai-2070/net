@@ -1414,7 +1414,7 @@ impl CapabilitySet {
     /// runs first because most tags in the set won't carry the target
     /// value — that lets the key parse (`strip_prefix` + `split_once`)
     /// run only on the small set of value-matching candidates. See
-    /// `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #5.
+    /// `docs/internal/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #5.
     fn has_indexed_software_value(
         &self,
         family_prefix: &str,
@@ -1461,7 +1461,7 @@ impl CapabilitySet {
     /// (`CapabilityFilter::matches` memory / VRAM checks). Avoids
     /// forcing the full `HardwareCapabilities` decode via
     /// `views().hardware()` when only one tag is needed. See
-    /// `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #2.
+    /// `docs/internal/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #2.
     pub(crate) fn axis_value(
         &self,
         axis: crate::adapter::net::behavior::tag::TaxonomyAxis,
@@ -1513,7 +1513,7 @@ impl CapabilitySet {
     /// first-byte sniff, so receivers running this code accept both
     /// compact and JSON inputs.
     ///
-    /// See `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #3 for
+    /// See `docs/internal/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #3 for
     /// the rollout staging — flipping `to_bytes` itself to compact is
     /// a separate, deliberate wire-format change.
     pub fn to_bytes_compact(&self) -> Vec<u8> {
@@ -1888,7 +1888,7 @@ fn sorted_tag_vec(tags: &HashSet<Tag>) -> Vec<Tag> {
     // (N allocations) instead of `sort_by_key`'s re-evaluation on every
     // comparison (~N log N allocations). Output order is identical, so signed
     // announcement bytes stay stable. See
-    // docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §3.
+    // docs/internal/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §3.
     v.sort_by_cached_key(|a| a.to_string());
     v
 }
@@ -2651,7 +2651,7 @@ impl CapabilityFilter {
         // Tag-direct fast paths for single-field hardware predicates —
         // avoid forcing the full `HardwareCapabilities` decode (sort +
         // per-tag axis_key parse) when only one tag's value is needed.
-        // See `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #2.
+        // See `docs/internal/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` fix #2.
         if let Some(min_mem) = self.min_memory_gb {
             let mem = caps
                 .axis_value(TaxonomyAxis::Hardware, "memory_gb")

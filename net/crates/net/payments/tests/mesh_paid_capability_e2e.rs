@@ -1,6 +1,6 @@
 //! The canonical Net Payments loop, end to end, across the real mesh
 //! wire — **the one made impossible to regress** (M1 of
-//! `docs/plans/PAYMENTS_TEST_MATRIX.md`).
+//! `docs/internal/plans/PAYMENTS_TEST_MATRIX.md`).
 //!
 //! Every other paid-serve test proves one half: the payment flow crosses
 //! the wire (`mesh_payments_e2e`) but never invokes a handler; the tool

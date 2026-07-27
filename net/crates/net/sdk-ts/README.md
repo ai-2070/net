@@ -933,7 +933,7 @@ Four phases:
     are still Rust-only — operator scripts that need them
     from TypeScript call out to the `net-blob` CLI or a Rust-
     side daemon RPC until each follow-up wrapper lands. See
-    [`docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](../docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md)
+    [`docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](../../../../docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md)
     for the shipping status.
 - **Phase 3.5 — Active blob overflow (v0.3 blob track).** Push-
   side complement of Phase 4's pull-driven migration. Disabled
@@ -943,7 +943,7 @@ Four phases:
   (`dataforts_blob_overflow_*` — admitted / 6-label per-reason
   rejected / hysteresis edges / `active` gauge / `disk_ratio`)
   lands in `prometheusText()`. See
-  [`docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md`](../docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md)
+  [`docs/internal/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md`](../../../../docs/internal/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md)
   for design + per-PR shipping status.
 - **Phase 4 — Data gravity.** Per-chain read-rate counters with
   exponential decay. Threshold-crossing emissions stamp

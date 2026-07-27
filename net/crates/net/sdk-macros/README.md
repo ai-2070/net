@@ -36,4 +36,4 @@ surface (`name`, `description`, `version`, `tag` (repeatable),
 `stateless`, `estimated_time_ms`).
 
 Plan: A-7 of
-[`docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`](../docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md).
+[`docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`](../../../../docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md).

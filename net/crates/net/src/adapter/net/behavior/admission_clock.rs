@@ -1,4 +1,4 @@
-//! OA2-E0.4 of `docs/plans/OA2E_INTEGRATION_DESIGN.md` — a single
+//! OA2-E0.4 of `docs/internal/plans/OA2E_INTEGRATION_DESIGN.md` — a single
 //! paired clock sample for provider admission.
 //!
 //! Admission checks two things against time: proof/credential

@@ -4,7 +4,7 @@
 //! one that does must persist exactly its mutation. "Did/did not rewrite" is
 //! witnessed by the store inode on unix (a save renames a fresh temp over
 //! the file → new inode), per
-//! `docs/performance/payments-redeem-write-amplification.md`.
+//! `docs/internal/performance/payments-redeem-write-amplification.md`.
 //!
 //! These are plain engine/spend tests (no mesh gate), so they run on every
 //! build. The deeper invariants (concurrent-settle-once, republish, release-

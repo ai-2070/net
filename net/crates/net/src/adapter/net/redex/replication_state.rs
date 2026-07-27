@@ -1,5 +1,5 @@
 //! Replica state-machine validation — Phase C pre-scaffolding for
-//! `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §3.
+//! `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` §3.
 //!
 //! Pure-logic layer over the four-state model
 //! ([`ReplicaRole::{Leader, Replica, Candidate, Idle}`] from the

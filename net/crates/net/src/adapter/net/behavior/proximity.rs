@@ -480,7 +480,7 @@ pub struct ProximityGraph {
     /// O(1) entry counts for `nodes` / `edges` / `seen_pingwaves`. Avoids the
     /// per-shard walk of `DashMap::len()` (~1us) in `node_count()` / `stats()`.
     /// Maintained exactly on every insert and decremented on eviction. See
-    /// docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2.
+    /// docs/internal/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2.
     num_nodes: AtomicUsize,
     num_edges: AtomicUsize,
     num_seen: AtomicUsize,

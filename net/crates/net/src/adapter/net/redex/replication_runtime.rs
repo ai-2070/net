@@ -856,7 +856,7 @@ fn clear_leader_belief_and_tokens(
     outstanding: &Arc<Mutex<OutstandingRequests>>,
 ) {
     // Read-then-clear under a single `tracker` lock. Pre-fix
-    // [perf #71 in `docs/performance/net-perf-analysis.md`] this
+    // [perf #71 in `docs/internal/performance/net-perf-analysis.md`] this
     // took the tracker lock twice back-to-back — once to read
     // `believed_leader()`, once to `clear_believed_leader()`.
     // Coalescing is also defensively atomic with respect to a

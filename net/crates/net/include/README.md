@@ -369,7 +369,7 @@ Full design + cross-SDK rationale:
 
 Optional per-daemon `requiredCapabilities` / `optionalCapabilities` declaration. Wires the substrate's `MeshDaemon::required_capabilities` / `optional_capabilities` (Phase G slice 2) through the C ABI so daemons spawned via the Go-style factory dispatcher can declare what hardware / region / runtime they need before placement decisions run.
 
-Without this dispatcher installed, daemons advertise empty cap sets and `StandardPlacement` treats them as "runs anywhere" — back-compat with pre-Phase-6 consumers. Phase 6 of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+Without this dispatcher installed, daemons advertise empty cap sets and `StandardPlacement` treats them as "runs anywhere" — back-compat with pre-Phase-6 consumers. Phase 6 of `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
 
 **Lifecycle:**
 
@@ -413,7 +413,7 @@ The dispatcher is invoked at BOTH the initial-spawn path and the migration-targe
 
 ### Custom placement-filter callback (Phase 7)
 
-Path A (`StandardPlacement` config-driven scoring) is the default; this is the **escape hatch** when the in-tree axes don't capture the placement decision the operator needs. The substrate calls back into the consumer (C / language X) once per candidate when scoring; the consumer returns keep / drop. Phase 7 of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md` — full prose lives in the plan.
+Path A (`StandardPlacement` config-driven scoring) is the default; this is the **escape hatch** when the in-tree axes don't capture the placement decision the operator needs. The substrate calls back into the consumer (C / language X) once per candidate when scoring; the consumer returns keep / drop. Phase 7 of `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md` — full prose lives in the plan.
 
 Symbols are in `libnet_compute` (separate cdylib), declared in `net.go.h` next to the existing daemon dispatcher.
 

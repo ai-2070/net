@@ -18,7 +18,7 @@
 //! [`OverflowPushSink`] trait so the tick can be unit-tested
 //! against a recorder without spinning up a real mesh.
 //!
-//! [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`]: ../../../../../docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
+//! [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`]: ../../../../../docs/internal/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

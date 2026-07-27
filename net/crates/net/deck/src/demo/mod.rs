@@ -4,7 +4,7 @@
 //! of N `(Mesh, MeshOsRuntime, DaemonRuntime)` triples
 //! provisioned by `net_sdk::testing::ClusterHarness`.
 //!
-//! See `crates/net/docs/plans/DECK_DEMO_PLAN.md` for the
+//! See `docs/internal/plans/DECK_DEMO_PLAN.md` for the
 //! design rationale and phase breakdown. Phase 1 (this slice)
 //! boots the cluster and registers a `HeartbeatDaemon` per
 //! node — enough for LOGS / MESH.EVENTS / NODES / NET.MAP /

@@ -460,5 +460,5 @@ When any of these activate, ship Phase A; phases B-G follow as needed by the spe
 - [`CAPABILITY_SYSTEM_PLAN.md`](CAPABILITY_SYSTEM_PLAN.md) — Warriors phase; provides the `PlacementFilter` primitive that this scheduler applies recursively
 - [`MESHDB_PLAN.md`](MESHDB_PLAN.md) — federated query layer; surfaces cluster-wide scheduling state
 - [`CORTEX_ADAPTER_PLAN.md`](CORTEX_ADAPTER_PLAN.md) — local fold layer; daemon state migration relies on its snapshot/restore primitives
-- [`../misc/DATAFORTS_PLAN.md`](../misc/DATAFORTS_PLAN.md) — original deferral context: continuous rebalancing was named as Atomic Playboys candidate
+- [`../misc/DATAFORTS_PLAN.md`](DATAFORTS_PLAN.md) — original deferral context: continuous rebalancing was named as Atomic Playboys candidate
 - `RELEASE_ROADMAP.md` — Atomic Playboys release context

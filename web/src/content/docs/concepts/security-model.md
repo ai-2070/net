@@ -91,7 +91,7 @@ raw-bytes path. Net cannot move funds because it never holds the ability to.
 Security issues should go to the maintainers privately rather than through a
 public issue. Internal security audits of the core crate and the channel-auth
 path live under
-[`docs/misc/`](https://github.com/ai-2070/net/tree/master/net/crates/net/docs/misc)
+[`docs/internal/misc/`](https://github.com/ai-2070/net/tree/master/net/crates/net/docs/misc)
 in the repository.
 
 ## See also

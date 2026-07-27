@@ -448,7 +448,7 @@ Wire-level details and the subprotocol layout live in
 The substrate's `CapabilitySet` is a `{ tags, metadata }` wire shape
 post-Phase A.5.N. Beyond `announce_capabilities` / `find_nodes`, the
 SDK exposes the caller-local enhancement layer mirroring
-[`CAPABILITY_ENHANCEMENTS_PLAN.md`](../docs/plans/CAPABILITY_ENHANCEMENTS_PLAN.md):
+[`CAPABILITY_ENHANCEMENTS_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_ENHANCEMENTS_PLAN.md):
 
 ```rust
 use net_sdk::capabilities::{
@@ -1081,9 +1081,9 @@ resolves to the announcement-side `node_id` via a
 `CapabilityIndex::get_by_origin_hash` side index — the same lookup
 the greedy + migration admission gates use for `chain_caps`.
 
-See [`docs/misc/DATAFORTS_FEATURES.md`](../docs/misc/DATAFORTS_FEATURES.md)
+See [`docs/internal/plans/DATAFORTS_FEATURES.md`](../../../../docs/internal/plans/DATAFORTS_FEATURES.md)
 for the original audit and
-[`docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](../docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md)
+[`docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](../../../../docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md)
 for the v0.2 substrate-owned blob CAS plan + shipping status.
 
 ## nRPC (request / response over the mesh)
@@ -1643,7 +1643,7 @@ that triggered it or override the threshold.
 
 The full plan, including the cross-binding contract that
 keeps every language SDK on the same trait shape, lives at
-[`docs/plans/MESHOS_SDK_PLAN.md`](../docs/plans/MESHOS_SDK_PLAN.md).
+[`docs/internal/plans/MESHOS_SDK_PLAN.md`](../../../../docs/internal/plans/MESHOS_SDK_PLAN.md).
 
 ## Deck (operator SDK)
 
@@ -1766,7 +1766,7 @@ discriminator format every cross-language SDK shares — parse
 once, route on `KIND`. The full plan (including the
 intentional non-goals — no topology/identity management, no
 chain-mutation outside signed admin commits, no UI rendering)
-lives at [`docs/plans/DECK_SDK_PLAN.md`](../docs/plans/DECK_SDK_PLAN.md).
+lives at [`docs/internal/plans/DECK_SDK_PLAN.md`](../../../../docs/internal/plans/DECK_SDK_PLAN.md).
 
 ## API
 

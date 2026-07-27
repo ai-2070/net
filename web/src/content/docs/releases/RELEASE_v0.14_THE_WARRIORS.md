@@ -8,7 +8,7 @@ description: "Release notes for Net v0.14 — The Warriors — what shipped, wha
 
 v0.14 lands **cross-node replication for RedEX channels** end-to-end across the substrate and all five bindings. v0.13 ("Chippin' In") made capability the load-bearing layer; v0.14 makes replication the load-bearing layer underneath the channel surface. `SUBPROTOCOL_REDEX` is now a real wire codec, `ReplicationCoordinator` is a real tokio runtime task with a 4-state machine pinned per plan §3, leader election is deterministic nearest-RTT with a NodeId tiebreak (no broadcast, no epoch — microseconds-wide convergence), and catch-up is pull-based with bandwidth budgets and a 64 MiB hard ceiling. Every binding exposes the same `enable_replication(mesh)` / `open_file(name, cfg.with_replication(Some(rep)))` surface and the same per-channel Prometheus snapshot.
 
-The hardening posture from the Black Diamond line continues — every new surface ships with handle-lifetime, panic-safety, FFI-soundness, lock-order, and cancel-safety guarantees consistent with v0.11 / v0.12 / v0.13 — and a sixty-four-item second-pass review (`docs/misc/CODE_REVIEW_2026_05_11_REDEX_DISTRIBUTED.md`) shipped its closure commits before the v0.14 branch cut.
+The hardening posture from the Black Diamond line continues — every new surface ships with handle-lifetime, panic-safety, FFI-soundness, lock-order, and cancel-safety guarantees consistent with v0.11 / v0.12 / v0.13 — and a sixty-four-item second-pass review (`docs/internal/misc/CODE_REVIEW_2026_05_11_REDEX_DISTRIBUTED.md`) shipped its closure commits before the v0.14 branch cut.
 
 Alongside the replication landing, v0.14 carries two cross-cutting breaking changes: capability hardware / network units switch from MB / Mbps to GB / Gbps end-to-end, and the predicate-on-the-wire header renames from `cyberdeck-where:` to `net-where:` (predicate envelope ABI bumped to `2`).
 
@@ -16,7 +16,7 @@ Alongside the replication landing, v0.14 carries two cross-cutting breaking chan
 
 ## RedEX Distributed (substrate)
 
-The implementation plan in [`REDEX_DISTRIBUTED_PLAN.md`](https://github.com/ai-2070/net/blob/master/net/crates/net/docs/plans/REDEX_DISTRIBUTED_PLAN.md) phases A–I all closed before v0.14. The shape:
+The implementation plan in [`REDEX_DISTRIBUTED_PLAN.md`](https://github.com/ai-2070/net/blob/master/docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md) phases A–I all closed before v0.14. The shape:
 
 ### `ReplicationConfig`
 
@@ -124,7 +124,7 @@ The plan's test matrix landed in full:
 
 ## Hardening — `redex-distributed` second-pass review
 
-A two-pass review of the replication branch (`docs/misc/CODE_REVIEW_2026_05_11_REDEX_DISTRIBUTED.md`) landed sixty-four numbered items (R-1..R-64) plus four coverage gaps (C-1..C-4). The first pass closed forty-four; the second-pass review on 2026-05-12 surfaced one regression in the original R-23 fix plus nineteen new items; all closed before the v0.14 branch cut. Grouped by area:
+A two-pass review of the replication branch (`docs/internal/misc/CODE_REVIEW_2026_05_11_REDEX_DISTRIBUTED.md`) landed sixty-four numbered items (R-1..R-64) plus four coverage gaps (C-1..C-4). The first pass closed forty-four; the second-pass review on 2026-05-12 surfaced one regression in the original R-23 fix plus nineteen new items; all closed before the v0.14 branch cut. Grouped by area:
 
 ### Runtime / coordinator correctness
 

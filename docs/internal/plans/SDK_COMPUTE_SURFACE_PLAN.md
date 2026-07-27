@@ -10,7 +10,7 @@ The `net` crate ships a compute-on-mesh layer that no SDK exposes today:
 - **`Scheduler`** — placement-only (given a `CapabilityFilter`, pick a node). Not a persistent orchestrator.
 - **`MigrationOrchestrator`** — six-phase state machine (`Snapshot → Transfer → Restore → Replay → Cutover → Complete`) over `SUBPROTOCOL_MIGRATION` (0x0500). Stateless source/target handlers, stateful orchestrator.
 
-Design reference: [`COMPUTE.md`](COMPUTE.md) is the user-facing narrative. In-tree examples: `EchoDaemon` / `CounterDaemon` in `compute/host.rs` tests; end-to-end migration in `tests/three_node_integration.rs::test_migration_full_lifecycle_over_wire`.
+Design reference: [`COMPUTE.md`](../../../net/crates/net/docs/COMPUTE.md) is the user-facing narrative. In-tree examples: `EchoDaemon` / `CounterDaemon` in `compute/host.rs` tests; end-to-end migration in `tests/three_node_integration.rs::test_migration_full_lifecycle_over_wire`.
 
 This plan is **additive** on [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) and [`SDK_SECURITY_SURFACE_PLAN.md`](SDK_SECURITY_SURFACE_PLAN.md). It depends on identity (Stage A of the security plan) because daemons have an `EntityKeypair` identity — there is no sensible "anonymous daemon."
 
@@ -28,7 +28,7 @@ This plan is **additive** on [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) an
 - Automatic migration triggers (load-based, heartbeat-timeout-based). The core leaves this to the application; the SDK does not add one.
 - Scheduler as a persistent service. `Scheduler::place()` is a pure function today; keep it that way in the SDK.
 - CortEX-backed daemons as a distinct type. Daemons are storage-agnostic; using `TasksAdapter` from inside a daemon is an application choice, not a protocol coupling.
-- Permission-token gating on daemon execution. Capability matching is the v1 control mechanism per [`COMPUTE.md`](COMPUTE.md).
+- Permission-token gating on daemon execution. Capability matching is the v1 control mechanism per [`COMPUTE.md`](../../../net/crates/net/docs/COMPUTE.md).
 
 ## Coverage today
 

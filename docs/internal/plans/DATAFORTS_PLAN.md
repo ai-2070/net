@@ -1,6 +1,6 @@
 # Dataforts — Implementation Plan
 
-> Companion to [`misc/DATAFORTS_FEATURES.md`](misc/DATAFORTS_FEATURES.md). The features doc is the audit: which 25-of-28 wishlist items already ship and which are genuinely new work. **This doc sequences the new work across two coordinated releases** — phase order, gate criteria, scope boundaries, design decisions to lock, test strategy, risks, and effort. The frame: every phase **stays parked until its activation gate fires**. This is a "we know what to build when we have to" plan, not a build-everything roadmap.
+> Companion to [`misc/DATAFORTS_FEATURES.md`](DATAFORTS_FEATURES.md). The features doc is the audit: which 25-of-28 wishlist items already ship and which are genuinely new work. **This doc sequences the new work across two coordinated releases** — phase order, gate criteria, scope boundaries, design decisions to lock, test strategy, risks, and effort. The frame: every phase **stays parked until its activation gate fires**. This is a "we know what to build when we have to" plan, not a build-everything roadmap.
 
 ## Status
 
@@ -917,14 +917,14 @@ The activation gates haven't moved: ship reactively per phase when a real worklo
 
 ## See also
 
-- [`misc/DATAFORTS_FEATURES.md`](misc/DATAFORTS_FEATURES.md) — the audit that produced this plan
+- [`misc/DATAFORTS_FEATURES.md`](DATAFORTS_FEATURES.md) — the audit that produced this plan
 - [`REDEX_PLAN.md`](REDEX_PLAN.md) — single-node v1 substrate (phase predecessor)
 - [`REDEX_V2_PLAN.md`](REDEX_V2_PLAN.md) — single-node v2 (tiering, indices, typed wrappers — orthogonal to this plan)
-- [`misc/REDEX_MANIFEST_POINTER_DESIGN.md`](misc/REDEX_MANIFEST_POINTER_DESIGN.md) — on-disk layout for Phase 3's blob CAS
+- [`misc/REDEX_MANIFEST_POINTER_DESIGN.md`](../misc/REDEX_MANIFEST_POINTER_DESIGN.md) — on-disk layout for Phase 3's blob CAS
 - [`SCOPED_CAPABILITIES_PLAN.md`](SCOPED_CAPABILITIES_PLAN.md) — `scope:` tag convention reused by Phase 1
 - [`MULTIHOP_CAPABILITY_PLAN.md`](MULTIHOP_CAPABILITY_PLAN.md) — capability-announcement propagation that Phase 0 extends
 - [`CAPABILITY_BROADCAST_PLAN.md`](CAPABILITY_BROADCAST_PLAN.md) — broadcast machinery Phase 0 reuses
-- [`misc/NRPC_DESIGN.md`](misc/NRPC_DESIGN.md) — metrics + reliability surfaces Dataforts phases reuse
+- [`misc/NRPC_DESIGN.md`](../misc/NRPC_DESIGN.md) — metrics + reliability surfaces Dataforts phases reuse
 - [`CORTEX_ADAPTER_PLAN.md`](CORTEX_ADAPTER_PLAN.md) — local query layer that Phase 6's MeshDB would sit above
 - [`NETDB_PLAN.md`](NETDB_PLAN.md) — single-node query façade that MeshDB extends
-- [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) — user-facing storage narrative (each phase ships an additive section here)
+- [`STORAGE_AND_CORTEX.md`](../../../net/crates/net/docs/STORAGE_AND_CORTEX.md) — user-facing storage narrative (each phase ships an additive section here)

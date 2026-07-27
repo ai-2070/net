@@ -1,5 +1,5 @@
 //! Prometheus-shaped counters + gauges for the mesh-native blob
-//! adapter. Per the plan (`docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`
+//! adapter. Per the plan (`docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`
 //! § 6 / § 11), every adapter + node exposes:
 //!
 //! - `dataforts_blobs_stored_total{adapter}` — `store` /

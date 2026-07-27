@@ -139,7 +139,7 @@ pub use net::adapter::net::behavior::capability::{
 // by `net_sdk::subnets` — the auth types are 16/32-byte opaque
 // identifiers tied to the `CapabilityAnnouncement` allow-lists,
 // while the existing `SubnetId` is the 32-bit subnet-routing tag.
-// See `docs/plans/CAPABILITY_AUTH_PLAN.md` §"New identity types".
+// See `docs/internal/plans/CAPABILITY_AUTH_PLAN.md` §"New identity types".
 pub use net::adapter::net::behavior::group::GroupId as CapabilityGroupId;
 pub use net::adapter::net::behavior::subnet::SubnetId as CapabilitySubnetId;
 

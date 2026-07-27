@@ -1,6 +1,6 @@
 # Dataforts Blob Storage — implementation plan (v0.2)
 
-> Companion to [`DATAFORTS_PLAN.md`](../misc/DATAFORTS_PLAN.md). DATAFORTS_PLAN.md Phase 3 shipped in v0.15 as a `BlobRef` + `BlobAdapter` *hook* — the substrate carries the reference, the bytes live in the caller's existing storage system (S3, Ceph, IPFS, local FS). The single in-tree adapter is `FileSystemAdapter`. The plan also flags a deferred-but-named "full substrate-owned blob CAS" track. This document is that track: a **mesh-native blob store** that replaces the external-storage assumption with a content-addressed, chunked, RedEX-replicated layer composed against the v0.14 / v0.15 substrate. No new replication engine — chunks ride the existing `SUBPROTOCOL_REDEX` runtime. No S3 / IPFS / GCS integration. The mesh *is* the blob store.
+> Companion to [`DATAFORTS_PLAN.md`](DATAFORTS_PLAN.md). DATAFORTS_PLAN.md Phase 3 shipped in v0.15 as a `BlobRef` + `BlobAdapter` *hook* — the substrate carries the reference, the bytes live in the caller's existing storage system (S3, Ceph, IPFS, local FS). The single in-tree adapter is `FileSystemAdapter`. The plan also flags a deferred-but-named "full substrate-owned blob CAS" track. This document is that track: a **mesh-native blob store** that replaces the external-storage assumption with a content-addressed, chunked, RedEX-replicated layer composed against the v0.14 / v0.15 substrate. No new replication engine — chunks ride the existing `SUBPROTOCOL_REDEX` runtime. No S3 / IPFS / GCS integration. The mesh *is* the blob store.
 
 ## Status
 
@@ -358,7 +358,7 @@ Heat applies to blobs the same way it applies to chains, but with its own data s
 
 The shipped pipeline (PR-5j-a..d):
 
-1. **`BlobHeatRegistry`** ([`dataforts::gravity::BlobHeatRegistry`](../../src/adapter/net/dataforts/gravity/counter.rs)) — mirrors `HeatRegistry` keyed on `[u8; 32]`. Same LRU + cap discipline; same half-life decay.
+1. **`BlobHeatRegistry`** ([`dataforts::gravity::BlobHeatRegistry`](../../../net/crates/net/src/adapter/net/dataforts/gravity/counter.rs)) — mirrors `HeatRegistry` keyed on `[u8; 32]`. Same LRU + cap discipline; same half-life decay.
 2. **Fetch-path bump** — `MeshBlobAdapter::with_blob_heat(registry, half_life)` opts the adapter into bumping heat on every successful `fetch` / `fetch_range`. Only chunks the call actually touched bump (range fetches don't bump untouched chunks).
 3. **Tag emission** — `MeshBlobAdapter::tick_blob_heat(policy, sink)` walks the registry, applies decay, and routes each `Emit { rate }` / `Withdraw` decision through the `BlobHeatSink` trait. `MeshNode` implements the sink: the production wire form is a `heat:blob:<hex64>=<rate>` reserved tag added to the local `CapabilitySet` + rebroadcast via `announce_capabilities`. The `blob:` body sub-prefix keeps the tag disjoint from chain heat.
 4. **Migration controller** (G-3 below) consumes those tags.
@@ -371,12 +371,12 @@ The shipped pipeline (PR-5j-a..d):
 
 ### G-3 — Migration
 
-Per-node pull, not centralized push. Each node runs `drive_blob_migration_tick(local_caps, capability_index, adapter, size_resolver)` at the gravity-tick cadence ([`dataforts::blob::migration`](../../src/adapter/net/dataforts/blob/migration.rs)):
+Per-node pull, not centralized push. Each node runs `drive_blob_migration_tick(local_caps, capability_index, adapter, size_resolver)` at the gravity-tick cadence ([`dataforts::blob::migration`](../../../net/crates/net/src/adapter/net/dataforts/blob/migration.rs)):
 
 1. Walk peers in `capability_index`, parse each `heat:blob:<hex>=<rate>` tag via `parse_blob_heat_tag`.
 2. For each candidate `(hash, publisher_caps, rate)`, look up the chunk's wire size via the operator-supplied `size_resolver` callback.
-3. Run [`should_migrate_blob_to`](../../src/adapter/net/dataforts/blob/admission.rs) — the PR-5a primitive — against `local_caps + publisher_caps + size_bytes`. Verdict shape mirrors G-1's `should_pull_blob`.
-4. On admit, call [`BlobAdapter::prefetch`](../../src/adapter/net/dataforts/blob/adapter.rs) (PR-5i) with a `BlobRef::Small` constructed from `(hash, size)`. The adapter opens the chunk's content-addressed channel against the local Redex with replication config armed; the per-chunk replication runtime pulls the bytes from any holder advertising `causal:<hex>`.
+3. Run [`should_migrate_blob_to`](../../../net/crates/net/src/adapter/net/dataforts/blob/admission.rs) — the PR-5a primitive — against `local_caps + publisher_caps + size_bytes`. Verdict shape mirrors G-1's `should_pull_blob`.
+4. On admit, call [`BlobAdapter::prefetch`](../../../net/crates/net/src/adapter/net/dataforts/blob/adapter.rs) (PR-5i) with a `BlobRef::Small` constructed from `(hash, size)`. The adapter opens the chunk's content-addressed channel against the local Redex with replication config armed; the per-chunk replication runtime pulls the bytes from any holder advertising `causal:<hex>`.
 
 `drive_blob_migration_tick` returns a `BlobMigrationTickReport` with per-reason counters (`admitted`, `rejected_no_storage`, `rejected_gravity_disabled`, `rejected_proximity_zero`, `rejected_unhealthy`, `rejected_scope_mismatch`, `rejected_insufficient_disk`, `skipped_unknown_size`, `prefetch_errors`) so operators can dashboard the loop without hand-coding per-reason metrics.
 
@@ -668,11 +668,11 @@ If the workload comes via "we have S3 and want to keep using it" — v0.15's `Bl
 
 ## See also
 
-- [`DATAFORTS_PLAN.md`](../misc/DATAFORTS_PLAN.md) — the seven-phase plan including v0.15 Phase 3's external-hook shape.
-- [`DATAFORTS_FEATURES.md`](../misc/DATAFORTS_FEATURES.md) — the audit; mentions "deferred-but-named: full substrate-owned blob CAS" — this plan is that track.
+- [`DATAFORTS_PLAN.md`](DATAFORTS_PLAN.md) — the seven-phase plan including v0.15 Phase 3's external-hook shape.
+- [`DATAFORTS_FEATURES.md`](DATAFORTS_FEATURES.md) — the audit; mentions "deferred-but-named: full substrate-owned blob CAS" — this plan is that track.
 - [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`](DATAFORTS_BLOB_OVERFLOW_PLAN.md) — the v0.3 active overflow extension on top of this plan's pull-only posture.
 - [`REDEX_DISTRIBUTED_PLAN.md`](REDEX_DISTRIBUTED_PLAN.md) — the v0.14 replication runtime that blob chunks ride on. No replication-side changes needed for v0.2 blob.
-- [`RELEASE_v0.15_REBEL_YELL.md`](../releases/RELEASE_v0.15_REBEL_YELL.md) § Phase 3 — what shipped as the external-hook surface and what this plan extends.
+- [`RELEASE_v0.15_REBEL_YELL.md`](../../../web/src/content/docs/releases/RELEASE_v0.15_REBEL_YELL.md) § Phase 3 — what shipped as the external-hook surface and what this plan extends.
 
 ---
 

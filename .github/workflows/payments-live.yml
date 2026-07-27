@@ -21,7 +21,7 @@ name: Payments Live Conformance
 #     on a manual dispatch with `run_settle` checked AND the key present
 #     — a scheduled run never moves money.
 #
-# Record each run in `net/crates/net/docs/plans/PAYMENTS_P1_NETWORK_LADDER.md`
+# Record each run in `docs/internal/plans/PAYMENTS_P1_NETWORK_LADDER.md`
 # per its runbook (the doc is the ladder's go/no-go record).
 
 on:

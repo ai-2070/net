@@ -1031,7 +1031,7 @@ jobs:
 
   # net-payments benchmark-rot gate: compile (do not run) every bench so a
   # harness/API drift breaks CI, not the next person to run numbers.
-  # See docs/plans/PAYMENTS_BENCHMARKS_PLAN.md. `--no-run` means no
+  # See docs/internal/plans/PAYMENTS_BENCHMARKS_PLAN.md. `--no-run` means no
   # measurement, just typeck + link.
   #
   # Split out of `rust-sdk-tests`, where it was 696 of that job's 1140 seconds

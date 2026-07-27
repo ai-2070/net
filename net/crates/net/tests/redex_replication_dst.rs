@@ -1,5 +1,5 @@
 //! Deterministic-simulation tests for RedEX replication — Phase F
-//! of [`docs/plans/REDEX_DISTRIBUTED_PLAN.md`].
+//! of [`docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md`].
 //!
 //! These tests run the production state machine, election, catch-up,
 //! and heartbeat-tracker logic in a single-threaded deterministic

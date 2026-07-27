@@ -589,9 +589,9 @@ func main() {
 Errors surfaced as typed sentinels: `ErrBlob`, `ErrBlobClosed`,
 `ErrBlobInvalidConfig`.
 
-See [`docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md`](../net/crates/net/docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md)
+See [`docs/internal/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md`](../docs/internal/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md)
 for the active-overflow design + shipping status; see
-[`docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](../net/crates/net/docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md)
+[`docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md`](../docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md)
 for the v0.2 substrate-owned blob CAS design.
 
 ## Redis Streams consumer-side dedup helper

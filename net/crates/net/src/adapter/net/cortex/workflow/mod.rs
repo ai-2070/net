@@ -13,7 +13,7 @@
 //! deterministic fold ([`WorkflowFold`]) of transition events. The
 //! single writer is the task-lease holder; reopening the chain replays
 //! the history exactly (failover-resume). See
-//! `docs/plans/TASK_LIFECYCLE_PLAN.md`.
+//! `docs/internal/plans/TASK_LIFECYCLE_PLAN.md`.
 //!
 //! Phase A ships the state machine + replay here ([`WorkflowAdapter`])
 //! and the task lease in [`lease`]; triggers, shards, capability-

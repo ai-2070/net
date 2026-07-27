@@ -32,7 +32,7 @@ Every Net packet carries a `subprotocol_id: u16` identifying how the payload sho
 
 ### `SUBPROTOCOL_REDEX` dispatch codes (`0x0E00`)
 
-The replication subprotocol partitions its payload via a single `dispatch_code: u8` byte immediately after the 2-byte `subprotocol_id`. All multi-byte integers are **little-endian fixed-width** (no varints). `channel_id` is the 32-byte BLAKE2s hash of the channel name with the domain-separation label `"redex-channel-id-v1"`. See `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §2 for full byte layouts.
+The replication subprotocol partitions its payload via a single `dispatch_code: u8` byte immediately after the 2-byte `subprotocol_id`. All multi-byte integers are **little-endian fixed-width** (no varints). `channel_id` is the 32-byte BLAKE2s hash of the channel name with the domain-separation label `"redex-channel-id-v1"`. See `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` §2 for full byte layouts.
 
 | Code | Direction | Purpose | Size |
 |------|-----------|---------|------|

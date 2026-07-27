@@ -1,4 +1,4 @@
-//! OA-2 §2.5 of `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md` — the
+//! OA-2 §2.5 of `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md` — the
 //! admission replay guard.
 //!
 //! Authentication is never replay prevention (a pinned invariant):

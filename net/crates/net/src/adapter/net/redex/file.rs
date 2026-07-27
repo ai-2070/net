@@ -1145,7 +1145,7 @@ impl RedexFile {
     /// `state.index` is sorted by `seq` by construction, so the
     /// lookup uses [`slice::partition_point`] — O(log N) — to
     /// locate both range bounds. Pre-fix perf #52 in
-    /// `docs/performance/net-perf-analysis.md` this iterated the
+    /// `docs/internal/performance/net-perf-analysis.md` this iterated the
     /// whole index linearly to find `start`, then walked the tail
     /// to find `end` — O(N) per read regardless of range size.
     pub fn read_range(&self, start: u64, end: u64) -> Vec<RedexEvent> {

@@ -27,7 +27,7 @@
 //!   [`CountingRouter`] is the delivery barrier (counts every VERIFIED
 //!   dispatch outcome: `Inserted` / `Replaced` / `Rejected`).
 //!
-//! See `docs/plans/ISLAND_CLAIM_BENCHMARK_PLAN.md`.
+//! See `docs/internal/plans/ISLAND_CLAIM_BENCHMARK_PLAN.md`.
 
 #![allow(dead_code)]
 

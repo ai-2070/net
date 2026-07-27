@@ -1,7 +1,7 @@
 # RedEX + replication — Go FFI design note
 
 Companion to [`REDEX_DISTRIBUTED_PLAN.md`](REDEX_DISTRIBUTED_PLAN.md)
-Phase I and [`CONFIG_REPLICATION.md`](../CONFIG_REPLICATION.md). This
+Phase I and [`CONFIG_REPLICATION.md`](../../../net/crates/net/docs/CONFIG_REPLICATION.md). This
 doc scopes the Go FFI surface for Redex + replication so a future
 session can land it as focused mechanical work rather than a
 greenfield design exercise.

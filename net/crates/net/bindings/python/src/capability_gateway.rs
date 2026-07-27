@@ -1418,7 +1418,7 @@ mod tests {
 }
 
 /// The driven paid invoke through the **actual Python demand surface**
-/// (M3 of `docs/plans/PAYMENTS_TEST_MATRIX.md`): `build_payment_flow` →
+/// (M3 of `docs/internal/plans/PAYMENTS_TEST_MATRIX.md`): `build_payment_flow` →
 /// `do_invoke` (`gated_invoke` over a real `MeshGateway`) →
 /// `outcome_to_json`, exactly the composition `PyCapabilityGateway.invoke`
 /// wraps, against a real two-node paid provider.

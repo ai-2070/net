@@ -5,7 +5,7 @@
 The channel token-auth root-of-trust fix
 ([`docs/misc/SECURITY_AUDIT_2026_05_29_CHANNEL_AUTH.md`](../misc/SECURITY_AUDIT_2026_05_29_CHANNEL_AUTH.md))
 replaced the bare-token credential with a root-anchored
-[`TokenChain`](../src/adapter/net/identity/token.rs). A presented
+[`TokenChain`](../../../net/crates/net/src/adapter/net/identity/token.rs). A presented
 credential is now only honored if it roots at one of the channel's
 `token_roots`.
 

@@ -1,6 +1,6 @@
 //! nRPC — request/response on top of CortEX folds.
 //!
-//! See `docs/misc/NRPC_DESIGN.md` for the full architectural framing.
+//! See `docs/internal/misc/NRPC_DESIGN.md` for the full architectural framing.
 //! In short: an RPC server is a `RedexFold` whose state is the
 //! in-flight call set, whose events are typed `(REQUEST, RESPONSE,
 //! CANCEL, DEADLINE_EXCEEDED)`, whose `EventMeta::seq_or_ts` is the
@@ -325,7 +325,7 @@ pub enum RpcStatus {
     /// v0.4 capability-auth: the target's `CapabilityAnnouncement`
     /// either does not list the requested `nrpc:<service>` tag, or
     /// lists it with allow-lists the caller does not match. See
-    /// `docs/plans/CAPABILITY_AUTH_PLAN.md` §3. Distinct from
+    /// `docs/internal/plans/CAPABILITY_AUTH_PLAN.md` §3. Distinct from
     /// `Unauthorized` (channel-auth / token-scope failures) so
     /// operators can tell the two enforcement surfaces apart in
     /// audit logs.
@@ -452,7 +452,7 @@ pub struct RpcRequestPayload {
     ///
     /// Held as [`Bytes`] so [`Self::decode`] can zero-copy `slice_ref`
     /// the body out of the inbound event's `Bytes` payload — pre-fix
-    /// perf #84 in `docs/performance/net-perf-analysis.md` this was
+    /// perf #84 in `docs/internal/performance/net-perf-analysis.md` this was
     /// `Vec<u8>` and every decode did a `data[body_start..body_end].to_vec()`
     /// (a memcpy per frame). For high-RPS systems doing 100K+ RPCs/sec
     /// with 1 KB+ bodies that was 100+ MB/sec of pure memcpy.

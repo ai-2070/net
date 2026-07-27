@@ -6706,7 +6706,7 @@ pub struct MeshNode {
     /// the same `SUBPROTOCOL_FOLD` dispatch as capability +
     /// reservation announcements; the gang scheduler reads it
     /// alongside the capability fold for the numeric-filter step. See
-    /// `docs/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md`.
+    /// `docs/internal/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md`.
     island_fold: Arc<super::behavior::fold::Fold<super::behavior::fold::IslandTopologyFold>>,
     /// Hosts MeshOS currently observes as Unreachable. The gang matcher
     /// ([`Self::match_islands`]) prunes these from the candidate set so a
@@ -16127,7 +16127,7 @@ impl MeshNode {
         // u64 collisions are 2^-32 (effectively impossible) and
         // adversarial collisions take ~2^32 work per target, and
         // populate first-write-wins so a legitimate publisher's
-        // claim isn't displaced. See `docs/plans/WIRE_ORIGIN_HASH_64BIT.md`.
+        // claim isn't displaced. See `docs/internal/plans/WIRE_ORIGIN_HASH_64BIT.md`.
         //
         // Snapshotted once per packet rather than per-event; every
         // event in the same packet shares the same publisher.
@@ -23173,7 +23173,7 @@ impl MeshNode {
         // member). In practice queue-group members share a
         // capability posture (same operator, same tokens), so the
         // failure case is rare; documented in
-        // `docs/misc/NRPC_DESIGN.md` open-questions.
+        // `docs/internal/misc/NRPC_DESIGN.md` open-questions.
         let mut subscribers = self.roster.dispatch_recipients(publisher.channel());
 
         // Subnet visibility + AuthGuard filters folded into a single
@@ -23380,7 +23380,7 @@ impl MeshNode {
                 // clone the `Arc` per spawned task instead of
                 // calling `events.to_vec()` per peer. Pre-fix
                 // [discovery-routing perf #109 in
-                // `docs/performance/net-discovery-routing-analysis.md`]
+                // `docs/internal/performance/net-discovery-routing-analysis.md`]
                 // a 100-subscriber × 1000-event broadcast did 100
                 // Vec allocations + 100K `Bytes` refcount bumps;
                 // post-fix it's 1 Vec alloc + 1K `Bytes` bumps +
@@ -24840,7 +24840,7 @@ impl MeshNode {
     //
     // Capability Phase B: `Mesh::announce_chain` / `announce_chain_range`
     // / `withdraw_chain` / `find_chain_holders` per
-    // `docs/plans/CAPABILITY_SYSTEM_PLAN.md` §B. Mutates the user-
+    // `docs/internal/plans/CAPABILITY_SYSTEM_PLAN.md` §B. Mutates the user-
     // supplied capability baseline atomically + re-broadcasts via
     // `announce_capabilities`; the nrpc / nat tags layered on at
     // broadcast time aren't re-augmented twice. Each helper is
@@ -25068,7 +25068,7 @@ impl MeshNode {
     /// before calling.
     ///
     /// Rebel Yell Phase 4. See
-    /// `docs/misc/DATAFORTS_PLAN.md` § Phase 4.
+    /// `docs/internal/misc/DATAFORTS_PLAN.md` § Phase 4.
     #[cfg(feature = "dataforts")]
     pub async fn announce_heat(&self, origin_hash: u64, rate: f64) -> Result<(), AdapterError> {
         let hex = Self::chain_hex(origin_hash);

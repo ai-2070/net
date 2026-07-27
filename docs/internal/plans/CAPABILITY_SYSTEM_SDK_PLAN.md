@@ -852,5 +852,5 @@ The enhancement-track phase (9) lands incrementally as each `CAPABILITY_ENHANCEM
 - [`SDK_GROUPS_SURFACE_PLAN.md`](SDK_GROUPS_SURFACE_PLAN.md) — sister SDK plan for the groups surface; same patterns
 - [`SDK_PYTHON_PARITY_PLAN.md`](SDK_PYTHON_PARITY_PLAN.md) — Python-specific SDK parity considerations
 - [`SDK_GO_PARITY_PLAN.md`](SDK_GO_PARITY_PLAN.md) — Go-specific SDK parity considerations
-- [`misc/NRPC_DESIGN.md`](misc/NRPC_DESIGN.md) — pattern for cross-binding wrapper layers; `tests/cross_lang_nrpc/golden_vectors.json` is the fixture-format precedent this plan mirrors
+- [`misc/NRPC_DESIGN.md`](../misc/NRPC_DESIGN.md) — pattern for cross-binding wrapper layers; `tests/cross_lang_nrpc/golden_vectors.json` is the fixture-format precedent this plan mirrors
 - `RELEASE_ROADMAP.md` — The Warriors release context

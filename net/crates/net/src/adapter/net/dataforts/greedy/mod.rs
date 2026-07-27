@@ -14,7 +14,7 @@
 //! metrics surface land in subsequent slices — this slice is the
 //! decision substrate the runtime composes against.
 //!
-//! Locked design decisions live in `docs/misc/DATAFORTS_PLAN.md`
+//! Locked design decisions live in `docs/internal/misc/DATAFORTS_PLAN.md`
 //! § Phase 1 — Greedy-LRU dataforts — locked decisions.
 
 mod admission;

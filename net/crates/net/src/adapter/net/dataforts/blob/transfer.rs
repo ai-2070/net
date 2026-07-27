@@ -3,7 +3,7 @@
 //! On-demand cross-peer blob fetch that moves bytes over the router's
 //! reliable, scheduled streams — NOT RedEX replication (a replication
 //! primitive) and NOT nRPC (a request/reply primitive). See
-//! `docs/plans/FAIRSCHEDULER_TRANSPORT_PLAN.md`.
+//! `docs/internal/plans/FAIRSCHEDULER_TRANSPORT_PLAN.md`.
 //!
 //! T-1 (this slice): the subprotocol ID and the stream-allocation
 //! convention. The control packet that initiates a transfer and the

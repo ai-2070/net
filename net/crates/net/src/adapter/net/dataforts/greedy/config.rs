@@ -1,6 +1,6 @@
 //! `GreedyConfig` — per-node tuning surface for the greedy-LRU
 //! dataforts subsystem. Locked defaults match
-//! `docs/misc/DATAFORTS_PLAN.md` § Phase 1.
+//! `docs/internal/misc/DATAFORTS_PLAN.md` § Phase 1.
 
 use std::time::Duration;
 

@@ -1,6 +1,6 @@
 //! Forwarded invocation context — the spec-only foundation for opt-in,
 //! filtered, deny-by-default credential & header forwarding
-//! (`docs/plans/MCP_CREDENTIAL_FORWARDING_PLAN.md`, **Phase 0**).
+//! (`docs/internal/plans/MCP_CREDENTIAL_FORWARDING_PLAN.md`, **Phase 0**).
 //!
 //! # Posture
 //!
