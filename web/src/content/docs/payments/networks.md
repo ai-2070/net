@@ -37,6 +37,40 @@ Enabling a real network for a deployment means: list it in the spend policy's
 have a chain checker for it. The registry is the asset allowlist; it is not the
 enablement switch.
 
+## Config packs
+
+A pack is a pre-filled `FacilitatorConfig` for a known facilitator — endpoint,
+the `(scheme, network)` pairs it offers, chain RPC endpoints for the independent
+checker, and the tier to require before serving:
+
+```rust
+use net_payments::facilitator::packs;
+
+let sepolia = packs::x402_org_base_sepolia();          // no credentials needed
+let base    = packs::cdp_base_mainnet("secret://cdp"); // secret *ref*, not a key
+let solana  = packs::cdp_solana_mainnet("secret://cdp");
+let xrpl    = packs::t54_xrpl_mainnet();
+```
+
+Credentials are passed as **references** the deployment resolves, never as
+literals in config — the same reason the signer seam takes a callback rather
+than a key.
+
+Two fields on the config are worth setting deliberately rather than inheriting.
+`required_tier` is per CAIP-2 network and defaults to `observed`, which is
+receipt-trust; if you want depth, say so. And `rpc_endpoints` is what the
+independent checker queries — without one, nothing can promote a payment above
+`observed` no matter what the facilitator reports.
+
+## Mock is the conformance backbone
+
+Every example in this section, and the compiled
+[`docs_payments.rs`](https://github.com/ai-2070/net/blob/master/net/crates/net/payments/examples/docs_payments.rs),
+runs against `MockFacilitator` and `default_mock_registry`. That's deliberate:
+the mock rung exercises the identical lifecycle with no real value at stake, so
+a demo can't quietly train the policy path wrong. Under
+`SpendProfile::Production`, even a mock spend needs an approval.
+
 ## Why config-not-code matters
 
 A new payment *scheme* (EVM `exact`, SVM `exact`, XRPL `exact`) is real

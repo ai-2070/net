@@ -23,6 +23,27 @@ invoked over the mesh (nRPC); the x402 payment material rides as opaque preserve
 bytes inside the invocation. HTTP 402 is an adapter path for web APIs, not a
 requirement for Net providers ([x402 and Net](/docs/payments/x402-and-net)).
 
+## Run it first
+
+If you'd rather see the whole loop before reading about it, the compiled
+[`examples/docs_payments.rs`](https://github.com/ai-2070/net/blob/master/net/crates/net/payments/examples/docs_payments.rs)
+drives announced terms → provider-signed quote → caller spend policy → x402
+payload → verify + settle → billing, in one process against the mock
+facilitator:
+
+```sh
+cargo run -p net-payments --example docs_payments
+```
+
+```
+paid; redemption binding = 031cc917c742f74e…
+billed 2500 for docs-provider/summarize
+billing event df9efd87267bfd6d…  — 2500
+```
+
+Every Rust snippet in this section comes from that file, so CI compiles the
+docs along with the crate.
+
 ## Start here
 
 - [What Net Payments is (and is not)](/docs/payments/what-net-payments-is)
