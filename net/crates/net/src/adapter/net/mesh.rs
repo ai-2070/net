@@ -5378,6 +5378,17 @@ fn move_routing_authority<R>(
         // the epoch moves (Kyra OLB-2B-E3c).
         let advance = authority.advance();
         let live = authority.epoch();
+        // Test-only, under the gate, AFTER the advance and BEFORE the
+        // publication: nothing this transaction publishes may be visible yet.
+        // The post-publication hook proves "not too late"; only this one proves
+        // "not too early", which is the half the epoch-first ordering exists for.
+        #[cfg(test)]
+        {
+            let hook = authority.pre_publish_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(live);
+            }
+        }
         let result = publish();
         // Test-only, fired STILL UNDER THE GATE and after the whole publication:
         // the one instant at which "everything this epoch names is visible" must
@@ -5478,13 +5489,30 @@ struct RoutingAuthority {
     /// Test-only: fired inside [`move_routing_authority`] with the gate still
     /// HELD, immediately after the publication closure returns. Receives the
     /// epoch the publication was made under (OLB-2C).
+    ///
+    /// This alone witnesses only "not published too LATE". Its sibling below is
+    /// the other direction, and both are needed.
     #[cfg(test)]
-    post_publish_hook: parking_lot::Mutex<Option<PostPublishHook>>,
+    post_publish_hook: parking_lot::Mutex<Option<PublishPhaseHook>>,
+    /// Test-only: fired inside [`move_routing_authority`] with the gate HELD,
+    /// after the epoch advance and BEFORE the publication closure runs.
+    ///
+    /// The epoch-first discipline has two halves, and `post_publish_hook` proves
+    /// only one of them. Publishing EARLY — before the advance — is the hazard
+    /// `move_routing_authority`'s own doc comment describes: a reader observes
+    /// the new object under the OLD epoch identity and serves it as
+    /// old-authoritative. At this instant nothing the transaction publishes may
+    /// be visible yet, so a witness that samples here catches exactly that
+    /// (found by an adversarial re-read of the OLB-2C witnesses, 2026-07-27:
+    /// all four passed under a publish-before-advance mutation).
+    #[cfg(test)]
+    pre_publish_hook: parking_lot::Mutex<Option<PublishPhaseHook>>,
 }
 
-/// Test-only observer of a completed authority publication, still under the gate.
+/// Test-only observer of one phase of an authority publication, still under the
+/// gate. Receives the epoch the transaction advanced to.
 #[cfg(test)]
-type PostPublishHook = Arc<dyn Fn(u64) + Send + Sync>;
+type PublishPhaseHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 impl RoutingAuthority {
     fn new() -> Self {
@@ -5496,6 +5524,8 @@ impl RoutingAuthority {
             contention_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             post_publish_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            pre_publish_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -9839,8 +9869,15 @@ impl MeshNode {
     ///
     /// It runs on BOTH publication paths, including the `Ok(false)` no-visible-
     /// store-change return — an authority rotation over an unchanged store is
-    /// still an authority movement, and skipping the bump there is exactly the
-    /// hole this parameter exists to close.
+    /// still an authority movement, so skipping the bump there would be a hole.
+    ///
+    /// That second path is FAIL-CLOSED, not production-reachable: this helper's
+    /// only `Some` caller is `install_node_authority_inner`, which always passes
+    /// `authority.revocation` as the store, so `authority_changed &&
+    /// !store_changed` would need two `NodeAuthority`s sharing one store `Arc` —
+    /// which no constructor produces. It is witnessed structurally
+    /// (`an_authority_rotation_over_the_same_store_still_publishes_inside_the_epoch`)
+    /// precisely because nothing else exercises it.
     fn install_org_revocation_store_locked(
         &self,
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,

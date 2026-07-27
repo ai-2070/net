@@ -1090,3 +1090,51 @@ pin-refusal call intact, so the witness passes leg 1 and fails leg 2. The earlie
 mutation disabled the shared helper and stopped at the first assertion, which
 proves the helper but not both call sites. That mutation is the independent
 reviewer's to run.
+
+### Self-directed adversarial re-read of the OLB-2C witnesses — 2026-07-27
+
+Run at the user's request against `61211c9ed`, read-only (the mutation lane
+belongs to the independent reviewer). It does NOT count toward the independent
+gate — the brief was written by the author of the code under review — but it
+found a real defect, so it is recorded rather than discarded.
+
+**All four OLB-2C witnesses tested only ONE direction of the ordering.** They
+detect "published too late" and are blind to "published too EARLY". Confirmed by
+mutation, not by reading: with
+
+```rust
+publish();                                   // BEFORE the advance
+move_routing_authority(&authority, &registry, || {});
+```
+
+the wiring group ran **45 passed / 0 failed**. Every assertion is satisfied
+because the post-publication observer sees the new authority either way.
+
+Early publication is not a hypothetical: `move_routing_authority`'s own doc
+comment describes it as the hazard the epoch-first ordering exists to prevent — a
+reader observes the new object under the OLD epoch identity and serves it as
+old-authoritative. So the half of the ordering that the whole protocol is FOR was
+the unwitnessed half, in witnesses whose stated purpose is that ordering.
+
+**Closed** by `RoutingAuthority::pre_publish_hook`, fired under the gate after
+the advance and before the publication, where nothing the transaction publishes
+may be visible yet. Both authority witnesses now assert it. RED-verified
+separately on each branch: the changed-store witness fails under a publish-early
+mutation on its path, the unchanged-store witness fails under one on its path,
+and in each case it is the only witness that fails.
+
+Two lesser items from the same pass:
+
+- the unchanged-store witness's "store stays pointer-identical" assertion cannot
+  fail on any reachable path (the same `Arc` is both input and expected value).
+  Kept, relabelled as a PRECONDITION marker rather than counted as evidence.
+- the `also_publish` doc comment implied its second branch was
+  production-reachable. Corrected: it is fail-closed, since the only `Some`
+  caller always passes `authority.revocation`.
+
+**Generalisation worth keeping.** Three witness defects in this closure now share
+one shape: each proved a property in one direction and was blind to its inverse.
+The floor witness acknowledged before the barrier instead of after a proven
+failed acquisition; the OLB-2C witnesses caught late publication and not early.
+For any ordering claim "A must happen before B", a witness that only observes
+after B is at best half a proof.

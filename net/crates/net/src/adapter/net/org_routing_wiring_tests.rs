@@ -3470,6 +3470,30 @@ async fn an_authority_install_publishes_the_authority_under_its_own_epoch() {
 
     let next = adopt_authority(&node, &org, "b");
 
+    // The OTHER half of the ordering: at the instant AFTER the epoch advance and
+    // BEFORE the publication, nothing this transaction publishes may be visible
+    // yet. Without it, a mutation that publishes the authority BEFORE the advance
+    // leaves every other assertion satisfied — the post-publication observer sees
+    // the new authority either way. Publishing early is the hazard
+    // `move_routing_authority` documents: a reader observes the new object under
+    // the OLD epoch identity and serves it as old-authoritative.
+    let early = Arc::new(AtomicBool::new(false));
+    {
+        let early = early.clone();
+        let premature = next.clone();
+        let weak = Arc::downgrade(&node);
+        *node.routing_authority.pre_publish_hook.lock() = Some(Arc::new(move |_epoch| {
+            if let Some(node) = weak.upgrade() {
+                if node
+                    .node_authority()
+                    .is_some_and(|live| Arc::ptr_eq(&live, &premature))
+                {
+                    early.store(true, Ordering::Release);
+                }
+            }
+        }));
+    }
+
     // Sample the authority the node exposes at the publication instant.
     let observed: Arc<parking_lot::Mutex<Vec<(u64, bool)>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -3494,7 +3518,12 @@ async fn an_authority_install_publishes_the_authority_under_its_own_epoch() {
     node.install_node_authority(next.clone())
         .expect("install B");
     *node.routing_authority.post_publish_hook.lock() = None;
+    *node.routing_authority.pre_publish_hook.lock() = None;
 
+    assert!(
+        !early.load(Ordering::Acquire),
+        "the replacement authority was already visible BEFORE the epoch advance          — a reader in that window observes it under the OLD epoch identity"
+    );
     let observed = observed.lock().clone();
     assert_eq!(
         observed.len(),
@@ -3623,6 +3652,29 @@ async fn an_authority_rotation_over_the_same_store_still_publishes_inside_the_ep
 
     let advances = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let visible_in_callback = Arc::new(AtomicBool::new(false));
+    // The OTHER half of the ordering: at the instant AFTER the epoch advance and
+    // BEFORE the publication, nothing this transaction publishes may be visible
+    // yet. Without it, a mutation that publishes the authority BEFORE the advance
+    // leaves every other assertion satisfied — the post-publication observer sees
+    // the new authority either way. Publishing early is the hazard
+    // `move_routing_authority` documents: a reader observes the new object under
+    // the OLD epoch identity and serves it as old-authoritative.
+    let early = Arc::new(AtomicBool::new(false));
+    {
+        let early = early.clone();
+        let premature = replacement.clone();
+        let weak = Arc::downgrade(&node);
+        *node.routing_authority.pre_publish_hook.lock() = Some(Arc::new(move |_epoch| {
+            if let Some(node) = weak.upgrade() {
+                if node
+                    .node_authority()
+                    .is_some_and(|live| Arc::ptr_eq(&live, &premature))
+                {
+                    early.store(true, Ordering::Release);
+                }
+            }
+        }));
+    }
     {
         let advances = advances.clone();
         let visible = visible_in_callback.clone();
@@ -3659,12 +3711,20 @@ async fn an_authority_rotation_over_the_same_store_still_publishes_inside_the_ep
         .expect("re-installing the exact same store is accepted")
     };
     *node.routing_authority.post_publish_hook.lock() = None;
+    *node.routing_authority.pre_publish_hook.lock() = None;
 
+    assert!(
+        !early.load(Ordering::Acquire),
+        "the replacement authority was already visible BEFORE the epoch advance          — a reader in that window observes it under the OLD epoch identity"
+    );
     assert!(
         !store_changed,
         "precondition: the same store `Arc` is not a visible store change — \
          without this the test would silently be exercising the OTHER branch"
     );
+    // Cannot fail on any reachable path — the same `Arc` is both the input and
+    // what the other branch would store — so it is kept as a PRECONDITION marker
+    // for the reader, not counted as evidence.
     assert!(
         Arc::ptr_eq(
             &installed_store,
@@ -3673,7 +3733,7 @@ async fn an_authority_rotation_over_the_same_store_still_publishes_inside_the_ep
                 .load_full()
                 .expect("store still installed")
         ),
-        "the store must remain pointer-identical across an authority-only rotation"
+        "precondition marker: the store is pointer-identical on this branch"
     );
     assert_eq!(
         advances.load(Ordering::Acquire),
