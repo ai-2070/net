@@ -37,6 +37,10 @@ jobs:
       # workflow — is information-only / non-gating. Narrowing this list
       # silently drops every feature-gated unit test out of CI.
       UNIT_FEATURES: "net redex redex-disk cortex netdb meshdb meshos dataforts nat-traversal port-mapping tool batched-ingress cli regex"
+      # sccache trial job #1 of 3 (see the shared note in `integration-net-core`).
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: "0"
     defaults:
       run:
         working-directory: net/crates/net
@@ -46,21 +50,41 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      # Replaces the hand-rolled `actions/cache` block this job used to carry.
+      # That block keyed solely on `hashFiles('**/Cargo.lock')` with NO
+      # `restore-keys`, and GitHub cache entries are immutable: the first run to
+      # save under a given lockfile hash froze the target dir at that moment, and
+      # every lockfile bump after it fell back to a fully cold build. The last
+      # green master run missed on every single job for exactly that reason
+      # (`Cache not found for input keys: Linux-cargo-…`), then recompiled the
+      # whole dep graph. `rust-cache` keys on lockfile + rustc version + job and
+      # carries prefix `restore-keys`, so a lockfile bump restores the previous
+      # entry and rebuilds only what changed. It also prunes the target dir
+      # before saving, which is what shrinks the 79-91s "Post Cache cargo"
+      # upload these jobs were paying.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-unit-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: unit
+          workspaces: net/crates/net -> target
 
       # `--lib` runs EVERY in-source `#[cfg(test)]` unit; the broad
       # `$UNIT_FEATURES` set is what makes feature-gated modules (meshos,
       # port-mapping, …) actually compile + run here rather than only in
       # the non-gating Coverage workflow.
+      #
+      # DELIBERATELY still `cargo test`, not `cargo nextest run`. This is one
+      # large lib-test binary with thousands of tiny in-process units; nextest
+      # launches a process per test, which is a clear win for the multi-node
+      # integration binaries but is an open question here — process-launch
+      # overhead can exceed what the parallel scheduling buys back. The measured
+      # split says it would not matter much either way: on the last green master
+      # run this job spent 6 minutes almost entirely in rustc. Benchmark
+      # `cargo test --lib` against `cargo nextest run --lib` on one SHA
+      # (compile / execution / total / peak disk / flake count) before switching;
+      # the sccache + rust-cache changes above are the ones that move this job.
       - name: Run unit tests (all in-source units, full feature set)
         run: cargo test --lib --features "$UNIT_FEATURES"
 
@@ -218,10 +242,43 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test -p net-deck --bins
 
-  integration-tests:
-    name: Integration tests (Net, 3-node, Mikoshi, RedEX, CortEX, NetDB, nRPC, Dataforts, MeshDB, MeshOS)
+  # ===================================================================
+  # Integration suite — split across parallel jobs by FEATURE FAMILY.
+  # ===================================================================
+  #
+  # This used to be ONE job running 14 nextest groups back to back on a single
+  # runner, on the theory that sharing a runner shares the compile. It does not:
+  # every group passes a different `--features` set, so cargo re-fingerprints
+  # and rebuilds `net-mesh` and relinks the test binaries between groups.
+  #
+  # The measured split on the last green master run was stark — 21 minutes of
+  # wall clock against 107 SECONDS of actual test execution (the sum of every
+  # nextest `Summary` line). `Dataforts blob e2e` took 71s to run 2 tests in
+  # 0.043s; `Transport error-code mirror` 71s to run 7 tests in 0.6s. The steps
+  # that happened to reuse the previous step's feature set were the fast ones
+  # (`Sensing` 30s, `MeshDB` 3s, `MeshOS + Deck` 4s). Nearly all of the rest was
+  # repaid rustc.
+  #
+  # So the groups are dealt out across parallel jobs, each holding as few
+  # DISTINCT feature sets as possible, sized to finish at roughly the same time.
+  #
+  # Feature sets are NOT merged to shrink that count. Several of these
+  # boundaries ARE the gate: the in-memory `dataforts` group is separate from
+  # `dataforts redex-disk` precisely so the in-memory paths are proven to
+  # compile without the on-disk ones, and `--no-default-features`-shaped
+  # distinctions like the bare Bus + FFI group exist for the same reason.
+  # Nextest's `--partition` sharding is deliberately unused for that same
+  # reason — it would require flattening these into one union-feature build,
+  # which would silently retire every one of those distinctions.
+  #
+  # Cost trade: more aggregate runner minutes, much less wall clock. sccache
+  # (below) is what keeps the repeated dependency compilation from eating the
+  # difference.
+
+  integration-guard:
+    name: Integration test pin guard
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 5
     defaults:
       run:
         working-directory: net/crates/net
@@ -230,18 +287,22 @@ jobs:
 
       # Every OTHER test surface in this workflow is auto-discovered
       # (`cargo test -p <crate>` / bare `pytest` / `go test ./...`), so a
-      # new test file there is picked up for free. This job is the sole
-      # exception: it pins `--test <name>` explicitly, per feature group,
-      # to keep the crate from recompiling once per test binary. The cost
-      # of that is a silent failure mode — a new `tests/*.rs` runs in NO
-      # job until someone remembers to edit this file, and nothing
-      # complains. `unit-tests` is `--lib` (never touches `tests/`) and
+      # new test file there is picked up for free. The `integration-*`
+      # jobs are the sole exception: they pin `--test <name>` explicitly,
+      # per feature group, to keep the crate from recompiling once per
+      # test binary. The cost of that is a silent failure mode — a new
+      # `tests/*.rs` runs in NO job until someone remembers to edit this
+      # file, and nothing complains. `unit-tests` is `--lib` (never touches `tests/`) and
       # the Coverage workflow, which does auto-discover, only fires on
       # master + PRs and is pinned informational — so on a feature branch
       # an unpinned test is gated by nothing at all.
       #
       # This guard closes that. Any new `tests/*.rs` must either appear in
-      # a `--test` flag below or be added to UNPINNED_OK with a reason.
+      # a `--test` flag in one of the `integration-*` jobs below, or be
+      # added to UNPINNED_OK with a reason. It runs as its OWN job so the
+      # answer arrives in ~15s rather than behind a runner that is busy
+      # compiling, and so it stays a single check no matter how the
+      # feature families below are re-dealt.
       - name: Guard — every tests/*.rs is pinned to a step
         run: |
           # Tests that intentionally run nowhere in THIS workflow.
@@ -279,24 +340,62 @@ jobs:
           fi
           echo "OK: $(wc -l < /tmp/present.txt) test files, all accounted for."
 
+  # --- Family A: bare bus/FFI + net mesh -------------------------------
+  integration-net-core:
+    name: Integration — net core (bus/FFI, mesh, capability, migration, nRPC dispatch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # sccache trial, part 2 of 3 (with `unit-tests` and `rust-sdk-tests`).
+      # All five `integration-*` family jobs carry this block — they are
+      # collectively the one job this trial covers.
+      #
+      # These jobs are compile-bound, not test-bound, so a compiler-object cache
+      # is the lever that actually moves them — and unlike the target-dir cache
+      # it survives across the differing feature sets and across the parallel
+      # jobs this suite was just split into, which is what keeps the split from
+      # costing what it saves.
+      #
+      # `CARGO_INCREMENTAL: 0` is mandatory alongside it, not incidental: cargo's
+      # incremental state is large and fragile in CI (it is what produced the
+      # disk-full metadata corruption locally), and sccache only caches
+      # non-incremental compiler invocations, so leaving it on would silently
+      # bypass the cache for exactly the crates we care about.
+      #
+      # sccache's GHA backend shares the repo's 10 GB Actions cache quota with
+      # `rust-cache`. If eviction pressure shows up, that is the first thing to
+      # look at. The action prints hit/miss stats at job end — check them before
+      # widening this to the remaining Rust jobs.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v7
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-integration-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: integration-net-core
+          workspaces: net/crates/net -> target
 
       # nextest gives us per-test process isolation, smarter scheduling,
       # and `--no-fail-fast` semantics across grouped test binaries.
       # Tests below are batched by feature set so cargo recompiles the
       # library at most once per group instead of once per `--test` flag.
+      #
+      # `--no-tests=fail` is on every group. A test file listed under a feature
+      # set that does not satisfy its `#![cfg]` compiles to an EMPTY test binary
+      # and passes vacuously — the same silent-coverage hole the pin guard and
+      # the `windows-security-tests` job already close. An empty filterset is
+      # now an error, not a pass.
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -311,7 +410,7 @@ jobs:
       - name: Bus + FFI
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast
+          cargo nextest run --no-fail-fast --no-tests=fail
           --test bus_shutdown_drain
           --test bus_stranded_flush
           --test ffi_shutdown_race
@@ -322,7 +421,7 @@ jobs:
       - name: Net mesh, capability, migration, nRPC dispatch
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features "net fixtures"
+          cargo nextest run --no-fail-fast --no-tests=fail --features "net fixtures"
           --test integration_net
           --test three_node_integration
           --test channel_auth
@@ -356,11 +455,46 @@ jobs:
           --test event_pingwave
           --test route_withdraw
 
+  # --- Family B: NAT traversal + port mapping + RedEX ------------------
+  integration-nat-redex:
+    name: Integration — NAT traversal, port mapping, RedEX
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Same sccache trial as `integration-net-core` — see the note there.
+      # All five integration families carry it: reusing compiler objects
+      # ACROSS these jobs is what keeps the split from paying for itself in
+      # repeated dependency compilation.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration-nat-redex
+          workspaces: net/crates/net -> target
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       # === NAT traversal ==================================================
       - name: NAT traversal
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features "net nat-traversal"
+          cargo nextest run --no-fail-fast --no-tests=fail --features "net nat-traversal"
           --test connect_direct
           --test nat_classify
           --test peer_death_clears_capability_index
@@ -380,7 +514,7 @@ jobs:
       - name: Port mapping
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features "net port-mapping"
+          cargo nextest run --no-fail-fast --no-tests=fail --features "net port-mapping"
           --test port_mapping_null
           --test port_mapping_real_router
 
@@ -390,10 +524,45 @@ jobs:
       - name: RedEX
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features redex
+          cargo nextest run --no-fail-fast --no-tests=fail --features redex
           --test integration_redex
           --test redex_replication_dst
           --test redex_replication_e2e
+
+  # --- Family C: CortEX + nRPC + tools + sensing + NetDB ---------------
+  integration-cortex:
+    name: Integration — CortEX, nRPC, AI tools, sensing, NetDB
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Same sccache trial as `integration-net-core` — see the note there.
+      # All five integration families carry it: reusing compiler objects
+      # ACROSS these jobs is what keeps the split from paying for itself in
+      # repeated dependency compilation.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration-cortex
+          workspaces: net/crates/net -> target
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
 
       # === CortEX + nRPC service surface ==================================
       # `tool` chains to `cortex` (see `tool = ["cortex"]` in
@@ -404,7 +573,7 @@ jobs:
       - name: CortEX + nRPC + AI Tools
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features "cortex tool fixtures"
+          cargo nextest run --no-fail-fast --no-tests=fail --features "cortex tool fixtures"
           --test integration_cortex_adapter
           --test integration_cortex_tasks
           --test integration_cortex_memories
@@ -451,7 +620,7 @@ jobs:
       - name: Sensing
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features "cortex tool fixtures"
+          cargo nextest run --no-fail-fast --no-tests=fail --features "cortex tool fixtures"
           --test sensing_dispatch
           --test sensing_org_three_node
           --test sensing_lease
@@ -471,9 +640,50 @@ jobs:
       - name: NetDB
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features netdb
+          cargo nextest run --no-fail-fast --no-tests=fail --features netdb
           --test integration_netdb
           --test netdb_builder_and_accessors
+
+  # --- Family D: in-memory Dataforts + the MeshDB/MeshOS stores --------
+  # Three of the four groups here are plain `--features dataforts`, so they
+  # share one crate compile. The v0.3 conformance group sits with them rather
+  # than beside the on-disk blob suites it used to read next to — it needs no
+  # `redex-disk`, and grouping by feature set is the whole point. MeshDB and
+  # MeshOS ride along because they were 3s and 4s respectively: cheap enough
+  # that a dedicated runner would cost more in setup than it saves.
+  integration-dataforts:
+    name: Integration — Dataforts (in-memory), batched send/recv, MeshDB, MeshOS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Same sccache trial as `integration-net-core` — see the note there.
+      # All five integration families carry it: reusing compiler objects
+      # ACROSS these jobs is what keeps the split from paying for itself in
+      # repeated dependency compilation.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration-dataforts
+          workspaces: net/crates/net -> target
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
 
       # === Dataforts (greedy + gravity) + stream SACK ranges ==============
       # `stream_ack_ranges` (STREAM_ACK_BATCHING_AND_RANGES_PLAN R-6)
@@ -486,11 +696,12 @@ jobs:
       # capability advertisement.
       # The blob/dir transfer + transfer fairness/concurrency suites only
       # need `dataforts` (no `redex-disk`), so they batch into this same
-      # in-memory dataforts compile rather than the on-disk blob e2e group.
+      # in-memory dataforts compile rather than the on-disk blob e2e job
+      # (`integration-dataforts-disk`).
       - name: Dataforts greedy + gravity + stream SACK ranges + transfers
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features dataforts
+          cargo nextest run --no-fail-fast --no-tests=fail --features dataforts
           --test dataforts_greedy_e2e
           --test dataforts_gravity_e2e
           --test stream_ack_ranges
@@ -518,7 +729,7 @@ jobs:
       - name: Scheduled-stream batched drain (Linux sendmmsg path)
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features dataforts --no-capture
+          cargo nextest run --no-fail-fast --no-tests=fail --features dataforts --no-capture
           --test send_drain_depth
           --test scheduled_stream
           --test scheduled_stream_integrity
@@ -543,32 +754,9 @@ jobs:
       - name: Batched ingress (Linux recvmmsg path)
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features dataforts,batched-ingress --no-capture
+          cargo nextest run --no-fail-fast --no-tests=fail --features dataforts,batched-ingress --no-capture
           --test batched_ingress_integrity
           --test recv_drain_depth
-
-      # === Dataforts blob e2e (multi-node + migration) ====================
-      # `redex-disk` is required so MeshBlobAdapter can spin up a real
-      # on-disk RedEX per node — separate from the in-memory dataforts
-      # group above so the on-disk paths get compiled.
-      - name: Dataforts blob e2e
-        if: ${{ !cancelled() }}
-        run: cargo nextest run --no-fail-fast --features "dataforts redex-disk" --test dataforts_blob_e2e
-
-      # === Transport C ABI error-code mirror ==============================
-      # Parses `include/net_transport.h` and asserts every `#define
-      # NET_*` matches its Rust `pub const NET_*` sibling. Gated on
-      # `net + dataforts + netdb + redex-disk` per the test's cfg.
-      - name: Transport error-code mirror
-        if: ${{ !cancelled() }}
-        run: cargo nextest run --no-fail-fast --features "net dataforts netdb redex-disk" --test transport_error_codes
-
-      # === Dataforts net-blob CLI =========================================
-      # Pulls in clap via the `cli` feature; kept separate so the
-      # non-CLI dataforts groups don't pay the clap compile cost.
-      - name: Dataforts net-blob CLI
-        if: ${{ !cancelled() }}
-        run: cargo nextest run --no-fail-fast --features "dataforts cli" --test net_blob_cli
 
       # === Dataforts blob v0.3 conformance (Tree + CDC + RS) ==============
       # Phase-pinned end-to-end conformance tests for the v0.3 blob
@@ -587,7 +775,7 @@ jobs:
       - name: Dataforts blob v0.3 conformance
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features dataforts
+          cargo nextest run --no-fail-fast --no-tests=fail --features dataforts
           --test dataforts_blob_v3_tree_conformance
           --test dataforts_blob_v3_cdc_conformance
           --test dataforts_blob_v3_rs_conformance
@@ -599,7 +787,7 @@ jobs:
       # gate.
       - name: MeshDB
         if: ${{ !cancelled() }}
-        run: cargo nextest run --no-fail-fast --features meshdb --test meshdb_subprotocol_wire
+        run: cargo nextest run --no-fail-fast --no-tests=fail --features meshdb --test meshdb_subprotocol_wire
 
       # === MeshOS + Deck ==================================================
       # `meshos` chains to cortex → redex → net. The pipeline test pins
@@ -616,10 +804,73 @@ jobs:
       - name: MeshOS + Deck
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --features meshos
+          cargo nextest run --no-fail-fast --no-tests=fail --features meshos
           --test meshos_pipeline
           --test deck_pipeline
           --test scheduler_bridge_driver
+
+  # --- Family E: on-disk Dataforts + the CLI/ABI surfaces --------------
+  # The three groups that need something the in-memory family deliberately
+  # does NOT have — `redex-disk` for the real on-disk RedEX per node, and
+  # `cli` for clap. Kept in their own job for the same reason they were kept
+  # in their own steps: merging them into the plain `dataforts` family would
+  # retire the proof that the in-memory paths compile without them.
+  integration-dataforts-disk:
+    name: Integration — Dataforts (on-disk blob e2e), transport ABI, net-blob CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Same sccache trial as `integration-net-core` — see the note there.
+      # All five integration families carry it: reusing compiler objects
+      # ACROSS these jobs is what keeps the split from paying for itself in
+      # repeated dependency compilation.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration-dataforts-disk
+          workspaces: net/crates/net -> target
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # === Dataforts blob e2e (multi-node + migration) ====================
+      # `redex-disk` is required so MeshBlobAdapter can spin up a real
+      # on-disk RedEX per node — separate from the in-memory dataforts
+      # family so the on-disk paths get compiled.
+      - name: Dataforts blob e2e
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --no-tests=fail --features "dataforts redex-disk" --test dataforts_blob_e2e
+
+      # === Transport C ABI error-code mirror ==============================
+      # Parses `include/net_transport.h` and asserts every `#define
+      # NET_*` matches its Rust `pub const NET_*` sibling. Gated on
+      # `net + dataforts + netdb + redex-disk` per the test's cfg.
+      - name: Transport error-code mirror
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --no-tests=fail --features "net dataforts netdb redex-disk" --test transport_error_codes
+
+      # === Dataforts net-blob CLI =========================================
+      # Pulls in clap via the `cli` feature; kept separate so the
+      # non-CLI dataforts groups don't pay the clap compile cost.
+      - name: Dataforts net-blob CLI
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --no-fail-fast --no-tests=fail --features "dataforts cli" --test net_blob_cli
 
   loom-tests:
     name: Loom concurrency models
@@ -639,17 +890,19 @@ jobs:
       # itself is `[target.'cfg(loom)'.dev-dependencies]`) and
       # rebuilds every atomic-touching crate with loom's
       # substitute primitives. Sharing the cache with non-loom
-      # jobs would just thrash both.
-      - name: Cache cargo
-        uses: actions/cache@v6
+      # jobs would just thrash both — hence the distinct
+      # `shared-key`. `rust-cache` folds `RUST*` env vars into its
+      # key automatically, but RUSTFLAGS is set at STEP level here,
+      # not job level, so the action never sees it; the explicit
+      # key is what actually keeps the two families apart.
+      #
+      # No sccache on this job: `--cfg loom` is a global rustc flag that
+      # invalidates every object anyway, so there is nothing to reuse and
+      # the wrapper would only add overhead. This job runs in ~1 minute.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-loom-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: loom
+          workspaces: net/crates/net -> target
 
       # Loom tests exhaustively explore thread interleavings; release
       # mode is mandatory (debug builds are too slow to converge in CI
@@ -674,6 +927,11 @@ jobs:
     name: Rust SDK tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # sccache trial job #3 of 3 (see the note in `integration-net-core`).
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: "0"
     defaults:
       run:
         working-directory: net/crates/net/sdk
@@ -683,16 +941,21 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      # `sdk` and `payments` are members of the `net/crates/net` workspace, so
+      # both build into the one shared `net/crates/net/target` — a single
+      # `workspaces` entry covers this whole job.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-sdk-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: sdk
+          workspaces: net/crates/net -> target
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
 
       # Feature set covers every SDK integration test except
       # `redis_dedup_contract` (gated on `redis`, deferred until CI
@@ -701,8 +964,8 @@ jobs:
       # `cortex` / `testing` / `compute` / `nat-traversal` /
       # `port-mapping` / `tool` / `macros` compile to empty test
       # binaries and the contract goes silently unverified.
-      # `cargo test` auto-discovers every `tests/*.rs` file under
-      # `sdk/tests/`; the step name calls out the load-bearing
+      # nextest auto-discovers every `tests/*.rs` file under `sdk/tests/`
+      # exactly as `cargo test` did; the step name calls out the load-bearing
       # ones so a missing test binary is obvious in the CI log:
       #   - mesh_stream_backpressure — substrate flow-control pin
       #   - mesh_rpc_bidi_typed     — Phase E client-streaming +
@@ -719,15 +982,30 @@ jobs:
       #   - tool_macro              — `#[tool]` proc-macro
       #     expansion + serve-helper round-trip. Gated on
       #     `feature = "macros" + "cortex"`.
+      #
+      # nextest rather than `cargo test`: the SDK has 35 separate integration
+      # test binaries and `cargo test` runs them ONE AT A TIME, so the suite
+      # was serialising ~64s of execution that overlaps almost completely.
+      # This is the shape nextest's process scheduling is actually for. It also
+      # brings this job under `.config/nextest.toml` — the `terminate-after`
+      # hang guard (a stalled test becomes a named failure instead of eating
+      # the 20-minute budget) and the `retries = 0` override that keeps the
+      # security-race binaries from being retried into green.
       - name: Run Rust SDK tests (includes mesh_stream_backpressure, mesh_rpc_bidi_typed, tool_*)
-        run: cargo test --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
+        run: cargo nextest run --no-fail-fast --no-tests=fail --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
 
-      # SDK doctests — `///` examples in `sdk/src/`. Same feature set
-      # as the test run so doc examples gated on those features
-      # compile.
+      # SDK doctests — `///` examples in `sdk/src/`. nextest does NOT run
+      # doctests, so this `cargo test --doc` step is load-bearing, not a
+      # duplicate of the step above.
+      #
+      # The feature set MUST stay identical to that step's. It used to be
+      # narrower (no `dataforts`, no `aggregator`) and got away with it only
+      # because the old `cargo test` above ran the doctest target itself with
+      # the wide set. Under nextest it no longer does, so anything gated on
+      # those two would have compiled to nothing and gone silently unverified.
       - name: Run Rust SDK doctests
         if: ${{ !cancelled() }}
-        run: cargo test --doc --features "net cortex testing compute nat-traversal port-mapping tool macros"
+        run: cargo test --doc --features "net cortex dataforts testing compute nat-traversal port-mapping aggregator tool macros"
 
       # net-payments — x402 envelope model unit tests plus
       # `payments_golden_vectors`, the Rust source-of-truth verifier for
@@ -741,22 +1019,63 @@ jobs:
       - name: Run net-payments tests (includes payments_golden_vectors + mcp_gate_composition)
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
-        run: cargo test --all-features
+        run: cargo nextest run --no-fail-fast --no-tests=fail --all-features
 
-      # net-payments benchmark-rot gate: compile (do not run) every bench so
-      # a harness/API drift breaks CI, not the next person to run numbers.
-      # See docs/plans/PAYMENTS_BENCHMARKS_PLAN.md. Shares the cargo cache
-      # above; --no-run means no measurement, just typeck + link.
-      - name: Compile net-payments benches (--no-run)
+      # Same reason as the SDK doctest step: nextest does not run doctests, and
+      # the `cargo test --all-features` this replaced was running net-payments'
+      # `///` examples as a side effect. Without this they stop being gated.
+      - name: Run net-payments doctests
         if: ${{ !cancelled() }}
         working-directory: net/crates/net/payments
+        run: cargo test --doc --all-features
+
+  # net-payments benchmark-rot gate: compile (do not run) every bench so a
+  # harness/API drift breaks CI, not the next person to run numbers.
+  # See docs/plans/PAYMENTS_BENCHMARKS_PLAN.md. `--no-run` means no
+  # measurement, just typeck + link.
+  #
+  # Split out of `rust-sdk-tests`, where it was 696 of that job's 1140 seconds
+  # — 61% of the wall clock of a job whose actual tests take ~64s — and sat on
+  # the critical path for a gate that shares nothing with the SDK suite.
+  #
+  # It was also SEVEN cargo invocations, and the last one flipped `--features
+  # mesh`, which re-fingerprints the crate and forces a fresh compile of the
+  # payments tree. Collapsed to two, which is the floor:
+  #
+  #   * `--benches` selects every bench target in one pass, and silently skips
+  #     the ones whose `required-features` are unmet — which is exactly
+  #     `mesh_paid_invoke`. It also replaces the hand-maintained list of six
+  #     `--bench <name>` flags, so a NEW bench is gated the day it lands
+  #     instead of the day someone remembers to add it here. (It does pull the
+  #     lib in as a bench harness too; that is one small extra artifact and
+  #     worth the auto-discovery.)
+  #   * The second invocation is the only one that needs `mesh`.
+  #
+  # Keeping the first invocation featureless is deliberate — it is what proves
+  # the other benches have not silently acquired a dependency on `mesh`.
+  # Folding everything into a single `--features mesh` build would be one
+  # compile instead of two, and would retire that proof.
+  payments-bench-compile:
+    name: net-payments bench compile gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: net/crates/net/payments
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: payments-bench
+          workspaces: net/crates/net -> target
+
+      - name: Compile net-payments benches (--no-run)
         run: |
-          cargo bench --bench admission --no-run
-          cargo bench --bench admission_matrix --no-run
-          cargo bench --bench redeem_matrix --no-run
-          cargo bench --bench duplicate_storm --no-run
-          cargo bench --bench spend_contention --no-run
-          cargo bench --bench mock_lifecycle --no-run
+          cargo bench --benches --no-run
           cargo bench --features mesh --bench mesh_paid_invoke --no-run
 
   node-tests:
@@ -777,16 +1096,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-node-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: node
+          workspaces: net/crates/net -> target
 
       - name: Install npm dependencies
         run: npm i
@@ -849,16 +1162,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-sdk-ts-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: sdk-ts
+          workspaces: net/crates/net -> target
 
       # `sdk-ts/package.json` carries `@net-mesh/core: file:../bindings/node`
       # as a devDependency, so `npm i` over there picks up the sibling
@@ -934,16 +1241,10 @@ jobs:
           toolchain: "1.97.1"
           components: clippy, rustfmt, llvm-tools-preview
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-python-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: python
+          workspaces: net/crates/net -> target
 
       # maturin develop requires a virtualenv (refuses to install into
       # the system Python). Create one and prepend it to PATH so every
@@ -1065,16 +1366,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-go-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: go
+          workspaces: net/crates/net -> target
 
       # The Go bindings link against EIGHT cdylibs via cgo:
       #   - `-lnet` (libnet.so, the main `net-mesh` crate) from net.go
@@ -1174,16 +1469,10 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-clippy-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: clippy
+          workspaces: net/crates/net -> target
 
       # Stage 4 of PANIC_AUDIT_AND_LINT_HARDENING_PLAN.md: production
       # code (lib + bins) is denied for the four panic-hygiene + unsafe
@@ -1390,16 +1679,10 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-clippy-ffi-${{ matrix.crate.name }}-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: clippy-ffi-${{ matrix.crate.name }}
+          workspaces: net/crates/net -> target
 
       - name: Run clippy
         working-directory: ${{ matrix.crate.path }}
@@ -1469,16 +1752,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-test-ffi-${{ matrix.crate.name }}-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: test-ffi-${{ matrix.crate.name }}
+          workspaces: net/crates/net -> target
 
       # napi-rs links `napi_*` runtime symbols at load time (Node
       # provides them inside its embedded V8); a standalone
@@ -1722,16 +1999,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-cli-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: cli
+          workspaces: net/crates/net -> target
 
       # Toolchains for the typegen downstream type-checks (E-2 / E-3). Without
       # these, tests/typegen_downstream_{ts,python}.rs self-skip; installing
@@ -1775,16 +2046,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-aggregator-daemon-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: aggregator-daemon
+          workspaces: net/crates/net -> target
 
       - name: Run net-aggregator-daemon tests
         run: cargo test -p net-aggregator-daemon
@@ -1825,16 +2090,10 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-mcp-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: mcp
+          workspaces: net/crates/net -> target
 
       - name: Run clippy (production code, strict)
         run: cargo clippy -p net-mesh-mcp --lib --bins --features fixture -- -D warnings
@@ -1892,16 +2151,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-winsec-v1-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: winsec
+          workspaces: net/crates/net -> target
 
       # nextest here for the same reasons the ubuntu jobs use it, plus two
       # that are specific to this job (see `.config/nextest.toml`):
@@ -1983,16 +2236,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            net/crates/net/target/
-          key: ${{ runner.os }}-cargo-doc-v2-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: doc
+          workspaces: net/crates/net -> target
 
       - name: Build documentation
         run: cargo doc --no-deps --all-features

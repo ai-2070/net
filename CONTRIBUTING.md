@@ -54,7 +54,7 @@ document.
 - CI runs the Rust, Node, Python, and Go suites plus clippy and rustfmt. Every
   job must be green before merge.
 
-Useful local checks before pushing (run from `net/`):
+Useful local checks before pushing (run from `net/crates/net/`):
 
 ```bash
 cargo fmt --all -- --check
@@ -63,6 +63,43 @@ cargo test --lib
 ```
 
 Go bindings live in `go/` (`go test ./...`), the web docs in `web/`.
+
+### Focused runs, and why they should use nextest
+
+Use `cargo nextest run` rather than `cargo test` whenever you are running one
+named test or one module — a RED/GREEN mutation loop, a bisect, a "does this
+witness still fail without the fix" check.
+
+```bash
+# One named test.
+cargo nextest run --lib --features "$UNIT_FEATURES" --no-tests=fail --retries 0 \
+  -E 'test(=adapter::net::mesh::org_routing_wiring_tests::the_exact_test)'
+
+# A whole module.
+cargo nextest run --lib --features "$UNIT_FEATURES" --no-tests=fail --retries 0 \
+  -E 'test(/^adapter::net::mesh::org_routing_wiring_tests::/)'
+```
+
+`$UNIT_FEATURES` is the feature list the `unit-tests` job pins in
+`.github/workflows/ci.yml`; a narrower set silently compiles feature-gated
+modules to nothing.
+
+Why these flags, specifically:
+
+- **`--no-tests=fail`.** `cargo test -- <filter>` exits **0** when the filter
+  matches nothing, so a typo or a renamed module is indistinguishable from a
+  pass. This has already turned a real CI job into a green no-op once. An empty
+  filterset must be an error.
+- **`--retries 0`.** `.config/nextest.toml` grants two retries by default to
+  absorb transport-saturation noise in the multi-node suites. That is exactly
+  wrong for a mutation loop: you want the first attempt's verdict, not a
+  best-of-three.
+- **Process isolation and the `terminate-after` timeout** come along for free,
+  so a mutation that hangs a test fails by name instead of stalling.
+
+For a batch of mutations, reuse ONE detached worktree and ONE target directory
+across the whole batch. Building a fresh target dir per mutation is where a
+RED/GREEN loop actually goes slow — not in the test execution.
 
 ## Reporting security issues
 
