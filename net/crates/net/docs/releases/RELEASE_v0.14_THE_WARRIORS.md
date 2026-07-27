@@ -1,7 +1,3 @@
----
-title: "v0.14 — The Warriors"
-description: "Release notes for Net v0.14 — The Warriors — what shipped, what changed, and what it means for compatibility."
----
 # Net v0.14 — "The Warriors"
 
 *Named after Walter Hill's 1979 cult film and Rockstar Games' 2005 adaptation — a gang trying to make it home through hostile turf. Channels in this release do the same: replicas survive partitions, election storms, disk pressure, and divergent tails, and still converge on a consistent leader before the night is out.*
@@ -16,7 +12,7 @@ Alongside the replication landing, v0.14 carries two cross-cutting breaking chan
 
 ## RedEX Distributed (substrate)
 
-The implementation plan in [`REDEX_DISTRIBUTED_PLAN.md`](https://github.com/ai-2070/net/blob/master/docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md) phases A–I all closed before v0.14. The shape:
+The implementation plan in [`REDEX_DISTRIBUTED_PLAN.md`](../../../../../docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md) phases A–I all closed before v0.14. The shape:
 
 ### `ReplicationConfig`
 
@@ -363,4 +359,4 @@ Released 2026-05-12.
 
 ## License
 
-See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).
+See [LICENSE](../../LICENSE-APACHE).

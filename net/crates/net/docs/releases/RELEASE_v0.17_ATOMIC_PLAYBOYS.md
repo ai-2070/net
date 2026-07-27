@@ -1,7 +1,3 @@
----
-title: "v0.17 — Atomic Playboys"
-description: "Release notes for Net v0.17 — Atomic Playboys — what shipped, what changed, and what it means for compatibility."
----
 # Net v0.17 — "Atomic Playboys"
 
 *Named after Steve Stevens's 1989 solo album — same guitarist as v0.15's Rebel Yell, next chapter. v0.15 made the Dataforts data plane stand up. v0.16 stacked the MeshDB query plane on top. v0.17 stacks the MeshOS behavior plane on both: a per-node event loop + reconcile + admit + dispatch + scheduler + chain integration that composes against the capability index, proximity graph, replication election, daemon registry, migration orchestrator, and MeshDB snapshot fold the prior releases shipped.*
@@ -439,4 +435,4 @@ Released 2026-05-14.
 
 ## License
 
-See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).
+See [LICENSE](../../LICENSE-APACHE).

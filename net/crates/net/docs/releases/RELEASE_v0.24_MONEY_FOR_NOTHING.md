@@ -1,7 +1,3 @@
----
-title: "v0.24 — Money For Nothing"
-description: "Release notes for Net v0.24 — Money For Nothing — what shipped, what changed, and what it means for compatibility."
----
 # Net v0.24 — "Money For Nothing"
 
 *Named after the Dire Straits track that opened side two of Brothers in Arms in 1985 — the one Mark Knopfler wrote standing in a New York appliance store listening to a delivery guy heckling MTV, the one Sting flew in to harmonize the "I want my MTV" hook over a single take. Same wire, same semantics, same surface — money for nothing, and the bytes for free.*
@@ -192,4 +188,4 @@ Released 2026-05-26.
 
 ## License
 
-See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).
+See [LICENSE](../../LICENSE-APACHE).

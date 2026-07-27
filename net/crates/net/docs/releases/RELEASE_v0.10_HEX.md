@@ -1,7 +1,3 @@
----
-title: "v0.10 — Hex"
-description: "Release notes for Net v0.10 — Hex — what shipped, what changed, and what it means for compatibility."
----
 # Net v0.10 — "Killing Moon" Phase III
 
 v0.10 continues the v0.9 line. Same conviction, same shape: a hardening release with no new transports, no new SDK surfaces, and no new feature gates. Every commit on this branch is a bug fix, a regression test, or a documentation tightening sourced from a fresh round of multi-pass internal audits.
@@ -203,7 +199,7 @@ The work was driven by two parallel audit reports against the v0.9 line: a 171-i
 
 ### `mesh.rs` deep-read audit
 
-A separate single-file audit of `adapter/net/mesh.rs` (~8 K LOC) surfaced 9 additional defects that are scoped to that file. None of them are addressed in this release; all are slated for the next phase. For consumers running production deployments, the most consequential are listed below — the full audit is in [`docs/misc/BUG_AUDIT_2026_05_03_MESH.md`](https://github.com/ai-2070/net/blob/master/docs/internal/misc/BUG_AUDIT_2026_05_03_MESH.md).
+A separate single-file audit of `adapter/net/mesh.rs` (~8 K LOC) surfaced 9 additional defects that are scoped to that file. None of them are addressed in this release; all are slated for the next phase. For consumers running production deployments, the most consequential are listed below — the full audit is in [`docs/misc/BUG_AUDIT_2026_05_03_MESH.md`](../../../../../docs/internal/misc/BUG_AUDIT_2026_05_03_MESH.md).
 
 - **`spawn_heartbeat_loop` holds a DashMap shard guard across `.await`** — the heartbeat broadcast loop iterates `peers.iter()` and awaits `socket.send_to(...)` (heartbeat + pingwave, twice per peer) while still holding the iterator's `Ref` guard. Every other task touching the same shard blocks for the cumulative round-trip.
 - **`accept` / `start` mutual exclusion uses `AcqRel` where the comment relies on `SeqCst`** — Dekker-style mutual exclusion needs both sides SC. On x86 the LOCK'd RMW happens to fully fence so the race is unobservable; on AArch64 / RISC-V the dispatcher can race `handshake_responder` for the inbound msg1.
@@ -339,4 +335,4 @@ Released 2026-05-03.
 
 ## License
 
-See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).
+See [LICENSE](../../LICENSE-APACHE).

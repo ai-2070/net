@@ -1,7 +1,3 @@
----
-title: "v0.11 — Black Diamond"
-description: "Release notes for Net v0.11 — Black Diamond — what shipped, what changed, and what it means for compatibility."
----
 # Net v0.11 — "Killing Moon" Phase IV
 
 v0.11 closes the audit work that v0.10 left open. Same shape: a hardening release with no new transports, no new SDK surfaces, no new feature gates. Every commit on this branch is a bug fix, a regression test, a triage decision, or a wire-format bump that closes a structural gap the previous release flagged but couldn't ship inside its envelope.

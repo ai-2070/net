@@ -39,21 +39,19 @@ const NOT_PUBLISHED = new Set([
 
 // Paths the notes reference that moved, or that were always one directory
 // off. Applied before the generic resolution below.
+//
+// The two entries that used to patch up `../misc/DATAFORTS_PLAN.md` and a
+// bare `misc/BUG_AUDIT_2026_05_03_MESH.md` are gone: the plans, code reviews
+// and audits moved to `docs/internal/`, and the notes now spell that path
+// correctly, so the generic resolution below handles them. Keep this list for
+// links that genuinely can't resolve by path arithmetic.
 const LEGACY = [
-  [
-    "../misc/DATAFORTS_PLAN.md",
-    `${GH}/net/crates/net/docs/plans/DATAFORTS_PLAN.md`,
-  ],
   ["../sdk/README.md#", `${GH}/net/crates/net/sdk/README.md#`],
   ["../sdk-py/README.md#", `${GH}/net/crates/net/sdk-py/README.md#`],
   ["../sdk-ts/README.md#", `${GH}/net/crates/net/sdk-ts/README.md#`],
   ["../../include/README.md#", `${GH}/net/crates/net/include/README.md#`],
   ["../../../../../go/README.md#", `${GH}/go/README.md#`],
   ["../../../LICENSE-APACHE", `${GH}/LICENSE-APACHE`],
-  [
-    "misc/BUG_AUDIT_2026_05_03_MESH.md",
-    `${GH}/net/crates/net/docs/misc/BUG_AUDIT_2026_05_03_MESH.md`,
-  ],
 ];
 
 // Curated display titles, keyed by source filename. These are the sidebar
