@@ -314,3 +314,30 @@ pub struct SafetyEnvelope {
 | `behavior/proximity.rs` | `ProximityGraph`, `EnhancedPingwave`, latency edges |
 | `behavior/safety.rs` | `SafetyEnforcer`, `ResourceEnvelope`, `KillSwitchConfig` |
 | `behavior/sensing/` | Capability sensing — provider-free readiness interests, leader rendezvous, coalescing. See [`SENSING.md`](SENSING.md) |
+
+## The rest of the plane
+
+Everything above is the behavior plane as originally scoped: announcements,
+diffs, metadata, schema, rules, context, load balancing, proximity, safety.
+The module has since grown several subsystems that are larger than that
+original core and are **not** described above. This table is the honest map.
+
+| Subsystem | Size | Documented in |
+|---|---|---|
+| `behavior/meshos/` | ~22.4k LOC | **Nowhere.** Cluster-behavior engine, daemon supervision, reconcile arm, drift scorer |
+| `behavior/org_*.rs` (14 files) | ~31.1k LOC | [`ORGANIZATIONS.md`](ORGANIZATIONS.md) |
+| `behavior/sensing/` | ~16.1k LOC | [`SENSING.md`](SENSING.md) |
+| `behavior/fold/` | ~13.3k LOC | Partly — multifold appears in [`STATE.md`](STATE.md) and [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) |
+| `behavior/meshdb/` | ~13.2k LOC | **Nowhere.** Federated query AST, planner, executor |
+| `behavior/aggregator/` | ~4.5k LOC | Partly — [`CAPABILITY_ENHANCEMENTS_USAGE.md`](CAPABILITY_ENHANCEMENTS_USAGE.md) |
+| `behavior/gang/` | ~3.5k LOC | Partly — [`SENSING.md`](SENSING.md); user-facing guide covers the claim protocol |
+| `behavior/lifecycle/` | ~2.1k LOC | **Nowhere.** |
+| `behavior/scheduler_bridge/` | ~2.0k LOC | **Nowhere.** |
+| `behavior/deck.rs` | ~4.2k LOC | Operator surface — see the Deck reference on the docs site |
+| `behavior/placement.rs` | ~3.7k LOC | [`COMPUTE.md`](COMPUTE.md) |
+
+Roughly 40k LOC — MeshOS, MeshDB, lifecycle and the scheduler bridge — has no
+protocol-level doc. That is a gap, not a statement that those subsystems are
+unfinished; they ship, and the user-facing docs cover MeshDB and the Deck. It
+is recorded here so the next person doesn't have to rediscover it by reading
+the module tree.

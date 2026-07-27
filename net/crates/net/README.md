@@ -27,6 +27,7 @@ on the docs site.
 | [`TRANSPORT.md`](docs/TRANSPORT.md) | Wire format, the 64-byte header, encryption, packet pools, sessions, fair scheduling, multi-hop forwarding, routing, reliability, adaptive batching, failure detection, NAT traversal, swarm discovery |
 | [`IDENTITY.md`](docs/IDENTITY.md) | Entity identity, origin binding, permission tokens and delegation |
 | [`CHANNELS.md`](docs/CHANNELS.md) | Named hierarchical channels and capability-based authorization |
+| [`ORGANIZATIONS.md`](docs/ORGANIZATIONS.md) | Org identity, admission modes, private discovery, revocation floors |
 | [`BEHAVIOR.md`](docs/BEHAVIOR.md) | Capability announcements and indexing, diffs, node metadata, schema registry, autonomy rules, context fabric, load balancing, proximity graph, safety envelopes |
 | [`SUBNETS.md`](docs/SUBNETS.md) | The four-level subnet hierarchy and gateway visibility |
 | [`SUBPROTOCOLS.md`](docs/SUBPROTOCOLS.md) | The subprotocol registry, ID space, version negotiation, opaque forwarding |
