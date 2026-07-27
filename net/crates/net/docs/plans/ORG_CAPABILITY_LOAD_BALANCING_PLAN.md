@@ -225,15 +225,21 @@ OLB-2C authority-publication half — are SIGNED by Kyra (2026-07-27) at
 [`OLB_2B_CONSUMER_ENTRY_DESIGN.md`](OLB_2B_CONSUMER_ENTRY_DESIGN.md) for the
 frozen boundary it must preserve.
 
-*(Open, deliberately not reconciled here: the sign-off also names `351f93480` as
-`SAFE_LIVE_HEAD`. That token is RESERVED by this plan (below) and twice by
+**Head tokens (corrected 2026-07-28).** The sign-off initially named `351f93480`
+as `SAFE_LIVE_HEAD`; that was withdrawn on review, since the token is reserved by
+this plan (below) and twice by
 [`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md)
-for a separately reviewed provider-free leader lighting, which has not happened
-— `OrgCapabilityRegistration` is still dark and LS-1..LS-6 are unbuilt. Either
-the reservation is being retired deliberately, or the token was reused for what
-is really an OLB-2B signed head. Recorded as a question rather than resolved
-silently, because a plan whose process leans this hard on named heads cannot
-afford one name meaning two things.)*
+for a separately reviewed provider-free leader lighting that has not happened —
+`OrgCapabilityRegistration` is still dark and LS-1..LS-6 are unbuilt. The correct
+designations are:
+
+```text
+OLB_2B_SIGNED_HEAD = 351f93480ccd75f04cee305b5c53d8ab401e8724
+SAFE_LIVE_HEAD     = not established
+```
+
+The correction is to the token NAME only; it does not touch the E3c / OLB-2B.2
+signature or the 2B.3 authorization.
 
 **Merged is not signed, and the distinction is load-bearing here.** The
 merge-tier findings were closed before merge exactly as the pass-3 adjudication

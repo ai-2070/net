@@ -3758,21 +3758,35 @@ async fn an_authority_rotation_over_the_same_store_still_publishes_inside_the_ep
 
 // ---- OLB-2B.3a: the lock-free per-slot publication cell ------------------
 
-/// OLB-2B.3a. A handle's lock-free read observes exactly what the registry
-/// published — the same artifact `Arc`, not a copy and not a stale snapshot.
+/// OLB-2B.3a. A handle's lock-free read observes exactly what the REAL actor
+/// installation publishes — the same artifact `Arc` the locked registry seam
+/// returns.
 ///
-/// The hot-path contract (plan pins 7/8) is that a warmed call is an ArcSwap
-/// LOAD, never a lock. That is only worth anything if the cell the handle holds
-/// is the same one the actor installs into. The failure this witnesses against
-/// is a handle wired to a DETACHED cell: it would read `None` forever, look
-/// exactly like the deterministic cold outcome, and never be attributed to a
-/// bug.
+/// Drives `DirtyApply::apply` so the phase-5 installation runs for real. An
+/// earlier version of this witness used `install_facts_for_test`, which stores
+/// into the cell that already exists, and was therefore blind to the defect that
+/// matters most here: a production install that REPLACES the cell
+/// (`slot.facts = Arc::new(ArcSwapOption::from(..))` instead of
+/// `slot.facts.store(..)`) would leave every live `DemandHandle` holding the old
+/// cell — silently cold forever — while the locked seam happily reported the new
+/// artifact. The two seams diverging is the whole hazard of publishing through a
+/// cloned cell, so the witness must compare them after a real install
+/// (Kyra, 2B.3a review).
 #[tokio::test]
 async fn a_handles_lockfree_read_observes_the_registrys_published_artifact() {
-    use crate::adapter::net::behavior::org_routing::{DirtyApply, RegistryWork};
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
     use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
 
     let node = node().await;
+    let scratch = Scratch::new("lockfree-cell", &node);
+    node.install_org_revocation_store(scratch.store())
+        .expect("install");
+
     let source = ScopedSlotSource {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
@@ -3791,45 +3805,45 @@ async fn a_handles_lockfree_read_observes_the_registrys_published_artifact() {
 
     assert!(
         held.base_facts_unvalidated().is_none(),
-        "cold before anything is installed"
+        "cold before the actor has installed anything"
     );
 
-    // Install through the registry, then read through the HANDLE. If the handle
-    // held a detached cell this stays `None` and looks like an ordinary cold
-    // read.
-    let installed = Arc::new(
-        crate::adapter::net::behavior::org_routing_registry::SlotBaseFacts {
-            providers: SourceFacts::Unserved,
-            epoch: Default::default(),
-            actor_incarnation: 1,
-            slot_incarnation: 1,
-            earliest_expiry: u64::MAX,
+    // The REAL installation path: first demand queued the slot, so one apply
+    // pass reconstructs and installs it through phase 5 under the commit pin.
+    let outcome = registry.apply(
+        1,
+        ApplyRequest {
+            batch: PrivateDiscoveryChangeBatch {
+                generation: 0,
+                dirty: DirtyCapabilities::Clean,
+            },
+            registry_work: true,
         },
     );
-    registry.install_facts_for_test(key.clone(), installed.clone());
+    assert!(
+        matches!(outcome, ApplyOutcome::Current { .. }),
+        "the install pass must settle: {outcome:?}"
+    );
 
-    let seen = held
+    let via_registry = registry
+        .base_facts_unvalidated(&key)
+        .expect("the actor installed an artifact");
+    let via_handle = held
         .base_facts_unvalidated()
-        .expect("the handle must observe the registry's install");
+        .expect("the handle must observe the actor's install; `None` here means                  the handle holds a cell the production install no longer writes to");
     assert!(
-        Arc::ptr_eq(&seen, &installed),
-        "the handle must observe the SAME artifact the registry published, not a copy"
-    );
-    assert!(
-        Arc::ptr_eq(
-            &seen,
-            &registry
-                .base_facts_unvalidated(&key)
-                .expect("registry-side twin")
-        ),
-        "the lock-free and locked seams must agree — two cells would let them diverge"
+        Arc::ptr_eq(&via_handle, &via_registry),
+        "the lock-free and locked seams must return the SAME artifact — divergence          means the install replaced the cell instead of storing into it, leaving          every live handle permanently and silently cold"
     );
 
-    // And invalidation is observed through the same cell.
-    registry.invalidate_if_stale(&key, &installed);
+    // Invalidation must reach the handle through the same cell.
+    registry.invalidate_if_stale(&key, &via_registry);
     assert!(
         held.base_facts_unvalidated().is_none(),
-        "an invalidation must be visible through the handle, or the warmed path \
-         would keep serving retired facts"
+        "an invalidation must be visible through the handle, or the warmed path          would keep serving retired facts"
+    );
+    assert!(
+        registry.base_facts_unvalidated(&key).is_none(),
+        "and both seams must agree about the invalidation too"
     );
 }
