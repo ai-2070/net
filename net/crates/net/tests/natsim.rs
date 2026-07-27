@@ -130,7 +130,21 @@ impl Drop for ScenarioRun {
             }
         }
 
-        for path in &paths {
+        // Gateway NAT captures first. CI log viewers and copy-pasted
+        // output get truncated, and a previous run lost exactly the
+        // conntrack section to that truncation — so print the smallest,
+        // most decisive artifact before the bulkier helper logs rather
+        // than in alphabetical position.
+        let mut ordered: Vec<&std::path::PathBuf> = paths.iter().collect();
+        ordered.sort_by_key(|p| {
+            let is_nat = p
+                .file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.ends_with("_nat.log"));
+            (!is_nat, (*p).clone())
+        });
+
+        for path in ordered {
             let name = path
                 .file_name()
                 .and_then(|f| f.to_str())

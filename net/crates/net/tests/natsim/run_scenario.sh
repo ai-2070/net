@@ -159,18 +159,32 @@ fi
 # The trains keep refreshing these entries for the whole punch window
 # (UDP conntrack timeout is far longer than the 5 s deadline), so a
 # snapshot taken right after the verdict still shows them.
+# Section order is deliberate: the artifact dump prints each file's
+# TAIL, so the punch-relevant conntrack summary goes LAST. Putting it
+# first (as the first version did) meant a long `ip addr` / ruleset
+# section pushed the one thing worth reading out of the captured window.
 for gw in nsim_gwa nsim_gwb; do
   [[ -e "/var/run/netns/$gw" ]] || continue
+  CT="$STATE/${gw}_conntrack_raw.txt"
+  ip netns exec "$gw" conntrack -L 2>/dev/null >"$CT" \
+    || ip netns exec "$gw" cat /proc/net/nf_conntrack 2>/dev/null >"$CT" \
+    || echo "(no conntrack view available)" >"$CT"
   {
-    echo "### conntrack ($gw)"
-    ip netns exec "$gw" conntrack -L 2>/dev/null \
-      || ip netns exec "$gw" cat /proc/net/nf_conntrack 2>/dev/null \
-      || echo "(no conntrack view available)"
+    echo "### addrs ($gw)"
+    ip -n "$gw" addr 2>&1 | grep -E '^[0-9]+:|inet ' || true
     echo "### nft ruleset ($gw)"
     ip netns exec "$gw" nft list ruleset 2>&1 || true
-    echo "### addrs ($gw)"
-    ip -n "$gw" addr 2>&1 || true
+    echo "### conntrack, all UDP ($gw)"
+    grep -E 'udp' "$CT" || echo "(no udp entries)"
+    # Dead last, and the whole point of the capture: the A<->B flows.
+    # On gwb a healthy punch shows the B->A flow SNAT'd to sport=7002
+    # (the reflex A was told); anything else is the port-mismatch
+    # hypothesis confirmed.
+    echo "### PUNCH-RELEVANT: flows mentioning BOTH 10.99.0.2 and 10.99.0.3 ($gw)"
+    awk '/10\.99\.0\.2/ && /10\.99\.0\.3/' "$CT" || true
+    echo "### (end $gw)"
   } >"$STATE/${gw}_nat.log" 2>&1
+  rm -f "$CT"
 done
 
 # Open the artifacts read-only to non-root (no write bit anywhere)
