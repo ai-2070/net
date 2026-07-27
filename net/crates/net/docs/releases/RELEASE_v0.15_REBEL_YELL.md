@@ -541,7 +541,7 @@ net_free_string(cfg_json);
 net_mesh_blob_adapter_free(adapter);
 ```
 
-The C surface requires building the cdylib with `dataforts,netdb,redex-disk`; the Go binding wraps these via cgo and the SDK READMEs document the per-binding shape ([Rust](../sdk/README.md#phase-35--active-blob-overflow-v03) / [Python](../sdk-py/README.md#dataforts-greedy-cache-gravity-blob-refs-read-your-writes) / [TypeScript](../sdk-ts/README.md#dataforts-greedy-cache-gravity-blob-refs-read-your-writes) / [Go](../../../../../go/README.md#dataforts-blob-storage) / [C](../../include/README.md#dataforts-blob-storage-meshblobadapter--v03-overflow)).
+The C surface requires building the cdylib with `dataforts,netdb,redex-disk`; the Go binding wraps these via cgo and the SDK READMEs document the per-binding shape ([Rust](../../sdk/README.md#phase-35--active-blob-overflow-v03) / [Python](../../sdk-py/README.md#dataforts-greedy-cache-gravity-blob-refs-read-your-writes) / [TypeScript](../../sdk-ts/README.md#dataforts-greedy-cache-gravity-blob-refs-read-your-writes) / [Go](../../../../../go/README.md#dataforts-blob-storage) / [C](../../include/README.md#dataforts-blob-storage-meshblobadapter--v03-overflow)).
 
 ### Storage layout + safe-delete
 

@@ -2,7 +2,7 @@
 
 > Per-axis key shape + value typing for `CapabilitySet`. **Authoritative** for the Rust core schema (`behavior::schema::AXIS_SCHEMA`) and the per-binding generated schemas (TS `.d.ts`, Python TypedDict / Pydantic, Go codegen). CI guards each binding's regenerated schema against this doc; build fails on drift.
 >
-> Phase 2 of [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](plans/CAPABILITY_ENHANCEMENTS_PLAN.md). Companion to [`plans/CAPABILITY_SYSTEM_PLAN.md`](plans/CAPABILITY_SYSTEM_PLAN.md) §1 (typed taxonomy) — that doc defines the four-axis ontology; this doc enumerates the keys under each axis.
+> Phase 2 of [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_ENHANCEMENTS_PLAN.md). Companion to [`plans/CAPABILITY_SYSTEM_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_SYSTEM_PLAN.md) §1 (typed taxonomy) — that doc defines the four-axis ontology; this doc enumerates the keys under each axis.
 
 ## Status
 
@@ -22,7 +22,7 @@ The schema is **purely local** — bindings use it for auto-completion, static t
 
 ## Eternal-rule alignment
 
-Per [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](plans/CAPABILITY_ENHANCEMENTS_PLAN.md) "Locked decisions / The eternal rule":
+Per [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_ENHANCEMENTS_PLAN.md) "Locked decisions / The eternal rule":
 
 - This schema does NOT change wire format.
 - This schema does NOT enforce on incoming peer data — forward-compat decoders pass unknown keys with a warning, not an error.
@@ -142,7 +142,7 @@ Reserved key shapes (informational):
 
 ## Reserved cross-axis prefixes
 
-Per [`plans/CAPABILITY_SYSTEM_PLAN.md`](plans/CAPABILITY_SYSTEM_PLAN.md) §2: tag shapes that describe the *artifact* (chain, fork lineage, heat) rather than the node, so they don't fit a single taxonomy axis. Stored as `Tag::Reserved { prefix, body }`.
+Per [`plans/CAPABILITY_SYSTEM_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_SYSTEM_PLAN.md) §2: tag shapes that describe the *artifact* (chain, fork lineage, heat) rather than the node, so they don't fit a single taxonomy axis. Stored as `Tag::Reserved { prefix, body }`.
 
 | Prefix | Body shape | Notes |
 |---|---|---|
@@ -231,7 +231,7 @@ The `examples/gen_schema_*` binaries do not exist in the substrate today; runnin
 
 ## See also
 
-- [`plans/CAPABILITY_SYSTEM_PLAN.md`](plans/CAPABILITY_SYSTEM_PLAN.md) — §1 ratifies the four-axis ontology this schema enumerates.
-- [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](plans/CAPABILITY_ENHANCEMENTS_PLAN.md) Phase 2 — the schema layer this doc anchors.
-- [`plans/CAPABILITY_SYSTEM_SDK_PLAN.md`](plans/CAPABILITY_SYSTEM_SDK_PLAN.md) §10 + Phase 9a — per-binding generators that read this doc.
+- [`plans/CAPABILITY_SYSTEM_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_SYSTEM_PLAN.md) — §1 ratifies the four-axis ontology this schema enumerates.
+- [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_ENHANCEMENTS_PLAN.md) Phase 2 — the schema layer this doc anchors.
+- [`plans/CAPABILITY_SYSTEM_SDK_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md) §10 + Phase 9a — per-binding generators that read this doc.
 - [`BEHAVIOR.md`](BEHAVIOR.md) — overall behavior plane this lives in.

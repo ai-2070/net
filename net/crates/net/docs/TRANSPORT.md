@@ -44,7 +44,7 @@ Every Net packet starts with a 64-byte header aligned to a single CPU cache line
 
 ## Encryption
 
-**Handshake:** Noise NKpsk0 pattern via the `snow` crate. The initiator is anonymous, the responder's static key is known in advance. A pre-shared key adds symmetric authentication. Direct UDP is the default path (`MeshNode::connect`), but when two peers have no direct path, `MeshNode::connect_via(relay_addr, …)` carries the Noise messages inside `SUBPROTOCOL_HANDSHAKE` (0x0601) over an existing encrypted session through a relay — the relay sees authenticated Noise bytes but cannot forge them or derive the post-handshake session keys. See [`HANDSHAKE_RELAY_PLAN.md`](HANDSHAKE_RELAY_PLAN.md) for the design.
+**Handshake:** Noise NKpsk0 pattern via the `snow` crate. The initiator is anonymous, the responder's static key is known in advance. A pre-shared key adds symmetric authentication. Direct UDP is the default path (`MeshNode::connect`), but when two peers have no direct path, `MeshNode::connect_via(relay_addr, …)` carries the Noise messages inside `SUBPROTOCOL_HANDSHAKE` (0x0601) over an existing encrypted session through a relay — the relay sees authenticated Noise bytes but cannot forge them or derive the post-handshake session keys. (The design plan for this was removed in `a6beba551`; this paragraph is the surviving description.)
 
 **Payload encryption:** ChaCha20-Poly1305 AEAD with counter-based nonces. Each session derives separate TX/RX `SessionKeys` from the Noise handshake. The header is never encrypted -- only the payload.
 

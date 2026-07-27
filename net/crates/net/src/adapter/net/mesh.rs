@@ -25068,7 +25068,7 @@ impl MeshNode {
     /// before calling.
     ///
     /// Rebel Yell Phase 4. See
-    /// `docs/internal/misc/DATAFORTS_PLAN.md` § Phase 4.
+    /// `docs/internal/plans/DATAFORTS_PLAN.md` § Phase 4.
     #[cfg(feature = "dataforts")]
     pub async fn announce_heat(&self, origin_hash: u64, rate: f64) -> Result<(), AdapterError> {
         let hex = Self::chain_hex(origin_hash);
