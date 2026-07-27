@@ -23752,6 +23752,24 @@ impl MeshNode {
         self.announce_from_baseline(Some(caps), ttl, sign).await
     }
 
+    /// Re-announce the CURRENT baseline to peers without setting a new
+    /// one — the same `None` path the keep-alive and RT-3 loops take,
+    /// exposed for the in-crate callers that only want peer visibility
+    /// for a local registry change (`serve_rpc`'s auto re-announce).
+    ///
+    /// The distinction matters: `announce_capabilities(snapshot)` reads
+    /// the baseline OUTSIDE `announce_mu` and writes it back as a new
+    /// one, so a snapshot taken before a concurrent explicit announce
+    /// silently reverts that announce's capability set (the RT-3
+    /// clobber TOCTOU, review Finding 8, in a second guise). Reading
+    /// the baseline inside the lock — which is what `None` does — makes
+    /// the re-announce a pure republish that can never lose a
+    /// concurrently-announced capability.
+    pub(crate) async fn reannounce_current_capabilities(&self) -> Result<(), AdapterError> {
+        self.announce_from_baseline(None, Duration::from_secs(300), true)
+            .await
+    }
+
     /// Core announce path shared by explicit announces and the
     /// re-announce loops (RT-3 change-driven + keep-alive).
     ///
