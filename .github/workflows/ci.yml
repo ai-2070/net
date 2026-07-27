@@ -422,6 +422,7 @@ jobs:
           --test integration_nrpc_cross_lang_streaming
           --test integration_tool_announce
           --test capability_exposure_revocation
+          --test serve_rpc_reannounce_baseline
           --test nrpc_inbound_dispatcher
           --test nrpc_call_hijack
           --test nrpc_registration_order
