@@ -61,9 +61,20 @@ SETUP_ARGS=(--nat-a "$NAT_A" --nat-b "$NAT_B" "${SETUP_EXTRA[@]}")
 [[ "$PUBLIC_B" == 1 ]] && SETUP_ARGS+=(--public-b)
 "$HERE/setup.sh" "${SETUP_ARGS[@]}"
 
+# Log level for the helpers. This MUST reach trace: the rendezvous drop
+# paths that decide a punch's fate — the forged/non-coordinator
+# introduce drop, and every branch of `unsolicited_introduce_permitted`
+# (reflex-IP mismatch, per-source train budget, global concurrent-train
+# ceiling) — are all `tracing::trace!`. A `debug` default filters out
+# exactly the lines the failure needs, which is what the first
+# instrumented run did. Override with RUST_LOG=... to widen or quieten.
+NATSIM_LOG="${RUST_LOG:-net::adapter::net=trace,net=info}"
+
 launch() { # launch <netns> <logname> <args...>
   local ns="$1" log="$2"; shift 2
-  ip netns exec "$ns" "$BIN" "$@" >"$STATE/$log.log" 2>&1 &
+  # `ip netns exec` keeps the environment, but be explicit — this runs
+  # under sudo from the test wrapper, where the ambient env is stripped.
+  ip netns exec "$ns" env RUST_LOG="$NATSIM_LOG" "$BIN" "$@" >"$STATE/$log.log" 2>&1 &
   PIDS+=("$!")
 }
 
@@ -137,6 +148,44 @@ if [[ ! -s "$OUTCOME" ]]; then
   tail -n 40 "$STATE"/*.log >&2 || true
   exit 1
 fi
+
+# Snapshot each gateway's NAT state, BEFORE the EXIT trap tears the
+# namespaces down. This is the view the helper logs cannot provide: the
+# endpoints only see "I sent N keep-alives and received none", while the
+# question is what mapping the gateway actually installed for the punch
+# destination — specifically whether the public port it chose for the
+# peer-directed flow is the same one the peer was told to expect.
+#
+# The trains keep refreshing these entries for the whole punch window
+# (UDP conntrack timeout is far longer than the 5 s deadline), so a
+# snapshot taken right after the verdict still shows them.
+# Section order is deliberate: the artifact dump prints each file's
+# TAIL, so the punch-relevant conntrack summary goes LAST. Putting it
+# first (as the first version did) meant a long `ip addr` / ruleset
+# section pushed the one thing worth reading out of the captured window.
+for gw in nsim_gwa nsim_gwb; do
+  [[ -e "/var/run/netns/$gw" ]] || continue
+  CT="$STATE/${gw}_conntrack_raw.txt"
+  ip netns exec "$gw" conntrack -L 2>/dev/null >"$CT" \
+    || ip netns exec "$gw" cat /proc/net/nf_conntrack 2>/dev/null >"$CT" \
+    || echo "(no conntrack view available)" >"$CT"
+  {
+    echo "### addrs ($gw)"
+    ip -n "$gw" addr 2>&1 | grep -E '^[0-9]+:|inet ' || true
+    echo "### nft ruleset ($gw)"
+    ip netns exec "$gw" nft list ruleset 2>&1 || true
+    echo "### conntrack, all UDP ($gw)"
+    grep -E 'udp' "$CT" || echo "(no udp entries)"
+    # Dead last, and the whole point of the capture: the A<->B flows.
+    # On gwb a healthy punch shows the B->A flow SNAT'd to sport=7002
+    # (the reflex A was told); anything else is the port-mismatch
+    # hypothesis confirmed.
+    echo "### PUNCH-RELEVANT: flows mentioning BOTH 10.99.0.2 and 10.99.0.3 ($gw)"
+    awk '/10\.99\.0\.2/ && /10\.99\.0\.3/' "$CT" || true
+    echo "### (end $gw)"
+  } >"$STATE/${gw}_nat.log" 2>&1
+  rm -f "$CT"
+done
 
 # Open the artifacts read-only to non-root (no write bit anywhere)
 # so the invoking `cargo test` process can read the outcome path

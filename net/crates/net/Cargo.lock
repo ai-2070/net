@@ -2832,6 +2832,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "tracing-subscriber",
  "unicode-normalization",
  "x25519-dalek",
  "xxhash-rust",

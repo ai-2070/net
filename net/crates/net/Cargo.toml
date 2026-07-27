@@ -379,6 +379,14 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
+# `examples/natsim_node.rs` only. The natsim scenarios run helper nodes
+# inside network namespaces, and the rendezvous drop paths they need to
+# be debugged through log at trace/debug — with no subscriber installed
+# those lines go nowhere and a failed punch is indistinguishable from a
+# punch that was never attempted. Already in the workspace tree (cli,
+# payments, aggregator-daemon all depend on it), so this adds no new
+# third-party surface.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Custom-main latency benches (CPB capability-propagation suite) print
 # p50…p99.9 tails; Criterion is mediocre at p99.9. Same recipe as the
 # SDK crate's nrpc_tail/nrpc_churn benches.

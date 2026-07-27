@@ -46,12 +46,165 @@ fn natsim_node_bin() -> std::path::PathBuf {
     p
 }
 
+/// A completed scenario: the initiator's outcome JSON plus the state
+/// directory holding every helper's log and stats snapshot.
+///
+/// Derefs to the outcome, so assertions read exactly as they did when
+/// `scenario()` returned a bare `Value`. The reason it exists is
+/// [`Drop`]: on a failed assertion it dumps the other nodes' artifacts
+/// into the test output.
+///
+/// Without that, a failing scenario reports only the initiator's
+/// verdict — e.g. `punch_timeouts: 1` — and the responder's and
+/// coordinator's logs are torn down unread, because `run_scenario.sh`
+/// prints helper logs only on the *timeout* path (no outcome file at
+/// all). A punch that fails while still producing a verdict left no
+/// evidence of which side dropped it.
+struct ScenarioRun {
+    outcome: serde_json::Value,
+    state: std::path::PathBuf,
+}
+
+impl std::ops::Deref for ScenarioRun {
+    type Target = serde_json::Value;
+    fn deref(&self) -> &serde_json::Value {
+        &self.outcome
+    }
+}
+
+impl std::fmt::Display for ScenarioRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Delegates so the existing `{v:#}` assertion messages keep
+        // rendering the outcome JSON.
+        std::fmt::Display::fmt(&self.outcome, f)
+    }
+}
+
+impl Drop for ScenarioRun {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        eprintln!("\n=== natsim artifacts ({}) ===", self.state.display());
+        let entries = match std::fs::read_dir(&self.state) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("(state dir unreadable: {e})");
+                return;
+            }
+        };
+
+        // Inventory first, and account for EVERY entry — including ones
+        // that error out of `read_dir` or fail to open. The previous
+        // version silently dropped both (`.flatten()` on the iterator,
+        // and no line for a file it chose not to print), so a missing
+        // artifact was indistinguishable from an unreadable one and from
+        // one that was never written. That ambiguity cost a CI round.
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(e) => paths.push(e.path()),
+                Err(e) => eprintln!("  <read_dir entry error: {e}>"),
+            }
+        }
+        paths.sort();
+
+        let names: Vec<&str> = paths
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|f| f.to_str()))
+            .collect();
+        eprintln!("files ({}): {}", names.len(), names.join(" "));
+
+        // DELIBERATELY TINY BY DEFAULT.
+        //
+        // Two runs in a row lost the decisive lines to output
+        // truncation: the first dropped the tail, the second dropped the
+        // middle while keeping head and tail. No print *ordering*
+        // survives both, so the only reliable fix is to emit far less.
+        //
+        // Default output is a handful of lines: the per-gateway
+        // PUNCH-RELEVANT conntrack flows, and the `rendezvous:` lines
+        // from each node — which together are the entire diagnosis.
+        // Everything else (full logs, stats, ruleset, addresses) is
+        // still on disk and printed with NATSIM_FULL_ARTIFACTS=1.
+        let full = std::env::var_os("NATSIM_FULL_ARTIFACTS").is_some();
+
+        let read = |name: &str| -> Option<String> {
+            paths
+                .iter()
+                .find(|p| p.file_name().and_then(|f| f.to_str()) == Some(name))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        };
+
+        for gw in ["nsim_gwa", "nsim_gwb"] {
+            let file = format!("{gw}_nat.log");
+            match read(&file) {
+                None => eprintln!("\n[{gw}] no NAT capture ({file} absent or unreadable)"),
+                Some(body) => {
+                    // Everything after the PUNCH-RELEVANT marker.
+                    let tail: Vec<&str> = body
+                        .lines()
+                        .skip_while(|l| !l.starts_with("### PUNCH-RELEVANT"))
+                        .filter(|l| !l.starts_with("###"))
+                        .filter(|l| !l.trim().is_empty())
+                        .collect();
+                    if tail.is_empty() {
+                        eprintln!("\n[{gw}] no conntrack flow between the two public addrs");
+                    } else {
+                        eprintln!("\n[{gw}] A<->B conntrack flows:");
+                        for line in tail {
+                            eprintln!("  {line}");
+                        }
+                    }
+                }
+            }
+        }
+
+        for node in ["a", "b", "r"] {
+            let file = format!("{node}.log");
+            match read(&file) {
+                None => eprintln!("\n[{node}] no log"),
+                Some(body) => {
+                    let lines: Vec<&str> = body
+                        .lines()
+                        .filter(|l| l.contains("rendezvous:"))
+                        .map(|l| l.split_once("mesh: ").map(|(_, r)| r).unwrap_or(l))
+                        .collect();
+                    eprintln!("\n[{node}] rendezvous ({} lines):", lines.len());
+                    for line in lines {
+                        eprintln!("  {line}");
+                    }
+                }
+            }
+        }
+
+        if full {
+            for path in &paths {
+                let name = path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("<non-utf8>");
+                if !name.ends_with(".log") && !name.ends_with(".json") {
+                    continue;
+                }
+                match std::fs::read_to_string(path) {
+                    Ok(body) => eprintln!("\n--- {name} ---\n{body}"),
+                    Err(e) => eprintln!("\n--- {name} (UNREADABLE: {e}) ---"),
+                }
+            }
+        } else {
+            eprintln!("\n(set NATSIM_FULL_ARTIFACTS=1 for full logs; files kept in the dir above)");
+        }
+        eprintln!("=== end natsim artifacts ===\n");
+    }
+}
+
 /// Run one scenario script and return the initiator's outcome JSON.
 /// The script prints the outcome path on a `NATSIM_OUTCOME_PATH=`
 /// marker line (a bare "last line" is unsafe: the JSON body it
 /// follows ends without a trailing newline, so the path would glue
 /// onto the closing brace).
-fn scenario(name: &str) -> serde_json::Value {
+fn scenario(name: &str) -> ScenarioRun {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/natsim/run_scenario.sh");
     // Thread the profile-resolved helper path through sudo (which
     // strips the environment by default) so the script exercises the
@@ -79,7 +232,15 @@ fn scenario(name: &str) -> serde_json::Value {
         .map(str::trim)
         .expect("NATSIM_OUTCOME_PATH= marker on scenario stdout");
     let bytes = std::fs::read(path).expect("read outcome json");
-    serde_json::from_slice(&bytes).expect("parse outcome json")
+    let outcome = serde_json::from_slice(&bytes).expect("parse outcome json");
+    // The script leaves its state dir in place (a mktemp under /tmp);
+    // the outcome file sits directly inside it, so the parent is where
+    // every helper's log and stats snapshot live.
+    let state = std::path::Path::new(path)
+        .parent()
+        .expect("outcome path has a parent state dir")
+        .to_path_buf();
+    ScenarioRun { outcome, state }
 }
 
 fn stat(v: &serde_json::Value, key: &str) -> u64 {

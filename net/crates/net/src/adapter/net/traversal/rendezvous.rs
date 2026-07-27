@@ -442,6 +442,17 @@ impl RendezvousMsg {
             RendezvousMsg::PunchReject(rej) => encode_punch_reject(rej),
         }
     }
+
+    /// Static variant name, for logging the arrival of a rendezvous
+    /// message without formatting its whole body.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            RendezvousMsg::PunchRequest(_) => "PunchRequest",
+            RendezvousMsg::PunchIntroduce(_) => "PunchIntroduce",
+            RendezvousMsg::PunchAck(_) => "PunchAck",
+            RendezvousMsg::PunchReject(_) => "PunchReject",
+        }
+    }
 }
 
 fn encode_addr(buf: &mut BytesMut, addr: SocketAddr) {

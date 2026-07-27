@@ -60,6 +60,10 @@ def test_connect_direct_auto_is_exposed(mesh) -> None:
     assert callable(getattr(mesh, "connect_direct_auto", None))
 
 
-def test_auto_direct_upgrade_kwarg_accepted() -> None:
-    m = net.NetMesh("127.0.0.1:0", PSK, auto_direct_upgrade=True)
+@pytest.mark.parametrize("enabled", [True, False])
+def test_auto_direct_upgrade_kwarg_accepted(enabled: bool) -> None:
+    # Both poles: the flag defaults on, so False is the arm that would
+    # silently regress if the binding ever collapsed back to
+    # opt-in-only plumbing (`== Some(true)` instead of `if let`).
+    m = net.NetMesh("127.0.0.1:0", PSK, auto_direct_upgrade=enabled)
     m.shutdown()

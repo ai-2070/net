@@ -325,9 +325,18 @@ verified locally, the netns halves await their first CI run).
   keygen/public/joiner), `tests/natsim.rs` (`#[ignore]`d, Linux-only
   wrappers asserting outcome + stats deltas), and
   `.github/workflows/natsim.yml` (traversal-touching PRs + nightly +
-  manual). Cone = plain `masquerade persistent`, symmetric =
-  `masquerade fully-random`; R and X are two distinct public IPs so the
-  classifier's cone/symmetric discrimination is real.
+  manual). Cone = static `snat to <public>:<port>` plus an INPUT drop for
+  unsolicited inbound on that port, symmetric = `masquerade
+  fully-random`; R and X are two distinct public IPs so the classifier's
+  cone/symmetric discrimination is real.
+
+  Cone was originally plain `masquerade persistent` on the belief that it
+  gives endpoint-independent mapping. It does not — `persistent` pins the
+  source address, not the port — and under a simultaneous punch the
+  peer's inbound keep-alive poisoned the conntrack tuple the local
+  outbound needed, so the gateway reallocated the public port and the
+  "cone" NAT degraded to symmetric. That is why `cone_cone_punch` failed
+  from its first run; see `tests/natsim/README.md`.
 - Five scenarios wired: cone×cone punch, symmetric×cone exactly-once,
   symmetric×symmetric skip, dropped-keep-alives fallback-within-deadline,
   and the Stage 3 relay→direct upgrade (topology adjusted to shipped
@@ -379,11 +388,22 @@ verified locally, the netns halves await their first CI run).
 auto-selection) and 3b (migration-contract primitives + background upgrade).
 Deviations from the plan as written, all deliberate:
 
-- **`auto_direct_upgrade` defaults to `false`**, not `true`. This is new
-  live session-migration behavior; the flag exists so it can be enabled
-  per-deployment and validated against the Stage 4 real-NAT harness before any
-  consideration of flipping the default. The migration contract (C1–C4) is in
-  place to make it safe when enabled.
+- ~~**`auto_direct_upgrade` defaults to `false`**, not `true`.~~ **Resolved —
+  the default flipped to `true` (v0.34), matching the plan as originally
+  written.** The Stage 4 gate this deviation was waiting on is met: the netns +
+  nftables harness exercises the upgrade across genuine cone/symmetric NATs
+  (`natsim_relay_session_upgrades_to_direct`) on every traversal-touching PR and
+  nightly. The migration contract (C1–C4) makes the swap safe, and
+  `auto_direct_upgrade(false)` remains the kill switch.
+
+  Flipping the default required un-collapsing the opt-in-only plumbing at every
+  wrapper: the Rust SDK, FFI, Node, Python, and Go surfaces each translated the
+  flag as "if true → enable", which silently swallows an explicit `false` once
+  the core default is on. FFI and Go moved to tri-state (`Option<bool>` /
+  `*bool`) so an omitted field still means "inherit the default" while `false`
+  reaches the core config. The natsim helper needed the same fix — it set the
+  flag only when `--auto-upgrade` was passed, so the punch / fallback / skip
+  scenarios would otherwise have silently run with the upgrade enabled.
 - **The upgrade currently handles `Direct` pairs** (peer reachable at its
   reflex). The coordinated-punch (`SinglePunch`) upgrade reuses the same
   install machinery (`connect_via_cas` + `request_punch`) and is a follow-up;

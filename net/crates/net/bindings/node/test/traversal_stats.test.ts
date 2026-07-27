@@ -69,11 +69,14 @@ describe('traversalStats shape parity (stage 5)', () => {
     }
   })
 
-  it('accepts the autoDirectUpgrade option', async () => {
+  // Both poles: the flag defaults on, so `false` is the arm that
+  // would silently regress if the binding ever collapsed back to
+  // opt-in-only plumbing (`=== true` instead of a defined check).
+  it.each([true, false])('accepts autoDirectUpgrade: %s', async (enabled) => {
     const mesh = await NetMesh.create({
       bindAddr: '127.0.0.1:0',
       psk: PSK,
-      autoDirectUpgrade: true,
+      autoDirectUpgrade: enabled,
     })
     await mesh.shutdown()
   })

@@ -16,10 +16,16 @@
 #      nsim_a .2        nsim_b .2           (joiners behind NAT)
 #
 # NAT flavor per side (--nat-a / --nat-b):
-#   cone      — plain `masquerade persistent`: endpoint-independent
-#               mapping (same public port for every destination) →
-#               classifies Cone; filtering is conntrack (addr+port
-#               restricted), the realistic punch-needing case.
+#   cone      — static 1:1 `snat to <pub>:<port>` for the joiner's own
+#               port, giving genuinely endpoint-independent mapping
+#               (the same public port for every destination) →
+#               classifies Cone; filtering stays conntrack-based
+#               (address-restricted), the realistic punch-needing case.
+#               Plus an INPUT drop for unsolicited inbound on that port,
+#               which is both what a restricted NAT does and what keeps
+#               a simultaneous punch from poisoning the port mapping.
+#               See `one_side` for why `masquerade persistent` alone is
+#               NOT a cone NAT.
 #   symmetric — `masquerade fully-random`: a fresh public port per
 #               connection tuple → classifies Symmetric.
 #   none      — the joiner is expected to run publicly in nsim_wan
@@ -84,9 +90,9 @@ if [[ "$PUBLIC_B" == 1 ]]; then
   ip -n "$WAN" addr add 10.99.0.12/24 dev br0
 fi
 
-# one_side <letter> <gw_pub_ip> <lan_subnet> <nat_mode>
+# one_side <letter> <gw_pub_ip> <lan_subnet> <nat_mode> <joiner_port>
 one_side() {
-  local L="$1" PUB="$2" LAN="$3" MODE="$4"
+  local L="$1" PUB="$2" LAN="$3" MODE="$4" PORT="$5"
   [[ "$MODE" == "none" ]] && return 0
   local GW="nsim_gw$L" NS="nsim_$L"
   ip netns add "$GW"
@@ -110,20 +116,78 @@ one_side() {
 
   ip netns exec "$GW" sysctl -qw net.ipv4.ip_forward=1
 
-  local MASQ="masquerade persistent"
-  [[ "$MODE" == "symmetric" ]] && MASQ="masquerade fully-random"
+  if [[ "$MODE" == "symmetric" ]]; then
+    # `fully-random` scrambles the public port per destination tuple —
+    # a genuine symmetric NAT, and the punch is expected to fail.
+    ip netns exec "$GW" nft -f - <<EOF
+table ip nat {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "gw$L-wan" masquerade fully-random
+  }
+}
+EOF
+    return 0
+  fi
+
+  # Cone. Two rules, and both are load-bearing — plain
+  # `masquerade persistent` does NOT produce a cone NAT, which is what
+  # made `cone_cone_punch` fail intermittently:
+  #
+  # 1. `snat to $PUB:$PORT` for the joiner's own source port pins the
+  #    mapping. `persistent` pins the source *address*, not the port;
+  #    port preservation is only netfilter's best-effort heuristic and
+  #    it yields under tuple collision. Under collision the gateway
+  #    silently allocated a fresh public port (observed: 45573) while
+  #    the node had already advertised :$PORT through the rendezvous,
+  #    i.e. the "cone" NAT degraded to symmetric mid-punch — under
+  #    exactly the simultaneous-send condition the test exists to
+  #    exercise.
+  #
+  # 2. The input drop is what removes the collision. When both ends
+  #    fire at the synchronized `fire_at`, the peer's keep-alive can
+  #    reach this gateway *before* the local outbound leaves. Addressed
+  #    to the gateway's own public IP with no mapping yet, it lands in
+  #    INPUT — and conntrack records it as a flow, claiming the tuple
+  #    the local outbound then needs. Dropping it at filter priority,
+  #    before the confirm hook at the end of the chain, means the entry
+  #    is never inserted: the tuple stays free and the outbound
+  #    preserves its port.
+  #
+  # Restricted-cone semantics are preserved, deliberately. Dropping the
+  # unsolicited inbound is exactly what an address-restricted NAT does,
+  # and there is no DNAT here — the peer becomes reachable only once
+  # this side's own outbound has opened the mapping. A static DNAT
+  # would also fix the race, but it would make the gateway full-cone:
+  # the peer would be reachable unsolicited and `cone_cone_punch` would
+  # pass without any hole being punched, which is not a test.
+  #
+  # Once the mapping exists, the peer's keep-alives match it as replies,
+  # are un-NAT'd in prerouting and traverse FORWARD — never INPUT — so
+  # this rule cannot drop legitimate punched traffic.
   ip netns exec "$GW" nft -f - <<EOF
 table ip nat {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
-    oifname "gw$L-wan" $MASQ
+    oifname "gw$L-wan" udp sport $PORT snat to $PUB:$PORT
+    oifname "gw$L-wan" masquerade persistent
+  }
+}
+table ip filter {
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname "gw$L-wan" udp dport $PORT ct state new drop
   }
 }
 EOF
 }
 
-one_side a 10.99.0.2 192.168.101 "$NAT_A"
-one_side b 10.99.0.3 192.168.102 "$NAT_B"
+# The joiner ports are fixed by `run_scenario.sh` (a binds :7001, b
+# binds :7002), which is what lets the cone gateways pin a 1:1 port
+# mapping instead of gambling on netfilter's port-preservation
+# heuristic. Keep these in sync with the `--bind` flags there.
+one_side a 10.99.0.2 192.168.101 "$NAT_A" 7001
+one_side b 10.99.0.3 192.168.102 "$NAT_B" 7002
 
 if [[ "$DROP_DIRECT" == 1 ]]; then
   # Drop UDP routed straight between the two sides' public addresses,

@@ -110,9 +110,11 @@ mod natsim {
         // announces once per node, but the reflex-diff trigger and late
         // joiners lean on the re-announce loop.
         cfg.min_announce_interval = Duration::from_millis(100);
-        if auto_upgrade {
-            cfg = cfg.with_auto_direct_upgrade(true);
-        }
+        // Set both ways, never `if auto_upgrade`: the flag defaults on,
+        // so leaving it unset would silently enable the upgrade in the
+        // punch / fallback / skip scenarios that deliberately omit
+        // `--auto-upgrade` and assert on un-upgraded behavior.
+        cfg = cfg.with_auto_direct_upgrade(auto_upgrade);
         cfg
     }
 
@@ -154,6 +156,20 @@ mod natsim {
         // partial file.
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, bytes).expect("write state file");
+        // Make it world-readable *before* the rename. The helpers run as
+        // root inside the namespaces, so a fresh file lands 0600 under
+        // the default umask, while the non-root `cargo test` wrapper is
+        // what has to read these artifacts. `run_scenario.sh` chmods the
+        // state dir at the end, but the stats snapshots keep being
+        // rewritten every second afterwards — each rename installing a
+        // new root-only inode over the relaxed one — so a post-hoc chmod
+        // races the writers. Setting the mode here is the only version
+        // that holds for a file still being updated.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644));
+        }
         std::fs::rename(&tmp, path).expect("rename state file");
     }
 
@@ -186,9 +202,29 @@ mod natsim {
         })
     }
 
-    async fn serve_forever() -> ! {
+    /// Park for the rest of the scenario, republishing this node's
+    /// traversal stats to `<name>_stats.json` once a second.
+    ///
+    /// Only the initiator writes an `outcome.json`, so every other
+    /// node's view of the punch used to be invisible: when A reports
+    /// `punch_timeouts: 1` there was no way to tell whether the
+    /// responder ever received the introduce, armed an observer, or
+    /// emitted an ack. These snapshots make the responder's and
+    /// coordinator's counters readable after the fact, which is what
+    /// separates "R never fanned out" from "B dropped the introduce"
+    /// from "B's observer never fired".
+    async fn serve_forever_publishing_stats(
+        node: Arc<MeshNode>,
+        state: PathBuf,
+        name: String,
+    ) -> ! {
+        let path = state.join(format!("{name}_stats.json"));
         loop {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            write_atomic(
+                &path,
+                &serde_json::to_vec_pretty(&stats_json(&node)).unwrap(),
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -269,7 +305,7 @@ mod natsim {
             .await
             .expect("public announce");
         write_marker(&state, &format!("{name}_started"));
-        serve_forever().await
+        serve_forever_publishing_stats(node, state, name).await
     }
 
     async fn run_joiner(flags: HashMap<String, String>) {
@@ -370,8 +406,9 @@ mod natsim {
         write_marker(&state, &format!("{name}_ready"));
 
         let Some(target) = target else {
-            // Responder: serve until the script kills us.
-            serve_forever().await;
+            // Responder: serve until the script kills us. Its stats are
+            // the ones that say whether the introduce ever landed.
+            serve_forever_publishing_stats(node, state, name).await;
         };
 
         // Initiator: wait for the target's identity + readiness, then
@@ -473,7 +510,46 @@ mod natsim {
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
+    /// Install a `RUST_LOG`-driven subscriber writing to **stderr**.
+    ///
+    /// Without this the crate's `tracing` calls go nowhere, so the
+    /// rendezvous drop paths — the coordinator's fan-out checks and the
+    /// responder's `unsolicited_introduce_permitted` gate, all of which
+    /// drop silently by design — are invisible no matter what `RUST_LOG`
+    /// says. They are the difference between "R never introduced B" and
+    /// "B refused the introduce".
+    ///
+    /// stderr specifically: `keygen` prints its JSON to stdout and
+    /// `run_scenario.sh` parses that with `sed`, so log lines must not
+    /// share the stream.
+    fn init_tracing() {
+        use tracing_subscriber::{fmt, EnvFilter};
+        let raw = std::env::var("RUST_LOG").unwrap_or_default();
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+        let rendered = filter.to_string();
+        let _ = fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_target(true)
+            .try_init();
+        // Announce the filter actually in force, and prove the enabled
+        // level by emitting one line at each of debug and trace.
+        // Otherwise a log with no TRACE lines is ambiguous between "the
+        // filter was too coarse" and "no trace-level code path ran" —
+        // an ambiguity that cost a CI round here.
+        eprintln!("natsim_node: RUST_LOG={raw:?} effective_filter={rendered:?}");
+        // Emit under the *library's* target prefix, not this example's.
+        // A filter like `net::adapter::net=trace` doesn't match
+        // `natsim_node`, so self-test lines logged under the default
+        // target would stay silent even when the mesh code is at trace
+        // — proving nothing. These two say exactly which levels are
+        // live for the target the rendezvous code logs under.
+        tracing::debug!(target: "net::adapter::net::selftest", "natsim_node: debug enabled");
+        tracing::trace!(target: "net::adapter::net::selftest", "natsim_node: trace enabled");
+    }
+
     pub fn main() {
+        init_tracing();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
