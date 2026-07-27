@@ -98,7 +98,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     match flow.run(CAPABILITY, &terms_json).await {
-        CallerDecision::Paid { quote_id, proof, .. } => {
+        CallerDecision::Paid {
+            quote_id, proof, ..
+        } => {
             println!("paid; redemption binding = {quote_id}");
             let signed = proof["billing_event"].as_str().unwrap_or_default();
             let event = net_payments::BillingEvent::from_json_bytes(signed.as_bytes())?;
@@ -122,7 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for event in billing.read_all().await? {
         event.verify_signature()?;
-        println!("billing event {} — {}", event.billing_event_id, event.amount);
+        println!(
+            "billing event {} — {}",
+            event.billing_event_id, event.amount
+        );
     }
 
     Ok(())
@@ -142,7 +147,10 @@ async fn cap_per_call(path: &std::path::Path) -> Result<(), Box<dyn std::error::
 
 /// Docs: payments/spend-policy-and-approvals.md § "Approving a held quote"
 #[allow(dead_code)]
-async fn approve(path: &std::path::Path, quote_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+async fn approve(
+    path: &std::path::Path,
+    quote_id: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let policy = SpendPolicyEngine::new(path, SpendProfile::Production);
     Ok(policy.approve(quote_id).await?)
 }
@@ -167,6 +175,9 @@ async fn confirm_deeper(
 async fn stream(billing: Arc<BillingLog>) {
     let mut rx = billing.subscribe();
     while let Ok(event) = rx.recv().await {
-        println!("{} {} {}", event.billing_event_id, event.capability, event.amount);
+        println!(
+            "{} {} {}",
+            event.billing_event_id, event.capability, event.amount
+        );
     }
 }
