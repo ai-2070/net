@@ -61,12 +61,14 @@ SETUP_ARGS=(--nat-a "$NAT_A" --nat-b "$NAT_B" "${SETUP_EXTRA[@]}")
 [[ "$PUBLIC_B" == 1 ]] && SETUP_ARGS+=(--public-b)
 "$HERE/setup.sh" "${SETUP_ARGS[@]}"
 
-# Log level for the helpers. The rendezvous drop paths (coordinator
-# fan-out checks, the responder's unsolicited-introduce gate, the
-# keep-alive observer miss) are trace/debug lines; without them a failed
-# punch reports only `punch_timeouts: 1` with no cause. Override with
-# RUST_LOG=... to widen or quieten.
-NATSIM_LOG="${RUST_LOG:-net::adapter::net::mesh=debug,net=info}"
+# Log level for the helpers. This MUST reach trace: the rendezvous drop
+# paths that decide a punch's fate — the forged/non-coordinator
+# introduce drop, and every branch of `unsolicited_introduce_permitted`
+# (reflex-IP mismatch, per-source train budget, global concurrent-train
+# ceiling) — are all `tracing::trace!`. A `debug` default filters out
+# exactly the lines the failure needs, which is what the first
+# instrumented run did. Override with RUST_LOG=... to widen or quieten.
+NATSIM_LOG="${RUST_LOG:-net::adapter::net=trace,net=info}"
 
 launch() { # launch <netns> <logname> <args...>
   local ns="$1" log="$2"; shift 2

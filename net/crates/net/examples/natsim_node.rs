@@ -156,6 +156,20 @@ mod natsim {
         // partial file.
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, bytes).expect("write state file");
+        // Make it world-readable *before* the rename. The helpers run as
+        // root inside the namespaces, so a fresh file lands 0600 under
+        // the default umask, while the non-root `cargo test` wrapper is
+        // what has to read these artifacts. `run_scenario.sh` chmods the
+        // state dir at the end, but the stats snapshots keep being
+        // rewritten every second afterwards — each rename installing a
+        // new root-only inode over the relaxed one — so a post-hoc chmod
+        // races the writers. Setting the mode here is the only version
+        // that holds for a file still being updated.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644));
+        }
         std::fs::rename(&tmp, path).expect("rename state file");
     }
 

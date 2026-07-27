@@ -86,35 +86,83 @@ impl Drop for ScenarioRun {
             return;
         }
         eprintln!("\n=== natsim artifacts ({}) ===", self.state.display());
-        let Ok(entries) = std::fs::read_dir(&self.state) else {
-            eprintln!("(state dir unreadable — was it torn down?)");
-            return;
+        let entries = match std::fs::read_dir(&self.state) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("(state dir unreadable: {e})");
+                return;
+            }
         };
-        let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+
+        // Inventory first, and account for EVERY entry — including ones
+        // that error out of `read_dir` or fail to open. The previous
+        // version silently dropped both (`.flatten()` on the iterator,
+        // and no line for a file it chose not to print), so a missing
+        // artifact was indistinguishable from an unreadable one and from
+        // one that was never written. That ambiguity cost a CI round.
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(e) => paths.push(e.path()),
+                Err(e) => eprintln!("  <read_dir entry error: {e}>"),
+            }
+        }
         paths.sort();
-        for path in paths {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            // Logs and the per-node stats snapshots; skip the identity
-            // and marker files, which carry no diagnostic signal.
-            let is_stats = path
+
+        eprintln!("\n--- inventory ({} entries) ---", paths.len());
+        for path in &paths {
+            let name = path
                 .file_name()
                 .and_then(|f| f.to_str())
-                .is_some_and(|f| f.ends_with("_stats.json") || f.ends_with("_outcome.json"));
-            if ext != "log" && !is_stats {
+                .unwrap_or("<non-utf8>");
+            match std::fs::metadata(path) {
+                Ok(m) => {
+                    #[cfg(unix)]
+                    let mode = {
+                        use std::os::unix::fs::PermissionsExt;
+                        format!("{:o}", m.permissions().mode() & 0o777)
+                    };
+                    #[cfg(not(unix))]
+                    let mode = String::from("-");
+                    eprintln!("  {name}  {} bytes  mode {mode}", m.len());
+                }
+                Err(e) => eprintln!("  {name}  <stat failed: {e}>"),
+            }
+        }
+
+        for path in &paths {
+            let name = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("<non-utf8>");
+            // Logs and the per-node stats/outcome snapshots; the identity
+            // and marker files carry no diagnostic signal.
+            let interesting = name.ends_with(".log")
+                || name.ends_with("_stats.json")
+                || name.ends_with("_outcome.json");
+            if !interesting {
                 continue;
             }
-            match std::fs::read_to_string(&path) {
+            match std::fs::read_to_string(path) {
                 Ok(body) => {
-                    eprintln!("\n--- {} ---", path.display());
-                    // Logs can be long; the tail is where the punch
-                    // window lives.
                     let lines: Vec<&str> = body.lines().collect();
-                    let start = lines.len().saturating_sub(80);
+                    // Trace-level helper logs are long; the tail is where
+                    // the punch window lives.
+                    let start = lines.len().saturating_sub(400);
+                    eprintln!(
+                        "\n--- {name} ({} lines{}) ---",
+                        lines.len(),
+                        if start > 0 {
+                            format!(", last {}", lines.len() - start)
+                        } else {
+                            String::new()
+                        }
+                    );
                     for line in &lines[start..] {
                         eprintln!("{line}");
                     }
                 }
-                Err(e) => eprintln!("\n--- {} (unreadable: {e}) ---", path.display()),
+                Err(e) => eprintln!("\n--- {name} (UNREADABLE: {e}) ---"),
             }
         }
         eprintln!("=== end natsim artifacts ===\n");
