@@ -359,6 +359,7 @@ impl ScopedDiscoveryStore {
         &mut self,
         capability: VerifiedScopedCapability,
         now_secs: u64,
+        installed: &dyn InstalledConsumerGrants,
     ) -> ScopedIngestReport {
         if matches!(capability.scope(), CapabilityAudienceScope::Public) {
             return ScopedIngestReport {
@@ -409,14 +410,11 @@ impl ScopedDiscoveryStore {
                 // (review-pass-3 §3).
                 let mut swept_live = Vec::new();
                 let ceiling = Self::admission_ceiling(capability.scope());
-                if self.entries.len() >= ceiling {
-                    swept_live.append(&mut self.sweep_expired(now_secs));
-                    if self.entries.len() >= ceiling {
-                        return ScopedIngestReport {
-                            outcome: ScopedStoreOutcome::AtCapacity,
-                            swept_live,
-                        };
-                    }
+                if !self.reclaim_for_admission(ceiling, now_secs, installed, &mut swept_live) {
+                    return ScopedIngestReport {
+                        outcome: ScopedStoreOutcome::AtCapacity,
+                        swept_live,
+                    };
                 }
                 // Per-scope share, checked AFTER the global sweep so a
                 // reclaimable slot in this scope is counted. Same fail-closed
@@ -450,6 +448,84 @@ impl ScopedDiscoveryStore {
                 }
             }
         }
+    }
+
+    /// Free dormant occupancy until one more key fits under `ceiling`, reporting
+    /// whether it now does (review-pass-3 §3, resolved per Kyra 2026-07-27).
+    ///
+    /// This is what makes an uninstalled grant's rows a RECLAIMABLE CACHE rather
+    /// than either permanent occupancy or an eviction bolted onto credential
+    /// removal. Removing a credential still evicts nothing and still changes no
+    /// authority semantic — the record simply becomes non-queryable (OA3-4b2
+    /// slice 4 remains authoritative) AND, from now on, disposable. A reinstall
+    /// before pressure re-exposes the warm row with its generation high-water
+    /// intact; a reinstall after reclamation starts cold and needs a
+    /// re-announcement. Cache warmth may depend on pressure; authority may not.
+    ///
+    /// Ordered so the least valuable state goes first, and MINIMAL at every step —
+    /// each phase stops the moment one slot is free:
+    ///
+    /// 1. the ordinary expiry / tombstone-horizon sweep;
+    /// 2. TOMBSTONES of uninstalled grants — pure capacity, no visible provider
+    ///    set changes, so this fabricates no transition;
+    /// 3. LIVE rows of uninstalled grants — already invisible to every query, and
+    ///    reported through `swept_live` so they take exactly the accounting an
+    ///    expiry demotion takes;
+    /// 4. otherwise `AtCapacity`, unchanged.
+    ///
+    /// NEVER reclaimed: owner rows, rows of an INSTALLED grant, and any unexpired
+    /// active high-water merely because another key wants admission. Only rows
+    /// whose credential is currently uninstalled are candidates, which is why the
+    /// snapshot is the authority for that question and not a live lookup.
+    ///
+    /// `installed` is an immutable snapshot captured BEFORE the publication-gated
+    /// mutation, so this takes no new lock and adds no lock edge. Both race
+    /// directions are safe: a snapshot that still says "installed" after a removal
+    /// merely misses a reclamation a later admission retries; a snapshot that says
+    /// "uninstalled" while a reinstall lands linearizes the reclamation before the
+    /// reinstall, so that reinstall starts cold. Neither exposes unauthorized
+    /// state.
+    fn reclaim_for_admission(
+        &mut self,
+        ceiling: usize,
+        now_secs: u64,
+        installed: &dyn InstalledConsumerGrants,
+        swept_live: &mut Vec<ScopedKey>,
+    ) -> bool {
+        if self.entries.len() < ceiling {
+            return true;
+        }
+        // (1) Ordinary expiry / horizon sweep.
+        swept_live.append(&mut self.sweep_expired(now_secs));
+        if self.entries.len() < ceiling {
+            return true;
+        }
+        // (2) then (3). `entries` is a `BTreeMap`, so collecting candidates in
+        // iteration order is already deterministic — no sort under the gate.
+        for reclaim_live in [false, true] {
+            let victims: Vec<ScopedKey> = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.capability.is_some() == reclaim_live)
+                .filter(|(key, _)| dormant_grant_scope(&key.0, installed))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in victims {
+                if self.entries.len() < ceiling {
+                    return true;
+                }
+                if self.entries.remove(&key).is_some() {
+                    release_scope_slot(&mut self.scope_counts, &key.0);
+                    if reclaim_live {
+                        // Same reporting an expiry demotion uses, so the indexed
+                        // layer drops the record, forgets its expiry slot and
+                        // dirties exactly the capabilities it occupied.
+                        swept_live.push(key);
+                    }
+                }
+            }
+        }
+        self.entries.len() < ceiling
     }
 
     /// Capabilities discovered under a specific grant — entries whose scope is
@@ -543,45 +619,6 @@ impl ScopedDiscoveryStore {
         swept
     }
 
-    /// Forget every entry stored under `grant_id` — live records AND their
-    /// generation tombstones — and free their slots. Returns the keys whose LIVE
-    /// capability was dropped, in the same shape [`Self::sweep_expired`] reports,
-    /// so the indexed layer can drop exactly those (review-pass-3 §3).
-    ///
-    /// Called when the consumer grant credential is removed. Those rows are
-    /// already dead weight: with no installed record for `grant_id`, no query can
-    /// return them and no inbound envelope for the grant can be opened. Leaving
-    /// them behind meant a hostile grantor's flood held its slots for the
-    /// attacker-chosen expiry horizon EVEN AFTER the operator uninstalled the
-    /// grant — remediation that reclaimed nothing.
-    ///
-    /// The tombstones go with them, deliberately: removing a grant is a trust
-    /// reset, not a cache flush. Re-installing the same `grant_id` therefore
-    /// starts from a fresh generation high-water rather than inheriting the
-    /// previous installation's, which is the honest reading of an operator
-    /// withdrawing and re-issuing the credential.
-    pub fn forget_grant(&mut self, grant_id: &[u8; 32]) -> Vec<ScopedKey> {
-        let mut dropped = Vec::new();
-        let Self {
-            entries,
-            scope_counts,
-        } = self;
-        entries.retain(|key, e| {
-            if !matches!(
-                &key.0,
-                CapabilityAudienceScope::Grant { grant_id: g, .. } if g == grant_id
-            ) {
-                return true;
-            }
-            if e.capability.is_some() {
-                dropped.push(key.clone());
-            }
-            release_scope_slot(scope_counts, &key.0);
-            false
-        });
-        dropped
-    }
-
     /// The LIVE record stored under `key`, if any (tombstones read as absent).
     /// Lets the indexed [`ScopedDiscoveryState`] apply fresh expiry/floor
     /// currentness to an index bucket hit without exposing the entry map.
@@ -600,6 +637,54 @@ impl ScopedDiscoveryStore {
     /// Whether the store holds no LIVE scoped capabilities.
     pub fn is_empty(&self) -> bool {
         !self.entries.values().any(|e| e.capability.is_some())
+    }
+}
+
+/// The immutable installed-consumer-grant view a capacity reclamation tests
+/// dormant `Grant` rows against (review-pass-3 §3, Kyra 2026-07-27).
+///
+/// A trait rather than the registry type itself, so the store answers "is this
+/// grant currently installed?" from a value the CALLER captured, and can never be
+/// tempted to reach for `consumer_grant_mu` from under the publication gate. The
+/// snapshot must be loaded before the gated mutation begins; see
+/// [`ScopedDiscoveryStore::reclaim_for_admission`] for why both race directions
+/// are safe.
+pub trait InstalledConsumerGrants {
+    /// Whether a consumer grant credential for `grant_id` is installed.
+    fn is_installed(&self, grant_id: &[u8; 32]) -> bool;
+}
+
+impl InstalledConsumerGrants for super::org_grant_registry::ConsumerGrantSnapshot {
+    fn is_installed(&self, grant_id: &[u8; 32]) -> bool {
+        self.get(grant_id).is_some()
+    }
+}
+
+/// Every grant is uninstalled — the conservative view for callers with no
+/// consumer registry (the raw-store unit witnesses, and any path that has not
+/// captured a snapshot).
+pub struct NoConsumerGrants;
+
+impl InstalledConsumerGrants for NoConsumerGrants {
+    fn is_installed(&self, _grant_id: &[u8; 32]) -> bool {
+        false
+    }
+}
+
+/// Is this scope a `Grant` whose credential is currently UNINSTALLED — i.e. a row
+/// no query can return, and therefore reclaimable under pressure?
+///
+/// `Owner` (and structurally-refused `Public`) answer `false` unconditionally:
+/// the owner partition is never reclaimed for another key's benefit, which is the
+/// same reservation [`ScopedDiscoveryStore::OWNER_RESERVED_ENTRIES`] enforces from
+/// the other direction.
+fn dormant_grant_scope(
+    scope: &CapabilityAudienceScope,
+    installed: &dyn InstalledConsumerGrants,
+) -> bool {
+    match scope {
+        CapabilityAudienceScope::Grant { grant_id, .. } => !installed.is_installed(grant_id),
+        _ => false,
     }
 }
 
@@ -923,6 +1008,7 @@ impl ScopedDiscoveryState {
         &mut self,
         prepared: PreparedScopedCapability,
         now_secs: u64,
+        installed: &dyn InstalledConsumerGrants,
     ) -> ScopedStoreOutcome {
         let (capability, cap_ids) = prepared.into_parts();
         // Resource-bound hardening: refuse before touching any state so a
@@ -936,7 +1022,7 @@ impl ScopedDiscoveryState {
         // keys its `StoredEntry` off this exact `expires_at()`, so expiry tracking
         // and the store agree on every deadline.
         let expires_at = capability.expires_at();
-        let report = self.store.ingest(capability, now_secs);
+        let report = self.store.ingest(capability, now_secs, installed);
         let mut global = BTreeSet::new();
         let mut owner = BTreeSet::new();
         // Demotions from the internal capacity sweep are disjoint from the
@@ -983,30 +1069,6 @@ impl ScopedDiscoveryState {
         }
         self.record_change(&global, &owner);
         report.outcome
-    }
-
-    /// Forget every stored row for `grant_id`, dropping each from the index and
-    /// dirtying the capabilities whose provider set changed. Returns how many
-    /// LIVE capabilities were dropped (review-pass-3 §3).
-    ///
-    /// Same shape as [`Self::sweep_expired`], because it is the same operation
-    /// with a different trigger: the rows stop being queryable the moment the
-    /// consumer grant record is uninstalled, so this reclaims the slots that
-    /// invisibility already made worthless.
-    pub fn forget_grant(&mut self, grant_id: &[u8; 32]) -> usize {
-        let removed = self.store.forget_grant(grant_id);
-        let dropped = removed.len();
-        let mut global = BTreeSet::new();
-        let mut owner = BTreeSet::new();
-        for key in &removed {
-            note_removed_record(&self.index, key, &mut global, &mut owner);
-        }
-        self.record_change(&global, &owner);
-        for key in &removed {
-            self.index.remove_record(key);
-            self.forget_live_expiry(key);
-        }
-        dropped
     }
 
     /// Sweep expired records, dropping every demoted key from the index. Returns
@@ -1737,7 +1799,9 @@ mod tests {
         let cap = ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE;
         for index in 0..cap as u64 {
             assert_eq!(
-                store.ingest(owner_cap_n(index, 1, 10_000), 1).outcome,
+                store
+                    .ingest(owner_cap_n(index, 1, 10_000), 1, &NoConsumerGrants)
+                    .outcome,
                 ScopedStoreOutcome::Inserted
             );
         }
@@ -1745,13 +1809,17 @@ mod tests {
         // A further DISTINCT provider is refused; nothing is evicted (every entry
         // is in-horizon at now=1, so the fail-closed sweep frees no slot).
         assert_eq!(
-            store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 1).outcome,
+            store
+                .ingest(owner_cap_n(u64::MAX, 1, 10_000), 1, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::AtCapacity
         );
         assert_eq!(store.len(), cap);
         // An UPDATE to an already-known key is never capacity-gated.
         assert_eq!(
-            store.ingest(owner_cap_n(0, 2, 10_000), 1).outcome,
+            store
+                .ingest(owner_cap_n(0, 2, 10_000), 1, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Updated
         );
         assert_eq!(store.len(), cap);
@@ -1781,14 +1849,22 @@ mod tests {
         for index in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
             assert_eq!(
                 store
-                    .ingest(scoped_cap_in(hostile.clone(), index, 1, 10_000), 1)
+                    .ingest(
+                        scoped_cap_in(hostile.clone(), index, 1, 10_000),
+                        1,
+                        &AllInstalled
+                    )
                     .outcome,
                 ScopedStoreOutcome::Inserted
             );
         }
         assert_eq!(
             store
-                .ingest(scoped_cap_in(hostile.clone(), u64::MAX, 1, 10_000), 1)
+                .ingest(
+                    scoped_cap_in(hostile.clone(), u64::MAX, 1, 10_000),
+                    1,
+                    &AllInstalled
+                )
                 .outcome,
             ScopedStoreOutcome::AtCapacity,
             "the hostile scope must be capped at its own share",
@@ -1796,7 +1872,9 @@ mod tests {
 
         // The owner partition is untouched and still admits.
         assert_eq!(
-            store.ingest(owner_cap_n(0, 1, 10_000), 1).outcome,
+            store
+                .ingest(owner_cap_n(0, 1, 10_000), 1, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Inserted,
             "a flooded grant scope must not deny owner-scoped discovery",
         );
@@ -1806,7 +1884,9 @@ mod tests {
             audience_handle: [0x0Du8; 32],
         };
         assert_eq!(
-            store.ingest(scoped_cap_in(other, 0, 1, 10_000), 1).outcome,
+            store
+                .ingest(scoped_cap_in(other, 0, 1, 10_000), 1, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Inserted,
             "a flooded grant scope must not deny an unrelated grant",
         );
@@ -1878,7 +1958,11 @@ mod tests {
             };
             for _ in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE {
                 let outcome = store
-                    .ingest(scoped_cap_in(scope.clone(), provider_index, 1, 10_000), 1)
+                    .ingest(
+                        scoped_cap_in(scope.clone(), provider_index, 1, 10_000),
+                        1,
+                        &AllInstalled,
+                    )
                     .outcome;
                 provider_index += 1;
                 if matches!(outcome, ScopedStoreOutcome::Inserted) {
@@ -1894,7 +1978,9 @@ mod tests {
 
         // The reservation is what the owner partition is for, and it is intact.
         assert_eq!(
-            store.ingest(owner_cap_n(0, 1, 10_000), 1).outcome,
+            store
+                .ingest(owner_cap_n(0, 1, 10_000), 1, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Inserted,
             "a composed grant flood must not deny a NEW owner key",
         );
@@ -1905,63 +1991,185 @@ mod tests {
         };
         assert_eq!(
             store
-                .ingest(scoped_cap_in(latecomer, u64::MAX, 1, 10_000), 1)
+                .ingest(
+                    scoped_cap_in(latecomer, u64::MAX, 1, 10_000),
+                    1,
+                    &AllInstalled
+                )
                 .outcome,
             ScopedStoreOutcome::AtCapacity,
             "an unrelated grant is refused at the reserve, with its own share empty",
         );
     }
 
-    /// review-pass-3 §3 — uninstalling the hostile grant must reclaim its slots.
+    /// A view where EVERY grant is installed — the realistic shape for a flood
+    /// arriving under credentials the operator has not removed, and the one that
+    /// keeps the pure capacity witnesses about caps rather than about reclamation.
+    struct AllInstalled;
+
+    impl InstalledConsumerGrants for AllInstalled {
+        fn is_installed(&self, _grant_id: &[u8; 32]) -> bool {
+            true
+        }
+    }
+
+    /// A view where exactly the listed grants are installed.
+    struct Installed(Vec<[u8; 32]>);
+
+    impl InstalledConsumerGrants for Installed {
+        fn is_installed(&self, grant_id: &[u8; 32]) -> bool {
+            self.0.contains(grant_id)
+        }
+    }
+
+    fn grant_scope(id: u8, handle: u8) -> CapabilityAudienceScope {
+        CapabilityAudienceScope::Grant {
+            grant_id: [id; 32],
+            audience_handle: [handle; 32],
+        }
+    }
+
+    /// review-pass-3 §3, resolved per Kyra 2026-07-27 — an uninstalled grant's
+    /// rows are a RECLAIMABLE CACHE, not permanent occupancy.
     ///
-    /// Grant removal used to mutate only the consumer audience registry, which
-    /// hides the rows at query time and frees nothing: the flood held its slots
-    /// for the attacker-chosen expiry horizon, and the store is in-memory, so the
-    /// only real remediation was a node restart.
+    /// Removal itself evicts nothing (OA3-4b2 slice 4 stays authoritative, and
+    /// its integration witness is untouched). The wedge is closed at the other
+    /// end: once the credential is gone the rows are disposable, so a valid
+    /// admission that would otherwise hit `AtCapacity` reclaims them instead.
+    ///
+    /// One credential floods the whole non-owner budget through several audience
+    /// handles — each handle is a distinct scope with its own per-scope share, so
+    /// this is a single grant reaching the GLOBAL ceiling, which is exactly the
+    /// wedge shape.
     #[test]
-    fn uninstalling_a_grant_reclaims_the_slots_its_rows_held() {
+    fn a_dormant_grants_rows_are_reclaimed_before_at_capacity() {
         let mut store = ScopedDiscoveryStore::new();
         let hostile_id = [0x7A; 32];
-        let hostile = CapabilityAudienceScope::Grant {
-            grant_id: hostile_id,
-            audience_handle: [0x7B; 32],
-        };
-        let bystander = CapabilityAudienceScope::Grant {
-            grant_id: [0x0C; 32],
-            audience_handle: [0x0D; 32],
-        };
-        // A decades-long self-signed horizon is the point: nothing expires here.
-        for index in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
-            store.ingest(scoped_cap_in(hostile.clone(), index, 1, u64::MAX), 1);
-        }
-        store.ingest(scoped_cap_in(bystander.clone(), 9_000, 1, u64::MAX), 1);
-        assert_eq!(
-            store.entries_in_scope(&hostile),
-            ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE
-        );
+        let live_id = [0x0C; 32];
+        let live = grant_scope(0x0C, 0x0D);
+        let non_owner_ceiling =
+            ScopedDiscoveryStore::MAX_ENTRIES - ScopedDiscoveryStore::OWNER_RESERVED_ENTRIES;
 
-        let dropped = store.forget_grant(&hostile_id);
-        assert_eq!(
-            dropped.len(),
-            ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE,
-            "every LIVE row is reported, so the index drops exactly those",
-        );
-        assert_eq!(
-            store.entries_in_scope(&hostile),
-            0,
-            "and the SLOTS are freed — tombstones included, or the horizon still wins",
-        );
-        assert_eq!(
-            store.entries_in_scope(&bystander),
-            1,
-            "removal is scoped to the grant that was uninstalled",
-        );
-        // The reclaimed share is genuinely re-usable, not merely uncounted.
+        let mut provider_index = 0u64;
+        let mut handle = 0u8;
+        while store.entries.len() < non_owner_ceiling {
+            let scope = CapabilityAudienceScope::Grant {
+                grant_id: hostile_id,
+                audience_handle: [handle; 32],
+            };
+            for _ in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE {
+                if store.entries.len() >= non_owner_ceiling {
+                    break;
+                }
+                store.ingest(
+                    scoped_cap_in(scope.clone(), provider_index, 1, u64::MAX),
+                    1,
+                    &AllInstalled,
+                );
+                provider_index += 1;
+            }
+            handle += 1;
+        }
+        let occupied = store.entries.len();
+        assert_eq!(occupied, non_owner_ceiling, "the non-owner budget is full");
+
+        // While the credential is INSTALLED those rows are untouchable: another
+        // grant key is refused rather than reclaiming a live grant's rows.
         assert_eq!(
             store
-                .ingest(scoped_cap_in(hostile, 0, 1, u64::MAX), 1)
+                .ingest(
+                    scoped_cap_in(live.clone(), 9_000, 1, u64::MAX),
+                    1,
+                    &AllInstalled
+                )
                 .outcome,
+            ScopedStoreOutcome::AtCapacity,
+            "rows of an INSTALLED grant are never reclaimed for another key",
+        );
+        assert_eq!(store.entries.len(), occupied, "and nothing was taken");
+
+        // The operator uninstalls the hostile credential. That evicts nothing…
+        assert_eq!(
+            store.entries.len(),
+            occupied,
+            "removal is a read-time filter — the rows are still stored",
+        );
+        // …but the same admission now succeeds by reclaiming dormant occupancy.
+        let report = store.ingest(
+            scoped_cap_in(live, 9_000, 1, u64::MAX),
+            1,
+            &Installed(vec![live_id]),
+        );
+        assert_eq!(
+            report.outcome,
             ScopedStoreOutcome::Inserted,
+            "a dormant grant's rows are reclaimed before AtCapacity",
+        );
+        assert_eq!(
+            report.swept_live.len(),
+            1,
+            "MINIMAL: exactly one dormant row was freed to admit one key; got {:?}",
+            report.swept_live.len(),
+        );
+        assert!(
+            report.swept_live.iter().all(|key| matches!(
+                &key.0,
+                CapabilityAudienceScope::Grant { grant_id, .. } if grant_id == &hostile_id
+            )),
+            "and only the dormant grant's rows were taken",
+        );
+    }
+
+    /// The owner partition is never reclaimed for another key's benefit — the
+    /// same reservation `OWNER_RESERVED_ENTRIES` enforces from the other side.
+    #[test]
+    fn owner_rows_are_never_reclaimed_for_a_grant_admission() {
+        let mut store = ScopedDiscoveryStore::new();
+        let dormant = grant_scope(0x11, 0x12);
+        // Fill the OWNER partition to its per-scope share with unexpiring rows.
+        for index in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
+            store.ingest(owner_cap_n(index, 1, u64::MAX), 1, &NoConsumerGrants);
+        }
+        let owner_occupancy = store.len();
+        assert_eq!(owner_occupancy, ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE);
+
+        // A grant admission under no pressure must not touch them…
+        store.ingest(
+            scoped_cap_in(dormant.clone(), 1, 1, u64::MAX),
+            1,
+            &NoConsumerGrants,
+        );
+        assert_eq!(
+            store.len(),
+            owner_occupancy + 1,
+            "owner rows are not candidates for reclamation at any pressure",
+        );
+    }
+
+    /// Reclaiming only TOMBSTONES frees capacity without fabricating a
+    /// visible-provider transition: nothing is reported through `swept_live`, so
+    /// no capability is dirtied and no generation moves for it.
+    #[test]
+    fn tombstone_only_reclamation_reports_no_provider_set_change() {
+        let mut store = ScopedDiscoveryStore::new();
+        let dormant = grant_scope(0x21, 0x22);
+        let fresh = grant_scope(0x23, 0x24);
+        // One row that expires, becoming a tombstone with a live horizon.
+        store.ingest(
+            scoped_cap_in(dormant.clone(), 1, 1, 10),
+            1,
+            &Installed(vec![[0x21; 32]]),
+        );
+        // Expire it into a tombstone (horizon == expires_at, so a later sweep at
+        // the same instant forgets it — step 1 rather than step 2; either way the
+        // point is that no LIVE row is reported).
+        let report = store.ingest(scoped_cap_in(fresh, 2, 1, u64::MAX), 50, &NoConsumerGrants);
+        assert_eq!(report.outcome, ScopedStoreOutcome::Inserted);
+        assert!(
+            report.swept_live.is_empty(),
+            "an already-tombstoned row carries no live capability, so reclaiming \
+             it fabricates no provider-set change; got {:?}",
+            report.swept_live,
         );
     }
 
@@ -1973,25 +2181,31 @@ mod tests {
         let mut store = ScopedDiscoveryStore::new();
         // P (index 0) at generation 2, far-future expiry.
         assert_eq!(
-            store.ingest(owner_cap_n(0, 2, 10_000), 1).outcome,
+            store
+                .ingest(owner_cap_n(0, 2, 10_000), 1, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Inserted
         );
         // Fill this scope's share with distinct providers. The per-scope cap
         // (§4) binds before the global one for a single-audience flood, which
         // is the pressure this test is about.
         for index in 1..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
-            store.ingest(owner_cap_n(index, 1, 10_000), 1);
+            store.ingest(owner_cap_n(index, 1, 10_000), 1, &NoConsumerGrants);
         }
         assert_eq!(store.len(), ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE);
         // A brand-new provider is refused rather than evicting P's high-water.
         assert_eq!(
-            store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 1).outcome,
+            store
+                .ingest(owner_cap_n(u64::MAX, 1, 10_000), 1, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::AtCapacity
         );
         // Replay P at the OLDER generation 1: still Stale — the gen-2 high-water
         // was never evicted under capacity pressure.
         assert_eq!(
-            store.ingest(owner_cap_n(0, 1, 10_000), 1).outcome,
+            store
+                .ingest(owner_cap_n(0, 1, 10_000), 1, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Stale
         );
     }
@@ -2000,21 +2214,29 @@ mod tests {
     fn ingest_reports_insert_update_and_stale() {
         let mut store = ScopedDiscoveryStore::new();
         assert_eq!(
-            store.ingest(owner_cap(3, 1, 1000), 0).outcome,
+            store
+                .ingest(owner_cap(3, 1, 1000), 0, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Inserted
         );
         // Newer generation for the same (scope, provider) updates.
         assert_eq!(
-            store.ingest(owner_cap(3, 2, 1000), 0).outcome,
+            store
+                .ingest(owner_cap(3, 2, 1000), 0, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Updated
         );
         // Older-or-equal generation is stale and ignored.
         assert_eq!(
-            store.ingest(owner_cap(3, 2, 1000), 0).outcome,
+            store
+                .ingest(owner_cap(3, 2, 1000), 0, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Stale
         );
         assert_eq!(
-            store.ingest(owner_cap(3, 1, 1000), 0).outcome,
+            store
+                .ingest(owner_cap(3, 1, 1000), 0, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Stale
         );
         assert_eq!(store.len(), 1);
@@ -2034,7 +2256,7 @@ mod tests {
             b"x".to_vec(),
         );
         assert_eq!(
-            store.ingest(public, 0).outcome,
+            store.ingest(public, 0, &NoConsumerGrants).outcome,
             ScopedStoreOutcome::RejectedPublic
         );
         assert!(store.is_empty());
@@ -2045,9 +2267,9 @@ mod tests {
         let mut store = ScopedDiscoveryStore::new();
         let grant_x = [0xAA; 32];
         let grant_y = [0xBB; 32];
-        store.ingest(owner_cap(3, 1, 1000), 0);
-        store.ingest(grant_cap(grant_x, 4, 1, 1000), 0);
-        store.ingest(grant_cap(grant_y, 5, 1, 1000), 0);
+        store.ingest(owner_cap(3, 1, 1000), 0, &NoConsumerGrants);
+        store.ingest(grant_cap(grant_x, 4, 1, 1000), 0, &NoConsumerGrants);
+        store.ingest(grant_cap(grant_y, 5, 1, 1000), 0, &NoConsumerGrants);
         assert_eq!(store.len(), 3);
 
         // The grant-X query sees only grant-X providers — not owner, not grant-Y.
@@ -2075,8 +2297,8 @@ mod tests {
     fn predicate_filters_within_a_partition() {
         let mut store = ScopedDiscoveryStore::new();
         let grant = [0xAA; 32];
-        store.ingest(grant_cap(grant, 4, 1, 1000), 0);
-        store.ingest(grant_cap(grant, 5, 1, 1000), 0);
+        store.ingest(grant_cap(grant, 4, 1, 1000), 0, &NoConsumerGrants);
+        store.ingest(grant_cap(grant, 5, 1, 1000), 0, &NoConsumerGrants);
         // Predicate selecting only provider(5).
         let hits = store
             .find_capabilities_for_grant(&grant, 0, &no_floors(), |c| c.provider() == &provider(5));
@@ -2088,8 +2310,8 @@ mod tests {
     fn distinct_providers_under_one_grant_coexist() {
         let mut store = ScopedDiscoveryStore::new();
         let grant = [0xAA; 32];
-        store.ingest(grant_cap(grant, 4, 1, 1000), 0);
-        store.ingest(grant_cap(grant, 5, 1, 1000), 0);
+        store.ingest(grant_cap(grant, 4, 1, 1000), 0, &NoConsumerGrants);
+        store.ingest(grant_cap(grant, 5, 1, 1000), 0, &NoConsumerGrants);
         assert_eq!(
             store
                 .find_capabilities_for_grant(&grant, 0, &no_floors(), |_| true)
@@ -2101,9 +2323,9 @@ mod tests {
     #[test]
     fn sweep_removes_only_expired_entries() {
         let mut store = ScopedDiscoveryStore::new();
-        store.ingest(owner_cap(3, 1, 1000), 0); // expires 1000
-        store.ingest(grant_cap([0xAA; 32], 4, 1, 5000), 0); // expires 5000
-                                                            // At t=2000 the owner entry (expires 1000) is gone; the grant survives.
+        store.ingest(owner_cap(3, 1, 1000), 0, &NoConsumerGrants); // expires 1000
+        store.ingest(grant_cap([0xAA; 32], 4, 1, 5000), 0, &NoConsumerGrants); // expires 5000
+                                                                               // At t=2000 the owner entry (expires 1000) is gone; the grant survives.
         assert_eq!(store.sweep_expired(2000).len(), 1);
         assert_eq!(store.len(), 1);
         assert!(store
@@ -2122,7 +2344,7 @@ mod tests {
         // Expiry safety is a property of the QUERY, not of remembering to sweep.
         let mut store = ScopedDiscoveryStore::new();
         let grant = [0xAA; 32];
-        store.ingest(grant_cap(grant, 4, 1, 1000), 0); // expires 1000
+        store.ingest(grant_cap(grant, 4, 1, 1000), 0, &NoConsumerGrants); // expires 1000
         assert_eq!(
             store
                 .find_capabilities_for_grant(&grant, 500, &no_floors(), |_| true)
@@ -2145,9 +2367,11 @@ mod tests {
         // revive the key (the generation high-water survives the sweep).
         let mut store = ScopedDiscoveryStore::new();
         let grant = [0xAA; 32];
-        store.ingest(grant_cap(grant, 4, 1, 5000), 0); // gen 1, expires 5000
+        store.ingest(grant_cap(grant, 4, 1, 5000), 0, &NoConsumerGrants); // gen 1, expires 5000
         assert_eq!(
-            store.ingest(grant_cap(grant, 4, 2, 2000), 0).outcome, // gen 2, expires 2000
+            store
+                .ingest(grant_cap(grant, 4, 2, 2000), 0, &NoConsumerGrants)
+                .outcome, // gen 2, expires 2000
             ScopedStoreOutcome::Updated
         );
         // Sweep at t=3000: gen 2's live capability (expired at 2000) becomes a
@@ -2158,7 +2382,9 @@ mod tests {
             .is_empty());
         // Replay the OLDER generation 1 (still unexpired at 3000): refused.
         assert_eq!(
-            store.ingest(grant_cap(grant, 4, 1, 5000), 0).outcome,
+            store
+                .ingest(grant_cap(grant, 4, 1, 5000), 0, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Stale
         );
         assert!(store
@@ -2209,6 +2435,7 @@ mod tests {
                 b"owner-descriptor".to_vec(),
             ),
             0,
+            &NoConsumerGrants,
         );
 
         // Visible under the empty floor view it was admitted against.
@@ -2317,7 +2544,11 @@ mod tests {
         cap: VerifiedScopedCapability,
         now: u64,
     ) -> ScopedStoreOutcome {
-        state.ingest(PreparedScopedCapability::prepare(cap), now)
+        state.ingest(
+            PreparedScopedCapability::prepare(cap),
+            now,
+            &NoConsumerGrants,
+        )
     }
 
     /// The indexed owner query returns exactly the providers that declared the
@@ -2486,9 +2717,9 @@ mod tests {
     #[test]
     fn sweep_expired_reports_the_demoted_live_keys() {
         let mut store = ScopedDiscoveryStore::new();
-        store.ingest(owner_cap(3, 1, 1000), 0); // expires 1000
-        store.ingest(grant_cap([0xAA; 32], 4, 1, 5000), 0); // expires 5000
-                                                            // At t=2000 only the owner entry has expired.
+        store.ingest(owner_cap(3, 1, 1000), 0, &NoConsumerGrants); // expires 1000
+        store.ingest(grant_cap([0xAA; 32], 4, 1, 5000), 0, &NoConsumerGrants); // expires 5000
+                                                                               // At t=2000 only the owner entry has expired.
         let removed = store.sweep_expired(2000);
         assert_eq!(removed, vec![(owner_scope(), provider(3))]);
     }
@@ -2501,12 +2732,12 @@ mod tests {
         let mut store = ScopedDiscoveryStore::new();
         // Fill the owner scope's share with entries that all expire at 1000.
         for index in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
-            store.ingest(owner_cap_n(index, 1, 1000), 0);
+            store.ingest(owner_cap_n(index, 1, 1000), 0, &NoConsumerGrants);
         }
         // At t=2000 a new provider trips the per-scope guard, whose internal sweep
         // demotes every expired entry; the report lists them and the freed slots
         // admit the new key.
-        let report = store.ingest(owner_cap_n(u64::MAX, 1, 5000), 2000);
+        let report = store.ingest(owner_cap_n(u64::MAX, 1, 5000), 2000, &NoConsumerGrants);
         assert_eq!(report.outcome, ScopedStoreOutcome::Inserted);
         assert_eq!(
             report.swept_live.len(),
@@ -2589,58 +2820,6 @@ mod tests {
         assert_eq!(
             state.take_owner_change_batch().dirty,
             DirtyCapabilities::Clean
-        );
-    }
-
-    /// review-pass-3 §3 — purging an uninstalled grant is a real store mutation,
-    /// so the INDEX drops its records and the change stream carries the
-    /// capabilities whose provider set moved. A grant purge is grant churn: it
-    /// must not advance the owner stream.
-    #[test]
-    fn forgetting_a_grant_drops_its_index_records_and_dirties_its_capabilities() {
-        let mut state = ScopedDiscoveryState::new();
-        let hostile = [0xAA; 32];
-        ingest_indexed(
-            &mut state,
-            grant_cap_declaring(hostile, 4, 1, 10_000, "nrpc:g"),
-            0,
-        );
-        ingest_indexed(
-            &mut state,
-            grant_cap_declaring([0xBB; 32], 5, 1, 10_000, "nrpc:other"),
-            0,
-        );
-        ingest_indexed(
-            &mut state,
-            owner_cap_declaring(6, 1, 10_000, &["nrpc:owned"]),
-            0,
-        );
-        let _ = state.take_global_change_batch();
-        let _ = state.take_owner_change_batch();
-        let owner_rev = state.owner_revision();
-
-        assert_eq!(state.forget_grant(&hostile), 1, "one LIVE row was dropped");
-        assert_eq!(
-            state.take_global_change_batch().dirty,
-            one_cap("nrpc:g"),
-            "the purged grant's capability moved and must wake the global stream",
-        );
-        assert_eq!(
-            state.owner_revision(),
-            owner_rev,
-            "a grant purge is grant churn: the owner stream must not move",
-        );
-        assert_eq!(
-            state
-                .find_owner_private_providers(Some(&cap_id("nrpc:owned")), 0, &no_floors())
-                .len(),
-            1,
-            "and the owner partition is untouched",
-        );
-        assert_eq!(
-            state.forget_grant(&hostile),
-            0,
-            "purging an already-purged grant is a no-op",
         );
     }
 
@@ -3068,7 +3247,7 @@ mod tests {
             let mut s = state.lock();
             let prepared =
                 PreparedScopedCapability::prepare(owner_cap_declaring(3, 1, 10_000, &["nrpc:a"]));
-            s.ingest(prepared, 0);
+            s.ingest(prepared, 0, &NoConsumerGrants);
         }
         state
     }
@@ -3273,7 +3452,7 @@ mod tests {
             let mut s = global.state.lock();
             let prepared =
                 PreparedScopedCapability::prepare(owner_cap_declaring(4, 1, 10_000, &["nrpc:a"]));
-            s.ingest(prepared, 0);
+            s.ingest(prepared, 0, &NoConsumerGrants);
         }
         assert_eq!(global.drain().dirty, expected, "global reports its delta");
         assert_eq!(global.drain().dirty, DirtyCapabilities::Clean);
@@ -3335,15 +3514,17 @@ mod tests {
         let grant = [0xAA; 32];
 
         // Admissions across two distinct scopes.
-        store.ingest(owner_cap(3, 1, 1000), 0);
-        store.ingest(owner_cap(4, 1, 5000), 0);
-        store.ingest(grant_cap(grant, 5, 1, 1000), 0);
+        store.ingest(owner_cap(3, 1, 1000), 0, &NoConsumerGrants);
+        store.ingest(owner_cap(4, 1, 5000), 0, &NoConsumerGrants);
+        store.ingest(grant_cap(grant, 5, 1, 1000), 0, &NoConsumerGrants);
         assert_counts_match_scan(&store);
         assert_eq!(store.entries_in_scope(&owner_scope()), 2);
 
         // An UPDATE to a known key mutates in place — occupancy is unchanged.
         assert_eq!(
-            store.ingest(owner_cap(3, 2, 1000), 0).outcome,
+            store
+                .ingest(owner_cap(3, 2, 1000), 0, &NoConsumerGrants)
+                .outcome,
             ScopedStoreOutcome::Updated
         );
         assert_eq!(
@@ -3380,8 +3561,8 @@ mod tests {
     fn a_retained_tombstone_still_occupies_its_scope_slot() {
         let mut store = ScopedDiscoveryStore::new();
         // Watermark 10_000 (generation 1) but a short current expiry (generation 2).
-        store.ingest(owner_cap(3, 1, 10_000), 0);
-        store.ingest(owner_cap(3, 2, 1000), 0);
+        store.ingest(owner_cap(3, 1, 10_000), 0, &NoConsumerGrants);
+        store.ingest(owner_cap(3, 2, 1000), 0, &NoConsumerGrants);
         assert_eq!(store.entries_in_scope(&owner_scope()), 1);
 
         // At t=2000 it demotes to a tombstone the watermark still retains.
@@ -3402,14 +3583,14 @@ mod tests {
     fn the_maintained_count_drives_the_fail_closed_scope_guard() {
         let mut store = ScopedDiscoveryStore::new();
         for index in 0..ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE as u64 {
-            store.ingest(owner_cap_n(index, 1, 10_000), 0);
+            store.ingest(owner_cap_n(index, 1, 10_000), 0, &NoConsumerGrants);
         }
         assert_eq!(
             store.entries_in_scope(&owner_scope()),
             ScopedDiscoveryStore::MAX_ENTRIES_PER_SCOPE
         );
 
-        let refused = store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 0);
+        let refused = store.ingest(owner_cap_n(u64::MAX, 1, 10_000), 0, &NoConsumerGrants);
         assert_eq!(refused.outcome, ScopedStoreOutcome::AtCapacity);
         assert_eq!(
             store.entries_in_scope(&owner_scope()),

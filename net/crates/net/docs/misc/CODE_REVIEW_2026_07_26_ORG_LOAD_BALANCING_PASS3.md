@@ -96,9 +96,10 @@ redriven to a successor terminal/converged state as appropriate.
 ### Fix before OLB-2C is authorized
 
 - §3: reserve the owner partition structurally from the global scoped-store
-  budget and purge a consumer-grant audience's stored rows when that grant is
-  removed. Multiple granted scopes filling their aggregate allowance must not
-  deny a new owner key.
+  budget, and make an uninstalled grant's rows RECLAIMABLE UNDER PRESSURE.
+  Multiple granted scopes filling their aggregate allowance must not deny a new
+  owner key. (Amended 2026-07-27 — see the §3 finding for why "purge on removal"
+  was withdrawn.)
 - §5: red-couple incarnation fencing at the node read seam.
 - §6: freeze the load-bearing floors-before-epoch read discipline, preferably
   with an epoch/floors/epoch seqlock-style sample and a deterministic witness.
@@ -255,13 +256,53 @@ review churn.
 - **Failure scenario:** operator installs ≥8 consumer DISCOVER grants; one
   compromised grantor wedges the node's OWN org's new-provider discovery —
   and the 2B routing registry fed from it — until restart.
-- **Fix direction:** reserve the owner partition structurally (non-owner
+- **Fix direction (AMENDED 2026-07-27 — see the resolution below; the purge
+  half is WITHDRAWN):** reserve the owner partition structurally (non-owner
   scopes admit only up to `MAX_ENTRIES − MAX_ENTRIES_PER_SCOPE`, or a
-  dedicated owner pool); purge a grant's stored rows when its consumer
-  credential is removed (they are already dead weight at read time);
+  dedicated owner pool); ~~purge a grant's stored rows when its consumer
+  credential is removed (they are already dead weight at read time)~~;
   optionally add a node-side ceiling on `expires_at`/tombstone horizon. Add
   the k>1-scopes composition witness: global pool filled by multiple grant
   scopes must still admit a new owner key.
+- **Resolution (Kyra, 2026-07-27) — reclaim under pressure, do not purge on
+  removal.** The purge half of the fix direction above is WITHDRAWN. It was
+  caught by the closure run: it contradicts OA3-4b2 slice 4, whose witness
+  `removing_the_consumer_credential_hides_the_stored_granted_record` asserts in
+  terms that removal is a READ-TIME FILTER — *"the record was hidden, not evicted
+  — re-installing re-exposes it."* **OA3-4b2 remains authoritative.** Purging
+  would also have turned credential removal into a new authority semantic and
+  discarded the generation high-water, for a benefit that pressure-driven
+  reclamation delivers without either cost.
+
+  The composed contract:
+
+  ```text
+  remove credential   → immediately non-queryable; row becomes RECLAIMABLE; no eviction
+  reinstall before pressure → the existing valid row becomes queryable again (warm)
+  capacity pressure   → expired/forgettable reclaimed first
+                      → then rows of currently UNINSTALLED grants
+                      → only then AtCapacity
+  reinstall after reclamation → starts cold; requires re-announcement
+  ```
+
+  Cache warmth may depend on pressure. Authority must not.
+
+  Never reclaimed: owner rows, rows of an installed grant, unrelated active
+  authority, or an unexpired active high-water merely because another key wants
+  admission. Reclamation is MINIMAL — only enough dormant occupancy to admit the
+  new key — and deterministic (`BTreeMap` traversal order; no sorting under the
+  publication gate). Every reclaimed LIVE row takes the same accounting an expiry
+  demotion takes: index removal, expiry-metadata removal, capability dirtied,
+  global revision advanced, owner revision UNCHANGED. Pure tombstone reclamation
+  frees capacity without fabricating a visible-provider transition.
+
+  The installed-grant view is one immutable snapshot captured by an `ArcSwap`
+  load BEFORE the publication-gated ingest, so the raw store never acquires
+  `consumer_grant_mu` and no lock edge is added. Both race directions are safe: a
+  snapshot that still reads "installed" after a removal merely misses a
+  reclamation a later admission retries; one that reads "uninstalled" while a
+  reinstall lands linearizes the reclamation before the reinstall, so that
+  reinstall starts cold. Neither can expose unauthorized state.
 
 ### §4 — The lease wire leg emits legacy-only frames, so an org-audience lease acquire succeeds locally while every upstream registration is refused as authority laundering
 
@@ -747,7 +788,7 @@ this document required.
 
 | § | Status | Where |
 |---|---|---|
-| §3 — owner partition reserved; grant rows purged on removal | Closed | `4509f4820` |
+| §3 — owner partition reserved; dormant grant rows reclaimed under pressure | Closed | `4509f4820` + the 2026-07-27 correction |
 | §5 — incarnation fence red-coupled | Closed | `3162b2e00` |
 | §6 — floors-before-epoch read order frozen (seqlock sample) | Closed | `871908fb4` |
 | §7 — `base_facts_unvalidated`, crate-private, doc-pointed | Closed | `3162b2e00` |

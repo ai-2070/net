@@ -873,7 +873,7 @@ mod tests {
     use crate::adapter::net::behavior::org_scoped_ingest::{
         CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
     };
-    use crate::adapter::net::behavior::org_scoped_store::ScopedDiscoveryState;
+    use crate::adapter::net::behavior::org_scoped_store::{NoConsumerGrants, ScopedDiscoveryState};
     use crate::adapter::net::identity::EntityId;
 
     /// `(incarnation, source delta, registry-work flag)` per application.
@@ -930,7 +930,7 @@ mod tests {
 
     fn harness() -> Harness {
         let state = Arc::new(parking_lot::Mutex::new(ScopedDiscoveryState::new()));
-        state.lock().ingest(owner_record(3), 0);
+        state.lock().ingest(owner_record(3), 0, &NoConsumerGrants);
         let (tx, rx) = tokio::sync::watch::channel(0u64);
         Harness {
             state,
@@ -1255,7 +1255,7 @@ mod tests {
                 if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
                     // The source moves DURING the recapture — which is WHY it is
                     // superseded — dirtying a capability and waking the actor.
-                    state.lock().ingest(owner_record(4), 0);
+                    state.lock().ingest(owner_record(4), 0, &NoConsumerGrants);
                     let _ = tx.send(1);
                     ApplyOutcome::Superseded
                 } else {
@@ -1312,7 +1312,7 @@ mod tests {
         assert_eq!(h.health(), RoutingHealth::Healthy { incarnation: 1 });
 
         // Ordinary movement: a second provider dirties one capability.
-        h.state.lock().ingest(owner_record(4), 0);
+        h.state.lock().ingest(owner_record(4), 0, &NoConsumerGrants);
         let _ = h.tx.send(1);
         settle().await;
 

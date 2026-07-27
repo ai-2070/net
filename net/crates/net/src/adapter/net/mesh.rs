@@ -10553,36 +10553,9 @@ impl MeshNode {
         match current.without(grant_id) {
             Some(next) => {
                 self.consumer_grant_audiences.store(Arc::new(next));
-                self.purge_scoped_rows_for_grant(grant_id);
                 true
             }
             None => false,
-        }
-    }
-
-    /// Reclaim the private-discovery slots a now-uninstalled consumer grant was
-    /// holding (review-pass-3 §3).
-    ///
-    /// Removal previously mutated only the audience registry, which hides the
-    /// rows at QUERY time and leaves them occupying store slots until their
-    /// attacker-chosen expiry horizon passes. Composed with the global
-    /// cardinality guard that made uninstalling the hostile grant reclaim
-    /// nothing — the wedge outlived its own remediation.
-    ///
-    /// Runs under `consumer_grant_mu`, so it cannot race a re-install of the same
-    /// `grant_id` and wipe the successor's rows. The lock order is
-    /// `consumer_grant_mu -> publication gate`, and it is acyclic: the ingest
-    /// path reads the audience registry through its lock-free `ArcSwap` and never
-    /// takes this mutex.
-    fn purge_scoped_rows_for_grant(&self, grant_id: &[u8; 32]) {
-        let dropped = self
-            .scoped_publication
-            .gated_commit(&self.scoped_discovery, |state| state.forget_grant(grant_id));
-        if dropped > 0 {
-            tracing::debug!(
-                dropped,
-                "org scoped discovery: reclaimed stored rows for an uninstalled consumer grant"
-            );
         }
     }
 
@@ -10609,7 +10582,6 @@ impl MeshNode {
             Some(_) => match current.without(lease.grant_id()) {
                 Some(next) => {
                     self.consumer_grant_audiences.store(Arc::new(next));
-                    self.purge_scoped_rows_for_grant(lease.grant_id());
                     true
                 }
                 None => false,
@@ -21368,8 +21340,17 @@ impl MeshNode {
                 // (Kyra OLB-2A.1). The gate is already held, so this commits and
                 // publishes under it — serialized with every other mutation
                 // (OLB-2A.3.1).
+                // review-pass-3 §3 (Kyra 2026-07-27): ONE immutable
+                // installed-consumer-grant snapshot, loaded lock-free here and
+                // handed to the store, so a capacity reclamation can tell a
+                // dormant grant row from a live one WITHOUT the raw store ever
+                // reaching for `consumer_grant_mu` — no new lock edge under the
+                // publication gate. Captured before the mutation begins; both
+                // race directions against a concurrent install/remove are safe
+                // (see `reclaim_for_admission`).
+                let installed = consumer_grant_audiences.load_full();
                 let outcome = publication.commit(&publication_gate, scoped_discovery, |state| {
-                    state.ingest(prepared, now_secs)
+                    state.ingest(prepared, now_secs, &*installed)
                 });
                 // review-pass-3 §10: every outcome is COUNTED, not merely logged
                 // at debug. A capacity wedge additionally warns on its first
