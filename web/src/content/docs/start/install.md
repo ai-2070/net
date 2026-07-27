@@ -130,6 +130,17 @@ int main() {
 
 The C API is a thin handle-based wrapper over the same primitives. Examples for capabilities, MeshDB, MeshOS, and Deck live under `examples/` in the crate.
 
+## Deck (operator TUI)
+
+Separate binary, separate install — nothing else depends on it:
+
+```sh
+cargo install net-deck      # or: npm i -g @net-mesh/deck, pip install net-deck
+```
+
+See the [Deck reference](/docs/reference/deck) for the tabs and the signed admin
+surface.
+
 ## What you get out of the box
 
 Whichever language you start in, an install of Net brings:

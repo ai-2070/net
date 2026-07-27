@@ -343,3 +343,10 @@ Required capabilities are placement-hard: no match, no placement. Optional capab
 Daemons are the right primitive when the work is **long-running**, **stateful in a way that benefits from running on one specific node**, **driven by events**, and **needs to survive failures**. If any of those four are false, simpler primitives apply: a one-shot job for short work, a stateless service for stateless work, a polling consumer for non-event-driven work, a basic bus subscriber for work that doesn't need failure handling.
 
 For work that fits the daemon shape, the runtime is designed so that you stop thinking about placement and failure handling and start thinking about what your daemon actually does. That's the system working as intended.
+
+One shape that is *not* placement: work that needs an **exclusive** resource
+several nodes are competing for — a GPU island, an accelerator slot, a licensed
+seat. Placement decides where a daemon runs; it does not arbitrate a contended
+resource. That's the [gang-claim scheduler](/docs/guides/gang-scheduler), and
+what runs once the claim is held is the
+[task lifecycle](/docs/guides/task-lifecycle).

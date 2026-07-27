@@ -116,6 +116,8 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "netdb-queries",
       "dataforts",
       "daemons-and-placement",
+      "gang-scheduler",
+      "task-lifecycle",
       "continuity-and-migration",
       "nat-and-traversal",
     ],
@@ -130,6 +132,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "error-codes",
       "mcp-bridge",
       "cli",
+      "deck",
     ],
     tutorials: [
       "fleet-telemetry",
@@ -233,6 +236,8 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "guides/netdb-queries": "Querying with NetDB",
     "guides/dataforts": "Blob Storage (Dataforts)",
     "guides/daemons-and-placement": "Daemons and Placement",
+    "guides/gang-scheduler": "Claiming a Contended Resource",
+    "guides/task-lifecycle": "Task Lifecycle and Workflows",
     "guides/continuity-and-migration": "Continuity and Migration",
     "guides/nat-and-traversal": "NAT and Traversal",
 
@@ -247,6 +252,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "reference/error-codes": "Error Codes",
     "reference/mcp-bridge": "MCP Bridge",
     "reference/cli": "CLI Reference",
+    "reference/deck": "Deck (Operator TUI)",
 
     // SDKs
     sdk: "SDKs",
