@@ -1050,3 +1050,43 @@ deterministic refusal); owner reservation (letting grants consume it admits
 8,192 rather than 7,168); dormant-only reclamation. Baseline focused results at
 `80bb06b5a`: routing wiring 41, routing registry units 28, owner reservation 1,
 dormant reclamation 1. Zero-test filtered invocations were rejected and rerun.
+
+### Independent RED pass, focused schedule — 2026-07-27 (second run)
+
+Run against `318e7ebcf`, focused named RED tests only, no broad local gates.
+**Eight claimed witnesses were independently confirmed genuinely coupled**, each
+failing under a property-breaking mutation and each mutation reverted:
+
+| Claim | Independent mutation | Result |
+|---|---|---|
+| Store-generation exhaustion | re-arm `RegistryWork` after terminal settlement refusal | failed on "must NOT re-arm itself" |
+| Routing-authority exhaustion | terminal retirement → strict-older invalidation | equal-MAX fact survived; failed |
+| Empty-selection wake | disable `mark_if_movement()` | failed on missing pin-refusal wake |
+| Non-empty refusal | omit reinsertion of selected live slots | failed on "live slot still owes work" |
+| Poison mark, `raised=[]` | suppress the authority notification | epoch stayed 4 instead of 5 |
+| Poison-clear exclusion | bypass `poison_gate` | gate-reached acknowledgement timed out |
+| Poison recovery observability | suppress the empty-floor notification | failed on missing authority movement |
+| Changed-store authority transaction | split authority/store into two gated epoch transactions | witness observed two publications |
+
+**One further gap found, in `efa746f2c`.** Mutating the NO-STORE-CHANGE branch to
+publish the authority outside `move_routing_authority` left
+`an_authority_install_publishes_the_authority_under_its_own_epoch` green (1
+passed, 5,336 skipped): that witness only ever exercises the changed-store
+branch. The commit had already stated that only one of its three witnesses was
+RED-coupled; this identified the exact missing half, which is the difference
+between disclosing a gap and closing it.
+
+Closed by `an_authority_rotation_over_the_same_store_still_publishes_inside_the_epoch`
+— a **direct structural branch witness**, labelled as such because today's
+constructor gives each `NodeAuthority` its own store, so the branch is
+fail-closed rather than reachable end-to-end. A production workflow that can
+rotate authority over one store will owe its own end-to-end witness. RED-verified
+against the exact mutation: fails at the epoch-advance-count assertion, and is
+the only witness that fails. Wiring gate 44 → 45, both OLB-2C names pinned.
+
+**Still owed before this schedule closes:** the finer empty-selection mutation —
+remove ONLY the settlement-refusal `mark_if_movement()` call while leaving the
+pin-refusal call intact, so the witness passes leg 1 and fails leg 2. The earlier
+mutation disabled the shared helper and stopped at the first assertion, which
+proves the helper but not both call sites. That mutation is the independent
+reviewer's to run.

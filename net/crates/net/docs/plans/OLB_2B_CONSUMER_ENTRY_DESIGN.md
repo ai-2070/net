@@ -357,7 +357,25 @@ likewise fail-closed rather than currently reachable — a `NodeAuthority` owns 
 revocation store 1:1, so `authority_changed` and `store_changed` move together in
 practice.
 
-Witnesses (wiring gate 41 → 44, one new pinned name):
+**The no-store-change branch now has its own witness, added after an independent
+RED pass found it unwitnessed** (Kyra, 2026-07-27). Mutating that branch to
+publish the authority outside `move_routing_authority` left the changed-store
+witness GREEN, because that witness never reaches the branch — so the branch was
+code with no evidence behind it, which is precisely the gap the "only one of the
+three is RED-coupled" note pointed at without closing.
+`an_authority_rotation_over_the_same_store_still_publishes_inside_the_epoch`
+drives `install_org_revocation_store_locked` directly with the exact installed
+store `Arc` and asserts: `store_changed == false`, the store stays
+pointer-identical, the epoch advances exactly once, and the replacement authority
+is already visible inside the publication callback. It is a **direct structural
+branch witness** and is labelled so in the source: today's constructor gives each
+`NodeAuthority` its own store, so the branch is fail-closed rather than reachable
+end-to-end. **When a production workflow can rotate authority over one store,
+that workflow owes its own end-to-end witness — this one does not stand in for
+it.** RED-verified against Kyra's exact mutation: it fails at the
+epoch-advance-count assertion, and it is the only witness that fails.
+
+Witnesses (wiring gate 41 → 45, two new pinned names):
 `an_authority_install_publishes_the_authority_under_its_own_epoch` is the
 load-bearing one and observes from INSIDE the gate through a new
 `post_publish_hook`, because the window it tests is a few instructions wide and

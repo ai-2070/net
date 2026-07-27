@@ -3588,3 +3588,110 @@ async fn a_refused_authority_install_publishes_neither_half() {
         "a refused install must not advance the routing epoch"
     );
 }
+
+/// OLB-2C, the branch the changed-store witness does NOT reach: an authority
+/// rotation over the SAME revocation store `Arc`.
+///
+/// A **direct structural branch witness**, and labelled as such deliberately.
+/// Today's production constructor gives every `NodeAuthority` its own store, so
+/// `authority_changed` and `store_changed` move together and this branch is
+/// unreachable end-to-end — it exists fail-closed. An independent RED pass
+/// (Kyra, 2026-07-27) showed the consequence: mutating this branch to publish
+/// the authority OUTSIDE `move_routing_authority` left
+/// `an_authority_install_publishes_the_authority_under_its_own_epoch` green,
+/// because that witness only ever exercises the changed-store branch. So the
+/// branch was code with no evidence behind it.
+///
+/// This drives `install_org_revocation_store_locked` directly with the exact
+/// installed store `Arc`, which is the only way to reach the branch at all.
+/// **When a production workflow can rotate authority over one store, that
+/// workflow owes its own end-to-end witness — this one does not stand in for it.**
+#[tokio::test]
+async fn an_authority_rotation_over_the_same_store_still_publishes_inside_the_epoch() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x2fu8; 32]);
+
+    node.install_node_authority(adopt_authority(&node, &org, "g"))
+        .expect("install A");
+    // The EXACT installed `Arc` — passing it back is what makes the helper take
+    // its `Arc::ptr_eq` no-visible-change path.
+    let installed_store = node
+        .org_revocation
+        .load_full()
+        .expect("A's store is installed");
+    let replacement = adopt_authority(&node, &org, "h");
+
+    let advances = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let visible_in_callback = Arc::new(AtomicBool::new(false));
+    {
+        let advances = advances.clone();
+        let visible = visible_in_callback.clone();
+        let expected = replacement.clone();
+        let weak = Arc::downgrade(&node);
+        *node.routing_authority.post_publish_hook.lock() = Some(Arc::new(move |_epoch| {
+            advances.fetch_add(1, Ordering::AcqRel);
+            if let Some(node) = weak.upgrade() {
+                if node
+                    .node_authority()
+                    .is_some_and(|live| Arc::ptr_eq(&live, &expected))
+                {
+                    visible.store(true, Ordering::Release);
+                }
+            }
+        }));
+    }
+
+    let before = node.routing_authority.epoch();
+    let publish = {
+        let replacement = replacement.clone();
+        let slot = &node.node_authority;
+        move || slot.store(Some(replacement.clone()))
+    };
+    // Under `org_install`, as every production caller of the `_locked` helper is.
+    let store_changed = {
+        let _install = node.org_install.lock();
+        node.install_org_revocation_store_locked(
+            installed_store.clone(),
+            false,
+            None,
+            Some(&publish as &(dyn Fn() + Sync)),
+        )
+        .expect("re-installing the exact same store is accepted")
+    };
+    *node.routing_authority.post_publish_hook.lock() = None;
+
+    assert!(
+        !store_changed,
+        "precondition: the same store `Arc` is not a visible store change — \
+         without this the test would silently be exercising the OTHER branch"
+    );
+    assert!(
+        Arc::ptr_eq(
+            &installed_store,
+            &node
+                .org_revocation
+                .load_full()
+                .expect("store still installed")
+        ),
+        "the store must remain pointer-identical across an authority-only rotation"
+    );
+    assert_eq!(
+        advances.load(Ordering::Acquire),
+        1,
+        "an authority-only rotation must still be ONE routing epoch transaction: \
+         0 means the authority was published outside the epoch entirely"
+    );
+    assert!(
+        visible_in_callback.load(Ordering::Acquire),
+        "at the publication instant the replacement authority must already be \
+         live; observing the old one means the swap escaped the epoch naming it"
+    );
+    assert!(
+        node.routing_authority.epoch() > before,
+        "the routing epoch must advance even though no store changed"
+    );
+    assert!(
+        Arc::ptr_eq(&replacement, &node.node_authority().expect("authority")),
+        "the rotation must actually have landed"
+    );
+}
