@@ -221,6 +221,36 @@ let view = adapter.state().read();
 
 `wait_for_seq` resolves when the fold task has applied every event up to and including `seq`. For most flows you won't need it — the read-vs-write race is small enough that polling-style consumers don't notice — but when you do need it, it's the right primitive.
 
+### `WriteToken` — the portable form
+
+A bare `seq` only means something if you already know which chain it's on. The
+ingest paths also hand back a **`WriteToken`**: the address of a write as
+`(origin_hash, seq)` — which chain, and which event on it. Pass it to
+`wait_for_token` instead:
+
+```rust
+let token = adapter.ingest(envelope)?;          // WriteToken
+adapter.wait_for_token(token).await?;
+```
+
+`poll_for_token` is the non-async form. Both exist on `TasksAdapter` and
+`MemoriesAdapter`, and the token round-trips through every binding as a typed
+value, so a write's address can travel with a payload to whoever needs to wait
+on it.
+
+> **Tokens are not capabilities.** A `WriteToken` is plain in-process data with
+> public fields — unsigned, and forgeable by anything in the same process. The
+> guarantee comes from the *adapter*, not the token: an adapter bound to origin
+> X rejects any token whose `origin_hash` isn't X, with `WrongOrigin`. So a
+> token arriving over the wire is untrusted input that the receiving side
+> validates by virtue of which adapter it hands the token to. Don't synthesise
+> tokens in application code — a hand-rolled one that matches no real ingest
+> just hangs until the deadline.
+
+Concurrency is bounded. There's a per-channel cap on simultaneous
+`wait_for_token` permits (and a process-wide cap you can install), so a flood of
+waiters fails fast rather than accumulating.
+
 ## When CortEX is the wrong tool
 
 Two cases:
