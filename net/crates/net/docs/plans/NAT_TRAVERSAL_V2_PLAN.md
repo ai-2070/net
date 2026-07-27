@@ -325,9 +325,18 @@ verified locally, the netns halves await their first CI run).
   keygen/public/joiner), `tests/natsim.rs` (`#[ignore]`d, Linux-only
   wrappers asserting outcome + stats deltas), and
   `.github/workflows/natsim.yml` (traversal-touching PRs + nightly +
-  manual). Cone = plain `masquerade persistent`, symmetric =
-  `masquerade fully-random`; R and X are two distinct public IPs so the
-  classifier's cone/symmetric discrimination is real.
+  manual). Cone = static `snat to <public>:<port>` plus an INPUT drop for
+  unsolicited inbound on that port, symmetric = `masquerade
+  fully-random`; R and X are two distinct public IPs so the classifier's
+  cone/symmetric discrimination is real.
+
+  Cone was originally plain `masquerade persistent` on the belief that it
+  gives endpoint-independent mapping. It does not — `persistent` pins the
+  source address, not the port — and under a simultaneous punch the
+  peer's inbound keep-alive poisoned the conntrack tuple the local
+  outbound needed, so the gateway reallocated the public port and the
+  "cone" NAT degraded to symmetric. That is why `cone_cone_punch` failed
+  from its first run; see `tests/natsim/README.md`.
 - Five scenarios wired: cone×cone punch, symmetric×cone exactly-once,
   symmetric×symmetric skip, dropped-keep-alives fallback-within-deadline,
   and the Stage 3 relay→direct upgrade (topology adjusted to shipped

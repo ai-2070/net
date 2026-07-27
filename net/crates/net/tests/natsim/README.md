@@ -13,16 +13,36 @@ trivially arrives.
         .12 = B when it plays the public peer (relay_upgrade)
             |                       |
         nsim_gwa (.2)           nsim_gwb (.3)      ← NAT gateways
-      masquerade [persistent|       masquerade
-        fully-random]                  ...
+      static snat + input drop      masquerade
+        | masquerade fully-random      ...
             |                       |
         nsim_a (192.168.101.2)  nsim_b (192.168.102.2)
 ```
 
-- **cone** = plain `masquerade persistent`: endpoint-independent
-  mapping (one public port for all destinations) with conntrack
-  (address+port-restricted) filtering — the realistic punch-needing
-  NAT. The classifier reads it as `Cone`.
+- **cone** = static `snat to <public>:<port>` for the joiner's own port,
+  plus an INPUT drop for unsolicited inbound on that port. That gives
+  endpoint-independent mapping (one public port for all destinations)
+  with address-restricted filtering — the realistic punch-needing NAT.
+  The classifier reads it as `Cone`.
+
+  > **`masquerade persistent` is not a cone NAT.** The earlier version of
+  > this harness used it and claimed endpoint-independent mapping here.
+  > `persistent` pins the source *address*, not the port; port
+  > preservation is only netfilter's best-effort heuristic, and it yields
+  > under tuple collision. In a simultaneous punch the peer's keep-alive
+  > can reach the gateway before the local outbound leaves; with no
+  > mapping yet it lands in INPUT, where conntrack records it and claims
+  > the very tuple the outbound then needs — so the gateway allocated a
+  > fresh public port while the node had already advertised the old one
+  > through the rendezvous. The "cone" NAT degraded to symmetric under
+  > exactly the condition `cone_cone_punch` exists to exercise, and that
+  > test failed for as long as it did. The INPUT drop fixes it by
+  > refusing the packet *before* the conntrack confirm hook, so no entry
+  > is inserted and the tuple stays free.
+  >
+  > A static DNAT would also break the race, and was rejected: it makes
+  > the gateway full-cone, so the peer is reachable unsolicited and
+  > `cone_cone_punch` would pass without any hole being punched.
 - **symmetric** = `masquerade fully-random`: fresh public port per
   connection tuple. The classifier reads it as `Symmetric` because R
   and X (two *distinct* public IPs) observe different mappings.
