@@ -1,5 +1,5 @@
 ---
-title: v0.30.0 — Final Countdown
+title: "v0.30.0 — Final Countdown"
 description: "Release notes for Net v0.30.0 — Final Countdown — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.30 — "Final Countdown"

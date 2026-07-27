@@ -1,5 +1,5 @@
 ---
-title: v0.27.5 — Purple Rain
+title: "v0.27.5 — Purple Rain"
 description: "Release notes for Net v0.27.5 — Purple Rain — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.27.5 — "Purple Rain"

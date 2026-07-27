@@ -1,5 +1,5 @@
 ---
-title: v0.28.0 — Round and Round
+title: "v0.28.0 — Round and Round"
 description: "Release notes for Net v0.28.0 — Round and Round — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.28 — "Round and Round"

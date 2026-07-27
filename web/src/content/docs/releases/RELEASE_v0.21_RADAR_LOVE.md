@@ -1,5 +1,5 @@
 ---
-title: v0.21 — Radar Love
+title: "v0.21 — Radar Love"
 description: "Release notes for Net v0.21 — Radar Love — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.21 — "Radar Love"

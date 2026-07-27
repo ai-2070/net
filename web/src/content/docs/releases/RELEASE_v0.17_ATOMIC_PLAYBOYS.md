@@ -1,5 +1,5 @@
 ---
-title: v0.17 — Atomic Playboys
+title: "v0.17 — Atomic Playboys"
 description: "Release notes for Net v0.17 — Atomic Playboys — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.17 — "Atomic Playboys"

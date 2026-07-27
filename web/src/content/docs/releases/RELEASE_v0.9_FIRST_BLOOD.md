@@ -1,5 +1,5 @@
 ---
-title: v0.9 — First Blood
+title: "v0.9 — First Blood"
 description: "Release notes for Net v0.9 — First Blood — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.9 — "Killing Moon" Phase II

@@ -1,5 +1,5 @@
 ---
-title: v0.14 — The Warriors
+title: "v0.14 — The Warriors"
 description: "Release notes for Net v0.14 — The Warriors — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.14 — "The Warriors"

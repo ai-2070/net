@@ -1,5 +1,5 @@
 ---
-title: v0.26 — Monkey Business
+title: "v0.26 — Monkey Business"
 description: "Release notes for Net v0.26 — Monkey Business — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.26 — "Monkey Business"

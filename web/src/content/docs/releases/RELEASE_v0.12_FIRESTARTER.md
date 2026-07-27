@@ -1,5 +1,5 @@
 ---
-title: v0.12 — Firestarter
+title: "v0.12 — Firestarter"
 description: "Release notes for Net v0.12 — Firestarter — what shipped, what changed, and what it means for compatibility."
 ---
 # Net v0.12 — "Firestarter"
