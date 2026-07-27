@@ -1,17 +1,21 @@
 # CODE REVIEW 2026-07-26 — Org Capability Load Balancing, pass 3 (`load-balancing`)
 
-> **STATUS: all findings ADDRESSED; the closure RUN is incomplete.**
+> **STATUS: all findings ADDRESSED; the local closure run is EXECUTED at the
+> final exact head; the signature is still withheld on two items that are not
+> mine to certify.**
 >
 > Every finding in this document and in pass 2 has a landed fix and a witness —
 > see [Closure](#closure--every-finding-in-this-document-and-pass-2-is-now-addressed),
 > which maps each one to its commit. That includes the four **Fix now** gate
 > items and the two pass-2 items previously deferred by decision.
 >
-> This is NOT a sign-off. The adjudication below requires an exact-head closure
-> run before E3c / composed OLB-2B is signed, and three parts of it have not been
-> executed: the fourth clippy gate (`--all-features --all-targets`), the full
-> serial nextest matrices, and `cfg(unix)` verification under the Docker harness.
-> The mid-document
+> The exact-head run the adjudication demands is recorded in
+> [Exact-head closure run](#exact-head-closure-run--80bb06b5a) — including the
+> fourth clippy gate, which the previous revision of this banner listed as not
+> executed. What remains is stated there and is deliberately NOT dischargeable by
+> the author of the fixes.
+>
+> This is still NOT a sign-off. The mid-document
 > [Disposition](#disposition--corrective-descendant-of-2026-07-26-ceb88ed47--87aa71960--52c667d62)
 > section is historical and superseded; it is kept for the sequence, not the
 > state.
@@ -866,7 +870,11 @@ Run at the closure head, after the last finding landed.
   `--all-features --lib --bins -D warnings`, `--lib --bins -D warnings`, and
   `--no-default-features --lib --bins -D warnings` — all clean.
 
-**NOT verified on this host — do not read the above as covering it:**
+**NOT verified on this host — do not read the above as covering it.** *(Recorded
+as of the branch closure head. The first bullet is now SUPERSEDED: the fourth
+clippy gate ran clean at the final exact head — see
+[Exact-head closure run](#exact-head-closure-run--80bb06b5a). The other two
+bullets stand, and are carried into the outstanding list there.)*
 
 - **`cargo clippy --all-features --all-targets`** (the fourth gate, which lints
   the TEST surface with the four panic-hygiene lints `-A`'d). The host ran out of
@@ -889,10 +897,61 @@ clock it HUNG rather than failed, because the defect is an actor that is never
 idle. That is why that witness alone runs on the real clock: a regression must
 fail the job, not wedge it.
 
+### Exact-head closure run — `80bb06b5a`
+
+The "Test evidence" block above was gathered at the closure head on the branch.
+The head then moved twice — `670bef6e0` (the `--all-targets` test surface) and
+`cd39fda69` (intra-doc links for the rustdoc gate) — before the branch merged to
+master as PR #655 at **`80bb06b5a`**. Kyra's closure condition names the FINAL
+exact head, so the run below was performed against `80bb06b5a` rather than
+inherited from the branch. Windows host, `CARGO_INCREMENTAL=0`, clean worktree.
+
+| Gate | Exact command | Result |
+|---|---|---|
+| Clippy gate 4 | `cargo clippy --all-features --all-targets -- -D warnings -A unwrap_used -A expect_used -A undocumented_unsafe_blocks -A multiple_unsafe_ops_per_block` | **clean** |
+| Lib suite | `cargo test --lib --features "$UNIT_FEATURES"` | **5,444 passed, 0 failed, 1 ignored** |
+| Wiring gate | `cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests` | **41** (MIN 41); 3 pinned names present |
+| Supervisor gate | `cargo test --lib --features "$UNIT_FEATURES" behavior::org_routing::` | **24** (MIN 24); all 9 pinned names present |
+| Doctests | `cargo test --doc --features "$UNIT_FEATURES"` | **4 passed, 0 failed, 31 ignored** |
+| Rustdoc gate | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | **clean** |
+| Formatting | `cargo fmt --all -- --check` (net crate + SDK) | clean |
+
+**Two closure conditions have been closed by this run.** The fourth clippy gate —
+which the previous banner listed as unexecuted, and which the disk exhaustion
+during the branch closure prevented from completing — is clean at the final head.
+And the `670bef6e0` defect it existed to catch is worth recording as the
+justification for the gate rather than as a footnote: a `--lib`-only clippy plus
+a `--lib`-only test run is structurally incapable of seeing a signature change
+that ripples into `#[cfg(test)]` modules and `tests/*.rs`, so the §3 correction
+compiled green locally and broke on CI. That is exactly the coverage hole gate 4
+closes.
+
+**Note both gates sit EXACTLY at their floor** (41/41 and 24/24). That is by
+construction — each MIN was raised to the count in the commit that added the
+witnesses — but it means neither gate has slack: any deletion trips it
+immediately, which is the intended behaviour, and any addition must raise MIN in
+the same commit.
+
 ### What is still owed before E3c / composed OLB-2B can be signed
 
-The findings are closed; the CLOSURE RUN is not. Per the adjudication above, the
-signature needs an exact-head run with independent RED mutations, the serial
-broad matrices, the clippy/fmt/diff checks and a clean worktree. Outstanding from
-that list: the fourth clippy gate, the full serial matrices, and the `cfg(unix)`
-harness. The worktree is clean and the diff/fmt checks pass.
+The findings are closed and the local closure run is executed. Two items remain,
+and neither is dischargeable by the author of the fixes:
+
+1. **Independent RED mutations.** Every RED probe recorded in this document was
+   authored, run and reverted by the same author as the fix it couples to. That
+   demonstrates the witnesses are coupled to *something*; it does not
+   demonstrate they are coupled to the property a different reader would attack.
+   Two findings in this very closure were witness defects rather than code
+   defects — §17's sort was unobservable because capability IDs are blake3
+   hashes, and the floor-publish race witness self-deadlocked and had therefore
+   never proven its property. Both were found by the author only because a probe
+   behaved oddly, not because the witness was reviewed. This step is where that
+   class gets caught deliberately.
+2. **The CI conclusion for `80bb06b5a`.** The Linux jobs own the full serial
+   nextest matrices and every `cfg(unix)` path; a Windows host does not
+   substitute for either. This was not read from the authoring host, which has no
+   `gh` on `PATH` — recorded as unread rather than assumed green, since a merged
+   PR is evidence about branch protection, not about a specific run's conclusion.
+
+Until both are discharged, E3c / composed OLB-2B remains HELD and OLB-2C remains
+unauthorized, notwithstanding the merge to master.

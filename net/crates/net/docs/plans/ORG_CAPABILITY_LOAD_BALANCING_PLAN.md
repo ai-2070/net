@@ -219,10 +219,21 @@ candidate factoring is signed at `4dccb7767`. The bounded stop-and-review that
 gated OLB-2 has PASSED — see the implementation-status note above, which records
 the authorization and the OLB-2A slices that followed it. OLB-2A composed is
 signed at `65b9fe903`. OLB-2B (the supervised node-owned routing actor and its
-bounded registry) is LANDED on the `load-balancing` branch and is HELD pending
-the pass-2/pass-3 review closure recorded in
+bounded registry) is MERGED TO MASTER at `80bb06b5a` (PR #655, 2026-07-27) and is
+STILL HELD pending the pass-2/pass-3 review closure recorded in
 [`OLB_2B_CONSUMER_ENTRY_DESIGN.md`](OLB_2B_CONSUMER_ENTRY_DESIGN.md); OLB-2C is
 not authorized until that closure signs.
+
+**Merged is not signed, and the distinction is load-bearing here.** The
+merge-tier findings were closed before merge exactly as the pass-3 adjudication
+required, so the branch was mergeable; phase authorization is a separate gate
+that the merge does not discharge. The exact-head closure run demanded by that
+gate has now been EXECUTED at `80bb06b5a` and is recorded in
+[pass 3](../misc/CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS3.md#exact-head-closure-run--80bb06b5a).
+Two items remain, and neither is dischargeable by the author of the fixes: the
+independent RED mutations, and reading the CI conclusion for the merged head
+(this host has no `gh`, and its Windows runs cannot stand in for the `cfg(unix)`
+and serial-matrix coverage that only the Linux CI jobs provide).
 
 *(review-pass-3 §19: this paragraph previously still said "OLB-2 does not begin
 until it signs off", contradicting the implementation-status note above it, which

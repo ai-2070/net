@@ -1,7 +1,9 @@
 # OLB-2B consumer entry — design for review (revision 2)
 
-**Status: ENTRY REVIEWED AND AUTHORIZED; E3a–E3c LANDED; phase sign-off HELD
-pending the review-pass-2/pass-3 closure.**
+**Status: ENTRY REVIEWED AND AUTHORIZED; E3a–E3c LANDED AND MERGED TO MASTER at
+`80bb06b5a`; phase sign-off STILL HELD — the pass-2/pass-3 findings are closed
+and the exact-head closure run is executed, but two non-self-certifiable items
+remain (see "What is still held").**
 
 Revision 1 (`84080310f`) was HELD: core direction approved, implementation NOT
 authorized. Revision 2 adopted every refinement from that review and recorded the
@@ -11,7 +13,8 @@ entry-boundary re-review was run against.
 **Entry-boundary review outcome (recorded here per review-pass-3 §19).** The
 re-review this document asked for was held and PASSED, and implementation of the
 E-slices was authorized on that basis; the E1 entry landed at `5bf661f2f` and
-E3a–E3c are landed at HEAD of the `load-balancing` branch. The audit trail
+E3a–E3c landed on the `load-balancing` branch, which merged to master at
+`80bb06b5a` (PR #655, 2026-07-27). The audit trail
 previously had a hole here: the document still read "no OLB-2B source
 implementation begins before that review" while the source it forbids was fully
 landed, and no in-tree record of the outcome existed.
@@ -23,6 +26,20 @@ followed the implementation —
 [pass 3](../misc/CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS3.md) — and E3c /
 composed OLB-2B stays HELD until their adjudicated gate is closed and an
 exact-head closure run is recorded. OLB-2C is not authorized before that.
+
+The adjudicated gate is now closed and the exact-head run is recorded at
+[pass 3 → Exact-head closure run](../misc/CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS3.md#exact-head-closure-run--80bb06b5a).
+**Merging did not discharge the hold**, and neither does that run. Two items are
+outstanding, and both are outstanding BY DESIGN rather than by omission — a
+closure run executed by whoever wrote the fixes proves the fixes still compile
+and pass, not that they are correct:
+
+1. **Independent RED mutations.** Every probe recorded in this closure was
+   authored and reverted by the same author as the fix it tests. A witness that
+   its own author cannot imagine failing is the failure mode this step exists to
+   catch, so these must be run by someone else.
+2. **The CI conclusion for `80bb06b5a`.** The Linux jobs own the serial nextest
+   matrices and all `cfg(unix)` coverage; no Windows run substitutes for them.
 
 OLB-2A composed is SIGNED at `65b9fe903`; that signature does not authorize this
 phase.
