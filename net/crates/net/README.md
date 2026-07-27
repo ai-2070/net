@@ -32,6 +32,7 @@ on the docs site.
 | [`SUBPROTOCOLS.md`](docs/SUBPROTOCOLS.md) | The subprotocol registry, ID space, version negotiation, opaque forwarding |
 | [`STORAGE_AND_CORTEX.md`](docs/STORAGE_AND_CORTEX.md) | RedEX logs, CortEX folds, NetDB, durability |
 | [`COMPUTE.md`](docs/COMPUTE.md) | Daemons, capability-based placement, six-phase migration |
+| [`DATAFORTS.md`](docs/DATAFORTS.md) | Greedy caching, data gravity, content-addressed blobs, directory transfer |
 | [`STATE.md`](docs/STATE.md) | Distributed state |
 | [`SENSING.md`](docs/SENSING.md) | Capability sensing and interest coalescing |
 | [`CONTINUITY.md`](docs/CONTINUITY.md) | Observational continuity |
