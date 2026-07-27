@@ -123,7 +123,7 @@ Transports are constructor arguments — `NetNode(shards=4)` is memory;
 `NetNode(shards=4, redis_url="redis://localhost:6379")` and `jetstream_url=…`
 use those backends with the same `emit` / `subscribe` code.
 
-## Building with Claude Code
+## Claude Code Skill
 
 Net looks like Kafka or NATS from the outside, and the model underneath is
 different enough that an agent working from surface familiarity will write

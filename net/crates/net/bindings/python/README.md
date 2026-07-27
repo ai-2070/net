@@ -70,7 +70,7 @@ absent from the module.
 maturin develop --features "netdb redex-disk meshdb meshos"
 ```
 
-## Building with Claude Code
+## Claude Code Skill
 
 Net looks like Kafka or NATS from the outside, and the model underneath is
 different enough that an agent working from surface familiarity will write

@@ -144,7 +144,7 @@ that anyone processed it. Under backpressure it drops, and
 `stats().events_dropped` is how you find out. That distinction is the whole
 philosophy: [Submitted Is Not Completed](https://ai2070.net/docs/guides/submitted-is-not-completed).
 
-## Building with Claude Code
+## Claude Code Skill
 
 Net looks like Kafka or NATS from the outside, and the model underneath is
 different enough that an agent working from surface familiarity will write

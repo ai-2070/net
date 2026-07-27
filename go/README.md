@@ -157,7 +157,7 @@ And consumption is **poll-based** — pass `resp.NextID` back as the cursor to
 page forward. There is no async subscribe iterator; see
 [Watch](https://ai2070.net/docs/sdk/go/watch).
 
-## Building with Claude Code
+## Claude Code Skill
 
 Net looks like Kafka or NATS from the outside, and the model underneath is
 different enough that an agent working from surface familiarity will write

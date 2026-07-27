@@ -95,7 +95,7 @@ cargo bench --all-features
 
 See [`BENCHMARKS.md`](BENCHMARKS.md) for published numbers and methodology.
 
-## Building with Claude Code
+## Claude Code Skill
 
 Net looks like Kafka or NATS from the outside, and the model underneath is
 different enough that an agent working from surface familiarity will write

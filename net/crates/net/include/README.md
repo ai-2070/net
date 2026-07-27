@@ -100,7 +100,7 @@ length validation, alignment checks, idempotent free) are in
 | `examples/capability.c` | Capability, predicate and where-header helpers |
 | `examples/meshdb.c` | MeshDB factory AST, runner, iterator, sentinel decoder |
 
-## Building with Claude Code
+## Claude Code Skill
 
 Net looks like Kafka or NATS from the outside, and the model underneath is
 different enough that an agent working from surface familiarity will write
