@@ -365,7 +365,7 @@ impl SensingLeader {
     /// Register one consumer's provider-free interest under LEGACY authority
     /// (scope validation happens upstream, §4.10). Builds the legacy admitted
     /// seed from the session-proven root and delegates directly to the shared
-    /// coalescing core [`Self::register_capability_interest_inner`] — the intake
+    /// coalescing core `register_capability_interest_inner` — the intake
     /// both this legacy path and (piece 4) the org admitted path funnel into.
     /// Installing a node authority never changes this path's legacy behavior.
     #[allow(clippy::too_many_arguments)]

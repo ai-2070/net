@@ -1742,7 +1742,7 @@ impl OrgRevocationStore {
     /// view and bumps the generation while holding `live.write()`, so
     /// acquiring a read guard first guarantees no publication is
     /// mid-flight: the returned generation always matches the
-    /// currently-visible view. Unlike [`Self::publish_generation`],
+    /// currently-visible view. Unlike `publish_generation`,
     /// this can never return an old generation while a raised floor is
     /// already installed — the interleaving that would let a stale
     /// admission stamp compare "unchanged" and admit against a floor
@@ -1753,7 +1753,7 @@ impl OrgRevocationStore {
     }
 
     /// Hold the publication barrier: while this guard lives, NO floor
-    /// publication can land, because [`StoreCore::publish`] needs `live.write()`.
+    /// publication can land, because `StoreCore::publish` needs `live.write()`.
     ///
     /// This is real EXCLUSION, not observation. A consumer whose decision is
     /// itself load-bearing — the routing commit pin, whose `Current` causes the

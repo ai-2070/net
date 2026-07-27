@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// The two values the gate needs from the installed
-/// [`NodeAuthority`](super::super::org_authority::NodeAuthority): the owner
+/// [`NodeAuthority`]: the owner
 /// organization and the persisted verification skew. Extracted by the dispatch
 /// layer so the gate stays decoupled from authority construction/storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,7 +146,7 @@ enum ValidatedInner {
 ///
 /// With the payload behind a private field, neither is expressible outside
 /// `org_gate`: a holder can move the value and hand it to
-/// [`AdmittedSensingRegistration::from_validated_org`], and nothing else. The
+/// `AdmittedSensingRegistration::from_validated_org`, and nothing else. The
 /// proof and the non-`Clone` bound remain as defence in depth for code inside
 /// this module.
 #[derive(Debug, PartialEq, Eq)]

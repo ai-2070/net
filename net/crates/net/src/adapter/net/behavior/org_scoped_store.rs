@@ -20,7 +20,7 @@
 //! reader — [`ScopedDiscoveryStore::find_capabilities_for_grant`],
 //! [`ScopedDiscoveryStore::find_owner_private_capabilities`],
 //! [`ScopedDiscoveryState::find_owner_private_providers`] and
-//! [`ScopedDiscoveryState::find_scope_exact_private_providers`] — filters on the
+//! `ScopedDiscoveryState::find_scope_exact_private_providers` — filters on the
 //! audience scope BEFORE returning anything, so no surface here can hand a
 //! caller an entry from a scope it did not name. Anything added later must keep
 //! that property; it is the whole of the partition.
@@ -103,7 +103,7 @@ pub enum ScopedStoreOutcome {
     /// once a horizon-passed entry frees a slot.
     AtCapacity,
     /// The record declared more capabilities than the indexed layer's per-record
-    /// association budget ([`MAX_DECLARATIONS_PER_RECORD`]) — refused FAIL-CLOSED
+    /// association budget (`MAX_DECLARATIONS_PER_RECORD`) — refused FAIL-CLOSED
     /// by [`ScopedDiscoveryState`] BEFORE any store or index mutation, so a
     /// pathological owner descriptor cannot grow the index unbounded (Kyra
     /// OLB-2A.1). Produced only by the indexed layer, never the raw store; a
@@ -647,7 +647,7 @@ impl ScopedDiscoveryStore {
 /// grant currently installed?" from a value the CALLER captured, and can never be
 /// tempted to reach for `consumer_grant_mu` from under the publication gate. The
 /// snapshot must be loaded before the gated mutation begins; see
-/// [`ScopedDiscoveryStore::reclaim_for_admission`] for why both race directions
+/// `ScopedDiscoveryStore::reclaim_for_admission` for why both race directions
 /// are safe.
 pub trait InstalledConsumerGrants {
     /// Whether a consumer grant credential for `grant_id` is installed.
@@ -1003,7 +1003,7 @@ impl ScopedDiscoveryState {
     ///
     /// Refused FAIL-CLOSED as [`ScopedStoreOutcome::TooManyDeclarations`], with NO
     /// store, index, or change-stream mutation, if the record declares more than
-    /// [`MAX_DECLARATIONS_PER_RECORD`] capabilities.
+    /// `MAX_DECLARATIONS_PER_RECORD` capabilities.
     pub fn ingest(
         &mut self,
         prepared: PreparedScopedCapability,

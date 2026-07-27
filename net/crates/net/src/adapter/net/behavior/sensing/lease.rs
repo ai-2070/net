@@ -46,7 +46,8 @@
 //! is exactly why every sibling has one (review-pass-2 §6).
 //!
 //! There is no dead-entry reclamation to attempt before refusing: an entry is
-//! removed synchronously by the release that empties it ([`Self::release`]), and
+//! removed synchronously by the release that empties it
+//! ([`SensingInterestLeases::release`]), and
 //! this registry has no expiry of its own, so a refusal always reflects live
 //! holders and is never spurious.
 
@@ -81,10 +82,10 @@ const MAX_HOLDERS_PER_INTEREST: usize = 64;
 /// the pre-call registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseRefused {
-    /// The node already leases [`MAX_LEASED_INTERESTS`] distinct interests. A
+    /// The node already leases `MAX_LEASED_INTERESTS` distinct interests. A
     /// live interest is never evicted to make room.
     NodeAtCapacity,
-    /// This interest already has [`MAX_HOLDERS_PER_INTEREST`] live holders.
+    /// This interest already has `MAX_HOLDERS_PER_INTEREST` live holders.
     InterestAtCapacity,
 }
 

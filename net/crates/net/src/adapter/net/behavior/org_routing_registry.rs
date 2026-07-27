@@ -2,17 +2,17 @@
 //!
 //! Retains one node slot per AUTHORITY-SCOPED key, shared by every clone family
 //! demanding that same key, and rebuilds slots from the private-discovery source
-//! in bounded quanta. It implements [`DirtyApply`], so the supervised actor from
+//! in bounded quanta. It implements `DirtyApply`, so the supervised actor from
 //! E2 drives it and nothing else does.
 //!
 //! Three authoritative structures, deliberately separate:
 //!
-//! - [`RegistryWork`] answers only "is SOME work owed?" — a coalescing wake hint
+//! - `RegistryWork` answers only "is SOME work owed?" — a coalescing wake hint
 //!   (Kyra OLB-2B-E3a). The Boolean must never become the work queue;
-//! - [`RegistryInner::pending`] holds the exact slot identities that owe work;
-//! - [`RegistryInner::live_actor`] holds the ONE incarnation currently permitted
+//! - `RegistryInner::pending` holds the exact slot identities that owe work;
+//! - `RegistryInner::live_actor` holds the ONE incarnation currently permitted
 //!   to consume that work. It is bound to the actor LIFECYCLE via
-//!   [`DirtyApply::activate_incarnation`] / [`DirtyApply::deactivate_incarnation`],
+//!   `DirtyApply::activate_incarnation` / `DirtyApply::deactivate_incarnation`,
 //!   never to a high-water counter: a high-water mark cannot distinguish "a newer
 //!   actor took over" from "no actor is live", so a stale attempt could consume
 //!   pending identities, be rejected at installation, and still report success.

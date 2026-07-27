@@ -12,7 +12,7 @@
 //! `[profile.release]` sets `panic = "abort"`. A real panic in a release build
 //! therefore kills the process: tokio returns no panic `JoinError`, no `Drop`
 //! guard runs, and no in-process supervisor restarts anything. Supervision here is
-//! consequently built on EXPLICIT [`ActorFault`] returns, which return normally
+//! consequently built on EXPLICIT `ActorFault` returns, which return normally
 //! through the fence guard, resolve the inline incarnation future, back off, and
 //! restart (Kyra OLB-2B-E2).
 //!
