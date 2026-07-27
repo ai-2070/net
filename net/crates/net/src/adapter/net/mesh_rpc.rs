@@ -3618,11 +3618,20 @@ impl MeshNode {
         // already happened above; this is purely for peer
         // visibility (the broadcast path also re-runs the
         // self-index, which is a cheap version bump).
+        //
+        // Republish the CURRENT baseline (read inside `announce_mu`)
+        // rather than snapshotting it here and handing it back as a
+        // NEW baseline. This task is spawned, so its snapshot could be
+        // taken arbitrarily late — and an explicit
+        // `announce_capabilities(X)` landing in between would be
+        // reverted to the pre-`X` set, dropping capabilities the
+        // operator just announced from both the wire and this node's
+        // own self-index until something else announces. Same clobber
+        // TOCTOU the RT-3 loop closed by passing `None`.
         let mesh_for_announce = Arc::clone(self);
         let service_for_log = service.to_string();
         tokio::spawn(async move {
-            let baseline = mesh_for_announce.user_caps_snapshot();
-            if let Err(e) = mesh_for_announce.announce_capabilities(baseline).await {
+            if let Err(e) = mesh_for_announce.reannounce_current_capabilities().await {
                 tracing::warn!(
                     error = %e,
                     service = %service_for_log,
