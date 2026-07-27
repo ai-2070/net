@@ -2025,20 +2025,25 @@ async fn a_floor_publish_racing_the_scoped_insert_is_refused_then_recovers() {
     // any subscriber is notified, so the raced view the recheck must catch is
     // already in place when the wait below completes; the subscriber then simply
     // waits for the publication gate until this ingest releases it.
-    let mut floors_map = BTreeMap::new();
-    floors_map.insert(unrelated_member.clone(), 5u32);
-    let bundle = OrgRevocationBundle::try_issue(&org, &floors_map).expect("issue race bundle");
-    let publisher: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
-        std::sync::Mutex::new(None);
-    let bundle_cell = std::sync::Mutex::new(Some(bundle));
+    // `OnceLock`, not a `Mutex`: the probe is `&(dyn Fn() + Sync)` so the cell
+    // must be `Sync`, and `std::sync::Mutex::lock` is a disallowed method here.
+    let publisher: std::sync::OnceLock<std::thread::JoinHandle<()>> = std::sync::OnceLock::new();
     let race_probe = || {
         let store_for_publish = store.clone();
-        let bundle = bundle_cell.lock().expect("bundle").take().expect("once");
-        *publisher.lock().expect("publisher") = Some(std::thread::spawn(move || {
+        let member = unrelated_member.clone();
+        let handle = std::thread::spawn(move || {
+            // Rebuilt inside the thread rather than captured, so nothing has to
+            // be moved out of a shared cell.
+            let org = OrgKeypair::from_bytes([0x89u8; 32]);
+            let mut floors_map = BTreeMap::new();
+            floors_map.insert(member, 5u32);
+            let bundle =
+                OrgRevocationBundle::try_issue(&org, &floors_map).expect("issue race bundle");
             store_for_publish
                 .apply_bundle(&bundle)
                 .expect("apply race floor");
-        }));
+        });
+        let _ = publisher.set(handle);
         // Deterministic: spin until the raise is in the LIVE view. No sleep, and
         // no dependence on the subscriber, which cannot finish until we return.
         while store.snapshot().floor_for(&org.org_id(), &unrelated_member) < 5 {
@@ -2047,9 +2052,7 @@ async fn a_floor_publish_racing_the_scoped_insert_is_refused_then_recovers() {
     };
     node.ingest_scoped_announcement_probed_for_test(&raced_bytes, &race_probe);
     publisher
-        .lock()
-        .expect("publisher")
-        .take()
+        .into_inner()
         .expect("the probe published")
         .join()
         .expect("the floor publish completes once the gate is released");

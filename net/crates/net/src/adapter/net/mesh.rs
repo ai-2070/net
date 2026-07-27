@@ -34028,7 +34028,7 @@ mod scoped_publication_ordering_tests {
     use crate::adapter::net::behavior::org_scoped_ingest::{
         CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
     };
-    use crate::adapter::net::behavior::org_scoped_store::ScopedDiscoveryState;
+    use crate::adapter::net::behavior::org_scoped_store::{NoConsumerGrants, ScopedDiscoveryState};
     use crate::adapter::net::identity::EntityId;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -34121,7 +34121,7 @@ mod scoped_publication_ordering_tests {
             let (publication, state) = (publication.clone(), state.clone());
             thread::spawn(move || {
                 publication.gated_commit(&state, |s| {
-                    s.ingest(prepared_owner(3, 1), 0);
+                    s.ingest(prepared_owner(3, 1), 0, &NoConsumerGrants);
                 });
             })
         };
@@ -34148,7 +34148,7 @@ mod scoped_publication_ordering_tests {
     #[test]
     fn an_older_publication_cannot_overwrite_a_newer_one() {
         let (publication, state) = run_forced_interleaving(|s| {
-            s.ingest(prepared_owner(4, 1), 0);
+            s.ingest(prepared_owner(4, 1), 0, &NoConsumerGrants);
         });
         assert_eq!(
             state.lock().revision(),
@@ -34169,7 +34169,7 @@ mod scoped_publication_ordering_tests {
     fn a_concurrent_noop_cannot_publish_delayed_work() {
         let (publication, state) = run_forced_interleaving(|s| {
             // Same provider AND generation as A: Stale, no visible change.
-            s.ingest(prepared_owner(3, 1), 0);
+            s.ingest(prepared_owner(3, 1), 0, &NoConsumerGrants);
         });
         assert_eq!(
             state.lock().revision(),
@@ -34197,7 +34197,7 @@ mod exact_expiry_timer_tests {
     use crate::adapter::net::behavior::org_scoped_ingest::{
         CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
     };
-    use crate::adapter::net::behavior::org_scoped_store::ScopedDiscoveryState;
+    use crate::adapter::net::behavior::org_scoped_store::{NoConsumerGrants, ScopedDiscoveryState};
     use crate::adapter::net::identity::EntityId;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -34300,7 +34300,7 @@ mod exact_expiry_timer_tests {
         fn ingest(&self, record: PreparedScopedCapability) {
             let now = self.clock_ms.load(Ordering::SeqCst) / 1_000;
             self.publication.gated_commit(&self.state, |s| {
-                s.ingest(record, now);
+                s.ingest(record, now, &NoConsumerGrants);
             });
         }
 
@@ -34325,8 +34325,8 @@ mod exact_expiry_timer_tests {
     #[tokio::test(start_paused = true)]
     async fn sweeps_a_due_record_then_arms_to_the_survivor() {
         let mut h = Harness::start(100, |s| {
-            s.ingest(owner(3, 1, 50), 0); // due at clock 100
-            s.ingest(owner(4, 1, 200), 0); // survives
+            s.ingest(owner(3, 1, 50), 0, &NoConsumerGrants); // due at clock 100
+            s.ingest(owner(4, 1, 200), 0, &NoConsumerGrants); // survives
         });
 
         // First arm is the SURVIVOR's deadline: the due record was swept first,
