@@ -1,3 +1,7 @@
+---
+title: NAT and Traversal
+description: Most production deployments have nodes behind NATs — cloud VPCs with private subnets, residential connections, mobile networks, restricted corporate environments.
+---
 # NAT and Traversal
 
 Most production deployments have nodes behind NATs — cloud VPCs with private subnets, residential connections, mobile networks, restricted corporate environments. Net's NAT-traversal layer makes the mesh work in those environments without the operator having to think about it: nodes probe their own connectivity, classify what kind of NAT they're sitting behind, and use the right combination of reflex, rendezvous, and (optionally) port mapping to reach peers.

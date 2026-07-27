@@ -1,3 +1,7 @@
+---
+title: Task Lifecycle and Workflows
+description: A task in Net is a single-writer RedEX chain, and its state is the deterministic fold of the transitions written to it.
+---
 # Task Lifecycle and Workflows
 
 A task in Net is a **single-writer RedEX chain**, and its state is the

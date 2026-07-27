@@ -1,3 +1,7 @@
+---
+title: Durable Logs (RedEX)
+description: RedEX turns a channel into a durable, append-only log.
+---
 # Durable Logs with RedEX
 
 RedEX turns a channel into a durable, append-only log. Once a channel is opened as a RedEX file, every event published on it is appended in causal order, persisted to disk if you ask for it, and made available to consumers as a tail subscription. RedEX is the foundation that everything else in the storage stack — folded state, queries, replication — composes against.

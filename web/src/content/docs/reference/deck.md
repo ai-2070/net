@@ -1,3 +1,7 @@
+---
+title: Deck (Operator TUI)
+description: "net-deck is the operator TUI — a live view of the mesh with signed admin actions on top."
+---
 # Deck — the operator TUI
 
 `net-deck` is the operator cyberdeck: a terminal UI over a live mesh, with

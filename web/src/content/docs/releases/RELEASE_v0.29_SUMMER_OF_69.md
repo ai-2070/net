@@ -1,3 +1,7 @@
+---
+title: "v0.29.0 — Summer of '69"
+description: "Release notes for Net v0.29.0 — Summer of '69 — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.29 — "Summer of '69"
 
 *Named after Bryan Adams' 1985 single off* Reckless *— the first-real-six-string, played-'til-my-fingers-bled anthem every bar band mistook for its own autobiography, "those were the best days of my life."*

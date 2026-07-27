@@ -1,3 +1,7 @@
+---
+title: v0.10 — Hex
+description: "Release notes for Net v0.10 — Hex — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.10 — "Killing Moon" Phase III
 
 v0.10 continues the v0.9 line. Same conviction, same shape: a hardening release with no new transports, no new SDK surfaces, and no new feature gates. Every commit on this branch is a bug fix, a regression test, or a documentation tightening sourced from a fresh round of multi-pass internal audits.

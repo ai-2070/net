@@ -1,3 +1,7 @@
+---
+title: Artifacts
+description: The bus is a coordination layer, not a file transfer.
+---
 # Go — Move Artifacts
 
 The bus is a coordination layer, not a file transfer. Move large data as a

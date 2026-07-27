@@ -1,3 +1,7 @@
+---
+title: Verification Tiers
+description: "\"Did the payment go through?\" is not a yes/no question on a blockchain — a transaction can be seen, then confirmed to some depth, then (rarely) reorged out."
+---
 # Verification tiers
 
 "Did the payment go through?" is not a yes/no question on a blockchain — a

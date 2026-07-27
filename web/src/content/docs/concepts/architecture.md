@@ -1,3 +1,7 @@
+---
+title: Architecture
+description: Net is built in three layers, stacked from the bytes on the wire up to the state your application reads.
+---
 # Architecture
 
 Net is built in three layers, stacked from the bytes on the wire up to the state your application reads. Each layer is independently understandable, and the boundaries between them are sharp on purpose — a problem at one layer doesn't reach into the others, and a change at one layer doesn't ripple up or down.

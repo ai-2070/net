@@ -1,3 +1,7 @@
+---
+title: Daemon With Failover
+description: This tutorial walks through building a stateful daemon that runs across a standby group, with an active node processing events and passive replicas ready to take over when the active fails.
+---
 # A Distributed Daemon That Survives Node Failures
 
 This tutorial walks through building a stateful daemon that runs across a standby group, with an active node processing events and passive replicas ready to take over when the active fails. By the end you'll have a working daemon, a working standby group, and a worked example of what failover actually looks like end to end.

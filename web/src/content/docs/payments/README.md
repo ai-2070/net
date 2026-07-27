@@ -1,3 +1,7 @@
+---
+title: Payments
+description: Net Payments is how a capability charges for its work and a caller pays to invoke it — without Net ever touching the money.
+---
 # Payments
 
 Net Payments is how a capability charges for its work and a caller pays to invoke

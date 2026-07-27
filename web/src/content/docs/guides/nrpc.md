@@ -1,3 +1,7 @@
+---
+title: Typed RPC with nRPC
+description: "Typed request/response over channels: unary, server-streaming, client-streaming and duplex calls on one primitive."
+---
 # Typed RPC with nRPC
 
 nRPC layers request/response semantics on top of channels. Where the bus is fire-and-forget — you publish, subscribers pull — nRPC gives you a typed call that takes arguments, returns a result, and threads identity, capability targeting, cancellation, and tracing through the same primitive.

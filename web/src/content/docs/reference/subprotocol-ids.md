@@ -1,3 +1,7 @@
+---
+title: Subprotocol Registry
+description: Every Net packet carries a 16-bit subprotocolid in its header.
+---
 # Subprotocol Registry
 
 Every Net packet carries a 16-bit `subprotocol_id` in its header. The id tells the receiver how to interpret the payload — plain event, causal event, snapshot, daemon migration message, NAT-traversal probe, and so on. This page is the canonical list of assigned ids, the ranges reserved for future use, and the rules that govern how the space evolves.

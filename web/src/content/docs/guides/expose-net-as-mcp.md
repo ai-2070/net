@@ -1,3 +1,7 @@
+---
+title: Expose Net as MCP
+description: "The reverse of wrapping: net mcp serve runs a stdio MCP server that exposes the mesh's capabilities to any local MCP host — a desktop agent, an IDE — as a small set of meta-tools."
+---
 # Expose Net as MCP
 
 The reverse of [wrapping](/docs/guides/wrap-mcp-server): `net mcp serve` runs a

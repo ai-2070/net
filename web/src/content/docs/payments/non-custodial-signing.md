@@ -1,3 +1,7 @@
+---
+title: Non-Custodial Signing
+description: Net never holds a settlement key. It cannot move your funds, because it never has the ability to — by construction, not by policy.
+---
 # Non-custodial signing
 
 Net never holds a settlement key. It cannot move your funds, because it never has

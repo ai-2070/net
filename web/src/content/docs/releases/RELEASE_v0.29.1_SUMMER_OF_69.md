@@ -1,3 +1,7 @@
+---
+title: "v0.29.1 — Summer of '69"
+description: "Release notes for Net v0.29.1 — Summer of '69 — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.29.1 — "Summer of '69"
 
 *Same Bryan Adams first-real-six-string as [v0.29](/docs/releases/release-v0.29-summer-of-69) — one more coat of wax on the guitar, not a new song. A maintenance patch: version hygiene, a dependency refresh, one SDK rename, and comment/doc cleanup. No new mesh behavior.*

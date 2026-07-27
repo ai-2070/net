@@ -1,3 +1,7 @@
+---
+title: Organizations
+description: Identity answers who is this entity. Permission tokens answer what is this entity allowed to do on a channel.
+---
 # Organizations
 
 [Identity](/docs/concepts/identity) answers *who is this entity*. Permission tokens answer *what is this entity allowed to do on a channel*. Organizations answer a third question that neither one can: **which company is this caller acting for, and did my company authorize them?**

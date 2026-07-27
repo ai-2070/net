@@ -1,3 +1,7 @@
+---
+title: Quickstart
+description: This page gets you from zero to a working event bus in about five minutes.
+---
 # Quickstart
 
 This page gets you from zero to a working event bus in about five minutes. We'll start a bus on a single process, publish a few events, see what the bus did with them, and then point at what changes when you want the same code to run across a real mesh.

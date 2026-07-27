@@ -1,3 +1,7 @@
+---
+title: Tutorials
+description: The pages in this section are end-to-end builds.
+---
 # Tutorials
 
 The pages in this section are end-to-end builds. Each one starts from an empty project, walks through the design decisions, and ends with something that works — code you could lift, adapt, and ship.

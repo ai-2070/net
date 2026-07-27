@@ -1,3 +1,7 @@
+---
+title: The Failure Schematic
+description: "When a payment is refused, a human gets an error message — but an agent needs to know why, who can fix it, and what's safe to do next, without parsing prose."
+---
 # The failure schematic
 
 When a payment is refused, a human gets an error message — but an *agent* needs

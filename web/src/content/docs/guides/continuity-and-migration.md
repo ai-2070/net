@@ -1,3 +1,7 @@
+---
+title: Continuity and Migration
+description: Daemons that survive node failures are the whole point of the runtime, and continuity is the layer that makes survival meaningful.
+---
 # Continuity and Migration
 
 Daemons that survive node failures are the whole point of the runtime, and continuity is the layer that makes survival meaningful. A daemon migrating from one node to another isn't just "the same code running somewhere else" — its identity, its causal chain, its observed history, and the events in flight at the moment of cutover all have to travel with it. Continuity is the protocol that gets that right.

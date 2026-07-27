@@ -1,3 +1,7 @@
+---
+title: Install
+description: Net ships as a Rust crate with first-class bindings for Node, Python, and Go, and a C ABI for everything else.
+---
 # Install
 
 Net ships as a Rust crate with first-class bindings for Node, Python, and Go, and a C ABI for everything else. Pick the one that matches your language; the API surface is the same across all of them.

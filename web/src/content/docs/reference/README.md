@@ -1,3 +1,7 @@
+---
+title: Reference
+description: "This section is the detail layer. The guides will get you working; the concepts will get you reasoning correctly about what's running; the reference is what you reach for when you"
+---
 # Reference
 
 This section is the detail layer. The guides will get you working; the concepts will get you reasoning correctly about what's running; the reference is what you reach for when you need exact signatures, exact wire formats, and exact behavior in edge cases.

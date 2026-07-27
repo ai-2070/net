@@ -1,3 +1,7 @@
+---
+title: What It Is (and Is Not)
+description: "An agent that invokes a capability needs to answer commercial questions the transport layer can't: what does this cost?"
+---
 # What Net Payments is (and is not)
 
 An agent that invokes a capability needs to answer commercial questions the

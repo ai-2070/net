@@ -1,3 +1,7 @@
+---
+title: Discover
+description: Query the mesh by what you need, not by who has it.
+---
 # Rust — Discover Capabilities
 
 Query the mesh by *what you need*, not by who has it. Two surfaces: list tools, or

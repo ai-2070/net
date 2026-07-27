@@ -1,3 +1,7 @@
+---
+title: Identity
+description: Identity in Net is bound to cryptographic keys, not to network addresses, hostnames, or hardware.
+---
 # Identity
 
 Identity in Net is bound to cryptographic keys, not to network addresses, hostnames, or hardware. An entity is its ed25519 public key. Every other identifier — the 8-byte origin hash in the packet header, the 8-byte node ID used for routing, the entries in capability sets and channel rosters — is derived from that key. Move the key to a different machine and the entity moves with it; revoke the key and every reference to the entity becomes invalid at the same moment.

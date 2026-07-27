@@ -1,3 +1,7 @@
+---
+title: v0.32.0 — Summer Madness
+description: "Release notes for Net v0.32.0 — Summer Madness — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.32 — "Summer Madness"
 
 *Named after Kool & the Gang's 1974 instrumental from Light of Worlds — a Moog-soaked slow burn with no vocal. All groove, no words: the track carries everything a lyric would.*

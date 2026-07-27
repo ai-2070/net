@@ -1,3 +1,7 @@
+---
+title: "Spend Policy & Approvals"
+description: The model requests an invocation; it does not decide whether to spend.
+---
 # Spend policy & approvals
 
 The model requests an invocation; it does not decide whether to spend. That

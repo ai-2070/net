@@ -1,3 +1,7 @@
+---
+title: Replication Configuration
+description: "This page is the reference for the per-channel RedEX replication knobs — what each field does, what ranges are valid, and what failure modes you'll see in production."
+---
 # Replication Configuration
 
 This page is the reference for the per-channel RedEX replication knobs — what each field does, what ranges are valid, and what failure modes you'll see in production. It's the operator-facing companion to [durable logs](/docs/guides/durable-logs) and goes into the detail the guide doesn't.

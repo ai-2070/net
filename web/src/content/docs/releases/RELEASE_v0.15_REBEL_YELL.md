@@ -1,3 +1,7 @@
+---
+title: v0.15 — Rebel Yell
+description: "Release notes for Net v0.15 — Rebel Yell — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.15 — "Rebel Yell"
 
 ## Dataforts

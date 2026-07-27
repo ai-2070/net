@@ -1,3 +1,7 @@
+---
+title: Daemons and Placement
+description: A daemon in Net is a long-running stateful event processor.
+---
 # Daemons and Placement
 
 A daemon in Net is a long-running stateful event processor. You write a small piece of code that consumes events and produces events; the runtime handles where it runs, what it can see, when it gets migrated, and how it survives node failures. The whole point is to let you write the *what* — the business logic — and leave the *where* and *when* to the system.

@@ -1,3 +1,7 @@
+---
+title: Guides
+description: "Task-oriented guides: how to publish and consume, make a channel durable, run a daemon that survives node failure."
+---
 # Guides
 
 The pages in this section are task-oriented. Each one answers a "how do I…" question — how do I publish and consume events, how do I make a channel durable, how do I run a daemon that survives a node failure — and gives you the code, the model behind it, and the gotchas to know about.

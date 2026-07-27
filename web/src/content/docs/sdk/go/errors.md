@@ -1,3 +1,7 @@
+---
+title: Errors
+description: "Go surfaces failures as error values you check on every call — there's no exception path."
+---
 # Go — Errors and Recovery
 
 Go surfaces failures as `error` values you check on every call — there's no

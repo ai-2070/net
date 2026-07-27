@@ -1,3 +1,7 @@
+---
+title: Quickstart
+description: Ingest returns once the event is accepted into the local ring buffer — acceptance, not delivery (see Submitted Is Not Completed).
+---
 # Go — Quickstart
 
 ```bash

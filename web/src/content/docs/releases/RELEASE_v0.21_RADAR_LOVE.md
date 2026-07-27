@@ -1,3 +1,7 @@
+---
+title: v0.21 — Radar Love
+description: "Release notes for Net v0.21 — Radar Love — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.21 — "Radar Love"
 
 *Named after Golden Earring's 1973 cut — the one with Cesar Zuiderwijk's two-bar drum intro that every garage band on three continents has tried to copy, and George Kooymans' lyric about a driver getting a wordless lover's-distress signal at half past four in the morning and burning it down the highway to answer it. "I been driving all night, my hand's wet on the wheel" — the song's whole urgency is in the gap between the call landing and the driver arriving, and shrinking that gap to as close to zero as the road will allow. v0.19 pushed the substrate past its prior throughput ceilings; v0.20 added a signed authorization gate on top of every nRPC invoke. v0.21 turns the dial toward latency — eliminating dead time on the hot path. Per-packet RX no longer pre-zeroes a 1500-byte buffer just for the kernel to overwrite it. Manifest fetches no longer wait for the previous chunk before requesting the next one. The capability index no longer clones a HashSet to compute an intersection. The replay-window check no longer takes the same lock twice. Across ~100 fixed items the substrate gets a faster reflex arc on every hot path that runs more than once per request.*

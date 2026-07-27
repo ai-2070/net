@@ -1,3 +1,7 @@
+---
+title: v0.27.2 — Purple Rain
+description: "Release notes for Net v0.27.2 — Purple Rain — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.27.2 — "Purple Rain"
 
 ## A security release — one critical auth fix, and the nRPC wire path keeps shrinking

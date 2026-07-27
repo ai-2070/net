@@ -1,3 +1,7 @@
+---
+title: Subnets
+description: A subnet is a way of grouping nodes that should share scope.
+---
 # Subnets
 
 A subnet is a way of grouping nodes that should share scope. Nodes in the same subnet see each other's local traffic by default; nodes in different subnets see each other only when a channel's visibility explicitly says they should. Gateways at subnet boundaries enforce this — without decrypting payloads, without per-flow state, without a central authority deciding what crosses.

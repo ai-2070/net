@@ -1,3 +1,7 @@
+---
+title: Watch
+description: The Go binding is poll-based — there is no async subscribe iterator.
+---
 # Go — Watch the Event Stream
 
 The Go binding is **poll-based** — there is no async subscribe iterator. You watch

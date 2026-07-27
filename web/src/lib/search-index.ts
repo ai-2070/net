@@ -1,8 +1,8 @@
 import "server-only";
-import { readFileSync } from "node:fs";
 import GithubSlugger from "github-slugger";
 import {
   getDocTree,
+  readDocSource,
   type DocFile,
   type DocFolder,
 } from "@/lib/docs";
@@ -103,9 +103,12 @@ function pageTitle(source: string, fallback: string): string {
   return m ? stripInline(m[1]!.trim()) : fallback;
 }
 
+// Body only — `readDocSource` strips the frontmatter block, which is
+// metadata for the tree and would otherwise be indexed as prose (and
+// surface as a snippet reading `title: … description: …`).
 function readFileText(file: DocFile): string {
   try {
-    return readFileSync(file.filePath, "utf8");
+    return readDocSource(file);
   } catch {
     return "";
   }

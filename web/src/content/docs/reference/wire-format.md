@@ -1,3 +1,7 @@
+---
+title: Wire Format
+description: "This page is the byte-level reference for Net's packet wire format."
+---
 # Wire Format
 
 This page is the byte-level reference for Net's packet wire format. You won't need it for application code — the SDK does the framing — but you'll want it for debugging packet captures, writing a custom adapter, or building a relay or proxy that needs to read the routing fields without decrypting payloads.

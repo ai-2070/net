@@ -1,3 +1,7 @@
+---
+title: Troubleshooting
+description: Symptoms that look like bugs and are usually the system working as designed — plus the ones that are genuinely bugs, and how to tell them apart.
+---
 # Troubleshooting
 
 Symptoms that look like bugs and are usually the system working as designed —

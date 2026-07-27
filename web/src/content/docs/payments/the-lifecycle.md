@@ -1,3 +1,7 @@
+---
+title: The Lifecycle
+description: One PaymentEngine runs the provider side of a paid capability; one CallerPaymentFlow runs the caller side.
+---
 # The lifecycle
 
 One `PaymentEngine` runs the provider side of a paid capability; one

@@ -1,3 +1,7 @@
+---
+title: v0.27.6 — Purple Rain
+description: "Release notes for Net v0.27.6 — Purple Rain — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.27.6 — "Purple Rain"
 
 A **bindings & integration bug-fix release.** A full-workspace bug hunt across the `net` crate (~100k LOC Rust) plus the Go / Python / FFI binding layers landed **34 of 37 findings** across 47 commits and three review rounds. Every concrete first-pass bug lived at the **language-binding / FFI edge** — including three use-after-free races in the shipped Go module that are reachable by ordinary context cancellation.

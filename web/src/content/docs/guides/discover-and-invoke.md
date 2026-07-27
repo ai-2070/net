@@ -1,3 +1,7 @@
+---
+title: Discover and Invoke
+description: "The core agent loop, without an MCP host in the middle: ask the mesh who can do the work, then make a typed call and get a typed result."
+---
 # Discover and Invoke
 
 The core agent loop, without an MCP host in the middle: ask the mesh who can do

@@ -1,3 +1,7 @@
+---
+title: Errors
+description: The C ABI has no exceptions — it communicates failure through return values and puts memory ownership entirely in your hands.
+---
 # C — Errors and Ownership
 
 The C ABI has no exceptions — it communicates failure through **return values** and

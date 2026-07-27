@@ -1,3 +1,7 @@
+---
+title: Submitted Is Not Completed
+description: "Most systems answer the question \"did the work happen?\" with a status code."
+---
 # Submitted Is Not Completed
 
 Most systems answer the question "did the work happen?" with a status code. You

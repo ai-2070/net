@@ -1,3 +1,7 @@
+---
+title: Networks
+description: "Adding a chain to Net Payments is configuration, not code: a facilitator config pack, entries in the signed asset registry, and a conformance run."
+---
 # Networks
 
 Adding a chain to Net Payments is **configuration, not code**: a facilitator

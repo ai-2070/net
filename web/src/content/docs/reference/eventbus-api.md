@@ -1,3 +1,7 @@
+---
+title: EventBus API
+description: "This page is the reference for the core event-bus surface — the types you'll touch when constructing, ingesting, polling, and shutting down a bus."
+---
 # EventBus API
 
 This page is the reference for the core event-bus surface — the types you'll touch when constructing, ingesting, polling, and shutting down a bus. The shapes here are the Rust API; the bindings mirror them with language-native conventions.

@@ -1,3 +1,7 @@
+---
+title: Invoke
+description: Discovery tells you who can; invoking does the work and returns a typed result.
+---
 # TypeScript — Invoke a Capability
 
 Discovery tells you who *can*; invoking does the work and returns a typed result.

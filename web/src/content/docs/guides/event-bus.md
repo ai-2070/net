@@ -1,3 +1,7 @@
+---
+title: Using the Event Bus
+description: "The event bus is the surface you'll spend most of your time at."
+---
 # Using the Event Bus
 
 The event bus is the surface you'll spend most of your time at. This guide goes past the quickstart into the patterns you'll actually need in production: cursored consumption, filtered subscriptions, multi-shard polling, backpressure, and the lifecycle invariants that keep the bus from losing data.

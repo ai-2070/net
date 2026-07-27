@@ -1,3 +1,7 @@
+---
+title: Security Model
+description: What Net protects, how, and — more usefully — what it does not protect and where the trust actually bottoms out.
+---
 # Security Model
 
 What Net protects, how, and — more usefully — what it does not protect and where

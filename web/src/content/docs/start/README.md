@@ -1,3 +1,7 @@
+---
+title: Start
+description: "This section is the front door. Four pages, in order: what Net is and where it fits, a five-minute quickstart that gets a bus running and shows you which crate to depend on, the in"
+---
 # Start
 
 This section is the front door. Four pages, in order: what Net is and where it fits, a five-minute quickstart that gets a bus running and shows you which crate to depend on, the install guide for every supported language, and how to install the Net Claude skills if you're building with a coding agent.

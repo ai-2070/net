@@ -1,3 +1,7 @@
+---
+title: Claude Skills
+description: "If you're building against Net with a coding agent, install the Net Claude skills first."
+---
 # Claude Skills
 
 If you're building against Net with a coding agent, install the Net Claude skills first. They're the reason the generated code is right instead of merely plausible.

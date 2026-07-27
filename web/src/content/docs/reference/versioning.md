@@ -1,3 +1,7 @@
+---
+title: "Versioning & Compatibility"
+description: Net is pre-1.0. That is the single most important compatibility fact on this page, and everything below is qualified by it.
+---
 # Versioning and Compatibility
 
 Net is pre-1.0. That is the single most important compatibility fact on this

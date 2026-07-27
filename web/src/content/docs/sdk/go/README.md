@@ -1,3 +1,7 @@
+---
+title: Go
+description: "The Go binding wraps the same Rust core, so it walks the same agentic loop as the other SDKs — with two Go-idiomatic differences it shares with C: the bus is poll-based (you Poll w"
+---
 # Go SDK
 
 The Go binding wraps the same Rust core, so it walks the same agentic loop as the

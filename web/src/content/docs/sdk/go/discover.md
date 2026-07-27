@@ -1,3 +1,7 @@
+---
+title: Discover
+description: "FindNodes returns ([]uint64, error) — the matching node ids."
+---
 # Go — Discover Capabilities
 
 ## Filter nodes by capability

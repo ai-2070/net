@@ -1,3 +1,7 @@
+---
+title: Running in Production
+description: The defaults are tuned for tests and benchmarks, not for production.
+---
 # Running Net in Production
 
 The defaults are tuned for tests and benchmarks, not for production. This guide

@@ -1,3 +1,7 @@
+---
+title: v0.31.0 — Hold the Line
+description: "Release notes for Net v0.31.0 — Hold the Line — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.31 — "Hold The Line"
 
 *Named after Toto's 1978 debut single — David Paich's piano hook, Steve Lukather's guitar, Bobby Kimball's belt, the AOR staple whose chorus insists "hold the line, love isn't always on time."*

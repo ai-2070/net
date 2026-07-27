@@ -1,3 +1,7 @@
+---
+title: Billing
+description: Billing in Net is a record of commercial facts, not an invoicing system.
+---
 # Billing
 
 Billing in Net is a **record of commercial facts**, not an invoicing system. Each

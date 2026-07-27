@@ -1,3 +1,7 @@
+---
+title: x402 and Net
+description: "x402 is the payment wire; Net wraps it in signed envelopes and carries the original bytes unchanged so signatures survive the trip."
+---
 # x402 and Net
 
 x402 is the payment wire: an HTTP-native protocol for demanding and settling a

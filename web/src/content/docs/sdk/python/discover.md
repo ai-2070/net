@@ -1,3 +1,7 @@
+---
+title: Discover
+description: "List the tools a node can see on the mesh with listtools, and react to changes with watchtools:"
+---
 # Python — Discover Capabilities
 
 List the tools a node can see on the mesh with `list_tools`, and react to changes

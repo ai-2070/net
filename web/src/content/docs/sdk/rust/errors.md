@@ -1,3 +1,7 @@
+---
+title: Errors
+description: "The Rust SDK's error taxonomy: failure is a typed outcome you can branch on, never a silence."
+---
 # Rust — Errors and Recovery
 
 Failure is a typed outcome, not a silence. The SDK gives you enough structure to

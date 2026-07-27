@@ -1,3 +1,7 @@
+---
+title: Concepts
+description: "The pages in this section describe how Net is put together — the mental model you need to write code against it, and the reasoning behind the pieces you'll find in the API."
+---
 # Concepts
 
 The pages in this section describe how Net is put together — the mental model you need to write code against it, and the reasoning behind the pieces you'll find in the API.

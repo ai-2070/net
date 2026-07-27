@@ -1,3 +1,7 @@
+---
+title: Folded State (CortEX)
+description: CortEX is how you turn a log into queryable state.
+---
 # Folded State with CortEX
 
 CortEX is how you turn a log into queryable state. You write a fold — a function that consumes events one at a time and updates a piece of state — and CortEX runs it against a RedEX log, persists the state, and exposes it to readers. The pattern is event sourcing, made first-class.

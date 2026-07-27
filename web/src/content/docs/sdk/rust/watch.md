@@ -1,3 +1,7 @@
+---
+title: Watch
+description: Invoking gets you one result. Watching gets you the ongoing facts — the events the work emits as it happens.
+---
 # Rust — Watch the Event Stream
 
 Invoking gets you one result. Watching gets you the ongoing facts — the events the

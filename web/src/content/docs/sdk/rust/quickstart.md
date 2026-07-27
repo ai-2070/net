@@ -1,3 +1,7 @@
+---
+title: Quickstart
+description: Install the SDK and run a node that emits and counts events — the smallest loop that proves the bus works.
+---
 # Rust — Quickstart
 
 Install the SDK and run a node that emits and counts events — the smallest loop

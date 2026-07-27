@@ -1,3 +1,7 @@
+---
+title: Watch
+description: Invoking gets you one result; watching gets you the ongoing facts.
+---
 # TypeScript — Watch the Event Stream
 
 Invoking gets you one result; watching gets you the ongoing facts. This is the

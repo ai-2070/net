@@ -1,3 +1,7 @@
+---
+title: v0.28.0 — Round and Round
+description: "Release notes for Net v0.28.0 — Round and Round — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.28 — "Round and Round"
 
 *Named after Ratt's 1984 breakout from* Out of the Cellar *— Warren DeMartini's lead cutting over a Sunset Strip glam stomp, Milton Berle mugging through the MTV video, the hook every band on the Strip wished it had while it scrapped for the same stage. "What comes around goes around." That is contention resolved the right way: v0.28's scheduler doesn't stop jobs from fighting over a contended island — it makes the losers loop. Reject, back off, re-query, come around again; because the backoff is bounded, the round always terminates on exactly one winner — never a deadlock, never a livelock — and the losing reserve is reconciled away while the chain's total order arbitrates.*

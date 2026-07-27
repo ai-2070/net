@@ -1,3 +1,7 @@
+---
+title: v0.16 — Eye of the Tiger
+description: "Release notes for Net v0.16 — Eye of the Tiger — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.16 — "Eye of the Tiger"
 
 ## MeshDB

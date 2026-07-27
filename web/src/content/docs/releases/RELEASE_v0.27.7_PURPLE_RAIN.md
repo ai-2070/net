@@ -1,3 +1,7 @@
+---
+title: v0.27.7 — Purple Rain
+description: "Release notes for Net v0.27.7 — Purple Rain — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.27.7 — "Purple Rain"
 
 A **NAT-traversal & port-discovery security-hardening release.** Two focused code reviews — the rendezvous/hole-punch runtime (`adapter/net/traversal/**` + `mesh.rs`) and the port-discovery surfaces (UPnP-IGD + the NAT-classification reflex sweep) — surfaced **13 findings**; **11 landed** across 17 commits and three review rounds, with the remaining 2 deliberately deferred. The headline fix closes an unauthenticated UDP-reflection vector on the rendezvous coordinator; the rest harden the NAT-classification sweep against flapping and tighten the discovery surfaces.

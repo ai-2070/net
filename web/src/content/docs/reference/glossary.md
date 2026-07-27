@@ -1,3 +1,7 @@
+---
+title: Glossary
+description: Net coins terms quickly. This is the one-line version of each; the linked page is the long one.
+---
 # Glossary
 
 Net coins terms quickly. This is the one-line version of each; the linked page

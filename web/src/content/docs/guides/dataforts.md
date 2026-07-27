@@ -1,3 +1,7 @@
+---
+title: Blob Storage (Dataforts)
+description: Dataforts is the layer in Net that handles large, content-addressed payloads — the things that are too big to live inline in events but too important to leave on a separate object store.
+---
 # Blob Storage with Dataforts
 
 Dataforts is the layer in Net that handles large, content-addressed payloads — the things that are too big to live inline in events but too important to leave on a separate object store. Model weights, training data, video segments, generated artifacts, file trees, anything where you want deduplication, locality, and the same identity-bound access semantics the rest of Net gives you.

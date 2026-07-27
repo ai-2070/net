@@ -1,3 +1,7 @@
+---
+title: Capabilities
+description: Capabilities are how nodes in a Net mesh describe what they can do.
+---
 # Capabilities
 
 Capabilities are how nodes in a Net mesh describe what they can do. A node announces a capability set — a collection of tags and metadata — and other nodes can query, filter, and route against that set. Capabilities are the substrate underneath placement decisions, channel authorization, capability-aware subscriptions, the targeting layer of nRPC, and the discovery surface for AI tools.

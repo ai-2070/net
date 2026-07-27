@@ -1,3 +1,7 @@
+---
+title: C
+description: The C ABI (net.h) is the smallest, most explicit binding.
+---
 # C SDK
 
 The C ABI (`net.h`) is the smallest, most explicit binding. It exposes the **event

@@ -1,3 +1,7 @@
+---
+title: Claiming a Contended Resource
+description: "Some resources can't be shared. A GPU NVLink domain, an accelerator slot, a licensed seat — one holder at a time, and two nodes that both believe they hold it is a corruption bug,"
+---
 # Claiming a Contended Resource
 
 Some resources can't be shared. A GPU NVLink domain, an accelerator slot, a

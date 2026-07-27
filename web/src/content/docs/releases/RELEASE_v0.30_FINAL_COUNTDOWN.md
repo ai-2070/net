@@ -1,3 +1,7 @@
+---
+title: v0.30.0 — Final Countdown
+description: "Release notes for Net v0.30.0 — Final Countdown — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.30 — "Final Countdown"
 
 *Named after Europe's 1986 synth-fanfare arena anthem off* The Final Countdown *— the four-note keyboard hook every stadium air-plays and nobody can name the second verse of, "we're leaving together, but still it's farewell to the ground."*

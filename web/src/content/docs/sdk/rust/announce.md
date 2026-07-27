@@ -1,3 +1,7 @@
+---
+title: Announce
+description: A capability is a typed unit of work a node can do.
+---
 # Rust — Announce a Capability
 
 A capability is a typed unit of work a node can do. You announce it; every peer

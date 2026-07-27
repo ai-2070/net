@@ -1,3 +1,7 @@
+---
+title: Recover a Failed Workflow
+description: Discovering and invoking a capability is only half the job.
+---
 # Recover a Failed Workflow
 
 Discovering and invoking a capability is only half the job. The other half is what
