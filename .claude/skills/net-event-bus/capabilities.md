@@ -428,3 +428,9 @@ Capability routing is for **placement** (pick a node), not **delivery** (the bus
 - `patterns.md` § "I want per-tenant capability discovery without standing up subnets" — the recipe-level summary that links here.
 - `filter-dsl.md` — the **bus-side** equality filter for narrowing *event payloads*, as opposed to the `Predicate` AST here for selecting *nodes*. The two compose (capability predicate targets receivers, filter narrows the response).
 - `org.md` — encrypted, audience-scoped announcements (`OwnerScoped` / `GrantedAudience`) and the per-call admission proof behind them. Reach for it when discovery must be an authorization boundary rather than a filter.
+
+## Further reading
+
+- [Capabilities](https://ai2070.net/docs/concepts/capabilities)
+- [Discover and Invoke](https://ai2070.net/docs/guides/discover-and-invoke)
+- [Capability Schema](https://ai2070.net/docs/reference/capability-schema)

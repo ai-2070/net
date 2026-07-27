@@ -280,3 +280,7 @@ x402 documents are always carried as base64 of preserved bytes and **never
 re-serialized through a binding's own JSON encoder.** The golden-vector
 verifiers in each language exist precisely to prove byte-preservation holds
 across the language boundary — that's their whole job (`testing.md`).
+
+## Further reading
+
+- [What It Is (and Is Not)](https://ai2070.net/docs/payments/what-net-payments-is)

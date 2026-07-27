@@ -139,3 +139,8 @@ A consumer that wants "is the north gate open?" folds `door.unlocked` / `door.un
 - **Success is a projection consumers compute over facts**, not a primitive you publish.
 
 When the user's event names or payloads carry `ok` / `done` / `200` / `delivered` semantics, walk them down the ladder and reshape the event as a fact. See `concepts.md` § Publisher (what a receipt does and doesn't mean), `payloads.md` (event form), `cortex.md` (folding facts into a status view), `gotchas.md` § "I need exactly-once delivery" (idempotency keys so a fact is safe to see twice), and `nrpc.md` (when a caller genuinely needs a typed reply).
+
+## Further reading
+
+- [Submitted Is Not Completed](https://ai2070.net/docs/guides/submitted-is-not-completed)
+- [Events and Causality](https://ai2070.net/docs/concepts/events-and-causality)

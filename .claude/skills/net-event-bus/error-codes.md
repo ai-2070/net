@@ -149,3 +149,11 @@ Adapter constructors and their `Debug` impls **scrub `user:password@` from conne
 - `filter-dsl.md` — what produces `ConsumerError::InvalidFilter`.
 - `concepts.md` § Identity — token chains behind `TokenError`.
 - `org.md` — the org credential/admission model behind the `org:` vocabulary, and the local kinds worth recognizing on sight.
+
+## Further reading
+
+- [Error Codes](https://ai2070.net/docs/reference/error-codes)
+- [Rust errors](https://ai2070.net/docs/sdk/rust/errors)
+- [TypeScript errors](https://ai2070.net/docs/sdk/typescript/errors)
+- [Python errors](https://ai2070.net/docs/sdk/python/errors)
+- [Go errors](https://ai2070.net/docs/sdk/go/errors)

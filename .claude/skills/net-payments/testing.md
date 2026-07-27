@@ -196,3 +196,7 @@ Never enable `unsafe-dev-signer` on mainnet.
   the real-asset registry.
 - Use `tempfile` for the engine/policy/billing store paths so tests don't
   collide on the per-user default paths.
+
+## Further reading
+
+- [The Lifecycle](https://ai2070.net/docs/payments/the-lifecycle)

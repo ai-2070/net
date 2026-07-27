@@ -139,3 +139,8 @@ Subcommands may also emit a JSON `{"error": …, "detail": …}` line to **stder
 - `nrpc.md` — the discovered-tool / typed-call surface `typegen` generates against.
 - `capabilities.md` — the `ai-tool:*` capability tags `typegen` discovers.
 - `org.md` — what the `net-mesh org` artifacts mean, the startup-side `install_org_authority` / `install_provider_grant_audience` calls that consume them, and the `org:<domain>:<kind>` errors.
+
+## Further reading
+
+- [CLI Reference](https://ai2070.net/docs/reference/cli)
+- [Deck (Operator TUI)](https://ai2070.net/docs/reference/deck)

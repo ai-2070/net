@@ -187,3 +187,9 @@ Common analogy traps. If the user is using these mental models, gently redirect:
 ---
 
 When you've internalized this, go to `apis.md` for the actual code patterns, and `patterns.md` for task-shape recipes.
+
+## Further reading
+
+- [Architecture](https://ai2070.net/docs/concepts/architecture)
+- [What is Net?](https://ai2070.net/docs/start/what-is-net)
+- [Events and Causality](https://ai2070.net/docs/concepts/events-and-causality)

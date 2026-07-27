@@ -155,3 +155,8 @@ Endpoint/network/RPC constants live in `packs` (`X402_ORG_FACILITATOR`,
 `CDP_FACILITATOR`, `T54_XRPL_FACILITATOR`, `NETWORK_BASE_SEPOLIA`, `NETWORK_BASE`,
 `NETWORK_SOLANA`, `NETWORK_XRPL`, `RPC_BASE_SEPOLIA`, `RPC_BASE`, `RPC_SOLANA`,
 `RPC_XRPL`).
+
+## Further reading
+
+- [The Lifecycle](https://ai2070.net/docs/payments/the-lifecycle)
+- [Verification Tiers](https://ai2070.net/docs/payments/verification-tiers)

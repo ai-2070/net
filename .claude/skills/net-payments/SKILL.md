@@ -144,3 +144,7 @@ carrying a mental model that produces compiling-but-rejected code.
 
 If the user asks about these, say where they stand rather than inventing an
 API.
+
+## Further reading
+
+- [Payments documentation](https://ai2070.net/docs/payments)

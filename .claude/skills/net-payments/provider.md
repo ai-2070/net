@@ -196,3 +196,7 @@ let _handle = serve_payments(&mesh, provider_channel)?;   // registers QUOTE_SER
 Service names: `net.payments.quote.v1`, `net.payments.pay.v1`. The caller uses
 `MeshPaymentChannel` (see `caller.md`). `serve_payments` returns a
 `PaymentServeHandle` — keep it alive for the registration to stand.
+
+## Further reading
+
+- [The Lifecycle](https://ai2070.net/docs/payments/the-lifecycle)

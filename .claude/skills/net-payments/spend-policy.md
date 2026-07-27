@@ -172,3 +172,7 @@ and ~3.1 s at 128. The coupling is the **global file lock**, not accounting
 authority. So: don't promise a customer that sharding by asset or capability
 will scale spend checks, and don't design around per-capability parallelism
 until the store backend changes. No partitioned engine is authorized yet.
+
+## Further reading
+
+- [Spend Policy & Approvals](https://ai2070.net/docs/payments/spend-policy-and-approvals)

@@ -159,3 +159,8 @@ SDK, you've inverted the doctrine — the substrate stays clean.
 - Inbound HTTP 402 serving — deferred, demand-driven (`http402.md`).
 - The base mesh, nRPC, capabilities, MCP bridge mechanics — that's the
   `net-event-bus` skill's territory; this skill assumes it.
+
+## Further reading
+
+- [What It Is (and Is Not)](https://ai2070.net/docs/payments/what-net-payments-is)
+- [The Failure Schematic](https://ai2070.net/docs/payments/failure-schematic)

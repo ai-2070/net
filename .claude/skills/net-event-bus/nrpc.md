@@ -566,3 +566,8 @@ True subprocess-based interop tests (Node caller → Rust server, Python caller 
 - **Tool discovery + `tool.watch`** — `net/crates/net/sdk/src/tool.rs` (`list_tools` / `watch_tools` / `serve_tool_watch`), `net/crates/net/src/adapter/net/cortex/tool.rs` (`TOOL_WATCH_SERVICE`, `WatchToolsRequest`, `ToolWatchFrame`).
 - **Org-protected calls** — `net_sdk::mesh_rpc::OrgProofIntent` on `CallOptions` is the low-level seam under `mesh.org(..).call(..)`; use it when you need an exact provider, a specific grant, or an unusual proof TTL. See `org.md`.
 - **READMEs** — `net/crates/net/README.md` § nRPC (top-level concept + cross-binding spec); per-binding READMEs each have an `## nRPC` section with language-idiomatic examples.
+
+## Further reading
+
+- [Typed RPC with nRPC](https://ai2070.net/docs/guides/nrpc)
+- [Recover a Failed Workflow](https://ai2070.net/docs/guides/recover-failed-workflow)

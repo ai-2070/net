@@ -328,3 +328,8 @@ For the wire codec and the full election rules, see `net/README.md` § Replicati
 **"Can I rotate files manually?"** No log rotation in the substrate sense — retention knobs are the only built-in trim mechanism. If you need archive-and-truncate semantics (compress old segments off to S3), build it on top of `read_range` + `sweep_retention`.
 
 **"What's the relationship to CortEX?"** CortEX is "RedEX tail + a fold function → in-memory state with a query API." `cortex.md` covers the full picture. For raw log access, stay in RedEX.
+
+## Further reading
+
+- [Durable Logs (RedEX)](https://ai2070.net/docs/guides/durable-logs)
+- [Replication Configuration](https://ai2070.net/docs/reference/replication-config)

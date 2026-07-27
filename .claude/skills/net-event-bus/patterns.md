@@ -220,3 +220,8 @@ Need a typed reply / RPC semantics?
     ├── Streaming response from one request? → TypedMeshRpc.callStreaming
     └── Need deadline + retries / hedging? → callWithRetry / callWithHedge / CircuitBreaker
 ```
+
+## Further reading
+
+- [Guides](https://ai2070.net/docs/guides)
+- [Tutorials](https://ai2070.net/docs/tutorials)

@@ -236,3 +236,7 @@ own replay guard.
   callbacks are async (`Promise`). The outbound HTTP-402 client
   (`PaymentHttpClient`) wires `eip155` only. **Go/C** have no payment flow, so no
   signer surface (`bindings.md`).
+
+## Further reading
+
+- [Non-Custodial Signing](https://ai2070.net/docs/payments/non-custodial-signing)

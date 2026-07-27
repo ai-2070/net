@@ -128,3 +128,7 @@ They **compose**: an nRPC call can carry a capability predicate (`net-where`) to
 - `error-codes.md` — `ConsumerError::InvalidFilter` and where it fires.
 - `apis.md` — where the filter argument goes on each SDK's subscribe/consume call.
 - `payloads.md` — shape your event so the fields you filter on are top-level and cheap to reach.
+
+## Further reading
+
+- [Filter DSL](https://ai2070.net/docs/reference/filter-dsl)

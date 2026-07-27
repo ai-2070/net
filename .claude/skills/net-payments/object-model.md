@@ -260,3 +260,7 @@ a verification input.
 registry revision it was authored under. See `networks.md` for `AssetRegistry`
 and the signed-default policy (allowed assets, decimals cross-check,
 equivalence classes). CAIP `ChainId` / `AssetId` are in `x402.md`.
+
+## Further reading
+
+- [The Lifecycle](https://ai2070.net/docs/payments/the-lifecycle)

@@ -102,3 +102,7 @@ tax/VAT logic, no ERP connectors. Net emits signed billing events; partners
 and customers turn them into invoices, accounting records, and dashboards
 under their own policy and posture. If a request asks Net to *render* or
 *store* an accounting artifact, it's out of scope (`gotchas.md`).
+
+## Further reading
+
+- [Billing](https://ai2070.net/docs/payments/billing)

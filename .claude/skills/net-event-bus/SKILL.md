@@ -33,7 +33,7 @@ You have several reference files in this directory. Load them on demand — do n
 | `redex.md` | When the user needs **durable per-channel append-only logs** ("survive a node restart", "replay from offset N", "tail this channel with retention"). Local files per node; cross-node replication is opt-in per file — with the full `ReplicationConfig` reference (ranges, defaults, `UnderCapacity`, bandwidth classes), the coordinator lifecycle, `SyncNack` retry policy, the seven Prometheus counters, and the failure-mode table. |
 | `cortex.md` | When the user needs **folded queryable state** ("SQLite-shaped queries on the event stream", "react to changes in derived state", `Tasks` / `Memories` / custom adapters, NetDB cross-adapter query façade). Sits on top of RedEX. |
 | `dataforts.md` | When the user asks about **greedy caching**, **data gravity** (chains drift toward readers), **blob refs** (substrate carries content-addressed pointers; bytes in S3 / Ceph / IPFS / FS), **read-your-writes** (`WriteToken` + `wait_for_token` so a producer reads its own write deterministically), or **peer-to-peer blob/dir transfer over the mesh** (`fetch_blob` / `store_dir` / `fetch_dir`, the `net-mesh transfer` CLI). Compositional data plane on top of RedEX + CortEX. |
-| `runtime.md` | When writing a `shutdown` path, handling errors, integrating into an existing async runtime (axum, FastAPI, Express), or debugging "why are my events missing?" |
+| `runtime.md` | When writing a `shutdown` path, handling errors, integrating into an existing async runtime (axum, FastAPI, Express), or debugging "why are my events missing?" Also **partitions and healing** — recovery throttling under mass failure, the `Suspected → Confirmed → Healing → Healed` phases, and the one that surprises people: after a conflicted heal the losing side's writes survive as a **fork**, not a merge, so an app assuming "one entity, one chain" silently reads only the winner. |
 | `observability.md` | When the user asks "how do I know events are being dropped?" or wires Prometheus/OTel. Stat fields per SDK, the silent-drop trap, tuning knobs. |
 | `payloads.md` | When the user is shaping their event schema or asking about size limits, large blobs, batching, or cross-language schema interop (u64/BigInt edges, casing, optional/null, schema evolution). |
 | `filter-dsl.md` | When the user wants a subscriber to receive **only some** events on a channel (equality predicates, `$and`/`$or`/`$not`, dot-paths) — the bus-side filter. Not to be confused with capability predicates (`capabilities.md`), which select *nodes*, not payloads. |
@@ -101,3 +101,8 @@ The event-bus surface is a small slice of Net. The following exist but are out o
 - **Mesh transport internals** — packet codec, Noise handshake, routing-table internals. Point at `net/crates/net/docs/`. The application-level mesh setup is in `mesh.md`; capability routing on top of the mesh is in `capabilities.md`; per-peer streams over the mesh are in `streams.md`.
 
 If the user asks about these, point them at the relevant section of `net/README.md` rather than guessing.
+
+## Further reading
+
+- [The documentation site](https://ai2070.net/docs)
+- [What is Net?](https://ai2070.net/docs/start/what-is-net)
