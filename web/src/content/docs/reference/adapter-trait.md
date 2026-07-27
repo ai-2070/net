@@ -178,6 +178,8 @@ self.record_seen(batch.producer_nonce, batch.first_seq);
 
 For backends with native dedup (Redis Streams' MSGID, JetStream's `Nats-Msg-Id`), the adapter just passes the nonce through. For backends without, a small persistent map suffices.
 
+The nonce is fresh per process unless you set `producer_nonce_path`, which matters on restart. For the Redis Streams case specifically — where a `MULTI`/`EXEC` timeout can commit a batch twice — and for the consumer-side `RedisStreamDedup` helper in all five languages, see [Redis Streams Deduplication](/docs/reference/redis-dedup).
+
 ## Polling shape
 
 `ShardPollResult` is the consumer-side type:

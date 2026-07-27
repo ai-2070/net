@@ -128,6 +128,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     reference: [
       "eventbus-api",
       "adapter-trait",
+      "redis-dedup",
       "filter-dsl",
       "subprotocol-ids",
       "capability-schema",
