@@ -264,7 +264,6 @@ async fn routed_frames_authenticate_origin_coalesce_and_fan_back() {
     // `ev.from_node` below is the AEAD-verified end-to-end origin.
     let counters = Arc::new(SensingCounters::default());
     let leader = Arc::new(Mutex::new(SensingLeader::new(
-        owner_root,
         CandidatePolicy::default(),
         3,
         512,
@@ -490,12 +489,12 @@ async fn routed_frames_authenticate_origin_coalesce_and_fan_back() {
         let branch = ProviderInterestKey::new(key, PROVIDER);
         let mut downstreams = leader.relay.table.downstreams(&branch, Instant::now());
         downstreams.sort_by_key(|d| match d {
-            DownstreamId::Local | DownstreamId::Leader => (0, 0),
+            DownstreamId::Local | DownstreamId::LeasedLocal | DownstreamId::Leader => (0, 0),
             DownstreamId::Peer(id) => (1, *id),
         });
         let mut expected_rows = vec![DownstreamId::Peer(nid_a), DownstreamId::Peer(nid_c)];
         expected_rows.sort_by_key(|d| match d {
-            DownstreamId::Local | DownstreamId::Leader => (0, 0),
+            DownstreamId::Local | DownstreamId::LeasedLocal | DownstreamId::Leader => (0, 0),
             DownstreamId::Peer(id) => (1, *id),
         });
         assert_eq!(

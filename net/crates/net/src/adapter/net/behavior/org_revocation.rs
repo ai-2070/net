@@ -66,10 +66,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use serde::{Deserialize, Serialize};
 
 use super::org::{OrgError, OrgId, OrgRevocationBundle};
@@ -92,6 +92,14 @@ impl OrgRevocationState {
     /// The empty state (fresh adopt).
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Test seam: a state with explicit floors, as a merged bundle would
+    /// leave it, without constructing and signing a bundle. Test-only — never
+    /// a supported downstream constructor for synthetic authority state.
+    #[cfg(test)]
+    pub(crate) fn from_floors_for_test(floors: BTreeMap<(OrgId, EntityId), u32>) -> Self {
+        Self { floors }
     }
 
     /// The current floor for `(org, member)`. Absent keys floor at
@@ -471,7 +479,66 @@ struct StoreCore {
     /// Never ahead of the durably persisted state.
     live: RwLock<Arc<OrgRevocationState>>,
     /// Bumped on every publish; lets callers order publications.
+    ///
+    /// Advanced with `checked_add`, NEVER wrapping — see
+    /// [`StoreCore::generation_exhausted`].
     generation: AtomicU64,
+    /// Terminal: the publication generation space is exhausted.
+    ///
+    /// A wrapping counter is not a currentness signal. Once it wraps, a NEW
+    /// floor view carries a generation a consumer has already seen, so evidence
+    /// built against the OLD view compares equal to the new one. Rather than
+    /// wrap, the generation freezes and this latches, and every consumer that
+    /// uses the generation for currentness must fail closed on it (Kyra
+    /// OLB-2B-E3c).
+    ///
+    /// Distinct from POISON, which means "durability uncertain" and can be
+    /// cleared by a successful locked reread. Exhaustion is not recoverable
+    /// in-process: clearing it would hand out an identity already in use.
+    generation_exhausted: AtomicBool,
+    /// Serializes POISON transitions on this core against readers that must hold
+    /// poison immobile.
+    ///
+    /// Poison is a path-registry write, not a view publication, so `live` does
+    /// not order it. A consumer whose decision is itself load-bearing — the
+    /// routing commit pin, whose `Current` causes `Healthy` — must be able to
+    /// hold poison still across its validation AND its settlement, or the two
+    /// remain independently interleavable (Kyra OLB-2B-E3c).
+    ///
+    /// FROZEN ORDER: `poison_gate` → `live`. Every poison transition on a live
+    /// core takes this before any later `live.write()`, and every pin takes it
+    /// before `live.read()`, so no cycle is reachable.
+    ///
+    /// BOTH directions. A recovery CLEAR is as load-bearing as a mark: a pin
+    /// that validated `poisoned == true` and then watched the clear land mid
+    /// settlement reports `Current` for an authority that is already gone. Every
+    /// live-core transition therefore goes through [`StoreCore::mark_poisoned`]
+    /// / [`StoreCore::clear_poison`], never the raw path-registry helpers
+    /// (Kyra OLB-2B-E3c closure).
+    poison_gate: Mutex<()>,
+    /// Test-only: fired immediately before a publish attempts `live.write()`, so
+    /// a witness can acknowledge that a publisher REACHED the blocked
+    /// acquisition instead of inferring it from elapsed time.
+    #[cfg(test)]
+    publish_blocking_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: the same acknowledgment for `poison_gate` — fired immediately
+    /// before a poison transition attempts the lock. Elapsed time is not
+    /// evidence that a contender reached the gate.
+    #[cfg(test)]
+    poison_blocking_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only, one-shot: force `apply_bundle`'s next state write to report a
+    /// POST-rename durability failure while leaving the file at its prior
+    /// bytes — the exact uncertainty PostRename names. On Windows the phase is
+    /// otherwise unreachable (write-through rename, §13), so the poison-mark
+    /// wake (E3c blockers §1) has no other witness route there.
+    #[cfg(test)]
+    force_post_rename: AtomicBool,
+    /// Test-only: fired by [`StoreCore::lock_poison_gate`] ONLY when its try
+    /// OBSERVED the gate held, immediately before blocking (E3c blockers §3).
+    /// Contrast [`StoreCore::poison_blocking_hook`], which fires before the
+    /// attempt regardless of contention.
+    #[cfg(test)]
+    poison_contended_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Raise subscribers, each with a removable token. A REGISTRY,
     /// not a single slot (review-9 addendum): registering a second
     /// observer must never silently steal the first one's
@@ -518,6 +585,13 @@ impl StoreCore {
     /// the per-key max with the outgoing view makes "an installed
     /// floor never lowers" structural rather than assumed.
     fn publish(&self, mut next: OrgRevocationState) -> Vec<RaisedFloor> {
+        #[cfg(test)]
+        {
+            let hook = self.publish_blocking_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let mut live = self.live.write();
         // §15 — the per-key max keeps the LIVE view safe, but silently
         // absorbing a weaker incoming state hides the fact that DISK is now
@@ -568,7 +642,22 @@ impl StoreCore {
         // (one uncontended `Mutex::take`) unless a test armed the hook.
         #[cfg(any(test, feature = "fixtures"))]
         self.run_publish_pause_hook();
-        self.generation.fetch_add(1, Ordering::Release);
+        // CHECKED, never wrapping: at the ceiling the generation freezes and the
+        // exhaustion latch is set, so a consumer comparing generations for
+        // currentness fails closed instead of matching a reused identity.
+        let current = self.generation.load(Ordering::Acquire);
+        match current.checked_add(1) {
+            Some(next) => self.generation.store(next, Ordering::Release),
+            None => {
+                if !self.generation_exhausted.swap(true, Ordering::AcqRel) {
+                    tracing::error!(
+                        "org revocation: publication generation space exhausted; \
+                         the generation is frozen and every generation-based \
+                         currentness check must now fail closed"
+                    );
+                }
+            }
+        }
         raised
     }
 
@@ -600,6 +689,102 @@ impl StoreCore {
         }
     }
 
+    /// Wake every subscriber for an authority change that raised NO floor.
+    ///
+    /// [`Self::notify`] returns immediately on an empty raise set, which is
+    /// right for a publication that changed nothing. A POISON CLEAR is not that:
+    /// recovery republishes the same durable view, so it raises no floor, yet
+    /// what this node is permitted to serve just went from "nothing" back to the
+    /// real material. Without an explicit wake the routing registry stays
+    /// reconciled to obsolete `Unserved` facts until some reader happens to trip
+    /// the lazy epoch check (Kyra OLB-2B-E3c closure).
+    ///
+    /// Callers MUST invoke this with no file lock, reload guard, `poison_gate`
+    /// or `live` guard held — a subscriber takes the routing authority gate, and
+    /// a routing settlement holding that gate takes `poison_gate` + `live.read`.
+    fn notify_authority_changed(&self) {
+        let subscribers: Vec<FloorsRaisedCallback> = self
+            .subscribers
+            .read()
+            .iter()
+            .map(|(_, callback)| callback.clone())
+            .collect();
+        for callback in subscribers {
+            callback(&[]);
+        }
+    }
+
+    /// Mark this live core's path poisoned, under `poison_gate`, returning
+    /// whether this was the false→true TRANSITION (E3c blockers §1).
+    ///
+    /// The ONLY way production marks a path that has a live core. Calling the
+    /// raw path-registry helper instead would let the mark land inside a
+    /// [`PublicationPin`]'s validate-then-settle window.
+    fn mark_poisoned(&self) -> bool {
+        let _gate = self.lock_poison_gate();
+        mark_poisoned(&self.backing_id, &self.path)
+    }
+
+    /// Clear this live core's path poison, under `poison_gate`.
+    ///
+    /// The inverse of [`Self::mark_poisoned`] and exactly as load-bearing: a pin
+    /// that validated `poisoned == true` and then watched a raw clear land would
+    /// settle `Current` over a reconstruction built for an authority that no
+    /// longer exists (Kyra OLB-2B-E3c closure).
+    ///
+    /// Deliberately does NOT notify: every caller still holds the interprocess
+    /// file lock here. The wake is [`Self::notify_authority_changed`], invoked
+    /// once the caller has released everything.
+    fn clear_poison(&self) {
+        let _gate = self.lock_poison_gate();
+        clear_poison(&self.backing_id, &self.path);
+    }
+
+    /// Acquire `poison_gate` for a poison TRANSITION (mark or clear) — never
+    /// used by [`PublicationPin`], whose acquisition is the thing transitions
+    /// contend with. Try-then-block, with two distinct test acknowledgements
+    /// (E3c blockers §3):
+    ///
+    /// - the BLOCKING hook fires before the acquisition is attempted — the
+    ///   placement rendezvous a witness uses to hold a transition at the gate
+    ///   while it stages a pin;
+    /// - the CONTENDED hook fires ONLY when the try observed the gate held,
+    ///   immediately before blocking. It is the acknowledgement the gap
+    ///   witnesses wait on: an ack that fires regardless of contention proves
+    ///   only that the contender was scheduled, and a negative assertion
+    ///   sequenced after it can pass vacuously under a slow scheduler with the
+    ///   protection broken. An ack that required `try_lock` to FAIL proves the
+    ///   exclusion was actually met.
+    fn lock_poison_gate(&self) -> MutexGuard<'_, ()> {
+        self.run_poison_blocking_hook();
+        match self.poison_gate.try_lock() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(test)]
+                {
+                    let hook = self.poison_contended_hook.lock().clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                self.poison_gate.lock()
+            }
+        }
+    }
+
+    /// Fire the poison-gate acknowledgment hook if a test installed one. Runs
+    /// immediately BEFORE the blocking acquisition, so a witness proves a
+    /// contender reached the gate rather than inferring it from elapsed time.
+    fn run_poison_blocking_hook(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.poison_blocking_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
     /// Remove the subscriber registered under `token`. Unknown tokens
     /// are a no-op. Called by [`RaiseSubscription`]'s Drop through a
     /// `Weak<StoreCore>` (R2-2), so a subscription is retired
@@ -607,6 +792,28 @@ impl StoreCore {
     /// facade `Drop` a capture cycle could keep from running.
     fn remove_subscriber(&self, token: u64) {
         self.subscribers.write().retain(|(t, _)| *t != token);
+    }
+}
+
+/// Run `mutate` with the POISON GATE of the live core backing `id`, if one
+/// exists.
+///
+/// The construction paths can poison a path BEFORE they have joined its core —
+/// but a sibling handle may already hold one, with pins running against it. This
+/// finds that core through the registry, drops the registry lock (so the gate is
+/// never taken beneath it), and holds only the gate across the mutation. No live
+/// core means no pin can exist, so the raw mutation is already exclusive.
+fn with_live_poison_gate<R>(id: &BackingId, mutate: impl FnOnce() -> R) -> R {
+    let existing = {
+        let guard = core_registry().lock();
+        guard.cores.get(id).and_then(std::sync::Weak::upgrade)
+    };
+    match existing {
+        Some(core) => {
+            let _gate = core.lock_poison_gate();
+            mutate()
+        }
+        None => mutate(),
     }
 }
 
@@ -990,6 +1197,16 @@ fn join_or_create_core(
         reload: Mutex::new(()),
         live: RwLock::new(Arc::new(disk)),
         generation: AtomicU64::new(0),
+        generation_exhausted: AtomicBool::new(false),
+        poison_gate: Mutex::new(()),
+        #[cfg(test)]
+        publish_blocking_hook: Mutex::new(None),
+        #[cfg(test)]
+        poison_blocking_hook: Mutex::new(None),
+        #[cfg(test)]
+        force_post_rename: AtomicBool::new(false),
+        #[cfg(test)]
+        poison_contended_hook: Mutex::new(None),
         subscribers: RwLock::new(Vec::new()),
         next_subscriber: AtomicU64::new(0),
         #[cfg(any(test, feature = "fixtures"))]
@@ -1046,6 +1263,74 @@ pub(crate) fn publish_guard_pair<'a>(
         _guards: vec![g1, g2],
     }
 }
+/// Holds this store's authority IMMOBILE.
+///
+/// While alive, both floor publication and poison transitions are blocked:
+/// publication needs `live.write()`, and every poison transition on a live core
+/// takes `poison_gate`. That is what lets a consumer validate and then act as ONE
+/// operation rather than two interleavable steps (Kyra OLB-2B-E3c).
+pub struct PublicationPin<'a> {
+    core: &'a StoreCore,
+    _poison: parking_lot::MutexGuard<'a, ()>,
+    _live: parking_lot::RwLockReadGuard<'a, Arc<OrgRevocationState>>,
+}
+
+impl PublicationPin<'_> {
+    /// The generation this pin is holding still, or `Err` if exhausted.
+    pub fn generation(&self) -> Result<BarrieredGeneration, GenerationExhausted> {
+        OrgRevocationStore::sample_generation(self.core)
+    }
+
+    /// Live poison, re-read through the guard.
+    pub fn poisoned(&self) -> bool {
+        is_poisoned(&self.core.backing_id, &self.core.path)
+    }
+}
+
+/// A publication generation sampled coherently with its terminal state.
+///
+/// Deliberately opaque. The raw `u64` is only meaningful next to the exhaustion
+/// latch it was sampled with, so handing out a bare integer invites exactly the
+/// aliasing this type exists to prevent — a consumer comparing frozen values and
+/// concluding "unchanged". Compare these, do not unwrap them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BarrieredGeneration(u64);
+
+impl BarrieredGeneration {
+    /// The raw value. For stamping and logging only — a currentness DECISION
+    /// must compare `BarrieredGeneration`s, so the exhaustion latch they were
+    /// sampled with cannot be dropped on the floor.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Test-only: fabricate a generation for stamp-comparison unit tests that
+    /// never touch a real store.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn from_raw_for_test(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+/// The publication generation space is exhausted: the counter is frozen, so it
+/// can no longer distinguish floor views.
+///
+/// TERMINAL and fail-closed. Every consumer that uses the generation as a
+/// currentness discriminator must refuse rather than proceed — a frozen counter
+/// makes a post-exhaustion publication look identical to no publication at all
+/// (Kyra OLB-2B-E3c). Returned as an `Err` precisely so no consumer can ignore
+/// it by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenerationExhausted;
+
+impl std::fmt::Display for GenerationExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("org revocation publication generation space is exhausted")
+    }
+}
+
+impl std::error::Error for GenerationExhausted {}
 
 /// The node-local persisted revocation maxima plus its published
 /// live view. See the module docs for the locked reload order and
@@ -1215,7 +1500,18 @@ impl OrgRevocationStore {
                         })
                     }
                     Err(WritePhase::PostRename(reason)) => {
-                        mark_poisoned(&backing_id, &path);
+                        // No core joined yet, but a same-path sibling may hold
+                        // one: gate against ITS pins (Kyra OLB-2B-E3c closure).
+                        // No authority wake here, deliberately (contrast
+                        // `apply_bundle`, E3c blockers §1): this store failed
+                        // to initialize, so it has no subscribers, and the
+                        // interprocess lock is still held — a sibling core's
+                        // routing facts are repaired by the lazy read-time
+                        // epoch comparison, which is the accepted coverage for
+                        // this create-over-a-live-sibling corner.
+                        with_live_poison_gate(&backing_id, || {
+                            let _ = mark_poisoned(&backing_id, &path);
+                        });
                         return Err(OrgRevocationError::DurabilityUncertain {
                             path: path.display().to_string(),
                             reason,
@@ -1233,11 +1529,18 @@ impl OrgRevocationStore {
         };
         let (core, raised) = join_or_create_core(backing_id.clone(), &path, state)?;
         if was_poisoned {
-            clear_poison(&backing_id, &path);
+            // Through the CORE, under its poison gate: a sibling handle's
+            // routing pin may be mid-settlement against `poisoned == true`.
+            core.clear_poison();
         }
         drop(lock);
         let store = Self { core };
         store.core.notify(&raised);
+        if was_poisoned {
+            // Recovery raises no floor, so `notify` alone is silent — yet the
+            // authority just moved from "unusable" back to usable.
+            store.core.notify_authority_changed();
+        }
         Ok(store)
     }
 
@@ -1286,11 +1589,14 @@ impl OrgRevocationStore {
         })?;
         let (core, raised) = join_or_create_core(backing_id.clone(), &path, state)?;
         if was_poisoned {
-            clear_poison(&backing_id, &path);
+            core.clear_poison();
         }
         drop(lock);
         let store = Self { core };
         store.core.notify(&raised);
+        if was_poisoned {
+            store.core.notify_authority_changed();
+        }
         Ok(store)
     }
 
@@ -1321,6 +1627,43 @@ impl OrgRevocationStore {
         is_poisoned(&self.core.backing_id, &self.core.path)
     }
 
+    /// Whether the publication generation space is exhausted.
+    ///
+    /// OBSERVABILITY ONLY. Never use this to decide currentness: read
+    /// independently of the generation it qualifies, it races the very
+    /// publication that exhausts the space. Currentness decisions must take the
+    /// coherent [`Result`] from [`Self::barriered_generation`] or
+    /// [`Self::snapshot_with_generation`], which sample both under one barrier
+    /// (Kyra OLB-2B-E3c).
+    pub fn generation_exhausted_for_metrics(&self) -> bool {
+        self.core.generation_exhausted.load(Ordering::Acquire)
+    }
+
+    /// Test-only: drive the publication generation to its ceiling, so a witness
+    /// can exercise the exhaustion branch without 2^64 real publications.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn saturate_generation_for_test(&self) {
+        self.core.generation.store(u64::MAX, Ordering::Release);
+    }
+
+    /// Test-only: arm the pre-`live.write()` acknowledgment hook, so a witness
+    /// can prove a publisher REACHED the blocked acquisition rather than
+    /// inferring it from elapsed time.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn arm_publish_blocking_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.core.publish_blocking_hook.lock() = Some(hook);
+    }
+
+    /// Test-only: force one publication of the current view.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn republish_for_test(&self) {
+        let current = (*self.core.live.read()).as_ref().clone();
+        self.core.publish(current);
+    }
+
     /// Test-only: mark this store's backing path poisoned so
     /// [`Self::is_poisoned`] returns true, without forcing a real
     /// fsync failure. Lets a witness exercise the
@@ -1331,7 +1674,38 @@ impl OrgRevocationStore {
     #[doc(hidden)]
     #[cfg(any(test, feature = "fixtures"))]
     pub fn mark_poisoned_for_test(&self) {
-        mark_poisoned(&self.core.backing_id, &self.core.path);
+        self.core.mark_poisoned();
+    }
+
+    /// Test-only: arm the pre-`poison_gate` PLACEMENT hook — fired before a
+    /// poison transition attempts the acquisition, whether or not the gate is
+    /// held. Fires for marks AND clears, including the ones the production
+    /// recovery paths perform. A rendezvous point, NOT contention evidence:
+    /// for that, arm [`Self::arm_poison_contended_hook`] (E3c blockers §3).
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn arm_poison_blocking_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.core.poison_blocking_hook.lock() = Some(hook);
+    }
+
+    /// Test-only: arm the poison-gate CONTENTION acknowledgment — fired only
+    /// when a transition's `try_lock` observed the gate held, immediately
+    /// before it blocks (E3c blockers §3). This is the ack the gap witnesses
+    /// sequence their negative assertions after: it proves the exclusion was
+    /// met, not merely that the contender got scheduled.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn arm_poison_contended_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.core.poison_contended_hook.lock() = Some(hook);
+    }
+
+    /// Test-only, one-shot: force the next `apply_bundle` state write to report
+    /// a POST-rename durability failure without touching the file (E3c
+    /// blockers §1). See the [`StoreCore::force_post_rename`] field.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn arm_forced_post_rename_for_test(&self) {
+        self.core.force_post_rename.store(true, Ordering::Release);
     }
 
     /// `true` iff `other` is backed by the same normalized path —
@@ -1351,7 +1725,15 @@ impl OrgRevocationStore {
     /// OLD generation. Admission stamping must use
     /// [`Self::barriered_generation`] / [`Self::snapshot_with_generation`]
     /// instead — see their docs (OA2-E1 Kyra review).
-    pub fn publish_generation(&self) -> u64 {
+    ///
+    /// Demoted from `pub` and marked dead-code-tolerant rather than deleted
+    /// (review-pass-3 §12): it has no production caller — which is exactly why it
+    /// was dangerous to export, since the only use a caller could invent for a
+    /// bare unbarriered `u64` with no exhaustion signal is the currentness
+    /// decision the paragraph above forbids. It survives as the contrast case the
+    /// barrier witnesses assert against.
+    #[allow(dead_code)]
+    pub(crate) fn publish_generation(&self) -> u64 {
         self.core.generation.load(Ordering::Acquire)
     }
 
@@ -1360,14 +1742,53 @@ impl OrgRevocationStore {
     /// view and bumps the generation while holding `live.write()`, so
     /// acquiring a read guard first guarantees no publication is
     /// mid-flight: the returned generation always matches the
-    /// currently-visible view. Unlike [`Self::publish_generation`],
+    /// currently-visible view. Unlike `publish_generation`,
     /// this can never return an old generation while a raised floor is
     /// already installed — the interleaving that would let a stale
     /// admission stamp compare "unchanged" and admit against a floor
     /// that has actually risen.
-    pub fn barriered_generation(&self) -> u64 {
+    pub fn barriered_generation(&self) -> Result<BarrieredGeneration, GenerationExhausted> {
         let _live = self.core.live.read();
-        self.core.generation.load(Ordering::Acquire)
+        Self::sample_generation(&self.core)
+    }
+
+    /// Hold the publication barrier: while this guard lives, NO floor
+    /// publication can land, because `StoreCore::publish` needs `live.write()`.
+    ///
+    /// This is real EXCLUSION, not observation. A consumer whose decision is
+    /// itself load-bearing — the routing commit pin, whose `Current` causes the
+    /// supervisor to publish `Healthy` — cannot be made sound by sampling and
+    /// then acting: a publication landing between the sample and the decision
+    /// makes the decision false with nothing to detect it (Kyra OLB-2B-E3c).
+    /// Holding the barrier through the decision closes that gap by construction.
+    ///
+    /// Subscribers are invoked OUTSIDE the publish locks, so a blocked publisher
+    /// cannot deadlock against a callback that takes the routing authority gate.
+    /// Hold it briefly and never across an await.
+    pub fn pin_publication(&self) -> PublicationPin<'_> {
+        // Poison gate BEFORE the view barrier: `apply_bundle` marks poison and
+        // only then publishes, so the reverse order would deadlock against it.
+        let poison = self.core.poison_gate.lock();
+        let live = self.core.live.read();
+        PublicationPin {
+            core: &self.core,
+            _poison: poison,
+            _live: live,
+        }
+    }
+
+    /// Sample the generation and its terminal state under ONE `live.read()`.
+    ///
+    /// The caller must already hold that guard. Sampling them with two
+    /// independent calls is itself raceable: the publication that exhausts the
+    /// space sets the latch and freezes the counter, so a reader can observe the
+    /// frozen counter with the pre-exhaustion latch and conclude "unchanged"
+    /// (Kyra OLB-2B-E3c).
+    fn sample_generation(core: &StoreCore) -> Result<BarrieredGeneration, GenerationExhausted> {
+        if core.generation_exhausted.load(Ordering::Acquire) {
+            return Err(GenerationExhausted);
+        }
+        Ok(BarrieredGeneration(core.generation.load(Ordering::Acquire)))
     }
 
     /// A floor snapshot together with the exact generation it
@@ -1375,10 +1796,12 @@ impl OrgRevocationStore {
     /// Kyra review). Publication-barriered like
     /// [`Self::barriered_generation`], so the `(snapshot, generation)`
     /// pair is always consistent — no seqlock retry needed.
-    pub fn snapshot_with_generation(&self) -> (Arc<OrgRevocationState>, u64) {
+    pub fn snapshot_with_generation(
+        &self,
+    ) -> Result<(Arc<OrgRevocationState>, BarrieredGeneration), GenerationExhausted> {
         let live = self.core.live.read();
-        let generation = self.core.generation.load(Ordering::Acquire);
-        (live.clone(), generation)
+        let generation = Self::sample_generation(&self.core)?;
+        Ok((live.clone(), generation))
     }
 
     /// Test-only (`#[doc(hidden)]`, mirroring the review-11
@@ -1452,6 +1875,12 @@ impl OrgRevocationStore {
     /// retires the subscription — draining any in-flight callback and
     /// removing it from the core through a `Weak<StoreCore>` (R2-2), so
     /// cleanup never depends on this facade's own drop.
+    ///
+    /// The callback may also be invoked with an EMPTY slice, meaning "this
+    /// path's revocation AUTHORITY moved without raising any floor" — the poison
+    /// recovery case. A subscriber that only iterates `raised` sees a harmless
+    /// no-op; one that tracks authority (the routing registry) must treat it as
+    /// a change (Kyra OLB-2B-E3c closure).
     #[must_use = "dropping the returned guard immediately unsubscribes the callback"]
     pub fn subscribe_floors_raised(
         &self,
@@ -1525,8 +1954,13 @@ impl OrgRevocationStore {
         // have dropped — a callback that re-enters `apply_bundle`
         // on the same store must not deadlock (review-9).
         enum LockedOutcome {
-            Applied(Vec<RaisedFloor>),
-            DurabilityUncertain(Vec<RaisedFloor>, String),
+            /// Raised floors, plus whether this apply RECOVERED the path from
+            /// poison — which owes an authority wake even when nothing rose.
+            Applied(Vec<RaisedFloor>, bool),
+            /// Raised floors, the reason, and whether the mark was the
+            /// false→true TRANSITION — which owes the same wake the recovery
+            /// does when nothing rose (E3c blockers §1).
+            DurabilityUncertain(Vec<RaisedFloor>, String, bool),
         }
 
         // 1. Verify the incoming bundle's signature + canonical
@@ -1598,9 +2032,25 @@ impl OrgRevocationStore {
 
             // 5. Persist iff the disk state changed; the write must
             //    complete before anything is published.
-            let mut durability_uncertain: Option<String> = None;
+            let mut durability_uncertain: Option<(String, bool)> = None;
             if raised_on_disk > 0 {
-                match write_atomic_phased(path, &merged.to_file_bytes()?) {
+                // Test seam: report a post-rename durability failure while
+                // leaving the file at its PRIOR bytes — the exact uncertainty
+                // PostRename names (the entry may resolve to the old state).
+                // On Windows the phase is otherwise unreachable in production
+                // (write-through rename, §13), so the mark path has no other
+                // witness route there.
+                #[cfg(test)]
+                let write = if self.core.force_post_rename.swap(false, Ordering::AcqRel) {
+                    Err(WritePhase::PostRename(
+                        "forced post-rename failure (test seam)".to_string(),
+                    ))
+                } else {
+                    write_atomic_phased(path, &merged.to_file_bytes()?)
+                };
+                #[cfg(not(test))]
+                let write = write_atomic_phased(path, &merged.to_file_bytes()?);
+                match write {
                     Ok(()) => {}
                     Err(WritePhase::PreRename(reason)) => {
                         // Old file (rename never happened) and old
@@ -1621,8 +2071,10 @@ impl OrgRevocationStore {
                         // instance may pretend disk and memory are
                         // synchronized until recovery proves the
                         // entry durable.
-                        mark_poisoned(&self.core.backing_id, path);
-                        durability_uncertain = Some(reason);
+                        // Ordered BEFORE the publish below, matching the frozen
+                        // `poison_gate` → `live` order.
+                        let newly_poisoned = self.core.mark_poisoned();
+                        durability_uncertain = Some((reason, newly_poisoned));
                     }
                 }
             }
@@ -1633,28 +2085,55 @@ impl OrgRevocationStore {
             //    recovered poison and release the lock;
             //    notification happens outside.
             let raised = self.core.publish(merged);
-            if was_poisoned && durability_uncertain.is_none() {
-                clear_poison(&self.core.backing_id, path);
+            let recovered = was_poisoned && durability_uncertain.is_none();
+            if recovered {
+                // Through the CORE: the clear is exactly as load-bearing as the
+                // mark, and the file lock is still held here — the wake for it
+                // happens below, outside every guard.
+                self.core.clear_poison();
             }
             drop(lock);
             match durability_uncertain {
-                None => LockedOutcome::Applied(raised),
-                Some(reason) => LockedOutcome::DurabilityUncertain(raised, reason),
+                None => LockedOutcome::Applied(raised, recovered),
+                Some((reason, newly)) => LockedOutcome::DurabilityUncertain(raised, reason, newly),
             }
         };
 
         match outcome {
-            LockedOutcome::Applied(raised) => {
+            LockedOutcome::Applied(raised, recovered) => {
                 self.core.notify(&raised);
+                if recovered {
+                    // A recovery that raised nothing still moved authority.
+                    self.core.notify_authority_changed();
+                }
                 Ok(raised)
             }
-            LockedOutcome::DurabilityUncertain(raised, reason) => {
+            LockedOutcome::DurabilityUncertain(raised, reason, newly_poisoned) => {
                 let err = OrgRevocationError::DurabilityUncertain {
                     path: path.display().to_string(),
                     reason,
                 };
                 tracing::error!("{err}");
                 self.core.notify(&raised);
+                if newly_poisoned && raised.is_empty() {
+                    // The MARK owes the same wake the CLEAR does (E3c blockers
+                    // §1): what this node may serve just went from the real
+                    // material to NOTHING, yet `notify` is silent on an empty
+                    // raise set — which is exactly what a mark produces
+                    // whenever the live view was already ahead of what disk
+                    // can prove (the rollback case PostRename models). Without
+                    // this, the registry stays reconciled to pre-poison facts
+                    // until a reader happens to trip the lazy epoch check.
+                    //
+                    // Guarded on BOTH conditions: a non-empty `raised` already
+                    // woke every subscriber above — authority-tracking
+                    // subscribers treat any invocation as movement, so waking
+                    // again would double-bump the epoch for one transition —
+                    // and a re-mark of an already-poisoned path has no
+                    // transition to report; routing facts are already stamped
+                    // `poisoned == true`.
+                    self.core.notify_authority_changed();
+                }
                 Err(err)
             }
         }
@@ -1811,11 +2290,17 @@ fn poison_path_key(normalized_path: &Path) -> PathBuf {
 
 /// Poison `normalized_path` under BOTH indexes (R3-2), recording `id` in the
 /// path's id set so recovery can retire every id ever poisoned here.
-fn mark_poisoned(id: &BackingId, normalized_path: &Path) {
+/// Returns whether the path was NEWLY poisoned — neither index held it before.
+/// The transition signal `apply_bundle` uses to decide whether a mark that
+/// raised no floor still owes an authority wake (E3c blockers §1). Computed
+/// under the registry lock, so it cannot race a concurrent mark or clear.
+fn mark_poisoned(id: &BackingId, normalized_path: &Path) -> bool {
     let key = poison_path_key(normalized_path);
     let mut reg = poison_registry().lock();
+    let newly = !reg.by_id.contains(id) && !reg.by_path.contains_key(&key);
     reg.by_id.insert(id.clone());
     reg.by_path.entry(key).or_default().insert(id.clone());
+    newly
 }
 
 /// Poisoned iff EITHER the live sidecar identity OR the canonical state
@@ -4124,7 +4609,7 @@ mod tests {
             OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
                 .expect("init"),
         );
-        let g0 = store.barriered_generation();
+        let g0 = store.barriered_generation().expect("not exhausted").get();
 
         // Arm the one-shot pause, then raise a floor on another thread:
         // it swaps the live view and blocks BEFORE bumping the
@@ -4153,8 +4638,8 @@ mod tests {
         let reader = {
             let store = store.clone();
             std::thread::spawn(move || {
-                let g = store.barriered_generation();
-                let _ = reader_tx.send(g);
+                let g = store.barriered_generation().expect("not exhausted");
+                let _ = reader_tx.send(g.get());
             })
         };
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -4175,7 +4660,53 @@ mod tests {
             g0 + 1,
             "the barriered read returned the NEW generation, never the stale one",
         );
-        assert_eq!(store.barriered_generation(), g0 + 1);
+        assert_eq!(
+            store.barriered_generation().expect("not exhausted").get(),
+            g0 + 1
+        );
         assert!(store.floor_for(&org().org_id(), &member()) >= 9);
+    }
+
+    /// The publication generation NEVER wraps: at the ceiling it freezes and
+    /// latches.
+    ///
+    /// Wrapping is not a bounded-counter inconvenience, it is an aliasing bug: a
+    /// consumer using the generation as a currentness discriminator would accept
+    /// evidence built against the OLD view as current against the NEW one (Kyra
+    /// OLB-2B-E3c).
+    #[test]
+    fn an_exhausted_publication_generation_freezes_rather_than_wrapping() {
+        let scratch = Scratch::new();
+        let store =
+            OrgRevocationStore::init(scratch.state_path(), ProvisioningExpectation::MayBeFresh)
+                .expect("init");
+
+        assert!(store.barriered_generation().is_ok());
+        store.saturate_generation_for_test();
+        assert_eq!(
+            store
+                .barriered_generation()
+                .expect("not yet exhausted")
+                .get(),
+            u64::MAX
+        );
+
+        store.republish_for_test();
+
+        assert_eq!(
+            store.barriered_generation(),
+            Err(GenerationExhausted),
+            "the exhausted space must be reported as an ERROR the caller cannot              ignore, not as a frozen integer that reads as unchanged"
+        );
+        assert_eq!(
+            store.snapshot_with_generation().err(),
+            Some(GenerationExhausted),
+            "the coherent snapshot sampler fails closed the same way"
+        );
+        assert!(store.generation_exhausted_for_metrics());
+
+        // Terminal: a further publication does not clear it.
+        store.republish_for_test();
+        assert_eq!(store.barriered_generation(), Err(GenerationExhausted));
     }
 }

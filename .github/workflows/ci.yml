@@ -64,6 +64,143 @@ jobs:
       - name: Run unit tests (all in-source units, full feature set)
         run: cargo test --lib --features "$UNIT_FEATURES"
 
+      # OLB-2B-E3c: the production routing-plane wiring witnesses
+      # (`src/adapter/net/org_routing_wiring_tests.rs`, included from `mesh.rs`).
+      # The step above already runs them — this one exists to make the coverage
+      # NAMED and drift-detecting, the `--lib` analogue of the pinned
+      # `--test <file>` discipline used for the integration binaries below.
+      #
+      # A filtered run that matches nothing exits 0, so "the module was renamed,
+      # feature-gated, or deleted" would otherwise look identical to "it passed".
+      # The count assertion is what closes that: these witnesses are the only
+      # proof that ONE global drain is minted, that the dirty stream reaches the
+      # real registry, that shutdown joins the routing task before returning, and
+      # that the publication gate is a commit pin rather than a reconstruction
+      # lock -- plus, since the E3c closure, that shutdown cannot slip between the
+      # supervisor spawn and its handle publication, that revocation authority is
+      # inside the currentness token, that an unserved scope reads cold rather
+      # than authoritatively empty, that cached facts crossing their expiry read
+      # cold, that Drop fences rather than detaching, that a concurrent shutdown
+      # cannot return while routing registration is unresolved, that revocation
+      # authority is pinned through installation and revalidated at read, and that
+      # authority-only movement invalidates and requeues -- plus, since the
+      # poison closure, that a durability POISON is immobile through settlement
+      # in BOTH directions (a production recovery clear cannot land under a live
+      # publication pin), and that leaving steady poison is observable: the
+      # recovery wakes routing proactively AND a reader retires the stranded
+      # `Unserved` reconstruction on its own -- plus, since the E3c-blockers
+      # closure, that steady poison itself settles Current over an Unserved
+      # source rather than retrying forever, that an empty-raise poison MARK
+      # wakes routing as proactively as the clear does, and that terminal
+      # authority exhaustion retires its MAX-stamped facts and fences readiness
+      # independently of supervisor health -- plus, since review-pass-3, that the
+      # OTHER exhaustion arm (an exhausted store publication generation, which
+      # the pin ACCEPTS and only the settlement refuses) parks the actor without
+      # spinning and without losing its queue, and that an EMPTY registry whose
+      # authority moves inside the probe->settle window is re-driven rather than
+      # stranded at `Rebuilding`, that the read seam fences a DEAD incarnation's
+      # still-retained facts, and that its authority sample cannot straddle a
+      # store install. Losing any of them silently would be worse than losing
+      # them loudly.
+      #
+      # NOTE: they are gated `#[cfg(test)]`, NOT `feature = "fixtures"` —
+      # `$UNIT_FEATURES` deliberately excludes `fixtures`, so a fixtures gate
+      # would compile this module to a silent 0-test no-op here.
+      - name: Gate OLB-2B routing-plane wiring witnesses
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          MIN=41
+          out=$(cargo test --lib --features "$UNIT_FEATURES" \
+                  org_routing_wiring_tests 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" \
+                | grep -oE 'test result: ok\. [0-9]+ passed' \
+                | grep -oE '[0-9]+' | head -1)
+          if [ -z "$n" ] || [ "$n" -lt "$MIN" ]; then
+            echo "::error::expected >= $MIN routing-plane wiring witnesses, ran ${n:-0}."
+            echo "The module is src/adapter/net/org_routing_wiring_tests.rs, declared"
+            echo "in mesh.rs. If witnesses were intentionally removed, lower MIN in"
+            echo "this step in the same commit — do not let the gate pass vacuously."
+            exit 1
+          fi
+          # Cardinality alone cannot tell WHICH witness vanished, so pin the
+          # names of the ones that carry a security property outright.
+          REQUIRED="shutdown_overlapping_registration_cannot_return_unresolved
+          a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive
+          a_snapshot_cannot_straddle_a_store_publication
+          a_publication_cannot_occupy_the_gap_between_validation_and_settlement
+          poison_cannot_occupy_the_gap_between_validation_and_settlement
+          a_recovery_poison_clear_cannot_land_under_a_publication_pin
+          a_poison_recovery_retires_the_unserved_reconstruction_it_left
+          a_poison_mark_that_raises_no_floor_wakes_routing_without_a_reader
+          a_reader_retires_unserved_facts_once_their_poison_clears
+          steady_poison_settles_current_over_an_unserved_source
+          an_exhausted_store_generation_stops_certified_emission
+          an_exhausted_authority_epoch_fences_rather_than_aliasing
+          terminal_exhaustion_retires_max_stamped_facts_and_fences_readiness
+          an_exhausted_store_generation_parks_apply_without_spinning_and_recovers
+          an_empty_registry_whose_authority_moves_under_the_probe_is_redriven
+          the_read_seam_fences_a_dead_incarnations_facts
+          the_read_seams_authority_sample_cannot_straddle_a_store_install
+          an_exhausted_scoped_generation_fences_the_routing_source
+          an_unserved_scope_reads_cold_rather_than_authoritatively_empty"
+          for required in $REQUIRED; do
+            if ! printf "%s" "$out" | grep -q "$required"; then
+              echo "::error::required routing witness missing: $required"
+              exit 1
+            fi
+          done
+          echo "routing-plane wiring witnesses: $n passed (min $MIN); all named security witnesses present"
+
+      # OLB-2B-E2/E3c: the SUPERVISOR/incarnation/crash-loop witnesses
+      # (`behavior::org_routing::tests`), gated on the same count+name pattern as
+      # the wiring witnesses above.
+      #
+      # review-pass-3 §18: this module runs in the gating `--lib` step only
+      # because a2509d8a3 widened its cfg from `all(test, feature = "fixtures")`
+      # to plain `test` — the exact regression that already happened once on this
+      # branch. The wiring witnesses got a floor and pinned names; these got
+      # nothing, so a future "clean up the fixtures seams" re-gating would drop
+      # the incarnation fence, the crash-loop budget, the shutdown-ordering
+      # proofs and the non-convergence backoff out of every gating job in
+      # silence. Same reasoning as the note below: `$UNIT_FEATURES` excludes
+      # `fixtures`, so a fixtures gate compiles this module to a silent 0-test
+      # no-op here.
+      - name: Gate OLB-2B routing supervisor witnesses
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          MIN=24
+          out=$(cargo test --lib --features "$UNIT_FEATURES" \
+                  behavior::org_routing:: 2>&1 | tee /dev/stderr)
+          n=$(printf '%s\n' "$out" \
+                | grep -oE 'test result: ok\. [0-9]+ passed' \
+                | grep -oE '[0-9]+' | head -1)
+          if [ -z "$n" ] || [ "$n" -lt "$MIN" ]; then
+            echo "::error::expected >= $MIN routing supervisor witnesses, ran ${n:-0}."
+            echo "The module is the #[cfg(test)] mod tests in"
+            echo "src/adapter/net/behavior/org_routing.rs. If it was re-gated to"
+            echo "feature = \"fixtures\", it compiles to a silent no-op in this job —"
+            echo "that is the regression this floor exists to catch."
+            exit 1
+          fi
+          REQUIRED="a_held_stream_fences_instead_of_starting_a_drainless_actor
+          only_the_live_incarnations_routes_are_usable
+          incarnation_overflow_fences_rather_than_reusing_an_id
+          a_deterministic_fault_exhausts_the_restart_budget_and_stays_fenced
+          unwind_only_a_panicking_apply_still_runs_the_fence_guard
+          shutdown_inside_apply_is_never_followed_by_healthy
+          cancelling_the_supervisor_drops_the_incarnation_and_frees_the_lease
+          a_closed_watch_without_shutdown_is_loud_and_terminal
+          a_sustained_superseded_streak_backs_off_and_reports_degraded"
+          for required in $REQUIRED; do
+            if ! printf "%s" "$out" | grep -q "$required"; then
+              echo "::error::required routing supervisor witness missing: $required"
+              exit 1
+            fi
+          done
+          echo "routing supervisor witnesses: $n passed (min $MIN); all named security witnesses present"
+
       # Doctests live in `///` comment blocks across `src/` and `sdk/src/`.
       # `cargo test --lib` does not execute them — they need a separate
       # `cargo test --doc` invocation. Same broad feature set so doc
@@ -315,6 +452,9 @@ jobs:
         run: >
           cargo nextest run --no-fail-fast --features "cortex tool fixtures"
           --test sensing_dispatch
+          --test sensing_org_three_node
+          --test sensing_lease
+          --test sensing_lease_wire
           --test sensing_failure_plane
           --test sensing_fallback
           --test sensing_origin_emitter

@@ -121,6 +121,23 @@ pub enum ResolutionRefusal {
         /// The configured `maximum_fanout`.
         cap: usize,
     },
+    /// A second registration joined an existing coalescing key whose cached
+    /// admitted authority provenance does NOT match this registration's — an
+    /// org-vs-legacy (or cross-org) collision on one `ProviderInterestKey`.
+    /// Computationally unreachable in honest operation (the interest digest
+    /// binds the audience, and the org-commitment and entity-owner-root audience
+    /// families are cryptographically disjoint), so this is a defensive
+    /// invariant: a future digest/scope refactor that silently invalidated the
+    /// key-separation proof would surface here as a loud refusal rather than a
+    /// silent authority downgrade of the coalesced demand.
+    AuthorityMismatch,
+    /// An admitted wrapper reached the leader's CAPABILITY intake carrying a
+    /// non-capability leg (e.g. a provider leg). Refused BEFORE candidate
+    /// resolution, seed insertion, or any table mutation — the leg is the sole,
+    /// immutable source of the registering consumer + timing, so a mismatched leg
+    /// must never be cached as a coalesced interest's seed. A code-level
+    /// invariant (the admitted intake is crate-internal), never honest input.
+    AdmittedLegMismatch,
 }
 
 /// The bounded outcome of one resolution pass.

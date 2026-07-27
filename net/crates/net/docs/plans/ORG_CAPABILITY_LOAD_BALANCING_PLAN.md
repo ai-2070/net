@@ -1,38 +1,173 @@
 # Org Capability Load Balancing Plan (OLB)
 
-**Version:** v0.4 — applies Kyra's re-review verdict (2026-07-22, read
-at master `6e9d686ee`): every architecture dimension **APPROVED**
-(product surface, private-provider sensing path, organization sensing
-authority, node-global lifecycle ownership, cadence aggregation,
-viability semantics, hot-path performance, bounded SameOrg-first
-rollout); three narrow implementation points pinned here —
+**Version:** v0.6 — incorporates the 2026-07-24 performance/adversarial review
+while preserving the approved exact-provider-first architecture. The integrated
+pins are:
 
-13. the registration wire choice is **pinned**: organization-
-    authenticated variants APPENDED to `SensingInterestFrame` under the
-    existing 0x0C02 subprotocol, eight locked requirements (§5.1b;
-    sensing plan S0);
-14. route-set publication is **publish-if-current** over a full
-    `RouteSourceGeneration` source vector — never last-writer-wins
-    (§7);
-15. authority validity edges arm **deadline timers**
-    (`next_authority_deadline` + one reconciler timer per capability),
-    with the per-call temporal recheck retained as defense in depth
-    (§7; OLB-2 witnesses).
+13. organization-authenticated variants remain APPENDED to
+    `SensingInterestFrame` under existing 0x0C02 (§5.1b; sensing plan S0);
+14. route-set publication remains **publish-if-current** over the complete
+    `RouteSourceGeneration`, never last-writer-wins (§7);
+15. all client families share ONE node-owned bounded routing scheduler/deadline
+    structure; no actor/task/timer exists per capability or client family;
+16. OLB and the provider-free leader share only the transactional indexed
+    private-discovery storage/source substrate plus session/topology generations,
+    never authority-filtered candidate or lifecycle state;
+17. accepted scoped descriptors are decoded once at ingest and queried by
+    capability bucket; a discovery mutation never triggers one store scan per
+    warmed capability/client family;
+18. every warmed call compares an OPAQUE coherent authority epoch
+    (installation identity/generation + barriered revocation generation) before
+    proof/send; token mismatch forbids use of the cached route set.
 
-Per the verdict, once these are confirmed: **OLB-0 → OLB-1 → bounded
-stop-and-review**, with no further architecture review before OLB-0.
+Execution remains **OLB-1 → bounded stop-and-review → OLB-2**; the integrated
+leader design does not reopen OLB-0 or move the stop boundary.
 
-v0.3 applied Kyra's performance ruling (2026-07-22):
-the public product shape was confirmed simple enough; the
-implementation is now pinned so a warmed `org.call` is **two
-comparisons, not a recomputation of the network** —
+**Implementation status (2026-07-24) — Option-A exact-provider track.** The org
+sensing go-live ships **exact-provider first**: only the relay re-authoring of
+`OrgProviderRegistration` is live; the `OrgCapabilityRegistration` (leader /
+capability-resolution) path remains deliberately **dark**. The live provider
+slice is signed at **`SAFE_PROVIDER_LIVE_HEAD = b76f67284`**; its three-node
+transport/CI closure is signed at `e7fce993e`. Node-global local-projection and
+pre-leader race closure is signed at
+**`PRE_LEADER_CLOSURE_HEAD = cdb416a6b`**. The complete seed-derived leader
+lifecycle entry condition is signed at
+**`LEADER_ENTRY_CONDITION_HEAD = f2c82e467`**.
+
+These closures complete the practical Option-A OLB-0 substrate. **OLB-1
+candidate factoring is SIGNED** at `OLB1_SIGNED_HEAD = 4dccb7767`
+(behavior-preserving `AuthorizedOrgCandidate` factoring in `call.rs`, with direct
+reachability sampled in sorted order to preserve the pre-factoring selection).
+The mandatory bounded stop-and-review passed, so **OLB-2 is authorized and its
+first slice, OLB-2A, is landing** — the GENERIC transactional indexed
+private-discovery substrate. **OLB-2A.1** (`ScopedDiscoveryState` wraps
+`ScopedDiscoveryStore`) makes the owner-plane capability query a SINGLE indexed
+bucket lookup (`owner_by_capability[cap]`, no scan of unrelated scopes) with NO
+per-record descriptor decode: the descriptor is decoded once at ingest into an
+opaque `PreparedScopedCapability` — bound to the verified record BEFORE the final
+publication-race recheck, so the row and its index buckets cannot diverge — and a
+per-record declaration budget bounds index associations fail-closed.
+`ingest`/`sweep_expired` return the visible-set delta the index consumes in one
+transaction. **OLB-2A.2** adds the CHANGE SOURCE: monotone global + owner
+mutation/sweep generations and bounded affected-capability deltas (`RebuildAll`
+overflow), maintained per mutation on the qualifying transitions. The generations
+are polled read-only via `MeshNode` (`private_discovery_generation`/
+`_owner_generation`); the DESTRUCTIVE deltas are crate-internal, drained through
+the atomic `ScopedDiscoveryState::take_{global,owner}_change_batch`
+(generation + dirty captured under one lock) reserved for the single node-owned
+consumer of each stream. The owner stream is a subset of the global stream, so
+valid grant-audience churn never ADVANCES the owner generation — a claim about
+that generation, not about wakeups: the change watch carries the GLOBAL
+generation, so grant-only movement can still wake an owner-only consumer, which
+then observes its generation unmoved and sleeps again. Only a distinct
+owner-filtered watch would make grant churn invisible to it, and none exists
+today. These are
+MUTATION/SWEEP generations, not yet complete query-visible-set generations —
+wall-clock expiry and floor raises change results before they advance. **OLB-2A.3**
+closes that and adds the push wake, in bounded sub-slices: **2A.3.1** (SIGNED at
+`93f7b03d2`) routes every scoped-store mutation through one
+`ScopedMutationPublication` — a node-global gate bound to the change `watch`.
+Each transaction holds the gate from BEFORE its final currentness recheck (so
+the signed 2A.1 recheck→insert boundary stays closed) through its publication, so
+mutation and publication SERIALIZE node-wide: an older transaction's publication
+can never overwrite a newer one, and only a transaction that advanced the
+generation publishes (a no-op wakes nobody). `subscribe_private_discovery_changes`
+is the read-only push signal, replacing the interim poll-only model. **2A.3.2** is
+the EXACT-EXPIRY SOURCE ONLY: event-driven `next_visible_expiry` min-tracking in
+`ScopedDiscoveryState` (an ordered expiry multiset over the records whose expiry
+can change a query result — live AND declaring at least one capability; tombstones
+and inert zero-declaration rows are excluded, since a deadline no wake can follow
+would be a minimum the timer is never re-armed to) plus ONE node-owned resettable
+exact-expiry timer (`run_exact_expiry_timer`) that arms to exactly that deadline,
+sweeps at it through the gated commit (so consumers wake), and re-arms to any
+earlier deadline a mutation introduces via the same change watch. The arm is
+derived from the ABSOLUTE deadline against a subsecond wall clock, so it does not
+round up to the next whole second; the timer arms its shutdown wake BEFORE
+observing the shutdown flag, so a `notify_waiters` landing in that window cannot
+strand it (both Kyra OLB-2A.3.2). Reads stay expiry-safe (`now < expires_at` at
+query time), so this is promptness/wake, not a correctness boundary, and the 60 s
+GC remains a retention backstop — including for the inert rows above.
+**2A.3.3** (landed) closes the last gap — REVOCATION FLOOR RAISES. A raised floor
+retracts a stored record at query time with no store mutation, so before this it
+advanced no generation and woke nobody: a consumer kept serving a provider the org
+had just revoked until unrelated churn moved the store. The node's existing
+floor-raise subscription (and the install-time reconciliation sweep, for a store
+installed after its floors already rose) now also runs
+`ScopedDiscoveryState::note_floors_raised` through the gated commit. Each raised
+`(org, provider, floor)` reaches exactly that provider's records through a reverse
+provider index — never a live-set scan — applying the same predicate as the
+read-time filter against the STORED org and membership generation.
+
+That reverse index holds the FLOOR-VISIBLE records, not every live row, and a
+record leaves it the once, on the raise that first hides it. Measuring the
+transition against that set rather than against "is this row invisible under the
+new floor" is what makes invalidation IDEMPOTENT (Kyra OLB-2A.3.3): a repeated or
+INCREMENTAL raise over an already-hidden row, an install-snapshot replay in either
+order, an equal or dominating store replacement, and the row's eventual expiry or
+capacity demotion are all structural no-ops rather than spurious generation
+advances and wakes. Store membership, the declaration map, and the owner buckets
+are deliberately unchanged — floors are monotone, so a retracted row can never
+return; it stays a live row the read-time filter hides and is reclaimed by the
+ordinary expiry/GC path, which keeps the signed invariant that the index mirrors
+exactly the store's live set. Only the currentness helpers narrow (the row also
+leaves the exact-expiry wake metadata, since an invisible row's deadline can no
+longer produce a visible transition); a later current re-announcement is admitted
+normally and reinstalls both.
+
+With 2A.3.2 and 2A.3.3 landed the generations are QUERY-VISIBLE-SET generations —
+store mutation, exact expiry, and floor movement each advance them, and each
+genuine transition advances them exactly once — closing the OLB-2A.2 caveat above. All of OLB-2A.3 must land and be
+reviewed before any reconciler consumes this source.
+
+**Exclusive destructive-drain ownership belongs to the OLB-2B actor-entry
+boundary, not to 2A.3** (Kyra, 2026-07-24; a first attempt inside 2A.3.2 was
+reverted). The destructive `take_global_change_batch` /
+`take_owner_change_batch` must gain a single owner BEFORE the reconciler's first
+drain — but the ownership capability has to be established together with its
+consumer, in one slice that also seals the raw takes behind it (they are
+`pub(crate)` today, so a mint alone does not make a second drainer
+unrepresentable), fixes the handle's visibility to the actor's module, and
+defines startup/drop/panic/restart policy for a stranded stream. The invariant
+that stands regardless: no reconciler may consume this source before exclusive
+ownership exists. **OLB-2A.4** (landed) replaces the store's `entries_in_scope` scan with a
+maintained per-scope count. The per-scope admission guard consults it on every NEW
+key, so the scan made admission cost grow with total store occupancy — up to two
+passes over 8192 entries per insert, on the inbound dispatch path, paid by every
+scope regardless of its own size. `scope_counts` is maintained in the same
+operation as the entry map whose membership it counts, at the only two sites that
+change that membership (admitting a new key, forgetting one past its tombstone
+horizon); tombstones deliberately keep their slot, which is what stops a demoted
+key from rolling a scope's budget backward. Behavior-preserving: the guard is
+unchanged apart from where it reads the count. This substrate is shared with the
+provider-free leader track but carries no authority-filtered candidate or
+lifecycle state. The separate
+owner-private provider-free leader design lives in
+[`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md).
+It is NOT an OLB-1..OLB-5 prerequisite and remains unauthorized for build. The
+plans share only the transactional indexed private-discovery storage/source
+substrate plus peer-session/routing/proximity generations. Whichever track lands
+it first exposes the same internal predecoded buckets, bounded dirty deltas, and
+wakes to the other. The leader's owner projection/resolver, provider-free
+leases, and `OrgCapabilityRegistration` never enter exact-provider OLB.
+
+The live slice also closes the explicit-fleet-root cross-authority coalescence
+class: legacy sensing intake rejects an organization-derived audience when
+authority is installed, and authority installation (runtime and configured
+startup) is refused over an explicit fleet root equal to the org's canonical
+sensing commitment. Global `SAFE_LIVE_HEAD` remains reserved for an eventual,
+separately reviewed provider-free leader lighting; it is not required to ship
+OLB-5.
+
+v0.3 established the hot-path performance ruling; v0.6 tightens its authority
+semantics. The public product shape remains simple and a warmed `org.call` is
+fixed O(1) work—not a recomputation of the network—while retaining the mandatory
+opaque authority-epoch comparison:
 
 7. the hot path is an `ArcSwap` load of a **change-driven immutable
-   `OrgRouteSet`** — no rediscovery, no candidate revalidation scans,
-   no observation scans, no sorting, no interest reconciliation, and no
-   registration waits on the request path (§7);
-8. a per-call complexity contract: route-set load, temporal recheck,
-   P2C sample, proof, dispatch — all O(1) (§7);
+   `OrgRouteSet`** — no rediscovery, candidate scan, observation scan, sort,
+   interest reconciliation, or registration wait (§7);
+8. the per-call contract is route-set load, authority-epoch comparison,
+   temporal window recheck, P2C sample, proof, dispatch — all O(1) (§7);
 9. per-request sorting of Ready candidates is prohibited; the fallback
    vector is sorted once at rebuild (§9);
 10. exact-provider fan-out is hard-bounded (32 sensed providers per
@@ -52,14 +187,16 @@ SameOrg-first rollout, granted-unsensed fallback, and node-global
 ownership doctrine); implementation was **BLOCKED** on two structural
 findings and four bounded corrections, all applied in this revision:
 
-1. **Private providers never entered the sensing producer path** —
-   org-private routing now uses **exact-provider, org-authenticated
-   sensing leases** derived from private authorized discovery, never
-   provider-free rendezvous (§5.1a, §7). The provider-free sensing
-   population deliberately excludes locally private nRPC services (the
-   private-capability existence-oracle guard), so a rendezvous leader
-   can never re-discover what private discovery already authorized;
-   `resolved_population` is a projection-stage clamp, not a producer.
+1. **Private providers never entered the sensing producer path** — this OLB
+   track uses **exact-provider, org-authenticated sensing leases** derived from
+   private authorized discovery, never a generic provider-free rendezvous
+   population (§5.1a, §7). The exact-provider population is therefore fixed
+   upstream by private discovery; `resolved_population` remains a
+   projection-stage clamp, not a producer. A separately reviewed provider-free
+   leader MAY consume an owner-private projection only inside an
+   organization-admitted, audience-isolated interest as specified by
+   `ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`; that parallel path never supplies
+   OLB candidates and never feeds the plaintext fold.
 2. **Organization membership is now authenticated at sensing
    registration** — membership-cert-carrying registration variants,
    validated at every receiving hop; a narrow additive wire extension
@@ -77,9 +214,21 @@ findings and four bounded corrections, all applied in this revision:
 6. **The P2C sampler contract is pinned** (seed + nonce; reproducible,
    non-stampeding) (§9).
 
-**Status: the three re-review pins are applied. Pending Kyra's
-confirmation of them, implementation proceeds OLB-0 → OLB-1 → bounded
-stop-and-review with no further architecture review before OLB-0.**
+**Current execution point:** architecture and Option-A OLB-0 are signed; OLB-1
+candidate factoring is signed at `4dccb7767`. The bounded stop-and-review that
+gated OLB-2 has PASSED — see the implementation-status note above, which records
+the authorization and the OLB-2A slices that followed it. OLB-2A composed is
+signed at `65b9fe903`. OLB-2B (the supervised node-owned routing actor and its
+bounded registry) is LANDED on the `load-balancing` branch and is HELD pending
+the pass-2/pass-3 review closure recorded in
+[`OLB_2B_CONSUMER_ENTRY_DESIGN.md`](OLB_2B_CONSUMER_ENTRY_DESIGN.md); OLB-2C is
+not authorized until that closure signs.
+
+*(review-pass-3 §19: this paragraph previously still said "OLB-2 does not begin
+until it signs off", contradicting the implementation-status note above it, which
+had said the opposite since `4dccb7767`. For a plan whose process leans this hard
+on recorded gates, a self-contradicting status is a hole in the audit trail, not
+a typo.)*
 
 **The sentence:** organization-aware load balancing is an internal
 composition of private authorized discovery, capability sensing, and
@@ -114,6 +263,9 @@ implemented two-verb facade this composes beneath),
 [`CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`](CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md)
 (the sensing SDK lifecycle this consumes — its S0/S1 are OLB-0's
 prerequisite, including the org-authenticated registration seam),
+[`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md)
+(the parallel provider-free owner-private leader design — shares only the
+indexed private-discovery/source substrate and does not gate OLB-1..OLB-5),
 [`ORG_CAPABILITY_AUTH_PLAN.md`](ORG_CAPABILITY_AUTH_PLAN.md) /
 [`OA2E_INTEGRATION_DESIGN.md`](OA2E_INTEGRATION_DESIGN.md) (the closed
 authority substrate — untouched here),
@@ -192,34 +344,37 @@ kind's classification and nothing else (the OSDK-L review rule).
 
 ### 3.1 The org call path
 
-`OrgClient::call` (`sdk/src/org/call.rs:85`) → `call_bytes` (`:115`) →
-`call_bytes_deadline` (`:135`), which calls `plan(service)` (`:142`) and
+`OrgClient::call` (`sdk/src/org/call.rs:109`) → `call_bytes` (`:139`) →
+`call_bytes_deadline` (`:159`), which calls `plan(service)` (`:166`) and
 then issues exactly one `MeshNode::call` to the planned provider
-(`:160`). No retry exists on any path.
+(`:186`). No retry exists on any path.
 
-`plan` today:
+`plan` today (post-OLB-1 factoring):
 
 ```text
 derive CapabilityAuthorityId::for_tag("nrpc:<service>")
-→ discover_private (call.rs:300)
-     SameOrg  → MeshNode::owner_private_capability_providers (call.rs:303)
-     Granted  → MeshNode::granted_capability_providers per DISCOVER
-                grant (call.rs:318)
-→ authorized_targets (call.rs:234)
+→ authorized_candidates (call.rs:262)
+     discover_private (call.rs:275)
+       SameOrg  → MeshNode::owner_private_capability_providers (call.rs:357)
+       Granted  → MeshNode::granted_capability_providers per DISCOVER
+                  grant (call.rs:372)
      classify Candidate { provider, owner_org, same_org } (call.rs:69)
-     into Mode::SameOrg | Mode::Granted(grant) (call.rs:60)
-     via match_invoke_grant (call.rs:346; ambiguity is a typed error)
-→ sort targets by EntityId bytes (call.rs:265 — "load-blind on purpose")
-→ pick the FIRST candidate with a live direct session:
-     peer_entity_id(provider.node_id()) == Some(provider) (call.rs:212)
-→ intent_for → canonical nine-field OrgProofIntent (call.rs:271;
+       into Mode::SameOrg | Mode::Granted(grant) (call.rs:60)
+       via match_invoke_grant (call.rs:400; ambiguity is a typed error),
+       in DISCOVERY order (preserves which ambiguity surfaces)
+     sort AuthorizedOrgCandidate by EntityId bytes (call.rs:311 — "load-blind")
+     annotate direct reachability in SORTED order (call.rs:323):
+       peer_entity_id(provider.node_id()) == Some(provider)
+→ select the first direct candidate (call.rs:235), else
+     ProviderNotDirect (call.rs:239), else NoAuthorizedProvider (call.rs:244)
+→ intent_for → canonical nine-field OrgProofIntent (call.rs:333;
      mesh_rpc.rs:231-253)
 → one exact-target call → coarse 0x0009 denial decode
 ```
 
-That is secure but load-blind. The selection comment in `call.rs:262-264`
-says so explicitly: spreading load was "a policy the facade has no basis
-to invent." Sensing is that basis.
+That is secure but load-blind. The ordering (`call.rs:311`) is deliberately
+load-blind: spreading load was "a policy this stage has no basis to invent."
+Sensing is that basis.
 
 ### 3.2 What sensing already supplies
 
@@ -608,10 +763,9 @@ owner with client lifetime:
 
 ```rust
 struct OrgRoutingState {
-    watches: Mutex<BoundedMap<OrgInterestKey, ExactInterestSet>>,
-    routes:  BoundedMap<CapabilityKey, ArcSwap<OrgRouteSet>>,
+    slots: Mutex<BoundedMap<CapabilityKey, NodeOrgRouteHandle>>,
     selector: SensedSelectorState,
-    // one wake-driven reconciler task per clone family
+    // ownership handle only; no task/timer/reconciler
 }
 
 pub struct OrgClient {
@@ -623,20 +777,19 @@ pub struct OrgClient {
 Semantics:
 
 ```text
-all OrgClient clones            → share routing state
-first call to service C         → install exact-provider interest guards
-later call to C                 → reuse the warmed route set
-authorized provider set changes → acquire new exact interests,
-                                  release removed interests
-input change                    → reconciler rebuilds the route set;
-                                  calls only ever read
-last client clone drops/closes  → release all guards, stop reconciler
+all OrgClient clones            → share one family handle set
+independent client families     → share node base facts + scheduler
+first call to service C         → acquire node route-slot + exact lease handles
+later call to C                 → read the slot's immutable route set
+authorized provider set changes → node actor acquires/releases lease delta
+input change                    → node actor rebuilds/publishes; calls only read
+last family clone drops/closes  → release that family's slot/lease references
+last node-slot consumer drops   → retire shared slot; node actor remains bounded
 ```
 
-The actual registration refcount remains node-global (below).
-`OrgRoutingState` owns only RAII guards, the route snapshots, and
-selector state — the `AudienceLeaseGuard` ownership shape, one level up.
-The internal machinery is exactly four operations and stays that way:
+The actual registration refcount and routing scheduler remain node-global.
+`OrgRoutingState` owns only RAII/route-slot handles and selector nonce state. The
+internal machinery is exactly four operations and stays that way:
 
 ```text
 maintain candidate set
@@ -645,19 +798,18 @@ project immutable route set
 select one provider
 ```
 
-**Bound the cache.** Service names are caller-controlled, so the watch
-and route maps share a fixed bound: **64 distinct warmed capabilities
-per client state** (implementation default, not a public option). At
-the bound:
+**Bound the cache.** Service names are caller-controlled: at most **64 distinct
+warmed capabilities per clone family** and **256 retained warmed route slots
+node-wide** (implementation defaults, not public options). At either bound:
 
 ```text
 organization call still proceeds
-→ sensing is treated as unavailable
-→ deterministic fallback
+→ run current-authority deterministic unsensed plan
+→ retain no extra route/watch/timer state
 → capacity metric increments
 ```
 
-Never an unbounded per-client service/watch cache.
+Never an unbounded per-client or node-wide service/watch cache.
 
 ### The hot path: a change-driven immutable route set
 
@@ -665,8 +817,9 @@ The warmed request path is:
 
 ```text
 ArcSwap load of the precomputed route set
-→ choose two Ready candidates
-→ compare two scores
+→ load coherent node authority epoch; equality-check route epoch
+→ temporal window recheck
+→ choose two Ready candidates and compare scores
 → construct proof
 → send
 ```
@@ -691,27 +844,46 @@ struct OrgRouteSet {
     unknown: Arc<[AuthorizedRoute]>, // pre-sorted deterministic fallback
     non_viable_count: usize,
     sources: RouteSourceGeneration,  // full source vector (internal)
+    authority_epoch: OrgAuthorityEpoch,
+    next_private_discovery_deadline: Option<SystemTime>,
     next_authority_deadline: Option<SystemTime>,
 }
 
 struct RouteSourceGeneration {
-    private_discovery: u64,
-    authority: u64,
+    private_discovery_global: u64,
+    authority: OrgAuthorityEpoch,
     sessions: u64,
     sensing: u64,
     topology: u64,
     watch_population: u64,
 }
+
+/// Opaque crate-internal equality token, coherently published with authority.
+struct OrgAuthorityEpoch {
+    authority_identity: OpaqueIdentity,
+    store_identity: OpaqueIdentity,
+    installation_generation: u64,
+    barriered_revocation_generation: u64,
+    poisoned: bool,
+}
 ```
+
+`OrgAuthorityEpoch` is the SDK-facing INTERNAL analogue of the sensing gate's
+`SensingAuthorityStamp`: it includes authority/store identity, installation
+generation, `OrgRevocationStore::barriered_generation()`, and poison state. It
+must be published coherently at the authority/store transaction boundary; a bare
+counter that can expose new floors with an old epoch is forbidden. The type and
+identities are not public API.
 
 The reconciler rebuilds a capability's route set when — and only when —
 an input changes:
 
-- private discovery generation;
+- global private-discovery generation (Owner or Grant), including the shared
+  node-owned exact-expiry wake;
 - membership/dispatcher/grant validity edges;
-- direct-session state;
+- direct-session generation;
 - sensing generation (`subscribe_sensing_overlay_changes`);
-- route topology;
+- routing/proximity generation;
 - capability watch population;
 - the earliest authority validity deadline (a wall-clock timer —
   below).
@@ -738,8 +910,45 @@ routes. `org.call` reads the latest snapshot and never blocks on,
 waits for, or performs a rebuild — a staleness observation on the read
 path may enqueue a rebuild, never perform one inline.
 
-**Authority validity edges arm timers.** Certificate and grant expiry
-are wall-clock transitions that emit no network or sensing event.
+**Rebuild once per node/source movement, not once per client family.**
+`MeshNode` owns a bounded internal `NodeOrgRoutingRegistry`; `OrgRoutingState`
+remains a clone-shared SDK ownership handle, not a task owner. The registry
+builds one immutable SameOrg base-facts snapshot per `(acting_org, capability,
+source vector)` from the shared PREDECODED scoped bucket plus node-global sensing
+and route inputs. Independent clients reuse that base snapshot. Their final
+route set may still narrow by caller membership/dispatcher/exact grants, but it
+never re-queries the store, re-decodes a descriptor, or rebuilds the shared
+sensing/route join.
+
+Hard bounds:
+
+```text
+max warmed capabilities per OrgRoutingState clone family: 64
+max retained warmed route slots node-wide across all families: 256
+max sensed providers per capability: 32
+```
+
+At the node-wide route-slot cap, an unretained capability uses the existing
+current-authority deterministic unsensed cold path and allocates no watcher,
+actor, timer, or cache slot. This is bounded degradation, not call failure.
+Dropping owners in arbitrary order removes only their weak consumer reference;
+the last reference retires the shared slot/lease state.
+
+One long-lived node-owned routing actor consumes all families' dirty work. It
+owns a bounded dirty-capability set plus `RebuildAll`, one single-flight build,
+one trailing-pass bit, and one ordered authority-deadline heap/`DelayQueue`.
+Bursts collapse; overflow becomes `RebuildAll`; processing yields between bounded
+work quanta. Explicit shutdown cancels pending work/deadlines. There is no
+reconciler, spawned sleeper, or authority timer per clone family/capability.
+
+For an accepted private-discovery delta, the actor looks up only affected
+predecoded capability buckets. Grant-only movement does not rebuild unrelated
+owner base facts. Publication remains per-route-set publish-if-current against
+the COMPLETE source vector; calls continue reading prior immutable snapshots
+while work proceeds.
+
+**Authority validity edges use the node deadline heap.** Certificate and grant
+expiry are wall-clock transitions that emit no network or sensing event.
 Without a timer, a route set preferring a grant that expires at T keeps
 preferring it after T: every call selects it, the per-call recheck
 refuses, and calls can keep failing until an unrelated event rebuilds —
@@ -747,37 +956,61 @@ the recheck preserves security but not availability. Each route set
 therefore records `next_authority_deadline`, computed from the earliest
 relevant membership `not_after`, dispatcher `not_after`,
 selected/candidate grant `not_after`, and any other canonical authority
-validity boundary the route set consumed. The reconciler schedules one
-timer per capability for that deadline:
+validity boundary the route set consumed. The node actor maintains one ordered
+deadline structure across all retained route slots:
 
 ```text
-deadline reached
-→ enqueue capability rebuild
+earliest node deadline reached
+→ enqueue every route slot due at that instant
 → reselect from currently valid candidates
+→ arm the next node deadline
 ```
 
-The per-call temporal recheck remains mandatory as defense in depth;
-the timer improves availability, it does not replace validation.
+The per-call temporal recheck remains mandatory for wall-clock validity; the
+heap improves availability, not authority.
 
-Per-call complexity (warmed):
+**Mandatory warmed-call currentness checks.** Immediately before proof
+construction/send, compare wall clock with both route-set deadlines and load the
+node's coherent `OrgAuthorityEpoch`. If a consumed private record has reached
+`next_private_discovery_deadline`, the cached route set is unusable even when the
+exact-expiry actor has not finished rebuilding. Likewise, poison, authority
+absence/identity mismatch, installation movement, barriered floor movement, or
+an authority deadline forbids cached selection. On any mismatch/deadline:
 
 ```text
-route-set load             O(1)
-per-call temporal recheck  O(1)   (clock math — below)
-P2C sampling               O(1)
-proof construction         O(1)
-exact dispatch             O(1), excluding network
+discard cached selection for this call
+→ enqueue route rebuild
+→ run one slow INTERNAL current-authority plan
+   (fresh authority/store snapshot; caller membership + dispatcher floors;
+    selected/provider membership floors; exact grant currentness)
+→ if current authority cannot be established: fail locally BEFORE proof/send
+→ otherwise deterministic current selection and one exact protected send
+```
+
+The slow transition path is not ordinary warmed behavior and may query current
+authority/private discovery; it never uses stale cached candidates. A revocation
+linearized after the epoch check races the call in the normal way; one
+linearized before it cannot pass with an old route set.
+
+Per-call complexity (ordinary warmed):
+
+```text
+route-set load                    O(1)
+coherent authority-epoch compare  O(1)   mandatory
+per-call temporal recheck         O(1)   clock math
+P2C sampling                      O(1)
+proof construction                O(1)
+exact dispatch                    O(1), excluding network
 ```
 
 **What the route set caches — and what it never caches.** Cached: the
-discovery → authority-match → session → sensing join, the fallback
-ordering, and the Viable scores. Never cached: the **locked per-call
-temporal recheck** of membership, dispatcher, and the selected grant
-(the facade's three-stage validity contract — cheap window comparisons
-against already-validated structures, kept on the hot path by design);
-the call id, digest, signature, and proof (minted fresh per call);
-admission (provider-local, always). The route cache accelerates
-ranking; it is never an authority cache.
+discovery → authority-match → session → sensing join, fallback ordering, and
+Viable scores. Never cached as permanently authoritative: node authority/store
+identity, revocation floors, temporal credential validity, call id, digest,
+signature, proof, or provider admission. The opaque epoch comparison, both
+route-set deadline checks, and credential window checks are mandatory on every
+call. The cache accelerates ranking; it cannot survive authority or private-
+discovery expiry movement unnoticed.
 
 **Lifecycle stays off the request path:**
 
@@ -785,13 +1018,12 @@ ranking; it is never an authority cache.
 sensing registration is never in the invocation latency budget
 ```
 
-A first cold call performs the full computation inline once and selects
-deterministically; it enqueues lease acquisition and the route-set
-build, and awaits none of: leader election, a registration
-acknowledgment, an attestation, watch refresh, route-set
-reconciliation. If acquiring the node-global lease would contend or
-emit, it is enqueued to the reconciler and the call proceeds with
-Unknown.
+A first cold call—or a call whose authority epoch moved—performs the bounded
+current-authority computation inline once and selects deterministically. It
+enqueues lease acquisition/route rebuild and awaits none of leader election,
+registration acknowledgment, attestation, watch refresh, or reconciliation. If
+node-global lease work would contend or emit, it is queued to the node actor and
+the call proceeds with Unknown only after current authority was established.
 
 ### Bounded sensed fan-out
 
@@ -801,7 +1033,8 @@ options):
 
 ```text
 max sensed providers per capability: 32
-max warmed capabilities per OrgClient state: 64
+max warmed capabilities per OrgRoutingState clone family: 64
+max retained warmed route slots node-wide: 256
 ```
 
 If a pool exceeds the provider bound:
@@ -885,8 +1118,18 @@ B closes
 → exact deregistration
 ```
 
-Stale deregistration/re-registration tokens cannot remove a successor
-registration.
+A stale lease ticket cannot remove a successor holder from the
+node-global lease **registry** (the local invariant). The **remote**
+provider row is a different matter: the sensing intake applies interest
+frames in arrival order (it does not reorder by sequence), so a reordered
+stale `Deregister` may transiently remove the remote row. Sensing is
+advisory soft state — the surviving node-global lease re-registers at
+ttl/2 and the observation is `Unknown`/`Potential` until repair, so
+deterministic authorized routing continues and no `org.call` fails. The
+ttl/2 refresh owner is the node-global lease lifecycle (one owner per
+installed key: first holder arms, last disarms), not a per-clone-family
+task; it and the reordered-deregister→refresh-recovery witness are the
+OLB-2 exit gate (sensing plan §4.3/S0, §6 witness 36).
 
 ### Capacity behavior
 
@@ -1213,15 +1456,19 @@ not wait for it. The minimal org-specific sequence is:
 1. authenticated same-org sensing registration   (sensing S0 subset)
 2. node-global exact-interest leases             (sensing S0 subset)
 3. provider evaluator lifecycle                  (sensing S0/S1 subset)
-4. clone-shared bounded OrgRoutingState          (OLB-2)
-5. immutable route-set projection                (OLB-2)
-6. O(1) P2C selection                            (OLB-3)
-7. live three-node witness                       (OLB-5)
+4. clone-shared bounded OrgRoutingState handles  (OLB-2)
+5. node-shared bounded base facts/scheduler       (OLB-2)
+6. immutable route sets + authority epoch         (OLB-2)
+7. O(1) P2C selection                             (OLB-3)
+8. live three-node witness                        (OLB-5)
 ```
 
 Generic provider-free sensing, ordinary nRPC sensed routing, compute
-placement, language sensing bindings, and cross-org SENSE land
-separately and do not gate this release.
+placement, language sensing bindings, the owner-private provider-free leader,
+and cross-org SENSE land separately and do not gate this release. The leader
+track may land the shared transactional indexed-discovery/source substrate
+first; that generic storage acceleration and source publication is the only
+cross-track dependency.
 
 ### OLB-0 — prerequisite: node-global sensing lifecycle + org-authenticated registration
 
@@ -1229,11 +1476,12 @@ This is the **org-required subset** of the sensing plan's S0 + S1
 ([`CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md`](CAPABILITY_SENSING_SDK_INTEGRATION_PLAN.md)) —
 registration authority, exact-provider leases, deregistration,
 evaluator ownership, and the provider `provide()` lifecycle; **not**
-the generic consumer watch surface. This plan additionally pins it
-because the current tree has none of it: interests have **no public
-deregistration and no refcount anywhere** (TTL soft-state only,
-`mesh.rs:1670-1677`), and the registration frame carries **no
-membership proof**.
+the generic consumer watch surface. The practical Option-A subset is now
+implemented and signed through `cdb416a6b`: node-global lease/refcount/cadence
+ownership and `OrgProviderRegistration` are live. The appended
+`OrgCapabilityRegistration` wire/gate types exist but their dispatch arm stays
+dark and belongs to the separate leader plan; lighting it is not part of
+OLB-0's exit.
 
 Deliver:
 
@@ -1297,19 +1545,37 @@ including `ProviderNotDirect` and considered-count semantics).
 
 For same-org candidates:
 
-- add the clone-shared, **bounded** `OrgRoutingState` (§7; bounds
-  pinned: 64 warmed capabilities per client state, 32 sensed providers
-  per capability, deterministic truncation + metric);
-- add the wake-driven reconciler and immutable `OrgRouteSet`
-  projection (§7): single-flight, generation-stamped, `ArcSwap`
-  published; calls only read;
-- on first call per service, acquire one exact-provider lease per
+- consume the shared transactional indexed-discovery/source substrate specified
+  in `ORG_SENSING_LEADER_SUBSTRATE_PLAN.md` §6: predecoded scoped capability
+  buckets, bounded affected-capability deltas, global revision/exact-expiry wake,
+  and peer-session/routing generations. If absent, land this GENERIC slice first
+  with its atomic index/expiry/lock-scope witnesses. OLB never consumes the
+  leader's authority-filtered owner projection/resolver/reconciliation;
+- add clone-shared bounded `OrgRoutingState` route-slot handles (64 family cap)
+  plus node-owned `NodeOrgRoutingRegistry` (256 node route-slot cap), shared
+  SameOrg base facts, one dirty-work/deadline actor, and deterministic unsensed
+  degradation at either cap;
+- add generation-stamped, `ArcSwap`-published `OrgRouteSet` projection. Calls
+  only read. Independent client families reuse the node's same capability
+  discovery/sensing/route base facts; final caller/grant narrowing remains local;
+- add coherent `OrgAuthorityEpoch` publication and mandatory per-call comparison.
+  On mismatch, never use the route set; run the current-authority slow plan or
+  fail locally before proof/send;
+- on first retained route slot per service, acquire one exact-provider lease per
   authorized same-org provider (enqueued, never awaited); on
   provider-set change, acquire new / release removed; on last client
   drop, release all;
+- add the **node-global sensing-interest ttl/2 refresh owner** — the
+  convergence backstop for a reordered stale deregister (§7). This is
+  owned by the node-global lease lifecycle, not an SDK family: one refresh owner
+  per installed key (first holder arms, later holders share, last holder
+  disarms), using its bounded node-owned due-time actor rather than one task per
+  lease. The node routing actor rebuilds immutable route sets; the lease refresh
+  actor keeps wire registrations alive. Never give each client family a refresh
+  loop;
 - join observations via `sensed_candidates` with the authorized
   population as `resolved_population` (projection-stage clamp) —
-  inside the reconciler, never on the request path;
+  inside the node routing actor, never on the request path;
 - classify per §8 (evidence layer + projection layer);
 - make granted candidates Unknown/Potential unconditionally;
 - pin the tag↔CapabilityId mapping for `nrpc:<service>`.
@@ -1326,17 +1592,42 @@ Exit witnesses:
 - **a warmed call issues no scoped-store query, no observation-map
   scan, no sort, and no registration emission** (instrumented
   witness);
-- a burst of change wakes coalesces into one rebuild; calls during a
-  rebuild read the prior snapshot;
-- an authorized-set change acquires/releases exactly the delta;
+- 1,024 indexed rows + one affected capability: rebuild visits only that bucket
+  and performs ZERO descriptor decodes after ingest; 64 warmed capabilities and
+  many independent clients do not multiply store scans or shared base-fact
+  builds;
+- many independent clients for the same node/capability observe one shared
+  discovery/sensing/route base projection, one source rebuild, and one underlying
+  exact-interest registration; last consumer alone retires it;
+- 64 dirty capabilities keep routing actor/task count constant; 1,000 duplicate
+  wakes leave one active pass and at most one trailing retry; one node deadline
+  structure covers all route slots, and shared private expiry advances exactly
+  at record expiry; if rebuilding is deliberately paused past that deadline, a
+  call rejects the expired cached route and runs the fresh slow plan—no expired
+  provider enters `OrgProofIntent`;
+- at 64 family slots or 256 node slots, the call runs current-authority
+  deterministic unsensed fallback and retains no extra state;
+- an authorized-set change acquires/releases exactly the lease delta;
 - a pool of 33+ providers: deterministic 32 sensed (EntityId-byte
   order), remainder Unknown fallback, `org_sensing_truncated_total`
   incremented, the call succeeds;
 - at the watch-map bound, calls proceed unsensed with the capacity
   metric incremented;
-- the per-call temporal recheck still refuses an
-  expired-since-rebuild credential (the route cache is not an
-  authority cache);
+- every ordinary warmed call compares the route set's `OrgAuthorityEpoch` with
+  the coherently published node epoch before proof/send;
+- caller membership floor raise, dispatcher floor movement, selected-provider
+  membership floor raise, authority/store replacement, and poison each make the
+  cached token mismatch. The call uses no cached selection: a fresh-authority
+  slow plan either sends once under current authority or fails locally;
+- force "new floors visible / old epoch" during publication: the barrier witness
+  proves that impossible; a floor raise linearized before the check never enters
+  `OrgProofIntent` through an old route set;
+- the temporal recheck separately refuses credentials expired by wall clock;
+- **(convergence)** a reordered stale `Deregister` that transiently
+  removes the remote provider row is repaired by the node-global
+  ttl/2 refresh — the observation is `Unknown`/`Potential` until repair
+  and no `org.call` fails; and a last-holder close disarms the refresh
+  owner so no later refresh resurrects the retired row (no ghost demand);
 - a rebuild whose source generations changed during computation
   discards its result and re-enqueues; the stale result never
   publishes (publish-if-current);
@@ -1467,8 +1758,14 @@ The plan is complete when all are true:
 - [ ] Lazy watches are retained in a bounded, clone-shared
       `OrgRoutingState`; a second call is warm; the last client drop
       releases every guard.
-- [ ] Cadence relaxes when the strictest watcher drops; stale lease
-      tokens cannot remove a successor registration.
+- [ ] Cadence relaxes when the strictest watcher drops; a stale lease
+      ticket cannot remove a successor holder from the node-global
+      registry (local invariant).
+- [ ] (OLB-2 exit) A reordered stale `Deregister` that transiently
+      removes the remote row is repaired by the node-global lease's
+      ttl/2 refresh; the observation is `Unknown`/`Potential` until
+      repair and no `org.call` fails; a last-holder close disarms the
+      refresh owner (no ghost demand).
 - [ ] The warmed org.call path is: ArcSwap route-set load → two-index
       P2C → proof → send — no rediscovery, no candidate revalidation
       scan, no observation scan, no sorting, no interest

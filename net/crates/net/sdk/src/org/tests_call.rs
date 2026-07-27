@@ -134,16 +134,16 @@ async fn plan_builds_the_canonical_same_org_intent() {
 
     let client = bind(&mesh, &a, &identity, vec![]);
     let capability = cap("nrpc:internal.reindex");
-    let (targets, considered) = client
-        .authorized_targets(&capability)
+    let (candidates, considered) = client
+        .authorized_candidates(&capability)
         .expect("authority decision");
 
     assert_eq!(considered, 1, "one owner-private candidate");
-    assert_eq!(targets.len(), 1);
-    assert_eq!(&targets[0].0, provider.entity_id());
-    assert_eq!(targets[0].1, Mode::SameOrg);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(&candidates[0].provider, provider.entity_id());
+    assert_eq!(candidates[0].mode, Mode::SameOrg);
 
-    let intent = client.intent_for(capability, targets[0].0.clone(), targets[0].1.clone());
+    let intent = client.intent_for(&candidates[0]);
     // All nine fields.
     assert_eq!(intent.caller.entity_id(), identity.entity_id());
     assert_eq!(&intent.membership, client.membership());
@@ -179,14 +179,14 @@ async fn plan_builds_the_canonical_cross_org_intent() {
     );
 
     let capability = cap("nrpc:customer.read");
-    let (targets, considered) = client
-        .authorized_targets(&capability)
+    let (candidates, considered) = client
+        .authorized_candidates(&capability)
         .expect("authority decision");
     assert_eq!(considered, 1);
-    assert_eq!(targets.len(), 1, "one authorized cross-org target");
-    assert_eq!(targets[0].1, Mode::Granted(Box::new(grant.clone())));
+    assert_eq!(candidates.len(), 1, "one authorized cross-org target");
+    assert_eq!(candidates[0].mode, Mode::Granted(Box::new(grant.clone())));
 
-    let intent = client.intent_for(capability, targets[0].0.clone(), targets[0].1.clone());
+    let intent = client.intent_for(&candidates[0]);
     assert_eq!(
         intent.capability_grant.as_ref(),
         Some(&grant),
@@ -228,11 +228,11 @@ async fn the_public_plane_is_never_consulted() {
     );
 
     let client = bind(&mesh, &a, &identity, vec![]);
-    let (targets, considered) = client
-        .authorized_targets(&cap("nrpc:public.svc"))
+    let (candidates, considered) = client
+        .authorized_candidates(&cap("nrpc:public.svc"))
         .expect("authority decision");
     assert_eq!(considered, 0, "a public announcement is not a candidate");
-    assert!(targets.is_empty());
+    assert!(candidates.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -248,14 +248,14 @@ async fn an_owner_record_matches_only_the_capability_it_declares() {
     let client = bind(&mesh, &a, &identity, vec![]);
     assert_eq!(
         client
-            .authorized_targets(&cap("nrpc:internal.reindex"))
+            .authorized_candidates(&cap("nrpc:internal.reindex"))
             .expect("decision")
             .1,
         1
     );
     assert_eq!(
         client
-            .authorized_targets(&cap("nrpc:not.declared"))
+            .authorized_candidates(&cap("nrpc:not.declared"))
             .expect("decision")
             .1,
         0,
@@ -297,12 +297,12 @@ async fn a_discover_only_grant_resolves_but_cannot_invoke() {
         "nrpc:customer.read",
     );
 
-    let (targets, considered) = client
-        .authorized_targets(&cap("nrpc:customer.read"))
+    let (candidates, considered) = client
+        .authorized_candidates(&cap("nrpc:customer.read"))
         .expect("authority decision");
     assert_eq!(considered, 1, "discovery DID resolve the provider");
     assert!(
-        targets.is_empty(),
+        candidates.is_empty(),
         "but DISCOVER alone is never invocation authority"
     );
 
@@ -358,7 +358,7 @@ async fn overlapping_grants_are_an_ambiguity_error() {
     );
 
     let err = client
-        .authorized_targets(&capability)
+        .authorized_candidates(&capability)
         .expect_err("must refuse");
     match err {
         OrgSdkError::Credentials(OrgCredentialError::AmbiguousCapabilityGrant {
@@ -417,11 +417,11 @@ async fn a_grant_whose_target_scope_excludes_the_provider_does_not_authorize() {
         "nrpc:customer.read",
     );
 
-    let (targets, considered) = client
-        .authorized_targets(&capability)
+    let (candidates, considered) = client
+        .authorized_candidates(&capability)
         .expect("authority decision");
     assert_eq!(considered, 1, "resolved");
-    assert!(targets.is_empty(), "but not covered by any INVOKE grant");
+    assert!(candidates.is_empty(), "but not covered by any INVOKE grant");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -443,13 +443,69 @@ async fn selection_is_deterministic_lowest_provider_id() {
     let expected = std::cmp::min(p1.entity_id().clone(), p2.entity_id().clone());
 
     for _ in 0..5 {
-        let (targets, considered) = client
-            .authorized_targets(&capability)
+        let (candidates, considered) = client
+            .authorized_candidates(&capability)
             .expect("authority decision");
         assert_eq!(considered, 2);
-        assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].0, expected, "lowest entity id wins, every time");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].provider, expected,
+            "lowest entity id wins, every time"
+        );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OLB-1 selection surface: direct reachability now rides each
+/// `AuthorizedOrgCandidate`, and `plan` selects the first *directly reachable*
+/// authorized provider in deterministic order — not merely the first authorized
+/// one. Here the reachable provider sorts LATER, so a selector that ignored
+/// reachability (or dropped the flag in the factoring) would pick the wrong
+/// provider or wrongly report `ProviderNotDirect`.
+#[tokio::test]
+async fn selection_prefers_a_direct_provider_over_an_earlier_indirect_one() {
+    let a = org_a();
+    let (mesh, identity, dir) = mesh_with_authority("plan-direct-pref", Some(&a)).await;
+    let p1 = EntityKeypair::generate();
+    let p2 = EntityKeypair::generate();
+    inject_owner_envelope(&mesh, &a, &p1, &["nrpc:internal.reindex"]);
+    inject_owner_envelope(&mesh, &a, &p2, &["nrpc:internal.reindex"]);
+
+    // Pin a live direct session to whichever provider sorts LATER, leaving the
+    // lower-EntityId provider authorized but indirect.
+    let (lower, higher) = if p1.entity_id() < p2.entity_id() {
+        (&p1, &p2)
+    } else {
+        (&p2, &p1)
+    };
+    mesh.node()
+        .test_pin_peer_entity(higher.entity_id().node_id(), higher.entity_id().clone());
+
+    let client = bind(&mesh, &a, &identity, vec![]);
+    let capability = cap("nrpc:internal.reindex");
+
+    // Both authorized, deterministic order, exactly one direct — the later one.
+    let (candidates, _) = client
+        .authorized_candidates(&capability)
+        .expect("authority decision");
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(
+        &candidates[0].provider,
+        lower.entity_id(),
+        "sorted lowest-first"
+    );
+    assert!(!candidates[0].direct, "the lower provider has no session");
+    assert!(candidates[1].direct, "the higher provider is pinned direct");
+
+    // plan selects the direct provider even though it sorts later.
+    let intent = client
+        .plan("internal.reindex")
+        .expect("a directly reachable provider exists");
+    assert_eq!(
+        &intent.provider,
+        higher.entity_id(),
+        "direct reachability beats sort order"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -558,4 +614,127 @@ async fn an_expired_membership_refuses_at_call_time() {
         "got {err:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OLB-2A.2: ingesting an owner capability through the real path advances the
+/// private-discovery change generations — the read-only poll a reconciler uses to
+/// learn that discovery moved, wired end-to-end through the MeshNode accessors.
+/// (The destructive delta drain is crate-internal per the OLB-2A closure, so the
+/// delta CONTENT is witnessed at the `ScopedDiscoveryState` level in the core.)
+#[tokio::test]
+async fn ingest_advances_the_private_discovery_generation() {
+    let a = org_a();
+    let (mesh, _identity, dir) = mesh_with_authority("pd-generation", Some(&a)).await;
+    let provider = EntityKeypair::generate();
+
+    assert_eq!(mesh.node().private_discovery_generation(), 0);
+    assert_eq!(mesh.node().private_discovery_owner_generation(), 0);
+
+    inject_owner_envelope(&mesh, &a, &provider, &["nrpc:internal.reindex"]);
+
+    assert!(
+        mesh.node().private_discovery_generation() >= 1,
+        "global generation advanced"
+    );
+    assert!(
+        mesh.node().private_discovery_owner_generation() >= 1,
+        "owner generation advanced"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OLB-2A.3: a scoped-store mutation that changes the visible set WAKES the
+/// private-discovery change watch (the push signal a consumer awaits instead of
+/// polling), and a no-op (a stale re-ingest) does NOT — the centralized helper
+/// only publishes when the generation actually advanced.
+#[tokio::test]
+async fn a_visible_mutation_wakes_the_watch_and_a_noop_does_not() {
+    let a = org_a();
+    let (mesh, _identity, dir) = mesh_with_authority("pd-watch", Some(&a)).await;
+    let provider = EntityKeypair::generate();
+
+    let mut rx = mesh.node().subscribe_private_discovery_changes();
+    assert_eq!(*rx.borrow_and_update(), 0);
+
+    inject_owner_envelope(&mesh, &a, &provider, &["nrpc:internal.reindex"]);
+    assert!(
+        rx.has_changed().expect("sender alive"),
+        "a visible-set change wakes the watch"
+    );
+    assert!(*rx.borrow_and_update() >= 1);
+
+    // The same envelope again is a stale re-ingest — no visible change, no wake.
+    inject_owner_envelope(&mesh, &a, &provider, &["nrpc:internal.reindex"]);
+    assert!(
+        !rx.has_changed().expect("sender alive"),
+        "a no-op mutation must not wake the watch"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// review-pass-3 §17 — candidate order is GLOBAL, not per-plane.
+///
+/// The OLB-1 sort was red-coupled to nothing: the discovery source
+/// (`owner_by_capability: BTreeMap<_, BTreeSet<ScopedKey>>`) already yields
+/// ascending-EntityId order WITHIN one scope, and both determinism witnesses put
+/// both providers in the SAME owner scope — so deleting the sort left every test
+/// passing deterministically. It is load-bearing only ACROSS planes or scopes,
+/// which no test constructed; the phase-3 sorted-order reachability sampling was
+/// likewise unobservable in any single-threaded test.
+///
+/// Both relative orderings are driven, so the assertion cannot pass vacuously
+/// whichever plane discovery happens to enumerate first: with the sort removed,
+/// one of the two arrangements must come back out of order.
+#[tokio::test]
+async fn candidate_order_is_global_across_the_owner_and_grant_planes() {
+    for grant_provider_sorts_lower in [true, false] {
+        let (a, b) = (org_a(), org_b());
+        let label = if grant_provider_sorts_lower {
+            "plan-cross-plane-grant-lo"
+        } else {
+            "plan-cross-plane-owner-lo"
+        };
+        let (mesh, identity, dir) = mesh_with_authority(label, Some(&a)).await;
+        let tag = "nrpc:customer.read";
+
+        // Pick the pair so the required plane holds the LOWER EntityId.
+        let (owner_provider, grant_provider) = loop {
+            let owner = EntityKeypair::generate();
+            let granted = EntityKeypair::generate();
+            if (granted.entity_id() < owner.entity_id()) == grant_provider_sorts_lower {
+                break (owner, granted);
+            }
+        };
+
+        let (grant, secret) = discover_grant(&b, a.org_id(), cap(tag), 3600);
+        let secret_copy = copy_secret(&secret);
+        let client = bind(&mesh, &a, &identity, vec![(grant.clone(), Some(secret))]);
+        inject_owner_envelope(&mesh, &a, &owner_provider, &[tag]);
+        inject_granted_envelope(&mesh, &b, &grant_provider, &grant, &secret_copy, tag);
+
+        let (candidates, _) = client
+            .authorized_candidates(&cap(tag))
+            .expect("authority decision");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "{label}: one candidate from each plane"
+        );
+        assert!(
+            candidates.iter().any(|c| matches!(c.mode, Mode::SameOrg)),
+            "{label}: the owner plane really is represented"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| matches!(c.mode, Mode::Granted(_))),
+            "{label}: and so is the grant plane"
+        );
+        assert!(
+            candidates[0].provider.as_bytes() < candidates[1].provider.as_bytes(),
+            "{label}: candidates must be in GLOBAL ascending EntityId order — \
+             per-plane discovery order is not a total order",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

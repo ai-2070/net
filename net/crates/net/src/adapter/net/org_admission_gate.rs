@@ -19,7 +19,9 @@ use super::behavior::org::OrgId;
 use super::behavior::org_admission::{AdmissionDenied, OrgAdmission};
 use super::behavior::org_authority::NodeAuthority;
 use super::behavior::org_call::{OrgCallProof, ORG_ADMISSION_HEADER};
-use super::behavior::org_revocation::{OrgRevocationState, OrgRevocationStore};
+use super::behavior::org_revocation::{
+    BarrieredGeneration, OrgRevocationState, OrgRevocationStore,
+};
 use super::cortex::{RpcCodecError, RpcHeader, RpcRequestPayload};
 use super::identity::EntityId;
 use super::mesh::MeshNode;
@@ -116,7 +118,13 @@ pub struct AdmissionStamp {
     /// The store's floor-publish generation — bumps on every floor
     /// publish (under the reload lock), so a floor raise changes the
     /// stamp even when the same store `Arc` stays installed.
-    pub store_generation: u64,
+    ///
+    /// `None` once the generation space is EXHAUSTED. A frozen counter can no
+    /// longer distinguish views, so a publication after exhaustion would present
+    /// an identical stamp and read as "unchanged" — admitting a caller the new
+    /// floors revoke (Kyra OLB-2B-E3c). `None` never compares current, in either
+    /// position.
+    pub store_generation: Option<BarrieredGeneration>,
     /// Whether the active store is poisoned as of this capture.
     pub poisoned: bool,
 }
@@ -127,7 +135,13 @@ impl AdmissionStamp {
     /// i.e. the security view the proof was verified against is still
     /// live. Any change, or a now-poisoned store, is a stale view.
     pub fn is_current(&self, current: &AdmissionStamp) -> bool {
-        self == current && !current.poisoned
+        // An exhausted generation is unusable authority on EITHER side: the
+        // captured view cannot be shown still live, and the live view cannot be
+        // shown to have moved.
+        self.store_generation.is_some()
+            && current.store_generation.is_some()
+            && self == current
+            && !current.poisoned
     }
 }
 
@@ -143,7 +157,7 @@ pub fn capture_admission_stamp(mesh: &MeshNode) -> AdmissionStamp {
     let authority_ptr = authority
         .as_ref()
         .map_or(0, |a| Arc::as_ptr(a) as *const () as usize);
-    let (store_ptr, store_generation, poisoned) = store.as_ref().map_or((0, 0, false), |s| {
+    let (store_ptr, store_generation, poisoned) = store.as_ref().map_or((0, None, false), |s| {
         (
             Arc::as_ptr(s) as *const () as usize,
             // Publication-barriered (Kyra E1 review): a bare
@@ -151,7 +165,7 @@ pub fn capture_admission_stamp(mesh: &MeshNode) -> AdmissionStamp {
             // while a floor publish holds `live.write()` mid-swap, so
             // a stale stamp would compare "unchanged". The barriered
             // read serializes against the swap.
-            s.barriered_generation(),
+            s.barriered_generation().ok(),
             s.is_poisoned(),
         )
     });
@@ -226,7 +240,12 @@ pub fn verify_provider_authority(
     // Publication-barriered floors + generation (Kyra E1 review): both
     // read under one `live.read()`, so the pair is consistent and the
     // generation cannot lag an in-progress floor swap.
-    let (floors, store_generation) = store.snapshot_with_generation();
+    // An exhausted generation is unusable authority, exactly like poison: the
+    // verification below would be against floors whose currentness can no longer
+    // be witnessed.
+    let (floors, store_generation) = store
+        .snapshot_with_generation()
+        .map_err(|_| AdmissionDenied::ProviderAuthorityUnavailable)?;
     let provider = mesh.entity_id().clone();
     // Live self-verify against the ONE admission ClockSample (AV-6
     // item 6): an expired / below-floor / foreign-bound owner cert
@@ -246,7 +265,7 @@ pub fn verify_provider_authority(
     let stamp = AdmissionStamp {
         authority_ptr: Arc::as_ptr(&authority) as *const () as usize,
         store_ptr: Arc::as_ptr(&store) as *const () as usize,
-        store_generation,
+        store_generation: Some(store_generation),
         // Verified non-poisoned above; a poison arriving after this
         // point is caught by the §9.5 recheck via the live stamp.
         poisoned: false,
@@ -743,15 +762,33 @@ mod tests {
         let base = AdmissionStamp {
             authority_ptr: 0x1000,
             store_ptr: 0x2000,
-            store_generation: 7,
+            store_generation: Some(BarrieredGeneration::from_raw_for_test(7)),
             poisoned: false,
         };
         assert!(base.is_current(&base), "identical, unpoisoned → current");
 
         // Floor rose (generation bumped) → stale.
         let mut gen_bumped = base;
-        gen_bumped.store_generation = 8;
+        gen_bumped.store_generation = Some(BarrieredGeneration::from_raw_for_test(8));
         assert!(!base.is_current(&gen_bumped));
+
+        // Generation space EXHAUSTED on either side → never current. A frozen
+        // counter would otherwise make a publication after exhaustion compare
+        // identical to no publication at all (Kyra OLB-2B-E3c).
+        let mut exhausted = base;
+        exhausted.store_generation = None;
+        assert!(
+            !base.is_current(&exhausted),
+            "a live view whose generation is exhausted cannot be shown current"
+        );
+        assert!(
+            !exhausted.is_current(&base),
+            "a captured view sampled at exhaustion cannot be shown still live"
+        );
+        assert!(
+            !exhausted.is_current(&exhausted),
+            "and two exhausted samples must NOT compare equal-and-current"
+        );
 
         // Authority swapped → stale.
         let mut swapped = base;

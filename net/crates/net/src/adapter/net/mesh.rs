@@ -1060,10 +1060,26 @@ struct DispatchCtx {
     /// envelopes. Absent ⇒ this node cannot ingest scoped discovery and drops
     /// every `SUBPROTOCOL_SCOPED_CAPABILITY_ANN` packet.
     node_authority: Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
+    /// OLB org-auth (piece 4): the publication lock serializing authority/store
+    /// installation. The org sensing intake captures a coherent authority
+    /// snapshot under it and rechecks currency immediately before the table
+    /// mutation. Same `Arc` as the matching `MeshNode` field.
+    org_install: Arc<parking_lot::Mutex<()>>,
+    /// OLB org-auth (piece 4): the monotonic installation generation advanced
+    /// under `org_install` — the sole discriminator for an `A → B → exact-A`
+    /// authority rotation in the sensing authority stamp. Same `Arc` as the
+    /// matching `MeshNode` field.
+    org_install_generation: Arc<std::sync::atomic::AtomicU64>,
     /// OA3-5: the private-discovery store verified scoped announcements land in.
     /// See the matching field doc on `MeshNode`.
     scoped_discovery:
-        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>>,
+        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
+    /// OLB-2A.3: the private-discovery publication primitive (gate + wake). See
+    /// the matching `MeshNode` field.
+    scoped_publication: Arc<ScopedMutationPublication>,
+    /// review-pass-3 §10: per-outcome private-discovery intake counters. See the
+    /// matching `MeshNode` field.
+    scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. See the matching field doc on `MeshNode`.
     scoped_relay_gate: Arc<super::behavior::org_scoped_relay::ScopedAnnRelayGate>,
@@ -1237,6 +1253,9 @@ struct DispatchCtx {
     /// SI-3c: the verified-observation seam (latest + refusals +
     /// provider epochs). See the matching field on `MeshNode`.
     sensing_observations: Arc<parking_lot::Mutex<SensingObservations>>,
+    /// Review L1 linearization: the local-projection transaction mutex. Same
+    /// `Arc` (and frozen lock order) as the matching `MeshNode` field.
+    sensing_local_projection_mu: Arc<parking_lot::Mutex<()>>,
     /// Pending StreamWindow grants enqueue by the receive path,
     /// drained by `MeshNode::spawn_stream_grant_drainer_loop`. T1.1
     /// from `PERF_AUDIT_2026_05_19_NRPC.md`.
@@ -2783,19 +2802,61 @@ const SECURITY_CORRECTIVE_ATTEMPTS: u8 = 3;
 /// open. Certificate wall-clock expiry is handled separately (the
 /// send path re-derives the desired cert every time, which checks
 /// temporal validity), since expiry changes no generation.
+/// The revocation store's publication state, as the send seqlock sees it.
+///
+/// Three states, NOT `Option<generation>`. Collapsing "no store installed" and
+/// "installed store exhausted" into one `None` makes them compare EQUAL, so an
+/// exhausted stamp compares current against itself and the send path keeps
+/// emitting the cached owner certificate — exactly the alias the `Result` was
+/// introduced to remove (Kyra OLB-2B-E3c). `Exhausted` is a distinct, terminal
+/// state that [`SendStamp::is_current`] refuses on either side.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendStoreStamp {
+    /// No store installed.
+    Absent,
+    /// Installed and usable, at this barriered generation.
+    Live {
+        store_ptr: usize,
+        generation: super::behavior::org_revocation::BarrieredGeneration,
+    },
+    /// Installed, but its publication generation space is exhausted, so its
+    /// currentness can no longer be witnessed. TERMINAL.
+    Exhausted { store_ptr: usize },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SendStamp {
-    /// `Arc::as_ptr` of the installed revocation store (0 = none).
-    store_ptr: usize,
-    /// The installed store's publish generation (bumped on every
-    /// floor publish, under the reload lock).
-    store_generation: u64,
+    /// The installed store's publication state.
+    store: SendStoreStamp,
     /// `Arc::as_ptr` of the installed node authority (0 = none).
     authority_ptr: usize,
     /// Bumped by [`MeshNode::set_owner_cert_emission`] — a toggle
     /// on the SAME authority/store changes no pointer or
     /// generation, so it needs its own counter.
     emission_generation: u64,
+}
+
+impl SendStamp {
+    /// `true` iff the captured view is still live AND usable.
+    ///
+    /// SEMANTIC, not raw equality. `Exhausted` on either side is terminal
+    /// unusable authority: two exhausted stamps are equal, so a bare `==` would
+    /// let the send path keep emitting a cached owner certificate after the
+    /// generation froze (Kyra OLB-2B-E3c).
+    fn is_current(&self, current: &SendStamp) -> bool {
+        !matches!(self.store, SendStoreStamp::Exhausted { .. })
+            && !matches!(current.store, SendStoreStamp::Exhausted { .. })
+            // The emission counter is fenced on the same principle
+            // (review-pass-3 §12): it LATCHES at `u64::MAX` rather than wrapping,
+            // so the ceiling is a terminal sentinel. Past it every toggle would
+            // receive the same identity, and the counter exists precisely because
+            // a toggle changes no other observable field — so a frozen one would
+            // let the send path keep emitting a cached owner certificate across a
+            // disable.
+            && self.emission_generation != u64::MAX
+            && current.emission_generation != u64::MAX
+            && self == current
+    }
 }
 
 /// A [`SendStamp`] plus the exact authority/store `Arc`s it
@@ -3762,6 +3823,108 @@ const SENSING_UPSTREAM_MIN_GAP: Duration = Duration::from_millis(100);
 
 /// SI-4 review P0: fan one batch of leader-relay deliveries out to
 /// the REAL destinations. The leader's relay works on semantic
+/// Review L1 narrow-hold: reconcile a branch's shared LOCAL consumer cell to the
+/// authoritative local-demand projection
+/// ([`sensing::InterestTable::local_consumer_interval`]) after ANY table mutation
+/// that can remove or partition a node-local row — re-anchor a surviving cell to
+/// the strictest survivor (`Some`), or drop it when no live local row remains
+/// (`None`). This projection is the SOLE local-liveness classifier; no call site
+/// re-derives `Local`/`LeasedLocal` ownership, so the two rows can never drift.
+fn reconcile_local_consumer_cell(
+    table: &parking_lot::Mutex<sensing::InterestTable>,
+    observations: &parking_lot::Mutex<SensingObservations>,
+    overlay: &tokio::sync::watch::Sender<u64>,
+    key: &sensing::ProviderInterestKey,
+    now: Instant,
+) {
+    let aggregate = table.lock().local_consumer_interval(key, now);
+    if observations
+        .lock()
+        .reconcile_consumer_interval(key, aggregate)
+    {
+        overlay.send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+}
+
+/// Review L1 narrow-hold: the PERIODIC materialized-branch reconciliation. For
+/// every branch the observation store tracks that is not backed by a live
+/// (solicited) capability interest: drop the whole branch if no downstream row
+/// remains, else reconcile its shared consumer cell to the authoritative local
+/// projection ([`sensing::InterestTable::local_consumer_interval`]) — re-anchor a
+/// surviving cell to the strictest live local row (Local OR LeasedLocal), or drop
+/// a cell with no live local row. This is the SOLE local-liveness classifier in
+/// the sweep; it never re-derives Local-only liveness (which deleted lease-only
+/// cells and never relaxed a survivor). Also picks up expiry: an expired local
+/// row is excluded from `local_consumer_interval`, so the surviving aggregate
+/// relaxes here on the next tick.
+///
+/// Review L1 linearization: the WHOLE snapshot→classify→apply sequence runs
+/// under `projection_mu`, so a concurrent lease/direct registration serializes
+/// against it — the sweep can never apply a stale `None` (or stale aggregate)
+/// snapshot over a cell a rival anchored after the snapshot was taken.
+/// `pause_before_apply` is the deterministic-witness seam: it fires between the
+/// snapshot and the apply, INSIDE the transaction.
+fn reconcile_materialized_consumer_cells(
+    projection_mu: &parking_lot::Mutex<()>,
+    table: &parking_lot::Mutex<sensing::InterestTable>,
+    observations: &parking_lot::Mutex<SensingObservations>,
+    overlay: &tokio::sync::watch::Sender<u64>,
+    live_interests: &std::collections::HashSet<sensing::CapabilityInterestKey>,
+    now: Instant,
+    pause_before_apply: Option<&(dyn Fn() + Sync)>,
+) {
+    let _projection = projection_mu.lock();
+    let branch_keys: std::collections::HashSet<sensing::ProviderInterestKey> = {
+        let observations = observations.lock();
+        observations
+            .latest
+            .keys()
+            .chain(observations.upstream.keys())
+            .chain(observations.consumer_cells.keys())
+            .chain(observations.slots.keys().map(|(branch, _)| branch))
+            .cloned()
+            .collect()
+    };
+    let mut dead_branches = Vec::new();
+    let mut reconcile: Vec<(sensing::ProviderInterestKey, Option<Duration>)> = Vec::new();
+    {
+        let table = table.lock();
+        for key in branch_keys {
+            if live_interests.contains(&key.interest) {
+                continue;
+            }
+            if table.downstreams(&key, now).is_empty() {
+                // No watch, no rows: nothing justifies ANY of the branch's state.
+                dead_branches.push(key);
+                continue;
+            }
+            reconcile.push((key.clone(), table.local_consumer_interval(&key, now)));
+        }
+    }
+    // Witness seam: hold the transaction open between the snapshot and the
+    // apply so a rival registration provably serializes behind the sweep.
+    if let Some(pause) = pause_before_apply {
+        pause();
+    }
+    if dead_branches.is_empty() && reconcile.is_empty() {
+        return;
+    }
+    let mut overlay_moved = false;
+    {
+        let mut observations = observations.lock();
+        for key in dead_branches {
+            overlay_moved |= observations.consumer_cells.contains_key(&key);
+            observations.reclaim_branch(&key);
+        }
+        for (key, aggregate) in reconcile {
+            overlay_moved |= observations.reconcile_consumer_interval(&key, aggregate);
+        }
+    }
+    if overlay_moved {
+        overlay.send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+}
+
 /// attestations; the wire form is this hop's latest cache — matched
 /// on (incarnation, seq) so a torn race skips (the next beat
 /// repairs) and "relays forward identical signed bytes" holds for
@@ -3822,7 +3985,7 @@ fn dispatch_sensing_leader_deliveries(
                     );
                 }
             }
-            sensing::DownstreamId::Local => {
+            sensing::DownstreamId::Local | sensing::DownstreamId::LeasedLocal => {
                 let interval = wire.promised_cadence;
                 overlay_moved |= observations.lock().feed_consumer_cell(
                     &branch,
@@ -4057,16 +4220,50 @@ impl SensingObservations {
         }
     }
 
-    /// SI-4 re-review item 5, consumer half: the LOCAL watch's own D
-    /// changed (Local re-registration or a provider-free expectation
-    /// refresh at a different D) — re-anchor the overlay cell now.
-    fn update_consumer_interval(
+    /// Review L1 follow-up: create-or-re-anchor the shared LOCAL consumer cell
+    /// for a branch to the derived local aggregate. A node-local REGISTRATION
+    /// establishes the watch immediately (projection `Unknown` until the first
+    /// delivery), so the cell exists and carries the aggregate cadence from
+    /// registration — not only after a delivery lazily creates it — and the
+    /// cadence is the min across Local + LeasedLocal, never one registering row.
+    fn anchor_consumer_cell(
         &mut self,
         branch: &sensing::ProviderInterestKey,
         interval: Duration,
+        factor: u32,
+        now: Instant,
     ) {
-        if let Some(cell) = self.consumer_cells.get_mut(branch) {
-            cell.update_interval(interval);
+        self.consumer_cells
+            .entry(branch.clone())
+            .and_modify(|cell| cell.update_interval(interval))
+            .or_insert_with(|| sensing::ObservationCell::register(now, interval, factor));
+    }
+
+    /// Review L1 follow-up: the shared consumer cell must be reconciled to the
+    /// surviving local-consumer aggregate after either node-local row changes.
+    /// `Some(interval)` re-anchors the cell (creating none — delivery lazily
+    /// registers it); `None` (no live local row remains) DROPS the cell so a
+    /// branch kept alive only by a peer/leader row leaves no ghost local
+    /// consumer overlay. Returns whether the branch's projection moved (the
+    /// overlay-change signal input).
+    fn reconcile_consumer_interval(
+        &mut self,
+        branch: &sensing::ProviderInterestKey,
+        local_aggregate: Option<Duration>,
+    ) -> bool {
+        match local_aggregate {
+            Some(interval) => {
+                if let Some(cell) = self.consumer_cells.get_mut(branch) {
+                    let before = cell.projected();
+                    cell.update_interval(interval);
+                    return cell.projected() != before;
+                }
+                false
+            }
+            // No live local row remains — drop the cell (a peer/leader row may
+            // still keep the transport branch alive). Removing a live cell is an
+            // overlay change; report it conservatively.
+            None => self.consumer_cells.remove(branch).is_some(),
         }
     }
 
@@ -4077,12 +4274,39 @@ impl SensingObservations {
         &mut self,
         interest: &sensing::CapabilityInterestKey,
         interval: Duration,
+        local_aggregates: &std::collections::HashMap<sensing::ProviderInterestKey, Duration>,
     ) {
         for (key, cell) in self.consumer_cells.iter_mut() {
             if &key.interest == interest {
-                cell.update_interval(interval);
+                // review-pass-3 §14c: the digest-watch expectation is ONE demand
+                // on this cell, not the whole of it. A branch carrying BOTH a
+                // watch and a direct node-local row re-anchored to the watch's
+                // interval alone, which loses to `local_consumer_interval` — the
+                // invariant `table.rs` states for this cell: it must re-anchor to
+                // the strictest across every live node-local row, never to the
+                // latest mutating row's own interval.
+                let effective = local_aggregates
+                    .get(key)
+                    .map_or(interval, |local| (*local).min(interval));
+                cell.update_interval(effective);
             }
         }
+    }
+
+    /// The branches whose consumer cell is keyed under `interest`, so a caller
+    /// can resolve each one's local aggregate under the TABLE lock before taking
+    /// the observations lock (review-pass-3 §14c). Split this way deliberately:
+    /// nesting observations -> table would introduce a lock order this file does
+    /// not otherwise use.
+    fn consumer_branches_for(
+        &self,
+        interest: &sensing::CapabilityInterestKey,
+    ) -> Vec<sensing::ProviderInterestKey> {
+        self.consumer_cells
+            .keys()
+            .filter(|key| &key.interest == interest)
+            .cloned()
+            .collect()
     }
 }
 
@@ -4191,7 +4415,36 @@ fn disrupt_sensing_provider(
 /// branch's continuity window immediately (the upstream re-send
 /// rides the next refresh — no spec cache at this hop).
 #[allow(clippy::too_many_arguments)]
+/// Reclaim a dead branch's projection state, under the projection transaction
+/// and only if it is STILL dead (review-pass-3 §14a).
+///
+/// The 0494a7620 linearization covered intake, sweep and attestation; the
+/// branch-death consequences were left outside it. Between the table mutation
+/// that decided this branch had no downstreams and this reclaim, a registration
+/// can complete — its table row survives, but `reclaim_branch` erases the
+/// consumer cell it just anchored and the warm start it just took, and nothing
+/// restores them until the next origin beat.
+///
+/// The re-check mirrors the one the attestation-refusal path already performs for
+/// exactly this race: hold the projection mutex, confirm the branch is still
+/// unclaimed, and only then reclaim.
+fn reclaim_dead_sensing_branch(
+    projection_mu: &parking_lot::Mutex<()>,
+    table: &parking_lot::Mutex<sensing::InterestTable>,
+    observations: &parking_lot::Mutex<SensingObservations>,
+    key: &sensing::ProviderInterestKey,
+) {
+    let _projection = projection_mu.lock();
+    if !table.lock().downstreams(key, Instant::now()).is_empty() {
+        return;
+    }
+    observations.lock().reclaim_branch(key);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_sensing_removal_action(
+    projection_mu: &parking_lot::Mutex<()>,
+    table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &parking_lot::Mutex<SensingObservations>,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
     emitter_stamp: Option<u64>,
@@ -4206,7 +4459,7 @@ fn apply_sensing_removal_action(
 ) {
     match action {
         sensing::UpstreamAction::Deregister => {
-            observations.lock().reclaim_branch(key);
+            reclaim_dead_sensing_branch(projection_mu, table, observations, key);
             if key.provider == local_node_id {
                 if let (Some(emitter), Some(stamp)) = (emitter.lock().as_mut(), emitter_stamp) {
                     emitter.retire_if_stale(&key.interest.interest_digest, stamp);
@@ -4247,6 +4500,7 @@ fn apply_sensing_removal_action(
 /// last interest — never waiting for the ttl sweep.
 #[allow(clippy::too_many_arguments)]
 fn remove_sensing_downstream(
+    projection_mu: &parking_lot::Mutex<()>,
     table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &parking_lot::Mutex<SensingObservations>,
     emitter: &parking_lot::Mutex<Option<sensing::OriginEmitter>>,
@@ -4267,6 +4521,8 @@ fn remove_sensing_downstream(
         .remove_downstream(sensing::DownstreamId::Peer(failed), now);
     for (key, action) in actions {
         apply_sensing_removal_action(
+            projection_mu,
+            table,
             observations,
             emitter,
             emitter_stamp,
@@ -4292,6 +4548,7 @@ fn remove_sensing_downstream(
 #[cfg(feature = "redex")]
 #[allow(clippy::too_many_arguments)]
 fn remove_sensing_leader_consumer(
+    projection_mu: &parking_lot::Mutex<()>,
     leader: &parking_lot::Mutex<Option<sensing::SensingLeader>>,
     table: &parking_lot::Mutex<sensing::InterestTable>,
     observations: &parking_lot::Mutex<SensingObservations>,
@@ -4329,6 +4586,8 @@ fn remove_sensing_leader_consumer(
                 );
                 for (key, mesh_action) in mesh_actions {
                     apply_sensing_removal_action(
+                        projection_mu,
+                        table,
                         observations,
                         emitter,
                         emitter_stamp,
@@ -4614,16 +4873,27 @@ fn spawn_sensing_frame_send(
         return;
     };
     let socket = socket.clone();
+    // Reserve the stream sequence and build the packet SYNCHRONOUSLY, before
+    // spawning the send. A caller serializing two sends (e.g. under the lease
+    // apply mutex) thereby stamps their packets with stream sequences in call
+    // order rather than in racing-task order. (Allocating the sequence inside
+    // the spawned task — as this did before OLB-0.2's fix — let a
+    // later-created send take an earlier sequence.)
+    //
+    // NOTE: this orders the SENDS; the sensing intake applies interest frames
+    // in arrival order and does not currently reorder or reject by sequence,
+    // so it does not by itself resolve a deregister vs. re-acquire race at the
+    // receiver — soft-state ttl/2 refresh (holder-owned) does.
+    let events = [Bytes::from(payload)];
+    // SI-4a: the stream id is the hop-authored ENVELOPE — for 0x0C03 it
+    // carries the §4.4 continuity-bearing flag (see
+    // `sensing::SENSING_PROVISIONAL_STREAM`).
+    let seq = session.get_or_create_stream(stream_id).next_tx_seq();
+    let packet = {
+        let mut builder = session.thread_local_pool().get();
+        builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol)
+    };
     tokio::spawn(async move {
-        let events = [Bytes::from(payload)];
-        // SI-4a: the stream id is the hop-authored ENVELOPE — for
-        // 0x0C03 it carries the §4.4 continuity-bearing flag (see
-        // `sensing::SENSING_PROVISIONAL_STREAM`).
-        let seq = session.get_or_create_stream(stream_id).next_tx_seq();
-        let packet = {
-            let mut builder = session.thread_local_pool().get();
-            builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol)
-        };
         let _ = socket.send_to(&packet, addr).await;
     });
 }
@@ -4739,6 +5009,41 @@ pub enum SensingRegistrationError {
     /// (existing-key refreshes stay admitted at capacity) — the
     /// retry-after-frees contract is identical.
     AtCapacity,
+    /// OLB-0: a lease (re-)registration hit the interest table's
+    /// `max_interests_per_peer` amplification bound
+    /// ([`sensing::RegisterOutcome::OverCap`]) — nothing was installed, so
+    /// the lease acquisition is rolled back. Retry after capacity frees.
+    OverCapacity,
+    /// OLB-0: a lease (re-)registration was refused locally against the
+    /// cached provider floor
+    /// ([`sensing::RegisterOutcome::RefusedByCachedFloor`]) — no row was
+    /// installed, so the lease acquisition is rolled back.
+    RefusedByFloor {
+        /// The cached minimum sample interval the request fell below.
+        minimum_supported: Duration,
+    },
+    /// Review-pass-2 §6: the node-global sensing-interest LEASE registry is at
+    /// one of its cardinality bounds — too many distinct leased interests, or
+    /// too many live holders of this one. Nothing was minted, recorded or sent,
+    /// so there is nothing to roll back; retry after a holder releases.
+    LeaseAtCapacity(sensing::LeaseRefused),
+    /// Review-pass-3 §4: the requested interest carries an ORGANIZATION-derived
+    /// audience commitment, and the lease wire leg cannot speak for one yet.
+    ///
+    /// `register_sensing_interest_as` emits
+    /// `SensingInterestFrame::provider_registration` unconditionally — the LEGACY
+    /// variant, with no authority-aware planning, unlike the inbound path's
+    /// `apply_provider_registration` -> `plan_provider_continuation`. Any
+    /// org-authoritative provider refuses exactly that frame when its audience is
+    /// that org's canonical sensing commitment, counting `protocol_invalid` on the
+    /// PROVIDER. So the acquisition would install a local `LeasedLocal` row,
+    /// return success, and emit a frame designed to be refused — with the refusal
+    /// observable only on the far side and nothing in-slice to re-drive it.
+    ///
+    /// Refused LOUDLY here instead, matching the advisory posture, until the
+    /// lease leg threads `plan_provider_continuation` the way the inbound leg
+    /// does.
+    OrgAudienceUnsupported,
 }
 
 impl std::fmt::Display for SensingRegistrationError {
@@ -4754,11 +5059,928 @@ impl std::fmt::Display for SensingRegistrationError {
             Self::AtCapacity => {
                 f.write_str("origin at live-stream capacity — registration rolled back")
             }
+            Self::OverCapacity => f.write_str(
+                "sensing interest table at max_interests_per_peer — lease acquisition rolled back",
+            ),
+            Self::RefusedByFloor { minimum_supported } => write!(
+                f,
+                "sensing registration refused against cached floor (min {minimum_supported:?}) — lease acquisition rolled back"
+            ),
+            Self::LeaseAtCapacity(sensing::LeaseRefused::NodeAtCapacity) => f.write_str(
+                "node at its distinct sensing-interest lease bound — nothing acquired",
+            ),
+            Self::LeaseAtCapacity(sensing::LeaseRefused::InterestAtCapacity) => f.write_str(
+                "sensing interest at its live-holder bound — nothing acquired",
+            ),
+            Self::OrgAudienceUnsupported => f.write_str(
+                "organization-derived sensing audience: the lease wire leg emits legacy \
+                 frames only, which an org-authoritative provider refuses — nothing acquired",
+            ),
         }
     }
 }
 
 impl std::error::Error for SensingRegistrationError {}
+
+/// Fixtures-only hook carrying the exact-expiry timer's next armed deadline
+/// (`None` when no live record gates a wake).
+#[cfg(feature = "fixtures")]
+type ExpiryArmHook = Arc<dyn Fn(Option<u64>) + Send + Sync>;
+
+/// The node-global scoped-discovery publication primitive (Kyra OLB-2A.3.1
+/// closure).
+///
+/// Binds the mutation-ordering `gate` to the change-`watch` sender so every
+/// scoped-store mutation and its publication SERIALIZE node-wide: a transaction
+/// holds `gate` from BEFORE its final currentness recheck through its
+/// publication, so publications cannot invert relative to mutation order and the
+/// watch can never regress below [`ScopedDiscoveryState::revision`]. Publishing
+/// only when a transaction actually advanced the generation keeps a no-op from
+/// waking a consumer. Acquiring the gate before the recheck (not between the
+/// recheck and the insert) keeps the signed 2A.1 recheck→insert boundary closed:
+/// the wait happens first, then the security view is validated, then the mutation
+/// runs immediately.
+///
+/// [`ScopedDiscoveryState::revision`]: super::behavior::org_scoped_store::ScopedDiscoveryState::revision
+struct ScopedMutationPublication {
+    gate: parking_lot::Mutex<()>,
+    changed: tokio::sync::watch::Sender<u64>,
+    /// Fixtures-only: fired when a gate acquisition finds the gate HELD, before
+    /// the blocking `lock()` — the deterministic contention signal the concurrent
+    /// publication-ordering witnesses wait on. Absent from production builds.
+    #[cfg(feature = "fixtures")]
+    contention_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fixtures-only: fired after the state unlock and BEFORE publication (with
+    /// the gate still held), so a witness can pause a transaction between its
+    /// mutation and its publish. Absent from production builds.
+    #[cfg(feature = "fixtures")]
+    publish_pause: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Fixtures-only: fired by the exact-expiry timer each time it computes its
+    /// next deadline and is about to wait, carrying that deadline (`None` when no
+    /// live record gates a wake). Lets a witness observe the timer's arming and
+    /// advance the clock deterministically instead of racing a real sleep. Absent
+    /// from production builds.
+    #[cfg(feature = "fixtures")]
+    expiry_arm_hook: parking_lot::Mutex<Option<ExpiryArmHook>>,
+    /// Fixtures-only: fired by the exact-expiry timer AFTER it registers its
+    /// shutdown wake and BEFORE it observes the shutdown flag — precisely the
+    /// window in which a `notify_waiters` that retained no permit would strand the
+    /// timer. Lets a witness fire the real shutdown sequence inside that window.
+    /// Absent from production builds.
+    #[cfg(feature = "fixtures")]
+    shutdown_arm_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl ScopedMutationPublication {
+    fn new() -> Self {
+        Self {
+            gate: parking_lot::Mutex::new(()),
+            changed: tokio::sync::watch::channel(0u64).0,
+            #[cfg(feature = "fixtures")]
+            contention_hook: parking_lot::Mutex::new(None),
+            #[cfg(feature = "fixtures")]
+            publish_pause: parking_lot::Mutex::new(None),
+            #[cfg(feature = "fixtures")]
+            expiry_arm_hook: parking_lot::Mutex::new(None),
+            #[cfg(feature = "fixtures")]
+            shutdown_arm_hook: parking_lot::Mutex::new(None),
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// Signal (fixtures-only) that the exact-expiry timer has computed `deadline`
+    /// and is about to wait on it. A no-op in production builds.
+    fn signal_expiry_armed(&self, deadline: Option<u64>) {
+        #[cfg(feature = "fixtures")]
+        if let Some(hook) = self.expiry_arm_hook.lock().clone() {
+            hook(deadline);
+        }
+        #[cfg(not(feature = "fixtures"))]
+        let _ = deadline;
+    }
+
+    /// Signal (fixtures-only) that the exact-expiry timer has REGISTERED its
+    /// shutdown wake and has not yet observed the shutdown flag. A no-op in
+    /// production builds.
+    fn signal_expiry_shutdown_armed(&self) {
+        #[cfg(feature = "fixtures")]
+        if let Some(hook) = self.shutdown_arm_hook.lock().clone() {
+            hook();
+        }
+    }
+
+    /// Acquire the mutation-ordering gate. Try-then-block, so a witness observes
+    /// contention deterministically: the fixtures hook fires only when the gate
+    /// is already held, immediately before the blocking `lock()`.
+    fn lock_gate(&self) -> parking_lot::MutexGuard<'_, ()> {
+        match self.gate.try_lock() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(feature = "fixtures")]
+                if let Some(hook) = self.contention_hook.lock().clone() {
+                    hook();
+                }
+                self.gate.lock()
+            }
+        }
+    }
+
+    /// Publish `after` — the post-mutation generation — but only if the
+    /// transaction advanced it. MUST be called with the gate held and the state
+    /// lock released; serialized by the gate, so the watch value is monotone and
+    /// converges to [`ScopedDiscoveryState::revision`].
+    ///
+    /// [`ScopedDiscoveryState::revision`]: super::behavior::org_scoped_store::ScopedDiscoveryState::revision
+    fn publish_if_changed(&self, before: u64, after: u64) {
+        #[cfg(feature = "fixtures")]
+        if let Some(hook) = self.publish_pause.lock().clone() {
+            hook();
+        }
+        if before != after {
+            self.changed.send_replace(after);
+        }
+    }
+
+    /// Commit `f` under the state lock, capturing the generation before and
+    /// after, then (after releasing the state lock) publishing the new generation
+    /// if it advanced. The inbound ingest path uses this directly because it
+    /// holds the gate across its currentness recheck as well.
+    ///
+    /// Gate ownership is COMPILER-ENFORCED, not documented (review-pass-3 §15):
+    /// the caller hands over its live [`Self::lock_gate`] guard, so there is no
+    /// way to reach this without one. It used to be a convention with no
+    /// assertion, no guard parameter and no proof token behind it, and a future
+    /// gateless caller would have compiled silently — re-opening the OLB-2A.3.1
+    /// publication inversion with every existing test green.
+    ///
+    /// The guard is borrowed rather than consumed so a caller can keep holding it
+    /// across work that follows the commit, which the ingest path does.
+    fn commit<R>(
+        &self,
+        _gate: &parking_lot::MutexGuard<'_, ()>,
+        scoped_discovery: &Arc<
+            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
+        >,
+        f: impl FnOnce(&mut super::behavior::org_scoped_store::ScopedDiscoveryState) -> R,
+    ) -> R {
+        let (result, before, after) = {
+            let mut state = scoped_discovery.lock();
+            let before = state.revision();
+            let result = f(&mut state);
+            let after = state.revision();
+            (result, before, after)
+        };
+        self.publish_if_changed(before, after);
+        result
+    }
+
+    /// Acquire the gate, then [`Self::commit`] — for a self-contained mutation
+    /// with no separate pre-mutation recheck to hold the gate across (the GC
+    /// sweep).
+    fn gated_commit<R>(
+        &self,
+        scoped_discovery: &Arc<
+            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
+        >,
+        f: impl FnOnce(&mut super::behavior::org_scoped_store::ScopedDiscoveryState) -> R,
+    ) -> R {
+        let gate = self.lock_gate();
+        self.commit(&gate, scoped_discovery, f)
+    }
+}
+
+/// Advance a node-local identity counter without ever ALIASING a previous value
+/// (review-pass-3 §12).
+///
+/// The house rule the branch already applies to the routing epoch and the store's
+/// publication generation — "never wrap, latch and fail closed" — stated for the
+/// remaining counters that participate in stamp equality. Neither wrapping nor
+/// saturating is safe on its own: both hand a later state an identity a previous
+/// state already used, and every consumer of these counters compares them for
+/// EQUALITY to decide "nothing moved".
+///
+/// `u64::MAX` is the terminal sentinel. The counter latches there, and every
+/// `is_current` that reads it refuses on that value from either side, so an
+/// exhausted identity can never compare current — with itself or with anything
+/// else. Reaching it takes 2^64 node-local operations; the point is that the
+/// claim in the docs is now true of the code.
+fn advance_fenced_generation(counter: &std::sync::atomic::AtomicU64, what: &'static str) {
+    let outcome = counter.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |current| current.checked_add(1).filter(|next| *next != u64::MAX),
+    );
+    if outcome.is_err() {
+        // Latched: report the TRANSITION once rather than on every later call.
+        if counter
+            .swap(u64::MAX, std::sync::atomic::Ordering::AcqRel)
+            .checked_add(1)
+            .is_some()
+        {
+            tracing::error!(
+                counter = what,
+                "org authority: identity counter space exhausted; every stamp \
+                 reading it now fails closed rather than reusing an identity"
+            );
+        }
+    }
+}
+
+/// The production [`SlotSource`] — the routing registry's binding to real
+/// private discovery (OLB-2B-E3c).
+///
+/// Implements the signed E3b seam literally, and the split is the whole point:
+///
+/// - [`SlotSource::snapshot`] takes the STATE lock only, briefly, and returns
+///   fully owned rows. It does NOT take the publication gate, so a mutation can
+///   commit the instant the capture ends;
+/// - reconstruction runs on the returned material with no source lock, no
+///   registry lock, no await;
+/// - [`SlotSource::pin_if_current`] takes the publication GATE — the thing that
+///   serializes every ingest, sweep, floor retraction and publication — and holds
+///   it only across the conditional installation.
+///
+/// Holding that gate across reconstruction instead would block all private
+/// discovery behind a whole quantum of store queries (Kyra OLB-2B-E3b).
+///
+/// # Why the gate makes the pin sound
+///
+/// A mutation holds the gate from before its currentness recheck through its
+/// publication. So while the pin holds the gate, no mutation can commit; and if
+/// one committed between the snapshot and the pin, the revision read under the
+/// gate differs from the expected one and the pin refuses. A snapshot that raced
+/// a mutation's state-lock section but preceded its publication still reads the
+/// post-mutation revision, and the pin then blocks until that publication is
+/// ordered — so the wake the discarded attempt relies on is already queued.
+struct ScopedSlotSource {
+    scoped_discovery:
+        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
+    publication: Arc<ScopedMutationPublication>,
+    org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+    authority: Arc<RoutingAuthority>,
+    /// Test-only: fires INSIDE `settle_if_current`, after the validation has
+    /// succeeded and before the settlement — the exact gap a publication must not
+    /// be able to occupy.
+    #[cfg(test)]
+    settle_gap_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Slots asked for under a scope this source does not serve. Counted rather
+    /// than silently answered with "no providers".
+    unserved_scope: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Owned, bounded material for ONE quantum: the exact rows for the exact keys the
+/// registry selected, captured at `generation`.
+struct ScopedSourceSnapshot {
+    token: super::behavior::org_routing_registry::SourceToken,
+    /// ONLY the keys this source can actually speak for. A key absent here
+    /// reconstructs as `SourceFacts::Unserved`, never as an empty provider set.
+    rows: std::collections::BTreeMap<
+        super::behavior::org_routing_registry::SlotKey,
+        Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider>,
+    >,
+}
+
+/// Publish an authority change and advance the routing epoch as ONE ordered unit
+/// (OLB-2B-E3c).
+///
+/// `publish` runs INSIDE the authority gate, so the new authority cannot become
+/// query-visible before the epoch that names it. Publishing first and bumping
+/// afterwards leaves a window in which routing still stamps, commits and serves
+/// under the old authority — and a live commit pin holding this gate would hold
+/// that window open for as long as it liked.
+///
+/// The registry invalidation runs OUTSIDE the gate: the registry takes its own
+/// lock, and the frozen order is authority gate -> publication gate, never
+/// authority gate -> registry lock. It is not optional — authority movement need
+/// not touch scoped state at all, so there may be no other wake.
+///
+/// A movement that EXHAUSTS the epoch space takes the terminal branch instead:
+/// facts stamped `u64::MAX` are exactly the ones a strictly-older invalidation
+/// can never name, so the transition retires everything itself — once, without
+/// re-queueing, because rebuilt facts could never be installed again (E3c
+/// blockers §2).
+fn move_routing_authority<R>(
+    authority: &RoutingAuthority,
+    registry: &super::behavior::org_routing_registry::NodeOrgRoutingRegistry,
+    publish: impl FnOnce() -> R,
+) -> R {
+    let (result, live, advance) = {
+        let _gate = authority.lock_gate();
+        // Epoch FIRST, publication second. `org_routing_base_facts` reads
+        // lock-free, so it never sees this gate; publishing the new store before
+        // the epoch that names it leaves a window where a reader observes store B
+        // with epoch R and serves A-derived facts as B-authoritative. Advancing
+        // first makes the transition conservatively COLD instead: a reader sees
+        // either (A, R) or (B, R+1), and facts stamped R stop matching the moment
+        // the epoch moves (Kyra OLB-2B-E3c).
+        let advance = authority.advance();
+        let live = authority.epoch();
+        let result = publish();
+        (result, live, advance)
+    };
+    // Outside the gate: the registry takes its own lock, and the frozen order is
+    // authority gate -> publication gate, never authority gate -> registry lock.
+    match advance {
+        // CONDITIONAL on `live`, so a reconciliation that installed valid
+        // successor facts in this window is not wiped.
+        AuthorityAdvance::Advanced => registry.invalidate_authority_older_than(live),
+        // The one transition `invalidate_authority_older_than` cannot express:
+        // `live` froze at `u64::MAX`, and `< u64::MAX` structurally spares the
+        // MAX-stamped facts whose identity is the very thing now unable to
+        // prove currentness (E3c blockers §2).
+        AuthorityAdvance::NewlyExhausted => registry.retire_terminal(),
+        // Retirement already ran at the transition; there is nothing retained
+        // to fence, and re-queueing anything here would be a promise of work
+        // that can never complete.
+        AuthorityAdvance::AlreadyExhausted => {}
+    }
+    result
+}
+
+/// Test-only RAII flag: set while a joiner waits on the routing-task slot.
+#[cfg(test)]
+struct RoutingJoinWaiting<'a>(&'a AtomicBool);
+
+#[cfg(test)]
+impl<'a> RoutingJoinWaiting<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+#[cfg(test)]
+impl Drop for RoutingJoinWaiting<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// What one [`RoutingAuthority::advance`] did (E3c blockers §2).
+///
+/// `NewlyExhausted` is reported EXACTLY ONCE, at the transition, and it is the
+/// caller's one chance to retire retained routing state: every fact already
+/// stamped `u64::MAX` survives `invalidate_authority_older_than(u64::MAX)` —
+/// strictly-older cannot name the ceiling itself — so nothing later can fence
+/// what this call does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "NewlyExhausted obligates the caller to retire retained routing state"]
+enum AuthorityAdvance {
+    /// The epoch moved to a fresh identity.
+    Advanced,
+    /// THIS call crossed the ceiling: the terminal latch was just set.
+    NewlyExhausted,
+    /// The space was already terminal before this call.
+    AlreadyExhausted,
+}
+
+/// The node-owned routing authority (OLB-2B-E3c).
+///
+/// Two jobs, and they are why routing authority is node-owned rather than read
+/// straight off the revocation slot:
+///
+/// - `epoch` is a MONOTONE identity for the current authority. A raw `Arc`
+///   address is not: a store can be replaced, freed, and a new one allocated at
+///   the same address with the same barriered generation, so pointer identity is
+///   ABA-vulnerable. A counter that only ever increases cannot alias a previous
+///   authority (Kyra OLB-2B-E3c);
+/// - `gate` serializes authority movement against the routing COMMIT PIN, so an
+///   install cannot land between the pin accepting a token and the registry
+///   finishing its conditional installation beneath it.
+struct RoutingAuthority {
+    gate: parking_lot::Mutex<()>,
+    epoch: AtomicU64,
+    /// Set once the epoch space is exhausted. Terminal: routing serves nothing
+    /// and commits nothing from then on.
+    exhausted: AtomicBool,
+    /// Test-only: fired when a gate acquisition finds the gate HELD, immediately
+    /// before the blocking `lock()`. The deterministic contention signal the
+    /// witnesses wait on instead of inferring from elapsed time.
+    #[cfg(test)]
+    contention_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl RoutingAuthority {
+    fn new() -> Self {
+        Self {
+            gate: parking_lot::Mutex::new(()),
+            epoch: AtomicU64::new(1),
+            exhausted: AtomicBool::new(false),
+            #[cfg(test)]
+            contention_hook: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Acquire the authority gate, try-then-block, signalling contention.
+    fn lock_gate(&self) -> parking_lot::MutexGuard<'_, ()> {
+        match self.gate.try_lock() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(test)]
+                {
+                    let hook = self.contention_hook.lock().clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                self.gate.lock()
+            }
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::Acquire)
+    }
+
+    /// Advance the authority epoch, or FENCE routing if the space is exhausted.
+    ///
+    /// Neither saturating nor wrapping. Saturation is not a safe ceiling: at
+    /// `u64::MAX` every subsequent authority receives the SAME identity, so a
+    /// token minted under one store commits under an unrelated replacement —
+    /// exactly the aliasing the monotone counter exists to prevent (Kyra
+    /// OLB-2B-E3c). Exhaustion is terminal and fail-closed: `is_exhausted`
+    /// makes every scope unserved and refuses every commit pin.
+    fn advance(&self) -> AuthorityAdvance {
+        let mut current = self.epoch.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(1) else {
+                // `swap`, not `store`: the false→true TRANSITION is reported to
+                // exactly one caller, which owes the terminal retirement.
+                if self.exhausted.swap(true, Ordering::AcqRel) {
+                    return AuthorityAdvance::AlreadyExhausted;
+                }
+                tracing::error!(
+                    "org routing: authority epoch space exhausted; routing is \
+                     fenced rather than reusing an authority identity"
+                );
+                return AuthorityAdvance::NewlyExhausted;
+            };
+            match self.epoch.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return AuthorityAdvance::Advanced,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl ScopedSlotSource {
+    /// The live revocation floor view, plus whether the authority is usable.
+    ///
+    /// The floors come from exactly the store this reads, and the `Arc` is
+    /// returned with them so the snapshot filters against the same view it
+    /// reports.
+    fn revocation_view(
+        &self,
+    ) -> (
+        bool,
+        u64,
+        Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
+    ) {
+        Self::revocation_view_of(&self.org_revocation)
+    }
+
+    /// The same sampling the snapshot uses, shared with the cached-read seam so
+    /// both compare like with like.
+    fn revocation_view_of(
+        slot: &ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
+    ) -> (
+        bool,
+        u64,
+        Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
+    ) {
+        let store = slot.load_full();
+        let (poisoned, floor_generation) = match store.as_ref() {
+            // An EXHAUSTED publication generation is unusable authority for the
+            // same reason poison is: the generation can no longer distinguish
+            // floor views, so it can no longer witness currentness. Folded into
+            // the same fail-closed flag, and sampled COHERENTLY with the
+            // generation it qualifies (Kyra OLB-2B-E3c).
+            Some(store) => match store.barriered_generation() {
+                Ok(generation) => (store.is_poisoned(), generation.get()),
+                Err(_) => (true, 0),
+            },
+            // Un-adopted: no store, implicit floor 0.
+            None => (false, 0),
+        };
+        (poisoned, floor_generation, store)
+    }
+
+    /// Every authority input reconstruction depends on, as one comparable token.
+    ///
+    /// Revocation is in here because it is not merely an input to filtering — it
+    /// IS authority. A floor becomes live BEFORE the floor-raise subscriber
+    /// retracts the scoped rows it invalidates, so there is a window in which the
+    /// scoped revision is unchanged while rows the source would serve are already
+    /// unauthorized. A scoped-only token installs facts inside that window and
+    /// lets the callback retract them a moment later (Kyra OLB-2B-E3c). Store
+    /// replacement has the same shape between publishing the new identity and
+    /// completing scoped reconciliation.
+    ///
+    /// Poison and the barriered floor generation are inside the EPOCH as well as
+    /// the authority number because they can move WITHOUT a node-mediated
+    /// install — the authority epoch covers what the node serializes, these
+    /// cover the rest. The token is derived from the epoch so the two can never
+    /// disagree about what a fact was built under.
+    fn token(
+        &self,
+        epoch: super::behavior::org_routing_registry::SourceEpoch,
+        exhausted: bool,
+    ) -> super::behavior::org_routing_registry::SourceToken {
+        super::behavior::org_routing_registry::SourceToken::new(vec![
+            epoch.generation,
+            epoch.authority,
+            epoch.floor_generation,
+            u64::from(epoch.poisoned),
+            u64::from(exhausted),
+        ])
+    }
+}
+
+impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnapshot {
+    fn token(&self) -> super::behavior::org_routing_registry::SourceToken {
+        self.token.clone()
+    }
+
+    fn providers(
+        &self,
+        key: &super::behavior::org_routing_registry::SlotKey,
+    ) -> super::behavior::org_routing_registry::SourceFacts {
+        use super::behavior::org_routing_registry::SourceFacts;
+        // Reconstruction proper: no lock of any kind, no await. Ordering is
+        // imposed HERE rather than at capture, so the deterministic projection is
+        // off-lock work.
+        let Some(rows) = self.rows.get(key) else {
+            // Not captured => this source cannot speak for the scope at all.
+            // Deliberately NOT an empty provider set: see `SourceFacts`.
+            return SourceFacts::Unserved;
+        };
+        let mut providers = rows.clone();
+        // Provider ascending (the deterministic projection order), generation
+        // DESCENDING within a provider. `Vec::dedup_by` passes elements in
+        // reverse slice order and removes the first argument, so the FIRST of
+        // each run survives — with an ascending tiebreak this defensive dedup
+        // would keep the OLDEST generation. The rows are one-per-provider by
+        // construction today (`find_scope_exact_private_providers` keys on
+        // `(scope, provider)` under exact scope equality), so the dedup is a
+        // no-op; it is kept as the defense it was meant to be, pointed the right
+        // way (review-pass-2 §5).
+        providers.sort_by(|a, b| {
+            a.provider
+                .cmp(&b.provider)
+                .then_with(|| b.generation.cmp(&a.generation))
+        });
+        providers.dedup_by(|a, b| a.provider == b.provider);
+        SourceFacts::Served(providers.into())
+    }
+}
+
+/// Holds every authority input still, through the conditional installation AND
+/// the settlement beneath it.
+///
+/// Three guards, and the third is the one that matters most. Scoped mutation and
+/// node-mediated authority movement are excluded by the two gates. Revocation
+/// FLOOR publication is excluded by holding the store's publication barrier —
+/// `StoreCore::publish` needs `live.write()`, so it cannot land while this pin
+/// lives. Sampling floors and then settling would not be enough: `Current` is
+/// what causes the supervisor to publish `Healthy`, so a publication landing
+/// between the sample and the settlement makes that claim false with nothing left
+/// to detect it (Kyra OLB-2B-E3c).
+struct ScopedCommitPin<'a> {
+    _authority_gate: parking_lot::MutexGuard<'a, ()>,
+    _publication_gate: parking_lot::MutexGuard<'a, ()>,
+    /// The installed store, so settlement can take its publication barrier.
+    store: Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
+    epoch: super::behavior::org_routing_registry::SourceEpoch,
+    #[cfg(test)]
+    settle_gap_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl ScopedCommitPin<'_> {
+    /// Does the pinned view still match what this pin was minted against?
+    ///
+    /// Floors are compared through the held barrier. Poison is a separate
+    /// path-registry write the barrier does not block, so it is genuinely
+    /// re-sampled — but the pin holds the store's POISON GATE across this check
+    /// and the settlement beneath it, in BOTH directions: a mark and a recovery
+    /// clear are equally capable of making a settled `Current` false.
+    fn matches(&self, pinned: &super::behavior::org_revocation::PublicationPin<'_>) -> bool {
+        let Ok(generation) = pinned.generation() else {
+            // Terminal exhaustion: currentness can no longer be witnessed.
+            return false;
+        };
+        pinned.poisoned() == self.epoch.poisoned && generation.get() == self.epoch.floor_generation
+    }
+}
+
+impl super::behavior::org_routing_registry::SourceCommitPin for ScopedCommitPin<'_> {
+    fn epoch(&self) -> super::behavior::org_routing_registry::SourceEpoch {
+        self.epoch
+    }
+
+    /// The gates exclude scoped mutation and node-mediated authority movement.
+    /// They do NOT exclude the revocation store's own publication — floors and
+    /// poison publish through `StoreCore`'s internal synchronization, which no
+    /// routing gate reaches. So the pin completes its guarantee by RE-VERIFYING
+    /// them (Kyra OLB-2B-E3c).
+    /// The check and the settlement happen under ONE held publication barrier, so
+    /// no floor publication can interleave between them. `StoreCore::publish`
+    /// needs `live.write()`; this holds `live.read()` across both.
+    fn settle_if_current(
+        &self,
+        settle: &mut dyn FnMut() -> super::behavior::org_routing::ApplyOutcome,
+    ) -> Option<super::behavior::org_routing::ApplyOutcome> {
+        let Some(store) = self.store.as_ref() else {
+            // No store installed: there is nothing that can publish.
+            return Some(settle());
+        };
+        let pinned = store.pin_publication();
+        if !self.matches(&pinned) {
+            return None;
+        }
+        // Still under the barrier — a publication cannot land here.
+        #[cfg(test)]
+        if let Some(hook) = self.settle_gap_hook.as_ref() {
+            hook();
+        }
+        Some(settle())
+    }
+}
+
+impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
+    fn snapshot(
+        &self,
+        keys: &[super::behavior::org_routing_registry::SlotKey],
+    ) -> Box<dyn super::behavior::org_routing_registry::SourceSnapshot> {
+        use super::behavior::org_revocation::OrgRevocationState;
+        let now_secs = super::behavior::org::current_timestamp();
+
+        // Revocation authority FIRST, and the floors come from exactly the store
+        // the token names. Capturing it before the scoped rows means any floor
+        // movement that could invalidate those rows is either inside the token or
+        // caught by the commit pin.
+        // Store view and routing epoch sampled as ONE coherent unit under the
+        // authority gate. Off-gate they can straddle a publication: store A with
+        // epoch R+1, whose token then compares equal to live store B if A and B
+        // happen to share a floor generation — installing A-derived rows as
+        // B-authoritative (Kyra OLB-2B-E3c). Released immediately; the rows below
+        // are covered by the scoped revision in the same token.
+        let (poisoned, floor_generation, store, authority, exhausted) = {
+            let _gate = self.authority.lock_gate();
+            let (poisoned, floor_generation, store) = self.revocation_view();
+            (
+                poisoned,
+                floor_generation,
+                store,
+                self.authority.epoch(),
+                self.authority.is_exhausted(),
+            )
+        };
+        let empty_floors = OrgRevocationState::empty();
+        let floors_snapshot = store.as_ref().map(|s| s.snapshot());
+        let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+
+        let mut unserved = 0u64;
+        let (generation, rows, generations_exhausted) = {
+            let state = self.scoped_discovery.lock();
+            let generation = state.revision();
+            // Sampled under the SAME lock as the generation it qualifies: read
+            // separately it races the very mutation that latches it
+            // (review-pass-3 §12).
+            let generations_exhausted = state.generations_exhausted();
+            let exhausted = exhausted || generations_exhausted;
+            let mut rows = std::collections::BTreeMap::new();
+            for key in keys {
+                let scope = key.scope.scope();
+                if !matches!(
+                    scope,
+                    super::behavior::org_scoped_ingest::CapabilityAudienceScope::Owner { .. }
+                ) || poisoned
+                    || exhausted
+                {
+                    // Absent from `rows` => reconstructed as `Unserved`. A
+                    // POISONED revocation authority makes every scope unserved:
+                    // there is no usable floor view to filter against, and
+                    // serving unfiltered rows is worse than serving none.
+                    unserved += 1;
+                    continue;
+                }
+                rows.insert(
+                    key.clone(),
+                    state.find_scope_exact_private_providers(
+                        scope,
+                        &key.capability,
+                        now_secs,
+                        floors,
+                    ),
+                );
+            }
+            (generation, rows, generations_exhausted)
+        };
+        if unserved > 0 {
+            self.unserved_scope
+                .fetch_add(unserved, std::sync::atomic::Ordering::AcqRel);
+        }
+        let epoch = super::behavior::org_routing_registry::SourceEpoch {
+            generation,
+            authority,
+            floor_generation,
+            poisoned,
+        };
+        let token = self.token(epoch, exhausted || generations_exhausted);
+        Box::new(ScopedSourceSnapshot { token, rows })
+    }
+
+    fn pin_if_current(
+        &self,
+        expected: &super::behavior::org_routing_registry::SourceToken,
+    ) -> Option<Box<dyn super::behavior::org_routing_registry::SourceCommitPin + '_>> {
+        // BOTH gates, and both are held through the conditional installation
+        // beneath this pin. The publication gate stops scoped mutation; the
+        // authority gate stops revocation installs and floor movement. Verifying
+        // the token and then holding only the scoped gate would leave authority
+        // free to move between acceptance and installation — the install would
+        // land against an authority that is already gone (Kyra OLB-2B-E3c).
+        //
+        // Order is fixed: authority gate, then publication gate. Every authority
+        // mutation takes only the authority gate, so no inversion is reachable.
+        let authority_gate = self.authority.lock_gate();
+        let publication_gate = self.publication.lock_gate();
+        let (poisoned, floor_generation, store) = self.revocation_view();
+        let (generation, generations_exhausted) = {
+            let state = self.scoped_discovery.lock();
+            (state.revision(), state.generations_exhausted())
+        };
+        // Either identity space latching is terminal: a frozen counter cannot
+        // witness that the view is still the one the token names, so it must not
+        // be able to authorize an installation (review-pass-3 §12).
+        let exhausted = self.authority.is_exhausted() || generations_exhausted;
+        let epoch = super::behavior::org_routing_registry::SourceEpoch {
+            generation,
+            authority: self.authority.epoch(),
+            floor_generation,
+            poisoned,
+        };
+        if exhausted || self.token(epoch, exhausted) != *expected {
+            return None;
+        }
+        Some(Box::new(ScopedCommitPin {
+            _authority_gate: authority_gate,
+            _publication_gate: publication_gate,
+            store,
+            epoch,
+            #[cfg(test)]
+            settle_gap_hook: self.settle_gap_hook.lock().clone(),
+        }))
+    }
+
+    fn liveness(&self) -> super::behavior::org_routing_registry::SourceLiveness {
+        use super::behavior::org_routing_registry::SourceLiveness;
+        // Two TERMINAL latches: the node-owned authority epoch and the scoped
+        // change generation. Both are monotone in-memory identity spaces with no
+        // successor to move to, so nothing can retire either (review-pass-3 §12
+        // folds the second one in — it is `SourceEpoch::generation`, the plane's
+        // coherence token, and the only counter in the set a remote peer
+        // influences at all).
+        if self.authority.is_exhausted() || self.scoped_discovery.lock().generations_exhausted() {
+            return SourceLiveness::Terminal;
+        }
+        // The installed store's publication generation is the OTHER way a
+        // settlement becomes impossible, and it is the one review-pass-3 §1
+        // names: `revocation_view_of` folds exhaustion into the STABLE
+        // `(poisoned = true, floor_generation = 0)` view, so the token compares
+        // equal pass after pass and `pin_if_current` ACCEPTS — while
+        // `ScopedCommitPin::matches` refuses on `Err(GenerationExhausted)`
+        // forever. Without this signal the actor re-snapshots, re-pins, re-fails
+        // and re-marks itself awake at `yield_now` rate, with no source movement
+        // required at all.
+        //
+        // FENCED, not terminal: this is store state, and a replacement install
+        // both swaps the store and advances the routing epoch, after which this
+        // reads `Live` again and the invalidation that movement performs supplies
+        // the wake. So the queue is kept and only the self-wake is suppressed.
+        if self
+            .org_revocation
+            .load()
+            .as_ref()
+            .is_some_and(|store| store.barriered_generation().is_err())
+        {
+            return SourceLiveness::Fenced;
+        }
+        SourceLiveness::Live
+    }
+}
+
+/// Drive the node's single exact-expiry timer (OLB-2A.3.2).
+///
+/// Reads [`ScopedDiscoveryState::next_visible_expiry`] and arms to exactly that
+/// deadline, so an expired private-discovery record is swept — and its consumers
+/// woken — at its deadline instead of up to 60 s later. Waking is driven by the
+/// SAME change watch the mutation paths publish to: any mutation that advances a
+/// generation (e.g. an insert with an earlier expiry) wakes the timer, which
+/// re-reads `next_visible_expiry` and re-arms to the new, earlier deadline. Reads
+/// are already expiry-safe — the store filters `now < expires_at` at query time,
+/// so a not-yet-swept expiry is invisible to queries regardless — so this governs
+/// promptness and wake latency, NOT a correctness boundary. The 60 s GC stays a
+/// retention backstop, including for inert records that declare no capability and
+/// so advance no generation (they never wake this timer).
+///
+/// The sweep runs through [`ScopedMutationPublication::gated_commit`], so it
+/// serializes with inbound ingest and its publication cannot invert (OLB-2A.3.1).
+/// `wall_now` is injected so a witness can drive a deterministic clock in lockstep
+/// with paused time; production samples the real wall clock.
+///
+/// [`ScopedDiscoveryState::next_visible_expiry`]: super::behavior::org_scoped_store::ScopedDiscoveryState::next_visible_expiry
+async fn run_exact_expiry_timer(
+    scoped: Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
+    publication: Arc<ScopedMutationPublication>,
+    mut changed: tokio::sync::watch::Receiver<u64>,
+    wall_now: impl Fn() -> Duration + Send,
+    shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
+) {
+    loop {
+        // Arm the shutdown wake BEFORE observing the shutdown flag.
+        // `notify_waiters` retains NO permit for a waiter that arrives later, so
+        // checking the flag first loses a shutdown that lands in the gap: the timer
+        // then parks — forever with no live deadline, or until a distant one —
+        // while `MeshNode::shutdown` awaits its tracked handle, hanging shutdown
+        // (Kyra OLB-2A.3.2). That is exactly what an inline `notified()` inside the
+        // `select!` below would do, because a `Notified` captures the
+        // notify-waiters epoch when it is CONSTRUCTED: constructing it after the
+        // notify misses that notify permanently. Constructing (and enabling, so the
+        // waiter is registered rather than merely epoch-stamped) first inverts the
+        // order against the shutdown sequence (`store` then `notify_waiters`):
+        // either the store is visible to the load below, or this waiter was already
+        // armed when the notify ran. Re-armed per iteration, so the same argument
+        // covers every wait.
+        let shutdown_signal = shutdown_notify.notified();
+        tokio::pin!(shutdown_signal);
+        shutdown_signal.as_mut().enable();
+        publication.signal_expiry_shutdown_armed();
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        // Mark the current change version SEEN before reading state: a mutation
+        // that lands between here and the wait is then never missed — if it lands
+        // before the read, the read reflects it; either way `changed()` fires and
+        // we re-arm. (Marking seen AFTER the read could drop a wake for an earlier
+        // deadline.) The timer's own sweep-publish is likewise marked seen here on
+        // the next iteration, so it never self-wakes into a busy loop.
+        changed.borrow_and_update();
+        let next = { scoped.lock().next_visible_expiry() };
+        let now = wall_now();
+        let Some(deadline) = next else {
+            publication.signal_expiry_armed(None);
+            tokio::select! {
+                _ = changed.changed() => {}
+                _ = &mut shutdown_signal => return,
+            }
+            continue;
+        };
+        let wait = exact_expiry_wait(deadline, now);
+        if wait.is_zero() {
+            // Deadline reached (or already past): sweep every currently-expired
+            // record in one pass. The next deadline is then strictly in the
+            // future, or nothing is tracked — no immediate re-sweep.
+            let forgotten = publication.gated_commit(&scoped, |s| s.sweep_expired(now.as_secs()));
+            if forgotten > 0 {
+                tracing::debug!(forgotten, "scoped discovery: exact-expiry swept");
+            }
+            continue;
+        }
+        publication.signal_expiry_armed(Some(deadline));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = changed.changed() => {}
+            _ = &mut shutdown_signal => return,
+        }
+    }
+}
+
+/// How long the exact-expiry timer waits for `deadline_secs`, given `wall_now` —
+/// the wall clock as a duration since the Unix epoch.
+///
+/// Derived from the ABSOLUTE deadline rather than an integer-second delta, so the
+/// wall clock's SUBSECOND part is not discarded (Kyra OLB-2A.3.2): at wall 99.900 s
+/// a deadline of 100 s is 100 ms away, where a second-truncated delta would sleep a
+/// full second and wake at ~100.900 — publishing the sweep almost a second after
+/// the records became query-invisible. `Duration::ZERO` means the deadline has been
+/// reached: sweep now.
+fn exact_expiry_wait(deadline_secs: u64, wall_now: Duration) -> Duration {
+    Duration::from_secs(deadline_secs).saturating_sub(wall_now)
+}
 
 /// Multi-peer mesh node.
 ///
@@ -4946,7 +6168,69 @@ pub struct MeshNode {
     /// and sweep are short synchronous critical sections on the inbound dispatch
     /// path, with no await held.
     scoped_discovery:
-        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>>,
+        Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
+    /// OLB-2A.3: the private-discovery publication primitive — the mutation
+    /// ordering gate bound to the change-wake sender. Every scoped-store mutation
+    /// (ingest, sweep) runs through `ScopedMutationPublication::commit` /
+    /// `gated_commit`, which holds the gate across the transaction and its
+    /// publication, so the watch carries the latest published global generation
+    /// and can never regress (Kyra OLB-2A.3.1 closure). The owner generation and
+    /// the dirty deltas are read from the state on wake.
+    scoped_publication: Arc<ScopedMutationPublication>,
+    /// review-pass-3 §10: per-outcome counters for the private-discovery intake.
+    /// Every refusal used to be `debug!`/`trace!` and nothing else, so a capacity
+    /// wedge, a forged-envelope storm and a persistent publication-race refusal
+    /// were all indistinguishable from silence at any normal log level.
+    scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters>,
+    /// OLB-2B-E3c: the node's ONE bounded routing registry — the real consumer of
+    /// the private-discovery dirty stream, and the `DirtyApply` the supervised
+    /// actor drives. Constructed here so its retained slots outlive any single
+    /// actor incarnation; the actor's authority over it is claimed and revoked by
+    /// the incarnation lifecycle, not by construction.
+    routing_registry: Arc<super::behavior::org_routing_registry::NodeOrgRoutingRegistry>,
+    /// OLB-2B-E3a: the registry-work wake — the second source in the actor's wait
+    /// set, for the transitions private-discovery movement cannot signal (first
+    /// demand, slot lifecycle).
+    routing_work: Arc<super::behavior::org_routing::RegistryWork>,
+    /// OLB-2B-E2: the live routing health view. `Fenced` until an incarnation
+    /// completes a recapture, and fenced again the moment one dies.
+    routing_health: super::behavior::org_routing::SharedRoutingHealth,
+    /// OLB-2B-E2/E3b: supervision and registry counters.
+    routing_metrics: Arc<super::behavior::org_routing::RoutingMetrics>,
+    routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics>,
+    /// OLB-2B-E3c: slots whose audience scope the production source does not
+    /// serve (the grant plane). Counted, never silently answered as "no
+    /// providers".
+    routing_unserved_scope: Arc<std::sync::atomic::AtomicU64>,
+    /// OLB-2B-E3c: the node-owned routing authority — the monotone epoch every
+    /// routing fact is stamped with, and the gate that serializes authority
+    /// movement against the routing commit pin.
+    routing_authority: Arc<RoutingAuthority>,
+    /// OLB-2B-E3c: the supervisor task, held for a DETERMINISTIC join.
+    ///
+    /// Kept in its own slot rather than the shared `tasks` vector because that
+    /// vector is populated from a spawned task, so a fast shutdown can miss it.
+    /// The routing task must be joined — awaiting it is the proof that the actor
+    /// fenced and the exclusive drain dropped, and therefore the only thing that
+    /// makes a successor mint possible.
+    routing_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    /// OLB-2B-E3c: guards the SINGLE production supervisor construction path.
+    routing_started: Arc<AtomicBool>,
+    /// Test-only: set while a joiner is waiting on the routing-task slot.
+    #[cfg(test)]
+    routing_join_waiting: Arc<AtomicBool>,
+    /// Test-only: fires between the supervisor spawn and the handle publication.
+    #[cfg(test)]
+    routing_spawn_pause_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: fires inside the read seam's authority sample, between the
+    /// revocation view and the epoch RE-CHECK — the window a store install must
+    /// not be able to occupy undetected (review-pass-3 §6).
+    #[cfg(test)]
+    routing_sample_gap_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Actor observation points, threaded into the supervisor. See `ActorHooks`
+    /// for why this is `any(test, fixtures)` rather than fixtures alone.
+    #[cfg(any(test, feature = "fixtures"))]
+    routing_hooks: Arc<super::behavior::org_routing::ActorHooks>,
     /// OA3-5 §3.2: the bounded relay dedup gate for opaque scoped-announcement
     /// propagation. Shared across the inbound dispatch so a flooded envelope is
     /// forwarded at most once per node; never decrypts or stores anything.
@@ -4982,6 +6266,58 @@ pub struct MeshNode {
     /// consumer registry belongs to: two `Mesh` wrappers over one node share
     /// this, so neither can withdraw an audience the other is still using.
     org_audience_leases: Arc<super::behavior::org_grant_registry::OrgAudienceLeases>,
+    /// OLB-0 §4.3: node-global sensing-interest leases — refcount +
+    /// cadence aggregation, keyed to the NODE for the same reason as
+    /// `org_audience_leases`: two `Mesh`/binding wrappers over one node
+    /// registering the same interest must share one wire registration,
+    /// so neither's drop withdraws an interest the other still holds.
+    sensing_interest_leases: sensing::SensingInterestLeases,
+    /// Serializes each sensing-lease decision with the synchronous
+    /// allocation of its wire packet's stream sequence
+    /// (`spawn_sensing_frame_send` reserves the sequence and builds the
+    /// packet before spawning the send), so racing sends carry stream
+    /// sequences in decision order rather than task-scheduling order.
+    ///
+    /// This orders the SENDS. It does NOT by itself resolve a deregister
+    /// racing a re-acquire at the receiver: the sensing intake applies
+    /// interest frames in arrival order and does not currently reorder or
+    /// reject by sequence, so a late-arriving stale deregister can still
+    /// remove a live successor. Full convergence relies on the holder's
+    /// ttl/2 soft-state refresh — owned by the lease consumer (the SDK
+    /// watch / org routing reconciler), not this slice. A receiver-enforced
+    /// installation generation would close it at the wire, but that is a
+    /// deferred sensing-wire change (§4.3).
+    sensing_lease_apply_mu: parking_lot::Mutex<()>,
+    /// Review L1 linearization: the LOCAL-projection transaction mutex. Every
+    /// operation that changes OR applies the node-local consumer projection
+    /// (the `Local`/`LeasedLocal` rows' derived
+    /// [`sensing::InterestTable::local_consumer_interval`] aggregate feeding the
+    /// shared consumer cell) holds this across its
+    /// `table mutation → aggregate snapshot → consumer-cell apply` section, so a
+    /// concurrent registration can never apply a stale captured aggregate
+    /// last-writer style, and the maintenance sweep can never apply a stale
+    /// `None` snapshot over a concurrently refreshed lease cell. Each guarded
+    /// section is atomic mutation+snapshot+apply (or fresh-snapshot+apply);
+    /// sections deliberately END before the leader refusal fan-out
+    /// (`apply_sensing_leader_refusal` re-enters `feed_sensing_origin`, which
+    /// takes this mutex itself — holding across would self-deadlock; the
+    /// fan-out registers only `Leader` rows, which are not part of the local
+    /// projection).
+    ///
+    /// FROZEN lock order: `sensing_lease_apply_mu` → THIS →
+    /// `sensing_interest_table` → `sensing_observations` (the emitter is a leaf
+    /// never nested with the table). Never acquire in reverse. Shared `Arc` with
+    /// the dispatch context and the maintenance task.
+    sensing_local_projection_mu: Arc<parking_lot::Mutex<()>>,
+    /// Fixtures-only contention observer (review L1 round 4): invoked by the
+    /// node-local registration core when its `try_lock` on
+    /// `sensing_local_projection_mu` observes the mutex HELD, before falling
+    /// back to the blocking `lock()`. The concurrency witnesses wait on this
+    /// signal, so "the rival blocked behind the open transaction" is proved by
+    /// actual observed contention rather than a scheduler-dependent timeout.
+    /// Absent from production builds.
+    #[cfg(feature = "fixtures")]
+    sensing_projection_contention_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Monotonic stamp for CONSUMER grant-audience installations (OSDK S0).
     /// Each accepted install claims the next value, so a
     /// [`ConsumerAudienceLease`](super::behavior::org_grant_registry::ConsumerAudienceLease)
@@ -5009,6 +6345,14 @@ pub struct MeshNode {
     /// not both validate against the same older view and publish
     /// in reverse order.
     org_install: Arc<parking_lot::Mutex<()>>,
+    /// OLB org-auth: a monotonic generation advanced under `org_install`
+    /// exactly once per COMPLETE authority/store installation transaction that
+    /// changes the visible security view (`None`→X, A→B, or A→B→exact-Arc-A).
+    /// The sensing authority stamp includes it so an `A → B → A` rotation is
+    /// detected even though the authority `Arc` pointer returns to its original
+    /// value (a bare pointer/generation stamp cannot). Not bumped for a failed
+    /// install or an exact no-op re-install.
+    org_install_generation: Arc<std::sync::atomic::AtomicU64>,
     /// OA-1: whether self-announcements attach the installed
     /// authority's owner certificate. `false` (the default) keeps
     /// the announcement byte-identical to the pre-OA-1 shape;
@@ -5615,8 +6959,19 @@ pub struct MeshNode {
     /// the cap-filter + ed25519 verify path. Successful subscribes
     /// clear the counter for that peer.
     auth_failures: Arc<DashMap<u64, AuthFailureState>>,
-    /// Background tasks
-    tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
+    /// Background tasks.
+    ///
+    /// A SYNCHRONOUS mutex, deliberately (review-pass-3 §16): `start` is not
+    /// async, so an async mutex here forced the handles to be published from a
+    /// spawned task — the exact pattern the routing supervisor's own comment
+    /// names as unsafe for deterministic teardown, and closed for the routing
+    /// task alone. A fast shutdown could miss the push and leave the expiry timer
+    /// free to run one more `gated_commit` sweep and watch publication after
+    /// `shutdown()` returned. Benign for state (everything is `Arc`-held and
+    /// self-terminating, and the shutdown wake is armed before the flag check),
+    /// but it made every shutdown-ordering witness racy. It is only ever held
+    /// across a `Vec` push or a `mem::take`, never across an await.
+    tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
     shutdown: Arc<AtomicBool>,
     /// Shutdown notifier
@@ -6027,6 +7382,12 @@ impl MeshNode {
         #[cfg(feature = "redex")]
         let sensing_leader: Arc<parking_lot::Mutex<Option<sensing::SensingLeader>>> =
             Arc::new(parking_lot::Mutex::new(None));
+        // Hoisted out of the struct literal so the peer-failure handler can hold
+        // it: branch-death reclaim runs under the projection transaction like
+        // every other projection mutation (review-pass-3 §14a).
+        let sensing_local_projection_mu: Arc<parking_lot::Mutex<()>> =
+            Arc::new(parking_lot::Mutex::new(()));
+        let sensing_projection_mu_failure = sensing_local_projection_mu.clone();
         let sensing_table_failure = sensing_interest_table.clone();
         let sensing_observations_failure = sensing_observations.clone();
         let sensing_overlay_failure = sensing_overlay_changed.clone();
@@ -6150,6 +7511,7 @@ impl MeshNode {
                 // local emission streams retire with their last
                 // interest — event-driven, never the ttl sweep.
                 remove_sensing_downstream(
+                    &sensing_projection_mu_failure,
                     &sensing_table_failure,
                     &sensing_observations_failure,
                     &sensing_emitter_failure,
@@ -6164,6 +7526,7 @@ impl MeshNode {
                 );
                 #[cfg(feature = "redex")]
                 remove_sensing_leader_consumer(
+                    &sensing_projection_mu_failure,
                     &sensing_leader_failure,
                     &sensing_table_failure,
                     &sensing_observations_failure,
@@ -6328,6 +7691,40 @@ impl MeshNode {
         // registries, so the signal is echo-safe by construction.
         let local_caps_changed = Arc::new(tokio::sync::watch::channel(0u64).0);
 
+        // OLB-2B-E3c: the routing plane. Built here, before the node literal, so
+        // the registry binds to the very same scoped state, publication gate and
+        // revocation slot the ingest paths use — one source of truth, not a
+        // parallel copy. The SUPERVISOR is deliberately NOT built here: it owns the
+        // exclusive destructive drain, and its single production construction path
+        // is `spawn_org_routing_supervisor`, reached only from `start`.
+        let scoped_discovery = Arc::new(parking_lot::Mutex::new(
+            super::behavior::org_scoped_store::ScopedDiscoveryState::new(),
+        ));
+        let scoped_publication = Arc::new(ScopedMutationPublication::new());
+        let scoped_ingest_counters: Arc<super::behavior::org_scoped_store::ScopedIngestCounters> =
+            Arc::default();
+        let org_revocation: Arc<
+            ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>,
+        > = Arc::new(ArcSwapOption::empty());
+        let routing_work: Arc<super::behavior::org_routing::RegistryWork> = Arc::default();
+        let routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics> =
+            Arc::default();
+        let routing_unserved_scope = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let routing_authority = Arc::new(RoutingAuthority::new());
+        let routing_registry = super::behavior::org_routing_registry::NodeOrgRoutingRegistry::new(
+            Arc::new(ScopedSlotSource {
+                scoped_discovery: scoped_discovery.clone(),
+                publication: scoped_publication.clone(),
+                org_revocation: org_revocation.clone(),
+                authority: routing_authority.clone(),
+                #[cfg(test)]
+                settle_gap_hook: parking_lot::Mutex::new(None),
+                unserved_scope: routing_unserved_scope.clone(),
+            }),
+            routing_work.clone(),
+            routing_registry_metrics.clone(),
+        );
+
         let node = Self {
             identity: Arc::new(identity),
             static_keypair,
@@ -6367,11 +7764,28 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             cancel_registry: Arc::new(crate::adapter::net::cancel_registry::CancelRegistry::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
-            org_revocation: Arc::new(ArcSwapOption::empty()),
+            org_revocation,
             node_authority: Arc::new(ArcSwapOption::empty()),
-            scoped_discovery: Arc::new(parking_lot::Mutex::new(
-                super::behavior::org_scoped_store::ScopedDiscoveryStore::new(),
-            )),
+            scoped_discovery,
+            scoped_publication,
+            scoped_ingest_counters,
+            routing_registry,
+            routing_work,
+            routing_health: super::behavior::org_routing::new_routing_health(),
+            routing_metrics: Arc::default(),
+            routing_registry_metrics,
+            routing_unserved_scope,
+            routing_authority,
+            routing_task: parking_lot::Mutex::new(None),
+            routing_started: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            routing_join_waiting: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            routing_spawn_pause_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            routing_sample_gap_hook: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "fixtures"))]
+            routing_hooks: Arc::default(),
             scoped_relay_gate: Arc::new(
                 super::behavior::org_scoped_relay::ScopedAnnRelayGate::new(),
             ),
@@ -6386,6 +7800,11 @@ impl MeshNode {
             org_audience_leases: Arc::new(
                 super::behavior::org_grant_registry::OrgAudienceLeases::default(),
             ),
+            sensing_interest_leases: sensing::SensingInterestLeases::default(),
+            sensing_lease_apply_mu: parking_lot::Mutex::new(()),
+            sensing_local_projection_mu,
+            #[cfg(feature = "fixtures")]
+            sensing_projection_contention_hook: parking_lot::Mutex::new(None),
             consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
             #[cfg(feature = "cortex")]
             rpc_admission_rate_limit: Arc::new(
@@ -6406,6 +7825,7 @@ impl MeshNode {
                 ),
             ),
             org_install: Arc::new(parking_lot::Mutex::new(())),
+            org_install_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             owner_cert_emission_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             org_raise_subscription: Arc::new(parking_lot::Mutex::new(None)),
             emission_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6534,7 +7954,7 @@ impl MeshNode {
             published_chains: Arc::new(DashMap::new()),
             auth_guard: Arc::new(AuthGuard::new()),
             auth_failures: Arc::new(DashMap::new()),
-            tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             pending_stream_grants: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -6706,6 +8126,63 @@ impl MeshNode {
         requested_sample_interval: Duration,
         soft_state_ttl: Duration,
     ) -> Result<sensing::RegisterOutcome, SensingRegistrationError> {
+        // The DIRECT registration path owns the node-local `Local` row.
+        self.register_sensing_interest_as(
+            sensing::DownstreamId::Local,
+            spec,
+            provider,
+            requested_sample_interval,
+            soft_state_ttl,
+            None,
+        )
+    }
+
+    /// Fixtures-only witness seam (review L1 linearization): run a direct
+    /// registration that invokes `pause` INSIDE the local-projection
+    /// transaction — after the table mutation + aggregate capture, before the
+    /// consumer-cell apply — so the concurrent-registration race witness in
+    /// `tests/sensing_lease.rs` can hold the transaction open while a rival
+    /// lease acquire attempts to interleave. Gated behind `fixtures` (round 4):
+    /// the callback executes while `sensing_local_projection_mu` is held, so it
+    /// must not be part of the installed production API.
+    #[cfg(feature = "fixtures")]
+    #[doc(hidden)]
+    pub fn register_sensing_interest_paused_for_test(
+        &self,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+        pause: &(dyn Fn() + Sync),
+    ) -> Result<sensing::RegisterOutcome, SensingRegistrationError> {
+        self.register_sensing_interest_as(
+            sensing::DownstreamId::Local,
+            spec,
+            provider,
+            requested_sample_interval,
+            soft_state_ttl,
+            Some(pause),
+        )
+    }
+
+    /// The shared node-local registration core, parameterized by the owning
+    /// downstream identity: `Local` for the direct API, `LeasedLocal` for the
+    /// interest-lease path (review §1 — separating the identity keeps a lease
+    /// mutation from ever touching a direct row, and vice versa).
+    ///
+    /// Review L1 linearization: the whole mutation→snapshot→apply sequence runs
+    /// under [`Self::sensing_local_projection_mu`], so the consumer-cell anchor
+    /// applies the aggregate captured WITH the mutation — a concurrent rival
+    /// cannot complete in between and be overwritten by a stale capture.
+    fn register_sensing_interest_as(
+        &self,
+        downstream: sensing::DownstreamId,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        requested_sample_interval: Duration,
+        soft_state_ttl: Duration,
+        pause_before_apply: Option<&(dyn Fn() + Sync)>,
+    ) -> Result<sensing::RegisterOutcome, SensingRegistrationError> {
         if !self.config.enable_sensing_coalescing {
             return Err(SensingRegistrationError::Disabled);
         }
@@ -6737,27 +8214,57 @@ impl MeshNode {
         let key = sensing::ProviderInterestKey::new(spec.key(), provider);
         let ttl = soft_state_ttl.min(self.config.sensing_interest_ttl);
         let now = Instant::now();
-        let (outcome, aggregate) = {
+        // Review L1 linearization: mutation → aggregate snapshot → consumer-cell
+        // apply is ONE transaction under the projection mutex (held to the end of
+        // this function — the self-provider refusal partition and capacity
+        // rollback below also mutate the projection). Acquired try-then-block so
+        // the fixtures-only contention observer can signal ACTUAL observed
+        // contention (round 4): the hook fires only after `try_lock` found the
+        // mutex held, never on the uncontended fast path.
+        let _projection = match self.sensing_local_projection_mu.try_lock() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(feature = "fixtures")]
+                if let Some(hook) = self.sensing_projection_contention_hook.lock().clone() {
+                    hook();
+                }
+                self.sensing_local_projection_mu.lock()
+            }
+        };
+        let (outcome, aggregate, local_aggregate) = {
             let mut table = self.sensing_interest_table.lock();
             let outcome = table.register(
                 &key,
-                sensing::DownstreamId::Local,
+                downstream,
                 requested_sample_interval,
                 ttl,
                 proven_root,
                 now,
             );
-            (outcome, table.aggregate(&key, now))
+            (
+                outcome,
+                table.aggregate(&key, now),
+                table.local_consumer_interval(&key, now),
+            )
         };
+        // Witness seam: hold the transaction open between the capture and the
+        // apply so a concurrent rival provably serializes behind it.
+        if let Some(pause) = pause_before_apply {
+            pause();
+        }
         if matches!(outcome, sensing::RegisterOutcome::Registered(_)) {
             // SI-4 re-review item 5: a (re-)registration can move
             // both the branch aggregate (this hop's continuity
-            // window) and the Local watch's own D (the overlay
-            // cell's window) — re-anchor both immediately, never at
-            // the next beat.
+            // window) and the local consumer overlay's window —
+            // re-anchor both immediately, never at the next beat.
+            // Review L1 follow-up: the shared consumer cell re-anchors to the
+            // DERIVED local aggregate (min across Local + LeasedLocal), never
+            // this one registering row's interval.
             let mut observations = self.sensing_observations.lock();
             observations.update_upstream_interval(&key, aggregate);
-            observations.update_consumer_interval(&key, requested_sample_interval);
+            if let Some(local) = local_aggregate {
+                observations.anchor_consumer_cell(&key, local, self.config.continuity_factor, now);
+            }
         }
         if matches!(outcome, sensing::RegisterOutcome::Registered(_)) && provider == self.node_id {
             // SI-3: the node registered interest in ITSELF — feed
@@ -6786,7 +8293,17 @@ impl MeshNode {
                         let _ = self.sensing_interest_table.lock().deregister(
                             &key.interest.interest_digest,
                             Some(provider),
-                            sensing::DownstreamId::Local,
+                            downstream,
+                            now,
+                        );
+                        // Review L1 narrow-hold: the rollback removed the row this
+                        // registration eagerly anchored a consumer cell for —
+                        // reconcile the cell (dropped when no local row survives).
+                        reconcile_local_consumer_cell(
+                            &self.sensing_interest_table,
+                            &self.sensing_observations,
+                            &self.sensing_overlay_changed,
+                            &key,
                             now,
                         );
                         return Err(SensingRegistrationError::AtCapacity);
@@ -6827,6 +8344,16 @@ impl MeshNode {
                             }
                         }
                         self.sensing_emitter_notify.notify_one();
+                        // Review L1 narrow-hold: the refusal partition may have
+                        // removed a local row — reconcile the shared consumer cell
+                        // to the surviving aggregate (or drop it).
+                        reconcile_local_consumer_cell(
+                            &self.sensing_interest_table,
+                            &self.sensing_observations,
+                            &self.sensing_overlay_changed,
+                            &key,
+                            now,
+                        );
                         return Ok(sensing::RegisterOutcome::RefusedByCachedFloor {
                             minimum_supported: refusal.minimum_supported,
                         });
@@ -6840,7 +8367,7 @@ impl MeshNode {
             // provisional.
             {
                 let mut observations = self.sensing_observations.lock();
-                let slot_key = (key.clone(), sensing::DownstreamId::Local);
+                let slot_key = (key.clone(), downstream);
                 if !observations.slots.contains_key(&slot_key) {
                     if let Some(cached) = observations.latest.get(&key).cloned() {
                         observations.slots.insert(
@@ -6852,11 +8379,15 @@ impl MeshNode {
                                 pending: false,
                             },
                         );
+                        // Review L1 follow-up: warm the shared consumer cell at
+                        // the DERIVED local aggregate (min across Local +
+                        // LeasedLocal), so a second local owner joining a cached
+                        // branch does not warm it at its own (possibly looser) D.
                         let moved = observations.feed_consumer_cell(
                             &key,
                             &cached,
                             false,
-                            requested_sample_interval,
+                            local_aggregate.unwrap_or(requested_sample_interval),
                             self.config.continuity_factor,
                             now,
                         );
@@ -6897,6 +8428,300 @@ impl MeshNode {
             }
         }
         Ok(outcome)
+    }
+
+    /// OLB-0 §4.3: acquire a node-global lease on an EXACT-provider
+    /// sensing interest, (re-)registering it on the wire only when this
+    /// acquisition changes what must be installed. Equivalent interests
+    /// from other wrappers over this node share one wire registration and
+    /// one refresh cadence (their minimum requested interval); the
+    /// returned ticket must be released exactly once.
+    ///
+    /// The soft-state ttl is a single node-owned policy
+    /// ([`MeshNodeConfig::sensing_interest_ttl`]), never a caller input, so
+    /// there is no second per-holder aggregation to keep consistent.
+    ///
+    /// Fails (rolling the just-taken reference back, leaving no dangling
+    /// count) if the (re-)registration errors OR returns any non-installed
+    /// outcome — `OverCap` or `RefusedByCachedFloor` become
+    /// [`SensingRegistrationError::OverCapacity`] /
+    /// [`SensingRegistrationError::RefusedByFloor`], so the lease registry
+    /// never records an installation the interest table refused. The
+    /// organization-routing layer converts such a failure into `Potential`
+    /// and keeps routing deterministically; sensing failure is never
+    /// invocation failure.
+    pub fn acquire_sensing_interest_lease(
+        &self,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        requested_sample_interval: Duration,
+    ) -> Result<sensing::SensingLeaseTicket, SensingRegistrationError> {
+        // Review-pass-3 §4: refuse an ORG-derived audience before anything is
+        // minted, recorded or sent. The wire leg below emits
+        // `provider_registration` — the LEGACY frame — unconditionally, and an
+        // org-authoritative provider refuses precisely that frame when its
+        // audience is that org's canonical sensing commitment. Acquiring would
+        // therefore install a `LeasedLocal` row, report `Ok`, and emit something
+        // designed to be refused, with the refusal visible only as
+        // `protocol_invalid` on the far side and nothing in-slice to re-drive it.
+        //
+        // Detectable locally only against the org this node itself holds
+        // authority for: a commitment is a one-way derivation, so a fleet root
+        // configured equal to a FOREIGN org's commitment cannot be recognised
+        // from here. That residual closes with the wire leg, not with this
+        // guard — the real fix is threading `plan_provider_continuation` into
+        // the lease leg the way `apply_provider_registration` already does. This
+        // is the loud refusal in the meantime, and it covers the in-tree case:
+        // the org routing plane's exact-provider acquisition is same-org.
+        if self.spec_carries_own_org_audience(spec) {
+            tracing::warn!(
+                provider = format!("{:#x}", provider),
+                "sensing lease: refused an organization-derived audience — the lease wire \
+                 leg cannot emit authority-aware frames yet (review-pass-3 §4)"
+            );
+            return Err(SensingRegistrationError::OrgAudienceUnsupported);
+        }
+        let key = sensing::SensingLeaseKey::ExactProvider {
+            audience: spec.audience,
+            interest_digest: spec.interest_digest(),
+            provider,
+        };
+        // Serialize the decision with the synchronous allocation of its wire
+        // packet's stream sequence (see `sensing_lease_apply_mu` for the exact
+        // ordering guarantee and its limits).
+        let _apply = self.sensing_lease_apply_mu.lock();
+        // Review-pass-2 §6: a bounded registry. A capacity refusal mints nothing
+        // and records nothing, so — unlike the wire-failure path below — there
+        // is no reference to roll back.
+        let (token, action) = self
+            .sensing_interest_leases
+            .acquire(key, spec, requested_sample_interval)
+            .map_err(SensingRegistrationError::LeaseAtCapacity)?;
+        let ticket = sensing::SensingLeaseTicket { key, token };
+        if let Err(err) = self.apply_sensing_lease_action(key, action) {
+            // Roll the reference back and reconcile the wire to the post-release
+            // view. The lease owns a DISTINCT `LeasedLocal` row (review §1), so
+            // when the first-holder acquire installed nothing the rollback
+            // Deregister targets an absent lease row and is a true no-op — it can
+            // no longer tear down a `Local` row a direct registration installed
+            // for the same key.
+            let rollback = self.sensing_interest_leases.release(ticket);
+            // 2026-07-23 §6 residual: the rollback cannot propagate its own
+            // error — we are already returning the original failure — but
+            // discarding it silently is what leaves the lease registry and the
+            // wire disagreeing with nothing to say so. Counted and warned.
+            if let Err(rollback_err) = self.apply_sensing_lease_action(key, rollback) {
+                self.sensing_interest_leases.note_reconcile_failure();
+                tracing::warn!(
+                    provider = format!("{:#x}", provider),
+                    error = %rollback_err,
+                    "sensing lease: rollback could not reconcile the wire; the lease \
+                     registry and the wire may disagree until the next mutation"
+                );
+            }
+            return Err(err);
+        }
+        Ok(ticket)
+    }
+
+    /// Whether `spec`'s audience is the canonical sensing commitment of the
+    /// organization this node holds authority for (review-pass-3 §4).
+    ///
+    /// The same comparison the inbound legacy classification makes, asked from
+    /// the SENDING side: it is what tells an org-authoritative peer that a legacy
+    /// frame is authority laundering, so it is also what tells us the frame we
+    /// are about to emit will be refused.
+    fn spec_carries_own_org_audience(&self, spec: &sensing::InterestSpec) -> bool {
+        self.node_authority.load_full().is_some_and(|authority| {
+            spec.audience == sensing::canonical_org_sensing_commitment(&authority.owner_org())
+        })
+    }
+
+    /// Release a sensing-interest lease acquired via
+    /// [`acquire_sensing_interest_lease`](Self::acquire_sensing_interest_lease).
+    /// Ticket-owned: all wire identity comes from the registry's stored
+    /// state, never from re-supplied arguments, so a ticket can never be
+    /// released against a different interest. Idempotent — the last holder's
+    /// release deregisters, a strictest-holder release relaxes the cadence
+    /// to the surviving minimum, and an already-released ticket is a no-op.
+    pub fn release_sensing_interest_lease(&self, ticket: sensing::SensingLeaseTicket) {
+        let _apply = self.sensing_lease_apply_mu.lock();
+        let action = self.sensing_interest_leases.release(ticket);
+        // 2026-07-23 §6 residual: release has no error channel — the holder is
+        // dropping its reference either way — so a failed wire reconciliation
+        // here is exactly the silent registry/wire divergence that residual
+        // names. Counted and warned rather than swallowed.
+        if let Err(err) = self.apply_sensing_lease_action(ticket.key, action) {
+            self.sensing_interest_leases.note_reconcile_failure();
+            tracing::warn!(
+                error = %err,
+                "sensing lease: release could not reconcile the wire; the lease registry \
+                 and the wire may disagree until the next mutation"
+            );
+        }
+    }
+
+    /// Execute the wire transition a lease mutation calls for. Called only
+    /// under `sensing_lease_apply_mu`. The action carries the authoritative
+    /// spec; the provider comes from the key; the ttl is the node policy.
+    fn apply_sensing_lease_action(
+        &self,
+        key: sensing::SensingLeaseKey,
+        action: sensing::LeaseAction,
+    ) -> Result<(), SensingRegistrationError> {
+        // Only exact-provider leases are wired in this slice; a provider-free
+        // key resolves through the rendezvous leader path, added later.
+        let sensing::SensingLeaseKey::ExactProvider { provider, .. } = key else {
+            return Ok(());
+        };
+        match action {
+            sensing::LeaseAction::Register { spec, interval }
+            | sensing::LeaseAction::Reregister { spec, interval } => {
+                // The lease owns the `LeasedLocal` slot, never the direct `Local`
+                // row (review §1).
+                match self.register_sensing_interest_as(
+                    sensing::DownstreamId::LeasedLocal,
+                    &spec,
+                    provider,
+                    interval,
+                    self.config.sensing_interest_ttl,
+                    None,
+                )? {
+                    sensing::RegisterOutcome::Registered(_) => Ok(()),
+                    // The table installed nothing — do not let the lease claim
+                    // an installation. The caller rolls the reference back.
+                    sensing::RegisterOutcome::OverCap => {
+                        Err(SensingRegistrationError::OverCapacity)
+                    }
+                    sensing::RegisterOutcome::RefusedByCachedFloor { minimum_supported } => {
+                        Err(SensingRegistrationError::RefusedByFloor { minimum_supported })
+                    }
+                }
+            }
+            sensing::LeaseAction::Deregister { spec } => {
+                self.deregister_sensing_interest_as(
+                    sensing::DownstreamId::LeasedLocal,
+                    &spec,
+                    provider,
+                );
+                Ok(())
+            }
+            sensing::LeaseAction::Unchanged => Ok(()),
+        }
+    }
+
+    /// OLB-0: exact local deregistration of a previously registered
+    /// sensing interest for `provider` — the teardown the soft-state
+    /// sweep otherwise performs on expiry, made explicit for the lease.
+    /// Mirrors the peer `Deregister` frame arm for the LOCAL downstream:
+    /// reclaim a dead branch's observations, retire the origin emission
+    /// stream when this node is itself the provider, and route the
+    /// deregister upstream otherwise. A no-op when the plane is disabled
+    /// or no such row exists.
+    pub fn deregister_sensing_interest(&self, spec: &sensing::InterestSpec, provider: u64) {
+        // The DIRECT path retires the node-local `Local` row it owns.
+        self.deregister_sensing_interest_as(sensing::DownstreamId::Local, spec, provider);
+    }
+
+    /// The shared node-local deregistration core, parameterized by the owning
+    /// downstream identity (review §1): `Local` for the direct API,
+    /// `LeasedLocal` for the interest lease — a deregistration only ever
+    /// removes the row its own path installed.
+    fn deregister_sensing_interest_as(
+        &self,
+        downstream: sensing::DownstreamId,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+    ) {
+        if !self.config.enable_sensing_coalescing {
+            return;
+        }
+        // Review L1 linearization: the removal and its consumer-cell
+        // reconciliation are one transaction under the projection mutex.
+        let _projection = self.sensing_local_projection_mu.lock();
+        let key = sensing::ProviderInterestKey::new(spec.key(), provider);
+        let now = Instant::now();
+        // Closure item 7: stamp snapshot BEFORE the table mutation the
+        // retire decision rests on.
+        let emitter_stamp = self.sensing_emitter.lock().as_ref().map(|e| e.stamp());
+        let actions = self.sensing_interest_table.lock().deregister(
+            &key.interest.interest_digest,
+            Some(provider),
+            downstream,
+            now,
+        );
+        for (branch_key, action) in actions {
+            // Review L1 follow-up: reconcile the shared consumer cell to the
+            // SURVIVING local aggregate (min across Local + LeasedLocal). A
+            // surviving local row re-anchors the cell to the strictest survivor
+            // (never leaving it at the removed row's cadence); no surviving local
+            // row drops the cell, so a branch kept alive only by a peer/leader
+            // row leaves no ghost local consumer overlay.
+            let local_aggregate = self
+                .sensing_interest_table
+                .lock()
+                .local_consumer_interval(&branch_key, now);
+            if self
+                .sensing_observations
+                .lock()
+                .reconcile_consumer_interval(&branch_key, local_aggregate)
+            {
+                self.sensing_overlay_changed
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
+            // A dead branch reclaims its observations with the table.
+            if action == sensing::UpstreamAction::Deregister {
+                self.sensing_observations.lock().reclaim_branch(&branch_key);
+            }
+            // A loosened aggregate re-anchors the surviving branch's
+            // continuity window immediately.
+            if let sensing::UpstreamAction::Register { strictest } = action {
+                self.sensing_observations
+                    .lock()
+                    .update_upstream_interval(&branch_key, Some(strictest));
+            }
+            if branch_key.provider == self.node_id {
+                // This node is the origin — the last downstream's death
+                // retires the emission stream unless a registration raced
+                // in after the snapshot.
+                if action == sensing::UpstreamAction::Deregister {
+                    if let (Some(emitter), Some(stamp)) =
+                        (self.sensing_emitter.lock().as_mut(), emitter_stamp)
+                    {
+                        emitter.retire_if_stale(&branch_key.interest.interest_digest, stamp);
+                    }
+                }
+                continue;
+            }
+            if action == sensing::UpstreamAction::Deregister {
+                self.send_sensing_deregister_upstream_direct(&branch_key);
+            }
+        }
+    }
+
+    /// The `&self` counterpart of
+    /// [`send_sensing_deregister_upstream`](Self::send_sensing_deregister_upstream)
+    /// (which routes off a `DispatchCtx`): encode and route one
+    /// `Deregister` frame toward the branch's provider.
+    fn send_sensing_deregister_upstream_direct(&self, key: &sensing::ProviderInterestKey) {
+        let frame = sensing::SensingInterestFrame::Deregister {
+            interest_digest: key.interest.interest_digest,
+            target: Some(key.provider),
+        };
+        if let Ok(bytes) = sensing::encode_interest_frame(&frame) {
+            spawn_sensing_frame_send(
+                &self.socket,
+                &self.peers,
+                &self.addr_to_node,
+                &self.router,
+                &self.partition_filter,
+                self.node_id,
+                key.provider,
+                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                sensing::SUBPROTOCOL_SENSING_INTEREST,
+                bytes,
+            );
+        }
     }
 
     /// SI-4 review P0: register (or refresh) a PROVIDER-FREE
@@ -6969,9 +8794,32 @@ impl MeshNode {
         // SI-4 re-review item 5: a refreshed expectation can change
         // the consumer's D — every overlay cell under the digest
         // re-anchors immediately, never at the next beat.
-        self.sensing_observations
-            .lock()
-            .update_consumer_intervals(&key, requested_sample_interval);
+        //
+        // review-pass-3 §14c: as ONE projection transaction, and MIN-ed against
+        // each branch's live node-local aggregate. Read under the table lock and
+        // applied under the observations lock, never nested, so no new lock order
+        // is introduced.
+        {
+            let _projection = self.sensing_local_projection_mu.lock();
+            let branches = self.sensing_observations.lock().consumer_branches_for(&key);
+            let now = Instant::now();
+            let local_aggregates: std::collections::HashMap<_, _> = {
+                let table = self.sensing_interest_table.lock();
+                branches
+                    .into_iter()
+                    .filter_map(|branch| {
+                        table
+                            .local_consumer_interval(&branch, now)
+                            .map(|interval| (branch, interval))
+                    })
+                    .collect()
+            };
+            self.sensing_observations.lock().update_consumer_intervals(
+                &key,
+                requested_sample_interval,
+                &local_aggregates,
+            );
+        }
         if sensing_upstream_damper_admits(
             &self.sensing_upstream_damper,
             leader,
@@ -7398,11 +9246,158 @@ impl MeshNode {
         self.sensing_local_root
     }
 
+    /// Test seam (OLB-0 §4.3): the node-global sensing-interest lease's
+    /// live holder count and installed interval for one key — `None` when
+    /// no holder references it (e.g. after a rolled-back acquisition).
+    ///
+    /// §19 / review-pass-2 §1: compiled out of consumer builds. Read-only, so it
+    /// is gated for consistency with its mutating siblings rather than for
+    /// availability — a test seam is not release surface.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sensing_lease_entry_for_test(
+        &self,
+        key: &sensing::SensingLeaseKey,
+    ) -> Option<(usize, Duration)> {
+        self.sensing_interest_leases.entry_for_test(key)
+    }
+
+    /// Test seam (OLB-0 §4.3): install a cached provider floor for an exact
+    /// interest, as a live provider refusal would, so a lease acquire below
+    /// the floor is refused with
+    /// [`sensing::RegisterOutcome::RefusedByCachedFloor`] without driving the
+    /// refusal protocol.
+    ///
+    /// §19 / review-pass-2 §1 — GATED, and this is the load-bearing one. This
+    /// takes `&self` on a live node and writes an arbitrary `refused_minimum`
+    /// into the live `sensing_interest_table`, after which every genuine
+    /// registration for that `(interest, provider)` returns
+    /// [`sensing::RegisterOutcome::RefusedByCachedFloor`] indefinitely. Left
+    /// ungated it is an unauthenticated off-switch for that branch's sensing
+    /// plane, reachable by anything linked against this crate.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn install_sensing_cached_floor_for_test(
+        &self,
+        spec: &sensing::InterestSpec,
+        provider: u64,
+        floor: Duration,
+    ) {
+        let key = sensing::ProviderInterestKey::new(spec.key(), provider);
+        self.sensing_interest_table
+            .lock()
+            .set_cached_floor_for_test(&key, floor);
+    }
+
+    /// Test seam (OLB-0 §4.3): clear a cached provider floor for an exact
+    /// interest (as a floor relaxation would). Gated with its installing
+    /// sibling (review-pass-2 §1).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn clear_sensing_cached_floor_for_test(&self, spec: &sensing::InterestSpec, provider: u64) {
+        let key = sensing::ProviderInterestKey::new(spec.key(), provider);
+        self.sensing_interest_table
+            .lock()
+            .clear_cached_floor_for_test(&key);
+    }
+
+    /// Test seam (review L1 follow-up): the shared LOCAL consumer overlay cell's
+    /// current interval for a branch — the derived local aggregate (min across
+    /// the direct `Local` and leased `LeasedLocal` rows). `None` when no consumer
+    /// cell exists for the branch. Lets the coexistence witness assert the
+    /// aggregate-derived cadence without racing behavioral timing. Read-only;
+    /// gated with the rest of the group (review-pass-2 §1).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn sensing_consumer_cell_interval_for_test(
+        &self,
+        key: &sensing::ProviderInterestKey,
+    ) -> Option<Duration> {
+        self.sensing_observations
+            .lock()
+            .consumer_cells
+            .get(key)
+            .map(|cell| cell.own_interval())
+    }
+
+    /// Test seam (review L1 narrow-hold): run ONE periodic materialized-branch
+    /// consumer-cell reconciliation at `now` — the production maintenance sweep's
+    /// cell-lifecycle pass, in isolation. Witnesses drive lease-only survival and
+    /// expiry relax-back deterministically by passing a synthetic `now` past a
+    /// row's expiry, without racing the real maintenance cadence.
+    ///
+    /// GATED (review-pass-2 §1): it takes `&self` on a live node and drives a
+    /// real maintenance transaction at a CALLER-CHOSEN `now`, so an arbitrary
+    /// future instant expires live rows from outside.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn run_sensing_consumer_cell_sweep_for_test(&self, now: Instant) {
+        self.run_sensing_consumer_cell_sweep_inner(now, None);
+    }
+
+    /// Fixtures-only witness seam (review L1 linearization): the sweep with a
+    /// `pause` fired INSIDE its projection transaction — after the snapshot,
+    /// before the apply — so the sweep/refresh race witness can hold the
+    /// transaction open while a rival lease acquire attempts to interleave.
+    /// Gated behind `fixtures` (round 4): the callback executes while
+    /// `sensing_local_projection_mu` is held.
+    #[cfg(feature = "fixtures")]
+    #[doc(hidden)]
+    pub fn run_sensing_consumer_cell_sweep_paused_for_test(
+        &self,
+        now: Instant,
+        pause: &(dyn Fn() + Sync),
+    ) {
+        self.run_sensing_consumer_cell_sweep_inner(now, Some(pause));
+    }
+
+    /// Fixtures-only witness seam (review L1 round 4): install (or clear) the
+    /// projection-contention observer the registration core fires when its
+    /// `try_lock` on `sensing_local_projection_mu` observes the mutex held.
+    #[cfg(feature = "fixtures")]
+    #[doc(hidden)]
+    pub fn set_sensing_projection_contention_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.sensing_projection_contention_hook.lock() = hook;
+    }
+
+    /// The shared body of the two sweep seams above. Test-only with them: the
+    /// PRODUCTION maintenance loop calls
+    /// [`reconcile_materialized_consumer_cells`] directly with its own live
+    /// interest set, so this wrapper exists solely to let a witness drive one
+    /// pass at a synthetic `now` (review-pass-2 §1).
+    #[cfg(any(test, feature = "fixtures"))]
+    fn run_sensing_consumer_cell_sweep_inner(
+        &self,
+        now: Instant,
+        pause: Option<&(dyn Fn() + Sync)>,
+    ) {
+        let live_interests: std::collections::HashSet<sensing::CapabilityInterestKey> = self
+            .sensing_capability_interests
+            .lock()
+            .keys()
+            .cloned()
+            .collect();
+        reconcile_materialized_consumer_cells(
+            &self.sensing_local_projection_mu,
+            &self.sensing_interest_table,
+            &self.sensing_observations,
+            &self.sensing_overlay_changed,
+            &live_interests,
+            now,
+            pause,
+        );
+    }
+
     /// Install the sensing-leader role on this node (plan §4.1),
     /// enabling the leader-addressed `CapabilityRegistration` intake
     /// on the 0x0C02 dispatch arm. Built from this node's config
-    /// (owner root, `continuity_factor`, `max_interests_per_peer`)
-    /// with the default bounded-exploration policy. Returns `false`
+    /// (`continuity_factor`, `max_interests_per_peer`) with the
+    /// default bounded-exploration policy — the role carries no owner
+    /// root (review §2: authority derives from each interest's
+    /// admitted seed). Returns `false`
     /// (installing nothing) while `enable_sensing_coalescing` is
     /// off; idempotent — re-assuming replaces the role with a fresh
     /// (empty) one, exactly the soft-state re-registration contract
@@ -7417,8 +9412,9 @@ impl MeshNode {
         if !self.config.enable_sensing_coalescing {
             return false;
         }
+        // Review §2: the leader carries no owner root — every interest's trust
+        // anchor is its admitted seed's proven root.
         let leader = sensing::SensingLeader::new(
-            self.sensing_local_root,
             sensing::CandidatePolicy::default(),
             self.config.continuity_factor,
             self.config.max_interests_per_peer,
@@ -7763,7 +9759,10 @@ impl MeshNode {
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
-        self.install_org_revocation_store_locked(store, false, None)
+        if self.install_org_revocation_store_locked(store, false, None)? {
+            advance_fenced_generation(&self.org_install_generation, "org_install_generation");
+        }
+        Ok(())
     }
 
     /// Deterministic-witness seam: run a store installation that
@@ -7779,7 +9778,10 @@ impl MeshNode {
         pause: &(dyn Fn() + Sync),
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
-        self.install_org_revocation_store_locked(store, false, Some(pause))
+        if self.install_org_revocation_store_locked(store, false, Some(pause))? {
+            advance_fenced_generation(&self.org_install_generation, "org_install_generation");
+        }
+        Ok(())
     }
 
     /// Body of [`Self::install_org_revocation_store`], called with
@@ -7793,12 +9795,19 @@ impl MeshNode {
     /// verification): re-acquiring the same non-reentrant reload
     /// guard here would deadlock, and the caller's pin already
     /// froze both live views.
+    ///
+    /// Returns whether the VISIBLE store changed: `Ok(false)` when the exact
+    /// same store `Arc` was already installed (no publication), `Ok(true)` when
+    /// a `None`→store or A→B publication occurred. The caller owns the
+    /// `org_install_generation` bump at the complete transaction boundary — the
+    /// helper never bumps, so an authority+store transaction publishes one
+    /// generation change, not an intermediate store bump then an authority bump.
     fn install_org_revocation_store_locked(
         &self,
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
         pin_held: bool,
         pause_before_swap: Option<&(dyn Fn() + Sync)>,
-    ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
+    ) -> Result<bool, super::behavior::org_revocation::OrgRevocationError> {
         // Fast poison reject (rechecked UNDER the pin below — a
         // candidate can be poisoned between here and the swap).
         if store.is_poisoned() {
@@ -7811,7 +9820,8 @@ impl MeshNode {
         let current = self.org_revocation.load_full();
         if let Some(cur) = &current {
             if Arc::ptr_eq(cur, &store) {
-                return Ok(());
+                // Exact same installed store — no visible change, no bump.
+                return Ok(false);
             }
         }
 
@@ -7881,6 +9891,15 @@ impl MeshNode {
         let fold = self.capability_fold.clone();
         let slot = self.org_revocation.clone();
         let me = Arc::downgrade(&store);
+        // OLB-2A.3.3: the same raise also retracts scoped-discovery records at
+        // query time, so it must dirty their capabilities and wake consumers.
+        let scoped_discovery = self.scoped_discovery.clone();
+        let scoped_publication = self.scoped_publication.clone();
+        // OLB-2B-E3c: a floor rise moves ROUTING AUTHORITY, whether or not it
+        // retracts any scoped row. Captured so the callback can advance the
+        // routing epoch and invalidate retained routing facts.
+        let routing_authority = self.routing_authority.clone();
+        let routing_registry = self.routing_registry.clone();
         // AV-10 / R2-3: liveness is enforced by the subscription's
         // exclusion lease inside `subscribe_floors_raised`, not a separate
         // owner token. Dropping the returned guard on teardown/replacement
@@ -7918,6 +9937,39 @@ impl MeshNode {
                     );
                 }
             }
+            // OLB-2A.3.3: the raise ALSO retracted every scoped-discovery record
+            // whose admitted membership generation now falls below its provider's
+            // floor — the read-time currentness filter hides them from this moment
+            // on, with no store mutation to advance a generation. Dirty exactly
+            // those capabilities and publish the wake, so a consumer's projection
+            // cannot keep serving a provider the org just revoked. Through the
+            // node-global gated commit, so this serializes with inbound ingest and
+            // its publication cannot invert (OLB-2A.3.1). Safe to run here: the
+            // store invokes subscribers OUTSIDE its publish/reload locks, and this
+            // callback takes no revocation lock.
+            // OLB-2B-E3c: advance routing authority BEFORE the scoped retraction
+            // publishes. A rise that retracts nothing still changes what the
+            // routing source is allowed to serve, and it advances no scoped
+            // revision — so routing must learn about it from the epoch, not from
+            // the scoped wake.
+            //
+            // This is also the proactive wake for a POISON RECOVERY, which
+            // invokes subscribers with an EMPTY `raised` slice: it raises no
+            // floor and retracts nothing, but it moves the authority from
+            // "unusable, everything Unserved" back to usable. The epoch bump
+            // invalidates every retained fact and re-queues the slots, so health
+            // converges without waiting for a reader to trip the lazy check
+            // (Kyra OLB-2B-E3c closure). The two loops below are no-ops on an
+            // empty slice, which is exactly right.
+            move_routing_authority(&routing_authority, &routing_registry, || {});
+            let retracted = scoped_publication
+                .gated_commit(&scoped_discovery, |s| s.note_floors_raised(raised));
+            if retracted > 0 {
+                tracing::info!(
+                    retracted,
+                    "revocation floor rise retracted scoped-discovery record(s)"
+                );
+            }
         });
         // Swap the node's observer slot: drop the guard held on the
         // outgoing store FIRST so a detached store neither keeps nor
@@ -7929,7 +9981,16 @@ impl MeshNode {
             slot.take();
             *slot = Some(subscription);
         }
-        self.org_revocation.store(Some(store.clone()));
+        // OLB-2B-E3c: the swap and the routing-authority bump are ONE ordered
+        // unit under the authority gate. Publishing the store first and bumping
+        // after leaves a window in which the new store is already query-visible
+        // while routing still stamps, commits and serves under the old authority
+        // — and a live commit pin holding this gate would hold that window open
+        // for as long as it liked (Kyra OLB-2B-E3c). Taking the gate FIRST means
+        // an install cannot become visible while a pin is alive.
+        move_routing_authority(&self.routing_authority, &self.routing_registry, || {
+            self.org_revocation.store(Some(store.clone()));
+        });
         drop(_pin);
 
         // No epoch bump: the installed store's IDENTITY changed, and
@@ -7960,7 +10021,29 @@ impl MeshNode {
                 );
             }
         }
-        Ok(())
+        // The same install-time gap applies to scoped discovery (OLB-2A.3.3): a
+        // store installed after its floors rose fires no raise callback, so the
+        // install itself must dirty the capabilities those floors retract —
+        // otherwise a consumer keeps a projection naming providers the newly
+        // installed authority already revoked. ONE transaction over the whole
+        // snapshot, so this is a single generation advance and a single wake
+        // rather than one per floor; an empty snapshot dirties nothing and wakes
+        // nobody.
+        let raised: Vec<super::behavior::org_revocation::RaisedFloor> = snapshot
+            .iter()
+            .map(|((org, member), floor)| (*org, member.clone(), *floor))
+            .collect();
+        let retracted = self
+            .scoped_publication
+            .gated_commit(&self.scoped_discovery, |s| s.note_floors_raised(&raised));
+        if retracted > 0 {
+            tracing::info!(
+                retracted,
+                "store installation retracted scoped-discovery record(s)"
+            );
+        }
+        // A visible store publication occurred (None→store or A→B).
+        Ok(true)
     }
 
     /// OA-1: the installed org revocation store, if any.
@@ -8035,6 +10118,30 @@ impl MeshNode {
         // ArcSwap fields).
         let _install = self.org_install.lock();
 
+        // Kyra amended-verdict closure 2 (cross-authority coalescence): refuse
+        // installing organization authority over an EXPLICIT sensing fleet root
+        // (`config.sensing_owner_root`) configured EQUAL to this org's canonical
+        // sensing commitment. In that configuration a legacy sensing registration
+        // proven under the fleet root and an org-authenticated row derive the SAME
+        // `ProviderInterestKey`, so they would coalesce into one aggregate — a
+        // reachable org→legacy downgrade / authority-laundering path. Runtime
+        // rejection at legacy intake (see `handle_sensing_interest_frame`) cannot
+        // retroactively purge legacy rows accepted BEFORE the authority existed, so
+        // the fail-closed boundary is here: never publish an authority whose org
+        // commitment collides with the immutable local fleet root. This covers both
+        // runtime adoption and configured startup (the startup config-load routes
+        // through this method before networking begins).
+        if self.config.sensing_owner_root.is_some()
+            && self.sensing_local_root
+                == sensing::canonical_org_sensing_commitment(&authority.owner_org())
+        {
+            return Err(
+                super::behavior::org_authority::OrgAuthorityError::SensingFleetRootCollision {
+                    owner_org: authority.owner_org(),
+                },
+            );
+        }
+
         // Review-9 addendum + review-11 P1: pin BOTH the candidate
         // AND the currently-installed store across verification AND
         // publication. Without the candidate pin, a concurrent apply
@@ -8076,7 +10183,10 @@ impl MeshNode {
             pause();
         }
 
-        if let Some(existing) = self.node_authority.load_full() {
+        // Load the currently-installed authority ONCE (under `org_install`) for
+        // both the one-owner check and the change decision below.
+        let existing_authority = self.node_authority.load_full();
+        if let Some(existing) = &existing_authority {
             if existing.owner_org() != authority.owner_org() {
                 return Err(
                     super::behavior::org_authority::OrgAuthorityError::AlreadyOwned {
@@ -8086,10 +10196,26 @@ impl MeshNode {
                 );
             }
         }
+        // The immediate change decision is IDENTITY-based (`Arc::ptr_eq`), not
+        // org/cert equality: a same-org renewal or key rotation is still a
+        // distinct installed security view. Historical `A → B → A` is caught by
+        // the installation generation, not this pointer compare.
+        let authority_changed = existing_authority
+            .as_ref()
+            .map(|current| !Arc::ptr_eq(current, &authority))
+            .unwrap_or(true);
         // The pin is already held over both cores → `pin_held = true`.
-        self.install_org_revocation_store_locked(candidate_store.clone(), true, None)
+        let store_changed = self
+            .install_org_revocation_store_locked(candidate_store.clone(), true, None)
             .map_err(super::behavior::org_authority::OrgAuthorityError::Revocation)?;
-        self.node_authority.store(Some(authority));
+        if authority_changed {
+            self.node_authority.store(Some(authority));
+        }
+        // One generation transition for the COMPLETE authority+store
+        // transaction (never one for the store then one for the authority).
+        if authority_changed || store_changed {
+            advance_fenced_generation(&self.org_install_generation, "org_install_generation");
+        }
         // No epoch bump: the installed authority's IDENTITY changed,
         // captured directly by the send-path [`SendStamp`]
         // (review-11 P1).
@@ -8138,6 +10264,66 @@ impl MeshNode {
     /// OA-1: the installed node authority, if any.
     pub fn node_authority(&self) -> Option<Arc<super::behavior::org_authority::NodeAuthority>> {
         self.node_authority.load_full()
+    }
+
+    /// OLB org-auth: capture a coherent, pinned snapshot of this node's sensing
+    /// authority view under the `org_install` publication lock — the org
+    /// registration gate validates against it and rechecks its stamp before
+    /// mutation ([`Self::sensing_authority_snapshot_current`]).
+    #[allow(dead_code)]
+    pub(crate) fn capture_sensing_authority_snapshot(
+        &self,
+    ) -> Result<sensing::SensingAuthoritySnapshot, sensing::SensingAuthorityUnavailable> {
+        sensing::capture_sensing_authority_snapshot(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            &self.org_install_generation,
+        )
+    }
+
+    /// OLB org-auth: whether a previously-captured sensing authority snapshot is
+    /// still the live view (the admission linearization recheck). Recaptures
+    /// the current stamp under `org_install` and compares — a floor raise,
+    /// authority/store swap, `A → B → A` rotation, or poison transition all
+    /// make it stale.
+    #[allow(dead_code)]
+    pub(crate) fn sensing_authority_snapshot_current(
+        &self,
+        snapshot: &sensing::SensingAuthoritySnapshot,
+    ) -> bool {
+        sensing::capture_current_sensing_stamp(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            &self.org_install_generation,
+        )
+        .is_some_and(|current| snapshot.stamp().is_current(&current))
+    }
+
+    /// OLB org-auth (piece 2): capture a pinned, live proof of THIS node's own
+    /// organization membership for re-authoring an org sensing registration whose
+    /// already-validated organization is `org_id`, at `now_secs`. Threads the
+    /// node's own entity as the local entity, so the returned certificate is
+    /// always this relay's own — the value a fresh upstream `OrgProviderRegistration`
+    /// carries. Deliberately independent of `owner_cert_emission_enabled`: sensing
+    /// relay re-authoring is a distinct authorization from the OA announcement
+    /// surface. Consumed by the dispatch re-authoring path (org-auth part-2 piece
+    /// 4); `#[allow(dead_code)]` until then.
+    #[allow(dead_code)]
+    pub(crate) fn capture_live_org_relay_membership(
+        &self,
+        org_id: super::behavior::org::OrgId,
+        now_secs: u64,
+    ) -> Result<sensing::LiveOrgRelayMembership, sensing::RelayMembershipUnavailable> {
+        sensing::capture_live_org_relay_membership(
+            &self.org_install,
+            &self.node_authority,
+            &self.org_revocation,
+            self.entity_id(),
+            org_id,
+            now_secs,
+        )
     }
 
     /// Best-effort wake of a current-baseline re-announce (OA3-4b2): a provider
@@ -8545,7 +10731,7 @@ impl MeshNode {
         // the send-path [`SendStamp`] cannot observe indirectly —
         // bump its dedicated counter so a cached announcement
         // re-validates before its next send (review-11 P1).
-        self.emission_generation.fetch_add(1, Ordering::AcqRel);
+        advance_fenced_generation(&self.emission_generation, "emission_generation");
         Ok(())
     }
 
@@ -8762,7 +10948,18 @@ impl MeshNode {
             return None;
         }
         if let Some(store) = self.org_revocation.load_full() {
-            let floor = store.floor_for(&cert.org_id, &cert.member);
+            // Fail closed on terminal exhaustion at CONSTRUCTION, not only at the
+            // send seqlock: the floor comparison below is meaningful only if the
+            // view it reads can still be shown current, and a cert built here is
+            // CACHED for reuse (Kyra OLB-2B-E3c).
+            let Ok((floors, _generation)) = store.snapshot_with_generation() else {
+                tracing::error!(
+                    org = %cert.org_id,
+                    "owner-cert emission dark: revocation publication generation \n                     exhausted — the floor view's currentness can no longer be \n                     witnessed"
+                );
+                return None;
+            };
+            let floor = floors.floor_for(&cert.org_id, &cert.member);
             if cert.generation < floor {
                 tracing::warn!(
                     org = %cert.org_id,
@@ -8801,10 +10998,19 @@ impl MeshNode {
         let store = self.org_revocation.load_full();
         let authority = self.node_authority.load_full();
         let stamp = SendStamp {
-            store_ptr: store
-                .as_ref()
-                .map_or(0, |s| Arc::as_ptr(s) as *const () as usize),
-            store_generation: store.as_ref().map_or(0, |s| s.barriered_generation()),
+            store: match store.as_ref() {
+                None => SendStoreStamp::Absent,
+                Some(s) => {
+                    let store_ptr = Arc::as_ptr(s) as *const () as usize;
+                    match s.barriered_generation() {
+                        Ok(generation) => SendStoreStamp::Live {
+                            store_ptr,
+                            generation,
+                        },
+                        Err(_) => SendStoreStamp::Exhausted { store_ptr },
+                    }
+                }
+            },
             authority_ptr: authority
                 .as_ref()
                 .map_or(0, |a| Arc::as_ptr(a) as *const () as usize),
@@ -8933,7 +11139,7 @@ impl MeshNode {
                 // AND the sealing provider snapshot all still hold. The pinned
                 // `snapshot` Arcs are still alive for this comparison, so a
                 // swapped-away authority/store cannot reuse the captured addresses.
-                if self.security_stamp() == stamp
+                if stamp.is_current(&self.security_stamp())
                     && visibility_stable
                     && authority_stable
                     && provider_grants_stable
@@ -9159,6 +11365,8 @@ impl MeshNode {
             &self.org_revocation,
             &self.consumer_grant_audiences,
             &self.scoped_discovery,
+            &self.scoped_publication,
+            &self.scoped_ingest_counters,
             &decoded,
             0,
             None,
@@ -9187,6 +11395,8 @@ impl MeshNode {
             &self.org_revocation,
             &self.consumer_grant_audiences,
             &self.scoped_discovery,
+            &self.scoped_publication,
+            &self.scoped_ingest_counters,
             &decoded,
             0,
             Some(probe),
@@ -9244,7 +11454,6 @@ impl MeshNode {
         EntityId,
     )> {
         use super::behavior::org_revocation::OrgRevocationState;
-        use super::behavior::org_scoped_store::PrivateCapabilityProvider;
         // Mirror the ingest path: borrow the LIVE floor snapshot (an un-adopted
         // node with no revocation store queries against an implicit empty floor
         // set), so the currentness filter reflects real node state.
@@ -9252,23 +11461,12 @@ impl MeshNode {
         let empty_floors = OrgRevocationState::empty();
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
+        // OLB-2A: a specific capability is served from the sidecar index (no
+        // per-record descriptor decode); the `None` seam still scans. Freshness
+        // (expiry + revocation-floor currentness) is applied per hit inside.
         self.scoped_discovery
             .lock()
-            .find_owner_private_capabilities(now_secs, floors, |c| match capability {
-                None => true,
-                Some(want) => super::behavior::org_scoped_ingest::descriptor_declares_capability(
-                    c.descriptor(),
-                    want,
-                ),
-            })
-            .into_iter()
-            .map(|c| {
-                (
-                    PrivateCapabilityProvider::from_verified(c),
-                    c.provider().clone(),
-                )
-            })
-            .collect()
+            .find_owner_private_providers(capability, now_secs, floors)
     }
 
     #[doc(hidden)]
@@ -9366,6 +11564,65 @@ impl MeshNode {
             .map(|c| c.provider().clone())
             .collect()
     }
+
+    /// The private-discovery QUERY-VISIBLE change generation over EITHER partition,
+    /// owner or grant (OLB-2A.3 complete). Advances once per transition that
+    /// changes a capability's query-visible provider bucket, from ALL THREE
+    /// sources:
+    ///
+    /// - a store mutation (an accepted ingest, or a sweep dropping a live record);
+    /// - EXACT EXPIRY — the node timer's sweep at a record's deadline;
+    /// - REVOCATION-FLOOR movement — a raised floor retracting a record, which
+    ///   changes query results with no store mutation at all.
+    ///
+    /// A consumer polls it to learn that private discovery moved. It is a
+    /// COALESCED invalidation/checkpoint value, not a count of events: a
+    /// `Stale`/refused ingest, a mutation touching no query-visible capability
+    /// bucket, and a REPLAYED transition (a repeated or incremental floor raise
+    /// over an already-retracted record, or that record's later expiry or capacity
+    /// demotion) all leave it unchanged.
+    pub fn private_discovery_generation(&self) -> u64 {
+        self.scoped_discovery.lock().revision()
+    }
+
+    /// The private-discovery query-visible change generation over the OWNER
+    /// partition only — the same three sources restricted to owner records, so
+    /// valid grant-audience churn never ADVANCES it.
+    ///
+    /// That is a statement about this generation, NOT about wakeups. The change
+    /// watch ([`Self::subscribe_private_discovery_changes`]) carries the GLOBAL
+    /// generation, so grant-only movement can still wake a receiver that only
+    /// cares about the owner partition; such a consumer observes this generation
+    /// unmoved and goes back to sleep. Only a distinct owner-filtered watch would
+    /// make grant churn invisible to it, and none exists today (Kyra OLB-2B
+    /// design review).
+    pub fn private_discovery_owner_generation(&self) -> u64 {
+        self.scoped_discovery.lock().owner_revision()
+    }
+
+    /// Subscribe to the private-discovery change wake (OLB-2A.3): the receiver
+    /// carries the latest published GLOBAL query-visible generation
+    /// ([`Self::private_discovery_generation`]), republished after any qualifying
+    /// source — store mutation, exact expiry, or revocation-floor retraction —
+    /// commits through the node-global publication gate. A no-op or replayed
+    /// transition publishes nothing.
+    ///
+    /// The watch is only a WAKE HINT: it coalesces, so a woken consumer must read
+    /// the authoritative generation and drain the dirty batch rather than infer
+    /// what moved from the value itself. Read-only push signal (the
+    /// `local_caps_changed` idiom); draining the dirty deltas is the single
+    /// node-owned consumer's crate-internal concern, not exposed here.
+    pub fn subscribe_private_discovery_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.scoped_publication.subscribe()
+    }
+
+    // The DESTRUCTIVE dirty-capability drains are deliberately NOT public
+    // MeshNode API (Kyra OLB-2A.2): they belong to the single node-owned consumer
+    // of each stream. Since OLB-2B they are MODULE-PRIVATE to `org_scoped_store`
+    // and reachable only through `PrivateDiscoveryDrain`, the unforgeable handle
+    // the node's mint leases out one-at-a-time per stream — so a second concurrent
+    // drainer is unrepresentable rather than merely discouraged. The read-only
+    // `private_discovery_generation` polls above remain safe to expose.
 
     /// Test seam (OA3 closure witness): advance the visibility generation as a
     /// concurrent registration would, so a send fired after a visibility change
@@ -9939,6 +12196,11 @@ impl MeshNode {
             }
         };
         let capability_gc_handle = self.spawn_capability_gc_loop();
+        let exact_expiry_handle = self.spawn_exact_expiry_timer();
+        // OLB-2B-E3c. Its handle goes to `routing_task`, NOT the shared `tasks`
+        // vector: that vector is filled from a spawned task, so a fast shutdown
+        // can miss it, and this task must be joined deterministically.
+        self.start_org_routing_supervisor();
         let capability_reannounce_handle = self.spawn_capability_reannounce_loop();
         let capability_announce_on_change_handle = self.spawn_capability_announce_on_change_loop();
         let fold_generation_gc_handle = self.spawn_fold_generation_gc_loop();
@@ -10004,16 +12266,19 @@ impl MeshNode {
             None
         };
 
-        // Store handles — can't block here, but we need them for shutdown
-        let tasks = self.tasks.clone();
-        tokio::spawn(async move {
-            let mut tasks = tasks.lock().await;
+        // Store handles SYNCHRONOUSLY, before `start` returns (review-pass-3
+        // §16). Publishing them from a spawned task let a fast shutdown observe an
+        // empty vector and return while these were still running — the same race
+        // the routing supervisor's handle slot was rewritten to close.
+        {
+            let mut tasks = self.tasks.lock();
             tasks.push(recv_handle);
             tasks.push(heartbeat_handle);
             tasks.push(stream_grant_drainer_handle);
             tasks.push(retransmit_handle);
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
+            tasks.push(exact_expiry_handle);
             tasks.push(capability_reannounce_handle);
             tasks.push(capability_announce_on_change_handle);
             tasks.push(fold_generation_gc_handle);
@@ -10025,7 +12290,7 @@ impl MeshNode {
             if let Some(h) = port_mapping_handle {
                 tasks.push(h);
             }
-        });
+        }
     }
 
     /// Start the node through its `Arc`, enabling the periodic capability
@@ -10051,6 +12316,430 @@ impl MeshNode {
         // `shutdown_notify`.
         #[cfg(feature = "nat-traversal")]
         let _upgrade_loop_handle = self.spawn_direct_upgrade_loop();
+    }
+
+    /// The ONE production path that constructs a [`RoutingSupervisor`] and
+    /// therefore the ONE that mints the exclusive global destructive drain
+    /// (OLB-2B-E3c).
+    ///
+    /// Everything the supervisor needs is node-owned and already built; all this
+    /// does is hand it the mint and run it. Two properties matter:
+    ///
+    /// - **exactly one mint.** `PrivateDiscoveryDrains::new` is called nowhere else
+    ///   in production, and the `routing_started` latch refuses a second start even
+    ///   if `start` is called twice. The drain's own lease would refuse the second
+    ///   claim regardless — this makes the refusal loud instead of a fenced actor;
+    /// - **the OWNER stream is never claimed.** The supervisor mints
+    ///   `PrivateDiscoveryStream::Global` only; the owner stream stays available for
+    ///   the provider-free leader track (Kyra OLB-2B, Q4).
+    fn start_org_routing_supervisor(&self) {
+        if self.routing_started.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                "org routing: the supervisor is already running; ignoring the \
+                 duplicate start. The global private-discovery drain is minted \
+                 exactly once per node."
+            );
+            return;
+        }
+
+        // The slot lock is held across the shutdown check, the spawn AND the
+        // handle publication, and `join_org_routing_supervisor` takes the same
+        // lock. Without that, a shutdown landing between `tokio::spawn` and the
+        // store would take `None`, return without joining, and leave an unjoined
+        // supervisor alive after teardown completed (Kyra OLB-2B-E3c). The latch
+        // above does not close this: it admits one starter, it does not order the
+        // starter against shutdown.
+        //
+        // Nothing here awaits, so the guard never spans a suspension point.
+        let mut task_slot = self.routing_task.lock();
+        if self.shutdown.load(Ordering::Acquire) {
+            // Shutdown won the slot. Stay fenced rather than spawning an actor
+            // nobody will ever join.
+            return;
+        }
+
+        let supervisor = super::behavior::org_routing::RoutingSupervisor::new(
+            super::behavior::org_scoped_store::PrivateDiscoveryDrains::new(
+                self.scoped_discovery.clone(),
+            ),
+            self.routing_health.clone(),
+            self.routing_metrics.clone(),
+        );
+        let changed = self.scoped_publication.subscribe();
+        let apply: super::behavior::org_routing::SharedApply = self.routing_registry.clone();
+        let work = self.routing_work.clone();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        #[cfg(any(test, feature = "fixtures"))]
+        let hooks = self.routing_hooks.clone();
+
+        let handle = tokio::spawn(async move {
+            supervisor
+                .run(
+                    changed,
+                    apply,
+                    work,
+                    shutdown,
+                    shutdown_notify,
+                    #[cfg(any(test, feature = "fixtures"))]
+                    hooks,
+                )
+                .await;
+        });
+        #[cfg(test)]
+        self.routing_spawn_pause();
+        *task_slot = Some(handle);
+    }
+
+    /// Test-only: raise the shutdown flag exactly as `shutdown()` does, without
+    /// tearing anything down — so a witness can prove startup observes it.
+    #[cfg(test)]
+    fn shutdown_flag_for_test(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Test-only pause between the spawn and the handle publication — the exact
+    /// window a shutdown must not be able to slip through.
+    #[cfg(test)]
+    fn routing_spawn_pause(&self) {
+        let hook = self.routing_spawn_pause_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Test-only: whether a joiner is currently BLOCKED on the routing-task slot.
+    ///
+    /// Lets the concurrent-registration witness wait on the real contention
+    /// rather than on elapsed time.
+    #[cfg(test)]
+    fn routing_join_blocked_for_test(&self) -> bool {
+        self.routing_join_waiting
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Signal-and-join the routing supervisor.
+    ///
+    /// Awaiting the task is the proof the caller needs: the supervisor future owns
+    /// the incarnation future, which owns the fence guard and the exclusive drain,
+    /// so the task resolving means health is fenced and the drain lease is
+    /// released. Only then can a successor mint succeed (OLB-2B-E3c).
+    ///
+    /// PRECONDITION: the shutdown flag and notification must already have been
+    /// issued. Awaiting a supervisor that has not been told to stop blocks until
+    /// its source closes.
+    async fn join_org_routing_supervisor(&self) {
+        // Taking the slot is what serializes against `start_org_routing_supervisor`:
+        // either startup published the handle before releasing the slot (so this
+        // takes it), or this ran first and startup then observes the shutdown flag
+        // under the same lock and spawns nothing. The guard is dropped BEFORE the
+        // await — no lock spans a suspension point.
+        let handle = {
+            #[cfg(test)]
+            let _waiting = RoutingJoinWaiting::new(&self.routing_join_waiting);
+            self.routing_task.lock().take()
+        };
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
+    /// Whether the routing plane has CONVERGED — a live incarnation completed a
+    /// recapture and the authority it built under can still prove currentness.
+    /// `false` while rebuilding and whenever fenced (OLB-2B-E2).
+    ///
+    /// Converged is not the same as serving (review-pass-3 §20a). Under steady
+    /// poison the design deliberately settles `Current` over an all-`Unserved`
+    /// reconstruction — witnessed by (25c) — so this reads `true` while every
+    /// warm read is cold at the seam. That is the intended shape: reconciliation
+    /// has caught up with an authority that currently serves nothing, which is a
+    /// different claim from "routes are available". Callers that need the second
+    /// one must read [`Self::org_authority_exhaustion`] and the seam's own
+    /// `None`, not this flag.
+    ///
+    /// Terminal authority exhaustion is checked INDEPENDENTLY of supervisor
+    /// health (E3c blockers §2): the terminal advance restarts nothing, so a
+    /// `Healthy` published before it survives it — and `Healthy` is exactly
+    /// what an authority that can no longer prove currentness must not be able
+    /// to keep saying.
+    pub fn org_routing_ready(&self) -> bool {
+        !self.routing_authority.is_exhausted()
+            && matches!(
+                **self.routing_health.load(),
+                super::behavior::org_routing::RoutingHealth::Healthy { .. }
+            )
+    }
+
+    /// Actor incarnations started, and abnormal source-closure exits
+    /// (OLB-2B-E2). A nonzero second value is loud: invalidations stopped while
+    /// discovery can still change.
+    pub fn org_routing_supervision_counts(&self) -> (u64, u64) {
+        (
+            self.routing_metrics.incarnations_started(),
+            self.routing_metrics.source_closed_unexpected(),
+        )
+    }
+
+    /// Terminal identity exhaustion across the org authority planes, as one
+    /// operator-facing reading (review-pass-3 §13(a)):
+    /// `(revocation publication generation, routing authority epoch,
+    /// scoped change generation)`.
+    ///
+    /// Each is a monotone in-memory identity space that LATCHES rather than
+    /// wrapping, and each latch is terminal — the plane it names fails closed
+    /// from then on. Production observability used to be a single
+    /// `tracing::error!` at latch time, and
+    /// `OrgRevocationStore::generation_exhausted_for_metrics` — written for
+    /// exactly this — was wired to no metrics surface at all, its only reference
+    /// being its own unit test. This is that surface.
+    ///
+    /// The revocation reading is OBSERVABILITY ONLY, as its accessor's doc
+    /// requires: it is a bare atomic load that does not cross the live-view lock,
+    /// so it must never be used to decide currentness. Every currentness decision
+    /// takes the barriered `Result` instead.
+    pub fn org_authority_exhaustion(&self) -> (bool, bool, bool) {
+        (
+            self.org_revocation
+                .load()
+                .as_ref()
+                .is_some_and(|store| store.generation_exhausted_for_metrics()),
+            self.routing_authority.is_exhausted(),
+            self.scoped_discovery.lock().generations_exhausted(),
+        )
+    }
+
+    /// Private-discovery intake outcomes (review-pass-3 §10):
+    /// `[inserted, updated, stale, rejected_public, at_capacity,
+    /// too_many_declarations, verify_refused, race_refused]`.
+    ///
+    /// Every one of these used to be `debug!` or `trace!` and nothing else, so
+    /// the three that matter operationally were invisible: a capacity wedge
+    /// (`at_capacity`), a forged-envelope storm (`verify_refused`), and a
+    /// persistent publication-race refusal (`race_refused`) each look exactly
+    /// like a quiet node above debug level. `at_capacity` additionally warns on
+    /// its first refusal and every 1024th after it.
+    pub fn org_scoped_ingest_counts(&self) -> [u64; 8] {
+        self.scoped_ingest_counters.snapshot()
+    }
+
+    /// Routing NON-CONVERGENCE: `(current superseded streak, high-water streak,
+    /// degraded entries)` (review-pass-2 §2).
+    ///
+    /// A sustained streak means the private-discovery source is moving faster
+    /// than one bounded quantum can close, so the recapture never settles.
+    /// Nonzero current = retrying now (and, past the threshold, backing off);
+    /// the high-water survives recovery so a node can be diagnosed after the
+    /// fact; `degraded_entries` counts the transitions into the explicit
+    /// cold-and-loud state, where health is forced to `Rebuilding` rather than
+    /// letting an unbounded rebuild loop look healthy from outside.
+    pub fn org_routing_convergence(&self) -> (u64, u64, u64) {
+        self.routing_metrics.superseded_streaks()
+    }
+
+    /// Retained routing slots and the work owed over them (OLB-2B-E3b).
+    pub fn org_routing_slots(&self) -> (usize, usize) {
+        (
+            self.routing_registry.retained_slots(),
+            self.routing_registry.pending_slots(),
+        )
+    }
+
+    /// Sensing-interest lease refusals: `(node at capacity, interest at
+    /// capacity)` (review-pass-2 §6). Each means a caller was deterministically
+    /// refused a lease rather than a live holder being displaced.
+    pub fn sensing_lease_refusals(&self) -> (u64, u64) {
+        self.sensing_interest_leases.refusals()
+    }
+
+    /// Lease wire reconciliations that FAILED after the registry had already
+    /// committed its side (2026-07-23 §6 residual).
+    ///
+    /// The rollback and release legs have no error channel — the caller is
+    /// returning the original failure, or nothing at all — so these used to be
+    /// discarded. Nonzero means the lease registry and the wire may disagree for
+    /// that interest until some later mutation reconciles them.
+    pub fn sensing_lease_reconcile_failures(&self) -> u64 {
+        self.sensing_interest_leases.reconcile_failures()
+    }
+
+    /// Deterministic routing refusals: family-at-capacity, node-at-capacity,
+    /// identity-space-exhausted (OLB-2B-E3b). Each means a caller took the
+    /// current-authority cold path rather than a live slot being evicted.
+    pub fn org_routing_refusals(&self) -> (u64, u64, u64) {
+        (
+            self.routing_registry_metrics.refused_family_at_capacity(),
+            self.routing_registry_metrics.refused_node_at_capacity(),
+            self.routing_registry_metrics.refused_id_space_exhausted(),
+        )
+    }
+
+    /// Routing reconciliation counters: installs, slots retired, facts
+    /// invalidated, obsolete artifacts discarded, stale-actor rejections,
+    /// recaptures restarted, settlements refused (OLB-2B-E3b, review-pass-3 §8).
+    ///
+    /// The last two answer different operator questions and used to be conflated.
+    /// `stale_actor_rejections` is actor LIFECYCLE churn — supervisor restarts,
+    /// fencing, incarnation movement. `settlements_refused` is AUTHORITY movement
+    /// under a held commit pin: the actor was live and the pass was valid, but the
+    /// revocation store published underneath it. Heavy floor churn shows up in the
+    /// second and says nothing about the first.
+    pub fn org_routing_reconciliation_counts(&self) -> [u64; 7] {
+        [
+            self.routing_registry_metrics.installs(),
+            self.routing_registry_metrics.slots_retired(),
+            self.routing_registry_metrics.facts_invalidated(),
+            self.routing_registry_metrics.discarded_obsolete(),
+            self.routing_registry_metrics.stale_actor_rejections(),
+            self.routing_registry_metrics.recaptures_restarted(),
+            self.routing_registry_metrics.settlements_refused(),
+        ]
+    }
+
+    /// Slots asked for under an audience scope the production source does not
+    /// serve — the grant plane, which is not capability-indexed. Never silently
+    /// answered as "no providers" (OLB-2B-E3c).
+    pub fn org_routing_unserved_scope_count(&self) -> u64 {
+        self.routing_unserved_scope
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mint a routing clone family over this node's registry.
+    ///
+    /// The consumer that will hold demand handles is the WARMED-CALL path, which
+    /// is deliberately outside the OLB-2B entry boundary (Kyra) — so this seam has
+    /// no in-crate production caller yet, and that is the reviewed scope decision
+    /// rather than a missing consumer. The allow is scoped to exactly these two
+    /// methods; it is NOT a module-wide or per-slice allowance.
+    #[allow(dead_code)]
+    pub(crate) fn org_routing_family(
+        &self,
+    ) -> Result<
+        super::behavior::org_routing_registry::RoutingFamily,
+        super::behavior::org_routing_registry::DemandRefused,
+    > {
+        self.routing_registry.new_family()
+    }
+
+    /// A COHERENT sample of the routing authority epoch and the revocation view
+    /// it qualifies: `(authority, poisoned, floor_generation)`, or `None` if the
+    /// two could not be observed under one unchanging identity (review-pass-3
+    /// §6).
+    ///
+    /// Seqlock-style — epoch, floors, RE-CHECK epoch — because the read seam's
+    /// safety used to rest on an unmarked ORDERING and nothing else. The write
+    /// side advances the epoch BEFORE publishing the store, so sampling floors
+    /// first and the epoch second is the conservative direction and `(B, R)` is
+    /// unobservable. Sampling them the other way round — a natural "cheap compare
+    /// first" refactor — admits loading epoch `R` before the advance and floors
+    /// from store `B` after the publish. On a `None -> store` install BOTH sides
+    /// read `floor_generation == 0, poisoned == false`, which are the NORMAL
+    /// first-install values rather than a coincidence, so facts stamped
+    /// `(R, 0, false)` under no store would compare EQUAL under store `B` and be
+    /// served as `B`-authoritative.
+    ///
+    /// Re-checking the epoch removes the ordering from the argument entirely: any
+    /// interleaving that could produce a mixed sample also moves the epoch, and a
+    /// moved epoch fails the re-check. Bounded rather than a retry loop — this is
+    /// a lock-free read path, and authority movement is node-mediated and rare,
+    /// so exhausting the attempts means something is genuinely churning and the
+    /// honest answer is a cold read.
+    fn sample_routing_authority(&self) -> Option<(u64, bool, u64)> {
+        const ATTEMPTS: usize = 4;
+        for _ in 0..ATTEMPTS {
+            let before = self.routing_authority.epoch();
+            let (poisoned, floor_generation, _store) =
+                ScopedSlotSource::revocation_view_of(&self.org_revocation);
+            // Test-only: the exact window a store install must not be able to
+            // occupy undetected.
+            #[cfg(test)]
+            {
+                let hook = self.routing_sample_gap_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            if self.routing_authority.epoch() == before {
+                return Some((before, poisoned, floor_generation));
+            }
+        }
+        None
+    }
+
+    /// The registry's base facts for `key`, if a slot is retained, currently
+    /// holds valid facts, AND the live health still allows the incarnation that
+    /// built them.
+    ///
+    /// Health is not source currentness — that is what the generation stamp is
+    /// for — but it IS the fence: an incarnation that died after installing must
+    /// not keep serving through its artifacts. `None` is the deterministic cold
+    /// outcome for every one of those reasons.
+    #[allow(dead_code)]
+    pub(crate) fn org_routing_base_facts(
+        &self,
+        key: &super::behavior::org_routing_registry::SlotKey,
+    ) -> Option<Arc<super::behavior::org_routing_registry::SlotBaseFacts>> {
+        let facts = self.routing_registry.base_facts_unvalidated(key)?;
+        // Revalidate the AUTHORITY these facts were built under against the live
+        // one. Checking authority only when something happens to rebuild the slot
+        // is not enough: a store that poisons AFTER installation moves no epoch
+        // and retracts no scoped row, so the cached facts would stay readable
+        // indefinitely (Kyra OLB-2B-E3c). A mismatch drops them and re-queues the
+        // exact slot, so the actor rebuilds it rather than leaving a hole.
+        //
+        // BEFORE the `Unserved` cold return below, not after. `Unserved` facts
+        // are exactly the ones a poison recovery must retire: they were built
+        // under a poisoned authority, the recovery republishes the same durable
+        // view so it raises no floor, and returning cold first would leave the
+        // registry reconciled to that obsolete reconstruction indefinitely
+        // (Kyra OLB-2B-E3c closure).
+        let Some((authority, poisoned, floor_generation)) = self.sample_routing_authority() else {
+            // The sample could not be taken coherently. Cold, and NOT stale: we
+            // do not know that these facts are wrong, so retiring them would
+            // discard valid work.
+            return None;
+        };
+        let stale = self.routing_authority.is_exhausted()
+            || facts.epoch.authority != authority
+            // The floor generation moves INDEPENDENTLY of the authority epoch:
+            // a floor publication is authoritative inside the revocation store
+            // before the subscriber that advances the epoch is even notified. So
+            // it is checked on its own (Kyra OLB-2B-E3c).
+            || facts.epoch.floor_generation != floor_generation
+            // COMPARED, not read as a predicate. Live poison alone would make
+            // every read under steady poison stale, re-queue the slot, and churn
+            // forever against a source that will keep reconstructing `Unserved`.
+            // The comparison catches both transitions and neither steady state.
+            || facts.epoch.poisoned != poisoned;
+        if stale {
+            // Conditional on the EXACT artifact read above: a delayed reader must
+            // not delete a current replacement installed in the meantime.
+            self.routing_registry.invalidate_if_stale(key, &facts);
+            return None;
+        }
+        // A scope this source cannot speak for has NO evidence, so it must read
+        // cold rather than as a proven-empty provider set (Kyra OLB-2B-E3c).
+        // Reconciled is not usable: this is where Option A's `Current` over an
+        // unusable source stays honest at the read boundary.
+        if matches!(
+            facts.providers,
+            super::behavior::org_routing_registry::SourceFacts::Unserved
+        ) {
+            return None;
+        }
+        // Expiry is enforced HERE, against the wall clock, not merely at capture.
+        // Reconstruction and the commit can both cross a deadline, and the
+        // exact-expiry timer is asynchronous — it may be waiting on the very
+        // publication gate the commit pin holds. The scoped store's uncached
+        // reads are expiry-safe by filtering at query time; a cache is only
+        // expiry-safe if its read seam does the same, so the timer governs
+        // promptness rather than correctness.
+        if super::behavior::org::current_timestamp() >= facts.earliest_expiry {
+            return None;
+        }
+        self.routing_health
+            .load()
+            .allows(facts.actor_incarnation)
+            .then_some(facts)
     }
 
     /// Spawn the NAT classification loop. Waits until at least 2
@@ -10215,6 +12904,7 @@ impl MeshNode {
         // This loop is the right home: same cadence (60 s), same purpose
         // (bounded retention of observation state), already shutdown-aware.
         let scoped = self.scoped_discovery.clone();
+        let scoped_publication = self.scoped_publication.clone();
         let interval = self.config.capability_gc_interval;
         let dedup_retention =
             std::time::Duration::from_secs(2 * u64::from(CapabilityAnnouncement::DEFAULT_TTL_SECS));
@@ -10233,7 +12923,11 @@ impl MeshNode {
                     _ = tick.tick() => {
                         seen.retain(|_, instant| instant.elapsed() < dedup_retention);
                         let now_secs = super::behavior::org::current_timestamp();
-                        let forgotten = scoped.lock().sweep_expired(now_secs);
+                        // Through the centralized gated commit so a sweep that
+                        // drops a live record wakes any consumer, serialized with
+                        // inbound ingest so publications never invert (OLB-2A.3.1).
+                        let forgotten =
+                            scoped_publication.gated_commit(&scoped, |s| s.sweep_expired(now_secs));
                         if forgotten > 0 {
                             tracing::debug!(
                                 forgotten,
@@ -10245,6 +12939,36 @@ impl MeshNode {
                 }
             }
         })
+    }
+
+    /// Spawn the node's single exact-expiry timer (OLB-2A.3.2).
+    ///
+    /// Complements the periodic 60 s GC: instead of waiting up to a full interval,
+    /// it sweeps each expired private-discovery record at exactly its deadline and
+    /// wakes consumers promptly, re-arming to any earlier deadline a mutation
+    /// introduces. One per node; it parks harmlessly when no record is live. See
+    /// [`run_exact_expiry_timer`] for the semantics.
+    fn spawn_exact_expiry_timer(&self) -> JoinHandle<()> {
+        let scoped = self.scoped_discovery.clone();
+        let publication = self.scoped_publication.clone();
+        let changed = self.scoped_publication.subscribe();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        tokio::spawn(run_exact_expiry_timer(
+            scoped,
+            publication,
+            changed,
+            // The FULL wall clock, subsecond part included, so the arm is exact.
+            // `.as_secs()` at the sweep matches `org::current_timestamp`, so the
+            // store's expiry semantics are unchanged.
+            || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+            },
+            shutdown,
+            shutdown_notify,
+        ))
     }
 
     /// Spawn the periodic capability re-announce loop.
@@ -10529,6 +13253,7 @@ impl MeshNode {
         let partition_filter = self.partition_filter.clone();
         let local_node_id = self.node_id;
         let observations = self.sensing_observations.clone();
+        let projection_mu = self.sensing_local_projection_mu.clone();
         let overlay = self.sensing_overlay_changed.clone();
         let factor = self.config.continuity_factor;
         let counters = self.sensing_counters.clone();
@@ -10593,15 +13318,19 @@ impl MeshNode {
                         .filter_map(|downstream| match downstream {
                             sensing::DownstreamId::Peer(node) => Some(node),
                             // SI-4 review P1 (self-provider watch):
-                            // the origin's own Local row consumes
-                            // the SAME signed beats below.
-                            sensing::DownstreamId::Local => {
+                            // the origin's own node-local row (direct
+                            // `Local` or leased `LeasedLocal`) consumes
+                            // the SAME signed beats below — take the
+                            // strictest interval across both.
+                            sensing::DownstreamId::Local | sensing::DownstreamId::LeasedLocal => {
+                                let interval = table
+                                    .lock()
+                                    .downstream_entry(&branch, downstream)
+                                    .map(|row| row.requested_sample_interval)
+                                    .unwrap_or(Duration::from_millis(50));
                                 local_interval = Some(
-                                    table
-                                        .lock()
-                                        .downstream_entry(&branch, sensing::DownstreamId::Local)
-                                        .map(|row| row.requested_sample_interval)
-                                        .unwrap_or(Duration::from_millis(50)),
+                                    local_interval
+                                        .map_or(interval, |existing| existing.min(interval)),
                                 );
                                 None
                             }
@@ -10649,16 +13378,30 @@ impl MeshNode {
                             .latest
                             .insert(branch.clone(), signed.clone());
                     }
-                    if let Some(interval) = local_interval {
-                        let moved = {
-                            let mut observations = observations.lock();
-                            observations
-                                .feed_consumer_cell(&branch, &signed, true, interval, factor, now)
-                        };
-                        if moved {
-                            overlay.send_modify(|generation| {
-                                *generation = generation.wrapping_add(1);
-                            });
+                    if local_interval.is_some() {
+                        // review-pass-3 §14b: the aggregate read and the cell
+                        // apply are ONE projection transaction. The
+                        // `local_interval` above was derived before the signature
+                        // — long enough for a lease tighten to commit in between,
+                        // which would re-anchor the shared cell to the stale
+                        // LOOSER cadence until the next beat or tick. Re-derived
+                        // under the mutex, so the value applied is the one that
+                        // was live when it was applied, matching the field's own
+                        // "changes OR applies" contract.
+                        let _projection = projection_mu.lock();
+                        let interval = { table.lock().local_consumer_interval(&branch, now) };
+                        if let Some(interval) = interval {
+                            let moved = {
+                                let mut observations = observations.lock();
+                                observations.feed_consumer_cell(
+                                    &branch, &signed, true, interval, factor, now,
+                                )
+                            };
+                            if moved {
+                                overlay.send_modify(|generation| {
+                                    *generation = generation.wrapping_add(1);
+                                });
+                            }
                         }
                     }
                     // SI-4 re-review P0: locally signed beats
@@ -10781,25 +13524,11 @@ impl MeshNode {
             }
         })
     }
-
-    /// Spawn the main receive loop.
-    ///
-    /// This is the heart of the mesh node. Every packet from every peer
-    /// arrives here. The loop:
-    /// 1. Looks up the session by source address
-    /// 2. For local packets: decrypts and queues events
-    /// 3. For forwarded packets: passes to router (no decryption)
-    /// 4. For heartbeats: updates failure detector
-    fn spawn_receive_loop(&self) -> JoinHandle<()> {
-        let socket = self.socket.socket_arc();
-        let shutdown = self.shutdown.clone();
-        let shutdown_notify = self.shutdown_notify.clone();
-        // Only read where the batched path can actually run (Linux + feature);
-        // elsewhere the per-packet path is the only option.
-        #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
-        let batched_ingress = self.config.batched_ingress;
-
-        let ctx = DispatchCtx {
+    /// The per-dispatch context: a cheap clone of the node's shared handles
+    /// (Arc/DashMap/config). Extracted so the receive loop and, in tests, the
+    /// org sensing dispatch operations can obtain one from `&self`.
+    fn dispatch_ctx(&self) -> DispatchCtx {
+        DispatchCtx {
             local_node_id: self.node_id,
             peers: self.peers.clone(),
             addr_to_node: self.addr_to_node.clone(),
@@ -10814,6 +13543,8 @@ impl MeshNode {
             org_revocation: self.org_revocation.clone(),
             node_authority: self.node_authority.clone(),
             scoped_discovery: self.scoped_discovery.clone(),
+            scoped_publication: self.scoped_publication.clone(),
+            scoped_ingest_counters: self.scoped_ingest_counters.clone(),
             scoped_relay_gate: self.scoped_relay_gate.clone(),
             consumer_grant_audiences: self.consumer_grant_audiences.clone(),
             #[cfg(feature = "redex")]
@@ -10857,6 +13588,8 @@ impl MeshNode {
             rpc_local_services: self.rpc_local_services.clone(),
             sensing_emitter: self.sensing_emitter.clone(),
             sensing_emitter_notify: self.sensing_emitter_notify.clone(),
+            org_install: self.org_install.clone(),
+            org_install_generation: self.org_install_generation.clone(),
             signing_identity: self.identity.clone(),
             capability_version: self.capability_version.clone(),
             sensing_observer_gate: self.sensing_observer_gate.clone(),
@@ -10864,6 +13597,7 @@ impl MeshNode {
             sensing_overlay_changed: self.sensing_overlay_changed.clone(),
             sensing_capability_interests: self.sensing_capability_interests.clone(),
             sensing_observations: self.sensing_observations.clone(),
+            sensing_local_projection_mu: self.sensing_local_projection_mu.clone(),
             pending_stream_grants: self.pending_stream_grants.clone(),
             pending_stream_grants_notify: self.pending_stream_grants_notify.clone(),
             control_stats: self.control_stats.clone(),
@@ -10906,7 +13640,27 @@ impl MeshNode {
             max_auth_failures_per_window: self.config.max_auth_failures_per_window,
             auth_failure_window: self.config.auth_failure_window,
             auth_throttle_duration: self.config.auth_throttle_duration,
-        };
+        }
+    }
+
+    /// Spawn the main receive loop.
+    ///
+    /// This is the heart of the mesh node. Every packet from every peer
+    /// arrives here. The loop:
+    /// 1. Looks up the session by source address
+    /// 2. For local packets: decrypts and queues events
+    /// 3. For forwarded packets: passes to router (no decryption)
+    /// 4. For heartbeats: updates failure detector
+    fn spawn_receive_loop(&self) -> JoinHandle<()> {
+        let socket = self.socket.socket_arc();
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        // Only read where the batched path can actually run (Linux + feature);
+        // elsewhere the per-packet path is the only option.
+        #[cfg(all(target_os = "linux", feature = "batched-ingress"))]
+        let batched_ingress = self.config.batched_ingress;
+
+        let ctx = self.dispatch_ctx();
 
         // Local receiver abstraction so the select! loop body below is
         // written once across the per-packet path and the Linux batched-
@@ -12285,6 +15039,8 @@ impl MeshNode {
                         &ctx.org_revocation,
                         &ctx.consumer_grant_audiences,
                         &ctx.scoped_discovery,
+                        &ctx.scoped_publication,
+                        &ctx.scoped_ingest_counters,
                         &admit.envelope,
                         from_node,
                         None,
@@ -13617,6 +16373,7 @@ impl MeshNode {
         let sensing_overlay_changed = self.sensing_overlay_changed.clone();
         let continuity_factor = self.config.continuity_factor;
         let sensing_capability_interests = self.sensing_capability_interests.clone();
+        let sensing_local_projection_mu = self.sensing_local_projection_mu.clone();
         // SI-2: the leader role's own soft state (per-consumer rows
         // in its relay table, drained interests) expires on the same
         // tick — an abandoned leader must converge to empty
@@ -13771,6 +16528,21 @@ impl MeshNode {
                             // decisions rest on.
                             let emitter_stamp =
                                 sensing_emitter.lock().as_ref().map(|e| e.stamp());
+                            // Review L1 linearization: expiry runs as TWO
+                            // separate projection transactions. Transaction 1
+                            // (this scope): `expire` computes actions and the
+                            // loop applies the branch-death consequences — a
+                            // lease/direct registration cannot interleave
+                            // between the two. Transaction 2 (the materialized
+                            // reconciliation later this tick) takes a FRESH
+                            // snapshot under the same mutex and relaxes the
+                            // surviving branches' consumer cells; the gap
+                            // between the transactions is race-safe precisely
+                            // because transaction 2 re-snapshots — it never
+                            // applies state captured here. Hence the explicit
+                            // scope: the guard MUST drop before it.
+                            {
+                            let _projection = sensing_local_projection_mu.lock();
                             let actions =
                                 sensing_interest_table.lock().expire(Instant::now());
                             for (key, action) in actions {
@@ -13830,6 +16602,7 @@ impl MeshNode {
                                         );
                                     }
                                 }
+                            }
                             }
 
                             // Closure item 6: age out refusal
@@ -13917,8 +16690,22 @@ impl MeshNode {
                                     .collect();
                                 (continuities, slot_keys)
                             };
+                            // Review L1 linearization: the catch-up's local-
+                            // aggregate snapshot and its consumer-cell feeds are
+                            // one projection transaction (explicitly dropped
+                            // after the feed loop, before the network flushes
+                            // and leader feeds).
+                            let projection_guard = sensing_local_projection_mu.lock();
                             let mut live_pending = Vec::new();
                             let mut dead_slots = Vec::new();
+                            // Review L1 follow-up: the shared consumer cell is fed
+                            // at the branch's derived local aggregate (min across
+                            // Local + LeasedLocal), precomputed once here under the
+                            // table lock, never at the per-row catch-up interval.
+                            let mut local_aggregates: HashMap<
+                                sensing::ProviderInterestKey,
+                                Duration,
+                            > = HashMap::new();
                             {
                                 let mut table = sensing_interest_table.lock();
                                 for (branch, continuity) in continuities {
@@ -13927,6 +16714,18 @@ impl MeshNode {
                                 for ((branch, downstream), pending) in pending {
                                     match table.downstream_entry(&branch, downstream) {
                                         Some(row) if row.expires_at > poll_now => {
+                                            if matches!(
+                                                downstream,
+                                                sensing::DownstreamId::Local
+                                                    | sensing::DownstreamId::LeasedLocal
+                                            ) && !local_aggregates.contains_key(&branch)
+                                            {
+                                                if let Some(agg) =
+                                                    table.local_consumer_interval(&branch, poll_now)
+                                                {
+                                                    local_aggregates.insert(branch.clone(), agg);
+                                                }
+                                            }
                                             if pending {
                                                 live_pending.push((
                                                     branch,
@@ -13955,6 +16754,11 @@ impl MeshNode {
                                 for key in dead_slots {
                                     observations.slots.remove(&key);
                                 }
+                                // Review L1 follow-up: feed each branch's shared
+                                // consumer cell at most once per sweep.
+                                let mut fed_local: std::collections::HashSet<
+                                    sensing::ProviderInterestKey,
+                                > = std::collections::HashSet::new();
                                 for (branch, downstream, interval) in live_pending {
                                     let bearing = observations
                                         .upstream
@@ -13994,17 +16798,28 @@ impl MeshNode {
                                             }
                                             // SI-4b: the local
                                             // consumer's due catch-
-                                            // up feeds its cell.
-                                            sensing::DownstreamId::Local => {
-                                                overlay_moved |= observations
-                                                    .feed_consumer_cell(
-                                                        &branch,
-                                                        &cached,
-                                                        bearing,
-                                                        interval,
-                                                        continuity_factor,
-                                                        poll_now,
-                                                    );
+                                            // up feeds its cell (direct
+                                            // or leased node-local row).
+                                            sensing::DownstreamId::Local
+                                            | sensing::DownstreamId::LeasedLocal => {
+                                                // Feed the ONE shared consumer
+                                                // cell once per branch, at the
+                                                // derived local aggregate.
+                                                if fed_local.insert(branch.clone()) {
+                                                    let agg = local_aggregates
+                                                        .get(&branch)
+                                                        .copied()
+                                                        .unwrap_or(interval);
+                                                    overlay_moved |= observations
+                                                        .feed_consumer_cell(
+                                                            &branch,
+                                                            &cached,
+                                                            bearing,
+                                                            agg,
+                                                            continuity_factor,
+                                                            poll_now,
+                                                        );
+                                                }
                                             }
                                             // SI-4 review P0: the
                                             // leader row's catch-up
@@ -14024,6 +16839,11 @@ impl MeshNode {
                                     }
                                 }
                             }
+                            // The projection transaction ends before the
+                            // network flushes and leader feeds (the leader
+                            // delivery fan-out feeds cells with the wire's
+                            // promised cadence, outside the local projection).
+                            drop(projection_guard);
                             #[cfg(feature = "redex")]
                             for (branch, cached, bearing) in leader_feeds {
                                 let Ok(semantic) = sensing::semantic_attestation(
@@ -14110,77 +16930,15 @@ impl MeshNode {
                                     });
                                 interests.keys().cloned().collect()
                             };
-                            let branch_keys: std::collections::HashSet<
-                                sensing::ProviderInterestKey,
-                            > = {
-                                let observations = sensing_observations.lock();
-                                observations
-                                    .latest
-                                    .keys()
-                                    .chain(observations.upstream.keys())
-                                    .chain(observations.consumer_cells.keys())
-                                    .chain(
-                                        observations
-                                            .slots
-                                            .keys()
-                                            .map(|(branch, _)| branch),
-                                    )
-                                    .cloned()
-                                    .collect()
-                            };
-                            let mut dead_branches = Vec::new();
-                            let mut dead_cells = Vec::new();
-                            {
-                                let table = sensing_interest_table.lock();
-                                for key in branch_keys {
-                                    if live_interests.contains(&key.interest) {
-                                        continue;
-                                    }
-                                    if table.downstreams(&key, poll_now).is_empty() {
-                                        // No watch, no rows: nothing
-                                        // justifies ANY of the
-                                        // branch's state.
-                                        dead_branches.push(key);
-                                        continue;
-                                    }
-                                    let local_live = table
-                                        .downstream_entry(
-                                            &key,
-                                            sensing::DownstreamId::Local,
-                                        )
-                                        .is_some_and(|row| {
-                                            row.expires_at > poll_now
-                                        });
-                                    if !local_live {
-                                        // Relay duty continues; only
-                                        // the local consumer view
-                                        // lost its justification.
-                                        dead_cells.push(key);
-                                    }
-                                }
-                            }
-                            if !dead_branches.is_empty() || !dead_cells.is_empty() {
-                                let mut projection_dropped = false;
-                                let mut observations = sensing_observations.lock();
-                                for key in dead_branches {
-                                    projection_dropped |= observations
-                                        .consumer_cells
-                                        .contains_key(&key);
-                                    observations.reclaim_branch(&key);
-                                }
-                                for key in dead_cells {
-                                    projection_dropped |= observations
-                                        .consumer_cells
-                                        .remove(&key)
-                                        .is_some();
-                                }
-                                drop(observations);
-                                if projection_dropped {
-                                    sensing_overlay_changed.send_modify(|generation| {
-                                        *generation = generation.wrapping_add(1);
-                                    });
-                                }
-                            }
+                            reconcile_materialized_consumer_cells(
+                                &sensing_local_projection_mu,
+                                &sensing_interest_table,
+                                &sensing_observations,
+                                &sensing_overlay_changed,
+                                &live_interests,
+                                poll_now,
+                                None,
+                            );
                         }
 
                         // Bound the ack-ranges capability-gate cache
@@ -16167,6 +18925,22 @@ impl MeshNode {
     ///   needs the full spec; the stale stricter D upstream is
     ///   conservative and the next downstream refresh repairs it).
     fn handle_sensing_interest_frame(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        // review-pass-3 §11(b): a peer that has spent its rolling auth-failure
+        // budget is dropped BEFORE the decode, so a forged-cert flood stops buying
+        // an Ed25519 verify per frame. Checked here rather than inside the org
+        // admission because the point is to refuse the work, not to account for
+        // it afterwards. The same window and thresholds the channel-membership
+        // plane uses; `max_auth_failures_per_window == u16::MAX` disables it.
+        if Self::is_auth_throttled(from_node, ctx) {
+            ctx.sensing_counters
+                .protocol_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                "sensing: peer is auth-throttled; frame dropped before decode"
+            );
+            return;
+        }
         // Strict decode (wire.rs, 4 KiB cap, trailing bytes
         // rejected): a failure is malformed protocol input — count
         // and drop silently, like the unknown-subprotocol drop.
@@ -16207,6 +18981,13 @@ impl MeshNode {
                 Some(*audience_scope)
             }
             sensing::SensingInterestFrame::Deregister { .. } => None,
+            // Organization-authenticated variants carry their audience through the
+            // membership authority gate ([`verify_org_sensing_registration`]), not
+            // the legacy session-scope path, so no legacy claimed scope is derived
+            // here. The main match routes `OrgProviderRegistration` to the live org
+            // gate and `OrgCapabilityRegistration` to the dark drop.
+            sensing::SensingInterestFrame::OrgCapabilityRegistration { .. }
+            | sensing::SensingInterestFrame::OrgProviderRegistration { .. } => None,
         };
         let session_root =
             if ctx.sensing_fleet_scope && claimed_scope == Some(ctx.sensing_local_root) {
@@ -16215,6 +18996,41 @@ impl MeshNode {
                 entity_root
             };
         let now = Instant::now();
+        // OLB org-auth (piece 4): ONE explicit wall-clock sample for this
+        // dispatch — the org gate validates the sender certificate against it AND
+        // the remote membership capture is taken against it, so a wall-clock step
+        // cannot open a window between the two checks.
+        let now_secs = super::behavior::org::current_timestamp();
+
+        // Kyra amended-verdict closure 1 (authority-aware classification at legacy
+        // intake): when this node holds organization authority, a LEGACY
+        // registration whose declared audience is this org's canonical sensing
+        // commitment is authority laundering. `validate_subscriber_scope` proves
+        // every admitted legacy row is keyed under `sensing_local_root`, so a fleet
+        // root configured equal to the org commitment would let such a legacy row
+        // share a `ProviderInterestKey` with an org row (org→legacy downgrade).
+        // Classify by the installed authority and refuse before any leader/table
+        // mutation. `claimed_scope` is `Some` ONLY for the two legacy registration
+        // variants (org variants carry their audience through the membership gate;
+        // Deregister carries none), so this touches exactly the legacy legs. Closure
+        // 2 refuses installing authority over such a fleet root, so this branch is
+        // unreachable in a correctly-configured node — it is the independent second
+        // line at the point of use.
+        if let Some(claimed) = claimed_scope {
+            if let Some(authority) = ctx.node_authority.load_full() {
+                if claimed == sensing::canonical_org_sensing_commitment(&authority.owner_org()) {
+                    ctx.sensing_counters
+                        .protocol_invalid
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        from_node = format!("{:#x}", from_node),
+                        "sensing: legacy registration with organization-derived \
+                         audience refused (authority-aware classification)"
+                    );
+                    return;
+                }
+            }
+        }
 
         match &frame {
             sensing::SensingInterestFrame::CapabilityRegistration {
@@ -16389,6 +19205,12 @@ impl MeshNode {
                                 .map(|strictest| (*provider, strictest))
                         })
                         .collect();
+                    // Piece-3: the interest's admitted seed carries the authority
+                    // provenance the upstream continuation must preserve. Fetch it
+                    // while the leader lock is held; the deferred emission derives
+                    // its provider continuation from it (never re-inferred from the
+                    // audience).
+                    let seed = leader.interest_seed(&registration.interest);
                     drop(slot);
                     if branch_demands.is_empty() {
                         return;
@@ -16467,22 +19289,32 @@ impl MeshNode {
                         ) {
                             continue;
                         }
-                        let upstream = sensing::SensingInterestFrame::provider_registration(
-                            &spec, provider, strictest, ttl,
-                        );
-                        if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-                            spawn_sensing_frame_send(
-                                &ctx.socket,
-                                &ctx.peers,
-                                &ctx.addr_to_node,
-                                &ctx.router,
-                                &ctx.partition_filter,
-                                ctx.local_node_id,
-                                provider,
-                                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                                sensing::SUBPROTOCOL_SENSING_INTEREST,
-                                bytes,
-                            );
+                        // Piece-3 authority-aware leader continuation: derive the
+                        // provider leg from the interest's admitted seed and let
+                        // `plan_provider_continuation` pick the frame kind by
+                        // authority. Org intake is dark, so the capture is
+                        // fail-closed `|_| None`.
+                        let Some(seed) = &seed else {
+                            continue;
+                        };
+                        let continuation = seed.provider_continuation(provider, strictest, ttl);
+                        if let Some(upstream) =
+                            sensing::plan_provider_continuation(&continuation, |_org| None)
+                        {
+                            if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                                spawn_sensing_frame_send(
+                                    &ctx.socket,
+                                    &ctx.peers,
+                                    &ctx.addr_to_node,
+                                    &ctx.router,
+                                    &ctx.partition_filter,
+                                    ctx.local_node_id,
+                                    provider,
+                                    sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                                    sensing::SUBPROTOCOL_SENSING_INTEREST,
+                                    bytes,
+                                );
+                            }
                         }
                     }
                 }
@@ -16519,219 +19351,29 @@ impl MeshNode {
                 ) else {
                     return;
                 };
-                let key = sensing::ProviderInterestKey::new(validated.spec.key(), validated.target);
-                // Cap the accepted lifetime at the local soft-state
-                // horizon (plan §5) so a downstream can't pin rows.
-                let ttl = validated.soft_state_ttl.min(ctx.sensing_interest_ttl);
-                let outcome = ctx.sensing_interest_table.lock().register(
-                    &key,
-                    sensing::DownstreamId::Peer(from_node),
-                    validated.requested_sample_interval,
-                    ttl,
-                    proven_root,
-                    now,
+                // The legacy relay re-authoring funnels into the shared provider
+                // semantic operation, carrying the session-proven root as legacy
+                // authority evidence (no org snapshot); clamp, table register, and
+                // the authority-aware emission live there.
+                // 2026-07-23 §7 residual: the proven root is DERIVED from the
+                // spec inside `from_validated_legacy` now, so an admission can no
+                // longer pair one interest's spec with another's proven root.
+                // `validate_subscriber_scope` above returned `Ok` only because
+                // `validated.spec.audience == session_root`, so the two are the
+                // same value; asserted rather than assumed.
+                debug_assert_eq!(
+                    proven_root, validated.spec.audience,
+                    "the proven root must be the one scope validation returned for THIS spec"
                 );
-                match outcome {
-                    sensing::RegisterOutcome::Registered(action) => {
-                        // The target provider itself has no upstream —
-                        // there the registration feeds the origin
-                        // emitter instead (SI-3).
-                        if validated.target == ctx.local_node_id {
-                            // SI-7 coalescing-efficacy headline (plan
-                            // §4.1): this node is the PROVIDER. For a
-                            // provider-free interest, a second DISTINCT
-                            // upstream on the branch means two leaders
-                            // resolved the same interest here — the
-                            // residual divergent resolution the future
-                            // gate weighs. Provider-targeted
-                            // (`Node`/`Nodes`) registrations are
-                            // excluded: multiple direct surveillants
-                            // are intended, not a coalescing failure.
-                            if validated.spec.providers.is_provider_free() {
-                                ctx.sensing_counters
-                                    .provider_free_registrations
-                                    .fetch_add(1, Ordering::Relaxed);
-                                let distinct_upstreams = ctx
-                                    .sensing_interest_table
-                                    .lock()
-                                    .downstreams(&key, now)
-                                    .into_iter()
-                                    .filter(|downstream| {
-                                        matches!(downstream, sensing::DownstreamId::Peer(_))
-                                    })
-                                    .count();
-                                if distinct_upstreams >= 2 {
-                                    ctx.sensing_counters
-                                        .divergent_resolution_merge_miss
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            Self::feed_sensing_origin(
-                                ctx,
-                                &key,
-                                &validated.spec,
-                                sensing::DownstreamId::Peer(from_node),
-                                now,
-                            );
-                            return;
-                        }
-                        // A registration can't kill the last
-                        // downstream, but honor the action shape
-                        // exhaustively anyway.
-                        if action == sensing::UpstreamAction::Deregister {
-                            Self::send_sensing_deregister_upstream(ctx, &key);
-                            return;
-                        }
-                        // SI-4a warm-start (§4.4), disciplined by
-                        // the SI-4 review (P1): ONLY a NEWLY
-                        // CREATED downstream row is warm-started —
-                        // a refresh resend must never restart a
-                        // live delivery clock, clear pending work,
-                        // or record itself as a live delivery
-                        // (under D = ttl with ttl/2 refreshes that
-                        // starved the downstream to permanent
-                        // provisional Unknown). The send is ALWAYS
-                        // provisional; the downstream's gate
-                        // absorbs duplicates as StaleSeq.
-                        let cached = {
-                            let mut observations = ctx.sensing_observations.lock();
-                            let slot_key = (key.clone(), sensing::DownstreamId::Peer(from_node));
-                            if observations.slots.contains_key(&slot_key) {
-                                None
-                            } else {
-                                let cached = observations.latest.get(&key).cloned();
-                                if let Some(cached) = &cached {
-                                    observations.slots.insert(
-                                        slot_key,
-                                        SensingDeliverySlot {
-                                            last_status: Some(cached.status),
-                                            last_delivered: Some((
-                                                cached.origin_incarnation,
-                                                cached.seq,
-                                            )),
-                                            next_due: now + validated.requested_sample_interval,
-                                            pending: false,
-                                        },
-                                    );
-                                }
-                                cached
-                            }
-                        };
-                        if let Some(cached) = cached {
-                            if let Ok(bytes) = sensing::encode_attestation(&cached) {
-                                spawn_sensing_frame_send(
-                                    &ctx.socket,
-                                    &ctx.peers,
-                                    &ctx.addr_to_node,
-                                    &ctx.router,
-                                    &ctx.partition_filter,
-                                    ctx.local_node_id,
-                                    from_node,
-                                    sensing::SENSING_PROVISIONAL_STREAM,
-                                    sensing::SUBPROTOCOL_READINESS_ATTESTATION,
-                                    bytes,
-                                );
-                            }
-                        }
-                        // SI-3 closure (item 2's principle at the
-                        // damper seam): anti-entropy on EVERY
-                        // admitted registration/refresh at the
-                        // CURRENT aggregate, min-gap damped — the
-                        // exact `register_sensing_interest` / leader-
-                        // seam shape. The previous trailing-edge-only
-                        // send lost a damper-suppressed transition
-                        // forever (`register()` had already committed
-                        // `last_advertised`, so later refreshes
-                        // diffed to `None`) AND let upstream rows
-                        // starve to ttl expiry in leaderless relay
-                        // chains (§4.3 refreshes rows at ttl/2 —
-                        // every hop must re-send, not just the
-                        // first). The damper bounds the re-send rate;
-                        // the receiving hop's register is an
-                        // idempotent refresh.
-                        let Some(strictest) =
-                            ctx.sensing_interest_table.lock().aggregate(&key, now)
-                        else {
-                            return;
-                        };
-                        // SI-4 re-review item 5: the aggregate moved
-                        // with this registration — re-anchor the
-                        // hop's continuity window now, not at the
-                        // next beat.
-                        ctx.sensing_observations
-                            .lock()
-                            .update_upstream_interval(&key, Some(strictest));
-                        if !sensing_upstream_damper_admits(
-                            &ctx.sensing_upstream_damper,
-                            validated.target,
-                            *key.interest.interest_digest.as_bytes(),
-                            sensing_effective_min_gap(ttl),
-                        ) {
-                            return;
-                        }
-                        let upstream = sensing::SensingInterestFrame::provider_registration(
-                            &validated.spec,
-                            validated.target,
-                            strictest,
-                            ttl,
-                        );
-                        if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-                            spawn_sensing_frame_send(
-                                &ctx.socket,
-                                &ctx.peers,
-                                &ctx.addr_to_node,
-                                &ctx.router,
-                                &ctx.partition_filter,
-                                ctx.local_node_id,
-                                validated.target,
-                                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                                sensing::SUBPROTOCOL_SENSING_INTEREST,
-                                bytes,
-                            );
-                        }
-                    }
-                    sensing::RegisterOutcome::OverCap => {
-                        ctx.sensing_over_cap.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(
-                            from_node = format!("{:#x}", from_node),
-                            "sensing: registration refused over per-peer cap"
-                        );
-                    }
-                    sensing::RegisterOutcome::RefusedByCachedFloor { minimum_supported } => {
-                        tracing::debug!(
-                            from_node = format!("{:#x}", from_node),
-                            floor_ms = minimum_supported.as_millis() as u64,
-                            "sensing: registration refused by cached provider floor"
-                        );
-                        // SI-3: when THIS node is the origin, it can
-                        // author + sign the refusal response itself
-                        // (one-shot, rides the attestation plane).
-                        // A RELAY's cached-floor refusal stays local
-                        // (§4.4 no-round-trip): a relay cannot sign
-                        // an attestation for a foreign origin —
-                        // re-sending the origin's cached refusal is
-                        // SI-4's latest-per-key anti-entropy.
-                        if validated.target == ctx.local_node_id {
-                            ctx.sensing_counters
-                                .cadence_refusals
-                                .fetch_add(1, Ordering::Relaxed);
-                            let generation = ctx.capability_version.load(Ordering::Relaxed);
-                            let beat = {
-                                let mut slot = ctx.sensing_emitter.lock();
-                                slot.as_mut().map(|emitter| {
-                                    emitter.refusal_beat(
-                                        &validated.spec,
-                                        sensing::CadenceRefusal { minimum_supported },
-                                        generation,
-                                    )
-                                })
-                            };
-                            if let Some(beat) = beat {
-                                Self::send_sensing_refusal_beat(ctx, beat, [from_node]);
-                            }
-                        }
-                    }
-                }
+                let admitted = sensing::AdmittedSensingRegistration::from_validated_legacy(
+                    validated.spec.clone(),
+                    sensing::RegistrationLeg::Provider {
+                        target: validated.target,
+                        requested_sample_interval: validated.requested_sample_interval,
+                        soft_state_ttl: validated.soft_state_ttl,
+                    },
+                );
+                Self::apply_provider_registration(ctx, &admitted, None, from_node, now, now_secs);
             }
             sensing::SensingInterestFrame::Deregister {
                 interest_digest,
@@ -16748,9 +19390,19 @@ impl MeshNode {
                 );
                 for (key, action) in actions {
                     // Closure item 6: a dead branch reclaims its
-                    // observations with the table.
+                    // observations with the table. review-pass-3 §14a:
+                    // under the projection transaction, and only if the
+                    // branch is STILL dead — a registration completing in
+                    // this window keeps its table row, so an unguarded
+                    // reclaim would erase the consumer cell and warm start
+                    // it just anchored.
                     if action == sensing::UpstreamAction::Deregister {
-                        ctx.sensing_observations.lock().reclaim_branch(&key);
+                        reclaim_dead_sensing_branch(
+                            &ctx.sensing_local_projection_mu,
+                            &ctx.sensing_interest_table,
+                            &ctx.sensing_observations,
+                            &key,
+                        );
                     }
                     // SI-4 re-review item 5: a loosened aggregate
                     // re-anchors the surviving branch's continuity
@@ -16782,6 +19434,428 @@ impl MeshNode {
                     // Register (loosened aggregate): the upstream
                     // re-send stays skipped in SI-2a — see the
                     // method docs.
+                }
+            }
+            // Live (exact-provider go-live): the organization PROVIDER
+            // re-authoring path. The frame's membership certificate is verified at
+            // this hop by the authority gate before it can reach the interest
+            // table; the CAPABILITY (leader) variant below stays dark.
+            sensing::SensingInterestFrame::OrgProviderRegistration { .. } => {
+                // Piece-4 exact-provider go-live (provider leg): the org authority
+                // gate admits the frame to a narrow validated wrapper + a pinned
+                // snapshot, then the SAME provider semantic operation the legacy
+                // path uses does the final stamp recheck immediately before the
+                // table mutation and re-authors upstream under THIS relay's own
+                // live membership (or emits nothing — never a legacy downgrade).
+                if let Some((admitted, snapshot)) =
+                    Self::admit_org_registration(ctx, &frame, from_node, &sender_entity, now_secs)
+                {
+                    Self::apply_provider_registration(
+                        ctx,
+                        &admitted,
+                        Some(&snapshot),
+                        from_node,
+                        now,
+                        now_secs,
+                    );
+                }
+            }
+            // The organization CAPABILITY (leader-addressed) variant stays
+            // structurally dark: lighting it requires an owner-private candidate
+            // substrate (scoped-discovery projection, per-interest org-root
+            // resolution) that the exact-provider first release deliberately does
+            // not build. Exact-provider org sensing rides OrgProviderRegistration
+            // above, selected upstream by the owner-scoped discovery client.
+            sensing::SensingInterestFrame::OrgCapabilityRegistration { .. } => {
+                tracing::debug!(
+                    "sensing: org capability registration dropped \
+                     (exact-provider release: leader path not lit)"
+                );
+            }
+        }
+    }
+
+    /// OLB org-auth (piece 4, exact-provider): the organization sensing
+    /// registration authority gate. Captures a coherent authority snapshot under
+    /// `org_install`, runs `verify_org_sensing_registration` against the PINNED
+    /// view at a single `now_secs`, and returns the narrow admitted wrapper
+    /// TOGETHER WITH the pinned snapshot — the caller performs the final
+    /// stamp-currency recheck immediately before its table mutation, so no
+    /// preparatory work intervenes between the recheck and the mutation. Any gate
+    /// failure (no authority/store, poison, cert/scope rejection) returns `None`;
+    /// nothing is emitted and the observation stays `Unknown`/`Potential`.
+    fn admit_org_registration(
+        ctx: &DispatchCtx,
+        frame: &sensing::SensingInterestFrame,
+        from_node: u64,
+        sender_entity: &EntityId,
+        now_secs: u64,
+    ) -> Option<(
+        sensing::AdmittedSensingRegistration,
+        sensing::SensingAuthoritySnapshot,
+    )> {
+        // Cheap STRUCTURAL bounds reject BEFORE the Ed25519 verify + the
+        // org_install snapshot capture (review §4): interval/ttl are resource
+        // limits, not authority evidence, so rejecting a garbage-bounded frame
+        // here costs an attacker a signature verify + three org_install
+        // acquisitions less. The authoritative re-check stays in
+        // `apply_provider_registration` (under the held table guard).
+        let (interval, ttl) = match frame {
+            sensing::SensingInterestFrame::OrgProviderRegistration {
+                requested_sample_interval,
+                soft_state_ttl,
+                ..
+            }
+            | sensing::SensingInterestFrame::OrgCapabilityRegistration {
+                requested_sample_interval,
+                soft_state_ttl,
+                ..
+            } => (*requested_sample_interval, *soft_state_ttl),
+            _ => return None,
+        };
+        if !sensing_interval_in_bounds(interval, ctx.sensing_interest_ttl) || ttl.is_zero() {
+            // review-pass-3 §11(a): counted AND traced. This was the one refused
+            // sensing input that was completely invisible — no counter and no
+            // trace — while all three legacy analogs at least `trace!`. A peer
+            // sending malformed bounds is a protocol fault like any other, and an
+            // operator seeing org intake vanish had nothing to look at.
+            ctx.sensing_counters
+                .protocol_invalid
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                ?interval,
+                ?ttl,
+                "sensing: org registration rejected on interval/ttl bounds"
+            );
+            return None;
+        }
+        let snapshot = match sensing::capture_sensing_authority_snapshot(
+            &ctx.org_install,
+            &ctx.node_authority,
+            &ctx.org_revocation,
+            &ctx.org_install_generation,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(unavailable) => {
+                // Review §4: a missing authority/store or a poisoned store makes
+                // this node silently ignore ALL org intake — count it per reason.
+                match unavailable {
+                    sensing::SensingAuthorityUnavailable::Poisoned => {
+                        ctx.sensing_counters
+                            .org_store_poisoned
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    sensing::SensingAuthorityUnavailable::NoAuthority
+                    | sensing::SensingAuthorityUnavailable::NoStore
+                    | sensing::SensingAuthorityUnavailable::GenerationExhausted => {
+                        ctx.sensing_counters
+                            .org_authority_unavailable
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return None;
+            }
+        };
+        let validated = match sensing::verify_org_sensing_registration(
+            frame,
+            from_node,
+            sender_entity,
+            Some(snapshot.authority_view()),
+            snapshot.floors(),
+            now_secs,
+            &ctx.sensing_counters,
+        ) {
+            Ok(validated) => validated,
+            Err(rejection) => {
+                // review-pass-3 §11(b): the org sensing path now feeds the SAME
+                // rolling auth-failure window the channel-membership plane uses.
+                // A refused org registration is an authority rejection — a forged
+                // or revoked cert, a wrong audience, a floor-retracted membership
+                // — and every one of them cost this node an Ed25519 verify plus
+                // three `org_install` acquisitions. Without throttling, a
+                // forged-cert flood buys that work per frame indefinitely.
+                Self::record_auth_failure(from_node, ctx);
+                tracing::trace!(
+                    from_node = format!("{:#x}", from_node),
+                    ?rejection,
+                    "sensing: org registration refused; counted toward the auth-failure window"
+                );
+                return None;
+            }
+        };
+        // An admitted registration clears the window, so an honest peer that
+        // occasionally fails (a cert renewal race, a floor moving mid-flight) does
+        // not accumulate toward the throttle.
+        Self::clear_auth_failures(from_node, ctx);
+        Some((
+            sensing::AdmittedSensingRegistration::from_validated_org(validated),
+            snapshot,
+        ))
+    }
+
+    /// OLB org-auth (piece 4, exact-provider): the shared PROVIDER re-authoring
+    /// operation both the legacy `ProviderRegistration` and the org
+    /// `OrgProviderRegistration` intakes funnel into after admission. The Provider
+    /// leg is the sole source of target/interval/ttl.
+    ///
+    /// The admitted authority is bound EXHAUSTIVELY to the supplied currentness
+    /// evidence (Kyra amended-verdict closure 5): a `Legacy` admission REQUIRES
+    /// `org_authority == None`, an `Org` admission REQUIRES a pinned `Some(..)`
+    /// snapshot, and the mismatched combinations (`Org`+`None`, `Legacy`+`Some`)
+    /// fail closed with no row. For an ORG admission the FINAL currency recheck
+    /// runs under the HELD interest-table guard, immediately before the register
+    /// (closure 4): acquiring the table lock cannot open a post-check window, so a
+    /// floor raise, authority swap, or poison after the gate makes the verdict
+    /// stale and creates no row. Registers the downstream row (owner_root =
+    /// `admitted.proven_root()`), feeds the origin when THIS node is the target,
+    /// and — for a remote target — authors the upstream continuation through
+    /// [`plan_provider_continuation`](sensing::plan_provider_continuation): legacy
+    /// emits the legacy frame; org captures THIS relay's own live membership at
+    /// `now_secs` and emits a fresh `OrgProviderRegistration`; org-without-membership
+    /// emits nothing — never a legacy downgrade.
+    fn apply_provider_registration(
+        ctx: &DispatchCtx,
+        admitted: &sensing::AdmittedSensingRegistration,
+        org_authority: Option<&sensing::SensingAuthoritySnapshot>,
+        from_node: u64,
+        now: Instant,
+        now_secs: u64,
+    ) {
+        let sensing::RegistrationLeg::Provider {
+            target,
+            requested_sample_interval,
+            soft_state_ttl,
+        } = admitted.leg()
+        else {
+            return;
+        };
+        // Bound the wire interval and refuse zero-ttl rows before any table work.
+        if !sensing_interval_in_bounds(requested_sample_interval, ctx.sensing_interest_ttl)
+            || soft_state_ttl.is_zero()
+        {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                interval_ms = requested_sample_interval.as_millis() as u64,
+                ttl_ms = soft_state_ttl.as_millis() as u64,
+                "sensing: out-of-bounds interval/ttl dropped"
+            );
+            return;
+        }
+        // Cap the accepted lifetime at the local soft-state horizon (plan §5).
+        let ttl = soft_state_ttl.min(ctx.sensing_interest_ttl);
+        let spec = admitted.spec();
+        let key = sensing::ProviderInterestKey::new(spec.key(), target);
+        // Acquire the interest-table guard FIRST, then bind the admitted authority
+        // to its currentness evidence and — for an org admission — perform the FINAL
+        // currency recheck, all under the SAME held guard, and register without ever
+        // releasing it (Kyra amended-verdict closures 4 + 5).
+        //
+        // Closure 5 (exhaustive authority↔evidence binding): the `Option` shape
+        // alone would silently accept `Org`+`None` (skipping the recheck) or
+        // `Legacy`+`Some` (a spurious recheck on a non-org row). Match both together
+        // so only the two coherent pairings mutate; the rest fail closed with no
+        // row.
+        //
+        // Closure 4 (no post-check window): the recheck ran BEFORE `.lock()`
+        // previously, so table-lock contention could stall between a passing check
+        // and the register while a floor/rotation/poison landed. Holding the guard
+        // across the recheck AND the register closes that window — the successful
+        // check is the admission linearization point and the mutation follows it
+        // atomically. (Lock order: interest-table → org_install; no path takes the
+        // reverse, so this cannot deadlock.)
+        let outcome = {
+            let mut table = ctx.sensing_interest_table.lock();
+            match (admitted.authority(), org_authority) {
+                (sensing::RegistrationAuthority::Legacy { .. }, None) => {}
+                (sensing::RegistrationAuthority::Org { .. }, Some(snapshot)) => {
+                    let stale = match sensing::capture_current_sensing_stamp(
+                        &ctx.org_install,
+                        &ctx.node_authority,
+                        &ctx.org_revocation,
+                        &ctx.org_install_generation,
+                    ) {
+                        None => true,
+                        Some(current) => !snapshot.stamp().is_current(&current),
+                    };
+                    if stale {
+                        // Review §4: the pinned view went stale between the gate
+                        // and the mutation boundary — count it, then create no row.
+                        ctx.sensing_counters
+                            .org_stale_stamp
+                            .fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+                // Incoherent authority/evidence pairing — a caller bug; never mutate.
+                (sensing::RegistrationAuthority::Org { .. }, None)
+                | (sensing::RegistrationAuthority::Legacy { .. }, Some(_)) => {
+                    tracing::error!(
+                        from_node = format!("{:#x}", from_node),
+                        "sensing: admitted authority and currentness evidence disagree \
+                         — refusing to register"
+                    );
+                    return;
+                }
+            }
+            table.register(
+                &key,
+                sensing::DownstreamId::Peer(from_node),
+                requested_sample_interval,
+                ttl,
+                admitted.proven_root(),
+                now,
+            )
+        };
+        match outcome {
+            sensing::RegisterOutcome::Registered(action) => {
+                // The target provider itself has no upstream — feed the origin.
+                if target == ctx.local_node_id {
+                    if spec.providers.is_provider_free() {
+                        ctx.sensing_counters
+                            .provider_free_registrations
+                            .fetch_add(1, Ordering::Relaxed);
+                        let distinct_upstreams = ctx
+                            .sensing_interest_table
+                            .lock()
+                            .downstreams(&key, now)
+                            .into_iter()
+                            .filter(|downstream| {
+                                matches!(downstream, sensing::DownstreamId::Peer(_))
+                            })
+                            .count();
+                        if distinct_upstreams >= 2 {
+                            ctx.sensing_counters
+                                .divergent_resolution_merge_miss
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Self::feed_sensing_origin(
+                        ctx,
+                        &key,
+                        spec,
+                        sensing::DownstreamId::Peer(from_node),
+                        now,
+                    );
+                    return;
+                }
+                if action == sensing::UpstreamAction::Deregister {
+                    Self::send_sensing_deregister_upstream(ctx, &key);
+                    return;
+                }
+                // SI-4a warm-start: ONLY a newly-created downstream row.
+                let cached = {
+                    let mut observations = ctx.sensing_observations.lock();
+                    let slot_key = (key.clone(), sensing::DownstreamId::Peer(from_node));
+                    if observations.slots.contains_key(&slot_key) {
+                        None
+                    } else {
+                        let cached = observations.latest.get(&key).cloned();
+                        if let Some(cached) = &cached {
+                            observations.slots.insert(
+                                slot_key,
+                                SensingDeliverySlot {
+                                    last_status: Some(cached.status),
+                                    last_delivered: Some((cached.origin_incarnation, cached.seq)),
+                                    next_due: now + requested_sample_interval,
+                                    pending: false,
+                                },
+                            );
+                        }
+                        cached
+                    }
+                };
+                if let Some(cached) = cached {
+                    if let Ok(bytes) = sensing::encode_attestation(&cached) {
+                        spawn_sensing_frame_send(
+                            &ctx.socket,
+                            &ctx.peers,
+                            &ctx.addr_to_node,
+                            &ctx.router,
+                            &ctx.partition_filter,
+                            ctx.local_node_id,
+                            from_node,
+                            sensing::SENSING_PROVISIONAL_STREAM,
+                            sensing::SUBPROTOCOL_READINESS_ATTESTATION,
+                            bytes,
+                        );
+                    }
+                }
+                let Some(strictest) = ctx.sensing_interest_table.lock().aggregate(&key, now) else {
+                    return;
+                };
+                ctx.sensing_observations
+                    .lock()
+                    .update_upstream_interval(&key, Some(strictest));
+                if !sensing_upstream_damper_admits(
+                    &ctx.sensing_upstream_damper,
+                    target,
+                    *key.interest.interest_digest.as_bytes(),
+                    sensing_effective_min_gap(ttl),
+                ) {
+                    return;
+                }
+                let continuation = admitted.provider_continuation(target, strictest, ttl);
+                if let Some(upstream) =
+                    sensing::plan_provider_continuation(&continuation, |org_id| {
+                        sensing::capture_live_org_relay_membership(
+                            &ctx.org_install,
+                            &ctx.node_authority,
+                            &ctx.org_revocation,
+                            ctx.signing_identity.entity_id(),
+                            org_id,
+                            now_secs,
+                        )
+                        .ok()
+                    })
+                {
+                    if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                        spawn_sensing_frame_send(
+                            &ctx.socket,
+                            &ctx.peers,
+                            &ctx.addr_to_node,
+                            &ctx.router,
+                            &ctx.partition_filter,
+                            ctx.local_node_id,
+                            target,
+                            sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                            sensing::SUBPROTOCOL_SENSING_INTEREST,
+                            bytes,
+                        );
+                    }
+                }
+            }
+            sensing::RegisterOutcome::OverCap => {
+                ctx.sensing_over_cap.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    from_node = format!("{:#x}", from_node),
+                    "sensing: registration refused over per-peer cap"
+                );
+            }
+            sensing::RegisterOutcome::RefusedByCachedFloor { minimum_supported } => {
+                tracing::debug!(
+                    from_node = format!("{:#x}", from_node),
+                    floor_ms = minimum_supported.as_millis() as u64,
+                    "sensing: registration refused by cached provider floor"
+                );
+                if target == ctx.local_node_id {
+                    ctx.sensing_counters
+                        .cadence_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    let generation = ctx.capability_version.load(Ordering::Relaxed);
+                    let beat = {
+                        let mut slot = ctx.sensing_emitter.lock();
+                        slot.as_mut().map(|emitter| {
+                            emitter.refusal_beat(
+                                spec,
+                                sensing::CadenceRefusal { minimum_supported },
+                                generation,
+                            )
+                        })
+                    };
+                    if let Some(beat) = beat {
+                        Self::send_sensing_refusal_beat(ctx, beat, [from_node]);
+                    }
                 }
             }
         }
@@ -16831,10 +19905,22 @@ impl MeshNode {
                 return;
             }
             Err((sensing::StreamRefusal::AtCapacity, _)) => {
+                // Review L1 linearization: rollback + reconcile are one
+                // projection transaction.
+                let _projection = ctx.sensing_local_projection_mu.lock();
                 let _ = ctx.sensing_interest_table.lock().deregister(
                     &key.interest.interest_digest,
                     Some(key.provider),
                     downstream,
+                    now,
+                );
+                // Review L1 narrow-hold: reconcile the shared consumer cell after
+                // the capacity rollback removed the row.
+                reconcile_local_consumer_cell(
+                    &ctx.sensing_interest_table,
+                    &ctx.sensing_observations,
+                    &ctx.sensing_overlay_changed,
+                    key,
                     now,
                 );
                 tracing::debug!(
@@ -16851,10 +19937,26 @@ impl MeshNode {
         ctx.sensing_counters
             .cadence_refusals
             .fetch_add(1, Ordering::Relaxed);
-        let partition =
-            ctx.sensing_interest_table
-                .lock()
-                .on_refusal(key, refusal.minimum_supported, now);
+        // Review L1 linearization: the partition and its consumer-cell
+        // reconciliation are ONE projection transaction. The guard deliberately
+        // ends before the leader fan-out below — `apply_sensing_leader_refusal`
+        // re-enters this function (which takes the mutex itself) and registers
+        // only `Leader` rows, which are not part of the local projection.
+        let partition = {
+            let _projection = ctx.sensing_local_projection_mu.lock();
+            let partition =
+                ctx.sensing_interest_table
+                    .lock()
+                    .on_refusal(key, refusal.minimum_supported, now);
+            reconcile_local_consumer_cell(
+                &ctx.sensing_interest_table,
+                &ctx.sensing_observations,
+                &ctx.sensing_overlay_changed,
+                key,
+                now,
+            );
+            partition
+        };
         let generation = ctx.capability_version.load(Ordering::Relaxed);
         let beat = {
             let mut slot = ctx.sensing_emitter.lock();
@@ -16883,7 +19985,9 @@ impl MeshNode {
         let signed_refusal = Self::send_sensing_refusal_beat(ctx, beat, {
             partition.refused.into_iter().filter_map(|d| match d {
                 sensing::DownstreamId::Peer(node) => Some(node),
-                sensing::DownstreamId::Local | sensing::DownstreamId::Leader => None,
+                sensing::DownstreamId::Local
+                | sensing::DownstreamId::LeasedLocal
+                | sensing::DownstreamId::Leader => None,
             })
         });
         // SI-4 re-review item 4: a refused Leader row at the LOCAL
@@ -16906,6 +20010,8 @@ impl MeshNode {
         }
         #[cfg(not(feature = "redex"))]
         let _ = signed_refusal;
+        // (The consumer-cell reconcile ran inside the partition's projection
+        // transaction above; the leader fan-out touches only Leader rows.)
     }
 
     /// SI-3c: the 0x0C03 verified intake (plan §4.2/§4.6) — the
@@ -17244,11 +20350,27 @@ impl MeshNode {
                     );
                 }
             }
-            let partition = ctx.sensing_interest_table.lock().on_refusal(
-                &branch,
-                attestation.promised_cadence,
-                now,
-            );
+            // Review L1 linearization: the partition and its consumer-cell
+            // reconciliation are ONE projection transaction; the guard ends
+            // before the leader fan-out below (`apply_sensing_leader_refusal`
+            // re-enters `feed_sensing_origin`, which takes the mutex itself, and
+            // registers only `Leader` rows — not part of the local projection).
+            let partition = {
+                let _projection = ctx.sensing_local_projection_mu.lock();
+                let partition = ctx.sensing_interest_table.lock().on_refusal(
+                    &branch,
+                    attestation.promised_cadence,
+                    now,
+                );
+                reconcile_local_consumer_cell(
+                    &ctx.sensing_interest_table,
+                    &ctx.sensing_observations,
+                    &ctx.sensing_overlay_changed,
+                    &branch,
+                    now,
+                );
+                partition
+            };
             // SI-4 re-review item 4: a refused Leader row partitions
             // the leader relay's REAL per-consumer rows FIRST — the
             // exact signed refusal reaches every refused consumer,
@@ -17289,20 +20411,31 @@ impl MeshNode {
                 // consumers may have re-registered above — the
                 // branch is then alive again and must not be torn
                 // down under the pre-partition consequence.
-                let still_dead = ctx
-                    .sensing_interest_table
-                    .lock()
-                    .downstreams(&branch, now)
-                    .is_empty();
+                //
+                // Review L1 linearization: the liveness read and the branch-death
+                // application are one atomic projection transaction, so a
+                // concurrent local registration either lands before (the re-read
+                // sees its row → not dead) or after (its anchor re-creates the
+                // state this reclaim removed).
+                let still_dead = {
+                    let _projection = ctx.sensing_local_projection_mu.lock();
+                    let still_dead = ctx
+                        .sensing_interest_table
+                        .lock()
+                        .downstreams(&branch, now)
+                        .is_empty();
+                    if still_dead {
+                        // The partition emptied the branch — the warm-start
+                        // status and epoch memory reclaim now; the refusal
+                        // tombstone above ages out via the sweep.
+                        ctx.sensing_observations.lock().reclaim_status(&branch);
+                    }
+                    still_dead
+                };
                 if still_dead {
                     if branch.provider != ctx.local_node_id {
                         Self::send_sensing_deregister_upstream(ctx, &branch);
                     }
-                    // The partition emptied the branch — the
-                    // warm-start status and epoch memory reclaim
-                    // now; the refusal tombstone above ages out via
-                    // the sweep.
-                    ctx.sensing_observations.lock().reclaim_status(&branch);
                     return;
                 }
             }
@@ -17313,6 +20446,8 @@ impl MeshNode {
             ctx.sensing_observations
                 .lock()
                 .update_upstream_interval(&branch, aggregate);
+            // (The consumer-cell reconcile ran inside the partition's projection
+            // transaction above; the leader fan-out touches only Leader rows.)
             return;
         }
         // SI-4a: the frozen SI-0f relay semantics on real sessions.
@@ -17424,6 +20559,12 @@ impl MeshNode {
         bearing: bool,
         now: Instant,
     ) {
+        // Review L1 linearization: the row snapshot (whose local rows derive the
+        // aggregate below) and the consumer-cell feed are one projection
+        // transaction — a rival registration cannot complete in between and be
+        // overwritten by this beat applying a stale aggregate. Dropped before
+        // the peer forwards and leader feed below.
+        let projection_guard = ctx.sensing_local_projection_mu.lock();
         let rows: Vec<(sensing::DownstreamId, Duration)> = {
             let table = ctx.sensing_interest_table.lock();
             table
@@ -17436,9 +20577,24 @@ impl MeshNode {
                 })
                 .collect()
         };
+        // Review L1 follow-up: the single authoritative local-consumer demand
+        // for this branch — the strictest interval across the live node-local
+        // rows (Local + LeasedLocal). The shared consumer cell is fed at THIS
+        // aggregate, at most once per beat, never once per row.
+        let local_interval = rows
+            .iter()
+            .filter(|(d, _)| {
+                matches!(
+                    d,
+                    sensing::DownstreamId::Local | sensing::DownstreamId::LeasedLocal
+                )
+            })
+            .map(|(_, interval)| *interval)
+            .min();
         let mut forwards: Vec<u64> = Vec::new();
         let mut overlay_moved = false;
         let mut feed_leader = false;
+        let mut local_fed = false;
         {
             let mut observations = ctx.sensing_observations.lock();
             for (downstream, interval) in rows {
@@ -17460,20 +20616,24 @@ impl MeshNode {
                     slot.pending = false;
                     match downstream {
                         sensing::DownstreamId::Peer(node) => forwards.push(node),
-                        // SI-4b: the Local row IS this node's own
-                        // consumer — its delivery point feeds the
-                        // overlay cell with the hop's OUTGOING
-                        // bearing (the same §4.4 rule any peer
-                        // gets).
-                        sensing::DownstreamId::Local => {
-                            overlay_moved |= observations.feed_consumer_cell(
-                                branch,
-                                attestation,
-                                bearing,
-                                interval,
-                                ctx.sensing_continuity_factor,
-                                now,
-                            );
+                        // SI-4b: a node-local row (direct Local or leased
+                        // LeasedLocal) IS this node's own consumer — its
+                        // delivery point feeds the overlay cell with the hop's
+                        // OUTGOING bearing (the same §4.4 rule any peer gets).
+                        // Both ownership rows share ONE consumer cell, so feed it
+                        // at most once per beat, at the derived local aggregate.
+                        sensing::DownstreamId::Local | sensing::DownstreamId::LeasedLocal => {
+                            if !local_fed {
+                                overlay_moved |= observations.feed_consumer_cell(
+                                    branch,
+                                    attestation,
+                                    bearing,
+                                    local_interval.unwrap_or(interval),
+                                    ctx.sensing_continuity_factor,
+                                    now,
+                                );
+                                local_fed = true;
+                            }
                         }
                         // SI-4 review P0: the leader row's delivery
                         // point hands the beat to the leader relay,
@@ -17485,6 +20645,9 @@ impl MeshNode {
                 }
             }
         }
+        // The projection transaction ends before the peer forwards and the
+        // leader feed (which touches only leader-relay state).
+        drop(projection_guard);
         if overlay_moved {
             ctx.sensing_overlay_changed.send_modify(|generation| {
                 *generation = generation.wrapping_add(1);
@@ -17702,6 +20865,8 @@ impl MeshNode {
             );
             for (key, action) in mesh_actions {
                 apply_sensing_removal_action(
+                    &ctx.sensing_local_projection_mu,
+                    &ctx.sensing_interest_table,
                     &ctx.sensing_observations,
                     &ctx.sensing_emitter,
                     emitter_stamp,
@@ -17717,10 +20882,19 @@ impl MeshNode {
             }
         }
         for (branch, spec) in reconciliation.added {
-            let strictest = {
+            // Piece-3: fetch the interest's admitted seed with the aggregate under
+            // one leader lock — the reconciliation-added upstream continuation
+            // preserves the ORIGINAL admitted authority even though the seed left
+            // scope when `reconcile_with_snapshot` returned.
+            let (strictest, seed) = {
                 let slot = ctx.sensing_leader.lock();
-                slot.as_ref()
-                    .and_then(|leader| leader.relay.table.aggregate(&branch, now))
+                match slot.as_ref() {
+                    Some(leader) => (
+                        leader.relay.table.aggregate(&branch, now),
+                        leader.interest_seed(&branch.interest),
+                    ),
+                    None => (None, None),
+                }
             };
             let Some(strictest) = strictest else {
                 continue;
@@ -17742,26 +20916,25 @@ impl MeshNode {
                 .update_upstream_interval(&branch, Some(strictest));
             if branch.provider == ctx.local_node_id {
                 Self::feed_sensing_origin(ctx, &branch, &spec, sensing::DownstreamId::Leader, now);
-            } else {
-                let upstream = sensing::SensingInterestFrame::provider_registration(
-                    &spec,
-                    branch.provider,
-                    strictest,
-                    ttl,
-                );
-                if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-                    spawn_sensing_frame_send(
-                        &ctx.socket,
-                        &ctx.peers,
-                        &ctx.addr_to_node,
-                        &ctx.router,
-                        &ctx.partition_filter,
-                        ctx.local_node_id,
-                        branch.provider,
-                        sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                        sensing::SUBPROTOCOL_SENSING_INTEREST,
-                        bytes,
-                    );
+            } else if let Some(seed) = &seed {
+                let continuation = seed.provider_continuation(branch.provider, strictest, ttl);
+                if let Some(upstream) =
+                    sensing::plan_provider_continuation(&continuation, |_org| None)
+                {
+                    if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                        spawn_sensing_frame_send(
+                            &ctx.socket,
+                            &ctx.peers,
+                            &ctx.addr_to_node,
+                            &ctx.router,
+                            &ctx.partition_filter,
+                            ctx.local_node_id,
+                            branch.provider,
+                            sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                            sensing::SUBPROTOCOL_SENSING_INTEREST,
+                            bytes,
+                        );
+                    }
                 }
             }
         }
@@ -17788,10 +20961,18 @@ impl MeshNode {
         signed_refusal: &[u8],
         now: Instant,
     ) {
-        let partition = {
+        let (partition, seed) = {
             let mut slot = ctx.sensing_leader.lock();
             match slot.as_mut() {
-                Some(leader) => leader.on_refusal(branch, minimum_supported, now),
+                Some(leader) => {
+                    let partition = leader.on_refusal(branch, minimum_supported, now);
+                    // Fetch the surviving interest's admitted seed under the SAME
+                    // lock — the survivor re-registration's upstream continuation
+                    // preserves the ORIGINAL admitted authority (a Deregister
+                    // partition removed the interest, so the seed is then `None`).
+                    let seed = leader.interest_seed(&branch.interest);
+                    (partition, seed)
+                }
                 None => return,
             }
         };
@@ -17848,25 +21029,30 @@ impl MeshNode {
         let Some(current) = mesh_aggregate else {
             return;
         };
-        let upstream = sensing::SensingInterestFrame::provider_registration(
-            &spec,
-            branch.provider,
-            current,
-            ttl,
-        );
-        if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
-            spawn_sensing_frame_send(
-                &ctx.socket,
-                &ctx.peers,
-                &ctx.addr_to_node,
-                &ctx.router,
-                &ctx.partition_filter,
-                ctx.local_node_id,
-                branch.provider,
-                sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
-                sensing::SUBPROTOCOL_SENSING_INTEREST,
-                bytes,
-            );
+        // Piece-3 authority-aware survivor continuation: derive the provider leg
+        // from the interest's admitted seed and let `plan_provider_continuation`
+        // pick the frame kind by authority. Org intake is dark, so the capture is
+        // fail-closed `|_| None`. If the interest drained after on_refusal, author
+        // nothing (the ordinary soft-state contract) — never a legacy guess.
+        let Some(seed) = seed else {
+            return;
+        };
+        let continuation = seed.provider_continuation(branch.provider, current, ttl);
+        if let Some(upstream) = sensing::plan_provider_continuation(&continuation, |_org| None) {
+            if let Ok(bytes) = sensing::encode_interest_frame(&upstream) {
+                spawn_sensing_frame_send(
+                    &ctx.socket,
+                    &ctx.peers,
+                    &ctx.addr_to_node,
+                    &ctx.router,
+                    &ctx.partition_filter,
+                    ctx.local_node_id,
+                    branch.provider,
+                    sensing::SUBPROTOCOL_SENSING_INTEREST as u64,
+                    sensing::SUBPROTOCOL_SENSING_INTEREST,
+                    bytes,
+                );
+            }
         }
     }
 
@@ -17913,6 +21099,10 @@ impl MeshNode {
     /// `verify_scoped_ingest` re-checks everything against the LIVE revocation
     /// floors; a wrong-audience, expired, floored-provider, wrong-grantee, or
     /// forged envelope is refused and never stored.
+    // A static seam threading the per-node authority/store/change refs the
+    // dispatch arm and the test seams both supply; the change wake (OLB-2A.3)
+    // pushed it one over the arg-count lint.
+    #[allow(clippy::too_many_arguments)]
     fn ingest_scoped_announcement(
         node_authority: &Arc<ArcSwapOption<super::behavior::org_authority::NodeAuthority>>,
         org_revocation: &Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
@@ -17920,8 +21110,10 @@ impl MeshNode {
             arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>,
         >,
         scoped_discovery: &Arc<
-            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryStore>,
+            parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>,
         >,
+        publication: &ScopedMutationPublication,
+        counters: &super::behavior::org_scoped_store::ScopedIngestCounters,
         envelope: &super::behavior::org_scoped_ann::ScopedCapabilityAnnouncement,
         from_node: u64,
         probe: Option<&dyn Fn()>,
@@ -17972,12 +21164,28 @@ impl MeshNode {
             .as_ref()
             .map_or(0, |s| Arc::as_ptr(s) as *const () as usize);
         let empty_floors = OrgRevocationState::empty();
-        let pinned = store.as_ref().map(|s| s.snapshot_with_generation());
+        // `Err` => the store's currentness can no longer be witnessed. Treat it
+        // as unusable authority: `None` floors would silently fall back to the
+        // EMPTY floor set, which is the permissive direction (Kyra OLB-2B-E3c).
+        let pinned = match store.as_ref().map(|s| s.snapshot_with_generation()) {
+            None => None,
+            Some(Ok(pair)) => Some(pair),
+            Some(Err(_)) => {
+                tracing::error!(
+                    from_node = format!("{:#x}", from_node),
+                    "scoped-ann: revocation publication generation exhausted; \n                     ingest refused — the floor view's currentness can no longer \n                     be witnessed"
+                );
+                // FINAL, not Retryable: unlike poison, exhaustion is terminal, so
+                // releasing the dedup identity would only invite the same refusal
+                // on every redelivery for the whole retention horizon.
+                return ScopedIngestDisposition::Final;
+            }
+        };
         let floors: &OrgRevocationState = pinned
             .as_ref()
             .map(|(f, _)| f.as_ref())
             .unwrap_or(&empty_floors);
-        let pinned_generation = pinned.as_ref().map_or(0, |(_, g)| *g);
+        let pinned_generation = pinned.as_ref().map(|(_, g)| *g);
         let now_secs = super::behavior::org::current_timestamp();
         let ctx = ScopedIngestContext {
             local_owner_org: owner_org,
@@ -18036,9 +21244,25 @@ impl MeshNode {
         };
         match verify_scoped_ingest(envelope, &audience, &ctx) {
             Ok(verified) => {
-                // A test probe fires in the exact verify→recheck window a
-                // concurrent floor publish / store swap / authority rotation would
-                // land in, proving the recheck below catches it.
+                // Prepare BEFORE the final recheck (Kyra OLB-2A.1 closure): decode
+                // the descriptor's declared capabilities ONCE and bind them to the
+                // verified record, so no bounded descriptor work sits between the
+                // recheck and the insert, and the declarations the index is built
+                // from cannot diverge from the record the store admits.
+                let prepared =
+                    super::behavior::org_scoped_ingest::PreparedScopedCapability::prepare(verified);
+                // Acquire the publication ordering gate BEFORE the final recheck
+                // (Kyra OLB-2A.3.1): the wait for a concurrent transaction happens
+                // FIRST, so the security view is validated only after it — the
+                // signed recheck→insert boundary stays closed — and this
+                // transaction's mutation and publication serialize node-wide with
+                // every other, so a stale publication can never overwrite a newer
+                // one.
+                let publication_gate = publication.lock_gate();
+                // The test probe fires AFTER preparation and gate acquisition, in
+                // the exact prepare→recheck window a concurrent floor publish /
+                // store swap / authority rotation would land in, proving the
+                // recheck catches it.
                 if let Some(probe) = probe {
                     probe();
                 }
@@ -18059,9 +21283,11 @@ impl MeshNode {
                 let store_ptr_now = current_store
                     .as_ref()
                     .map_or(0, |s| Arc::as_ptr(s) as *const () as usize);
+                // `None` on exhaustion, which never equals the pinned `Some`, so
+                // the recheck below fails closed.
                 let generation_now = current_store
                     .as_ref()
-                    .map_or(0, |s| s.barriered_generation());
+                    .and_then(|s| s.barriered_generation().ok());
                 let poisoned_now = current_store
                     .as_ref()
                     .map(|s| s.is_poisoned())
@@ -18083,17 +21309,62 @@ impl MeshNode {
                     }
                 };
                 if !authority_stable || !store_stable || !consumer_stable {
+                    // review-pass-3 §10: a PERSISTENT publication-race refusal
+                    // means valid announcements are never landing, which is
+                    // indistinguishable from silence at `trace`.
+                    counters.note_race_refused();
                     tracing::trace!(
                         from_node = format!("{:#x}", from_node),
                         "scoped-ann: security view moved during verify; ingest refused \
                          (publication race)"
                     );
+                    // review-pass-3 §13(b): exhaustion that lands MID-VERIFY is
+                    // the same terminal condition the pin-time check already
+                    // classifies `Final`, and it must classify the same way here.
+                    // Recognised by its exact shape — the store did not move
+                    // (`store_ptr` unchanged) and its generation is now `None` —
+                    // which no recoverable race can produce. Retrying it wasted a
+                    // full redelivery cycle to reach the identical verdict, since
+                    // "exhaustion never clears".
+                    if store_ptr_now == store_ptr && generation_now.is_none() {
+                        return ScopedIngestDisposition::Final;
+                    }
                     // §24 — RETRYABLE: the view settles and the sender
                     // re-announces, but the dedup gate would have suppressed
                     // that re-announce at the same generation.
                     return ScopedIngestDisposition::Retryable;
                 }
-                let outcome = scoped_discovery.lock().ingest(verified, now_secs);
+                // Immediate lock + mutate — nothing sits between the recheck and
+                // the insert. The store ingests the prepared object, so the row and
+                // the index buckets built from its declarations are bound together
+                // (Kyra OLB-2A.1). The gate is already held, so this commits and
+                // publishes under it — serialized with every other mutation
+                // (OLB-2A.3.1).
+                // review-pass-3 §3 (Kyra 2026-07-27): ONE immutable
+                // installed-consumer-grant snapshot, loaded lock-free here and
+                // handed to the store, so a capacity reclamation can tell a
+                // dormant grant row from a live one WITHOUT the raw store ever
+                // reaching for `consumer_grant_mu` — no new lock edge under the
+                // publication gate. Captured before the mutation begins; both
+                // race directions against a concurrent install/remove are safe
+                // (see `reclaim_for_admission`).
+                let installed = consumer_grant_audiences.load_full();
+                let outcome = publication.commit(&publication_gate, scoped_discovery, |state| {
+                    state.ingest(prepared, now_secs, &*installed)
+                });
+                // review-pass-3 §10: every outcome is COUNTED, not merely logged
+                // at debug. A capacity wedge additionally warns on its first
+                // refusal and every 1024th after it, so it is both announced and
+                // shown to be sustained.
+                if counters.note_outcome(outcome) {
+                    tracing::warn!(
+                        from_node = format!("{:#x}", from_node),
+                        refusals = counters.snapshot()[4],
+                        "scoped-ann: private-discovery store AT CAPACITY; new provider keys \
+                         are being refused. The store is in-memory, so occupied slots free \
+                         only on expiry, grant removal, or restart."
+                    );
+                }
                 tracing::debug!(
                     from_node = format!("{:#x}", from_node),
                     ?outcome,
@@ -18113,6 +21384,9 @@ impl MeshNode {
                 }
             }
             Err(e) => {
+                // review-pass-3 §10: a forged-envelope storm is now visible above
+                // `trace`, as a rate rather than as individual lines.
+                counters.note_verify_refused();
                 tracing::trace!(
                     from_node = format!("{:#x}", from_node),
                     error = %e,
@@ -25313,13 +28587,20 @@ impl Adapter for MeshNode {
         self.shutdown_notify.notify_waiters();
         self.router.stop();
 
+        // OLB-2B-E3c: join the routing supervisor BEFORE the general task drain.
+        // Awaiting it proves the actor fenced and released the exclusive
+        // private-discovery drain, so no incarnation survives this call and a
+        // successor node can mint.
+        self.join_org_routing_supervisor().await;
+
         // Deactivate all sessions
         for entry in self.peers.iter() {
             entry.value().session.deactivate();
         }
 
-        // Wait for background tasks
-        let tasks = std::mem::take(&mut *self.tasks.lock().await);
+        // Wait for background tasks. Taken under the synchronous lock in its own
+        // scope so the guard is released before the first await.
+        let tasks = { std::mem::take(&mut *self.tasks.lock()) };
         for handle in tasks {
             let _ = handle.await;
         }
@@ -25379,6 +28660,19 @@ impl Drop for MeshNode {
         self.shutdown.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
         self.router.stop();
+        // OLB-2B-E3c: `shutdown().await` is the deterministic JOINED teardown.
+        // This is the best-effort path, and blocking on a Tokio task from a
+        // destructor is not safe — but silently dropping the `JoinHandle` merely
+        // DETACHES the supervisor, leaving it applying and republishing health
+        // over a node that is gone. So fence synchronously and abort the task:
+        // cancelling the supervisor future drops the incarnation it owns inline,
+        // which drops the fence guard and releases the exclusive global drain.
+        self.routing_health.store(Arc::new(
+            super::behavior::org_routing::RoutingHealth::Fenced,
+        ));
+        if let Some(handle) = self.routing_task.lock().take() {
+            handle.abort();
+        }
         // Review-11 P2: unsubscribe this node's raise callback from
         // its installed store. Without this, the callback the
         // shared `StoreCore` retains captures the node's
@@ -29530,4 +32824,1648 @@ mod oa34b2_query_currentness_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// OLB-2A.3.3 end-to-end: a revocation floor raised through the INSTALLED
+    /// store retracts the scoped-discovery record at query time AND dirties its
+    /// capability — advancing the private-discovery generation and publishing the
+    /// change wake. Without that, the retraction moves the query-visible set with
+    /// no store mutation, so a consumer's projection keeps naming a provider the
+    /// org just revoked until something unrelated happens to move the store.
+    ///
+    /// The floor is raised by the PROVIDER's org (B) over its own member, and
+    /// honoured by the consumer node (adopted into org A) — the real revocation
+    /// path for a granted record.
+    #[tokio::test]
+    async fn a_floor_raise_dirties_scoped_discovery_and_wakes_consumers() {
+        let org_b = OrgKeypair::from_bytes([0x42u8; 32]);
+        let org_a = OrgKeypair::from_bytes([0x7Au8; 32]);
+        let p = EntityKeypair::from_bytes([0xB1u8; 32]);
+        let p_entity = p.entity_id().clone();
+        let n = current_timestamp();
+        let exp = n + 600;
+
+        let (g, s) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:svc-a"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p_entity.clone()),
+            3600,
+        )
+        .expect("issue grant");
+        let s = s.expect("secret");
+        let grant_id = g.grant_id;
+
+        let (c, dir) = adopted_consumer(&org_a, "floorwake").await;
+        c.install_consumer_grant_audience(g.clone(), copy_secret(&s))
+            .expect("install grant");
+        c.ingest_scoped_announcement_for_test(&granted_envelope(&p, &org_b, &g, &s, "svc-a", exp));
+        assert_eq!(
+            c.scoped_granted_providers_for_test(&grant_id, n),
+            vec![p_entity.clone()],
+            "the record resolves before the floor rises",
+        );
+
+        // Checkpoint the wake AFTER the ingest, so only the raise can move it.
+        let mut changes = c.subscribe_private_discovery_changes();
+        changes.borrow_and_update();
+        let before = c.private_discovery_generation();
+
+        // Org B revokes its own member P: floor 2 is above the membership
+        // generation 1 the record was admitted against.
+        let mut floors = std::collections::BTreeMap::new();
+        floors.insert(p_entity.clone(), 2u32);
+        let bundle =
+            crate::adapter::net::behavior::org::OrgRevocationBundle::try_issue(&org_b, &floors)
+                .expect("issue bundle");
+        c.org_revocation_store()
+            .expect("installed")
+            .apply_bundle(&bundle)
+            .expect("apply floor 2");
+
+        assert!(
+            c.scoped_granted_providers_for_test(&grant_id, n).is_empty(),
+            "the revoked provider stops resolving",
+        );
+        assert!(
+            c.private_discovery_generation() > before,
+            "the retraction advanced the private-discovery generation",
+        );
+        assert!(
+            changes.has_changed().expect("watch alive"),
+            "and published the change wake",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+
+#[cfg(test)]
+mod sensing_authority_witness_tests {
+    //! OLB org-auth piece-1 real-install witness matrix: the installation
+    //! generation + sensing authority stamp against REAL adopted authorities
+    //! and stores on a live `MeshNode`. In-crate so the snapshot/stamp APIs
+    //! stay `pub(crate)`; no shipping generation accessor.
+    use super::*;
+    use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+    use crate::adapter::net::behavior::org_authority::NodeAuthority;
+    use crate::adapter::net::behavior::org_revocation::{
+        OrgRevocationStore, ProvisioningExpectation,
+    };
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn org() -> OrgKeypair {
+        OrgKeypair::from_bytes([0x42u8; 32])
+    }
+
+    async fn build_node() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x31u8; 32]),
+            )
+            .await
+            .expect("MeshNode::new"),
+        )
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "net-sensing-stamp-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Adopt a distinct authority `Arc` for this node under `org` (a real
+    /// ceremony into a fresh tempdir).
+    fn adopt(node: &MeshNode, org: &OrgKeypair, tag: &str) -> Arc<NodeAuthority> {
+        let entity = node.entity_id().clone();
+        let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("cert");
+        Arc::new(NodeAuthority::adopt(&scratch(tag), cert, &entity, 0, None).expect("adopt"))
+    }
+
+    // 1 — initial installation yields a constructible, current snapshot.
+    #[tokio::test]
+    async fn initial_install_snapshot_is_current() {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c1"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        assert!(node.sensing_authority_snapshot_current(&snap));
+    }
+
+    // 2 — reinstalling the EXACT same Arc is a no-op: no generation bump.
+    #[tokio::test]
+    async fn exact_arc_no_op_reinstall_stays_current() {
+        let node = build_node().await;
+        let a = adopt(&node, &org(), "c2");
+        node.install_node_authority(a.clone()).expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        node.install_node_authority(a).expect("reinstall exact A");
+        assert!(
+            node.sensing_authority_snapshot_current(&snap),
+            "exact no-op must not bump the installation generation"
+        );
+    }
+
+    // 3 — a failed installation (reaches real preflight) does not bump.
+    #[tokio::test]
+    async fn failed_foreign_install_does_not_bump() {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c3a"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        let foreign = adopt(&node, &OrgKeypair::from_bytes([0x99u8; 32]), "c3f");
+        assert!(
+            node.install_node_authority(foreign).is_err(),
+            "foreign-org install must fail at the one-owner preflight"
+        );
+        assert!(
+            node.sensing_authority_snapshot_current(&snap),
+            "a failed install must not bump the generation"
+        );
+    }
+
+    // 4 — authority A -> B (same org, distinct Arc) makes the snapshot stale.
+    #[tokio::test]
+    async fn authority_replacement_makes_snapshot_stale() {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c4a"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        node.install_node_authority(adopt(&node, &org(), "c4b"))
+            .expect("install B");
+        assert!(
+            !node.sensing_authority_snapshot_current(&snap),
+            "A->B must be stale"
+        );
+        let fresh = node
+            .capture_sensing_authority_snapshot()
+            .expect("recapture");
+        assert!(node.sensing_authority_snapshot_current(&fresh));
+    }
+
+    // 5 — the load-bearing ABA: A -> B -> exact Arc<A>. The live authority
+    // pointer returns to A's, but the installation generation advanced.
+    #[tokio::test]
+    async fn a_b_a_rotation_is_stale_via_installation_generation() {
+        let node = build_node().await;
+        let a = adopt(&node, &org(), "c5a");
+        let a_ptr = Arc::as_ptr(&a);
+        // Reinstalling exact Arc<A> reinstalls A's store too, so BOTH pointer
+        // components return to A's — isolating the installation generation as
+        // the sole discriminator.
+        let a_store = a.revocation.clone();
+        node.install_node_authority(a.clone()).expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        node.install_node_authority(adopt(&node, &org(), "c5b"))
+            .expect("install B");
+        node.install_node_authority(a).expect("reinstall exact A");
+        assert_eq!(
+            Arc::as_ptr(&node.node_authority().expect("authority")),
+            a_ptr,
+            "the live authority pointer must equal A's original"
+        );
+        assert!(
+            Arc::ptr_eq(&node.org_revocation_store().expect("store"), &a_store),
+            "the live store must also return to A's original store"
+        );
+        assert!(
+            !node.sensing_authority_snapshot_current(&snap),
+            "A->B->exact-A must be stale via the installation generation ALONE \
+             (both pointers and the store generation returned to A's)"
+        );
+        let fresh = node
+            .capture_sensing_authority_snapshot()
+            .expect("recapture");
+        assert!(node.sensing_authority_snapshot_current(&fresh));
+    }
+
+    // 7 — a dominating store replacement makes the snapshot stale and the
+    // fresh snapshot pins the new store.
+    #[tokio::test]
+    async fn store_replacement_makes_snapshot_stale() {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c7a"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        let replacement = Arc::new(
+            OrgRevocationStore::init(scratch("c7store"), ProvisioningExpectation::MayBeFresh)
+                .expect("init store"),
+        );
+        node.install_org_revocation_store(replacement.clone())
+            .expect("install dominating store");
+        // The NAMED replacement became live (not merely "some change").
+        assert!(
+            Arc::ptr_eq(
+                &node.org_revocation_store().expect("live store"),
+                &replacement
+            ),
+            "the intended replacement store must be the live one"
+        );
+        assert!(
+            !node.sensing_authority_snapshot_current(&snap),
+            "store A->B must be stale"
+        );
+        assert!(node
+            .capture_sensing_authority_snapshot()
+            .is_ok_and(|fresh| node.sensing_authority_snapshot_current(&fresh)));
+    }
+
+    // 8 — real store poison reaches the recheck and the fresh capture.
+    #[tokio::test]
+    async fn store_poison_is_stale_and_capture_returns_poisoned() {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c8"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+        node.org_revocation_store()
+            .expect("store installed")
+            .mark_poisoned_for_test();
+        assert!(
+            !node.sensing_authority_snapshot_current(&snap),
+            "a poison transition must make the snapshot stale"
+        );
+        assert_eq!(
+            node.capture_sensing_authority_snapshot().err(),
+            Some(sensing::SensingAuthorityUnavailable::Poisoned)
+        );
+    }
+
+    // 6 — a same-store floor raise through the real publication path makes the
+    // snapshot stale; the fresh snapshot OBSERVES the raised floor.
+    #[tokio::test]
+    async fn same_store_floor_raise_is_stale_and_observed() {
+        use crate::adapter::net::behavior::org::OrgRevocationBundle;
+        use crate::adapter::net::identity::EntityId;
+        use std::collections::BTreeMap;
+
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c6"))
+            .expect("install A");
+        let snap = node.capture_sensing_authority_snapshot().expect("capture");
+
+        let floored = EntityId::from_bytes([0x77u8; 32]);
+        let mut floors = BTreeMap::new();
+        floors.insert(floored.clone(), 5u32);
+        let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
+        node.org_revocation_store()
+            .expect("store")
+            .apply_bundle(&bundle)
+            .expect("apply floor raise");
+
+        assert!(
+            !node.sensing_authority_snapshot_current(&snap),
+            "a floor raise on the same store must be stale"
+        );
+        let fresh = node
+            .capture_sensing_authority_snapshot()
+            .expect("recapture");
+        assert!(node.sensing_authority_snapshot_current(&fresh));
+        assert_eq!(
+            fresh.floors().floor_for(&org().org_id(), &floored),
+            5,
+            "the fresh snapshot must observe the raised floor"
+        );
+    }
+
+    // 9 — capture blocks under org_install until the install publishes the
+    // complete authority/store/generation tuple; the returned snapshot is
+    // coherent and current. Channels/barriers only — the org_install mutex
+    // guarantees no result is available while the installer holds it.
+    //
+    // RED-coupled (verified locally, not committed): removing the
+    // `org_install.lock()` from `capture_sensing_authority_snapshot` makes the
+    // "capture completed while org_install held" assertion FAIL — the bounded
+    // `completed_rx.recv_timeout` returns `Ok` instead of `Timeout` because the
+    // lock-free capture races through. Production source restored after.
+    #[tokio::test]
+    async fn capture_blocks_until_install_publishes() {
+        use std::sync::mpsc;
+        use std::sync::Barrier;
+
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c9a"))
+            .expect("install A");
+        let b = adopt(&node, &org(), "c9b");
+
+        // `Barrier` is `Sync` (mpsc `Sender`/`Receiver` are not), so the pause
+        // closure coordinates via barriers; the channels prove capture started
+        // and did NOT complete while the installer held org_install.
+        let paused = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (completed_tx, completed_rx) = mpsc::channel::<()>();
+
+        let install_node = node.clone();
+        let paused_i = paused.clone();
+        let release_i = release.clone();
+        let install = std::thread::spawn(move || {
+            install_node
+                .install_node_authority_paused_for_test(b, &|| {
+                    // org_install is held throughout this pause.
+                    paused_i.wait();
+                    release_i.wait();
+                })
+                .expect("install B");
+        });
+
+        paused.wait(); // the installer is paused with org_install held
+
+        let capture_node = node.clone();
+        let capture = std::thread::spawn(move || {
+            started_tx.send(()).expect("started");
+            // Blocks on org_install (held by the paused installer) until release.
+            let result = capture_node.capture_sensing_authority_snapshot();
+            completed_tx.send(()).expect("completed");
+            result
+        });
+        started_rx.recv().expect("capture started before release");
+
+        // While publication exclusion is held, the capture MUST NOT complete.
+        // A bounded wait (not a sleep): it returns immediately on an incorrect
+        // early completion, and gives a finite bound in the correct blocked case.
+        assert!(
+            matches!(
+                completed_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "capture completed while org_install was held"
+        );
+
+        release.wait(); // installer publishes B, then drops org_install
+        install.join().expect("install thread");
+        completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("capture completes after publication");
+        let snap = capture.join().expect("capture thread").expect("snapshot");
+        assert!(
+            node.sensing_authority_snapshot_current(&snap),
+            "the post-install snapshot must be coherent and current"
+        );
+    }
+
+    // 10 — piece-2 wrapper wiring: the live relay membership capture threads
+    // THIS node's own entity and returns THIS node's own certificate (the value
+    // a fresh upstream OrgProviderRegistration would carry). The exhaustive
+    // refusal matrix lives with the free function in `org_gate`; this proves the
+    // MeshNode wrapper wires the right fields.
+    #[tokio::test]
+    async fn live_relay_membership_returns_this_nodes_own_cert() {
+        use crate::adapter::net::behavior::org::current_timestamp;
+
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), "c10"))
+            .expect("install A");
+        let membership = node
+            .capture_live_org_relay_membership(org().org_id(), current_timestamp())
+            .expect("relay membership");
+        assert_eq!(membership.owner_cert().member, *node.entity_id());
+        assert_eq!(membership.org_id(), org().org_id());
+    }
+
+    // ---- piece-4 (exact-provider): live org PROVIDER dispatch witnesses -------
+    //
+    // Direct against the production `admit_org_registration` +
+    // `apply_provider_registration` operations over a real adopted authority.
+    // The cert-source / no-legacy-fallback of the EMISSION are proven in
+    // org_gate's planner witnesses; here we prove the intake→recheck→row path and
+    // the Blocker-3 mutation-boundary currency check.
+    use crate::adapter::net::behavior::org::{
+        current_timestamp, OrgRevocationBundle, ORG_CERT_TTL_SECS_RECOMMENDED,
+    };
+    use std::collections::BTreeMap;
+
+    const D: Duration = Duration::from_millis(100);
+    const ORG_TTL: Duration = Duration::from_secs(30);
+    const FROM_NODE: u64 = 0xA11CE;
+
+    /// A node that has adopted its own `org()` membership authority.
+    async fn org_node(tag: &str) -> Arc<MeshNode> {
+        let node = build_node().await;
+        node.install_node_authority(adopt(&node, &org(), tag))
+            .expect("install org authority");
+        node
+    }
+
+    fn org_commitment() -> sensing::AudienceScopeCommitment {
+        sensing::canonical_org_sensing_commitment(&org().org_id())
+    }
+
+    fn member_cert(entity: &EntityId, generation: u32) -> OrgMembershipCert {
+        OrgMembershipCert::try_issue(
+            &org(),
+            entity.clone(),
+            generation,
+            ORG_CERT_TTL_SECS_RECOMMENDED,
+        )
+        .expect("issue member cert")
+    }
+
+    fn org_spec(target: u64, audience: sensing::AudienceScopeCommitment) -> sensing::InterestSpec {
+        sensing::InterestSpec {
+            capability_id: sensing::CapabilityId::new("gpu.infer"),
+            constraints: sensing::CanonicalConstraints::from_entries([("model", "llama")]).unwrap(),
+            work_latency: sensing::WorkLatencyEnvelope::start_within(Duration::from_secs(2)),
+            providers: sensing::ProviderSelector::Node(target),
+            result_mode: sensing::ResultMode::Any,
+            disclosure_class: sensing::DisclosureClass::Owner,
+            audience,
+        }
+    }
+
+    fn org_provider_frame(
+        target: u64,
+        audience: sensing::AudienceScopeCommitment,
+        cert: OrgMembershipCert,
+    ) -> sensing::SensingInterestFrame {
+        sensing::SensingInterestFrame::org_provider_registration(
+            &org_spec(target, audience),
+            target,
+            D,
+            ORG_TTL,
+            cert,
+        )
+    }
+
+    /// Pin `sender` as the authenticated entity behind `FROM_NODE`.
+    fn pin_sender(node: &MeshNode, sender: &EntityId) {
+        node.peer_entity_ids.insert(FROM_NODE, sender.clone());
+    }
+
+    // W1 — a valid org provider registration lands a row whose proven root is the
+    // CANONICAL ORG COMMITMENT (not a legacy entity root).
+    #[tokio::test]
+    async fn valid_org_provider_registration_lands_org_committed_row() {
+        let node = org_node("op1").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1); // a remote provider
+        let key =
+            sensing::ProviderInterestKey::new(org_spec(target, org_commitment()).key(), target);
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("a valid org provider registration is admitted");
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            now,
+            now_secs,
+        );
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::Peer(FROM_NODE))
+            .expect("the org provider row is present");
+        assert_eq!(
+            row.owner_root,
+            org_commitment(),
+            "the org row carries the canonical org commitment, not a legacy root"
+        );
+    }
+
+    // W2 — a foreign-org certificate admits nothing.
+    #[tokio::test]
+    async fn foreign_org_provider_registration_creates_no_row() {
+        let node = org_node("op2").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let foreign = OrgKeypair::from_bytes([0x99u8; 32]);
+        let foreign_cert = OrgMembershipCert::try_issue(
+            &foreign,
+            sender.clone(),
+            1,
+            ORG_CERT_TTL_SECS_RECOMMENDED,
+        )
+        .expect("foreign cert");
+        let foreign_audience = sensing::canonical_org_sensing_commitment(&foreign.org_id());
+        let ctx = node.dispatch_ctx();
+        assert!(MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, foreign_audience, foreign_cert),
+            FROM_NODE,
+            &sender,
+            current_timestamp(),
+        )
+        .is_none());
+        assert!(
+            node.sensing_table_is_empty(),
+            "a foreign org records nothing"
+        );
+    }
+
+    // W3 — a revoked (floored) sender admits nothing.
+    #[tokio::test]
+    async fn floored_sender_creates_no_row() {
+        let node = org_node("op3").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let mut floors = BTreeMap::new();
+        floors.insert(sender.clone(), 2u32); // floor above the gen-1 cert
+        let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
+        node.org_revocation_store()
+            .expect("store")
+            .apply_bundle(&bundle)
+            .expect("apply floor");
+        let ctx = node.dispatch_ctx();
+        assert!(MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            current_timestamp(),
+        )
+        .is_none());
+        assert!(
+            node.sensing_table_is_empty(),
+            "a revoked sender records nothing"
+        );
+    }
+
+    // W4 — a poisoned store admits nothing.
+    #[tokio::test]
+    async fn poisoned_store_creates_no_row() {
+        let node = org_node("op4").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        node.org_revocation_store()
+            .expect("store")
+            .mark_poisoned_for_test();
+        let ctx = node.dispatch_ctx();
+        assert!(MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            current_timestamp(),
+        )
+        .is_none());
+        assert!(
+            node.sensing_table_is_empty(),
+            "a poisoned store records nothing"
+        );
+    }
+
+    // W5 — a floor raise BETWEEN the gate and the pre-register recheck creates no
+    // row: the pinned snapshot is stale at the mutation boundary (Blocker-3).
+    // RED-coupled: deleting the recheck in `apply_provider_registration` lets the
+    // row land.
+    #[tokio::test]
+    async fn floor_raise_between_gate_and_register_creates_no_row() {
+        let node = org_node("op5").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("admitted");
+        // A revocation publishes (any floor raise bumps the store generation).
+        let mut floors = BTreeMap::new();
+        floors.insert(EntityId::from_bytes([0xEEu8; 32]), 3u32);
+        let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
+        node.org_revocation_store()
+            .expect("store")
+            .apply_bundle(&bundle)
+            .expect("apply floor");
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            now,
+            now_secs,
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "a floor raise at the mutation boundary creates no row"
+        );
+    }
+
+    // W6 — an authority swap between the gate and the recheck creates no row.
+    #[tokio::test]
+    async fn authority_swap_between_gate_and_register_creates_no_row() {
+        let node = org_node("op6a").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("admitted");
+        node.install_node_authority(adopt(&node, &org(), "op6b"))
+            .expect("reinstall a fresh authority");
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            now,
+            now_secs,
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "an authority swap at the mutation boundary creates no row"
+        );
+    }
+
+    // W7 — a poison transition between the gate and the recheck creates no row.
+    #[tokio::test]
+    async fn poison_between_gate_and_register_creates_no_row() {
+        let node = org_node("op7").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("admitted");
+        node.org_revocation_store()
+            .expect("store")
+            .mark_poisoned_for_test();
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            now,
+            now_secs,
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "a poison at the mutation boundary creates no row"
+        );
+    }
+
+    // ---- Kyra amended-verdict closures: authority-binding + lock ordering ------
+
+    /// A legacy `ProviderRegistration` frame with the SAME spec `org_provider_frame`
+    /// builds, so an org row and a legacy row for one target share a
+    /// `ProviderInterestKey` iff the legacy audience is admitted — the exact
+    /// coalescence the closures prevent.
+    fn legacy_provider_frame(
+        target: u64,
+        audience: sensing::AudienceScopeCommitment,
+    ) -> sensing::SensingInterestFrame {
+        sensing::SensingInterestFrame::provider_registration(
+            &org_spec(target, audience),
+            target,
+            D,
+            ORG_TTL,
+        )
+    }
+
+    /// A node whose EXPLICIT sensing fleet root is `commitment` (fleet scope on,
+    /// `sensing_local_root == commitment`). No authority is installed.
+    async fn fleet_node(commitment: sensing::AudienceScopeCommitment) -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut config = MeshNodeConfig::new(addr, [0x31u8; 32]);
+        config.sensing_owner_root = Some(commitment);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), config)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    /// Reach the state closure 2 forbids at install (fleet root == org commitment
+    /// AND authority installed) by wiring the authority + its store in DIRECTLY,
+    /// bypassing `install_node_authority`'s collision refusal. Test-only: this
+    /// reconstructs the vulnerable state so closure 1's INDEPENDENT intake
+    /// classification can be exercised as the second line.
+    fn force_install_bypassing_collision_guard(node: &MeshNode, authority: Arc<NodeAuthority>) {
+        node.org_revocation
+            .store(Some(authority.revocation.clone()));
+        node.node_authority.store(Some(authority));
+        advance_fenced_generation(&node.org_install_generation, "org_install_generation");
+    }
+
+    // C5/C6 — Org admission REQUIRES a pinned snapshot; supplying `None` is an
+    // incoherent pairing that mutates nothing. RED-coupled: the prior
+    // `if let Some(snapshot) = org_authority` shape skipped the recheck for `None`
+    // and registered the org row.
+    #[tokio::test]
+    async fn org_admission_without_snapshot_creates_no_row() {
+        let node = org_node("op11").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, _snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("admitted");
+        MeshNode::apply_provider_registration(&ctx, &admitted, None, FROM_NODE, now, now_secs);
+        assert!(
+            node.sensing_table_is_empty(),
+            "an Org admission with no currentness evidence mutates nothing"
+        );
+    }
+
+    // C5/C6 — Legacy admission REQUIRES no snapshot; supplying `Some(..)` is an
+    // incoherent pairing that mutates nothing. RED-coupled: the prior shape ran a
+    // spurious recheck (which passes on an unchanged view) and registered the
+    // legacy row.
+    #[tokio::test]
+    async fn legacy_admission_with_snapshot_creates_no_row() {
+        let node = org_node("op12").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let snapshot = node.capture_sensing_authority_snapshot().expect("snapshot");
+        // A legacy provider admission proven under this node's sensing_local_root.
+        let admitted = sensing::AdmittedSensingRegistration::from_validated_legacy(
+            org_spec(target, node.sensing_local_root()),
+            sensing::RegistrationLeg::Provider {
+                target,
+                requested_sample_interval: D,
+                soft_state_ttl: ORG_TTL,
+            },
+        );
+        MeshNode::apply_provider_registration(
+            &ctx,
+            &admitted,
+            Some(&snapshot),
+            FROM_NODE,
+            now,
+            now_secs,
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "a Legacy admission carrying org currentness evidence mutates nothing"
+        );
+    }
+
+    // C4 — the final org currency check runs UNDER the held interest-table guard,
+    // so table-lock contention cannot open a post-check/pre-register window. Hold
+    // the guard so apply BLOCKS at lock acquisition (strictly before its final
+    // check), raise a floor to stale the pinned snapshot, then release: apply
+    // acquires, rechecks, finds the snapshot stale, and lands NO row. The mutation
+    // is ordered before the check by the lock alone — apply cannot reach the check
+    // until it holds the guard, which it cannot until we drop ours, which we do only
+    // after the floor raise. RED note (verified locally): moving the recheck back
+    // ahead of `.lock()` lets a row land here.
+    #[tokio::test]
+    async fn final_currency_check_runs_under_the_held_table_guard() {
+        let node = org_node("op13").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let now = Instant::now();
+        let now_secs = current_timestamp();
+        let (admitted, snapshot) = MeshNode::admit_org_registration(
+            &ctx,
+            &org_provider_frame(target, org_commitment(), member_cert(&sender, 1)),
+            FROM_NODE,
+            &sender,
+            now_secs,
+        )
+        .expect("admitted");
+
+        let guard = node.sensing_interest_table.lock();
+        std::thread::scope(|s| {
+            let apply_ctx = ctx.clone();
+            let apply_admitted = admitted.clone();
+            let apply_snapshot = &snapshot;
+            let handle = s.spawn(move || {
+                MeshNode::apply_provider_registration(
+                    &apply_ctx,
+                    &apply_admitted,
+                    Some(apply_snapshot),
+                    FROM_NODE,
+                    now,
+                    now_secs,
+                );
+            });
+            // Raise a floor while apply is parked on the guard we hold.
+            let mut floors = BTreeMap::new();
+            floors.insert(EntityId::from_bytes([0xEEu8; 32]), 3u32);
+            let bundle = OrgRevocationBundle::try_issue(&org(), &floors).expect("bundle");
+            node.org_revocation_store()
+                .expect("store")
+                .apply_bundle(&bundle)
+                .expect("apply floor");
+            drop(guard);
+            handle.join().expect("apply thread");
+        });
+        assert!(
+            node.sensing_table_is_empty(),
+            "a floor raise while apply is parked on the table guard makes the pinned \
+             snapshot stale at the final check — no row"
+        );
+    }
+
+    // C7 — production dispatch: an encoded valid OrgProviderRegistration flows
+    // through `handle_sensing_interest_frame` and lands the canonical org row.
+    // RED-coupled: removing the live match arm (dark drop) leaves no row.
+    #[tokio::test]
+    async fn dispatched_org_provider_registration_lands_org_row() {
+        let node = org_node("op14").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let key =
+            sensing::ProviderInterestKey::new(org_spec(target, org_commitment()).key(), target);
+        let ctx = node.dispatch_ctx();
+        let bytes = sensing::encode_interest_frame(&org_provider_frame(
+            target,
+            org_commitment(),
+            member_cert(&sender, 1),
+        ))
+        .expect("encode");
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::Peer(FROM_NODE))
+            .expect("org row present via production dispatch");
+        assert_eq!(
+            row.owner_root,
+            org_commitment(),
+            "the dispatched org provider row carries the canonical org commitment"
+        );
+    }
+
+    // C7 — production dispatch: an encoded valid OrgCapabilityRegistration is
+    // structurally dark in the exact-provider release; dispatch mutates nothing.
+    #[tokio::test]
+    async fn dispatched_org_capability_registration_stays_dark() {
+        let node = org_node("op15").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let ctx = node.dispatch_ctx();
+        // consumer == FROM_NODE (routed-origin binding); dropped before the gate.
+        let cap = sensing::SensingInterestFrame::org_capability_registration(
+            &org_spec(node.node_id(), org_commitment()),
+            D,
+            ORG_TTL,
+            FROM_NODE,
+            member_cert(&sender, 1),
+        );
+        let bytes = sensing::encode_interest_frame(&cap).expect("encode");
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
+        assert!(
+            node.sensing_table_is_empty(),
+            "the org capability (leader) variant stays dark — no mutation"
+        );
+    }
+
+    // C2/C3 — the explicit-fleet-root collision closure. With `sensing_owner_root`
+    // configured EQUAL to the org's canonical commitment, installing the org
+    // authority is refused fail-closed. RED-coupled: removing the install guard lets
+    // the authority publish over the colliding fleet root.
+    #[tokio::test]
+    async fn fleet_root_equal_to_org_commitment_refuses_authority_install() {
+        let node = fleet_node(sensing::canonical_org_sensing_commitment(&org().org_id())).await;
+        let err = node
+            .install_node_authority(adopt(&node, &org(), "collide"))
+            .expect_err("install over a colliding fleet root must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::adapter::net::behavior::org_authority::OrgAuthorityError::SensingFleetRootCollision { .. }
+            ),
+            "expected SensingFleetRootCollision, got {err:?}"
+        );
+        assert!(
+            node.node_authority().is_none(),
+            "no authority is installed after the refusal"
+        );
+    }
+
+    // C3 — the dynamic-install-history sequence: start without authority, accept a
+    // legacy row proven under the fleet root, then attempt to install the matching
+    // org authority. The install is refused, so the pre-existing legacy row can
+    // never gain an org sibling on a shared key. (C1's intake classification is
+    // inactive with no authority installed — this is exactly why closure 2 refuses
+    // the install rather than trying to purge the row.)
+    #[tokio::test]
+    async fn dynamic_history_legacy_fleet_row_then_install_refused() {
+        let commitment = sensing::canonical_org_sensing_commitment(&org().org_id());
+        let node = fleet_node(commitment).await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+        let bytes = sensing::encode_interest_frame(&legacy_provider_frame(target, commitment))
+            .expect("encode");
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
+        assert!(
+            !node.sensing_table_is_empty(),
+            "a legacy provider claiming the fleet root lands a row before any authority"
+        );
+        let err = node
+            .install_node_authority(adopt(&node, &org(), "collide2"))
+            .expect_err("install must be refused so no org row can join the legacy row");
+        assert!(matches!(
+            err,
+            crate::adapter::net::behavior::org_authority::OrgAuthorityError::SensingFleetRootCollision { .. }
+        ));
+    }
+
+    // review-pass-3 §11 — the two 2026-07-23 §4 residuals on the org intake.
+    //
+    // (a) The interval/ttl pre-gate reject returned `None` with NO counter and NO
+    // trace — the one refused sensing input that was completely invisible, while
+    // all three legacy analogs at least `trace!`.
+    //
+    // (b) The org sensing path was not subject to `max_auth_failures_per_window`:
+    // the only throttle sites were the channel-membership plane, so a forged-cert
+    // flood bought an Ed25519 verify plus three `org_install` acquisitions per
+    // frame, indefinitely.
+    #[tokio::test]
+    async fn org_intake_counts_bounds_rejects_and_throttles_a_refused_flood() {
+        let node = org_node("intake-residuals").await;
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+
+        // (a) a zero soft-state ttl is refused at the cheap structural pre-gate.
+        let before = sensing::SensingCounters::get(&node.sensing_counters.protocol_invalid);
+        let bad = sensing::SensingInterestFrame::org_provider_registration(
+            &org_spec(target, org_commitment()),
+            target,
+            D,
+            Duration::ZERO,
+            member_cert(&sender, 1),
+        );
+        let bytes = sensing::encode_interest_frame(&bad).expect("encode");
+        MeshNode::handle_sensing_interest_frame(&bytes, FROM_NODE, &ctx);
+        assert!(
+            sensing::SensingCounters::get(&node.sensing_counters.protocol_invalid) > before,
+            "an out-of-bounds org registration must be COUNTED, not silently dropped"
+        );
+        assert!(node.sensing_table_is_empty(), "and must install nothing");
+
+        // (b) a flood of registrations whose cert names a different member is an
+        // authority refusal, and spends the peer's rolling budget.
+        let impostor = EntityKeypair::generate().entity_id().clone();
+        let forged = sensing::SensingInterestFrame::org_provider_registration(
+            &org_spec(target, org_commitment()),
+            target,
+            D,
+            ORG_TTL,
+            member_cert(&impostor, 1),
+        );
+        let forged = sensing::encode_interest_frame(&forged).expect("encode");
+        assert!(
+            !MeshNode::is_auth_throttled(FROM_NODE, &ctx),
+            "precondition: the peer starts with a full budget"
+        );
+        for _ in 0..=node.config.max_auth_failures_per_window {
+            MeshNode::handle_sensing_interest_frame(&forged, FROM_NODE, &ctx);
+        }
+        assert!(
+            MeshNode::is_auth_throttled(FROM_NODE, &ctx),
+            "a sustained refused-cert flood must exhaust the auth-failure window"
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "and no row was ever created by any of it"
+        );
+    }
+
+    // review-pass-3 §4 — an ORG-audience sensing lease is refused LOUDLY rather
+    // than acquiring locally and emitting a frame the provider refuses.
+    //
+    // The lease wire leg emits `provider_registration` — the legacy variant —
+    // unconditionally, and C1's intake classification makes any org-authoritative
+    // provider refuse exactly that frame when its audience is that org's canonical
+    // commitment. So the acquire used to install a `LeasedLocal` row, return
+    // `Ok(Registered)`, and emit something designed to be rejected, with the
+    // rejection observable only as `protocol_invalid` on the far side.
+    //
+    // RED-coupled: removing the guard makes the acquire proceed past it, so the
+    // "nothing was minted" assertions below fail.
+    #[tokio::test]
+    async fn an_org_audience_sensing_lease_is_refused_rather_than_silently_laundered() {
+        let commitment = sensing::canonical_org_sensing_commitment(&org().org_id());
+        let node = fleet_node(commitment).await;
+        force_install_bypassing_collision_guard(&node, adopt(&node, &org(), "lease-org-audience"));
+        let target = node.node_id().wrapping_add(1);
+
+        let err = node
+            .acquire_sensing_interest_lease(&org_spec(target, commitment), target, D)
+            .expect_err("an org-derived audience must not acquire");
+        assert!(
+            matches!(err, SensingRegistrationError::OrgAudienceUnsupported),
+            "expected the loud org-audience refusal, got {err:?}"
+        );
+        assert!(
+            node.sensing_interest_leases.is_empty(),
+            "the refusal happens BEFORE anything is minted, so there is nothing to roll back"
+        );
+        assert!(
+            node.sensing_table_is_empty(),
+            "and no LeasedLocal row was installed for a registration the wire would refuse"
+        );
+
+        // Specific to the org derivation, not a blanket lease refusal: an audience
+        // that is not this org's commitment gets whatever the ordinary path says,
+        // never this error.
+        let unrelated = sensing::AudienceScopeCommitment::from_bytes([0x5E; 32]);
+        let other = node
+            .acquire_sensing_interest_lease(&org_spec(target, unrelated), target, D)
+            .err();
+        assert!(
+            !matches!(
+                other,
+                Some(SensingRegistrationError::OrgAudienceUnsupported)
+            ),
+            "a non-org audience must not be caught by the org guard"
+        );
+    }
+
+    // C1/C3 — the real explicit-root collision witness. Reconstruct the state
+    // closure 2 forbids (fleet root == org commitment AND authority installed) and
+    // prove closure 1's intake classification is the independent second line: a
+    // legacy registration whose admitted audience is the org commitment is REFUSED
+    // (no row), while a valid OrgProviderRegistration for the SAME interest+target
+    // lands its org row — so the two never share an aggregate. RED-coupled: removing
+    // the C1 intake guard lets the legacy frame land a row on the org key, and the
+    // org frame then coalesces into it.
+    #[tokio::test]
+    async fn org_derived_legacy_audience_refused_while_org_row_lands() {
+        let commitment = sensing::canonical_org_sensing_commitment(&org().org_id());
+        let node = fleet_node(commitment).await;
+        force_install_bypassing_collision_guard(&node, adopt(&node, &org(), "c1direct"));
+        let sender = EntityKeypair::generate().entity_id().clone();
+        pin_sender(&node, &sender);
+        let target = node.node_id().wrapping_add(1);
+        let ctx = node.dispatch_ctx();
+
+        // (a) A legacy provider claiming the fleet root (== org commitment): under
+        // fleet admission its scope validation would PASS and key the row under the
+        // org commitment — the exact laundering. C1 refuses it at intake and counts
+        // the refusal as protocol-invalid.
+        let protocol_invalid_before =
+            sensing::SensingCounters::get(&node.sensing_counters().protocol_invalid);
+        let legacy_bytes =
+            sensing::encode_interest_frame(&legacy_provider_frame(target, commitment))
+                .expect("encode");
+        MeshNode::handle_sensing_interest_frame(&legacy_bytes, FROM_NODE, &ctx);
+        assert!(
+            node.sensing_table_is_empty(),
+            "C1 refuses the organization-derived legacy audience — no row"
+        );
+        assert_eq!(
+            sensing::SensingCounters::get(&node.sensing_counters().protocol_invalid),
+            protocol_invalid_before + 1,
+            "the C1 refusal increments the protocol_invalid security counter"
+        );
+
+        // (b) A valid OrgProviderRegistration for the SAME interest + target lands
+        // the org row (and, because (a) landed nothing, it is the only row).
+        let org_bytes = sensing::encode_interest_frame(&org_provider_frame(
+            target,
+            commitment,
+            member_cert(&sender, 1),
+        ))
+        .expect("encode");
+        MeshNode::handle_sensing_interest_frame(&org_bytes, FROM_NODE, &ctx);
+        let key = sensing::ProviderInterestKey::new(org_spec(target, commitment).key(), target);
+        let row = node
+            .sensing_downstream_entry(&key, sensing::DownstreamId::Peer(FROM_NODE))
+            .expect("the org row lands");
+        assert_eq!(row.owner_root, commitment);
+        assert_eq!(
+            node.sensing_downstreams(&key).len(),
+            1,
+            "only the org row exists — no coalesced legacy demand on the shared key"
+        );
+    }
+
+    // C2 (configured-startup path) — the collision guard must also fire when the
+    // authority is loaded from `node_authority_dir` at construction, BEFORE
+    // networking begins. Adopt an authority on disk for this node's entity, then
+    // build a node whose explicit fleet root equals the org commitment: startup
+    // opens the authority, routes through the same guarded installer, and fails
+    // fast. RED-coupled to C2 through the distinct configured-startup path.
+    #[tokio::test]
+    async fn configured_startup_over_colliding_fleet_root_fails() {
+        let kp = EntityKeypair::generate();
+        let entity = kp.entity_id().clone();
+        let dir = scratch("startup-collide");
+        let cert =
+            OrgMembershipCert::try_issue(&org(), entity.clone(), 1, ORG_CERT_TTL_SECS_RECOMMENDED)
+                .expect("cert");
+        NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt authority to dir");
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut config = MeshNodeConfig::new(addr, [0x31u8; 32]);
+        config.sensing_owner_root =
+            Some(sensing::canonical_org_sensing_commitment(&org().org_id()));
+        config.node_authority_dir = Some(dir);
+
+        let err = MeshNode::new(kp, config)
+            .await
+            .err()
+            .expect("configured startup over a colliding fleet root must fail before networking");
+        assert!(
+            err.to_string().contains("fleet root"),
+            "startup failure must name the fleet-root collision, got: {err}"
+        );
+    }
+}
+
+/// OLB-2A.3.1 closure (Kyra): the node-global publication gate serializes each
+/// scoped-store mutation with its publication, so an older transaction's
+/// publication can never overwrite a newer one, and a concurrent no-op can never
+/// publish another transaction's work. Forced deterministic interleaving via the
+/// fixtures pause/contention hooks — no scheduler-dependent timing.
+#[cfg(all(test, feature = "fixtures"))]
+mod scoped_publication_ordering_tests {
+    use super::ScopedMutationPublication;
+    use crate::adapter::net::behavior::capability::CapabilitySet;
+    use crate::adapter::net::behavior::org::OrgId;
+    use crate::adapter::net::behavior::org_scoped_ingest::{
+        CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
+    };
+    use crate::adapter::net::behavior::org_scoped_store::{NoConsumerGrants, ScopedDiscoveryState};
+    use crate::adapter::net::identity::EntityId;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// A one-shot condvar flag with a timeout so a bug is a FAILURE, not a hang.
+    #[derive(Default)]
+    struct Flag {
+        set: parking_lot::Mutex<bool>,
+        cv: parking_lot::Condvar,
+    }
+    impl Flag {
+        fn raise(&self) {
+            *self.set.lock() = true;
+            self.cv.notify_all();
+        }
+        fn wait(&self, what: &str) {
+            let mut guard = self.set.lock();
+            while !*guard {
+                if self
+                    .cv
+                    .wait_for(&mut guard, Duration::from_secs(5))
+                    .timed_out()
+                    && !*guard
+                {
+                    panic!("timed out waiting for {what}");
+                }
+            }
+        }
+    }
+
+    /// An owner record declaring one capability, so an insert advances the
+    /// generation.
+    fn prepared_owner(provider_seed: u8, generation: u64) -> PreparedScopedCapability {
+        let descriptor = CapabilitySet::new().add_tag("nrpc:x").to_bytes_compact();
+        PreparedScopedCapability::prepare(VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Owner {
+                org_id: OrgId::from_bytes([1u8; 32]),
+                audience_handle: [0x11u8; 32],
+            },
+            EntityId::from_bytes([provider_seed; 32]),
+            OrgId::from_bytes([1u8; 32]),
+            generation,
+            10_000,
+            5,
+            None,
+            descriptor,
+        ))
+    }
+
+    /// Force the interleaving: transaction A mutates (provider 3, gen 1 → state 1)
+    /// and PAUSES between its mutation and its publication while holding the gate;
+    /// transaction B (its mutation supplied by the caller) then blocks on the
+    /// gate. Only after B is proven blocked is A released. Returns the shared
+    /// publication and state for the caller to assert on.
+    fn run_forced_interleaving(
+        b_mutation: impl FnOnce(&mut ScopedDiscoveryState) + Send + 'static,
+    ) -> (
+        Arc<ScopedMutationPublication>,
+        Arc<parking_lot::Mutex<ScopedDiscoveryState>>,
+    ) {
+        let publication = Arc::new(ScopedMutationPublication::new());
+        let state = Arc::new(parking_lot::Mutex::new(ScopedDiscoveryState::new()));
+
+        let a_paused = Arc::new(Flag::default());
+        let release_a = Arc::new(Flag::default());
+        let b_contended = Arc::new(Flag::default());
+        let paused_once = Arc::new(AtomicBool::new(false));
+
+        // The FIRST transaction to reach the pause (A) waits; later ones (B) pass.
+        {
+            let (a_paused, release_a, paused_once) =
+                (a_paused.clone(), release_a.clone(), paused_once.clone());
+            *publication.publish_pause.lock() = Some(Arc::new(move || {
+                if paused_once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                a_paused.raise();
+                release_a.wait("A to be released");
+            }));
+        }
+        // Fired when B finds the gate held.
+        {
+            let b_contended = b_contended.clone();
+            *publication.contention_hook.lock() = Some(Arc::new(move || b_contended.raise()));
+        }
+
+        let a = {
+            let (publication, state) = (publication.clone(), state.clone());
+            thread::spawn(move || {
+                publication.gated_commit(&state, |s| {
+                    s.ingest(prepared_owner(3, 1), 0, &NoConsumerGrants);
+                });
+            })
+        };
+        a_paused.wait("A to pause before publishing");
+
+        let b = {
+            let (publication, state) = (publication.clone(), state.clone());
+            thread::spawn(move || {
+                publication.gated_commit(&state, b_mutation);
+            })
+        };
+        // B is now blocked on the gate A holds — the serialization is proven.
+        b_contended.wait("B to block on the publication gate");
+
+        release_a.raise();
+        a.join().expect("A joins");
+        b.join().expect("B joins");
+        (publication, state)
+    }
+
+    /// An older transaction's publication cannot overwrite a newer one: the gate
+    /// forces A to publish generation 1 before B publishes 2, so the watch ends
+    /// at 2 and never regresses to 1.
+    #[test]
+    fn an_older_publication_cannot_overwrite_a_newer_one() {
+        let (publication, state) = run_forced_interleaving(|s| {
+            s.ingest(prepared_owner(4, 1), 0, &NoConsumerGrants);
+        });
+        assert_eq!(
+            state.lock().revision(),
+            2,
+            "two distinct owners advanced the state"
+        );
+        assert_eq!(
+            *publication.subscribe().borrow(),
+            2,
+            "the watch ends at the newer generation, never overwritten by the older"
+        );
+    }
+
+    /// A concurrent no-op cannot publish another transaction's work: B's stale
+    /// re-ingest changes nothing, so only A's changed transaction publishes and
+    /// both the state and the watch settle at 1.
+    #[test]
+    fn a_concurrent_noop_cannot_publish_delayed_work() {
+        let (publication, state) = run_forced_interleaving(|s| {
+            // Same provider AND generation as A: Stale, no visible change.
+            s.ingest(prepared_owner(3, 1), 0, &NoConsumerGrants);
+        });
+        assert_eq!(
+            state.lock().revision(),
+            1,
+            "the no-op re-ingest advanced nothing"
+        );
+        assert_eq!(
+            *publication.subscribe().borrow(),
+            1,
+            "only the changed transaction published; the no-op did not"
+        );
+    }
+}
+
+/// OLB-2A.3.2: the node's single exact-expiry timer arms to the earliest live
+/// deadline, sweeps at it through the gated commit (so consumers wake), and
+/// re-arms to any earlier deadline a mutation introduces. Deterministic — an
+/// injected clock plus the fixtures arm signal remove any dependence on real
+/// sleep timing; paused time is advanced only in lockstep with that clock.
+#[cfg(all(test, feature = "fixtures"))]
+mod exact_expiry_timer_tests {
+    use super::{run_exact_expiry_timer, ScopedMutationPublication};
+    use crate::adapter::net::behavior::capability::CapabilitySet;
+    use crate::adapter::net::behavior::org::OrgId;
+    use crate::adapter::net::behavior::org_scoped_ingest::{
+        CapabilityAudienceScope, PreparedScopedCapability, VerifiedScopedCapability,
+    };
+    use crate::adapter::net::behavior::org_scoped_store::{NoConsumerGrants, ScopedDiscoveryState};
+    use crate::adapter::net::identity::EntityId;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    /// An owner record declaring one capability, expiring at `expires_at`.
+    fn owner(provider_seed: u8, generation: u64, expires_at: u64) -> PreparedScopedCapability {
+        let descriptor = CapabilitySet::new().add_tag("nrpc:x").to_bytes_compact();
+        PreparedScopedCapability::prepare(VerifiedScopedCapability::for_test(
+            CapabilityAudienceScope::Owner {
+                org_id: OrgId::from_bytes([1u8; 32]),
+                audience_handle: [0x11u8; 32],
+            },
+            EntityId::from_bytes([provider_seed; 32]),
+            OrgId::from_bytes([1u8; 32]),
+            generation,
+            expires_at,
+            5,
+            None,
+            descriptor,
+        ))
+    }
+
+    /// Shared state + publication, an injectable WALL clock (milliseconds since the
+    /// Unix epoch, so subsecond arming is expressible), an arm-signal channel, and a
+    /// spawned timer. The clock is decoupled from tokio's paused clock so a witness
+    /// advances both explicitly and in lockstep.
+    struct Harness {
+        state: Arc<parking_lot::Mutex<ScopedDiscoveryState>>,
+        publication: Arc<ScopedMutationPublication>,
+        clock_ms: Arc<AtomicU64>,
+        watch: tokio::sync::watch::Receiver<u64>,
+        arms: tokio::sync::mpsc::UnboundedReceiver<Option<u64>>,
+        shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
+        timer: tokio::task::JoinHandle<()>,
+    }
+
+    impl Harness {
+        /// Seed the state (directly, before the timer runs, so its first read sees
+        /// the whole seed) then spawn the timer with the wall clock at
+        /// `clock_start_secs`.
+        fn start(clock_start_secs: u64, seed: impl FnOnce(&mut ScopedDiscoveryState)) -> Self {
+            Self::start_with(clock_start_secs, seed, |_, _, _| {})
+        }
+
+        /// Like [`Self::start`], but `configure` runs BEFORE the timer is spawned —
+        /// so a witness can install a hook the timer's very first iteration must
+        /// already observe.
+        fn start_with(
+            clock_start_secs: u64,
+            seed: impl FnOnce(&mut ScopedDiscoveryState),
+            configure: impl FnOnce(&Arc<ScopedMutationPublication>, &Arc<AtomicBool>, &Arc<Notify>),
+        ) -> Self {
+            let state = Arc::new(parking_lot::Mutex::new(ScopedDiscoveryState::new()));
+            seed(&mut state.lock());
+            let publication = Arc::new(ScopedMutationPublication::new());
+            let clock_ms = Arc::new(AtomicU64::new(clock_start_secs * 1_000));
+            let (arm_tx, arms) = tokio::sync::mpsc::unbounded_channel();
+            *publication.expiry_arm_hook.lock() = Some(Arc::new(move |d| {
+                let _ = arm_tx.send(d);
+            }));
+            let watch = publication.subscribe();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_notify = Arc::new(Notify::new());
+            configure(&publication, &shutdown, &shutdown_notify);
+            let timer = {
+                let state_t = state.clone();
+                let pub_t = publication.clone();
+                let clock_t = clock_ms.clone();
+                let shutdown_t = shutdown.clone();
+                let notify_t = shutdown_notify.clone();
+                let changed = publication.subscribe();
+                tokio::spawn(async move {
+                    run_exact_expiry_timer(
+                        state_t,
+                        pub_t,
+                        changed,
+                        move || Duration::from_millis(clock_t.load(Ordering::SeqCst)),
+                        shutdown_t,
+                        notify_t,
+                    )
+                    .await
+                })
+            };
+            Harness {
+                state,
+                publication,
+                clock_ms,
+                watch,
+                arms,
+                shutdown,
+                shutdown_notify,
+                timer,
+            }
+        }
+
+        /// Ingest through the publication so the timer wakes on the change.
+        fn ingest(&self, record: PreparedScopedCapability) {
+            let now = self.clock_ms.load(Ordering::SeqCst) / 1_000;
+            self.publication.gated_commit(&self.state, |s| {
+                s.ingest(record, now, &NoConsumerGrants);
+            });
+        }
+
+        async fn next_arm(&mut self) -> Option<u64> {
+            self.arms.recv().await.expect("timer arm signal")
+        }
+
+        fn set_clock(&self, secs: u64) {
+            self.clock_ms.store(secs * 1_000, Ordering::SeqCst);
+        }
+
+        async fn stop(self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            self.shutdown_notify.notify_waiters();
+            let _ = self.timer.await;
+        }
+    }
+
+    /// A record already past its deadline is swept the moment the timer reads it —
+    /// through the gated commit, so the change watch advances to the swept
+    /// generation — and the timer then arms to the surviving record's deadline.
+    #[tokio::test(start_paused = true)]
+    async fn sweeps_a_due_record_then_arms_to_the_survivor() {
+        let mut h = Harness::start(100, |s| {
+            s.ingest(owner(3, 1, 50), 0, &NoConsumerGrants); // due at clock 100
+            s.ingest(owner(4, 1, 200), 0, &NoConsumerGrants); // survives
+        });
+
+        // First arm is the SURVIVOR's deadline: the due record was swept first,
+        // without arming.
+        assert_eq!(h.next_arm().await, Some(200));
+
+        assert_eq!(h.state.lock().len(), 1, "the due record was swept");
+        assert_eq!(h.state.lock().next_visible_expiry(), Some(200));
+        let revision = h.state.lock().revision();
+        assert_ne!(revision, 0);
+        assert_eq!(
+            *h.watch.borrow(),
+            revision,
+            "the sweep woke consumers at the swept generation"
+        );
+        h.stop().await;
+    }
+
+    /// An earlier record introduced after the timer armed wakes it through the
+    /// change watch; it re-reads and re-arms to the nearer deadline.
+    #[tokio::test(start_paused = true)]
+    async fn rearms_to_an_earlier_deadline() {
+        let mut h = Harness::start(0, |_| {});
+        assert_eq!(
+            h.next_arm().await,
+            None,
+            "an empty live set arms with no deadline"
+        );
+
+        h.ingest(owner(3, 1, 100));
+        assert_eq!(h.next_arm().await, Some(100));
+
+        // A nearer deadline must pull the arm in.
+        h.ingest(owner(4, 1, 10));
+        assert_eq!(
+            h.next_arm().await,
+            Some(10),
+            "the timer re-armed to the earlier deadline"
+        );
+        h.stop().await;
+    }
+
+    /// When the armed deadline elapses the timer fires: advancing the injected
+    /// clock and paused time in lockstep to the deadline sweeps the due record and
+    /// re-arms (here, to an empty live set).
+    #[tokio::test(start_paused = true)]
+    async fn fires_a_sweep_when_the_armed_deadline_elapses() {
+        let mut h = Harness::start(0, |_| {});
+        assert_eq!(h.next_arm().await, None);
+
+        h.ingest(owner(3, 1, 100));
+        assert_eq!(h.next_arm().await, Some(100));
+
+        // Move the clock to the deadline, let the timer register its sleep, then
+        // advance paused time so the sleep elapses.
+        h.set_clock(100);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(100)).await;
+
+        assert_eq!(
+            h.next_arm().await,
+            None,
+            "the live set is empty after the sweep"
+        );
+        assert_eq!(
+            h.state.lock().len(),
+            0,
+            "the record was swept at its deadline"
+        );
+        assert_eq!(h.state.lock().next_visible_expiry(), None);
+        h.stop().await;
+    }
+
+    /// The wait is derived from the ABSOLUTE deadline, so the wall clock's
+    /// subsecond part is not discarded: a deadline 100 ms away is a 100 ms wait,
+    /// not a full second that would publish the sweep ~900 ms after the records
+    /// became query-invisible (Kyra OLB-2A.3.2).
+    #[test]
+    fn the_arm_keeps_the_wall_clocks_subsecond_part() {
+        assert_eq!(
+            super::exact_expiry_wait(100, Duration::from_millis(99_900)),
+            Duration::from_millis(100),
+            "a deadline 100ms away must not round up to a full second"
+        );
+        // A whole-second wall clock still waits the whole second.
+        assert_eq!(
+            super::exact_expiry_wait(100, Duration::from_secs(99)),
+            Duration::from_secs(1)
+        );
+        // Reached, and passed: sweep now.
+        assert_eq!(
+            super::exact_expiry_wait(100, Duration::from_secs(100)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            super::exact_expiry_wait(100, Duration::from_millis(100_500)),
+            Duration::ZERO
+        );
+    }
+
+    /// A shutdown landing in the window between the timer registering its shutdown
+    /// wake and observing the shutdown flag still stops it. `notify_waiters` keeps
+    /// no permit for a later registrant, so checking the flag first would strand a
+    /// timer with no live deadline forever — hanging `MeshNode::shutdown`, which
+    /// awaits every tracked handle (Kyra OLB-2A.3.2).
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_in_the_registration_window_still_stops_the_timer() {
+        // Empty live set: the timer parks with NO deadline, so a lost notification
+        // is an indefinite hang rather than a bounded delay.
+        let h = Harness::start_with(
+            0,
+            |_| {},
+            |publication, shutdown, notify| {
+                let (shutdown, notify) = (shutdown.clone(), notify.clone());
+                let fired = Arc::new(AtomicBool::new(false));
+                // Fire the REAL shutdown sequence (store then notify_waiters) from
+                // inside the registration window, once.
+                *publication.shutdown_arm_hook.lock() = Some(Arc::new(move || {
+                    if fired.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    shutdown.store(true, Ordering::Release);
+                    notify.notify_waiters();
+                }));
+            },
+        );
+
+        // A hang must be a FAILURE, not a hung test: under paused time the runtime
+        // auto-advances to this deadline as soon as every task is idle.
+        let joined = tokio::time::timeout(Duration::from_secs(5), h.timer).await;
+        assert!(
+            joined.is_ok(),
+            "the timer must exit when shutdown lands in its registration window"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "org_routing_wiring_tests.rs"]
+mod org_routing_wiring_tests;

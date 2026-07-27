@@ -1326,6 +1326,13 @@ async fn at_capacity_registration_surfaced_and_rolled_back() {
         node.sensing_downstreams(&overflow_branch).is_empty(),
         "the refused registration's row is rolled back, never dark",
     );
+    // Review L1 narrow-hold: registration eagerly anchors a consumer cell, so the
+    // AtCapacity rollback must remove that just-created cell too — no ghost.
+    assert!(
+        node.sensing_consumer_cell_interval_for_test(&overflow_branch)
+            .is_none(),
+        "the eagerly-created consumer cell is rolled back with the row",
+    );
     assert_eq!(node.sensing_live_streams(), MAX_LIVE_SENSING_STREAMS);
 
     // Refreshes of existing live streams still succeed at cap.

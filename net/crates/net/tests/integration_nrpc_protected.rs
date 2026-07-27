@@ -2008,13 +2008,54 @@ async fn a_floor_publish_racing_the_scoped_insert_is_refused_then_recovers() {
     // touching this provider's own floor.
     let (raced_provider, raced_bytes) = make_envelope(0x72);
     let unrelated_member = EntityKeypair::from_bytes([0xAAu8; 32]).entity_id().clone();
+    // The publish runs on ANOTHER THREAD, and the probe waits only until the new
+    // floor is VISIBLE — not until `apply_bundle` returns.
+    //
+    // Publishing inline here self-deadlocks, and did: the probe fires while the
+    // ingest holds the scoped publication gate, `apply_bundle` notifies its
+    // floor-raise subscriber synchronously on that same thread, and the
+    // subscriber's `gated_commit` re-acquires the gate we are already holding.
+    // `parking_lot::Mutex` is not reentrant, so the test hung for its full
+    // `terminate-after` budget instead of exercising the recheck — meaning this
+    // witness proved nothing at all. (Pre-existing since 758edc126; found by the
+    // 2026-07-27 OLB closure run.)
+    //
+    // Off-thread, the same sequence is ordinary blocking rather than a cycle:
+    // `StoreCore::publish` swaps the live view and bumps the generation BEFORE
+    // any subscriber is notified, so the raced view the recheck must catch is
+    // already in place when the wait below completes; the subscriber then simply
+    // waits for the publication gate until this ingest releases it.
+    // `OnceLock`, not a `Mutex`: the probe is `&(dyn Fn() + Sync)` so the cell
+    // must be `Sync`, and `std::sync::Mutex::lock` is a disallowed method here.
+    let publisher: std::sync::OnceLock<std::thread::JoinHandle<()>> = std::sync::OnceLock::new();
     let race_probe = || {
-        let mut floors_map = BTreeMap::new();
-        floors_map.insert(unrelated_member.clone(), 5u32);
-        let bundle = OrgRevocationBundle::try_issue(&org, &floors_map).expect("issue race bundle");
-        store.apply_bundle(&bundle).expect("apply race floor");
+        let store_for_publish = store.clone();
+        let member = unrelated_member.clone();
+        let handle = std::thread::spawn(move || {
+            // Rebuilt inside the thread rather than captured, so nothing has to
+            // be moved out of a shared cell.
+            let org = OrgKeypair::from_bytes([0x89u8; 32]);
+            let mut floors_map = BTreeMap::new();
+            floors_map.insert(member, 5u32);
+            let bundle =
+                OrgRevocationBundle::try_issue(&org, &floors_map).expect("issue race bundle");
+            store_for_publish
+                .apply_bundle(&bundle)
+                .expect("apply race floor");
+        });
+        let _ = publisher.set(handle);
+        // Deterministic: spin until the raise is in the LIVE view. No sleep, and
+        // no dependence on the subscriber, which cannot finish until we return.
+        while store.snapshot().floor_for(&org.org_id(), &unrelated_member) < 5 {
+            std::thread::yield_now();
+        }
     };
     node.ingest_scoped_announcement_probed_for_test(&raced_bytes, &race_probe);
+    publisher
+        .into_inner()
+        .expect("the probe published")
+        .join()
+        .expect("the floor publish completes once the gate is released");
     assert!(
         !node
             .scoped_owner_providers_for_test(now)

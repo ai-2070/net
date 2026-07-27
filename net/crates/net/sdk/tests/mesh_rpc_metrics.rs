@@ -198,10 +198,10 @@ async fn server_side_metrics_increment_for_unary_and_streaming() {
     /// which routinely flaked on Windows where scheduler overhead
     /// can push a 2ms sleep to 5-15ms actual.
     const HANDLER_SLEEP: Duration = Duration::from_millis(30);
-    /// Bucket index whose upper bound is 100ms. Must hold
-    /// `HANDLER_SLEEP + scheduler_overhead < 100ms` for the
-    /// assertion below to be stable.
-    const HANDLER_BUCKET_INDEX: usize = 4;
+    // (The former `HANDLER_BUCKET_INDEX` — the ≤100ms bucket — is gone with the
+    // upper-bound assertion that used it. See the histogram assertions below:
+    // an upper bound on wall-clock is a race against the scheduler, so the test
+    // now asserts a lower bound and the +Inf total instead.)
 
     struct Echo;
     #[async_trait]
@@ -322,13 +322,33 @@ async fn server_side_metrics_increment_for_unary_and_streaming() {
         4,
         "+Inf bucket equals handler_duration_count",
     );
-    // 30ms sleep → comfortably under the 100ms bucket boundary
-    // even with worst-case Windows scheduler overhead. The
-    // bucket is cumulative (counts everything ≤ 100ms) so a
-    // healthy run lands all 4 observations here.
+    // The property under test is that handler durations are OBSERVED, not that
+    // this machine is fast. Asserted with a LOWER bound and a total, both of
+    // which load can only reinforce:
+    //
+    //   - nothing completed within the ≤5ms bucket, so the 30ms handler sleep
+    //     really was measured rather than a zero duration being recorded;
+    //   - the +Inf bucket (cumulative total) carries every observation.
+    //
+    // The previous assertion — "at least one observation landed in the ≤100ms
+    // bucket" — was an UPPER bound on wall-clock, i.e. a race against the
+    // scheduler. It was observed failing under a fully parallel suite run while
+    // passing 3/3 in isolation, which is the second time this test has flaked on
+    // the same axis (see `HANDLER_SLEEP`'s comment for the 2ms → 30ms round).
+    // Raising the boundary again would just move the threshold; removing the
+    // upper bound removes the race.
+    assert_eq!(
+        echo.handler_duration_buckets[0], 0,
+        "a {HANDLER_SLEEP:?} handler must never be recorded in the ≤5ms bucket; got {:?}",
+        echo.handler_duration_buckets,
+    );
     assert!(
-        echo.handler_duration_buckets[HANDLER_BUCKET_INDEX] >= 1,
-        "at least one handler must land in the ≤100ms bucket; got {:?}",
+        *echo
+            .handler_duration_buckets
+            .last()
+            .expect("the histogram has a +Inf bucket")
+            >= 1,
+        "every handler duration must be recorded in the +Inf total; got {:?}",
         echo.handler_duration_buckets,
     );
     // Stronger invariant: the cumulative-histogram math holds

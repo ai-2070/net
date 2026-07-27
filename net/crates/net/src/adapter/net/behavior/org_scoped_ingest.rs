@@ -557,24 +557,72 @@ fn verify_granted_ingest(
 /// grant is a [`ScopedIngestError::DescriptorOutsideGrant`]. Canonicity is
 /// enforced by requiring the descriptor to equal its own re-encoding, so a
 /// non-canonical framing cannot slip a second logical form past the shape check.
-/// Whether an OWNER descriptor declares `capability` among its tags (OSDK S1).
+/// Decode the full set of capability-authority ids a stored OWNER descriptor
+/// declares, ONCE, so the scoped-discovery index (OLB-2A) can bucket a record by
+/// capability at ingest instead of re-decoding the descriptor on every
+/// owner-plane query.
 ///
-/// Unlike the granted case below, an owner envelope legitimately carries EVERY
-/// owner-scoped tag its provider serves, so a stored owner record is not by
-/// itself an answer about one capability — the query decodes the descriptor and
-/// asks. Read-only over already-ingest-verified bytes: a descriptor that fails
-/// to decode simply declares nothing (it can no longer be a security decision,
-/// having already passed ingest).
-pub(crate) fn descriptor_declares_capability(
-    descriptor: &[u8],
-    capability: &CapabilityAuthorityId,
-) -> bool {
+/// An owner envelope legitimately carries EVERY owner-scoped tag its provider
+/// serves, so a stored owner record is not by itself an answer about one
+/// capability — the descriptor must be decoded and each tag mapped to its
+/// capability-authority id. This is the exact
+/// [`CapabilitySet::from_bytes`] decode and per-tag
+/// [`CapabilityAuthorityId::for_tag`] derivation the owner-plane query performed
+/// per record before OLB-2A, so an indexed bucket lookup admits precisely the
+/// records a per-query descriptor decode would have. Read-only over
+/// already-ingest-verified bytes: a descriptor that fails to decode declares
+/// nothing (owner descriptors are not validated for decodability at ingest —
+/// only granted descriptors are — so this is a "declares nothing" fallback,
+/// never a security decision). The result is deduplicated and returned in a
+/// stable order.
+pub(crate) fn decode_declared_capabilities(descriptor: &[u8]) -> Vec<CapabilityAuthorityId> {
     let Some(caps) = CapabilitySet::from_bytes(descriptor) else {
-        return false;
+        return Vec::new();
     };
     caps.tags
         .iter()
-        .any(|tag| &CapabilityAuthorityId::for_tag(&tag.to_string()) == capability)
+        .map(|tag| CapabilityAuthorityId::for_tag(&tag.to_string()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// A verified scoped capability with its declared capability-authority ids
+/// decoded ONCE and bound to it (Kyra OLB-2A.1 closure).
+///
+/// Only this module — which produced the [`VerifiedScopedCapability`] — can
+/// construct one, and the indexed store ingests it as a single object. So the
+/// descriptor decode happens BEFORE the ingest path's final security recheck
+/// (never between the recheck and the insert), and a stored row can never
+/// diverge from the index buckets built from its declarations: there is no way
+/// to hand the store a record and an independently-supplied declaration set.
+pub struct PreparedScopedCapability {
+    verified: VerifiedScopedCapability,
+    declarations: std::sync::Arc<[CapabilityAuthorityId]>,
+}
+
+impl PreparedScopedCapability {
+    /// Decode the verified record's declared capabilities once and bind them to
+    /// the record. This is the bounded descriptor work the ingest path performs
+    /// before its final recheck.
+    pub(crate) fn prepare(verified: VerifiedScopedCapability) -> Self {
+        let declarations = decode_declared_capabilities(verified.descriptor()).into();
+        Self {
+            verified,
+            declarations,
+        }
+    }
+
+    /// Consume into the verified record and its bound declarations, so the
+    /// indexed store installs both in one transaction.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        VerifiedScopedCapability,
+        std::sync::Arc<[CapabilityAuthorityId]>,
+    ) {
+        (self.verified, self.declarations)
+    }
 }
 
 fn descriptor_binds_grant_capability(
