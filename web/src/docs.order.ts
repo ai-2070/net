@@ -68,8 +68,14 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "artifacts",
       "errors",
     ],
-    // C exposes only the bus in its ABI — an honest two-page spine, not seven.
-    "sdk/c": ["quickstart", "errors"],
+    // C doesn't follow the announce/discover/invoke spine — it's ten headers
+    // across five libraries, so it's organised by boundary concern instead.
+    "sdk/c": [
+      "quickstart",
+      "headers-and-linking",
+      "memory-and-threading",
+      "errors",
+    ],
     "agent-briefs": [
       "wrap-and-use-an-mcp-server",
       "build-a-recoverable-capability",
