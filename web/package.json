@@ -9,8 +9,10 @@
     "start": "npx next start",
     "prettier": "npx prettier --write .",
     "check:docs": "node scripts/check-doc-links.mjs",
+    "sync:releases": "node scripts/sync-releases.mjs",
+    "check:releases": "node scripts/sync-releases.mjs --check",
     "check:types": "npx tsc --noEmit",
-    "check": "npm run check:docs && npm run check:types && npx next lint",
+    "check": "npm run check:docs && npm run check:releases && npm run check:types",
     "analyze": "cross-env ANALYZE=true npm run build",
     "analyze:server": "npx cross-env BUNDLE_ANALYZE=server next build",
     "analyze:browser": "npx cross-env BUNDLE_ANALYZE=browser next build"

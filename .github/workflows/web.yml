@@ -40,18 +40,28 @@ jobs:
       - name: Check doc links
         run: npm run check:docs
 
+      # The site's release notes are generated from the crate's copy. If
+      # someone edits one and not the other, this is what says so.
+      - name: Check release notes are in sync
+        run: npm run check:releases
+
       - name: Typecheck
         run: npm run check:types
 
-      - name: Lint
-        run: npx next lint
-
-      # No `prettier --check` step. `npm run prettier` exists but has never
-      # been enforced, and 119 files under web/ (source and content alike)
-      # are currently unformatted. Turning the gate on means reformatting
-      # all of them — a decision worth making on its own, not as a
-      # side effect of the first workflow that happens to touch this
-      # directory. Until then a check step would fail every run.
+      # No lint or format step, and both omissions are deliberate:
+      #
+      #   - ESLint is currently broken repo-wide. `eslint-plugin-react`
+      #     (via eslint-config-next) crashes under ESLint 10 with
+      #     "contextOrFilename.getFilename is not a function" on every
+      #     file. `next lint` is also gone in Next 16.
+      #   - `prettier --check` fails on 119 files under web/, source and
+      #     content alike; `npm run prettier` exists but has never been
+      #     enforced.
+      #
+      # Both are worth fixing, and both mean touching files far outside
+      # the docs — so they're their own change, not a silent side effect
+      # of the first workflow to cover this directory. Adding a step that
+      # fails every run would just train people to ignore it.
 
   build:
     name: Build
