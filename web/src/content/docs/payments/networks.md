@@ -33,7 +33,7 @@ shipped."** As of this writing:
 
 Enabling a real network for a deployment means: list it in the spend policy's
 `allowed_networks`, wire a facilitator config pack, provide an
-[`ExternalSigner`](./non-custodial-signing), and — to serve above `observed` —
+[`ExternalSigner`](/docs/payments/non-custodial-signing), and — to serve above `observed` —
 have a chain checker for it. The registry is the asset allowlist; it is not the
 enablement switch.
 

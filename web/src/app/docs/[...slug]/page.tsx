@@ -11,10 +11,7 @@ import {
 } from "@/lib/docs";
 import { DocsContent } from "@/components/DocsContent";
 import { DocsToc } from "@/components/DocsToc";
-import {
-  DocsPrevNextTop,
-  DocsPrevNextBottom,
-} from "@/components/DocsPrevNext";
+import { DocsPrevNextTop, DocsPrevNextBottom } from "@/components/DocsPrevNext";
 
 interface PageProps {
   params: Promise<{ slug: string[] }>;
@@ -261,7 +258,11 @@ export default async function DocPage({ params }: PageProps) {
           })}
         </div>
         <DocsPrevNextTop prev={prev} next={next} />
-        <DocsContent source={source} format={resolved.file.ext} />
+        <DocsContent
+          source={source}
+          format={resolved.file.ext}
+          baseDir={resolved.file.slug.slice(0, -1)}
+        />
         <DocsPrevNextBottom prev={prev} next={next} />
       </main>
       <TocRail entries={toc} />

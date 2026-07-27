@@ -1,6 +1,6 @@
 # Organizations
 
-[Identity](./identity) answers *who is this entity*. Permission tokens answer *what is this entity allowed to do on a channel*. Organizations answer a third question that neither one can: **which company is this caller acting for, and did my company authorize them?**
+[Identity](/docs/concepts/identity) answers *who is this entity*. Permission tokens answer *what is this entity allowed to do on a channel*. Organizations answer a third question that neither one can: **which company is this caller acting for, and did my company authorize them?**
 
 That distinction matters as soon as a mesh spans more than one commercial party. A partner's inference service, a customer's data plane, and your own internal tooling can all be peers on the same mesh, but "peer on the mesh" is not "may call my billing service." An organization is the unit of authority that closes that gap — and unlike every other authorization surface in Net, it governs *visibility* as well as access.
 

@@ -325,6 +325,70 @@ const headingClasses = {
   base: "group [&_.anchor]:opacity-0 hover:[&_.anchor]:opacity-100 focus-within:[&_.anchor]:opacity-100",
 };
 
+const LINK_CLASS =
+  "text-accent underline decoration-accent-dim underline-offset-[3px] hover:text-ink";
+
+// Resolve a `./`- or `../`-relative markdown href the way its author meant
+// it: against the directory the *file* lives in, not against the URL the
+// page happens to render at. Those differ for folder READMEs —
+// `start/README.md` renders at `/docs/start`, so the browser would resolve
+// `./quickstart` to `/docs/quickstart` and 404. `check-doc-links` rejects
+// relative hrefs outright; this is the runtime backstop for anything that
+// slips in, and it keeps such links in-app instead of opening a new tab.
+function resolveRelativeHref(href: string, baseDir: readonly string[]): string {
+  const [target, frag] = href.split("#");
+  const segments = [...baseDir];
+  for (const part of target.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") segments.pop();
+    else segments.push(part.replace(/\.mdx?$/, ""));
+  }
+  const path = segments.join("/");
+  return `/docs${path ? `/${path}` : ""}${frag ? `#${frag}` : ""}`;
+}
+
+function makeAnchor(baseDir: readonly string[] = []) {
+  return function Anchor(props: AnchorHTMLAttributes<HTMLAnchorElement>) {
+    const href = props.href ?? "";
+
+    // Heading anchor link from rehype-autolink-headings.
+    if (hasAnchorClass(props.className)) {
+      return (
+        <a
+          {...props}
+          className="anchor ml-2 text-ink-faint hover:text-accent transition-opacity no-underline font-mono align-middle"
+          aria-label="Anchor"
+        >
+          #
+        </a>
+      );
+    }
+
+    if (href.startsWith("/") || href.startsWith("#")) {
+      return (
+        <Link href={href} className={LINK_CLASS}>
+          {props.children}
+        </Link>
+      );
+    }
+    if (href.startsWith("./") || href.startsWith("../")) {
+      return (
+        <Link href={resolveRelativeHref(href, baseDir)} className={LINK_CLASS}>
+          {props.children}
+        </Link>
+      );
+    }
+    return (
+      <a
+        {...props}
+        target="_blank"
+        rel="noopener noreferrer"
+        className={LINK_CLASS}
+      />
+    );
+  };
+}
+
 const mdxComponents = {
   // Heading hierarchy
   // - H1: site's signature display font (Major Mono Display) at a small
@@ -466,42 +530,7 @@ const mdxComponents = {
     );
   },
 
-  a: (props: AnchorHTMLAttributes<HTMLAnchorElement>) => {
-    const href = props.href ?? "";
-
-    // Heading anchor link from rehype-autolink-headings.
-    if (hasAnchorClass(props.className)) {
-      return (
-        <a
-          {...props}
-          className="anchor ml-2 text-ink-faint hover:text-accent transition-opacity no-underline font-mono align-middle"
-          aria-label="Anchor"
-        >
-          #
-        </a>
-      );
-    }
-
-    const isInternal = href.startsWith("/") || href.startsWith("#");
-    if (isInternal) {
-      return (
-        <Link
-          href={href}
-          className="text-accent underline decoration-accent-dim underline-offset-[3px] hover:text-ink"
-        >
-          {props.children}
-        </Link>
-      );
-    }
-    return (
-      <a
-        {...props}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="text-accent underline decoration-accent-dim underline-offset-[3px] hover:text-ink"
-      />
-    );
-  },
+  a: makeAnchor(),
 
   table: (props: { children?: ReactNode }) => (
     <div className="overflow-x-auto my-6 border border-line bg-bg-2/30">
@@ -585,10 +614,17 @@ const mdxComponents = {
 export function DocsContent({
   source,
   format = "md",
+  baseDir,
 }: {
   source: string;
   format?: "md" | "mdx";
+  /** Directory the source file lives in, as slug segments — used to resolve
+   *  any relative link the author left behind. */
+  baseDir?: readonly string[];
 }) {
+  const components = baseDir?.length
+    ? { ...mdxComponents, a: makeAnchor(baseDir) }
+    : mdxComponents;
   return (
     <article className="docs-content">
       <MDXRemote
@@ -614,7 +650,7 @@ export function DocsContent({
             ],
           },
         }}
-        components={mdxComponents}
+        components={components}
       />
     </article>
   );

@@ -2,7 +2,7 @@
 
 This page gets you from zero to a working event bus in about five minutes. We'll start a bus on a single process, publish a few events, consume them back, and then point at what changes when you want the same code to run across a real mesh.
 
-The examples are in Rust because the core crate is Rust, but the same surface exists for [Node, Python, and Go](./install). If you're working in one of those bindings, swap the import line and the syntax — the call shapes match.
+The examples are in Rust because the core crate is Rust, but the same surface exists for [Node, Python, and Go](/docs/start/install). If you're working in one of those bindings, swap the import line and the syntax — the call shapes match.
 
 ## Install
 
@@ -56,7 +56,7 @@ let request = ConsumeRequest::new(100)
 let response = bus.poll(request).await?;
 ```
 
-The filter DSL covers existence, equality, numeric comparisons, string matching, and semver — the full grammar lives in the [filter reference](../reference/filter-dsl).
+The filter DSL covers existence, equality, numeric comparisons, string matching, and semver — the full grammar lives in the [filter reference](/docs/reference/filter-dsl).
 
 ## Switch to the mesh
 

@@ -25,7 +25,7 @@ db.tasks().state().read().count_where(&filter);
 db.memories().watch().where_tag("important").stream();
 ```
 
-The builder ships exactly these two models. A custom fold isn't registered through the builder — you drive it with a `CortexAdapter` directly (see the [CortEX guide](./cortex-folds)) and manage its handle alongside the NetDB.
+The builder ships exactly these two models. A custom fold isn't registered through the builder — you drive it with a `CortexAdapter` directly (see the [CortEX guide](/docs/guides/cortex-folds)) and manage its handle alongside the NetDB.
 
 ## Queries
 

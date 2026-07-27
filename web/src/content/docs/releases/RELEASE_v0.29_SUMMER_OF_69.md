@@ -6,7 +6,7 @@
 
 The continuous-rebalance arm — Phase D-1's `diff_scheduler` — has shipped for releases: a pure function over `MeshOsState` that evicts the worst sub-floor holder of a led chain when a better alternative clears the hysteresis gap and the chain is off cooldown, two-stage (evict → Phase C refills). It worked. It was also a **polling wall**: every reconcile tick it called the installed scorer's `score()` for every holder of every led chain, *inside* the pure reconcile pass, whether or not anything had moved. On a stable mesh of N led chains that is N pointless capability evaluations per tick, forever.
 
-v0.29 turns that arm into a drift scorer: history-aware, cost-aware, and — in the common case — almost free. It is the [drift-scorer implementation plan](../plans/MESH_SCHEDULER_IMPL_PLAN.md) Phases 0–3 landed onto the **as-built** MeshOS reconcile architecture, not a notional standalone daemon. One branch, ~20 commits, ~1.5K lines of new Rust and tests, entirely inside the MeshOS reconcile arm.
+v0.29 turns that arm into a drift scorer: history-aware, cost-aware, and — in the common case — almost free. It is the [drift-scorer implementation plan](https://github.com/ai-2070/net/blob/master/net/crates/net/docs/plans/MESH_SCHEDULER_IMPL_PLAN.md) Phases 0–3 landed onto the **as-built** MeshOS reconcile architecture, not a notional standalone daemon. One branch, ~20 commits, ~1.5K lines of new Rust and tests, entirely inside the MeshOS reconcile arm.
 
 The organizing observation is the one that has shaped every release since the substrate stopped being a prototype: **the hard parts already existed — the work was a control loop over them, not new infrastructure.** The `PlacementScorer` trait, the two-stage evict→refill, the `last_rebalance` cooldown, the capability-fold `generation` counter that already ticks when a node's tags change, the type-enforced migration veto — all shipped already. v0.29 is the loop that decides *when to sample, what to remember, and whether a move is worth its cost*. No new fold, no new transport, no `Instant::now()` in the fold.
 
@@ -69,7 +69,7 @@ New public surface: `MigrationCost`, `MigrationCostModel`, plus the defaulted `m
 
 ## The hardening pass — what the drift-scorer review forced
 
-A [dedicated code review](../misc/CODE_REVIEW_2026_06_27_MESH_SCHEDULER_DRIFT_SCORER.md) of the landed drift scorer found the gaps between the plan and the shipped code: **1 Critical, 5 Important, 7 Nit.** The pure cores were solid — the snapshot/decision split is deterministic, the dirty fold is stable, the backstop cadence is correct. The findings clustered where a multiplicative default silently neutered a feature, where a cross-tick staleness window met a live query, and where tests asserted things that were structurally guaranteed regardless of the code under test. Every one is fixed on the branch with a regression test; the full crate lib suite (4,529 tests) and clippy are green.
+A [dedicated code review](https://github.com/ai-2070/net/blob/master/net/crates/net/docs/misc/CODE_REVIEW_2026_06_27_MESH_SCHEDULER_DRIFT_SCORER.md) of the landed drift scorer found the gaps between the plan and the shipped code: **1 Critical, 5 Important, 7 Nit.** The pure cores were solid — the snapshot/decision split is deterministic, the dirty fold is stable, the backstop cadence is correct. The findings clustered where a multiplicative default silently neutered a feature, where a cross-tick staleness window met a live query, and where tests asserted things that were structurally guaranteed regardless of the code under test. Every one is fixed on the branch with a regression test; the full crate lib suite (4,529 tests) and clippy are green.
 
 **The Phase 3 gate was dead on arrival (Critical).** `MigrationCost.reliability_factor` is a *multiplier* in `score_equivalent`, but a derived `Default` made it `0.0` — so any cost built via the documented `..Default::default()` idiom collapsed to zero and the net-benefit gate never vetoed anything. The whole shipped Phase 3 feature was a silent no-op for any caller that didn't explicitly set the weight, and the two passing tests dodged it by hard-coding `1.0`. A hand-written `Default` now sets the neutral `1.0`, and `score_equivalent` clamps a non-positive or non-finite weight to `1.0` so a real migration always carries its transfer + disruption cost.
 
@@ -131,4 +131,4 @@ Released 2026-06-27.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

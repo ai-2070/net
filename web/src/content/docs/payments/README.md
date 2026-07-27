@@ -16,24 +16,24 @@ opaque reference plus a commitment, never the record itself.
 
 Net Payments does **not** custody funds, process payments, issue invoices,
 determine taxes, or clear transactions. If you're looking for a payment
-processor, this isn't one — and [that's the point](./what-net-payments-is).
+processor, this isn't one — and [that's the point](/docs/payments/what-net-payments-is).
 
 **You don't need an HTTP server.** Net-native paid capabilities are announced and
 invoked over the mesh (nRPC); the x402 payment material rides as opaque preserved
 bytes inside the invocation. HTTP 402 is an adapter path for web APIs, not a
-requirement for Net providers ([x402 and Net](./x402-and-net)).
+requirement for Net providers ([x402 and Net](/docs/payments/x402-and-net)).
 
 ## Start here
 
-- [What Net Payments is (and is not)](./what-net-payments-is)
-- [x402 and Net](./x402-and-net) — the payment wire, and what Net wraps around it
-- [The lifecycle](./the-lifecycle) — quote → verify → settle → serve → bill
-- [Verification tiers](./verification-tiers) — `observed | confirmed(n) | final`
-- [Spend policy & approvals](./spend-policy-and-approvals)
-- [Non-custodial signing](./non-custodial-signing)
-- [Networks](./networks) — config, not code
-- [The failure schematic](./failure-schematic) — machine-actionable denials
-- [Billing](./billing)
+- [What Net Payments is (and is not)](/docs/payments/what-net-payments-is)
+- [x402 and Net](/docs/payments/x402-and-net) — the payment wire, and what Net wraps around it
+- [The lifecycle](/docs/payments/the-lifecycle) — quote → verify → settle → serve → bill
+- [Verification tiers](/docs/payments/verification-tiers) — `observed | confirmed(n) | final`
+- [Spend policy & approvals](/docs/payments/spend-policy-and-approvals)
+- [Non-custodial signing](/docs/payments/non-custodial-signing)
+- [Networks](/docs/payments/networks) — config, not code
+- [The failure schematic](/docs/payments/failure-schematic) — machine-actionable denials
+- [Billing](/docs/payments/billing)
 
 ## The object model at a glance
 
@@ -48,4 +48,4 @@ byte encoding, and each carries references and commitments — never customer da
 | `net.payment.verification@1` | a tiered verification result (see below) |
 | `net.billing.event@1` | an immutable usage record |
 
-The [lifecycle](./the-lifecycle) walks these in order.
+The [lifecycle](/docs/payments/the-lifecycle) walks these in order.

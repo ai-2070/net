@@ -113,7 +113,7 @@ let request = ConsumeRequest::new(100).filter(filter);
 
 The path syntax is dot-separated (`"error.stack.0"`) and supports numeric segments for array indexing. The value side of an equality is any JSON value — strings, numbers, booleans, nested objects — and is compared by structural equality.
 
-Filters serialize as JSON, so the same filter can travel as a subscription parameter or as an nRPC `net-where` header without leaving your Rust code. For the exact grammar, see [filter-dsl reference](../reference/filter-dsl).
+Filters serialize as JSON, so the same filter can travel as a subscription parameter or as an nRPC `net-where` header without leaving your Rust code. For the exact grammar, see [filter-dsl reference](/docs/reference/filter-dsl).
 
 ## Targeting specific shards
 

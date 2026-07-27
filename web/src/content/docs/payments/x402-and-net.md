@@ -48,9 +48,9 @@ around it:
 - **`net.settlement.ref@1`** — a reference to the settled on-chain transaction
   (the x402 settlement response, carried opaquely) plus the network and
   facilitator.
-- **`net.payment.verification@1`** — a [tiered](./verification-tiers)
+- **`net.payment.verification@1`** — a [tiered](/docs/payments/verification-tiers)
   verification result.
-- **`net.billing.event@1`** — an immutable [billing](./billing) record.
+- **`net.billing.event@1`** — an immutable [billing](/docs/payments/billing) record.
 
 Every envelope has exactly one **canonical byte encoding** (sorted keys, compact,
 integers only, floats rejected) and is signed by an entity's ed25519 key over

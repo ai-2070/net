@@ -6,6 +6,6 @@ Tutorials are longer than guides because they cover the whole arc. You'll read a
 
 The three tutorials here cover different parts of the surface:
 
-- **[Fleet telemetry](./fleet-telemetry)** — edge devices publishing to a hierarchical channel namespace, gateways scoping by subnet, a fold materializing aggregate metrics for an operator dashboard. Hits channels, subnets, capabilities, folds.
-- **[Distributed daemon with failover](./distributed-daemon)** — a stateful daemon running across a standby group, surviving a node failure by promoting a passive replica. Hits MeshDaemon, placement, standby groups, continuity.
-- **[Event-sourced service](./event-sourced-service)** — building a small service backed by RedEX, with a CortEX fold materializing the queryable view and snapshot/restore handling restarts. Hits the storage stack, queries, and snapshots.
+- **[Fleet telemetry](/docs/tutorials/fleet-telemetry)** — edge devices publishing to a hierarchical channel namespace, gateways scoping by subnet, a fold materializing aggregate metrics for an operator dashboard. Hits channels, subnets, capabilities, folds.
+- **[Distributed daemon with failover](/docs/tutorials/distributed-daemon)** — a stateful daemon running across a standby group, surviving a node failure by promoting a passive replica. Hits MeshDaemon, placement, standby groups, continuity.
+- **[Event-sourced service](/docs/tutorials/event-sourced-service)** — building a small service backed by RedEX, with a CortEX fold materializing the queryable view and snapshot/restore handling restarts. Hits the storage stack, queries, and snapshots.

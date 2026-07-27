@@ -33,17 +33,17 @@ compliance check, it's wrong.
    structures — they never replace, translate, or re-encode them.
 2. **Byte-preservation is law.** x402 documents ride as base64 of their original
    bytes; Net never re-serializes a received x402 doc. See [x402 and
-   Net](./x402-and-net).
+   Net](/docs/payments/x402-and-net).
 3. **Non-custodial by construction.** Identity keys are not settlement keys, and
    there is no raw-bytes signing path. See [Non-custodial
-   signing](./non-custodial-signing).
+   signing](/docs/payments/non-custodial-signing).
 4. **Verification is a tier, not a boolean.** A facilitator receipt is
    `observed`; depth and finality come from an independent on-chain check. See
-   [Verification tiers](./verification-tiers).
+   [Verification tiers](/docs/payments/verification-tiers).
 5. **The policy engine decides, not the model.** Spend policy runs before money
    leaves; handlers never see an unpaid call. See [Spend policy &
-   approvals](./spend-policy-and-approvals).
-6. **Enabling a network is config, not code.** See [Networks](./networks).
+   approvals](/docs/payments/spend-policy-and-approvals).
+6. **Enabling a network is config, not code.** See [Networks](/docs/payments/networks).
 
 ## The data boundary
 

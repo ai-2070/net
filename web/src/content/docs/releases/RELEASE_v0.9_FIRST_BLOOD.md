@@ -251,4 +251,4 @@ Released 2026-05-02.
 
 ## License
 
-See [LICENSE](../../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/LICENSE-APACHE).
