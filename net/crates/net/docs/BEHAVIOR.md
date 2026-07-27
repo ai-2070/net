@@ -322,22 +322,22 @@ diffs, metadata, schema, rules, context, load balancing, proximity, safety.
 The module has since grown several subsystems that are larger than that
 original core and are **not** described above. This table is the honest map.
 
-| Subsystem | Size | Documented in |
+| Subsystem | What it is | Documented in |
 |---|---|---|
-| `behavior/meshos/` | ~22.4k LOC | **Nowhere.** Cluster-behavior engine, daemon supervision, reconcile arm, drift scorer |
-| `behavior/org_*.rs` (14 files) | ~31.1k LOC | [`ORGANIZATIONS.md`](ORGANIZATIONS.md) |
-| `behavior/sensing/` | ~16.1k LOC | [`SENSING.md`](SENSING.md) |
-| `behavior/fold/` | ~13.3k LOC | Partly — multifold appears in [`STATE.md`](STATE.md) and [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) |
-| `behavior/meshdb/` | ~13.2k LOC | **Nowhere.** Federated query AST, planner, executor |
-| `behavior/aggregator/` | ~4.5k LOC | Partly — [`CAPABILITY_ENHANCEMENTS_USAGE.md`](CAPABILITY_ENHANCEMENTS_USAGE.md) |
-| `behavior/gang/` | ~3.5k LOC | Partly — [`SENSING.md`](SENSING.md); user-facing guide covers the claim protocol |
-| `behavior/lifecycle/` | ~2.1k LOC | **Nowhere.** |
-| `behavior/scheduler_bridge/` | ~2.0k LOC | **Nowhere.** |
-| `behavior/deck.rs` | ~4.2k LOC | Operator surface — see the Deck reference on the docs site |
-| `behavior/placement.rs` | ~3.7k LOC | [`COMPUTE.md`](COMPUTE.md) |
+| `behavior/org_*.rs` | Org identity, admission, private discovery, revocation | [`ORGANIZATIONS.md`](ORGANIZATIONS.md) |
+| `behavior/meshos/` | Cluster-behavior engine, daemon supervision, reconcile arm, drift scorer | **Nowhere** |
+| `behavior/sensing/` | Provider-free readiness interests, leader rendezvous, coalescing | [`SENSING.md`](SENSING.md) |
+| `behavior/fold/` | Multifold state aggregation | Partly — [`STATE.md`](STATE.md), [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) |
+| `behavior/meshdb/` | Federated query AST, planner, executor | **Nowhere** |
+| `behavior/aggregator/` | Aggregator registry and spawn RPC | Partly — [`CAPABILITY_ENHANCEMENTS_USAGE.md`](CAPABILITY_ENHANCEMENTS_USAGE.md) |
+| `behavior/gang/` | Atomic gang-claim of contended resources | Partly — [`SENSING.md`](SENSING.md); the claim protocol is on the docs site |
+| `behavior/lifecycle/` | Task lifecycle states and transitions | **Nowhere** |
+| `behavior/scheduler_bridge/` | Bridge between the scheduler and the reconcile arm | **Nowhere** |
+| `behavior/deck.rs` | Operator command surface | Deck reference on the docs site |
+| `behavior/placement.rs` | `StandardPlacement` scorer and custom filters | [`COMPUTE.md`](COMPUTE.md) |
 
-Roughly 40k LOC — MeshOS, MeshDB, lifecycle and the scheduler bridge — has no
-protocol-level doc. That is a gap, not a statement that those subsystems are
-unfinished; they ship, and the user-facing docs cover MeshDB and the Deck. It
-is recorded here so the next person doesn't have to rediscover it by reading
-the module tree.
+MeshOS, MeshDB, lifecycle and the scheduler bridge have no protocol-level doc
+at all — collectively a large fraction of the plane. That is a gap, not a
+statement that those subsystems are unfinished; they ship, and the user-facing
+docs cover MeshDB and the Deck. It is recorded here so the next person doesn't
+have to rediscover it by reading the module tree.

@@ -1,8 +1,8 @@
 # Organization Capability Auth
 
 Services that only an authorized organization may **discover or call** — and
-that are *invisible*, not merely refused, to everyone else. Roughly 31k LOC
-across fourteen `behavior/org_*.rs` modules.
+that are *invisible*, not merely refused, to everyone else. Implemented across
+the `behavior/org_*.rs` modules.
 
 Design plan and locked decisions:
 [`ORG_CAPABILITY_AUTH_PLAN.md`](../../../../docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md).
