@@ -149,6 +149,30 @@ if [[ ! -s "$OUTCOME" ]]; then
   exit 1
 fi
 
+# Snapshot each gateway's NAT state, BEFORE the EXIT trap tears the
+# namespaces down. This is the view the helper logs cannot provide: the
+# endpoints only see "I sent N keep-alives and received none", while the
+# question is what mapping the gateway actually installed for the punch
+# destination — specifically whether the public port it chose for the
+# peer-directed flow is the same one the peer was told to expect.
+#
+# The trains keep refreshing these entries for the whole punch window
+# (UDP conntrack timeout is far longer than the 5 s deadline), so a
+# snapshot taken right after the verdict still shows them.
+for gw in nsim_gwa nsim_gwb; do
+  [[ -e "/var/run/netns/$gw" ]] || continue
+  {
+    echo "### conntrack ($gw)"
+    ip netns exec "$gw" conntrack -L 2>/dev/null \
+      || ip netns exec "$gw" cat /proc/net/nf_conntrack 2>/dev/null \
+      || echo "(no conntrack view available)"
+    echo "### nft ruleset ($gw)"
+    ip netns exec "$gw" nft list ruleset 2>&1 || true
+    echo "### addrs ($gw)"
+    ip -n "$gw" addr 2>&1 || true
+  } >"$STATE/${gw}_nat.log" 2>&1
+done
+
 # Open the artifacts read-only to non-root (no write bit anywhere)
 # so the invoking `cargo test` process can read the outcome path
 # printed below, and a human can inspect the helper logs.
