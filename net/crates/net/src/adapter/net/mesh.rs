@@ -9783,6 +9783,19 @@ impl MeshNode {
                 let Some(msg) = rendezvous::decode(&payload) else {
                     continue;
                 };
+                // Arrival log for the whole rendezvous subprotocol.
+                // Every other log on these paths sits on a *drop*
+                // branch, so a punch that simply never got its
+                // messages was indistinguishable from one whose
+                // messages were rejected — both produced total
+                // silence. This line is what separates "the
+                // introduce never arrived" from "it arrived and we
+                // dropped it"; the drop branches then say why.
+                tracing::debug!(
+                    from = format!("{:#x}", from_node),
+                    msg = msg.kind_str(),
+                    "rendezvous: message received"
+                );
                 match msg {
                     rendezvous::RendezvousMsg::PunchRequest(req) => {
                         Self::handle_punch_request(from_node, req, ctx);
@@ -15519,6 +15532,22 @@ impl MeshNode {
             return;
         }
 
+        // The mediation itself, logged before the two sends. A
+        // coordinator that reaches this point has committed to
+        // introducing both ends; if the responder never reacts, this
+        // line is what proves the introduce was actually addressed to
+        // it and with which reflex.
+        tracing::debug!(
+            requester = format!("{:#x}", from_node),
+            target = format!("{:#x}", req.target),
+            a_reflex = %a_reflex,
+            b_reflex = %b_reflex,
+            a_addr = %a_addr,
+            b_addr = %b_addr,
+            fire_at_ms,
+            "rendezvous: mediating punch, introducing both ends"
+        );
+
         let socket_a = ctx.socket.clone();
         let socket_b = ctx.socket.clone();
         tokio::spawn(async move {
@@ -15537,7 +15566,11 @@ impl MeshNode {
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            let _ = socket_a.send_to(&packet, a_addr).await;
+            // A discarded send error here used to be indistinguishable
+            // from a delivered introduce.
+            if let Err(e) = socket_a.send_to(&packet, a_addr).await {
+                tracing::debug!(dest = %a_addr, error = %e, "rendezvous: introduce send to requester failed");
+            }
         });
         tokio::spawn(async move {
             let pool = b_session.thread_local_pool();
@@ -15555,7 +15588,9 @@ impl MeshNode {
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            let _ = socket_b.send_to(&packet, b_addr).await;
+            if let Err(e) = socket_b.send_to(&packet, b_addr).await {
+                tracing::debug!(dest = %b_addr, error = %e, "rendezvous: introduce send to target failed");
+            }
         });
     }
 
@@ -15722,6 +15757,19 @@ impl MeshNode {
         ctx.punch_observers
             .insert(intro.peer_reflex, (intro.peer, obs_tx));
 
+        // What this node is now waiting for. Paired with the
+        // observer-miss log in the receive loop, this pins down the
+        // "train arrived from an address other than the reflex the
+        // coordinator named" case: compare `observing` here against
+        // the `source` reported there.
+        tracing::debug!(
+            counterpart = format!("{:#x}", intro.peer),
+            observing = %intro.peer_reflex,
+            coordinator = format!("{:#x}", coordinator_node_id),
+            fire_at_ms = intro.fire_at_ms,
+            "rendezvous: punch scheduled; arming observer and starting keep-alive train"
+        );
+
         // Compute keep-alive send delays. `fire_at_ms` is a Unix
         // epoch millisecond value synthesized by R; the lead is
         // `fire_at - now`, clamped to `punch_deadline`. See
@@ -15763,12 +15811,32 @@ impl MeshNode {
         });
         tokio::spawn(async move {
             let start = tokio::time::Instant::now();
+            // Count sends and surface the first error. A train that
+            // cannot leave the host (no route inside the namespace,
+            // EPERM from a filter hook) is otherwise silent, and looks
+            // exactly like a train the peer's NAT dropped.
+            let mut sent = 0u32;
+            let mut first_err: Option<String> = None;
             for offset in offsets {
                 tokio::time::sleep_until(start + offset).await;
-                let _ = socket_send
+                match socket_send
                     .send_to(&keepalive_payload[..], peer_reflex)
-                    .await;
+                    .await
+                {
+                    Ok(_) => sent += 1,
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e.to_string());
+                        }
+                    }
+                }
             }
+            tracing::debug!(
+                dest = %peer_reflex,
+                opener_sent = sent,
+                error = ?first_err,
+                "rendezvous: keep-alive opener burst complete"
+            );
             // Sustain the train for the rest of the punch window. The
             // §3 burst above is only a 250 ms opener; a real cone NAT
             // often needs repeated keep-alives to latch, because the
@@ -15811,8 +15879,19 @@ impl MeshNode {
             // burn the attempt — a later valid keep-alive still fires.
             if !await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await
             {
+                tracing::debug!(
+                    counterpart = format!("{:#x}", peer),
+                    observing = %peer_reflex,
+                    "rendezvous: observer gave up — no valid keep-alive from the \
+                     counterpart within punch_deadline; no ack will be sent"
+                );
                 return;
             }
+            tracing::debug!(
+                counterpart = format!("{:#x}", peer),
+                observing = %peer_reflex,
+                "rendezvous: observer fired — counterpart's keep-alive arrived, sending ack"
+            );
             // Observer fired — build + send the ack via the
             // coordinator session, same shape as the former
             // `send_punch_ack_via` helper.
@@ -15837,7 +15916,9 @@ impl MeshNode {
                 PacketFlags::NONE,
                 super::traversal::SUBPROTOCOL_RENDEZVOUS,
             );
-            let _ = socket_ack.send_to(&packet, coord_addr).await;
+            if let Err(e) = socket_ack.send_to(&packet, coord_addr).await {
+                tracing::debug!(dest = %coord_addr, error = %e, "rendezvous: ack send to coordinator failed");
+            }
         });
     }
 

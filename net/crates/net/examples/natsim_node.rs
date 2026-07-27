@@ -524,12 +524,28 @@ mod natsim {
     /// share the stream.
     fn init_tracing() {
         use tracing_subscriber::{fmt, EnvFilter};
+        let raw = std::env::var("RUST_LOG").unwrap_or_default();
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+        let rendered = filter.to_string();
         let _ = fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
             .with_target(true)
             .try_init();
+        // Announce the filter actually in force, and prove the enabled
+        // level by emitting one line at each of debug and trace.
+        // Otherwise a log with no TRACE lines is ambiguous between "the
+        // filter was too coarse" and "no trace-level code path ran" —
+        // an ambiguity that cost a CI round here.
+        eprintln!("natsim_node: RUST_LOG={raw:?} effective_filter={rendered:?}");
+        // Emit under the *library's* target prefix, not this example's.
+        // A filter like `net::adapter::net=trace` doesn't match
+        // `natsim_node`, so self-test lines logged under the default
+        // target would stay silent even when the mesh code is at trace
+        // — proving nothing. These two say exactly which levels are
+        // live for the target the rendezvous code logs under.
+        tracing::debug!(target: "net::adapter::net::selftest", "natsim_node: debug enabled");
+        tracing::trace!(target: "net::adapter::net::selftest", "natsim_node: trace enabled");
     }
 
     pub fn main() {
