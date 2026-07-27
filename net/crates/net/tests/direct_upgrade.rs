@@ -528,6 +528,122 @@ async fn symmetric_pair_defers_on_the_long_recheck() {
     );
 }
 
+/// A local NAT reclassification re-arms the upgrade throttle: every
+/// pair action is a function of the local class, so a change invalidates
+/// every cached outcome. Without this the peer waits out a window sized
+/// for the old classification — up to the 5 min `SkipPunch` re-check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_reclassification_rearms_the_upgrade_throttle() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, r, b, _x) = upgrade_topology().await;
+    // No reflex exchange → the Direct arm has no target, so the attempt
+    // fails immediately and banks a backoff.
+    a.reclassify_nat().await;
+    establish_relay_session(&a, &r, &b).await;
+    let b_id = b.node_id();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    a.attempt_direct_upgrade_for_test(b_id).await;
+    assert_eq!(
+        a.upgrade_failure_count_for_test(b_id),
+        Some(1),
+        "precondition: the failed attempt banked a backoff",
+    );
+    assert!(
+        a.upgrade_next_eligible_in_for_test(b_id) > Some(Duration::from_secs(1)),
+        "precondition: the throttle window is open for seconds",
+    );
+
+    // Localhost classifies Open; move to a genuinely different class.
+    a.force_nat_class_for_test(NatClass::Cone);
+
+    assert_eq!(
+        a.upgrade_failure_count_for_test(b_id),
+        Some(0),
+        "a reclassification must clear the failure count",
+    );
+    assert_eq!(
+        a.upgrade_next_eligible_in_for_test(b_id),
+        Some(Duration::ZERO),
+        "a reclassification must reopen the throttle window immediately",
+    );
+    assert!(
+        a.upgrade_try_acquire_for_test(b_id).is_some(),
+        "the peer should be immediately attemptable again",
+    );
+}
+
+/// The reset fires only on an *actual* class change. The periodic
+/// classify loop commits on every tick (60 s default); resetting
+/// unconditionally would wipe the failure counter that often and cap a
+/// pathological pair's retry interval at 60 s forever, defeating the
+/// exponential backoff entirely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclassification_to_the_same_class_leaves_the_backoff_intact() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, r, b, _x) = upgrade_topology().await;
+    a.reclassify_nat().await;
+    establish_relay_session(&a, &r, &b).await;
+    let b_id = b.node_id();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    a.attempt_direct_upgrade_for_test(b_id).await;
+    a.attempt_direct_upgrade_for_test(b_id).await;
+    assert_eq!(
+        a.upgrade_failure_count_for_test(b_id),
+        Some(2),
+        "precondition: two failures banked",
+    );
+
+    // Re-publish the class the node already holds — a no-change commit,
+    // which is what every steady-state classify tick is.
+    assert_eq!(a.nat_class(), NatClass::Open, "localhost classifies Open");
+    a.force_nat_class_for_test(NatClass::Open);
+
+    assert_eq!(
+        a.upgrade_failure_count_for_test(b_id),
+        Some(2),
+        "an unchanged classification must not reset the backoff",
+    );
+    assert!(
+        a.upgrade_next_eligible_in_for_test(b_id) > Some(Duration::from_secs(1)),
+        "an unchanged classification must not reopen the throttle window",
+    );
+}
+
+/// The reset must not clear `in_flight`. An attempt that is running
+/// right now still owns its slot; releasing it here would let the scan
+/// loop spawn the duplicate that `UpgradeAttemptGuard` exists to
+/// prevent — a reclassification is exactly the kind of event that can
+/// land mid-attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclassification_does_not_release_an_in_flight_attempt() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, r, b, _x) = upgrade_topology().await;
+    a.reclassify_nat().await;
+    establish_relay_session(&a, &r, &b).await;
+    let b_id = b.node_id();
+
+    let guard = a
+        .upgrade_try_acquire_for_test(b_id)
+        .expect("first acquire should win the slot");
+
+    a.force_nat_class_for_test(NatClass::Cone);
+
+    assert!(
+        a.upgrade_try_acquire_for_test(b_id).is_none(),
+        "a reclassification must not release a running attempt's slot",
+    );
+    drop(guard);
+    assert!(
+        a.upgrade_try_acquire_for_test(b_id).is_some(),
+        "the slot is still released normally when the attempt finishes",
+    );
+}
+
 /// Review finding #3: the background upgrade loop holds only a Weak
 /// self-ref, so an `Arc<MeshNode>` dropped WITHOUT an explicit
 /// `shutdown()` still runs `Drop` (which sets `shutdown` and tears the

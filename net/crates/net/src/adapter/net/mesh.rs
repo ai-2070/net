@@ -20164,6 +20164,54 @@ impl MeshNode {
         })
     }
 
+    /// Publish `class` as this node's NAT classification, re-arming the
+    /// direct-path upgrade throttle if the class actually **changed**.
+    ///
+    /// Every pair action this node computes is a function of the local
+    /// class, so a reclassification invalidates every cached outcome:
+    /// a pair deferred as `SinglePunch` or `SkipPunch` may now be
+    /// `Direct`, and a backed-off pair may now succeed. Without this,
+    /// the peer waits out a window sized for the old classification —
+    /// up to the 5 min `SkipPunch` re-check.
+    ///
+    /// **Only on an actual change.** The periodic classify loop commits
+    /// on every tick (60 s default); resetting unconditionally would
+    /// wipe the failure counter that often and cap a pathological pair's
+    /// retry interval at 60 s forever, defeating the backoff. The
+    /// `swap` makes the compare-and-reset a single atomic step, so two
+    /// concurrent publishers can't both conclude "unchanged."
+    ///
+    /// `in_flight` is deliberately preserved: an attempt that is running
+    /// right now still owns its slot, and clearing it here would let the
+    /// scan loop spawn a duplicate — the failure mode
+    /// [`UpgradeAttemptGuard`] exists to prevent.
+    ///
+    /// No peer-side counterpart is needed. [`Self::peer_nat_class`] and
+    /// [`Self::peer_reflex_addr`] read through to the capability fold at
+    /// attempt time rather than caching, so a peer's re-announced class
+    /// is already visible to the next attempt; the only cost there is
+    /// waiting out the current window, which is now always bounded.
+    #[cfg(feature = "nat-traversal")]
+    fn publish_nat_class(&self, class: super::traversal::classify::NatClass) {
+        let prior = self
+            .nat_class
+            .swap(class.as_u8(), std::sync::atomic::Ordering::AcqRel);
+        if prior == class.as_u8() {
+            return;
+        }
+        tracing::debug!(
+            prior = ?super::traversal::classify::NatClass::from_u8(prior),
+            current = ?class,
+            "nat-traversal: local class changed, re-arming direct-path upgrades",
+        );
+        for mut entry in self.upgrade_cache.iter_mut() {
+            let e = entry.value_mut();
+            e.done = false;
+            e.failures = 0;
+            e.next_eligible = UpgradeInstant::now();
+        }
+    }
+
     /// Record a terminal outcome: the session is direct (or can't be
     /// upgraded) — stop attempting.
     #[cfg(feature = "nat-traversal")]
@@ -20945,10 +20993,7 @@ impl MeshNode {
         // stay lock-free.
         let _g = self.traversal_publish_mu.lock();
         self.reflex_addr.store(Some(Arc::new(external)));
-        self.nat_class.store(
-            super::traversal::classify::NatClass::Open.as_u8(),
-            Ordering::Release,
-        );
+        self.publish_nat_class(super::traversal::classify::NatClass::Open);
         self.reflex_override_active.store(true, Ordering::Release);
 
         // Reset the rate-limit floor so the next
@@ -21009,10 +21054,7 @@ impl MeshNode {
         // "no current observation" answer rather than the stale
         // override.
         self.reflex_addr.store(None);
-        self.nat_class.store(
-            super::traversal::classify::NatClass::Unknown.as_u8(),
-            Ordering::Release,
-        );
+        self.publish_nat_class(super::traversal::classify::NatClass::Unknown);
         // Same rate-limit reset as `set_reflex_override` — the
         // next `announce_capabilities` call broadcasts
         // unconditionally instead of coalescing against the
@@ -21104,7 +21146,11 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     #[doc(hidden)]
     pub fn force_nat_class_for_test(&self, class: super::traversal::classify::NatClass) {
-        self.nat_class.store(class.as_u8(), Ordering::Release);
+        // Routed through the same publisher as the classifier so a
+        // forced class re-arms the upgrade throttle exactly as a real
+        // reclassification would — otherwise tests would exercise a
+        // code path production never takes.
+        self.publish_nat_class(class);
     }
 
     /// Test / debug accessor for the most-recent local
@@ -21521,7 +21567,7 @@ impl MeshNode {
             );
             return;
         };
-        self.nat_class.store(class.as_u8(), Ordering::Release);
+        self.publish_nat_class(class);
         self.reflex_addr.store(Some(Arc::new(addr)));
         tracing::debug!(
             nat_class = ?class,
