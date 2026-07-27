@@ -156,7 +156,7 @@ perspective rather than the orchestrator's.
 
 | File | Purpose |
 |------|---------|
-| `continuity/chain.rs` | `ContinuityProof`, `ContinuityStatus`, proof verification |
+| `continuity/chain.rs` | `ContinuityProof`, `ContinuityStatus`, `ProofError`, proof verification |
 | `continuity/cone.rs` | `CausalCone`, `Causality`, horizon-based causal queries |
 | `continuity/discontinuity.rs` | `Discontinuity`, `ForkRecord`, `fork_entity()` |
 | `continuity/observation.rs` | `ObservationWindow`, `HorizonDivergence` |
