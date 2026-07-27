@@ -1,8 +1,10 @@
 # CODE REVIEW 2026-07-26 — Org Capability Load Balancing, pass 3 (`load-balancing`)
 
-> **STATUS: all findings ADDRESSED; the local closure run is EXECUTED at the
-> final exact head; the signature is still withheld on two items that are not
-> mine to certify.**
+> **STATUS: CLOSED AND SIGNED at `351f93480` (Kyra, 2026-07-27).** Every finding
+> addressed, the exact-head closure run executed, and the independent RED gate
+> discharged — including the three defects that gate found which the author's own
+> passes had not (see the two "Independent RED pass" sections and the
+> self-directed re-read below). OLB-2B.3 is authorized.
 >
 > Every finding in this document and in pass 2 has a landed fix and a witness —
 > see [Closure](#closure--every-finding-in-this-document-and-pass-2-is-now-addressed),
@@ -932,7 +934,11 @@ witnesses — but it means neither gate has slack: any deletion trips it
 immediately, which is the intended behaviour, and any addition must raise MIN in
 the same commit.
 
-### What is still owed before E3c / composed OLB-2B can be signed
+### What was still owed before E3c / composed OLB-2B could be signed
+
+*(SUPERSEDED — both items were discharged; see
+[Independent RED pass — final](#independent-red-pass--final-2026-07-27-signed).
+Kept for the sequence.)*
 
 The findings are closed and the local closure run is executed. Two items remain,
 and neither is dischargeable by the author of the fixes:
@@ -1138,3 +1144,49 @@ The floor witness acknowledged before the barrier instead of after a proven
 failed acquisition; the OLB-2C witnesses caught late publication and not early.
 For any ordering claim "A must happen before B", a witness that only observes
 after B is at best half a proof.
+
+---
+
+## Independent RED pass — FINAL, 2026-07-27, SIGNED
+
+Reviewed head: **`351f93480ccd75f04cee305b5c53d8ab401e8724`**. Every mutation
+selected exactly one test with zero retries and was reverted between runs; no
+broad local matrices were duplicated.
+
+| Mutation | Exact failure |
+|---|---|
+| Remove ONLY the settlement-refusal `mark_if_movement()`, preserving the pin-refusal call | leg 1 completed, then "the empty-selection SETTLE refusal must mark for the same reason" — proving both call sites independently, not just the shared helper |
+| Unchanged store: publish outside the epoch transaction | "an authority-only rotation must still be ONE routing epoch transaction: 0 means the authority was published outside the epoch entirely" (left 0, right 1) |
+| Unchanged store: publish BEFORE the advance | the epoch still advanced once, so the advance-count evidence could not catch it; the inverse-order witness failed at "the replacement authority was already visible BEFORE the epoch advance" |
+| Changed store: publish authority before `move_routing_authority` | same early-visibility assertion, on the other branch |
+
+Every reverted baseline passed. **Both directions are now independently closed on
+both branches: publication cannot be too late, and cannot be too early.**
+
+Focused closure: empty-selection 1/1; unchanged-store authority 1/1;
+changed-store authority 1/1; repaired floor-publication 1/1; routing wiring
+45/45; `git diff --check` clean. Exact-SHA CI: 45 checks, 44 success, 1 neutral
+(non-gating reviewer), 0 failures — unit, integration, Loom, coverage, clippy,
+fmt, docs, Windows security, Rust/Python/TS/Node/Go/FFI, MCP, NAT matrix. No
+review artifact, worktree or target remained.
+
+### Verdict
+
+**E3c SIGNED. OLB-2B SIGNED through the completed substrate. OLB-2B.2 SIGNED,
+including the OLB-2C publication half. OLB-2B.3 AUTHORIZED.** The
+E3c / OLB-2B.2 hold is lifted.
+
+### What the independent gate actually bought
+
+Three defects that the author's own passes did not find, each a witness that was
+green without proving its claim:
+
+1. the floor-publication witness acknowledged before the barrier instead of after
+   a proven failed acquisition (found by the gate);
+2. the OLB-2C unchanged-store branch had no witness at all (found by the gate);
+3. the publish-too-early direction was unwitnessed on both branches (found by a
+   self-directed re-read the gate's second finding prompted).
+
+All three share one shape — **half a proof**: a property verified in one
+direction with its inverse invisible. That is the durable lesson from this
+closure, and it is why the gate is a process requirement rather than a formality.

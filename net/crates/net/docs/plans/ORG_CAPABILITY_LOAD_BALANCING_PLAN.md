@@ -218,11 +218,22 @@ findings and four bounded corrections, all applied in this revision:
 candidate factoring is signed at `4dccb7767`. The bounded stop-and-review that
 gated OLB-2 has PASSED — see the implementation-status note above, which records
 the authorization and the OLB-2A slices that followed it. OLB-2A composed is
-signed at `65b9fe903`. OLB-2B (the supervised node-owned routing actor and its
-bounded registry) is MERGED TO MASTER at `80bb06b5a` (PR #655, 2026-07-27) and is
-STILL HELD pending the pass-2/pass-3 review closure recorded in
-[`OLB_2B_CONSUMER_ENTRY_DESIGN.md`](OLB_2B_CONSUMER_ENTRY_DESIGN.md); OLB-2C is
-not authorized until that closure signs.
+signed at `65b9fe903`. **OLB-2B composed (E1–E3c) and OLB-2B.2 — including the
+OLB-2C authority-publication half — are SIGNED by Kyra (2026-07-27) at
+`351f93480`, after a complete independent RED pass.** The E3c hold is LIFTED and
+**OLB-2B.3 is AUTHORIZED**; see
+[`OLB_2B_CONSUMER_ENTRY_DESIGN.md`](OLB_2B_CONSUMER_ENTRY_DESIGN.md) for the
+frozen boundary it must preserve.
+
+*(Open, deliberately not reconciled here: the sign-off also names `351f93480` as
+`SAFE_LIVE_HEAD`. That token is RESERVED by this plan (below) and twice by
+[`ORG_SENSING_LEADER_SUBSTRATE_PLAN.md`](ORG_SENSING_LEADER_SUBSTRATE_PLAN.md)
+for a separately reviewed provider-free leader lighting, which has not happened
+— `OrgCapabilityRegistration` is still dark and LS-1..LS-6 are unbuilt. Either
+the reservation is being retired deliberately, or the token was reused for what
+is really an OLB-2B signed head. Recorded as a question rather than resolved
+silently, because a plan whose process leans this hard on named heads cannot
+afford one name meaning two things.)*
 
 **Merged is not signed, and the distinction is load-bearing here.** The
 merge-tier findings were closed before merge exactly as the pass-3 adjudication

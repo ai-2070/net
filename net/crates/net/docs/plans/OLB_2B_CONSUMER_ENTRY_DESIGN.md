@@ -1,9 +1,14 @@
 # OLB-2B consumer entry — design for review (revision 2)
 
-**Status: ENTRY REVIEWED AND AUTHORIZED; E3a–E3c LANDED AND MERGED TO MASTER at
-`80bb06b5a`; phase sign-off STILL HELD — the pass-2/pass-3 findings are closed
-and the exact-head closure run is executed, but two non-self-certifiable items
-remain (see "What is still held").**
+**Status: SIGNED by Kyra 2026-07-27 at `351f93480`.** E3c SIGNED; OLB-2B SIGNED
+through the completed substrate; OLB-2B.2 SIGNED including the OLB-2C publication
+half; **OLB-2B.3 AUTHORIZED**. The hold recorded below is LIFTED — the section is
+kept for the sequence, not the state.
+
+The signature followed a complete independent RED pass that closed both
+directions of the authority-publication ordering on both branches, plus the
+settlement-leg empty-selection mutation, plus exact-SHA CI (45 checks, 44 success,
+1 non-gating neutral, 0 failures).
 
 Revision 1 (`84080310f`) was HELD: core direction approved, implementation NOT
 authorized. Revision 2 adopted every refinement from that review and recorded the
@@ -19,7 +24,8 @@ previously had a hole here: the document still read "no OLB-2B source
 implementation begins before that review" while the source it forbids was fully
 landed, and no in-tree record of the outcome existed.
 
-**What is still held.** Landing is not signing. Three adversarial branch reviews
+**What was still held** *(SUPERSEDED by the 2026-07-27 signature above; kept for
+the sequence)*. Landing is not signing. Three adversarial branch reviews
 followed the implementation —
 [2026-07-23](../misc/CODE_REVIEW_2026_07_23_ORG_LOAD_BALANCING.md),
 [pass 2](../misc/CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS2.md) and
