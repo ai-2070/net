@@ -42,6 +42,12 @@ use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+/// The direct-path upgrade's throttle clock. `tokio::time::Instant`
+/// (not `std::time::Instant`) so `tokio::time::pause()` advances the
+/// backoff windows in tests instead of forcing them to sleep in real
+/// time. Interchangeable API; under a live runtime it is the same clock.
+#[cfg(feature = "nat-traversal")]
+use tokio::time::Instant as UpgradeInstant;
 
 use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 use super::failure::{FailureDetector, FailureDetectorConfig, NodeStatus};
@@ -705,16 +711,132 @@ impl RendezvousBudgets {
 /// from re-punching on every scan: a failure backs off exponentially, a
 /// success stops further attempts (the session is now direct), and a
 /// busy-defer retries after a short delay.
+///
+/// `in_flight` — not a timed lease — is what makes "one attempt per
+/// peer" true. A timed lease has to guess an upper bound on the attempt,
+/// and the attempt's own worst case is `handshake_retries ×
+/// handshake_timeout` plus the inter-retry sleeps (15.3 s at the
+/// defaults) — longer than any lease short enough to be useful. An
+/// expired-but-still-running lease let the 1 s scan loop spawn a second
+/// attempt for the same peer, which fast-fails on the occupied
+/// `pending_handshakes` slot and records a *failure* against a peer
+/// whose real attempt is still alive: `failures` double-counts and the
+/// backoff escalates on a peer that is merely slow. The flag is
+/// acquired atomically under the shard write guard and released by
+/// [`UpgradeAttemptGuard`], so the window can't be mistimed.
+///
+/// Times are [`tokio::time::Instant`], not [`std::time::Instant`], so
+/// `tokio::time::pause()` advances the eligibility windows and the
+/// schedule is testable without sleeping through it.
 #[cfg(feature = "nat-traversal")]
 #[derive(Debug, Clone, Copy)]
 struct UpgradeCacheEntry {
     /// Earliest instant a fresh attempt is allowed.
-    next_eligible: Instant,
+    next_eligible: UpgradeInstant,
     /// Consecutive failures — drives the exponential backoff.
     failures: u32,
     /// Once a direct session is established there is nothing left to
     /// upgrade; stop attempting.
     done: bool,
+    /// An attempt is running right now. Set under the entry's write
+    /// guard by [`MeshNode::upgrade_try_acquire`], cleared on
+    /// [`UpgradeAttemptGuard`] drop.
+    in_flight: bool,
+}
+
+#[cfg(feature = "nat-traversal")]
+impl UpgradeCacheEntry {
+    /// A fresh entry: eligible now, no failures, not terminal, idle.
+    fn idle() -> Self {
+        Self {
+            next_eligible: UpgradeInstant::now(),
+            failures: 0,
+            done: false,
+            in_flight: false,
+        }
+    }
+}
+
+/// RAII in-flight marker for one peer's direct-path upgrade attempt.
+/// Held for the whole attempt (including every handshake retry) and
+/// dropped when it finishes — however it finishes, including a panic in
+/// the spawned attempt task.
+///
+/// Drop deliberately uses `get_mut` rather than `entry().or_insert`: if
+/// the peer was evicted mid-attempt (heartbeat sweep, which removes the
+/// cache entry), the guard must not resurrect an entry for a peer that
+/// is gone.
+#[cfg(feature = "nat-traversal")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct UpgradeAttemptGuard {
+    cache: Arc<DashMap<u64, UpgradeCacheEntry>>,
+    peer_id: u64,
+}
+
+#[cfg(feature = "nat-traversal")]
+impl Drop for UpgradeAttemptGuard {
+    fn drop(&mut self) {
+        if let Some(mut e) = self.cache.get_mut(&self.peer_id) {
+            e.in_flight = false;
+        }
+    }
+}
+
+/// Base unit of the direct-path upgrade's exponential backoff. The
+/// nominal delay after `n` consecutive failures is
+/// `BASE << min(n, MAX_SHIFT)` — so the *first* failure waits
+/// `BASE << 1` = 4 s, not 2 s (the counter is incremented before the
+/// shift). Documented rather than "fixed" because the 4 s floor is the
+/// behavior the schedule was tuned and reviewed against.
+#[cfg(feature = "nat-traversal")]
+const UPGRADE_BACKOFF_BASE: Duration = Duration::from_secs(2);
+
+/// Cap the backoff at `BASE << 5` = 64 s.
+#[cfg(feature = "nat-traversal")]
+const UPGRADE_BACKOFF_MAX_SHIFT: u32 = 5;
+
+/// Nominal (pre-jitter) backoff after `failures` consecutive failed
+/// upgrade attempts: 4 s, 8 s, 16 s, 32 s, then 64 s forever.
+#[cfg(feature = "nat-traversal")]
+fn upgrade_backoff(failures: u32) -> Duration {
+    UPGRADE_BACKOFF_BASE.saturating_mul(1u32 << failures.min(UPGRADE_BACKOFF_MAX_SHIFT))
+}
+
+/// Spread a retry deterministically over `[0.75 × base, base]`.
+///
+/// Without this, nodes that started together scan on the same 1 s
+/// cadence and retry failed upgrades in synchronized 4/8/16/32/64 s
+/// waves — every relayed pair in a co-started fleet re-handshaking at
+/// the same instants. The offset is derived from the node pair and the
+/// failure count, so it is stable across restarts (no RNG, no wall
+/// clock — both would break the paused-time tests) yet re-rolls on each
+/// retry, and different pairs land on different phases.
+///
+/// Jitter subtracts rather than adds so the documented ceiling stays
+/// exactly 64 s: a retry can land early, never later than nominal.
+#[cfg(feature = "nat-traversal")]
+fn upgrade_jitter(seed: u64, base: Duration) -> Duration {
+    // splitmix64 finalizer — cheap, well-distributed on adjacent seeds
+    // (node ids that differ in one bit must not share a phase).
+    let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    // Take 24 bits → fraction in [0, 1); shave off up to a quarter.
+    let frac = (z >> 40) as u128; // 0 ..= 2^24 - 1
+    let nanos = base.as_nanos();
+    let shave = nanos / 4 * frac / (1 << 24);
+    Duration::from_nanos((nanos - shave) as u64)
+}
+
+/// Jitter seed for one peer's `n`-th retry. Mixes both node ids so the
+/// two ends of a pair (and every other pair a node has) get distinct
+/// phases, and the failure count so successive retries don't stay in
+/// lockstep once two pairs happen to collide.
+#[cfg(feature = "nat-traversal")]
+fn upgrade_jitter_seed(node_id: u64, peer_id: u64, failures: u32) -> u64 {
+    node_id ^ peer_id.rotate_left(32) ^ (failures as u64).wrapping_mul(0x2545_f491_4f6c_dd1d)
 }
 
 /// RAII reservation for one global unsolicited-train slot. Holding it
@@ -20003,30 +20125,43 @@ impl MeshNode {
     // ── Background direct-path upgrade (Stage 3) ─────────────────────────
 
     /// `true` if a fresh upgrade attempt for `peer_id` is allowed right
-    /// now — no cache entry, or an entry that isn't `done` and whose
-    /// backoff/defer window has elapsed.
+    /// now — no cache entry, or an entry that isn't `done`, has no
+    /// attempt in flight, and whose backoff/defer window has elapsed.
+    ///
+    /// Advisory only: this is the scan loop's cheap read-side filter.
+    /// The binding decision is [`Self::upgrade_try_acquire`], which
+    /// re-tests the same predicate under the entry's write guard.
     #[cfg(feature = "nat-traversal")]
     fn upgrade_should_attempt(&self, peer_id: u64) -> bool {
         match self.upgrade_cache.get(&peer_id) {
             None => true,
-            Some(e) => !e.done && Instant::now() >= e.next_eligible,
+            Some(e) => !e.done && !e.in_flight && UpgradeInstant::now() >= e.next_eligible,
         }
     }
 
-    /// Lease an attempt: push `next_eligible` out so the scan loop won't
-    /// re-spawn a second attempt for this peer while one is in flight.
-    /// The attempt's outcome recorder overwrites this.
+    /// Claim the single in-flight attempt slot for `peer_id`, or return
+    /// `None` if another attempt holds it or the throttle window hasn't
+    /// elapsed. The check-and-set is atomic under the DashMap shard's
+    /// write guard, so two concurrent scan ticks can't both win.
+    ///
+    /// The returned guard releases the slot on drop — including when
+    /// the attempt task panics — so the slot can't leak and wedge a
+    /// peer on the relay path permanently.
     #[cfg(feature = "nat-traversal")]
-    fn upgrade_lease(&self, peer_id: u64, lease: Duration) {
+    fn upgrade_try_acquire(&self, peer_id: u64) -> Option<UpgradeAttemptGuard> {
         let mut e = self
             .upgrade_cache
             .entry(peer_id)
-            .or_insert(UpgradeCacheEntry {
-                next_eligible: Instant::now(),
-                failures: 0,
-                done: false,
-            });
-        e.next_eligible = Instant::now() + lease;
+            .or_insert(UpgradeCacheEntry::idle());
+        if e.done || e.in_flight || UpgradeInstant::now() < e.next_eligible {
+            return None;
+        }
+        e.in_flight = true;
+        drop(e);
+        Some(UpgradeAttemptGuard {
+            cache: self.upgrade_cache.clone(),
+            peer_id,
+        })
     }
 
     /// Record a terminal outcome: the session is direct (or can't be
@@ -20036,11 +20171,7 @@ impl MeshNode {
         let mut e = self
             .upgrade_cache
             .entry(peer_id)
-            .or_insert(UpgradeCacheEntry {
-                next_eligible: Instant::now(),
-                failures: 0,
-                done: false,
-            });
+            .or_insert(UpgradeCacheEntry::idle());
         e.done = true;
     }
 
@@ -20051,30 +20182,24 @@ impl MeshNode {
         let mut e = self
             .upgrade_cache
             .entry(peer_id)
-            .or_insert(UpgradeCacheEntry {
-                next_eligible: Instant::now(),
-                failures: 0,
-                done: false,
-            });
-        e.next_eligible = Instant::now() + delay;
+            .or_insert(UpgradeCacheEntry::idle());
+        e.next_eligible = UpgradeInstant::now() + delay;
     }
 
-    /// Record a failed attempt: exponential backoff on the retry.
+    /// Record a failed attempt: exponential backoff on the retry, with
+    /// deterministic per-peer jitter so co-started nodes don't retry in
+    /// synchronized waves. See [`upgrade_backoff`] / [`upgrade_jitter`].
     #[cfg(feature = "nat-traversal")]
     fn upgrade_record_failure(&self, peer_id: u64) {
-        const BASE: Duration = Duration::from_secs(2);
-        const MAX_SHIFT: u32 = 5; // cap backoff at BASE << 5 = 64 s
+        let node_id = self.node_id;
         let mut e = self
             .upgrade_cache
             .entry(peer_id)
-            .or_insert(UpgradeCacheEntry {
-                next_eligible: Instant::now(),
-                failures: 0,
-                done: false,
-            });
+            .or_insert(UpgradeCacheEntry::idle());
         e.failures = e.failures.saturating_add(1);
-        let backoff = BASE.saturating_mul(1u32 << e.failures.min(MAX_SHIFT));
-        e.next_eligible = Instant::now() + backoff;
+        let seed = upgrade_jitter_seed(node_id, peer_id, e.failures);
+        let backoff = upgrade_jitter(seed, upgrade_backoff(e.failures));
+        e.next_eligible = UpgradeInstant::now() + backoff;
     }
 
     /// Attempt a single background direct-path upgrade of a
@@ -20159,8 +20284,18 @@ impl MeshNode {
             // `SinglePunch` upgrades aren't wired yet, but the pair may
             // become `Direct` after a reclassification. Defer instead
             // of marking terminal so the scan revisits it.
+            // Jittered for the same reason as the failure backoff: in a
+            // fleet where most pairs classify `SinglePunch`, an
+            // unjittered constant re-checks every one of them on the
+            // same 30 s beat.
             PairAction::SinglePunch => {
-                self.upgrade_record_defer(peer_id, SINGLEPUNCH_RECHECK);
+                self.upgrade_record_defer(
+                    peer_id,
+                    upgrade_jitter(
+                        upgrade_jitter_seed(self.node_id, peer_id, 0),
+                        SINGLEPUNCH_RECHECK,
+                    ),
+                );
                 return;
             }
         };
@@ -20200,7 +20335,10 @@ impl MeshNode {
     /// synchronously, bypassing the background scan loop's timing so
     /// integration tests are deterministic under parallel load. The
     /// caller is responsible for the C1 lower-node-id check the loop
-    /// normally enforces.
+    /// normally enforces, and this deliberately does *not* claim the
+    /// in-flight slot ([`Self::upgrade_try_acquire`]) — a test driving
+    /// attempts by hand is already serializing them, and taking the
+    /// slot here would make the throttle window gate the test.
     #[doc(hidden)]
     #[cfg(feature = "nat-traversal")]
     pub async fn attempt_direct_upgrade_for_test(&self, peer_id: u64) {
@@ -20263,6 +20401,39 @@ impl MeshNode {
         self.upgrade_cache.get(&peer_id).map(|e| e.done)
     }
 
+    /// Test hook: consecutive-failure count of `peer_id`'s throttle
+    /// entry, or `None` if there is no entry. Pins that busy-defers
+    /// don't inflate the backoff and that a duplicate attempt can't
+    /// double-count a failure.
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_failure_count_for_test(&self, peer_id: u64) -> Option<u32> {
+        self.upgrade_cache.get(&peer_id).map(|e| e.failures)
+    }
+
+    /// Test hook: seconds until `peer_id`'s throttle window reopens, or
+    /// `None` if there is no entry. Lets a paused-time test read the
+    /// scheduled backoff without sleeping through it.
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_next_eligible_in_for_test(&self, peer_id: u64) -> Option<Duration> {
+        self.upgrade_cache.get(&peer_id).map(|e| {
+            e.next_eligible
+                .saturating_duration_since(UpgradeInstant::now())
+        })
+    }
+
+    /// Test hook: claim the in-flight attempt slot for `peer_id`, the
+    /// same way the scan loop does. `None` means an attempt is already
+    /// running (or the throttle window hasn't elapsed). Dropping the
+    /// returned guard releases the slot — which is how a test proves
+    /// "only one attempt per peer at a time" without racing the loop.
+    #[doc(hidden)]
+    #[cfg(feature = "nat-traversal")]
+    pub fn upgrade_try_acquire_for_test(&self, peer_id: u64) -> Option<UpgradeAttemptGuard> {
+        self.upgrade_try_acquire(peer_id)
+    }
+
     /// Spawn the background direct-path upgrade scan loop (Stage 3).
     /// Every tick, find relay-routed peers for which this node is the
     /// lower-id initiator (C1) and whose throttle window has elapsed,
@@ -20282,7 +20453,6 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     pub fn spawn_direct_upgrade_loop(self: &Arc<Self>) -> JoinHandle<()> {
         const SCAN_INTERVAL: Duration = Duration::from_secs(1);
-        const ATTEMPT_LEASE: Duration = Duration::from_secs(10);
 
         let weak = Arc::downgrade(self);
         let shutdown = self.shutdown.clone();
@@ -20327,11 +20497,21 @@ impl MeshNode {
                     .collect();
 
                 for peer_id in candidates {
-                    // Lease before spawning so the next scan doesn't
-                    // double-fire while this attempt is in flight.
-                    node.upgrade_lease(peer_id, ATTEMPT_LEASE);
+                    // Claim the in-flight slot before spawning. The
+                    // candidate filter above is an unsynchronized read,
+                    // so this is where the one-attempt-per-peer
+                    // invariant is actually decided; `None` means
+                    // another attempt is still running (or the window
+                    // reopened and closed between the two checks).
+                    let Some(guard) = node.upgrade_try_acquire(peer_id) else {
+                        continue;
+                    };
                     let n = node.clone();
                     tokio::spawn(async move {
+                        // Moved in, not borrowed: the slot is held for
+                        // the attempt's full lifetime — every handshake
+                        // retry — and released here on any exit path.
+                        let _guard = guard;
                         n.attempt_direct_upgrade(peer_id).await;
                     });
                 }
@@ -23842,6 +24022,142 @@ mod heartbeat_aead_tests {
         assert_eq!(
             routed_rotation_outcome(&info, &static_a, &[0xDDu8; 32], Duration::from_millis(1)),
             RoutedRotationOutcome::AcceptRotation,
+        );
+    }
+
+    /// The direct-path upgrade's nominal backoff schedule:
+    /// 4, 8, 16, 32, then 64 s forever. The first delay is 4 s, not the
+    /// 2 s `UPGRADE_BACKOFF_BASE` suggests, because the failure counter
+    /// is incremented before the shift — pinned here so the documented
+    /// schedule and the code can't drift apart.
+    #[cfg(feature = "nat-traversal")]
+    #[test]
+    fn upgrade_backoff_schedule_is_4_8_16_32_64() {
+        assert_eq!(upgrade_backoff(1), Duration::from_secs(4));
+        assert_eq!(upgrade_backoff(2), Duration::from_secs(8));
+        assert_eq!(upgrade_backoff(3), Duration::from_secs(16));
+        assert_eq!(upgrade_backoff(4), Duration::from_secs(32));
+        assert_eq!(upgrade_backoff(5), Duration::from_secs(64));
+    }
+
+    /// The backoff caps at 64 s and never overflows, however long a
+    /// pathological pair keeps failing. `1u32 << failures` would panic
+    /// (debug) or wrap (release) past 31 shifts without the clamp, so
+    /// this covers the saturating boundary too.
+    #[cfg(feature = "nat-traversal")]
+    #[test]
+    fn upgrade_backoff_caps_at_64s() {
+        for failures in [6u32, 12, 31, 32, 1_000, u32::MAX] {
+            assert_eq!(
+                upgrade_backoff(failures),
+                Duration::from_secs(64),
+                "failures={failures} must clamp to the 64 s ceiling"
+            );
+        }
+    }
+
+    /// Jitter only ever shaves — a retry lands in `[0.75 × base, base]`,
+    /// never later. That is what keeps "the backoff caps at 64 s" true
+    /// as a wall-clock statement and not just a nominal one.
+    #[cfg(feature = "nat-traversal")]
+    #[test]
+    fn upgrade_jitter_stays_within_lower_quarter() {
+        for failures in 1..=6u32 {
+            let base = upgrade_backoff(failures);
+            for peer_id in 0..64u64 {
+                let d = upgrade_jitter(upgrade_jitter_seed(0xABCD, peer_id, failures), base);
+                assert!(
+                    d <= base && d >= base * 3 / 4,
+                    "jitter {d:?} outside [0.75×{base:?}, {base:?}]"
+                );
+            }
+        }
+    }
+
+    /// Jitter is a pure function of (node, peer, failure count) — no RNG
+    /// and no wall clock, so a paused-time test sees the same schedule
+    /// every run and a restarted node doesn't re-roll its phase.
+    #[cfg(feature = "nat-traversal")]
+    #[test]
+    fn upgrade_jitter_is_deterministic() {
+        let base = upgrade_backoff(3);
+        let seed = upgrade_jitter_seed(7, 9, 3);
+        let first = upgrade_jitter(seed, base);
+        for _ in 0..8 {
+            assert_eq!(upgrade_jitter(seed, base), first);
+        }
+    }
+
+    /// The point of the jitter: co-started nodes must not retry in
+    /// lockstep. Adjacent peer ids (the common case — ids allocated in
+    /// sequence across a fleet) have to land on well-spread phases, so
+    /// the splitmix64 finalizer is doing real avalanche work rather
+    /// than passing correlated low bits through.
+    #[cfg(feature = "nat-traversal")]
+    #[test]
+    fn upgrade_jitter_desynchronizes_adjacent_peers() {
+        let base = upgrade_backoff(5); // the 64 s ceiling — the worst wave
+        let delays: std::collections::HashSet<Duration> = (0..64u64)
+            .map(|peer_id| upgrade_jitter(upgrade_jitter_seed(1000, 1000 + peer_id, 5), base))
+            .collect();
+        assert!(
+            delays.len() >= 60,
+            "adjacent peer ids must not share retry phases, got {} distinct \
+             delays across 64 peers",
+            delays.len()
+        );
+    }
+
+    /// Successive retries for the *same* pair re-roll their phase, so
+    /// two pairs that happen to collide on one round don't stay
+    /// collided for every round after it.
+    #[cfg(feature = "nat-traversal")]
+    #[test]
+    fn upgrade_jitter_reseeds_per_retry() {
+        let fractions: std::collections::HashSet<u64> = (1..=5u32)
+            .map(|failures| {
+                let base = upgrade_backoff(failures);
+                let d = upgrade_jitter(upgrade_jitter_seed(3, 4, failures), base);
+                // Normalize out the differing bases: compare phase, not
+                // absolute delay.
+                (d.as_nanos() * 1000 / base.as_nanos()) as u64
+            })
+            .collect();
+        assert!(
+            fractions.len() >= 4,
+            "each retry must re-roll the jitter phase, got {fractions:?}"
+        );
+    }
+
+    /// Source-level pin for the default-on blocker: the scan loop must
+    /// gate on the RAII in-flight slot, never on a timed lease. A lease
+    /// has to guess an upper bound on the attempt, and the attempt's own
+    /// worst case (`handshake_retries × handshake_timeout` + inter-retry
+    /// sleeps = 15.3 s at the defaults) exceeded the 10 s lease that
+    /// shipped — so the 1 s scanner could spawn a second attempt for a
+    /// peer whose first was still running. The duplicate fast-fails on
+    /// the occupied `pending_handshakes` slot and records a failure,
+    /// double-counting `failures` and escalating the backoff on a peer
+    /// that is merely slow.
+    #[cfg(feature = "nat-traversal")]
+    #[test]
+    fn upgrade_loop_gates_on_in_flight_slot_not_a_timed_lease() {
+        let src = include_str!("mesh.rs");
+        let start = src
+            .find("pub fn spawn_direct_upgrade_loop")
+            .expect("spawn_direct_upgrade_loop must exist");
+        let body = &src[start..(start + 3000).min(src.len())];
+
+        assert!(
+            body.contains("upgrade_try_acquire(peer_id)"),
+            "regression: the scan loop must claim the in-flight slot via \
+             upgrade_try_acquire before spawning an attempt"
+        );
+        assert!(
+            !body.contains("ATTEMPT_LEASE"),
+            "regression: the timed attempt lease is the default-on blocker \
+             — a lease shorter than the 15.3 s worst-case attempt lets the \
+             scanner double-fire for one peer"
         );
     }
 

@@ -125,6 +125,10 @@ pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
     TokenScope,
 };
+/// Exported only so `upgrade_try_acquire_for_test` has a nameable
+/// return type in integration tests; `#[doc(hidden)]` at the definition.
+#[cfg(feature = "nat-traversal")]
+pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
     ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingReadinessOverlay,
     SensingRegistrationError, ACK_RANGES_CAPABILITY_TAG,
