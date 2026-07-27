@@ -110,7 +110,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=45
+          MIN=46
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -130,6 +130,7 @@ jobs:
           a_snapshot_cannot_straddle_a_store_publication
           an_authority_install_publishes_the_authority_under_its_own_epoch
           an_authority_rotation_over_the_same_store_still_publishes_inside_the_epoch
+          a_handles_lockfree_read_observes_the_registrys_published_artifact
           a_publication_cannot_occupy_the_gap_between_validation_and_settlement
           poison_cannot_occupy_the_gap_between_validation_and_settlement
           a_recovery_poison_clear_cannot_land_under_a_publication_pin

@@ -332,7 +332,7 @@ Application and bounds:
 |---|---|
 | **2B-entry** | §5 boundary: drain ownership + lease + supervisor + fencing + minimal registry + bounded application. |
 | **2B.2** | Coherent `OrgAuthorityEpoch` publication + mandatory per-call comparison before proof/send. **Publication half LANDED as OLB-2C** (see below); the per-call comparison waits on 2B.3's warmed route set, which is the thing there would be to compare. |
-| **2B.3** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current + warmed-call consumption. |
+| **2B.3** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current + warmed-call consumption. **2B.3a landed** (below); 2B.3b is the warmed-call consumer. |
 | **2B.4** | Exact-provider lease acquire/release on route-slot lifecycle + node-global ttl/2 refresh owner (first holder arms, last disarms). |
 | **2B.5** | `sensed_candidates` join + §8 classification + granted-candidates-Unknown, inside the actor, never on the request path. |
 
@@ -391,6 +391,43 @@ fails it at exactly its coupled assertion. The other two —
 `a_refused_authority_install_publishes_neither_half` — are regression guards, not
 RED-coupled to this change: the old ordering satisfied both, and they exist to
 catch a future split of the two publications into separate ordered units.
+
+**OLB-2B.3a — the lock-free per-slot publication cell.** Two findings shaped the
+slice boundary, both from reading the signed substrate before writing anything:
+
+1. **The deterministic sort already exists.** `ScopedSourceSnapshot::providers`
+   sorts provider-ascending, generation-descending, off-lock at reconstruction.
+   Plan pin 9 ("the fallback vector is sorted once at rebuild") was therefore
+   already satisfied, so a "sort once at rebuild" slice would have been a no-op
+   dressed as progress.
+2. **What was actually missing is the LOCK.** Every read went through
+   `base_facts_unvalidated(&key)`, which takes the registry mutex and does a
+   `BTreeMap` lookup — so the warmed path would have contended with the actor's
+   quantum on every call. Plan pins 7/8 say the hot path is an `ArcSwap` load.
+
+`Slot.facts` is now an `Arc<ArcSwapOption<SlotBaseFacts>>` cell. Every MUTATION
+still happens under the registry lock exactly as before — the install/invalidate
+ordering E3c signed is untouched — and the cell adds only a lock-free read.
+`DemandHandle` clones the cell at demand time under the same lock acquisition
+that takes the reference, so the hot path needs no map lookup and no lock: one
+atomic load yields the immutable artifact. Holding the cell is sound precisely
+because holding the handle is what prevents the slot being retired, so a handle
+can never carry a dead incarnation's cell.
+
+The witness targets the trap this design could have laid: a handle wired to a
+DETACHED cell would read `None` forever, look exactly like the deterministic cold
+outcome, and never be attributed to a bug.
+`a_handles_lockfree_read_observes_the_registrys_published_artifact` asserts the
+handle observes the same artifact `Arc` the registry published, that the
+lock-free and locked seams agree, and that an invalidation is visible through the
+cell. RED-verified against a detached cell. Wiring gate 45 → 46.
+
+`DemandHandle::base_facts_unvalidated` is named for what it is — the review that
+renamed `base_facts` to `base_facts_unvalidated` did so because an accessor that
+looks authoritative and is not is a trap, and a friendlier-named lock-free twin
+would have re-laid it. Authority revalidation stays the node seam's job. Its one
+`#[allow(dead_code)]` names 2B.3b as its consumer; per the E3c discipline, an
+allow still there after 2B.3b lands means that consumer never arrived.
 
 The OLB-2 exit witnesses (warmed-call instrumentation, 1024-row bucket isolation,
 33+ provider truncation, epoch mismatch matrix, convergence/ghost-demand) attach to

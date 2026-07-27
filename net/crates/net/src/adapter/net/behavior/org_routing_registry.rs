@@ -28,6 +28,7 @@
 //! sorting or projection; and no registry method a source implementation could
 //! re-enter takes the commit pin.
 
+use arc_swap::ArcSwapOption;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -359,7 +360,20 @@ struct Slot {
     refs: usize,
     /// `None` until a recapture installs facts, and cleared the moment anything
     /// invalidates them. `None` IS the deterministic cold outcome.
-    facts: Option<Arc<SlotBaseFacts>>,
+    ///
+    /// An `ArcSwapOption` CELL rather than a plain field (OLB-2B.3): every
+    /// MUTATION still happens under the registry lock exactly as before, so the
+    /// install/invalidate ordering the E3c closure signed is unchanged. What the
+    /// cell adds is a lock-free READ — a `DemandHandle` clones this `Arc` at
+    /// demand time, so the warmed path loads the artifact with one atomic and
+    /// never contends with the actor's quantum. That is the hot-path contract
+    /// (plan pins 7/8: the warmed call is an ArcSwap load, not a lock).
+    ///
+    /// Cell identity is per SLOT INCARNATION: a retired slot's entry is dropped
+    /// with the slot, so a handle from a dead incarnation cannot be revived. It
+    /// cannot be stale either — a live handle is precisely what stops the slot
+    /// being retired.
+    facts: Arc<ArcSwapOption<SlotBaseFacts>>,
 }
 
 #[derive(Default)]
@@ -413,7 +427,7 @@ impl RegistryInner {
     fn invalidate(&mut self, key: &SlotKey) -> bool {
         self.slots
             .get_mut(key)
-            .is_some_and(|slot| slot.facts.take().is_some())
+            .is_some_and(|slot| slot.facts.swap(None).is_some())
     }
 
     /// Queue every retained slot and drop every fact — the expansion step of a
@@ -442,7 +456,7 @@ impl RegistryInner {
         self.slots
             .iter()
             .filter(|(_, slot)| {
-                !slot.facts.as_ref().is_some_and(|facts| {
+                !slot.facts.load().as_ref().is_some_and(|facts| {
                     facts.actor_incarnation == incarnation
                         && facts.slot_incarnation == slot.incarnation
                         && facts.epoch == epoch
@@ -559,6 +573,33 @@ pub(crate) struct DemandHandle {
     registry: Arc<NodeOrgRoutingRegistry>,
     family: FamilyId,
     key: SlotKey,
+    /// The slot's publication cell, cloned once at demand time (OLB-2B.3).
+    ///
+    /// This is what makes the warmed read lock-free: the handle already names
+    /// exactly one slot, so the hot path needs no map lookup and no registry
+    /// lock — one atomic load and it holds the immutable artifact. Holding the
+    /// cell is sound precisely because holding the handle is what prevents the
+    /// slot being retired, so the cell can never be a dead incarnation's.
+    facts: Arc<ArcSwapOption<SlotBaseFacts>>,
+}
+
+impl DemandHandle {
+    /// The slot's currently published artifact, or `None` for the cold outcome.
+    ///
+    /// UNVALIDATED, exactly like its registry-side twin: this returns whatever
+    /// is published, and authority revalidation is the NODE seam's job
+    /// (`MeshNode::org_routing_base_facts`). Named to say so — the review that
+    /// renamed `base_facts` to `base_facts_unvalidated` did it because an
+    /// accessor that looks authoritative and is not is a trap, and adding a
+    /// lock-free twin would re-lay it under a friendlier name.
+    ///
+    /// The allow is scoped to this ONE method and names its consumer: the warmed
+    /// call path (OLB-2B.3b), which is the next slice. Per the E3c discipline, a
+    /// leftover allow here after 2B.3b lands means that consumer never arrived.
+    #[allow(dead_code)]
+    pub(crate) fn base_facts_unvalidated(&self) -> Option<Arc<SlotBaseFacts>> {
+        self.facts.load_full()
+    }
 }
 
 impl Drop for DemandHandle {
@@ -617,7 +658,7 @@ impl NodeOrgRoutingRegistry {
         key: SlotKey,
     ) -> Result<DemandHandle, DemandRefused> {
         let mut queued = false;
-        {
+        let cell = {
             let mut inner = self.inner.lock();
             if inner.family_handles(family) >= MAX_HANDLES_PER_FAMILY {
                 self.metrics
@@ -646,7 +687,7 @@ impl NodeOrgRoutingRegistry {
                     Slot {
                         incarnation,
                         refs: 0,
-                        facts: None,
+                        facts: Arc::new(ArcSwapOption::empty()),
                     },
                 );
                 inner
@@ -657,16 +698,26 @@ impl NodeOrgRoutingRegistry {
                 inner.pending.insert(key.clone());
                 queued = true;
             }
-            if let Some(slot) = inner.slots.get_mut(&key) {
-                slot.refs += 1;
-            }
+            // Captured under the SAME lock acquisition that takes the reference,
+            // so the cell can only be the one belonging to the incarnation this
+            // handle is now keeping alive.
+            let Some(slot) = inner.slots.get_mut(&key) else {
+                // Unreachable: the block above inserts it when absent. Fail
+                // closed rather than fabricating a detached cell that no install
+                // would ever write to — a handle reading a cell the registry
+                // does not own would be permanently, silently cold.
+                return Err(DemandRefused::NodeAtCapacity);
+            };
+            slot.refs += 1;
+            let cell = slot.facts.clone();
             *inner
                 .families
                 .entry(family)
                 .or_default()
                 .entry(key.clone())
                 .or_insert(0) += 1;
-        }
+            cell
+        };
         if queued {
             // Private discovery did not move, so this is the ONLY thing that will
             // wake the actor for it.
@@ -676,6 +727,7 @@ impl NodeOrgRoutingRegistry {
             registry: self.clone(),
             family,
             key,
+            facts: cell,
         })
     }
 
@@ -732,7 +784,7 @@ impl NodeOrgRoutingRegistry {
     /// witnesses asserting on RETENTION specifically — several of them precisely
     /// to prove that the seam fences something the registry still holds.
     pub(crate) fn base_facts_unvalidated(&self, key: &SlotKey) -> Option<Arc<SlotBaseFacts>> {
-        self.inner.lock().slots.get(key)?.facts.clone()
+        self.inner.lock().slots.get(key)?.facts.load_full()
     }
 
     /// Authority moved to `live`: drop every fact stamped with an OLDER
@@ -758,6 +810,7 @@ impl NodeOrgRoutingRegistry {
                 .iter()
                 .filter(|(_, slot)| {
                     slot.facts
+                        .load()
                         .as_ref()
                         .is_some_and(|facts| facts.epoch.authority < live)
                 })
@@ -796,13 +849,14 @@ impl NodeOrgRoutingRegistry {
             };
             let still_observed = slot
                 .facts
+                .load()
                 .as_ref()
                 .is_some_and(|live| Arc::ptr_eq(live, observed));
             if !still_observed {
                 // Someone installed a newer artifact. Leave it alone.
                 return;
             }
-            slot.facts = None;
+            slot.facts.store(None);
             self.metrics
                 .facts_invalidated
                 .fetch_add(1, Ordering::AcqRel);
@@ -835,7 +889,7 @@ impl NodeOrgRoutingRegistry {
         let mut inner = self.inner.lock();
         let mut invalidated = 0u64;
         for slot in inner.slots.values_mut() {
-            if slot.facts.take().is_some() {
+            if slot.facts.swap(None).is_some() {
                 invalidated += 1;
             }
         }
@@ -866,9 +920,9 @@ impl NodeOrgRoutingRegistry {
         let slot = inner.slots.entry(key).or_insert(Slot {
             incarnation: 1,
             refs: 1,
-            facts: None,
+            facts: Arc::new(ArcSwapOption::empty()),
         });
-        slot.facts = Some(facts);
+        slot.facts.store(Some(facts));
     }
 
     pub(crate) fn retained_slots(&self) -> usize {
@@ -1229,13 +1283,13 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     // Cold at every read anyway; nothing to bound.
                     SourceFacts::Unserved => u64::MAX,
                 };
-                slot.facts = Some(Arc::new(SlotBaseFacts {
+                slot.facts.store(Some(Arc::new(SlotBaseFacts {
                     providers: facts,
                     epoch,
                     actor_incarnation: incarnation,
                     slot_incarnation,
                     earliest_expiry,
-                }));
+                })));
                 self.metrics.installs.fetch_add(1, Ordering::AcqRel);
             }
 
@@ -2497,6 +2551,7 @@ mod tests {
         assert!(
             f.registry.inner.lock().slots.values().all(|slot| slot
                 .facts
+                .load()
                 .as_ref()
                 .is_some_and(|facts| facts.epoch.generation == generation)),
             "ONE coherent source generation across the whole retained set"

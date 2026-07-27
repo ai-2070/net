@@ -3755,3 +3755,81 @@ async fn an_authority_rotation_over_the_same_store_still_publishes_inside_the_ep
         "the rotation must actually have landed"
     );
 }
+
+// ---- OLB-2B.3a: the lock-free per-slot publication cell ------------------
+
+/// OLB-2B.3a. A handle's lock-free read observes exactly what the registry
+/// published — the same artifact `Arc`, not a copy and not a stale snapshot.
+///
+/// The hot-path contract (plan pins 7/8) is that a warmed call is an ArcSwap
+/// LOAD, never a lock. That is only worth anything if the cell the handle holds
+/// is the same one the actor installs into. The failure this witnesses against
+/// is a handle wired to a DETACHED cell: it would read `None` forever, look
+/// exactly like the deterministic cold outcome, and never be attributed to a
+/// bug.
+#[tokio::test]
+async fn a_handles_lockfree_read_observes_the_registrys_published_artifact() {
+    use crate::adapter::net::behavior::org_routing::{DirtyApply, RegistryWork};
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+
+    let node = node().await;
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
+        unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    };
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(Arc::new(source), work, Arc::default());
+    registry.activate_incarnation(1);
+
+    let family = registry.new_family().expect("family");
+    let key = slot(31, "nrpc:lockfree");
+    let held = family.demand(key.clone()).expect("demand");
+
+    assert!(
+        held.base_facts_unvalidated().is_none(),
+        "cold before anything is installed"
+    );
+
+    // Install through the registry, then read through the HANDLE. If the handle
+    // held a detached cell this stays `None` and looks like an ordinary cold
+    // read.
+    let installed = Arc::new(
+        crate::adapter::net::behavior::org_routing_registry::SlotBaseFacts {
+            providers: SourceFacts::Unserved,
+            epoch: Default::default(),
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            earliest_expiry: u64::MAX,
+        },
+    );
+    registry.install_facts_for_test(key.clone(), installed.clone());
+
+    let seen = held
+        .base_facts_unvalidated()
+        .expect("the handle must observe the registry's install");
+    assert!(
+        Arc::ptr_eq(&seen, &installed),
+        "the handle must observe the SAME artifact the registry published, not a copy"
+    );
+    assert!(
+        Arc::ptr_eq(
+            &seen,
+            &registry
+                .base_facts_unvalidated(&key)
+                .expect("registry-side twin")
+        ),
+        "the lock-free and locked seams must agree — two cells would let them diverge"
+    );
+
+    // And invalidation is observed through the same cell.
+    registry.invalidate_if_stale(&key, &installed);
+    assert!(
+        held.base_facts_unvalidated().is_none(),
+        "an invalidation must be visible through the handle, or the warmed path \
+         would keep serving retired facts"
+    );
+}
