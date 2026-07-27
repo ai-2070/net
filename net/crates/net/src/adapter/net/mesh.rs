@@ -7060,6 +7060,28 @@ impl MeshNode {
     /// past one TTL) — that needs an owned `Arc` to re-broadcast. Drive
     /// the node through [`Self::start_arc`] (as the SDK / FFI do) to get
     /// it; a bare `start` is for short-lived / test nodes.
+    ///
+    /// **The same missing `Arc` also drops in-window announcements.**
+    /// [`Self::announce_capabilities`] rate-limits the broadcast to
+    /// `min_announce_interval` (10 s default) and normally coalesces a
+    /// within-window call into a trailing-edge flush at the end of the
+    /// window. That flush is a spawned task, so it needs the owned `Arc`
+    /// too — under a bare `start` there is nothing to schedule, and the
+    /// call is **silently dropped while still returning `Ok(())`**. With
+    /// no re-announce loop either, the change then never reaches peers
+    /// at all: they keep serving the previous announcement's tags,
+    /// reflex, and `nat:*` class until something else triggers an
+    /// out-of-window announce.
+    ///
+    /// This bites hardest on state peers act on rather than merely
+    /// display — a NAT reclassification publishes a new `nat:*` tag, and
+    /// a peer still reading the old one computes the wrong pair action
+    /// for the direct-path upgrade. Under `start_arc` the flush fires
+    /// and the new class propagates promptly. A test that forces a class
+    /// and re-announces on a bare-`start` node observes neither, which
+    /// reads convincingly like a stale-fold bug and is not one: set the
+    /// class *before* the first announce (see `force_nat_class_for_test`),
+    /// or drive the node with [`Self::start_arc`].
     pub fn start(&self) {
         use std::sync::atomic::Ordering as AtOrd;
         if self.started.swap(true, AtOrd::SeqCst) {
@@ -17026,6 +17048,15 @@ impl MeshNode {
     /// TTL defaults to 5 minutes. Unsigned (signatures tie in with
     /// Stage E channel auth). For explicit control over TTL or
     /// signing, see [`Self::announce_capabilities_with`].
+    ///
+    /// `Ok(())` means the announcement was accepted locally, **not that
+    /// it was broadcast.** Calls inside the `min_announce_interval`
+    /// window (10 s default) coalesce into one trailing-edge flush at
+    /// the end of the window — and on a node started with
+    /// [`Self::start`] rather than [`Self::start_arc`] there is no owned
+    /// `Arc` to schedule that flush with, so the broadcast is dropped
+    /// outright. See [`Self::start`] for why that combination makes a
+    /// changed announcement look like a stale peer-side fold.
     pub async fn announce_capabilities(&self, caps: CapabilitySet) -> Result<(), AdapterError> {
         // Default to signed — the node always has a keypair (either
         // caller-supplied or ephemeral at construction time), so
