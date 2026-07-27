@@ -117,6 +117,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "recover-failed-workflow",
       "submitted-is-not-completed",
       "event-bus",
+      "mesh-streams",
       "nrpc",
       "private-capabilities",
       "durable-logs",
