@@ -109,75 +109,91 @@ impl Drop for ScenarioRun {
         }
         paths.sort();
 
-        eprintln!("\n--- inventory ({} entries) ---", paths.len());
-        for path in &paths {
-            let name = path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("<non-utf8>");
-            match std::fs::metadata(path) {
-                Ok(m) => {
-                    #[cfg(unix)]
-                    let mode = {
-                        use std::os::unix::fs::PermissionsExt;
-                        format!("{:o}", m.permissions().mode() & 0o777)
-                    };
-                    #[cfg(not(unix))]
-                    let mode = String::from("-");
-                    eprintln!("  {name}  {} bytes  mode {mode}", m.len());
+        let names: Vec<&str> = paths
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|f| f.to_str()))
+            .collect();
+        eprintln!("files ({}): {}", names.len(), names.join(" "));
+
+        // DELIBERATELY TINY BY DEFAULT.
+        //
+        // Two runs in a row lost the decisive lines to output
+        // truncation: the first dropped the tail, the second dropped the
+        // middle while keeping head and tail. No print *ordering*
+        // survives both, so the only reliable fix is to emit far less.
+        //
+        // Default output is a handful of lines: the per-gateway
+        // PUNCH-RELEVANT conntrack flows, and the `rendezvous:` lines
+        // from each node — which together are the entire diagnosis.
+        // Everything else (full logs, stats, ruleset, addresses) is
+        // still on disk and printed with NATSIM_FULL_ARTIFACTS=1.
+        let full = std::env::var_os("NATSIM_FULL_ARTIFACTS").is_some();
+
+        let read = |name: &str| -> Option<String> {
+            paths
+                .iter()
+                .find(|p| p.file_name().and_then(|f| f.to_str()) == Some(name))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        };
+
+        for gw in ["nsim_gwa", "nsim_gwb"] {
+            let file = format!("{gw}_nat.log");
+            match read(&file) {
+                None => eprintln!("\n[{gw}] no NAT capture ({file} absent or unreadable)"),
+                Some(body) => {
+                    // Everything after the PUNCH-RELEVANT marker.
+                    let tail: Vec<&str> = body
+                        .lines()
+                        .skip_while(|l| !l.starts_with("### PUNCH-RELEVANT"))
+                        .filter(|l| !l.starts_with("###"))
+                        .filter(|l| !l.trim().is_empty())
+                        .collect();
+                    if tail.is_empty() {
+                        eprintln!("\n[{gw}] no conntrack flow between the two public addrs");
+                    } else {
+                        eprintln!("\n[{gw}] A<->B conntrack flows:");
+                        for line in tail {
+                            eprintln!("  {line}");
+                        }
+                    }
                 }
-                Err(e) => eprintln!("  {name}  <stat failed: {e}>"),
             }
         }
 
-        // Gateway NAT captures first. CI log viewers and copy-pasted
-        // output get truncated, and a previous run lost exactly the
-        // conntrack section to that truncation — so print the smallest,
-        // most decisive artifact before the bulkier helper logs rather
-        // than in alphabetical position.
-        let mut ordered: Vec<&std::path::PathBuf> = paths.iter().collect();
-        ordered.sort_by_key(|p| {
-            let is_nat = p
-                .file_name()
-                .and_then(|f| f.to_str())
-                .is_some_and(|f| f.ends_with("_nat.log"));
-            (!is_nat, (*p).clone())
-        });
-
-        for path in ordered {
-            let name = path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("<non-utf8>");
-            // Logs and the per-node stats/outcome snapshots; the identity
-            // and marker files carry no diagnostic signal.
-            let interesting = name.ends_with(".log")
-                || name.ends_with("_stats.json")
-                || name.ends_with("_outcome.json");
-            if !interesting {
-                continue;
-            }
-            match std::fs::read_to_string(path) {
-                Ok(body) => {
-                    let lines: Vec<&str> = body.lines().collect();
-                    // Trace-level helper logs are long; the tail is where
-                    // the punch window lives.
-                    let start = lines.len().saturating_sub(400);
-                    eprintln!(
-                        "\n--- {name} ({} lines{}) ---",
-                        lines.len(),
-                        if start > 0 {
-                            format!(", last {}", lines.len() - start)
-                        } else {
-                            String::new()
-                        }
-                    );
-                    for line in &lines[start..] {
-                        eprintln!("{line}");
+        for node in ["a", "b", "r"] {
+            let file = format!("{node}.log");
+            match read(&file) {
+                None => eprintln!("\n[{node}] no log"),
+                Some(body) => {
+                    let lines: Vec<&str> = body
+                        .lines()
+                        .filter(|l| l.contains("rendezvous:"))
+                        .map(|l| l.split_once("mesh: ").map(|(_, r)| r).unwrap_or(l))
+                        .collect();
+                    eprintln!("\n[{node}] rendezvous ({} lines):", lines.len());
+                    for line in lines {
+                        eprintln!("  {line}");
                     }
                 }
-                Err(e) => eprintln!("\n--- {name} (UNREADABLE: {e}) ---"),
             }
+        }
+
+        if full {
+            for path in &paths {
+                let name = path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("<non-utf8>");
+                if !name.ends_with(".log") && !name.ends_with(".json") {
+                    continue;
+                }
+                match std::fs::read_to_string(path) {
+                    Ok(body) => eprintln!("\n--- {name} ---\n{body}"),
+                    Err(e) => eprintln!("\n--- {name} (UNREADABLE: {e}) ---"),
+                }
+            }
+        } else {
+            eprintln!("\n(set NATSIM_FULL_ARTIFACTS=1 for full logs; files kept in the dir above)");
         }
         eprintln!("=== end natsim artifacts ===\n");
     }
