@@ -90,6 +90,62 @@ platform equivalent — see [`dirs`](https://docs.rs/dirs)). A first run with no
 config directory yields an empty store; a malformed file is surfaced on stderr
 rather than silently ignored.
 
+## Driving Deck from code
+
+The TUI is one client. The same operator surface is an SDK — `DeckClient` in
+TypeScript and Python, `libnet_deck` via `net_deck.h` in C — so you can script
+what the TUI does interactively.
+
+```typescript
+import { DeckClient } from '@net-mesh/sdk';
+
+const deck = await DeckClient.new(config);   // or DeckClient.fromMeshos(...)
+const summary = deck.statusSummary();
+await deck.close();
+```
+
+The constructor is private — build through the static `new` or, when you
+already have a MeshOS handle, `fromMeshos`. Python takes the SDK and identity
+directly: `DeckClient(sdk, identity)`.
+
+**Reading:**
+
+| Method | Returns |
+|---|---|
+| `identity()` | The `OperatorIdentity` this client signs as |
+| `status()` / `statusSummary()` | Current cluster state; the latter as a typed `StatusSummary` |
+| `snapshots()` | Node state snapshots |
+| `statusSummaryStream()` | Live summary updates rather than polling |
+| `audit()` | An `AuditQuery` over the signed admin log |
+| `subscribeLogs(filter)` / `subscribeFailures()` | Streams of `LogRecord` / `FailureRecord` |
+
+**Acting** — every one of these is a signed event on the chain, not a mutation,
+and each returns the `ChainCommit` it produced. That's what makes the audit
+trail complete: `deck.admin` is an `AdminCommands` handle exposing `drain`,
+`enterMaintenance`, `exitMaintenance`, `cordon`, `uncordon`, `dropReplicas`,
+`invalidatePlacement`, `restartAllDaemons` and `clearAvoidList`, each taking
+the target node id.
+
+Migrations are aborted through the same path — `AdminEvent::KillMigration`
+targets a migration by id.
+
+## Authoring a daemon that responds
+
+The other side of the operator surface is `MeshOsDaemonSdk`, which hands your
+daemon a `MeshOsDaemonHandle` (carrying `daemonId` and `daemonName`) and a
+control-event channel. The control events are exactly what the admin commands
+above produce:
+
+| `DaemonControl` | Meaning |
+|---|---|
+| `Shutdown { gracePeriodMs }` | Stop, and you have this long |
+| `DrainStart { gracePeriodMs }` / `DrainFinish` | Stop accepting work, then finish |
+| `BackpressureOn { level }` / `BackpressureOff` | Slow down, and by how much |
+| `Unknown` | A control event this SDK version doesn't recognise — ignore it rather than failing |
+
+A daemon that handles these participates in `drain` and `enterMaintenance`
+properly instead of being killed. Errors surface as `MeshOsSdkError`.
+
 ## See also
 
 - [CLI reference](/docs/reference/cli) — the non-interactive surface.
