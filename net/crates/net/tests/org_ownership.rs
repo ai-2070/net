@@ -1,5 +1,5 @@
 //! OA-1 §1.6 exit-gate integration witnesses —
-//! `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md` (scaffolded
+//! `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md` (scaffolded
 //! ownership) against real `MeshNode` instances:
 //!
 //! 1. Wire witness — an owner cert attached under the emission

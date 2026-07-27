@@ -1,6 +1,6 @@
 # Capability Enhancements — Worked Examples
 
-Concrete usage patterns for the features shipped under [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](plans/CAPABILITY_ENHANCEMENTS_PLAN.md). Companion to the canonical schema at [`CAPABILITIES_SCHEMA.md`](CAPABILITIES_SCHEMA.md) and the substrate spec at [`plans/CAPABILITY_SYSTEM_PLAN.md`](plans/CAPABILITY_SYSTEM_PLAN.md). Every example below is Rust against `behavior::*`; per-binding surfaces (TS / Python / Go) ship under [`plans/CAPABILITY_SYSTEM_SDK_PLAN.md`](plans/CAPABILITY_SYSTEM_SDK_PLAN.md) Phase 9 and re-export the same shapes.
+Concrete usage patterns for the features shipped under [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_ENHANCEMENTS_PLAN.md). Companion to the canonical schema at [`CAPABILITIES_SCHEMA.md`](CAPABILITIES_SCHEMA.md) and the substrate spec at [`plans/CAPABILITY_SYSTEM_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_SYSTEM_PLAN.md). Every example below is Rust against `behavior::*`; per-binding surfaces (TS / Python / Go) ship under [`plans/CAPABILITY_SYSTEM_SDK_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md) Phase 9 and re-export the same shapes.
 
 The recipes assume `use net::adapter::net::behavior::*;` unless noted.
 
@@ -406,9 +406,9 @@ Linear scan over indexed nodes; each is evaluated against the predicate via the 
 
 ## See also
 
-- [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](plans/CAPABILITY_ENHANCEMENTS_PLAN.md) — the canonical plan.
+- [`plans/CAPABILITY_ENHANCEMENTS_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_ENHANCEMENTS_PLAN.md) — the canonical plan.
 - [`CAPABILITIES_SCHEMA.md`](CAPABILITIES_SCHEMA.md) — authoritative key + value-type spec.
-- [`plans/CAPABILITY_SYSTEM_PLAN.md`](plans/CAPABILITY_SYSTEM_PLAN.md) — substrate plan; the foundation.
-- [`plans/CAPABILITY_SYSTEM_SDK_PLAN.md`](plans/CAPABILITY_SYSTEM_SDK_PLAN.md) — per-binding API surfaces (Phase 9).
+- [`plans/CAPABILITY_SYSTEM_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_SYSTEM_PLAN.md) — substrate plan; the foundation.
+- [`plans/CAPABILITY_SYSTEM_SDK_PLAN.md`](../../../../docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md) — per-binding API surfaces (Phase 9).
 - `tests/cross_lang_capability/` — golden-vector fixtures pinning wire format for binding consumers.
 - `tests/cross_lang_capability_fixtures.rs` — Rust reference test loading the fixtures.

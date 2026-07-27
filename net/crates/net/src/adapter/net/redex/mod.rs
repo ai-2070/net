@@ -6,11 +6,11 @@
 //! [`ChannelName`](super::ChannelName) so the existing
 //! [`AuthGuard`](super::AuthGuard) surface applies.
 //!
-//! See `docs/REDEX_PLAN.md` for the full design.
+//! See `docs/internal/plans/REDEX_PLAN.md` for the full design.
 //!
 //! The private `replication` submodule houses the Phase A
 //! wire-protocol scaffold for cross-node replication per
-//! `docs/plans/REDEX_DISTRIBUTED_PLAN.md`. Its public types
+//! `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md`. Its public types
 //! ([`SyncRequest`], [`SyncResponse`], [`SyncHeartbeat`],
 //! [`SyncNack`], [`ChannelId`], [`ReplicaRole`]) are re-exported
 //! flat under `redex::`; the codec layer only — the

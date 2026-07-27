@@ -305,7 +305,6 @@ Everything `OrgClient` does is expressible by hand through `OrgProofIntent` on `
 - Bindings: `bindings/node/org.ts`, `bindings/python/python/net/org.py`, `go/org.go`, `include/net_org.h`
 - CLI: `net/crates/net/cli/src/commands/org.rs`, `commands/node.rs`
 - Frozen error vocabulary: `net/crates/net/tests/cross_lang_org/error_vectors.json`
-- Plan: `net/crates/net/docs/plans/ORG_CAPABILITY_AUTH_PLAN.md`, `ORG_CAPABILITY_LANGUAGE_SDKS_PLAN.md`
 
 ## Cross-references
 
@@ -314,3 +313,8 @@ Everything `OrgClient` does is expressible by hand through `OrgProofIntent` on `
 - `error-codes.md` — the `RpcError` kinds `org:rpc:` reuses.
 - `cli.md` — `net-mesh org` / `net-mesh node adopt` argument reference.
 - `mcp.md` — `net wrap` publishes owner-scoped capabilities; org auth is the general form of that scoping.
+
+## Further reading
+
+- [Private Capabilities](https://ai2070.net/docs/guides/private-capabilities)
+- [Organizations](https://ai2070.net/docs/concepts/organizations)

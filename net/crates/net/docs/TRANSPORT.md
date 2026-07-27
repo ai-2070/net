@@ -44,7 +44,7 @@ Every Net packet starts with a 64-byte header aligned to a single CPU cache line
 
 ## Encryption
 
-**Handshake:** Noise NKpsk0 pattern via the `snow` crate. The initiator is anonymous, the responder's static key is known in advance. A pre-shared key adds symmetric authentication. Direct UDP is the default path (`MeshNode::connect`), but when two peers have no direct path, `MeshNode::connect_via(relay_addr, …)` carries the Noise messages inside `SUBPROTOCOL_HANDSHAKE` (0x0601) over an existing encrypted session through a relay — the relay sees authenticated Noise bytes but cannot forge them or derive the post-handshake session keys. See [`HANDSHAKE_RELAY_PLAN.md`](HANDSHAKE_RELAY_PLAN.md) for the design.
+**Handshake:** Noise NKpsk0 pattern via the `snow` crate. The initiator is anonymous, the responder's static key is known in advance. A pre-shared key adds symmetric authentication. Direct UDP is the default path (`MeshNode::connect`), but when two peers have no direct path, `MeshNode::connect_via(relay_addr, …)` carries the Noise messages through a relay — the relay sees authenticated Noise bytes but cannot forge them or derive the post-handshake session keys. A relayed handshake is **not** a subprotocol: it rides as an ordinary routed Net packet with the `HANDSHAKE` bit set in the header's `PacketFlags`, sharing the forwarding path with data packets. (It used to consume subprotocol `0x0601`; that ID is now unallocated. The design plan was removed in `a6beba551`, so this paragraph is the surviving description.)
 
 **Payload encryption:** ChaCha20-Poly1305 AEAD with counter-based nonces. Each session derives separate TX/RX `SessionKeys` from the Noise handshake. The header is never encrypted -- only the payload.
 
@@ -288,6 +288,66 @@ pub struct Pingwave {
 `CapabilityAd` announces what a node can do (GPU, tools, memory, model slots, tags). `LocalGraph` maintains a k-hop radius view of the mesh topology.
 
 **Benchmark:** Graph construction for 5,000 nodes in 125 us.
+
+## NAT Traversal
+
+**Optimization, not correctness.** Two peers behind NATs already reach each
+other through routed handshakes plus relay forwarding — that fallback never
+goes away. Traversal adds a shorter path when a direct punch is feasible,
+cutting the per-packet relay tax and the load concentrated on topological
+relays. Nothing here is required to talk to NATed peers; it's required to talk
+to them *faster*. Full design in
+[`NAT_TRAVERSAL_PLAN.md`](../../../../docs/internal/plans/NAT_TRAVERSAL_PLAN.md).
+
+**Classification is peer-probed, not STUN-style.** A node sends a reflex probe
+on `SUBPROTOCOL_REFLEX` (`0x0D00`) to a small set of connected peers and
+classifies itself `Open`, `Cone`, `Symmetric` or `Unknown` from the observed
+reflex addresses. The result rides on capability announcements as a `nat:*` tag
+plus a `reflex_addr` field, so peers gain a direct-connect candidate without a
+separate discovery round-trip.
+
+**Rendezvous is three messages** on `SUBPROTOCOL_RENDEZVOUS` (`0x0D01`):
+
+| Message | Direction | Carries |
+|---|---|---|
+| `PunchRequest` | A → coordinator R | Intent to reach B |
+| `PunchIntroduce` | R → A and B | The counterpart's reflex address + a synchronized `fire_at` |
+| `PunchAck` | observer → peer, routed path | Confirmation the punch landed |
+
+At `fire_at` each side sends a short keep-alive train to prime NAT state. A
+pair-type matrix decides per connection whether to punch, skip
+(Symmetric × Symmetric), or go direct; `MeshNode::connect_direct` drives it
+end-to-end.
+
+**Port mapping is opt-in.** `MeshNodeConfig::with_try_port_mapping(true)`
+probes NAT-PMP (RFC 6886, inlined codec with the RFC-mandated kernel
+source-address filter), falls back to UPnP-IGD via `igd-next`, installs a
+mapping on success and renews every 30 minutes. On install it calls
+`set_reflex_override(external)`, promoting the node to `Open` with the mapped
+address; after three consecutive renewal failures, or at shutdown, it revokes
+and clears. A router that speaks neither protocol leaves the node on the
+classifier path, which is fine. Design in
+[`PORT_MAPPING_PLAN.md`](../../../../docs/internal/plans/PORT_MAPPING_PLAN.md).
+
+**Stats are decision / action / outcome**, not matrix guesses.
+`MeshNode::traversal_stats()` returns three monotonic counters:
+
+| Counter | Bumped when |
+|---|---|
+| `punches_attempted` | A coordinator mediated a `PunchRequest` + `PunchIntroduce` round-trip — only on real wire activity |
+| `punches_succeeded` | An ack arrived **and** the direct handshake landed |
+| `relay_fallbacks` | The session landed on the routed path after a `SkipPunch` decision, a failed punch, or a failed direct attempt — only once the fallback handshake itself succeeded |
+
+The counters partition real activity, so traversal effectiveness can be read
+off them without inflation from matrix-only decisions or double-counted
+failures.
+
+**Feature-gated.** `nat-traversal` turns on the classifier, rendezvous and
+`connect_direct`; `port-mapping` adds the router-control surface. Both are off
+by default, so a build without them produces a cdylib identical to the
+pre-traversal one. The Go, NAPI and PyO3 bindings keep their traversal symbols
+as fallback stubs returning `ErrTraversalUnsupported` (or the binding's
+equivalent), so callers link unconditionally and discover the gate at runtime.
 
 ## Socket Layer
 

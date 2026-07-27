@@ -1,4 +1,4 @@
-//! OA-2 §2.1–§2.2 of `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md` —
+//! OA-2 §2.1–§2.2 of `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md` —
 //! the organization grant family:
 //!
 //! - [`CapabilityAuthorityId`] — the deterministic 32-byte

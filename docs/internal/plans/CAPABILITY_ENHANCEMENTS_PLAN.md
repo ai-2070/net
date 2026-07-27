@@ -569,7 +569,7 @@ Enhancements ship independently as their gates fire. The eternal rule above is t
 **Consumed by:**
 
 - [`REDEX_DISTRIBUTED_PLAN.md`](REDEX_DISTRIBUTED_PLAN.md) — `PlacementFilter` scoring uses `CapabilitySet::views()` extensively. Lazy projections (Phase 1) keep that path cheap. Predicate AST in nRPC (Phase 5) lets RedEX leaders push placement filters into replica candidate scans.
-- [`misc/DATAFORTS_PLAN.md`](misc/DATAFORTS_PLAN.md) Phase 1 — chain composition helpers (Phase 3) + predicate AST in nRPC (Phase 5) compose naturally with the greedy-LRU placement filter.
+- [`misc/DATAFORTS_PLAN.md`](DATAFORTS_PLAN.md) Phase 1 — chain composition helpers (Phase 3) + predicate AST in nRPC (Phase 5) compose naturally with the greedy-LRU placement filter.
 - Future Atomic Playboys candidates — full federated MeshDB, full federated scheduler, mesh-wide debugging — all build on the predicate-AST-as-canonical-language foundation laid by Phase 5 here.
 
 **Supersedes:** none. Layers additively on top of Phase A; doesn't replace any existing primitive.
@@ -580,5 +580,5 @@ Enhancements ship independently as their gates fire. The eternal rule above is t
 
 - [`CAPABILITY_SYSTEM_PLAN.md`](CAPABILITY_SYSTEM_PLAN.md) — the substrate this plan enriches.
 - [`CAPABILITY_SYSTEM_SDK_PLAN.md`](CAPABILITY_SYSTEM_SDK_PLAN.md) — per-binding SDK structure.
-- [`CAPABILITIES.md`](../CAPABILITIES.md) — operator-facing capability documentation (will incorporate axis schemas from Phase 2).
-- [`COMPUTE.md`](../COMPUTE.md) — Mikoshi integration notes; consumer of `CapabilitySet::diff` for placement re-evaluation triggers.
+- [`CAPABILITIES.md`](../../../web/src/content/docs/concepts/capabilities.md) — operator-facing capability documentation (will incorporate axis schemas from Phase 2).
+- [`COMPUTE.md`](../../../net/crates/net/docs/COMPUTE.md) — Mikoshi integration notes; consumer of `CapabilitySet::diff` for placement re-evaluation triggers.

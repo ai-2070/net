@@ -20,7 +20,7 @@
 //!
 //! # Why this exists
 //!
-//! See `crates/net/docs/plans/DECK_DEMO_HARNESS_PLAN.md` Phase 0 +
+//! See `docs/internal/plans/DECK_DEMO_HARNESS_PLAN.md` Phase 0 +
 //! Phase 0.5. The short version: `MeshOsRuntime` is a pure
 //! in-memory snapshot fold (sdk.rs:643 constructs it with an empty
 //! `ProbeRegistry` and no network bind), and `Mesh` is the

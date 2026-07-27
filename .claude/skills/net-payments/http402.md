@@ -102,3 +102,7 @@ spend engine, the `SchemeSigner`, and the byte-preservation discipline are all
 shared. If you find yourself writing an x402↔Net "adapter," stop: the objects
 already *are* x402 (that's doctrine 1, and building a parallel wire format is a
 rejected PR — see `gotchas.md`).
+
+## Further reading
+
+- [x402 and Net](https://ai2070.net/docs/payments/x402-and-net)

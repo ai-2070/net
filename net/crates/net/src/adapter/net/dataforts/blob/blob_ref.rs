@@ -127,7 +127,7 @@ pub const BLOB_REF_MAX_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 /// threshold ride as a single [`BlobRef::Small`]; above it, the
 /// chunker emits a [`BlobRef::Manifest`].
 ///
-/// [`DATAFORTS_BLOB_STORAGE_PLAN.md`]: ../../../../../docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md
+/// [`DATAFORTS_BLOB_STORAGE_PLAN.md`]: ../../../../../docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md
 pub const BLOB_CHUNK_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Hard ceiling on the number of chunks a single

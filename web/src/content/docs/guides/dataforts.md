@@ -82,6 +82,32 @@ process_artifact(&bytes);
 
 The producer puts the bytes once. The reference fans out through the bus to every consumer. Each consumer pulls the bytes from the nearest holder — sometimes that's the producer, sometimes it's a peer that read it earlier and cached it. Network traffic scales with how many distinct consumers actually want the blob, not with how many subscribers the channel has.
 
+### `publish_with_blob` — the two steps as one
+
+Storing and then publishing by hand has a race: a consumer can receive the
+reference before the bytes are durable. `publish_with_blob` does both with the
+ordering pinned:
+
+```rust
+let receipt = publish_with_blob(
+    &mesh, &adapter, &publisher,
+    "mem://artifact",
+    bytes,
+    BlobDurability::DurableOnLocal,
+).await?;
+```
+
+`BlobDurability` picks how hard the store commits before the event goes out —
+`BestEffort` or `DurableOnLocal`. Retrying a failed call must keep the *same*
+durability: dropping from `DurableOnLocal` to `BestEffort` on a retry after a
+partial sync publishes an event whose consumer can race the substrate's flush
+of the remaining chunks.
+
+One failure mode is worth knowing. If the store succeeds and only the mesh
+publish fails, you get `BlobError::Backend` — but the blob **is** stored and
+durable. Don't re-store it; republish with `MeshNode::publish` directly, using
+the receipt's `blob_ref.encode()` as the payload.
+
 ## Directory trees with `store_dir` and `fetch_dir`
 
 Directory transfer is a first-class operation on top of the blob primitive. `store_dir` walks a local directory, hashes each file and each subtree, and writes a manifest blob that references them all; `fetch_dir` consumes a manifest blob and materializes the tree on the receiving side.

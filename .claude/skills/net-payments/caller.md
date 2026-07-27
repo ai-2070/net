@@ -153,3 +153,8 @@ pub struct SystemClock;   // wall-clock ns
 Inject a fixed clock in tests to exercise expiry deterministically. There is
 no global clock in the protocol — expiry uses signer timestamps with bounded
 policy tolerance (`verification.md`, `spend-policy.md`).
+
+## Further reading
+
+- [The Lifecycle](https://ai2070.net/docs/payments/the-lifecycle)
+- [Spend Policy & Approvals](https://ai2070.net/docs/payments/spend-policy-and-approvals)

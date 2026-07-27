@@ -1,6 +1,6 @@
 # NetDB — query façade over CortEX state
 
-> **Looking for how to use this?** [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) is the user-facing narrative. This doc is the implementation plan.
+> **Looking for how to use this?** [`STORAGE_AND_CORTEX.md`](../../../net/crates/net/docs/STORAGE_AND_CORTEX.md) is the user-facing narrative. This doc is the implementation plan.
 
 ## Status
 

@@ -100,7 +100,7 @@ pub struct StateSnapshot {
     /// Timestamp when snapshot was taken (unix nanos).
     pub created_at: u64,
     /// Opaque wire slot for channel-re-bind metadata populated by
-    /// [`DAEMON_CHANNEL_REBIND_PLAN.md`](../../../../docs/DAEMON_CHANNEL_REBIND_PLAN.md).
+    /// [`DAEMON_CHANNEL_REBIND_PLAN.md`](../../../../../../../docs/internal/plans/DAEMON_CHANNEL_REBIND_PLAN.md).
     /// Stage 1 of the identity-migration plan lands this as an
     /// always-empty `Vec` so the wire format is forward-compatible
     /// with the channel-re-bind work even though the typed
@@ -109,7 +109,7 @@ pub struct StateSnapshot {
     pub bindings_bytes: Vec<u8>,
     /// Encrypted ed25519 seed + attestation for cross-node identity
     /// transport. Populated by
-    /// [`DAEMON_IDENTITY_MIGRATION_PLAN.md`](../../../../docs/DAEMON_IDENTITY_MIGRATION_PLAN.md)
+    /// [`DAEMON_IDENTITY_MIGRATION_PLAN.md`](../../../../../../../docs/internal/plans/DAEMON_IDENTITY_MIGRATION_PLAN.md)
     /// Stage 3; Stage 1 always emits `None`. A `None` envelope on
     /// restore means "public-identity migration" — the target gets
     /// a read-only keypair that can still serve `entity_id` /

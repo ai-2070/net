@@ -202,3 +202,8 @@ Semantics worth knowing before you reach for them:
 
 - Core: `net/crates/net/src/adapter/net/behavior/gang/` (scheduler) + `behavior/fold/island.rs` (topology fold) + `cortex/workflow/` (lifecycle).
 - SDK: Rust `sdk/src/gang.rs` + `sdk/src/cortex/workflow.rs`; TS `sdk-ts/src/mesh.ts` + `cortex.ts`; Python `sdk-py/src/net_sdk/mesh.py`; Go `go/mesh.go` + `go/cortex.go`; C `include/net.go.h` + `include/net_cortex.h`.
+
+## Further reading
+
+- [Claiming a Contended Resource](https://ai2070.net/docs/guides/gang-scheduler)
+- [Task Lifecycle and Workflows](https://ai2070.net/docs/guides/task-lifecycle)

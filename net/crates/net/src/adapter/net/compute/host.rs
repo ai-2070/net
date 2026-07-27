@@ -40,7 +40,7 @@ pub struct DaemonHost {
     /// channel; read by [`Self::take_snapshot`] to serialize into
     /// `StateSnapshot::bindings_bytes` so the migration target can
     /// replay the subscriptions. See
-    /// [`DAEMON_CHANNEL_REBIND_PLAN.md`](../../../../docs/DAEMON_CHANNEL_REBIND_PLAN.md).
+    /// [`DAEMON_CHANNEL_REBIND_PLAN.md`](../../../../../../../docs/internal/plans/DAEMON_CHANNEL_REBIND_PLAN.md).
     ///
     /// `Arc<DashMap>` because the host itself lives under a
     /// registry-level `Mutex` (for single-threaded `process()`

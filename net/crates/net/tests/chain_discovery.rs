@@ -3,8 +3,8 @@
 //! helpers.
 //!
 //! These are the Capability Phase B primitives from
-//! `docs/plans/CAPABILITY_SYSTEM_PLAN.md` §B, the hard prerequisite
-//! that `docs/plans/REDEX_DISTRIBUTED_PLAN.md` Phase C/D/E depend
+//! `docs/internal/plans/CAPABILITY_SYSTEM_PLAN.md` §B, the hard prerequisite
+//! that `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` Phase C/D/E depend
 //! on. Tests pin:
 //!
 //! - Idempotent advertise: announce_chain twice with different tips

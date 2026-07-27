@@ -40,7 +40,7 @@
 //! - `stateless = true|false` — defaults to true.
 //! - `estimated_time_ms = N` — soft latency hint (defaults to 0).
 //!
-//! Plan: slice A-7 in `docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`.
+//! Plan: slice A-7 in `docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`.
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;

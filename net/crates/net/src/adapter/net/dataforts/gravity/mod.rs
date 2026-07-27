@@ -18,7 +18,7 @@
 //!
 //! Adding a heat counter to (1) and a heat-weighted preference in
 //! (2) gets gravity for free. See
-//! `docs/misc/DATAFORTS_PLAN.md` § Phase 4 for the locked design
+//! `docs/internal/plans/DATAFORTS_PLAN.md` § Phase 4 for the locked design
 //! decisions.
 //!
 //! Pure-logic pieces (counter decay + emission decision + policy

@@ -21,9 +21,68 @@ if err := bus.IngestRaw(payload); err != nil {
 - **Serialization / config** — a bug. Retrying reruns it.
 - **Shutdown / not-connected** — a state change; retrying won't undo it.
 
-The binding maps the core error kinds to Go errors with stable prefixes (the
-`RegistryClientError` / `FoldQueryClientError` types carry a typed `Kind`), so you
-can branch on the kind where you need to. The full taxonomy is the
+## Sentinels and `errors.Is`
+
+The binding exports 49 sentinel errors. Compare with `errors.Is` — the
+returned error wraps the sentinel with context, so `==` will not match:
+
+```go
+if errors.Is(err, net.ErrBackpressure) {
+    // the one case a blind retry fixes
+}
+```
+
+**Bus and lifecycle:** `ErrBackpressure`, `ErrIngestionFailed`, `ErrPollFailed`,
+`ErrInitFailed`, `ErrShuttingDown`, `ErrInvalidJSON`, `ErrNullPointer`,
+`ErrBufferTooSmall`, `ErrUnknown`.
+
+**Mesh and streams:** `ErrMeshInit`, `ErrMeshHandshake`, `ErrMeshTransport`,
+`ErrNotConnected`, `ErrStreamEnded`, `ErrStreamTimeout`, `ErrChannel`,
+`ErrChannelAuth`.
+
+**Storage:** `ErrRedex`, `ErrNetDb`, `ErrCortexClosed`, `ErrCortexFold`.
+
+**Tokens** — the whole reason a permission check failed, which matters because
+each one implies a different fix: `ErrTokenExpired`, `ErrTokenNotYetValid`,
+`ErrTokenInvalidFormat`, `ErrTokenInvalidSignature`, `ErrTokenNotAuthorized`,
+`ErrTokenDelegationNotAllowed`, `ErrTokenDelegationExhausted`, plus
+`ErrIdentity`.
+
+**NAT traversal** — all of these mean "the direct path didn't open," and none
+of them break correctness; the routed path still works:
+`ErrTraversalUnsupported`, `ErrTraversalPunchFailed`,
+`ErrTraversalPeerNotReachable`, `ErrTraversalReflexTimeout`,
+`ErrTraversalPortMapUnavailable`, `ErrTraversalRendezvousNoRelay`,
+`ErrTraversalRendezvousRejected`, `ErrTraversalTransport`.
+
+**Organizations:** `ErrOrgAdmissionDenied`, `ErrOrgCredentials`,
+`ErrOrgDiscovery`, `ErrOrgProvision`, `ErrOrgRPC`, `ErrOrgAlreadyServing`,
+`ErrOrgClosed`, `ErrOrgUnclassified`.
+
+**MeshOS:** `ErrMeshOs`, `ErrMeshOsInvalidArg`, `ErrMeshOsCallFailed`,
+`ErrMeshOsAlreadyShutdown`.
+
+## Typed error structs
+
+Where a failure has structure rather than just an identity, the binding returns
+a struct with a typed `Kind` field — use `errors.As`:
+
+```go
+var ge *net.GroupError
+if errors.As(err, &ge) {
+    switch ge.Kind {
+    // ... GroupErrorKind values
+    }
+}
+```
+
+`GroupError` (`GroupErrorKind`), `MigrationError` (`MigrationErrorKind`),
+`RegistryClientError` (`RegistryErrorKind`), `FoldQueryClientError`
+(`FoldQueryErrorKind`), plus `DaemonError`, `DeckError`, `McpError`,
+`MeshOsSdkError`, `OrgError`, `RpcError`, `RpcCallStatusError` and
+`DuplicateKindError`.
+
+The wire-level codes these wrap are in the
 [Error Codes](/docs/reference/error-codes) reference.
 
 ## Recover an RPC call

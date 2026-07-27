@@ -1,5 +1,5 @@
 //! MeshOS SDK — Rust surface. The canonical daemon-author API
-//! per [`MESHOS_SDK_PLAN.md`](../../../../../../docs/plans/MESHOS_SDK_PLAN.md).
+//! per [`MESHOS_SDK_PLAN.md`](../../../../../../../../docs/internal/plans/MESHOS_SDK_PLAN.md).
 //!
 //! [`MeshOsDaemonHandle`] wraps a registered daemon's lifecycle:
 //! a per-daemon control-event receiver, a read-only metadata

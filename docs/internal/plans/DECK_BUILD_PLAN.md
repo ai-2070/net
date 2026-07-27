@@ -2,7 +2,7 @@
 
 Working doc for replacing every fixture in `src/tabs/*` with a
 real SDK projection. The strategic 6-phase doc lives at
-[`../docs/plans/DECK_PLAN.md`](../docs/plans/DECK_PLAN.md); this
+[`../docs/plans/DECK_PLAN.md`](DECK_PLAN.md); this
 file is the tactical "which fixture becomes which SDK call, in
 what order" engineering plan.
 
@@ -358,5 +358,5 @@ The seeder lives in `src/demo.rs` and stays gated behind
 
 ---
 
-*Tactical companion to [`../docs/plans/DECK_PLAN.md`](../docs/plans/DECK_PLAN.md).
+*Tactical companion to [`../docs/plans/DECK_PLAN.md`](DECK_PLAN.md).
 Update as substrate gaps close + new tabs land.*

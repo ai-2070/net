@@ -22,7 +22,7 @@
 //! cannot satisfy the public-output contract.
 //!
 //! Durable state placement follows decision D1 in
-//! `docs/plans/PAYMENTS_BENCHMARKS_PLAN.md`: the ordinary operational
+//! `docs/internal/plans/PAYMENTS_BENCHMARKS_PLAN.md`: the ordinary operational
 //! filesystem is the PRIMARY result (the durable JSON+fsync transaction IS
 //! the current payment semantics); tmpfs is a diagnostic floor that the
 //! operator must opt into AND label. We never infer "memory-backed" from a

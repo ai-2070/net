@@ -13,7 +13,7 @@ A survey of `src/adapter/net/` confirmed the same iceberg shape as
 Stages C and D: the primitives are built but never wired up.
 
 1. **`ChannelConfig::can_publish` / `can_subscribe` exist and work**
-   ([`channel/config.rs:111–154`](../src/adapter/net/channel/config.rs)).
+   ([`channel/config.rs:111–154`](../../../net/crates/net/src/adapter/net/channel/config.rs)).
    They intersect `publish_caps` / `subscribe_caps` against the
    sender's `CapabilitySet` and, if `require_token` is set, call
    `TokenCache::check(entity_id, scope, channel_hash)`. Unit tests

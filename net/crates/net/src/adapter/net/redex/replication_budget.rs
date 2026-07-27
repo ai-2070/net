@@ -1,4 +1,4 @@
-//! Bandwidth budget — `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §5 +
+//! Bandwidth budget — `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` §5 +
 //! Locked decision 10.
 //!
 //! Token-bucket rate limiter the catch-up loop consults before

@@ -327,3 +327,7 @@ Credit-grant math: `5 MB / 64 KB ≈ 80` round trips, each a `StreamWindow` pack
 - `runtime.md` § Errors — bus-side error matrix, including the bus's separate `Backpressure` semantics under `FailProducer`.
 - `runtime.md` § Per-SDK shutdown — streams ride on `MeshNode`; closing the mesh closes all streams it owns.
 - `concepts.md` § Transport — streams require the mesh transport. Memory / Redis / JetStream don't have a stream surface.
+
+## Further reading
+
+- [Mesh Streams and Backpressure](https://ai2070.net/docs/guides/mesh-streams)

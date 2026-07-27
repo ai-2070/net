@@ -171,7 +171,7 @@ netdb = ["cortex"]
 # streaming aggregates across many nodes and chains.
 # Disabled by default; activation requires a concrete consumer
 # workload (telemetry + Deck metrics are the named
-# candidates). See `docs/plans/MESHDB_PLAN.md`.
+# candidates). See `docs/internal/plans/MESHDB_PLAN.md`.
 meshdb = ["cortex"]
 # MeshOS (Atomic Playboys, follows MeshDB) — cluster-behavior
 # engine. One canonical event loop per node that reconciles
@@ -182,7 +182,7 @@ meshdb = ["cortex"]
 # reconcile no-op + action executor); later phases fill in
 # supervision (B), replica enforcement (C), locality + admin
 # events (D), maintenance state machine (E), behavior snapshot
-# fold (F), and backpressure (G). See `docs/plans/MESHOS_PLAN.md`.
+# fold (F), and backpressure (G). See `docs/internal/plans/MESHOS_PLAN.md`.
 meshos = ["cortex", "dep:blake3"]
 # Dataforts (Rebel Yell) — compile the dataforts module surface,
 # which covers every phase the plan calls runtime-toggleable:
@@ -191,7 +191,7 @@ meshos = ["cortex", "dep:blake3"]
 # phase exposes its own `enable_*` / `disable_*` operator
 # methods on `Redex`; toggling at runtime is the cluster-policy
 # control surface, not a Cargo-feature decision. See
-# `docs/misc/DATAFORTS_PLAN.md` for the per-phase wiring + the
+# `docs/internal/misc/DATAFORTS_PLAN.md` for the per-phase wiring + the
 # rationale for the single compile-time gate.
 dataforts = [
     "redex",
@@ -473,7 +473,7 @@ harness = false
 required-features = ["net"]
 
 # CPB — capability propagation benchmark suite (custom main + hdrhistogram).
-# See docs/plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md.
+# See docs/internal/plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md.
 [[bench]]
 name = "capability_propagation"
 harness = false

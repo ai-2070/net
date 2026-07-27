@@ -10,7 +10,7 @@ on top.
 This doc covers the **Rust SDK** surface that landed in Wave 2 of
 the AI tool-calling work. Bindings (Node / Python / Go) and format
 translators (OpenAI / Anthropic / Gemini / MCP) are tracked in
-`docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`.
+`docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`.
 
 ## Quickstart
 
@@ -575,6 +575,6 @@ Python/Go, camelCase in Node TS). Empty input-schema fallback to
 
 ## Plan reference
 
-See `docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md` for the full
+See `docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md` for the full
 slice-by-slice plan, locked design decisions, and Wave 3 / 4 follow-
 ups (bindings + format translators).

@@ -256,6 +256,68 @@ Wire format is JSON, but transport-layer protocol details (framing, handshake ve
 
 ---
 
+## Partitions and healing
+
+A partition is not a failure mode you handle with a retry. Both sides are
+**alive and still accepting writes** — they just can't see each other. The
+substrate detects this, keeps running, and reconciles on heal. What you need to
+know is what your application sees on the other side of that.
+
+### Mass failure throttles recovery
+
+Before concluding "partition," the mesh classifies failures as `Independent` or
+`MassFailure`. The thresholds are **ratios, not counts**, so they scale with
+mesh size: a 2-second correlation window, mass failure at 30% of tracked nodes,
+subnet-correlated at 80% of failures sharing a subnet ancestor.
+
+The consequence for you: during a mass failure, recovery is deliberately
+**throttled** (default 3 concurrent migrations) to prevent a recovery storm from
+finishing what the outage started. Independent failures recover unthrottled. If
+you are watching daemons fail over and they seem to be taking their time during
+a big outage, that is the budget working, not a stall.
+
+### The phases
+
+```text
+Suspected → Confirmed → Healing { reappeared } → Healed
+```
+
+`Suspected` is asymmetric visibility that might be a blip. `Confirmed` means the
+mesh has decided. `Healing` carries the node ids that came back.
+
+### What happens to your data on heal
+
+On heal, each divergent entity log reconciles from the horizon recorded at the
+split. Three outcomes:
+
+| Outcome | Meaning | Your action |
+|---|---|---|
+| `AlreadyConverged` | Both sides idle, or wrote identical chains | None |
+| `Catchup` | One side has events the other lacks | None — missing events ship to the behind side |
+| `Conflict` | **Both sides wrote**, chains diverge | See below |
+
+`Conflict` resolution is deterministic and coordination-free — both sides reach
+the same verdict independently, with no protocol round-trip:
+
+1. **Longest chain wins** (it was more active during the partition).
+2. **Tie:** lower `parent_hash` wins. Both sides can compute this.
+3. The losing chain is **not discarded** — it becomes a `ForkRecord` with
+   documented lineage, via the same honest-discontinuity machinery a crash uses.
+
+### The thing that will surprise you
+
+**After a conflicted heal, your entity has forked.** Events aren't lost, but
+they're no longer on one chain — the losing side's writes live under a new
+origin with a recorded fork point. An application that assumes "one entity, one
+chain, forever" will silently read only the winner.
+
+If your workload can have both sides writing the same entity during a
+partition, decide up front what a fork means for you: reconcile at the
+application layer, or design so that only one side is ever authoritative (a
+standby group rather than two active writers). The substrate will not silently
+pick a merge for you, and that is deliberate — see `event-semantics.md` on why
+a fact observed at one layer is not an end-to-end truth.
+
 ## Quick reference: stats observability
 
 ```rust
@@ -274,3 +336,9 @@ print(f"ingested={s.events_ingested} dropped={s.events_dropped}")
 ```
 
 Pull these on a timer (every 1–10s) into your metrics system. `events_dropped` should normally be 0; sustained non-zero means the producer is out-running the consumer or transport.
+
+## Further reading
+
+- [Troubleshooting](https://ai2070.net/docs/guides/troubleshooting)
+- [Running in Production](https://ai2070.net/docs/guides/production-deployment)
+- [Continuity and Migration](https://ai2070.net/docs/guides/continuity-and-migration)

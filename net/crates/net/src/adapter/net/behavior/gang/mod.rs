@@ -28,7 +28,7 @@
 //! [`ResourceId`](crate::adapter::net::behavior::fold::ResourceId)
 //! (locked decision 1).
 //!
-//! Phasing (see `docs/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md`):
+//! Phasing (see `docs/internal/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md`):
 //! Phase A ships the topology fold + this read pipeline + the single-
 //! island CAS; multi-island ordered-acquire (Phase C) and the
 //! quorum-witnessed `→ Active` with a fencing epoch (Phase D) build

@@ -46,7 +46,7 @@
 //! Go, C) mirrors a subset of it in its own house style, deciding nothing
 //! itself (doctrine: no logic in bindings — bindings build the flow,
 //! marshal arguments, and project results). The per-language parity
-//! matrix in `docs/plans/PAYMENTS_LANGUAGE_SDKS_PLAN.md` is the contract:
+//! matrix in `docs/internal/plans/PAYMENTS_LANGUAGE_SDKS_PLAN.md` is the contract:
 //! a language surface is "done" when its column matches. The failure
 //! schematic (`net_sdk::tool_payment`'s `net.payment.failure@1`) is part
 //! of the surface every language gets; its cross-language tolerance is

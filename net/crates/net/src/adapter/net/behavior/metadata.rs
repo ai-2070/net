@@ -969,7 +969,7 @@ pub struct MetadataStore {
     /// O(1) live node count. `DashMap::len()` walks every shard (~1us); the
     /// capacity gate in `upsert` and `len()`/`stats()` read this instead.
     /// Maintained exactly on the Vacant-insert / remove paths. See
-    /// docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2/§4.
+    /// docs/internal/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2/§4.
     node_count: AtomicUsize,
     /// Maximum capacity
     max_capacity: Option<usize>,

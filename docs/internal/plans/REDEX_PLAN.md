@@ -1,6 +1,6 @@
 # RedEX v1 — local append-only streaming log
 
-> **Looking for how to use this?** [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) is the user-facing narrative (API surface, durability trade-offs, restart behavior). This doc is the implementation plan.
+> **Looking for how to use this?** [`STORAGE_AND_CORTEX.md`](../../../net/crates/net/docs/STORAGE_AND_CORTEX.md) is the user-facing narrative (API surface, durability trade-offs, restart behavior). This doc is the implementation plan.
 
 ## Status
 
@@ -325,7 +325,7 @@ v1's contract is: `tail` is expressive enough that a fold can run against it. Th
 
 ## Durability & crash semantics (shipped)
 
-Disk-backed files (`RedexFileConfig::persistent = true` + a `Redex` manager configured with `with_persistent_dir`) are governed by a per-file [`FsyncPolicy`](../src/adapter/net/redex/config.rs):
+Disk-backed files (`RedexFileConfig::persistent = true` + a `Redex` manager configured with `with_persistent_dir`) are governed by a per-file [`FsyncPolicy`](../../../net/crates/net/src/adapter/net/redex/config.rs):
 
 ```rust
 pub enum FsyncPolicy {

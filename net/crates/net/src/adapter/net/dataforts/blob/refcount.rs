@@ -2,7 +2,7 @@
 //! [`super::mesh::MeshBlobAdapter`]'s GC sweep consults to decide
 //! which chunks are deletable.
 //!
-//! Per the plan (`docs/plans/DATAFORTS_BLOB_STORAGE_PLAN.md` § 5),
+//! Per the plan (`docs/internal/plans/DATAFORTS_BLOB_STORAGE_PLAN.md` § 5),
 //! GC is required for correctness — without it the mesh's
 //! content-addressed blob store grows monotonically. The sweep
 //! contract:

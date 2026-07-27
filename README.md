@@ -66,7 +66,6 @@ The Rust crate, npm scope, and PyPI dist all publish under `net-mesh*` / `@net-m
 - [Security](#security)
 - [The Blackwall](#the-blackwall)
 - [Implementation](#implementation)
-- [Status](#status)
 - [SDKs](#sdks)
 - [Benchmarks](#benchmarks)
 

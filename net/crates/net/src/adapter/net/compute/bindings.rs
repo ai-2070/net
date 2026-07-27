@@ -1,7 +1,7 @@
 //! Daemon subscription ledger — tracks what a daemon has subscribed
 //! to so channel bindings can be replayed on the migration target.
 //!
-//! See [`DAEMON_CHANNEL_REBIND_PLAN.md`](../../../../docs/DAEMON_CHANNEL_REBIND_PLAN.md)
+//! See [`DAEMON_CHANNEL_REBIND_PLAN.md`](../../../../../../../docs/internal/plans/DAEMON_CHANNEL_REBIND_PLAN.md)
 //! for the end-to-end design. This module owns the in-memory ledger
 //! (on [`DaemonHost`](super::DaemonHost)) plus the wire
 //! serialization that rides inside `StateSnapshot::bindings_bytes`

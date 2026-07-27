@@ -71,7 +71,7 @@ Stage C's own dependencies remain unchanged: it requires Stages A
 
 ### On-wire form
 
-Use [`CapabilityAnnouncement`](../src/adapter/net/behavior/capability.rs)
+Use [`CapabilityAnnouncement`](../../../net/crates/net/src/adapter/net/behavior/capability.rs)
 (behavior/capability.rs:690). It already has:
 
 - Full `CapabilitySet` (hardware, software, models, tools, tags, limits)

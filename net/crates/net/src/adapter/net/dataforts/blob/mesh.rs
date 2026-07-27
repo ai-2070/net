@@ -247,7 +247,7 @@ pub const DEFAULT_OVERFLOW_TICK_INTERVAL_MS: u64 = 30_000;
 /// See [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`] for the full
 /// design.
 ///
-/// [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`]: ../../../../../docs/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
+/// [`DATAFORTS_BLOB_OVERFLOW_PLAN.md`]: ../../../../../docs/internal/plans/DATAFORTS_BLOB_OVERFLOW_PLAN.md
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OverflowConfig {
     /// Operator-visible master switch. `false` by default;

@@ -3,8 +3,8 @@
 This doc is the **user-level narrative** for Net's single-node storage
 stack: RedEX (the log), CortEX (the fold driver and domain models), and
 NetDB (the query façade). For the design rationale + implementation
-plans see [`REDEX_PLAN.md`](REDEX_PLAN.md), [`CORTEX_ADAPTER_PLAN.md`](CORTEX_ADAPTER_PLAN.md),
-and [`NETDB_PLAN.md`](NETDB_PLAN.md). This doc is "how do I *use* it and
+plans see [`REDEX_PLAN.md`](../../../../docs/internal/plans/REDEX_PLAN.md), [`CORTEX_ADAPTER_PLAN.md`](../../../../docs/internal/plans/CORTEX_ADAPTER_PLAN.md),
+and [`NETDB_PLAN.md`](../../../../docs/internal/plans/NETDB_PLAN.md). This doc is "how do I *use* it and
 what do I need to know when I do."
 
 Target reader: an engineer writing a daemon that reads + writes
@@ -29,7 +29,9 @@ mesh-bound state.
 - **RedEX** is the primitive: a named monotonic log (`ChannelName` →
   `RedexFile`). 20-byte index records, inline-or-heap payloads, a
   tail API that delivers events in order. Single-node. Optionally
-  disk-backed via the `redex-disk` feature.
+  disk-backed via the `redex-disk` feature. Heap payloads land in a
+  `HeapSegment` — a grow-only `Vec<u8>` with a 3 GB hard cap, where
+  each index record carries the `(offset, len)` into the segment.
 - **CortEX** drives folds over RedEX tails. A domain model (`tasks`,
   `memories`) implements `RedexFold<State>`, which mutates state as
   events arrive. The adapter owns the `Arc<RwLock<State>>` and a
@@ -237,7 +239,7 @@ Design choices that matter here:
 The following are designed but not shipped in v2. Knowing the shape
 helps you structure daemons so adopting them later is straightforward.
 
-- **Hot → warm mmap tiering** ([`REDEX_V2_PLAN.md`](REDEX_V2_PLAN.md)).
+- **Hot → warm mmap tiering** ([`REDEX_V2_PLAN.md`](../../../../docs/internal/plans/REDEX_V2_PLAN.md)).
   A separate mmap-backed segment for frozen history, with transparent
   reads across hot heap + warm mmap. Reduces memory pressure on
   long-lived files; unblocks ~billions of retained events.

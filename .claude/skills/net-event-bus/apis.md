@@ -248,3 +248,11 @@ Out-of-scope features (read these directly from source):
 - **Permission tokens for channel auth** — see `net/README.md` § Security surface.
 - **RedEX / CortEX / NetDB** — separate APIs for persistence and queryable state. See `net/README.md` § RedEX and CortEX + NetDB.
 - **Mikoshi (live daemon migration)** — separate API for stateful event processors. See `net/README.md` § Daemons and Mikoshi.
+
+## Further reading
+
+- [Rust quickstart](https://ai2070.net/docs/sdk/rust/quickstart)
+- [TypeScript quickstart](https://ai2070.net/docs/sdk/typescript/quickstart)
+- [Python quickstart](https://ai2070.net/docs/sdk/python/quickstart)
+- [Go quickstart](https://ai2070.net/docs/sdk/go/quickstart)
+- [C quickstart](https://ai2070.net/docs/sdk/c/quickstart)

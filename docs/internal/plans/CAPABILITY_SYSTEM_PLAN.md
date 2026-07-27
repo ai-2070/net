@@ -679,7 +679,7 @@ Shipped in `src/adapter/net/behavior/placement.rs` (3464 lines). `PlacementFilte
 
 Compute path consumes `PlacementFilter` today — `compute/fork_group.rs`, `compute/daemon.rs`, `compute/daemon_factory.rs` all integrate. `MeshDaemon::requirements()` ships at `compute/daemon.rs:35`. Full Mikoshi target-selection upgrade + `mikoshi-placement-v2` feature flag wiring remains the unticked portion.
 
-"Mikoshi" is the colloquial name for the existing 6-phase migration stack — `compute/{migration,orchestrator,migration_source,migration_target,scheduler}.rs` plus `MigrationOrchestrator` and `Scheduler`. See [`COMPUTE.md`](../COMPUTE.md) for the full surface. This phase upgrades target selection inside that existing stack to consult `PlacementFilter`; the migration mechanism (snapshot → transfer → restore → replay → cutover → complete) is unchanged per [Locked decision 6](#six-previously-open-questions).
+"Mikoshi" is the colloquial name for the existing 6-phase migration stack — `compute/{migration,orchestrator,migration_source,migration_target,scheduler}.rs` plus `MigrationOrchestrator` and `Scheduler`. See [`COMPUTE.md`](../../../net/crates/net/docs/COMPUTE.md) for the full surface. This phase upgrades target selection inside that existing stack to consult `PlacementFilter`; the migration mechanism (snapshot → transfer → restore → replay → cutover → complete) is unchanged per [Locked decision 6](#six-previously-open-questions).
 
 - `Scheduler::find_migration_targets` (and the existing `place_migration`) consult `PlacementFilter` for scoring + the locked three-step tie-breaker.
 - A wrapping `Scheduler::select_migration_target(daemon, &dyn PlacementFilter) -> Option<NodeId>` returns the highest-scoring candidate; legacy capability-match-only behavior preserved as `LegacyPlacement` impl of `PlacementFilter` for one minor version.
@@ -856,7 +856,7 @@ When any of these fire, Warriors ships as a coherent release; this plan's conten
 **Consumed by:**
 
 - [`REDEX_DISTRIBUTED_PLAN.md`](REDEX_DISTRIBUTED_PLAN.md) — uses `PlacementFilter` for replica placement; uses `causal:` advertisement for replica discovery; uses `metadata.intent` and `metadata.colocate-with` for intent-aware and colocation-aware placement; uses anti-affinity penalty for leader concentration prevention.
-- [`misc/DATAFORTS_PLAN.md`](misc/DATAFORTS_PLAN.md) Phase 1 (Greedy LRU dataforts in Rebel Yell) — composes `PlacementFilter` for chain-cache placement; consumes `metadata.intent` and `metadata.colocate-with` for the 5-axis greedy filter.
+- [`misc/DATAFORTS_PLAN.md`](DATAFORTS_PLAN.md) Phase 1 (Greedy LRU dataforts in Rebel Yell) — composes `PlacementFilter` for chain-cache placement; consumes `metadata.intent` and `metadata.colocate-with` for the 5-axis greedy filter.
 - Future Atomic Playboys candidates (full MeshDB, Mikoshi v2, federated scheduler) — all build on the primitives shipped here.
 
 **Replaces:**
@@ -871,11 +871,11 @@ When any of these fire, Warriors ships as a coherent release; this plan's conten
 - [`REDEX_PLAN.md`](REDEX_PLAN.md) — single-node v1 substrate
 - [`REDEX_V2_PLAN.md`](REDEX_V2_PLAN.md) — single-node v2 (orthogonal)
 - [`REDEX_DISTRIBUTED_PLAN.md`](REDEX_DISTRIBUTED_PLAN.md) — Phase 2 of The Warriors; consumes everything in this plan
-- [`misc/DATAFORTS_PLAN.md`](misc/DATAFORTS_PLAN.md) — phased plan; this doc is the implementation detail for Phase 0 + Phase 6 + Phase 7
-- [`misc/DATAFORTS_FEATURES.md`](misc/DATAFORTS_FEATURES.md) — feature audit
+- [`misc/DATAFORTS_PLAN.md`](DATAFORTS_PLAN.md) — phased plan; this doc is the implementation detail for Phase 0 + Phase 6 + Phase 7
+- [`misc/DATAFORTS_FEATURES.md`](DATAFORTS_FEATURES.md) — feature audit
 - [`SCOPED_CAPABILITIES_PLAN.md`](SCOPED_CAPABILITIES_PLAN.md) — `scope:` convention reused unchanged
 - [`MULTIHOP_CAPABILITY_PLAN.md`](MULTIHOP_CAPABILITY_PLAN.md) — propagation primitive extended for metadata
 - [`CAPABILITY_BROADCAST_PLAN.md`](CAPABILITY_BROADCAST_PLAN.md) — broadcast machinery reused
 - [`CHANNEL_AUTH_GUARD_PLAN.md`](CHANNEL_AUTH_GUARD_PLAN.md) — ACL gating for capability tags + metadata
-- [`misc/NRPC_DESIGN.md`](misc/NRPC_DESIGN.md) — pattern for protocol convention layered on existing reliable-stream + capability infrastructure
+- [`misc/NRPC_DESIGN.md`](../misc/NRPC_DESIGN.md) — pattern for protocol convention layered on existing reliable-stream + capability infrastructure
 - `RELEASE_ROADMAP.md` — The Warriors release context

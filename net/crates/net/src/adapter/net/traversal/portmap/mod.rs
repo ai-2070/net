@@ -31,7 +31,7 @@
 //!
 //! # Lifecycle
 //!
-//! See `docs/PORT_MAPPING_PLAN.md` decision 3 for the state
+//! See `docs/internal/plans/PORT_MAPPING_PLAN.md` decision 3 for the state
 //! machine diagram. One-shot install at spawn; renewal every
 //! [`super::TraversalConfig::port_mapping_renewal`]; three
 //! consecutive renewal failures revoke; shutdown revokes too.
@@ -501,7 +501,7 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 pub(crate) const RENEWAL_FAILURE_THRESHOLD: u32 = 3;
 
 /// Drives the port-mapping lifecycle for a single mesh node.
-/// See module docs + `docs/PORT_MAPPING_PLAN.md` decision 3.
+/// See module docs + `docs/internal/plans/PORT_MAPPING_PLAN.md` decision 3.
 ///
 /// Tests construct this directly and drive it against a
 /// [`MockPortMapperClient`]; production callers go through

@@ -636,7 +636,7 @@ thread_local! {
 
     /// Per-thread counter that gates the dead-entry reap walk on
     /// `acquire`/`release`. Pre-fix [perf #17/#32 in
-    /// `docs/performance/net-perf-analysis.md`] every call ran a
+    /// `docs/internal/performance/net-perf-analysis.md`] every call ran a
     /// `HashMap::retain` that called `Weak::strong_count()` (an
     /// atomic load) on every entry — at packet rates this dominated
     /// the TLS path's cost (82ns vs 38ns for the shared pool in

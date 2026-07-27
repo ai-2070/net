@@ -126,3 +126,7 @@ Overrides: `NET_PAYMENTS_LIVE_FACILITATOR`, `NET_PAYMENTS_LIVE_RPC`,
 
 If any step reaches for a new envelope type or a branch in core, stop — that's
 the review invariant firing.
+
+## Further reading
+
+- [Networks](https://ai2070.net/docs/payments/networks)

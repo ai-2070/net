@@ -12,7 +12,7 @@
 //! `Regex`, `VersionRange`, `SumNumericTag`, and `Min/MaxNumericTag`
 //! land in 6c-B (capacity ranking) and 6c-C (advanced matchers).
 //!
-//! See `docs/plans/MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
+//! See `docs/internal/plans/MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`.
 
 use std::collections::{HashMap, HashSet};
 

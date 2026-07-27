@@ -135,7 +135,7 @@ impl RedisAdapter {
     /// Since `event.raw` is already pre-serialized JSON bytes, we embed it directly
     /// using `RawValue` semantics to avoid double-serialization.
     ///
-    /// Pre-fix [perf #30 in `docs/performance/net-perf-analysis.md`]
+    /// Pre-fix [perf #30 in `docs/internal/performance/net-perf-analysis.md`]
     /// the `insertion_ts.to_string().as_bytes()` and
     /// `shard_id.to_string().as_bytes()` patterns allocated a fresh
     /// `String` per event purely to extract the decimal bytes — 2N
@@ -232,7 +232,7 @@ impl RedisAdapter {
         };
 
         let mut events = Vec::with_capacity(limit);
-        // Pre-fix [perf #31 in `docs/performance/net-perf-analysis.md`]
+        // Pre-fix [perf #31 in `docs/internal/performance/net-perf-analysis.md`]
         // tracked `last_seen_id: Option<String>` and ran
         // `Some(id.to_string())` on every iteration — only the LAST
         // value matters, so a 10K-entry response did 9999 wasted
@@ -662,7 +662,7 @@ fn is_transient_error(e: &RedisError) -> bool {
         // body. Includes `NOREPLICAS` (a wait-aof timeout) which
         // doesn't have a typed kind in this redis crate version.
         //
-        // Pre-fix [perf #40 in `docs/performance/net-perf-analysis.md`]
+        // Pre-fix [perf #40 in `docs/internal/performance/net-perf-analysis.md`]
         // ran `e.to_string().to_uppercase()` and called `.contains`
         // nine times — two `String` allocations per classified
         // error, on a path that's hot in a degraded-broker state

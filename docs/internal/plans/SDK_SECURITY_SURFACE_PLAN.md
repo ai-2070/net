@@ -4,9 +4,9 @@
 
 The `net` crate ships a three-layer security / organization model that no SDK exposes today:
 
-1. **Identity** — ed25519-rooted entities. `EntityKeypair` signs, `PermissionToken` delegates, `TokenCache` caches hot lookups. See [`IDENTITY.md`](IDENTITY.md) for the design.
+1. **Identity** — ed25519-rooted entities. `EntityKeypair` signs, `PermissionToken` delegates, `TokenCache` caches hot lookups. See [`IDENTITY.md`](../../../net/crates/net/docs/IDENTITY.md) for the design.
 2. **Capabilities** — what a node can do: hardware, software, models, tools, tags, limits. `CapabilitySet` is the value type; `CapabilityAnnouncement` is the wire primitive; `CapabilityIndex` is the queryable sidecar.
-3. **Subnets** — hierarchical 4-level grouping for routing/visibility. `SubnetId` (bit-packed u32), `SubnetPolicy` (tag → level mapping), `SubnetGateway` (forwarding-time enforcement). See [`SUBNETS.md`](SUBNETS.md).
+3. **Subnets** — hierarchical 4-level grouping for routing/visibility. `SubnetId` (bit-packed u32), `SubnetPolicy` (tag → level mapping), `SubnetGateway` (forwarding-time enforcement). See [`SUBNETS.md`](../../../net/crates/net/docs/SUBNETS.md).
 
 These compose: identity issues tokens, tokens reference capabilities, capabilities derive subnet membership, channels gate access via all three. The [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) explicitly cuts channel auth from Stages 6–7 for this reason — without an identity + token surface in the SDK, a caller can't construct a `PermissionToken` to pass to `subscribeChannel`.
 
@@ -57,7 +57,7 @@ follow-up outside this plan).
 
 ## Design principles
 
-1. **Security defaults safe, not permissive.** `Net::builder()` today produces an anonymous node. Adding identity should be opt-in (not breaking) but once opted in, defaults should match the production recommendations in [`IDENTITY.md`](IDENTITY.md) (short token TTLs, small delegation depth, token required for global-visibility channels).
+1. **Security defaults safe, not permissive.** `Net::builder()` today produces an anonymous node. Adding identity should be opt-in (not breaking) but once opted in, defaults should match the production recommendations in [`IDENTITY.md`](../../../net/crates/net/docs/IDENTITY.md) (short token TTLs, small delegation depth, token required for global-visibility channels).
 2. **Keys are caller-owned.** No SDK method writes to a hardcoded path. Users pass bytes in or a path in; the SDK only operates on what they hand it. This avoids fighting every user's secret-management strategy (vault, k8s secrets, envelope encryption, enclave).
 3. **Zero-cost when unused.** A node that doesn't set an identity pays nothing — no signing, no cache, no announcement. Current performance profile must not regress for the "anonymous mesh" use case.
 4. **Composition via handles, not globals.** `Identity` is a handle a user creates and hands to `Net::builder().identity(id)` (and `MeshBuilder::identity(id)`). No thread-local, no `static`, no env-var fallback. Explicit beats magic.
@@ -841,7 +841,7 @@ wire format + signature invariance across hop bumps.
 
 ### Security posture
 
-- **Default TTLs for `issue_token`.** [`IDENTITY.md`](IDENTITY.md) argues for short TTLs. The SDK surface should not default to infinity. Pick `15m` as the SDK default and document.
+- **Default TTLs for `issue_token`.** [`IDENTITY.md`](../../../net/crates/net/docs/IDENTITY.md) argues for short TTLs. The SDK surface should not default to infinity. Pick `15m` as the SDK default and document.
 - **Delegation depth default.** 0 (no re-delegation) is the safe default. Users who want delegation set it explicitly.
 - **`scope` as string union vs bitfield.** TS surface uses `('publish' | 'subscribe' | ...)[]` for readability. NAPI converts to `TokenScope` bitfield. Round-trip tests must verify the `admin` + `delegate` combinations survive.
 - **Anonymous-mode compatibility.** Confirm the existing anonymous emit/poll/mesh path produces packets with `origin_hash=0` and that channel gate `require_token=false` accepts them. No change needed if already true; document explicitly.

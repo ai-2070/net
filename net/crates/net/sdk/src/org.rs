@@ -3,7 +3,7 @@
 //! operators and daemon authors import from `net_sdk::org::*`
 //! instead of reaching into the core crate.
 //!
-//! See `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md`. OA-1 ships
+//! See `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md`. OA-1 ships
 //! belonging only: an [`OrgMembershipCert`] proves which single
 //! organization owns a node and feeds the fold's `owner_org`
 //! discovery projection after ingest verification. Nothing here

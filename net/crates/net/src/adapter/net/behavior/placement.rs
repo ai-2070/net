@@ -1,7 +1,7 @@
 //! Placement filter — substrate primitive for "given an artifact and a
 //! candidate node, how good a fit is the candidate?"
 //!
-//! Phase F slice 1 of [`CAPABILITY_SYSTEM_PLAN.md`](../../../../docs/plans/CAPABILITY_SYSTEM_PLAN.md).
+//! Phase F slice 1 of [`CAPABILITY_SYSTEM_PLAN.md`](../../../../../../../docs/internal/plans/CAPABILITY_SYSTEM_PLAN.md).
 //! Lays the trait + `Artifact` enum + a `LegacyPlacement` shim that
 //! preserves today's `find_migration_targets` behavior. Phase F
 //! slice 2+ will land `StandardPlacement` (the multi-axis reference
@@ -111,7 +111,7 @@ pub enum Artifact<'a> {
 }
 
 /// Substrate-level placement primitive. Trait surface locked by
-/// [`CAPABILITY_SYSTEM_PLAN.md`](../../../../docs/plans/CAPABILITY_SYSTEM_PLAN.md) §7.
+/// [`CAPABILITY_SYSTEM_PLAN.md`](../../../../../../../docs/internal/plans/CAPABILITY_SYSTEM_PLAN.md) §7.
 ///
 /// Application code that wants opinionated placement implements
 /// this trait directly; callers pass `&dyn PlacementFilter` to the

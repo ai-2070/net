@@ -110,7 +110,7 @@ pub struct NetSession {
     /// Per-session cache of the resolved peer `NodeId`.
     ///
     /// Pre-fix [discovery-routing perf #108 in
-    /// `docs/performance/net-discovery-routing-analysis.md`] the
+    /// `docs/internal/performance/net-discovery-routing-analysis.md`] the
     /// inbound dispatcher's RPC hook ran the
     /// `addr_to_node → peers.get → session_id-match → fallback
     /// O(N) peer scan` resolution chain on **every** inbound RPC
@@ -423,7 +423,7 @@ impl NetSession {
             None => return TxAdmit::StreamClosed,
             Some(state) => {
                 // Cache `epoch` once — pre-fix [perf #42 in
-                // `docs/performance/net-perf-analysis.md`] the field
+                // `docs/internal/performance/net-perf-analysis.md`] the field
                 // was read twice through the `Ref`, once for the
                 // epoch-mismatch check and once on the return tuple.
                 // Trivial field access today but the cache also makes
@@ -1737,7 +1737,7 @@ mod heartbeat_api_drift_check {
     //! production-side caller in `mod.rs` and `mesh.rs` that
     //! constructs a heartbeat must go through
     //! [`NetSession::build_heartbeat`]. See
-    //! `docs/HEARTBEAT_UNIFICATION_PLAN.md` Step 4.
+    //! `docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md` Step 4.
     //!
     //! `PacketBuilder::new` is `pub(crate)` so the type system
     //! already forbids external callers. Within the crate,
@@ -1805,7 +1805,7 @@ mod heartbeat_api_drift_check {
             "mod.rs production callers of `.build_heartbeat()` drifted from the \
              approved allowlist. If you intentionally added a new caller, route it \
              through `Session::build_heartbeat` and update this allowlist. \
-             See docs/HEARTBEAT_UNIFICATION_PLAN.md."
+             See docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md."
         );
     }
 
@@ -1820,7 +1820,7 @@ mod heartbeat_api_drift_check {
             "mesh.rs production callers of `.build_heartbeat()` drifted from the \
              approved allowlist. If you intentionally added a new caller, route it \
              through `Session::build_heartbeat` and update this allowlist. \
-             See docs/HEARTBEAT_UNIFICATION_PLAN.md."
+             See docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md."
         );
     }
 }

@@ -260,3 +260,8 @@ Set `RUST_LOG=net::adapter::net::traversal=debug,net::adapter::net::failure=info
 - `runtime.md` § "The shutdown contract" — when each stat is valid. Reading `events_ingested` after `shutdown` is fine (the counters are not torn down). Reading mesh stream/traversal stats after the mesh socket is closed is not — `stream_stats` returns `None` once the session is gone.
 - `runtime.md` § "Debugging: 'Why are my events missing?'" — checklist that uses these counters as the diagnostic surface.
 - `concepts.md` § "Backpressure: silence, not a signal" — the design rationale for why drops are silent by default.
+
+## Further reading
+
+- [Running in Production](https://ai2070.net/docs/guides/production-deployment)
+- [Troubleshooting](https://ai2070.net/docs/guides/troubleshooting)

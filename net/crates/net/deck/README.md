@@ -34,7 +34,7 @@ net-deck
 cargo run -p net-deck --features demo
 ```
 
-The `demo` feature wires `net_sdk::testing::ClusterHarness` — real daemons, real migrations, real blob adapters, a real `RpcObserver` feeding the NRPC tail. See `crates/net/docs/plans/DECK_DEMO_PLAN.md`.
+The `demo` feature wires `net_sdk::testing::ClusterHarness` — real daemons, real migrations, real blob adapters, a real `RpcObserver` feeding the NRPC tail. See `docs/internal/plans/DECK_DEMO_PLAN.md`.
 
 ## Tabs
 

@@ -79,6 +79,32 @@ bus.ingest_raw(raw)?;
 
 Either form is safe to call from many threads concurrently. The shard hashing keeps producers from contending on the same buffer.
 
+### The SDK's five ingest methods
+
+`net_sdk::Net` wraps the above in a family that trades ergonomics against
+speed. Pick by what you already have in hand:
+
+| Method | Takes | Speed | Returns |
+|---|---|---|---|
+| `emit(&T)` | Anything `Serialize` | Fast | `Receipt` |
+| `emit_str(json)` | `&str` | Fast | `Receipt` |
+| `emit_raw(bytes)` | `impl Into<Bytes>` | Fastest | `Receipt` |
+| `emit_batch(&[T])` | Slice of `Serialize` | Bulk | `usize` accepted |
+| `emit_raw_batch(Vec<Bytes>)` | Raw byte vecs | Bulk, fastest | `usize` accepted |
+
+The single-event forms return a `Receipt` (`shard_id`, `timestamp`) confirming
+acceptance into the ring buffer. The batch forms return **a count**, not
+receipts — so `accepted < len` means some were dropped and you won't know
+which. If that matters, emit singly or track it yourself.
+
+`emit_raw` is fastest because it skips both the JSON parse and the hash
+computation — reach for it when the bytes came off a socket or a file and you
+have no reason to look inside them.
+
+The other bindings expose the same family: `emit` / `emitRaw` / `emitBatch` in
+TypeScript, `emit` / `emit_raw` / `emit_batch` in Python, `Ingest` /
+`IngestRaw` in Go.
+
 ## Consumption
 
 `bus.poll()` is the cursor-based consumer. You pass a `ConsumeRequest` describing what you want (limit, optional cursor, optional filter, optional shard set), and the bus merges results across shards in causal order.

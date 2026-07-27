@@ -29,7 +29,7 @@ v0.29.1 is a **patch release with no functional change to the scheduler or any m
 ## Docs & comments
 
 - Dropped the stale *"in Phase 2"* future-tense framing from the drift-scorer comments in `event_loop.rs` / `scheduler.rs` — cadence + dirty-bit gating already shipped in v0.29, so the deferral wording was wrong. Comment-only; the code is unchanged.
-- Synced the `LocalScheduler` / `ScoreHistory` / `ScoreSnapshot` sketch in [`MESH_SCHEDULER_IMPL_PLAN.md`](../plans/MESH_SCHEDULER_IMPL_PLAN.md) to the as-built types.
+- Synced the `LocalScheduler` / `ScoreHistory` / `ScoreSnapshot` sketch in [`MESH_SCHEDULER_IMPL_PLAN.md`](../../../../../docs/internal/plans/MESH_SCHEDULER_IMPL_PLAN.md) to the as-built types.
 
 ---
 

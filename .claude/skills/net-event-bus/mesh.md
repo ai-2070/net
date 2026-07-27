@@ -187,7 +187,7 @@ Don't try to make Net do mDNS / SRV / DNS-SD. It's the wrong layer — pick a se
 
 ## NAT traversal — opt-in optimization
 
-**The routed-handshake fallback always works.** Two NATed peers behind any combination of cones, symmetrics, or unknown classifications still reach each other through encrypted relay forwarding. NAT traversal cuts the per-packet relay tax when a direct path is feasible — that's it. Full design: `net/crates/net/docs/NAT_TRAVERSAL_PLAN.md`. Operator-facing summary: `net/crates/net/README.md` § NAT Traversal.
+**The routed-handshake fallback always works.** Two NATed peers behind any combination of cones, symmetrics, or unknown classifications still reach each other through encrypted relay forwarding. NAT traversal cuts the per-packet relay tax when a direct path is feasible — that's it. See <https://ai2070.net/docs/guides/nat-and-traversal>.
 
 Cargo feature: `nat-traversal` (Rust SDK). The TS / Python bindings ship with stubs that no-op or return a "feature not built" error when the underlying cdylib was built without it.
 
@@ -365,3 +365,10 @@ All of it degrades cleanly against un-upgraded peers.
 - **Call `accept()` for every responder peer BEFORE `start()`.** Calling `accept()` after `start()` returns `AdapterError::Fatal` (`net/crates/net/src/adapter/net/mesh.rs:4386`) — the runtime rejects it explicitly to prevent the handshake-race hang.
 - **Watch `traversal_stats` if NAT traversal is on.** A `relay_fallbacks` counter that grows much faster than `punches_succeeded` says the punch path isn't earning its keep — fine for correctness, expensive for relays. When it does, the cause counters (`punch_timeouts` / `punch_rejections` / `rendezvous_no_relay`) tell you which failure mode dominates, and a healthy `upgrades_succeeded` means relayed sessions are still being reclaimed into direct ones in the background.
 - **Shutdown cleanly.** See `runtime.md` — same contract as memory transport, plus the mesh closes peer sessions on the way out (peers see "graceful departure" rather than "suspect").
+
+## Further reading
+
+- [NAT and Traversal](https://ai2070.net/docs/guides/nat-and-traversal)
+- [Subnets](https://ai2070.net/docs/concepts/subnets)
+- [Channels](https://ai2070.net/docs/concepts/channels)
+- [Security Model](https://ai2070.net/docs/concepts/security-model)

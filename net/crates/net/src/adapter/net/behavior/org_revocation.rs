@@ -1,5 +1,5 @@
 //! Restart-persistent organization revocation maxima — OA-1 §1.5 of
-//! `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md`.
+//! `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md`.
 //!
 //! An in-memory monotone merge of
 //! [`OrgRevocationBundle`] floors

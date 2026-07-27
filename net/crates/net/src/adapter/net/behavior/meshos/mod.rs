@@ -4,7 +4,7 @@
 //! intent, and folds the result into a behavior snapshot for
 //! Deck.
 //!
-//! Phase A of [`MESHOS_PLAN.md`](../../../../../docs/plans/MESHOS_PLAN.md) —
+//! Phase A of [`MESHOS_PLAN.md`](../../../../../../../../docs/internal/plans/MESHOS_PLAN.md) —
 //! the skeleton. Lands the module shape + the canonical types +
 //! the loop body. Reconcile returns an empty action list under
 //! every input; the action executor drains an empty queue under
@@ -15,7 +15,7 @@
 //! - Phase C → replica enforcement (pull / drop / placement /
 //!   eviction; leader-only `Request*` actions).
 //! - Phase D → locality + admin event handling; the body of
-//!   [`MESH_SCHEDULER_PLAN.md`](../../../../../docs/plans/MESH_SCHEDULER_PLAN.md)
+//!   [`MESH_SCHEDULER_PLAN.md`](../../../../../../../../docs/internal/plans/MESH_SCHEDULER_PLAN.md)
 //!   lands here as Phase D-1.
 //! - Phase E → maintenance state machine (Active →
 //!   EnteringMaintenance → Maintenance → ExitingMaintenance →

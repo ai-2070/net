@@ -9,7 +9,7 @@
 > them, *without either side calling the other.* Companion to Thunderdome (the claim),
 > Time (the task state), [`MESH_SCHEDULER_PLAN.md`](MESH_SCHEDULER_PLAN.md) (the drift
 > scorer this coexists with), the MeshOS reconcile loop it projects into, and
-> [`PLAN_CORRECTIONS.md`](PLAN_CORRECTIONS.md) (whose `AfterTerminal` trigger this plan's
+> [`PLAN_CORRECTIONS.md`](MESH_SCHEDULER_PLAN_CORRECTIONS.md) (whose `AfterTerminal` trigger this plan's
 > Phase B consumes). **Come Together release** (Beatles) — two desired-state machines meet
 > at the boundary and never call each other's names.
 
@@ -112,7 +112,7 @@ Prerequisites:
 - ~~**`IslandTopology` fold** (gang scheduler input).~~ ✅ Landed.
 - **PARTIALLY LANDED — needs the corrections plan's primitive:** failure propagation in
   shard fan-out depends on `Trigger::AfterTerminal`, which is introduced in
-  [`PLAN_CORRECTIONS.md`](PLAN_CORRECTIONS.md) §2. This plan's Projection 3 consumes it.
+  [`PLAN_CORRECTIONS.md`](MESH_SCHEDULER_PLAN_CORRECTIONS.md) §2. This plan's Projection 3 consumes it.
   Either ship that primitive first or sequence the corrections-plan work to land before
   Phase B of this plan.
 - **NEW, this plan:** four projections (§Design) + the migration-veto rule. Zero of these
@@ -602,7 +602,7 @@ All resolutions below are load-bearing rules, not advisory. Changes from v1 are 
   plan's recovery test asserts against.
 - [`TASK_LIFECYCLE_PLAN.md`](TASK_LIFECYCLE_PLAN.md) — the task state projected into
   `DaemonIntent`; the failure-propagation path lifecycle signals trigger.
-- [`PLAN_CORRECTIONS.md`](PLAN_CORRECTIONS.md) — §2 `Trigger::AfterTerminal` primitive
+- [`PLAN_CORRECTIONS.md`](MESH_SCHEDULER_PLAN_CORRECTIONS.md) — §2 `Trigger::AfterTerminal` primitive
   that this plan's Projection 3 consumes; §1 `Blocked` decision affects whether the
   workflow state machine has a state that this plan would need to project (if `Blocked`
   is kept and means "submitted but resource-blocked," Projection 1 needs a row for it).

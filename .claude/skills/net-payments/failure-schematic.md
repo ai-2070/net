@@ -191,3 +191,7 @@ tag.
   `engine_unavailable_denial`, `redeem_via_engine`)
 - Cross-language tolerance fixture: `tests/cross_lang_payments/payment_vectors.json`
   (`failure_schematic_vectors`)
+
+## Further reading
+
+- [The Failure Schematic](https://ai2070.net/docs/payments/failure-schematic)

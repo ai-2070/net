@@ -15,7 +15,7 @@
 // direct-call composition (TODO).
 //
 // Plan: see
-// `crates/net/docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
+// `docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
 // slices B-1 / B-2 / B-4. Mirror of the Rust SDK's
 // `net_sdk::tool` + `net_sdk::tool::formats` modules — cross-
 // language tests (T-1) will pin byte equality across both.

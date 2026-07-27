@@ -16,7 +16,7 @@ shipped the subscribe-gate and publish-gate auth checks:
 capability filters, `require_token`, TOFU entity-id binding. That
 work proved the model end-to-end, but left three gaps that the
 main README's
-[`AuthGuard` description](../README.md#channels)
+[`AuthGuard` description](../../../net/crates/net/README.md#channels)
 implies are already closed:
 
 > AuthGuard enforces authorization at the channel boundary. It
@@ -29,13 +29,13 @@ implies are already closed:
 **Today's reality:**
 
 1. `AuthGuard` exists and works
-   ([`guard.rs:62`](../src/adapter/net/channel/guard.rs)) — 4 KB
+   ([`guard.rs:62`](../../../net/crates/net/src/adapter/net/channel/guard.rs)) — 4 KB
    bloom filter, atomic bits, verified cache, exact-channel ACL.
    Tested in isolation; wired into RedEX for storage-plane gating
-   ([`redex/manager.rs:28`](../src/adapter/net/redex/manager.rs)).
+   ([`redex/manager.rs:28`](../../../net/crates/net/src/adapter/net/redex/manager.rs)).
 2. It is **not** wired into `MeshNode`. Publish fan-out iterates
    subscribers from `roster` with no per-packet auth check
-   ([`mesh.rs:2690`](../src/adapter/net/mesh.rs)).
+   ([`mesh.rs:2690`](../../../net/crates/net/src/adapter/net/mesh.rs)).
 3. Expired tokens don't evict subscribers. A subscriber that
    presents a 60-second token at subscribe time gets unbounded
    access thereafter.
@@ -108,7 +108,7 @@ This plan closes those gaps.
 ### Populating AuthGuard on subscribe
 
 Today, successful `authorize_subscribe`
-([`mesh.rs:2499`](../src/adapter/net/mesh.rs)) writes the
+([`mesh.rs:2499`](../../../net/crates/net/src/adapter/net/mesh.rs)) writes the
 subscriber into `roster` and returns `(true, None)`. Add a new
 step right before the return:
 
@@ -122,13 +122,13 @@ ctx.auth_guard.allow_channel(
 `origin_hash_of` derives the 32-bit origin from the peer's node id
 (low 32 bits of the u64 is fine — matches the `NetHeader.origin`
 field semantics). `allow_channel` is the existing
-[`guard.rs:169`](../src/adapter/net/channel/guard.rs) method that
+[`guard.rs:169`](../../../net/crates/net/src/adapter/net/channel/guard.rs) method that
 sets the two bloom bits AND inserts into the exact-name ACL.
 
 ### Fast path on publish
 
 Today, `publish_many`
-([`mesh.rs:2690`](../src/adapter/net/mesh.rs)) does:
+([`mesh.rs:2690`](../../../net/crates/net/src/adapter/net/mesh.rs)) does:
 
 ```rust
 for peer_id in subscribers {
@@ -162,7 +162,7 @@ for peer_id in subscribers {
 Performance note: `peer_id as u32` is the truncation
 `routing_id(node_id)` already uses for the routing-header
 `src_id` field
-([`mesh.rs:383`](../src/adapter/net/mesh.rs)). Same derivation on
+([`mesh.rs:383`](../../../net/crates/net/src/adapter/net/mesh.rs)). Same derivation on
 both ends keeps `origin_hash` consistent across the hot path.
 
 ### Expiry sweep

@@ -172,3 +172,7 @@ Two setup mistakes produce a confusing "service not found" rather than an auth e
 - **Don't mock the bus.** Use the real SDK with memory transport. Mocking pub/sub leads to tests that pass but ship broken integrations — exactly the failure mode the SDK's "small enough to use everywhere" property is designed to prevent.
 - **Don't assert on timestamps.** They're nanosecond-resolution and machine-dependent. Assert on ordering and content, not absolute time.
 - **Don't assert on shard IDs.** Shard assignment is hash-based and may change between SDK versions.
+
+## Further reading
+
+- [Running in Production](https://ai2070.net/docs/guides/production-deployment)

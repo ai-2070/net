@@ -9,7 +9,7 @@
 //! projection at the desired/observed boundary that lives *here* — no
 //! I/O, no calls back into either layer.
 //!
-//! Projections (see `docs/plans/MESHOS_SCHEDULER_INTEGRATION_PLAN.md`):
+//! Projections (see `docs/internal/plans/MESHOS_SCHEDULER_INTEGRATION_PLAN.md`):
 //! - 1 — task → daemon intent (`project_daemon_intents`). Implemented.
 //! - 2 — claim → forced placement (`project_forced_placements`, backed
 //!   by `ClaimRegistry`). Implemented — closes Phase A.

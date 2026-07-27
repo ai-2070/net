@@ -11,7 +11,7 @@
 //!   `NetMesh.listTools()` in `lib.rs`.
 //!
 //! Gated on the binding's `tool` feature (default-on).
-//! Plan slice: B-3 of `docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`.
+//! Plan slice: B-3 of `docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

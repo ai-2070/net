@@ -4,7 +4,7 @@
 
 This document specifies the substrate-level changes required to scale Net meshes past ~100K nodes using the **existing** subnet, channel, and replica-group primitives more deliberately. The bulk of what's needed is already in the substrate; the remaining work is aggregator daemons (built on `ReplicaGroup` of `MeshDaemon`), CLI ergonomics, and the fold framework that consumes these primitives.
 
-This is a complement to the [Multi-Fold Plan](./MULTIFOLD_PLAN.md). The multi-fold framework handles per-fold state aggregation; the work here describes how that aggregation composes with existing subnet hierarchy to scale to millions of nodes.
+This is a complement to the [Multi-Fold Plan](SCALING_MULTIFOLD_PLAN.md). The multi-fold framework handles per-fold state aggregation; the work here describes how that aggregation composes with existing subnet hierarchy to scale to millions of nodes.
 
 The principle: **scale by subdivision (existing hierarchical subnets) and summarization (new aggregator daemons via ReplicaGroup), using primitives already in the substrate. No new architecture tier; no parallel scoping mechanism.**
 

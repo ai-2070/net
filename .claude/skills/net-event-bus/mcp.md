@@ -154,6 +154,10 @@ net forwarding set-value <ref>                    # store the VALUE (stdin → O
 - `capabilities.md` — the discovery layer the bridge announces onto (`find_nodes` / capability tags). A bridged tool is a capability with `compat_tier: "mcp_bridge"`.
 - `nrpc.md` — the request/response layer the `describe` and `invoke` calls ride on.
 - `mesh.md` — PSK / identity bootstrap for the two nodes (`net wrap` host + `net mcp serve` client) to reach each other.
-- `net/crates/net/docs/plans/MCP_BRIDGE_PLAN.md` — the design of record (phases, doctrine, open risks).
-- `net/crates/net/docs/plans/MCP_CREDENTIAL_FORWARDING_PLAN.md` — the forwarding design of record (deny-by-default posture, phases, threat model).
 - Source of truth: `net/crates/net/adapters/mcp/src/` (`wrap/*` supply side, `serve/*` demand side, `spec/*` MCP wire types, `forward/*` credential forwarding — policy store, secret value backend, X25519 sealing).
+
+## Further reading
+
+- [Wrap an MCP Server](https://ai2070.net/docs/guides/wrap-mcp-server)
+- [Expose Net as MCP](https://ai2070.net/docs/guides/expose-net-as-mcp)
+- [MCP Bridge reference](https://ai2070.net/docs/reference/mcp-bridge)

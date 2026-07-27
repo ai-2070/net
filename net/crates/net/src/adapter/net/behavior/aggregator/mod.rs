@@ -2,7 +2,7 @@
 //! detail-fold state and republishing the summaries on channels
 //! with broader visibility.
 //!
-//! Design + rationale: `docs/plans/SCALING_SUBNET_SPEC.md`
+//! Design + rationale: `docs/internal/plans/SCALING_SUBNET_SPEC.md`
 //! Phases B + C. The async lifecycle sibling trait
 //! ([`LifecycleDaemon`](crate::adapter::net::behavior::lifecycle::LifecycleDaemon))
 //! and its generic group primitive

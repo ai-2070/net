@@ -262,3 +262,8 @@ compiling-but-rejected code:
   byte-preservation rule; carry the original bytes.
 - "add a branch for network X" outside `src/x402/` → doctrine 1; networks are
   config + registry, not code.
+
+## Further reading
+
+- [What It Is (and Is Not)](https://ai2070.net/docs/payments/what-net-payments-is)
+- [x402 and Net](https://ai2070.net/docs/payments/x402-and-net)

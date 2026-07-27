@@ -99,3 +99,8 @@ Bigger events = higher throughput, higher per-event tail latency.
 For coordination signals (intents, state changes, decisions), favor small. For bulk telemetry where you want high MB/s, batch a few hundred readings into one event — but stop when one event approaches the ring-buffer slot size.
 
 `emit_batch` / `emitBatch` / `IngestRawBatch` is the right tool for batching: it amortizes the per-call overhead while keeping each event individually addressable on the wire.
+
+## Further reading
+
+- [Wire Format](https://ai2070.net/docs/reference/wire-format)
+- [Using the Event Bus](https://ai2070.net/docs/guides/event-bus)

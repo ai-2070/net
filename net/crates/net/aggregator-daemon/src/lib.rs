@@ -2,7 +2,7 @@
 //! the Net-mesh substrate's [`AggregatorRegistry`] and one or
 //! more aggregator groups loaded from a TOML config file.
 //!
-//! Slice 8 of `docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
+//! Slice 8 of `docs/internal/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
 //! Closes the AL-6 "needs daemon process" gap: the substrate
 //! primitives (`AggregatorRegistry`, `LifecycleGroup`,
 //! `HealthMonitor`, `aggregator.registry` RPC) are already in

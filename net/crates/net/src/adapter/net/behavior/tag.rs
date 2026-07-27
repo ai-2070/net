@@ -1,7 +1,7 @@
 //! Typed-taxonomy capability tags — Phase A foundations of the
 //! Capability System Plan.
 //!
-//! See `docs/plans/CAPABILITY_SYSTEM_PLAN.md` §§1–2 for the design.
+//! See `docs/internal/plans/CAPABILITY_SYSTEM_PLAN.md` §§1–2 for the design.
 //! This module ships the load-bearing primitives the rest of Phase A
 //! builds on:
 //!
@@ -299,7 +299,7 @@ impl Tag {
     ///
     /// Allocates: the returned `TagKey` owns its `key` string. Hot
     /// paths that iterate a tag set should prefer [`Self::axis_key_ref`]
-    /// — see `docs/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` for the
+    /// — see `docs/internal/misc/PERF_AUDIT_2026_05_28_CAPABILITY.md` for the
     /// per-tag allocation cost this avoids.
     pub fn axis_key(&self) -> Option<TagKey> {
         match self {

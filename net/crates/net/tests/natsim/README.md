@@ -1,6 +1,6 @@
 # natsim — real-NAT scenario harness
 
-Stage 4 of `docs/plans/NAT_TRAVERSAL_V2_PLAN.md`: the only place the
+Stage 4 of `docs/internal/plans/NAT_TRAVERSAL_V2_PLAN.md`: the only place the
 NAT-traversal layer is validated against **actual NAT behavior**
 (Linux netfilter masquerade) instead of loopback, where every packet
 trivially arrives.

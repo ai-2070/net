@@ -168,6 +168,34 @@ CortEX comes with two reference folds: tasks and memories. Tasks model long-runn
 
 You don't have to use them. They live alongside any folds you write yourself; CortEX is happy to drive multiple folds against the same RedEX log, or different folds against different logs, and the NetDB facade composes them all under one query surface.
 
+### The adapter types, by binding
+
+Both models ship as adapters you can open standalone against a `Redex`, or
+reach through a `NetDb` that composes them.
+
+| | Rust | TypeScript | Python | Go |
+|---|---|---|---|---|
+| Log manager | `cortex::Redex::new()`, `::with_persistent_dir(path)` | `new Redex(opts)` | `Redex(...)` | `NewRedex(...)` |
+| Open tasks | `cortex::TasksAdapter::open(redex, origin)` | `TasksAdapter` | `TasksAdapter.open(...)` | `OpenTasks(redex, originHash, persistent)` |
+| Open memories | `cortex::MemoriesAdapter::open(redex, origin)` | `MemoriesAdapter` | `MemoriesAdapter` | `OpenMemories(...)` |
+| Compose both | `cortex::NetDb::builder(redex)` | `NetDb.open(config)` | `NetDb` builder | `OpenNetDb(redex, cfg)` |
+| Typed handles | `db.tasks()` / `db.memories()` | same | same | `db.Tasks()` / `db.Memories()` |
+| Initial result + deltas | `adapter.snapshot_and_watch(watcher)` | `snapshotAndWatch` | `snapshot_and_watch_tasks` / `..._memories` | `SnapshotAndWatch` |
+| Persist | `db.snapshot()` → `NetDbSnapshot` | `snapshot()` | `snapshot()` | `db.Snapshot()` → `[]byte` |
+| Restore | `NetDbBuilder::build_from_snapshot(&bundle)` | `NetDb.openFromSnapshot(...)` | `build_from_snapshot` | `OpenNetDbFromSnapshot(redex, cfg, bundle)` |
+
+Python also exposes context managers that open an adapter and close it on scope
+exit, so you don't leak a handle on an exception path. Go returns
+`(*TasksAdapter, error)` from `OpenTasks` and requires an explicit `Close()`;
+its mutation methods (`Create`, `Rename`, `Complete`, `Delete`) each return the
+sequence number of the event they appended, which is what you pass to
+`WaitForSeq` for read-your-writes.
+
+`snapshot_and_watch` is the important one: it hands back the current state *and*
+the delta stream as one atomic operation, so nothing lands between your initial
+read and the start of watching. Reaching for a separate list-then-subscribe is
+the bug it exists to prevent.
+
 ## Failure handling
 
 Folds can fail. An event with a bad payload, a logic bug in the fold, an underflow on a counter — all of these manifest as an `Err` from `apply()`. The runtime's response is configurable:
@@ -192,6 +220,36 @@ let view = adapter.state().read();
 ```
 
 `wait_for_seq` resolves when the fold task has applied every event up to and including `seq`. For most flows you won't need it — the read-vs-write race is small enough that polling-style consumers don't notice — but when you do need it, it's the right primitive.
+
+### `WriteToken` — the portable form
+
+A bare `seq` only means something if you already know which chain it's on. The
+ingest paths also hand back a **`WriteToken`**: the address of a write as
+`(origin_hash, seq)` — which chain, and which event on it. Pass it to
+`wait_for_token` instead:
+
+```rust
+let token = adapter.ingest(envelope)?;          // WriteToken
+adapter.wait_for_token(token).await?;
+```
+
+`poll_for_token` is the non-async form. Both exist on `TasksAdapter` and
+`MemoriesAdapter`, and the token round-trips through every binding as a typed
+value, so a write's address can travel with a payload to whoever needs to wait
+on it.
+
+> **Tokens are not capabilities.** A `WriteToken` is plain in-process data with
+> public fields — unsigned, and forgeable by anything in the same process. The
+> guarantee comes from the *adapter*, not the token: an adapter bound to origin
+> X rejects any token whose `origin_hash` isn't X, with `WrongOrigin`. So a
+> token arriving over the wire is untrusted input that the receiving side
+> validates by virtue of which adapter it hands the token to. Don't synthesise
+> tokens in application code — a hand-rolled one that matches no real ingest
+> just hangs until the deadline.
+
+Concurrency is bounded. There's a per-channel cap on simultaneous
+`wait_for_token` permits (and a process-wide cap you can install), so a flood of
+waiters fails fast rather than accumulating.
 
 ## When CortEX is the wrong tool
 

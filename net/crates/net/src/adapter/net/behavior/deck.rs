@@ -1,5 +1,5 @@
 //! Deck SDK — Phase 1 (Rust) per
-//! [`DECK_SDK_PLAN.md`](../../../../../../docs/plans/DECK_SDK_PLAN.md).
+//! [`DECK_SDK_PLAN.md`](../../../../../../../docs/internal/plans/DECK_SDK_PLAN.md).
 //!
 //! Operator-side surface, the dual of `behavior::meshos::sdk`
 //! (the daemon-author surface). Daemons author against

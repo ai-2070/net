@@ -1,5 +1,5 @@
 //! `ReplicationCoordinator` core — Phase C slice of
-//! `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §3.
+//! `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` §3.
 //!
 //! One coordinator per replicated channel per replica. Holds the
 //! validated [`ReplicaRole`] state, the channel's chain identity,

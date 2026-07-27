@@ -203,7 +203,7 @@ The work was driven by two parallel audit reports against the v0.9 line: a 171-i
 
 ### `mesh.rs` deep-read audit
 
-A separate single-file audit of `adapter/net/mesh.rs` (~8 K LOC) surfaced 9 additional defects that are scoped to that file. None of them are addressed in this release; all are slated for the next phase. For consumers running production deployments, the most consequential are listed below — the full audit is in [`docs/misc/BUG_AUDIT_2026_05_03_MESH.md`](https://github.com/ai-2070/net/blob/master/net/crates/net/docs/misc/BUG_AUDIT_2026_05_03_MESH.md).
+A separate single-file audit of `adapter/net/mesh.rs` (~8 K LOC) surfaced 9 additional defects that are scoped to that file. None of them are addressed in this release; all are slated for the next phase. For consumers running production deployments, the most consequential are listed below — the full audit is in [`docs/misc/BUG_AUDIT_2026_05_03_MESH.md`](https://github.com/ai-2070/net/blob/master/docs/internal/misc/BUG_AUDIT_2026_05_03_MESH.md).
 
 - **`spawn_heartbeat_loop` holds a DashMap shard guard across `.await`** — the heartbeat broadcast loop iterates `peers.iter()` and awaits `socket.send_to(...)` (heartbeat + pingwave, twice per peer) while still holding the iterator's `Ref` guard. Every other task touching the same shard blocks for the cumulative round-trip.
 - **`accept` / `start` mutual exclusion uses `AcqRel` where the comment relies on `SeqCst`** — Dekker-style mutual exclusion needs both sides SC. On x86 the LOCK'd RMW happens to fully fence so the race is unobservable; on AArch64 / RISC-V the dispatcher can race `handshake_responder` for the inbound msg1.

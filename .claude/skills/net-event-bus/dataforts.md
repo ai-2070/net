@@ -364,6 +364,8 @@ if err := tasks.WaitForSeq(seq, 250*time.Millisecond); err != nil { /* … */ }
 
 ## When you need more
 
-- **Full plan + activation gates per phase**: `net/crates/net/docs/misc/DATAFORTS_PLAN.md`.
-- **Wishlist audit** (what's a Dataforts phase vs. what already ships via core primitives): `net/crates/net/docs/misc/DATAFORTS_FEATURES.md`.
 - **Cargo feature interaction**: `net` crate's `dataforts` feature pulls `cortex + blake3 + xxhash-rust`. Builds without it get the substrate path unchanged (RedEX, CortEX, NetDB, replication all work as normal).
+
+## Further reading
+
+- [Blob Storage (Dataforts)](https://ai2070.net/docs/guides/dataforts)

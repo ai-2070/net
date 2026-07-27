@@ -1,6 +1,6 @@
 //! `net cap (show|query|nodes|announce)` — capability advertisement
 //! and discovery from the local snapshot, plus offline compose-and-sign
-//! for v0.4 capability-auth (see `docs/plans/CAPABILITY_AUTH_PLAN.md`).
+//! for v0.4 capability-auth (see `docs/internal/plans/CAPABILITY_AUTH_PLAN.md`).
 //!
 //! `show` / `query` / `nodes` read `DeckClient::status()` and filter
 //! the snapshot's per-peer `capability_set`. `announce` builds a
@@ -45,7 +45,7 @@ pub enum CapCommand {
     /// `--version`; the new bytes supersede the old at any
     /// receiver that folds them. There is no separate `revoke`
     /// verb — that's the locked design (see
-    /// `docs/plans/CAPABILITY_AUTH_PLAN.md` §"Locked design points").
+    /// `docs/internal/plans/CAPABILITY_AUTH_PLAN.md` §"Locked design points").
     Announce(AnnounceArgs),
 }
 

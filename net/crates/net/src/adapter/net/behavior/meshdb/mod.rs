@@ -1,7 +1,7 @@
 //! MeshDB — federated query layer above the capability-query
 //! primitives + CortEX folds.
 //!
-//! Phase A of [`MESHDB_PLAN.md`](../../../../../docs/plans/MESHDB_PLAN.md).
+//! Phase A of [`MESHDB_PLAN.md`](../../../../../../../../docs/internal/plans/MESHDB_PLAN.md).
 //! Lands the typed [`MeshQuery`] AST + supporting types + the
 //! [`MeshError`] enum. The planner + executor follow in Phases A
 //! (atomic operators) → B (time-travel) → C..F (lineage, joins,

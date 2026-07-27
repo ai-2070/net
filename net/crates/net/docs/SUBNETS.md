@@ -102,3 +102,4 @@ Gateway stats (forwarded/dropped counts) are tracked via atomics for zero-conten
 | `subnet/id.rs` | `SubnetId`, hierarchy operations, distance |
 | `subnet/assignment.rs` | `SubnetPolicy`, `SubnetRule`, label matching |
 | `subnet/gateway.rs` | `SubnetGateway`, visibility enforcement, export table |
+| `subnet/error.rs` | `SubnetError` — every failure the subnet surface returns |

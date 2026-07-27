@@ -1,4 +1,4 @@
-//! OA2-E0.3 of `docs/plans/OA2E_INTEGRATION_DESIGN.md` — direct-
+//! OA2-E0.3 of `docs/internal/plans/OA2E_INTEGRATION_DESIGN.md` — direct-
 //! session caller identity for provider admission.
 //!
 //! On the inbound RPC path there are two "identities":

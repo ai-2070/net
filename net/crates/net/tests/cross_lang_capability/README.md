@@ -2,7 +2,7 @@
 
 Golden-vector fixtures pinning the wire format of capability-system features that bindings (Node / Python / Go) consume. Same pattern as `tests/cross_lang_nrpc/golden_vectors.json` for nRPC; each binding's compat test loads the same fixture and asserts byte-identical encoding / structural equivalence with the Rust reference.
 
-Phase 5.B + 1 of `docs/plans/CAPABILITY_ENHANCEMENTS_PLAN.md`. Surfaced through Phase 9 of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+Phase 5.B + 1 of `docs/internal/plans/CAPABILITY_ENHANCEMENTS_PLAN.md`. Surfaced through Phase 9 of `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
 
 ## Files
 
@@ -34,11 +34,11 @@ Each binding loads the fixture, decodes the predicate, runs its host-language ev
 - Composite recursion — short-circuiting `And` / `Or`; `Not` inversion; arbitrary depth.
 - Real-world predicates — `(GPU OR ≥64GB) AND has-intent AND NOT decommissioning AND python≥3.10`, with both passing and failing contexts, including the OR's memory-only branch.
 
-Phase 9c of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`. SDKs that expose a host-language `evaluatePredicate(pred, tags, metadata)` consume this fixture in their per-binding test suites.
+Phase 9c of `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`. SDKs that expose a host-language `evaluatePredicate(pred, tags, metadata)` consume this fixture in their per-binding test suites.
 
 ### `predicate_trace.json`
 
-Pins `Predicate::evaluate_with_trace(ctx)` output for representative `(predicate, tags, metadata)` triples — the cost-ordered, short-circuiting trace evaluator. Phase 9d slice of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+Pins `Predicate::evaluate_with_trace(ctx)` output for representative `(predicate, tags, metadata)` triples — the cost-ordered, short-circuiting trace evaluator. Phase 9d slice of `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
 
 - `wire` is the canonical `PredicateWire`.
 - `tags` + `metadata` form the evaluation context.
@@ -51,7 +51,7 @@ The fixture also pins the planner's stable cost-sort: in the `and_runs_all_when_
 
 ### `predicate_debug_report_redacted.json`
 
-Pins `redactMetadataKeys(report, keys)` — the SDK-side scrubber that rewrites metadata-clause labels to hide sensitive predicate values before persisting / sharing a debug report. Phase 9d redaction of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+Pins `redactMetadataKeys(report, keys)` — the SDK-side scrubber that rewrites metadata-clause labels to hide sensitive predicate values before persisting / sharing a debug report. Phase 9d redaction of `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
 
 - `report` is a previously-aggregated `PredicateDebugReport`.
 - `redact_keys` is the array of metadata key names whose values should be scrubbed.
@@ -68,7 +68,7 @@ The substrate doesn't ship a redaction implementation (Phase 6 of `CAPABILITY_EN
 
 ### `predicate_debug_report.json`
 
-Pins `PredicateDebugReport::from_evaluations(pred, contexts)` output for representative `(predicate, corpus)` pairs — the per-clause aggregator that operators reach for to answer "how often did each clause fire / match across this candidate set". Phase 9d full of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+Pins `PredicateDebugReport::from_evaluations(pred, contexts)` output for representative `(predicate, corpus)` pairs — the per-clause aggregator that operators reach for to answer "how often did each clause fire / match across this candidate set". Phase 9d full of `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
 
 - `wire` is the canonical `PredicateWire`.
 - `contexts` is an array of `{tags, metadata}` evaluation contexts (the corpus).
@@ -80,7 +80,7 @@ Coverage: empty corpus → zero everything; single-leaf corpus with a mix of hit
 
 ### `capability_validation.json`
 
-Pins `validate_capabilities(caps)` output for representative `caps` payloads. Phase 9a of `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+Pins `validate_capabilities(caps)` output for representative `caps` payloads. Phase 9a of `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
 
 - Each case carries a wire-format `caps` (`{ "tags": [...], "metadata": {...} }`) plus the `expected_errors` + `expected_warnings` arrays a conformant validator emits.
 - Bindings sort their output canonically (each list sorted by `JSON.stringify` / equivalent of each entry) before comparing.
@@ -90,7 +90,7 @@ The fixture's top-level `schema_metadata_soft_cap_bytes` field pins the substrat
 
 ### `placement_score.json`
 
-Pins `StandardPlacement::placement_score(target, artifact)` for representative `(config, candidate, artifact)` triples — the substrate's multi-axis composition matrix. Phase 7 / locked-decisions fixture from `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
+Pins `StandardPlacement::placement_score(target, artifact)` for representative `(config, candidate, artifact)` triples — the substrate's multi-axis composition matrix. Phase 7 / locked-decisions fixture from `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`.
 
 - `config` is a subset of `StandardPlacement` settings. Currently the schema covers the deterministic axes:
   - `scope_filter`: array of scope-label strings (e.g. `"scope:tenant:foo"` or the body-only form `"tenant:foo"`); omit the field to disable the axis.

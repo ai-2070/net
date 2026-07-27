@@ -1,5 +1,5 @@
 //! Regression guard for the redemption write-amplification fix
-//! (`docs/performance/payments-redeem-write-amplification.md`).
+//! (`docs/internal/performance/payments-redeem-write-amplification.md`).
 //!
 //! `redeem_for_invocation` must perform a durable store write on exactly one
 //! outcome — `Admitted`, which flips `rec.redeemed`. Every `Denied{..}`

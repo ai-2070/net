@@ -1,5 +1,5 @@
 //! Node ownership scaffolding — OA-1 §1.2 of
-//! `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md`.
+//! `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md`.
 //!
 //! `net node adopt` provisions a node with THREE separately
 //! versioned files in its authority directory (separately

@@ -9,7 +9,7 @@
 //! event access, drop down to [`crate::adapter::net::redex::RedexFile`]
 //! directly.
 //!
-//! See `docs/NETDB_PLAN.md` for the full design.
+//! See `docs/internal/plans/NETDB_PLAN.md` for the full design.
 
 mod db;
 mod error;

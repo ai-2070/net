@@ -154,7 +154,7 @@ pub struct FailureDetector {
     /// O(1) tracked-node count. `DashMap::len()` walks every shard (~1us);
     /// node_count()/stats().nodes_tracked read this instead. Maintained on the
     /// insert (heartbeat) / remove / cleanup paths — the only ones that change
-    /// map size. See docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §4.
+    /// map size. See docs/internal/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §4.
     num_nodes: AtomicUsize,
     /// Last cleanup time
     last_cleanup: Mutex<Instant>,

@@ -8,7 +8,7 @@
 //! both the network handle and the daemon-SDK wrapper for each
 //! node.
 //!
-//! See `crates/net/docs/plans/DECK_DEMO_HARNESS_PLAN.md` Phase 0
+//! See `docs/internal/plans/DECK_DEMO_HARNESS_PLAN.md` Phase 0
 //! + Phase 0.5 + Item C for the full design rationale.
 
 use std::sync::Arc;

@@ -1,6 +1,6 @@
 //! `MeshQuery` AST + supporting types.
 //!
-//! Phase A of [`MESHDB_PLAN.md`](../../../../../../docs/plans/MESHDB_PLAN.md).
+//! Phase A of [`MESHDB_PLAN.md`](../../../../../../../../docs/internal/plans/MESHDB_PLAN.md).
 //! Closed under composition: every variant nests other queries,
 //! so a single typed expression encodes a full federated plan.
 //!

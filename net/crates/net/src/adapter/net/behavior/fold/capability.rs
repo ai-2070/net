@@ -7,7 +7,7 @@
 //! quote.
 //!
 //! Replaces the deleted `behavior::capability::CapabilityIndex` —
-//! see `docs/plans/MULTIFOLD_PHASE_3B_CUTOVER.md` for the
+//! see `docs/internal/plans/MULTIFOLD_PHASE_3B_CUTOVER.md` for the
 //! end-to-end cutover that landed.
 //!
 //! Tags ship as canonical `String`s — the same form the legacy
