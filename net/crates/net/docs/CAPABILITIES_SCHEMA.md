@@ -192,10 +192,10 @@ Each binding's `validate_capabilities(caps)` returns a `ValidationReport` with t
 2. **Warnings** (`ValidationWarning`) — forward-compat or operator hygiene:
    - `UnknownKey { axis, key }` — known axis, unknown key (forward-compat: a future binding emits a key this binding doesn't yet know).
    - `MetadataOversize { soft, hard }` — `metadata` total size exceeds the soft cap.
-   - `EmptyTag` — empty tag string in the set (silently dropped at parse time; surfaced here for diagnostic).
+   - `LegacyTag { .. }` — a `Tag::Legacy` (untyped) tag; future major versions may deprecate.
 
-3. **Info** — purely informational, no action required:
-   - `LegacyTag(string)` — a `Tag::Legacy` (untyped) tag; future major versions may deprecate.
+Empty tag strings are dropped at parse time and produce no warning — a
+`ValidationWarning::EmptyTag` variant was described here but never shipped.
 
 The report's overall status:
 

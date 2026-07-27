@@ -14,7 +14,7 @@ Every Net packet carries a `subprotocol_id: u16` identifying how the payload sho
 | `0x0401` | State snapshots |
 | `0x0500` | Daemon migration |
 | `0x0600` | Subprotocol negotiation |
-| `0x0601` | Handshake relay (relayed Noise NKpsk0) |
+| `0x0601` | *Unallocated* — was handshake relay; see the note below |
 | `0x0700` | Continuity proofs |
 | `0x0701` | Fork announcements |
 | `0x0702` | Continuity proof transfer |
@@ -29,6 +29,14 @@ Every Net packet carries a `subprotocol_id: u16` identifying how the payload sho
 | `0x0E00` | RedEX Distributed replication |
 | `0x1000..0xEFFF` | Vendor / third-party |
 | `0xF000..0xFFFF` | Experimental / ephemeral |
+
+> **`0x0601` was reclaimed.** Handshake relay originally consumed a
+> subprotocol ID. It no longer does: a relayed Noise NKpsk0 handshake rides as
+> an ordinary routed Net packet with the `HANDSHAKE` bit set in the **Net
+> header's** `PacketFlags`, wrapped in the 18-byte routing header, sharing the
+> forwarding path with data packets. Nothing in the substrate allocates
+> `0x0601` today. Treat it as free, but prefer a fresh ID over reuse — old
+> peers may still recognise it.
 
 ### `SUBPROTOCOL_REDEX` dispatch codes (`0x0E00`)
 
