@@ -332,7 +332,7 @@ Application and bounds:
 |---|---|
 | **2B-entry** | §5 boundary: drain ownership + lease + supervisor + fencing + minimal registry + bounded application. |
 | **2B.2** | Coherent `OrgAuthorityEpoch` publication + mandatory per-call comparison before proof/send. **Publication half LANDED as OLB-2C** (see below); the per-call comparison waits on 2B.3's warmed route set, which is the thing there would be to compare. |
-| **2B.3** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current + warmed-call consumption. **2B.3a landed** (below); 2B.3b is the warmed-call consumer. |
+| **2B.3** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current + warmed-call consumption. **2B.3a landed** (below, HOLD pending CI); **2B.3b** has a bounded boundary design awaiting review — [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md). Not authorized for implementation. |
 | **2B.4** | Exact-provider lease acquire/release on route-slot lifecycle + node-global ttl/2 refresh owner (first holder arms, last disarms). |
 | **2B.5** | `sensed_candidates` join + §8 classification + granted-candidates-Unknown, inside the actor, never on the request path. |
 
