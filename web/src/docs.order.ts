@@ -101,6 +101,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "organizations",
       "subnets",
       "storage-stack",
+      "security-model",
     ],
     guides: [
       "wrap-mcp-server",
@@ -120,6 +121,8 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "task-lifecycle",
       "continuity-and-migration",
       "nat-and-traversal",
+      "production-deployment",
+      "troubleshooting",
     ],
     reference: [
       "eventbus-api",
@@ -133,6 +136,8 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "mcp-bridge",
       "cli",
       "deck",
+      "glossary",
+      "versioning",
     ],
     tutorials: [
       "fleet-telemetry",
@@ -221,6 +226,7 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "concepts/organizations": "Organizations",
     "concepts/subnets": "Subnets",
     "concepts/storage-stack": "The Storage Stack",
+    "concepts/security-model": "Security Model",
 
     // Guides
     "guides/wrap-mcp-server": "Wrap an MCP Server",
@@ -240,6 +246,8 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "guides/task-lifecycle": "Task Lifecycle and Workflows",
     "guides/continuity-and-migration": "Continuity and Migration",
     "guides/nat-and-traversal": "NAT and Traversal",
+    "guides/production-deployment": "Running in Production",
+    "guides/troubleshooting": "Troubleshooting",
 
     // Reference
     "reference/eventbus-api": "EventBus API",
@@ -253,6 +261,8 @@ export const DOCS_ORDER: DocsOrderConfig = {
     "reference/mcp-bridge": "MCP Bridge",
     "reference/cli": "CLI Reference",
     "reference/deck": "Deck (Operator TUI)",
+    "reference/glossary": "Glossary",
+    "reference/versioning": "Versioning & Compatibility",
 
     // SDKs
     sdk: "SDKs",
