@@ -1,6 +1,6 @@
 //! Tunables for the NAT-traversal subsystem.
 //!
-//! Defaults match the values locked in `docs/NAT_TRAVERSAL_PLAN.md`.
+//! Defaults match the values locked in `docs/internal/plans/NAT_TRAVERSAL_PLAN.md`.
 //! Callers override via `MeshBuilder`-exposed setters once the
 //! per-stage wiring lands; defaults are sized so a caller who
 //! enables `nat-traversal` without further configuration gets
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn defaults_match_plan() {
         // Guard against accidental tuning drift. Any change here
-        // needs a matching update to docs/NAT_TRAVERSAL_PLAN.md.
+        // needs a matching update to docs/internal/plans/NAT_TRAVERSAL_PLAN.md.
         let cfg = TraversalConfig::default();
         assert_eq!(cfg.reflex_timeout, Duration::from_secs(3));
         assert_eq!(cfg.classify_deadline, Duration::from_secs(5));

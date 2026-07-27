@@ -1737,7 +1737,7 @@ mod heartbeat_api_drift_check {
     //! production-side caller in `mod.rs` and `mesh.rs` that
     //! constructs a heartbeat must go through
     //! [`NetSession::build_heartbeat`]. See
-    //! `docs/HEARTBEAT_UNIFICATION_PLAN.md` Step 4.
+    //! `docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md` Step 4.
     //!
     //! `PacketBuilder::new` is `pub(crate)` so the type system
     //! already forbids external callers. Within the crate,
@@ -1805,7 +1805,7 @@ mod heartbeat_api_drift_check {
             "mod.rs production callers of `.build_heartbeat()` drifted from the \
              approved allowlist. If you intentionally added a new caller, route it \
              through `Session::build_heartbeat` and update this allowlist. \
-             See docs/HEARTBEAT_UNIFICATION_PLAN.md."
+             See docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md."
         );
     }
 
@@ -1820,7 +1820,7 @@ mod heartbeat_api_drift_check {
             "mesh.rs production callers of `.build_heartbeat()` drifted from the \
              approved allowlist. If you intentionally added a new caller, route it \
              through `Session::build_heartbeat` and update this allowlist. \
-             See docs/HEARTBEAT_UNIFICATION_PLAN.md."
+             See docs/internal/plans/HEARTBEAT_UNIFICATION_PLAN.md."
         );
     }
 }

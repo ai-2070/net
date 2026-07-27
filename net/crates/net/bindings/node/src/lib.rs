@@ -1230,7 +1230,7 @@ mod mesh_bindings {
     /// Channel registration config. `publishCaps` / `subscribeCaps`
     /// are capability filters enforced at subscribe time + before
     /// the publish fan-out; `requireToken` gates on a valid
-    /// `PermissionToken`. See `docs/CHANNEL_AUTH_PLAN.md`.
+    /// `PermissionToken`. See `docs/internal/plans/CHANNEL_AUTH_PLAN.md`.
     #[napi(object)]
     pub struct ChannelConfigJs {
         /// Canonical channel name. Crosses the boundary as a string

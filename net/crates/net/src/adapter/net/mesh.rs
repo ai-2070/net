@@ -6665,7 +6665,7 @@ pub struct MeshNode {
     traversal_publish_mu: Arc<parking_lot::Mutex<()>>,
     /// Traversal tunables — probe timeouts, classification
     /// deadline, punch cadence, and port-mapping renewal interval.
-    /// Defaults match `docs/NAT_TRAVERSAL_PLAN.md`. Exposed via
+    /// Defaults match `docs/internal/plans/NAT_TRAVERSAL_PLAN.md`. Exposed via
     /// `MeshBuilder` setters in stage 5; internal-only today.
     #[cfg(feature = "nat-traversal")]
     traversal_config: super::traversal::TraversalConfig,
@@ -7072,7 +7072,7 @@ pub struct MeshNode {
     /// publish fan-out via `check_fast`. The bloom filter + verified
     /// cache keep authorization at O(1) without per-packet
     /// signature verification. See
-    /// [`docs/CHANNEL_AUTH_GUARD_PLAN.md`](../../../../docs/CHANNEL_AUTH_GUARD_PLAN.md).
+    /// [`docs/internal/plans/CHANNEL_AUTH_GUARD_PLAN.md`](../../../../../../docs/internal/plans/CHANNEL_AUTH_GUARD_PLAN.md).
     auth_guard: Arc<AuthGuard>,
     /// Per-peer auth-failure tracker. Counts failed
     /// `authorize_subscribe` attempts per `auth_failure_window` and
@@ -12959,7 +12959,7 @@ impl MeshNode {
 
     /// Spawn a port-mapping task driven by `client`. Drives the
     /// UPnP-IGD / NAT-PMP / PCP lifecycle per
-    /// `docs/PORT_MAPPING_PLAN.md`:
+    /// `docs/internal/plans/PORT_MAPPING_PLAN.md`:
     ///
     /// 1. Probe the client; on failure, exit without side
     ///    effects.

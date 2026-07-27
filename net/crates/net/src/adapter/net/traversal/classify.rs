@@ -33,7 +33,7 @@ use std::net::SocketAddr;
 /// should use [`crate::adapter::net::behavior::metadata::NatType`]
 /// directly. This type is the *publishable* summary that fits
 /// on one tag and drives the connect-time pair-type matrix in
-/// `docs/NAT_TRAVERSAL_PLAN.md` §8.
+/// `docs/internal/plans/NAT_TRAVERSAL_PLAN.md` §8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum NatClass {

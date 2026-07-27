@@ -57,7 +57,7 @@
 //! Today visibility enforcement covers `Visibility::SubnetLocal` and
 //! `Visibility::ParentVisible`. `Visibility::Exported` and multi-hop
 //! gateway routing are follow-ups; see
-//! [`docs/SUBNET_ENFORCEMENT_PLAN.md`](../../docs/SUBNET_ENFORCEMENT_PLAN.md).
+//! [`docs/internal/plans/SUBNET_ENFORCEMENT_PLAN.md`](../../../../../docs/internal/plans/SUBNET_ENFORCEMENT_PLAN.md).
 
 pub use net::adapter::net::subnet::{
     DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule,

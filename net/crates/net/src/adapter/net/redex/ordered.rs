@@ -15,7 +15,7 @@
 //! order to seq assignment depends on which thread wins each lock
 //! acquisition and is not deterministic.
 //!
-//! See `docs/REDEX_V2_PLAN.md` §7.
+//! See `docs/internal/plans/REDEX_V2_PLAN.md` §7.
 
 use bytes::Bytes;
 

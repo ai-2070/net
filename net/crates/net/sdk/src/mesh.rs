@@ -982,7 +982,7 @@ impl Mesh {
     /// to `Global` and remain visible under most filters by design;
     /// nodes tagged `scope:subnet-local` only show up under
     /// [`crate::capabilities::ScopeFilter::SameSubnet`]. See
-    /// `docs/SCOPED_CAPABILITIES_PLAN.md` for the full table.
+    /// `docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md` for the full table.
     pub fn find_nodes_scoped(
         &self,
         filter: &crate::capabilities::CapabilityFilter,
@@ -1171,7 +1171,7 @@ impl Mesh {
 
     // ── NAT traversal ──────────────────────────────────────────
     //
-    // Framing (load-bearing — see `docs/NAT_TRAVERSAL_PLAN.md`
+    // Framing (load-bearing — see `docs/internal/plans/NAT_TRAVERSAL_PLAN.md`
     // stage 5): every user-visible docstring here must position
     // NAT traversal as **optimization, not correctness**. Nodes
     // behind NAT can always talk through the mesh's routed-

@@ -6,7 +6,7 @@
 //! [`ChannelName`](super::ChannelName) so the existing
 //! [`AuthGuard`](super::AuthGuard) surface applies.
 //!
-//! See `docs/REDEX_PLAN.md` for the full design.
+//! See `docs/internal/plans/REDEX_PLAN.md` for the full design.
 //!
 //! The private `replication` submodule houses the Phase A
 //! wire-protocol scaffold for cross-node replication per

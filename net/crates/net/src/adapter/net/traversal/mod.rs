@@ -14,7 +14,7 @@
 //! A `NatType::Symmetric` classification or a `PunchFailed` outcome
 //! is **not** a connectivity failure — it just means traffic keeps
 //! riding the relay. The design doc
-//! (`docs/NAT_TRAVERSAL_PLAN.md`) treats this framing as
+//! (`docs/internal/plans/NAT_TRAVERSAL_PLAN.md`) treats this framing as
 //! load-bearing; docstrings added here must not imply that any
 //! NAT-traversal primitive is required for peers behind NAT to
 //! talk to each other.
@@ -30,7 +30,7 @@
 //!
 //! # Staging
 //!
-//! Implemented incrementally per `docs/NAT_TRAVERSAL_PLAN.md`:
+//! Implemented incrementally per `docs/internal/plans/NAT_TRAVERSAL_PLAN.md`:
 //!
 //! | Stage | Surface                                    | Status            |
 //! |-------|--------------------------------------------|-------------------|
@@ -104,7 +104,7 @@ use arc_swap::ArcSwapOption;
 ///
 /// Plus three port-mapping fields (stage 4b): `port_mapping_active`
 /// plus a monotonic renewal counter and the current external
-/// `SocketAddr`. See `docs/PORT_MAPPING_PLAN.md` §8 for the
+/// `SocketAddr`. See `docs/internal/plans/PORT_MAPPING_PLAN.md` §8 for the
 /// derivation.
 ///
 /// Read via [`TraversalStats::snapshot`] for a consistent
@@ -359,7 +359,7 @@ impl TraversalStats {
 // =========================================================================
 
 /// Typed failures from the NAT-traversal subsystem. Matches the
-/// vocabulary locked in `docs/NAT_TRAVERSAL_PLAN.md` stage 5 — each
+/// vocabulary locked in `docs/internal/plans/NAT_TRAVERSAL_PLAN.md` stage 5 — each
 /// variant maps to a stable `kind` string the SDK bindings expose
 /// to callers.
 ///

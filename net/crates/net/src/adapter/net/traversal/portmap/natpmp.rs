@@ -15,7 +15,7 @@
 //!   bound to an operator-supplied gateway `Ipv4Addr`. Uses
 //!   `tokio::net::UdpSocket` for wire I/O; per-call deadline
 //!   of 1 s matches
-//!   `docs/PORT_MAPPING_PLAN.md` decision 4.
+//!   `docs/internal/plans/PORT_MAPPING_PLAN.md` decision 4.
 //!
 //! Gateway discovery (how to find the router's IP without the
 //! operator telling us) is **not** in this module — it's a
@@ -102,7 +102,7 @@ pub const OP_MAP_UDP: u8 = 1;
 pub const RESPONSE_OP_OFFSET: u8 = 128;
 
 /// Per-call deadline for UDP I/O against the gateway. Matches
-/// `docs/PORT_MAPPING_PLAN.md` decision 4; the plan notes this
+/// `docs/internal/plans/PORT_MAPPING_PLAN.md` decision 4; the plan notes this
 /// is a per-call timeout, not a per-task deadline.
 pub const NATPMP_DEADLINE: Duration = Duration::from_secs(1);
 

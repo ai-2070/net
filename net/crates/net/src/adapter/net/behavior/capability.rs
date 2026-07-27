@@ -2100,7 +2100,7 @@ pub struct CapabilityAnnouncement {
     /// advertised address before handing off to the Noise
     /// handshake, so a lying peer can only fail its own
     /// incoming punches, not redirect traffic to a third party
-    /// (see `docs/NAT_TRAVERSAL_PLAN.md` §7 for the trust model).
+    /// (see `docs/internal/plans/NAT_TRAVERSAL_PLAN.md` §7 for the trust model).
     ///
     /// **Wire compat.** `skip_serializing_if` keeps the old
     /// on-wire shape when the field is `None`, so pre-stage-2

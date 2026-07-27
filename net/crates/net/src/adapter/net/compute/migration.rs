@@ -33,7 +33,7 @@ pub enum MigrationPhase {
 /// from "give up, the target doesn't know this daemon kind"
 /// (`FactoryNotFound`).
 ///
-/// See [`DAEMON_RUNTIME_READINESS_PLAN.md`](../../../../docs/DAEMON_RUNTIME_READINESS_PLAN.md)
+/// See [`DAEMON_RUNTIME_READINESS_PLAN.md`](../../../../../../../docs/internal/plans/DAEMON_RUNTIME_READINESS_PLAN.md)
 /// for the retry-classification table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationFailureReason {
