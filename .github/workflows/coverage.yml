@@ -100,10 +100,26 @@ jobs:
       # contract pin) and the tool-aware paths in the
       # capability/fold layer — without it the AI tool surface
       # contributes 0% to the substrate coverage line.
+      #
+      # `fixtures` is REQUIRED here, unlike in the `unit-tests` job.
+      # Test seams such as `MeshNode::sensing_lease_entry_for_test` /
+      # `install_sensing_cached_floor_for_test` are gated
+      # `#[cfg(any(test, feature = "fixtures"))]`: the `test` arm covers
+      # the in-source `#[cfg(test)]` units (which is why `$UNIT_FEATURES`
+      # can and deliberately does omit `fixtures`), but an integration
+      # test in `tests/*.rs` is a SEPARATE crate linking the lib as a
+      # normal dependency, so only the `fixtures` arm exposes them there.
+      # Because this job drops `--test <file>` pins and compiles every
+      # auto-discovered target, a single such consumer (`tests/sensing_lease.rs`)
+      # is a hard E0599 that fails the whole coverage run — `--no-fail-fast`
+      # does not rescue a compile error. The gating `Sensing` and
+      # `CortEX + nRPC + AI Tools` steps in `ci.yml` already pass
+      # `fixtures` for exactly this reason; this keeps coverage able to
+      # build the same set.
       - name: Generate coverage (lcov)
         run: >
           cargo llvm-cov
-          --features "net redex cortex netdb meshos dataforts nat-traversal port-mapping tool"
+          --features "net redex cortex netdb meshos dataforts nat-traversal port-mapping tool fixtures"
           --no-fail-fast
           --lcov
           --output-path coverage.lcov
