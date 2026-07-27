@@ -20220,15 +20220,21 @@ impl MeshNode {
     ///
     /// This landing upgrades **`Direct` pairs** (the peer is directly
     /// reachable at its reflex). Coordinated-punch (`SinglePunch`)
-    /// upgrades reuse the same install machinery and are a follow-up;
-    /// `SkipPunch` pairs can never punch. `SkipPunch` is marked
-    /// terminal (`done`) so the scan stops revisiting it, but
-    /// `SinglePunch` is only *deferred*: a later reflex-drift
-    /// reclassification can flip the pair to `Direct`, and a permanent
-    /// `done` would pin the session to the relay for the rest of the
-    /// process's life. The per-peer cache entry is also dropped when
-    /// the peer is evicted (heartbeat sweep), so a session that
-    /// regresses direct→relay and reconnects starts from a clean slate.
+    /// upgrades reuse the same install machinery and are a follow-up.
+    ///
+    /// **No pair-action outcome is terminal.** Both `SinglePunch` and
+    /// `SkipPunch` are *deferred* (30 s / 5 min, jittered), never marked
+    /// `done`, because every classification this reads can change under
+    /// it: a reflex-drift reclassification can flip a pair to `Direct`,
+    /// and — the case that made a terminal `SkipPunch` a bug rather than
+    /// an optimization — the matrix reaches `SkipPunch` from `Unknown`,
+    /// which is the startup state at both ends. `done` is reserved for
+    /// the one outcome that is genuinely settled: the session is already
+    /// direct, so there is nothing left to upgrade.
+    ///
+    /// The per-peer cache entry is also dropped when the peer is evicted
+    /// (heartbeat sweep), so a session that regresses direct→relay and
+    /// reconnects starts from a clean slate.
     #[cfg(feature = "nat-traversal")]
     async fn attempt_direct_upgrade(&self, peer_id: u64) {
         use super::traversal::classify::{pair_action, PairAction};
@@ -20237,6 +20243,13 @@ impl MeshNode {
         // this long, so a NAT reclassification that makes it `Direct`
         // gets picked up instead of being cached off permanently.
         const SINGLEPUNCH_RECHECK: Duration = Duration::from_secs(30);
+
+        // Same idea for `SkipPunch`, on a longer beat. A pair that
+        // genuinely can't punch (symmetric × symmetric) will re-derive
+        // `SkipPunch` every time, so the re-check needs to be cheap and
+        // rare — it is: `pair_action` reads a local atomic plus the
+        // capability fold, no wire activity.
+        const SKIPPUNCH_RECHECK: Duration = Duration::from_secs(300);
 
         // Snapshot the current session.
         let Some((relay_addr, prior_sid, pubkey, busy)) = self.peers.get(&peer_id).map(|e| {
@@ -20276,9 +20289,28 @@ impl MeshNode {
                     return;
                 }
             },
-            // `SkipPunch` can never punch — terminal, stop scanning.
+            // `SkipPunch` can't punch *as currently classified* — but
+            // that classification may be provisional, so defer rather
+            // than mark terminal.
+            //
+            // The matrix reaches `SkipPunch` from `Unknown`, not just
+            // from symmetric × symmetric: `(Symmetric, Unknown)` and
+            // `(Unknown, Symmetric)` both land here (`classify.rs`).
+            // `Unknown` is the *startup* state at both ends — the local
+            // class until the first probe sweep commits
+            // (`NatClass::Unknown` at construction) and a peer's class
+            // until its announcement is indexed. The scan loop starts
+            // ticking at 1 s, well inside that window. Marking `done`
+            // here pinned such a peer to the relay for the life of its
+            // peer entry, on a classification that was about to change.
             PairAction::SkipPunch => {
-                self.upgrade_record_done(peer_id);
+                self.upgrade_record_defer(
+                    peer_id,
+                    upgrade_jitter(
+                        upgrade_jitter_seed(self.node_id, peer_id, 0),
+                        SKIPPUNCH_RECHECK,
+                    ),
+                );
                 return;
             }
             // `SinglePunch` upgrades aren't wired yet, but the pair may

@@ -428,6 +428,106 @@ async fn single_punch_pair_is_deferred_not_terminal() {
     );
 }
 
+/// A `SkipPunch` pair must be *deferred*, not marked terminal — the
+/// classification it rests on can be provisional.
+///
+/// The matrix reaches `SkipPunch` from `Unknown`, not just from
+/// symmetric × symmetric: `(Symmetric, Unknown)` lands here, and
+/// `Unknown` is exactly what `peer_nat_class` returns until the peer's
+/// announcement is indexed. The scan loop starts ticking at 1 s, well
+/// inside that window, so a peer evaluated during startup used to be
+/// marked terminal `done` and pinned to the relay for the life of its
+/// peer entry — on a classification that was about to change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skip_punch_from_an_unclassified_peer_is_not_terminal() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, r, b, _x) = upgrade_topology().await;
+    // Deliberately no `classify_and_exchange_reflexes`: B never
+    // announces a `nat:*` tag, so A sees it as `Unknown` — the startup
+    // state this test is about.
+    a.reclassify_nat().await;
+    establish_relay_session(&a, &r, &b).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    a.force_nat_class_for_test(NatClass::Symmetric);
+    let b_id = b.node_id();
+    assert_eq!(
+        a.peer_nat_class(b_id),
+        NatClass::Unknown,
+        "precondition: B's class has not been announced yet",
+    );
+
+    a.attempt_direct_upgrade_for_test(b_id).await;
+
+    assert_eq!(
+        a.upgrade_entry_is_done_for_test(b_id),
+        Some(false),
+        "a SkipPunch pair must not be terminal — this one is only \
+         SkipPunch because B's class hasn't arrived",
+    );
+    let next = a
+        .upgrade_next_eligible_in_for_test(b_id)
+        .expect("B has a throttle entry");
+    assert!(
+        next <= Duration::from_secs(300),
+        "the SkipPunch re-check must be bounded, got {next:?}",
+    );
+}
+
+/// The genuinely-unpunchable pair (symmetric × symmetric) is deferred on
+/// the same bounded re-check rather than cached off for good. Re-deriving
+/// `SkipPunch` every 5 min costs nothing on the wire — `pair_action`
+/// reads a local atomic plus the capability fold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symmetric_pair_defers_on_the_long_recheck() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, r, b, _x) = upgrade_topology().await;
+    // Both ends symmetric → SkipPunch on its own merits, not because of
+    // a missing announcement. The class is forced *before* the first
+    // announce, per `force_nat_class_for_test`'s contract: a re-announce
+    // after an earlier `nat:open` leaves the prior entry in the reader's
+    // fold, and `peer_nat_class` returns the first `nat:*` it finds.
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.force_nat_class_for_test(NatClass::Symmetric);
+    b.force_nat_class_for_test(NatClass::Symmetric);
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let b_id = b.node_id();
+    let ac = a.clone();
+    assert!(
+        wait_for(Duration::from_secs(8), || {
+            ac.peer_nat_class(b_id) == NatClass::Symmetric
+        })
+        .await,
+        "A should fold B's symmetric classification",
+    );
+
+    establish_relay_session(&a, &r, &b).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    a.attempt_direct_upgrade_for_test(b_id).await;
+
+    assert_eq!(
+        a.upgrade_entry_is_done_for_test(b_id),
+        Some(false),
+        "even a true symmetric × symmetric pair defers rather than \
+         caching a terminal outcome",
+    );
+    assert_eq!(
+        a.traversal_stats().upgrades_attempted,
+        0,
+        "a SkipPunch defer must not touch the wire",
+    );
+}
+
 /// Review finding #3: the background upgrade loop holds only a Weak
 /// self-ref, so an `Arc<MeshNode>` dropped WITHOUT an explicit
 /// `shutdown()` still runs `Drop` (which sets `shutdown` and tears the
