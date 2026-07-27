@@ -2405,6 +2405,21 @@ async fn authority_invalidation_spares_successor_facts() {
 /// land, because `Current` is what causes the supervisor to publish `Healthy` —
 /// sampling and then settling as two steps would make that claim false with
 /// nothing left to detect it.
+///
+/// REPAIRED after an independent RED pass (Kyra, 2026-07-27, at `80bb06b5a`)
+/// showed this witness green under a mutation that released the publication pin
+/// before the settlement — i.e. it did not prove the property it claims. The
+/// acknowledgement fired immediately BEFORE `live.write()`, so with the pin
+/// wrongly released the publisher could signal, acquire the lock, and have this
+/// observer read `published` before the publisher stored it. Elapsed time was
+/// already ruled out as evidence; "about to attempt" turns out to be no better,
+/// for the same reason.
+///
+/// The acknowledgement now fires only after a `try_write` has ACTUALLY FAILED,
+/// which is the one thing scheduling cannot fake: it means a holder is provably
+/// there at that instant, so the publisher is definitively blocked when the
+/// negative assertion below runs. Under the same mutation `try_write` succeeds,
+/// no acknowledgement is ever sent, and this witness fails at its wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement() {
     use crate::adapter::net::behavior::org_routing::{
@@ -2439,7 +2454,7 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
     // Bounded completion signal, so neither the negative assertion below nor the
     // join afterwards can hang the suite instead of failing it.
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    store.arm_publish_blocking_hook(Arc::new(move || {
+    store.arm_publish_contended_hook(Arc::new(move || {
         let _ = reached_tx.try_send(());
     }));
     {
@@ -2458,16 +2473,22 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
                 landed.store(true, Ordering::Release);
                 let _ = done.send(());
             }));
-            // Wait for the publisher to REACH the blocked `live.write()`, not for
-            // an interval — elapsed time also "passes" on a scheduler that never
-            // got there (Kyra OLB-2B-E3c).
-            reached
-                .lock()
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the publisher must reach the blocked live.write()");
+            // Wait for PROVEN contention: the publisher's `try_write` failed, so
+            // the settlement pin is demonstrably holding `live` right now.
+            // Neither an interval nor an "about to attempt" signal is evidence —
+            // both also occur when the barrier is absent.
+            reached.lock().recv_timeout(Duration::from_secs(10)).expect(
+                "the publisher's try_write must FAIL, proving the settlement pin \
+                     holds the publication barrier; no signal means the barrier was \
+                     released before the settlement",
+            );
+            // Sound only because of the line above: a failed `try_write` means the
+            // publisher is blocked inside `publish`, so it cannot yet have stored
+            // this flag.
             assert!(
                 !published.load(Ordering::Acquire),
-                "a floor publication landed between the validation and the                  settlement — they are separately interleavable"
+                "a floor publication landed between the validation and the \
+                 settlement — they are separately interleavable"
             );
         }));
     }

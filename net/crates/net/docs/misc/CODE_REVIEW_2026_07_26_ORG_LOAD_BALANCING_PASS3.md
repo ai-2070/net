@@ -937,7 +937,13 @@ the same commit.
 The findings are closed and the local closure run is executed. Two items remain,
 and neither is dischargeable by the author of the fixes:
 
-1. **Independent RED mutations.** Every RED probe recorded in this document was
+1. **Independent RED mutations — STARTED 2026-07-27, result HOLD, not complete.**
+   See [Independent RED pass](#independent-red-pass--2026-07-27-hold) below: it
+   found one witness green under a mutation that broke the property it claims,
+   and the pass did not reach the end of its mutation schedule. The original
+   reasoning for requiring it stands and was vindicated:
+
+   Every RED probe recorded in this document was
    authored, run and reverted by the same author as the fix it couples to. That
    demonstrates the witnesses are coupled to *something*; it does not
    demonstrate they are coupled to the property a different reader would attack.
@@ -955,3 +961,92 @@ and neither is dischargeable by the author of the fixes:
 
 Until both are discharged, E3c / composed OLB-2B remains HELD and OLB-2C remains
 unauthorized, notwithstanding the merge to master.
+
+---
+
+## Independent RED pass — 2026-07-27, HOLD
+
+Run by Kyra against the exact E3c head `80bb06b5ad6543098baf999ec0fe5d71095d8a9e`,
+in a disposable worktree, by an author other than the one who wrote the fixes.
+**Result: HOLD.** The gate did the thing it exists to do — it found a witness
+that was green without proving its claimed property.
+
+### The finding
+
+The mutation was the minimal one: release the publication pin before the
+settlement.
+
+```rust
+let pinned = store.pin_publication();
+if !self.matches(&pinned) { return None; }
+drop(pinned);                 // RED: release the barrier before settlement
+settle_gap_hook();
+Some(settle())
+```
+
+`a_publication_cannot_occupy_the_gap_between_validation_and_settlement` **passed
+anyway**, 1/1 and over 10 consecutive repetitions. The sibling poison witness
+failed under the same mutation, which is what proves the mutation was real and
+the failure was specific to this witness rather than to the harness.
+
+The defect was in the evidence, not the production code — the pin at
+`80bb06b5a` is held correctly. The floor-publication contender acknowledged
+immediately *before* attempting `live.write()`, so this schedule was admissible:
+
+```text
+pin wrongly released
+→ publisher sends "attempting" acknowledgement
+→ publisher ACQUIRES live.write()
+→ observer reads the proxy flag before the publisher stores it
+→ witness passes while a publication occupies the settlement gap
+```
+
+That is the forbidden "hook before the actual synchronization barrier" pattern.
+It is closure-blocking because floor exclusion is one of E3c's load-bearing
+claims: a witness that cannot fail is not evidence for it.
+
+**Note what this costs.** The E3c closure above cites this witness as proof of
+the settlement barrier. Until the repair below, that citation was unearned, and
+so is any conclusion drawn from it.
+
+### The repair
+
+`publish_blocking_hook` → **`publish_contended_hook`**, fired ONLY after
+`live.try_write()` has actually FAILED, immediately before blocking on `write()`.
+A failed acquisition is the one signal scheduling cannot fake: it means a holder
+is provably there at that instant, so the publisher is definitively blocked when
+the negative assertion runs. Under the same mutation `try_write` SUCCEEDS, no
+acknowledgement is ever sent, and the witness fails at its wait.
+
+The rename is not cosmetic. `StoreCore` already documented the distinction for
+the poison gate — a BLOCKING hook is a placement rendezvous, a CONTENDED hook is
+evidence — and the poison gap witness uses them correctly, staging on the first
+and sequencing its negative assertion after the second. The floor witness had
+only the placement hook and used it as evidence. Keeping the old name would have
+left the next reader the same trap.
+
+Verified at the repair head: the witness FAILS under Kyra's exact mutation, at
+the contention wait rather than anywhere else; passes 10/10 consecutively with
+the mutation reverted; the sibling poison witness still fails under it.
+
+### What this pass did NOT cover
+
+The pass stopped on a tool ceiling before mutation-testing:
+
+- terminal store/routing exhaustion;
+- empty and non-empty `Superseded` behaviour;
+- both poison transition directions;
+- the final reverted green state.
+
+**Repairing this witness therefore does not complete the independent RED gate.**
+The remaining schedule resumes from the repair head.
+
+### Coupling this pass DID confirm
+
+Independently verified as genuinely coupled: store/epoch ordering (publishing
+the store before advancing the epoch fails the ordering witness); slot
+incarnation fencing; identity exhaustion (restoring wrapping allocation breaks
+deterministic refusal); owner reservation (letting grants consume it admits
+8,192 rather than 7,168); dormant-only reclamation. Baseline focused results at
+`80bb06b5a`: routing wiring 41, routing registry units 28, owner reservation 1,
+dormant reclamation 1. Zero-test filtered invocations were rejected and rerun.
