@@ -6,6 +6,20 @@ Every snippet below is compiled in CI as [`examples/docs_quickstart.rs`](https:/
 
 The examples are in Rust because the core crate is Rust, but the same surface exists for [Node, Python, and Go](/docs/start/install). If you're working in one of those bindings, swap the import line and the syntax — the call shapes match.
 
+## First, which crate?
+
+Net ships two Rust entry points, and picking the wrong one is the most common way to lose an afternoon. They are layers, not alternatives:
+
+| | `net-mesh` (this page) | `net-mesh-sdk` ([SDK quickstart](/docs/sdk/rust/quickstart)) |
+|---|---|---|
+| Imports as | `net` | `net_sdk` |
+| You get | `EventBus` — shards, ring buffer, adapters, filters | `Net` (the bus, ergonomically) and `Mesh` (capabilities, nRPC, tools) |
+| Reach for it when | you're embedding the bus, writing an adapter, or tuning the ingest path | you're building an agent, a service, or anything that discovers and calls capabilities |
+
+**If you're new, you almost certainly want the SDK.** Capability discovery, typed RPC, daemons, and tool calling all live there, and its `Mesh` node finds peers by capability rather than by address. Read this page to understand the substrate underneath — it's short, and the mental model pays for itself the first time you tune a shard count or write an adapter.
+
+The two share one runtime: `net_sdk::Net` *is* an `EventBus` with a friendlier surface, and both crates pin to the same version.
+
 ## Install
 
 ```sh
@@ -128,8 +142,12 @@ That's the part that takes longer than five minutes to fully explore — channel
 ## The agentic path
 
 The event bus above is the substrate. Net's flagship use is agents discovering and
-invoking work across the mesh — a different loop on the same foundation:
+invoking work across the mesh — a different loop on the same foundation, and the
+one the SDK is built for:
 
+- [Rust SDK quickstart](/docs/sdk/rust/quickstart) — the same first program on the
+  `net_sdk` surface, then a two-node `Mesh` that discovers capabilities. **Start
+  here if you skipped the crate table above.**
 - [Discover and Invoke](/docs/guides/discover-and-invoke) — query the mesh by
   capability (`net-mesh cap query --tag …`) and make a typed call.
 - [Wrap an MCP Server](/docs/guides/wrap-mcp-server) — turn an existing MCP tool
