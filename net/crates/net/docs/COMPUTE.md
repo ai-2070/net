@@ -53,7 +53,7 @@ pub enum PlacementReason {
 }
 ```
 
-The scheduler queries the `CapabilityIndex` from the behavior plane to find nodes matching a daemon's `requirements()` and ranks them with `StandardPlacement` — the default scorer combining capability match, load, anti-affinity, resource fit, and proximity.
+The `PlacementScheduler` queries the `CapabilityIndex` from the behavior plane to find nodes matching a daemon's `requirements()` and ranks them with `StandardPlacement` — the default scorer combining capability match, load, anti-affinity, resource fit, and proximity.
 
 ### Daemon capability authoring
 

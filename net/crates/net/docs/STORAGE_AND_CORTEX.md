@@ -29,7 +29,9 @@ mesh-bound state.
 - **RedEX** is the primitive: a named monotonic log (`ChannelName` →
   `RedexFile`). 20-byte index records, inline-or-heap payloads, a
   tail API that delivers events in order. Single-node. Optionally
-  disk-backed via the `redex-disk` feature.
+  disk-backed via the `redex-disk` feature. Heap payloads land in a
+  `HeapSegment` — a grow-only `Vec<u8>` with a 3 GB hard cap, where
+  each index record carries the `(offset, len)` into the segment.
 - **CortEX** drives folds over RedEX tails. A domain model (`tasks`,
   `memories`) implements `RedexFold<State>`, which mutates state as
   events arrive. The adapter owns the `Arc<RwLock<State>>` and a
