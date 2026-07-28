@@ -52,6 +52,7 @@ on:
       - ".github/scripts/check-skill-examples.sh"
       - ".github/scripts/check-skill-example-ts.sh"
       - ".github/scripts/check-skill-vocab.py"
+      - ".github/scripts/check-skill-coverage.py"
       - ".github/scripts/check-skill-snippets.py"
       - ".github/skill-snippets/**"
       # Every surface the skills document. Broad roots on purpose: the previous
@@ -91,6 +92,7 @@ on:
       - ".github/scripts/check-skill-examples.sh"
       - ".github/scripts/check-skill-example-ts.sh"
       - ".github/scripts/check-skill-vocab.py"
+      - ".github/scripts/check-skill-coverage.py"
       - ".github/scripts/check-skill-snippets.py"
       - ".github/skill-snippets/**"
       # Every surface the skills document. Broad roots on purpose: the previous

@@ -97,6 +97,20 @@ while read -r f; do
     [ -z "$ref" ] && continue
     [ -f "$dir/$ref" ] && continue
     [ -f "$root/$ref" ] && continue
+    # A slashed reference is only ours if its leading directory exists in this
+    # skill. `bindings/coverage.md` is a corpus reference and gets checked;
+    # `specs/x402-specification-v2.md` names a file in the x402-foundation repo
+    # at a pinned commit, and no amount of looking will find it here. Checking
+    # by whether the directory exists keeps external citations out without an
+    # allowlist — at the cost that a typo in the directory name reads as
+    # external. Better than the previous rule, which extracted no slashed
+    # reference at all.
+    case "$ref" in
+      */*)
+        lead=${ref%%/*}
+        [ -d "$dir/$lead" ] || [ -d "$root/$lead" ] || continue
+        ;;
+    esac
     # The corpus index sits at `$SKILLS/README.md` and routes *into* the skills,
     # so its references resolve one level down. It cannot say which skill —
     # `gotchas.md`, `concepts.md` and `testing.md` each exist in both — so at the
@@ -108,10 +122,11 @@ while read -r f; do
       continue
     fi
     note "${f#$SKILLS/}: references $ref, which is neither a sibling nor at the skill root"
-    # `_` is in the class deliberately: the corpus uses hyphens today, so a
-    # reference to an underscored filename was simply never extracted — an
-    # invisible citation rather than a reported one.
-  done < <(grep -oh '`[a-z0-9_-]*\.md`' "$f" 2>/dev/null | tr -d '`' | sort -u)
+    # `_` and `/` are in the class deliberately. Without `_` a reference to an
+    # underscored filename was never extracted; without `/` the same was true of
+    # every nested reference — `bindings/coverage.md` is the first of those, and
+    # it would have been an invisible citation rather than a checked one.
+  done < <(grep -oh '`[a-z0-9_/-]*\.md`' "$f" 2>/dev/null | tr -d '`' | sort -u)
 done < <(skill_md)
 [ "$fail" -eq "$before" ] && ok "every referenced *.md resolves"
 
@@ -203,6 +218,18 @@ while read -r line; do
   [ -n "$line" ] && note "$line"
 done < <(python3 "$(dirname "$0")/check-skill-vocab.py" || true)
 [ "$fail" -eq "$before" ] && ok "documented vocabularies match every binding"
+
+# ------------------------------------------------------------ coverage matrices
+# The per-skill binding matrices are the one place "does binding X support
+# operation Y" is maintained. This verifies their declared evidence anchors and
+# holds the status/mode vocabulary closed — it does not, and cannot, verify
+# completeness. See the script's docstring for why absence is not inferred.
+echo "==> Binding coverage matrices"
+before=$fail
+while read -r line; do
+  [ -n "$line" ] && note "$line"
+done < <(python3 "$(dirname "$0")/check-skill-coverage.py" || true)
+[ "$fail" -eq "$before" ] && ok "coverage anchors resolve; vocabulary is closed"
 
 # ------------------------------------------------------------------ CLI verbs
 # The single installed binary is `net-mesh` (cli/Cargo.toml [[bin]]). A bare

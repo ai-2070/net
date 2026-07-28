@@ -21,6 +21,7 @@ You have several reference files in this directory. Load them on demand — do n
 | File | Read when |
 |---|---|
 | `concepts.md` | **Always** — before writing any integration code. The mental model. ~5 min read. |
+| `bindings/coverage.md` | **Before promising any surface exists in a given language.** Which of the five bindings supports which operation, with per-binding evidence. Not every operation is at parity: Go has no A2A and no filter DSL, Node and Python reach several surfaces only through the low-level package. |
 | `apis.md` | When generating actual code. Verified per-SDK templates for publish, subscribe, lifecycle. |
 | `patterns.md` | When the user describes a task ("I need a relay", "I need persistence", "I need fan-out across machines"). Maps tasks to recipes. |
 | `mesh.md` | When the user is deploying multi-host. Production transport recipe — PSK / identity bootstrap, peer discovery, NAT traversal toggles, port mapping, 2-node and 3-node working configs. Also **subnets** (`SubnetId` / `SubnetPolicy` / gateway `Visibility`) and the **channel-authorization trap**: capability filters are advisory (self-advertised); `require_token` + `token_roots` is the only real boundary. |

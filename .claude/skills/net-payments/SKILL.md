@@ -31,6 +31,7 @@ Load reference files on demand — do not read them all up front.
 | File | Read when |
 |---|---|
 | `concepts.md` | **Always first.** The mental model, the category line, the eight doctrines, the object model at a glance, the **data boundary** (what "commercial facts" may and may not carry — no PII, by construction), "no HTTP endpoint required," the review invariant. ~5 min. |
+| `bindings/coverage.md` | **Before promising payments works in a given language.** Payments is a three-binding subsystem: Rust, Node and Python only, and Node/Python reach it solely through the low-level package. Go and C have no payments API at all. |
 | `object-model.md` | When touching the five Net envelopes — exact fields, the canonical signing regime, versioning, idempotency, amounts. |
 | `x402.md` | When touching x402 structures — `X402Carry` byte-preservation, `PaymentRequirements`/`PaymentPayload`/settlement views, CAIP ids, the `exact` EVM scheme. |
 | `provider.md` | When the user **charges for a capability** — `PaymentEngine` lifecycle (quote → verify → settle → serve → bill), provider admission policy, pricing at publish, `serve_payments` over the mesh. |
