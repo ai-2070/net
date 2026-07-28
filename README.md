@@ -31,9 +31,26 @@ go get github.com/ai-2070/net/go
 
 The Rust crate, npm scope, and PyPI dist all publish under `net-mesh*` / `@net-mesh/core*`. Source-level imports stay as `net_sdk` / `@net-mesh/sdk` / `from net_sdk import ...`. See [SDKs](#sdks) for the lower-level core packages and full per-language usage.
 
+## Claude Code Skill
+
+Net looks like Kafka or NATS from the outside, and the model underneath is different enough that an agent working from surface familiarity will write integration code that compiles, runs, and is quietly wrong. Two Agent Skills load the correct mental model and verified per-SDK templates before the agent writes a line:
+
+```bash
+npx skills add ai-2070/net-claude-skill -g
+```
+
+Drop `-g` to install into the current project only. To update to the latest version:
+
+```bash
+npx skills update -g
+```
+
+Restart Claude Code and run `/skills` — **net-event-bus** (pub/sub, nRPC, the MCP bridge, organization capability auth, the gang-claim scheduler, RedEX / CortEX / Dataforts) and **net-payments** (x402 pricing, quotes, settlement, spend policy) should be listed. Source: [ai-2070/net-claude-skill](https://github.com/ai-2070/net-claude-skill). Full install options in [Claude Skills](https://ai2070.net/docs/start/claude-skills).
+
 ## Contents
 
 - [Install](#install)
+- [Claude Code Skill](#claude-code-skill)
 - [Why not best-effort](#why-not-best-effort)
 - [A new class of systems](#a-new-class-of-systems)
 - [Properties](#properties)
