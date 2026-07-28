@@ -8,7 +8,7 @@
 
 ## Status
 
-**Revision 2 — not started.** Revision 1's architecture was approved; its
+**Revision 3 — not started.** Revision 1's architecture was approved; its
 verification and scope gaps were not. Every correction below was checked against
 the tree rather than accepted on description, and two changed the plan
 materially:
@@ -23,6 +23,18 @@ materially:
 - **The refactor is not event-bus-only.** R1 measured `net-event-bus` and
   generalised. `net-payments/bindings.md` is **85% per-language** — worse than
   `apis.md`'s 68%.
+
+R3 corrects five smaller things, one of which was the same misclassification the
+plan itself warns about — `C nRPC` was written `n/a` when the skill's own
+`nrpc.md:387` says "**not exposed in `net.h`**". Making a rule and then breaking
+it two sections later is how the rule stops being believed.
+
+**One R3 item was not adopted**, with evidence: the review asked to weaken the
+appendix to "membership, not shape." Shape checking *is* implemented and was at
+the reviewed SHA — `check-skill-refs.py` compares a citation's `{ }` / `( )`
+against the variant's real form, and it is fault-injected in both directions.
+Weakening that line would have understated the tooling. The other two appendix
+corrections were right and are applied.
 
 ## The measurement that scopes it
 
@@ -60,9 +72,24 @@ enumerates markdown recursively, not two levels deep. Affected: cited repo
 paths, CLI invocations, internal-plan vocabulary, and the cross-reference loop
 (which reads `"$dir"*.md`).
 
-**0b. A nested fixture, not just a glob change.** A glob is one edit away from
-regressing. Add a permanent fixture — a nested file with a known-bad reference
-that CI asserts is *caught* — so the depth guarantee is tested, not assumed.
+**0b. A depth regression test, outside the published corpus.** A glob is one
+edit away from regressing, so the depth guarantee needs a test — but the
+`_probe.md` used above was *temporary evidence*, not a design. A permanently
+broken file under `net-event-bus/bindings/` would be worse than no test:
+`skills-publish` does `rsync -a --delete` over the whole skill directory, so it
+would be **published to users** as part of the public skill, and the checker
+would be permanently red or need an allowlist that weakens the real corpus.
+
+Two acceptable shapes — the second is preferred, since it exercises the
+production discovery path rather than a parallel one:
+
+```
+.github/fixtures/skill-checks/nested/bad.md   # checker run against a fixture corpus
+```
+```
+harness: create a temporary nested file → run the checker → assert nonzero and
+the expected diagnostic → remove it
+```
 
 **0c. Resolve the TypeScript publication gate.** R1's appendix listed "five
 hello-worlds compile or type-check" beside "publication is blocked when
@@ -125,10 +152,16 @@ generated declarations (TS), or carry a low-level FFI symbol the ergonomic SDK
 deliberately withholds.
 
 So: **the matrix is editorially authoritative; CI verifies its declared evidence
-anchors and selected critical absences.** Each non-`n/a` cell names its own
-evidence — a source path, a public symbol, a compile-checked example, or a
-conformance test — and the check resolves *that*. Negative evidence is asserted
-only where it is cheap and meaningful, cell by cell, never inferred globally.
+anchors and selected critical absences.** Three obligations, because a `not
+exposed` cell is not `n/a` but often has no enforceable proof either:
+
+| Cell | Obligation |
+|---|---|
+| positive (`supported` / `partial` / `experimental`) | names an evidence anchor — source path, public symbol, compile-checked example, or conformance test — which CI resolves |
+| negative (`not exposed` / `n/a`) | names its editorial rationale in prose; not machine-checked by default |
+| **selected critical** negatives | additionally carry enforceable absence evidence, chosen case by case |
+
+Absence is never inferred globally.
 
 ## Phase 2 — split generic binding material — **Priority 1, M**
 
@@ -146,7 +179,9 @@ Each companion carries only what changes generated code:
 5. return and error behaviour — throws vs returns `false` vs encodes status
 6. resource ownership and shutdown obligations
 7. feature availability + known gaps, pointing at `coverage.md`
-8. a link to its canonical checked example (see Phase 4 — *link*, not a copy)
+8. a link to its canonical checked example **where one already exists** — today
+   that is the five `hello.*` files; Phase 4 adds the rest and links them. The
+   routing refactor does not wait on the example expansion.
 9. where the authoritative binding source is
 10. what must never be inferred from another binding
 
@@ -170,19 +205,35 @@ R1 sized this M and left "important operation" undefined, which makes it
 subsystems × bindings — a design problem, not an implementation task. Two
 constraints have to be settled first.
 
-**The initial operation set is the public critical path**, nothing wider:
+**The initial operation set is a public critical path per skill** — R1 gave one
+list, and it was an event-bus capability/invocation journey that does not
+describe payments at all:
 
 ```
-construct/start · announce · discover · invoke · observe · handle one failure · shutdown
+net-event-bus     construct/start · publish+subscribe OR announce/discover/invoke ·
+                  observe · handle one failure · shutdown
+
+net-payments      caller:   inspect pricing · invoke · hit approval requirement ·
+                            approve · pay · classify outcome · close
+                  provider: construct · author pricing terms · publish one paid
+                            capability · gate an invocation · read billing · close
 ```
 
-Subsystem examples get added only where a binding's shape is surprising or
-commercially important — not by default.
+**Not all of that ships at once.** The first checked route is deliberately one
+per skill: the event-bus journey, and **one** payments demand path. The provider
+path follows only once the demand path is green in every binding that claims
+support. Naming the initial route is what keeps "bounded" real.
 
-**One canonical location per example.** The runnable file under `examples/` is
-canonical; the companion links to it and may quote a short excerpt only where
-that materially aids comprehension. CI compiles the file that ships with the
-skill, so markdown and file cannot diverge.
+Subsystem examples get added beyond that only where a binding's shape is
+surprising or commercially important — not by default.
+
+**One canonical location per example, and companions link only.** The runnable
+file under `examples/` is canonical; the companion points at it and does **not**
+quote it. A hand-copied excerpt diverges as readily as a duplicated file — the
+thing this rule exists to prevent — and "just a short excerpt" is exactly how
+that starts. If reading experience later proves excerpts are needed, add them
+mechanically (included from the file, or CI-verified as a literal contiguous
+region), never by hand.
 
 **The checkers need extending, and that is the real cost.**
 `check-skill-snippets.py` supports Rust only *by design* — a non-Rust marker is
@@ -194,8 +245,8 @@ Report coverage with explicit `n/a`, so a missing example is never mistaken for
 an unsupported binding:
 
 ```
-announce:  Rust ✓  TS ✓  Python ✓  Go ✓   C ✓
-nRPC:      Rust ✓  TS ✓  Python ✓  Go ✓   C n/a
+announce:  Rust ✓  TS ✓  Python ✓  Go ✓            C ✓
+nRPC:      Rust ✓  TS ✓  Python ✓  Go ✓            C not-exposed
 A2A:       Rust ✓  TS ✓  Python ✓  Go not-exposed  C not-exposed
 ```
 
@@ -213,10 +264,23 @@ A2A:       Rust ✓  TS ✓  Python ✓  Go not-exposed  C not-exposed
 
 ## Appendix — what CI proves today, precisely
 
-Cited paths exist and are tracked; documented symbols resolve; enum variants
-belong to their enum *and* match its shape; metric/config identifiers exist;
-cross-binding vocabularies agree; marked Rust snippets compile; the docs site
-carries the same path/variant/identifier/CLI checks.
+Stated at the precision the implementation actually supports, since the
+appendix's own point is that these catch *wrong*, not *incomplete*:
+
+- cited repo paths exist **and are tracked in git** (so a local build artifact
+  cannot mask a bad citation);
+- **a hard-coded set of 17 high-risk callable symbols** resolves — not every
+  documented symbol;
+- backticked, qualified `Enum::Variant` citations are checked for **membership
+  in known Rust enums, and for shape** — a tuple variant written `Foo { x }`
+  fails, and so does the reverse;
+- snake_case metric/config identifiers of ≥12 chars appear somewhere in source;
+- **one registered cross-binding vocabulary — the nRPC wire kinds** — agrees
+  across its checked sources; this is not a general comparison of all
+  vocabularies;
+- Rust snippets carrying `<!-- skill-check: compile -->` compile (2 of 114);
+- the docs site carries the same path / variant / identifier / CLI checks,
+  excluding release notes.
 
 Two honest qualifications, both corrected from R1:
 
