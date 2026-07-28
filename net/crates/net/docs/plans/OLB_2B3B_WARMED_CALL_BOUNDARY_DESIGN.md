@@ -1,302 +1,371 @@
-# OLB-2B.3b — warmed-call boundary design (for review)
+# OLB-2B.3b/c/d — warmed-call boundary design, revision 2 (for review)
 
-**Status: DESIGN FOR REVIEW. No implementation authorized.** Written at
-`49a3fa6dd`, on the 2B.3a substrate (`af651fa89`), against the frozen boundary in
-Kyra's 2026-07-27 authorization and the twelve required sections in the
-2026-07-28 review note.
+**Status: DESIGN FOR REVIEW. No implementation authorized.** Revision 1
+(`fd05a89ba`) was HELD FOR REVISION on eight adjudicated blockers plus one P0 and
+two P1s from the independent read-only review. This revision adopts the
+recommended re-slicing and answers each.
 
-**Prerequisite:** 2B.3a is HOLD pending its production-install witness coupling
-(repaired at `49a3fa6dd`) and exact-SHA CI. Nothing below may be built before
-that clears.
-
----
-
-## 0. The correction this design starts from
-
-The shorthand I proposed — *load facts → compare `SourceEpoch` → proof/send* —
-is **wrong, and dangerously so**, because it describes a strictly weaker check
-than the seam it replaces. `MeshNode::org_routing_base_facts` today enforces
-nine things, not one:
-
-```text
-1. artifact present at all                     (else cold)
-2. coherent authority sample succeeded         (seqlock; else cold, NOT stale)
-3. routing-authority exhaustion                (terminal ⇒ stale)
-4. epoch.authority        == live authority
-5. epoch.floor_generation == live floors       (moves independently)
-6. epoch.poisoned         == live poison       (COMPARED, never a predicate)
-7. providers is Served, not Unserved           (no evidence ≠ proven empty)
-8. wall-clock expiry vs earliest_expiry
-9. routing health allows facts.actor_incarnation
-```
-
-Each of 3–6 and 9 exists because a specific defect was found and closed during
-E3c. A warmed path that compares only `SourceEpoch` would silently reintroduce
-them. **The entire read contract moves to the warmed path unchanged; the only
-thing 2B.3b changes is where the artifact comes from.**
+**Substrate:** `OLB_2B3A_SIGNED_HEAD = fd05a89ba` — the per-slot
+`Arc<ArcSwapOption<SlotBaseFacts>>` publication cell. That signature explicitly
+does **not** claim `SlotBaseFacts` is the final `OrgRouteSet`, which is exactly
+the conflation revision 1 made.
 
 ---
 
-## 1. Ownership
+## 0. What revision 1 got wrong
 
-`RoutingFamily` lives in **`OrgRoutingState`** — the durable, clone-shared owner
-the plan already specifies (§7, correction 3). It is minted once, lazily, via
-`MeshNode::org_routing_family()`.
+Stated plainly, because the errors are structural rather than presentational.
 
-```text
-mesh.org(credentials)  ->  OrgClient { routing: Arc<OrgRoutingState> }
-                                        │
-                                        └── RoutingFamily (1 per state)
-                                              └── 64-handle budget
-```
+**It conflated the discovery substrate with the route set.** `SlotBaseFacts`
+carries `SourceFacts::Served(Arc<[PrivateCapabilityProvider]>)`, and a
+`PrivateCapabilityProvider` is four fields: `provider`, `owner_org`,
+`expires_at`, `generation`. It carries no invocation mode, no matched INVOKE
+grant, no provider-owner proof relation, no direct-session result, no session
+generation, no classification. A warmed path consuming it would have had to
+*reconstruct* the authority and reachability decision per call — which is
+precisely the work the architecture exists to move off the request path.
 
-- **Every `OrgClient` clone descended from ONE `mesh.org(...)` call shares one
-  `OrgRoutingState`, therefore one family, therefore one 64-handle budget.**
-- A **separate** `mesh.org(...)` call mints a **separate** family with its own
-  budget. This is deliberate and matches the signed registry semantics: the bound
-  counts HANDLES per family so duplicate demand cannot bypass it, and the node
-  bound (256 distinct slots) is what actually caps node-wide retention.
-- Two families demanding the same `(scope, capability)` share ONE node slot —
-  already true in the registry and witnessed.
+**§8 contradicted itself inside one paragraph:** "No scan… one linear pass for
+first-direct". A bounded linear pass over candidates *is* the candidate scan the
+plan prohibits. Writing both sentences adjacent and not noticing is the tell that
+I was describing the OLB-1 cold path with a cache in front of it, not the frozen
+hot path.
 
-**Not a task owner.** `OrgRoutingState` holds handles and reads; it never spawns,
-never rebuilds, never schedules. The node's single routing actor remains the only
-thing that builds.
+**It assumed one `(scope, capability)` handle per call.** One `org.call` composes
+the Owner scope with every relevant Grant scope; the registry key is
+`(PrivateAudienceScope, capability)`. So a logical capability owns *several*
+scoped slots, and revision 1 never said how they compose.
 
-## 2. Demand lifecycle
+**It deferred the sender boundary to a future review** — but this is the slice
+that reaches `MeshNode::call`, so this *is* that review.
 
-| Event | Action |
-|---|---|
-| First `org.call(cap)` for a `(scope, cap)` not held | mint a `DemandHandle`, insert into the state's bounded map |
-| Subsequent calls, same key | reuse the held handle; no registry interaction |
-| `demand()` refused (family 64 / node 256 / id space) | **no handle retained**; this call and every later one take the cold current-authority plan until capacity frees |
-| Last `OrgClient` clone of the family drops | `OrgRoutingState` drops → all handles drop → last reference retires each slot |
+**And a fact I should have checked before designing on top of it:**
+`ScopedSlotSource::snapshot` serves `CapabilityAudienceScope::Owner` only;
+everything else is counted `unserved` and reconstructs as `SourceFacts::Unserved`.
+Demanding Grant slots today yields deterministically cold artifacts. The composite
+warmed call revision 1 described is **not implementable on the current source**,
+and I designed a composition over a plane that does not exist.
 
-- **No eviction.** At the family bound the answer is deterministic degradation,
-  never displacing a live slot — the registry already refuses rather than evicts,
-  and the SDK must not layer eviction on top.
-- **No TTL.** A handle is retained until its family dies. Slot freshness is the
-  actor's job; handle lifetime is ownership, not caching.
-- Refusals increment the existing capacity counters; the call still succeeds via
-  the cold path.
+---
 
-## 3. The lock-free validation seam
-
-New node method, mirroring the existing one exactly except for its source:
-
-```rust
-pub(crate) fn org_routing_validated(
-    &self,
-    handle: &DemandHandle,
-) -> Option<Arc<SlotBaseFacts>>
-```
-
-It performs checks 1–9 verbatim. The one structural difference:
+## 1. The three artifacts, named and separated (blocker 1)
 
 ```text
-existing:  registry.base_facts_unvalidated(&key)   // registry LOCK + BTreeMap lookup
-warmed:    handle.base_facts_unvalidated()         // one ArcSwap load
+PrivateCapabilityProvider     raw discovery row  (provider, owner_org, expires_at, generation)
+        │
+        ▼  node actor, off request path
+SlotBaseFacts                 AUTHORITY-SCOPED DISCOVERY SUBSTRATE
+                              one per (PrivateAudienceScope, capability)
+                              node-shared; stamped with SourceEpoch + incarnations
+        │
+        ▼  node actor, off request path
+UnsensedRouteSet              INVOCATION-READY ROUTES
+                              one per LOGICAL capability (Owner ∪ served Grants)
+                              ready = []           (populated by 2B.5 sensing)
+                              unknown = preprojected, deterministically ordered
+                              carries the COMPLETE source vector + deadlines
 ```
 
-Everything else in the contract is already lock-free — `sample_routing_authority`
-is a seqlock over atomics, `routing_health` is an `ArcSwap`, exhaustion is an
-`AtomicBool`, expiry is a clock read.
+Only the third is loadable by a call. `SlotBaseFacts` becomes an actor-side
+**input** and stops being a read seam for anything but witnesses.
 
-**The one lock that remains, and why it is acceptable:** `invalidate_if_stale`
-takes the registry lock. It runs ONLY on the mismatch path, which is by
-definition the cold path that is about to run a full slow plan — so the hot path
-is lock-free and the cold path's lock is dwarfed by the work it precedes. This
-must be stated in the code, not assumed, because "the warmed path is lock-free"
-is a claim a future refactor can quietly break.
+Each `unknown` entry is preprojected to invocation-ready, i.e. it already
+contains: the provider, the invocation **mode** (SameOrg / Granted), the matched
+INVOKE grant identity where Granted, the provider-owner proof relation, the
+direct-session eligibility result, and the session generation that result was
+taken under. The warmed path takes entry `[0]` (or a P2C sample over `ready`, in
+2B.5). **It never inspects, filters, matches or orders anything.**
 
-**Both seams must remain.** The registry-side `base_facts_unvalidated(&key)` is
-used by witnesses that assert on RETENTION specifically. 2B.3a's witness already
-pins that the two seams return the same artifact.
+## 2. The Grant plane is not served — a prerequisite, not a detail (P0)
 
-## 4. Slot-incarnation safety
+`SourceFacts::Unserved` is not "no providers"; it is "no evidence", and the
+signed read seam deliberately reads it COLD. So Owner∪Grant composition cannot be
+built until the source can speak for Grant scopes.
 
-The handle is held across the **entire** cached-use attempt: validation, proof
-construction, and the send boundary. Holding it is what prevents retirement, so
-the slot cannot be retired and re-demanded underneath a call in flight.
-
-The artifact itself needs no such protection — it is an immutable `Arc` already
-loaded. Correctness comes from **ordering**, which is frozen here:
+That extension is its own bounded slice (**2B.3c-pre**, below) and must not
+weaken the frozen separations:
 
 ```text
-1. load the artifact from the cell          (one atomic)
-2. sample authority coherently
-3. compare (checks 3–6, 9) against THAT artifact
-4. temporal checks (8) and Served check (7)
-5. build the proof
-6. send
+DISCOVER ≠ INVOKE ≠ SENSE
 ```
 
-Step 3 must follow step 1. Sampling first and loading second validates an epoch
-against an artifact you had not yet read — the same class as the seqlock ordering
-review-pass-3 §6 froze, and it would be invisible in testing.
+A Grant candidate may enter the unsensed fallback **only after exact current
+INVOKE authority is established**, and remains Unknown/Potential until SENSE
+exists. This lights nothing in `OrgCapabilityRegistration`.
 
-## 5. The authority transaction
+## 3. Multi-scope composition (blocker 2)
 
-The exact sample immediately before proof construction:
-
-```rust
-let (authority, poisoned, floor_generation) = self.sample_routing_authority()?;
-let stale = self.routing_authority.is_exhausted()
-    || facts.epoch.authority         != authority
-    || facts.epoch.floor_generation  != floor_generation
-    || facts.epoch.poisoned          != poisoned;
-```
-
-plus `self.routing_health.load().allows(facts.actor_incarnation)`.
-
-`sample_routing_authority` returning `None` is **cold but NOT stale** — we do not
-know the facts are wrong, so retiring them would discard valid work.
-
-**Stated residual, not closed by this design.** There remains a window between
-validation and the packet leaving the host. Kyra ruled this a sender-boundary
-contract question requiring per-packet revalidation, deferred to the integrated
-sender review. 2B.3b does not narrow it and must not claim to. What 2B.3b does
-guarantee is that no *cached selection* crosses the boundary unvalidated.
-
-## 6. Temporal checks
-
-- `current_timestamp() >= facts.earliest_expiry` → cold. Enforced at the READ,
-  not only at capture: reconstruction and commit can both cross a deadline, and
-  the exact-expiry timer may itself be waiting on the publication gate.
-- The **existing** per-call temporal recheck of membership / dispatcher / grant
-  credentials stays exactly where OLB-1 put it. The route cache is never an
-  authority cache, and no expired credential may enter `OrgProofIntent`.
-- The two are independent: passing the route-freshness check never excuses the
-  credential check.
-
-## 7. Mismatch behaviour
+**Two-level, with the composite built by the node actor — never per family, never
+per call.**
 
 ```text
-any of checks 1–9 fails
-  → invalidate_if_stale(key, &the_exact_artifact_we_read)   [conditional]
-  → registry re-queues the slot and marks RegistryWork
-  → return None
-  → caller runs ONE current-authority slow plan, or fails locally
+level 1  (node-shared)   SlotBaseFacts per (scope, capability)     — 2B.3a, signed
+level 2  (node-shared)   UnsensedRouteSet per (acting_org, capability)
+                         built from the Owner slot ∪ every served Grant slot
+                         for that capability, under ONE coherent source epoch
 ```
 
-- Invalidation is **conditional on the exact artifact read**, so a delayed reader
-  cannot delete a newer replacement installed in the meantime.
-- **Never** an inline rebuild. A staleness observation on the read path enqueues;
-  it does not perform.
-- **Exactly one** slow plan. Not a retry loop, not "try warm again after the
-  rebuild" — that would make call latency depend on actor scheduling.
-- Cold and stale are distinguished: cold enqueues nothing.
+- **Composite identity** is `(acting_org, capability)`, not the caller. Caller-
+  and grant-specific narrowing that is genuinely per-caller stays local and O(1);
+  it must not require rebuilding or re-querying.
+- **Coherence:** the composite is built inside one quantum from contributing
+  slots that all carry the same `SourceEpoch`. A contributor whose epoch differs
+  makes the composite unbuildable this pass — it re-queues rather than mixing
+  epochs, which is the same rule E3c froze for multi-quantum recapture.
+- **Invalidation:** movement in ANY contributing scope invalidates the composite.
+  The composite records its contributor slot identities + incarnations; the
+  registry's existing per-slot invalidation additionally clears composites naming
+  that slot. This is the one genuinely new invalidation edge and it needs its own
+  witness (§11, W-C3).
+- **Grant-specific INVOKE matching happens at projection time**, in the actor, so
+  the published entry already names its matched grant.
 
-## 8. Selection
+## 4. Honest accounting (blocker 3) — and a plan-text correction
 
-From `SourceFacts::Served(providers)`, already sorted provider-ascending /
-generation-descending **once at rebuild**, off-lock, by
-`ScopedSourceSnapshot::providers`.
+The two options are not reconcilable with the substrate as it stands, and the
+arithmetic decides it:
 
-2B.3b uses the **deterministic fallback only** — sorted order, first directly
-reachable — which is byte-for-byte the behaviour OLB-1 froze and Kyra signed.
-P2C over `ready` is **not** in this slice: nothing populates `ready` until 2B.5
-adds the sensing join, and a sampler over a permanently empty vector would be
-untestable machinery pretending to be a policy.
+```text
+MAX_HANDLES_PER_FAMILY = 64      (scoped demand handles)
+MAX_NODE_SLOTS         = 256     (distinct scoped slots node-wide)
+```
 
-No scan, no per-request sort, no enumeration. The warmed path performs: one
-ArcSwap load, one authority sample, one linear pass for first-direct, one proof.
+If a logical capability spans Owner + up to S grants, then Option B's "64 logical
+capabilities" needs `64 × (1+S)` handles per family — 128 at S=1, 256 at S=3 —
+which collides with the node-wide bound at a single family. Option B is therefore
+only honest if the handle budget is raised well past the node bound, which is
+incoherent.
 
-## 9. Dispatch boundary — where retry becomes forbidden
+**Adopting Option A:**
 
-**Execution becomes ambiguous the instant the request is handed to the transport
-for send.** Before that point every failure is local and unambiguous (capacity
-refusal, cold read, epoch mismatch, expired credential) and falling back to one
-slow plan is safe. At and after that point:
+```text
+64  authority-scoped route demands per family
+256 retained authority-scoped slots node-wide
+```
 
-- no automatic retry, on any error, including timeout and provider denial;
-- one call ⇒ one call id ⇒ one signature;
-- a `NoViableProvider`-shaped local outcome must be produced **before** the send,
-  never after.
+A capability spanning N scopes consumes N demand units. This bounds the units
+that actually consume registry work and memory.
 
-The design must name the exact call in the implementation and put the rule in a
-comment there, because this is the invariant most likely to be eroded later by
-someone adding "just a retry on connection reset".
+**Consequence that must be applied, not glossed:** the plan says twice (§7, and
+the §13 OLB-2 bullet list)
 
-## 10. Dead-code closure
+```text
+max warmed capabilities per OrgRoutingState clone family: 64
+```
 
-Every temporary `#[allow(dead_code)]` 2B.3b must REMOVE (its consumer is exactly
-this slice):
+That sentence promises something the substrate does not implement. It must be
+reworded to *authority-scoped route demands*, in the same change that lands this
+accounting — otherwise the plan's own pin and the code disagree, which is the
+§19 defect class this review process already caught once.
 
-| File | Item |
-|---|---|
-| `org_routing_registry.rs:71` | `PrivateAudienceScope::new` |
-| `:101`, `:105` | `DemandRefused::{FamilyAtCapacity, NodeAtCapacity}` |
-| `:121` | `SlotBaseFacts::providers` — "read by the warmed-call consumer" |
-| `:359` | `Slot::refs` |
-| `:387`, `:412` | `RegistryInner::families`, `family_handles` |
-| `:549`, `:556` | `RoutingFamily` + its impl |
-| `:571` | `DemandHandle` |
-| `:599` | `DemandHandle::base_facts_unvalidated` |
-| `:654`, `:736` | `demand`, `release` |
-| `mesh.rs:12739` | `MeshNode::org_routing_family` |
-| `mesh.rs:12802` | `MeshNode::org_routing_base_facts` |
+*(Recorded conflict for the reviewer: the adjudication recommended Option A,
+while the re-slicing sketch listed "honest 64-logical-capability accounting" under
+2B.3b. I have taken the former as the operative instruction because the latter is
+not achievable within the existing bounds without the extra per-capability scope
+bound Option B requires. If Option B is intended, it needs
+`MAX_SCOPES_PER_CAPABILITY` named and the handle budget re-derived.)*
 
-Explicitly **NOT** 2B.3b's, and must remain: `org_routing.rs:114`
-(`ApplyOutcome::Fault`), `org_scoped_store.rs:1503`
-(`PrivateDiscoveryStream::Owner` — reserved for the LS track, Q4),
-`mesh.rs:10399/10416/10439` (sensing-snapshot seams belonging to other slices).
+## 5. Lock-free family lookup (blocker 4)
 
-**Per the E3c discipline: any allow in the first list still present after 2B.3b
-lands means the consumer did not really arrive, and the slice is not done.**
+A `Mutex<BoundedMap<..>>` on the warmed path would make "lock-free" false no
+matter how the artifact is loaded. Storage shape:
 
-## 11. Witnesses — every one stated as a mutation
+```text
+OrgRoutingState {
+    index: ArcSwap<CapabilityIndex>,     // immutable, bounded; READ path
+    mutate: parking_lot::Mutex<()>,      // miss / insert / drop ONLY
+}
+CapabilityIndex = bounded immutable map  capability -> Arc<CapabilityRouteHandle>
+```
 
-Each must fail under its mutation *and* be checked in the inverse direction where
-the property is an ordering. Three witness defects in the E3c closure shared the
-shape "proved one direction, blind to the inverse"; that check is now mandatory.
+Warmed read: `index.load()` → lookup → `route_set.load()`. **No SDK-state mutex,
+no registry mutex, two atomic loads.**
+
+Mutation (cold path only) takes `mutate`, clones the index, inserts, and
+`store`s the new one — copy-on-write at capability-warming frequency, which is
+bounded by 64 per family for the family's lifetime.
+
+**Not a `DashMap`:** it is internally sharded-locking, so it would leave the
+stated contract unproven while looking like it satisfied it.
+
+## 6. The exact cold/stale/invalidation matrix (blocker 5)
+
+Revision 1's "any of checks 1–9 fails → invalidate → requeue" was wrong and
+contradicted its own §5. Corrected, and this table is normative:
+
+| Condition | Classification | Invalidate / requeue? |
+|---|---|---|
+| Artifact absent | Cold | **No** |
+| Coherent authority sample unavailable | Cold, not known stale | **No** |
+| Authority / floor / poison / exhaustion mismatch | **Stale** | **Yes** — conditional on the exact artifact |
+| `SourceFacts::Unserved` | Structural cold | **No** |
+| Wall-clock expiry | Cold read refusal; the expiry actor owns promptness | **No** |
+| Routing health rejects the actor incarnation | Fenced cold | **No** |
+| Exact artifact replaced before invalidation | A newer publication won | **No** |
+
+Each "No" is load-bearing: invalidating `Unserved` recreates steady-poison churn;
+invalidating on an incoherent sample discards possibly-valid work; treating every
+cold outcome as owed work reintroduces the self-wake loops E3c closed.
+
+## 7. The coherent current-authority slow plan (P1)
+
+"Reuse `plan()`" is not an answer. Today `OrgClient::plan` does: credential
+temporal checks → private discovery → per-candidate authority/grant matching →
+direct-session annotation → deterministic selection. What the frozen transition
+requires is stronger:
+
+```text
+ONE coherent current authority/store snapshot
+→ caller membership + dispatcher floors/currentness
+→ provider membership floors/currentness
+→ exact grant currentness
+→ deterministic selection
+→ one proof intent
+→ one send, or local failure
+```
+
+**Deliverable before 2B.3d:** name that seam, and either prove `plan()` already
+holds a single coherent authority transaction across the whole decision, or
+introduce the transaction. The existing `sensing_authority_snapshot` /
+`capture_current_sensing_stamp` pairing is the nearest precedent for the shape.
+Until that is settled, the mismatch path has no proven destination and 2B.3d
+cannot be witnessed.
+
+## 8. The complete source vector and deadlines (P1)
+
+`SlotBaseFacts` stamps scoped generation, routing authority, floor generation,
+poison, provider expiry, actor + slot incarnations. `UnsensedRouteSet` must
+additionally carry, per plan §7's `RouteSourceGeneration`:
+
+```text
+session generation          topology generation
+sensing generation          watch population
+caller/grant projection identity
+next_private_discovery_deadline      next_authority_deadline
+```
+
+These cannot be demoted to per-call checks. Session eligibility and fallback
+ordering are **projected before publication**, so their inputs must be in the
+stamp or publish-if-current cannot detect their movement. And
+`next_authority_deadline` must arm a rebuild: without it an expired preferred
+grant stays selected indefinitely while every call falls cold — a liveness
+failure that looks exactly like a cold cache.
+
+## 9. The sender boundary belongs to this slice (blocker 6)
+
+Accepted. 2B.3d changes `OrgClient::call_bytes_deadline` and reaches
+`self.node.call(...)`, so it is the integrated sender review. The frozen sequence:
+
+```text
+load immutable route set        (ArcSwap)
+→ select ONE route              (take, never search)
+→ construct OrgProofIntent      locally
+→ FINAL coherent route/authority/temporal validation
+→ MeshNode::call
+```
+
+**Between the final validation and `MeshNode::call` there may be: no `.await`, no
+callback, no registry operation, and no alternative-provider selection.** The
+rule goes in a comment at that exact call, because it is the invariant most
+likely to be eroded by a later "just retry on connection reset".
+
+Authority movement *after* the final comparison is the ordinary linearization
+race and is accepted. **Holding an authority lock across a network send is
+forbidden** — that would make send latency a lock-hold time on the node's
+authority gate. This is stated as the boundary's contract rather than deferred
+again.
+
+## 10. Refusal semantics, per class (corrected)
+
+| Refusal | Policy | Why |
+|---|---|---|
+| `FamilyAtCapacity` | **Sticky cold for that family's lifetime** | No eviction, and family-held entries live until the family dies — capacity cannot free while the family is intact. Retrying per call is pure mutex pressure. |
+| `NodeAtCapacity` | **Retryable**, gated on a node capacity generation | Another family may release a slot. Refusal records the observed generation; a later cold call retries only if it moved. Without the generation, one attempt per cold call is safe but wasteful. |
+| `IdSpaceExhausted` | **Terminal — never retry** | No wrap, no alias, no churn. |
+
+Never: an unbounded refusal map, a spin, a wait on actor work, or a retry within
+the same call. The registry lock on the refusal path is acceptable precisely
+because the key is not warmed.
+
+## 11. Witnesses
+
+Both forms of zero-lock evidence, because each covers the other's blind spot:
+
+- **Instrumented counters** end-to-end — a complete warmed call acquires zero
+  routing-state and zero registry locks. A structural argument silently goes
+  stale; a counter does not.
+- **Real contention witnesses** — a counter can miss a newly introduced lock
+  site:
+
+```text
+hold the actual registry / state mutation mutex
+→ contender proves try_lock() FAILS          (proven contention, per the E3c rule)
+→ acknowledge
+→ complete one fully warmed call while the mutex remains held
+→ assert exactly one send
+→ release
+```
+
+Every wait and join bounded. Only a failed `try_lock` counts as contention
+evidence — "about to attempt" does not.
+
+Mutation list (each must fail; ordering claims must be checked in **both**
+directions, per the three E3c witness defects that were each half a proof):
 
 | # | Mutation | Must fail on |
 |---|---|---|
-| 1 | skip the epoch comparison entirely | a call under moved authority uses the cached route |
-| 2 | compare `epoch.authority` only (drop floors/poison) | floor movement, and each poison direction, separately |
-| 3 | sample authority BEFORE loading the artifact | ordering witness — the inverse of #1 |
-| 4 | skip the `routing_health.allows(actor_incarnation)` fence | a dead incarnation's artifact still serves |
-| 5 | skip the wall-clock expiry check | an expired provider enters `OrgProofIntent` |
-| 6 | use the handle's artifact without re-loading (stale cell use) | an invalidated slot still serves |
-| 7 | make invalidation unconditional (drop the `ptr_eq`) | a delayed reader deletes a newer replacement |
-| 8 | retry once after an ambiguous send | exactly-one-invocation witness |
-| 9 | select two providers / fan out | one call ⇒ one provider ⇒ one signature |
-| 10 | warm path falls back to the registry lock | instrumented: a warmed call takes zero registry locks |
-| 11 | on mismatch, rebuild inline instead of enqueuing | the call must not block on the actor |
-| 12 | on mismatch, retry the warm path after the rebuild | exactly ONE slow plan per call |
+| W1 | drop the epoch comparison | cached route used under moved authority |
+| W2 | compare `authority` only | floors, and each poison direction, separately |
+| W3 | sample authority before loading the artifact | ordering — the inverse of W1 |
+| W4 | drop the actor-incarnation fence | dead incarnation's artifact still serves |
+| W5 | drop the wall-clock expiry check | expired provider enters `OrgProofIntent` |
+| W6 | make invalidation unconditional | delayed reader deletes a newer replacement |
+| W7 | invalidate on `Unserved` / incoherent sample | the matrix in §6 — churn returns |
+| W8 | retry once after handoff | exactly-one-invocation |
+| W9 | select two providers | one call ⇒ one provider ⇒ one signature |
+| W10 | take any lock on the warmed path | counters + contention witness |
+| W11 | rebuild inline on mismatch | the call must not block on the actor |
+| W12 | retry warm after the rebuild | exactly ONE slow plan per call |
+| W-C1 | publish a composite from mixed epochs | composite coherence (§3) |
+| W-C2 | let a Grant contributor enter the fallback without current INVOKE authority | DISCOVER ≠ INVOKE |
+| W-C3 | movement in ONE contributing scope does not invalidate the composite | the new invalidation edge |
+| W-C4 | drop `next_authority_deadline` arming | expired preferred grant stays selected; every call cold |
 
-Witness 10 is the one that keeps this slice honest about being a hot path at all.
+## 12. Re-slicing (adopted)
 
-## 12. No premature surface
+| Slice | Content | Public call path |
+|---|---|---|
+| **2B.3c-pre** | Extend `ScopedSlotSource` to serve exact Grant-scoped buckets, INVOKE authority established at projection; Grant rows remain Unknown/Potential | unchanged |
+| **2B.3b** | `OrgRoutingState` + lock-free `ArcSwap` capability index + one `CapabilityRouteHandle` per warmed capability + composite Owner/Grant scoped demand ownership + Option-A accounting + refusal semantics (§10) | **unchanged** |
+| **2B.3c** | The projection: `SlotBaseFacts` → Owner ∪ served Grants → exact authority projection → direct/session eligibility → `ready = []` → deterministic preprojected `unknown` → complete source vector + deadlines → publish-if-current `Arc<UnsensedRouteSet>`. The node's one actor stays the only builder; no task or timer per family or capability. | unchanged |
+| **2B.3d** | Warmed call + sender integration (§9). **Every temporary consumer `allow(dead_code)` disappears here**, and the end-to-end no-lock / no-scan / one-send witnesses land. | **changes** |
 
-Nothing public is added. Specifically **not**: `OrgRouteSet`, `RouteCandidate`,
-any selector object, any candidate/provider list, any scoring or cost accessor,
-any call options. `OrgRoutingState`, `RoutingFamily`, `DemandHandle` and the
-validated seam all stay crate-internal.
+Revision 1's §10 dead-code list stands, but its closure moves to **2B.3d**, not
+2B.3b — an allow surviving 2B.3d means the consumer never arrived.
 
-The application-visible surface remains exactly:
+## 13. No premature surface
+
+Unchanged and unconditional. No public `OrgRouteSet`, `RouteCandidate`, selector,
+candidate or provider list, scoring or cost accessor, or call option.
+`NoViableProvider` and its count are OLB-4. The application-visible surface stays:
 
 ```rust
 let org = mesh.org(credentials)?;
 let response = org.call("customer.read", &request).await?;
 ```
 
-`NoViableProvider` and its `non_viable` count are **OLB-4**, not this slice.
-
 ---
 
-## Open questions for the reviewer
+## Open questions
 
-1. **Family-per-`mesh.org()` vs one node-wide family.** §1 gives each
-   `mesh.org(...)` its own 64-handle budget. An application calling `mesh.org()`
-   in a loop could therefore retain up to the 256 node slots through many small
-   families. The node bound still holds, but is per-call-site budgeting the
-   intended reading of "64 warmed capabilities per `OrgRoutingState` clone
-   family"?
-2. **Refusal stickiness.** §2 makes a refused demand take the cold path with no
-   retry-to-warm. Should a later call re-attempt `demand()`, or is
-   attempt-once-per-key the intended deterministic behaviour?
-3. **Witness 10's mechanism.** Proving "zero registry locks on the warmed path"
-   needs an instrumented counter on the registry mutex. Acceptable as a
-   `#[cfg(test)]` seam, or preferred as a structural argument instead?
+1. **§4 conflict** — Option A (adopted) vs the re-slicing's
+   "64-logical-capability accounting". If Option B is intended, it needs
+   `MAX_SCOPES_PER_CAPABILITY` and a re-derived handle budget; the plan-text
+   correction differs accordingly.
+2. **§3 composite identity** — `(acting_org, capability)` assumes caller-specific
+   narrowing is genuinely O(1) and never changes *ordering*. If any caller-
+   specific input can reorder the fallback, the composite must be family-scoped
+   instead, which changes the node-sharing story materially.
+3. **§7** — is proving `plan()`'s coherence in scope for 2B.3d, or does it want
+   its own slice before it? It is the mismatch path's only destination, so
+   2B.3d cannot be witnessed without it.
