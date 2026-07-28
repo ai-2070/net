@@ -49,6 +49,7 @@ on:
       - ".github/scripts/check-skill-refs.py"
       - ".github/scripts/check-skill-workflow.py"
       - ".github/scripts/check-skill-examples.sh"
+      - ".github/scripts/check-skill-vocab.py"
       # Every surface the skills document. Broad roots on purpose: the previous
       # list reached only `*/src/**` and missed 36 of the 66 source paths the
       # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
@@ -83,6 +84,7 @@ on:
       - ".github/scripts/check-skill-refs.py"
       - ".github/scripts/check-skill-workflow.py"
       - ".github/scripts/check-skill-examples.sh"
+      - ".github/scripts/check-skill-vocab.py"
       # Every surface the skills document. Broad roots on purpose: the previous
       # list reached only `*/src/**` and missed 36 of the 66 source paths the
       # skills actually cite — the whole Go binding, both non-Rust SDKs, the C

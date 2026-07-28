@@ -70,7 +70,15 @@ Caller-side failures surface with a stable `nrpc:` prefix so cross-language code
 | `transport`     | `RpcTransportError`                  |
 | `codec_encode`  | `RpcCodecError(direction='encode')`  |
 | `codec_decode`  | `RpcCodecError(direction='decode')`  |
-| `breaker_open`  | `BreakerOpenError` (resilience helper) |
+| `cancelled`     | `RpcCancelledError`                  |
+| `capability_denied` | `RpcCapabilityDeniedError`       |
+| anything else   | the base `RpcError` — the vocabulary is frozen, but forward-compatible |
+| `breaker_open`  | `BreakerOpenError` — **not a wire kind**; a client-side resilience helper |
+
+The eight wire kinds are single-sourced across Rust, Node, Python and Go; the
+authoritative mapping is the comment block at `net/crates/net/bindings/node/errors.ts:55`.
+An unrecognised kind degrades to the base class rather than throwing, so a new
+kind added later does not break an existing catch site.
 
 Each binding ships a `classifyError(e)` / `classify_error(e)` helper that maps a raw `nrpc:`-prefixed exception to the typed subclass. Used at catch sites where `instanceof` discrimination is awkward (e.g. fallback paths where the native module wasn't built; vitest dual-module-instance hazard).
 

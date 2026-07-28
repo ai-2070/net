@@ -305,7 +305,37 @@ an independent reviewer's sign-off, findings are fixed, and the check is green.
 
 ---
 
-## Phase 3 — non-Rust structural membership — **Priority 2, M**
+## Phase 3 — non-Rust structural membership — **Priority 2, M** — ⚠️ **narrowed on evidence, shipped**
+
+> **Outcome: the inventory step changed the answer, so the phase shipped smaller
+> than specified.** Step 1 (inventory before implementing) was the right
+> instruction and it paid: measuring the actual citation surface showed three
+> parsers would have guarded almost nothing.
+>
+> | Language | Surface in source | Cited by the skills |
+> |---|---|---|
+> | Python | **0** `Enum`/`StrEnum` classes in `sdk-py` | nothing to check |
+> | TypeScript | 10 string-literal union types | **2** quoted-literal citations, both in one line of `streams.md`, both correct |
+> | Go | 5 typed-const families | concentrated in **one** family, the `nrpc:` wire kinds |
+>
+> A citation convention plus three parsers plus per-language fixtures, to guard
+> roughly a dozen citations, is not a good trade. What *does* carry risk is the
+> narrow case those citations cluster in: **frozen cross-language vocabularies**
+> — a value single-sourced across four bindings and reproduced in the skills as
+> a table a reader pattern-matches on.
+>
+> Shipped `check-skill-vocab.py` for exactly that. It immediately found the nRPC
+> kind table missing `cancelled` and `capability_denied` — both real wire kinds
+> present in Rust, Node, Python and Go, both absent from the skill, so a
+> cross-language catch site written from that table would have missed them.
+>
+> **Not done, and deliberately:** the qualification grammar, the TS/Python/Go
+> parsers, and wrong-owner fault injection. If the skills later grow a table of
+> TS union members or Python enum members, that work becomes worth doing and
+> this section is the starting point. Adding a vocabulary to the shipped check is
+> four lines.
+
+The original scope follows, kept as the record of what was decided against.
 
 **Surface:** `check-skill-refs.py` — `read_sources()` brace-matches `pub enum` for
 `.rs` only. `.ts`, `.py`, and `.go` feed the identifier corpus but get no

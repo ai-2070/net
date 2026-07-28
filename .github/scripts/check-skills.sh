@@ -143,6 +143,17 @@ while read -r line; do
 done < <(python3 "$(dirname "$0")/check-skill-refs.py" || true)
 [ "$fail" -eq "$before" ] && ok "documented variants and identifiers all resolve"
 
+# ------------------------------------------------- cross-language vocabularies
+# Frozen string vocabularies that are single-sourced across four bindings and
+# reproduced as tables in the skills. Readers pattern-match on these, and they
+# drift silently — the nRPC kind table was missing two real wire kinds.
+echo "==> Cross-language vocabularies"
+before=$fail
+while read -r line; do
+  [ -n "$line" ] && note "$line"
+done < <(python3 "$(dirname "$0")/check-skill-vocab.py" || true)
+[ "$fail" -eq "$before" ] && ok "documented vocabularies match every binding"
+
 # ------------------------------------------------------------------ CLI verbs
 # The single installed binary is `net-mesh` (cli/Cargo.toml [[bin]]). A bare
 # `net <verb>` in the skills is a command the user cannot run.
