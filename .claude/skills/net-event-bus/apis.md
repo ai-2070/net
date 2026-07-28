@@ -89,10 +89,10 @@ await node.shutdown();
 - Validators are optional: `node.channel<T>('name', validator)` runs your function on each received event.
 - `BackpressureError` / `NotConnectedError` and the `sendWithRetry` helper are **mesh-stream APIs** (peer-to-peer streams on `MeshNode`), not bus APIs. The bus emit path never throws them — see `runtime.md`.
 
-## Python (`net-sdk`)
+## Python (`net-mesh-sdk`, imports as `net_sdk`)
 
 ```bash
-pip install net-sdk
+pip install net-mesh-sdk
 ```
 
 ```python
@@ -123,16 +123,17 @@ with NetNode(shards=4) as node:
 - Models can be `@dataclass`, Pydantic models (anything with `model_dump()`), or plain classes (anything with `__dict__`).
 - The native `net` module (PyO3 binding) is the escape hatch — `node.bus` exposes it. Use only for features not surfaced in `net_sdk`.
 
-## Rust (`net-sdk`)
+## Rust (`net-mesh-sdk`, imports as `net_sdk`)
 
 ```toml
 [dependencies]
-net-sdk = "..."
+net-mesh-sdk = "0.34"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 futures = "0.3"
 ```
 
+<!-- skill-check: compile -->
 ```rust
 use net_sdk::{Backpressure, Net};
 use serde::{Deserialize, Serialize};

@@ -47,27 +47,74 @@ on:
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
       - ".github/scripts/check-skill-refs.py"
-      # The skills document these surfaces; a change here can invalidate them.
-      # The core crate is in scope deliberately: every type the skills tabulate
-      # — RpcError, TokenError, StreamError, ChangeEvent, FoldErrorPolicy — is
-      # defined under `net/src`, not in the SDK, so narrowing to the SDK would
-      # have missed every defect this check was written to catch.
+      - ".github/scripts/check-skill-workflow.py"
+      - ".github/scripts/check-skill-examples.sh"
+      - ".github/scripts/check-skill-vocab.py"
+      - ".github/scripts/check-skill-snippets.py"
+      - ".github/skill-snippets/**"
+      # Every surface the skills document. Broad roots on purpose: the previous
+      # list reached only `*/src/**` and missed 36 of the 66 source paths the
+      # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
+      # headers, and `bindings/node/*.ts`, which sits at the package root rather
+      # than under `src/`. A false-positive run of a 13s check costs nothing; a
+      # missed run costs a published defect. `check-skills.sh` asserts this list
+      # still covers every cited path, so the two cannot drift apart.
+      - "go/**"
       - "net/crates/net/src/**"
-      - "net/crates/net/sdk/src/**"
-      - "net/crates/net/cli/src/**"
-      - "net/crates/net/payments/src/**"
-      - "net/crates/net/bindings/*/src/**"
+      - "net/crates/net/sdk/**"
+      - "net/crates/net/sdk-ts/**"
+      - "net/crates/net/sdk-py/**"
+      - "net/crates/net/cli/**"
+      - "net/crates/net/payments/**"
+      - "net/crates/net/bindings/**"
+      - "net/crates/net/adapters/**"
+      - "net/crates/net/include/**"
+      - "net/crates/net/docs/**"
+      - "net/crates/net/tests/**"
+      # Dependency or API resolution can shift without a source edit.
+      - "Cargo.lock"
+      - "go/go.mod"
+      - "net/crates/net/sdk-ts/package.json"
+      - "net/crates/net/sdk-py/pyproject.toml"
+      - "net/crates/net/bindings/*/package.json"
+      - "net/crates/net/bindings/*/pyproject.toml"
   pull_request:
     paths:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
       - ".github/scripts/check-skill-refs.py"
+      - ".github/scripts/check-skill-workflow.py"
+      - ".github/scripts/check-skill-examples.sh"
+      - ".github/scripts/check-skill-vocab.py"
+      - ".github/scripts/check-skill-snippets.py"
+      - ".github/skill-snippets/**"
+      # Every surface the skills document. Broad roots on purpose: the previous
+      # list reached only `*/src/**` and missed 36 of the 66 source paths the
+      # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
+      # headers, and `bindings/node/*.ts`, which sits at the package root rather
+      # than under `src/`. A false-positive run of a 13s check costs nothing; a
+      # missed run costs a published defect. `check-skills.sh` asserts this list
+      # still covers every cited path, so the two cannot drift apart.
+      - "go/**"
       - "net/crates/net/src/**"
-      - "net/crates/net/sdk/src/**"
-      - "net/crates/net/cli/src/**"
-      - "net/crates/net/payments/src/**"
-      - "net/crates/net/bindings/*/src/**"
+      - "net/crates/net/sdk/**"
+      - "net/crates/net/sdk-ts/**"
+      - "net/crates/net/sdk-py/**"
+      - "net/crates/net/cli/**"
+      - "net/crates/net/payments/**"
+      - "net/crates/net/bindings/**"
+      - "net/crates/net/adapters/**"
+      - "net/crates/net/include/**"
+      - "net/crates/net/docs/**"
+      - "net/crates/net/tests/**"
+      # Dependency or API resolution can shift without a source edit.
+      - "Cargo.lock"
+      - "go/go.mod"
+      - "net/crates/net/sdk-ts/package.json"
+      - "net/crates/net/sdk-py/pyproject.toml"
+      - "net/crates/net/bindings/*/package.json"
+      - "net/crates/net/bindings/*/pyproject.toml"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -92,6 +139,71 @@ jobs:
       - name: Check skills against the tree
         run: .github/scripts/check-skills.sh
 
+  examples:
+    name: Examples compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # No `cache-dependency-path`: there is no `go/go.sum`, and the scratch
+      # module resolves the binding through a local `replace`, so there is
+      # nothing to check sums against.
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go/go.mod
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install mypy
+        run: python -m pip install --upgrade mypy
+
+      # A compile floor, not an execution proof: it answers "does this still
+      # build against the tree?", never "does it print one line?" — that needs
+      # built artifacts (napi module, wheel, cdylib) and belongs in the release
+      # workflows. REQUIRE_ALL makes a missing toolchain a failure, so a runner
+      # that lost one cannot pass by skipping.
+      #
+      # Four of the five languages are covered here. `hello.ts` is NOT: it needs
+      # the napi-generated `bindings/node/index.d.ts`, which is gitignored, and
+      # regenerating it means a full `napi build`. It is type-checked in ci.yml's
+      # "TypeScript SDK tests" job, which already builds napi — so a broken
+      # hello.ts fails CI, but through that job rather than this gate.
+      - name: Compile the skill examples
+        env:
+          REQUIRE_ALL: "1"
+        run: .github/scripts/check-skill-examples.sh
+
+  snippets:
+    name: Snippets compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      # Opt-in: only blocks carrying `<!-- skill-check: compile -->` are
+      # extracted. The script always prints checked/total, so a green run never
+      # implies coverage it does not have — and an orphaned or malformed marker
+      # is an error, not a silent skip.
+      - name: Compile marked skill snippets
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: .github/scripts/check-skill-snippets.py
+
   publish:
     name: Mirror to net-claude-skill
     runs-on: ubuntu-latest
@@ -100,10 +212,20 @@ jobs:
       contents: read
 
     # The reason these two workflows were merged. `needs` makes the mirror wait
-    # on the check and skip entirely when it fails, so drift cannot reach the
+    # on the checks and skip entirely when any fails, so drift cannot reach the
     # public repo. As separate workflows they raced — GitHub does not sequence
     # one workflow behind another, so a red check published anyway.
-    needs: drift
+    #
+    # POLICY: every job that verifies content this job publishes belongs in this
+    # list. A job may be slow, or PR-only — but a *known-red* verification of the
+    # artifact must never publish that artifact. `check-skill-workflow.py`
+    # enforces it: any job not listed here fails the check unless it carries an
+    # explicit `# advisory: <reason>` comment. Later phases (examples, snippets)
+    # add themselves here as they land.
+    needs:
+      - drift
+      - examples
+      - snippets
 
     # Automatic publishes are master-only, and a pull request never publishes:
     # it runs with a read-only token and must not push to another repository.
@@ -187,16 +309,3 @@ jobs:
             -m "Published from .claude/skills/ by skills.yml.
           Source: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
           git push
-
-  # The five hello-world files in net-event-bus/examples/ are presented to
-  # users as "the first thing you run after install." Nothing builds them.
-  # Left as a sketch rather than a working job: each needs the SDK published
-  # or built locally first, which is what the release workflows already do.
-  # examples:
-  #   name: Build hello-world examples
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v7
-  #     - run: cargo build -p net-sdk --example hello
-  #     - run: go build -o /dev/null .claude/skills/net-event-bus/examples/hello.go
-  #     - run: npx tsx --noEmit .claude/skills/net-event-bus/examples/hello.ts

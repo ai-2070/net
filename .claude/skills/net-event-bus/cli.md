@@ -119,7 +119,7 @@ Things that will bite:
 | `0` | success |
 | `1` | generic error |
 | `2` | invalid arguments / parse failure |
-| `3` | SDK error (a `net-sdk` operation failed — transfer, query, …) |
+| `3` | SDK error (a `net-mesh-sdk` operation failed — transfer, query, …) |
 | `4` | `net ice`: simulation blocked |
 | `5` | `net ice`: operator policy rejected |
 | `6` | connection failure (no holder, unreachable peer, session refused) |

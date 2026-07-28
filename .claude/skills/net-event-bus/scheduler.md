@@ -66,7 +66,7 @@ The island record a node publishes: `{ id, units: [u32], capabilities: [tag], lo
 
 | SDK | Match / claim | Criteria type | Record type |
 |---|---|---|---|
-| Rust (`net-sdk`) | `mesh.match_islands(&c)` / `mesh.claim_island(&c, until).await` | `gang::MatchCriteria` (build directly — full `CapabilityQuery`) | `gang::IslandRecord { id, units: UnitSet, host, capabilities, load, p50_latency_us }` |
+| Rust (`net-mesh-sdk`) | `mesh.match_islands(&c)` / `mesh.claim_island(&c, until).await` | `gang::MatchCriteria` (build directly — full `CapabilityQuery`) | `gang::IslandRecord { id, units: UnitSet, host, capabilities, load, p50_latency_us }` |
 | TypeScript | `node.matchIslands(c)` / `await node.claimIsland(c, until)` | `IslandCriteria` (object) | `IslandTopologyInput` |
 | Python | `mesh.match_islands(tags_all, *, min_units=…, require_all=…, …)` | flat kwargs | `mesh.publish_island_topology(id, units, capabilities, load, p50)` |
 | Go | `node.MatchIslands(crit)` / `node.ClaimIsland(crit, until)` | `GangCriteria{ TagsAll, TagsAny, MinUnits, RequireAll, RequireAny, … }` | `IslandRecord{ ID, Units, Capabilities, Load, P50LatencyUs }` |

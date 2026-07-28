@@ -85,6 +85,19 @@ done < <(grep -ohE '`(net|go|web)/[A-Za-z0-9_/.-]+`' "$SKILLS"/*.md "$SKILLS"/*/
          | tr -d '`' | sed 's/:[0-9,-]*$//' | sort -u)
 [ "$fail" -eq "$before" ] && ok "every cited repo path is tracked in git"
 
+# ------------------------------------------------------------ workflow wiring
+# Two ways this whole apparatus can be real and still useless: never running, or
+# running and not blocking. So the workflow itself is checked — every path the
+# skills cite must be watched by a trigger, and every job must gate `publish` (or
+# say why it does not). A check that fires on nothing, or that goes red while the
+# mirror publishes anyway, reads as coverage while providing none.
+echo "==> Workflow wiring (triggers + publish gating)"
+before=$fail
+while read -r line; do
+  [ -n "$line" ] && note "$line"
+done < <(python3 "$(dirname "$0")/check-skill-workflow.py" || true)
+[ "$fail" -eq "$before" ] && ok "triggers cover every cited path; every job gates publish"
+
 # ------------------------------------------------------------ symbol canaries
 # Counts that the prose depends on. A drop means the SDK churned underneath the
 # docs; a rise usually means a new variant nobody documented yet.
@@ -129,6 +142,17 @@ while read -r line; do
   [ -n "$line" ] && note "$line"
 done < <(python3 "$(dirname "$0")/check-skill-refs.py" || true)
 [ "$fail" -eq "$before" ] && ok "documented variants and identifiers all resolve"
+
+# ------------------------------------------------- cross-language vocabularies
+# Frozen string vocabularies that are single-sourced across four bindings and
+# reproduced as tables in the skills. Readers pattern-match on these, and they
+# drift silently — the nRPC kind table was missing two real wire kinds.
+echo "==> Cross-language vocabularies"
+before=$fail
+while read -r line; do
+  [ -n "$line" ] && note "$line"
+done < <(python3 "$(dirname "$0")/check-skill-vocab.py" || true)
+[ "$fail" -eq "$before" ] && ok "documented vocabularies match every binding"
 
 # ------------------------------------------------------------------ CLI verbs
 # The single installed binary is `net-mesh` (cli/Cargo.toml [[bin]]). A bare

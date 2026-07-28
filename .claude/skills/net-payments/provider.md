@@ -161,11 +161,32 @@ use net_payments::core::terms::PricingTerms;
 let terms = PricingTerms::new(provider.entity_id().clone(), "prov/fixture-tool", vec![template_carry], registry_ref);
 ```
 
-Attach `terms` to the capability announcement (native `RegisterTool` publish
-options; the MCP bridge's `publish_server` opts carry the same field). A paid
-capability is **metadata + invocation policy, not a different kind of tool.**
-The caller reads these terms from discovery and drives its side
-(`caller.md`). The templates are non-binding until a quote instantiates one.
+Attach the canonical JSON to the descriptor with
+`ToolDescriptorBuilder::pricing_terms(terms_json)`
+(`net/crates/net/sdk/src/tool.rs`) — the substrate carries the string opaquely
+and never parses payment objects. The MCP bridge's `publish_server` /
+`publish_tools` opts carry the same field. A paid capability is **metadata +
+invocation policy, not a different kind of tool.** The caller reads these terms
+from discovery and drives its side (`caller.md`). The templates are non-binding
+until a quote instantiates one.
+
+**An announced price must be an enforced price, and the SDK refuses to let you
+break that.** The two serve paths are a fail-closed pair:
+
+| You call | Descriptor has `pricing_terms` | Result |
+|---|---|---|
+| `serve_tool` / `serve_tool_streaming` | yes | **refused** — `ServeError::UnenforceablePricing` |
+| `serve_tool` / `serve_tool_streaming` | no | serves free, as intended |
+| `serve_tool_paid(descriptor, gate, handler)` | yes | serves, gated |
+| `serve_tool_paid(..)` | no | **refused** — `ServeError::MissingPricingTerms` |
+
+So you cannot announce a price on a path that has no gate (it would be
+discovered as paid and served free to any direct caller), and you cannot put a
+gate on an unannounced price (it would refuse every caller with no way to know
+why). `serve_tool_paid` takes an `Arc<dyn ToolPaymentGate>` —
+`redeem(tool_id, quote_id, binding) -> Result<(), GateDenial>`; the request body
+is decoded **before** the gate, so a structurally invalid call is rejected
+without consuming the quote.
 
 ## The provider gate in the invocation chain
 

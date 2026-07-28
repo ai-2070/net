@@ -67,7 +67,7 @@ builds via `maturin develop`, where a disabled feature's classes are simply
 absent from the module.
 
 ```bash
-maturin develop --features "netdb redex-disk meshdb meshos"
+maturin develop --features "cortex meshdb meshos"
 ```
 
 ## Claude Code Skill

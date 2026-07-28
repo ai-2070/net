@@ -70,7 +70,15 @@ Caller-side failures surface with a stable `nrpc:` prefix so cross-language code
 | `transport`     | `RpcTransportError`                  |
 | `codec_encode`  | `RpcCodecError(direction='encode')`  |
 | `codec_decode`  | `RpcCodecError(direction='decode')`  |
-| `breaker_open`  | `BreakerOpenError` (resilience helper) |
+| `cancelled`     | `RpcCancelledError`                  |
+| `capability_denied` | `RpcCapabilityDeniedError`       |
+| anything else   | the base `RpcError` — the vocabulary is frozen, but forward-compatible |
+| `breaker_open`  | `BreakerOpenError` — **not a wire kind**; a client-side resilience helper |
+
+The eight wire kinds are single-sourced across Rust, Node, Python and Go; the
+authoritative mapping is the comment block at `net/crates/net/bindings/node/errors.ts:55`.
+An unrecognised kind degrades to the base class rather than throwing, so a new
+kind added later does not break an existing catch site.
 
 Each binding ships a `classifyError(e)` / `classify_error(e)` helper that maps a raw `nrpc:`-prefixed exception to the typed subclass. Used at catch sites where `instanceof` discrimination is awkward (e.g. fallback paths where the native module wasn't built; vitest dual-module-instance hazard).
 
@@ -107,12 +115,13 @@ If no node advertises the service, the call fails `RpcError::NoRoute` — which 
 You can require more than "any server for this service": ship a capability predicate alongside the call and let the *receiver* evaluate it against its own capability set. A mismatched receiver refuses without invoking the handler.
 
 ```rust
-use net_sdk::capabilities::{p, tag_key};
+use net_sdk::capabilities::pred;
 use net_sdk::mesh_rpc::{CallOptionsExt, CallOptionsTyped};
 
-let predicate = p.and(&[
-    p.exists(&tag_key("hardware", "gpu")),
-    p.semver_compatible(&tag_key("software", "cuda_version"), "12.0.0"),
+// `pred!` is a macro over dotted string keys — see `capabilities.md`.
+let predicate = pred!(and [
+    pred!(exists "hardware.gpu"),
+    pred!(num_at_least "hardware.memory_gb", 16.0),
 ]);
 let opts = CallOptionsTyped::default().with_where(&predicate)?;
 
@@ -177,7 +186,7 @@ Server-side handler panics are caught, counted on `ServiceMetrics::handler_panic
 
 The typed surface ships in the **native binding**, not the SDK wrapper. Each language has the same five methods (`serve` / `call` / `callService` / `callStreaming` / `findServiceNodes`) plus the resilience helpers (`RetryPolicy` + `callWithRetry`, `HedgePolicy` + `callWithHedge`, `CircuitBreaker`).
 
-### Rust (`net-sdk`, feature = "cortex")
+### Rust (`net-mesh-sdk`, feature = "cortex")
 
 ```rust
 use net_sdk::mesh::{Mesh, MeshBuilder};

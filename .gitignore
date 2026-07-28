@@ -71,3 +71,9 @@ DEBUG_*.md
 # OpenClaw — root-level reference clone only (anchored, same reason).
 /openclaw/
 net/crates/net/docs/BRAINSTORMING.md
+
+# Generated crate for the skill-snippet compile check
+# (.github/scripts/check-skill-snippets.py). Kept under the repo root rather
+# than a temp dir so local re-runs reuse the incremental build; the Rust
+# workspace root is net/crates/net, so its own /target rule does not cover this.
+/target/

@@ -24,6 +24,7 @@ recognisable. Those go in ABSENT_OK rather than weakening the pattern.
 Prints one line per mismatch and exits 1; silent exit 0 when clean.
 """
 
+import argparse
 import pathlib
 import re
 import sys
@@ -32,14 +33,23 @@ SKILLS = pathlib.Path(".claude/skills")
 SOURCE_ROOTS = [pathlib.Path("net/crates"), pathlib.Path("go")]
 SOURCE_EXT = {".rs", ".ts", ".py", ".go", ".toml", ".h"}
 
-# Identifiers the skills name on purpose despite their absence from source.
-ABSENT_OK = {
-    # org.md names this to say it must never exist.
-    "audience_secret_bytes",
-    # scheduler.md's rename note, so an agent recognises stale `*Gpu*` code.
-    "match_gpu_islands",
-    "claim_gpu_island",
-    "warm_models",
+# Identifiers a corpus names on purpose despite their absence from source.
+# Keyed by corpus so one document set's deliberate absence cannot silence
+# another's genuine defect.
+ABSENT_OK_BY_CORPUS = {
+    ".claude/skills": {
+        # org.md names this to say it must never exist.
+        "audience_secret_bytes",
+        # scheduler.md's rename note, so an agent recognises stale `*Gpu*` code.
+        "match_gpu_islands",
+        "claim_gpu_island",
+        "warm_models",
+    },
+    "web/src/content/docs": {
+        # A local binding in the fleet-telemetry tutorial's example code, not
+        # an API name.
+        "fleet_root_entity_id",
+    },
 }
 
 # Trailing `[^`]*` so struct-like variants written with their fields
@@ -81,13 +91,42 @@ def read_sources():
 
 
 def main():
-    corpus, enums = read_sources()
-    skill_text = {p: p.read_text() for p in SKILLS.rglob("*.md")}
-    bad = 0
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--corpus",
+        default=str(SKILLS),
+        help="directory of markdown to check (default: .claude/skills)",
+    )
+    ap.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="path substring to skip; repeatable. Use for dated artifacts such "
+        "as release notes, which record what was true at the time and must not "
+        "be rewritten to match today's tree.",
+    )
+    args = ap.parse_args()
 
-    variants = set()
-    idents = set()
-    for text in skill_text.values():
+    root = pathlib.Path(args.corpus)
+    if not root.exists():
+        print(f"corpus does not exist: {root}")
+        return 1
+    absent_ok = ABSENT_OK_BY_CORPUS.get(args.corpus, set())
+
+    corpus, enums = read_sources()
+    files = [
+        p
+        for p in sorted(root.rglob("*.md*"))
+        if not any(x in str(p) for x in args.exclude)
+    ]
+    if not files:
+        print(f"no markdown found under {root} after exclusions — check the args")
+        return 1
+
+    bad = 0
+    variants, idents = set(), set()
+    for p in files:
+        text = p.read_text()
         variants |= set(VARIANT_REF.findall(text))
         idents |= set(IDENT_REF.findall(text))
 
@@ -102,7 +141,7 @@ def main():
             bad += 1
 
     for ident in sorted(idents):
-        if len(ident) < 12 or ident in ABSENT_OK:
+        if len(ident) < 12 or ident in absent_ok:
             continue
         if ident not in corpus:
             print(f"identifier appears nowhere in source: {ident}")

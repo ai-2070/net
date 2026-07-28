@@ -77,9 +77,20 @@ The Python binding bridges a Python callable `(typed_data_json: str) -> str`
 straight into `ExternalSigner` under scheme `eip155` — the key stays on the
 Python side; only the typed doc and the signature cross. The **Node** binding
 bridges the same seam with an **async** callback (`(typedIntentJson) =>
-Promise<string>`) over a `ThreadsafeFunction`→Promise bridge; its per-call
-timeout is one-sided (drops the Rust wait, does NOT cancel the JS callback — a
-signer timeout is indeterminate). Both cover all three schemes (`bindings.md`).
+Promise<string>`) over a `ThreadsafeFunction`→Promise bridge. Both cover all
+three schemes (`bindings.md`).
+
+**The Node per-call budget is 60 s and the timeout is one-sided.** It bounds how
+long Rust waits and does **not** cancel the JS callback: a slow wallet can still
+prompt the user and produce a signature after the gateway has already returned a
+timeout. No funds move (that signature is never redeemed — the quote isn't
+paid), but the prompt is not recalled. Treat a signer timeout as
+**indeterminate**, never as "the wallet did nothing," and keep the callback's own
+work well inside the budget.
+
+None of the three `External*` signers derive `Debug`. That is deliberate: a
+struct holding a credential handle is the classic thing that gets `{:?}`-logged.
+If you wrap or embed one, don't add a `Debug` impl that reaches the callback.
 
 ## `ExternalSvmSigner` — the Solana wallet shape (exact-SVM)
 
@@ -115,6 +126,18 @@ callback receives the structured `XrplPaymentIntent` and returns the hex
 presigned `Payment` blob. **The wallet owns the key, the XRPL
 canonical-serialization machinery, and the `Sequence` / `LastLedgerSequence`
 bookkeeping — none of which enter Net.**
+
+```rust
+pub struct XrplPaymentIntent {
+    pub network: String,
+    pub asset: String,
+    pub pay_to: String,
+    pub amount: String,
+    pub invoice_id: String,               // the invoice binding (MemoData/InvoiceID)
+    pub destination_tag: Option<u32>,     // required by exchange-hosted destinations
+    pub source_tag: Option<u32>,
+}
+```
 
 ```rust
 use net_payments::flow::signer::ExternalXrplSigner;

@@ -64,7 +64,7 @@ What the vectors pin:
   strings + `safe_to_retry`/`safe_to_requote` bools) **and** `object` == the
   tag." A tagged-but-incomplete/mistyped object is rejected, same as Rust —
   non-Rust verifiers must validate the shape, not just the tag, or they drift.
-  Rust decides via the real `FailureSchematic` (a `net-sdk` dev-dep) with
+  Rust decides via the real `FailureSchematic` (a `net-mesh-sdk` dev-dep) with
   byte-stable re-emission; the fixture is generated from that type
   (`failure-schematic.md`).
 

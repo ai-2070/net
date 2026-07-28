@@ -45,6 +45,7 @@ jobs:
       - name: Check release notes are in sync
         run: npm run check:releases
 
+
       - name: Typecheck
         run: npm run check:types
 

@@ -180,46 +180,84 @@ pub struct CapabilityFilter {
 
 ## Predicates — the richer query surface
 
-`CapabilityFilter` is the field-comparison surface; it's deliberately narrow. For arbitrary boolean queries (semver compatibility, regex on values, metadata thresholds, AND/OR/NOT compositions) every binding ships a typed `Predicate` AST. Same wire format across Rust / TS / Python / Go / C — pinned by the JSON fixtures under `tests/cross_lang_capability/`.
+`CapabilityFilter` is the field-comparison surface; it's deliberately narrow. For arbitrary boolean queries (regex on values, numeric thresholds, metadata equality, AND/OR/NOT compositions) every binding ships a typed `Predicate` AST. Same wire format across Rust / TS / Python / Go / C — pinned by the JSON fixtures under `tests/cross_lang_capability/`.
 
 ```rust
-use net_sdk::capabilities::{
-    p, evaluate_predicate, predicate_to_rpc_header,
-    validate_capabilities, tag_key,
-};
+use net_sdk::capabilities::pred;
+use net_sdk::capabilities::predicate::{EvalContext, PredicateDebugReport, predicate_to_rpc_header};
+use net_sdk::capabilities::schema::validate_capabilities;
 
-let pred = p.and(&[
-    p.exists(&tag_key("hardware", "gpu")),
-    p.numeric_at_least(&tag_key("hardware", "memory_gb"), 64.0),
-    p.semver_compatible(&tag_key("software", "runtime.python"), "3.11.0"),
-    p.metadata_equals("intent", "ml-training"),
+// `pred!` is a MACRO with a parse-time DSL, not a builder object.
+// Each invocation is one clause; compose with `and [..]` / `or [..]` / `not ..`.
+// Keys are dotted strings. Rust has no `tag_key(axis, name)` helper — Python
+// does, which is one of the ways a transliterated example goes wrong.
+let predicate = pred!(and [
+    pred!(exists "hardware.gpu"),
+    pred!(num_at_least "hardware.memory_gb", 64.0),
+    pred!(metadata_equals "intent", "ml-training"),
 ]);
-
-// Local evaluation against any (tags, metadata).
-let matched = evaluate_predicate(&pred, &caps.tags, &caps.metadata);
 
 // Wire form for nRPC `net-where:` headers — pair with the
 // header-bearing call variants so the server short-circuits
 // candidates without re-running the predicate per hop.
-let header_value = predicate_to_rpc_header(&pred);
+let header_value = predicate_to_rpc_header(&predicate);
+
+// Evaluation is a METHOD on the predicate, taking an EvalContext
+// built from the (tags, metadata) you're testing against.
+let ctx = EvalContext::new(&tags, &metadata);
+let matched = predicate.evaluate(&ctx);
+
+// Single-evaluation trace — which clauses ran, which short-circuited.
+let (result, trace) = predicate.evaluate_with_trace(&ctx);
+
+// Corpus aggregation: match counts per clause across many candidates.
+let report = PredicateDebugReport::from_evaluations(&predicate, contexts);
+println!("{}", report.render());   // total_candidates / matched / clause_stats
 
 // Validate a CapabilitySet against the canonical schema before
 // announcing — catches typos, type mismatches, oversize metadata,
 // legacy-tag warnings.
-let report = validate_capabilities(&caps);
-if !report.is_valid() { /* report.errors */ }
-
-// Detect what changed between two snapshots.
-let delta = caps.diff(&prev);
-
-// Single-evaluation trace + corpus aggregation with optional
-// metadata-key redaction before persistence.
-let (result, trace) = evaluate_predicate_with_trace(&pred, &tags, &metadata);
-let report = predicate_debug_report(&pred, &corpus);
-let safe = redact_metadata_keys(&report, &["intent"]);
+let validation = validate_capabilities(&caps);
 ```
 
-Identical surface in TS (`p.and`, `p.exists`, `evaluatePredicate`, `predicateToRpcHeader` / `predicateFromRpcHeader`, `validateCapabilities`, `diffCapabilities`, `evaluatePredicateWithTrace`, `predicateDebugReport`, `redactMetadataKeys`), Python (`p.and_`, `p.exists`, `evaluate_predicate`, …), Go (`Predicate{}`, `EvaluatePredicate`, `PredicateToWhereHeader`), and C (`net_predicate_evaluate`, `net_validate_capabilities`, `net_predicate_to_where_header`, `net_predicate_evaluate_with_trace`, `net_predicate_aggregate_debug_report`, `net_predicate_redact_metadata_keys`). A predicate authored in TS and shipped to a Go server via the header decodes losslessly.
+**The Rust shape is not the TS shape — same wire format, different ergonomics.**
+Rust gives you a `pred!` macro plus methods on `Predicate`; the other bindings
+expose free functions, because a macro doesn't translate. Don't transliterate an
+example across languages:
+
+| | Build | Evaluate | Trace | Corpus report | Redact |
+|---|---|---|---|---|---|
+| Rust | `pred!(..)` macro | `predicate.evaluate(&ctx)` | `predicate.evaluate_with_trace(&ctx)` | `PredicateDebugReport::from_evaluations` | — |
+| TS | `p.and` / `p.exists` | `evaluatePredicate` | `evaluatePredicateWithTrace` | `predicateDebugReport` | `redactMetadataKeys` |
+| Python | `p.and_` / `p.exists` + `tag_key` | `evaluate_predicate` | `evaluate_predicate_with_trace` | `predicate_debug_report` | `redact_metadata_keys` |
+| Go | **not available** — see below | | | | |
+| C | **not in `net.h`** — see below | | | | |
+
+Two availability traps the tables above would otherwise hide:
+
+- **Go has no predicate surface in the published module.** `github.com/ai-2070/net/go`
+  ships none of this. A `predBuilder` with `Exists` / `Equals` / `NumericAtLeast`
+  exists at `net/crates/net/bindings/go/net/capability.go`, but that tree carries
+  no `go.mod` — it is a *reference* binding (the phrasing `go/meshdb.go` uses for
+  its own richer surface), not something a Go user can import. Use the
+  `net-where:` header from another language, or filter server-side.
+- **The C predicate functions are declared in `include/net.go.h`, not `net.h`.**
+  Those are two separate headers — neither includes the other, and `net.h` is the
+  one this skill tells C users to `#include`. `net_predicate_evaluate`,
+  `net_predicate_evaluate_with_trace`, `net_predicate_aggregate_debug_report`,
+  `net_predicate_to_where_header`, `net_validate_capabilities` and
+  `net_predicate_redact_metadata_keys` are all real, all in the CGO-facing
+  header.
+
+**Rust has no metadata-key redaction.** `redactMetadataKeys` /
+`redact_metadata_keys` exist for TS and Python; the Rust SDK re-exports the
+report type but not a redactor — redaction lives in the FFI layer the bindings
+sit on (`src/ffi/predicate_debug.rs`). Redact before persisting a report from
+those bindings; from Rust, strip the keys yourself.
+
+A predicate authored in TS and shipped to a server via the header still decodes
+losslessly wherever the *evaluation* surface exists — it is authoring and
+inspection ergonomics that differ, plus the two availability gaps above.
 
 **Placement-filter callbacks.** When the substrate's built-in scoring axes don't fit your placement rule, plug a host-language predicate in via `placement_filter_from_fn(...)` (Rust SDK / TS / Python / Go) — the substrate calls back per candidate. Pair with `standard_placement(custom_filter_id=...)` so the daemon-placement scheduler weights your callback alongside its native axes. C consumers reach the same dispatcher via `net_compute_set_placement_filter_dispatcher` + `net_compute_register_placement_filter` (`include/net.go.h`).
 

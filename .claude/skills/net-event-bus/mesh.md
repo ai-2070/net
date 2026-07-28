@@ -193,7 +193,7 @@ Cargo feature: `nat-traversal` (Rust SDK). The TS / Python bindings ship with st
 
 ```rust
 // Rust — Cargo.toml
-// net-sdk = { version = "...", features = ["nat-traversal"] }
+// net-mesh-sdk = { version = "0.34", features = ["nat-traversal"] }
 
 // Ergonomic path — auto-selects the rendezvous coordinator for you:
 let session = mesh.connect_direct_auto(peer_node_id, &peer_pubkey).await?;

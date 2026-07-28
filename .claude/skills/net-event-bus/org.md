@@ -112,7 +112,7 @@ The membership must also name *this mesh's* entity (`member_binding_mismatch`).
 
 All five surfaces are at parity for the two verbs. The codec is **JSON**, hard-coded, matching every other typed layer in the SDK; drop to the bytes seam if you marshal yourself.
 
-### Rust (`net-sdk`, features `net` + `cortex`)
+### Rust (`net-mesh-sdk`, features `net` + `cortex`)
 
 ```rust
 use net_sdk::org::{OrgAccess, OrgCaller, OrgCredentials, OrgSdkError};

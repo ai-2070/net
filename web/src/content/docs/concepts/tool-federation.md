@@ -53,9 +53,9 @@ it. Nothing is agreed in advance.
 
 ## Where the MCP bridge fits
 
-MCP is the on-ramp, not the destination. `net wrap` takes an existing stdio MCP
+MCP is the on-ramp, not the destination. `net-mesh wrap` takes an existing stdio MCP
 server and publishes its tools as owner-scoped mesh capabilities, so work you've
-already done becomes federated without a rewrite. `net mcp serve` goes the other
+already done becomes federated without a rewrite. `net-mesh mcp serve` goes the other
 way, fronting the mesh to a local MCP host like Claude Code.
 
 Bridged tools carry `compat_tier: "mcp_bridge"` and are request/response only —

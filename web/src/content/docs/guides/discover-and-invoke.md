@@ -16,15 +16,31 @@ that announcement into a local capability index; you query the index by what you
 need. From the CLI:
 
 ```
-net cap query --tag gpu --tag vram:24      # nodes that advertise BOTH tags
-net cap nodes                              # every (node, capabilities) the index knows
-net cap show                               # the local node's own capabilities
+net-mesh cap query --tag hardware.gpu --tag hardware.gpu.vram_gb=24
+net-mesh cap nodes    # every (node, capabilities) the index knows
+net-mesh cap show     # the local node's own capabilities
 ```
 
 `--tag` is required and repeatable; a node matches only when its advertised set
 contains **every** tag you list. Announcements propagate multi-hop across the mesh
-(bounded by a hop count), so `net cap query` can return a node several hops away,
-not just a direct neighbor.
+(bounded by a hop count), so `net-mesh cap query` can return a node several hops
+away, not just a direct neighbor.
+
+Two things to get right, because the CLI will not warn you:
+
+- **Tags are matched as exact strings, against the canonical wire form.** The
+  index holds what the node announced — `hardware.gpu`, `hardware.gpu.vram_gb=24`
+  — so `--tag gpu` or `--tag vram:24` match nothing at all. A typed builder
+  (`HardwareCapabilities::new().with_gpu(...)`) emits the canonical form; see
+  [Capabilities](/docs/concepts/capabilities) for the full key schema.
+- **The CLI is separator-sensitive; the SDK is not.** `cap query` does plain set
+  membership, so a node that announced `hardware.gpu.vram_gb=24` is not found by
+  `--tag hardware.gpu.vram_gb:24`. The SDK's `has_tag` deliberately treats `=`
+  and `:` as equivalent — the CLI path does not go through it. Match the
+  separator the announcer used, or query from the SDK.
+- **There is no threshold matching here.** `--tag hardware.gpu.vram_gb=24` means
+  *exactly 24*, not *at least 24* — a 80 GB H100 does not match. For "≥ 24 GB"
+  you need a predicate (`num_at_least`) through the SDK, below.
 
 From the SDK, the same query returns node ids you can call directly:
 
