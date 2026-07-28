@@ -559,7 +559,7 @@ True subprocess-based interop tests (Node caller → Rust server, Python caller 
 
 - **Rust core** — `net/crates/net/src/adapter/net/mesh_rpc.rs` (client surface), `net/crates/net/src/adapter/net/cortex/rpc.rs` (server fold), `net/crates/net/src/adapter/net/mesh_rpc_metrics.rs` (per-service counters + Prometheus formatter).
 - **Rust SDK** — `net/crates/net/sdk/src/mesh_rpc.rs` (typed wrappers), `net/crates/net/sdk/src/mesh_rpc_resilience.rs` (`RetryPolicy` / `HedgePolicy` / `CircuitBreaker`).
-- **Node binding** — `net/crates/net/bindings/node/src/mesh_rpc.rs` (napi cdylib), `net/crates/net/bindings/node/mesh_rpc.js` (JS wrapper class), `net/crates/net/bindings/node/errors.js` (`classifyError`).
+- **Node binding** — `net/crates/net/bindings/node/src/mesh_rpc.rs` (napi cdylib), `net/crates/net/bindings/node/mesh_rpc.ts` (wrapper class), `net/crates/net/bindings/node/errors.ts` (`classifyError`).
 - **Python binding** — `net/crates/net/bindings/python/src/mesh_rpc.rs` (PyO3 cdylib), `net/crates/net/bindings/python/python/net/mesh_rpc.py` (Python wrapper).
 - **Go C-ABI** — `net/crates/net/bindings/go/rpc-ffi/src/lib.rs` (cdylib), `net/crates/net/bindings/go/net/mesh_rpc.go` (reference cgo wrapper), `net/crates/net/bindings/go/net/resilience.go` (pure-Go resilience helpers).
 - **Cross-binding contract** — `net/crates/net/tests/cross_lang_nrpc/golden_vectors.json` (shared fixture), the three binding compat tests (paths above).

@@ -63,13 +63,24 @@ done
 [ "$fail" -eq "$before" ] && ok "every referenced *.md resolves"
 
 # --------------------------------------------------------- repo source paths
+# Checked against git, not the filesystem. A developer's tree holds build output
+# the repo does not — `bindings/node/*.js` is gitignored `tsc` output beside the
+# tracked `.ts` — so an `[ -e ]` test passes locally and fails on a clean CI
+# checkout, which is exactly backwards: it lets a citation to a generated file
+# through on the machine where it was written.
 echo "==> Source paths cited by the skills"
 before=$fail
 while read -r p; do
-  [ -e "$p" ] || note "cited path does not exist: $p"
+  git ls-files --error-unmatch "$p" >/dev/null 2>&1 && continue   # tracked file
+  [ -n "$(git ls-files "$p" | head -1)" ] && continue             # tracked directory
+  if [ -e "$p" ]; then
+    note "cited path is not tracked by git (build artifact?): $p"
+  else
+    note "cited path does not exist: $p"
+  fi
 done < <(grep -ohE '`(net|go|web)/[A-Za-z0-9_/.-]+`' "$SKILLS"/*.md "$SKILLS"/*/*.md \
          | tr -d '`' | sed 's/:[0-9,-]*$//' | sort -u)
-[ "$fail" -eq "$before" ] && ok "every cited repo path exists"
+[ "$fail" -eq "$before" ] && ok "every cited repo path is tracked in git"
 
 # ------------------------------------------------------------ symbol canaries
 # Counts that the prose depends on. A drop means the SDK churned underneath the
