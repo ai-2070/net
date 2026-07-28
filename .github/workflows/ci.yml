@@ -407,6 +407,10 @@ jobs:
       # once CI service containers are added.
 
       # === Bus + FFI (no features) ========================================
+      # `doc_link_guard` rides here because it needs no features and is pure
+      # filesystem work (~1s) — it costs nothing on a compile unit that is
+      # already being built, and a doc guard that runs nowhere is a doc guard
+      # that rots.
       - name: Bus + FFI
         if: ${{ !cancelled() }}
         run: >
@@ -415,6 +419,7 @@ jobs:
           --test bus_stranded_flush
           --test ffi_shutdown_race
           --test ffi_poll_buffer
+          --test doc_link_guard
 
       # === Net mesh + capability + discovery + migration + nRPC dispatch ==
       # All --features net tests share one compile.
