@@ -33,7 +33,7 @@ The Rust crate, npm scope, and PyPI dist all publish under `net-mesh*` / `@net-m
 
 ## Claude Code Skill
 
-Net looks like Kafka or NATS from the outside, and the model underneath is different enough that an agent working from surface familiarity will write integration code that compiles, runs, and is quietly wrong. Two Agent Skills load the correct mental model and verified per-SDK templates before the agent writes a line:
+Agent Skills load the correct mental model and verified per-SDK templates:
 
 ```bash
 npx skills add ai-2070/net-claude-skill -g
