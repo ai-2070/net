@@ -85,6 +85,18 @@ done < <(grep -ohE '`(net|go|web)/[A-Za-z0-9_/.-]+`' "$SKILLS"/*.md "$SKILLS"/*/
          | tr -d '`' | sed 's/:[0-9,-]*$//' | sort -u)
 [ "$fail" -eq "$before" ] && ok "every cited repo path is tracked in git"
 
+# --------------------------------------------------------- trigger coverage
+# A check that never runs is worse than no check: it reads as coverage. This
+# asserts every path the skills cite is watched by `skills.yml`, so citing a new
+# source file and forgetting to widen the triggers is caught here rather than by
+# a defect reaching the published mirror.
+echo "==> Workflow trigger coverage"
+before=$fail
+while read -r line; do
+  [ -n "$line" ] && note "$line"
+done < <(python3 "$(dirname "$0")/check-skill-triggers.py" || true)
+[ "$fail" -eq "$before" ] && ok "every cited path is watched by skills.yml"
+
 # ------------------------------------------------------------ symbol canaries
 # Counts that the prose depends on. A drop means the SDK churned underneath the
 # docs; a rise usually means a new variant nobody documented yet.

@@ -47,27 +47,66 @@ on:
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
       - ".github/scripts/check-skill-refs.py"
-      # The skills document these surfaces; a change here can invalidate them.
-      # The core crate is in scope deliberately: every type the skills tabulate
-      # — RpcError, TokenError, StreamError, ChangeEvent, FoldErrorPolicy — is
-      # defined under `net/src`, not in the SDK, so narrowing to the SDK would
-      # have missed every defect this check was written to catch.
+      - ".github/scripts/check-skill-triggers.py"
+      # Every surface the skills document. Broad roots on purpose: the previous
+      # list reached only `*/src/**` and missed 36 of the 66 source paths the
+      # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
+      # headers, and `bindings/node/*.ts`, which sits at the package root rather
+      # than under `src/`. A false-positive run of a 13s check costs nothing; a
+      # missed run costs a published defect. `check-skills.sh` asserts this list
+      # still covers every cited path, so the two cannot drift apart.
+      - "go/**"
       - "net/crates/net/src/**"
-      - "net/crates/net/sdk/src/**"
-      - "net/crates/net/cli/src/**"
-      - "net/crates/net/payments/src/**"
-      - "net/crates/net/bindings/*/src/**"
+      - "net/crates/net/sdk/**"
+      - "net/crates/net/sdk-ts/**"
+      - "net/crates/net/sdk-py/**"
+      - "net/crates/net/cli/**"
+      - "net/crates/net/payments/**"
+      - "net/crates/net/bindings/**"
+      - "net/crates/net/adapters/**"
+      - "net/crates/net/include/**"
+      - "net/crates/net/docs/**"
+      - "net/crates/net/tests/**"
+      # Dependency or API resolution can shift without a source edit.
+      - "Cargo.lock"
+      - "go/go.mod"
+      - "net/crates/net/sdk-ts/package.json"
+      - "net/crates/net/sdk-py/pyproject.toml"
+      - "net/crates/net/bindings/*/package.json"
+      - "net/crates/net/bindings/*/pyproject.toml"
   pull_request:
     paths:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
       - ".github/scripts/check-skill-refs.py"
+      - ".github/scripts/check-skill-triggers.py"
+      # Every surface the skills document. Broad roots on purpose: the previous
+      # list reached only `*/src/**` and missed 36 of the 66 source paths the
+      # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
+      # headers, and `bindings/node/*.ts`, which sits at the package root rather
+      # than under `src/`. A false-positive run of a 13s check costs nothing; a
+      # missed run costs a published defect. `check-skills.sh` asserts this list
+      # still covers every cited path, so the two cannot drift apart.
+      - "go/**"
       - "net/crates/net/src/**"
-      - "net/crates/net/sdk/src/**"
-      - "net/crates/net/cli/src/**"
-      - "net/crates/net/payments/src/**"
-      - "net/crates/net/bindings/*/src/**"
+      - "net/crates/net/sdk/**"
+      - "net/crates/net/sdk-ts/**"
+      - "net/crates/net/sdk-py/**"
+      - "net/crates/net/cli/**"
+      - "net/crates/net/payments/**"
+      - "net/crates/net/bindings/**"
+      - "net/crates/net/adapters/**"
+      - "net/crates/net/include/**"
+      - "net/crates/net/docs/**"
+      - "net/crates/net/tests/**"
+      # Dependency or API resolution can shift without a source edit.
+      - "Cargo.lock"
+      - "go/go.mod"
+      - "net/crates/net/sdk-ts/package.json"
+      - "net/crates/net/sdk-py/pyproject.toml"
+      - "net/crates/net/bindings/*/package.json"
+      - "net/crates/net/bindings/*/pyproject.toml"
   workflow_dispatch:
     inputs:
       dry_run:
