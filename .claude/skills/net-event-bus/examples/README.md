@@ -18,6 +18,6 @@ Each prints exactly one line: the event it emitted, received, and round-tripped.
 
 ## What CI checks here
 
-Every file in this directory is **compiled or type-checked** on each pull request against the current tree (`.github/scripts/check-skill-examples.sh`) — so a renamed method or a changed signature breaks the build rather than reaching you.
+Every file in this directory is **compiled or type-checked** on each pull request against the current tree — so a renamed method or a changed signature breaks the build rather than reaching you. `hello.c`, `hello.go`, `hello.rs` and `hello.py` run through `.github/scripts/check-skill-examples.sh`; `hello.ts` is checked in the TypeScript SDK job instead, because it needs the napi-generated type declarations that job already builds.
 
 That is a compile floor, not a promise that the commands above run. Executing them needs built artifacts (the napi module, the Python wheel, the C shared library), so the "prints exactly one line" claim is verified in the release pipelines rather than per-PR. If one of these fails to run for you against a released build, that is a bug worth reporting.

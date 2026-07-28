@@ -171,6 +171,12 @@ jobs:
       # built artifacts (napi module, wheel, cdylib) and belongs in the release
       # workflows. REQUIRE_ALL makes a missing toolchain a failure, so a runner
       # that lost one cannot pass by skipping.
+      #
+      # Four of the five languages are covered here. `hello.ts` is NOT: it needs
+      # the napi-generated `bindings/node/index.d.ts`, which is gitignored, and
+      # regenerating it means a full `napi build`. It is type-checked in ci.yml's
+      # "TypeScript SDK tests" job, which already builds napi — so a broken
+      # hello.ts fails CI, but through that job rather than this gate.
       - name: Compile the skill examples
         env:
           REQUIRE_ALL: "1"
