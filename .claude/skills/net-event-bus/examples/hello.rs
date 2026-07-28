@@ -5,7 +5,7 @@
 //!
 //! Cargo.toml:
 //!   [dependencies]
-//!   net-sdk = "..."
+//!   net-mesh-sdk = "0.34"
 //!   serde = { version = "1", features = ["derive"] }
 //!   tokio = { version = "1", features = ["rt", "macros", "time"] }
 //!   futures = "0.3"

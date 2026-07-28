@@ -177,7 +177,7 @@ Server-side handler panics are caught, counted on `ServiceMetrics::handler_panic
 
 The typed surface ships in the **native binding**, not the SDK wrapper. Each language has the same five methods (`serve` / `call` / `callService` / `callStreaming` / `findServiceNodes`) plus the resilience helpers (`RetryPolicy` + `callWithRetry`, `HedgePolicy` + `callWithHedge`, `CircuitBreaker`).
 
-### Rust (`net-sdk`, feature = "cortex")
+### Rust (`net-mesh-sdk`, feature = "cortex")
 
 ```rust
 use net_sdk::mesh::{Mesh, MeshBuilder};
