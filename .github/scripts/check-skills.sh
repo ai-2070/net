@@ -61,7 +61,7 @@ echo "==> Source paths cited by the skills"
 before=$fail
 while read -r p; do
   [ -e "$p" ] || note "cited path does not exist: $p"
-done < <(grep -ohE '`(net|go|web)/[A-Za-z0-9_/.-]+`' "$SKILLS"/*/*.md \
+done < <(grep -ohE '`(net|go|web)/[A-Za-z0-9_/.-]+`' "$SKILLS"/*.md "$SKILLS"/*/*.md \
          | tr -d '`' | sed 's/:[0-9,-]*$//' | sort -u)
 [ "$fail" -eq "$before" ] && ok "every cited repo path exists"
 
@@ -121,7 +121,7 @@ before=$fail
 while read -r hit; do
   [ -n "$hit" ] && note "bare 'net' CLI invocation (the binary is net-mesh): $hit"
 done < <(grep -rnE '(^|[^-[:alnum:]/])net (wrap|mcp|forwarding|org|node adopt|typegen|transfer)\b' \
-         "$SKILLS"/*/*.md || true)
+         "$SKILLS"/*.md "$SKILLS"/*/*.md || true)
 [ "$fail" -eq "$before" ] && ok "all CLI invocations use net-mesh"
 
 # ------------------------------------------------------- internal plan leakage
@@ -133,7 +133,7 @@ before=$fail
 while read -r hit; do
   [ -n "$hit" ] && note "internal planning reference: $hit"
 done < <(grep -rnE '\b(P[0-9]|WS[0-9])\b|Mode E|bugfixes-[0-9]|docs/internal|_PLAN\.md|RELEASE_v' \
-         "$SKILLS"/*/*.md || true)
+         "$SKILLS"/*.md "$SKILLS"/*/*.md || true)
 [ "$fail" -eq "$before" ] && ok "no internal plan/release references"
 
 echo

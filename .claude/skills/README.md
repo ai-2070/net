@@ -78,8 +78,8 @@ Each skill is a `SKILL.md` entry point plus reference files that Claude loads **
 | `streams.md` | Ordered point-to-point delivery with credit-grant backpressure. |
 | `nrpc.md` | Request/response — typed call → reply, deadlines, retries, hedging. |
 | `a2a.md` | The peer is an **agent**, not a service — task handoff (`serve_a2a` / `submit_task` / `cancel_task`, briefs carry Datafort refs), delegated agent identity (`DelegationChain`), device enrollment (`invite → join → approve`). Rust/Python/Node only. |
-| `mcp.md` | The MCP bridge — `net wrap` a stdio server as mesh capabilities, or `net mcp serve` the mesh to a local host; pinning + credential forwarding. |
-| `org.md` | Organization capability auth — a service only authorized orgs can discover or call (invisible, not refused): `net-mesh org` offline issuance, `net node adopt`, `serve_org` / `mesh.org(..).call`. |
+| `mcp.md` | The MCP bridge — `net-mesh wrap` a stdio server as mesh capabilities, or `net-mesh mcp serve` the mesh to a local host; pinning + credential forwarding. |
+| `org.md` | Organization capability auth — a service only authorized orgs can discover or call (invisible, not refused): `net-mesh org` offline issuance, `net-mesh node adopt`, `serve_org` / `mesh.org(..).call`. |
 | `redex.md` | Durable per-channel append-only logs (replay from offset, retention). |
 | `cortex.md` | Folded queryable state (SQLite-shaped queries, NetDB). |
 | `dataforts.md` | Greedy caching, data gravity, blob refs, read-your-writes. |

@@ -64,17 +64,10 @@ jobs:
   #     - run: go build -o /dev/null .claude/skills/net-event-bus/examples/hello.go
   #     - run: npx tsx --noEmit .claude/skills/net-event-bus/examples/hello.ts
 
-  # The skills are published from this directory to `ai-2070/net-claude-skill`,
-  # which is what `npx skills add` installs. Nothing verifies the two copies
-  # agree, so a fix here can sit unpublished indefinitely. Needs a token with
-  # read access to that repo before it can be turned on.
-  # published-sync:
-  #   name: In sync with net-claude-skill
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v7
-  #     - name: Diff against the published copy
-  #       run: |
-  #         git clone --depth 1 https://github.com/ai-2070/net-claude-skill.git /tmp/published
-  #         diff -r --exclude=.git .claude/skills/net-event-bus /tmp/published/net-event-bus
-  #         diff -r --exclude=.git .claude/skills/net-payments  /tmp/published/net-payments
+  # A published-copy diff used to belong here. It is unnecessary now:
+  # `skills-publish.yml` mirrors this directory to `ai-2070/net-claude-skill`
+  # on every push to master, so the two cannot drift by construction.
+  #
+  # Worth noting the ordering, though — that publish trigger is armed while
+  # this check is not, so drift currently reaches the public repo unchecked.
+  # Enabling the triggers above closes that gap.
