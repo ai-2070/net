@@ -1,6 +1,6 @@
 # Error Codes — The Full Taxonomy
 
-Read this when the user needs to **pattern-match on a specific error variant** to decide what to do — retry vs. drop vs. re-auth vs. fix-a-bug — or is seeing an error name this skill's other files don't explain (`TokenError::Revoked`, `TagMatcherError::RegexNotBuiltIn`, `ScalingError::InCooldown`, `StreamError::Backpressure`, `RpcError::NoMatchingServer`).
+Read this when the user needs to **pattern-match on a specific error variant** to decide what to do — retry vs. drop vs. re-auth vs. fix-a-bug — or is seeing an error name this skill's other files don't explain (`TokenError::Revoked`, `TagMatcherError::RegexNotBuiltIn`, `ScalingError::InCooldown`, `StreamError::Backpressure`, `RpcError::CapabilityDenied`).
 
 **Relationship to `runtime.md`:** `runtime.md` covers the **SDK-facing** error surface each binding exposes (`SdkError`, TS/Python exceptions) and the practical "only `Backpressure` is blindly retry-safe" policy. This file is the **fuller core-crate taxonomy underneath** it, plus the subsystem errors (token/auth, tag matching, scaling, config, reliable-stream, nRPC) that don't fit the bus emit/poll path. If you just need "what do I retry on the bus," `runtime.md` is enough; come here when a variant name shows up that you need to classify.
 
@@ -85,20 +85,30 @@ The one-year TTL cap is a hard limit on the auth surface. Long-lived grants need
 ### `TagMatcherError` — capability-tag matcher compile/eval
 One variant: `RegexNotBuiltIn { pattern }` — a `TagMatcher::Regex` used against a build **without `--features regex`** (rebuild with it, or use a non-regex matcher); it carries the offending pattern. The `regex` feature is **off by default** (~1.1 MiB on binding artifacts). Pre-v0.24 a regex-less build silently returned empty matches; it's now this structured error, so a misconfigured query no longer looks like "nothing matched."
 
-### nRPC — `RpcError` / `RpcAppError`
-From `call_typed`, `call_streaming_typed`, `call_client_stream_typed`, `call_duplex_typed`:
+### nRPC — `RpcError`
+From `call_typed`, `call_streaming_typed`, `call_client_stream_typed`, `call_duplex_typed`.
+The enum is `net/crates/net/src/adapter/net/mesh_rpc.rs` — **seven variants, all
+struct-like except `Transport` and `Cancelled`**, so match with braces:
 
-| Variant | When it fires |
-|---|---|
-| `RpcError::NoServer` | no node currently serves this service name |
-| `RpcError::NoMatchingServer` | a `net-where:` predicate ruled out every advertising server |
-| `RpcError::Timeout` | call exceeded its configured timeout |
-| `RpcError::Canceled` | a `Mesh::cancel(token)` aborted the in-flight call |
-| `RpcError::Panic` | handler panicked; caught and surfaced typed |
-| `RpcError::Codec` | request/response encode/decode failed (`CodecEncode` / `CodecDecode`) |
-| `RpcAppError(code, detail)` | handler returned a typed application error |
+| Variant | When it fires | Retry? |
+|---|---|---|
+| `RpcError::NoRoute { target, reason }` | `target_node_id` unknown to the local mesh, or the caller's reply-channel subscription couldn't be set up | After re-discovery — not blindly |
+| `RpcError::Timeout { elapsed_ms }` | deadline elapsed before a RESPONSE arrived; the caller emits a CANCEL so the server drops the handler | Yes, if the call is idempotent |
+| `RpcError::ServerError { status, message, headers }` | server returned a non-`Ok` `RpcStatus`. **This is also how a handler's typed application error arrives** — see below | Depends on `status` |
+| `RpcError::Transport(AdapterError)` | publish failure, encryption error, underlying adapter fault | Per the inner `AdapterError` |
+| `RpcError::Codec { direction, message }` | `direction = Encode` failed before the wire; `Decode` means the response landed but didn't parse | No — caller-fixable bug (wrong codec / schema drift) |
+| `RpcError::CapabilityDenied { target, capability }` | the target does not authorize `nrpc:<capability>` | No — fix authorization |
+| `RpcError::Cancelled` | a caller-side cancel aborted the in-flight call | No |
 
-`RpcAppError` is **wire-stable across languages** — codes like `NRPC_TYPED_BAD_REQUEST` / `NRPC_TYPED_HANDLER_ERROR` are part of the cross-language fixture; each binding's typed wrapper maps `Codec*` to an idiomatic native error. Full surface + retries/hedging in `nrpc.md`.
+Two traps here. **`Cancelled` is spelled with two `l`s** — `Canceled` does not
+compile. And **there is no `RpcAppError` type**: a handler's typed application
+error rides back as `ServerError` whose `status` is `RpcStatus::Application(code)`,
+where `code` is a wire-stable `u16` — `NRPC_TYPED_BAD_REQUEST` (`0x8000`) and
+`NRPC_TYPED_HANDLER_ERROR` (`0x8001`), both declared in
+`net/crates/net/sdk/src/mesh_rpc.rs:63,70` and pinned by the cross-language
+fixture. `ServerError.headers` is the structured sidecar (e.g. a
+`net-failure-schematic` verdict); `message` stays the human diagnostic. Full
+surface + retries/hedging in `nrpc.md`.
 
 ### Org capability auth — the `org:<domain>:<kind>` wire vocabulary
 
@@ -129,7 +139,7 @@ Two rules the design enforces and your code should respect:
 |---|---|
 | `Backpressure` | the stream's outbound queue is full — no packets were enqueued; retry, drop, or surface further |
 | `NotConnected` | the underlying session is gone (peer disconnected, never connected, or the stream was closed) |
-| `Transport(_)` | underlying transport failure (socket / encryption error); wraps the originating adapter-level error's message |
+| `RpcError::Transport(_)` | underlying transport failure (socket / encryption error); wraps the originating adapter-level error's message |
 
 These are **per-peer stream** errors, not bus errors — see `streams.md`. `Backpressure` is the retry-safe one; `NotConnected` / `Transport` are terminal for that stream. (`WindowFull` and stream-reset live below this surface — the tx-credit admittance value and the wire reset message, respectively — not `StreamError` variants.)
 

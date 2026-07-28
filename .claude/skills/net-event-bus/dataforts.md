@@ -174,7 +174,7 @@ Adapter dispatch is **URI-scheme keyed**, not channel-config keyed. `BlobAdapter
 - **`fsync` of temp + parent dir** lands in the FS store path. Power loss between rename and OS flush doesn't leave zero-length files in the addressable space.
 - **Unique tmp suffixes.** `<hash>.<pid>.<atomic>.<nanos>.tmp` — concurrent stores on the same hash don't race or fail on Windows-rename, and idempotent re-stores hash-verify.
 - **Streaming hooks.** `fetch_stream` / `store_stream` ship as required methods on `BlobAdapter` with default implementations that route through `fetch` / `store`; adapters wanting real streaming override. FS adapter chunks at 256 KiB.
-- **`BlobRef::MAX_SIZE = 16 GiB` default cap.** Decode rejects larger sizes; `RedexFileConfig::with_blob_max_size` lifts the cap when an operator needs it.
+- **`BLOB_REF_MAX_SIZE = 16 GiB` cap** (a free constant in `blob_ref.rs`, not an associated const on `BlobRef`). Decode rejects larger sizes. There is **no config knob that lifts it** — a site needing more validates on construction and reaches for the `BlobAdapter` streaming hooks instead.
 - **Per-channel registry override.** `RedexFileConfig::with_blob_adapter_registry(Some(arc))` for multi-tenant isolation; default-tenant path uses the global singleton.
 - **`BlobError::NotFound(uri)` sanitizes the URI.** Control chars escape as `\xNN`, length caps at 256 bytes — a binding logging the error can't be log-injected by an attacker who controls the URI.
 
@@ -343,7 +343,7 @@ if err := tasks.WaitForSeq(seq, 250*time.Millisecond); err != nil { /* … */ }
 
 ### Operational notes
 
-- **`applied_through_seq()` vs. `folded_through_seq()`.** The wait keys on **applied** (events that actually ran through the fold), not the *folded* watermark — so a producer whose write hit a `FoldErrorPolicy::Skip` (via `RedexError::is_recoverable_decode`) doesn't get a premature `Ok(())` over state that doesn't reflect its write.
+- **`applied_through_seq()` vs. `folded_through_seq()`.** The wait keys on **applied** (events that actually ran through the fold), not the *folded* watermark — so a producer whose write hit a `FoldErrorPolicy::LogAndContinue` (via `RedexError::is_recoverable_decode`) doesn't get a premature `Ok(())` over state that doesn't reflect its write.
 - **`FoldStopped` is a real error.** When `running == false` (fold task crashed under `FoldErrorPolicy::Stop`), the wait surfaces `WaitForTokenError::FoldStopped { applied_through_seq }` rather than resolving every pending RYW wait with a silent `Ok(())`.
 - **`deadline_ms == 0` is a non-blocking poll** across every binding. Synchronous applied-vs-token check; no wait scheduled.
 - **Process-wide in-flight cap.** `set_global_ryw_inflight_cap(usize)` sets a process-wide bound on outstanding RYW waiters; every `wait_for_token` does a two-tier acquire (process-wide then per-adapter). The default per-adapter cap is 1024 (`ryw_inflight_cap`, non-FIFO).

@@ -100,6 +100,19 @@ do
 done
 [ "$fail" -eq "$before" ] && ok "all documented symbols resolve"
 
+# -------------------------------------------------------------- enum variants
+# Symbol existence is not enough: the skills tabulate error variants for agents
+# to pattern-match on, and a variant can be plausible, spelled right, and belong
+# to no enum. The nRPC table claimed NoServer / NoMatchingServer / Canceled /
+# Panic, none of which exist on RpcError (it has NoRoute / Timeout / ServerError
+# / Transport / Codec / CapabilityDenied / Cancelled). This checks membership.
+echo "==> Enum variants documented in the skills"
+before=$fail
+while read -r line; do
+  [ -n "$line" ] && note "$line"
+done < <(python3 "$(dirname "$0")/check-skill-enums.py" || true)
+[ "$fail" -eq "$before" ] && ok "every documented enum variant exists on its enum"
+
 # ------------------------------------------------------------------ CLI verbs
 # The single installed binary is `net-mesh` (cli/Cargo.toml [[bin]]). A bare
 # `net <verb>` in the skills is a command the user cannot run.

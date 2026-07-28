@@ -13,7 +13,7 @@ If you want to query across multiple CortEX adapters as one handle, see **NetDB*
 - **A `CortexAdapter<State>` owns one RedEX file** and runs a fold loop over its tail. State is `Arc<RwLock<State>>`; queries read-lock, fold-step writes.
 - **`State` is yours.** `Tasks` and `Memories` are concrete examples (`TasksState`, `MemoriesState`); your own adapter can hold anything — `HashMap`, `Vec`, a custom indexed structure.
 - **The fold runs on a tokio task.** `applied_through_seq()` tracks how far the fold has applied; the read-your-writes machinery hangs off this watermark. The seq is locally monotonic per-RedEX-file.
-- **State changes ride `changes()` / `changes_with_lag()`.** Hot subscribers see `u64` (or `ChangeEvent::Update { seq, lag }`) per applied seq — pair with `state.read()` to materialize the change.
+- **State changes ride `changes()` / `changes_with_lag()`.** Hot subscribers see `u64` (or `ChangeEvent::Seq(u64)`) per applied seq — pair with `state.read()` to materialize the change.
 - **Snapshots are first-class.** `adapter.snapshot()` returns `(bytes, applied_seq)`; `open_from_snapshot(bytes)` restores both the state and the applied watermark in one call. Pair with retention to avoid replaying every event on restart.
 - **Watchers are cheap.** `tasks.watch()` returns a `TasksWatcher` that yields on every change; many concurrent watchers fan out from the same fold task.
 - **No cross-adapter consistency.** Each adapter folds its own RedEX file; there's no global transaction across adapters. NetDB exposes them under one handle for query convenience, not for cross-adapter atomicity.
@@ -84,7 +84,7 @@ tasks.close()?;
 - `Tasks::open` / `Memories::open` take `(redex, channel, origin_hash, RedexFileConfig)`. The `origin_hash` is what `WriteToken`s bind to — `wait_for_token` rejects tokens from a different origin.
 - The fold loop runs on a tokio task; `tasks.is_running()` reports liveness. `tasks.close()` joins the task cleanly.
 - `state()` returns `Arc<RwLock<TasksState>>`. Queries take `state.read()` and use methods like `find_unique` / `find_many(&filter)` / `count_where`. Writes go through `tasks.create / .complete / .delete / .rename` — never mutate `state.write()` directly (you'd diverge from the RedEX log).
-- `changes()` returns a `Stream<Item = u64>`; `changes_with_lag()` returns `Stream<Item = ChangeEvent>` where `ChangeEvent::Lagged { skipped }` is emitted if the channel buffer overflowed. Use the latter when you can't tolerate dropped change notifications.
+- `changes()` returns a `Stream<Item = u64>`; `changes_with_lag()` returns `Stream<Item = ChangeEvent>`. `ChangeEvent` has exactly two **tuple** variants — `Seq(u64)` per applied seq, and `Lagged(u64)` carrying how many notifications were dropped when the broadcast buffer overflowed. Match with parens, not braces. Use the latter when you can't tolerate dropped change notifications. Note that by the time you see `Lagged`, `state()` already reflects past those events — the value is observability, not a gap you have to replay.
 - `applied_through_seq()` vs. `folded_through_seq()`: the former is what RYW waits on (events that actually applied to state); the latter is what the fold task observed (including skipped-via-`FoldErrorPolicy` events).
 - `snapshot_and_watch_*` is the atomic "give me the current state + a watcher that won't miss the next change" primitive. Avoid the `list_tasks() + watch_tasks()` pattern — a mutation between the two reads is silently lost.
 
@@ -258,7 +258,7 @@ let db = NetDb::builder(Redex::new()).origin(origin_hash).with_tasks().with_memo
 ## Common gotchas
 
 - **`tasks.state()` returns an `Arc<RwLock<State>>` (Rust) / a snapshot dict (Python) / a JS object (Node).** Don't write through it; writes diverge from the RedEX log. Use the adapter's mutating methods (`tasks.create / .complete / .delete / .rename`) — they go through `ingest_with_token`.
-- **`applied_through_seq` ≠ `folded_through_seq`.** RYW waits on applied (events that ran through the fold); folded includes events the fold task observed but skipped under `FoldErrorPolicy::Skip`.
+- **`applied_through_seq` ≠ `folded_through_seq`.** RYW waits on applied (events that ran through the fold); folded includes events the fold task observed but skipped under `FoldErrorPolicy::LogAndContinue`.
 - **`FoldStopped` is a real error.** The fold task can crash under `FoldErrorPolicy::Stop`; `wait_for_token` surfaces `WaitForTokenError::FoldStopped` rather than a silent `Ok(())`.
 - **The fold loop runs on a tokio task you don't see.** If you're embedding in a non-tokio runtime, you need a tokio runtime alive in the process — the substrate uses `tokio::spawn` under the hood.
 - **`open_from_snapshot` restores the applied watermark.** Subsequent events fold from there, not from seq 0. The applied watermark is the canonical "where am I in the log" pointer.
