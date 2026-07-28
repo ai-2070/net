@@ -21,13 +21,23 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/../.."
-SKILLS=".claude/skills"
+
+# The corpus root. Overridable *only* so `check-skills-depth.sh` can point this
+# same script at a throwaway copy: the depth guarantee needs a probe file, and a
+# probe planted in the real corpus would be one interrupted run away from being
+# rsynced to users. Everything else — cited paths, git resolution, the source
+# tree — is still read relative to the repo root.
+SKILLS="${SKILLS_DIR:-.claude/skills}"
 fail=0
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=1; }
+# A counter, not a flag. Each section reports success with
+# `[ "$fail" -eq "$before" ]`, which is only meaningful if `note` keeps
+# incrementing — as a 0/1 flag the first failure made every *later* section
+# print its green tick, because `before` and `fail` were both 1.
+note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 
 # The corpus, at any depth. One definition, used by every check below, so a file
@@ -98,7 +108,10 @@ while read -r f; do
       continue
     fi
     note "${f#$SKILLS/}: references $ref, which is neither a sibling nor at the skill root"
-  done < <(grep -oh '`[a-z0-9-]*\.md`' "$f" 2>/dev/null | tr -d '`' | sort -u)
+    # `_` is in the class deliberately: the corpus uses hyphens today, so a
+    # reference to an underscored filename was simply never extracted — an
+    # invisible citation rather than a reported one.
+  done < <(grep -oh '`[a-z0-9_-]*\.md`' "$f" 2>/dev/null | tr -d '`' | sort -u)
 done < <(skill_md)
 [ "$fail" -eq "$before" ] && ok "every referenced *.md resolves"
 
@@ -217,7 +230,7 @@ done < <(grep -nE '\b(P[0-9]|WS[0-9])\b|Mode E|bugfixes-[0-9]|docs/internal|_PLA
 echo
 if [ "$fail" -eq 0 ]; then
   echo "Skills agree with the tree."
-else
-  echo "Skills drifted from the tree — see above."
+  exit 0
 fi
-exit "$fail"
+echo "Skills drifted from the tree — $fail problem(s) above."
+exit 1

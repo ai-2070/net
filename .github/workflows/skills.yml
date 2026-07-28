@@ -46,6 +46,7 @@ on:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
+      - ".github/scripts/check-skills-depth.sh"
       - ".github/scripts/check-skill-refs.py"
       - ".github/scripts/check-skill-workflow.py"
       - ".github/scripts/check-skill-examples.sh"
@@ -83,6 +84,7 @@ on:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
+      - ".github/scripts/check-skills-depth.sh"
       - ".github/scripts/check-skill-refs.py"
       - ".github/scripts/check-skill-workflow.py"
       - ".github/scripts/check-skill-examples.sh"
@@ -138,6 +140,14 @@ jobs:
       # leakage. No toolchain needed — grep and python3, both on the runner.
       - name: Check skills against the tree
         run: .github/scripts/check-skills.sh
+
+      # Guards the checker rather than the content: three of the checks above
+      # used to stop at `*/*.md` and silently ignored anything nested deeper.
+      # This plants four defects in a nested file — in a throwaway copy of the
+      # corpus, never in `.claude/skills/`, which is rsynced to users — and
+      # asserts all four are reported.
+      - name: Check nested skill content is still discovered
+        run: .github/scripts/check-skills-depth.sh
 
   examples:
     name: Examples compile
