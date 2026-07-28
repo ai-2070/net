@@ -41,6 +41,12 @@ jobs:
   coverage:
     name: Coverage (cargo-llvm-cov)
     runs-on: ubuntu-latest
+    # Matches the 20-minute ceiling the gating test jobs in ci.yml use.
+    # An instrumented build of the full feature set plus every
+    # integration test is the slowest thing here; anything past this is
+    # a hang, not a slow run, and this job is advisory so killing it
+    # costs nothing.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: net/crates/net
