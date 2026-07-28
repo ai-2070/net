@@ -47,7 +47,7 @@ on:
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
       - ".github/scripts/check-skill-refs.py"
-      - ".github/scripts/check-skill-triggers.py"
+      - ".github/scripts/check-skill-workflow.py"
       # Every surface the skills document. Broad roots on purpose: the previous
       # list reached only `*/src/**` and missed 36 of the 66 source paths the
       # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
@@ -80,7 +80,7 @@ on:
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
       - ".github/scripts/check-skill-refs.py"
-      - ".github/scripts/check-skill-triggers.py"
+      - ".github/scripts/check-skill-workflow.py"
       # Every surface the skills document. Broad roots on purpose: the previous
       # list reached only `*/src/**` and missed 36 of the 66 source paths the
       # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
@@ -139,10 +139,18 @@ jobs:
       contents: read
 
     # The reason these two workflows were merged. `needs` makes the mirror wait
-    # on the check and skip entirely when it fails, so drift cannot reach the
+    # on the checks and skip entirely when any fails, so drift cannot reach the
     # public repo. As separate workflows they raced — GitHub does not sequence
     # one workflow behind another, so a red check published anyway.
-    needs: drift
+    #
+    # POLICY: every job that verifies content this job publishes belongs in this
+    # list. A job may be slow, or PR-only — but a *known-red* verification of the
+    # artifact must never publish that artifact. `check-skill-workflow.py`
+    # enforces it: any job not listed here fails the check unless it carries an
+    # explicit `# advisory: <reason>` comment. Later phases (examples, snippets)
+    # add themselves here as they land.
+    needs:
+      - drift
 
     # Automatic publishes are master-only, and a pull request never publishes:
     # it runs with a read-only token and must not push to another repository.
