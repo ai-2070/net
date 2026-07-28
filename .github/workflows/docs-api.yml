@@ -1,0 +1,74 @@
+name: Docs API
+
+# Does the documented API on the site actually exist?
+#
+# `web.yml` proves internal links resolve and the Astro site type-checks.
+# Neither says anything about whether a documented symbol, metric, path or CLI
+# verb is real. This does, in ~3s with no toolchain — just grep and python3.
+#
+# It has its own workflow rather than a step in `web.yml` because of the trigger
+# shape. Drift has two causes: editing the docs, and moving the source they
+# describe — so this must fire on Rust changes too. Widening `web.yml`'s paths
+# to cover them would run `npm ci` and a full site build on every source push;
+# this runs a 3s script instead.
+#
+# Release notes are excluded inside the script, deliberately: they record what
+# was true at the time (`BlobRef::MAX` was real at v0.15 and has since been
+# renamed), so a check that forces edits to them corrupts the record.
+#
+# Run locally:  .github/scripts/check-docs.sh
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "web/src/content/docs/**"
+      - ".github/workflows/docs-api.yml"
+      - ".github/scripts/check-docs.sh"
+      - ".github/scripts/check-skill-refs.py"
+      # The surfaces the docs describe. Same roots as skills.yml, for the same
+      # reason: the types the docs name live under `net/src` and the bindings,
+      # not only in the SDK.
+      - "go/**"
+      - "net/crates/net/src/**"
+      - "net/crates/net/sdk/**"
+      - "net/crates/net/sdk-ts/**"
+      - "net/crates/net/sdk-py/**"
+      - "net/crates/net/cli/**"
+      - "net/crates/net/payments/**"
+      - "net/crates/net/bindings/**"
+      - "net/crates/net/adapters/**"
+      - "net/crates/net/include/**"
+  pull_request:
+    paths:
+      - "web/src/content/docs/**"
+      - ".github/workflows/docs-api.yml"
+      - ".github/scripts/check-docs.sh"
+      - ".github/scripts/check-skill-refs.py"
+      - "go/**"
+      - "net/crates/net/src/**"
+      - "net/crates/net/sdk/**"
+      - "net/crates/net/sdk-ts/**"
+      - "net/crates/net/sdk-py/**"
+      - "net/crates/net/cli/**"
+      - "net/crates/net/payments/**"
+      - "net/crates/net/bindings/**"
+      - "net/crates/net/adapters/**"
+      - "net/crates/net/include/**"
+  workflow_dispatch:
+
+jobs:
+  docs-api:
+    name: Documented API exists
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # Cited source paths (resolved through git, so a local build artifact
+      # cannot mask a bad citation), enum-variant membership, metric/config
+      # identifiers, and CLI verb names derived from the CLI's own Command enum.
+      - name: Check documented API against the source tree
+        run: .github/scripts/check-docs.sh
