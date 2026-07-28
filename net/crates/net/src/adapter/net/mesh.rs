@@ -10683,7 +10683,7 @@ impl MeshNode {
     > {
         use super::behavior::org_grant_registry::{
             validate_consumer_record, ConsumerAudienceInstall, ConsumerAudienceLease,
-            GrantAudienceInstallError,
+            ConsumerGrantSnapshot, GrantAudienceInstallError, PreparedInstall,
         };
         let authority = self
             .node_authority
@@ -10710,22 +10710,29 @@ impl MeshNode {
         // publishing nothing, and the space cannot be recovered.
         let _guard = self.consumer_grant_mu.lock();
         let current = self.consumer_grant_audiences.load_full();
-        if current.install_is_noop(&record)? {
-            // Valid, publishes nothing, and consumes no identity — including
-            // after the allocator is exhausted, which is why this precedes it.
-            return Ok(ConsumerAudienceInstall::AlreadyPresent);
-        }
+        // EVERY ordinary refusal settles before allocation — idempotence,
+        // conflict AND capacity. Settling only idempotence left `AtCapacity`
+        // behind the allocator, so repeated distinct installs against a full
+        // registry would drain a finite, terminal authority space while
+        // publishing nothing (Kyra, 2B.3c-pre step-1 review).
+        let prepared = match current.prepare_install(&record, now_secs)? {
+            PreparedInstall::Noop => {
+                // Valid, publishes nothing, consumes no identity — including
+                // after the allocator is exhausted, which is why this precedes
+                // it.
+                return Ok(ConsumerAudienceInstall::AlreadyPresent);
+            }
+            PreparedInstall::Ready(slot) => slot,
+        };
+        // Past this point publication is certain, so claiming the identity
+        // cannot be wasted.
         let install_seq = self.allocate_consumer_grant_install_seq()?;
         let record = record.with_install_seq(install_seq);
-        match current.with_record(Arc::new(record), now_secs)? {
-            Some(next) => {
-                self.consumer_grant_audiences.store(Arc::new(next));
-                Ok(ConsumerAudienceInstall::Installed(
-                    ConsumerAudienceLease::new(grant_id, install_seq),
-                ))
-            }
-            None => Ok(ConsumerAudienceInstall::AlreadyPresent),
-        }
+        let next = ConsumerGrantSnapshot::finish_install(prepared, Arc::new(record));
+        self.consumer_grant_audiences.store(Arc::new(next));
+        Ok(ConsumerAudienceInstall::Installed(
+            ConsumerAudienceLease::new(grant_id, install_seq),
+        ))
     }
 
     /// OA3-4b2: remove a CONSUMER grant-audience record by `grant_id`. Returns
@@ -32932,6 +32939,66 @@ mod oa34b2_query_currentness_tests {
             c.consumer_grant_audiences.load_full().len(),
             before,
             "a refused install must publish nothing"
+        );
+    }
+
+    /// W-G10b. An `AtCapacity` refusal consumes no installation identity.
+    ///
+    /// Capacity refusal sits BEHIND idempotence, so settling idempotence alone
+    /// left it after the allocator: repeatedly requesting distinct installs
+    /// against a full active registry published nothing and permanently drained
+    /// a finite, terminal authority space. Found by an independent probe of the
+    /// production path after step 1 (Kyra), which is why the assertion is on the
+    /// identity rather than only on the error.
+    #[tokio::test]
+    async fn an_at_capacity_consumer_grant_install_consumes_no_identity() {
+        use crate::adapter::net::behavior::org_grant_registry::{
+            ConsumerGrantSnapshot, GrantAudienceInstallError,
+        };
+        let org_a = OrgKeypair::from_bytes([0xc5u8; 32]);
+        let org_b = OrgKeypair::from_bytes([0xc6u8; 32]);
+        let (c, _dir) = adopted_consumer(&org_a, "atcap").await;
+        let p = EntityKeypair::generate();
+
+        let mint = |tag: String| {
+            let (g, secret) = OrgCapabilityGrant::try_issue(
+                &org_b,
+                org_a.org_id(),
+                CapabilityAuthorityId::for_tag(&tag),
+                GrantRights::DISCOVER,
+                GrantTargetScope::ExactNode(p.entity_id().clone()),
+                3600,
+            )
+            .expect("issue");
+            (g, secret.expect("secret"))
+        };
+
+        // Fill the registry to its active ceiling.
+        for i in 0..ConsumerGrantSnapshot::CAPACITY {
+            let (g, secret) = mint(format!("nrpc:atcap-{i}"));
+            c.install_consumer_grant_audience(g, copy_secret(&secret))
+                .expect("fill install");
+        }
+        let before = c.consumer_grant_install_seq_for_test();
+
+        let (overflow, secret) = mint("nrpc:atcap-overflow".to_string());
+        let err = c
+            .install_consumer_grant_audience(overflow, copy_secret(&secret))
+            .expect_err("a full active registry must refuse");
+        assert_eq!(
+            err,
+            GrantAudienceInstallError::AtCapacity,
+            "refusal must stay typed"
+        );
+        assert_eq!(
+            c.consumer_grant_install_seq_for_test(),
+            before,
+            "an install that publishes nothing must consume no authority identity"
+        );
+        assert_eq!(
+            c.consumer_grant_audiences.load_full().len(),
+            ConsumerGrantSnapshot::CAPACITY,
+            "and it must publish no snapshot"
         );
     }
 

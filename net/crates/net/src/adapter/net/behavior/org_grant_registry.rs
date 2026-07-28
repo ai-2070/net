@@ -375,33 +375,30 @@ impl GrantAudienceRecords {
     /// [`GrantAudienceInstallError::AtCapacity`]. Node-context invariants
     /// (validity, rights, org/target) are checked BEFORE this by the caller —
     /// this layer owns only idempotency, conflict, and capacity.
-    /// Would installing `record` be a no-op? (OLB-2B.3c-pre)
+    /// Settle EVERY ordinary refusal — idempotence, conflict and capacity — and
+    /// return a slot the caller can fill infallibly (OLB-2B.3c-pre).
     ///
-    /// The same decision `install` makes, split out so a caller can learn it
-    /// BEFORE allocating an installation identity. `install_seq` is deliberately
-    /// not part of `records_identical`, which is what makes this answerable
-    /// against a record that has not been stamped yet.
-    fn install_is_noop(
+    /// This exists because the installation identity is now a finite, terminal
+    /// authority space. Any refusal that can happen AFTER allocation burns an
+    /// identity while publishing nothing, and repeated distinct installs against
+    /// a full registry would drain the space permanently. Settling idempotence
+    /// alone was not enough; capacity refusal sits behind it (Kyra, 2B.3c-pre
+    /// step-1 review).
+    ///
+    /// Once `Ready` is returned under the caller's mutex, no ordinary refusal
+    /// remains — which is the property that makes allocating afterwards safe.
+    /// The capacity check and expired-record reclamation happen HERE and are not
+    /// duplicated at the fill site.
+    fn prepare_install(
         &self,
         record: &GrantAudienceRecord,
-    ) -> Result<bool, GrantAudienceInstallError> {
-        match self.by_grant_id.get(record.grant_id()) {
-            Some(existing) if records_identical(existing, record) => Ok(true),
-            Some(_) => Err(GrantAudienceInstallError::Conflict),
-            None => Ok(false),
-        }
-    }
-
-    fn install(
-        &self,
-        record: Arc<GrantAudienceRecord>,
         capacity: usize,
         now_secs: u64,
-    ) -> Result<Option<Self>, GrantAudienceInstallError> {
+    ) -> Result<PreparedInstall, GrantAudienceInstallError> {
         let grant_id = *record.grant_id();
         if let Some(existing) = self.by_grant_id.get(&grant_id) {
-            return if records_identical(existing, &record) {
-                Ok(None)
+            return if records_identical(existing, record) {
+                Ok(PreparedInstall::Noop)
             } else {
                 Err(GrantAudienceInstallError::Conflict)
             };
@@ -437,8 +434,10 @@ impl GrantAudienceRecords {
                 return Err(GrantAudienceInstallError::AtCapacity);
             }
         }
-        next.insert(grant_id, record);
-        Ok(Some(Self { by_grant_id: next }))
+        Ok(PreparedInstall::Ready(PreparedSlot {
+            grant_id,
+            next: Self { by_grant_id: next },
+        }))
     }
 
     /// Copy-on-write remove. `None` = the grant id was not present (no-op — the
@@ -451,6 +450,40 @@ impl GrantAudienceRecords {
         let mut next = self.by_grant_id.clone();
         next.remove(grant_id);
         Some(Self { by_grant_id: next })
+    }
+}
+
+/// The outcome of settling every ordinary install refusal (OLB-2B.3c-pre).
+#[derive(Debug)]
+pub(crate) enum PreparedInstall {
+    /// The exact record is already installed: valid, publishes nothing, and must
+    /// consume no installation identity.
+    Noop,
+    /// Room is reserved and no ordinary refusal remains. Fill it infallibly.
+    Ready(PreparedSlot),
+}
+
+/// A reserved place in the next snapshot, awaiting its stamped record.
+///
+/// Deliberately carries the post-reclamation map rather than re-deriving it, so
+/// the capacity decision cannot be made twice and disagree with itself.
+#[derive(Debug)]
+pub(crate) struct PreparedSlot {
+    grant_id: [u8; 32],
+    next: GrantAudienceRecords,
+}
+
+impl PreparedSlot {
+    /// Insert the stamped record. INFALLIBLE by construction — every refusal was
+    /// already settled by [`GrantAudienceRecords::prepare_install`].
+    fn finish(mut self, record: Arc<GrantAudienceRecord>) -> GrantAudienceRecords {
+        debug_assert_eq!(
+            &self.grant_id,
+            record.grant_id(),
+            "a prepared slot must be filled by the record it was prepared for"
+        );
+        self.next.by_grant_id.insert(self.grant_id, record);
+        self.next
     }
 }
 
@@ -636,7 +669,10 @@ impl ProviderGrantSnapshot {
         record: Arc<GrantAudienceRecord>,
         now_secs: u64,
     ) -> Result<Option<Self>, GrantAudienceInstallError> {
-        Ok(self.0.install(record, Self::CAPACITY, now_secs)?.map(Self))
+        match self.0.prepare_install(&record, Self::CAPACITY, now_secs)? {
+            PreparedInstall::Noop => Ok(None),
+            PreparedInstall::Ready(slot) => Ok(Some(Self(slot.finish(record)))),
+        }
     }
 
     /// Remove `grant_id`; see [`GrantAudienceRecords::without`].
@@ -683,24 +719,19 @@ impl ConsumerGrantSnapshot {
     }
 
     /// Install a validated record; see [`GrantAudienceRecords::install`].
-    pub(crate) fn with_record(
-        &self,
-        record: Arc<GrantAudienceRecord>,
-        now_secs: u64,
-    ) -> Result<Option<Self>, GrantAudienceInstallError> {
-        Ok(self.0.install(record, Self::CAPACITY, now_secs)?.map(Self))
-    }
-
-    /// Whether installing `record` would publish nothing (OLB-2B.3c-pre).
-    ///
-    /// Lets the caller settle idempotence BEFORE claiming an installation
-    /// identity, so repeated idempotent installs consume none of a finite,
-    /// terminal identity space.
-    pub(crate) fn install_is_noop(
+    /// Settle every ordinary install refusal, reserving a slot to fill
+    /// (OLB-2B.3c-pre). See [`GrantAudienceRecords::prepare_install`].
+    pub(crate) fn prepare_install(
         &self,
         record: &GrantAudienceRecord,
-    ) -> Result<bool, GrantAudienceInstallError> {
-        self.0.install_is_noop(record)
+        now_secs: u64,
+    ) -> Result<PreparedInstall, GrantAudienceInstallError> {
+        self.0.prepare_install(record, Self::CAPACITY, now_secs)
+    }
+
+    /// Fill a reserved slot with its stamped record. Infallible by construction.
+    pub(crate) fn finish_install(slot: PreparedSlot, record: Arc<GrantAudienceRecord>) -> Self {
+        Self(slot.finish(record))
     }
 
     /// Remove `grant_id`; see [`GrantAudienceRecords::without`].
