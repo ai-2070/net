@@ -92,25 +92,26 @@ through a non-Rust allocator returns an error rather than reading garbage.
 *without* advancing the cursor. Size for 4 KB and you will not think about it
 again. The structured `net_poll_ex` path is unaffected.
 
-## Batch ingest reports what it dropped
-
-`net_ingest_raw_batch` takes two optional out-params:
+## Batch ingest tells you how many it dropped, not which
 
 ```c
 int net_ingest_raw_batch(
     net_handle_t handle,
-    const char* const* jsons,
+    const char** jsons,
     const size_t* lens,
-    size_t count,
-    size_t* out_failed_indices,   /* nullable; up to `count` indices */
-    size_t* out_failed_len        /* nullable; receives the count */
+    size_t count
 );
 ```
 
-A null entry or invalid UTF-8 no longer vanishes from the accepted count — its
-index is appended to `out_failed_indices`. Passing `NULL` for both keeps the
-older "just return a count" behaviour, but then `returned_count < count` only
-tells you drops happened, not which.
+The return value is the number of entries accepted. An entry with a null
+pointer, a length above `isize::MAX`, or invalid UTF-8 is skipped — the runtime
+logs a warning naming the reason, and the entry is simply missing from the
+count.
+
+**A short return tells you drops happened; it does not tell you which indices.**
+If you need that, ingest individually with `net_ingest_raw` and check each
+return, or validate your buffers before batching. There is no out-param form of
+this call.
 
 ## Next
 
