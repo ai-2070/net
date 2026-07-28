@@ -1,0 +1,202 @@
+name: Skills
+
+# Check the agent skills in `.claude/skills/`, then mirror them to the public
+# repo. Two jobs, in that order, because the second must not run when the first
+# is red.
+#
+# --- drift -------------------------------------------------------------------
+# The skills are ~9k lines of prose asserting that specific symbols, paths, and
+# CLI verbs exist. Nothing compiles them, so they rot silently while the crates
+# move underneath. This is the tripwire.
+#
+# It fires on two kinds of change, because drift has two causes: editing the
+# skills, and moving the surface they describe. The second is the one that rots
+# documentation quietly — a renamed CLI binary and a rewritten error enum both
+# landed with nothing pointing at the prose they invalidated.
+#
+# Run it locally any time:  .github/scripts/check-skills.sh
+#
+# --- publish -----------------------------------------------------------------
+# Mirrors `.claude/skills/` to `ai-2070/net-claude-skill`, the public repo that
+# `npx skills add ai-2070/net-claude-skill` installs from.
+#
+# The skills are authored here so they ship with the library and sit next to the
+# code they describe; that repo is a publish artifact, not a place to edit. Every
+# push to master that touches the directory copies, verbatim:
+#
+#   .claude/skills/net-event-bus/  ->  net-event-bus/
+#   .claude/skills/net-payments/   ->  net-payments/
+#   .claude/skills/README.md       ->  README.md
+#
+# Anything else over there (LICENSE-APACHE, LICENSE-MIT, sync.sh) is left alone.
+# The copy is `rsync --delete`, so a file deleted here is deleted there.
+#
+# Required repository secret: `SKILLS_PUBLISH_TOKEN`
+#   A fine-grained PAT scoped to `ai-2070/net-claude-skill` with
+#   `Contents: Read and write`. The default `GITHUB_TOKEN` is scoped to this
+#   repository and cannot push to another one.
+#
+# `workflow_dispatch` takes a `dry_run` input that prints the diff and stops
+# short of pushing — use it to check the wiring after changing the copy step.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - ".claude/skills/**"
+      - ".github/workflows/skills.yml"
+      - ".github/scripts/check-skills.sh"
+      - ".github/scripts/check-skill-enums.py"
+      # The skills document these surfaces; a change here can invalidate them.
+      # The core crate is in scope deliberately: every type the skills tabulate
+      # — RpcError, TokenError, StreamError, ChangeEvent, FoldErrorPolicy — is
+      # defined under `net/src`, not in the SDK, so narrowing to the SDK would
+      # have missed every defect this check was written to catch.
+      - "net/crates/net/src/**"
+      - "net/crates/net/sdk/src/**"
+      - "net/crates/net/cli/src/**"
+      - "net/crates/net/payments/src/**"
+      - "net/crates/net/bindings/*/src/**"
+  pull_request:
+    paths:
+      - ".claude/skills/**"
+      - ".github/workflows/skills.yml"
+      - ".github/scripts/check-skills.sh"
+      - ".github/scripts/check-skill-enums.py"
+      - "net/crates/net/src/**"
+      - "net/crates/net/sdk/src/**"
+      - "net/crates/net/cli/src/**"
+      - "net/crates/net/payments/src/**"
+      - "net/crates/net/bindings/*/src/**"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Show what would change without pushing"
+        type: boolean
+        default: false
+
+jobs:
+  drift:
+    name: Drift check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # Frontmatter + description budget, cross-file links, cited repo paths,
+      # API-surface canaries, documented-symbol resolution, enum-variant
+      # membership, CLI verb names, and internal-plan leakage. No toolchain
+      # needed — grep and python3, both already on the runner.
+      - name: Check skills against the tree
+        run: .github/scripts/check-skills.sh
+
+  publish:
+    name: Mirror to net-claude-skill
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    # The reason these two workflows were merged. `needs` makes the mirror wait
+    # on the check and skip entirely when it fails, so drift cannot reach the
+    # public repo. As separate workflows they raced — GitHub does not sequence
+    # one workflow behind another, so a red check published anyway.
+    needs: drift
+
+    # Automatic publishes are master-only, and a pull request never publishes:
+    # it runs with a read-only token and must not push to another repository.
+    #
+    # A manual dispatch is allowed from any branch, which is how the original
+    # workflow behaved and what makes `dry_run` useful — you can check the copy
+    # step from a branch before merging it. Note the sharp edge that comes with
+    # it: dispatching from a branch with `dry_run` off publishes that branch's
+    # skills for real.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
+
+    # Job-scoped, not workflow-scoped: two pushes in quick succession would
+    # otherwise race to publish, and the later one should wait rather than
+    # cancel so the mirror ends on the newest tree. Keeping it off the workflow
+    # means drift checks on other branches never queue behind a publish.
+    concurrency:
+      group: skills-publish
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Fail with an explanation rather than a 403 from the checkout below.
+      - name: Check the publish token is present
+        env:
+          TOKEN: ${{ secrets.SKILLS_PUBLISH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::SKILLS_PUBLISH_TOKEN is not set. Create a fine-grained PAT scoped to ai-2070/net-claude-skill with Contents: Read and write, then add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Checkout net-claude-skill
+        uses: actions/checkout@v7
+        with:
+          repository: ai-2070/net-claude-skill
+          token: ${{ secrets.SKILLS_PUBLISH_TOKEN }}
+          path: published
+
+      - name: Copy the skills across
+        run: |
+          set -euo pipefail
+          for skill in net-event-bus net-payments; do
+            test -f ".claude/skills/$skill/SKILL.md" || {
+              echo "::error::.claude/skills/$skill/SKILL.md is missing — refusing to publish"
+              exit 1
+            }
+            rsync -a --delete --exclude=.git ".claude/skills/$skill/" "published/$skill/"
+          done
+          cp .claude/skills/README.md published/README.md
+
+      # The workflow also fires on source-only changes (the drift paths above),
+      # which touch nothing the mirror carries. That lands here as an
+      # "already in sync" no-op rather than an empty commit.
+      - name: Commit and push
+        working-directory: published
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "already in sync with ${GITHUB_SHA}"
+            exit 0
+          fi
+
+          git add -A
+          git status --short
+
+          if [ "$DRY_RUN" = "true" ]; then
+            git diff --cached --stat
+            echo "dry run — not pushing"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit \
+            -m "skills: sync from net@${GITHUB_SHA:0:7}" \
+            -m "Published from .claude/skills/ by skills.yml.
+          Source: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          git push
+
+  # The five hello-world files in net-event-bus/examples/ are presented to
+  # users as "the first thing you run after install." Nothing builds them.
+  # Left as a sketch rather than a working job: each needs the SDK published
+  # or built locally first, which is what the release workflows already do.
+  # examples:
+  #   name: Build hello-world examples
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #     - run: cargo build -p net-sdk --example hello
+  #     - run: go build -o /dev/null .claude/skills/net-event-bus/examples/hello.go
+  #     - run: npx tsx --noEmit .claude/skills/net-event-bus/examples/hello.ts
