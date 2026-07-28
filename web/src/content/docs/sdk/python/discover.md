@@ -35,7 +35,7 @@ Capability-filter node discovery (the `find_nodes` surface, e.g. "GPU nodes with
 ≥24 GB VRAM") is available through the node's native handle in Python rather than a
 clean `MeshNode` method. The filter model is identical across bindings — see
 [Capabilities](/docs/concepts/capabilities) for the predicate surface and the CLI
-equivalent (`net cap query --tag …`). For most Python agent code, the tool API
+equivalent (`net-mesh cap query --tag …`). For most Python agent code, the tool API
 above is the path you want.
 
 Discovery is **advisory** — it tells you who *can*, with no exclusivity.
