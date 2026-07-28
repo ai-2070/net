@@ -5,9 +5,15 @@
 # The skills are a shadow copy of the SDK's public surface: ~9k lines of prose
 # asserting that specific symbols, paths, and CLI verbs exist. Nothing compiles
 # them, so they rot silently while the code moves underneath. This script is the
-# tripwire. It caught, on first run: a CLI renamed `net` -> `net-mesh` in 57
-# places, two source paths that became files, and a documented symbol
-# (`payment_gate`) that never existed.
+# tripwire. What it caught when it was written:
+#
+#   - a CLI renamed `net` -> `net-mesh`, still documented the old way 57 times
+#   - `net/README.md` cited 19 times; that file has never existed
+#   - two source paths that had become files
+#   - `payment_gate`, `RpcAppError`, `BlobRef::MAX_SIZE` and
+#     `RedexFileConfig::with_blob_max_size` documented as API — none exist
+#   - an nRPC error table where four of six variants were invented, and the
+#     one real spelling (`Cancelled`) was given with one `l`
 #
 # Run locally:  .github/scripts/check-skills.sh
 # Exit 0 = skills agree with the tree. Exit 1 = something drifted.

@@ -6,36 +6,43 @@ name: Skills
 # writing integration code — but nothing compiles them, so they rot silently
 # while the crates move underneath. This is the tripwire.
 #
-# ---------------------------------------------------------------------------
-# DISABLED. The automatic triggers below are intentionally commented out; the
-# job runs only when dispatched by hand from the Actions tab. To turn it on,
-# uncomment the `push` / `pull_request` blocks. The script it runs is real and
-# passes today — run it locally any time with:
+# It fires on two kinds of change, because drift has two causes: editing the
+# skills, and moving the surface they describe. The second is the one that
+# rots documentation silently — a renamed CLI binary and a rewritten error
+# enum both landed with nothing pointing at the prose they invalidated.
 #
-#     .github/scripts/check-skills.sh
-# ---------------------------------------------------------------------------
+# Run it locally any time:  .github/scripts/check-skills.sh
 
 on:
+  push:
+    branches: ["**"]
+    paths:
+      - ".claude/skills/**"
+      - ".github/workflows/skills-check.yml"
+      - ".github/scripts/check-skills.sh"
+      - ".github/scripts/check-skill-enums.py"
+      # The skills document these surfaces; a change here can invalidate them.
+      # The core crate is in scope deliberately: every type the skills tabulate
+      # — RpcError, TokenError, StreamError, ChangeEvent, FoldErrorPolicy — is
+      # defined under `net/src`, not in the SDK, so narrowing to the SDK would
+      # have missed every defect this check was written to catch.
+      - "net/crates/net/src/**"
+      - "net/crates/net/sdk/src/**"
+      - "net/crates/net/cli/src/**"
+      - "net/crates/net/payments/src/**"
+      - "net/crates/net/bindings/*/src/**"
+  pull_request:
+    paths:
+      - ".claude/skills/**"
+      - ".github/workflows/skills-check.yml"
+      - ".github/scripts/check-skills.sh"
+      - ".github/scripts/check-skill-enums.py"
+      - "net/crates/net/src/**"
+      - "net/crates/net/sdk/src/**"
+      - "net/crates/net/cli/src/**"
+      - "net/crates/net/payments/src/**"
+      - "net/crates/net/bindings/*/src/**"
   workflow_dispatch:
-
-  # push:
-  #   branches: ["**"]
-  #   paths:
-  #     - ".claude/skills/**"
-  #     - ".github/workflows/skills-check.yml"
-  #     - ".github/scripts/check-skills.sh"
-  #     # The skills document these surfaces; a change here can invalidate them.
-  #     - "net/crates/net/sdk/src/**"
-  #     - "net/crates/net/cli/src/**"
-  #     - "net/crates/net/payments/src/**"
-  # pull_request:
-  #   paths:
-  #     - ".claude/skills/**"
-  #     - ".github/workflows/skills-check.yml"
-  #     - ".github/scripts/check-skills.sh"
-  #     - "net/crates/net/sdk/src/**"
-  #     - "net/crates/net/cli/src/**"
-  #     - "net/crates/net/payments/src/**"
 
 jobs:
   drift:
@@ -46,8 +53,9 @@ jobs:
       - uses: actions/checkout@v7
 
       # Frontmatter + description budget, cross-file links, cited repo paths,
-      # API-surface canaries, documented-symbol resolution, CLI verb names,
-      # and internal-plan leakage. No toolchain needed — grep and python3.
+      # API-surface canaries, documented-symbol resolution, enum-variant
+      # membership, CLI verb names, and internal-plan leakage. No toolchain
+      # needed — grep and python3, both already on the runner.
       - name: Check skills against the tree
         run: .github/scripts/check-skills.sh
 
@@ -68,6 +76,7 @@ jobs:
   # `skills-publish.yml` mirrors this directory to `ai-2070/net-claude-skill`
   # on every push to master, so the two cannot drift by construction.
   #
-  # Worth noting the ordering, though — that publish trigger is armed while
-  # this check is not, so drift currently reaches the public repo unchecked.
-  # Enabling the triggers above closes that gap.
+  # One caveat on ordering: this check and that publish both trigger on a push
+  # to master, and they race — GitHub does not sequence one workflow behind
+  # another. A red check does not hold back the mirror. Landing skill changes
+  # via PR is what actually gates them, since the check runs there first.
