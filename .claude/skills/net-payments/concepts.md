@@ -68,8 +68,8 @@ Five signed envelope types. Naming is disciplined: `net.pricing.*`,
 | `net.payment.verification@1` | **Net-native, no x402 equivalent.** Tiered, chained, immutable verification events. |
 | `net.billing.event@1` | **Net-native, no x402 equivalent.** The signed usage record. |
 
-`net.payment.dispute@1` is *reserved* — a flag-only lifecycle extension, no
-dispute semantics before P5.
+`net.payment.dispute@1` is *reserved* — a flag-only lifecycle extension; no
+dispute semantics ship today.
 
 There is **no intent object.** The client-signed x402 `PaymentPayload`
 travels inside the invocation envelope. See `object-model.md` for the fields

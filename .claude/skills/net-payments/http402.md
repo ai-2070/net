@@ -13,8 +13,8 @@ Source: `payments/src/flow/http402.rs`, feature `http-facilitator`.
 - **Outbound (shipped):** a Net agent pays an external x402 HTTP endpoint —
   parse the 402 demand, run spend policy + signer, retry with the payload.
 - **Inbound (deferred, demand-driven):** x402-speaking HTTP agents paying Net
-  *capabilities* would need an HTTP endpoint surface Net doesn't ship in P1.
-  The deferral is deliberate — the deferral is the deliverable.
+  *capabilities* would need an HTTP endpoint surface Net does not ship. The
+  deferral is deliberate — the deferral is the deliverable.
 
 ## The v2 HTTP transport is header-only
 

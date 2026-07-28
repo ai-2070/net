@@ -149,13 +149,13 @@ SDK, you've inverted the doctrine — the substrate stays clean.
 
 ## Out of scope for this skill (point elsewhere)
 
-- Refund / dispute *semantics* (P5) — the `net.payment.dispute@1` tag is
-  *reserved* only.
+- Refund / dispute *semantics* — the `net.payment.dispute@1` tag is
+  *reserved* only; no semantics ship today.
 - RFQ / dynamic pricing — waits on x402 v2 dynamic-pricing maturity; **we do
   not invent a parallel dynamic flow** (doctrine 1). No counter-offer object
   exists, and that absence is the rule.
-- Accounts / postpaid tabs / prepaid balances (Mode E, P3–P4) — bilateral,
-  provider-scoped; company-held credits only via licensed partners.
+- Accounts / postpaid tabs / prepaid balances — bilateral, provider-scoped,
+  and not shipped; company-held credits only via licensed partners.
 - Inbound HTTP 402 serving — deferred, demand-driven (`http402.md`).
 - The base mesh, nRPC, capabilities, MCP bridge mechanics — that's the
   `net-event-bus` skill's territory; this skill assumes it.

@@ -66,7 +66,7 @@ Verified against `net/crates/net/sdk/src/error.rs`. The full enum:
 | Variant | Meaning | Your action |
 |---|---|---|
 | `Shutdown` | Node was shut down before this call | Stop using the node. Don't retry. |
-| `Ingestion(String)` | Local ring buffer rejected the event for a reason that doesn't map to a more specific variant | Fallback / future-proof bucket. The structured causes (`Sampled`, `Unrouted`, `Backpressure`, `Shutdown`) are routed to their own variants via `From<IngestionError>` — pre-`bugfixes-8` everything came through here as a string and callers had to substring-match. |
+| `Ingestion(String)` | Local ring buffer rejected the event for a reason that doesn't map to a more specific variant | Fallback / future-proof bucket. The structured causes (`Sampled`, `Unrouted`, `Backpressure`, `Shutdown`) are routed to their own variants via `From<IngestionError>`. Older releases sent everything through here as a string and callers had to substring-match. |
 | `Sampled` | Event was deliberately dropped by a sampling / decimation policy | Retry is pointless. Producer should accept the drop or change the sampling rate. |
 | `Unrouted` | No routable shard for the event (typically a topology-transient state — concurrent scale-down or shard still provisioning) | Retry once topology stabilizes. Back-off-and-retry on `Backpressure` semantics is the wrong remediation. |
 | `Poll(String)` | Subscriber poll failed | Often transient. Caller decides retry policy. |
@@ -86,7 +86,7 @@ additions — `Sampled` and `Unrouted` — are exactly that case: they
 moved out of `Ingestion(String)` so callers can dispatch on the cause
 without substring-matching. Code that string-matched on
 `Ingestion(...)` for "no shards" or "sampled" silently stops matching
-on `bugfixes-8` and later.
+once those causes get their own variants.
 
 `pub type Result<T> = std::result::Result<T, SdkError>;` — most APIs return this.
 

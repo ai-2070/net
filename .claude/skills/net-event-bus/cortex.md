@@ -272,7 +272,7 @@ let db = NetDb::builder(Redex::new()).origin(origin_hash).with_tasks().with_memo
 - **For the underlying log mechanics** (retention, replication, tail subscription) — see `redex.md`. CortEX sits on top.
 - **For read-your-writes details** (WriteToken construction, `applied_through_seq` vs. `folded_through_seq`, FoldStopped semantics, non-blocking poll) — see `dataforts.md` § Read-your-writes.
 - **For custom adapter authoring** — point at `net/crates/net/src/adapter/net/cortex/tasks/` and `cortex/memories/` as templates. The `CortexAdapter::open` + `RedexFold<State>` pair is the contract.
-- **For NetDB cross-binding semantics** — see `net/README.md` § NetDB.
+- **For NetDB cross-binding semantics** — see `README.md` § NetDB.
 
 ## Further reading
 

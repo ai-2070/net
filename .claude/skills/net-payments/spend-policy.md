@@ -56,8 +56,8 @@ engine.configure(|defaults, per_capability| {
 
 - **Real networks deny by default.** A real network is spendable only when
   explicitly listed in `allowed_networks` *and* a signer + facilitator config
-  exist for it. This is the operator's explicit production consent — the P1
-  ladder's rung-1 requirement.
+  exist for it. This is the operator's explicit production consent, and it is
+  the first rung of the enablement ladder in `networks.md`.
 - **The mock network auto-allows only under `SpendProfile::DevTest` or the
   explicit `.with_unsafe_mock_auto_allow(true)` flag.** Demos must not train
   the policy path wrong. In `Production` without the unsafe flag, even mock
@@ -120,8 +120,8 @@ Per-agent and per-delegation-chain budgets ride the same engine. The
 inheritance rule is doctrine: **child budget ≤ parent's remaining, always** —
 spend rolls up the chain. Spending on credit is still spending; caller-side
 policy applies regardless of settlement mode. Per-subagent spend attribution
-via the delegation chain is the demo nobody else can do (P5 territory); the
-enforcement primitive is this engine.
+via the delegation chain is not wired up yet; the enforcement primitive is
+this engine.
 
 ## Why the store is locked, not a daemon (yet)
 

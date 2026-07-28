@@ -129,7 +129,7 @@ Things that will bite:
 | `11` | `net db`: query JSON failed to parse |
 | `12` | `net db`: predicate DSL (`--where` / `--filter`) failed to parse |
 | `13` | `net ice`: an operator signature failed cryptographic verification |
-| `14` | `net typegen diff --exit-code`: a BREAKING change was detected |
+| `14` | `net-mesh typegen diff --exit-code`: a BREAKING change was detected |
 
 Subcommands may also emit a JSON `{"error": …, "detail": …}` line to **stderr** alongside the human-readable message. **Scripts should parse the JSON line, not scrape the human text.**
 

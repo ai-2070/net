@@ -34,7 +34,7 @@ What to do: ask what they actually need durability for. If "survive a node resta
 
 **No consumer groups.** Each subscriber is independent. There is no "deliver each message to exactly one of N workers" semantics built in.
 
-What to do: if they want work-queue semantics, the publisher can implement it: maintain its own list of workers and pick one per emit. Or use a different abstraction entirely (a daemon group with deterministic identity — see `net/README.md` § Mikoshi). For most event-bus use cases, broadcast-to-all-subscribers is what they want anyway.
+What to do: if they want work-queue semantics, the publisher can implement it: maintain its own list of workers and pick one per emit. Or use a different abstraction entirely (a daemon group with deterministic identity — see `README.md` § Mikoshi). For most event-bus use cases, broadcast-to-all-subscribers is what they want anyway.
 
 ## "Where do I commit my offset?"
 
@@ -92,7 +92,7 @@ What to do: ask why they need global ordering — usually it's a workaround for 
 
 **Identity is built in.** Every node has an ed25519 keypair; that's the authentication. Channel-level auth uses signed permission tokens (see `concepts.md` § Identity, capabilities, and routing).
 
-What to do: for a basic trusted mesh, you don't configure anything — identity is automatic. For multi-tenant or untrusted scenarios, point at `net/README.md` § Security surface for permission tokens.
+What to do: for a basic trusted mesh, you don't configure anything — identity is automatic. For multi-tenant or untrusted scenarios, point at `README.md` § Security surface for permission tokens.
 
 ## "Where are my events stored?"
 

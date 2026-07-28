@@ -26,7 +26,7 @@ The bus is transient. RedEX is what you reach for when "I need to survive a node
 | "Tail this channel + apply each event into in-memory state" | `RedexFile::tail()` + a fold loop (or `CortEX` — see `cortex.md`) |
 | "Replay everything from offset N" | `RedexFile::read_range(N, end_seq)` |
 | "Fan out to multiple consumers locally" | Each consumer calls `tail()` independently — they're independent cursors |
-| "Need cross-node durability" | Pair with `ReplicationConfig` (see `net/README.md` § Replication) or use the Redis / JetStream adapter on the bus instead |
+| "Need cross-node durability" | Pair with `ReplicationConfig` (detailed below) or use the Redis / JetStream adapter on the bus instead |
 | "Need queryable state, not a log" | `cortex.md` — RedEX is the substrate for CortEX |
 
 ---
@@ -315,7 +315,7 @@ Per-channel introspection (current role, manual transition for recovery) is `Red
 - **The replication factor is a hard guarantee; individual replicas are best-effort under pressure**, falling back to their `UnderCapacity` policy when local storage saturates.
 - **Skip-ahead is heap-only.** When the leader trims past a replica's local tail, in-memory replicas can `skip_to(first_seq)` and retry; **persistent files reject `skip_to` with a typed error** and fall back to NACK + heartbeat-cycle recovery while the persistent-tier rebuild path is still in development.
 
-For the wire codec and the full election rules, see `net/README.md` § Replication and `src/adapter/net/redex/`.
+For the wire codec and the full election rules, read `net/crates/net/src/adapter/net/redex/`.
 
 ---
 

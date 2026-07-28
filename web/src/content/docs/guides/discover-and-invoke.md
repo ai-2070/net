@@ -142,5 +142,5 @@ and driving the loop — start there rather than assembling the handshake by han
 
 If your agent lives in an MCP host, you don't call `call_typed` directly — the
 host calls the `net_invoke_capability` meta-tool exposed by
-[`net mcp serve`](/docs/guides/expose-net-as-mcp), which performs the same nRPC
+[`net-mesh mcp serve`](/docs/guides/expose-net-as-mcp), which performs the same nRPC
 invocation under the hood, gated by the pin/consent flow.

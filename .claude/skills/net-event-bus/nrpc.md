@@ -565,7 +565,7 @@ True subprocess-based interop tests (Node caller → Rust server, Python caller 
 - **Cross-binding contract** — `net/crates/net/tests/cross_lang_nrpc/golden_vectors.json` (shared fixture), the three binding compat tests (paths above).
 - **Tool discovery + `tool.watch`** — `net/crates/net/sdk/src/tool.rs` (`list_tools` / `watch_tools` / `serve_tool_watch`), `net/crates/net/src/adapter/net/cortex/tool.rs` (`TOOL_WATCH_SERVICE`, `WatchToolsRequest`, `ToolWatchFrame`).
 - **Org-protected calls** — `net_sdk::mesh_rpc::OrgProofIntent` on `CallOptions` is the low-level seam under `mesh.org(..).call(..)`; use it when you need an exact provider, a specific grant, or an unusual proof TTL. See `org.md`.
-- **READMEs** — `net/crates/net/README.md` § nRPC (top-level concept + cross-binding spec); per-binding READMEs each have an `## nRPC` section with language-idiomatic examples.
+- **READMEs** — `README.md` § nRPC (top-level concept + cross-binding spec); per-binding READMEs each have an `## nRPC` section with language-idiomatic examples.
 
 ## Further reading
 

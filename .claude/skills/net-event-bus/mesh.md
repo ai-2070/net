@@ -5,7 +5,7 @@ This is the file that turns "memory transport works in tests" into "two hosts in
 - You need to pick PSK vs identity keypair, decide on bootstrap topology, or wire NAT traversal.
 - You're standing up a relay / coordinator node and need it to actually accept peers.
 
-What is **not** here: mesh internals (forwarder loops, capability-index TTLs, AEAD tag handling — read `net/crates/net/src/adapter/net/`), custom subprotocols (`net/README.md` § Subprotocols), token issuance for permissioned channels (`runtime.md` § Errors mentions `ChannelRejected`; the issuance path is `Identity::issue_token` — `net/crates/net/sdk/src/identity.rs`).
+What is **not** here: mesh internals (forwarder loops, capability-index TTLs, AEAD tag handling — read `net/crates/net/src/adapter/net/`), custom subprotocols (`README.md` § Infinite extensibility via subprotocols), token issuance for permissioned channels (`runtime.md` § Errors mentions `ChannelRejected`; the issuance path is `Identity::issue_token` — `net/crates/net/sdk/src/identity.rs`).
 
 For the shutdown lifecycle, see `runtime.md`. For per-language kwargs not covered here, see the SDK READMEs (`net/crates/net/sdk-ts/README.md`, `sdk-py/README.md`, `sdk/README.md`). If the user is migrating from a broker (Kafka, NATS, Redis Streams) and reaching for "where do I run the mesh server," start with `gotchas.md` — there is no server.
 
