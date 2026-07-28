@@ -2,7 +2,7 @@
 
 > Closing the gap between "the skills are structurally checked" and "the skills are
 > correct." [`.github/scripts/check-skills.sh`](../../../.github/scripts/check-skills.sh)
-> now gates nine classes of drift in CI, and `publish` is blocked behind it
+> gates nine classes of drift in CI, and `publish` is blocked behind it
 > ([`skills.yml`](../../../.github/workflows/skills.yml)). What it cannot see is the
 > content that matters most: whether the code compiles, whether the payments skill is
 > as accurate as the event-bus one, and whether the behavioural prose is true.
@@ -12,19 +12,27 @@
 
 ## Status
 
-**Not started.** The five gaps below are the residue of a four-pass audit of
-`.claude/skills/` (2026-07-28). Nothing here is blocking: the skills are in good
-shape and the structural check is green. This is the work that would let us claim
-they are *verified* rather than *checked*.
+**Revision 2 — not started.** Revision 1 was reviewed and held. Every finding was
+verified against the tree and is incorporated below; the three that changed the
+shape of the plan were:
 
-Prerequisites: none. Each gap is independent and shippable on its own.
+- **The gate did not gate.** R1 listed "blocking the publish mirror on anything
+  new" as a non-goal, which contradicts the plan's purpose: `publish` needs only
+  `drift`, so a red `examples` job would mirror a broken hello-world in the same
+  run that proved it broken. Now Phase 0, and the non-goal is restated correctly.
+- **The triggers miss most of what the skills document.** Measured: **36 of 66**
+  cited-and-tracked source paths fall outside the workflow's path globs. Gap 4
+  could have been implemented in full and still never run on the changes it
+  targets. Now Phase 0.
+- **Several "done when" conditions claimed more than the machinery delivers.**
+  Compile-checking is not execution; a resolving test name is not proof; a
+  finished audit with no artifact is indistinguishable from a skim. Acceptance
+  criteria are now split by what each mechanism actually proves.
 
-Activation gate: gaps 1 and 3 are worth doing now — they are small and they cover
-the two highest-exposure surfaces (the first command a user runs, and the skill
-with the least scrutiny). Gaps 2, 4, and 5 are worth doing when the skills next
-take a large edit, since their value is proportional to churn.
+Prerequisites: Phase 0 gates everything else. Phases 1–5 are independently
+shippable after it.
 
-## Context — why these five
+## Context — why this work
 
 Four audit passes over the skills found 16 defects. The rate did not decline:
 
@@ -43,8 +51,8 @@ from "cache full." That metric does not exist — rejections are one counter wit
 `BandwidthExhausted` bumps the `capacity` reason
 ([`greedy/runtime.rs:136`](../../../net/crates/net/src/adapter/net/dataforts/greedy/runtime.rs)).
 
-That is the shape of what remains. Name-checking is a floor. The five gaps below
-are ordered by how much of the un-floored space each one covers.
+Name-checking is a floor. The phases below are ordered by how much of the
+un-floored space each one covers, after first making the floor actually load-bearing.
 
 The corpus, for sizing:
 
@@ -58,59 +66,308 @@ remaining 273 fences are output, wire dumps, and diagrams).
 
 ---
 
-## 1. The `examples/` never build — **Priority 1, S**
+## Phase 0 — make the gate load-bearing — **Priority 0, S**
+
+Prerequisite for every other phase. Neither item is a "nice to have": without
+them, later phases can be fully implemented and still fail to run, or run and
+fail to block.
+
+### 0a. Publication must fail closed on content checks
+
+**Surface:** [`skills.yml`](../../../.github/workflows/skills.yml), `publish.needs`.
+
+**Gap:** `publish` declares `needs: drift` only. Any job added by Phases 1–4 is
+advisory by default — it can go red while the same workflow run mirrors the
+invalid skill to `ai-2070/net-claude-skill`. This is sharpest for Phase 1, whose
+own justification is that the examples are the highest-exposure content in either
+skill.
+
+**Work:** every job that verifies content the mirror carries joins `publish.needs`:
+
+```yaml
+publish:
+  needs: [drift, examples, snippets]
+```
+
+**Policy, stated so later phases inherit it:** a job that verifies published
+content blocks publication. A job may be slow, or PR-only, or manually
+dispatched — but a *known-red* verification of the artifact must never publish
+that artifact. Where a check is too slow to run per-branch, run it PR-only and
+have the master publish depend on the PR having passed, rather than dropping the
+dependency.
+
+**Done when:** deleting a symbol referenced by a marked snippet makes `publish`
+skip, demonstrated on a scratch branch.
+
+### 0b. Trigger paths must cover the documented surface
+
+**Surface:** the `push` and `pull_request` `paths:` lists in `skills.yml`.
+
+**Gap:** measured against the paths the skills actually cite, **36 of 66
+cited-and-tracked source paths are unwatched**. The current list reaches
+`net/crates/net/{src,sdk/src,cli/src,payments/src}` and `bindings/*/src/**`, and
+misses:
+
+| Unwatched surface | Tracked files | Why it matters |
+|---|---|---|
+| `go/**` | 71 | The whole Go binding; `apis.md`, `nrpc.md`, `capabilities.md` document it |
+| `net/crates/net/sdk-ts/**` | 50 | The TypeScript SDK; `apis.md` templates target it |
+| `net/crates/net/sdk-py/**` | 52 | The Python SDK; ditto |
+| `net/crates/net/bindings/node/*.ts` | 81 (dir) | `bindings/*/src/**` misses these — they sit at the package root |
+| `net/crates/net/bindings/python/python/**` | 6 | The public Python wrapper surface |
+| `net/crates/net/include/**` | 11 | The C API; `hello.c` and `apis.md` depend on it |
+| `net/crates/net/adapters/mcp/**` | — | `mcp.md` cites `serve/gated.rs` directly |
+
+The `bindings/node/*.ts` case is the clearest demonstration: two commits before
+this plan was written, `nrpc.md` was corrected to cite `bindings/node/mesh_rpc.ts`
+and `errors.ts` instead of their gitignored `.js` build output — and the workflow
+does not watch either file.
+
+**Work:** replace the partial subdirectory list with correct broad roots.
+
+```yaml
+- "go/**"
+- "net/crates/net/src/**"
+- "net/crates/net/sdk/**"
+- "net/crates/net/sdk-ts/**"
+- "net/crates/net/sdk-py/**"
+- "net/crates/net/cli/**"
+- "net/crates/net/payments/**"
+- "net/crates/net/bindings/**"
+- "net/crates/net/adapters/**"
+- "net/crates/net/include/**"
+```
+
+Plus the manifests where dependency or API resolution can shift without a source
+edit: `Cargo.lock`, `go/go.mod`, `net/crates/net/sdk-ts/package.json`,
+`net/crates/net/sdk-py/pyproject.toml`, and the binding package manifests.
+
+Broad roots over another brittle partial list — the check is ~13s and a
+false-positive run costs nothing, while a missed run costs a published defect.
+
+**Done when:** a script asserts every path cited by the skills falls under at
+least one trigger glob, and it runs inside `check-skills.sh` so the two lists
+cannot drift apart. (This is itself a tenth check class, and the cheapest one in
+the plan.)
+
+### 0c. Correct the stale examples-job sketch
+
+The commented `examples:` block in `skills.yml` references
+`cargo build -p net-sdk --example hello`, which will not work — see Phase 1. Fix
+or delete it when Phase 1 lands so nobody implements the sketch.
+
+**Why S:** three edits and one assertion script. Half a day.
+
+---
+
+## Phase 1 — the `examples/` never build — **Priority 1, M**
 
 **Surface:** `.claude/skills/net-event-bus/examples/{hello.rs,hello.ts,hello.py,hello.go,hello.c}`
 plus its `README.md`.
 
 **Gap:** the README presents these as "the first thing a developer runs after
-`npm install` / `pip install` / `cargo add` — before they write any application
-code," and gives an exact run command per language. Nothing compiles or runs any
-of them. They are the highest-exposure content in either skill — a broken
-hello-world is the worst possible first contact — and the only content with a
-documented, mechanical success criterion ("each prints exactly one line").
+`npm install` / `pip install` / `cargo add`," and gives an exact command per
+language. Nothing compiles or runs any of them.
 
-**Work:**
-- Add an `examples` job to [`skills.yml`](../../../.github/workflows/skills.yml).
-  The sketch is already in that file, commented, with a note on what each needs.
-- Rust: the file is written to be dropped into a crate's `examples/` dir. Either
-  copy it into a scratch crate that depends on `net-sdk` at the workspace version,
-  or move it under `net/crates/net/sdk/examples/` and let `cargo build --examples`
-  cover it — the latter is less machinery and makes it a first-class example.
-- Go: `go build -o /dev/null` against the `go/` module.
-- TS: `tsc --noEmit` against `@net-mesh/sdk` types; a full `npx tsx` run needs the
-  napi artifact, so type-check first and consider running only on release builds.
-- Python: `python -m py_compile` as a floor; a real run needs the built wheel.
-- C: `gcc -fsyntax-only -I net/crates/net/include` as a floor; linking needs the
-  cdylib.
+### The two acceptance levels, kept distinct
 
-**Decision to make:** type-check/compile-only for all five (cheap, no artifacts,
-runs on every PR) versus actually executing them (proves the "one line" claim,
-but needs built bindings and therefore belongs in a release workflow). Recommend
-compile-only in `skills.yml` now, and a follow-up execution job wired into the
-existing release pipelines where the artifacts already exist.
+R1 conflated these. Compile-checking and executing prove different things and
+must not share a "done" condition.
 
-**Done when:** every file in `examples/` is compiled or type-checked by CI, and
-the run commands in `examples/README.md` are the same ones CI uses.
+**Level 1 — PR compile floor.** Runs on every PR, gates `publish`.
 
-**Why S:** five short files, no fixtures, and the job is already drafted.
+| Lang | Command | Proves |
+|---|---|---|
+| Rust | `cargo build` in a generated scratch crate | compiles against the workspace SDK |
+| Go | `go build -o /dev/null` in the `go/` module | compiles against the current module |
+| TS | `tsc --noEmit` with a generated `tsconfig` | type-checks against the current package surface |
+| Python | type-check against the installed/stubbed package | members and signatures resolve |
+| C | `gcc -fsyntax-only -I net/crates/net/include` | compiles against the current public headers |
+
+**`python -m py_compile` is not acceptable as the Python floor.** It proves
+syntax and nothing else — not that `net_sdk` imports, that referenced members
+exist, that signatures match, or that the example reaches the SDK at all. Use a
+type checker against the local package or its stubs. `py_compile` may stay as a
+cheap precheck, never as the acceptance proof.
+
+**Level 2 — release execution proof.** Runs where built artifacts already exist
+(the `release-*` workflows), not on every PR.
+
+- Execute the exact command printed in `examples/README.md`.
+- Assert exit 0, **exactly one line** of output, and that the emitted payload
+  round-trips to the expected value.
+
+Until Level 2 exists, the honest claim is "compile-checked," not "verified
+runnable," and the README should say so.
+
+### The Rust harness — decided, not offered
+
+R1 offered two options. Choosing: **keep the canonical `hello.rs` in the skill**
+and generate a scratch crate at `target/skill-examples/rust/` that pulls it in,
+depending on `net-sdk` by exact workspace path, building only that example.
+
+Moving it under `net/crates/net/sdk/examples/` was the other candidate and is
+rejected: it would either remove the file from the published skill or duplicate
+it, and `cargo build --examples` would silently widen the job to every unrelated
+SDK example. The scratch crate proves the exact file users receive.
+
+### Harness detail each language needs before implementation
+
+"Against the package" is not specific enough to implement. Each needs:
+
+- **TS** — generated `tsconfig.json`, module resolution mode, and whether it
+  resolves `@net-mesh/sdk` via workspace link or built `.d.ts`.
+- **Go** — module vs workspace context, and whether the example compiles against
+  `go/` in-tree or a published module path.
+- **Python** — package install (editable) vs stub-only resolution, and which type
+  checker.
+- **C** — feature defines, header include path, and whether the floor is
+  syntax-only or a real link against the cdylib.
+
+**Done when:** Level 1 covers all five languages, `publish` needs the job, and
+`examples/README.md` distinguishes "CI compiles this" from "CI runs this." Level 2
+is tracked as a separate item with its own done condition.
+
+**Why M, not S:** five toolchains, five harnesses, and the Python floor is a real
+piece of work rather than a one-liner.
 
 ---
 
-## 2. Snippets are not compiled — **Priority 2, L**
+## Phase 2 — payments verification, as signed audit slices — **Priority 1, L**
 
-**Surface:** 187 language-tagged fenced blocks across both skills.
+**Surface:** `.claude/skills/net-payments/` — 17 files, 3,201 lines.
 
-**Gap:** the checker validates *names* — that a symbol, variant, or identifier
-exists — never a signature, arity, or type. The three signature errors found by
-hand in pass 2 (`RpcAppError`, `BlobRef::MAX_SIZE`,
-`RedexFileConfig::with_blob_max_size`) were all name-shaped and would now be
+**Gap:** passes 1–4 were weighted heavily toward `net-event-bus`. Verified in
+payments: three constructor signatures (`PricingTerms::new`,
+`InProcessProvider::new`, `serve_payments`), the Rust/Python/Node/Go parity
+claims, `payment_gate`'s non-existence, the failure-schematic scope, and the
+plan-vocabulary sweep. **Not** verified: the five envelope field tables in
+`object-model.md`, `x402.md`'s byte-preservation claims, the tier transitions in
+`verification.md`, the whole of `signer.md`, `spend-policy.md`'s decision matrix,
+and `networks.md`'s ladder.
+
+### Split into three independently-signable slices
+
+R1 estimated gap 1 and this "a day between them," which was wrong and would have
+pressured the implementer into exactly the name-checking pass this plan exists to
+replace. No time estimate is given here; the slices are the unit of progress.
+
+**2a — the signer boundary.** The sharpest surface: `signer.md` documents a
+security invariant ("keys never cross the boundary"), and a wrong claim there is
+worse than a wrong claim about a metric. Comparing method names does not prove
+it. The audit must trace:
+
+- public binding signatures across Rust, Python, and Node;
+- request/intent serializers — what actually goes on the wire;
+- error and `Debug`/`Display` paths, which are a classic leak;
+- callback payloads and FFI structures;
+- whether any raw-key representation is *constructible* or *returnable* at all;
+- the exact contents of each signing intent (`SvmTransferIntent`,
+  `XrplPaymentIntent`, the EIP-3009 authoring path).
+
+**2a requires an independent reviewer** — not the person who wrote the audit.
+
+**2b — object model and verification state machine.** `object-model.md`'s five
+envelope tables field-by-field against `payments/src/core/`, including optionality
+and types; `verification.md`'s tier transitions and reorg handling against
+`payments/src/checker/` and `core/verification.rs`.
+
+**2c — remaining surfaces.** `spend-policy.md`, `x402.md`, `networks.md`,
+`facilitator.md`, `billing.md`, `http402.md`, `caller.md`, `provider.md`,
+`bindings.md`, `testing.md`.
+
+The crate maps almost 1:1 onto the skill's files (`engine/`, `flow/`,
+`facilitator/`, `core/`, `x402/`, `policy/`, `checker/`, `billing/` all exist),
+which is what makes slicing clean.
+
+### Durable evidence, not a transient audit
+
+R1's done condition — "diffed against source and the findings fixed" — leaves no
+artifact. Six months on, nobody can distinguish a source-pinned field-by-field
+review from someone reading it and saying it looked fine.
+
+Each slice writes a ledger at `docs/internal/audits/SKILLS_PAYMENTS_<slice>_<YYYY-MM>.md`,
+one row per claim:
+
+| Field | Meaning |
+|---|---|
+| Claim | The specific assertion, quoted from the skill |
+| Authoritative source | Exact module/file — the thing that decides |
+| Source SHA | The commit audited, so staleness is computable |
+| Method | field-by-field \| boundary trace \| transition review |
+| Result | pass \| fail |
+| Finding / fix | Commit that fixed it, or "no change needed" |
+
+Anything mechanical that falls out feeds back into `check-skill-refs.py`.
+
+**Done when:** all three slices have a ledger pinned at a source SHA, 2a carries
+an independent reviewer's sign-off, findings are fixed, and the check is green.
+
+---
+
+## Phase 3 — non-Rust structural membership — **Priority 2, M**
+
+**Surface:** `check-skill-refs.py` — `read_sources()` brace-matches `pub enum` for
+`.rs` only. `.ts`, `.py`, and `.go` feed the identifier corpus but get no
+structural check.
+
+**Gap:** the enum-variant check caught the worst defect in the skills (four
+invented `RpcError` variants plus a one-letter misspelling that would not
+compile). There is no equivalent for a TS union, a Python enum, or a Go const
+block — and the skills document all three.
+
+### The blocker R1 missed: documentation must claim ownership
+
+Parsing `export type State = "ready" | "failed"` tells the checker what exists.
+It does not tell it that a backticked `` `'ready'` `` in a Markdown table claims
+membership in `State`. Rust works today only because the reference names its
+owner: `RpcError::NoRoute`.
+
+Measured across the skills:
+
+| Reference shape | Count | Checkable today |
+|---|---|---|
+| `Owner::Member` (Rust-style) | 229 | yes |
+| `Owner.member` (dotted) | 48 | ambiguous — member or method call |
+| Bare quoted literal (`'reliable'`, `'fire_and_forget'`) | 18 | **no owner named** |
+
+Without a convention, a checker can confirm `'reliable'` appears somewhere in the
+TS corpus and learn nothing about whether it is a valid `Reliability` value.
+
+**Work, in order:**
+
+1. Inventory the reference shapes actually used (the table above is the start).
+2. Choose a qualified citation convention and apply it: `State.ready` for TS,
+   `State.READY` for Python, `StateReady` bound to an identified const block for
+   Go, `Type.field` for struct fields.
+3. Define exactly which source shapes each parser supports — TS string-literal
+   unions and `as const` objects; Python `Enum`/`StrEnum` and dataclass fields;
+   Go `const (...)` blocks and exported struct fields.
+4. Add positive and negative fixtures per language.
+5. Fault-inject **wrong-owner membership**, not merely a globally-absent name. A
+   name existing somewhere in the corpus must not satisfy membership in the wrong
+   type — that is the whole point of the check.
+
+Output shape matches the Rust check ("X is not a member of Y — actual: ..."),
+since that message is what made the Rust findings actionable.
+
+**Done when:** a documented-but-nonexistent TS union member, Python enum member,
+and Go const each fail; and a *real* member cited against the *wrong* type also
+fails.
+
+---
+
+## Phase 4 — opt-in snippet compilation — **Priority 2, L**
+
+**Surface:** 187 language-tagged fenced blocks.
+
+**Gap:** the checker validates names, never a signature, arity, or type. The
+signature errors found by hand in pass 2 were all name-shaped and would now be
 caught; a wrong *argument order* still would not be.
 
-**The reason this is L, not M:** most snippets are fragments. Measured over the
-corpus:
+**Why L:** most snippets are fragments.
 
-| Lang | Blocks | With imports | Contains elision (`…`, `...`) |
+| Lang | Blocks | With imports | Contains elision |
 |---|---|---|---|
 | rust | 113 | 37 | 20 |
 | python | 31 | 19 | 5 |
@@ -118,171 +375,157 @@ corpus:
 | go | 9 | 4 | 7 |
 | c | 4 | 3 | 1 |
 
-Only about a third are self-contained. Wholesale extraction would produce a wall
-of failures that says nothing about correctness, and rewriting 187 blocks to be
-standalone would bloat the skills and hurt the reader.
+About a third are self-contained. Wholesale extraction produces a wall of
+failures that says nothing; rewriting 187 blocks to stand alone would bloat the
+skills and hurt the reader.
 
-**Work:** opt-in, incremental, in the rustdoc spirit.
-- Add a marker the extractor honours — an info-string suffix (` ```rust,check`)
-  or a preceding `<!-- check -->` comment. Unmarked blocks are skipped and
-  counted, so the report reads "41/113 rust blocks checked" rather than implying
-  full coverage (the `no silent caps` rule).
-- Extractor writes each marked block into a generated crate/package per language
-  under `target/skill-snippets/`, with a per-language preamble file supplying the
-  common imports.
-- Start by marking the blocks that already have imports and no elision — roughly
-  30 rust, 15 python, 10 ts. Ratchet from there.
-- Wire into `check-skills.sh` behind a flag (`--snippets`) so the fast path stays
-  ~13s, and run the slow path as a separate CI job.
+### Marker grammar — decided
 
-**Done when:** the marked subset compiles in CI, the skipped count is printed, and
-the marker is documented in `.claude/skills/README.md` so new snippets opt in.
+R1 offered ```` ```rust,check ```` or an HTML comment. Choosing the **HTML
+comment**: an info string of `rust,check` is treated as a literal language name
+by several renderers and loses Rust highlighting in the published skill.
 
-**Why L:** a per-language extractor plus preamble, five toolchains, and a
-first-pass marking sweep. The ratchet is what makes it tractable.
+```
+<!-- skill-check: compile -->
+```
 
----
+Rules: exactly one marker per fence, immediately adjacent; a malformed or
+orphaned marker is an **error**, not a silent skip. Reserve room to extend
+deliberately — `no-run`, `compile-fail`, `ignore reason="fragment"` — but ship
+`compile` alone first.
 
-## 3. `net-payments` has had a third the scrutiny — **Priority 1, M**
+### Preamble discipline
 
-**Surface:** `.claude/skills/net-payments/` — 17 files, 3,201 lines.
+A generated preamble supplying common imports is necessary and dangerous: a
+snippet can compile only because the harness imported something the skill never
+tells the reader to import, and then the job proves the harness rather than the
+documentation. Constraints:
 
-**Gap:** passes 1–4 were weighted heavily toward `net-event-bus`. What was
-actually verified in payments: three constructor signatures
-(`PricingTerms::new`, `InProcessProvider::new`, `serve_payments`), the
-Rust/Python/Node/Go parity claims, the `payment_gate` non-existence, the
-failure-schematic scope, and the plan-vocabulary sweep. What was **not**: the
-five envelope field tables in `object-model.md`, the `x402.md` byte-preservation
-claims, the tier-transition rules in `verification.md`, the whole of
-`signer.md` (242 lines of key-handling invariants), `spend-policy.md`'s decision
-matrix, and the network ladder in `networks.md`.
+- one checked-in preamble per language, reviewed as source;
+- imports and harness scaffolding only — **no helper behaviour**;
+- no preamble may define a symbol the public SDK is supposed to provide;
+- each marked snippet declares which preamble it expects;
+- preamble content is printed in CI diagnostics on failure.
 
-Nothing suggests it is worse than the event-bus skill was — but the event-bus
-skill turned out to have 16 defects, and this one has not been looked at the same
-way. `signer.md` is the sharpest: it documents a security boundary ("keys never
-cross"), and a wrong claim there is worse than a wrong claim about a metric.
+### Rollout
 
-**Work:** a pass at the depth applied to `net-event-bus`, in this order:
-1. `signer.md` — every `SchemeSigner` / `ExternalSigner` / `ExternalSvmSigner` /
-   `ExternalXrplSigner` method against `payments/src/`, and the no-raw-signing
-   invariant against the actual trait definition.
-2. `object-model.md` — the five envelope field tables against
-   `payments/src/core/`, field by field, including optionality and types.
-3. `verification.md` — tier transitions and reorg handling against
-   `payments/src/checker/` and `core/verification.rs`.
-4. `spend-policy.md`, `x402.md`, `networks.md`, `facilitator.md`.
-5. Feed anything mechanical back into `check-skill-refs.py`.
+- Extractor writes marked blocks into generated packages under
+  `target/skill-snippets/<lang>/`.
+- Mark the already-self-contained blocks first (~30 rust, ~15 python, ~10 ts),
+  then ratchet.
+- Report `checked/skipped` totals explicitly — "41/113 rust blocks checked" —
+  never a bare pass that implies full coverage.
+- Runs as its own job, not inside the ~13s `drift` path, and per Phase 0a it
+  joins `publish.needs`.
 
-**Done when:** each file above has been diffed against its source module and the
-findings fixed; the check stays green.
-
-**Why M:** ~3,200 lines against a crate that is already well-organised
-(`engine/`, `flow/`, `facilitator/`, `core/`, `x402/`, `policy/`, `checker/`,
-`billing/` map almost 1:1 onto the skill's files).
+**Done when:** the marked subset compiles in CI, totals are printed, orphaned
+markers fail, the marker is documented in `.claude/skills/README.md`, and a red
+snippet job blocks the mirror.
 
 ---
 
-## 4. Non-Rust surfaces get name-checks only — **Priority 2, M**
+## Phase 5 — behavioural claims traced to tests — **Priority 3, L**
 
-**Surface:** `check-skill-refs.py` — `read_sources()` brace-matches `pub enum`
-for `.rs` only; `.ts`, `.py`, and `.go` contribute to the identifier corpus but
-get no structural checking.
+**Surface:** the prose — the highest-value content in the skills and the only
+kind no mechanical check can evaluate.
 
-**Gap:** the enum-variant check is what caught the worst defect in the skills
-(four invented `RpcError` variants plus a one-letter misspelling that would not
-compile). There is no equivalent for a TS union type, a Python enum or dataclass
-field, or a Go const block — and the skills document all three. `bindings.md`,
-`apis.md`, and the per-language sections in `nrpc.md` are the exposure.
+**Gap:** pass 4 showed the ceiling directly. A name check would now catch the
+wrong metric name, but the *advice* attached to it was independently wrong, and
+only reading `runtime.rs` revealed that.
 
-**Work:**
-- TS: parse `export type X = 'a' | 'b'` and `export enum` / `as const` objects
-  from `sdk-ts/src/**` and `bindings/node/*.ts`; check documented members.
-- Python: parse `class X(Enum)` / `StrEnum` members and dataclass fields from
-  `sdk-py/src/net_sdk/**` and `bindings/python/python/**`.
-- Go: parse `const (...)` blocks and exported struct fields from `go/`.
-- Same output shape as the Rust check — "X is not a member of Y — actual: ..." —
-  since that message is what made the Rust findings actionable.
+### Proof tiers — because a resolving test name proves nothing
 
-**Done when:** a documented-but-nonexistent TS union member, Python enum member,
-and Go const each fail the check under fault injection.
+R1 said claims should point at "the test that proves it," but a name check
+establishes only that a test with that name exists. A vacuous test, a stale name,
+or an assertion on the wrong transition all pass. Tiers:
 
-**Why M:** three lightweight parsers. Regex is adequate — the goal is a tripwire,
-not a type checker — but each language needs its own shape.
+| Tier | Establishes |
+|---|---|
+| `exists` | the named test resolves |
+| `ci` | the test is selected by a required CI gate (reuse `integration-guard`'s pin logic in [`ci.yml`](../../../.github/workflows/ci.yml)) |
+| `reviewed` | a reviewer confirmed its assertions cover the cited claim |
+| `mutation` | a claim-negating mutation kills the test |
 
----
+### First-wave claims — named, not "top ~20"
 
-## 5. Behavioural claims are unverifiable by grep — **Priority 3, L**
+R1's "top ~20" would have let the implementer pick the twenty easiest to
+annotate. The first wave is exactly these, with required tier:
 
-**Surface:** the prose. "Cluster-cap eviction withdraws chain announcements
-inline." "After a conflicted heal the losing side's writes survive as a fork, not
-a merge." "A missing path and an empty `$and` both match nothing." The failure
-tables in `redex.md`, the partition phases in `runtime.md`, the ordering
-guarantees throughout.
+| Claim | Skill file | Tier |
+|---|---|---|
+| After a conflicted heal the losing side's writes survive as a fork, not a merge | `runtime.md` | mutation |
+| A facilitator receipt is `observed` only; `confirmed(n)`/`final` come solely from `ChainChecker` | `verification.md` | mutation |
+| Keys never cross the signer boundary | `signer.md` | mutation |
+| A missing path and an empty `$and`/`$or` both match nothing | `filter-dsl.md` | mutation |
+| Cluster-cap eviction withdraws the `causal:` announcement inline | `dataforts.md` | mutation |
+| Capability filters are advisory; `require_token` + `token_roots` is the only real boundary | `mesh.md` | mutation |
+| `match_islands` is advisory and holds nothing; only the CAS commits | `scheduler.md` | reviewed |
+| Backpressure is silent under `drop_*`; visible only via `events_dropped` | `concepts.md` | reviewed |
+| Replication `UnderCapacity` / `SyncNack` retry behaviour | `redex.md` | reviewed |
+| Consent runs before payment; no configured flow fails closed | `provider.md` | reviewed |
 
-**Gap:** this is the most valuable content in the skills — it is the reason an
-agent writes correct code instead of plausible code — and no mechanical check can
-touch it. Pass 4 demonstrated the ceiling directly: a name check would now catch
-the wrong metric name, but the *advice* attached to it was independently wrong,
-and only reading `runtime.rs` revealed that.
+### Mechanism
 
-**Work:** the only mechanism that scales is to make a claim point at the test that
-proves it.
-- Introduce a claim reference convention: an inline marker naming the test that
-  pins the behaviour, e.g. `(pinned: tests/redex_replication.rs::under_capacity_retries)`.
-- Extend the check to verify each referenced test **exists** and, where the
-  harness allows, that it is pinned to a CI step — reusing the
-  `integration-guard` logic already in [`ci.yml`](../../../.github/workflows/ci.yml).
-- Apply it to the highest-consequence claims first: partition/fork semantics
-  (`runtime.md`), replication failure modes (`redex.md`), filter-DSL empty-match
-  semantics (`filter-dsl.md`), and the payment tier transitions
-  (`verification.md`). A claim with no test to point at is itself a finding —
-  either the behaviour is untested, or the claim is speculative.
-- Explicitly **do not** attempt to check the prose itself. The deliverable is
-  traceability, not NLP.
+A hidden marker, not visible parenthetical prose — this ships publicly and the
+reader should not see audit scaffolding:
 
-**Done when:** the top ~20 behavioural claims carry a test reference, the check
-validates those references resolve, and any claim that could not be pinned is
-recorded here as a testing gap.
+```
+<!-- net-claim: redex-conflicted-heal
+     test: net/crates/net/tests/<file>.rs::<test>
+     proof: mutation -->
+```
 
-**Why L:** the marking is a judgement call per claim, and some claims will turn
-out to have no test behind them — which is the point, and which turns this into
-crate work rather than docs work.
+The checker rejects duplicate claim IDs and unresolved tests, and verifies the
+declared tier is satisfied as far as it can (resolution and CI selection
+mechanically; `reviewed` and `mutation` by requiring a ledger entry).
+
+**A claim with no test to point at is itself a finding** — either the behaviour is
+untested, or the claim is speculative. Both outcomes are useful, and the first
+turns part of this phase into crate work rather than docs work.
+
+**Done when:** every first-wave claim carries a marker at its required tier,
+unresolvable references fail the check, and claims that could not be pinned are
+recorded here as crate testing gaps.
 
 ---
 
 ## Sequencing
 
 ```
-1 (examples)  ──┐
-3 (payments)  ──┼── independent, do first, small + high exposure
-                │
-4 (non-Rust)  ──┘   feeds the same script as 3's mechanical findings
-                    │
-2 (snippets)  ──────┴── largest; benefits from 4's parsers
-                        │
-5 (claims)    ──────────┴── last; partly crate work, not docs work
+Phase 0  fix the gate            ── prerequisite for everything
+   │
+   ├── Phase 1  examples          ── highest exposure; needs 0a to block publish
+   ├── Phase 2  payments audit    ── largest unaudited surface; 2a needs a reviewer
+   │
+   └── Phase 3  non-Rust members  ── needs 0b to trigger at all
+          │
+          └── Phase 4  snippets   ── reuses Phase 3's parsers
+                 │
+                 └── Phase 5  claims ── partly crate work
 ```
 
-Gaps 1 and 3 are a day between them. Gap 4 is a natural follow-on because
-payments' mechanical findings want somewhere to live. Gaps 2 and 5 are the
-long tail and should be ratcheted, never big-banged.
+Phase 0 first, always — it is half a day and without it Phases 1–4 are advisory.
+Phases 1 and 2 are independent and can run in parallel. Phase 3 must not start
+before 0b, or it will be tested only by paths that never fire.
 
 ## Non-goals
 
+- **Expensive execution inside the fast `drift` job.** The ~13s structural path
+  stays fast. This is the *correct* form of R1's non-goal — it is about job
+  placement, not about whether verification blocks publication. Per Phase 0a, a
+  red content check always blocks the mirror.
 - **Rewriting snippets to be standalone.** It would bloat the skills and hurt the
-  reader. The opt-in marker exists precisely to avoid this.
-- **Checking prose with a model.** Gap 5 buys traceability to tests, not
+  reader. The opt-in marker exists to avoid exactly this.
+- **Checking prose with a model.** Phase 5 buys traceability to tests, not
   semantic verification.
-- **Extending any of this to the docs site.** `web/` has its own link checker and
+- **Extending this to the docs site.** `web/` has its own link checker and
   `doc_link_guard` covers the crate's docs; this plan is scoped to
   `.claude/skills/`.
-- **Blocking the publish mirror on anything new.** `publish` already needs
-  `drift`; slow jobs (gap 2's snippet compile) should stay off that path.
 
 ## Appendix — what the current check already covers
 
-`check-skills.sh`, ~13s, no toolchain. Nine classes, reported as eight
-sections (enum variants and identifiers share one pass over the tree):
+`check-skills.sh`, ~13s, no toolchain. Nine classes, reported as eight sections
+(enum variants and identifiers share one pass over the tree):
 
 | Class | Catches |
 |---|---|
@@ -296,4 +539,20 @@ sections (enum variants and identifiers share one pass over the tree):
 | CLI verbs | bare `net <verb>` when the binary is `net-mesh` |
 | Plan leakage | roadmap vocabulary (`P0`, `Mode E`, internal branch names) in a publicly-shipped skill |
 
-Every class has been fault-injected. The gaps above are what it still cannot see.
+Every class has been fault-injected. Phase 0b adds a tenth: trigger-path coverage
+of every cited source path.
+
+## What each mechanism proves, and does not
+
+Stated explicitly, because R1's acceptance criteria overclaimed.
+
+| Mechanism | Proves | Does not prove |
+|---|---|---|
+| `check-skills.sh` | names, paths, variants, identifiers resolve | signatures, arity, semantics |
+| Phase 1 Level 1 | examples compile against current surfaces | that they run, or print what the README says |
+| Phase 1 Level 2 | exact README command exits 0 with one correct line | anything about other snippets |
+| Phase 2 ledger | a human checked these claims at a named SHA | that they stay true after that SHA |
+| Phase 3 | a documented member belongs to the type it is cited under | that the member behaves as described |
+| Phase 4 | marked snippets compile with a reviewed preamble | unmarked snippets, or runtime behaviour |
+| Phase 5 `exists`/`ci` | a named test resolves and is gated | that its assertions cover the claim |
+| Phase 5 `mutation` | negating the claim breaks a test | claims not in the first wave |
