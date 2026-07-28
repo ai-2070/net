@@ -627,6 +627,33 @@ is the §19 defect class this process has already caught once.
 
 ## 16. 2B.3c-pre — the authorized slice
 
+### 16.0 Progress
+
+| Items | Status | Head |
+|---|---|---|
+| **1–3** — non-aliasing installation identity | **SIGNED** 2026-07-28 | `OLB_2B3C_PRE_STEP1_SIGNED_HEAD = 300e80f6c` |
+| 4–9, 12–14 — scope stamp + Grant source service | not started | — |
+| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | not started | — |
+
+Step 1's corrective lineage, kept because each turn found a distinct defect class
+and the sequence is the useful record:
+
+```text
+10381c4ad  identity substrate: checked, terminal, idempotence before allocation
+7c91c243d  settle CAPACITY before allocation too — every ordinary refusal, not
+           just the one I had been shown
+d50da4b48  type-bind the prepared candidate (debug_assert is not a release
+           guarantee); make publication observable (a pointer check cannot see a
+           transient publish-and-restore)
+300e80f6c  make the no-effect assertion TOTAL, so a witness cannot assert a
+           subset of {snapshot, publication, identity} by accident
+```
+
+What is signed, for every non-publishing outcome (`Noop`, `AtCapacity`,
+`IdSpaceExhausted`): the exact snapshot `Arc` does not move, the publication
+counter does not move even transiently, and the installation identity does not
+move. **Step 2 is not implicitly authorized by this signature.**
+
 **Scope (exactly these 16 items).**
 
 1. Replace the wrapping `consumer_grant_install_seq` with checked, irreversible,
