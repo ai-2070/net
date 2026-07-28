@@ -10727,8 +10727,8 @@ impl MeshNode {
             authority.config.verification_skew_secs,
         )?;
         let grant_id = *record.grant_id();
-        // Settle IDEMPOTENCE FIRST, then allocate — both under one guard
-        // (OLB-2B.3c-pre).
+        // Settle every ordinary refusal first, then allocate — both under one
+        // guard (OLB-2B.3c-pre).
         //
         // This used to claim the stamp before the store, justified by "a
         // claimed-but-unused stamp on the idempotent path is harmless (the
@@ -32930,28 +32930,52 @@ mod oa34b2_query_currentness_tests {
 
     // ---- OLB-2B.3c-pre: the installation identity is non-aliasing ----------
 
-    /// Assert an outcome published NOTHING.
+    /// Everything a non-publishing outcome must leave untouched, captured as ONE
+    /// value so a witness cannot assert a subset by accident.
+    #[derive(Clone)]
+    struct GrantRegistryState {
+        snapshot: Arc<crate::adapter::net::behavior::org_grant_registry::ConsumerGrantSnapshot>,
+        publications: u64,
+        identity: u64,
+    }
+
+    fn grant_registry_state(node: &MeshNode) -> GrantRegistryState {
+        GrantRegistryState {
+            snapshot: node.consumer_grant_audiences.load_full(),
+            publications: node.consumer_grant_publications_for_test(),
+            identity: node.consumer_grant_install_seq_for_test(),
+        }
+    }
+
+    /// Assert an outcome changed NOTHING: no snapshot, no publication (even
+    /// transient), and no installation identity.
     ///
-    /// Pointer identity alone is insufficient: a path that publishes an
-    /// intermediate snapshot and then restores the original leaves the final
-    /// pointer unchanged, and lock-free readers can observe that transient. The
-    /// publication COUNTER is what makes the negative claim provable, so both
-    /// are checked (Kyra, 2B.3c-pre step-1 re-review).
-    fn assert_no_publication(
-        node: &MeshNode,
-        snapshot_before: &Arc<
-            crate::adapter::net::behavior::org_grant_registry::ConsumerGrantSnapshot,
-        >,
-        publications_before: u64,
-    ) {
+    /// All three are needed and none implies another. A path that publishes an
+    /// intermediate snapshot and restores the original leaves the final POINTER
+    /// unchanged, and lock-free readers can observe that transient. Terminal
+    /// exhaustion that moves the identity counter while still returning
+    /// `IdSpaceExhausted` is a real mutation behind a correct-looking error.
+    ///
+    /// The first version of this helper covered only the first two and left the
+    /// identity to each call site. Two independent reviews then found the same
+    /// gap: W-G9 and the post-exhaustion half of W-G10 had not repeated it, so a
+    /// mutation moving the identity passed a test named
+    /// `..._refuses_without_mutating`. A partial helper makes the omission the
+    /// default; a total one makes it unrepresentable.
+    fn assert_no_effect(node: &MeshNode, before: &GrantRegistryState) {
         assert!(
-            Arc::ptr_eq(snapshot_before, &node.consumer_grant_audiences.load_full()),
+            Arc::ptr_eq(&before.snapshot, &node.consumer_grant_audiences.load_full()),
             "a non-publishing outcome must leave the EXACT snapshot installed"
         );
         assert_eq!(
             node.consumer_grant_publications_for_test(),
-            publications_before,
+            before.publications,
             "a non-publishing outcome must not publish even transiently"
+        );
+        assert_eq!(
+            node.consumer_grant_install_seq_for_test(),
+            before.identity,
+            "a non-publishing outcome must not move the installation identity"
         );
     }
 
@@ -32979,8 +33003,7 @@ mod oa34b2_query_currentness_tests {
         let secret = secret.expect("secret");
 
         c.exhaust_consumer_grant_install_ids_for_test();
-        let snapshot_before = c.consumer_grant_audiences.load_full();
-        let publications_before = c.consumer_grant_publications_for_test();
+        let before = grant_registry_state(&c);
         let err = c
             .install_consumer_grant_audience(g, copy_secret(&secret))
             .expect_err("an exhausted identity space must refuse");
@@ -32989,7 +33012,7 @@ mod oa34b2_query_currentness_tests {
             crate::adapter::net::behavior::org_grant_registry::GrantAudienceInstallError::IdSpaceExhausted,
             "refusal must be typed, not a fabricated identity or an abort"
         );
-        assert_no_publication(&c, &snapshot_before, publications_before);
+        assert_no_effect(&c, &before);
     }
 
     /// W-G10b. An `AtCapacity` refusal consumes no installation identity.
@@ -33029,9 +33052,7 @@ mod oa34b2_query_currentness_tests {
             c.install_consumer_grant_audience(g, copy_secret(&secret))
                 .expect("fill install");
         }
-        let before = c.consumer_grant_install_seq_for_test();
-        let snapshot_before = c.consumer_grant_audiences.load_full();
-        let publications_before = c.consumer_grant_publications_for_test();
+        let before = grant_registry_state(&c);
 
         let (overflow, secret) = mint("nrpc:atcap-overflow".to_string());
         let err = c
@@ -33042,12 +33063,7 @@ mod oa34b2_query_currentness_tests {
             GrantAudienceInstallError::AtCapacity,
             "refusal must stay typed"
         );
-        assert_eq!(
-            c.consumer_grant_install_seq_for_test(),
-            before,
-            "an install that publishes nothing must consume no authority identity"
-        );
-        assert_no_publication(&c, &snapshot_before, publications_before);
+        assert_no_effect(&c, &before);
     }
 
     /// W-G10. An idempotent install consumes no installation identity — and
@@ -33077,28 +33093,20 @@ mod oa34b2_query_currentness_tests {
 
         c.install_consumer_grant_audience(g.clone(), copy_secret(&secret))
             .expect("first install");
-        let after_first = c.consumer_grant_install_seq_for_test();
-        let snapshot_before = c.consumer_grant_audiences.load_full();
-        let publications_before = c.consumer_grant_publications_for_test();
+        let before = grant_registry_state(&c);
 
         c.install_consumer_grant_audience(g.clone(), copy_secret(&secret))
             .expect("idempotent reinstall");
-        assert_eq!(
-            c.consumer_grant_install_seq_for_test(),
-            after_first,
-            "an install that publishes nothing must consume no identity"
-        );
-        assert_no_publication(&c, &snapshot_before, publications_before);
+        assert_no_effect(&c, &before);
 
         // And the ordering is load-bearing the other way round too: with the
         // space exhausted, the idempotent path must still be VALID, because it
         // never needed an identity.
         c.exhaust_consumer_grant_install_ids_for_test();
-        let snapshot_before = c.consumer_grant_audiences.load_full();
-        let publications_before = c.consumer_grant_publications_for_test();
+        let before = grant_registry_state(&c);
         c.install_consumer_grant_audience(g, copy_secret(&secret))
             .expect("an idempotent install must survive exhaustion");
-        assert_no_publication(&c, &snapshot_before, publications_before);
+        assert_no_effect(&c, &before);
     }
 
     async fn adopted_consumer(org: &OrgKeypair, tag: &str) -> (Arc<MeshNode>, std::path::PathBuf) {
