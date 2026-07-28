@@ -699,7 +699,7 @@ Licensed under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
-at your option. The MIT arm exists so GPLv2-only projects — the Linux kernel, OpenWrt userspace, BusyBox — can use Net; Apache-2.0's patent-termination and NOTICE clauses are incompatible with GPLv2. Take the Apache-2.0 arm if you want the express patent grant.
+at your option.
 
 ### Contribution
 
