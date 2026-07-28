@@ -1,11 +1,16 @@
 # OLB-2B.3 — warmed-call boundary design, revision 5 (for review)
 
-**Status: DESIGN FOR REVIEW. No slice authorized for implementation.**
-Revision 4's architecture was ACCEPTED and held on a missing prerequisite beneath
-2B.3c-pre. Revision 5 preserves all of revision 4 and adds §2A — the
-consumer-Grant currentness substrate — plus the dual-cell invalidation exactness
-in §1.1, the witnesses for both, and plan-reconciliation ownership. **A
-prerequisite repair, not another route-artifact redesign.**
+**Status: SIGNED as a DESIGN at `1c1b652e6`** =
+`OLB_2B3_BOUNDARY_DESIGN_HEAD`. A design signature only — it authorizes no
+implementation beyond the existing 2B.3a substrate.
+
+**Revision 5 + closure addenda.** The two mandatory addenda are folded in where
+they belong rather than appended: the scope-stamp / batch-token separation in
+§2A.1, the 2B.3c-pre plan divergence in §15, and W-G13 (installed Grant expiry,
+including the empty-provider case) in §12.
+
+**`2B.3c-pre` is AUTHORIZED**; every other slice is not. Its exact scope, its
+slice-local witnesses, and the boundary of what it may NOT touch are in §16.
 
 **Substrate:** `OLB_2B3A_SIGNED_HEAD = fd05a89ba` — the per-slot
 `Arc<ArcSwapOption<SlotBaseFacts>>` publication cell, and nothing more.
@@ -191,6 +196,32 @@ For a batch containing several Grant keys, `SourceToken` carries the
 global "some Grant changed" bit. A conservative global consumer-Grant generation
 may participate in actor invalidation, but it cannot replace the per-slot stamp
 if unrelated Grant movement is to leave unaffected slots current.
+
+**The two must stay separate — normative.** The batch vector protects the
+capture/commit transaction; it must **not** become a common epoch copied into
+every selected `SlotBaseFacts`. If it were, unrelated Grant movement would make
+Owner and unrelated Grant facts stale, contradicting W-G8.
+
+```text
+Owner slot     →  Owner stamp
+Grant G1 slot  →  exact G1 installation stamp
+Grant G2 slot  →  exact G2 installation stamp
+```
+
+```text
+SourceToken                        transaction-wide capture/commit coherence
+ScopedDiscoveryAuthorityStamp      per-slot cached currentness
+```
+
+The source interface therefore returns the per-key stamp alongside its facts (or
+an equivalent exact construction — the type is internal, the separation is not):
+
+```rust
+struct ScopedSourceFacts {
+    facts:     SourceFacts,
+    authority: ScopedDiscoveryAuthorityStamp,
+}
+```
 
 ### 2A.2 Wake and invalidation edge
 
@@ -523,6 +554,19 @@ release). All waits bounded. Ordering claims checked in **both** directions.
 | W-G10 | allocate the identity before proving a real install | an idempotent install consumes no identity |
 | W-G11 | unconditional second-cell clear | a delayed old-pool invalidation preserves a newer pool |
 | W-G12 | couple both cells unconditionally | a session-only pool invalidation preserves still-current facts |
+| **W-G13** | omit the installed Grant deadline from the scoped source deadline | installed DISCOVER Grant expiry arms actor work and turns cached Grant facts `Unserved` |
+
+**W-G13 must cover the empty-provider case**, and that is the whole point of it:
+
+```text
+installed Grant + zero visible providers
+  → Served(empty) ONLY while the exact Grant authority is current
+  → Grant expiry ⇒ Unserved
+```
+
+Deriving `earliest_expiry` from provider rows alone gives an empty served bucket
+`u64::MAX`, which would cache expired Grant authority **indefinitely** — the
+deadline has to come from the installed Grant, not from its contents.
 
 W-G11 and W-G12 are the **inverse** directions of W-S4, and are listed separately
 because "clear both conditionally" is exactly the phrasing that hides them.
@@ -569,10 +613,98 @@ it true:
 | `max warmed capabilities per OrgRoutingState clone family: 64` — **both** detailed bound blocks (§7, §13) **and the earlier summary wording near the top** (pin 10) | **2B.3b** |
 | Node-shared `OrgRouteSet` with a single `next_authority_deadline` → scoped node-owned pool deadlines + family route deadlines + **no family timer** | **2B.3c** (pool half) and **2B.3d** (family half) |
 | `RouteSourceGeneration` as one flat vector → split across `ScopedUnsensedRoutePool` and family `OrgRouteSet` | **2B.3c** |
+| The complete source/currentness vector omits the **exact installed consumer Grant identity**, and consumer-Grant publication is absent from routing wake/invalidation | **2B.3c-pre** |
+
+The 2B.3c-pre edit must state that a Grant-scoped source is current **only** under
+the exact installed consumer Grant authority — grant ID, installation identity,
+signed Grant identity, audience handle, and Grant authority deadline — and must
+name install / remove / replacement as **source movement** that invalidates
+affected Grant-scoped retained work.
 
 Sign-off on each slice is conditional on its plan edits landing **in the same
 commit as the code**, not tracked as follow-up. The plan and the code disagreeing
 is the §19 defect class this process has already caught once.
+
+## 16. 2B.3c-pre — the authorized slice
+
+**Scope (exactly these 16 items).**
+
+1. Replace the wrapping `consumer_grant_install_seq` with checked, irreversible,
+   fail-closed allocation.
+2. Add typed `GrantAudienceInstallError::IdSpaceExhausted`.
+3. Allocate only for a real new installation; idempotent installs stay valid and
+   consume nothing — **including after allocator exhaustion**.
+4. Define the exact immutable consumer-Grant installation identity.
+5. Capture the precise current installed Grant record for each Grant-scoped source.
+6. Filter rows by exact signature and audience handle, preserving the live query.
+7. Deterministic exact Grant identity vector in `SourceToken`.
+8. **Only** the exact per-key scope stamp in each published `SlotBaseFacts`.
+9. Extend commit-pin protection through phase-5 installation and settlement.
+10. Publish install / remove / remove-if-current / replacement routing
+    notifications **only after** consumer-Grant publication synchronization is
+    released.
+11. Rebuild/invalidate affected retained Grant slots **without** relying on
+    `ScopedDiscoveryState::revision`.
+12. Include exact installed Grant authority expiry in source deadlines.
+13. Serve exact installed DISCOVER Grant scopes as `SourceFacts::Served`.
+14. Absent / expired / poisoned / exhausted / mismatched-signature /
+    mismatched-handle Grant authority ⇒ structural `Unserved`.
+15. Update the normative plan for the §2A divergence **in the same commit**.
+16. Public call path unchanged; `OrgCapabilityRegistration` stays dark.
+
+**Slice-local witnesses:** W-G1, W-G3, W-G4, W-G5, W-G6, W-G7, W-G8, W-G9,
+W-G10, W-G13 — plus the part of **W-G2** that exists now:
+
+```text
+removal invalidates the exact cached SlotBaseFacts
+→ a subsequent handle load cannot retain Served facts
+```
+
+W-G2's later halves belong to the slices that create their artifacts (2B.3c →
+pool invalidation; 2B.3d → family route invalidation). **This slice must not
+claim artifacts were invalidated before they exist.** W-G11 and W-G12 are
+design-approved but belong to 2B.3c, where the second cell exists.
+
+**Ordering proof — documented and witnessed.** Abstract order:
+
+```text
+authority/currentness publication protection
+→ scoped publication protection
+→ registry phase-5 settlement
+```
+
+Consumer-Grant publication either joins an already-held publication gate or
+introduces one explicitly ordered guard. The proof covers:
+
+```text
+capture the exact installed Grant
+→ reconstruct OFF-LOCK
+→ pin the exact Grant publication
+→ verify SourceToken
+→ install SlotBaseFacts
+→ settle Current
+→ release
+```
+
+**No consumer-Grant mutation may land between verification and settlement.**
+Notification sits outside that protected section, and **no registry lock is taken
+while holding the consumer-Grant mutation mutex.**
+
+**Explicitly NOT in this slice:** `ScopedUnsensedRoutePool`; the second per-slot
+`ArcSwap` cell; `OrgRoutingState`'s capability index; atomic multi-demand family
+acquisition; family `OrgRouteSet`; the coherent cold-plan rewrite; warmed-call
+consumption; `MeshNode::call` integration; public API changes; provider-free
+lighting. The existing facts cell remains the signed 2B.3a cell.
+
+**Closure gate:** exact SHA + ancestry; focused tests with selected counts; every
+critical witness selects exactly one test; `CARGO_INCREMENTAL=0`;
+`cargo nextest -j 1 --no-tests=fail --retries 0`; bounded waits and joins; no
+retries on security/race witnesses; independent RED for at least — removal
+notification omitted, signature removed from currentness, Grant commit-pin
+protection released before settlement, counter returned to wrapping, allocation
+moved before the idempotence determination, Grant deadline removed from source
+expiry; baseline pass after every restoration; relevant group run; touched
+format/diff check; exact-SHA GitHub conclusions; clean canonical state.
 
 ## Open questions
 
