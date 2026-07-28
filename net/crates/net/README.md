@@ -104,14 +104,19 @@ different enough that an agent working from surface familiarity will write
 integration code that runs and is quietly wrong. Install the skills first:
 
 ```bash
-git clone https://github.com/ai-2070/net-claude-skill.git /tmp/net-claude-skill
-mkdir -p ~/.claude/skills
-cp -R /tmp/net-claude-skill/net-event-bus /tmp/net-claude-skill/net-payments ~/.claude/skills/
+npx skills add ai-2070/net-claude-skill -g
+```
+
+Drop `-g` to install into the current project only. To update to the latest
+version:
+
+```bash
+npx skills update -g
 ```
 
 Restart Claude Code and run `/skills` — **net-event-bus** and **net-payments**
-should be listed. Full install options — project-scoped, symlinked to stay
-current — in [Claude Skills](https://ai2070.net/docs/start/claude-skills).
+should be listed. Full install options in
+[Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
 ## Links
 

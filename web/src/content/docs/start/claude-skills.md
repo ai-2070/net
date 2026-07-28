@@ -27,7 +27,31 @@ Claude Code looks in two places:
 
 ## Install
 
-### Clone into your skills directory
+```bash
+npx skills add ai-2070/net-claude-skill -g
+```
+
+The [`skills` CLI](https://github.com/vercel-labs/skills) detects which coding agents you have, asks which skills you want, and puts them where that agent looks — `~/.claude/skills/` for Claude Code, `~/.codex/skills/` for Codex. Windows included. Drop `-g` to install into the current project only.
+
+To update to the latest version:
+
+```bash
+npx skills update -g
+```
+
+A few flags for when you don't want the prompts:
+
+```bash
+npx skills add ai-2070/net-claude-skill --skill '*' -a claude-code -g   # both skills, Claude Code
+npx skills add ai-2070/net-claude-skill --skill net-payments -g         # just one skill
+npx skills add ai-2070/net-claude-skill --skill '*' -a '*' -g           # every agent it supports
+```
+
+These are plain Agent Skills, so `-a '*'` covers Codex, Cursor, Copilot, Cline, and the rest. The CLI symlinks each agent's skills directory to one canonical copy, so one `npx skills update` refreshes them all — pass `--copy` if symlinks aren't an option.
+
+### Without the CLI
+
+A skill is just a directory containing a `SKILL.md`, so copying the folders in works:
 
 ```bash
 git clone https://github.com/ai-2070/net-claude-skill.git /tmp/net-claude-skill
@@ -44,21 +68,7 @@ Copy-Item -Recurse "$env:TEMP\net-claude-skill\net-event-bus" "$env:USERPROFILE\
 Copy-Item -Recurse "$env:TEMP\net-claude-skill\net-payments" "$env:USERPROFILE\.claude\skills\"
 ```
 
-### Install into a single project
-
-From the root of the repo where you want the skills available to everyone working on it:
-
-```bash
-mkdir -p .claude/skills
-git clone https://github.com/ai-2070/net-claude-skill.git /tmp/net-claude-skill
-cp -R /tmp/net-claude-skill/net-event-bus /tmp/net-claude-skill/net-payments .claude/skills/
-git add .claude/skills/net-event-bus .claude/skills/net-payments
-git commit -m "Add Net Claude skills"
-```
-
-### Symlink to stay current
-
-Clone once somewhere permanent and symlink, so `git pull` updates the installed skills in place:
+Swap `~/.claude/skills/` for `<your-repo>/.claude/skills/` to install into a single project, then commit the two directories. To hack on the skills locally, clone once somewhere permanent and symlink so `git pull` updates them in place:
 
 ```bash
 git clone https://github.com/ai-2070/net-claude-skill.git ~/src/net-claude-skill
@@ -86,9 +96,13 @@ Skills load automatically when a request matches. To see one fire, ask for somet
 
 ## Updating and removing
 
-If you cloned or copied, re-run the copy step (or `git pull` in the clone, then copy). If you symlinked, `git pull` is enough.
+`npx skills update -g` updates to the latest version, as above. To uninstall:
 
-To uninstall:
+```bash
+npx skills remove net-event-bus net-payments -g
+```
+
+If you installed by hand, re-run the copy step to update — a symlinked clone needs only `git pull` — and remove with:
 
 ```bash
 rm -rf ~/.claude/skills/net-event-bus ~/.claude/skills/net-payments   # personal

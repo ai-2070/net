@@ -77,16 +77,21 @@ different enough that an agent working from surface familiarity will write
 integration code that runs and is quietly wrong. Install the skills first:
 
 ```bash
-git clone https://github.com/ai-2070/net-claude-skill.git /tmp/net-claude-skill
-mkdir -p ~/.claude/skills
-cp -R /tmp/net-claude-skill/net-event-bus /tmp/net-claude-skill/net-payments ~/.claude/skills/
+npx skills add ai-2070/net-claude-skill -g
+```
+
+Drop `-g` to install into the current project only. To update to the latest
+version:
+
+```bash
+npx skills update -g
 ```
 
 Restart Claude Code and run `/skills` — **net-event-bus** and **net-payments**
 should be listed. `net-event-bus` covers pub/sub, nRPC, the MCP bridge,
 organization capability auth, the gang-claim scheduler, and RedEX / CortEX /
 Dataforts. `net-payments` covers x402 pricing, quotes, settlement and spend
-policy. Full install options — project-scoped, symlinked to stay current — in
+policy. Full install options in
 [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
 ## What's in the box
