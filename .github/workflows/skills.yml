@@ -46,7 +46,7 @@ on:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
-      - ".github/scripts/check-skill-enums.py"
+      - ".github/scripts/check-skill-refs.py"
       # The skills document these surfaces; a change here can invalidate them.
       # The core crate is in scope deliberately: every type the skills tabulate
       # — RpcError, TokenError, StreamError, ChangeEvent, FoldErrorPolicy — is
@@ -62,7 +62,7 @@ on:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
-      - ".github/scripts/check-skill-enums.py"
+      - ".github/scripts/check-skill-refs.py"
       - "net/crates/net/src/**"
       - "net/crates/net/sdk/src/**"
       - "net/crates/net/cli/src/**"
@@ -87,8 +87,8 @@ jobs:
 
       # Frontmatter + description budget, cross-file links, cited repo paths,
       # API-surface canaries, documented-symbol resolution, enum-variant
-      # membership, CLI verb names, and internal-plan leakage. No toolchain
-      # needed — grep and python3, both already on the runner.
+      # membership, metric/config identifiers, CLI verb names, and internal-plan
+      # leakage. No toolchain needed — grep and python3, both on the runner.
       - name: Check skills against the tree
         run: .github/scripts/check-skills.sh
 

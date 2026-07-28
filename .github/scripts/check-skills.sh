@@ -24,6 +24,9 @@ cd "$(dirname "$0")/../.."
 SKILLS=".claude/skills"
 fail=0
 
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
 note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=1; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 
@@ -117,18 +120,15 @@ do
 done
 [ "$fail" -eq "$before" ] && ok "all documented symbols resolve"
 
-# -------------------------------------------------------------- enum variants
-# Symbol existence is not enough: the skills tabulate error variants for agents
-# to pattern-match on, and a variant can be plausible, spelled right, and belong
-# to no enum. The nRPC table claimed NoServer / NoMatchingServer / Canceled /
-# Panic, none of which exist on RpcError (it has NoRoute / Timeout / ServerError
-# / Transport / Codec / CapabilityDenied / Cancelled). This checks membership.
-echo "==> Enum variants documented in the skills"
+# ------------------------------------------------- enum variants + identifiers
+# Both checks come from one read of the source tree; see the script's docstring
+# for what each catches and why symbol-existence alone was not enough.
+echo "==> Enum variants and metric/config identifiers"
 before=$fail
 while read -r line; do
   [ -n "$line" ] && note "$line"
-done < <(python3 "$(dirname "$0")/check-skill-enums.py" || true)
-[ "$fail" -eq "$before" ] && ok "every documented enum variant exists on its enum"
+done < <(python3 "$(dirname "$0")/check-skill-refs.py" || true)
+[ "$fail" -eq "$before" ] && ok "documented variants and identifiers all resolve"
 
 # ------------------------------------------------------------------ CLI verbs
 # The single installed binary is `net-mesh` (cli/Cargo.toml [[bin]]). A bare

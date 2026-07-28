@@ -38,7 +38,7 @@ Per-node speculative caching of in-scope chains observed via the tail-subscripti
 | `nic_peak_bytes_per_s` | `None` (→ 125 MB/s = 1 Gbps) | Operator override of the NIC-peak probe. Set explicitly on > 1 Gbps NICs. |
 | `intent_match` | `AnyOfLocalCapabilities` | Capability-preference axis. `IntentMatchPolicy` is `Disabled` \| `AnyOfLocalCapabilities` \| `Strict`; `GreedyConfig::default()` sets `AnyOfLocalCapabilities` (admit chains whose `intent:<label>` the local node has capability for). `Strict` requires the registry's declared capabilities; `Disabled` passes the axis. There is no `MatchAnyAdvertised`. |
 | `colocation_policy` | `SoftPreference` | Colocation axis. `ColocationPolicy` is `Ignore` \| `SoftPreference` \| `StrictRequired`; `GreedyConfig::default()` sets `SoftPreference` (raises admission preference). `StrictRequired` rejects events whose colocation target isn't already cached locally; `Ignore` disables the axis. |
-| `observer_inflight_cap` | `1024` | `tokio::sync::Semaphore` size on the observe fan-out. Saturation drops events and bumps `dataforts_greedy_observer_dropped_overloaded`. |
+| `observer_inflight_cap` | `1024` | `tokio::sync::Semaphore` size on the observe fan-out. Saturation drops events and bumps the snapshot's `observer_dropped_overloaded_total`. |
 
 ### Wire-up
 
@@ -85,7 +85,8 @@ redex.enableGreedyDataforts(mesh, {
 
 ### Operational notes
 
-- **Bandwidth-budget rejection has its own counter** (`dataforts_greedy_admit_throttled_bandwidth_total`). Disambiguate "NIC saturated" from "cache full" on the operator dashboard.
+- **Admission rejections are one counter with a `reason` label**, not a counter per reason: `dataforts_greedy_admit_rejected_total{reason="scope|intent|colocation|capacity|bandwidth"}`. Watch the label, not a metric name per cause.
+- **`reason` does not cleanly separate "NIC saturated" from "cache full."** The admission gate's bandwidth axis bumps `reason="bandwidth"` (a mis-set `nic_peak_bytes_per_s` looks like a reject storm there), but a *post-admission* bandwidth-budget refusal is `BandwidthExhausted`, which bumps the **`capacity`** reason. So `capacity` mixes cache-full with budget-exhausted. Correlate with `bandwidth_budget_fraction` and the NIC-peak override before concluding the cache is full.
 - **Cluster-cap eviction withdraws chain announcements inline.** Peers see the `causal:<hex>` advertisement drop in the same tick.
 - **`upsert` on reopen subtracts old bytes from `total_bytes`.** The cluster-cap budget stays accurate across reopens.
 - **`observer_inflight_cap` is the spawn fan-out bound.** A flooding peer can't pile up unbounded outstanding tasks; on saturation the event drops and the counter bumps.
