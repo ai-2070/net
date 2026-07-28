@@ -6378,8 +6378,17 @@ pub struct MeshNode {
     /// [`ConsumerAudienceLease`](super::behavior::org_grant_registry::ConsumerAudienceLease)
     /// names ONE installation rather than a grant id that a later
     /// remove-then-install could silently rebind. Node-local and never on the
-    /// wire; monotone for the process lifetime (wrapping would take ~5.8e11
-    /// years at one install per nanosecond).
+    /// wire; strictly monotone and CHECKED (OLB-2B.3c-pre).
+    ///
+    /// This previously wrapped, defended by "wrapping would take ~5.8e11 years
+    /// at one install per nanosecond". That is a DENSITY argument, and density
+    /// arguments do not survive a counter becoming an authority identity:
+    /// equality against it decides whether a stale lease may remove the current
+    /// installation, and (from 2B.3c-pre) whether cached Grant-scoped routing
+    /// facts were built under the still-installed grant. Allocation is now
+    /// `checked_add`, exhaustion is terminal and refuses fail-closed, and an
+    /// idempotent install consumes nothing — see
+    /// [`Self::allocate_consumer_grant_install_seq`].
     consumer_grant_install_seq: std::sync::atomic::AtomicU64,
     /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
     /// shared across EVERY protected `serve_rpc_protected` registration on this
@@ -10602,6 +10611,53 @@ impl MeshNode {
         )
     }
 
+    /// Allocate the next consumer-Grant installation identity, or refuse
+    /// (OLB-2B.3c-pre).
+    ///
+    /// Checked, never wrapping, never saturating. The identity is compared for
+    /// EQUALITY to decide whether a stale lease may remove the CURRENT
+    /// installation, so wrapping lets an ancient lease alias a later
+    /// installation, and saturating gives every later installation the same
+    /// identity — the same defect wearing a safer-looking operator. Exhaustion
+    /// is terminal by construction: the counter only ever increases, so once
+    /// `checked_add` fails it fails forever (review-pass-3 §12 discipline).
+    fn allocate_consumer_grant_install_seq(
+        &self,
+    ) -> Result<u64, super::behavior::org_grant_registry::GrantAudienceInstallError> {
+        let mut observed = self.consumer_grant_install_seq.load(Ordering::Acquire);
+        loop {
+            let Some(next) = observed.checked_add(1) else {
+                return Err(
+                    super::behavior::org_grant_registry::GrantAudienceInstallError::IdSpaceExhausted,
+                );
+            };
+            match self.consumer_grant_install_seq.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(observed),
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    /// Test-only: drive the installation-identity allocator to its ceiling, so
+    /// exhaustion is reachable without 2^64 installs.
+    #[cfg(test)]
+    fn exhaust_consumer_grant_install_ids_for_test(&self) {
+        self.consumer_grant_install_seq
+            .store(u64::MAX, Ordering::Release);
+    }
+
+    /// Test-only: the allocator's current position, for proving that an
+    /// idempotent install consumed nothing.
+    #[cfg(test)]
+    fn consumer_grant_install_seq_for_test(&self) -> u64 {
+        self.consumer_grant_install_seq.load(Ordering::Acquire)
+    }
+
     /// OSDK S0: [`install_consumer_grant_audience`] returning an ownership proof.
     ///
     /// Identical validation, idempotency, conflict, and capacity semantics; the
@@ -10642,16 +10698,25 @@ impl MeshNode {
             authority.config.verification_skew_secs,
         )?;
         let grant_id = *record.grant_id();
-        // Claim the stamp before the store so the published record and the
-        // returned lease carry the same value; a claimed-but-unused stamp on the
-        // idempotent path is harmless (the counter is only ever compared for
-        // equality, never for density).
-        let install_seq = self
-            .consumer_grant_install_seq
-            .fetch_add(1, Ordering::Relaxed);
-        let record = record.with_install_seq(install_seq);
+        // Settle IDEMPOTENCE FIRST, then allocate — both under one guard
+        // (OLB-2B.3c-pre).
+        //
+        // This used to claim the stamp before the store, justified by "a
+        // claimed-but-unused stamp on the idempotent path is harmless (the
+        // counter is only ever compared for equality, never for density)". That
+        // reasoning was sound only while the counter was pure bookkeeping. The
+        // identity is now checked and TERMINAL, so density is exactly what
+        // matters: repeated idempotent installs would burn a finite space while
+        // publishing nothing, and the space cannot be recovered.
         let _guard = self.consumer_grant_mu.lock();
         let current = self.consumer_grant_audiences.load_full();
+        if current.install_is_noop(&record)? {
+            // Valid, publishes nothing, and consumes no identity — including
+            // after the allocator is exhausted, which is why this precedes it.
+            return Ok(ConsumerAudienceInstall::AlreadyPresent);
+        }
+        let install_seq = self.allocate_consumer_grant_install_seq()?;
+        let record = record.with_install_seq(install_seq);
         match current.with_record(Arc::new(record), now_secs)? {
             Some(next) => {
                 self.consumer_grant_audiences.store(Arc::new(next));
@@ -32826,6 +32891,93 @@ mod oa34b2_query_currentness_tests {
             unsafe { std::ptr::write_volatile(b, 0) };
         }
         copy
+    }
+
+    // ---- OLB-2B.3c-pre: the installation identity is non-aliasing ----------
+
+    /// W-G9. Exhausting the installation-identity space refuses fail-closed and
+    /// mutates nothing.
+    ///
+    /// The identity is compared for EQUALITY to authorize removal of the current
+    /// installation, so an aliased identity is an authorization defect, not a
+    /// bookkeeping one. Wrapping or saturating would both keep this green.
+    #[tokio::test]
+    async fn grant_install_identity_exhaustion_refuses_without_mutating() {
+        let org_a = OrgKeypair::from_bytes([0xc1u8; 32]);
+        let org_b = OrgKeypair::from_bytes([0xc2u8; 32]);
+        let (c, _dir) = adopted_consumer(&org_a, "idspace").await;
+        let p = EntityKeypair::generate();
+        let (g, secret) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:idspace"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p.entity_id().clone()),
+            3600,
+        )
+        .expect("issue");
+        let secret = secret.expect("secret");
+
+        c.exhaust_consumer_grant_install_ids_for_test();
+        let before = c.consumer_grant_audiences.load_full().len();
+        let err = c
+            .install_consumer_grant_audience(g, copy_secret(&secret))
+            .expect_err("an exhausted identity space must refuse");
+        assert_eq!(
+            err,
+            crate::adapter::net::behavior::org_grant_registry::GrantAudienceInstallError::IdSpaceExhausted,
+            "refusal must be typed, not a fabricated identity or an abort"
+        );
+        assert_eq!(
+            c.consumer_grant_audiences.load_full().len(),
+            before,
+            "a refused install must publish nothing"
+        );
+    }
+
+    /// W-G10. An idempotent install consumes no installation identity — and
+    /// therefore still succeeds after the allocator is exhausted.
+    ///
+    /// The allocation used to precede the idempotence decision, justified by the
+    /// counter being "only ever compared for equality, never for density". Once
+    /// the space is finite and terminal, density is exactly what matters:
+    /// re-installing the same grant in a loop would burn it while publishing
+    /// nothing.
+    #[tokio::test]
+    async fn an_idempotent_grant_install_consumes_no_identity() {
+        let org_a = OrgKeypair::from_bytes([0xc3u8; 32]);
+        let org_b = OrgKeypair::from_bytes([0xc4u8; 32]);
+        let (c, _dir) = adopted_consumer(&org_a, "idem").await;
+        let p = EntityKeypair::generate();
+        let (g, secret) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:idem"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p.entity_id().clone()),
+            3600,
+        )
+        .expect("issue");
+        let secret = secret.expect("secret");
+
+        c.install_consumer_grant_audience(g.clone(), copy_secret(&secret))
+            .expect("first install");
+        let after_first = c.consumer_grant_install_seq_for_test();
+
+        c.install_consumer_grant_audience(g.clone(), copy_secret(&secret))
+            .expect("idempotent reinstall");
+        assert_eq!(
+            c.consumer_grant_install_seq_for_test(),
+            after_first,
+            "an install that publishes nothing must consume no identity"
+        );
+
+        // And the ordering is load-bearing the other way round too: with the
+        // space exhausted, the idempotent path must still be VALID, because it
+        // never needed an identity.
+        c.exhaust_consumer_grant_install_ids_for_test();
+        c.install_consumer_grant_audience(g, copy_secret(&secret))
+            .expect("an idempotent install must survive exhaustion");
     }
 
     async fn adopted_consumer(org: &OrgKeypair, tag: &str) -> (Arc<MeshNode>, std::path::PathBuf) {

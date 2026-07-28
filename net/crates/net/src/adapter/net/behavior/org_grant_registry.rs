@@ -149,6 +149,18 @@ pub enum GrantAudienceInstallError {
     /// The registry is at capacity and no expired record could be reclaimed —
     /// refused fail-closed rather than evicting an active record.
     AtCapacity,
+    /// The installation-identity space is exhausted (OLB-2B.3c-pre).
+    ///
+    /// TERMINAL and irreversible. The identity is compared for EQUALITY to
+    /// decide whether a stale lease may remove the current installation, and —
+    /// once Grant-scoped routing caches exist — whether cached facts were built
+    /// under the still-installed grant. Wrapping would let an ancient lease
+    /// alias a later installation; saturating would give every later
+    /// installation the same identity, which is the same defect with a friendlier
+    /// name. Refusing is the only safe answer, and it is refused fail-closed
+    /// rather than aborting the process over a bookkeeping limit
+    /// (review-pass-3 §12 discipline, applied to this counter).
+    IdSpaceExhausted,
 }
 
 impl std::fmt::Display for GrantAudienceInstallError {
@@ -173,6 +185,9 @@ impl std::fmt::Display for GrantAudienceInstallError {
                 "a different grant is already installed under this grant id"
             }
             GrantAudienceInstallError::AtCapacity => "grant-audience registry at capacity",
+            GrantAudienceInstallError::IdSpaceExhausted => {
+                "grant-audience installation identity space exhausted"
+            }
         };
         f.write_str(s)
     }
@@ -360,6 +375,23 @@ impl GrantAudienceRecords {
     /// [`GrantAudienceInstallError::AtCapacity`]. Node-context invariants
     /// (validity, rights, org/target) are checked BEFORE this by the caller —
     /// this layer owns only idempotency, conflict, and capacity.
+    /// Would installing `record` be a no-op? (OLB-2B.3c-pre)
+    ///
+    /// The same decision `install` makes, split out so a caller can learn it
+    /// BEFORE allocating an installation identity. `install_seq` is deliberately
+    /// not part of `records_identical`, which is what makes this answerable
+    /// against a record that has not been stamped yet.
+    fn install_is_noop(
+        &self,
+        record: &GrantAudienceRecord,
+    ) -> Result<bool, GrantAudienceInstallError> {
+        match self.by_grant_id.get(record.grant_id()) {
+            Some(existing) if records_identical(existing, record) => Ok(true),
+            Some(_) => Err(GrantAudienceInstallError::Conflict),
+            None => Ok(false),
+        }
+    }
+
     fn install(
         &self,
         record: Arc<GrantAudienceRecord>,
@@ -657,6 +689,18 @@ impl ConsumerGrantSnapshot {
         now_secs: u64,
     ) -> Result<Option<Self>, GrantAudienceInstallError> {
         Ok(self.0.install(record, Self::CAPACITY, now_secs)?.map(Self))
+    }
+
+    /// Whether installing `record` would publish nothing (OLB-2B.3c-pre).
+    ///
+    /// Lets the caller settle idempotence BEFORE claiming an installation
+    /// identity, so repeated idempotent installs consume none of a finite,
+    /// terminal identity space.
+    pub(crate) fn install_is_noop(
+        &self,
+        record: &GrantAudienceRecord,
+    ) -> Result<bool, GrantAudienceInstallError> {
+        self.0.install_is_noop(record)
     }
 
     /// Remove `grant_id`; see [`GrantAudienceRecords::without`].
