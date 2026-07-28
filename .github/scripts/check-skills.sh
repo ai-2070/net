@@ -30,6 +30,22 @@ trap 'rm -rf "$TMP"' EXIT
 note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=1; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 
+# The corpus, at any depth. One definition, used by every check below, so a file
+# is never visible to some checks and invisible to others — three of them used
+# to stop at `*/*.md`, which a `bindings/rust.md` sits one level below.
+#
+# `find`, not `git ls-files`: publication is `rsync -a --delete` over the skill
+# directory, so an untracked file on disk ships to users exactly like a tracked
+# one. The checker has to see what the publisher would copy. (Cited *targets*
+# are still resolved through git — that is the opposite direction and wants the
+# opposite rule.)
+skill_md() { find "$SKILLS" -type f -name '*.md' | sort; }
+
+if [ -z "$(skill_md)" ]; then
+  echo "  ✗ no markdown found under $SKILLS — the checker would pass vacuously" >&2
+  exit 1
+fi
+
 # ---------------------------------------------------------------- frontmatter
 echo "==> Frontmatter"
 want_version=$(grep -m1 '^version' net/crates/net/sdk/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
@@ -56,13 +72,34 @@ done
 [ "$fail" -eq 0 ] && ok "frontmatter keys, net-version, description budget"
 
 # --------------------------------------------------------- cross-file links
+# A reference resolves as a sibling of the citing file or at its skill root —
+# the two places a reader would look. For a top-level file those are the same
+# directory, so this is unchanged for the flat corpus and correct for a nested
+# one, where `bindings/rust.md` naming `coverage.md` means its sibling.
 echo "==> Cross-references between skill files"
 before=$fail
-for dir in "$SKILLS"/*/; do
-  while read -r f; do
-    [ -n "$f" ] && [ ! -f "$dir$f" ] && note "$(basename "$dir"): references $f, which does not exist"
-  done < <(grep -oh '`[a-z0-9-]*\.md`' "$dir"*.md 2>/dev/null | tr -d '`' | sort -u)
-done
+while read -r f; do
+  [ -z "$f" ] && continue
+  dir=$(dirname "$f")
+  root=$(printf '%s' "$f" | sed -E "s#^($SKILLS/[^/]+)/.*#\1#")
+  [ -d "$root" ] || root="$SKILLS"
+  while read -r ref; do
+    [ -z "$ref" ] && continue
+    [ -f "$dir/$ref" ] && continue
+    [ -f "$root/$ref" ] && continue
+    # The corpus index sits at `$SKILLS/README.md` and routes *into* the skills,
+    # so its references resolve one level down. It cannot say which skill —
+    # `gotchas.md`, `concepts.md` and `testing.md` each exist in both — so at the
+    # corpus root the rule relaxes to "exists somewhere in the corpus". Weaker
+    # than the rule inside a skill, and only applied where a skill root is not a
+    # meaningful frame of reference.
+    if [ "$dir" = "$SKILLS" ] &&
+       [ -n "$(find "$SKILLS" -type f -name "$ref" -print -quit)" ]; then
+      continue
+    fi
+    note "${f#$SKILLS/}: references $ref, which is neither a sibling nor at the skill root"
+  done < <(grep -oh '`[a-z0-9-]*\.md`' "$f" 2>/dev/null | tr -d '`' | sort -u)
+done < <(skill_md)
 [ "$fail" -eq "$before" ] && ok "every referenced *.md resolves"
 
 # --------------------------------------------------------- repo source paths
@@ -81,7 +118,7 @@ while read -r p; do
   else
     note "cited path does not exist: $p"
   fi
-done < <(grep -ohE '`(net|go|web)/[A-Za-z0-9_/.-]+`' "$SKILLS"/*.md "$SKILLS"/*/*.md \
+done < <(grep -ohE '`(net|go|web)/[A-Za-z0-9_/.-]+`' $(skill_md) \
          | tr -d '`' | sed 's/:[0-9,-]*$//' | sort -u)
 [ "$fail" -eq "$before" ] && ok "every cited repo path is tracked in git"
 
@@ -161,8 +198,8 @@ echo "==> CLI invocations"
 before=$fail
 while read -r hit; do
   [ -n "$hit" ] && note "bare 'net' CLI invocation (the binary is net-mesh): $hit"
-done < <(grep -rnE '(^|[^-[:alnum:]/])net (wrap|mcp|forwarding|org|node adopt|typegen|transfer)\b' \
-         "$SKILLS"/*.md "$SKILLS"/*/*.md || true)
+done < <(grep -nE '(^|[^-[:alnum:]/])net (wrap|mcp|forwarding|org|node adopt|typegen|transfer)\b' \
+         $(skill_md) || true)
 [ "$fail" -eq "$before" ] && ok "all CLI invocations use net-mesh"
 
 # ------------------------------------------------------- internal plan leakage
@@ -173,8 +210,8 @@ echo "==> Internal planning vocabulary"
 before=$fail
 while read -r hit; do
   [ -n "$hit" ] && note "internal planning reference: $hit"
-done < <(grep -rnE '\b(P[0-9]|WS[0-9])\b|Mode E|bugfixes-[0-9]|docs/internal|_PLAN\.md|RELEASE_v' \
-         "$SKILLS"/*.md "$SKILLS"/*/*.md || true)
+done < <(grep -nE '\b(P[0-9]|WS[0-9])\b|Mode E|bugfixes-[0-9]|docs/internal|_PLAN\.md|RELEASE_v' \
+         $(skill_md) || true)
 [ "$fail" -eq "$before" ] && ok "no internal plan/release references"
 
 echo
