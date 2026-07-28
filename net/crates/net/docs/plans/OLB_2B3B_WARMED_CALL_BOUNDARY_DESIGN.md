@@ -1,97 +1,112 @@
-# OLB-2B.3 — warmed-call boundary design, revision 3 (for review)
+# OLB-2B.3 — warmed-call boundary design, revision 4 (for review)
 
 **Status: DESIGN FOR REVIEW. No slice authorized for implementation.**
-Revision 2 (`be3097b4d`) was accepted as a major correction but HELD on one
-remaining structural conflation. This revision is focused: it replaces the
-node-shared final route set with a node-shared **pool** plus a family-specific
-final projection, moves INVOKE matching out of the Grant source, adds atomic
-multi-demand acquisition, splits the deadlines, names the bounds, and inserts
-`2B.3d-pre`. Everything else from revision 2 stands.
+Revision 3 (`00fca8a43`) was accepted in direction and held for a focused
+correction. This revision applies exactly the seven required changes; everything
+else in revision 3 stands.
 
 **Substrate:** `OLB_2B3A_SIGNED_HEAD = fd05a89ba` — the per-slot
 `Arc<ArcSwapOption<SlotBaseFacts>>` publication cell, and nothing more.
 
 ---
 
-## 0. What revision 2 got wrong
+## 0. What revision 3 got wrong
 
-Revision 2 asked whether caller-specific narrowing could reorder the fallback,
-and proposed a node-shared `(acting_org, capability)` final route set on the
-assumption it could not. **It can**, for two independent reasons, and the second
-is fatal to the whole idea of the node computing a final route:
+**It carried an inherited self-contradiction about deadlines.** Revision 3 says
+"no family actor and no family timer" and, four sections later, "`next_authority_
+deadline` must ARM a rebuild". Both sentences were inherited from revision 2 —
+where the artifact was node-shared and arming was correct — and neither was
+re-examined when the artifact became family-specific. Arming is right for
+actor-owned scoped sources and wrong for family credentials, which have nothing
+to arm.
 
-**The grant registry is node-global; families are not.** It holds the union of
-grants leased by every live family. Two `OrgClient` families can share
-`acting_org` and `capability` while holding different exact grants:
+That is the same failure mode as revision 2's "No scan / one linear pass": two
+adjacent statements that cannot both be true, produced by carrying text across a
+structural change instead of re-deriving it. Worth naming twice because it is
+evidently my dominant failure mode in design documents, and it is cheap to check
+for.
 
-```text
-Family A: grants [G1, G2]        Family B: grants [G3]
-```
-
-A node-shared route whose first entry requires `G1` is usable by A and must be
-rejected by B — and B rejecting it *is* caller-specific candidate filtering on
-the warmed path, which is the thing the architecture forbids.
-
-**INVOKE authority is not derivable from the DISCOVER scope.** A provider
-discovered through one DISCOVER grant may be invoked under a *different*
-INVOKE-only grant, and more than one matching INVOKE grant is
-`AmbiguousCapabilityGrant`. So `ScopedSlotSource` and a node-global actor
-**cannot** establish the matched INVOKE grant from the discovery scope alone.
-Revision 2's line
-
-> INVOKE authority established at Grant source projection
-
-is therefore wrong. The Grant source establishes DISCOVER **visibility and
-provenance**, nothing about the caller's INVOKE authority.
-
-I had the evidence for this and did not use it. Revision 2's own §3 hedged that
-the composite "assumes caller-specific narrowing … never changes *ordering*",
-flagged it as open question 2, and then built the slicing on the convenient
-answer anyway. Raising a risk and then designing as if it resolved favourably is
-not the same as resolving it.
+**It also proposed a node-wide union pool** keyed `(acting_org, capability)`,
+which discards the signed authority key one layer too early. Corrected below.
 
 ---
 
-## 1. Four artifacts (corrected)
+## 1. Four artifacts, scope-partitioned
 
 ```text
 1  PrivateCapabilityProvider    raw private-discovery row
 
-2  SlotBaseFacts                node-shared AUTHORITY-SCOPED DISCOVERY SUBSTRATE
+2  SlotBaseFacts                node-shared discovery substrate
                                 key: (PrivateAudienceScope, capability)
                                                                   [2B.3a, SIGNED]
 
-3  UnsensedRoutePool            node-shared PRECOMPUTED ROUTING SUBSTRATE
-                                key: (acting_org, capability)
-     carries      Owner + Grant discovery provenance; provider and proven owner
-                  relation; direct/session eligibility; session/source
-                  generations; deterministic node-global ordering inputs;
-                  discovery/provider deadlines
-     claims NOT   matched caller INVOKE grant; final caller eligibility;
-                  final caller fallback order
+3  ScopedUnsensedRoutePool      node-shared PRECOMPUTED ROUTING SUBSTRATE
+                                key: (PrivateAudienceScope, capability)   ← same key
+     carries      discovery provenance for THAT scope; provider and proven owner
+                  relation; direct/session eligibility computed under ONE
+                  coherent session generation; scoped source vector; scoped
+                  deadlines
+     claims NOT   matched caller INVOKE grant; caller eligibility; caller order
 
 4  OrgRouteSet                  FAMILY-SPECIFIC INVOCATION-READY ARTIFACT
                                 held in CapabilityRouteHandle
      carries      exact SameOrg/Granted mode; exact matched INVOKE grant; final
-                  deterministic fallback order; ONE preselected unsensed
-                  fallback; family authority deadline; node-pool identity/source
-                  stamp
+                  deterministic order; ONE preselected fallback; family
+                  deadlines; the exact contributor vector (slot identity, slot
+                  incarnation, pool identity/generation, source epoch)
 ```
 
 **Only artifact 4 is loadable by a warmed call.**
 
-## 2. Grant-plane source service — 2B.3c-pre (reworded)
+Keeping `(PrivateAudienceScope, capability)` for artifact 3 rather than unioning:
 
-`ScopedSlotSource::snapshot` serves `CapabilityAudienceScope::Owner` only;
-everything else reconstructs `SourceFacts::Unserved`, which the signed read seam
-reads COLD. Extending it is a prerequisite, and its scope is now stated
-correctly:
+- **the family never processes another family's Grant plane.** A family loads
+  only the scoped pools it holds demand handles for, so rows outside its retained
+  DISCOVER scopes are *structurally inaccessible* rather than filtered away. That
+  shrinks the cross-family surface instead of making it correct-by-filtering;
+- **it preserves the signed authority key** already used by the source slot,
+  publication cell, demand handle, generation, incarnation, invalidation and
+  retention;
+- **invalidation stays exact.** Grant A movement invalidates Grant A × capability
+  — not a union containing Owner and every unrelated Grant scope;
+- **the 256 bound becomes structural** (§4);
+- **cold projection scales with family breadth, not node breadth.** Owner + two
+  DISCOVER grants projects three pools, whatever else the node hosts.
 
-- establishes **exact installed DISCOVER authority and provenance** for
-  Grant-scoped buckets;
-- performs **no caller INVOKE matching** — that is not derivable here;
-- Grant rows remain Unknown/Potential until SENSE exists;
-- lights nothing in `OrgCapabilityRegistration`.
+### 1.1 Publication shape — a second cell, not a changed one
+
+The signed 2B.3a cell is not reopened:
+
+```rust
+struct Slot {
+    facts:    Arc<ArcSwapOption<SlotBaseFacts>>,          // 2B.3a, SIGNED
+    unsensed: Arc<ArcSwapOption<ScopedUnsensedRoutePool>>, // 2B.3c
+}
+```
+
+`DemandHandle` clones **both** cells under the same registry acquisition that
+takes the slot reference — the property 2B.3a's witness already pins, extended to
+the second cell and needing the same coupling.
+
+Actor cycle:
+
+```text
+capture scoped facts
+→ build the scoped pool OFF-LOCK
+→ revalidate the complete source/session stamp
+→ publish the pool IF CURRENT
+```
+
+Invalidation clears **both** exact slot publications, conditionally on the exact
+artifacts observed.
+
+## 2. Grant-plane source service — 2B.3c-pre
+
+`ScopedSlotSource::snapshot` serves `Owner` only; everything else reconstructs
+`SourceFacts::Unserved`, which reads COLD. The extension establishes **exact
+installed DISCOVER authority and provenance** for Grant-scoped buckets, performs
+**no caller INVOKE matching**, leaves Grant rows Unknown/Potential until SENSE
+exists, and lights nothing in `OrgCapabilityRegistration`.
 
 ```text
 DISCOVER ≠ INVOKE ≠ SENSE
@@ -100,75 +115,80 @@ DISCOVER ≠ INVOKE ≠ SENSE
 ## 3. Where each projection runs
 
 ```text
-node actor, off request path        →  UnsensedRoutePool          (heavy, shared)
+node actor, off request path   →  ScopedUnsensedRoutePool     (heavy, shared)
    store reconstruction, session/topology join, deadline management,
    source generation tracking. NEVER inline. NEVER per family.
 
-cold path, bounded, copy-on-write   →  OrgRouteSet                (pure narrowing)
-   family credential projection over the immutable pool.
-   NO store reconstruction, NO session scanning, NO sensing reconciliation,
-   NO actor work. Publishes into the family's CapabilityRouteHandle.
+cold path, bounded, COW        →  OrgRouteSet                 (pure narrowing)
+   over the family's OWN retained scoped pools. No store reconstruction,
+   no session query, no sensing reconciliation, no actor work.
 ```
 
-**No family actor and no family timer.** The family projection is a bounded pure
-function of `(immutable pool, family credential set)`.
+**No family actor, no family timer.** The plan must carry this distinction
+normatively, or "calls never rebuild" stays ambiguous:
 
-The plan must state this distinction normatively, because "calls never rebuild"
-is otherwise ambiguous:
-
-> **shared node route-pool rebuild: actor only, never inline.**
+> **scoped-pool rebuild: actor only, never inline.**
 > **family credential projection: bounded cold-path copy-on-write publication.**
 
-### 3.1 OLB-1 semantics the family projection must preserve exactly
+The pool's direct/session annotations are computed under **one** coherent session
+generation, and the family projection performs no session query. **If contributing
+pools carry different required source/session generations, the projection refuses
+to publish** rather than composing mixed observations.
 
-Non-negotiable; these are the frozen, signed behaviours:
-
-- Owner discovery precedes Grant discovery for duplicate-provider treatment;
-- Grant discovery follows the credential family's grant order where that affects
-  observable ambiguity;
-- the same provider on both planes remains ONE candidate;
-- INVOKE matching considers the family's **complete exact** grant set;
-- zero matches ⇒ skip that granted candidate;
-- more than one match ⇒ `AmbiguousCapabilityGrant`, **never** a silent choice;
-- sorting happens only AFTER authority construction;
-- direct reachability annotates, it never creates authority.
-
-## 4. Accounting — Option A, with atomic acquisition
+### 3.1 Family projection order — exact OLB-1 semantics
 
 ```text
-MAX_SOURCE_SLOTS_PER_NODE         = 256   authority-scoped source slots
-MAX_SCOPED_DEMANDS_PER_FAMILY     = 64    scoped demand handles
-MAX_CAPABILITY_ENTRIES_PER_FAMILY ≤ 64    (every capability costs ≥ 1 demand)
-UnsensedRoutePool objects                 ≤ 1 per retained capability, and each
-                                          MUST be backed by ≥ 1 retained source
-                                          slot ⇒ derivably bounded by 256
+Owner pool first
+→ Grant pools in exact credential grant order
+→ duplicate-provider policy (same provider on both planes = ONE candidate)
+→ match INVOKE against the family's COMPLETE exact grant set
+→ reject ambiguity (§5)
+→ authority construction
+→ final provider-byte sort
+→ preselect the first direct route
 ```
 
-The pool must **not** become an independent unbounded `(acting_org, capability)`
-map. Family `OrgRouteSet` objects live inside the bounded family capability index
-and need no node-global registry or actor sink.
+Non-negotiable: zero INVOKE matches ⇒ skip that granted candidate; sorting only
+AFTER authority construction; direct reachability annotates and never creates
+authority.
 
-A capability spanning Owner + Grant A + Grant B consumes **three** family demand
-units. So at most 64 capability index entries, but **64 logical warmed
-capabilities is not guaranteed**.
-
-**Plan-text correction, landing in the same code slice.** Both normative
-occurrences (§7 and the §13 OLB-2 bullet list) of
+## 4. Accounting
 
 ```text
-max warmed capabilities per OrgRoutingState clone family: 64
+MAX_SOURCE_SLOTS_PER_NODE          = 256
+MAX_SCOPED_DEMANDS_PER_FAMILY      = 64
+MAX_CAPABILITY_ENTRIES_PER_FAMILY <= 64
+ScopedUnsensedRoutePool count       = source-slot count <= 256   (structural)
 ```
 
-become
+Pool ownership is physically attached to the source slot, so the bound needs no
+separate map and no "must remain backed by a slot" lifecycle invariant.
+
+**The demand set is what the family actually leased.** A logical capability's
+exact demand set is:
 
 ```text
-max retained authority-scoped route demands per OrgRoutingState clone family: 64
+Owner
++ each Grant audience THIS FAMILY ACTUALLY LEASED FOR DISCOVER
 ```
 
-### 4.1 Complete demand-set acquisition is ATOMIC
+Not every grant merely carrying the DISCOVER right: a DISCOVER grant without its
+matching installed audience secret yields no installed consumer audience, and
+demanding it would create a permanently `Unserved` required contributor — a slot
+that can never be satisfied, consuming budget forever.
+
+**INVOKE-only grants are not source demands.** They remain available to the
+family projection for matching providers discovered through Owner or another
+DISCOVER grant.
+
+**Plan-text correction, same code slice.** Both normative occurrences (§7, §13)
+of `max warmed capabilities per OrgRoutingState clone family: 64` become
+`max retained authority-scoped route demands per OrgRoutingState clone family: 64`.
+
+### 4.1 Atomic complete demand-set acquisition
 
 ```text
-derive exact required source scopes
+derive the exact required source scopes (leased DISCOVER audiences only)
 → sort + deduplicate keys
 → under ONE registry transaction:
      check family handle capacity for the WHOLE set
@@ -178,16 +198,81 @@ derive exact required source scopes
 → publish the CapabilityRouteHandle
 ```
 
-On any refusal: **retain zero handles, create zero partial capability entries,
-enqueue zero partial composite work.** Demanding scopes sequentially and keeping
-the prefix would silently warm an incomplete Owner/Grant view — a correctness
-failure that presents as a routing preference.
+On any refusal: **zero handles retained, zero partial capability entries, zero
+partial work enqueued.** A kept prefix would silently warm an incomplete
+Owner/Grant view — a correctness failure presenting as a routing preference.
 
-All-or-none witnesses required for: family capacity; node capacity;
-incarnation-space exhaustion; duplicate scoped keys; and failure *after* some IDs
-have been considered.
+## 5. Ambiguity refuses publication; the cold plan produces the error
 
-## 5. Lock-free family lookup (stands from revision 2)
+On `AmbiguousCapabilityGrant` during family projection:
+
+```text
+RETAIN the CapabilityRouteHandle and the complete demand set
+publish NO OrgRouteSet
+clear any prior exact family artifact
+execute the coherent 2B.3d-pre cold plan
+→ that ONE canonical path returns AmbiguousCapabilityGrant
+```
+
+One producer for a security-relevant error, and `OrgRouteSet` never becomes a
+cached `Result`.
+
+**Ambiguity is not terminal.** A candidate may disappear, a matching grant may
+expire, the pools may move, or a replacement family may hold a different grant
+set. So "refuse warming" means *refuse final route publication* — **not** drop
+the capability entry and **not** reacquire demand repeatedly.
+
+**Do not generalize.** `NoAuthorizedProvider`, expired membership and expired
+dispatcher stay canonical cold-plan outcomes; none of them becomes a cached
+error.
+
+## 6. Layered cold/stale/invalidation matrix (normative)
+
+| Condition | Family artifact | Scoped pool | Actor work |
+|---|---|---|---|
+| Family membership / dispatcher / INVOKE deadline | **clear exact family route** | preserve | **no** |
+| Pool / source deadline | clear family route | **stale/invalid** | **yes** |
+| Incoherent authority sample | **preserve**; cold | preserve | no |
+| Exact newer family route won | preserve newer | preserve | no |
+| Scoped contributor generation mismatch | clear exact family route | **rebuild the stale contributor only** | yes |
+| Ambiguous family projection | **publish none** | preserve | no |
+| Artifact absent | cold | — | no |
+| `SourceFacts::Unserved` | structural cold | — | no |
+| Routing health rejects the actor incarnation | fenced cold | preserve | no |
+
+"Wall-clock expiry is never invalidated because the expiry actor owns
+promptness" remains true for **actor-owned scoped sources**. It is *not*
+sufficient for a family route that deliberately has no timer — see §7.
+
+## 7. Deadlines: two policies, not one
+
+**Actor-managed scoped-pool deadlines — these ARM node-actor work:**
+private-discovery expiry; installed DISCOVER grant expiry/replacement; provider
+authority expiry; session/source movement. At or after them the pool is stale and
+the actor owns rebuilding it.
+
+**Family `OrgRouteSet` deadlines — these arm NOTHING:** membership expiry;
+dispatcher expiry; matched INVOKE grant expiry; the family minimum effective
+deadline. They are checked on **every warmed call**.
+
+On family-only deadline expiry:
+
+```text
+conditionally clear the exact family OrgRouteSet
+→ do NOT clear a scoped pool
+→ do NOT enqueue node actor work
+→ pure-project again from the current scoped pools for FUTURE calls
+→ THIS call uses exactly one coherent cold plan
+→ never retry the warmed path within that call
+```
+
+If an alternate current INVOKE grant or route exists, the reprojection publishes
+it for the next call; if membership/dispatcher is terminal for that family,
+nothing is published. This removes the liveness failure **without** a family
+timer: the first call crossing the deadline is cold and canonical, later calls
+are warm on the newly projected alternate.
+
+## 8. Lock-free family lookup
 
 ```text
 OrgRoutingState {
@@ -197,75 +282,22 @@ OrgRoutingState {
 ```
 
 Warmed read: `index.load()` → handle → `route_set.load()`. No SDK-state mutex, no
-registry mutex. Mutation is copy-on-write at capability-warming frequency. **Not
-a `DashMap`** — internally sharded locking would leave the contract unproven
-while appearing to satisfy it.
+registry mutex. **Not a `DashMap`** — internally sharded locking would leave the
+contract unproven while appearing to satisfy it.
 
-## 6. Cold/stale/invalidation matrix (normative; stands from revision 2)
+## 9. Refusal semantics, per class
 
-| Condition | Classification | Invalidate / requeue? |
-|---|---|---|
-| Artifact absent | Cold | **No** |
-| Coherent authority sample unavailable | Cold, not known stale | **No** |
-| Authority / floor / poison / exhaustion mismatch | **Stale** | **Yes** — conditional on the exact artifact |
-| `SourceFacts::Unserved` | Structural cold | **No** |
-| Wall-clock expiry | Cold read refusal; expiry actor owns promptness | **No** |
-| Routing health rejects the actor incarnation | Fenced cold | **No** |
-| Exact artifact replaced before invalidation | Newer publication won | **No** |
-
-Applied to the two-level shape: a family `OrgRouteSet` mismatch conditionally
-clears **that family's** artifact and enqueues shared actor work **only if the
-shared pool/source is itself stale**. An expired family grant must never poison
-or delete the shared pool for other families.
-
-## 7. Split deadlines
-
-The pool cannot carry one complete caller authority deadline, because families
-differ in membership, dispatcher, INVOKE grant expiry and credential projection
-identity.
-
-| `UnsensedRoutePool` | Family `OrgRouteSet` |
+| Refusal | Policy |
 |---|---|
-| `next_private_discovery_deadline` | pool identity / generation |
-| `next_discovery_grant_deadline` | membership deadline |
-| `next_provider_authority_deadline` | dispatcher deadline |
-| session / source generations | matched INVOKE grant deadline |
-| | family credential-projection identity |
-| | **minimum effective deadline** |
+| `FamilyAtCapacity` | **sticky cold** for the family's lifetime — no eviction, entries live until the family dies |
+| `NodeAtCapacity` | **retryable**, gated on a node capacity generation; retry only if it moved |
+| `IdSpaceExhausted` | **terminal — never retry** |
 
-`next_authority_deadline` must ARM a rebuild. Without it an expired preferred
-grant stays selected indefinitely while every call falls cold — a liveness
-failure that is indistinguishable from a cold cache.
+## 10. 2B.3d-pre — the coherent current-authority cold plan
 
-## 8. Refresh paths
-
-**Capability miss:**
-
-```text
-atomically acquire the complete scoped demand set   (§4.1)
-→ load the current node UnsensedRoutePool
-→ bounded family projection
-→ publish OrgRouteSet into the CapabilityRouteHandle
-→ execute through the fully validated result, or one cold plan
-```
-
-**Warmed currentness mismatch:**
-
-```text
-conditionally clear the exact family OrgRouteSet
-→ enqueue shared actor work ONLY if the shared pool/source is stale
-→ execute ONE coherent cold plan
-```
-
-After the actor publishes a newer pool, a later cold call performs the pure
-narrowing and publishes the next family route set.
-
-## 9. 2B.3d-pre — the coherent current-authority cold plan
-
-Its own slice, before sender integration. It is the only valid destination for
-every warm miss and mismatch, it has independent security and race properties, it
-can be reviewed without changing dispatch, and 2B.3d cannot prove "one slow plan,
-then one send" until it exists.
+Its own slice, before sender integration: it is the only valid destination for
+every warm miss, mismatch, family-deadline expiry and ambiguity, so 2B.3d cannot
+be witnessed without it.
 
 ```text
 capture immutable current authority/store inputs
@@ -278,96 +310,71 @@ capture immutable current authority/store inputs
 → one OrgProofIntent
 ```
 
-If the final comparison refuses due to concurrent movement: **local refusal, no
-transport handoff, no automatic provider retry, no waiting for actor work.**
-
-Must preserve existing OLB-1 behaviour and errors exactly:
+Refusal at the final comparison: **local refusal, no transport handoff, no
+automatic provider retry, no waiting for actor work.** Preserves exactly:
 `AmbiguousCapabilityGrant`, `NoAuthorizedProvider`, Owner-before-Grant duplicate
-behaviour, provider-byte deterministic ordering, first-direct selection, and the
-exact considered count.
+behaviour, provider-byte ordering, first-direct selection, exact considered count.
 
-## 10. The warmed path and the sender boundary (2B.3d)
+## 11. Warmed path and sender boundary (2B.3d)
 
 ```text
 ArcSwap family capability-index load
 → CapabilityRouteHandle lookup
 → ArcSwap OrgRouteSet load
-→ complete stamp / currentness validation
-→ TAKE the preselected route            (never search)
+→ complete stamp / currentness / family-deadline validation
+→ TAKE the preselected route          (never search)
 → construct OrgProofIntent locally
 → final credentials/authority validation
 → MeshNode::call
 ```
 
-**No grant scan, provider scan, sort, or matching on warmed success.**
-
-**Between the final validation and `MeshNode::call`: no `.await`, no callback, no
-registry operation, no alternative-provider selection.** The rule goes in a
-comment at that exact call. Authority movement after the final comparison is the
-ordinary linearization race and is accepted; **holding an authority lock across a
-network send is forbidden.**
-
-2B.3d then merely chooses between two already-proven inputs — a valid warmed
-`OrgRouteSet`, or one coherent cold-plan result — and owns the one-send boundary.
-
-## 11. Refusal semantics, per class (stands from revision 2)
-
-| Refusal | Policy |
-|---|---|
-| `FamilyAtCapacity` | **Sticky cold** for that family's lifetime — no eviction, entries live until the family dies, so capacity cannot free while the family is intact |
-| `NodeAtCapacity` | **Retryable**, gated on a node capacity generation; retry only if it moved |
-| `IdSpaceExhausted` | **Terminal — never retry** |
-
-Never an unbounded refusal map, a spin, a wait on actor work, or a retry within
-the same call.
+**No grant scan, provider scan, sort, or matching on warmed success. Between the
+final validation and `MeshNode::call`: no `.await`, no callback, no registry
+operation, no alternative-provider selection.** Authority movement after the
+final comparison is the ordinary linearization race and is accepted; **holding an
+authority lock across a network send is forbidden.**
 
 ## 12. Witnesses
 
-Both forms of zero-lock evidence — instrumented end-to-end counters (a structural
-argument goes stale) **and** real contention witnesses (a counter misses a new
-lock site):
-
-```text
-hold the actual registry / state mutation mutex
-→ contender proves try_lock() FAILS       (only a failed try counts, per E3c)
-→ acknowledge
-→ complete one fully warmed call while the mutex remains held
-→ assert exactly one send
-→ release
-```
-
-All waits and joins bounded. Ordering claims are checked in **both** directions.
+Both zero-lock forms — instrumented end-to-end counters *and* a real contention
+witness (hold the actual mutex; contender proves `try_lock` **fails**;
+acknowledge; complete one fully warmed call while held; assert exactly one send;
+release). All waits bounded. Ordering claims checked in **both** directions.
 
 | # | Mutation | Must fail on |
 |---|---|---|
-| W1–W12 | *(unchanged from revision 2)* | epoch/floors/poison, ordering inverse, actor fence, expiry, unconditional invalidation, matrix violations, retry after handoff, two providers, any warmed-path lock, inline rebuild, retry-warm-after-rebuild |
-| W-A1..A5 | partial demand acquisition: family cap, node cap, id exhaustion, duplicate keys, failure after IDs considered | all-or-none — zero handles, zero partial entries, zero partial work |
-| W-F1 | family B uses a route requiring family A's grant | family-specific eligibility |
+| W1–W12 | *(revision 2, unchanged)* | epoch/floors/poison, ordering inverse, actor fence, expiry, unconditional invalidation, matrix violations, retry after handoff, two providers, any warmed-path lock, inline rebuild, retry-warm-after-rebuild |
+| W-A1..A5 | partial demand acquisition (family cap, node cap, id exhaustion, duplicate keys, failure after IDs considered) | all-or-none |
+| W-S1 | family projection reads a scoped pool it holds no handle for | structural inaccessibility |
+| W-S2 | compose pools with differing source/session generations | refuse publication, not mixed observation |
+| W-S3 | second cell not cloned under the same acquisition as the first | both cells coupled to the slot incarnation |
+| W-S4 | invalidate only the facts cell, not the pool cell | both publications cleared conditionally |
 | W-F2 | derive the matched INVOKE grant from the DISCOVER scope | INVOKE ≠ DISCOVER |
-| W-F3 | silently pick one of several matching INVOKE grants | `AmbiguousCapabilityGrant` preserved |
-| W-F4 | expired family grant clears the shared pool | family invalidation must not poison the pool |
+| W-F3 | silently pick one of several matching INVOKE grants | ambiguity never resolved silently |
 | W-F5 | family projection performs store/session work | pure narrowing only |
+| **W-M1** | ambiguity publishes an error-bearing route set | no route published; cold plan produces the error; warmed sender unreachable |
+| **W-M2** | ambiguity drops the capability entry / demand set | demand retained, so later movement can warm it |
+| **W-M3** | ambiguity resolved by movement | a later cold projection publishes a normal route set |
+| **W-D1** | family deadline expiry enqueues actor work or clears a pool | family-only refresh (§7) |
+| **W-D2** | family deadline expiry retries the warmed path in-call | one cold plan, then reproject for later calls |
+| **W-D3** | drop scoped-pool deadline arming | actor-owned staleness must still arm |
 | W-P1 | publish a pool from mixed epochs | pool coherence |
-| W-P2 | pool retained with no backing source slot | derivable 256 bound |
-| W-D1 | drop `next_authority_deadline` arming | expired preferred grant stays selected; all calls cold |
-| W-C1 | movement in one contributing scope leaves the pool valid | contributor invalidation edge |
+| W-N1 | demand a DISCOVER grant with no installed audience secret | never create a permanently `Unserved` contributor |
+| W-N2 | treat an INVOKE-only grant as a source demand | INVOKE-only grants are not demands |
 
-## 13. Implementation sequence (adopted)
+## 13. Implementation sequence
 
 | Slice | Content | Public call path |
 |---|---|---|
-| **2B.3c-pre** | Grant-scoped source service: exact installed DISCOVER authority and provenance. No caller INVOKE matching. | unchanged |
-| **2B.3b** | `OrgRoutingState`; lock-free immutable capability index; **atomic complete scoped-demand acquisition**; Option-A accounting + plan-text correction; refusal generation semantics; family `CapabilityRouteHandle` ownership. | unchanged |
-| **2B.3c** | Node-shared `UnsensedRoutePool`: Owner + served Grant composition; session/direct projection; complete node source vector and deadlines; publish-if-current. **No caller-specific final route claim.** | unchanged |
-| **2B.3d-pre** | Coherent current-authority cold-plan seam; exact existing behaviour preserved. **Must sign before 2B.3d.** | unchanged |
-| **2B.3d** | Family-specific `OrgRouteSet` projection/publication; warmed validation; one preselected route; final validation adjacent to `MeshNode::call`; zero routing locks, zero scans, one exact send. **Every temporary consumer `allow(dead_code)` disappears here.** | **changes** |
-
-Family projection may be split out of 2B.3d if that slice grows too large, but it
-must exist before the warmed consumer.
+| **2B.3c-pre** | Grant-scoped `SlotBaseFacts` service: exact installed DISCOVER authority and provenance only | unchanged |
+| **2B.3b** | `OrgRoutingState`; lock-free capability index; atomic complete demand-set acquisition; demand set from actually-leased DISCOVER audiences; Option-A accounting + plan correction; refusal capacity generation; `CapabilityRouteHandle` ownership | unchanged |
+| **2B.3c** | Per-slot `ScopedUnsensedRoutePool` publication (second cell); coherent direct/session projection; exact scoped source vector and deadlines; publish-if-current. **No union pool, no caller INVOKE matching.** | unchanged |
+| **2B.3d-pre** | Coherent current-authority cold-plan seam; existing errors, ordering, counts and provider choice preserved | unchanged |
+| **2B.3d** | Family projection over exact retained scoped pools; ambiguity refuses publication; family-only deadline refresh; warmed validation; one preselected route; final validation adjacent to `MeshNode::call`; zero routing locks, zero scans, one send. **Every temporary consumer `allow(dead_code)` disappears here.** | **changes** |
 
 ## 14. No premature surface
 
-No public `OrgRouteSet`, `UnsensedRoutePool`, `RouteCandidate`, selector,
+No public `OrgRouteSet`, `ScopedUnsensedRoutePool`, `RouteCandidate`, selector,
 candidate or provider list, scoring or cost accessor, or call option.
 `NoViableProvider` and its count are OLB-4. The application surface stays:
 
@@ -378,17 +385,16 @@ let response = org.call("customer.read", &request).await?;
 
 ---
 
+## Removed by this revision
+
+Scope partitioning makes these unnecessary, and they are deleted rather than left
+to rot: the node-union pool lifecycle; the `(acting_org, capability)` pool map;
+the "every pool must remain backed by at least one retained source slot"
+invariant (now structural); and the union-contributor invalidation machinery
+(W-C1 from revision 3), replaced by exact per-slot invalidation.
+
 ## Open questions
 
-1. **Pool sharing across families with disjoint grants.** The pool carries Grant
-   discovery provenance for the union of served Grant scopes. A family that holds
-   none of those grants narrows them all away — correct, but it means pool size
-   is driven by node-wide grant breadth while each family may use a fraction. Is
-   that acceptable, or should the pool be partitioned by discovery scope so a
-   narrow family projects over less?
-2. **`AmbiguousCapabilityGrant` on the warmed path.** Ambiguity is a property of
-   the family's grant set, so it is resolvable at family-projection time. Should
-   an ambiguous capability be published as a route set that *always* fails
-   locally with that error, or refused warming entirely so every call takes the
-   cold path and produces it there? The first is O(1); the second keeps exactly
-   one code path producing the error.
+None. Both revision-3 questions are answered above (scope partitioning; ambiguity
+produced only by the cold plan), and the deadline contradiction they exposed is
+resolved in §7.
