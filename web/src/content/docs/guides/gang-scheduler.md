@@ -73,15 +73,21 @@ The numeric axes are **live**, not static inventory: `max_load` and
 ### Selection policy is a scheduling decision
 
 `SelectionPolicy` is the knob that decides what your cluster looks like under
-load, and the three options pull in genuinely different directions:
+load, and the four options pull in genuinely different directions:
 
 - **`LeastLoaded`** (default) — spread. Lowest-load island first, island id
   ascending as a deterministic tie-break.
 - **`Pack`** — consolidate. Most-loaded-but-still-passing island first, so whole
   islands stay idle and claimable by a future large gang. Pick this when big
   gangs matter more than tail latency.
-- **`LoadBand { target }`** — aim for a load level. Avoids both stone-cold
-  islands (cold-start cost) and near-saturated ones (tail-latency cliff).
+- **`LoadBand(f32)`** — aim for a load level. Avoids both stone-cold islands
+  (cold-start cost) and near-saturated ones (tail-latency cliff). Note it is a
+  **tuple** variant in Rust — `SelectionPolicy::LoadBand(0.6)`, not a struct
+  variant with a named `target` field. Python and Go expose the target as a
+  separate flat field instead.
+- **`LowestId`** — deterministic. Lowest island id that passes, ignoring load
+  entirely. Useful when you want reproducible placement across runs rather than
+  balanced placement.
 
 ## Claim it
 

@@ -17,9 +17,23 @@ and doing it per-identifier took minutes.
    counter with a `reason` label) and three sensing knobs documented with a
    `candidate_` prefix they do not carry.
 
+Variant citations are also checked for *shape*: `LoadBand { target }` for a
+tuple variant `LoadBand(f32)` is wrong in a way membership alone cannot see.
+
 Some identifiers are legitimately absent: prose that names a thing precisely to
 say it must not exist, or a rename note listing the old name so stale code is
 recognisable. Those go in ABSENT_OK rather than weakening the pattern.
+
+TWO BOUNDARIES, both real and both worth knowing before trusting a green run:
+
+  * Only **backticked, qualified** citations are seen — `Enum::Variant`. A bare
+    `Variant` in a bullet list names no owner (the Phase 3 problem), and code
+    inside fenced blocks is not scanned here at all; that is the snippet
+    compiler's job.
+  * Membership and shape are checked, **completeness is not**. A page listing
+    two of four variants and calling them "the three options" passes. That
+    exact defect existed in `guides/gang-scheduler.md` and had to be found by
+    reading.
 
 Prints one line per mismatch and exits 1; silent exit 0 when clean.
 """
@@ -54,7 +68,7 @@ ABSENT_OK_BY_CORPUS = {
 
 # Trailing `[^`]*` so struct-like variants written with their fields
 # (`RpcError::NoRoute { target, reason }`) are checked too, not skipped.
-VARIANT_REF = re.compile(r"`([A-Z][A-Za-z]+)::([A-Z][A-Za-z]+)[^`]*`")
+VARIANT_REF = re.compile(r"`([A-Z][A-Za-z]+)::([A-Z][A-Za-z]+)([^`]*)`")
 # snake_case, >=3 segments and >=12 chars so ordinary prose does not qualify.
 IDENT_REF = re.compile(r"`([a-z][a-z0-9]*(?:_[a-z0-9]+){2,})`")
 
@@ -85,8 +99,17 @@ def read_sources():
                         if depth == 0:
                             break
                     i += 1
-                found = set(re.findall(r"^\s{4}([A-Z]\w*)", src[m.end() : i], re.M))
-                enums.setdefault(m.group(1), [set(), str(path)])[0].update(found)
+                # Capture the delimiter after each variant name so a
+                # documented shape can be checked, not just the name:
+                # `LoadBand { target }` for a tuple variant `LoadBand(f32)` is
+                # wrong in a way membership alone cannot see.
+                found = {}
+                for vm in re.finditer(
+                    r"^\s{4}([A-Z]\w*)\s*([({])?", src[m.end() : i], re.M
+                ):
+                    shape = {"(": "tuple", "{": "struct"}.get(vm.group(2), "unit")
+                    found[vm.group(1)] = shape
+                enums.setdefault(m.group(1), [{}, str(path)])[0].update(found)
     return "\n".join(corpus), enums
 
 
@@ -130,13 +153,30 @@ def main():
         variants |= set(VARIANT_REF.findall(text))
         idents |= set(IDENT_REF.findall(text))
 
-    for enum, var in sorted(variants):
+    for enum, var, trailing in sorted(variants):
         # An unknown name is a struct, trait, or non-Rust type — not our business.
-        if enum in enums and var not in enums[enum][0]:
+        if enum not in enums:
+            continue
+        if var not in enums[enum][0]:
             have = ", ".join(sorted(enums[enum][0])) or "(none)"
             print(
                 f"{enum}::{var} is not a variant of {enum} "
                 f"({enums[enum][1]}) — actual: {have}"
+            )
+            bad += 1
+            continue
+        # Shape, when the citation shows one. A bare `Enum::Variant` says
+        # nothing about shape and is left alone.
+        want = enums[enum][0][var]
+        shown = (
+            "struct" if trailing.lstrip().startswith("{")
+            else "tuple" if trailing.lstrip().startswith("(")
+            else None
+        )
+        if shown and shown != want:
+            print(
+                f"{enum}::{var} is a {want} variant but is written as a "
+                f"{shown} variant ({enums[enum][1]})"
             )
             bad += 1
 
