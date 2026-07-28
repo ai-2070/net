@@ -81,7 +81,7 @@
     "marked": "^18.0.4",
     "moment": "2.30.1",
     "moment-timezone": "0.6.3",
-    "motion": "12.42.2",
+    "motion": "12.43.0",
     "next": "16.2.12",
     "next-mdx-remote": "6.0.0",
     "next-recaptcha-v3": "1.5.3",
