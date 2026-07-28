@@ -1,118 +1,194 @@
 # Agent Skills — language routing
 
 > Make the skills route by binding instead of presenting five API shapes at
-> once. Adopts the reviewed recommendation (shared doctrine + thin binding
-> companions + checked per-language examples), **scoped by measurement** — the
-> uniform version would churn files that have nothing to gain.
+> once. Shared doctrine + explicit routing + thin binding companions + checked
+> examples — not five cloned skills, not one giant multilingual file.
 > Companion to [`SKILLS_VERIFICATION_PLAN.md`](SKILLS_VERIFICATION_PLAN.md),
 > which proves the skills match the tree; this one decides what an agent loads.
 
 ## Status
 
-**Not started.** The architecture is agreed: shared conceptual skill, explicit
-language routing, thin binding companions, checked examples per binding — not
-five cloned skills, and not one giant multilingual file.
+**Revision 2 — not started.** Revision 1's architecture was approved; its
+verification and scope gaps were not. Every correction below was checked against
+the tree rather than accepted on description, and two changed the plan
+materially:
 
-What follows is where the measurement changes the shape of the work.
+- **Nested companions would escape three of five checks.** Not a theory — I put
+  a file at `net-event-bus/bindings/_probe.md` with five planted defects. The
+  enum-variant and identifier checks caught theirs (they use `rglob`); the
+  **CLI-invocation, cited-path, and plan-vocabulary checks silently passed**,
+  because `check-skills.sh` globs `"$SKILLS"/*.md "$SKILLS"/*/*.md` and a
+  companion sits one level deeper. Moving content under `bindings/` before
+  fixing this would quietly retire three checks.
+- **The refactor is not event-bus-only.** R1 measured `net-event-bus` and
+  generalised. `net-payments/bindings.md` is **85% per-language** — worse than
+  `apis.md`'s 68%.
 
 ## The measurement that scopes it
 
-Per-language content is **not** evenly spread. Splitting every subsystem file
-would be churn for most of them:
+Per-language content is not evenly spread. A uniform split would churn files
+with nothing to gain:
 
-| File | Lines | Shared | Per-language | Worth splitting? |
+| File | Lines | Shared | Per-language | Split? |
 |---|---|---|---|---|
-| `apis.md` | 270 | 31% | **68%** | **Yes — this is the whole problem** |
-| `runtime.md` | 344 | 63% | 36% | Partly |
-| `nrpc.md` | 582 | 64% | 35% | No — see below |
-| `scheduler.md` | 209 | **94%** | 5% | No |
+| `net-payments/bindings.md` | 286 | 14% | **85%** | **Yes** — Python 146, Node/TS 79, Go 10, Rust 9 |
+| `net-event-bus/apis.md` | 270 | 31% | **68%** | **Yes** |
+| `net-event-bus/runtime.md` | 344 | 63% | 36% | Partly |
+| `net-event-bus/nrpc.md` | 582 | 64% | 35% | No |
+| `net-event-bus/scheduler.md` | 209 | **94%** | 5% | No |
+| `net-payments/{caller,provider,testing}.md` | 592 | **100%** | 0% | No |
 
-86 per-language sections are spread across 12 files. But the 35% in `nrpc.md`
-is **operation-specific** — "how Python does nRPC" — and under the review's own
-definition that belongs in the subsystem file, not in `bindings/python.md`
-("binding companions explain how that language expresses Net *generally*").
-Moving it would scatter one subsystem across five files and lose the grouping
-that makes the chapter readable.
+The 35% in `nrpc.md` is **operation-specific** — "how Python does nRPC" — and by
+the companions' own definition ("how that language expresses Net *generally*")
+belongs in the subsystem chapter. Splitting it would scatter one subsystem
+across five files. `apis.md` and `bindings.md` are the opposite: their bulk is
+generic-language material — package name, sync vs async construction, error
+shape, iterator semantics, lifecycle — welded into one file a Python reader
+loads to get a fraction of.
 
-`apis.md` is the opposite: its 68% *is* generic-language material — package
-name, sync vs async construction, error shape, iterator semantics, lifecycle.
-That is precisely a binding companion, currently welded into one file that a
-Python reader loads to get 34 relevant lines out of 270.
+*(Method note: the first pass reported "Python 225" for `bindings.md` because
+the heading `## Node / TS — … (parity with Python)` matched `Python` before
+`Node`. The corrected split is above. A heading-span heuristic needs its
+attributions spot-checked, not trusted.)*
 
-**So the refactor is narrow: `apis.md` becomes the binding companions.** Most
-subsystem files keep their per-language sections.
+## Phase 0 — make nested content verifiable — **Priority 0, S**
 
-## Phase 1 — the binding capability matrix — **Priority 1, S**
+Prerequisite. Without it the later phases silently reduce coverage.
 
-The one genuinely new artifact, and the one the review is most right about:
-curated, mechanically checked, more useful than any generated type inventory.
+**0a. Recursive discovery.** Every corpus-level check in `check-skills.sh`
+enumerates markdown recursively, not two levels deep. Affected: cited repo
+paths, CLI invocations, internal-plan vocabulary, and the cross-reference loop
+(which reads `"$dir"*.md`).
 
-**Why it earns its place:** parity claims are currently prose scattered across
-at least 8 files (`SKILL.md`, `bindings.md`, `nrpc.md`, `org.md`, `runtime.md`,
-`observability.md`, `README.md`, …). They drift, and one already had:
-`net-payments/bindings.md` said billing was Rust + Python when Node has
-`readBilling` too — fixed during the 2c audit, but only because someone read it.
+**0b. A nested fixture, not just a glob change.** A glob is one edit away from
+regressing. Add a permanent fixture — a nested file with a known-bad reference
+that CI asserts is *caught* — so the depth guarantee is tested, not assumed.
 
-A single source with a check makes that class impossible.
+**0c. Resolve the TypeScript publication gate.** R1's appendix listed "five
+hello-worlds compile or type-check" beside "publication is blocked when
+verification is red." Those do not compose. `check-skill-examples.sh` skips
+TypeScript when the napi declaration is absent (deliberately, and exempt from
+`REQUIRE_ALL`), and `hello.ts` is type-checked in `ci.yml` — which
+`skills.yml`'s `publish` job cannot depend on, since `needs` does not cross
+workflows. So: TS CI red + skills green → the mirror still publishes.
 
-**Shape** — statuses must distinguish absence from unsupported:
+That is the cross-workflow race the merged workflow was built to remove, still
+open for one language. **Close it rather than document it** — the published
+skill advertises TypeScript as first-class. Options, cheapest first: a reusable
+workflow both depend on; generate the napi declaration inside the skills
+workflow; or move publication behind a suite that covers everything. Whichever
+is chosen, the appendix claim gets corrected either way.
+
+## Phase 1 — domain-local capability matrices — **Priority 1, S**
+
+One matrix **per skill**, not one global file: the publisher copies
+`net-event-bus/`, `net-payments/` and `README.md` and nothing else, so a
+root-level matrix would never ship, and each skill must stand alone when
+installed by itself.
 
 ```
-full | partial | verify-only | core-only | poll-only | not-exposed | n/a
+net-event-bus/bindings/coverage.md
+net-payments/bindings/coverage.md
 ```
 
-`n/a` is load-bearing: "C has no A2A because A2A is not a C-shaped API" is a
-different fact from "Go's A2A is missing," and a matrix that conflates them
-tells an agent to attempt the wrong thing.
+**Why it earns its place:** parity claims are prose in at least 8 files today,
+and one had already drifted — `net-payments/bindings.md` said billing was Rust +
+Python when Node has `readBilling` too. Fixed during the 2c audit, but only
+because someone read it.
 
-**Checked, not generated.** Generation cannot distinguish public-but-experimental
-from supported, verifier-only from full, or shipped-dark from available. The
-matrix is curated; the check asserts the *falsifiable* half — that a cell
-claiming `full`/`partial` has a resolvable symbol behind it, and that a cell
-claiming `not-exposed` has none.
+### Cell vocabulary — one dimension at a time
 
-**Done when:** one file is the source of truth, the skills' prose parity claims
-point at it rather than restating it, and a check fails when a cell disagrees
-with the tree.
+R1's list mixed completeness, access mode, layer and availability into one
+column, leaving "is Go payments `partial` or `verify-only`?" undecidable. Split:
 
-## Phase 2 — `apis.md` → `bindings/*.md` — **Priority 1, M**
+| Column | Values |
+|---|---|
+| **Status** | `supported` · `partial` · `experimental` · `not exposed` · `n/a` |
+| **Mode** | (blank) · `poll` · `verify-only` · `core-only` |
 
-Split the 68% by language; keep the 31% shared as the routing page plus the
-capability matrix. Each companion carries exactly what changes generated code:
+`Mode` qualifies a status rather than competing with it: C's event bus is
+`supported` + `poll`; Go payments is `partial` + `verify-only`; capability
+sensing is `experimental` + `core-only`.
 
-1. package / import (they differ — `net-mesh-sdk` publishes, `net_sdk` imports)
+**`n/a` is reserved for "this operation makes no sense here",** not "this
+binding lacks it." R1 got its own example wrong: *"C has no A2A because A2A is
+not a C-shaped API"* — A2A could perfectly well have a C ABI; it does not have
+one **yet**. That is `not exposed`. Misfiling it as `n/a` tells an agent the
+gap is permanent and stops anyone asking for it.
+
+### What the check can honestly assert
+
+Not completeness. A symbol proves one narrow fact: *an expected anchor exists on
+this surface*. It cannot prove `supported`, and absence is worse — a binding may
+alias, project under another name, expose dynamically (Python), surface through
+generated declarations (TS), or carry a low-level FFI symbol the ergonomic SDK
+deliberately withholds.
+
+So: **the matrix is editorially authoritative; CI verifies its declared evidence
+anchors and selected critical absences.** Each non-`n/a` cell names its own
+evidence — a source path, a public symbol, a compile-checked example, or a
+conformance test — and the check resolves *that*. Negative evidence is asserted
+only where it is cheap and meaningful, cell by cell, never inferred globally.
+
+## Phase 2 — split generic binding material — **Priority 1, M**
+
+`net-event-bus/apis.md` → `bindings/{rust,typescript,python,go,c}.md`, and the
+same for `net-payments/bindings.md` (option **C** from the review: keep the 14%
+shared as router + matrix, split the Python 146 / Node 79 / Go 10 / Rust 9). The
+shared remainder of each becomes the routing page.
+
+Each companion carries only what changes generated code:
+
+1. package / import — they differ (`net-mesh-sdk` publishes, `net_sdk` imports)
 2. construction + configuration, and whether it is async
 3. runtime model, including blocking hidden behind an async surface
 4. exact names and argument shapes (positional / kwargs / options object)
-5. return and error behaviour — throws vs returns false vs encodes status
+5. return and error behaviour — throws vs returns `false` vs encodes status
 6. resource ownership and shutdown obligations
-7. feature availability + known gaps, pointing at the matrix
-8. one checked minimal example
+7. feature availability + known gaps, pointing at `coverage.md`
+8. a link to its canonical checked example (see Phase 4 — *link*, not a copy)
 9. where the authoritative binding source is
 10. what must never be inferred from another binding
 
-**Done when:** `apis.md` is a routing page, five companions exist, and the
-existing checks still pass over the new layout.
+Subsystem chapters keep their operation-specific language sections.
+
+**Done when:** both files are routing pages, companions exist, and the checks
+pass *with Phase 0b's fixture proving they reach the new depth*.
 
 ## Phase 3 — routing rules in `SKILL.md` — **Priority 2, S**
 
-The skill already says "identify the language" as workflow step 1. Make it
-binding-selection rather than a passing instruction:
+The skill says "identify the language" as workflow step 1. Make it binding
+selection: inspect the project manifest; load exactly one companion before
+generating; consult `coverage.md` before promising a surface exists; never
+default to Rust because Rust is the substrate; read the binding's own
+source/types when still uncertain; and with no project context and no language
+named, **ask** — one of the few questions worth blocking on.
 
-1. inspect the project manifest to determine the actual binding;
-2. load that companion before generating;
-3. consult the matrix before promising a surface exists;
-4. never default to Rust because Rust is the substrate;
-5. when the surface is still uncertain, read the binding's own source/types;
-6. with no project context and no language named, **ask** — this is one of the
-   few questions worth blocking on.
+## Phase 4 — bounded checked examples — **Priority 2, L**
 
-## Phase 4 — per-language example coverage — **Priority 2, M**
+R1 sized this M and left "important operation" undefined, which makes it
+subsystems × bindings — a design problem, not an implementation task. Two
+constraints have to be settled first.
 
-Today: one hello-world per language, all compile-checked (four gate `publish`,
-TypeScript gates via `ci.yml`). The review wants a canonical checked example per
-*important operation* per binding, with docs and skills pointing at them rather
-than keeping unrelated copies.
+**The initial operation set is the public critical path**, nothing wider:
+
+```
+construct/start · announce · discover · invoke · observe · handle one failure · shutdown
+```
+
+Subsystem examples get added only where a binding's shape is surprising or
+commercially important — not by default.
+
+**One canonical location per example.** The runnable file under `examples/` is
+canonical; the companion links to it and may quote a short excerpt only where
+that materially aids comprehension. CI compiles the file that ships with the
+skill, so markdown and file cannot diverge.
+
+**The checkers need extending, and that is the real cost.**
+`check-skill-snippets.py` supports Rust only *by design* — a non-Rust marker is
+a hard error — and `check-skill-examples.sh` is hardcoded around the five
+`hello.*` files. Either generalise to a manifest, or extend per known directory
+structure. Decide before starting.
 
 Report coverage with explicit `n/a`, so a missing example is never mistaken for
 an unsupported binding:
@@ -120,35 +196,37 @@ an unsupported binding:
 ```
 announce:  Rust ✓  TS ✓  Python ✓  Go ✓   C ✓
 nRPC:      Rust ✓  TS ✓  Python ✓  Go ✓   C n/a
-A2A:       Rust ✓  TS ✓  Python ✓  Go n/a C n/a
+A2A:       Rust ✓  TS ✓  Python ✓  Go not-exposed  C not-exposed
 ```
-
-Sequenced last: it is the largest, and it is worth far more once Phase 2 gives
-each example an obvious home.
 
 ## Explicitly not doing
 
 - **Five skills per language.** Duplicates doctrine, drifts on security and
-  failure semantics, breaks cross-language projects, and misrepresents the
-  domain — the domain is the event bus, not the language.
+  failure semantics, breaks cross-language projects, misrepresents the domain.
 - **Auto-extracted multilingual type inventories.** A second synthetic SDK
-  representation, noisy, and unable to express the things that actually break
-  generated code: that Node's `close()` must precede mesh shutdown, that
-  Python's async iteration calls blocking FFI, that a payment gate returns a
-  status object rather than throwing. Native compilers and type-checkers are
-  already the authority and are already wired into CI.
+  representation that cannot express what breaks generated code: that Node's
+  `close()` must precede mesh shutdown, that Python's async iteration calls
+  blocking FFI, that a payment gate returns a status object rather than
+  throwing. Native compilers are already the authority and already in CI.
 - **Splitting subsystem files by language.** `scheduler.md` is 94% shared;
-  `nrpc.md`'s per-language content is operation-specific. Only `apis.md` earns
-  it.
+  `nrpc.md`'s per-language content is operation-specific.
 
-## Appendix — what CI already proves
+## Appendix — what CI proves today, precisely
 
-Relevant because it decides how much the companions must assert rather than
-demonstrate: cited paths exist and are tracked; documented symbols resolve; enum
-variants belong to their enum *and* match its shape; metric/config identifiers
-exist; cross-binding vocabularies agree; five hello-worlds compile or
-type-check; marked snippets compile; publication is blocked when verification is
-red; and the docs site has the same path/variant/identifier/CLI checks.
+Cited paths exist and are tracked; documented symbols resolve; enum variants
+belong to their enum *and* match its shape; metric/config identifiers exist;
+cross-binding vocabularies agree; marked Rust snippets compile; the docs site
+carries the same path/variant/identifier/CLI checks.
 
-The gap this plan closes is not correctness. It is that an agent currently loads
-five API shapes to write one.
+Two honest qualifications, both corrected from R1:
+
+- **Four hello-worlds gate publication, not five.** C, Go, Rust and Python run
+  in `skills.yml`'s `examples` job, which `publish` needs. TypeScript is checked
+  in `ci.yml` and therefore does **not** gate the mirror — Phase 0c closes this.
+- **The checks catch *wrong*, not *incomplete*.** Only backticked, qualified
+  `Enum::Variant` citations are seen, and a page listing three of four variants
+  passes. That defect existed in `guides/gang-scheduler.md` and was found by
+  reading.
+
+The gap this plan closes is not correctness. It is that an agent loads five API
+shapes to write one.
