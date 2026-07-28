@@ -189,7 +189,8 @@ use net_sdk::capabilities::schema::validate_capabilities;
 
 // `pred!` is a MACRO with a parse-time DSL, not a builder object.
 // Each invocation is one clause; compose with `and [..]` / `or [..]` / `not ..`.
-// Keys are dotted strings — there is no `tag_key(axis, name)` helper.
+// Keys are dotted strings. Rust has no `tag_key(axis, name)` helper — Python
+// does, which is one of the ways a transliterated example goes wrong.
 let predicate = pred!(and [
     pred!(exists "hardware.gpu"),
     pred!(num_at_least "hardware.memory_gb", 64.0),
@@ -224,19 +225,39 @@ Rust gives you a `pred!` macro plus methods on `Predicate`; the other bindings
 expose free functions, because a macro doesn't translate. Don't transliterate an
 example across languages:
 
-| | Build | Evaluate | Trace | Corpus report |
-|---|---|---|---|---|
-| Rust | `pred!(..)` macro | `predicate.evaluate(&ctx)` | `predicate.evaluate_with_trace(&ctx)` | `PredicateDebugReport::from_evaluations` |
-| TS | `p.and` / `p.exists` | `evaluatePredicate` | `evaluatePredicateWithTrace` | `predicateDebugReport` |
-| Python | `p.and_` / `p.exists` | `evaluate_predicate` | — | — |
-| Go | `Predicate{}` literal | `EvaluatePredicate` | — | — |
-| C | — | `net_predicate_evaluate` | `net_predicate_evaluate_with_trace` | `net_predicate_aggregate_debug_report` |
+| | Build | Evaluate | Trace | Corpus report | Redact |
+|---|---|---|---|---|---|
+| Rust | `pred!(..)` macro | `predicate.evaluate(&ctx)` | `predicate.evaluate_with_trace(&ctx)` | `PredicateDebugReport::from_evaluations` | — |
+| TS | `p.and` / `p.exists` | `evaluatePredicate` | `evaluatePredicateWithTrace` | `predicateDebugReport` | `redactMetadataKeys` |
+| Python | `p.and_` / `p.exists` + `tag_key` | `evaluate_predicate` | `evaluate_predicate_with_trace` | `predicate_debug_report` | `redact_metadata_keys` |
+| Go | **not available** — see below | | | | |
+| C | **not in `net.h`** — see below | | | | |
 
-Metadata-key redaction before persisting a report (`redactMetadataKeys` in TS,
-`net_predicate_redact_metadata_keys` in C) has **no Rust SDK equivalent** — it
-lives in the FFI layer the bindings sit on. A predicate authored in TS and
-shipped to a Go server via the header still decodes losslessly; it is only the
-authoring and inspection ergonomics that differ.
+Two availability traps the tables above would otherwise hide:
+
+- **Go has no predicate surface in the published module.** `github.com/ai-2070/net/go`
+  ships none of this. A `predBuilder` with `Exists` / `Equals` / `NumericAtLeast`
+  exists at `net/crates/net/bindings/go/net/capability.go`, but that tree carries
+  no `go.mod` — it is a *reference* binding (the phrasing `go/meshdb.go` uses for
+  its own richer surface), not something a Go user can import. Use the
+  `net-where:` header from another language, or filter server-side.
+- **The C predicate functions are declared in `include/net.go.h`, not `net.h`.**
+  Those are two separate headers — neither includes the other, and `net.h` is the
+  one this skill tells C users to `#include`. `net_predicate_evaluate`,
+  `net_predicate_evaluate_with_trace`, `net_predicate_aggregate_debug_report`,
+  `net_predicate_to_where_header`, `net_validate_capabilities` and
+  `net_predicate_redact_metadata_keys` are all real, all in the CGO-facing
+  header.
+
+**Rust has no metadata-key redaction.** `redactMetadataKeys` /
+`redact_metadata_keys` exist for TS and Python; the Rust SDK re-exports the
+report type but not a redactor — redaction lives in the FFI layer the bindings
+sit on (`src/ffi/predicate_debug.rs`). Redact before persisting a report from
+those bindings; from Rust, strip the keys yourself.
+
+A predicate authored in TS and shipped to a server via the header still decodes
+losslessly wherever the *evaluation* surface exists — it is authoring and
+inspection ergonomics that differ, plus the two availability gaps above.
 
 **Placement-filter callbacks.** When the substrate's built-in scoring axes don't fit your placement rule, plug a host-language predicate in via `placement_filter_from_fn(...)` (Rust SDK / TS / Python / Go) — the substrate calls back per candidate. Pair with `standard_placement(custom_filter_id=...)` so the daemon-placement scheduler weights your callback alongside its native axes. C consumers reach the same dispatcher via `net_compute_set_placement_filter_dispatcher` + `net_compute_register_placement_filter` (`include/net.go.h`).
 
