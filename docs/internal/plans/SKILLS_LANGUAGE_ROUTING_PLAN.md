@@ -269,7 +269,7 @@ appendix's own point is that these catch *wrong*, not *incomplete*:
 
 - cited repo paths exist **and are tracked in git** (so a local build artifact
   cannot mask a bad citation);
-- **a hard-coded set of 17 high-risk callable symbols** resolves — not every
+- **a hard-coded set of 18 high-risk callable symbols** resolves — not every
   documented symbol;
 - backticked, qualified `Enum::Variant` citations are checked for **membership
   in known Rust enums, and for shape** — a tuple variant written `Foo { x }`
@@ -284,9 +284,13 @@ appendix's own point is that these catch *wrong*, not *incomplete*:
 
 Two honest qualifications, both corrected from R1:
 
-- **Four hello-worlds gate publication, not five.** C, Go, Rust and Python run
-  in `skills.yml`'s `examples` job, which `publish` needs. TypeScript is checked
-  in `ci.yml` and therefore does **not** gate the mirror — Phase 0c closes this.
+- **Four hello-worlds gate publication, not five, and none of them *runs*.**
+  C is syntax-checked, Go gets `go vet`, Rust builds, Python gets mypy — all in
+  `skills.yml`'s `examples` job, which `publish` needs. No example's behaviour
+  is executed anywhere, so the README's "prints exactly one line" is still
+  unverified; that is the Level 2 release-execution proof, not this. TypeScript
+  is type-checked in `ci.yml` and therefore does **not** gate the mirror at all
+  — Phase 0c closes that.
 - **The checks catch *wrong*, not *incomplete*.** Only backticked, qualified
   `Enum::Variant` citations are seen, and a page listing three of four variants
   passes. That defect existed in `guides/gang-scheduler.md` and was found by
