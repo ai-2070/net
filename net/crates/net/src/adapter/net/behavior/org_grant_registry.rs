@@ -391,10 +391,11 @@ impl GrantAudienceRecords {
     /// duplicated at the fill site.
     fn prepare_install(
         &self,
-        record: &GrantAudienceRecord,
+        candidate: PreparedRecord,
         capacity: usize,
         now_secs: u64,
     ) -> Result<PreparedInstall, GrantAudienceInstallError> {
+        let record = candidate.as_record();
         let grant_id = *record.grant_id();
         if let Some(existing) = self.by_grant_id.get(&grant_id) {
             return if records_identical(existing, record) {
@@ -434,10 +435,10 @@ impl GrantAudienceRecords {
                 return Err(GrantAudienceInstallError::AtCapacity);
             }
         }
-        Ok(PreparedInstall::Ready(PreparedSlot {
-            grant_id,
+        Ok(PreparedInstall::Ready(Box::new(PreparedSlot {
             next: Self { by_grant_id: next },
-        }))
+            candidate,
+        })))
     }
 
     /// Copy-on-write remove. `None` = the grant id was not present (no-op — the
@@ -460,29 +461,80 @@ pub(crate) enum PreparedInstall {
     /// consume no installation identity.
     Noop,
     /// Room is reserved and no ordinary refusal remains. Fill it infallibly.
-    Ready(PreparedSlot),
+    ///
+    /// Boxed: the slot carries the post-reclamation map and the owned candidate,
+    /// so the variant dwarfs `Noop`.
+    Ready(Box<PreparedSlot>),
 }
 
-/// A reserved place in the next snapshot, awaiting its stamped record.
+/// The candidate a preparation OWNS.
 ///
-/// Deliberately carries the post-reclamation map rather than re-deriving it, so
-/// the capacity decision cannot be made twice and disagree with itself.
+/// `GrantAudienceRecord` is deliberately not `Clone` — it holds the audience
+/// secret, and the type exists to keep those bytes behind one `Arc` rather than
+/// copied. So the consumer variant carries the record by MOVE until its
+/// installation identity exists, and the provider variant carries the `Arc` it
+/// was already handed.
+#[derive(Debug)]
+pub(crate) enum PreparedRecord {
+    /// Consumer install: awaiting the installation identity.
+    ///
+    /// Boxed to keep the enum small. The record still MOVES rather than being
+    /// copied, which is the property that matters — it holds the audience
+    /// secret and is deliberately not `Clone`.
+    Unstamped(Box<GrantAudienceRecord>),
+    /// Provider install: already final.
+    Stamped(Arc<GrantAudienceRecord>),
+}
+
+impl PreparedRecord {
+    fn as_record(&self) -> &GrantAudienceRecord {
+        match self {
+            Self::Unstamped(record) => record,
+            Self::Stamped(record) => record,
+        }
+    }
+}
+
+/// A reserved place in the next snapshot, together with the exact candidate it
+/// was reserved FOR.
+///
+/// Carries the post-reclamation map rather than re-deriving it, so the capacity
+/// decision cannot be made twice and disagree with itself — and carries the
+/// candidate, so no independently supplied record can cross the post-allocation
+/// boundary. The earlier shape took the record as a `finish` argument and
+/// checked it with `debug_assert_eq!`, which is not a release-mode guarantee:
+/// a slot prepared for A could be filled with B, keying the map by A while the
+/// record inside claimed B. "Infallible by construction" has to be stronger than
+/// "the present caller happens to behave" (Kyra, 2B.3c-pre step-1 re-review).
 #[derive(Debug)]
 pub(crate) struct PreparedSlot {
-    grant_id: [u8; 32],
     next: GrantAudienceRecords,
+    candidate: PreparedRecord,
 }
 
 impl PreparedSlot {
-    /// Insert the stamped record. INFALLIBLE by construction — every refusal was
-    /// already settled by [`GrantAudienceRecords::prepare_install`].
-    fn finish(mut self, record: Arc<GrantAudienceRecord>) -> GrantAudienceRecords {
-        debug_assert_eq!(
-            &self.grant_id,
-            record.grant_id(),
-            "a prepared slot must be filled by the record it was prepared for"
-        );
-        self.next.by_grant_id.insert(self.grant_id, record);
+    /// Stamp the OWNED candidate and insert it. Consumer path.
+    ///
+    /// Takes only the identity — the record cannot be substituted.
+    fn finish_with_install_seq(mut self, install_seq: u64) -> GrantAudienceRecords {
+        let record = match self.candidate {
+            PreparedRecord::Unstamped(record) => Arc::new((*record).with_install_seq(install_seq)),
+            // Unreachable on the consumer path; publishing the retained record
+            // unchanged is the only fail-safe answer, since substituting one is
+            // exactly what this type exists to prevent.
+            PreparedRecord::Stamped(record) => record,
+        };
+        self.next.by_grant_id.insert(*record.grant_id(), record);
+        self.next
+    }
+
+    /// Insert the OWNED candidate unchanged. Provider path.
+    fn finish(mut self) -> GrantAudienceRecords {
+        let record = match self.candidate {
+            PreparedRecord::Stamped(record) => record,
+            PreparedRecord::Unstamped(record) => Arc::new(*record),
+        };
+        self.next.by_grant_id.insert(*record.grant_id(), record);
         self.next
     }
 }
@@ -663,15 +715,18 @@ impl ProviderGrantSnapshot {
         self.0.len() == 0
     }
 
-    /// Install a validated record; see [`GrantAudienceRecords::install`].
+    /// Install a validated record; see [`GrantAudienceRecords::prepare_install`].
     pub(crate) fn with_record(
         &self,
         record: Arc<GrantAudienceRecord>,
         now_secs: u64,
     ) -> Result<Option<Self>, GrantAudienceInstallError> {
-        match self.0.prepare_install(&record, Self::CAPACITY, now_secs)? {
+        match self
+            .0
+            .prepare_install(PreparedRecord::Stamped(record), Self::CAPACITY, now_secs)?
+        {
             PreparedInstall::Noop => Ok(None),
-            PreparedInstall::Ready(slot) => Ok(Some(Self(slot.finish(record)))),
+            PreparedInstall::Ready(slot) => Ok(Some(Self(slot.finish()))),
         }
     }
 
@@ -718,20 +773,27 @@ impl ConsumerGrantSnapshot {
         self.0.len() == 0
     }
 
-    /// Install a validated record; see [`GrantAudienceRecords::install`].
+    /// Install a validated record; see [`GrantAudienceRecords::prepare_install`].
     /// Settle every ordinary install refusal, reserving a slot to fill
     /// (OLB-2B.3c-pre). See [`GrantAudienceRecords::prepare_install`].
     pub(crate) fn prepare_install(
         &self,
-        record: &GrantAudienceRecord,
+        record: GrantAudienceRecord,
         now_secs: u64,
     ) -> Result<PreparedInstall, GrantAudienceInstallError> {
-        self.0.prepare_install(record, Self::CAPACITY, now_secs)
+        self.0.prepare_install(
+            PreparedRecord::Unstamped(Box::new(record)),
+            Self::CAPACITY,
+            now_secs,
+        )
     }
 
-    /// Fill a reserved slot with its stamped record. Infallible by construction.
-    pub(crate) fn finish_install(slot: PreparedSlot, record: Arc<GrantAudienceRecord>) -> Self {
-        Self(slot.finish(record))
+    /// Stamp and publish the slot's OWN candidate. Infallible by construction.
+    ///
+    /// Takes only the installation identity: the record was fixed at preparation
+    /// time and cannot be substituted here.
+    pub(crate) fn finish_install(slot: PreparedSlot, install_seq: u64) -> Self {
+        Self(slot.finish_with_install_seq(install_seq))
     }
 
     /// Remove `grant_id`; see [`GrantAudienceRecords::without`].
