@@ -7,8 +7,8 @@
 use super::*;
 use crate::adapter::net::behavior::org_grant::CapabilityAuthorityId;
 use crate::adapter::net::behavior::org_routing_registry::{
-    PrivateAudienceScope, SlotKey, SlotSource, SourceCommitPin, SourceFacts, SourceSnapshot,
-    SourceToken,
+    PrivateAudienceScope, ScopedDiscoveryAuthorityStamp, ScopedSourceFacts, SlotKey, SlotSource,
+    SourceCommitPin, SourceFacts, SourceSnapshot, SourceToken,
 };
 use crate::adapter::net::behavior::org_scoped_ingest::CapabilityAudienceScope;
 use crate::adapter::net::behavior::org_scoped_store::{
@@ -213,7 +213,7 @@ impl SourceSnapshot for PausingSnapshot {
     fn token(&self) -> SourceToken {
         self.inner.token()
     }
-    fn providers(&self, key: &SlotKey) -> SourceFacts {
+    fn providers(&self, key: &SlotKey) -> ScopedSourceFacts {
         let hook = self.during_build.lock().take();
         if let Some(hook) = hook {
             hook();
@@ -229,12 +229,16 @@ impl SlotSource for PausingSource {
             during_build: self.during_build.clone(),
         })
     }
-    fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>> {
+    fn pin_if_current(
+        &self,
+        _keys: &[SlotKey],
+        expected: &SourceToken,
+    ) -> Option<Box<dyn SourceCommitPin + '_>> {
         let hook = self.before_pin.lock().take();
         if let Some(hook) = hook {
             hook();
         }
-        let pin = self.inner.pin_if_current(expected)?;
+        let pin = self.inner.pin_if_current(_keys, expected)?;
         let hook = self.after_pin.lock().take();
         if let Some(hook) = hook {
             hook();
@@ -274,6 +278,7 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
                 scoped_discovery: scoped.clone(),
                 publication: publication.clone(),
                 org_revocation: node.org_revocation.clone(),
+                consumer_grants: node.consumer_grant_audiences.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -379,6 +384,7 @@ async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -396,11 +402,11 @@ async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
 
     let snapshot = source.snapshot(&[owner_key.clone(), grant_key.clone()]);
     assert!(
-        matches!(snapshot.providers(&owner_key), SourceFacts::Served(ref p) if p.is_empty()),
+        matches!(snapshot.providers(&owner_key).facts, SourceFacts::Served(ref p) if p.is_empty()),
         "an owner scope with no rows is SERVED with exact empty evidence"
     );
     assert!(
-        matches!(snapshot.providers(&grant_key), SourceFacts::Unserved),
+        matches!(snapshot.providers(&grant_key).facts, SourceFacts::Unserved),
         "an unsupported scope is UNSERVED, not authoritatively empty"
     );
     assert_eq!(
@@ -413,12 +419,12 @@ async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
     let token = snapshot.token();
     assert!(
         source
-            .pin_if_current(&SourceToken::new(vec![u64::MAX]))
+            .pin_if_current(&[], &SourceToken::new(vec![u64::MAX]))
             .is_none(),
         "a token the source has left is refused"
     );
     assert!(
-        source.pin_if_current(&token).is_some(),
+        source.pin_if_current(&[], &token).is_some(),
         "the live token is accepted while the snapshot is still held"
     );
 }
@@ -549,6 +555,7 @@ async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -560,7 +567,7 @@ async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
     let token = snapshot.token();
     let scoped_before = node.scoped_discovery.lock().revision();
     assert!(
-        source.pin_if_current(&token).is_some(),
+        source.pin_if_current(&[], &token).is_some(),
         "nothing has moved yet"
     );
 
@@ -591,25 +598,25 @@ async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
     );
 
     assert!(
-        source.pin_if_current(&token).is_none(),
+        source.pin_if_current(&[], &token).is_none(),
         "a snapshot taken under the OLD revocation authority cannot commit"
     );
 
     // Re-snapshot under the now-current authority: it commits again.
     let fresh = source.snapshot(std::slice::from_ref(&key));
     let fresh_token = fresh.token();
-    assert!(source.pin_if_current(&fresh_token).is_some());
+    assert!(source.pin_if_current(&[], &fresh_token).is_some());
 
     // POISON alone defeats it too: an unusable floor view is unusable authority,
     // so every scope becomes UNSERVED rather than served unfiltered.
     store.mark_poisoned_for_test();
     assert!(
-        source.pin_if_current(&fresh_token).is_none(),
+        source.pin_if_current(&[], &fresh_token).is_none(),
         "poisoning the revocation authority invalidates a snapshot taken before it"
     );
     let poisoned = source.snapshot(std::slice::from_ref(&key));
     assert!(
-        matches!(poisoned.providers(&key), SourceFacts::Unserved),
+        matches!(poisoned.providers(&key).facts, SourceFacts::Unserved),
         "a poisoned revocation authority serves NOTHING rather than unfiltered rows"
     );
 
@@ -678,6 +685,7 @@ async fn cached_facts_that_crossed_their_expiry_read_cold() {
     // Install facts directly, as a quantum that raced the deadline would leave
     // them: valid at capture, expired by the time they are read.
     let expired = Arc::new(SlotBaseFacts {
+        authority: ScopedDiscoveryAuthorityStamp::Owner,
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: crate::adapter::net::behavior::org_routing_registry::SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -822,6 +830,7 @@ async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -834,7 +843,7 @@ async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
 
     let snapshot = source.snapshot(std::slice::from_ref(&key));
     let pin = source
-        .pin_if_current(&snapshot.token())
+        .pin_if_current(&[], &snapshot.token())
         .expect("nothing has moved");
 
     let installed = Arc::new(AtomicBool::new(false));
@@ -870,7 +879,7 @@ async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
     assert!(node.org_revocation.load().is_some());
 
     assert!(
-        source.pin_if_current(&snapshot.token()).is_none(),
+        source.pin_if_current(&[], &snapshot.token()).is_none(),
         "a token from the retired authority must be refused"
     );
 }
@@ -908,6 +917,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
     node.routing_registry.install_facts_for_test(
         key.clone(),
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -929,6 +939,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
     node.routing_registry.install_facts_for_test(
         key.clone(),
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -960,6 +971,7 @@ async fn an_exhausted_authority_epoch_fences_rather_than_aliasing() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -996,11 +1008,11 @@ async fn an_exhausted_authority_epoch_fences_rather_than_aliasing() {
 
     let snapshot = source.snapshot(std::slice::from_ref(&key));
     assert!(
-        matches!(snapshot.providers(&key), SourceFacts::Unserved),
+        matches!(snapshot.providers(&key).facts, SourceFacts::Unserved),
         "an exhausted authority serves nothing"
     );
     assert!(
-        source.pin_if_current(&snapshot.token()).is_none(),
+        source.pin_if_current(&[], &snapshot.token()).is_none(),
         "and commits nothing"
     );
 }
@@ -1022,6 +1034,7 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -1030,11 +1043,11 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
 
     let healthy = source.snapshot(std::slice::from_ref(&key));
     assert!(
-        matches!(healthy.providers(&key), SourceFacts::Served(_)),
+        matches!(healthy.providers(&key).facts, SourceFacts::Served(_)),
         "precondition: a usable authority serves the scope"
     );
     let healthy_token = healthy.token();
-    assert!(source.pin_if_current(&healthy_token).is_some());
+    assert!(source.pin_if_current(&[], &healthy_token).is_some());
 
     store.saturate_generation_for_test();
     store.republish_for_test();
@@ -1045,11 +1058,11 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
 
     let snapshot = source.snapshot(std::slice::from_ref(&key));
     assert!(
-        matches!(snapshot.providers(&key), SourceFacts::Unserved),
+        matches!(snapshot.providers(&key).facts, SourceFacts::Unserved),
         "an exhausted publication generation serves NOTHING"
     );
     assert!(
-        source.pin_if_current(&healthy_token).is_none(),
+        source.pin_if_current(&[], &healthy_token).is_none(),
         "and a token minted under the usable authority no longer commits"
     );
 }
@@ -1231,6 +1244,7 @@ async fn an_exhausted_store_generation_parks_apply_without_spinning_and_recovers
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -1336,6 +1350,7 @@ async fn an_empty_registry_whose_authority_moves_under_the_probe_is_redriven() {
                 scoped_discovery: node.scoped_discovery.clone(),
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
+                consumer_grants: node.consumer_grant_audiences.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1470,6 +1485,7 @@ async fn an_exhausted_scoped_generation_fences_the_routing_source() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -1479,7 +1495,7 @@ async fn an_exhausted_scoped_generation_fences_the_routing_source() {
     let healthy = source.snapshot(std::slice::from_ref(&key));
     let healthy_token = healthy.token();
     assert!(
-        matches!(healthy.providers(&key), SourceFacts::Served(_)),
+        matches!(healthy.providers(&key).facts, SourceFacts::Served(_)),
         "precondition: a usable generation serves the scope"
     );
     drop(healthy);
@@ -1511,17 +1527,17 @@ async fn an_exhausted_scoped_generation_fences_the_routing_source() {
 
     let fenced = source.snapshot(std::slice::from_ref(&key));
     assert!(
-        matches!(fenced.providers(&key), SourceFacts::Unserved),
+        matches!(fenced.providers(&key).facts, SourceFacts::Unserved),
         "an exhausted change generation serves NOTHING"
     );
     let fenced_token = fenced.token();
     drop(fenced);
     assert!(
-        source.pin_if_current(&healthy_token).is_none(),
+        source.pin_if_current(&[], &healthy_token).is_none(),
         "a token minted under the usable generation no longer commits"
     );
     assert!(
-        source.pin_if_current(&fenced_token).is_none(),
+        source.pin_if_current(&[], &fenced_token).is_none(),
         "and neither does one minted UNDER the exhaustion — two exhausted samples \
          must never compare equal-and-current"
     );
@@ -1620,6 +1636,7 @@ async fn a_delayed_reader_does_not_delete_a_newer_artifact() {
     let key = slot(13, "nrpc:delayed-reader");
     let facts = |authority: u64| {
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -1684,6 +1701,7 @@ async fn the_read_seam_fences_a_dead_incarnations_facts() {
     let node = node().await;
     let key = slot(29, "nrpc:incarnation-fence");
     let facts = Arc::new(SlotBaseFacts {
+        authority: ScopedDiscoveryAuthorityStamp::Owner,
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -1760,6 +1778,7 @@ async fn the_read_seams_authority_sample_cannot_straddle_a_store_install() {
     assert!(node.org_revocation.load().is_none());
     let key = slot(30, "nrpc:coherent-sample");
     let facts = Arc::new(SlotBaseFacts {
+        authority: ScopedDiscoveryAuthorityStamp::Owner,
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -1844,6 +1863,7 @@ async fn poisoning_authority_colds_already_cached_facts() {
     node.routing_registry.install_facts_for_test(
         key.clone(),
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -1896,6 +1916,7 @@ async fn authority_only_movement_invalidates_and_requeues_everything() {
     node.routing_registry.install_facts_for_test(
         key.clone(),
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: scoped_before,
@@ -1958,6 +1979,7 @@ async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
             scoped_discovery: node.scoped_discovery.clone(),
             publication: node.scoped_publication.clone(),
             org_revocation: node.org_revocation.clone(),
+            consumer_grants: node.consumer_grant_audiences.clone(),
             authority: node.routing_authority.clone(),
             settle_gap_hook: parking_lot::Mutex::new(None),
             unserved_scope: node.routing_unserved_scope.clone(),
@@ -2066,6 +2088,7 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -2112,6 +2135,7 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
                     scoped_discovery: node.scoped_discovery.clone(),
                     publication: node.scoped_publication.clone(),
                     org_revocation: node.org_revocation.clone(),
+                    consumer_grants: node.consumer_grant_audiences.clone(),
                     authority: node.routing_authority.clone(),
                     settle_gap_hook: parking_lot::Mutex::new(None),
                     unserved_scope: node.routing_unserved_scope.clone(),
@@ -2143,7 +2167,7 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
 
     // Whatever it sampled is COHERENT: it commits against the live authority.
     assert!(
-        source.pin_if_current(&token).is_some(),
+        source.pin_if_current(&[], &token).is_some(),
         "the snapshot must have sampled one side of the transition, not a mix"
     );
 }
@@ -2170,6 +2194,7 @@ async fn the_epoch_advances_before_the_store_becomes_visible() {
     node.routing_registry.install_facts_for_test(
         key.clone(),
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -2249,6 +2274,7 @@ async fn a_floor_publication_under_the_pin_cannot_settle_current() {
                 scoped_discovery: node.scoped_discovery.clone(),
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
+                consumer_grants: node.consumer_grant_audiences.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2359,6 +2385,7 @@ async fn authority_invalidation_spares_successor_facts() {
 
     let facts = |authority: u64| {
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -2440,6 +2467,7 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2559,6 +2587,7 @@ async fn poison_cannot_occupy_the_gap_between_validation_and_settlement() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2694,6 +2723,7 @@ async fn poison_before_the_validation_is_detected() {
                 scoped_discovery: node.scoped_discovery.clone(),
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
+                consumer_grants: node.consumer_grant_audiences.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3222,6 +3252,7 @@ async fn a_reader_retires_unserved_facts_once_their_poison_clears() {
 
     let poisoned_facts = |floor_generation: u64| {
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Unserved,
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -3403,12 +3434,18 @@ async fn duplicate_provider_rows_collapse_to_the_newest_generation() {
     // because the input happened to be sorted the right way.
     let snapshot = ScopedSourceSnapshot {
         token: SourceToken::default(),
-        rows: [(key.clone(), vec![row(3, 300), row(9, 900), row(5, 500)])]
-            .into_iter()
-            .collect(),
+        rows: [(
+            key.clone(),
+            (
+                vec![row(3, 300), row(9, 900), row(5, 500)],
+                ScopedDiscoveryAuthorityStamp::Owner,
+            ),
+        )]
+        .into_iter()
+        .collect(),
     };
 
-    let SourceFacts::Served(providers) = snapshot.providers(&key) else {
+    let SourceFacts::Served(providers) = snapshot.providers(&key).facts else {
         panic!("a captured scope must reconstruct as Served");
     };
     assert_eq!(providers.len(), 1, "one row per provider survives");
@@ -3791,6 +3828,7 @@ async fn a_handles_lockfree_read_observes_the_registrys_published_artifact() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),

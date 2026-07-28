@@ -122,6 +122,10 @@ pub(crate) struct SlotBaseFacts {
     pub providers: SourceFacts,
     /// The WHOLE source epoch these facts were built and committed under.
     pub epoch: SourceEpoch,
+    /// The EXACT scope authority these facts were reconstructed under
+    /// (OLB-2B.3c-pre). Per-key: never the batch-wide Grant vector, or unrelated
+    /// Grant movement would invalidate Owner and unrelated Grant facts.
+    pub authority: ScopedDiscoveryAuthorityStamp,
     pub actor_incarnation: u64,
     pub slot_incarnation: u64,
     /// The earliest `expires_at` across the retained providers, or `u64::MAX`
@@ -177,6 +181,54 @@ pub(crate) struct SourceEpoch {
     pub poisoned: bool,
 }
 
+/// The EXACT authority under which one scope's rows are query-visible
+/// (OLB-2B.3c-pre).
+///
+/// Per-SLOT, never per-batch. The batch `SourceToken` protects the
+/// capture/commit transaction; this protects one cached artifact. Copying a
+/// batch-wide value into every `SlotBaseFacts` would make unrelated Grant
+/// movement invalidate Owner and unrelated Grant facts — exactly what W-G8
+/// forbids.
+///
+/// For the Grant plane the installed consumer Grant IS authority, not a
+/// decryption convenience: the live query admits a row only while the stored
+/// grant signature and audience handle equal the CURRENTLY INSTALLED ones, so a
+/// cached artifact must compare the same things. All four components are bound:
+///
+/// - `grant_id` alone is insufficient — remove-then-reinstall, and a DIFFERENT
+///   signed grant reusing the id, both leave it equal;
+/// - `install_seq` distinguishes remove/reinstall of the same grant. It is the
+///   checked, terminal, non-aliasing identity signed at `300e80f6c`; a wrapping
+///   one would let an old artifact match a later installation;
+/// - `grant_signature` distinguishes a different signed grant under the same id —
+///   the signature binds the whole canonical grant;
+/// - `audience_handle` mirrors the live query's defense-in-depth check, so the
+///   cached path is never weaker than the uncached one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScopedDiscoveryAuthorityStamp {
+    /// The owner plane: authority is the node's own org, already covered by the
+    /// routing authority epoch and revocation view in [`SourceEpoch`].
+    Owner,
+    /// The grant plane: exactly one installed consumer Grant.
+    Grant {
+        grant_id: [u8; 32],
+        install_seq: u64,
+        grant_signature: [u8; 64],
+        audience_handle: [u8; 32],
+    },
+}
+
+/// One scope's reconstructed facts TOGETHER with the exact authority that
+/// produced them (OLB-2B.3c-pre).
+///
+/// They travel as one value so a caller cannot stamp facts with an authority
+/// that did not produce them.
+#[derive(Clone, Debug)]
+pub(crate) struct ScopedSourceFacts {
+    pub facts: SourceFacts,
+    pub authority: ScopedDiscoveryAuthorityStamp,
+}
+
 /// An opaque, comparable summary of EVERY authority input a snapshot was taken
 /// under.
 ///
@@ -225,8 +277,9 @@ pub(crate) trait SourceSnapshot {
     /// that proved it current.
     fn token(&self) -> SourceToken;
 
-    /// Reconstruct `key`'s authority-scoped facts from the captured material.
-    fn providers(&self, key: &SlotKey) -> SourceFacts;
+    /// Reconstruct `key`'s authority-scoped facts, with the exact scope
+    /// authority that produced them.
+    fn providers(&self, key: &SlotKey) -> ScopedSourceFacts;
 }
 
 /// A SHORT currentness pin, held only across final validation and installation.
@@ -286,7 +339,18 @@ pub(crate) trait SlotSource: Send + Sync + 'static {
     /// `None` means something the reconstruction depended on moved, and the
     /// caller must install nothing. ALWAYS called before the registry lock is
     /// taken, never while holding it — see the module's frozen lock order.
-    fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>>;
+    /// `keys` is the SAME batch the snapshot was taken over.
+    ///
+    /// The token's Grant half is a vector of the exact installation identities
+    /// THIS batch selected, so re-deriving it requires knowing which grants
+    /// those were. Passing the keys lets the pin compare like with like instead
+    /// of falling back to a global "some Grant moved" bit, which would defeat
+    /// every commit pin in flight on unrelated Grant movement (OLB-2B.3c-pre).
+    fn pin_if_current(
+        &self,
+        keys: &[SlotKey],
+        expected: &SourceToken,
+    ) -> Option<Box<dyn SourceCommitPin + '_>>;
 
     /// Whether this source can still settle a commit, and if it cannot, whether
     /// that is recoverable (E3c blockers §2, review-pass-3 §1).
@@ -1105,7 +1169,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             let probe = self.source.snapshot(&[]);
             let token = probe.token();
             drop(probe);
-            let Some(commit) = self.source.pin_if_current(&token) else {
+            let Some(commit) = self.source.pin_if_current(&[], &token) else {
                 // The refusal is REGISTRY-visible movement, exactly as it is on
                 // the non-empty path, and it must be marked for exactly the same
                 // reason (E3c blockers §3, review-pass-3 §2). What makes the
@@ -1178,7 +1242,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         // expensive part of a quantum, and blocking private-discovery ingest,
         // expiry and floor mutation behind it is exactly what the snapshot/commit
         // split exists to prevent (Kyra OLB-2B-E3b).
-        let built: Vec<(SlotKey, u64, SourceFacts)> = selected
+        let built: Vec<(SlotKey, u64, ScopedSourceFacts)> = selected
             .iter()
             .map(|(key, slot_incarnation)| {
                 (key.clone(), *slot_incarnation, snapshot.providers(key))
@@ -1187,7 +1251,8 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         drop(snapshot);
 
         // --- phase 4: the COMMIT pin, before the registry lock ---
-        let Some(commit) = self.source.pin_if_current(&snapshot_token) else {
+        let pin_keys: Vec<SlotKey> = selected.iter().map(|(key, _)| key.clone()).collect();
+        let Some(commit) = self.source.pin_if_current(&pin_keys, &snapshot_token) else {
             // An UNSETTLEABLE refusal is not movement (E3c blockers §2,
             // review-pass-3 §1): the mark below would spin the actor on
             // `Superseded` until shutdown, because nothing has to move for the
@@ -1274,6 +1339,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     slot_moved = true;
                     continue;
                 }
+                let ScopedSourceFacts { facts, authority } = facts;
                 let earliest_expiry = match &facts {
                     SourceFacts::Served(providers) => providers
                         .iter()
@@ -1286,6 +1352,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 slot.facts.store(Some(Arc::new(SlotBaseFacts {
                     providers: facts,
                     epoch,
+                    authority,
                     actor_incarnation: incarnation,
                     slot_incarnation,
                     earliest_expiry,
@@ -1510,7 +1577,7 @@ mod tests {
         fn token(&self) -> SourceToken {
             SourceToken::new(vec![self.generation])
         }
-        fn providers(&self, key: &SlotKey) -> SourceFacts {
+        fn providers(&self, key: &SlotKey) -> ScopedSourceFacts {
             self.state.queried.lock().push(key.clone());
             self.state
                 .assert_no_registry_lock("no registry lock may be held across reconstruction");
@@ -1522,7 +1589,10 @@ mod tests {
             if let Some(hook) = hook {
                 hook();
             }
-            SourceFacts::Served(Arc::from(Vec::new()))
+            ScopedSourceFacts {
+                facts: SourceFacts::Served(Arc::from(Vec::new())),
+                authority: ScopedDiscoveryAuthorityStamp::Owner,
+            }
         }
     }
 
@@ -1575,7 +1645,11 @@ mod tests {
             })
         }
 
-        fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>> {
+        fn pin_if_current(
+            &self,
+            _keys: &[SlotKey],
+            expected: &SourceToken,
+        ) -> Option<Box<dyn SourceCommitPin + '_>> {
             self.0.assert_no_registry_lock(
                 "the commit pin must be acquired BEFORE the registry lock",
             );

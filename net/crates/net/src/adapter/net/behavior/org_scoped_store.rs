@@ -1475,6 +1475,44 @@ impl ScopedDiscoveryState {
             .find_capabilities_for_grant(grant_id, now_secs, floors, predicate)
     }
 
+    /// Grant-scoped providers for ONE capability under `grant_id`
+    /// (OLB-2B.3c-pre).
+    ///
+    /// The routing analogue of [`Self::find_scope_exact_private_providers`], for
+    /// the plane that has no capability index: the grant partition binds its
+    /// capability at ingest and is served by a store scan, so the capability
+    /// narrowing happens here against `declarations_by_record` rather than by
+    /// decoding descriptors at query time. That keeps the ZERO-decode rule the
+    /// owner path already holds.
+    ///
+    /// `predicate` carries the caller's exact installed-Grant currentness check
+    /// (signature and audience handle). It is a parameter rather than something
+    /// computed here because the installed Grant lives on the node, not in the
+    /// store, and the source must compare against the very record it stamped.
+    pub(crate) fn find_grant_exact_private_providers<F>(
+        &self,
+        grant_id: &[u8; 32],
+        capability: &CapabilityAuthorityId,
+        now_secs: u64,
+        floors: &OrgRevocationState,
+        predicate: F,
+    ) -> Vec<PrivateCapabilityProvider>
+    where
+        F: FnMut(&VerifiedScopedCapability) -> bool,
+    {
+        let declarations = &self.index.declarations_by_record;
+        self.store
+            .find_capabilities_for_grant(grant_id, now_secs, floors, predicate)
+            .into_iter()
+            .filter(|rec| {
+                declarations
+                    .get(&(rec.scope().clone(), rec.provider().clone()))
+                    .is_some_and(|caps| caps.contains(capability))
+            })
+            .map(PrivateCapabilityProvider::from_verified)
+            .collect()
+    }
+
     /// Number of LIVE stored scoped capabilities (tombstones excluded).
     pub fn len(&self) -> usize {
         self.store.len()

@@ -5320,6 +5320,11 @@ struct ScopedSlotSource {
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
     publication: Arc<ScopedMutationPublication>,
     org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+    /// The installed consumer Grants. Grant-scoped rows are query-visible only
+    /// while an exact one is installed, so this is AUTHORITY for that plane, not
+    /// a decryption convenience (OLB-2B.3c-pre).
+    consumer_grants:
+        Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
     authority: Arc<RoutingAuthority>,
     /// Test-only: fires INSIDE `settle_if_current`, after the validation has
     /// succeeded and before the settlement — the exact gap a publication must not
@@ -5337,9 +5342,16 @@ struct ScopedSourceSnapshot {
     token: super::behavior::org_routing_registry::SourceToken,
     /// ONLY the keys this source can actually speak for. A key absent here
     /// reconstructs as `SourceFacts::Unserved`, never as an empty provider set.
+    ///
+    /// Each entry carries the EXACT scope authority its rows were captured
+    /// under, so the per-key stamp cannot drift from the rows it authorizes
+    /// (OLB-2B.3c-pre).
     rows: std::collections::BTreeMap<
         super::behavior::org_routing_registry::SlotKey,
-        Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider>,
+        (
+            Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider>,
+            super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
+        ),
     >,
 }
 
@@ -5652,14 +5664,103 @@ impl ScopedSlotSource {
         &self,
         epoch: super::behavior::org_routing_registry::SourceEpoch,
         exhausted: bool,
+        grant_identities: &[u64],
     ) -> super::behavior::org_routing_registry::SourceToken {
-        super::behavior::org_routing_registry::SourceToken::new(vec![
+        let mut words = vec![
             epoch.generation,
             epoch.authority,
             epoch.floor_generation,
             u64::from(epoch.poisoned),
             u64::from(exhausted),
-        ])
+        ];
+        // The DETERMINISTIC vector of exact selected Grant installation
+        // identities, not one global "some Grant moved" bit (OLB-2B.3c-pre).
+        // A global bit would make unrelated Grant movement defeat every commit
+        // pin in flight; the vector moves only when a grant THIS batch selected
+        // moves. Length is included so a batch selecting a strict prefix cannot
+        // compare equal to one selecting more.
+        words.push(grant_identities.len() as u64);
+        words.extend_from_slice(grant_identities);
+        super::behavior::org_routing_registry::SourceToken::new(words)
+    }
+
+    /// The exact installed-Grant authority for every Grant key in `keys`, from
+    /// ONE consumer snapshot (OLB-2B.3c-pre).
+    ///
+    /// Returns the per-key stamps AND the deterministic identity vector for the
+    /// token. Both come from the same `load_full`, so they cannot name different
+    /// installations.
+    ///
+    /// A grant is omitted — leaving its key structurally `Unserved` — when it is
+    /// not installed, when the scope's audience handle does not match the
+    /// installed record, or when the installed grant is not currently valid.
+    /// That last one is why the deadline cannot be derived from provider rows
+    /// alone: an installed Grant with zero visible providers would otherwise
+    /// yield `Served(empty)` bounded by `u64::MAX` and cache expired Grant
+    /// authority indefinitely (W-G13).
+    fn grant_installations_for(
+        slot: &Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
+        keys: &[super::behavior::org_routing_registry::SlotKey],
+        now_secs: u64,
+    ) -> (
+        std::collections::BTreeMap<
+            [u8; 32],
+            super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
+        >,
+        Vec<u64>,
+    ) {
+        use super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp;
+        use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
+        use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+        let installed = slot.load_full();
+        let mut stamps = std::collections::BTreeMap::new();
+        for key in keys {
+            let CapabilityAudienceScope::Grant {
+                grant_id,
+                audience_handle,
+            } = key.scope.scope()
+            else {
+                continue;
+            };
+            if stamps.contains_key(grant_id) {
+                continue;
+            }
+            let Some(record) = installed.get(grant_id) else {
+                continue;
+            };
+            if record.audience_handle() != audience_handle {
+                continue;
+            }
+            // An installed-but-expired Grant authorizes nothing. Checked here so
+            // the key falls to `Unserved` rather than being served under dead
+            // authority.
+            if record
+                .grant()
+                .is_valid_at_with_skew(now_secs, MAX_TOKEN_CLOCK_SKEW_SECS)
+                .is_err()
+            {
+                continue;
+            }
+            stamps.insert(
+                *grant_id,
+                ScopedDiscoveryAuthorityStamp::Grant {
+                    grant_id: *grant_id,
+                    install_seq: record.install_seq(),
+                    grant_signature: record.grant().signature,
+                    audience_handle: *record.audience_handle(),
+                },
+            );
+        }
+        // BTreeMap iteration is grant-id ascending, so the vector is
+        // deterministic without an explicit sort.
+        let identities = stamps
+            .values()
+            .filter_map(|stamp| match stamp {
+                ScopedDiscoveryAuthorityStamp::Grant { install_seq, .. } => Some(*install_seq),
+                ScopedDiscoveryAuthorityStamp::Owner => None,
+            })
+            .collect();
+        (stamps, identities)
     }
 }
 
@@ -5671,16 +5772,26 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
     fn providers(
         &self,
         key: &super::behavior::org_routing_registry::SlotKey,
-    ) -> super::behavior::org_routing_registry::SourceFacts {
-        use super::behavior::org_routing_registry::SourceFacts;
+    ) -> super::behavior::org_routing_registry::ScopedSourceFacts {
+        use super::behavior::org_routing_registry::{
+            ScopedDiscoveryAuthorityStamp, ScopedSourceFacts, SourceFacts,
+        };
         // Reconstruction proper: no lock of any kind, no await. Ordering is
         // imposed HERE rather than at capture, so the deterministic projection is
         // off-lock work.
-        let Some(rows) = self.rows.get(key) else {
+        let Some((rows, authority)) = self.rows.get(key) else {
             // Not captured => this source cannot speak for the scope at all.
             // Deliberately NOT an empty provider set: see `SourceFacts`.
-            return SourceFacts::Unserved;
+            //
+            // The stamp is `Owner` because there is nothing to be current
+            // ABOUT: an unserved reconstruction carries no rows, and the read
+            // seam refuses it structurally before any authority comparison.
+            return ScopedSourceFacts {
+                facts: SourceFacts::Unserved,
+                authority: ScopedDiscoveryAuthorityStamp::Owner,
+            };
         };
+        let authority = *authority;
         let mut providers = rows.clone();
         // Provider ascending (the deterministic projection order), generation
         // DESCENDING within a provider. `Vec::dedup_by` passes elements in
@@ -5697,7 +5808,10 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
                 .then_with(|| b.generation.cmp(&a.generation))
         });
         providers.dedup_by(|a, b| a.provider == b.provider);
-        SourceFacts::Served(providers.into())
+        ScopedSourceFacts {
+            facts: SourceFacts::Served(providers.into()),
+            authority,
+        }
     }
 }
 
@@ -5779,6 +5893,8 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         keys: &[super::behavior::org_routing_registry::SlotKey],
     ) -> Box<dyn super::behavior::org_routing_registry::SourceSnapshot> {
         use super::behavior::org_revocation::OrgRevocationState;
+        use super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp;
+        use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
         let now_secs = super::behavior::org::current_timestamp();
 
         // Revocation authority FIRST, and the floors come from exactly the store
@@ -5806,6 +5922,19 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
 
+        // ONE consumer-Grant snapshot for the whole batch, captured BEFORE the
+        // store lock. Every Grant key is stamped and filtered from this one
+        // snapshot, so a concurrent install/remove cannot leave one key's rows
+        // authorized by an installation another key's stamp does not name
+        // (OLB-2B.3c-pre).
+        //
+        // Two products, two jobs: the per-key STAMP goes into the artifact and
+        // protects it from unrelated Grant movement; the deterministic VECTOR of
+        // selected identities goes into the token and protects this
+        // capture/commit transaction.
+        let (grant_installations, grant_identity_vector) =
+            Self::grant_installations_for(&self.consumer_grants, keys, now_secs);
+
         let mut unserved = 0u64;
         let (generation, rows, generations_exhausted) = {
             let state = self.scoped_discovery.lock();
@@ -5818,28 +5947,78 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             let mut rows = std::collections::BTreeMap::new();
             for key in keys {
                 let scope = key.scope.scope();
-                if !matches!(
-                    scope,
-                    super::behavior::org_scoped_ingest::CapabilityAudienceScope::Owner { .. }
-                ) || poisoned
-                    || exhausted
-                {
-                    // Absent from `rows` => reconstructed as `Unserved`. A
-                    // POISONED revocation authority makes every scope unserved:
-                    // there is no usable floor view to filter against, and
-                    // serving unfiltered rows is worse than serving none.
+                // A POISONED or EXHAUSTED revocation authority makes EVERY scope
+                // unserved: there is no usable floor view to filter against, and
+                // serving unfiltered rows is worse than serving none.
+                if poisoned || exhausted {
                     unserved += 1;
                     continue;
                 }
-                rows.insert(
-                    key.clone(),
-                    state.find_scope_exact_private_providers(
-                        scope,
-                        &key.capability,
-                        now_secs,
-                        floors,
-                    ),
-                );
+                match scope {
+                    CapabilityAudienceScope::Owner { .. } => {
+                        rows.insert(
+                            key.clone(),
+                            (
+                                state.find_scope_exact_private_providers(
+                                    scope,
+                                    &key.capability,
+                                    now_secs,
+                                    floors,
+                                ),
+                                ScopedDiscoveryAuthorityStamp::Owner,
+                            ),
+                        );
+                    }
+                    // OLB-2B.3c-pre: the grant plane, served ONLY under the exact
+                    // installed consumer Grant. The stamps were captured from ONE
+                    // snapshot before this lock, so the stamp, the row filter and
+                    // the token cannot disagree about which installation
+                    // authorized these rows.
+                    CapabilityAudienceScope::Grant { grant_id, .. } => {
+                        let Some(
+                            stamp @ ScopedDiscoveryAuthorityStamp::Grant {
+                                grant_signature,
+                                audience_handle,
+                                ..
+                            },
+                        ) = grant_installations.get(grant_id).copied()
+                        else {
+                            // Absent, expired, or handle-mismatched installed
+                            // Grant: no evidence at all. Deliberately NOT an
+                            // empty provider set.
+                            unserved += 1;
+                            continue;
+                        };
+                        rows.insert(
+                            key.clone(),
+                            (
+                                state.find_grant_exact_private_providers(
+                                    grant_id,
+                                    &key.capability,
+                                    now_secs,
+                                    floors,
+                                    |c| {
+                                        // EXACTLY the live query's predicate. A
+                                        // cached path comparing less would serve
+                                        // rows the uncached path refuses.
+                                        c.grant_signature() == Some(&grant_signature)
+                                            && matches!(
+                                                c.scope(),
+                                                CapabilityAudienceScope::Grant {
+                                                    audience_handle: h, ..
+                                                } if h == &audience_handle
+                                            )
+                                    },
+                                ),
+                                stamp,
+                            ),
+                        );
+                    }
+                    // Public and anything else: not a private routing plane.
+                    _ => {
+                        unserved += 1;
+                    }
+                }
             }
             (generation, rows, generations_exhausted)
         };
@@ -5853,12 +6032,17 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             floor_generation,
             poisoned,
         };
-        let token = self.token(epoch, exhausted || generations_exhausted);
+        let token = self.token(
+            epoch,
+            exhausted || generations_exhausted,
+            &grant_identity_vector,
+        );
         Box::new(ScopedSourceSnapshot { token, rows })
     }
 
     fn pin_if_current(
         &self,
+        keys: &[super::behavior::org_routing_registry::SlotKey],
         expected: &super::behavior::org_routing_registry::SourceToken,
     ) -> Option<Box<dyn super::behavior::org_routing_registry::SourceCommitPin + '_>> {
         // BOTH gates, and both are held through the conditional installation
@@ -5887,7 +6071,14 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             floor_generation,
             poisoned,
         };
-        if exhausted || self.token(epoch, exhausted) != *expected {
+        // Re-derived under BOTH gates, from the same keys, so a consumer-Grant
+        // install/remove between the snapshot and here defeats the pin. Checking
+        // the scoped and revocation halves but not this one would let a
+        // WITHDRAWN Grant's rows install as current (OLB-2B.3c-pre).
+        let now_secs = super::behavior::org::current_timestamp();
+        let (_, grant_identities) =
+            Self::grant_installations_for(&self.consumer_grants, keys, now_secs);
+        if exhausted || self.token(epoch, exhausted, &grant_identities) != *expected {
             return None;
         }
         Some(Box::new(ScopedCommitPin {
@@ -7778,12 +7969,18 @@ impl MeshNode {
         let routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics> =
             Arc::default();
         let routing_unserved_scope = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Hoisted: the routing source shares this exact slot, because installed
+        // consumer Grants are AUTHORITY for the grant plane (OLB-2B.3c-pre).
+        let consumer_grant_audiences = Arc::new(arc_swap::ArcSwap::from_pointee(
+            super::behavior::org_grant_registry::ConsumerGrantSnapshot::empty(),
+        ));
         let routing_authority = Arc::new(RoutingAuthority::new());
         let routing_registry = super::behavior::org_routing_registry::NodeOrgRoutingRegistry::new(
             Arc::new(ScopedSlotSource {
                 scoped_discovery: scoped_discovery.clone(),
                 publication: scoped_publication.clone(),
                 org_revocation: org_revocation.clone(),
+                consumer_grants: consumer_grant_audiences.clone(),
                 authority: routing_authority.clone(),
                 #[cfg(test)]
                 settle_gap_hook: parking_lot::Mutex::new(None),
@@ -7860,9 +8057,7 @@ impl MeshNode {
             provider_grant_audiences: Arc::new(arc_swap::ArcSwap::from_pointee(
                 super::behavior::org_grant_registry::ProviderGrantSnapshot::empty(),
             )),
-            consumer_grant_audiences: Arc::new(arc_swap::ArcSwap::from_pointee(
-                super::behavior::org_grant_registry::ConsumerGrantSnapshot::empty(),
-            )),
+            consumer_grant_audiences,
             provider_grant_mu: parking_lot::Mutex::new(()),
             consumer_grant_mu: parking_lot::Mutex::new(()),
             org_audience_leases: Arc::new(
@@ -12891,6 +13086,52 @@ impl MeshNode {
         None
     }
 
+    /// Whether a stamped scope authority is still EXACTLY the installed one
+    /// (OLB-2B.3c-pre).
+    ///
+    /// `Owner` is trivially current: the owner plane's authority is the node's
+    /// own org, already covered by the routing epoch, floors and poison bit in
+    /// [`SourceEpoch`], all compared separately above.
+    ///
+    /// The grant arm compares all four bound components. `grant_id` alone would
+    /// pass a remove-then-reinstall and a different signed grant reusing the id;
+    /// the installation identity catches the first and the signature the second,
+    /// and the handle mirrors the live query's own defense-in-depth check so the
+    /// cached path is never weaker than the uncached one. Expiry is included
+    /// because an installed-but-expired Grant authorizes nothing, and deriving
+    /// the deadline from provider rows alone would let an empty served bucket
+    /// sit at `u64::MAX` forever (W-G13).
+    fn scope_authority_is_current(
+        &self,
+        stamped: &super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
+    ) -> bool {
+        use super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp;
+        use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+        let ScopedDiscoveryAuthorityStamp::Grant {
+            grant_id,
+            install_seq,
+            grant_signature,
+            audience_handle,
+        } = stamped
+        else {
+            return true;
+        };
+        let installed = self.consumer_grant_audiences.load();
+        let Some(record) = installed.get(grant_id) else {
+            return false;
+        };
+        record.install_seq() == *install_seq
+            && record.grant().signature == *grant_signature
+            && record.audience_handle() == audience_handle
+            && record
+                .grant()
+                .is_valid_at_with_skew(
+                    super::behavior::org::current_timestamp(),
+                    MAX_TOKEN_CLOCK_SKEW_SECS,
+                )
+                .is_ok()
+    }
+
     /// The registry's base facts for `key`, if a slot is retained, currently
     /// holds valid facts, AND the live health still allows the incarnation that
     /// built them.
@@ -12939,6 +13180,21 @@ impl MeshNode {
         if stale {
             // Conditional on the EXACT artifact read above: a delayed reader must
             // not delete a current replacement installed in the meantime.
+            self.routing_registry.invalidate_if_stale(key, &facts);
+            return None;
+        }
+        // OLB-2B.3c-pre: revalidate the EXACT scope authority these facts were
+        // reconstructed under. This is the security half of serving the grant
+        // plane: a consumer Grant removed after publication leaves the scoped
+        // revision, the routing epoch, the floors and the poison bit all
+        // unchanged, so without this the cached facts keep serving providers the
+        // node has WITHDRAWN discovery authority for.
+        //
+        // Compared, not re-read as a predicate — the same discipline poison
+        // needed. Any difference (removed, reinstalled, replaced under the same
+        // id, handle changed, now expired) fails equality and retires the exact
+        // artifact.
+        if !self.scope_authority_is_current(&facts.authority) {
             self.routing_registry.invalidate_if_stale(key, &facts);
             return None;
         }
