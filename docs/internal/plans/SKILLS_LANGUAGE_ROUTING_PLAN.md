@@ -8,7 +8,8 @@
 
 ## Status
 
-**Revision 3 — not started.** Revision 1's architecture was approved; its
+**Revision 3 — Phase 0 done, Phases 1–4 not started.** Revision 1's architecture
+was approved; its
 verification and scope gaps were not. Every correction below was checked against
 the tree rather than accepted on description, and two changed the plan
 materially:
@@ -63,9 +64,23 @@ the heading `## Node / TS — … (parity with Python)` matched `Python` before
 `Node`. The corrected split is above. A heading-span heuristic needs its
 attributions spot-checked, not trusted.)*
 
-## Phase 0 — make nested content verifiable — **Priority 0, S**
+## Phase 0 — make nested content verifiable — **Priority 0, S** — **DONE**
 
 Prerequisite. Without it the later phases silently reduce coverage.
+
+Landed in `752577efe` (0a), `37ec878f3` (0b) and the commit carrying 0c. Three
+things were found while implementing it that the plan had not anticipated:
+
+- `fail` in `check-skills.sh` and `check-docs.sh` was a 0/1 flag while every
+  section reported success with `[ "$fail" -eq "$before" ]`. After the first
+  failure, every later section printed a green tick it had not earned. Exit
+  codes were always right, which is why it survived. Now a counter.
+- The cross-reference extractor matched ``[a-z0-9-]*\.md`` and could not see a
+  citation to an underscored filename at all.
+- Recursion exposed `.claude/skills/README.md`, which the old glob never
+  examined. It is the corpus index and routes *into* the skills, so its
+  references resolve one level down and cannot name which skill — the rule
+  relaxes there and only there.
 
 **0a. Recursive discovery.** Every corpus-level check in `check-skills.sh`
 enumerates markdown recursively, not two levels deep. Affected: cited repo
@@ -91,6 +106,15 @@ harness: create a temporary nested file → run the checker → assert nonzero a
 the expected diagnostic → remove it
 ```
 
+*Implemented as a hybrid, because the harness shape has the same publication
+hazard in weaker form — an interrupted run leaves the probe in the corpus and
+the next push mirrors it.* `check-skills.sh` took an optional `SKILLS_DIR`, so
+`check-skills-depth.sh` plants its probe in a throwaway copy under `$TMPDIR`.
+That keeps the production discovery path under test — same script, same
+`skill_md()`, same greps — while `.claude/skills/` is never written to at all.
+Verified in both directions: four planted defects at depth 3 are all reported,
+and reverting `skill_md()` to the old two-level glob turns all four red.
+
 **0c. Resolve the TypeScript publication gate.** R1's appendix listed "five
 hello-worlds compile or type-check" beside "publication is blocked when
 verification is red." Those do not compose. `check-skill-examples.sh` skips
@@ -105,6 +129,25 @@ skill advertises TypeScript as first-class. Options, cheapest first: a reusable
 workflow both depend on; generate the napi declaration inside the skills
 workflow; or move publication behind a suite that covers everything. Whichever
 is chosen, the appendix claim gets corrected either way.
+
+*Closed by a fourth option that costs less than any of those.* The check moved
+into `check-skill-example-ts.sh`, called by both workflows, so there is one
+definition rather than two copies to drift. `skills.yml` gained a `typescript`
+job that builds napi and runs it, restricted by `if:` to exactly the events
+where `publish` can run — a full napi build is ~10 minutes, and `skills.yml`
+fires on every documented surface, so running it always would attach that cost
+to most pushes to buy nothing. On a branch or PR the same script runs in
+`ci.yml`, which is where the signal is wanted early; the one thing `ci.yml`
+cannot do is block this workflow's mirror, and that is the only case the new job
+covers.
+
+Two conditions that must agree now sit 80 lines apart, so
+`check-skill-workflow.py` asserts it. Divergence does not reopen the gate —
+GitHub skips a job whose dependency was skipped, so `publish` goes with it — but
+it silently stops the mirror on events where the gate does not run. The edit
+that *would* reopen it is adding a status-check function to `publish`'s own
+`if:`, since that replaces the implicit "every dependency succeeded" and turns
+every `needs` entry into decoration; asserted separately. Both fault-injected.
 
 ## Phase 1 — domain-local capability matrices — **Priority 1, S**
 
@@ -284,13 +327,15 @@ appendix's own point is that these catch *wrong*, not *incomplete*:
 
 Two honest qualifications, both corrected from R1:
 
-- **Four hello-worlds gate publication, not five, and none of them *runs*.**
+- **All five hello-worlds now gate publication, and none of them *runs*.**
   C is syntax-checked, Go gets `go vet`, Rust builds, Python gets mypy — all in
-  `skills.yml`'s `examples` job, which `publish` needs. No example's behaviour
-  is executed anywhere, so the README's "prints exactly one line" is still
-  unverified; that is the Level 2 release-execution proof, not this. TypeScript
-  is type-checked in `ci.yml` and therefore does **not** gate the mirror at all
-  — Phase 0c closes that.
+  `skills.yml`'s `examples` job. TypeScript is type-checked in a separate
+  `typescript` job, because it needs a ~10-minute `napi build` to produce the
+  gitignored `index.d.ts`; that job is restricted to publication-eligible events
+  and `publish` needs both. On a branch or PR the same script runs in `ci.yml`
+  instead. No example's behaviour is executed anywhere, so the README's "prints
+  exactly one line" is still unverified; that is the Level 2 release-execution
+  proof, not this.
 - **The checks catch *wrong*, not *incomplete*.** Only backticked, qualified
   `Enum::Variant` citations are seen, and a page listing three of four variants
   passes. That defect existed in `guides/gang-scheduler.md` and was found by

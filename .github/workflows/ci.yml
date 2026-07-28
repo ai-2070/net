@@ -1212,37 +1212,17 @@ jobs:
         run: npm run build
 
       # The skill's TypeScript hello-world, type-checked against this same
-      # surface. It lives here rather than in skills.yml's `examples` job
-      # because it needs the napi-generated `index.d.ts` the step above
-      # produced — that file is gitignored, so a clean checkout does not have it
-      # and the examples job cannot resolve `@net-mesh/core` at all.
+      # surface. It runs here because it needs the napi-generated `index.d.ts`
+      # the step above produced — that file is gitignored, so a clean checkout
+      # does not have it and skills.yml's `examples` job cannot resolve
+      # `@net-mesh/core` at all.
       #
-      # `extends` the SDK's own tsconfig so `types: ["node"]` and the installed
-      # @types/node resolve naturally. Two overrides are load-bearing: `rootDir`
-      # must widen to `..` (the example and `bindings/node/*.ts` both sit outside
-      # `src/`), and `baseUrl` is deliberately absent — TypeScript 6 makes it a
-      # hard error, and the `paths` below are already relative to this file.
+      # The check itself lives in a script because skills.yml runs the identical
+      # check as a publication gate: `needs` does not cross workflows, so this
+      # job alone could not stop the mirror publishing a TypeScript example that
+      # no longer compiles.
       - name: Type-check the skill hello-world example
-        run: |
-          set -euo pipefail
-          cp "$GITHUB_WORKSPACE/.claude/skills/net-event-bus/examples/hello.ts" ./skill-hello.ts
-          cat > tsconfig.skill-example.json <<'JSON'
-          {
-            "extends": "./tsconfig.json",
-            "compilerOptions": {
-              "noEmit": true,
-              "rootDir": "..",
-              "paths": {
-                "@net-mesh/sdk": ["./src/index.ts"],
-                "@net-mesh/core": ["../bindings/node/index.d.ts"],
-                "@net-mesh/core/*": ["../bindings/node/*"]
-              }
-            },
-            "include": ["skill-hello.ts"]
-          }
-          JSON
-          npx tsc --noEmit -p tsconfig.skill-example.json
-          rm -f skill-hello.ts tsconfig.skill-example.json
+        run: "$GITHUB_WORKSPACE/.github/scripts/check-skill-example-ts.sh"
 
       # vitest auto-discovers everything under `test/`. Notable
       # deck-specific coverage exercised by this step:

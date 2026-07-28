@@ -135,8 +135,11 @@ fi
 # SDK build fails anyway) — far too expensive to duplicate here.
 #
 # So: check it when the artifact happens to be present (the local-dev case), and
-# otherwise say where the authoritative check runs. `ci.yml`'s "TypeScript SDK
-# tests" job already builds napi and runs tsc; hello.ts is type-checked there.
+# otherwise say where the authoritative check runs. Two jobs build napi and then
+# run `.github/scripts/check-skill-example-ts.sh`: ci.yml's "TypeScript SDK
+# tests" (every push, so a broken example fails CI early) and skills.yml's
+# `typescript` (publication-eligible events only, so it can actually block the
+# mirror — `needs` does not cross workflows).
 echo "==> TypeScript — type check against the SDK source"
 NAPI_DTS="$ROOT/net/crates/net/bindings/node/index.d.ts"
 if [ ! -f "$NAPI_DTS" ]; then
