@@ -1,0 +1,109 @@
+name: Publish skills
+
+# Mirrors `.claude/skills/` to `ai-2070/net-claude-skill`, the public repo that
+# `npx skills add ai-2070/net-claude-skill` installs from.
+#
+# The skills are authored here so they ship with the library and sit next to the
+# code they describe; that repo is a publish artifact, not a place to edit. Every
+# push to master that touches the directory copies, verbatim:
+#
+#   .claude/skills/net-event-bus/  ->  net-event-bus/
+#   .claude/skills/net-payments/   ->  net-payments/
+#   .claude/skills/README.md       ->  README.md
+#
+# Anything else over there (LICENSE-APACHE, LICENSE-MIT, sync.sh) is left alone.
+# The copy is `rsync --delete`, so a file deleted here is deleted there.
+#
+# Required repository secret: `SKILLS_PUBLISH_TOKEN`
+#   A fine-grained PAT scoped to `ai-2070/net-claude-skill` with
+#   `Contents: Read and write`. The default `GITHUB_TOKEN` is scoped to this
+#   repository and cannot push to another one.
+#
+# `workflow_dispatch` takes a `dry_run` input that prints the diff and stops
+# short of pushing — use it to check the wiring before arming the push trigger.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".claude/skills/**"
+      - ".github/workflows/skills-publish.yml"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Show what would change without pushing"
+        type: boolean
+        default: false
+
+# Two pushes in quick succession would otherwise race to publish; the later one
+# waits rather than cancelling, so the mirror always ends on the newest tree.
+concurrency:
+  group: skills-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Mirror to net-claude-skill
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # Fail with an explanation rather than a 403 from the checkout below.
+      - name: Check the publish token is present
+        env:
+          TOKEN: ${{ secrets.SKILLS_PUBLISH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::SKILLS_PUBLISH_TOKEN is not set. Create a fine-grained PAT scoped to ai-2070/net-claude-skill with Contents: Read and write, then add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Checkout net-claude-skill
+        uses: actions/checkout@v7
+        with:
+          repository: ai-2070/net-claude-skill
+          token: ${{ secrets.SKILLS_PUBLISH_TOKEN }}
+          path: published
+
+      - name: Copy the skills across
+        run: |
+          set -euo pipefail
+          for skill in net-event-bus net-payments; do
+            test -f ".claude/skills/$skill/SKILL.md" || {
+              echo "::error::.claude/skills/$skill/SKILL.md is missing — refusing to publish"
+              exit 1
+            }
+            rsync -a --delete --exclude=.git ".claude/skills/$skill/" "published/$skill/"
+          done
+          cp .claude/skills/README.md published/README.md
+
+      - name: Commit and push
+        working-directory: published
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "already in sync with ${GITHUB_SHA}"
+            exit 0
+          fi
+
+          git add -A
+          git status --short
+
+          if [ "$DRY_RUN" = "true" ]; then
+            git diff --cached --stat
+            echo "dry run — not pushing"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit \
+            -m "skills: sync from net@${GITHUB_SHA:0:7}" \
+            -m "Published from .claude/skills/ by skills-publish.yml.
+          Source: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          git push
