@@ -109,7 +109,8 @@ What to do: include a unique event ID (hash of payload + timestamp) and have con
 **If you're on the Redis transport, the dedup primitive is already there.** The Redis adapter writes a stable `dedup_id` field on every XADD entry (`{producer_nonce}:{shard}:{seq_start}:{i}`) so a producer-retry-induced duplicate has the same `dedup_id` as its original. Net ships an LRU-bounded consumer-side helper across every SDK that filters those duplicates without you maintaining the set yourself. Sizing rule of thumb: `events_per_sec × dedup_window_seconds`.
 
 ```rust
-// Rust
+// Rust — needs `net-mesh-sdk = { version = "0.34", features = ["redis"] }`;
+// the export is behind `#[cfg(feature = "redis")]` and is absent on defaults.
 use net_sdk::RedisStreamDedup;
 let mut dedup = RedisStreamDedup::with_capacity(600_000);
 if !dedup.is_duplicate(&entry.dedup_id) { process(entry); }

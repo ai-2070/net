@@ -387,7 +387,53 @@ fails.
 
 ---
 
-## Phase 4 — opt-in snippet compilation — **Priority 2, L**
+## Phase 4 — opt-in snippet compilation — **Priority 2, L** — ⚠️ **shipped; ratchet started**
+
+> **It found the worst defect of the whole programme on its first real run.**
+> `capabilities.md` — the file the skill itself calls "the differentiator vs
+> Kafka/NATS/Redis" — documented a predicate API that has never existed:
+>
+> ```rust
+> use net_sdk::capabilities::{p, evaluate_predicate, predicate_to_rpc_header,
+>                             validate_capabilities, tag_key};
+> let pred = p.and(&[ p.exists(&tag_key("hardware", "gpu")), ... ]);
+> ```
+>
+> Of those five imports: `p` and `evaluate_predicate` and `tag_key` do not
+> exist anywhere; `predicate_to_rpc_header` and `validate_capabilities` are real
+> but live in `capabilities::predicate::` and `capabilities::schema::`
+> respectively, not the parent module. The real API is a **`pred!` macro** with a
+> parse-time DSL and dotted string keys — a different shape entirely, documented
+> correctly in the SDK's own doc comment the whole time. No name-level check
+> could have caught this: every symbol was plausible and the prose around it was
+> accurate.
+>
+> **Harness lessons worth keeping**, each found by a failing run rather than
+> reasoning:
+>
+> - *Always wrap in a function.* An "emit items as-is, wrap statements"
+>   heuristic split exactly wrong on the mixed snippets docs are full of
+>   (declare a type, then use it). Rust allows items inside fn bodies, so one
+>   rule covers all three shapes.
+> - *Hoist whole `use` statements, not lines.* The multi-line `use foo::{ ... };`
+>   form is everywhere in these files; a line-based split silently breaks it.
+> - *The preamble must be empty.* It started with `use std::sync::Arc;` as a
+>   convenience and immediately collided with the snippets that (correctly)
+>   import it themselves — and worse, would have let a snippet pass while
+>   missing an import its reader needs. It is now empty by policy, with the
+>   reasoning recorded in the file.
+> - *`cargo check`, not `cargo build`.* Linking adds nothing here and drags in
+>   build-script link failures unrelated to any snippet.
+>
+> **Ratchet state:** the marker is `<!-- skill-check: compile -->`; unmarked
+> blocks are skipped and the checked/total ratio is always printed, so a green
+> run never implies coverage it does not have. Only Rust is wired up — a marker
+> on any other language is a hard error rather than a silent pass, so extending
+> it is a deliberate act. `ratchet-skill-snippets.py` unmarks failures during
+> maintenance and is deliberately NOT run in CI, where it would let coverage
+> quietly fall.
+
+The original scope follows.
 
 **Surface:** 187 language-tagged fenced blocks.
 

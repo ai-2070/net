@@ -115,12 +115,13 @@ If no node advertises the service, the call fails `RpcError::NoRoute` — which 
 You can require more than "any server for this service": ship a capability predicate alongside the call and let the *receiver* evaluate it against its own capability set. A mismatched receiver refuses without invoking the handler.
 
 ```rust
-use net_sdk::capabilities::{p, tag_key};
+use net_sdk::capabilities::pred;
 use net_sdk::mesh_rpc::{CallOptionsExt, CallOptionsTyped};
 
-let predicate = p.and(&[
-    p.exists(&tag_key("hardware", "gpu")),
-    p.semver_compatible(&tag_key("software", "cuda_version"), "12.0.0"),
+// `pred!` is a macro over dotted string keys — see `capabilities.md`.
+let predicate = pred!(and [
+    pred!(exists "hardware.gpu"),
+    pred!(num_at_least "hardware.memory_gb", 16.0),
 ]);
 let opts = CallOptionsTyped::default().with_where(&predicate)?;
 

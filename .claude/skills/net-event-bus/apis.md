@@ -133,6 +133,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 futures = "0.3"
 ```
 
+<!-- skill-check: compile -->
 ```rust
 use net_sdk::{Backpressure, Net};
 use serde::{Deserialize, Serialize};

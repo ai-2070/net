@@ -50,6 +50,8 @@ on:
       - ".github/scripts/check-skill-workflow.py"
       - ".github/scripts/check-skill-examples.sh"
       - ".github/scripts/check-skill-vocab.py"
+      - ".github/scripts/check-skill-snippets.py"
+      - ".github/skill-snippets/**"
       # Every surface the skills document. Broad roots on purpose: the previous
       # list reached only `*/src/**` and missed 36 of the 66 source paths the
       # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
@@ -85,6 +87,8 @@ on:
       - ".github/scripts/check-skill-workflow.py"
       - ".github/scripts/check-skill-examples.sh"
       - ".github/scripts/check-skill-vocab.py"
+      - ".github/scripts/check-skill-snippets.py"
+      - ".github/skill-snippets/**"
       # Every surface the skills document. Broad roots on purpose: the previous
       # list reached only `*/src/**` and missed 36 of the 66 source paths the
       # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
@@ -172,6 +176,28 @@ jobs:
           REQUIRE_ALL: "1"
         run: .github/scripts/check-skill-examples.sh
 
+  snippets:
+    name: Snippets compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      # Opt-in: only blocks carrying `<!-- skill-check: compile -->` are
+      # extracted. The script always prints checked/total, so a green run never
+      # implies coverage it does not have — and an orphaned or malformed marker
+      # is an error, not a silent skip.
+      - name: Compile marked skill snippets
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: .github/scripts/check-skill-snippets.py
+
   publish:
     name: Mirror to net-claude-skill
     runs-on: ubuntu-latest
@@ -193,6 +219,7 @@ jobs:
     needs:
       - drift
       - examples
+      - snippets
 
     # Automatic publishes are master-only, and a pull request never publishes:
     # it runs with a read-only token and must not push to another repository.
