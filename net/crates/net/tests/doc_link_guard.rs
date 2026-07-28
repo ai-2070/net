@@ -157,9 +157,9 @@ fn doc_paths_mentioned_in_source_resolve() {
         let Ok(src) = std::fs::read_to_string(file) else {
             continue;
         };
-        for token in src.split(|c: char| {
-            !(c.is_alphanumeric() || c == '/' || c == '_' || c == '.' || c == '-')
-        }) {
+        for token in src
+            .split(|c: char| !(c.is_alphanumeric() || c == '/' || c == '_' || c == '.' || c == '-'))
+        {
             let Some(idx) = token.find("docs/") else {
                 continue;
             };
