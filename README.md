@@ -45,7 +45,7 @@ Drop `-g` to install into the current project only. To update to the latest vers
 npx skills update -g
 ```
 
-Restart Claude Code and run `/skills` — **net-event-bus** (pub/sub, nRPC, the MCP bridge, organization capability auth, the gang-claim scheduler, RedEX / CortEX / Dataforts) and **net-payments** (x402 pricing, quotes, settlement, spend policy) should be listed. Source: [ai-2070/net-claude-skill](https://github.com/ai-2070/net-claude-skill). Full install options in [Claude Skills](https://ai2070.net/docs/start/claude-skills).
+Restart Claude Code and run `/skills` Source: [ai-2070/net-claude-skill](https://github.com/ai-2070/net-claude-skill). Full install options in [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
 ## Contents
 
