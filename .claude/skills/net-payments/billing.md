@@ -40,8 +40,8 @@ appends a *freshly-emitted* billing event). `read_all` re-verifies every record
 as it loads, so a corrupted or forged line fails loudly rather than flowing
 into accounting.
 
-Billing surfaces exist in the SDKs that have payments: **Rust and Python** in
-P0/P1; other languages are verifier-level only (`bindings.md`).
+Billing surfaces exist in the SDKs that have payments: **Rust, Python, and
+Node**; other languages are verifier-level only (`bindings.md`).
 
 ## Immutability
 

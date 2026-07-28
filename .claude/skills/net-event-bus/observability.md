@@ -155,9 +155,9 @@ These are not all wired to every binding — for cross-SDK consumption, scrape v
 
 ## Adapter-specific stats
 
-**Redis adapter.** Subscriber-side lag and the dedup helper are the two surfaces. The dedup `RedisStreamDedup.len()` / `capacity()` (Python) tells you how full the consumer-side ID set is — when `len() / capacity()` approaches 1, dedups will start rolling off and you may re-deliver. Adapter source: `net/crates/net/src/adapter/redis/`.
+**Redis adapter.** Subscriber-side lag and the dedup helper are the two surfaces. The dedup `RedisStreamDedup.len()` / `capacity()` (Python) tells you how full the consumer-side ID set is — when `len() / capacity()` approaches 1, dedups will start rolling off and you may re-deliver. Adapter source: `net/crates/net/src/adapter/redis.rs`.
 
-**JetStream adapter.** Stream-age, consumer-pending, and redelivery counters surface from JetStream itself — the adapter does not duplicate them. Read from your NATS deployment's monitoring port (`/jsz`) and correlate with `events_dispatched` on the publisher. Adapter source: `net/crates/net/src/adapter/jetstream/`.
+**JetStream adapter.** Stream-age, consumer-pending, and redelivery counters surface from JetStream itself — the adapter does not duplicate them. Read from your NATS deployment's monitoring port (`/jsz`) and correlate with `events_dispatched` on the publisher. Adapter source: `net/crates/net/src/adapter/jetstream.rs`.
 
 ---
 

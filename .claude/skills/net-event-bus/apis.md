@@ -1,16 +1,27 @@
 # Net SDK API Reference
 
-**Drift check before trusting these signatures:**
+**Drift check before trusting these signatures.** From a checkout of the Net
+repo, one command verifies this whole skill against the tree — cited paths,
+documented symbols, CLI verbs, and the API-surface counts below:
+
 ```bash
-# Rust: confirms emit/emit_raw/emit_str/emit_batch/emit_raw_batch are still exported (expect 5)
+.github/scripts/check-skills.sh
+```
+
+If you only want the two counts this file depends on:
+
+```bash
+# Confirms emit/emit_raw/emit_str/emit_batch/emit_raw_batch are still exported (expect 5)
 grep -cE "^\s*pub fn emit" net/crates/net/sdk/src/net.rs
-# Rust: confirms the SdkError variant set this skill enumerates (expect 13).
+# Confirms the SdkError variant set this skill enumerates (expect 13).
 # `SdkError` is `#[non_exhaustive]` — count drift can also mean a *new*
 # variant was added that this skill hasn't documented yet.
 grep -cE "^\s*(Shutdown|Ingestion|Sampled|Unrouted|Poll|Adapter|Serialization|Config|NoMesh|Backpressure|NotConnected|ChannelRejected|Traversal)\b" net/crates/net/sdk/src/error.rs
 ```
 
-If any count drops, the SDK has churned underneath this doc — re-verify from source. If anything else looks wrong, **read the SDK source directly** — it is authoritative. The README is a good intro; the source is ground truth.
+If a count moves, the SDK has churned underneath this doc — re-verify from
+source. If anything else looks wrong, **read the SDK source directly** — it is
+authoritative. The README is a good intro; the source is ground truth.
 
 | Language | Path | Key files |
 |---|---|---|
@@ -230,7 +241,7 @@ These bite people regardless of language. Internalize them.
 - **JSON everywhere.** The wire format is JSON bytes. There is no schema registry. The JSON either parses on the consumer or it doesn't.
 - **Shutdown is required.** Don't rely on process exit. Call `shutdown()` / `Shutdown()` / `net_shutdown()`. The ring buffer needs a clean drain.
 - **Subscribe is hot.** A subscriber sees events emitted *after* it subscribed, plus whatever's still in the ring buffer. No replay-from-zero. If the user wants replay, they need RedEX or an adapter — not the bus.
-- **Backpressure is silent under `drop_*` modes; under `fail_producer` it surfaces per-language.** Always also watch `stats().events_dropped`. Per-SDK error shapes are detailed in each SDK's "Key facts" above and in `runtime.md` § Errors — don't duplicate the matrix here. The one-line summary: Rust returns `SdkError::Backpressure` / `Sampled` / `Unrouted` / `Ingestion(_)` (all four are structured causes since `bugfixes-8`; pre-`bugfixes-8` everything came through `Ingestion(String)`), TS throws on the `emit*` path / returns `false`/short on the `publish*`/`fire*` path, Python raises from the binding, Go/C return error codes.
+- **Backpressure is silent under `drop_*` modes; under `fail_producer` it surfaces per-language.** Always also watch `stats().events_dropped`. Per-SDK error shapes are detailed in each SDK's "Key facts" above and in `runtime.md` § Errors — don't duplicate the matrix here. The one-line summary: Rust returns `SdkError::Backpressure` / `Sampled` / `Unrouted` / `Ingestion(_)` (all four are structured causes; older releases routed everything through `Ingestion(String)`), TS throws on the `emit*` path / returns `false`/short on the `publish*`/`fire*` path, Python raises from the binding, Go/C return error codes.
 - **`_channel` is reserved** in TS/Python channel payloads. Don't put your own field there.
 - **Transport is set at construction.** A node can have only one transport. To bridge transports, run two nodes in the same process and forward between them.
 - **`shards` is a parallelism knob, not a partitioning scheme.** It does not give you Kafka-style ordered partitions. It just parallelizes ingestion. Default is fine for most workloads.
@@ -241,13 +252,13 @@ These bite people regardless of language. Internalize them.
 
 Out-of-scope features (read these directly from source):
 
-- **nRPC (request/response)** — typed `serve` + `call` + `callStreaming` with deadlines / retry / hedge / circuit-breaker. Separate convention layer over the bus. See `nrpc.md` and `net/crates/net/README.md` § nRPC.
+- **nRPC (request/response)** — typed `serve` + `call` + `callStreaming` with deadlines / retry / hedge / circuit-breaker. Separate convention layer over the bus. See `nrpc.md` and `README.md` § nRPC.
 - **Mesh transport configuration** (peer discovery, NAT traversal, port mapping, identity keys) — each SDK exposes mesh-specific kwargs. See SDK README's "Mesh" section.
-- **Subnets and capability tags** — set on node construction; affect channel visibility. See `net/README.md` § Subnets and Capabilities.
+- **Subnets and capability tags** — set on node construction; affect channel visibility. See `README.md` § Subnets and Capabilities.
 - **Capability discovery** — `mesh.find_nodes(filter)` / `find_nodes_scoped(filter, scope)` / `find_best_node(req)` for picking the right peer by hardware/model/tag. Reserved `scope:tenant:*` / `scope:region:*` / `scope:subnet-local` tags narrow discovery to per-tenant or per-region pools without channel-level subnet routing.
-- **Permission tokens for channel auth** — see `net/README.md` § Security surface.
-- **RedEX / CortEX / NetDB** — separate APIs for persistence and queryable state. See `net/README.md` § RedEX and CortEX + NetDB.
-- **Mikoshi (live daemon migration)** — separate API for stateful event processors. See `net/README.md` § Daemons and Mikoshi.
+- **Permission tokens for channel auth** — see `README.md` § Security surface.
+- **RedEX / CortEX / NetDB** — separate APIs for persistence and queryable state. See `README.md` § RedEX and CortEX + NetDB.
+- **Mikoshi (live daemon migration)** — separate API for stateful event processors. See `README.md` § Daemons and Mikoshi.
 
 ## Further reading
 

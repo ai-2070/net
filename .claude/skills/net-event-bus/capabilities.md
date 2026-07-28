@@ -26,7 +26,7 @@ pub struct CapabilitySet {
 - `Tag::AxisPresent { axis, key }` — boolean axis tag (`hardware.gpu`).
 - `Tag::AxisValue { axis, key, value, separator }` — keyed axis tag (`hardware.gpu.vram_gb=24`, `software.os:linux`). The substrate accepts `=` or `:` as separator and stores it on the wire; semantic equality ignores the separator (`software.os=linux` and `software.os:linux` match).
 - `Tag::Reserved { prefix, body }` — reserved cross-axis tag (`scope:tenant:foo`, `causal:<hex>`, `fork-of:<hex>`, `heat:warm`). Only substrate code emits these; `Tag::parse_user` rejects reserved prefixes from application input.
-- `Tag::Legacy(String)` — untyped pre-Phase-A free-form (`nat:full-cone`, `nrpc:my-service`).
+- `Tag::Legacy(String)` — untyped legacy free-form (`nat:full-cone`, `nrpc:my-service`).
 
 Hardware / software / model / tool / resource-limit views are *projections* of the tag set, lazily decoded via `caps.views()`:
 
@@ -221,7 +221,7 @@ let safe = redact_metadata_keys(&report, &["intent"]);
 
 Identical surface in TS (`p.and`, `p.exists`, `evaluatePredicate`, `predicateToRpcHeader` / `predicateFromRpcHeader`, `validateCapabilities`, `diffCapabilities`, `evaluatePredicateWithTrace`, `predicateDebugReport`, `redactMetadataKeys`), Python (`p.and_`, `p.exists`, `evaluate_predicate`, …), Go (`Predicate{}`, `EvaluatePredicate`, `PredicateToWhereHeader`), and C (`net_predicate_evaluate`, `net_validate_capabilities`, `net_predicate_to_where_header`, `net_predicate_evaluate_with_trace`, `net_predicate_aggregate_debug_report`, `net_predicate_redact_metadata_keys`). A predicate authored in TS and shipped to a Go server via the header decodes losslessly.
 
-**Placement-filter callbacks (Phase 7).** When the substrate's built-in scoring axes don't fit your placement rule, plug a host-language predicate in via `placement_filter_from_fn(...)` (Rust SDK / TS / Python / Go) — the substrate calls back per candidate. Pair with `standard_placement(custom_filter_id=...)` so the daemon-placement scheduler weights your callback alongside its native axes. C consumers reach the same dispatcher via `net_compute_set_placement_filter_dispatcher` + `net_compute_register_placement_filter` (`include/net.go.h`).
+**Placement-filter callbacks.** When the substrate's built-in scoring axes don't fit your placement rule, plug a host-language predicate in via `placement_filter_from_fn(...)` (Rust SDK / TS / Python / Go) — the substrate calls back per candidate. Pair with `standard_placement(custom_filter_id=...)` so the daemon-placement scheduler weights your callback alongside its native axes. C consumers reach the same dispatcher via `net_compute_set_placement_filter_dispatcher` + `net_compute_register_placement_filter` (`include/net.go.h`).
 
 ---
 

@@ -18,7 +18,7 @@ use net_payments::core::registry::default_registry_v1;
 use net_payments::billing::BillingLog;
 
 let provider = Arc::new(provider_keypair);            // the mesh EntityKeypair — this IS the provider identity
-let facilitator = Arc::new(MockFacilitator::new());   // P0; swap for HttpFacilitator in P1 (facilitator.md)
+let facilitator = Arc::new(MockFacilitator::new());   // swap for HttpFacilitator on a real network (facilitator.md)
 let admission = Arc::new(AdmitAll);                    // dev only; real provider policy is your impl
 let registry = default_registry_v1(provider.entity_id().clone());
 
@@ -169,11 +169,18 @@ The caller reads these terms from discovery and drives its side
 
 ## The provider gate in the invocation chain
 
-The `payment_gate` composes into `gated_invoke`:
+There is no `payment_gate` symbol — the payment gate is a *stage* inside
+`gated_invoke` (`net/crates/net/adapters/mcp/src/serve/gated.rs`), driven by
+the `PaymentFlow` you pass in:
 
 ```
-identity → consent → payment verification (accept_payment + tier policy) → provider policy re-check → handler
+describe → validate → consent gate → payment gate → invoke (handler)
 ```
+
+Two properties worth holding onto: **consent runs before payment** (never buy
+access to something the user hasn't consented to invoke), and **no configured
+flow fails closed** (`GatewayError::Denied`) — the handler never sees an unpaid
+call.
 
 For MCP-gateway hosts, the `mcp-gate` feature provides
 `EnginePaymentAdmission::new(Arc<engine>)` (impls `net_mcp::serve::PaymentAdmission`),

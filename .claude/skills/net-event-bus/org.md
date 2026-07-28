@@ -312,7 +312,7 @@ Everything `OrgClient` does is expressible by hand through `OrgProofIntent` on `
 - `nrpc.md` — the transport org calls ride on; status codes, deadlines, cancellation.
 - `error-codes.md` — the `RpcError` kinds `org:rpc:` reuses.
 - `cli.md` — `net-mesh org` / `net-mesh node adopt` argument reference.
-- `mcp.md` — `net wrap` publishes owner-scoped capabilities; org auth is the general form of that scoping.
+- `mcp.md` — `net-mesh wrap` publishes owner-scoped capabilities; org auth is the general form of that scoping.
 
 ## Further reading
 

@@ -64,9 +64,9 @@ per deployment:
 
 ## The network-enablement ladder (operational state, 2026-07-12)
 
-Engineering for the P0 + P1 rungs is complete; each rung is a shipped config
-pack + registry entries + a conformance run. Check the rung's state in the
-table below before telling the user a network is "live."
+Each rung is a shipped config pack + registry entries + a conformance run.
+Check the rung's state in the table below before telling the user a network is
+"live."
 
 | Rung | Network | Pack | State |
 |---|---|---|---|

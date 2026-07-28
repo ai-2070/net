@@ -1,28 +1,28 @@
 # Dataforts — greedy cache, gravity, blob refs, read-your-writes
 
-Dataforts is the **compositional data plane** on top of the substrate. Four phases compose against the existing RedEX / CortEX / capability-index / proximity-graph layers — there's no new wire protocol and no separate coordinator service. All four ship behind the single `dataforts` Cargo feature; pre-built artifacts ship with it enabled.
+Dataforts is the **compositional data plane** on top of the substrate. Four layers compose against the existing RedEX / CortEX / capability-index / proximity-graph layers — there's no new wire protocol and no separate coordinator service. All four ship behind the single `dataforts` Cargo feature; pre-built artifacts ship with it enabled.
 
-Greedy and gravity are **runtime-toggleable policies** — operators flip them on / off live against a running mesh, no rebuild required. The Cargo feature gates whether the surface compiles at all; the per-phase decision is operational.
+Greedy and gravity are **runtime-toggleable policies** — operators flip them on / off live against a running mesh, no rebuild required. The Cargo feature gates whether the surface compiles at all; the per-layer decision is operational.
 
-If you came here from `redex.md` or `cortex.md` looking for "how do I read my own write deterministically?" — that's Phase 5 below. If you came looking for "how do I cache chains from peers automatically?" — that's Phase 1. The four phases are independent; pick the ones that match your workload.
+If you came here from `redex.md` or `cortex.md` looking for "how do I read my own write deterministically?" — that's Read-your-writes below. If you came looking for "how do I cache chains from peers automatically?" — that's Greedy-LRU caching. The four layers are independent; pick the ones that match your workload.
 
 ---
 
 ## When to reach for Dataforts
 
-| Need | Phase | Lookup |
+| Need | Layer | Lookup |
 |---|---|---|
-| "Nodes near a chain should cache it speculatively, evict cold ones under pressure" | Phase 1 — Greedy | `Redex::enable_greedy_dataforts(mesh, …)` |
-| "Hot chains should drift toward the readers that drive the heat" | Phase 4 — Gravity | `Redex::enable_gravity_for_greedy(mesh, …)` |
-| "Substrate should carry a content-addressed reference; bytes live in S3 / Ceph / IPFS / local FS" | Phase 3 — Blob | `BlobAdapterRegistry::register` + `blob_publish` / `blob_resolve` |
+| "Nodes near a chain should cache it speculatively, evict cold ones under pressure" | Greedy caching | `Redex::enable_greedy_dataforts(mesh, …)` |
+| "Hot chains should drift toward the readers that drive the heat" | Data gravity | `Redex::enable_gravity_for_greedy(mesh, …)` |
+| "Substrate should carry a content-addressed reference; bytes live in S3 / Ceph / IPFS / local FS" | Blob refs | `BlobAdapterRegistry::register` + `blob_publish` / `blob_resolve` |
 | "Move a blob / directory **peer-to-peer over the mesh** — no external store in the path" | Transfer | `serve_blob_transfer` + `fetch_blob` / `store_dir` / `fetch_dir` |
-| "Producer needs to read its own write deterministically through the cache" | Phase 5 — RYW | `tasks.wait_for_token(token, deadline)` |
+| "Producer needs to read its own write deterministically through the cache" | Read-your-writes | `tasks.wait_for_token(token, deadline)` |
 
-The four phases are independent. A deployment can run greedy without gravity (hoard, don't rebalance), gravity without greedy (drift-only on pre-seeded replicas), both, or neither (substrate-only). Same for blob and RYW.
+The four layers are independent. A deployment can run greedy without gravity (hoard, don't rebalance), gravity without greedy (drift-only on pre-seeded replicas), both, or neither (substrate-only). Same for blob and RYW.
 
 ---
 
-## Phase 1 — Greedy-LRU caching
+## Greedy-LRU caching
 
 Per-node speculative caching of in-scope chains observed via the tail-subscription path. The mesh fans every event through a `GreedyObserver`; the runtime decides whether to admit each event into a per-channel cache file. Cold channels evict under cluster-cap pressure and withdraw their `causal:<hex>` advertisement so peers re-route to a healthy holder.
 
@@ -94,7 +94,7 @@ redex.enableGreedyDataforts(mesh, {
 
 ---
 
-## Phase 4 — Data gravity
+## Data gravity
 
 Per-chain read-rate counters with exponential decay. Threshold-crossing emissions stamp `heat:<hex>=<rate>` onto the chain's existing capability announcement; greedy admission weights cache pulls by `heat × scope-match × proximity-rank`. Cold chains evict first under cluster-cap pressure; hot chains migrate toward the readers that drive the heat. Gravity emerges from greedy + heat counters + capability-preference automatically — no separate migration engine.
 
@@ -152,7 +152,7 @@ redex.enableGravityForGreedy(mesh, {
 
 ---
 
-## Phase 3 — `BlobRef` + `BlobAdapter`
+## `BlobRef` + `BlobAdapter`
 
 Content-addressed reference whose bytes live in the caller's existing storage (S3, Ceph, IPFS, local FS). The substrate carries the reference, never owns the bytes. Adapters implement `fetch` / `store` (or the streaming variants for multi-GB payloads); the `FileSystemAdapter` ships in-tree.
 
@@ -220,9 +220,9 @@ Each binding lets you write adapters in the host language:
 
 ## Mesh blob + directory transfer
 
-Phase 3's `BlobRef` is a *reference*; the bytes still have to move. Besides the storage adapters (S3 / Ceph / FS pull), there's **peer-to-peer transfer over the mesh transport itself** — `SUBPROTOCOL_BLOB_TRANSFER` rides the fair-scheduled streams (`StreamConfig.scheduled = true`, see `streams.md`), so a node fetches a content-addressed blob — or a whole directory — directly from a peer that holds it, with no external store in the path.
+The `BlobRef` above is a *reference*; the bytes still have to move. Besides the storage adapters (S3 / Ceph / FS pull), there's **peer-to-peer transfer over the mesh transport itself** — `SUBPROTOCOL_BLOB_TRANSFER` rides the fair-scheduled streams (`StreamConfig.scheduled = true`, see `streams.md`), so a node fetches a content-addressed blob — or a whole directory — directly from a peer that holds it, with no external store in the path.
 
-This composes with Phase 3: `store_dir` writes chunks **into** a `BlobAdapter` and returns a manifest `BlobRef`; `fetch_blob` / `fetch_dir` pull those chunks **over the mesh** from whoever holds them. You can use the transfer surface without an S3-style backend at all (the FS adapter is enough).
+This composes with `BlobRef`: `store_dir` writes chunks **into** a `BlobAdapter` and returns a manifest `BlobRef`; `fetch_blob` / `fetch_dir` pull those chunks **over the mesh** from whoever holds them. You can use the transfer surface without an S3-style backend at all (the FS adapter is enough).
 
 **How it works.** Discovery rides the capability fold's `causal:<hex>` advertisement. The requester picks a holder, opens a freshly-allocated transfer stream, and the holder validates possession-of-hash as the capability, then chunks the blob into ≤8108-byte reliable events terminated by FIN. The receiver concatenates by arrival order and verifies BLAKE3. **The hash is an unguessable 256-bit bearer token** — anyone who can name the hash can fetch the bytes, so sensitive content must layer channel / capability auth above this transport (or treat the hash itself as a secret).
 
@@ -296,7 +296,7 @@ The verbs compose with the shell (pipe into `send-blob`, redirect `recv-blob` to
 
 ---
 
-## Phase 5 — Read-your-writes
+## Read-your-writes
 
 Every successful `Tasks::create` / `Memories::insert` / etc. returns the RedEX **seq** (a `u64`). The simplest read-your-writes wait is `wait_for_seq(seq)` — it blocks until the local fold has actually *applied* that sequence number, not just folded it. When you need a deadline or the origin-bound token primitive, wrap the seq in a `WriteToken { origin_hash, seq }` and call `wait_for_token(token, deadline)`. Either way, a producer reads its own write through the cache deterministically; no busy-poll, no time-window heuristic.
 

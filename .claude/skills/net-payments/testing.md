@@ -98,8 +98,8 @@ The design's acceptance test: **the mock and the HTTP client pass the
   server that speaks the spec (including its error vocabulary).
 - `flow_end_to_end.rs`, `exact_scheme_flow_e2e.rs` — the caller flow through
   quote → payload → settle → serve.
-- `mesh_payments_e2e.rs` — real two-node mesh (the P0 two-machine demo's
-  shape), `serve_payments` + `MeshPaymentChannel`.
+- `mesh_payments_e2e.rs` — real two-node mesh, `serve_payments` +
+  `MeshPaymentChannel`.
 - `mcp_gate_composition.rs` — the `gated_invoke` composition with the payment
   gate.
 - `spend_policy.rs` — auto-allow is silent; over-cap returns the structured

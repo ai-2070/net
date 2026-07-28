@@ -4,9 +4,9 @@ x402 facilitators are the services that actually `verify` and `settle`
 payments on a chain. Net treats a facilitator as a **named dependency, never a
 trust root**: a facilitator receipt justifies tier `observed` and nothing
 more (`verification.md`). The interface is one trait; the mock and the real
-HTTP client implement the *same* one — pointing P0 at a real facilitator is
-construction config, zero interface changes. That equivalence is the
-acceptance test of the whole P1 design.
+HTTP client implement the *same* one — moving from the mock to a real
+facilitator is construction config, zero interface changes. That equivalence
+is the acceptance test of the whole design.
 
 Source: `payments/src/facilitator/`.
 

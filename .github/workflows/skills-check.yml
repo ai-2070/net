@@ -1,0 +1,80 @@
+name: Skills
+
+# The agent skills in `.claude/skills/` are ~9k lines of prose asserting that
+# specific symbols, paths, and CLI verbs exist. They ship publicly via
+# `ai-2070/net-claude-skill` and are the first thing an agent loads before
+# writing integration code — but nothing compiles them, so they rot silently
+# while the crates move underneath. This is the tripwire.
+#
+# ---------------------------------------------------------------------------
+# DISABLED. The automatic triggers below are intentionally commented out; the
+# job runs only when dispatched by hand from the Actions tab. To turn it on,
+# uncomment the `push` / `pull_request` blocks. The script it runs is real and
+# passes today — run it locally any time with:
+#
+#     .github/scripts/check-skills.sh
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+
+  # push:
+  #   branches: ["**"]
+  #   paths:
+  #     - ".claude/skills/**"
+  #     - ".github/workflows/skills-check.yml"
+  #     - ".github/scripts/check-skills.sh"
+  #     # The skills document these surfaces; a change here can invalidate them.
+  #     - "net/crates/net/sdk/src/**"
+  #     - "net/crates/net/cli/src/**"
+  #     - "net/crates/net/payments/src/**"
+  # pull_request:
+  #   paths:
+  #     - ".claude/skills/**"
+  #     - ".github/workflows/skills-check.yml"
+  #     - ".github/scripts/check-skills.sh"
+  #     - "net/crates/net/sdk/src/**"
+  #     - "net/crates/net/cli/src/**"
+  #     - "net/crates/net/payments/src/**"
+
+jobs:
+  drift:
+    name: Drift check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # Frontmatter + description budget, cross-file links, cited repo paths,
+      # API-surface canaries, documented-symbol resolution, CLI verb names,
+      # and internal-plan leakage. No toolchain needed — grep and python3.
+      - name: Check skills against the tree
+        run: .github/scripts/check-skills.sh
+
+  # The five hello-world files in net-event-bus/examples/ are presented to
+  # users as "the first thing you run after install." Nothing builds them.
+  # Left as a sketch rather than a working job: each needs the SDK published
+  # or built locally first, which is what the release workflows already do.
+  # examples:
+  #   name: Build hello-world examples
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #     - run: cargo build -p net-sdk --example hello
+  #     - run: go build -o /dev/null .claude/skills/net-event-bus/examples/hello.go
+  #     - run: npx tsx --noEmit .claude/skills/net-event-bus/examples/hello.ts
+
+  # The skills are published from this directory to `ai-2070/net-claude-skill`,
+  # which is what `npx skills add` installs. Nothing verifies the two copies
+  # agree, so a fix here can sit unpublished indefinitely. Needs a token with
+  # read access to that repo before it can be turned on.
+  # published-sync:
+  #   name: In sync with net-claude-skill
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #     - name: Diff against the published copy
+  #       run: |
+  #         git clone --depth 1 https://github.com/ai-2070/net-claude-skill.git /tmp/published
+  #         diff -r --exclude=.git .claude/skills/net-event-bus /tmp/published/net-event-bus
+  #         diff -r --exclude=.git .claude/skills/net-payments  /tmp/published/net-payments

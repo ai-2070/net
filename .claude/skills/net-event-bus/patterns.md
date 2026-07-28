@@ -38,7 +38,7 @@ Configure mesh peers (at least one bootstrap peer) on construction. See SDK READ
 
 - **Redis transport** — events go to Redis Streams; durability and retention are Redis's. Use if you already run Redis.
 - **JetStream transport** — same idea via NATS JetStream.
-- **RedEX** (in addition to memory transport) — local append-only log per channel, per node, per file. Each node decides retention. No cluster. See `net/README.md` § RedEX. This is the "lightweight, no external dependency" option.
+- **RedEX** (in addition to memory transport) — local append-only log per channel, per node, per file. Each node decides retention. No cluster. See `README.md` § RedEX. This is the "lightweight, no external dependency" option.
 
 If the user says "I need exactly-once delivery" — Net does not provide this at the bus level. They need application-level idempotency (event hash deduplication) or a persistence adapter that gives them offsets.
 
@@ -144,7 +144,7 @@ JSON is the wire format. There is no schema registry. Producer and consumer must
 
 ## "I want auth — only some subscribers should see this channel"
 
-Register the channel with `token_roots` and present a **root-anchored `TokenChain`** when subscribing (see `concepts.md` § Identity and `net/README.md` § Security surface). The chain is honored only if it roots at one of the channel's `token_roots`, binds at its leaf to the subscriber's `EntityId`, and authorizes the action at every link; the publisher re-checks expiry + revocation while the subscription lives, and revocation is immediate. **Delegated** publishers must install their chain locally with `MeshNode::set_publish_chain(channel, chain)`; **direct-issued** publishers need no change.
+Register the channel with `token_roots` and present a **root-anchored `TokenChain`** when subscribing (see `concepts.md` § Identity and `README.md` § Security surface). The chain is honored only if it roots at one of the channel's `token_roots`, binds at its leaf to the subscriber's `EntityId`, and authorizes the action at every link; the publisher re-checks expiry + revocation while the subscription lives, and revocation is immediate. **Delegated** publishers must install their chain locally with `MeshNode::set_publish_chain(channel, chain)`; **direct-issued** publishers need no change.
 
 This is out of scope for the basic event-bus skill — point at the source if the user needs it. The native `net` binding exposes the chain API; the SDK surfaces a presented token via `SubscribeOptions.token`, and `set_publish_chain` lives on the core `MeshNode`.
 
@@ -152,7 +152,7 @@ This is out of scope for the basic event-bus skill — point at the source if th
 
 Use **subnet policies** with capability tags. Tag dev nodes with `env:dev`, prod with `env:prod`, define a subnet policy that maps the tag to a subnet level, declare the channel as `SubnetLocal`. Cross-subnet subscribes are rejected at the publisher.
 
-Out of scope for the basic skill. Point at `net/README.md` § Subnets.
+Out of scope for the basic skill. Point at `README.md` § Subnets.
 
 ## "I want per-tenant capability discovery without standing up subnets"
 
