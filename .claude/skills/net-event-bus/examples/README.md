@@ -1,8 +1,23 @@
 # Sanity-check examples
 
-Each file in this directory is a **minimal, runnable** example that proves install → publish → subscribe works end-to-end. Use these as the first thing a developer runs after `npm install` / `pip install` / `cargo add` — before they write any application code.
+Each file in this directory is a **minimal, runnable** example. Use these as the first thing a developer runs after `npm install` / `pip install` / `cargo add` — before they write any application code.
 
-All examples use the **memory transport** (no network, no peers needed) and run in a single process. Once these work, the developer knows the SDK is wired up correctly and can move on to mesh transport, channels, persistence, etc.
+All examples use the **memory transport** (no network, no peers needed) and run
+in a single process.
+
+**Memory transport does not deliver events, and that is by design.** It selects
+the Noop adapter, which counts batches and discards them — `adapter/noop.rs`
+says "Just count, don't store", and its `poll_shard` returns an empty result.
+Events flow producer → ring buffer → drain worker → adapter, so with Noop
+there is nothing to read: `subscribe()` never yields and `poll()` always
+returns zero.
+
+These examples therefore prove **ingestion**, not round-trip. That is the right
+scope for an install check — it exercises the whole path a developer can get
+wrong (package name, import name, construction, config validation, shutdown)
+without needing a broker or a second host. To actually receive events you need
+an adapter that retains them: Redis, JetStream, or the mesh transport between
+two nodes. See `mesh.md`.
 
 Two routes, each in all five bindings.
 
@@ -32,12 +47,34 @@ where they differ most:
 
 **The Rust and Python packages publish under a different name than they import.** `cargo add net-mesh-sdk` then `use net_sdk::…`; `pip install net-mesh-sdk` then `from net_sdk import …`. There is no package called `net-sdk` — don't install one.
 
-Each prints exactly one line: the event it emitted, received, and round-tripped. If you see that line, the SDK is working.
+`hello.*` prints one line reporting that the bus accepted the event. If you see it, the SDK is installed and wired up correctly.
 
 ## What CI checks here
 
-Every file in this directory is **compiled or type-checked** on each pull request against the current tree — so a renamed method or a changed signature breaks the build rather than reaching you. `hello.c`, `hello.go`, `hello.rs` and `hello.py` run through `.github/scripts/check-skill-examples.sh`; `hello.ts` goes through `.github/scripts/check-skill-example-ts.sh`, run by the two jobs that build the napi type declarations it needs.
+Every file here is **compiled or type-checked** on each pull request against the
+current tree, so a renamed method or a changed signature breaks the build rather
+than reaching you. `hello.c`, `hello.go`, `hello.rs` and `hello.py` go through
+`.github/scripts/check-skill-examples.sh`; the `.ts` files go through
+`.github/scripts/check-skill-example-ts.sh`, run by the two jobs that build the
+napi type declarations it needs.
 
-Both are driven from `.github/skill-examples.json`, which requires every binding to be listed for every route as either a checked file or an explicit, reasoned absence. A source file sitting in this directory but missing from that manifest is an error — otherwise it would ship to users with nothing compiling it.
+**Every example is also executed**, in all five bindings, with its stdout
+matched against a contract and bounded by a timeout. That is not belt-and-braces: a compile floor cannot
+catch an example that builds and then hangs, and both `hello.rs` and `hello.ts`
+did exactly that for months — clean compile, blocked forever on a subscribe that
+could never yield — while this README promised they printed one line. Nothing
+short of running them would have found it.
 
-That is a compile floor, not a promise that the commands above run. Executing them needs built artifacts (the napi module, the Python wheel, the C shared library), so the "prints exactly one line" claim is verified in the release pipelines rather than per-PR. If one of these fails to run for you against a released build, that is a bug worth reporting.
+Each runs where its artifacts already exist, so the marginal cost is the
+execution itself: Rust in `skills.yml`'s `examples` job, TypeScript in the two
+jobs that build the napi module, Python in `ci.yml`'s `python-tests` (the only
+job with both the maturin binding and the `net_sdk` wrapper), and Go and C in
+`ci.yml`'s `go-tests`, the only job that produces a linkable `libnet`.
+
+Both are driven from `.github/skill-examples.json`, which requires every binding
+to be listed for every route as either a checked file or an explicit, reasoned
+absence — and, for execution, records which bindings run where. Its coverage
+report prints **▶** for executed against **✓** for compiled-only, so a partially
+executed route can never read as a fully executed one. A source file sitting in
+this directory but missing from that manifest is an error; otherwise it would
+ship to users with nothing compiling it.

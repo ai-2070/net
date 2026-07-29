@@ -58,6 +58,16 @@ iterator inside `asyncio.to_thread(...)`. See `runtime.md` § Python.
 This is the Python-specific trap that survives being ported from the TypeScript
 docs, where `for await...of` really is non-blocking.
 
+## The buffer-capacity rule no compiler enforces
+
+`ring_buffer_capacity` must be a **power of two and at least 1024**. It is
+validated in the shared core config at construction, so every binding raises the
+same way — and no compile or type check catches it. The default is 1,048,576
+(1M events per shard), which is also why a "demonstrate backpressure" snippet
+that emits a few thousand events into a default node drops nothing at all.
+
+Spelt `buffer_capacity=1024` in this binding.
+
 ## Names and shapes
 
 - `node.channel('name', Model)` — the named-channel surface. The model may be a

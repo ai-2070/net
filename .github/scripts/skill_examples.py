@@ -23,6 +23,7 @@ where support is recorded, and the two answer different questions.
 import argparse
 import json
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -114,6 +115,37 @@ def validate(m):
             if rel not in tr:
                 problems.append(f"{where}: `files.{b}` -> {rel} is not tracked in git")
 
+        # The execution contract. A compile floor cannot catch an example that
+        # builds and then hangs, so anything with a `run` block is executed —
+        # and any binding NOT executed has to say why, for the same reason
+        # `absent` does.
+        run = ex.get("run")
+        if run is not None:
+            if not str(run.get("expect", "")).strip():
+                problems.append(f"{where}: `run` has no `expect` pattern")
+            else:
+                try:
+                    re.compile(run["expect"])
+                except re.error as e:
+                    problems.append(f"{where}: `run.expect` is not a valid regex: {e}")
+            if not isinstance(run.get("timeout_s"), int) or run["timeout_s"] <= 0:
+                problems.append(
+                    f"{where}: `run.timeout_s` must be a positive integer — a "
+                    f"hanging example is the failure this catches, so it needs a "
+                    f"bound"
+                )
+            nw = run.get("not_wired") or {}
+            for b, reason in nw.items():
+                if b not in files:
+                    problems.append(
+                        f"{where}: `run.not_wired.{b}` is not a binding with a file"
+                    )
+                if not str(reason).strip():
+                    problems.append(
+                        f"{where}: `run.not_wired.{b}` has no reason. An unexplained "
+                        f"gap in execution reads like full coverage."
+                    )
+
     # The reverse direction, and the one that fails quietly: a source file added
     # to an example directory but never listed here is published to users and
     # compiled by nothing. The manifest is only a coverage record if it is the
@@ -142,25 +174,50 @@ def entries(m):
             yield b, f"{ex['dir']}/{name}", ex["id"]
 
 
+def run_entries(m, lang):
+    """`<path>\\t<id>\\t<timeout>\\t<expect>` for each example runnable in `lang`."""
+    for ex in m.get("examples") or []:
+        run = ex.get("run")
+        if not run:
+            continue
+        name = (ex.get("files") or {}).get(lang)
+        if not name or lang in (run.get("not_wired") or {}):
+            continue
+        yield f"{ex['dir']}/{name}", ex["id"], run["timeout_s"], run["expect"]
+
+
 def report(m):
     bindings = m["bindings"]
     # name + space + mark, then a two-column gutter.
     width = max(len(b) for b in bindings) + 4
     print("Checked-example coverage")
     print(
-        "  A tick means the file compiles or type-checks against the current "
-        "tree.\n  It does not mean the example runs, and it does not mean the "
-        "binding\n  lacks the feature — that is bindings/coverage.md."
+        "  ▶ executed: it compiles AND runs, and its stdout matched the "
+        "contract.\n"
+        "  ✓ compiled or type-checked only — nothing proves it runs.\n"
+        "  — no example for this binding.\n"
+        "  None of this says the binding lacks the feature; that is "
+        "bindings/coverage.md."
     )
     for ex in m.get("examples") or []:
         print(f"\n  {ex['id']} ({ex['skill']}) — {ex['route']}")
         files, absent = ex.get("files") or {}, ex.get("absent") or {}
+        run = ex.get("run") or {}
+        nw = run.get("not_wired") or {}
         cells = []
         for b in bindings:
-            cells.append(f"{b} {'✓' if b in files else '—'}".ljust(width))
+            if b not in files:
+                mark = "—"
+            elif run and b not in nw:
+                mark = "▶"          # compiled AND executed
+            else:
+                mark = "✓"          # compiled only
+            cells.append(f"{b} {mark}".ljust(width))
         print("    " + "".join(cells))
         for b, reason in absent.items():
-            print(f"    — {b}: {reason}")
+            print(f"    — no example: {b} — {reason}")
+        for b, reason in nw.items():
+            print(f"    ✓ compiled, not executed here: {b} — {reason}")
 
 
 def main():
@@ -168,6 +225,8 @@ def main():
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--run-spec", metavar="LANG",
+                    help="tab-separated run contracts for LANG")
     args = ap.parse_args()
 
     try:
@@ -187,6 +246,10 @@ def main():
         return 0
     if args.report:
         report(m)
+        return 0
+    if args.run_spec:
+        for path, eid, timeout, expect in run_entries(m, args.run_spec):
+            print(f"{path}\t{eid}\t{timeout}\t{expect}")
         return 0
 
     ap.print_help()

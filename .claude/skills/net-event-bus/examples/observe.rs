@@ -1,72 +1,69 @@
-//! Observe a drop, and handle a producer failure (Rust).
+//! What the drop counters actually tell you (Rust).
 //!
 //! Drop this into your crate's `examples/` directory and run:
 //!   cargo run --example observe
 //!
 //! Cargo.toml: same dependencies as `hello.rs`.
 //!
-//! What it proves: `stats()` reports drops, and under `FailProducer` the
-//! producer sees a structured `SdkError` rather than silence.
+//! THE POINT OF THIS FILE, AND IT IS NOT WHAT YOU EXPECT.
 //!
-//! WHY THIS EXISTS. Under the default `DropOldest` / `DropNewest` modes,
-//! backpressure is *silent* — nothing throws, nothing returns false, and the
-//! only evidence is `events_dropped`. If you take one thing from this file:
-//! alert on that counter, because nothing else will tell you.
+//! The usual advice — "backpressure is silent, so watch `events_dropped`" — is
+//! wrong for the one mode where it matters most, and that mode is the default.
+//!
+//! Both counters sit at the **producer boundary**: they record what the bus
+//! accepted or refused from you, not what survived to an adapter.
+//!
+//!   - `DropOldest` (the default) evicts to make room, so the producer always
+//!     succeeds and `events_dropped` never moves. Events are lost and nothing
+//!     in-process says so.
+//!   - `DropNewest` and `FailProducer` refuse the producer instead, so the
+//!     `emit` call *and* `events_dropped` both see it.
+//!
+//! The exact counts vary between runs and between bindings: the drain worker
+//! races the producer, so how full the buffer gets is a timing question. The
+//! shape is what matters, not the numbers.
 
 use net_sdk::{Backpressure, Net};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 struct Tick {
     seq: u64,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> net_sdk::error::Result<()> {
-    // --- Silent drops: the default posture -------------------------------
+/// Push far past capacity with nothing consuming, and report the counters.
+async fn measure(label: &str, mode: Backpressure) -> net_sdk::error::Result<()> {
     let node = Net::builder()
         .shards(1)
-        .buffer_capacity(64)
-        .backpressure(Backpressure::DropOldest)
-        .memory()
-        .build()
-        .await?;
-
-    // Far more events than the buffer holds, with nothing consuming them.
-    for seq in 0..1_000 {
-        // Note the `?`: this returns Ok even while events are being dropped.
-        node.emit(&Tick { seq })?;
-    }
-
-    let s = node.stats();
-    println!(
-        "DropOldest: ingested={} dropped={} batches={}",
-        s.events_ingested, s.events_dropped, s.batches_dispatched
-    );
-    node.shutdown().await?;
-
-    // --- FailProducer: the one mode that tells you -----------------------
-    let strict = Net::builder()
-        .shards(1)
-        .buffer_capacity(64)
-        .backpressure(Backpressure::FailProducer)
+        .buffer_capacity(1024) // power of two, and >= 1024 — both enforced
+        .backpressure(mode)
         .memory()
         .build()
         .await?;
 
     let mut refused = 0u32;
-    for seq in 0..1_000 {
-        if let Err(e) = strict.emit(&Tick { seq }) {
-            // Structured, not a string: match the variant. `SdkError` is
-            // #[non_exhaustive], so keep a catch-all arm.
+    for seq in 0..20_000 {
+        if node.emit(&Tick { seq }).is_err() {
             refused += 1;
-            if refused == 1 {
-                println!("FailProducer: first refusal -> {e:?}");
-            }
         }
     }
-    println!("FailProducer: refused {refused} of 1000");
 
-    strict.shutdown().await?;
+    let s = node.stats();
+    println!(
+        "{label:<13} ingested={:<6} dropped={:<6} emit_errors={}",
+        s.events_ingested, s.events_dropped, refused
+    );
+
+    node.shutdown().await
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> net_sdk::error::Result<()> {
+    println!("20,000 events into a 1024-slot buffer, nothing consuming:\n");
+    measure("DropOldest", Backpressure::DropOldest).await?;
+    measure("DropNewest", Backpressure::DropNewest).await?;
+    measure("FailProducer", Backpressure::FailProducer).await?;
+    println!("\nDropOldest loses events silently — and it is the default.");
+    println!("The other two refuse the producer, so emit() and the counter agree.");
     Ok(())
 }

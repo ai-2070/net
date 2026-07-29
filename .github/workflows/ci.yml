@@ -13,6 +13,15 @@ on:
       - "net/**"
       - "go/**"
       - ".github/workflows/ci.yml"
+      # Three jobs here execute the skill examples — Python in `python-tests`,
+      # Go and C in `go-tests` — because those are the only jobs holding the
+      # maturin wheel and the libnet cdylib. Without these paths, editing an
+      # example would not run the checks that execute it, and a hang could land
+      # green. `skills.yml` fires on the same files for the compile floor.
+      - ".claude/skills/net-event-bus/examples/**"
+      - ".github/skill-examples.json"
+      - ".github/scripts/run-skill-examples.sh"
+      - ".github/scripts/skill_examples.py"
 
 env:
   CARGO_TERM_COLOR: always
@@ -1334,6 +1343,23 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: pytest -v -s --timeout=30 --timeout-method=thread
 
+      # The skill examples import `net_sdk`, the ergonomic wrapper, which sits
+      # on the binding `maturin develop` just built. This is the only job with
+      # both layers: sdk-py-tests installs the wrapper `--no-deps` on purpose
+      # (so its suite needs no maturin), and this job had the binding but not
+      # the wrapper. One pure-Python editable install closes the gap.
+      - name: Install the sdk-py wrapper
+        run: pip install --no-deps -e ../../sdk-py
+
+      # Executed, not just type-checked. hello.py's siblings in Rust and
+      # TypeScript both compiled clean for months while hanging forever on a
+      # subscribe that could never yield; only running them found it. The
+      # runner bounds every example with a timeout, so a hang is reported
+      # rather than reproduced.
+      - name: Run the Python skill examples
+        working-directory: ${{ github.workspace }}
+        run: .github/scripts/run-skill-examples.sh --lang python
+
   sdk-py-tests:
     name: Python SDK tests (sdk-py, pytest)
     runs-on: ubuntu-latest
@@ -1471,6 +1497,23 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
         run: go test -v -tags abi_stability -run TestABIStabilityU64FFIRoundTrip ./...
+
+      # The Go and C skill examples, executed against the cdylibs built above.
+      # This job is the only place they can run: cgo links against libnet, and
+      # the C example links against it directly, so the *compile* checks
+      # elsewhere use `go vet` and `gcc -fsyntax-only` — neither of which
+      # links, let alone runs.
+      #
+      # C rides along here rather than in ffi-tests because ffi-tests is a
+      # cargo-test matrix per FFI crate and never produces a linkable libnet
+      # plus a C toolchain in one place. This job already has both.
+      - name: Run the Go and C skill examples
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/net/crates/net/target/release
+          NET_LIB_DIR: ${{ github.workspace }}/net/crates/net/target/release
+        run: |
+          .github/scripts/run-skill-examples.sh --lang go
+          .github/scripts/run-skill-examples.sh --lang c
 
   clippy:
     name: Clippy

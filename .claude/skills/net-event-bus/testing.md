@@ -4,17 +4,41 @@ How to write tests that are fast, deterministic, and don't flake.
 
 ---
 
-## The default: memory transport, single process, two nodes
+## Read this before choosing a transport for a test
 
-For 90% of tests, do this:
+**Memory transport does not deliver events.** It selects the Noop adapter, which
+counts batches and discards them — `adapter/noop.rs` says "Just count, don't
+store", and its `poll_shard` returns an empty result. Events flow producer →
+ring buffer → drain worker → adapter, so with Noop there is nothing to read:
+`subscribe()` never yields and `poll()` always returns zero.
 
-1. Use the **memory transport** (no constructor flags = memory by default).
-2. Run two `NetNode` instances in the same process — one publisher, one subscriber.
-3. Subscribe **before** publishing.
-4. Use a small ring buffer (`shards: 1, buffer_capacity: 64`) so issues surface fast.
-5. Always `shutdown` in a teardown hook, even on test failure.
+A test that publishes on a memory node and waits for a subscriber **hangs**. It
+does not fail with a useful message; it waits forever.
 
-Memory transport gives you the full SDK surface (channels, typed events, backpressure semantics) without UDP, NAT, or peer discovery — all the things that make tests flaky.
+That rules memory transport out for delivery tests and rules it *in* for
+everything up to the adapter boundary:
+
+| Testing this | Transport |
+|---|---|
+| Construction, config validation, shutdown | memory |
+| Ingestion accepted / refused, backpressure behaviour | memory |
+| Serialization of your payload type | memory |
+| **Delivery — a subscriber actually receives** | mesh (two nodes), Redis, or JetStream |
+| Ordering, replay, retention | Redis, JetStream, or RedEX |
+
+For delivery tests, bind two nodes to `127.0.0.1` on different UDP ports over
+the mesh transport — see § Two-node mesh below. That is the cheapest transport
+that actually round-trips in one process.
+
+### Rules that still apply to every test
+
+1. Run each node in the same process; there is no broker to start.
+2. Subscribe **before** publishing — subscriptions are hot (§ The race trap).
+3. Set `buffer_capacity` explicitly if you are exercising backpressure. It must
+   be a **power of two and at least 1024**, enforced at construction and caught
+   by no compiler. The default is 1,048,576 per shard, so a few thousand events
+   will not fill it.
+4. Always `shutdown` in a teardown hook, even on test failure.
 
 ## The race trap: subscribe before publish
 
@@ -84,8 +108,12 @@ func TestMyThing(t *testing.T) {
 
 ### "I emit X, the subscriber sees X"
 
+**This needs a delivering transport.** On a memory node it hangs forever — the
+Noop adapter stores nothing, so the subscriber never yields. Build `node` over
+the mesh transport (§ In-process mesh), Redis, or JetStream.
+
 ```python
-def test_roundtrip(node):
+def test_roundtrip(node):   # node must NOT be a memory-transport node
     ch = node.channel('test', dict)
     received = []
 
@@ -105,16 +133,33 @@ def test_roundtrip(node):
 
 ### "I emit fast enough to trigger backpressure"
 
-Set ring buffer small, emit in a tight loop, assert `events_dropped > 0`:
+Two things make the obvious version of this test wrong.
+
+**`buffer_capacity` must be a power of two and at least 1024.** A smaller value
+is rejected at construction, not silently rounded.
+
+**`drop_oldest` never increments `events_dropped`.** It evicts to make room, so
+the producer always succeeds and the counter stays at zero however far past
+capacity you push — and it is the default. Both counters sit at the *producer*
+boundary: they record what the bus accepted or refused from you, not what
+survived to an adapter. Assert against a mode that refuses the producer.
 
 ```python
-import time
-node = NetNode(shards=1, buffer_capacity=8, backpressure='drop_oldest')
-for i in range(1000):
-    node.emit({'i': i})
-time.sleep(0.1)
+node = NetNode(shards=1, buffer_capacity=1024, backpressure='fail_producer')
+refused = 0
+for i in range(20_000):
+    try:
+        node.emit({'i': i})
+    except Exception:
+        refused += 1
+
+assert refused > 0
 assert node.stats().events_dropped > 0
 ```
+
+The exact counts vary run to run — the drain worker races the producer — so
+assert on "> 0", never on a specific number. `examples/observe.*` prints all
+three modes side by side if you want to see the difference.
 
 ### "Shutdown is clean and idempotent"
 

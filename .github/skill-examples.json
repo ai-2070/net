@@ -11,7 +11,14 @@
     "",
     "`absent` is for a binding that will not get this example, with the reason.",
     "It is not a to-do list \u2014 a route that is merely unwritten yet should say",
-    "so in its reason."
+    "so in its reason.",
+    "",
+    "`run` holds the execution contract: the stdout regex the example must match",
+    "and the timeout. A compile floor cannot catch an example that builds and then",
+    "hangs \u2014 which is exactly what hello.* did \u2014 so anything listed here is also",
+    "executed. `run.not_wired` names bindings whose artifacts are not available in",
+    "the job that runs the others, with the reason; same rule as `absent`, so a",
+    "partially-executed route can never read as a fully-executed one."
   ],
   "bindings": [
     "rust",
@@ -25,7 +32,7 @@
       "id": "hello",
       "skill": "net-event-bus",
       "title": "Hello, mesh",
-      "route": "construct \u00b7 publish \u00b7 subscribe \u00b7 shutdown",
+      "route": "construct \u00b7 publish \u00b7 verify the bus accepted it \u00b7 shutdown",
       "dir": ".claude/skills/net-event-bus/examples",
       "files": {
         "rust": "hello.rs",
@@ -34,13 +41,18 @@
         "go": "hello.go",
         "c": "hello.c"
       },
-      "absent": {}
+      "absent": {},
+      "run": {
+        "expect": "accepted: .*ingested=1",
+        "timeout_s": 60,
+        "not_wired": {}
+      }
     },
     {
       "id": "observe",
       "skill": "net-event-bus",
-      "title": "Observe a drop",
-      "route": "ingest under backpressure \u00b7 read stats \u00b7 handle one failure \u00b7 shutdown",
+      "title": "What the drop counters tell you",
+      "route": "push past capacity in all three backpressure modes \u00b7 read the producer-side counters",
       "dir": ".claude/skills/net-event-bus/examples",
       "files": {
         "rust": "observe.rs",
@@ -49,7 +61,12 @@
         "go": "observe.go",
         "c": "observe.c"
       },
-      "absent": {}
+      "absent": {},
+      "run": {
+        "expect": "loses events silently",
+        "timeout_s": 120,
+        "not_wired": {}
+      }
     }
   ]
 }

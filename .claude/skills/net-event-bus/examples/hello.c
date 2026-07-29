@@ -1,21 +1,30 @@
-/* Minimal sanity check for the C binding.
+/*
+ * Minimal sanity check for the C ABI.
  *
- * Build:
- *   gcc hello.c -L /path/to/libnet -lnet -lpthread -ldl -lm -o hello
- * Run:
- *   ./hello
+ * Build: gcc hello.c -lnet -lpthread -ldl -lm && ./a.out
  *
- * What it proves: the library loads, a node initializes, you can ingest a
- * JSON event, poll it back, free the result, and shutdown cleanly.
+ * What it proves: the header and library link, a node starts, a raw JSON event
+ * is accepted, and shutdown is clean.
  *
- * No named-channel API and no async — write the poll yourself.
+ * WHAT IT DELIBERATELY DOES NOT DO: read the event back.
+ *
+ * The default transport is memory, which selects the Noop adapter. Events flow
+ * producer -> ring buffer -> drain worker -> adapter, and the Noop adapter
+ * counts batches and discards them (adapter/noop.rs: "Just count, don't store";
+ * its poll_shard returns an empty result). So on memory transport net_poll_ex
+ * always returns zero events — a round-trip example here would spin forever.
+ *
+ * To actually receive events you need an adapter that retains them: Redis or
+ * JetStream, or the mesh transport between two nodes. See mesh.md.
+ *
+ * NOTE ON HEADERS: this uses net.h, the event-bus header. It cannot be combined
+ * in one translation unit with net.go.h (mesh, capabilities, channels) — both
+ * use the NET_SDK_H guard and net.go.h is not a superset.
  */
 
+#include "net.h"
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
-
-#include "net.h"
 
 int main(void) {
     net_handle_t node = net_init("{\"num_shards\": 1}");
@@ -24,33 +33,31 @@ int main(void) {
         return 1;
     }
 
-    const char* json = "{\"msg\":\"hello, mesh\"}";
-    if (net_ingest_raw(node, json, strlen(json)) != 0) {
-        fprintf(stderr, "net_ingest_raw failed\n");
+    const char *json = "{\"msg\":\"hello, mesh\"}";
+    if (net_ingest_raw(node, json, strlen(json)) < 0) {
+        fprintf(stderr, "ingest failed\n");
         net_shutdown(node);
         return 1;
     }
 
-    /* Small wait for the drain worker. */
-    usleep(20 * 1000);
-
-    net_poll_result_t result;
-    int rc = net_poll_ex(node, 10, NULL, &result);
-    if (rc != 0) {
-        fprintf(stderr, "net_poll_ex failed (rc=%d)\n", rc);
+    /* events_ingested counts at the *producer* boundary — it says the bus
+     * accepted the event, not that anything received or stored it. */
+    net_stats_t stats;
+    if (net_stats_ex(node, &stats) < 0) {
+        fprintf(stderr, "net_stats_ex failed\n");
         net_shutdown(node);
         return 1;
     }
-    if (result.count == 0) {
-        fprintf(stderr, "no events received\n");
-        net_free_poll_result(&result);
+    if (stats.events_ingested != 1) {
+        fprintf(stderr, "the bus did not accept the event\n");
         net_shutdown(node);
         return 1;
     }
 
-    printf("received: %.*s\n", (int)result.events[0].raw_len, result.events[0].raw);
+    printf("accepted: ingested=%llu dropped=%llu\n",
+           (unsigned long long)stats.events_ingested,
+           (unsigned long long)stats.events_dropped);
 
-    net_free_poll_result(&result);
     net_shutdown(node);
     return 0;
 }

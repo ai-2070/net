@@ -65,17 +65,38 @@ These bite regardless of language.
 - **Subscribe is hot.** A subscriber sees events emitted *after* it subscribed,
   plus whatever is still in the ring buffer. There is no replay-from-zero. If
   the user wants replay, that is RedEX or an adapter — not the bus.
-- **Backpressure is silent under `drop_*` modes.** Always watch
-  `stats().events_dropped`. Under `fail_producer` the failure surfaces
-  differently in every binding; each companion gives its own shape, and
-  `runtime.md` § Errors has the full matrix. Do not infer one from another.
+- **`events_dropped` does not detect the default mode's losses.** Both counters
+  sit at the *producer* boundary: they record what the bus accepted or refused
+  from you, not what survived to an adapter. `drop_oldest` — the default —
+  evicts to make room, so the producer always succeeds and the counter never
+  moves. `drop_newest` and `fail_producer` refuse the producer, so the emit call
+  and the counter agree. If you need to know that events were lost under the
+  default, compare against what the adapter received downstream.
+  `examples/observe.*` prints all three side by side.
 - **`_channel` is reserved** in TypeScript and Python channel payloads. Do not
   put your own field there.
 - **Transport is set at construction.** A node has exactly one. To bridge
   transports, run two nodes in one process and forward between them.
+- **Memory transport does not deliver events.** It selects the Noop adapter,
+  which counts batches and discards them (`adapter/noop.rs`: "Just count, don't
+  store"; its `poll_shard` returns an empty result). Events flow producer → ring
+  buffer → drain worker → adapter, so with Noop there is nothing to read:
+  `subscribe()` never yields and `poll()` always returns zero. A round-trip on a
+  memory node **hangs** rather than failing. Use it for construction, config,
+  ingestion and backpressure work; use mesh, Redis or JetStream when a
+  subscriber has to actually receive something.
 - **`shards` is a parallelism knob, not a partitioning scheme.** It does not
   give Kafka-style ordered partitions; it parallelizes ingestion. The default is
   fine for most workloads.
+- **Ring buffer capacity must be a power of two and at least 1024**, validated
+  in the shared core config at construction. No compile or type check catches a
+  bad value. The default is 1,048,576 events *per shard*, which is also why a
+  snippet meant to demonstrate backpressure has to lower it — a few thousand
+  events into a default node drop nothing. Each companion gives the spelling.
+- **Backpressure mode accepts either casing.** `"DropOldest"` and
+  `"drop_oldest"` both parse, so the Go docs' CamelCase and the TypeScript
+  type's snake_case are the same thing. An *unrecognised* value is rejected
+  outright rather than falling back to a default.
 
 ## When the bus surface is not enough
 
