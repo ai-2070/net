@@ -3,7 +3,7 @@
 //! unhealthy replicas via an operator-supplied factory.
 //!
 //! Direction B / step 4b of
-//! `docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
+//! `docs/internal/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
 //! Built as a sibling to `LifecycleGroup` rather than baked
 //! into the group itself so:
 //!

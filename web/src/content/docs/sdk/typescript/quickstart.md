@@ -1,3 +1,7 @@
+---
+title: Quickstart
+description: "Install the TypeScript SDK and run a node that emits, subscribes, and shuts down cleanly."
+---
 # TypeScript — Quickstart
 
 ```bash

@@ -506,7 +506,7 @@ async fn three_node_replication_fans_out_to_every_replica() {
 // ────────────────────────────────────────────────────────────────
 //
 // Pins the explicit gate from
-// `docs/misc/DATAFORTS_PLAN.md` Phase 2:
+// `docs/internal/misc/DATAFORTS_PLAN.md` Phase 2:
 //
 //   Performance budget. Replication overhead ≤ 30% of single-node
 //   append throughput at steady state. Treat regression as test

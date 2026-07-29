@@ -6,7 +6,7 @@
 //! caller-supplied [`super::redex::RedexFold`] as the tail advances.
 //! Exposes the materialized state as the read-side NetDB handle.
 //!
-//! See `docs/CORTEX_ADAPTER_PLAN.md` for the full design.
+//! See `docs/internal/plans/CORTEX_ADAPTER_PLAN.md` for the full design.
 //!
 //! # Layering
 //!

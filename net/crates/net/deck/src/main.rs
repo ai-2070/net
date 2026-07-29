@@ -12,7 +12,7 @@
 //!   MeshOS cluster via `net_sdk::testing::ClusterHarness`
 //!   with real daemons, real migrations, real blob adapters,
 //!   and a real nRPC observer feeding the NRPC tail. See
-//!   `crates/net/docs/plans/DECK_DEMO_PLAN.md`.
+//!   `docs/internal/plans/DECK_DEMO_PLAN.md`.
 
 mod app;
 mod bookmarks;

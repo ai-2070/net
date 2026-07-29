@@ -1,5 +1,5 @@
 //! Deterministic nearest-RTT leader election —
-//! `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §4 + Locked Decision 3.
+//! `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` §4 + Locked Decision 3.
 //!
 //! Pure function over each node's locally-known state. No
 //! broadcast, no epoch, no collection window, no `PlacementFilter`

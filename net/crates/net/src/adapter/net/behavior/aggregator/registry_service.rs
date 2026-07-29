@@ -1,7 +1,7 @@
 //! `aggregator.registry` RPC service — read-only enumeration
 //! surface for the daemon process's [`AggregatorRegistry`].
 //!
-//! Slice 7 of `docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
+//! Slice 7 of `docs/internal/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
 //! Mirrors the `fold.query` service pattern: postcard-encoded
 //! wire types, RPC handler holding an `Arc<AggregatorRegistry>`,
 //! pure-fn `answer` for unit testing without the RPC plumbing.

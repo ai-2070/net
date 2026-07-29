@@ -12,7 +12,7 @@ discovery (C-3 ``list_tools`` / ``watch_tools``) follow once the
 underlying pyo3 surface exposes them.
 
 Plan: see
-``crates/net/docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md``,
+``docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md``,
 slices C-1 / C-2 / C-4. Mirror of the Rust SDK's ``net_sdk::tool``
 + ``net_sdk::tool::formats`` modules and the Node TS ``tool.ts``
 shim — cross-language tests (T-1) will pin byte equality across

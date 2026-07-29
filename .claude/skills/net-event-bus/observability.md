@@ -58,7 +58,20 @@ Source: `net/crates/net/include/net.h:92-97`. Exposed via `net_stats(handle, buf
 | `events_dropped` | `uint64_t` | Same as Rust. |
 | `batches_dispatched` | `uint64_t` | Same as Rust. |
 
-The Go binding mirrors `net_stats_ex` directly — same field names.
+**The Go binding does *not* use these field names.** It mirrors `net_stats_ex`
+in *content*, but the struct is Go-cased and one field is misspelled:
+
+| Go field | Note |
+|---|---|
+| `EventsIngested` | — |
+| `EventsDropped` | — |
+| `BatchesDispathed` | **sic** — missing the second `c`. `stats.BatchesDispatched` does not compile. |
+
+The `json:` tags do carry the snake_case names, so a JSON round-trip looks like
+the C header; direct field access does not. `Stats()` also returns
+`(*Stats, error)` in Go, where the other bindings return the struct directly.
+
+`examples/observe.go` uses all three fields, so this stays true or CI breaks.
 
 ### Cross-SDK naming
 
@@ -155,9 +168,9 @@ These are not all wired to every binding — for cross-SDK consumption, scrape v
 
 ## Adapter-specific stats
 
-**Redis adapter.** Subscriber-side lag and the dedup helper are the two surfaces. The dedup `RedisStreamDedup.len()` / `capacity()` (Python) tells you how full the consumer-side ID set is — when `len() / capacity()` approaches 1, dedups will start rolling off and you may re-deliver. Adapter source: `net/crates/net/src/adapter/redis/`.
+**Redis adapter.** Subscriber-side lag and the dedup helper are the two surfaces. The dedup `RedisStreamDedup.len()` / `capacity()` (Python) tells you how full the consumer-side ID set is — when `len() / capacity()` approaches 1, dedups will start rolling off and you may re-deliver. Adapter source: `net/crates/net/src/adapter/redis.rs`.
 
-**JetStream adapter.** Stream-age, consumer-pending, and redelivery counters surface from JetStream itself — the adapter does not duplicate them. Read from your NATS deployment's monitoring port (`/jsz`) and correlate with `events_dispatched` on the publisher. Adapter source: `net/crates/net/src/adapter/jetstream/`.
+**JetStream adapter.** Stream-age, consumer-pending, and redelivery counters surface from JetStream itself — the adapter does not duplicate them. Read from your NATS deployment's monitoring port (`/jsz`) and correlate with `events_dispatched` on the publisher. Adapter source: `net/crates/net/src/adapter/jetstream.rs`.
 
 ---
 
@@ -260,3 +273,8 @@ Set `RUST_LOG=net::adapter::net::traversal=debug,net::adapter::net::failure=info
 - `runtime.md` § "The shutdown contract" — when each stat is valid. Reading `events_ingested` after `shutdown` is fine (the counters are not torn down). Reading mesh stream/traversal stats after the mesh socket is closed is not — `stream_stats` returns `None` once the session is gone.
 - `runtime.md` § "Debugging: 'Why are my events missing?'" — checklist that uses these counters as the diagnostic surface.
 - `concepts.md` § "Backpressure: silence, not a signal" — the design rationale for why drops are silent by default.
+
+## Further reading
+
+- [Running in Production](https://ai2070.net/docs/guides/production-deployment)
+- [Troubleshooting](https://ai2070.net/docs/guides/troubleshooting)

@@ -64,7 +64,7 @@ What the vectors pin:
   strings + `safe_to_retry`/`safe_to_requote` bools) **and** `object` == the
   tag." A tagged-but-incomplete/mistyped object is rejected, same as Rust —
   non-Rust verifiers must validate the shape, not just the tag, or they drift.
-  Rust decides via the real `FailureSchematic` (a `net-sdk` dev-dep) with
+  Rust decides via the real `FailureSchematic` (a `net-mesh-sdk` dev-dep) with
   byte-stable re-emission; the fixture is generated from that type
   (`failure-schematic.md`).
 
@@ -98,8 +98,8 @@ The design's acceptance test: **the mock and the HTTP client pass the
   server that speaks the spec (including its error vocabulary).
 - `flow_end_to_end.rs`, `exact_scheme_flow_e2e.rs` — the caller flow through
   quote → payload → settle → serve.
-- `mesh_payments_e2e.rs` — real two-node mesh (the P0 two-machine demo's
-  shape), `serve_payments` + `MeshPaymentChannel`.
+- `mesh_payments_e2e.rs` — real two-node mesh, `serve_payments` +
+  `MeshPaymentChannel`.
 - `mcp_gate_composition.rs` — the `gated_invoke` composition with the payment
   gate.
 - `spend_policy.rs` — auto-allow is silent; over-cap returns the structured
@@ -196,3 +196,7 @@ Never enable `unsafe-dev-signer` on mainnet.
   the real-asset registry.
 - Use `tempfile` for the engine/policy/billing store paths so tests don't
   collide on the per-user default paths.
+
+## Further reading
+
+- [The Lifecycle](https://ai2070.net/docs/payments/the-lifecycle)

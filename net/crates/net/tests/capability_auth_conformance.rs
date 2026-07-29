@@ -1,5 +1,5 @@
 //! v0.4 capability-auth conformance test — Phase 3 of
-//! `docs/plans/CAPABILITY_AUTH_PLAN.md`. The plan's §7 lists six
+//! `docs/internal/plans/CAPABILITY_AUTH_PLAN.md`. The plan's §7 lists six
 //! scenarios the gate must satisfy; each test below pins one of
 //! them against real `MeshNode` instances so a regression that
 //! shifts the spec gets caught at the integration boundary.

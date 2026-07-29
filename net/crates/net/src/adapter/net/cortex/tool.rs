@@ -18,7 +18,7 @@
 //! this module are only the SDK-facing additions and the streaming
 //! envelope.
 //!
-//! Plan: see `docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
+//! Plan: see `docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
 //! slices S-2 (descriptor + fold integration) and S-4 (feature gate
 //! + envelope).
 
@@ -225,7 +225,7 @@ impl ToolDescriptor {
 /// custom) lowers into the framework's native streaming protocol.
 ///
 /// Plan: locked decision #4 in
-/// `docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`.
+/// `docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolEvent {
@@ -390,7 +390,7 @@ impl ToolListWatch {
 /// the latest descriptor with the new aggregated `node_count` plus
 /// the previous count.
 ///
-/// Plan: see `docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
+/// Plan: see `docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
 /// slice A-5.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolListChange {
@@ -500,7 +500,7 @@ pub enum ToolMetadataResponse {
 // `watch_tools` and streams one `ToolWatchFrame` per change to the
 // subscriber, with a bounded per-subscriber buffer and an explicit
 // resync signal on overflow. See
-// `docs/plans/REALTIME_ROUTING_AND_DISCOVERY_PLAN.md` §4.4 Track C.
+// `docs/internal/plans/REALTIME_ROUTING_AND_DISCOVERY_PLAN.md` §4.4 Track C.
 
 /// Canonical nRPC service name for the server-streamed remote tool
 /// watch. Both halves of the call (the auto-installed server handler

@@ -1,3 +1,7 @@
+---
+title: Continuity and Migration
+description: Daemons that survive node failures are the whole point of the runtime, and continuity is the layer that makes survival meaningful.
+---
 # Continuity and Migration
 
 Daemons that survive node failures are the whole point of the runtime, and continuity is the layer that makes survival meaningful. A daemon migrating from one node to another isn't just "the same code running somewhere else" — its identity, its causal chain, its observed history, and the events in flight at the moment of cutover all have to travel with it. Continuity is the protocol that gets that right.
@@ -24,6 +28,23 @@ let messages = orchestrator.start_migration(
 ```
 
 Once started, the orchestrator drives every step. The source node snapshots the daemon (state plus causal chain head plus observed horizon); the target restores from the snapshot using a local `DaemonFactoryRegistry` that knows how to construct daemons of this kind; events that arrive on the source during the transfer are buffered and shipped to the target via `BufferedEvents`; the target replays the buffer in strict sequence order; routing flips at cutover; the source cleans up.
+
+### Watching it happen
+
+The SDK hands back handles rather than making you poll the registry:
+
+| Handle | What it gives you |
+|---|---|
+| `DaemonHandle` | `stats()` for the live counters, `snapshot()` for the current `StateSnapshot` (or `None` if the daemon doesn't snapshot) |
+| `MigrationHandle` | `phase()` for the current `MigrationPhase`, `wait()` to block until the move completes, `wait_with_timeout(d)` for a bounded version |
+
+`wait()` consumes the handle — it's the end of that migration's story, so
+there's nothing left to ask afterwards. Take `phase()` readings first if you
+want progress.
+
+An operator can also abort a migration in flight: `AdminEvent::KillMigration`
+is the Deck-side proposal that cancels one by id. See
+[Deck](/docs/reference/deck).
 
 The orchestrator can pick a target itself. `start_migration_auto` queries the capability index for migration-capable nodes that match the daemon's requirements, and returns the chosen target node id alongside the first batch of migration messages:
 

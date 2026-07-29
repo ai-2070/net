@@ -2,7 +2,7 @@
  * Net C SDK — Capability Aggregation Example
  *
  * Demonstrates the Phase 6c capability-aggregation surface added
- * by `docs/plans/MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`:
+ * by `docs/internal/plans/MULTIFOLD_PHASE_6C_CAPACITY_AGGREGATION.md`:
  *
  *   - net_capability_aggregate          — bucket-and-count
  *                                         primitive over the

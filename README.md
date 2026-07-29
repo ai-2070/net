@@ -31,9 +31,26 @@ go get github.com/ai-2070/net/go
 
 The Rust crate, npm scope, and PyPI dist all publish under `net-mesh*` / `@net-mesh/core*`. Source-level imports stay as `net_sdk` / `@net-mesh/sdk` / `from net_sdk import ...`. See [SDKs](#sdks) for the lower-level core packages and full per-language usage.
 
+## Claude Code Skill
+
+Agent Skills load the correct mental model and verified per-SDK templates:
+
+```bash
+npx skills add ai-2070/net-claude-skill -g
+```
+
+Drop `-g` to install into the current project only. To update to the latest version:
+
+```bash
+npx skills update -g
+```
+
+Restart Claude Code and run `/skills` Source: [ai-2070/net-claude-skill](https://github.com/ai-2070/net-claude-skill). Full install options in [Claude Skills](https://ai2070.net/docs/start/claude-skills).
+
 ## Contents
 
 - [Install](#install)
+- [Claude Code Skill](#claude-code-skill)
 - [Why not best-effort](#why-not-best-effort)
 - [A new class of systems](#a-new-class-of-systems)
 - [Properties](#properties)
@@ -66,7 +83,6 @@ The Rust crate, npm scope, and PyPI dist all publish under `net-mesh*` / `@net-m
 - [Security](#security)
 - [The Blackwall](#the-blackwall)
 - [Implementation](#implementation)
-- [Status](#status)
 - [SDKs](#sdks)
 - [Benchmarks](#benchmarks)
 
@@ -700,7 +716,7 @@ Licensed under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
-at your option. The MIT arm exists so GPLv2-only projects — the Linux kernel, OpenWrt userspace, BusyBox — can use Net; Apache-2.0's patent-termination and NOTICE clauses are incompatible with GPLv2. Take the Apache-2.0 arm if you want the express patent grant.
+at your option.
 
 ### Contribution
 

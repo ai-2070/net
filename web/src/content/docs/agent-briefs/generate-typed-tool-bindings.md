@@ -1,3 +1,7 @@
+---
+title: Generate Typed Tool Bindings
+description: "Generate typed client code from a capability schema and gate CI on breaking schema changes, using net-mesh typegen."
+---
 # Brief: Generate Typed Tool Bindings
 
 **Goal.** Turn a tool your node discovered at runtime into typed, compile-checked

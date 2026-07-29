@@ -114,14 +114,25 @@ function lookupLanguages(slug: string[]): Language[] | undefined {
   return undefined;
 }
 
-function resolveTitle(slug: string[], rawName: string): string {
-  return customLabel(slug) ?? titleize(rawName);
+// Precedence: the page's own frontmatter, then a `docs.order.ts` label
+// override, then the titleized filename. Frontmatter wins because the page
+// is the thing being named; the config override survives for entries with
+// no file of their own (folders without a README).
+function resolveTitle(
+  slug: string[],
+  rawName: string,
+  frontmatter?: DocFrontmatter,
+): string {
+  return frontmatter?.title ?? customLabel(slug) ?? titleize(rawName);
 }
 
 export type DocFile = {
   kind: "file";
   slug: string[];
   title: string;
+  /** One-line summary from frontmatter. Feeds page metadata and the
+   *  folder index; absent when the page hasn't declared one. */
+  description?: string;
   filePath: string;
   ext: "md" | "mdx";
   /** Languages this doc is gated to, per `DocsOrderConfig.languages`.
@@ -133,6 +144,8 @@ export type DocFolder = {
   kind: "folder";
   slug: string[];
   title: string;
+  /** One-line summary, taken from the folder README's frontmatter. */
+  description?: string;
   readme: DocFile | null;
   children: DocNode[];
   /** Languages this folder is gated to. Absent = universal. Gating a
@@ -190,6 +203,61 @@ function isReadme(name: string): boolean {
   return /^readme\.mdx?$/i.test(name);
 }
 
+// ---- Frontmatter ----------------------------------------------------------
+//
+// A doc may open with a `---` fenced block carrying `title` and
+// `description`. That's the entire supported schema, which is why this is
+// twenty lines of parser rather than a YAML dependency: keys are known,
+// values are single-line scalars, and anything else is ignored rather than
+// guessed at. Titles used to live in `docs.order.ts` as a hand-maintained
+// label per page — a second file to remember to edit, and nothing caught
+// you when you forgot.
+
+export type DocFrontmatter = {
+  title?: string;
+  description?: string;
+};
+
+const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
+
+function parseFrontmatter(source: string): {
+  data: DocFrontmatter;
+  body: string;
+} {
+  const match = FRONTMATTER.exec(source);
+  if (!match) return { data: {}, body: source };
+
+  const data: DocFrontmatter = {};
+  for (const line of match[1].split(/\r?\n/)) {
+    const at = line.indexOf(":");
+    if (at < 0) continue;
+    const key = line.slice(0, at).trim();
+    if (key !== "title" && key !== "description") continue;
+    let value = line.slice(at + 1).trim();
+    // Strip one layer of matching quotes; a description with a colon in it
+    // has to be quoted, and we shouldn't hand the quotes to the renderer.
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (value) data[key] = value;
+  }
+  return { data, body: source.slice(match[0].length) };
+}
+
+// Frontmatter is read once per file during the tree walk and again when a
+// page renders. In production the tree is memoized, so this is a handful of
+// reads per build rather than per request.
+function readFrontmatter(filePath: string): DocFrontmatter {
+  try {
+    return parseFrontmatter(readFileSync(filePath, "utf8")).data;
+  } catch {
+    return {};
+  }
+}
+
 function buildFolder(absPath: string, slugChain: string[]): DocFolder {
   const folderName = slugChain[slugChain.length - 1] ?? "";
   const entries = readdirSync(absPath).sort((a, b) => a.localeCompare(b));
@@ -207,10 +275,12 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     } else if (stat.isFile() && isDocFile(entry)) {
       const childSlug = [...slugChain, slugSegment(entry)];
       if (isHidden(childSlug)) continue;
+      const fm = readFrontmatter(entryPath);
       const file: DocFile = {
         kind: "file",
         slug: childSlug,
-        title: resolveTitle(childSlug, entry),
+        title: resolveTitle(childSlug, entry, fm),
+        description: fm.description,
         filePath: entryPath,
         ext: extOf(entry),
         languages: lookupLanguages(childSlug),
@@ -227,10 +297,15 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     (n) => n.slug[n.slug.length - 1] ?? "",
   );
 
+  // A folder renders at its README's URL, so the README's frontmatter names
+  // the section. Folders without one fall back to the config label.
+  const readmeFm = readme ? readFrontmatter(readme.filePath) : undefined;
+
   return {
     kind: "folder",
     slug: slugChain,
-    title: resolveTitle(slugChain, folderName),
+    title: resolveTitle(slugChain, folderName, readmeFm),
+    description: readmeFm?.description,
     readme,
     children: orderedChildren,
     languages: lookupLanguages(slugChain),
@@ -271,10 +346,12 @@ function buildDocTree(): DocTree {
     } else if (stat.isFile() && isDocFile(entry)) {
       const childSlug = [slugSegment(entry)];
       if (isHidden(childSlug)) continue;
+      const fm = readFrontmatter(entryPath);
       const file: DocFile = {
         kind: "file",
         slug: childSlug,
-        title: resolveTitle(childSlug, entry),
+        title: resolveTitle(childSlug, entry, fm),
+        description: fm.description,
         filePath: entryPath,
         ext: extOf(entry),
         languages: lookupLanguages(childSlug),
@@ -322,8 +399,7 @@ export function resolveDoc(slug: string[]): ResolvedDoc | null {
 
       const folder = folders.find((f) => lastSlug(f) === segment);
       if (folder) {
-        if (folder.readme)
-          return { kind: "file", file: folder.readme, folder };
+        if (folder.readme) return { kind: "file", file: folder.readme, folder };
         return { kind: "folder-index", folder };
       }
       return null;
@@ -365,8 +441,11 @@ export function getAllSlugs(): string[][] {
   return out;
 }
 
+// Returns the body only. Frontmatter is metadata for the tree, not content —
+// leaving it in would render a stray `---` rule and a line of `title: …` at
+// the top of every page, and would feed the search index too.
 export function readDocSource(file: DocFile): string {
-  return readFileSync(file.filePath, "utf8");
+  return parseFrontmatter(readFileSync(file.filePath, "utf8")).body;
 }
 
 // Table-of-contents entry for one heading in a doc.

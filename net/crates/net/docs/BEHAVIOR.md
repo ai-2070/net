@@ -96,7 +96,7 @@ The `Visibility` enum on `ChannelConfig` is a separate concept — channel visib
 
 ### Real-time propagation: push + anti-entropy (RT-1..RT-5)
 
-Discovery is **push-driven with timer-based repair**, never timer-driven with push as an afterthought (`docs/plans/REALTIME_ROUTING_AND_DISCOVERY_PLAN.md`):
+Discovery is **push-driven with timer-based repair**, never timer-driven with push as an afterthought (`docs/internal/plans/REALTIME_ROUTING_AND_DISCOVERY_PLAN.md`):
 
 - **Change-driven announcements.** Local capability mutations (serve/stop-serve a tool, capability set changes) fire a dedicated local-changes signal (`local_caps_changed`, a `watch` generation counter — deliberately separate from the fold-wide signal so inbound peer announcements can never echo into a local re-announce). A debounced announcer loop (`announce_debounce`, default 100 ms) coalesces bursts and broadcasts once; `min_announce_interval` (10 s) stays as the rate ceiling but is **trailing-edge-safe** — an announce absorbed inside the window re-broadcasts at window end (`AnnounceGate`), so the last change always propagates. `capability_reannounce_interval` (150 s) is thereby demoted from "the propagation latency" to a pure anti-entropy/TTL keep-alive. The end-to-end latency and coalescing behaviour of this path are measured by the CPB benchmark suite (`benches/capability_*`; see `plans/CAPABILITY_PROPAGATION_BENCHMARK_PLAN.md`): a rapid registry burst collapses to one announcement, an in-window explicit-announce burst to one leading + one trailing publication (observed as ~2 remote updates applied at the consumer), and default-policy convergence is rate-limit-dominated (not the 100 ms debounce).
 - **Event pingwaves + route withdrawal** make route birth and death event-driven at the transport layer — see `TRANSPORT.md` §Routing for RT-4/RT-5 details and knobs (`event_pingwave_min_gap`, `enable_route_withdraw`).
@@ -314,3 +314,30 @@ pub struct SafetyEnvelope {
 | `behavior/proximity.rs` | `ProximityGraph`, `EnhancedPingwave`, latency edges |
 | `behavior/safety.rs` | `SafetyEnforcer`, `ResourceEnvelope`, `KillSwitchConfig` |
 | `behavior/sensing/` | Capability sensing — provider-free readiness interests, leader rendezvous, coalescing. See [`SENSING.md`](SENSING.md) |
+
+## The rest of the plane
+
+Everything above is the behavior plane as originally scoped: announcements,
+diffs, metadata, schema, rules, context, load balancing, proximity, safety.
+The module has since grown several subsystems that are larger than that
+original core and are **not** described above. This table is the honest map.
+
+| Subsystem | What it is | Documented in |
+|---|---|---|
+| `behavior/org_*.rs` | Org identity, admission, private discovery, revocation | [`ORGANIZATIONS.md`](ORGANIZATIONS.md) |
+| `behavior/meshos/` | Cluster-behavior engine, daemon supervision, reconcile arm, drift scorer | **Nowhere** |
+| `behavior/sensing/` | Provider-free readiness interests, leader rendezvous, coalescing | [`SENSING.md`](SENSING.md) |
+| `behavior/fold/` | Multifold state aggregation | Partly — [`STATE.md`](STATE.md), [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) |
+| `behavior/meshdb/` | Federated query AST, planner, executor | **Nowhere** |
+| `behavior/aggregator/` | Aggregator registry and spawn RPC | Partly — [`CAPABILITY_ENHANCEMENTS_USAGE.md`](CAPABILITY_ENHANCEMENTS_USAGE.md) |
+| `behavior/gang/` | Atomic gang-claim of contended resources | Partly — [`SENSING.md`](SENSING.md); the claim protocol is on the docs site |
+| `behavior/lifecycle/` | Task lifecycle states and transitions | **Nowhere** |
+| `behavior/scheduler_bridge/` | Bridge between the scheduler and the reconcile arm | **Nowhere** |
+| `behavior/deck.rs` | Operator command surface | Deck reference on the docs site |
+| `behavior/placement.rs` | `StandardPlacement` scorer and custom filters | [`COMPUTE.md`](COMPUTE.md) |
+
+MeshOS, MeshDB, lifecycle and the scheduler bridge have no protocol-level doc
+at all — collectively a large fraction of the plane. That is a gap, not a
+statement that those subsystems are unfinished; they ship, and the user-facing
+docs cover MeshDB and the Deck. It is recorded here so the next person doesn't
+have to rediscover it by reading the module tree.

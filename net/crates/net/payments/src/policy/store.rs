@@ -206,7 +206,7 @@ where
 /// `mutate_json`, an outcome that mutates nothing still re-serializes and
 /// `fsync`s the entire store, so a caller spraying (say) unknown quote ids
 /// could force one global-lock + fsync per attempt. See
-/// `docs/performance/payments-redeem-write-amplification.md`.
+/// `docs/internal/performance/payments-redeem-write-amplification.md`.
 ///
 /// **At-most-once is unchanged.** The load, decision, and conditional save
 /// all run under the *same* advisory lock, so a check-and-set

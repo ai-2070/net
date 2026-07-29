@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { entryVisibleIn, type Language } from "@/lib/docs-language";
@@ -11,6 +11,13 @@ import type {
   ClientDocNode,
   ClientDocTree,
 } from "@/lib/docs";
+
+// A section longer than COLLAPSE_THRESHOLD collapses at rest to its first
+// COLLAPSE_TO entries. The threshold is set above the longest hand-curated
+// section (Guides, 19) so only genuinely unbounded lists collapse — in
+// practice that means Releases, which grows every version.
+const COLLAPSE_THRESHOLD = 20;
+const COLLAPSE_TO = 8;
 
 function slugHref(slug: string[]): string {
   return slug.length === 0 ? "/docs" : `/docs/${slug.join("/")}`;
@@ -203,6 +210,27 @@ function FolderBlock({
 }) {
   const within = descendsFrom(folder.slug, active);
   const count = countDocs(folder);
+
+  // Releases is 35 flat entries and dominated the sidebar, pushing every
+  // other section below the fold. Long sections collapse to their first
+  // few — newest first, which is the order that matters for releases — with
+  // the rest one click away. Nothing is hidden from routing or search; this
+  // is purely how much of a long list is shown at rest.
+  const overflows = folder.children.length > COLLAPSE_THRESHOLD;
+  // If the page you're on lives in the hidden tail, don't hide it — a
+  // sidebar that can't show you where you are is worse than a long one.
+  const activeIsHidden =
+    overflows &&
+    folder.children
+      .slice(COLLAPSE_TO)
+      .some((c) => isActive(c.slug, active) || descendsFrom(c.slug, active));
+  const [expanded, setExpanded] = useState(false);
+  const collapsed = overflows && !expanded && !activeIsHidden;
+  const shown = collapsed
+    ? folder.children.slice(0, COLLAPSE_TO)
+    : folder.children;
+  const hiddenCount = collapsed ? folder.children.length - COLLAPSE_TO : 0;
+
   return (
     <section className="mb-4">
       <Link
@@ -231,8 +259,8 @@ function FolderBlock({
         ════════════════════════════════════════════
       </div>
       <div>
-        {folder.children.map((child, i, arr) => {
-          const last = i === arr.length - 1;
+        {shown.map((child, i) => {
+          const last = i === shown.length - 1 && !hiddenCount;
           if (child.kind === "file") {
             return (
               <FileRow
@@ -253,6 +281,15 @@ function FolderBlock({
             />
           );
         })}
+        {hiddenCount > 0 ? (
+          <button
+            type="button"
+            onClick={() => setExpanded(true)}
+            className="w-full text-left pl-2 pr-2 py-0.5 text-[10px] tracking-[0.12em] uppercase font-mono text-ink-faint hover:text-accent transition-colors"
+          >
+            <span className="text-accent-dim">⋯</span> show {hiddenCount} more
+          </button>
+        ) : null}
       </div>
     </section>
   );

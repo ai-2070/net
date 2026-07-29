@@ -1,3 +1,7 @@
+---
+title: The Agentic Mesh
+description: AI agents need work done. The work lives somewhere else — in tools, APIs, other agents, files, GPUs, browsers, enterprise systems, and humans.
+---
 # The Agentic Mesh
 
 AI agents need work done. The work lives somewhere else — in tools, APIs, other

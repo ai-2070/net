@@ -1,3 +1,7 @@
+---
+title: Daemons and Placement
+description: A daemon in Net is a long-running stateful event processor.
+---
 # Daemons and Placement
 
 A daemon in Net is a long-running stateful event processor. You write a small piece of code that consumes events and produces events; the runtime handles where it runs, what it can see, when it gets migrated, and how it survives node failures. The whole point is to let you write the *what* — the business logic — and leave the *where* and *when* to the system.
@@ -234,7 +238,7 @@ name = "fleet-west"
 replicas = 3
 ```
 
-The `aggregator.registry` RPC service lets any node enumerate, spawn, scale, and unregister aggregator groups on any other node. The CLI exposes `net aggregator spawn / scale / ls / query --remote --node-addr <ip:port> --node-pubkey <hex>` for operating against a live daemon over the wire.
+The `aggregator.registry` RPC service lets any node enumerate, spawn, scale, and unregister aggregator groups on any other node. The CLI exposes `net-mesh aggregator spawn / scale / ls / query --remote --node-addr <ip:port> --node-pubkey <hex>` for operating against a live daemon over the wire.
 
 ## Replica groups
 
@@ -343,3 +347,10 @@ Required capabilities are placement-hard: no match, no placement. Optional capab
 Daemons are the right primitive when the work is **long-running**, **stateful in a way that benefits from running on one specific node**, **driven by events**, and **needs to survive failures**. If any of those four are false, simpler primitives apply: a one-shot job for short work, a stateless service for stateless work, a polling consumer for non-event-driven work, a basic bus subscriber for work that doesn't need failure handling.
 
 For work that fits the daemon shape, the runtime is designed so that you stop thinking about placement and failure handling and start thinking about what your daemon actually does. That's the system working as intended.
+
+One shape that is *not* placement: work that needs an **exclusive** resource
+several nodes are competing for — a GPU island, an accelerator slot, a licensed
+seat. Placement decides where a daemon runs; it does not arbitrate a contended
+resource. That's the [gang-claim scheduler](/docs/guides/gang-scheduler), and
+what runs once the claim is held is the
+[task lifecycle](/docs/guides/task-lifecycle).

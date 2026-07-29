@@ -119,7 +119,7 @@ Things that will bite:
 | `0` | success |
 | `1` | generic error |
 | `2` | invalid arguments / parse failure |
-| `3` | SDK error (a `net-sdk` operation failed — transfer, query, …) |
+| `3` | SDK error (a `net-mesh-sdk` operation failed — transfer, query, …) |
 | `4` | `net ice`: simulation blocked |
 | `5` | `net ice`: operator policy rejected |
 | `6` | connection failure (no holder, unreachable peer, session refused) |
@@ -129,7 +129,7 @@ Things that will bite:
 | `11` | `net db`: query JSON failed to parse |
 | `12` | `net db`: predicate DSL (`--where` / `--filter`) failed to parse |
 | `13` | `net ice`: an operator signature failed cryptographic verification |
-| `14` | `net typegen diff --exit-code`: a BREAKING change was detected |
+| `14` | `net-mesh typegen diff --exit-code`: a BREAKING change was detected |
 
 Subcommands may also emit a JSON `{"error": …, "detail": …}` line to **stderr** alongside the human-readable message. **Scripts should parse the JSON line, not scrape the human text.**
 
@@ -139,3 +139,8 @@ Subcommands may also emit a JSON `{"error": …, "detail": …}` line to **stder
 - `nrpc.md` — the discovered-tool / typed-call surface `typegen` generates against.
 - `capabilities.md` — the `ai-tool:*` capability tags `typegen` discovers.
 - `org.md` — what the `net-mesh org` artifacts mean, the startup-side `install_org_authority` / `install_provider_grant_audience` calls that consume them, and the `org:<domain>:<kind>` errors.
+
+## Further reading
+
+- [CLI Reference](https://ai2070.net/docs/reference/cli)
+- [Deck (Operator TUI)](https://ai2070.net/docs/reference/deck)

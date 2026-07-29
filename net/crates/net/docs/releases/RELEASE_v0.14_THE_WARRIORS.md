@@ -12,7 +12,7 @@ Alongside the replication landing, v0.14 carries two cross-cutting breaking chan
 
 ## RedEX Distributed (substrate)
 
-The implementation plan in [`REDEX_DISTRIBUTED_PLAN.md`](../plans/REDEX_DISTRIBUTED_PLAN.md) phases A–I all closed before v0.14. The shape:
+The implementation plan in [`REDEX_DISTRIBUTED_PLAN.md`](../../../../../docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md) phases A–I all closed before v0.14. The shape:
 
 ### `ReplicationConfig`
 

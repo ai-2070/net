@@ -1,5 +1,5 @@
 //! Organization identity, membership, and revocation floors — OA-1
-//! of `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md` (scaffolded
+//! of `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md` (scaffolded
 //! ownership).
 //!
 //! An organization is identified by its ed25519 verifying key

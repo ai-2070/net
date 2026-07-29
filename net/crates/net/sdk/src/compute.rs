@@ -6,9 +6,9 @@
 //! lifecycle gate that decides when inbound migrations may land.
 //!
 //! This file is Stage 1 of
-//! [`SDK_COMPUTE_SURFACE_PLAN.md`](../../../docs/SDK_COMPUTE_SURFACE_PLAN.md)
+//! [`SDK_COMPUTE_SURFACE_PLAN.md`](../../../../../docs/internal/plans/SDK_COMPUTE_SURFACE_PLAN.md)
 //! plus the lifecycle half of
-//! [`DAEMON_RUNTIME_READINESS_PLAN.md`](../../../docs/DAEMON_RUNTIME_READINESS_PLAN.md):
+//! [`DAEMON_RUNTIME_READINESS_PLAN.md`](../../../../../docs/internal/plans/DAEMON_RUNTIME_READINESS_PLAN.md):
 //! local spawn / snapshot / stop, with an explicit
 //! `Registering → Ready → ShuttingDown` fence. Migration is Stage 2;
 //! the wire-level half of the readiness plan
@@ -1347,7 +1347,7 @@ impl DaemonRuntime {
     }
 
     /// `start_migration` with caller-supplied options. Stage 6 of
-    /// [`DAEMON_IDENTITY_MIGRATION_PLAN.md`](../../../docs/DAEMON_IDENTITY_MIGRATION_PLAN.md):
+    /// [`DAEMON_IDENTITY_MIGRATION_PLAN.md`](../../../../../docs/internal/plans/DAEMON_IDENTITY_MIGRATION_PLAN.md):
     /// lets the caller opt out of identity transport when the daemon
     /// doesn't need to sign anything on the target.
     pub async fn start_migration_with(
@@ -1821,10 +1821,10 @@ async fn teardown_subscriptions(inner: Arc<Inner>, bindings: Vec<SubscriptionBin
 /// Options for [`DaemonRuntime::start_migration_with`].
 ///
 /// - Stage 6 of
-///   [`DAEMON_IDENTITY_MIGRATION_PLAN.md`](../../../docs/DAEMON_IDENTITY_MIGRATION_PLAN.md):
+///   [`DAEMON_IDENTITY_MIGRATION_PLAN.md`](../../../../../docs/internal/plans/DAEMON_IDENTITY_MIGRATION_PLAN.md):
 ///   the `transport_identity` flag. Default `true`.
 /// - Stages 3 + 4 of
-///   [`DAEMON_RUNTIME_READINESS_PLAN.md`](../../../docs/DAEMON_RUNTIME_READINESS_PLAN.md):
+///   [`DAEMON_RUNTIME_READINESS_PLAN.md`](../../../../../docs/internal/plans/DAEMON_RUNTIME_READINESS_PLAN.md):
 ///   the `retry_not_ready` budget. When the migration target
 ///   responds `NotReady` (runtime still in `Registering`), the
 ///   source backs off + re-initiates up to this total elapsed

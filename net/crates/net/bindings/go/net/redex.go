@@ -25,7 +25,7 @@
 //
 // This wrapper covers the operator-facing replication surface that
 // landed alongside the Phase I Go binding work in
-// `docs/plans/REDEX_DISTRIBUTED_PLAN.md`:
+// `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md`:
 //
 //   - `Redex.New() / Redex.NewWithPersistentDir(dir) / Redex.Close()`
 //   - `Redex.EnableReplication(mesh)`

@@ -1,4 +1,4 @@
-//! Heartbeat tracking — `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §6.
+//! Heartbeat tracking — `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` §6.
 //!
 //! Pure-logic component the [`ReplicationCoordinator`]'s eventual
 //! heartbeat loop drives. Tracks per-peer last-seen / role / tail

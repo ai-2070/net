@@ -43,7 +43,10 @@ jobs:
       - name: Install nftables
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q nftables iproute2
+          # `conntrack` is for the post-scenario NAT snapshot: it renders
+          # the mappings far more readably than /proc/net/nf_conntrack,
+          # which run_scenario.sh falls back to if it is missing.
+          sudo apt-get install -y -q nftables iproute2 conntrack
 
       - name: Build helper + test binaries
         working-directory: net/crates/net

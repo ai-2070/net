@@ -482,7 +482,7 @@ pub struct RoutingTable {
     /// walks every shard (~1us); the stream-admission gate (`may_admit_stream`,
     /// per novel stream) and route_count()/stream_count()/aggregate_stats read
     /// these atomics instead. Maintained exactly on every insert/remove. See
-    /// docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2/§4.
+    /// docs/internal/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2/§4.
     num_routes: AtomicUsize,
     num_streams: AtomicUsize,
 }

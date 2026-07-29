@@ -23,7 +23,7 @@
 //! sentinel (placeholder envelopes have no business reaching
 //! dispatch); and tampered envelopes (the signature won't verify
 //! against the recomputed signing bytes). See
-//! `docs/plans/SCALING_MULTIFOLD_PLAN.md` § Wire format for the
+//! `docs/internal/plans/SCALING_MULTIFOLD_PLAN.md` § Wire format for the
 //! authoritative field semantics and on-wire ordering.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};

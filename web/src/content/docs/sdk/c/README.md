@@ -1,27 +1,45 @@
+---
+title: C
+description: The C ABI is the most explicit binding — ten headers across five shared libraries, covering the bus, the mesh, nRPC, storage and the federated query layer.
+---
 # C SDK
 
-The C ABI (`net.h`) is the smallest, most explicit binding. It exposes the **event
-bus** — ingest and poll — with manual memory management, and it's what you use to
-embed Net in a C/C++ program or bind a language that isn't one of the first-class
-SDKs.
+The C ABI is the most explicit binding: manual memory management, return codes
+instead of exceptions, and no threads managed for you. It is what you use to
+embed Net in a C/C++ program or to bind a language that isn't one of the
+first-class SDKs.
 
 ```bash
-# build the shared library + bundle the header
 cargo build --release --features ffi,net
-# then link against the cdylib and include net.h
+# then link against the cdylib and include the headers you need
 ```
 
-## Scope (stated plainly)
+## Scope
 
-The C ABI covers the **bus** (`net_init`, `net_ingest_raw`, `net_poll_ex`,
-`net_shutdown`) plus keypair and dedup helpers. The higher-level **agentic mesh
-surface** — capability announce/discover, tools, nRPC invoke, blob transfer — is
-**not exposed in the C ABI**. For that loop, use one of the fuller bindings
-([Rust](/docs/sdk/rust), [TypeScript](/docs/sdk/typescript),
-[Python](/docs/sdk/python), [Go](/docs/sdk/go)), or drive the mesh from C by
-shelling out to the `net-mesh` CLI ([CLI Reference](/docs/reference/cli)).
+The C surface is **ten headers across five shared libraries**, not one header.
+Between them they cover the event bus, mesh transport, capability
+announce/discover, channels, nRPC (including streaming and cancellable calls),
+RedEX/CortEX storage, blob and directory transfer, the federated query layer,
+daemon authoring, and the Deck operator surface.
 
-So the C spine is two pages, not seven — pretending otherwise would be fiction:
+It is the largest binding by symbol count and the least ergonomic. The
+first-class SDKs ([Rust](/docs/sdk/rust), [TypeScript](/docs/sdk/typescript),
+[Python](/docs/sdk/python), [Go](/docs/sdk/go)) wrap the same primitives with
+lifetimes, error types and async iteration handled for you — prefer them unless
+you specifically need the C ABI.
 
-1. **[Quickstart](/docs/sdk/c/quickstart)** — ingest and poll, with memory rules.
-2. **[Errors](/docs/sdk/c/errors)** — return codes and ownership.
+## Pages
+
+1. **[Quickstart](/docs/sdk/c/quickstart)** — ingest and poll, with the memory rules.
+2. **[Headers and Linking](/docs/sdk/c/headers-and-linking)** — the ten headers, which library each resolves against, and the `net.h` / `net.go.h` choice you make per translation unit.
+3. **[Memory and Threading](/docs/sdk/c/memory-and-threading)** — ownership, the polling cursor trap, and the guarantees the FFI boundary makes.
+4. **[Errors](/docs/sdk/c/errors)** — return codes and the `NET_ERR_*` table.
+
+## Correction
+
+An earlier version of this page said the agentic mesh surface was "not exposed
+in the C ABI" and pointed C users at the `net-mesh` CLI for capability
+discovery and nRPC. That was wrong. `net.go.h` alone declares 182 functions,
+including `net_mesh_announce_capabilities`, `net_mesh_find_best_node_scoped`
+and `net_mesh_subscribe_channel_with_token`; `net_rpc.h` declares ten
+`net_rpc_call*` variants. The CLI is a convenience, not the only path.

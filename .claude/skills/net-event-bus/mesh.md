@@ -5,7 +5,7 @@ This is the file that turns "memory transport works in tests" into "two hosts in
 - You need to pick PSK vs identity keypair, decide on bootstrap topology, or wire NAT traversal.
 - You're standing up a relay / coordinator node and need it to actually accept peers.
 
-What is **not** here: mesh internals (forwarder loops, capability-index TTLs, AEAD tag handling — read `net/crates/net/src/adapter/net/`), custom subprotocols (`net/README.md` § Subprotocols), token issuance for permissioned channels (`runtime.md` § Errors mentions `ChannelRejected`; the issuance path is `Identity::issue_token` — `net/crates/net/sdk/src/identity.rs`).
+What is **not** here: mesh internals (forwarder loops, capability-index TTLs, AEAD tag handling — read `net/crates/net/src/adapter/net/`), custom subprotocols (`README.md` § Infinite extensibility via subprotocols), token issuance for permissioned channels (`runtime.md` § Errors mentions `ChannelRejected`; the issuance path is `Identity::issue_token` — `net/crates/net/sdk/src/identity.rs`).
 
 For the shutdown lifecycle, see `runtime.md`. For per-language kwargs not covered here, see the SDK READMEs (`net/crates/net/sdk-ts/README.md`, `sdk-py/README.md`, `sdk/README.md`). If the user is migrating from a broker (Kafka, NATS, Redis Streams) and reaching for "where do I run the mesh server," start with `gotchas.md` — there is no server.
 
@@ -187,13 +187,13 @@ Don't try to make Net do mDNS / SRV / DNS-SD. It's the wrong layer — pick a se
 
 ## NAT traversal — opt-in optimization
 
-**The routed-handshake fallback always works.** Two NATed peers behind any combination of cones, symmetrics, or unknown classifications still reach each other through encrypted relay forwarding. NAT traversal cuts the per-packet relay tax when a direct path is feasible — that's it. Full design: `net/crates/net/docs/NAT_TRAVERSAL_PLAN.md`. Operator-facing summary: `net/crates/net/README.md` § NAT Traversal.
+**The routed-handshake fallback always works.** Two NATed peers behind any combination of cones, symmetrics, or unknown classifications still reach each other through encrypted relay forwarding. NAT traversal cuts the per-packet relay tax when a direct path is feasible — that's it. See <https://ai2070.net/docs/guides/nat-and-traversal>.
 
 Cargo feature: `nat-traversal` (Rust SDK). The TS / Python bindings ship with stubs that no-op or return a "feature not built" error when the underlying cdylib was built without it.
 
 ```rust
 // Rust — Cargo.toml
-// net-sdk = { version = "...", features = ["nat-traversal"] }
+// net-mesh-sdk = { version = "0.34", features = ["nat-traversal"] }
 
 // Ergonomic path — auto-selects the rendezvous coordinator for you:
 let session = mesh.connect_direct_auto(peer_node_id, &peer_pubkey).await?;
@@ -298,7 +298,7 @@ A whole plane exists for the existential question *"can **any** authorized provi
 
 **As of 0.34 you should almost certainly not turn it on.** It ships dark: `enable_sensing_coalescing = false` by default, the rendezvous-leader role additionally gated behind the `redex` build feature, and there is **no TS / Python / Go SDK surface** — Rust core only. A mesh that leaves the flag off is byte-for-byte the previous release on the wire; its two frames (`0x0C02` `SensingInterestFrame`, `0x0C03` `ReadinessAttestation`) are never emitted.
 
-The knobs, all defaulted inert, so you recognize them in a config diff: `enable_sensing_coalescing` (`false`), `sensing_interest_ttl` (30 s), `max_interests_per_peer` (512), `max_constraint_bytes` (1 KiB), `attestation_cadence_floor` (50 ms), `continuity_factor` (3), and the candidate-exploration bounds `candidate_initial_fanout` (1), `candidate_standby_count` (1), `candidate_max_fanout` (3), `each_mode_max_providers` (32).
+The knobs, all defaulted inert, so you recognize them in a config diff: `enable_sensing_coalescing` (`false`), `sensing_interest_ttl` (30 s), `max_interests_per_peer` (512), `max_constraint_bytes` (1 KiB), `attestation_cadence_floor` (50 ms), `continuity_factor` (3), and the candidate-exploration bounds, which live on the sensing controller's own config rather than `MeshNodeConfig` and carry no `candidate_` prefix: `initial_fanout` (1), `standby_count` (1), `maximum_fanout` (3), `each_mode_max_providers` (32).
 
 If you do evaluate it: **everything the plane reports is advisory.** Proofs are soft state, origin-signed, converging by expiry, and always defer the final yes/no to the admission path below. Follow a `Ready` with your own admission recheck — never treat it as authorization to proceed. Its first consumer is the gang scheduler's candidate pruning (`scheduler.md`). Operator surface: `net/crates/net/docs/SENSING.md`.
 
@@ -365,3 +365,10 @@ All of it degrades cleanly against un-upgraded peers.
 - **Call `accept()` for every responder peer BEFORE `start()`.** Calling `accept()` after `start()` returns `AdapterError::Fatal` (`net/crates/net/src/adapter/net/mesh.rs:4386`) — the runtime rejects it explicitly to prevent the handshake-race hang.
 - **Watch `traversal_stats` if NAT traversal is on.** A `relay_fallbacks` counter that grows much faster than `punches_succeeded` says the punch path isn't earning its keep — fine for correctness, expensive for relays. When it does, the cause counters (`punch_timeouts` / `punch_rejections` / `rendezvous_no_relay`) tell you which failure mode dominates, and a healthy `upgrades_succeeded` means relayed sessions are still being reclaimed into direct ones in the background.
 - **Shutdown cleanly.** See `runtime.md` — same contract as memory transport, plus the mesh closes peer sessions on the way out (peers see "graceful departure" rather than "suspect").
+
+## Further reading
+
+- [NAT and Traversal](https://ai2070.net/docs/guides/nat-and-traversal)
+- [Subnets](https://ai2070.net/docs/concepts/subnets)
+- [Channels](https://ai2070.net/docs/concepts/channels)
+- [Security Model](https://ai2070.net/docs/concepts/security-model)

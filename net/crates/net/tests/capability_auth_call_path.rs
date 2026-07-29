@@ -1,6 +1,6 @@
 //! Integration tests for the v0.4 capability-auth execute-gate
 //! along the `call_service` path. Phase 2 of
-//! `docs/plans/CAPABILITY_AUTH_PLAN.md` — the unit tests in
+//! `docs/internal/plans/CAPABILITY_AUTH_PLAN.md` — the unit tests in
 //! `behavior::capability::tests` exercise [`CapabilityIndex::may_execute`]
 //! in isolation; these tests exercise it across the wire on real
 //! `MeshNode` handshakes so the caller-side gate (inside

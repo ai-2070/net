@@ -1,3 +1,7 @@
+---
+title: Quickstart
+description: "Install the Python SDK and run a node that emits, subscribes, and reports what the bus accepted."
+---
 # Python — Quickstart
 
 ```bash

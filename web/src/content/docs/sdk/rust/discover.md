@@ -1,3 +1,7 @@
+---
+title: Discover
+description: Query the mesh by what you need, not by who has it.
+---
 # Rust — Discover Capabilities
 
 Query the mesh by *what you need*, not by who has it. Two surfaces: list tools, or
@@ -61,7 +65,7 @@ let nodes: Vec<u64> = mesh.find_nodes(&filter);   // not async — returns node 
 and `find_nodes_scoped` narrows to a tenant/region/subnet pool. Announcements
 propagate multi-hop (bounded by a hop count), so a match can be several hops away.
 Richer predicates (numeric, semver, AND/OR/NOT) and the CLI equivalent
-(`net cap query --tag …`) are in [Capabilities](/docs/concepts/capabilities).
+(`net-mesh cap query --tag …`) are in [Capabilities](/docs/concepts/capabilities).
 
 Discovery is **advisory** — it tells you who *can*, with no exclusivity. To
 atomically claim a contended exclusive resource, that's the scheduler, not

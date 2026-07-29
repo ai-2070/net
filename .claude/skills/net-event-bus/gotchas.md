@@ -34,7 +34,7 @@ What to do: ask what they actually need durability for. If "survive a node resta
 
 **No consumer groups.** Each subscriber is independent. There is no "deliver each message to exactly one of N workers" semantics built in.
 
-What to do: if they want work-queue semantics, the publisher can implement it: maintain its own list of workers and pick one per emit. Or use a different abstraction entirely (a daemon group with deterministic identity — see `net/README.md` § Mikoshi). For most event-bus use cases, broadcast-to-all-subscribers is what they want anyway.
+What to do: if they want work-queue semantics, the publisher can implement it: maintain its own list of workers and pick one per emit. Or use a different abstraction entirely (a daemon group with deterministic identity — see `README.md` § Mikoshi). For most event-bus use cases, broadcast-to-all-subscribers is what they want anyway.
 
 ## "Where do I commit my offset?"
 
@@ -65,7 +65,7 @@ What to do: a few options.
 - Switch to `Backpressure::FailProducer` so the producer learns about the failure and can react.
 - If they need lossless delivery, switch to mesh transport with `Reliability::Reliable` per stream, or use a persistence adapter.
 
-Drops in Net are loud-by-stats, silent-by-protocol. Check `node.stats().events_dropped`.
+Drops in Net are silent-by-protocol, and **only partly loud-by-stats**: `events_dropped` counts producer-boundary refusals, so it moves under `drop_newest` / `fail_producer` and stays at zero under the default `drop_oldest`, which evicts silently.
 
 ## "How do I do request/reply (RPC)?"
 
@@ -92,7 +92,7 @@ What to do: ask why they need global ordering — usually it's a workaround for 
 
 **Identity is built in.** Every node has an ed25519 keypair; that's the authentication. Channel-level auth uses signed permission tokens (see `concepts.md` § Identity, capabilities, and routing).
 
-What to do: for a basic trusted mesh, you don't configure anything — identity is automatic. For multi-tenant or untrusted scenarios, point at `net/README.md` § Security surface for permission tokens.
+What to do: for a basic trusted mesh, you don't configure anything — identity is automatic. For multi-tenant or untrusted scenarios, point at `README.md` § Security surface for permission tokens.
 
 ## "Where are my events stored?"
 
@@ -109,7 +109,8 @@ What to do: include a unique event ID (hash of payload + timestamp) and have con
 **If you're on the Redis transport, the dedup primitive is already there.** The Redis adapter writes a stable `dedup_id` field on every XADD entry (`{producer_nonce}:{shard}:{seq_start}:{i}`) so a producer-retry-induced duplicate has the same `dedup_id` as its original. Net ships an LRU-bounded consumer-side helper across every SDK that filters those duplicates without you maintaining the set yourself. Sizing rule of thumb: `events_per_sec × dedup_window_seconds`.
 
 ```rust
-// Rust
+// Rust — needs `net-mesh-sdk = { version = "0.34", features = ["redis"] }`;
+// the export is behind `#[cfg(feature = "redis")]` and is absent on defaults.
 use net_sdk::RedisStreamDedup;
 let mut dedup = RedisStreamDedup::with_capacity(600_000);
 if !dedup.is_duplicate(&entry.dedup_id) { process(entry); }
@@ -181,3 +182,9 @@ What to do: walk them through `concepts.md`. Then map their use case to the reci
 **No — an event is a fact observed at one layer, not an end-to-end acknowledgement.** Transport success is not application success, and application success is not business success. A Net receipt confirms bytes were accepted for fan-out (and, with an opt-in reliability/persistence layer, that they were delivered or logged). It says nothing about whether a downstream effect actually landed — and neither should the event payload. Shaping an event as "the operation is OK" bakes a claim onto the wire that the producer usually can't back up; the quiet failure is the partial one, where the top said OK but a later stage didn't.
 
 What to do: read `event-semantics.md`. Name events after what occurred (`order.placed`, `door.unlocked`), past tense, at the layer that observed it. Make distinct outcomes **distinct events** (`job.submitted` / `job.applied` / `job.failed`), not one boolean — a failure is its own fact, not the absence of a success. Keep transport truth in the transport (`Receipt` / `Reliability::Reliable` / RedEX cursor), not in `{"delivered": true}`. Let consumers fold facts into their own success view (CortEX). If a caller genuinely needs to learn an outcome, that's nRPC (`nrpc.md`) — and even the reply is a fact, not a guarantee.
+
+## Further reading
+
+- [When to Use Net](https://ai2070.net/docs/worldview/right-and-wrong-use-cases)
+- [MCP vs Net](https://ai2070.net/docs/worldview/mcp-vs-net)
+- [REST vs Net](https://ai2070.net/docs/worldview/rest-vs-net)

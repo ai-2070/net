@@ -18,7 +18,7 @@ use net_payments::core::registry::default_registry_v1;
 use net_payments::billing::BillingLog;
 
 let provider = Arc::new(provider_keypair);            // the mesh EntityKeypair — this IS the provider identity
-let facilitator = Arc::new(MockFacilitator::new());   // P0; swap for HttpFacilitator in P1 (facilitator.md)
+let facilitator = Arc::new(MockFacilitator::new());   // swap for HttpFacilitator on a real network (facilitator.md)
 let admission = Arc::new(AdmitAll);                    // dev only; real provider policy is your impl
 let registry = default_registry_v1(provider.entity_id().clone());
 
@@ -161,19 +161,47 @@ use net_payments::core::terms::PricingTerms;
 let terms = PricingTerms::new(provider.entity_id().clone(), "prov/fixture-tool", vec![template_carry], registry_ref);
 ```
 
-Attach `terms` to the capability announcement (native `RegisterTool` publish
-options; the MCP bridge's `publish_server` opts carry the same field). A paid
-capability is **metadata + invocation policy, not a different kind of tool.**
-The caller reads these terms from discovery and drives its side
-(`caller.md`). The templates are non-binding until a quote instantiates one.
+Attach the canonical JSON to the descriptor with
+`ToolDescriptorBuilder::pricing_terms(terms_json)`
+(`net/crates/net/sdk/src/tool.rs`) — the substrate carries the string opaquely
+and never parses payment objects. The MCP bridge's `publish_server` /
+`publish_tools` opts carry the same field. A paid capability is **metadata +
+invocation policy, not a different kind of tool.** The caller reads these terms
+from discovery and drives its side (`caller.md`). The templates are non-binding
+until a quote instantiates one.
+
+**An announced price must be an enforced price, and the SDK refuses to let you
+break that.** The two serve paths are a fail-closed pair:
+
+| You call | Descriptor has `pricing_terms` | Result |
+|---|---|---|
+| `serve_tool` / `serve_tool_streaming` | yes | **refused** — `ServeError::UnenforceablePricing` |
+| `serve_tool` / `serve_tool_streaming` | no | serves free, as intended |
+| `serve_tool_paid(descriptor, gate, handler)` | yes | serves, gated |
+| `serve_tool_paid(..)` | no | **refused** — `ServeError::MissingPricingTerms` |
+
+So you cannot announce a price on a path that has no gate (it would be
+discovered as paid and served free to any direct caller), and you cannot put a
+gate on an unannounced price (it would refuse every caller with no way to know
+why). `serve_tool_paid` takes an `Arc<dyn ToolPaymentGate>` —
+`redeem(tool_id, quote_id, binding) -> Result<(), GateDenial>`; the request body
+is decoded **before** the gate, so a structurally invalid call is rejected
+without consuming the quote.
 
 ## The provider gate in the invocation chain
 
-The `payment_gate` composes into `gated_invoke`:
+There is no `payment_gate` symbol — the payment gate is a *stage* inside
+`gated_invoke` (`net/crates/net/adapters/mcp/src/serve/gated.rs`), driven by
+the `PaymentFlow` you pass in:
 
 ```
-identity → consent → payment verification (accept_payment + tier policy) → provider policy re-check → handler
+describe → validate → consent gate → payment gate → invoke (handler)
 ```
+
+Two properties worth holding onto: **consent runs before payment** (never buy
+access to something the user hasn't consented to invoke), and **no configured
+flow fails closed** (`GatewayError::Denied`) — the handler never sees an unpaid
+call.
 
 For MCP-gateway hosts, the `mcp-gate` feature provides
 `EnginePaymentAdmission::new(Arc<engine>)` (impls `net_mcp::serve::PaymentAdmission`),
@@ -196,3 +224,7 @@ let _handle = serve_payments(&mesh, provider_channel)?;   // registers QUOTE_SER
 Service names: `net.payments.quote.v1`, `net.payments.pay.v1`. The caller uses
 `MeshPaymentChannel` (see `caller.md`). `serve_payments` returns a
 `PaymentServeHandle` — keep it alive for the registration to stand.
+
+## Further reading
+
+- [The Lifecycle](https://ai2070.net/docs/payments/the-lifecycle)

@@ -1,3 +1,7 @@
+---
+title: Python
+description: The Python SDK wraps the same Rust core as every binding, so this spine walks the same agentic loop as Rust and TypeScript.
+---
 # Python SDK
 
 The Python SDK wraps the same Rust core as every binding, so this spine walks the

@@ -150,7 +150,7 @@ pub struct RedexFileConfig {
     pub tail_buffer_size: usize,
 
     /// Cross-node replication opt-in per
-    /// `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §1. `None` (default)
+    /// `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` §1. `None` (default)
     /// keeps the file single-node; `Some(cfg)` opts the channel
     /// into the `ReplicationCoordinator` lifecycle Phase C wires.
     ///

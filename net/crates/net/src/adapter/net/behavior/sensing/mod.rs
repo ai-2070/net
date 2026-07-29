@@ -1,6 +1,6 @@
 //! Capability sensing — SI-0 semantic spike.
 //!
-//! `docs/plans/SENSING_INTEREST_COALESCING_PLAN.md` (v4.1). The
+//! `docs/internal/plans/SENSING_INTEREST_COALESCING_PLAN.md` (v4.1). The
 //! product primitive is existential — "can any authorized provider
 //! currently satisfy capability Y under characteristics C and
 //! latency envelope L?" — with the provider identity in the answer,

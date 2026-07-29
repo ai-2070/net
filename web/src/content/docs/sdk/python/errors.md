@@ -1,3 +1,7 @@
+---
+title: Errors
+description: "The Python SDK's error taxonomy: failure is a typed outcome you can branch on, never a silence."
+---
 # Python — Errors and Recovery
 
 Failure is a typed outcome, not a silence. The rule matches every binding: **only
@@ -32,8 +36,57 @@ backoff), so prefer it over hand-rolling the loop above.
   it.
 - Serialization / config failures are bugs — retrying reruns the bug.
 
-The full taxonomy — the core ingestion/consumer/adapter errors plus subsystem
-errors (token, scaling, stream) — is the
+## The full exception taxonomy
+
+Everything below derives from `Exception`. Two families have a base class you
+can catch to handle the whole group; the rest are flat.
+
+**nRPC** — all derive from `RpcError`, so `except RpcError` covers the family.
+Import from `net` (not `net_sdk`):
+
+| Exception | Fires when | Retry? |
+|---|---|---|
+| `RpcTimeoutError` | Deadline elapsed before a response | Yes, with backoff |
+| `RpcNoRouteError` | No provider currently reachable | Yes — topology may settle |
+| `RpcTransportError` | Connection failed mid-call | Yes, with backoff |
+| `RpcServerError` | Handler returned a typed error status | No |
+| `RpcAppError` | Application-level failure; carries `(status, body)` | No |
+| `RpcCancelledError` | Call cancelled | No |
+| `RpcCodecError` | Encode/decode failure | No — bug |
+| `RpcCapabilityDeniedError` | Caller lacks the capability | No — get a credential |
+
+> **Gotcha.** These classes only exist when the extension is built with the
+> nRPC feature. Without it the module falls back to aliasing every one of them
+> to `RpcError`, which is itself aliased to `Exception` — so `except
+> RpcTimeoutError` silently becomes `except Exception` and swallows everything.
+> If you branch on RPC error type, confirm the feature is compiled in.
+
+**Organizations** — all derive from `OrgError`:
+`OrgAdmissionDeniedError`, `OrgCredentialsError`, `OrgDiscoveryError`,
+`OrgUnclassifiedError`.
+
+**Channels** — `ChannelAuthError` derives from `ChannelError`.
+
+**Flat, deriving straight from `Exception`:**
+
+| Exception | Surface |
+|---|---|
+| `BackpressureError` | Stream window full — the one blindly-retryable case |
+| `NotConnectedError` | Session gone; a state change |
+| `CortexError` / `NetDbError` / `RedexError` | Storage and folded state |
+| `MeshDbError` | Federated query layer |
+| `BlobError` | Blob publish/resolve |
+| `DaemonError` / `MigrationError` / `GroupError` | Compute, migration, replica groups |
+| `MeshOsSdkError` / `DeckSdkError` | Daemon authoring and the operator surface |
+| `IdentityError` / `TokenError` | Keys, signing, permission tokens |
+| `FoldQueryClientError` / `RegistryClientError` | Fold-query and registry RPC |
+| `PinsError` | MCP pin approval surface |
+
+Note that `MigrationError` and `GroupError` are flat here, where the TypeScript
+SDK nests both under `DaemonError` — catch them individually in Python.
+
+The wire-level codes these wrap — core ingestion/consumer/adapter errors plus
+token, scaling and stream errors — are in the
 [Error Codes](/docs/reference/error-codes) reference.
 
 ## Recover an nRPC call

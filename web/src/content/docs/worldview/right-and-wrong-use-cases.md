@@ -1,3 +1,7 @@
+---
+title: When to Use Net
+description: "Net is infrastructure with discipline, not \"use us for everything.\" The fastest way to trust a tool is to know where it doesn't belong — so this page is as explicit about the wrong"
+---
 # When to Use Net (and When Not To)
 
 Net is infrastructure with discipline, not "use us for everything." The fastest

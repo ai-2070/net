@@ -1,0 +1,410 @@
+name: Skills
+
+# Check the agent skills in `.claude/skills/`, then mirror them to the public
+# repo. Two jobs, in that order, because the second must not run when the first
+# is red.
+#
+# --- drift -------------------------------------------------------------------
+# The skills are ~9k lines of prose asserting that specific symbols, paths, and
+# CLI verbs exist. Nothing compiles them, so they rot silently while the crates
+# move underneath. This is the tripwire.
+#
+# It fires on two kinds of change, because drift has two causes: editing the
+# skills, and moving the surface they describe. The second is the one that rots
+# documentation quietly — a renamed CLI binary and a rewritten error enum both
+# landed with nothing pointing at the prose they invalidated.
+#
+# Run it locally any time:  .github/scripts/check-skills.sh
+#
+# --- publish -----------------------------------------------------------------
+# Mirrors `.claude/skills/` to `ai-2070/net-claude-skill`, the public repo that
+# `npx skills add ai-2070/net-claude-skill` installs from.
+#
+# The skills are authored here so they ship with the library and sit next to the
+# code they describe; that repo is a publish artifact, not a place to edit. Every
+# push to master that touches the directory copies, verbatim:
+#
+#   .claude/skills/net-event-bus/  ->  net-event-bus/
+#   .claude/skills/net-payments/   ->  net-payments/
+#   .claude/skills/README.md       ->  README.md
+#
+# Anything else over there (LICENSE-APACHE, LICENSE-MIT, sync.sh) is left alone.
+# The copy is `rsync --delete`, so a file deleted here is deleted there.
+#
+# Required repository secret: `SKILLS_PUBLISH_TOKEN`
+#   A fine-grained PAT scoped to `ai-2070/net-claude-skill` with
+#   `Contents: Read and write`. The default `GITHUB_TOKEN` is scoped to this
+#   repository and cannot push to another one.
+#
+# `workflow_dispatch` takes a `dry_run` input that prints the diff and stops
+# short of pushing — use it to check the wiring after changing the copy step.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - ".claude/skills/**"
+      - ".github/workflows/skills.yml"
+      - ".github/scripts/check-skills.sh"
+      - ".github/scripts/check-skills-depth.sh"
+      - ".github/scripts/check-skill-refs.py"
+      - ".github/scripts/check-skill-workflow.py"
+      - ".github/scripts/check-skill-examples.sh"
+      - ".github/scripts/skill_examples.py"
+      - ".github/scripts/run-skill-examples.sh"
+      - ".github/skill-examples.json"
+      - ".github/scripts/check-skill-example-ts.sh"
+      - ".github/scripts/check-skill-vocab.py"
+      - ".github/scripts/check-skill-coverage.py"
+      - ".github/scripts/check-skill-snippets.py"
+      - ".github/skill-snippets/**"
+      # Every surface the skills document. Broad roots on purpose: the previous
+      # list reached only `*/src/**` and missed 36 of the 66 source paths the
+      # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
+      # headers, and `bindings/node/*.ts`, which sits at the package root rather
+      # than under `src/`. A false-positive run of a 13s check costs nothing; a
+      # missed run costs a published defect. `check-skills.sh` asserts this list
+      # still covers every cited path, so the two cannot drift apart.
+      - "go/**"
+      - "net/crates/net/src/**"
+      - "net/crates/net/sdk/**"
+      - "net/crates/net/sdk-ts/**"
+      - "net/crates/net/sdk-py/**"
+      - "net/crates/net/cli/**"
+      - "net/crates/net/payments/**"
+      - "net/crates/net/bindings/**"
+      - "net/crates/net/adapters/**"
+      - "net/crates/net/include/**"
+      - "net/crates/net/docs/**"
+      - "net/crates/net/tests/**"
+      # Dependency or API resolution can shift without a source edit.
+      - "Cargo.lock"
+      - "go/go.mod"
+      - "net/crates/net/sdk-ts/package.json"
+      - "net/crates/net/sdk-py/pyproject.toml"
+      - "net/crates/net/bindings/*/package.json"
+      - "net/crates/net/bindings/*/pyproject.toml"
+  pull_request:
+    paths:
+      - ".claude/skills/**"
+      - ".github/workflows/skills.yml"
+      - ".github/scripts/check-skills.sh"
+      - ".github/scripts/check-skills-depth.sh"
+      - ".github/scripts/check-skill-refs.py"
+      - ".github/scripts/check-skill-workflow.py"
+      - ".github/scripts/check-skill-examples.sh"
+      - ".github/scripts/skill_examples.py"
+      - ".github/scripts/run-skill-examples.sh"
+      - ".github/skill-examples.json"
+      - ".github/scripts/check-skill-example-ts.sh"
+      - ".github/scripts/check-skill-vocab.py"
+      - ".github/scripts/check-skill-coverage.py"
+      - ".github/scripts/check-skill-snippets.py"
+      - ".github/skill-snippets/**"
+      # Every surface the skills document. Broad roots on purpose: the previous
+      # list reached only `*/src/**` and missed 36 of the 66 source paths the
+      # skills actually cite — the whole Go binding, both non-Rust SDKs, the C
+      # headers, and `bindings/node/*.ts`, which sits at the package root rather
+      # than under `src/`. A false-positive run of a 13s check costs nothing; a
+      # missed run costs a published defect. `check-skills.sh` asserts this list
+      # still covers every cited path, so the two cannot drift apart.
+      - "go/**"
+      - "net/crates/net/src/**"
+      - "net/crates/net/sdk/**"
+      - "net/crates/net/sdk-ts/**"
+      - "net/crates/net/sdk-py/**"
+      - "net/crates/net/cli/**"
+      - "net/crates/net/payments/**"
+      - "net/crates/net/bindings/**"
+      - "net/crates/net/adapters/**"
+      - "net/crates/net/include/**"
+      - "net/crates/net/docs/**"
+      - "net/crates/net/tests/**"
+      # Dependency or API resolution can shift without a source edit.
+      - "Cargo.lock"
+      - "go/go.mod"
+      - "net/crates/net/sdk-ts/package.json"
+      - "net/crates/net/sdk-py/pyproject.toml"
+      - "net/crates/net/bindings/*/package.json"
+      - "net/crates/net/bindings/*/pyproject.toml"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Show what would change without pushing"
+        type: boolean
+        default: false
+
+jobs:
+  drift:
+    name: Drift check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # Frontmatter + description budget, cross-file links, cited repo paths,
+      # API-surface canaries, documented-symbol resolution, enum-variant
+      # membership, metric/config identifiers, CLI verb names, and internal-plan
+      # leakage. No toolchain needed — grep and python3, both on the runner.
+      - name: Check skills against the tree
+        run: .github/scripts/check-skills.sh
+
+      # Guards the checker rather than the content: three of the checks above
+      # used to stop at `*/*.md` and silently ignored anything nested deeper.
+      # This plants four defects in a nested file — in a throwaway copy of the
+      # corpus, never in `.claude/skills/`, which is rsynced to users — and
+      # asserts all four are reported.
+      - name: Check nested skill content is still discovered
+        run: .github/scripts/check-skills-depth.sh
+
+  examples:
+    name: Examples compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # No `cache-dependency-path`: there is no `go/go.sum`, and the scratch
+      # module resolves the binding through a local `replace`, so there is
+      # nothing to check sums against.
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go/go.mod
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install mypy
+        run: python -m pip install --upgrade mypy
+
+      # A compile floor, not an execution proof: it answers "does this still
+      # build against the tree?", never "does it print one line?" — that needs
+      # built artifacts (napi module, wheel, cdylib) and belongs in the release
+      # workflows. REQUIRE_ALL makes a missing toolchain a failure, so a runner
+      # that lost one cannot pass by skipping.
+      #
+      # Four of the five languages are covered here. `hello.ts` is NOT: it needs
+      # the napi-generated `bindings/node/index.d.ts`, which is gitignored, and
+      # regenerating it means a full `napi build`. It has its own `typescript`
+      # job below, which pays that cost only on publication-eligible events; on
+      # a branch or PR the same check runs in ci.yml instead.
+      - name: Compile the skill examples
+        env:
+          REQUIRE_ALL: "1"
+        run: .github/scripts/check-skill-examples.sh
+
+      # The step above is a compile floor, and a compile floor cannot catch an
+      # example that builds and then hangs. `hello.rs` and `hello.ts` did
+      # exactly that for months: clean compile, blocked forever on a subscribe
+      # that could never yield, while the README promised "prints exactly one
+      # line". Only running them finds that.
+      #
+      # Rust runs here because the step above already built it — the marginal
+      # cost is the execution itself. The other four need artifacts this job
+      # does not have (napi module, maturin wheel, libnet cdylib) and are
+      # executed in the ci.yml jobs that do; `run.not_wired` in the manifest
+      # records which, and `--report` prints ▶ for executed against ✓ for
+      # compiled-only so the difference is never invisible.
+      - name: Run the Rust examples and check their output
+        run: .github/scripts/run-skill-examples.sh --lang rust
+
+  snippets:
+    name: Snippets compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      # Opt-in: only blocks carrying `<!-- skill-check: compile -->` are
+      # extracted. The script always prints checked/total, so a green run never
+      # implies coverage it does not have — and an orphaned or malformed marker
+      # is an error, not a silent skip.
+      - name: Compile marked skill snippets
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: .github/scripts/check-skill-snippets.py
+
+  typescript:
+    name: TypeScript example type-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    # PUBLICATION-GATE ONLY — and this condition must stay equal to `publish`'s
+    # below, which `check-skill-workflow.py` asserts. Divergence does not reopen
+    # the gate (GitHub skips a job whose dependency was skipped, so publish goes
+    # with it); it silently stops the mirror on events where this does not run.
+    # Quiet either way, hence the assertion.
+    #
+    # Why conditional at all, when every other job here runs unconditionally:
+    # this one needs a full `napi build`, ~10-15 minutes of Rust. skills.yml
+    # fires on every documented surface — `go/**`, `net/crates/net/**` — so
+    # running it always would attach that cost to a large share of pushes to buy
+    # nothing. On a branch or a PR, `hello.ts` is already type-checked by
+    # ci.yml's "TypeScript SDK tests" job, which runs there. The *only* thing
+    # ci.yml cannot do is block this workflow's mirror, so that is the only case
+    # this job covers.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
+
+    defaults:
+      run:
+        working-directory: net/crates/net/sdk-ts
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Same `shared-key` as ci.yml's sdk-ts-tests, so this reuses that job's
+      # cache rather than warming a second copy of the same build.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sdk-ts
+          workspaces: net/crates/net -> target
+
+      # Feature list is ci.yml's, and `redis` is load-bearing rather than
+      # incidental: `sdk-ts/src/redis-dedup.ts` does a real
+      # `export { RedisStreamDedup } from '@net-mesh/core'`, and the generated
+      # `index.d.ts` only declares it when the binding was built with that
+      # feature. Drop it and the SDK's own source stops type-checking, which
+      # looks like an example failure and is not.
+      - name: Build native module
+        working-directory: net/crates/net/bindings/node
+        run: |
+          npm i --ignore-scripts
+          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,org,test-helpers,dataforts
+
+      - name: Install npm dependencies
+        run: npm i
+
+      - name: Type-check the skill hello-world example
+        working-directory: .
+        run: .github/scripts/check-skill-example-ts.sh
+
+  publish:
+    name: Mirror to net-claude-skill
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    # The reason these two workflows were merged. `needs` makes the mirror wait
+    # on the checks and skip entirely when any fails, so drift cannot reach the
+    # public repo. As separate workflows they raced — GitHub does not sequence
+    # one workflow behind another, so a red check published anyway.
+    #
+    # POLICY: every job that verifies content this job publishes belongs in this
+    # list. A job may be slow, or PR-only — but a *known-red* verification of the
+    # artifact must never publish that artifact. `check-skill-workflow.py`
+    # enforces it: any job not listed here fails the check unless it carries an
+    # explicit `# advisory: <reason>` comment. Later phases (examples, snippets)
+    # add themselves here as they land.
+    needs:
+      - drift
+      - examples
+      - snippets
+      - typescript
+
+    # Automatic publishes are master-only, and a pull request never publishes:
+    # it runs with a read-only token and must not push to another repository.
+    #
+    # A manual dispatch is allowed from any branch, which is how the original
+    # workflow behaved and what makes `dry_run` useful — you can check the copy
+    # step from a branch before merging it. Note the sharp edge that comes with
+    # it: dispatching from a branch with `dry_run` off publishes that branch's
+    # skills for real.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
+
+    # Job-scoped, not workflow-scoped: two pushes in quick succession would
+    # otherwise race to publish, and the later one should wait rather than
+    # cancel so the mirror ends on the newest tree. Keeping it off the workflow
+    # means drift checks on other branches never queue behind a publish.
+    concurrency:
+      group: skills-publish
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Fail with an explanation rather than a 403 from the checkout below.
+      - name: Check the publish token is present
+        env:
+          TOKEN: ${{ secrets.SKILLS_PUBLISH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::SKILLS_PUBLISH_TOKEN is not set. Create a fine-grained PAT scoped to ai-2070/net-claude-skill with Contents: Read and write, then add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Checkout net-claude-skill
+        uses: actions/checkout@v7
+        with:
+          repository: ai-2070/net-claude-skill
+          token: ${{ secrets.SKILLS_PUBLISH_TOKEN }}
+          path: published
+
+      - name: Copy the skills across
+        run: |
+          set -euo pipefail
+          for skill in net-event-bus net-payments; do
+            test -f ".claude/skills/$skill/SKILL.md" || {
+              echo "::error::.claude/skills/$skill/SKILL.md is missing — refusing to publish"
+              exit 1
+            }
+            rsync -a --delete --exclude=.git ".claude/skills/$skill/" "published/$skill/"
+          done
+          cp .claude/skills/README.md published/README.md
+
+      # The workflow also fires on source-only changes (the drift paths above),
+      # which touch nothing the mirror carries. That lands here as an
+      # "already in sync" no-op rather than an empty commit.
+      - name: Commit and push
+        working-directory: published
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "already in sync with ${GITHUB_SHA}"
+            exit 0
+          fi
+
+          git add -A
+          git status --short
+
+          if [ "$DRY_RUN" = "true" ]; then
+            git diff --cached --stat
+            echo "dry run — not pushing"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit \
+            -m "skills: sync from net@${GITHUB_SHA:0:7}" \
+            -m "Published from .claude/skills/ by skills.yml.
+          Source: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          git push

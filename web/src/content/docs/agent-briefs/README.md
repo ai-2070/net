@@ -1,3 +1,7 @@
+---
+title: Agent Briefs
+description: "Task briefs written for a coding agent to execute rather than for a human to read, each with a verifiable end state."
+---
 # Agent Briefs
 
 Most docs are written for a human to read. These are written for an **agent to

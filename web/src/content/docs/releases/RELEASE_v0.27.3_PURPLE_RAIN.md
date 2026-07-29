@@ -1,3 +1,7 @@
+---
+title: "v0.27.3 — Purple Rain"
+description: "Release notes for Net v0.27.3 — Purple Rain — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.27.3 — "Purple Rain"
 
 ## 🟣 Packet-path AEAD swapped to `ring`
@@ -107,4 +111,4 @@ Released 2026-06-12.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE). `ring`'s third-party notice (ISC-style, with BoringSSL / OpenSSL-derived portions) applies to distributions bundling compiled crypto objects — see the crate README.
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE). `ring`'s third-party notice (ISC-style, with BoringSSL / OpenSSL-derived portions) applies to distributions bundling compiled crypto objects — see the crate README.

@@ -1,3 +1,7 @@
+---
+title: Announce
+description: Announce what a node can do; peers fold it into their index and can then discover and invoke it.
+---
 # Go — Announce a Capability
 
 Announce what a node can do; peers fold it into their index and can then discover

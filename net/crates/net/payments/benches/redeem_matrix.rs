@@ -6,7 +6,7 @@
 //! `redeem_for_invocation` ran `mutate_json`, which serialized + fsync'd +
 //! renamed the whole state file even for read-only `Denied{..}` outcomes.
 //! Fixed by `mutate_json_if_changed` (denials no longer write); see
-//! `docs/performance/payments-redeem-write-amplification.md`.
+//! `docs/internal/performance/payments-redeem-write-amplification.md`.
 //!
 //! Custom hdrhistogram harness (successful admission is stateful and
 //! single-use; store cardinality is a controlled axis), reporting through

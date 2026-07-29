@@ -130,11 +130,12 @@ During daemon migration, the entity exists in a `SuperpositionState` -- both old
 
 ```rust
 pub enum SuperpositionPhase {
-    PreMigration,       // Only at source
-    Transferring,       // At source, snapshot in flight
-    DualActive,         // Both source and target processing
-    PostCutover,        // Only at target
-    Settled,            // Migration complete, superposition collapsed
+    Localized,          // Entity exists only on source (pre-snapshot)
+    Spreading,          // Snapshot taken, target restoring; source still authoritative
+    Superposed,         // Both nodes may hold the entity
+    ReadyToCollapse,    // Target caught up; ready to collapse to one location
+    Collapsed,          // Routing switched, target canonical, source draining
+    Resolved,           // Source cleaned up; single location on target
 }
 
 pub struct SuperpositionState {
@@ -145,13 +146,17 @@ pub struct SuperpositionState {
 }
 ```
 
-Observers see the entity at both locations during `DualActive`. The superposition collapses to `Settled` after cutover completes and the source cleans up. This mirrors the migration state machine from Layer 5 but from the observer's perspective.
+Observers see the entity at both locations during `Superposed`. The
+superposition collapses through `Collapsed` — routing has switched but the
+source is still draining — to `Resolved` once the source cleans up. This mirrors
+the six-phase migration state machine from Layer 5, but from the observer's
+perspective rather than the orchestrator's.
 
 ## Source Files
 
 | File | Purpose |
 |------|---------|
-| `continuity/chain.rs` | `ContinuityProof`, `ContinuityStatus`, proof verification |
+| `continuity/chain.rs` | `ContinuityProof`, `ContinuityStatus`, `ProofError`, proof verification |
 | `continuity/cone.rs` | `CausalCone`, `Causality`, horizon-based causal queries |
 | `continuity/discontinuity.rs` | `Discontinuity`, `ForkRecord`, `fork_entity()` |
 | `continuity/observation.rs` | `ObservationWindow`, `HorizonDivergence` |

@@ -1,3 +1,7 @@
+---
+title: Error Codes
+description: This page enumerates every error type the core crate surfaces.
+---
 # Error Codes
 
 This page enumerates every error type the core crate surfaces. Errors are organized by the operation they come from — ingestion, consumption, and adapter — and each variant includes the conditions under which it fires and the right response from a caller.

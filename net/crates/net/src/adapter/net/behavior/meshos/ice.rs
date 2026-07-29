@@ -1,5 +1,5 @@
 //! ICE — break-glass operator surface, substrate side per
-//! [`DECK_SDK_PLAN.md`](../../../../../../docs/plans/DECK_SDK_PLAN.md)
+//! [`DECK_SDK_PLAN.md`](../../../../../../../../docs/internal/plans/DECK_SDK_PLAN.md)
 //! Phase 2.
 //!
 //! Locked decision #4 of the plan: blast-radius simulation is

@@ -5,7 +5,7 @@
 //! and (when a better alternative exists + cooldown elapsed)
 //! emits a `RequestEviction` for the worst under-scorer.
 //!
-//! [`MESH_SCHEDULER_PLAN.md`]: ../../../../../../docs/plans/MESH_SCHEDULER_PLAN.md
+//! [`MESH_SCHEDULER_PLAN.md`]: ../../../../../../docs/internal/plans/MESH_SCHEDULER_PLAN.md
 //!
 //! The substrate's `PlacementFilter` and capability index are
 //! exposed via the [`PlacementScorer`] trait — production

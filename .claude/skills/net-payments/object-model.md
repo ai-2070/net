@@ -66,7 +66,7 @@ constants:
 | `TAG_SETTLEMENT_REF` | `net.settlement.ref@1` |
 | `TAG_PAYMENT_VERIFICATION` | `net.payment.verification@1` |
 | `TAG_BILLING_EVENT` | `net.billing.event@1` |
-| `TAG_PAYMENT_DISPUTE` | `net.payment.dispute@1` — **reserved, no semantics before P5** |
+| `TAG_PAYMENT_DISPUTE` | `net.payment.dispute@1` — **reserved, no semantics today** |
 
 `ensure_tag(expected, got)` returns `VersionError::UnsupportedVersion {object,
 got, expected}` for a same-family version mismatch (serializes with
@@ -117,7 +117,7 @@ pub struct PaymentQuote {
     pub provider: EntityId,                        // issues + signs
     pub caller: EntityId,                          // per-caller: issuance asserts admission
     pub capability: String,
-    pub input_hash: Option<String>,                // blake3 of invocation input (RFQ binds; P0 None)
+    pub input_hash: Option<String>,                // blake3 of invocation input (currently always None)
     pub requirements: X402Carry<PaymentRequirements>, // INSTANTIATED, byte-preserved — what binds
     pub asset_registry: RegistryRef,               // verification uses THIS revision, never "latest"
     pub issued_at_ns: u64,
@@ -260,3 +260,7 @@ a verification input.
 registry revision it was authored under. See `networks.md` for `AssetRegistry`
 and the signed-default policy (allowed assets, decimals cross-check,
 equivalence classes). CAIP `ChainId` / `AssetId` are in `x402.md`.
+
+## Further reading
+
+- [The Lifecycle](https://ai2070.net/docs/payments/the-lifecycle)

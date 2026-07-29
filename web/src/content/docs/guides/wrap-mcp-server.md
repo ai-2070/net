@@ -1,17 +1,21 @@
+---
+title: Wrap an MCP Server
+description: The fastest way to put a capability on the mesh is to wrap a tool you already have.
+---
 # Wrap an MCP Server
 
 The fastest way to put a capability on the mesh is to wrap a tool you already
-have. `net wrap` spawns an existing stdio MCP server, reads its tool list,
+have. `net-mesh wrap` spawns an existing stdio MCP server, reads its tool list,
 announces each tool as a discoverable Net capability, and translates incoming
 mesh calls back into MCP `tools/call` — all without the Net core ever learning
 that MCP exists.
 
-> **MCP made tools callable. `net wrap` makes them discoverable.** See
+> **MCP made tools callable. `net-mesh wrap` makes them discoverable.** See
 > [MCP vs Net](/docs/worldview/mcp-vs-net) for where this fits.
 
 ## Prerequisite: a mesh to join
 
-`net wrap` builds a real mesh node under your identity and **joins the mesh via a
+`net-mesh wrap` builds a real mesh node under your identity and **joins the mesh via a
 peer** — so it needs at least one reachable node to join. You provide that peer's
 address, Noise public key, and pre-shared key:
 
@@ -29,7 +33,7 @@ command for federating a tool onto a mesh that already exists.
 ## Wrap a server
 
 ```
-net wrap github \
+net-mesh wrap github \
   --node-addr 203.0.113.7:4433 --node-pubkey 0x<peer-hex> --psk-hex <psk> \
   --identity ./operator.toml \
   --env GITHUB_TOKEN=ghp_xxx \
@@ -48,7 +52,7 @@ net wrap github \
   [credential forwarding](/docs/reference/mcp-bridge#credential-forwarding-opt-in-deny-by-default);
   a wrapped stdio server like this one never forwards.
 
-`net wrap` is long-running. It emits a `wrapped` event (the served + skipped
+`net-mesh wrap` is long-running. It emits a `wrapped` event (the served + skipped
 tools, the announced visibility/scope, and any widened origins), then a
 `tools_changed` event whenever the server's tool set changes, and a
 `server_exited` event when it stops — at which point the capabilities are
@@ -64,7 +68,7 @@ rejected at the wrapper, verified against the AEAD-authenticated caller origin.
 To widen who may invoke, admit specific caller origins explicitly:
 
 ```
-net wrap github --allow 0x<caller-origin> --allow 0x<other-origin> \
+net-mesh wrap github --allow 0x<caller-origin> --allow 0x<other-origin> \
   --node-addr <peer> --node-pubkey <hex> --psk-hex <psk> \
   -- npx -y @modelcontextprotocol/server-github
 ```
@@ -76,7 +80,7 @@ invocation — widening is always an explicit, per-origin decision.
 
 ## Credential status
 
-`net wrap` classifies each wrapped tool's credential exposure automatically. You
+`net-mesh wrap` classifies each wrapped tool's credential exposure automatically. You
 can override:
 
 - `--credentialed` — force status to `credentialed` (upward; always allowed).

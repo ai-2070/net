@@ -1,4 +1,4 @@
-//! OA-2 §2.3 of `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md` — the
+//! OA-2 §2.3 of `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md` — the
 //! per-call admission proof and its four-party call binding.
 //!
 //! An [`OrgCallProof`] rides exactly one `net-org-admission` RPC

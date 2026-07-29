@@ -1,8 +1,12 @@
+---
+title: "v0.27.2 — Purple Rain"
+description: "Release notes for Net v0.27.2 — Purple Rain — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.27.2 — "Purple Rain"
 
 ## A security release — one critical auth fix, and the nRPC wire path keeps shrinking
 
-Where v0.27.1 was pure performance and *nothing on the wire moved*, v0.27.2 leads with a four-pass security audit of the `net` crate and the fixes it surfaced — headlined by a **critical authorization-bypass** in the capability fold — then continues the hot-path work on the nRPC dispatch layer the [hot-path audit](../misc/PERF_AUDIT_2026_06_09_HOT_PATH.md) opened. The full security review is recorded in [`docs/misc/SECURITY_AUDIT_2026_06_09_NET_CRATE.md`](../misc/SECURITY_AUDIT_2026_06_09_NET_CRATE.md); this log is the operator-facing summary.
+Where v0.27.1 was pure performance and *nothing on the wire moved*, v0.27.2 leads with a four-pass security audit of the `net` crate and the fixes it surfaced — headlined by a **critical authorization-bypass** in the capability fold — then continues the hot-path work on the nRPC dispatch layer the [hot-path audit](https://github.com/ai-2070/net/blob/master/docs/internal/misc/PERF_AUDIT_2026_06_09_HOT_PATH.md) opened. The full security review is recorded in [`docs/misc/SECURITY_AUDIT_2026_06_09_NET_CRATE.md`](https://github.com/ai-2070/net/blob/master/docs/internal/misc/SECURITY_AUDIT_2026_06_09_NET_CRATE.md); this log is the operator-facing summary.
 
 The reassuring part first: **the audit found the crate unusually well-hardened.** Untrusted-wire parsing, token/chain auth, nonce/randomness handling, handshake identity binding, secret hygiene, and the filesystem/path surfaces all came back clean *and verified* (not assumed) — most classic hazards already had named, tested mitigations. One finding stood apart and is fixed below; the rest are medium/low hardening and defense-in-depth.
 
@@ -146,4 +150,4 @@ Released 2026-06-10.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

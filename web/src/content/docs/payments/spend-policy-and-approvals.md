@@ -1,3 +1,7 @@
+---
+title: "Spend Policy & Approvals"
+description: The model requests an invocation; it does not decide whether to spend.
+---
 # Spend policy & approvals
 
 The model requests an invocation; it does not decide whether to spend. That
@@ -25,6 +29,45 @@ Limits are per `(network, asset)`, in atomic units of the allowed asset:
 - **`max_per_call`** — require approval above this single-call amount;
 - **`max_per_day`** — require approval once the per-day total would exceed this;
 - **`allowed_networks` / `allowed_assets`** — the enablement allowlist.
+
+### Setting a cap
+
+The engine is constructed against a store path and a profile, and `configure`
+takes the write under the store's lock:
+
+```rust
+use net_payments::core::units::AtomicAmount;
+use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
+
+let policy = SpendPolicyEngine::new(&spend_path, SpendProfile::Production);
+policy
+    .configure(|defaults, _| {
+        defaults.max_per_call = Some(AtomicAmount::from_u128(1000));
+    })
+    .await?;
+```
+
+Amounts are `AtomicAmount` — atomic units of the asset, never a float. The
+profile is the fail-closed switch: `SpendProfile::Production` makes even mock
+spends require approval, `SpendProfile::DevTest` auto-allows the mock network
+under the limits. Neither profile lets a real network spend unless it's listed
+in `allowed_networks`.
+
+### Approving a held quote
+
+When policy returns `RequiresPaymentApproval`, nothing has been spent and the
+pending record carries the quote's canonical bytes. Approval is an
+**operator-only** verb, deliberately reachable from a different surface than
+the flow that asked for it:
+
+```rust
+let policy = SpendPolicyEngine::new(&spend_path, SpendProfile::Production);
+let approved: bool = policy.approve(&quote_id).await?;
+```
+
+Re-running the flow after approval redeems the exact quote the human saw.
+Approving quote *X* never authorizes a later quote *Y*, so a caller cannot get
+an approval for a cheap quote and spend it on an expensive one.
 
 The per-day counter is a **lock-held read-modify-write** on the shared store:
 coarse and correct beats clever and racy, so two processes hammering the cap can

@@ -1,10 +1,10 @@
 ---
 name: net-payments
-description: "Use this skill when the user is integrating the Net Payments SDK (`net-payments` Rust crate, `net_payments` lib, or the Python/Node `CapabilityGateway` + `PaymentProvider` payment surface) — x402-native payments for the Net mesh. Covers pricing a capability at discovery (`net.pricing.terms@1`), issuing signed quotes (`net.payment.quote@1`), the provider-side lifecycle engine (`PaymentEngine`: quote → verify → settle → tiered verification → billing), the caller-side flow (`CallerPaymentFlow` / `ProviderChannel`: pricing → spend policy → payload → pay), facilitators (mock + the real HTTP `verify`/`settle` client, config packs, auth), tiered verification (`observed | confirmed(n) | final`) with the independent on-chain `ChainChecker`, reorg handling, the settlement signer seam (`SchemeSigner` / `ExternalSigner` / `ExternalSvmSigner` / `ExternalXrplSigner` — EIP-3009 exact-EVM, SPL exact-SVM `sign_svm_transfer`/`SvmTransferIntent`, and exact-XRPL `sign_xrpl_payment`/`XrplPaymentIntent`; keys never cross the boundary), the spend policy engine (budgets, delegation inheritance, `requires_payment_approval`), immutable billing events + the billing stream, network enablement (CAIP-2/CAIP-19, the signed asset registry, Base/Solana/xrpl config-not-code ladder), the outbound HTTP 402 two-way door, the machine-actionable failure schematic (`net.payment.failure@1`) that rides denials beside the human error, the multi-language SDK surfaces (Python AND Node/TS both at full demand+supply parity with Rust — `CapabilityGateway`, the paid `PaymentProvider` + `buildPricingTerms`, HTTP-402 client, eip155/svm/xrpl signers, approval verbs, free `publishTools`), and cross-language golden vectors + conformance. Triggers on imports of `net-payments` / `net_payments`; on `x402`, `PaymentEngine`, `PaymentQuote`, `PricingTerms`, `net.payment.*` / `net.billing.* / net.settlement.*`, `X402Carry`, `PaymentRequirements`, `facilitator verify/settle`, `VerificationTier`, `confirmed(n)`, `reorg`, `SchemeSigner`, `ExternalSigner`, `ExternalSvmSigner`, `SvmTransferIntent`, SPL/Solana settlement, `SpendPolicyEngine`, `BillingEvent`, `MeshPaymentChannel`, `serve_payments`, `payment_gate`, `gated_invoke`, `requires_payment_approval`, `CAIP-2`/`CAIP-19`, `AssetRegistry`, `HttpFacilitator`, `x402/base`, `EIP-3009`, HTTP 402; and on phrases like 'price a capability', 'charge for a tool', 'pay to invoke', 'quote a payment', 'pay-before-serve', 'settle on Base/Solana', 'verify a payment on-chain', 'spend limit / budget', 'approve a payment', 'bill for usage', 'pay an x402 API'. This is a small, sharply-bounded slice: Net signs the commercial facts around invocation, it does NOT custody funds, process payments, issue invoices, or move money. Skip for unrelated event-bus / mesh work (that's the `net-event-bus` skill) or for editing payments' own internals unless the task is payments integration."
+description: "Use this skill when the user is integrating the Net Payments SDK (`net-payments` Rust crate, `net_payments` lib, or the Python/Node `CapabilityGateway` + `PaymentProvider` payment surface) — x402-native payments for the Net mesh. Covers pricing a capability at discovery (`net.pricing.terms@1`), issuing signed quotes (`net.payment.quote@1`), the provider-side lifecycle engine (`PaymentEngine`: quote → verify → settle → tiered verification → billing), the caller-side flow (`CallerPaymentFlow` / `ProviderChannel`: pricing → spend policy → payload → pay), facilitators (mock + the real HTTP `verify`/`settle` client, config packs, auth), tiered verification (`observed | confirmed(n) | final`) with the independent on-chain `ChainChecker`, reorg handling, the settlement signer seam (`SchemeSigner` / `ExternalSigner` / `ExternalSvmSigner` / `ExternalXrplSigner` — EIP-3009 exact-EVM, SPL exact-SVM `sign_svm_transfer`/`SvmTransferIntent`, and exact-XRPL `sign_xrpl_payment`/`XrplPaymentIntent`; keys never cross the boundary), the spend policy engine (budgets, delegation inheritance, `requires_payment_approval`), immutable billing events + the billing stream, network enablement (CAIP-2/CAIP-19, the signed asset registry, Base/Solana/xrpl config-not-code ladder), the outbound HTTP 402 two-way door, the machine-actionable failure schematic (`net.payment.failure@1`) that rides denials beside the human error, the multi-language SDK surfaces (Python AND Node/TS both at full demand+supply parity with Rust — `CapabilityGateway`, the paid `PaymentProvider` + `buildPricingTerms`, HTTP-402 client, eip155/svm/xrpl signers, approval verbs, free `publishTools`), and cross-language golden vectors + conformance. Triggers on imports of `net-payments` / `net_payments`; on `x402`, `PaymentEngine`, `PaymentQuote`, `PricingTerms`, `net.payment.*` / `net.billing.* / net.settlement.*`, `X402Carry`, `PaymentRequirements`, `facilitator verify/settle`, `VerificationTier`, `confirmed(n)`, `reorg`, `SchemeSigner`, `ExternalSigner`, `ExternalSvmSigner`, `SvmTransferIntent`, SPL/Solana settlement, `SpendPolicyEngine`, `BillingEvent`, `MeshPaymentChannel`, `serve_payments`, `PaymentFlow`, `gated_invoke`, `requires_payment_approval`, `CAIP-2`/`CAIP-19`, `AssetRegistry`, `HttpFacilitator`, `x402/base`, `EIP-3009`, HTTP 402; and on phrases like 'price a capability', 'charge for a tool', 'pay to invoke', 'quote a payment', 'pay-before-serve', 'settle on Base/Solana', 'verify a payment on-chain', 'spend limit / budget', 'approve a payment', 'bill for usage', 'pay an x402 API'. This is a small, sharply-bounded slice: Net signs the commercial facts around invocation, it does NOT custody funds, process payments, issue invoices, or move money. Skip for unrelated event-bus / mesh work (that's the `net-event-bus` skill) or for editing payments' own internals unless the task is payments integration."
 allowed-tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 metadata:
-  skill-version: 1.6.0
-  last-updated: 2026-07-26
+  skill-version: 1.8.1
+  last-updated: 2026-07-28
   net-version: 0.34.0
   x402-spec: "v2 @ 087922a5eecc06ea773636b75df205814ba295b5 (2026-05-29)"
 ---
@@ -31,6 +31,7 @@ Load reference files on demand — do not read them all up front.
 | File | Read when |
 |---|---|
 | `concepts.md` | **Always first.** The mental model, the category line, the eight doctrines, the object model at a glance, the **data boundary** (what "commercial facts" may and may not carry — no PII, by construction), "no HTTP endpoint required," the review invariant. ~5 min. |
+| `bindings/coverage.md` | **Before promising payments works in a given language.** Payments is a three-binding subsystem: Rust, Node and Python only, and Node/Python reach it solely through the low-level package. Go and C have no payments API at all. |
 | `object-model.md` | When touching the five Net envelopes — exact fields, the canonical signing regime, versioning, idempotency, amounts. |
 | `x402.md` | When touching x402 structures — `X402Carry` byte-preservation, `PaymentRequirements`/`PaymentPayload`/settlement views, CAIP ids, the `exact` EVM scheme. |
 | `provider.md` | When the user **charges for a capability** — `PaymentEngine` lifecycle (quote → verify → settle → serve → bill), provider admission policy, pricing at publish, `serve_payments` over the mesh. |
@@ -43,7 +44,7 @@ Load reference files on demand — do not read them all up front.
 | `billing.md` | When the user wants **usage records / a billing stream** — `BillingLog` (subscribe/read/export), immutability, the lifecycle-hooks doctrine, what billing is NOT. |
 | `http402.md` | When a Net agent **pays an external x402 HTTP API** — the outbound `X402HttpFlow` + the Python / Node `PaymentHttpClient`, the header-only v2 transport, why it's the same objects (the two-way door). |
 | `failure-schematic.md` | When handling **denials / refusals** — the `net.payment.failure@1` object that rides beside the human error, the reason→recovery mapping, the header discipline, its **payment-only scope** (`code: "payment"`; non-payment admission failures don't ride it), and how each surface (MCP / Python `failure` field / tracing) projects it. |
-| `bindings.md` | When the language matters — the per-language table (**Rust, Python, AND Node** all have a full demand+supply flow; Go is verifier-only), the `CapabilityGateway` (demand) + `PaymentProvider`/`buildPricingTerms` (supply) + HTTP-402 + signer surfaces, and Node's `close()` / `permissiveChannels` gotchas. |
+| `bindings.md` | **First, when any code is going to be written.** The routing page: which companion to load, and the two facts that decide whether there is code to write at all — payments is Rust/Python/Node only, and in Node and Python it lives in the low-level package (`@net-mesh/core`, `net`), never the wrapper. Then load exactly one of `bindings/{rust,typescript,python,go,c}.md`. |
 | `testing.md` | When writing/running tests — cross-language golden vectors, the mock conformance suite, the key-invariant negative test, feature-gated suites, the env-gated live run. |
 | `gotchas.md` | When the user's framing carries a wrong mental model, when migrating, or before merging — the review invariant, "what not to build," the byte-preservation trap, common mistakes. |
 
@@ -83,18 +84,35 @@ carrying a mental model that produces compiling-but-rejected code.
 
 ## Workflow when integrating
 
-1. **Identify the language.** **Rust, Python, AND Node/TS** all have a full
-   native **demand + supply** flow — `CapabilityGateway` (pay to invoke),
-   `PaymentProvider` + `buildPricingTerms` (price + charge), the HTTP-402
-   client, eip155/svm/xrpl signers, approval verbs, and a free `publishTools`
-   path. **Go** has a golden-vector verifier but no flow; no native C payment
-   flow exists. Check `bindings.md` before promising a flow — especially Node's
-   `close()` / `permissiveChannels` requirements.
+1. **Select the binding, then load exactly one — and answer "is there a payments
+   API at all" before anything else.** Payments is a three-binding subsystem.
+   - **Read the language off the project**: `Cargo.toml` → Rust, `package.json`
+     → Node/TS, `pyproject.toml` or `requirements.txt` → Python, `go.mod` → Go,
+     `Makefile`/`CMakeLists.txt` beside `.c`/`.h` → C.
+   - **Rust, Python and Node/TS** have a full native demand + supply flow.
+     **Go and C have no payments API at all** — not partial, not reduced. Go has
+     a golden-vector conformance test and nothing else; C does not even have
+     that. If the task is "add x402 payments to our Go service", that is a
+     language choice or a feature request, not a coding task. Say so first.
+   - **Then read `bindings.md` (routing) and exactly one companion** —
+     `bindings/rust.md`, `bindings/typescript.md`, `bindings/python.md`,
+     `bindings/go.md`, `bindings/c.md`. `bindings/coverage.md` is the
+     per-operation matrix and the authoritative answer to "does this language
+     have X".
+   - **Payments is not in the ergonomic wrapper.** Neither `@net-mesh/sdk` nor
+     `net_sdk` contains a line of it. Every payments symbol in Node and Python
+     is in `@net-mesh/core` and `net` respectively, and there is no
+     `@net-mesh/payments` package. An import from the wrapper fails in a way
+     that looks like a missing feature.
+   - **Never default to Rust because the substrate is Rust. With no project
+     context and no language named, ask** — the answer decides whether there is
+     any code to write.
 2. **Read `concepts.md`** if this is your first invocation this session.
 3. **Which side is the user on?**
    - *Charging for a capability* (provider) → `provider.md`. Price at publish
-     (`net.pricing.terms@1`), run the `PaymentEngine` lifecycle, compose the
-     `payment_gate` into `gated_invoke`.
+     (`net.pricing.terms@1`), run the `PaymentEngine` lifecycle, pass a
+     `PaymentFlow` into `gated_invoke` so the payment gate runs before the
+     handler.
    - *Paying to invoke* (caller) → `caller.md`. `CallerPaymentFlow` over a
      `ProviderChannel`, spend policy, the approval loop; branch on the
      `net.payment.failure@1` schematic that rides a denial (`failure-schematic.md`).
@@ -135,12 +153,16 @@ carrying a mental model that produces compiling-but-rejected code.
   `net-event-bus` skill. This skill assumes the substrate and only covers the
   money layer on top.
 - **Refund/dispute semantics** — the `net.payment.dispute@1` tag is *reserved*;
-  no semantics before P5.
+  no semantics ship today.
 - **RFQ / dynamic pricing** — waits on x402 v2 dynamic-pricing maturity; no
   parallel dynamic flow, no counter-offer object (that absence is the rule).
-- **Accounts / postpaid / prepaid (Mode E)** — bilateral, provider-scoped,
-  later-stage; company-held credits only via licensed partners.
+- **Accounts / postpaid / prepaid** — bilateral, provider-scoped, and not
+  shipped; company-held credits only via licensed partners.
 - **Inbound HTTP 402 serving** — deferred, demand-driven.
 
 If the user asks about these, say where they stand rather than inventing an
 API.
+
+## Further reading
+
+- [Payments documentation](https://ai2070.net/docs/payments)

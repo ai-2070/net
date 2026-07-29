@@ -1,3 +1,7 @@
+---
+title: "v0.20.2 — Smoke on the Water"
+description: "Release notes for Net v0.20.2 — Smoke on the Water — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.20.2
 
 Correctness and hygiene patch on top of v0.20. No public API changes, no wire-format changes — drop-in for v0.20.x consumers.
@@ -32,4 +36,4 @@ Released 2026-05-20.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

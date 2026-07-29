@@ -1,3 +1,7 @@
+---
+title: Build a Recoverable Capability
+description: "Stand up a capability behind a standby group, kill the primary mid-run, and prove the call fails over."
+---
 # Brief: Build a Recoverable Capability
 
 **Goal.** Serve a native capability from two providers, invoke it by service name,

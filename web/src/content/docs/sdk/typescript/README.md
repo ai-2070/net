@@ -1,3 +1,7 @@
+---
+title: TypeScript
+description: "The TypeScript SDK (@net-mesh/sdk) wraps the same Rust core as every other binding, so this spine walks the same agentic loop as the Rust SDK — the concepts map one-to-one."
+---
 # TypeScript SDK
 
 The TypeScript SDK (`@net-mesh/sdk`) wraps the same Rust core as every other

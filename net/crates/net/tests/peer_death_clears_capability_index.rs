@@ -203,7 +203,7 @@ async fn capability_index_is_cleared_when_failure_detector_marks_peer_failed() {
     // typed `PunchReject` so A fails fast with
     // `unknown-target-reflex` instead of burning the full
     // `punch_deadline` (the rendezvous fast-fail contract — see
-    // `docs/plans/NAT_TRAVERSAL_V2_PLAN.md`). Same outcome as "B
+    // `docs/internal/plans/NAT_TRAVERSAL_V2_PLAN.md`). Same outcome as "B
     // never announced": the reject reason itself proves the index
     // no longer serves B's stale reflex.
     let start = tokio::time::Instant::now();

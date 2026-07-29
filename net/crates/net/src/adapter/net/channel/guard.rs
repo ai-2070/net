@@ -43,7 +43,7 @@ use super::{ChannelHash, ChannelName};
 /// Bloom-filter half of the authorization guard.
 ///
 /// Extracted from the monolithic `AuthGuard` under
-/// `docs/FAILURE_PATH_HARDENING_PLAN.md` §Stage 2 Option B —
+/// `docs/internal/plans/FAILURE_PATH_HARDENING_PLAN.md` §Stage 2 Option B —
 /// the atomics-only sub-piece that loom can model without
 /// requiring a DashMap shim. The two DashMaps on
 /// [`AuthGuard`] (`verified`, `exact`) stay outside this

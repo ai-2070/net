@@ -1,3 +1,7 @@
+---
+title: "v0.23 — Gimme Shelter"
+description: "Release notes for Net v0.23 — Gimme Shelter — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.23 — "Gimme Shelter"
 
 *Named after the Rolling Stones' 1969 opener on Let It Bleed — the one Keith Richards wrote during a thunderstorm at his Robert Fraser flat, the one Merry Clayton recorded in a single overnight session. Same wire, same semantics, same surface — gimme shelter, or I'm gonna fade away.*
@@ -199,4 +203,4 @@ Released 2026-05-25.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

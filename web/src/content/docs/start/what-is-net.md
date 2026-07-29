@@ -1,3 +1,7 @@
+---
+title: What is Net?
+description: "Net's flagship use is agentic capability federation — agents discovering, invoking, observing, and recovering work across a trusted mesh."
+---
 # What is Net?
 
 Net's flagship use is **agentic capability federation** — agents discovering,

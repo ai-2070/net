@@ -27,7 +27,7 @@
 //!
 //! Framing: none of this is load-bearing. If discovery fails,
 //! port-mapping is skipped — the mesh still reaches every peer
-//! through the routed-handshake path. `docs/PORT_MAPPING_PLAN.md`
+//! through the routed-handshake path. `docs/internal/plans/PORT_MAPPING_PLAN.md`
 //! decision 2 + parent framing apply.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

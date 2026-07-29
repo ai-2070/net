@@ -7,7 +7,7 @@
 //! [`CapabilityFold`], [`RoutingFold`], [`ReservationFold`] —
 //! plug in by implementing the trait.
 //!
-//! See `docs/plans/SCALING_MULTIFOLD_PLAN.md` for the design
+//! See `docs/internal/plans/SCALING_MULTIFOLD_PLAN.md` for the design
 //! rationale.
 
 use std::hash::Hash;

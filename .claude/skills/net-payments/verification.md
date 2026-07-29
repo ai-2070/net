@@ -140,3 +140,7 @@ No global clock. Quote expiry uses signer timestamps (ns since epoch) with a
 bounded policy tolerance (`PaymentEngine::with_expiry_tolerance_ns`).
 Verification uses block/ledger time where available. In tests, inject a fixed
 `Clock` to drive expiry deterministically.
+
+## Further reading
+
+- [Verification Tiers](https://ai2070.net/docs/payments/verification-tiers)

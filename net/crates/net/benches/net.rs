@@ -1823,7 +1823,7 @@ fn bench_failure_detector(c: &mut Criterion) {
     // of entries. Sharing the main `detector` would pollute the steady-state
     // 1000-node fixture that check_all/stats measure against (the source of
     // the old multi-hundred-ms check_all artifact). See
-    // docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §7.
+    // docs/internal/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §7.
     let growth_detector = FailureDetector::new();
     group.bench_function("heartbeat_new", |b| {
         let mut id = 10000u64;

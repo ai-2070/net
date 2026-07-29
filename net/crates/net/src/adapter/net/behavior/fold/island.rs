@@ -36,7 +36,7 @@
 //! `DEFAULT_TTL = 30s` matches the reservation fold: the live axes
 //! are only useful fresh, and a host that stops heartbeating should
 //! drop out of the topology within the window. See
-//! `docs/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md` §1.
+//! `docs/internal/plans/MESH_SCHEDULER_GANG_CLAIM_PLAN.md` §1.
 
 use std::time::Duration;
 

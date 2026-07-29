@@ -1,3 +1,7 @@
+---
+title: The Storage Stack
+description: The storage layer turns the ephemeral event bus into something you can build a system on.
+---
 # The Storage Stack
 
 The storage layer turns the ephemeral event bus into something you can build a system on. It's three layers stacked on top of each other — RedEX, CortEX, and NetDB — and the layers are deliberately small enough that you can use one without the others when that's what fits your problem.

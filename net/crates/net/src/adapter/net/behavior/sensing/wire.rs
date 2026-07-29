@@ -1,7 +1,7 @@
 //! SI-1 wire layer: committed subprotocol ids, the frozen postcard
 //! codec for the 0x0C02/0x0C03 payloads, and attestation signing +
 //! verification honoring the §4.2 transcript invariant
-//! (`docs/plans/SENSING_INTEREST_COALESCING_PLAN.md`, v4.3).
+//! (`docs/internal/plans/SENSING_INTEREST_COALESCING_PLAN.md`, v4.3).
 //!
 //! # Codec (postcard, strict)
 //!

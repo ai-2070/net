@@ -1,3 +1,7 @@
+---
+title: "v0.27.4 — Purple Rain"
+description: "Release notes for Net v0.27.4 — Purple Rain — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.27.4 — "Purple Rain"
 
 ## A maintenance release — dependency bumps only
@@ -68,4 +72,4 @@ Released 2026-06-13.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

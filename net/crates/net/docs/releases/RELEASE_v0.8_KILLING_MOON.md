@@ -44,4 +44,4 @@ The release ships when it's ready, not when it's convenient. It happens to ship 
 
 ## License
 
-See [LICENSE](../../../LICENSE-APACHE).
+See [LICENSE](../../../../../LICENSE-APACHE).

@@ -2,7 +2,7 @@
 //! `DISPATCH_REPLICA_SYNC` codes that ride on top of the existing
 //! reliable-stream `Mesh::publish` machinery.
 //!
-//! Phase A scaffold of `docs/plans/REDEX_DISTRIBUTED_PLAN.md`. Implements
+//! Phase A scaffold of `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md`. Implements
 //! the byte layouts pinned in §2 of that plan:
 //!
 //! - `SyncRequest`   (`0x20`, replica → leader)  — 47 bytes, fixed.

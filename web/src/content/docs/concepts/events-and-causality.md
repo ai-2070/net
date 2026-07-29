@@ -1,3 +1,7 @@
+---
+title: Events and Causality
+description: An event in Net is the unit of communication on a channel.
+---
 # Events and Causality
 
 An event in Net is the unit of communication on a channel. It carries a payload (opaque JSON bytes), an identity (who produced it), and a causal link (where it sits in the chain of things its producer has done and observed). Everything Net does with state — durable logs, folded views, daemon migration, partition recovery — is expressed in terms of events and the causal links that chain them together.

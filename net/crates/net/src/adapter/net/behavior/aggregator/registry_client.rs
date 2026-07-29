@@ -2,7 +2,7 @@
 //! [`MeshNode::call`] with typed `aggregator.registry`
 //! serialization.
 //!
-//! Slice 7 of `docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
+//! Slice 7 of `docs/internal/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
 //! Mirrors the [`FoldQueryClient`](super::query_client::FoldQueryClient)
 //! shape: take an `Arc<MeshNode>`, expose typed methods, marshal
 //! requests + replies via postcard.

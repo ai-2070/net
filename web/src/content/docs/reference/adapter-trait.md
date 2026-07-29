@@ -1,3 +1,7 @@
+---
+title: Adapter Trait
+description: Adapters are the persistence and transport plug-in for the event bus.
+---
 # Adapter Trait
 
 Adapters are the persistence and transport plug-in for the event bus. The bus's ingestion pipeline batches events per shard and hands the batches to an adapter; the adapter is responsible for getting them to durable storage (or to the mesh, or to another broker). The trait is small on purpose — most of the bus's complexity lives in the bus itself, leaving adapters as a focused integration point.
@@ -173,6 +177,8 @@ self.record_seen(batch.producer_nonce, batch.first_seq);
 ```
 
 For backends with native dedup (Redis Streams' MSGID, JetStream's `Nats-Msg-Id`), the adapter just passes the nonce through. For backends without, a small persistent map suffices.
+
+The nonce is fresh per process unless you set `producer_nonce_path`, which matters on restart. For the Redis Streams case specifically — where a `MULTI`/`EXEC` timeout can commit a batch twice — and for the consumer-side `RedisStreamDedup` helper in all five languages, see [Redis Streams Deduplication](/docs/reference/redis-dedup).
 
 ## Polling shape
 

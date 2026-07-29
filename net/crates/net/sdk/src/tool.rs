@@ -23,7 +23,7 @@
 //! one just establishes the type re-exports + the schema-derivation
 //! helper every later slice composes against.
 //!
-//! Plan: see `docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
+//! Plan: see `docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
 //! slice A-1.
 
 #[cfg(feature = "cortex")]

@@ -1,8 +1,12 @@
+---
+title: "v0.27.1 — Purple Rain"
+description: "Release notes for Net v0.27.1 — Purple Rain — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.27.1 — "Purple Rain"
 
 ## A pure performance release — nothing on the wire moves
 
-v0.27.1 ships no new systems, no new SDK surface, and no protocol changes. Every change either replaces an O(shards) operation with an O(1) atomic, swaps an O(n) full-scan for an index read, deletes an allocation, or corrects a benchmark fixture that was reporting fiction. The work is recorded in full in [`docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md`](../misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md); this log is the operator-facing summary.
+v0.27.1 ships no new systems, no new SDK surface, and no protocol changes. Every change either replaces an O(shards) operation with an O(1) atomic, swaps an O(n) full-scan for an index read, deletes an allocation, or corrects a benchmark fixture that was reporting fiction. The work is recorded in full in [`docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md`](https://github.com/ai-2070/net/blob/master/docs/internal/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md); this log is the operator-facing summary.
 
 The organizing observation, the same shape as v0.27's: **the substrate was answering cheap questions expensively.** `len()`, `node_count()`, and `stats()` are called on admission gates and per-selection hot paths, and the default `DashMap` shards to `4 × num_cpus` (128 on a 32-thread host), so every one of those calls locked and summed 128 shards regardless of how few entries the map held — an ~950 ns fixed cost to read a number the code could have maintained as it went. v0.27.1 maintains it as it goes.
 
@@ -126,4 +130,4 @@ Released 2026-06-09.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

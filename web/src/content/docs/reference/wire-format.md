@@ -1,3 +1,7 @@
+---
+title: Wire Format
+description: "This page is the byte-level reference for Net's packet wire format."
+---
 # Wire Format
 
 This page is the byte-level reference for Net's packet wire format. You won't need it for application code — the SDK does the framing — but you'll want it for debugging packet captures, writing a custom adapter, or building a relay or proxy that needs to read the routing fields without decrypting payloads.
@@ -51,14 +55,14 @@ All multi-byte integers are little-endian. The total header is 68 bytes; the pay
 | `HOP_TTL`         | 1     | u8      | Time-to-live in hops. Forwarders decrement; zero = drop.                      |
 | `HOP_COUNT`       | 1     | u8      | Hops traversed. Forwarders increment.                                         |
 | `FRAG_FLAGS`      | 1     | u8      | Fragmentation flags (more-fragments bit, etc.).                               |
-| `SUBPROTOCOL_ID`  | 2     | u16     | Identifies how the payload is interpreted. See [subprotocol-ids](./subprotocol-ids). |
+| `SUBPROTOCOL_ID`  | 2     | u16     | Identifies how the payload is interpreted. See [subprotocol-ids](/docs/reference/subprotocol-ids). |
 | `CHANNEL_HASH`    | 2     | u16     | xxh3-truncated hash of the channel name. Used for wire-speed authz.           |
 | `NONCE`           | 12    | bytes   | AEAD nonce (counter-based).                                                   |
 | `SESSION_ID`      | 8     | u64     | Identifies the encrypted session.                                             |
 | `STREAM_ID`       | 8     | u64     | Identifies the stream within the session.                                     |
 | `SEQUENCE`        | 8     | u64     | Per-stream sequence number.                                                   |
 | `ORIGIN_HASH`     | 8     | u64     | Full 64-bit BLAKE2s-MAC of sender's ed25519 pubkey (`EntityKeypair::origin_hash()`). Maps unambiguously to the publisher's `NodeId` via `origin_hash_to_node` — even under adversarial collision-grinding (~2^32 work per target). |
-| `SUBNET_ID`       | 4     | u32     | Packed 4-level subnet hierarchy. See [subnets](../concepts/subnets).         |
+| `SUBNET_ID`       | 4     | u32     | Packed 4-level subnet hierarchy. See [subnets](/docs/concepts/subnets).         |
 | `FRAGMENT_ID`     | 2     | u16     | Identifies a fragment group for reassembly.                                   |
 | `FRAGMENT_OFFSET` | 2     | u16     | Byte offset of this fragment in the original payload.                         |
 | `PAYLOAD_LEN`     | 2     | u16     | Length of the encrypted payload (excluding tag).                              |

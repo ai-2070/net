@@ -1,3 +1,7 @@
+---
+title: CLI Reference
+description: "The net-mesh binary exposes the substrate's operator surface."
+---
 # CLI Reference
 
 The `net-mesh` binary exposes the substrate's operator surface. Its command groups include `daemon` (run stateful daemons), `transfer` (move blobs and directories between nodes), `wrap` and `mcp` (the MCP bridge — wrap a stdio MCP server as mesh capabilities, or serve the mesh to a local MCP host), `forwarding` (credential-forwarding config), `typegen` (generate typed bindings from discovered AI tools), and `org` plus `node adopt` (organization capability-auth issuance and node ownership).

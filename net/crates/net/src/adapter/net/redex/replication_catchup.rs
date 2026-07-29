@@ -1,4 +1,4 @@
-//! Phase D pull-based catch-up — `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §5.
+//! Phase D pull-based catch-up — `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` §5.
 //!
 //! Two pure-function-ish helpers compose around the wire codec
 //! from Phase A:
@@ -527,7 +527,7 @@ pub fn apply_sync_response(
     }
     // Compute the new tail from the snapshot we already took
     // rather than re-locking via `file.next_seq()`. Pre-fix
-    // [perf #72 in `docs/performance/net-perf-analysis.md`] this
+    // [perf #72 in `docs/internal/performance/net-perf-analysis.md`] this
     // ran `file.next_seq()` after a successful append — a
     // parking_lot lock + atomic load — even though we know the
     // append bumped the counter by exactly `appended`. `next_seq()`

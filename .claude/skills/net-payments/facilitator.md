@@ -4,9 +4,9 @@ x402 facilitators are the services that actually `verify` and `settle`
 payments on a chain. Net treats a facilitator as a **named dependency, never a
 trust root**: a facilitator receipt justifies tier `observed` and nothing
 more (`verification.md`). The interface is one trait; the mock and the real
-HTTP client implement the *same* one — pointing P0 at a real facilitator is
-construction config, zero interface changes. That equivalence is the
-acceptance test of the whole P1 design.
+HTTP client implement the *same* one — moving from the mock to a real
+facilitator is construction config, zero interface changes. That equivalence
+is the acceptance test of the whole design.
 
 Source: `payments/src/facilitator/`.
 
@@ -155,3 +155,8 @@ Endpoint/network/RPC constants live in `packs` (`X402_ORG_FACILITATOR`,
 `CDP_FACILITATOR`, `T54_XRPL_FACILITATOR`, `NETWORK_BASE_SEPOLIA`, `NETWORK_BASE`,
 `NETWORK_SOLANA`, `NETWORK_XRPL`, `RPC_BASE_SEPOLIA`, `RPC_BASE`, `RPC_SOLANA`,
 `RPC_XRPL`).
+
+## Further reading
+
+- [The Lifecycle](https://ai2070.net/docs/payments/the-lifecycle)
+- [Verification Tiers](https://ai2070.net/docs/payments/verification-tiers)

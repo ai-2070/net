@@ -120,7 +120,7 @@ pub struct StateSnapshot {
 
 | File | Purpose |
 |------|---------|
-| `state/causal.rs` | `CausalLink`, `CausalChainBuilder`, `CausalEvent`, chain validation |
+| `state/causal.rs` | `CausalLink`, `CausalChainBuilder`, `CausalEvent`, `ChainError`, `WriteCausalEventsResult`, chain validation |
 | `state/horizon.rs` | `HorizonEncoder`, `ObservedHorizon`, bloom compression |
 | `state/log.rs` | `EntityLog`, `LogIndex`, append-only chain storage |
-| `state/snapshot.rs` | `StateSnapshot`, `SnapshotStore` |
+| `state/snapshot.rs` | `StateSnapshot`, `SnapshotStore`, `SnapshotError` |

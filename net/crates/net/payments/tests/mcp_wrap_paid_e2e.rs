@@ -1,6 +1,6 @@
 //! The MCP wrap path's paid invoke, end to end, across the real mesh
 //! wire with the **real `EnginePaymentAdmission`** (M2 of
-//! `docs/plans/PAYMENTS_TEST_MATRIX.md`).
+//! `docs/internal/plans/PAYMENTS_TEST_MATRIX.md`).
 //!
 //! The MCP-adapter twin of `mesh_paid_capability_e2e` (M1): where M1
 //! drives the SDK-native `serve_tool_paid` path against

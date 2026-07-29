@@ -1,3 +1,7 @@
+---
+title: "v0.19 — Push It to the Limit"
+description: "Release notes for Net v0.19 — Push It to the Limit — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.19 — "Push It To The Limit"
 
 *Named after Paul Engemann's 1983 anthem from the Scarface soundtrack. v0.18 stood up the operator plane — the TUI cyberdeck, the CLI, and five-language MeshOS / Deck SDKs sitting on top of three releases of substrate. v0.19 pushes the substrate itself past its prior ceilings: nRPC grows client-streaming, server-streaming for client-streamed requests, and full duplex; Dataforts moves from "blob store that paged once" to a terabyte-scale fabric with hierarchical manifests, content-defined chunking, Reed–Solomon erasure coding, durable streaming staging, and per-stream bandwidth classes; the carry-forward bug audit and a five-pass review of the bugfixes branch close 50+ replication / migration / blob / FFI / consumer-loop hazards. And the substrate gets a new name on its packages.*
@@ -241,4 +245,4 @@ Released 2026-05-19.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

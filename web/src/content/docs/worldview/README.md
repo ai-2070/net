@@ -1,3 +1,7 @@
+---
+title: Worldview
+description: "Before the machinery, the belief system. These pages explain why Net exists — the world agents are entering, when Net is the right tool and when it isn't, and how it relates to the"
+---
 # Worldview
 
 Before the machinery, the belief system. These pages explain *why* Net exists —

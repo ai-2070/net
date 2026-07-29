@@ -4,7 +4,7 @@
 //! and the language bindings marshal into them — one core, many faces, zero
 //! reimplementation.
 //!
-//! **Doctrine (see `docs/plans/MCP_BRIDGE_PLAN.md`).** The Net core and
+//! **Doctrine (see `docs/internal/plans/MCP_BRIDGE_PLAN.md`).** The Net core and
 //! protocol crates have zero MCP awareness; all MCP code lives here. This
 //! adapter rides on the public `net-mesh-sdk` surface only — never on core
 //! crates directly (the same rule the Redis / JetStream adapters follow).

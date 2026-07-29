@@ -64,9 +64,9 @@ per deployment:
 
 ## The network-enablement ladder (operational state, 2026-07-12)
 
-Engineering for the P0 + P1 rungs is complete; each rung is a shipped config
-pack + registry entries + a conformance run. Check the rung's state in the
-table below before telling the user a network is "live."
+Each rung is a shipped config pack + registry entries + a conformance run.
+Check the rung's state in the table below before telling the user a network is
+"live."
 
 | Rung | Network | Pack | State |
 |---|---|---|---|
@@ -126,3 +126,7 @@ Overrides: `NET_PAYMENTS_LIVE_FACILITATOR`, `NET_PAYMENTS_LIVE_RPC`,
 
 If any step reaches for a new envelope type or a branch in core, stop — that's
 the review invariant firing.
+
+## Further reading
+
+- [Networks](https://ai2070.net/docs/payments/networks)

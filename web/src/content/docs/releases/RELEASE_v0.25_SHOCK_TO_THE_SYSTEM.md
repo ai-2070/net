@@ -1,3 +1,7 @@
+---
+title: "v0.25 — Shock To The System"
+description: "Release notes for Net v0.25 — Shock To The System — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.25 — "Shock To The System"
 
 *Named after the lead single from Billy Idol's 1993 album Cyberpunk — the one he cut as a concept record about networks reshaping how people would work, recorded with a Mac LC III in the booth and a Macromedia Director CD-ROM tucked into the jewel case, panned at release for being too-soon and now read as a marker of the moment the network stopped being a thing other people did. Same wire, same nRPC, same capability fold — but every typed service is now an LLM-callable tool, and the capability subsystem stopped paying for what every other discovery layer is paying for.*
@@ -200,4 +204,4 @@ Released 2026-05-28.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

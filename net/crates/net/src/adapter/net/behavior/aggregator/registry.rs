@@ -3,7 +3,7 @@
 //! chosen name.
 //!
 //! Direction B / step 3 + step 6 (registry ↔ HealthMonitor
-//! integration) of `docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
+//! integration) of `docs/internal/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`.
 //! The registry is the substrate primitive operator CLI verbs
 //! (`net aggregator spawn / ls / scale`) operate against. A
 //! group's entry holds the live [`LifecycleGroup`] directly

@@ -476,7 +476,7 @@ pub struct LocalGraph {
     /// insert (via the `or_insert_with`/insert-return signal) and decremented
     /// in `cleanup`, so the count is race-free even though the cap *gate*
     /// reads it without holding a lock (the caps are intentionally soft).
-    /// See docs/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2.
+    /// See docs/internal/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2.
     num_nodes: AtomicUsize,
     num_edges: AtomicUsize,
     num_seen: AtomicUsize,

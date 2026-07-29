@@ -3,7 +3,7 @@
  *
  * Demonstrates the stateless capability / predicate helpers
  * shipped in the v0.10+1 cycle (Phase 9a, 9b, 9c, 9d of
- * `docs/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`):
+ * `docs/internal/plans/CAPABILITY_SYSTEM_SDK_PLAN.md`):
  *
  *   - net_validate_capabilities       — wire-format CapabilitySet
  *                                       validator

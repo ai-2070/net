@@ -96,7 +96,7 @@ pub enum AuthVerdict {
 
 ## Fan-out publishers
 
-Channels carry policy and names; they do not carry membership. To publish the same payload to every subscriber of a channel, wrap a [`ChannelPublisher`](../../src/adapter/net/channel/publisher.rs) around the channel name and call `MeshNode::publish` — one per-peer unicast per subscriber, no multicast primitive, no group cryptography.
+Channels carry policy and names; they do not carry membership. To publish the same payload to every subscriber of a channel, wrap a [`ChannelPublisher`](../src/adapter/net/channel/publisher.rs) around the channel name and call `MeshNode::publish` — one per-peer unicast per subscriber, no multicast primitive, no group cryptography.
 
 ### Subscriber roster
 

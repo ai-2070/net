@@ -99,7 +99,7 @@ meshdb = ["net/meshdb", "dep:postcard"]
 # methods that wire greedy-LRU + data-gravity + future phases.
 # Toggling between greedy / gravity / future phases is a
 # runtime decision via `Redex::enable_*` methods, not a Cargo
-# feature choice; see `docs/misc/DATAFORTS_PLAN.md`. Cortex
+# feature choice; see `docs/internal/misc/DATAFORTS_PLAN.md`. Cortex
 # isn't strictly required for the substrate, but the Python
 # install path threads through the cortex-gated Redex surface
 # so we activate it transitively for binding-side consistency.

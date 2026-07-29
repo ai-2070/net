@@ -1,3 +1,7 @@
+---
+title: "v0.30.0 — Final Countdown"
+description: "Release notes for Net v0.30.0 — Final Countdown — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.30 — "Final Countdown"
 
 *Named after Europe's 1986 synth-fanfare arena anthem off* The Final Countdown *— the four-note keyboard hook every stadium air-plays and nobody can name the second verse of, "we're leaving together, but still it's farewell to the ground."*
@@ -6,7 +10,7 @@
 
 Net's reliable transport has always recovered loss correctly, but bluntly. The receiver's only positive signal was a **cumulative** ack (`next_expected`) piggybacked on the `StreamWindow` credit grant, backed by a small **negative** gap bitmap (`StreamNack`) with a hard 64-sequence horizon and an RTO backstop. That is enough on a clean, low-volume path. On a bulk stream under loss it is a cliff: one lost head packet caps usable in-flight at 64 packets until the gap heals, and when the head-gap RTO finally fires, `get_timed_out` retransmits **every** timed-out packet behind it and collapses cwnd to `MIN_CWND` — thousands of spurious resends at the exact moment the link is stressed, because the sender never learned that everything *after* the hole was already received.
 
-v0.30 fixes both ends of that. It is the [stream-ack batching + SACK-range work](../plans/STREAM_ACK_BATCHING_AND_RANGES_PLAN.md): **batched control-frame emission** and **positive SACK-range ACKs**. One branch, the reliability receive index rewritten from a bitmap to a budgeted range set, a new capability-gated wire message, and a control-plane metrics surface.
+v0.30 fixes both ends of that. It is the [stream-ack batching + SACK-range work](https://github.com/ai-2070/net/blob/master/docs/internal/plans/STREAM_ACK_BATCHING_AND_RANGES_PLAN.md): **batched control-frame emission** and **positive SACK-range ACKs**. One branch, the reliability receive index rewritten from a bitmap to a budgeted range set, a new capability-gated wire message, and a control-plane metrics surface.
 
 The organizing observation is the same one that has shaped every release since the substrate stopped being a prototype: **the hard parts already existed — the work was a control loop over them, not new infrastructure.** The event-frame codec already looped multi-event frames on decode; the grant drainer already coalesced per stream (latest-wins); the capability-announcement path already auto-merges transport tags; the SRTT/RTO estimator (RFC 6298) already existed. v0.30 is the encode-side batching those readers were always ready for, plus a positive-ack message and a range index feeding the estimator that already knew how to consume it. No new fold, no new routing concept, no RTT plumbing into the proximity graph.
 
@@ -42,7 +46,7 @@ The sender needs to hear what the receiver *holds*, not just where the hole is. 
 
 ## The hardening pass — what the ACK review forced
 
-A [dedicated code review](../misc/CODE_REVIEW_2026_07_02_ACKS_PLAN_CANDIDATES.md) of the landed ack-batching branch ran ten finder angles into ~50 candidates, deduped to ~17 clusters, and adversarially verified each. The pure cores held — the range arithmetic (half-open intervals, head-collapse, merge/bridge, bitmap derivation, codec validation) checked out against its invariants. The real findings clustered where the *emission* path met concurrency and the wire: a cache that outlived the fact it cached, three lock acquisitions where one snapshot was meant, and a metric that claimed more than the network can guarantee. Every fix landed with a regression test; the full crate lib suite (4,559 tests) and clippy are green.
+A [dedicated code review](https://github.com/ai-2070/net/blob/master/docs/internal/misc/CODE_REVIEW_2026_07_02_ACKS_PLAN_CANDIDATES.md) of the landed ack-batching branch ran ten finder angles into ~50 candidates, deduped to ~17 clusters, and adversarially verified each. The pure cores held — the range arithmetic (half-open intervals, head-collapse, merge/bridge, bitmap derivation, codec validation) checked out against its invariants. The real findings clustered where the *emission* path met concurrency and the wire: a cache that outlived the fact it cached, three lock acquisitions where one snapshot was meant, and a metric that claimed more than the network can guarantee. Every fix landed with a regression test; the full crate lib suite (4,559 tests) and clippy are green.
 
 **A gate verdict cached before its own evidence arrived (the headline fix).** The per-peer ack-ranges capability gate reads through a 5 s TTL cache. But the retransmit tick consults it for every peer from its first 25 ms tick — *before* the peer's capability announcement has folded — so the opening loss episode of a fresh transfer would cache `false` and pin the legacy RTO-flood path for a full 5 s, exactly when SACK ranges matter most. A peer downgrade could likewise strand a stale `true`. The cache is now **invalidated event-driven**: `handle_capability_announcement` drops the peer's entry the instant its announcement folds, so both the connect-time race and the downgrade self-heal at once instead of on the TTL. Pinned by `ack_ranges_gate_reresolves_after_announcement_invalidation`.
 
@@ -52,7 +56,7 @@ A [dedicated code review](../misc/CODE_REVIEW_2026_07_02_ACKS_PLAN_CANDIDATES.md
 
 **Variable-size events shipping empty packets.** SACK packets were chunked by a worst-case fixed count (`MAX_ACK_RANGES` × 16 B ⇒ ~29 events/packet), so a batch of typical one-range events shipped datagrams ~85 % empty. A shared `emit_control_chunks` helper — one path for the six previously copy-pasted (and already drifted) chunk-emit sites — now packs by **actual framed size** via `pack_control_events`, filling each datagram. Plus the small wins: `on_ack_ranges` reuses its `last_sacked` buffer instead of allocating per SACK, and the three fixed-size decoders share one `require_exact_len` gate (the exact drift surface that once let a stale "need 16" message outlive a 24-byte grant).
 
-**Refuted, honestly.** Not every candidate survived. A "stale session address after migration" cluster was **refuted** — `session_id → peer_addr` is an immutable binding (every rebind builds a fresh session id), so grouping on session id and keeping the first address is behaviorally identical to the old per-grant addressing. A "reset-batch loss amplification" finding was refuted — per-reset loss was already permanent pre-batching; batching changes only fate-correlation, and `StreamReset` is itself a fast-fail optimization over the peer-side timeout. An "`Instant::now()` test panic" was refuted for this repo — Linux `Instant` doesn't underflow below the boot epoch and CI is Linux-only. All recorded with rationale in the [review resolution](../misc/CODE_REVIEW_2026_07_02_ACKS_PLAN_CANDIDATES.md#resolution-2026-07-02-post-verification).
+**Refuted, honestly.** Not every candidate survived. A "stale session address after migration" cluster was **refuted** — `session_id → peer_addr` is an immutable binding (every rebind builds a fresh session id), so grouping on session id and keeping the first address is behaviorally identical to the old per-grant addressing. A "reset-batch loss amplification" finding was refuted — per-reset loss was already permanent pre-batching; batching changes only fate-correlation, and `StreamReset` is itself a fast-fail optimization over the peer-side timeout. An "`Instant::now()` test panic" was refuted for this repo — Linux `Instant` doesn't underflow below the boot epoch and CI is Linux-only. All recorded with rationale in the [review resolution](https://github.com/ai-2070/net/blob/master/docs/internal/misc/CODE_REVIEW_2026_07_02_ACKS_PLAN_CANDIDATES.md#resolution-2026-07-02-post-verification).
 
 ---
 
@@ -109,4 +113,4 @@ Released 2026-07-02.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

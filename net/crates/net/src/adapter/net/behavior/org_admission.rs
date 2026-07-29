@@ -1,4 +1,4 @@
-//! OA-2 §2.4 of `docs/plans/ORG_CAPABILITY_AUTH_PLAN.md` — the
+//! OA-2 §2.4 of `docs/internal/plans/ORG_CAPABILITY_AUTH_PLAN.md` — the
 //! provider-local admission engine.
 //!
 //! Admission is provider-local, per-service, bound at registration,

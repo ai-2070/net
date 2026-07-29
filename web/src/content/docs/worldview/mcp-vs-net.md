@@ -1,3 +1,7 @@
+---
+title: MCP vs Net
+description: "The Model Context Protocol (MCP) gave the ecosystem a huge win: a standard way to make a tool callable by an agent."
+---
 # MCP vs Net
 
 The Model Context Protocol (MCP) gave the ecosystem a huge win: a standard way to

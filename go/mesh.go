@@ -168,10 +168,15 @@ type MeshConfig struct {
 	// busy-session deferral) so in-flight work is never dropped.
 	//
 	// Optimization, not correctness — traffic rides the relay
-	// until (and unless) a direct path lands. Default false.
+	// until (and unless) a direct path lands. Default true.
 	// Silently ignored when the Rust cdylib was built without
 	// `--features nat-traversal`.
-	AutoDirectUpgrade bool `json:"auto_direct_upgrade,omitempty"`
+	//
+	// Pointer so the zero value stays distinguishable from an
+	// explicit false: nil inherits the default (on), &false is the
+	// kill switch. A plain bool would collapse "unset" into "off"
+	// under `omitempty` and leave no way to disable the upgrade.
+	AutoDirectUpgrade *bool `json:"auto_direct_upgrade,omitempty"`
 }
 
 // StreamConfig configures an opened mesh stream.

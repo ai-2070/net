@@ -1,3 +1,7 @@
+---
+title: "v0.26 — Monkey Business"
+description: "Release notes for Net v0.26 — Monkey Business — what shipped, what changed, and what it means for compatibility."
+---
 # Net v0.26 — "Monkey Business"
 
 *Named after Skid Row's 1991 single — the opening track and lead-off shot from Slave to the Grind, the record that blew up the band's bubblegum-metal reputation and, in the same swing, became the first hard-rock album to debut at number one on the Billboard 200 in the SoundScan era. Their 1989 debut had floated on power ballads — "18 and Life," "I Remember You" — and the label wanted more of the same; the band handed back a heavier, meaner, downtuned record and put "Monkey Business" first, Rachel Bolan and Snake Sabo's swampy, menacing strut, all swagger and trouble grinning in the doorway.*
@@ -68,4 +72,4 @@ Released 2026-05-28.
 
 ## License
 
-See [LICENSE](../../LICENSE-APACHE).
+See [LICENSE](https://github.com/ai-2070/net/blob/master/net/crates/net/LICENSE-APACHE).

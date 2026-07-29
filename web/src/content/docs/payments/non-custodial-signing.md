@@ -1,3 +1,7 @@
+---
+title: Non-Custodial Signing
+description: Net never holds a settlement key. It cannot move your funds, because it never has the ability to — by construction, not by policy.
+---
 # Non-custodial signing
 
 Net never holds a settlement key. It cannot move your funds, because it never has
@@ -30,6 +34,49 @@ The typed document and the returned artifact are the *only* things that cross th
 boundary — in the language bindings, the signer is a callback that receives the
 typed intent as JSON and returns the artifact string. Key material is
 unrepresentable across the seam.
+
+The trait says it plainly — an address to pay from, and one method per typed
+document. Nothing takes `&[u8]`:
+
+```rust
+pub trait SchemeSigner: Send + Sync {
+    /// The payer address this signer controls.
+    fn address(&self) -> String;
+
+    /// EIP-712 typed data in, `0x…` r‖s‖v signature out.
+    async fn sign_typed_data(&self, typed_data: &Value) -> Result<String, SignerError>;
+
+    /// SPL transfer intent in, base64 partially-signed transaction out.
+    async fn sign_svm_transfer(&self, intent: &SvmTransferIntent) -> Result<String, SignerError>;
+
+    /// XRPL payment intent in, presigned Payment blob out.
+    async fn sign_xrpl_payment(&self, intent: &XrplPaymentIntent) -> Result<String, SignerError>;
+}
+```
+
+The per-scheme methods carry default implementations that return a **structured
+refusal**, so an EVM signer registered under the Solana namespace fails closed
+rather than authoring something it doesn't understand.
+
+Wiring your own wallet is a closure — Net calls it with the typed document and
+takes back the artifact:
+
+```rust
+use net_payments::flow::signer::ExternalSigner;
+
+let signer = ExternalSigner::new(
+    "0xYourPayerAddress",
+    |typed_data| Box::pin(async move {
+        // Hand `typed_data` to the wallet / HSM / remote signer.
+        // A policy-bearing wallet inspects amount, asset and recipient here.
+        my_wallet.sign_typed_data(typed_data).await
+    }),
+);
+```
+
+That closure is the whole boundary. Net constructed the document, so it knows
+what it asked for; your wallet holds the key, so it decides whether to grant it.
+Neither side needs the other's secret.
 
 ## Production vs. testnet
 

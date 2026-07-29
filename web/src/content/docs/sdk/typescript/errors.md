@@ -1,3 +1,7 @@
+---
+title: Errors
+description: "The TypeScript SDK's error taxonomy: failure is a typed outcome you can branch on, never a silence."
+---
 # TypeScript — Errors and Recovery
 
 Failure is a typed outcome, not a silence. The golden rule matches every binding:
@@ -41,7 +45,53 @@ try {
 }
 ```
 
-The full taxonomy is the [Error Codes](/docs/reference/error-codes) reference.
+## The full class taxonomy
+
+Every error the SDK throws is a subclass of `Error`, so `instanceof` is always
+the discriminator. The hierarchy is shallow and deliberate — where a family
+exists, catch the base to handle the whole family.
+
+**nRPC** — all extend `RpcError`, so `catch (e) { if (e instanceof RpcError) }`
+covers the family:
+
+| Class | Fires when | Retry? |
+|---|---|---|
+| `RpcTimeoutError` | Deadline elapsed before a response | Yes, with backoff |
+| `RpcNoRouteError` | No provider currently reachable for the target | Yes — topology may settle |
+| `RpcTransportError` | Connection failed mid-call | Yes, with backoff |
+| `RpcServerError` | Handler returned a typed error status | No — inspect `.status` |
+| `RpcCancelledError` | Call cancelled by the caller or a dropped stream | No |
+| `RpcCodecError` | Request or response failed to encode/decode | No — bug |
+| `RpcCapabilityDeniedError` | Caller lacks the capability to invoke | No — get a credential |
+
+**Organizations** — all extend `OrgError`:
+
+| Class | Fires when |
+|---|---|
+| `OrgAdmissionDeniedError` | Node refused admission to the org |
+| `OrgCredentialsError` | Missing, expired or malformed org credential |
+| `OrgDiscoveryError` | Org-scoped discovery failed |
+| `OrgUnclassifiedError` | Org failure the vocabulary doesn't name yet |
+
+**Compute** — `MigrationError` and `GroupError` both extend `DaemonError`.
+
+**Everything else** extends `Error` directly:
+
+| Class | Surface |
+|---|---|
+| `BackpressureError` | Stream window full — the one blindly-retryable case |
+| `NotConnectedError` | Connection lost; a state change, not a retry |
+| `ChannelError` / `ChannelAuthError` | Channel publish/subscribe; the latter is an authorization refusal |
+| `BreakerOpenError` | Circuit breaker is open — the provider is being fast-failed |
+| `CortexError` / `NetDbError` / `RedexError` | Storage and folded state |
+| `FoldQueryClientError` / `RegistryClientError` | Fold-query and aggregator-registry RPC |
+| `MeshOsSdkError` / `DeckSdkError` | Daemon authoring and the operator surface |
+| `IdentityError` / `TokenError` | Keys, signing, permission tokens |
+| `GatewayError` | Capability gateway, including payment refusals |
+| `ToolCallParseError` | A tool descriptor or call payload that won't parse |
+
+The wire-level codes these wrap are in the
+[Error Codes](/docs/reference/error-codes) reference.
 
 ## Recover an nRPC call
 

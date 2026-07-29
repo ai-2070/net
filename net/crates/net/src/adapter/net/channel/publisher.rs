@@ -17,8 +17,8 @@
 //! * `Collect` — never short-circuit; always return a full per-peer
 //!   `PublishReport` so the caller can decide what "success" means.
 //!
-//! See [`CHANNEL_PUBLISHER_PLAN.md`](../../../docs/CHANNEL_PUBLISHER_PLAN.md)
-//! for the design and non-goals.
+//! The design plan this was built from was removed in `a6beba551`; the
+//! module docs above are the surviving statement of intent.
 
 use super::name::{ChannelId, ChannelName};
 use crate::adapter::net::stream::Reliability;

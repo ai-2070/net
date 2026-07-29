@@ -21,7 +21,7 @@
 //!      state. `in_progress` is a race (a concurrent active claim) and is
 //!      measured in the P3 acceptance storm, not here.
 //!
-//! Raw output is preserved in `docs/performance/payments-admission-matrix.md`
+//! Raw output is preserved in `docs/internal/performance/payments-admission-matrix.md`
 //! as the baseline for later store-architecture work.
 //!
 //! Run: cargo bench -p net-payments --bench admission_matrix

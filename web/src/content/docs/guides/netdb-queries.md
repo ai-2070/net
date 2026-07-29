@@ -1,3 +1,7 @@
+---
+title: Querying with NetDB
+description: "NetDB is the query layer over CortEX folds — how to ask questions of materialized state."
+---
 # Querying with NetDB
 
 NetDB is the query layer on top of CortEX. Where CortEX gives you one fold over one log with one state, NetDB bundles many folds under one handle, federates queries across them, and gives you a single snapshot/restore surface that covers your whole materialized state in one operation.
@@ -25,7 +29,7 @@ db.tasks().state().read().count_where(&filter);
 db.memories().watch().where_tag("important").stream();
 ```
 
-The builder ships exactly these two models. A custom fold isn't registered through the builder — you drive it with a `CortexAdapter` directly (see the [CortEX guide](./cortex-folds)) and manage its handle alongside the NetDB.
+The builder ships exactly these two models. A custom fold isn't registered through the builder — you drive it with a `CortexAdapter` directly (see the [CortEX guide](/docs/guides/cortex-folds)) and manage its handle alongside the NetDB.
 
 ## Queries
 
@@ -73,23 +77,40 @@ while let Some(update) = stream.next().await {
 
 Watchers emit the current filter result on subscribe, then dedupe-emit on every state change that touches the filter. They're the substrate for live UIs, reactive dashboards, and anything else that needs to track state without polling.
 
-## Federated queries (when they land)
+## Federated queries (MeshDB)
 
-The single-node query path is the foundation. The layer NetDB is building toward — federated queries that span folds across multiple nodes — uses the same query AST but compiles it down to a tree of fold reads and capability-routed RPCs:
+The single-node query path is the foundation. The layer above it — federated queries that span folds across multiple nodes — ships as **MeshDB**, gated behind the `meshdb` feature, which is on by default in the SDK. It uses the same query AST but compiles it to a tree of fold reads and capability-routed RPCs.
 
-```rust
-// Federated query: every pending inference task across the GPU pool
-let federated = db.federate()
-    .where_capability(predicate!("hardware.gpu" exists))
-    .query::<Tasks>()
-    .where_status(TaskStatus::Pending)
-    .collect()
-    .await?;
-```
+Federated queries are portable structures. They travel to the nodes that have the data, execute there, and return results. There's no central coordinator and no global query plan — federation uses the same capability routing as nRPC, the same channel-roster mechanics as the bus, and the same identity guarantees as everything else.
 
-Federated queries are portable structures. They travel to the nodes that have the data, execute there, and return results. There's no central coordinator and no global query plan — the federation primitive uses the same capability routing as nRPC, the same channel-roster mechanics as the bus, and the same identity guarantees as everything else.
+### The MeshDB surface
 
-Federation is a focused follow-up; the SDK surface is staged, and the API above will firm up in successive releases. The single-node query path is stable and is what you'd ship against today.
+The shape is the same in every binding: build a **query**, hand it to a
+**runner** backed by a chain reader, and iterate the **stream** of rows.
+
+| | TypeScript / Python | Go |
+|---|---|---|
+| Chain reader | `InMemoryChainReader` | `NewMeshDbReader()`, `Append(origin, seq, payload)` |
+| Build a query | `QueryBuilder`, `MeshQuery` | `QueryAt(origin, seq)`, `QueryBetween(origin, start, end)`, `QueryLatest(origin)` |
+| Runner | `MeshQueryRunner` | `NewMeshDbRunner(reader)` |
+| Execute | `runner.execute(query)` → `MeshQueryStream` | `runner.Execute(query)` → `*MeshDbIter` |
+| Consume | iterate the stream | `it.Next()` row-at-a-time, or `it.Drain()` for all |
+
+Result and option types — `ResultRow`, `JoinedRow`, `AggregateResult`,
+`GroupKey`, `WindowBoundary`, `LineageEntry`, `CachePolicy`, `ExecuteOptions`,
+and a `Predicate` (re-exported as `MeshDbPredicate` in TypeScript, to
+disambiguate from the capability-system `Predicate`) — are exported alongside.
+
+Lifetimes are explicit because the runner holds native resources. Python
+provides `runner_cm(reader)` as a context manager; TypeScript provides
+`DisposableMeshQueryRunner` for the TC39 `using` protocol; Go requires
+`Free()` on the reader, query, runner and iterator.
+
+C consumers get the same surface through `net_meshdb.h` against the
+`libnet_meshdb` cdylib — see [Headers and Linking](/docs/sdk/c/headers-and-linking).
+
+Errors surface as `MeshDbError`, with a parseable kind (`parseMeshDbErrorKind`
+in TypeScript).
 
 ## Snapshots
 

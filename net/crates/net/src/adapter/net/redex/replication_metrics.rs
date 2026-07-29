@@ -1,5 +1,5 @@
 //! Replication metrics — Phase H scaffolding for
-//! `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §11.
+//! `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` §11.
 //!
 //! Defines the seven `dataforts_replication_*` metric shapes the
 //! `ReplicationCoordinator` (Phase C) emits, plus a bounded per-

@@ -1,5 +1,5 @@
 //! Per-channel replication configuration — Phase B opt-in for
-//! `docs/plans/REDEX_DISTRIBUTED_PLAN.md` §1.
+//! `docs/internal/plans/REDEX_DISTRIBUTED_PLAN.md` §1.
 //!
 //! `ReplicationConfig` is the opt-in surface that turns a v1 / v2
 //! single-node `RedexFile` into a replicated channel. It lives on

@@ -1,7 +1,7 @@
 //! nRPC SDK surface — typed `serve_rpc_typed` / `call_typed` over
 //! the underlying `MeshNode::serve_rpc` / `call` raw-bytes API.
 //!
-//! See `docs/misc/NRPC_DESIGN.md` for the architectural framing.
+//! See `docs/internal/misc/NRPC_DESIGN.md` for the architectural framing.
 //! This module is the user-facing wrapper that:
 //!
 //! - Hides the `Bytes`-in / `Bytes`-out shape behind serde

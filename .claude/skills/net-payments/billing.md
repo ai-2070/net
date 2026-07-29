@@ -40,8 +40,8 @@ appends a *freshly-emitted* billing event). `read_all` re-verifies every record
 as it loads, so a corrupted or forged line fails loudly rather than flowing
 into accounting.
 
-Billing surfaces exist in the SDKs that have payments: **Rust and Python** in
-P0/P1; other languages are verifier-level only (`bindings.md`).
+Billing surfaces exist in the SDKs that have payments: **Rust, Python, and
+Node**; other languages are verifier-level only (`bindings.md`).
 
 ## Immutability
 
@@ -102,3 +102,7 @@ tax/VAT logic, no ERP connectors. Net emits signed billing events; partners
 and customers turn them into invoices, accounting records, and dashboards
 under their own policy and posture. If a request asks Net to *render* or
 *store* an accounting artifact, it's out of scope (`gotchas.md`).
+
+## Further reading
+
+- [Billing](https://ai2070.net/docs/payments/billing)

@@ -1,6 +1,10 @@
+---
+title: Expose Net as MCP
+description: "The reverse of wrapping: net-mesh mcp serve runs a stdio MCP server that exposes the mesh's capabilities to any local MCP host — a desktop agent, an IDE — as a small set of meta-tools."
+---
 # Expose Net as MCP
 
-The reverse of [wrapping](/docs/guides/wrap-mcp-server): `net mcp serve` runs a
+The reverse of [wrapping](/docs/guides/wrap-mcp-server): `net-mesh mcp serve` runs a
 stdio MCP **server** that exposes the mesh's capabilities to any local MCP host —
 a desktop agent, an IDE — as a small set of meta-tools. The host doesn't need to
 know Net exists; it just sees tools it can call.
@@ -8,17 +12,17 @@ know Net exists; it just sees tools it can call.
 ## Run the shim
 
 ```
-net mcp serve \
+net-mesh mcp serve \
   --node-addr 203.0.113.7:4433 --node-pubkey 0x<peer-hex> --psk-hex <psk> \
   --identity ./operator.toml
 ```
 
-Like `net wrap`, this builds a mesh node and joins via a peer, then speaks the MCP
+Like `net-mesh wrap`, this builds a mesh node and joins via a peer, then speaks the MCP
 stdio protocol on stdin/stdout. Register it in your MCP host's config as a stdio
 server (the exact config shape is host-specific — it's the same way you'd register
 any `command`-based MCP server).
 
-**Run it under the same identity as your `net wrap` side** if you want to invoke
+**Run it under the same identity as your `net-mesh wrap` side** if you want to invoke
 your own owner-only wrapped tools without an explicit allow — owner-scoped tools
 admit callers by origin.
 
@@ -52,17 +56,17 @@ Approving a pin is the step the model **cannot** do for itself — a human does 
 out-of-band:
 
 ```
-net mcp pin approve provider/capability     # provider/capability is the id from a search result
-net mcp pin list                            # see pending + approved pins
-net mcp pin reject provider/capability      # remove one
+net-mesh mcp pin approve provider/capability     # provider/capability is the id from a search result
+net-mesh mcp pin list                            # see pending + approved pins
+net-mesh mcp pin reject provider/capability      # remove one
 ```
 
 The shim and the `pin` verbs share one per-user pin store, so an approval in one
-terminal is honored by the running `net mcp serve` in another. To pre-approve
+terminal is honored by the running `net-mesh mcp serve` in another. To pre-approve
 capabilities at startup instead, pass them on the serve command:
 
 ```
-net mcp serve --allow-capability provider/capability --node-addr <peer> --node-pubkey <hex> --psk-hex <psk>
+net-mesh mcp serve --allow-capability provider/capability --node-addr <peer> --node-pubkey <hex> --psk-hex <psk>
 ```
 
 Without a pin or `--allow-capability`, `net_invoke_capability` on a spicy

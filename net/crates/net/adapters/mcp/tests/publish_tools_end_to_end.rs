@@ -832,14 +832,40 @@ async fn a_refreshed_priced_local_tool_still_enforces_payment() {
         "add was re-served by the refresh: {delta:?}",
     );
 
+    // The re-announcement carries `add` again. Asserted on the HOST's own
+    // index, not the caller's, and without a `wait_until`: the origin-side
+    // announce rate limit (`min_announce_interval`, 10 s by default) coalesces
+    // every announce this test makes after the first, so when the peer-visible
+    // set converges is a function of that window, not of the refresh. The
+    // self-index is the announcement this node would ship, updated
+    // synchronously by `refresh` — the same idiom the withdraw assertion in
+    // `local_tools_are_discovered_described_and_invoked_across_two_nodes` uses.
     let filter = CapabilityFilter::new().require_tag("add");
     assert!(
-        wait_until(
-            || caller.find_nodes(&filter).contains(&b_id),
-            Duration::from_secs(5),
-        )
-        .await,
-        "caller re-discovers the refreshed priced tool",
+        host.find_nodes(&filter).contains(&b_id),
+        "the refreshed priced tool is re-announced",
+    );
+
+    // Cross-node, and independent of the announce window: the caller reads the
+    // refreshed catalog straight off the live describe service, so `add` is
+    // demand-side visible again — announced as priced — before the payment
+    // assertions below.
+    let describe_reply = call_retry(&caller, b_id, DESCRIBE_SERVICE, || {
+        Bytes::from_static(b"{}")
+    })
+    .await
+    .expect("describe succeeds after refresh");
+    let described: DescribeResponse =
+        serde_json::from_slice(describe_reply.body.as_ref()).expect("decode DescribeResponse");
+    let add_described = described
+        .tools
+        .iter()
+        .find(|t| t.tool_id == "add")
+        .expect("add is back in the described catalog after refresh");
+    assert_eq!(
+        add_described.pricing_terms.as_deref(),
+        Some(TERMS),
+        "the re-described tool still announces its price",
     );
 
     let add_body = || Bytes::from(serde_json::to_vec(&json!({ "a": 2, "b": 3 })).unwrap());

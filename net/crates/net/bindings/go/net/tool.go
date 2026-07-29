@@ -14,7 +14,7 @@
 // declared in this file's cgo prelude.
 //
 // Plan: see
-// `crates/net/docs/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
+// `docs/internal/plans/NRPC_AI_TOOL_CALLING_AND_AGENT_DX.md`,
 // slices D-1 / D-2. Mirror of the Rust SDK's `net_sdk::tool` +
 // `net_sdk::tool::formats`, the Node TS `tool.ts`, and the Python
 // `net.tool` modules. Cross-language tests (T-1) will pin byte

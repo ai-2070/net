@@ -2,7 +2,7 @@
 //! `MeshNode`'s pub/sub + per-channel-hash dispatch hook and the
 //! `cortex::rpc` server / client folds.
 //!
-//! See `docs/misc/NRPC_DESIGN.md` for the full architectural framing.
+//! See `docs/internal/misc/NRPC_DESIGN.md` for the full architectural framing.
 //! In short:
 //!
 //! - `serve_rpc(service, handler)` registers an inbound dispatcher
@@ -341,7 +341,7 @@ pub enum RpcError {
     /// target's latest `CapabilityAnnouncement` does not list
     /// the requested `nrpc:<service>` tag, or it lists the tag
     /// with allow-lists the caller does not match. See
-    /// `docs/plans/CAPABILITY_AUTH_PLAN.md` §3 for the model.
+    /// `docs/internal/plans/CAPABILITY_AUTH_PLAN.md` §3 for the model.
     ///
     /// Raised by the caller-side gate inside
     /// [`MeshNode::call_service`] BEFORE the request hits the
@@ -3410,7 +3410,7 @@ impl MeshNode {
         // gate was either silently permissive (no self-ann) or
         // silently denying (self-ann from a prior
         // `announce_capabilities` that pre-dated this service's
-        // registration). See `docs/misc/CODE_REVIEW_2026_05_19_CAPABILITY_AUTH.md`
+        // registration). See `docs/internal/misc/CODE_REVIEW_2026_05_19_CAPABILITY_AUTH.md`
         // H1 + H2.
         //
         // OA2-E0.1: register FIRST (vacant-only). A duplicate
@@ -3618,11 +3618,20 @@ impl MeshNode {
         // already happened above; this is purely for peer
         // visibility (the broadcast path also re-runs the
         // self-index, which is a cheap version bump).
+        //
+        // Republish the CURRENT baseline (read inside `announce_mu`)
+        // rather than snapshotting it here and handing it back as a
+        // NEW baseline. This task is spawned, so its snapshot could be
+        // taken arbitrarily late — and an explicit
+        // `announce_capabilities(X)` landing in between would be
+        // reverted to the pre-`X` set, dropping capabilities the
+        // operator just announced from both the wire and this node's
+        // own self-index until something else announces. Same clobber
+        // TOCTOU the RT-3 loop closed by passing `None`.
         let mesh_for_announce = Arc::clone(self);
         let service_for_log = service.to_string();
         tokio::spawn(async move {
-            let baseline = mesh_for_announce.user_caps_snapshot();
-            if let Err(e) = mesh_for_announce.announce_capabilities(baseline).await {
+            if let Err(e) = mesh_for_announce.reannounce_current_capabilities().await {
                 tracing::warn!(
                     error = %e,
                     service = %service_for_log,
@@ -4759,7 +4768,7 @@ impl MeshNode {
         //     selected. `call` re-checks the binding (defense in depth).
         //   * public (`None`) → the existing v0.4 caller-side `may_execute` gate,
         //     unchanged (permissive announcements admit any caller). See
-        //     `docs/plans/CAPABILITY_AUTH_PLAN.md` §3.
+        //     `docs/internal/plans/CAPABILITY_AUTH_PLAN.md` §3.
         //
         // Health filtering has already run above; this filtering precedes
         // `select_target` so routing never picks a peer the call would only
@@ -5007,7 +5016,7 @@ impl MeshNode {
         // Per-service route cache: one `DashMap::get(&str)` +
         // `Arc::clone` on the hot path instead of 2 `format!` +
         // 2 `ChannelName::new` + xxhash per call (T1.3 perf audit
-        // — `docs/misc/PERF_AUDIT_2026_05_19_NRPC.md`).
+        // — `docs/internal/misc/PERF_AUDIT_2026_05_19_NRPC.md`).
         let route = self.rpc_route_or_no_route(target_node_id, service)?;
         let self_origin = self.identity_origin_hash();
 

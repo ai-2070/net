@@ -1,7 +1,18 @@
+---
+title: Quickstart
+description: Install the SDK and run a node that emits and counts events — the smallest loop that proves the bus works.
+---
 # Rust — Quickstart
 
 Install the SDK and run a node that emits and counts events — the smallest loop
 that proves the bus works.
+
+This is the surface most people should build on. If you've come from the
+[Start quickstart](/docs/start/quickstart), you've seen the same loop one layer
+down: that page drives `net::EventBus` directly, this one drives `net_sdk::Net`,
+and `Net` *is* an `EventBus` with the ergonomics attached. You don't need to
+have read it — but if you're wondering which crate to depend on, the
+[crate comparison](/docs/start/quickstart#first-which-crate) is the short answer.
 
 ```bash
 cargo add net-mesh-sdk tokio serde serde_json

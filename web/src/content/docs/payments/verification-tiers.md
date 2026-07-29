@@ -1,3 +1,7 @@
+---
+title: Verification Tiers
+description: "\"Did the payment go through?\" is not a yes/no question on a blockchain — a transaction can be seen, then confirmed to some depth, then (rarely) reorged out."
+---
 # Verification tiers
 
 "Did the payment go through?" is not a yes/no question on a blockchain — a
@@ -7,8 +11,12 @@ disappears. Net makes the confidence level a **first-class tier**.
 
 ## The three tiers
 
-```
-observed | confirmed(n) | final
+```rust
+pub enum VerificationTier {
+    Observed,       // a facilitator saw it; no depth claim
+    Confirmed(u32), // n confirmations, established independently
+    Final,          // independently checked on-chain finality
+}
 ```
 
 - **`observed`** — a facilitator (or adapter) *saw* the transaction. **No depth
@@ -41,6 +49,45 @@ If a previously-confirmed settlement is reorged out, that is not an error to
 swallow — it is a **verdict**. The checker surfaces a reverted / invalidated
 result in the same family as a reorg, and the engine **freezes** the affected
 quote rather than pretending the payment stands. A frozen quote does not serve.
+
+## Requiring a tier
+
+The provider names its bar when it accepts the payment:
+
+```rust
+use net_payments::VerificationTier;
+
+let decision = engine
+    .accept_payment(&quote, &payload, VerificationTier::Observed, now_ns)
+    .await?;
+```
+
+The decision is not a boolean either. `PaymentDecision::Served` means the tier
+was met and the handler may run; `PendingTier { reached, required }` means the
+money settled but confidence hasn't caught up, so the handler does **not** run
+and you re-verify later; `Invalidated` means a previously-verified payment was
+withdrawn and the quote is frozen. `FacilitatorFailure` is the fail-closed
+default — nothing was consumed, and policy chooses retry or fallback.
+
+## Raising the bar after the fact
+
+Re-verification is where `confirmed(n)` and `final` actually come from, and it
+takes the `ChainChecker` explicitly — the type signature is the trust boundary:
+
+```rust
+let decision = engine
+    .re_verify_with_checker(
+        &quote_id,
+        checker,                          // &dyn ChainChecker — talks to the chain
+        VerificationTier::Confirmed(12),
+        now_ns,
+    )
+    .await?;
+```
+
+There is no overload that promotes a payment past `observed` using the
+facilitator's word. If you want depth, you pass something that queries the
+chain; `net_payments::checker` ships EIP-155, SVM, and XRPL implementations.
 
 ## Where it shows up
 

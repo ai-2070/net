@@ -66,7 +66,7 @@ The island record a node publishes: `{ id, units: [u32], capabilities: [tag], lo
 
 | SDK | Match / claim | Criteria type | Record type |
 |---|---|---|---|
-| Rust (`net-sdk`) | `mesh.match_islands(&c)` / `mesh.claim_island(&c, until).await` | `gang::MatchCriteria` (build directly — full `CapabilityQuery`) | `gang::IslandRecord { id, units: UnitSet, host, capabilities, load, p50_latency_us }` |
+| Rust (`net-mesh-sdk`) | `mesh.match_islands(&c)` / `mesh.claim_island(&c, until).await` | `gang::MatchCriteria` (build directly — full `CapabilityQuery`) | `gang::IslandRecord { id, units: UnitSet, host, capabilities, load, p50_latency_us }` |
 | TypeScript | `node.matchIslands(c)` / `await node.claimIsland(c, until)` | `IslandCriteria` (object) | `IslandTopologyInput` |
 | Python | `mesh.match_islands(tags_all, *, min_units=…, require_all=…, …)` | flat kwargs | `mesh.publish_island_topology(id, units, capabilities, load, p50)` |
 | Go | `node.MatchIslands(crit)` / `node.ClaimIsland(crit, until)` | `GangCriteria{ TagsAll, TagsAny, MinUnits, RequireAll, RequireAny, … }` | `IslandRecord{ ID, Units, Capabilities, Load, P50LatencyUs }` |
@@ -202,3 +202,8 @@ Semantics worth knowing before you reach for them:
 
 - Core: `net/crates/net/src/adapter/net/behavior/gang/` (scheduler) + `behavior/fold/island.rs` (topology fold) + `cortex/workflow/` (lifecycle).
 - SDK: Rust `sdk/src/gang.rs` + `sdk/src/cortex/workflow.rs`; TS `sdk-ts/src/mesh.ts` + `cortex.ts`; Python `sdk-py/src/net_sdk/mesh.py`; Go `go/mesh.go` + `go/cortex.go`; C `include/net.go.h` + `include/net_cortex.h`.
+
+## Further reading
+
+- [Claiming a Contended Resource](https://ai2070.net/docs/guides/gang-scheduler)
+- [Task Lifecycle and Workflows](https://ai2070.net/docs/guides/task-lifecycle)

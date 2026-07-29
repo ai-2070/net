@@ -6,7 +6,7 @@
 //! Parallel to
 //! [`ReplicaGroup`](crate::adapter::net::compute::replica_group::ReplicaGroup)
 //! (which targets sync [`MeshDaemon`](crate::adapter::net::compute::MeshDaemon)s).
-//! Direction B of `docs/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`:
+//! Direction B of `docs/internal/plans/AGGREGATOR_LIFECYCLE_DEFERRED_2026_05_23.md`:
 //! we keep `LifecycleDaemon` separate from `MeshDaemon` and
 //! share the underlying placement / capability primitives
 //! rather than the trait. Layered slices add:

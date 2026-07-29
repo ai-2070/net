@@ -1,3 +1,7 @@
+---
+title: Quickstart
+description: Ingest events and poll them back, freeing what the ABI hands you.
+---
 # C — Quickstart
 
 Ingest events and poll them back, freeing what the ABI hands you.
