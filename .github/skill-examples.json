@@ -45,11 +45,7 @@
       "run": {
         "expect": "accepted: .*ingested=1",
         "timeout_s": 60,
-        "not_wired": {
-          "python": "needs the maturin-built binding; not executed anywhere yet \u2014 ci.yml's sdk-py-tests is where it belongs",
-          "go": "cgo \u2014 needs the libnet cdylib; not executed anywhere yet \u2014 ci.yml's go-tests is where it belongs",
-          "c": "needs libnet built and linked; not executed anywhere yet \u2014 ci.yml's ffi-tests is where it belongs"
-        }
+        "not_wired": {}
       }
     },
     {
@@ -69,11 +65,7 @@
       "run": {
         "expect": "loses events silently",
         "timeout_s": 120,
-        "not_wired": {
-          "python": "needs the maturin-built binding; not executed anywhere yet \u2014 ci.yml's sdk-py-tests is where it belongs",
-          "go": "cgo \u2014 needs the libnet cdylib; not executed anywhere yet \u2014 ci.yml's go-tests is where it belongs",
-          "c": "needs libnet built and linked; not executed anywhere yet \u2014 ci.yml's ffi-tests is where it belongs"
-        }
+        "not_wired": {}
       }
     }
   ]

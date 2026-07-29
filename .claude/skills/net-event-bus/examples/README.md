@@ -58,16 +58,18 @@ than reaching you. `hello.c`, `hello.go`, `hello.rs` and `hello.py` go through
 `.github/scripts/check-skill-example-ts.sh`, run by the two jobs that build the
 napi type declarations it needs.
 
-**The Rust and TypeScript examples are also executed**, and their stdout is
-matched against a contract, with a timeout. That is not belt-and-braces: a compile floor cannot
+**Every example is also executed**, in all five bindings, with its stdout
+matched against a contract and bounded by a timeout. That is not belt-and-braces: a compile floor cannot
 catch an example that builds and then hangs, and both `hello.rs` and `hello.ts`
 did exactly that for months — clean compile, blocked forever on a subscribe that
 could never yield — while this README promised they printed one line. Nothing
 short of running them would have found it.
 
-Python, Go and C are **not executed anywhere yet** — they need a maturin wheel
-and the `libnet` cdylib, which live in other CI jobs. The manifest records that
-gap with a reason rather than leaving it implicit.
+Each runs where its artifacts already exist, so the marginal cost is the
+execution itself: Rust in `skills.yml`'s `examples` job, TypeScript in the two
+jobs that build the napi module, Python in `ci.yml`'s `python-tests` (the only
+job with both the maturin binding and the `net_sdk` wrapper), and Go and C in
+`ci.yml`'s `go-tests`, the only job that produces a linkable `libnet`.
 
 Both are driven from `.github/skill-examples.json`, which requires every binding
 to be listed for every route as either a checked file or an explicit, reasoned

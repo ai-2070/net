@@ -153,6 +153,92 @@ EOF
     done <<< "$SPEC"
     ;;
 
+  python)
+    # Needs BOTH layers importable: `net_sdk` (the wrapper the examples import)
+    # and `net` (the maturin-built binding it sits on). No CI job had both by
+    # default — sdk-py-tests installs the wrapper `--no-deps` on purpose, and
+    # python-tests builds the binding without the wrapper — so the caller has to
+    # provide both. Say which one is missing rather than emitting an ImportError
+    # traceback that reads like a broken example.
+    # Show the real ImportError, not a canned guess at the cause. A first
+    # version of this printed "run pip install -e ." for every failure, which
+    # was actively misleading when the true problem was a `net` binding from a
+    # different checkout missing a symbol `net_sdk` imports.
+    for mod in net net_sdk; do
+      if ! err=$(python3 -c "import $mod" 2>&1); then
+        note "cannot import \`$mod\`"
+        printf '%s\n' "$err" | sed 's/^/      /' | tail -6
+        echo "      net       <- 'maturin develop' in net/crates/net/bindings/python"
+        echo "      net_sdk   <- 'pip install --no-deps -e .' in net/crates/net/sdk-py"
+        echo "      Both must come from THIS checkout; a stale one on sys.path"
+        echo "      fails here as a missing attribute rather than a missing module."
+        exit 1
+      fi
+    done
+    while IFS=$'\t' read -r path id timeout expect; do
+      [ -z "$path" ] && continue
+      assert_run "$id: $(basename "$path")" "$timeout" "$expect" \
+        python3 "$ROOT/$path"
+    done <<< "$SPEC"
+    ;;
+
+  go)
+    # cgo: the binding links against the Rust cdylibs, so the caller must have
+    # built them and pointed the loader at them. This is why the *compile* check
+    # uses `go vet` — it type-checks without linking. Running needs the real
+    # thing.
+    if [ -z "${LD_LIBRARY_PATH:-}${DYLD_LIBRARY_PATH:-}" ]; then
+      note "neither LD_LIBRARY_PATH nor DYLD_LIBRARY_PATH is set — the cdylibs must be built and on the loader path"
+      exit 1
+    fi
+    while IFS=$'\t' read -r path id timeout expect; do
+      [ -z "$path" ] && continue
+      d="$WORK/go-$id"
+      mkdir -p "$d" && cp "$ROOT/$path" "$d/"
+      cat > "$d/go.mod" <<EOF
+module skillexamplerun
+
+go 1.26
+
+require github.com/ai-2070/net/go v0.0.0
+
+replace github.com/ai-2070/net/go => $ROOT/go
+EOF
+      if ! ( cd "$d" && go build -o "$d/bin" . ) >"$WORK/go-$id.log" 2>&1; then
+        note "$id: $(basename "$path") — did not link"
+        sed 's/^/      /' "$WORK/go-$id.log" | tail -15
+        continue
+      fi
+      assert_run "$id: $(basename "$path")" "$timeout" "$expect" "$d/bin"
+    done <<< "$SPEC"
+    ;;
+
+  c)
+    # Same cdylib requirement as Go, plus an explicit link step. NET_LIB_DIR
+    # tells us where the caller built libnet.
+    LIBDIR="${NET_LIB_DIR:-}"
+    if [ -z "$LIBDIR" ] || [ ! -d "$LIBDIR" ]; then
+      note "NET_LIB_DIR is unset or not a directory — point it at the cargo target dir holding libnet"
+      exit 1
+    fi
+    CC=$(command -v gcc || command -v cc)
+    if [ -z "$CC" ]; then
+      note "no C compiler on PATH"
+      exit 1
+    fi
+    while IFS=$'\t' read -r path id timeout expect; do
+      [ -z "$path" ] && continue
+      if ! "$CC" -o "$WORK/c-$id" "$ROOT/$path" \
+             -I "$ROOT/net/crates/net/include" -L "$LIBDIR" \
+             -lnet -lpthread -ldl -lm >"$WORK/c-$id.log" 2>&1; then
+        note "$id: $(basename "$path") — did not compile or link"
+        sed 's/^/      /' "$WORK/c-$id.log" | tail -15
+        continue
+      fi
+      assert_run "$id: $(basename "$path")" "$timeout" "$expect" "$WORK/c-$id"
+    done <<< "$SPEC"
+    ;;
+
   *)
     echo "  no runner implemented for '$LANG_ARG' in this script yet." >&2
     echo "  Add one here, and drop that binding from run.not_wired." >&2
