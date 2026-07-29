@@ -368,38 +368,45 @@ impl GrantAudienceRecords {
         self.by_grant_id.values()
     }
 
-    /// Copy-on-write install. `Ok(None)` = the identical record was already
-    /// present (idempotent); `Ok(Some(next))` = a new set to publish. A new key
-    /// past `capacity` first reclaims records whose grant has since expired
-    /// (`not_after <= now_secs`); if the set is still full it is refused
+    /// Settle EVERY ordinary refusal — idempotence, conflict and capacity — and
+    /// reserve room for `record` in the next snapshot (OLB-2B.3c-pre).
+    ///
+    /// A new key past `capacity` first reclaims records whose grant has since
+    /// expired; if the set is still full it is refused
     /// [`GrantAudienceInstallError::AtCapacity`]. Node-context invariants
     /// (validity, rights, org/target) are checked BEFORE this by the caller —
     /// this layer owns only idempotency, conflict, and capacity.
-    /// Settle EVERY ordinary refusal — idempotence, conflict and capacity — and
-    /// return a slot the caller can fill infallibly (OLB-2B.3c-pre).
     ///
-    /// This exists because the installation identity is now a finite, terminal
-    /// authority space. Any refusal that can happen AFTER allocation burns an
-    /// identity while publishing nothing, and repeated distinct installs against
-    /// a full registry would drain the space permanently. Settling idempotence
-    /// alone was not enough; capacity refusal sits behind it (Kyra, 2B.3c-pre
-    /// step-1 review).
+    /// Settling every refusal up front exists because the consumer installation
+    /// identity is a finite, terminal authority space. Any refusal that can
+    /// happen AFTER allocation burns an identity while publishing nothing, and
+    /// repeated distinct installs against a full registry would drain the space
+    /// permanently. Settling idempotence alone was not enough; capacity refusal
+    /// sits behind it (Kyra, 2B.3c-pre step-1 review).
     ///
     /// Once `Ready` is returned under the caller's mutex, no ordinary refusal
     /// remains — which is the property that makes allocating afterwards safe.
     /// The capacity check and expired-record reclamation happen HERE and are not
     /// duplicated at the fill site.
-    fn prepare_install(
+    ///
+    /// Takes the record by REFERENCE and hands back only the reserved map: the
+    /// two planes differ in what they insert (the provider's record is already
+    /// final; the consumer's must be stamped with an identity that does not
+    /// exist yet), and each owns that step. An earlier shape carried the
+    /// candidate through a two-variant `PreparedRecord`, which gave the consumer
+    /// fill site a provider arm it could never reach — and that arm published a
+    /// record with NO installation identity, so the lease it returned could
+    /// never have removed its own installation (review 2026-07-29 §4).
+    fn reserve(
         &self,
-        candidate: PreparedRecord,
+        record: &GrantAudienceRecord,
         capacity: usize,
         now_secs: u64,
-    ) -> Result<PreparedInstall, GrantAudienceInstallError> {
-        let record = candidate.as_record();
+    ) -> Result<Reserved, GrantAudienceInstallError> {
         let grant_id = *record.grant_id();
         if let Some(existing) = self.by_grant_id.get(&grant_id) {
             return if records_identical(existing, record) {
-                Ok(PreparedInstall::Noop)
+                Ok(Reserved::Noop)
             } else {
                 Err(GrantAudienceInstallError::Conflict)
             };
@@ -435,10 +442,7 @@ impl GrantAudienceRecords {
                 return Err(GrantAudienceInstallError::AtCapacity);
             }
         }
-        Ok(PreparedInstall::Ready(Box::new(PreparedSlot {
-            next: Self { by_grant_id: next },
-            candidate,
-        })))
+        Ok(Reserved::Ready(Self { by_grant_id: next }))
     }
 
     /// Copy-on-write remove. `None` = the grant id was not present (no-op — the
@@ -454,11 +458,31 @@ impl GrantAudienceRecords {
     }
 }
 
-/// The outcome of settling every ordinary install refusal (OLB-2B.3c-pre).
-#[derive(Debug)]
-pub(crate) enum PreparedInstall {
+/// The outcome of [`GrantAudienceRecords::reserve`] — room settled, but not yet
+/// filled (OLB-2B.3c-pre).
+///
+/// Private to this module: both planes consume it immediately, and neither hands
+/// it across a public boundary.
+enum Reserved {
     /// The exact record is already installed: valid, publishes nothing, and must
     /// consume no installation identity.
+    Noop,
+    /// Room is reserved and no ordinary refusal remains — the post-reclamation
+    /// map, carried rather than re-derived so the capacity decision cannot be
+    /// made twice and disagree with itself.
+    Ready(GrantAudienceRecords),
+}
+
+/// The outcome of settling every ordinary install refusal, for the CONSUMER
+/// plane (OLB-2B.3c-pre).
+///
+/// Only the consumer plane needs this two-step shape: its record cannot be
+/// finalized at reservation time because it must carry an installation identity
+/// that is only allocated once publication is certain. The provider plane's
+/// record is already final, so it reserves and inserts in one step.
+#[derive(Debug)]
+pub(crate) enum PreparedInstall {
+    /// Already installed, byte-identically. Publishes nothing.
     Noop,
     /// Room is reserved and no ordinary refusal remains. Fill it infallibly.
     ///
@@ -467,73 +491,41 @@ pub(crate) enum PreparedInstall {
     Ready(Box<PreparedSlot>),
 }
 
-/// The candidate a preparation OWNS.
+/// A reserved place in the next consumer snapshot, together with the exact
+/// candidate it was reserved FOR.
 ///
-/// `GrantAudienceRecord` is deliberately not `Clone` — it holds the audience
-/// secret, and the type exists to keep those bytes behind one `Arc` rather than
-/// copied. So the consumer variant carries the record by MOVE until its
-/// installation identity exists, and the provider variant carries the `Arc` it
-/// was already handed.
-#[derive(Debug)]
-pub(crate) enum PreparedRecord {
-    /// Consumer install: awaiting the installation identity.
-    ///
-    /// Boxed to keep the enum small. The record still MOVES rather than being
-    /// copied, which is the property that matters — it holds the audience
-    /// secret and is deliberately not `Clone`.
-    Unstamped(Box<GrantAudienceRecord>),
-    /// Provider install: already final.
-    Stamped(Arc<GrantAudienceRecord>),
-}
-
-impl PreparedRecord {
-    fn as_record(&self) -> &GrantAudienceRecord {
-        match self {
-            Self::Unstamped(record) => record,
-            Self::Stamped(record) => record,
-        }
-    }
-}
-
-/// A reserved place in the next snapshot, together with the exact candidate it
-/// was reserved FOR.
+/// Carries the candidate, so no independently supplied record can cross the
+/// post-allocation boundary. The earliest shape took the record as a `finish`
+/// argument and checked it with `debug_assert_eq!`, which is not a release-mode
+/// guarantee: a slot prepared for A could be filled with B, keying the map by A
+/// while the record inside claimed B. "Infallible by construction" has to be
+/// stronger than "the present caller happens to behave" (Kyra, 2B.3c-pre step-1
+/// re-review).
 ///
-/// Carries the post-reclamation map rather than re-deriving it, so the capacity
-/// decision cannot be made twice and disagree with itself — and carries the
-/// candidate, so no independently supplied record can cross the post-allocation
-/// boundary. The earlier shape took the record as a `finish` argument and
-/// checked it with `debug_assert_eq!`, which is not a release-mode guarantee:
-/// a slot prepared for A could be filled with B, keying the map by A while the
-/// record inside claimed B. "Infallible by construction" has to be stronger than
-/// "the present caller happens to behave" (Kyra, 2B.3c-pre step-1 re-review).
+/// The candidate is the CONSUMER's unstamped record and nothing else. It briefly
+/// carried a two-variant `PreparedRecord` shared with the provider plane, which
+/// left the fill site below with a provider arm it could never reach — and that
+/// arm published a record with no installation identity at all, so the lease it
+/// returned could never have removed its own installation. Applying this type's
+/// own standard to its last branch means deleting it, not documenting it
+/// (review 2026-07-29 §4).
+///
+/// Boxed inside `PreparedInstall`, but the record itself still MOVES rather than
+/// being copied — `GrantAudienceRecord` holds the audience secret and is
+/// deliberately not `Clone`.
 #[derive(Debug)]
 pub(crate) struct PreparedSlot {
     next: GrantAudienceRecords,
-    candidate: PreparedRecord,
+    candidate: Box<GrantAudienceRecord>,
 }
 
 impl PreparedSlot {
-    /// Stamp the OWNED candidate and insert it. Consumer path.
+    /// Stamp the OWNED candidate with its installation identity and insert it.
     ///
-    /// Takes only the identity — the record cannot be substituted.
+    /// Takes only the identity — the record cannot be substituted — and has no
+    /// branch, so there is no fail-safe answer left to get wrong.
     fn finish_with_install_seq(mut self, install_seq: u64) -> GrantAudienceRecords {
-        let record = match self.candidate {
-            PreparedRecord::Unstamped(record) => Arc::new((*record).with_install_seq(install_seq)),
-            // Unreachable on the consumer path; publishing the retained record
-            // unchanged is the only fail-safe answer, since substituting one is
-            // exactly what this type exists to prevent.
-            PreparedRecord::Stamped(record) => record,
-        };
-        self.next.by_grant_id.insert(*record.grant_id(), record);
-        self.next
-    }
-
-    /// Insert the OWNED candidate unchanged. Provider path.
-    fn finish(mut self) -> GrantAudienceRecords {
-        let record = match self.candidate {
-            PreparedRecord::Stamped(record) => record,
-            PreparedRecord::Unstamped(record) => Arc::new(*record),
-        };
+        let record = Arc::new((*self.candidate).with_install_seq(install_seq));
         self.next.by_grant_id.insert(*record.grant_id(), record);
         self.next
     }
@@ -715,18 +707,22 @@ impl ProviderGrantSnapshot {
         self.0.len() == 0
     }
 
-    /// Install a validated record; see [`GrantAudienceRecords::prepare_install`].
+    /// Install a validated record; see [`GrantAudienceRecords::reserve`].
+    ///
+    /// One step, not the consumer plane's two: a provider record is already
+    /// final, so there is no window between reserving room and filling it, and
+    /// nothing to allocate that a later refusal could waste.
     pub(crate) fn with_record(
         &self,
         record: Arc<GrantAudienceRecord>,
         now_secs: u64,
     ) -> Result<Option<Self>, GrantAudienceInstallError> {
-        match self
-            .0
-            .prepare_install(PreparedRecord::Stamped(record), Self::CAPACITY, now_secs)?
-        {
-            PreparedInstall::Noop => Ok(None),
-            PreparedInstall::Ready(slot) => Ok(Some(Self(slot.finish()))),
+        match self.0.reserve(&record, Self::CAPACITY, now_secs)? {
+            Reserved::Noop => Ok(None),
+            Reserved::Ready(mut next) => {
+                next.by_grant_id.insert(*record.grant_id(), record);
+                Ok(Some(Self(next)))
+            }
         }
     }
 
@@ -773,19 +769,26 @@ impl ConsumerGrantSnapshot {
         self.0.len() == 0
     }
 
-    /// Install a validated record; see [`GrantAudienceRecords::prepare_install`].
     /// Settle every ordinary install refusal, reserving a slot to fill
-    /// (OLB-2B.3c-pre). See [`GrantAudienceRecords::prepare_install`].
+    /// (OLB-2B.3c-pre). See [`GrantAudienceRecords::reserve`].
+    ///
+    /// Two steps, unlike the provider plane's one: the record cannot be
+    /// finalized here because it must carry an installation identity that is
+    /// only allocated once publication is certain — and allocating before every
+    /// refusal is settled would burn a terminal identity while publishing
+    /// nothing.
     pub(crate) fn prepare_install(
         &self,
         record: GrantAudienceRecord,
         now_secs: u64,
     ) -> Result<PreparedInstall, GrantAudienceInstallError> {
-        self.0.prepare_install(
-            PreparedRecord::Unstamped(Box::new(record)),
-            Self::CAPACITY,
-            now_secs,
-        )
+        match self.0.reserve(&record, Self::CAPACITY, now_secs)? {
+            Reserved::Noop => Ok(PreparedInstall::Noop),
+            Reserved::Ready(next) => Ok(PreparedInstall::Ready(Box::new(PreparedSlot {
+                next,
+                candidate: Box::new(record),
+            }))),
+        }
     }
 
     /// Stamp and publish the slot's OWN candidate. Infallible by construction.
