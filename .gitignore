@@ -38,6 +38,12 @@ net/crates/net/bindings/python/python/**/__pycache__/
 net/crates/net/sdk-py/src/*.egg-info/
 net/crates/net/sdk-py/**/__pycache__/
 
+# Bytecode anywhere. The two rules above are path-scoped, so importing one of
+# the CI scripts under `.github/scripts/` wrote a __pycache__ that nothing
+# ignored and it was committed by accident.
+__pycache__/
+*.pyc
+
 # Env variables
 .env
 .env.*

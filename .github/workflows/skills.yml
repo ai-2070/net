@@ -46,10 +46,15 @@ on:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
+      - ".github/scripts/check-skills-depth.sh"
       - ".github/scripts/check-skill-refs.py"
       - ".github/scripts/check-skill-workflow.py"
       - ".github/scripts/check-skill-examples.sh"
+      - ".github/scripts/skill_examples.py"
+      - ".github/skill-examples.json"
+      - ".github/scripts/check-skill-example-ts.sh"
       - ".github/scripts/check-skill-vocab.py"
+      - ".github/scripts/check-skill-coverage.py"
       - ".github/scripts/check-skill-snippets.py"
       - ".github/skill-snippets/**"
       # Every surface the skills document. Broad roots on purpose: the previous
@@ -83,10 +88,15 @@ on:
       - ".claude/skills/**"
       - ".github/workflows/skills.yml"
       - ".github/scripts/check-skills.sh"
+      - ".github/scripts/check-skills-depth.sh"
       - ".github/scripts/check-skill-refs.py"
       - ".github/scripts/check-skill-workflow.py"
       - ".github/scripts/check-skill-examples.sh"
+      - ".github/scripts/skill_examples.py"
+      - ".github/skill-examples.json"
+      - ".github/scripts/check-skill-example-ts.sh"
       - ".github/scripts/check-skill-vocab.py"
+      - ".github/scripts/check-skill-coverage.py"
       - ".github/scripts/check-skill-snippets.py"
       - ".github/skill-snippets/**"
       # Every surface the skills document. Broad roots on purpose: the previous
@@ -139,6 +149,14 @@ jobs:
       - name: Check skills against the tree
         run: .github/scripts/check-skills.sh
 
+      # Guards the checker rather than the content: three of the checks above
+      # used to stop at `*/*.md` and silently ignored anything nested deeper.
+      # This plants four defects in a nested file — in a throwaway copy of the
+      # corpus, never in `.claude/skills/`, which is rsynced to users — and
+      # asserts all four are reported.
+      - name: Check nested skill content is still discovered
+        run: .github/scripts/check-skills-depth.sh
+
   examples:
     name: Examples compile
     runs-on: ubuntu-latest
@@ -174,9 +192,9 @@ jobs:
       #
       # Four of the five languages are covered here. `hello.ts` is NOT: it needs
       # the napi-generated `bindings/node/index.d.ts`, which is gitignored, and
-      # regenerating it means a full `napi build`. It is type-checked in ci.yml's
-      # "TypeScript SDK tests" job, which already builds napi — so a broken
-      # hello.ts fails CI, but through that job rather than this gate.
+      # regenerating it means a full `napi build`. It has its own `typescript`
+      # job below, which pays that cost only on publication-eligible events; on
+      # a branch or PR the same check runs in ci.yml instead.
       - name: Compile the skill examples
         env:
           REQUIRE_ALL: "1"
@@ -204,6 +222,69 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
         run: .github/scripts/check-skill-snippets.py
 
+  typescript:
+    name: TypeScript example type-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    # PUBLICATION-GATE ONLY — and this condition must stay equal to `publish`'s
+    # below, which `check-skill-workflow.py` asserts. Divergence does not reopen
+    # the gate (GitHub skips a job whose dependency was skipped, so publish goes
+    # with it); it silently stops the mirror on events where this does not run.
+    # Quiet either way, hence the assertion.
+    #
+    # Why conditional at all, when every other job here runs unconditionally:
+    # this one needs a full `napi build`, ~10-15 minutes of Rust. skills.yml
+    # fires on every documented surface — `go/**`, `net/crates/net/**` — so
+    # running it always would attach that cost to a large share of pushes to buy
+    # nothing. On a branch or a PR, `hello.ts` is already type-checked by
+    # ci.yml's "TypeScript SDK tests" job, which runs there. The *only* thing
+    # ci.yml cannot do is block this workflow's mirror, so that is the only case
+    # this job covers.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
+
+    defaults:
+      run:
+        working-directory: net/crates/net/sdk-ts
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Same `shared-key` as ci.yml's sdk-ts-tests, so this reuses that job's
+      # cache rather than warming a second copy of the same build.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sdk-ts
+          workspaces: net/crates/net -> target
+
+      # Feature list is ci.yml's, and `redis` is load-bearing rather than
+      # incidental: `sdk-ts/src/redis-dedup.ts` does a real
+      # `export { RedisStreamDedup } from '@net-mesh/core'`, and the generated
+      # `index.d.ts` only declares it when the binding was built with that
+      # feature. Drop it and the SDK's own source stops type-checking, which
+      # looks like an example failure and is not.
+      - name: Build native module
+        working-directory: net/crates/net/bindings/node
+        run: |
+          npm i --ignore-scripts
+          npx napi build --platform --no-default-features --features redis,net,cortex,compute,groups,meshos,deck,meshdb,aggregator,tool,org,test-helpers,dataforts
+
+      - name: Install npm dependencies
+        run: npm i
+
+      - name: Type-check the skill hello-world example
+        working-directory: .
+        run: .github/scripts/check-skill-example-ts.sh
+
   publish:
     name: Mirror to net-claude-skill
     runs-on: ubuntu-latest
@@ -226,6 +307,7 @@ jobs:
       - drift
       - examples
       - snippets
+      - typescript
 
     # Automatic publishes are master-only, and a pull request never publishes:
     # it runs with a read-only token and must not push to another repository.

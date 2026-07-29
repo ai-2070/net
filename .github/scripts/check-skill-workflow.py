@@ -27,6 +27,21 @@ comment on the line above its name. Making the exception visible and deliberate
 is the point — the failure mode this guards is someone adding a job in a later
 phase and simply forgetting the dependency.
 
+**Conditional gates.** One gating job (`typescript`) is conditional, because it
+needs a ~10-minute napi build and only has to run when publication is possible.
+That makes two further things assertable.
+
+GitHub skips a job whose `needs` include a skipped job, so a narrower condition
+on a gate does *not* reopen the gate — it silently disables the mirror instead,
+which is safe but invisible. Both directions are worth catching, so any gating
+job carrying an `if:` must carry the same `if:` as `publish`.
+
+The edit that would genuinely reopen the gate is adding a status-check function
+(`always()`, `failure()`, `cancelled()`, `success()`) to `publish`'s own `if:`,
+since that replaces the implicit "every dependency succeeded". Asserted
+separately, because it is the one change that turns every `needs` entry above
+into decoration.
+
 Deliberately does not import PyYAML — it is not guaranteed on a runner, and the
 blocks parsed here are a fixed, simple shape. Prints one line per violation and
 exits 1; silent exit 0 when clean.
@@ -40,6 +55,12 @@ import sys
 WORKFLOW = pathlib.Path(".github/workflows/skills.yml")
 SKILLS = pathlib.Path(".claude/skills")
 CITED = re.compile(r"`((?:net|go|web)/[A-Za-z0-9_/.-]+)`")
+STATUS_FN = re.compile(r"\b(always|success|failure|cancelled)\s*\(")
+
+
+def norm(expr):
+    """Collapse whitespace so a folded `if: >-` compares equal to an inline one."""
+    return " ".join(expr.split())
 
 
 def trigger_globs():
@@ -109,14 +130,16 @@ def tracked(path):
 
 
 def jobs_and_gating():
-    """(job name -> advisory?, set of names in publish.needs).
+    """(job name -> advisory?, set of names in publish.needs, job name -> `if:`).
 
     Job names are the only keys indented exactly two spaces under `jobs:`.
-    `needs:` is accepted in both flow (`[a, b]`) and block (`- a`) form.
+    `needs:` is accepted in both flow (`[a, b]`) and block (`- a`) form, and
+    `if:` in both inline and folded (`>-`) form.
     """
-    jobs, needs = {}, set()
+    jobs, needs, conds = {}, set(), {}
     in_jobs = current = None
     advisory_next = in_needs_block = False
+    in_if_block = False
 
     for line in WORKFLOW.read_text().splitlines():
         if re.match(r"^jobs:\s*$", line):
@@ -136,9 +159,28 @@ def jobs_and_gating():
         if job:
             current = job.group(1)
             jobs[current] = advisory_next
-            advisory_next = in_needs_block = False
+            advisory_next = in_needs_block = in_if_block = False
             continue
         advisory_next = False
+
+        # A folded `if: >-` continues until the next key at job-property depth.
+        if in_if_block:
+            if re.match(r"^    [A-Za-z_][\w-]*:", line):
+                in_if_block = False
+            else:
+                conds[current] = (conds.get(current, "") + " " + stripped).strip()
+                continue
+
+        if current:
+            folded = re.match(r"^    if:\s*[>|]-?\s*$", line)
+            inline = re.match(r"^    if:\s*(\S.*?)\s*$", line)
+            if folded:
+                conds[current] = ""
+                in_if_block = True
+                continue
+            if inline:
+                conds[current] = inline.group(1)
+                continue
 
         if current != "publish":
             in_needs_block = False
@@ -160,7 +202,7 @@ def jobs_and_gating():
             scalar = re.match(r"^\s+needs:\s*([A-Za-z_][\w-]*)\s*$", line)
             if scalar:
                 needs.add(scalar.group(1))
-    return jobs, needs
+    return jobs, needs, conds
 
 
 def main():
@@ -176,7 +218,7 @@ def main():
                 f"cited path is not covered by any trigger glob in skills.yml: {p}"
             )
 
-    jobs, needs = jobs_and_gating()
+    jobs, needs, conds = jobs_and_gating()
     if "publish" not in jobs:
         problems.append("skills.yml has no `publish` job — parser or workflow changed")
     else:
@@ -188,6 +230,35 @@ def main():
                     f"job `{name}` is not in publish.needs — a red run would still "
                     f"mirror to net-claude-skill. Add it, or mark it "
                     f"`# advisory: <reason>`."
+                )
+
+        publish_if = norm(conds.get("publish", ""))
+        if not publish_if:
+            problems.append(
+                "publish has no `if:` — it would mirror from every branch and "
+                "every pull request. Parser or workflow changed."
+            )
+        if STATUS_FN.search(publish_if):
+            problems.append(
+                "publish's `if:` uses a status-check function, which replaces the "
+                "implicit 'every dependency succeeded'. Every entry in "
+                "publish.needs becomes decoration and a red check can publish."
+            )
+
+        # A gate that runs on fewer events than publish does not let a bad
+        # publish through — GitHub skips a job whose dependency was skipped — but
+        # it does silently stop the mirror. A gate that runs on *more* events
+        # just wastes a runner. Both are drift between two conditions that have
+        # to agree, sitting 80 lines apart.
+        for name in sorted(needs):
+            cond = norm(conds.get(name, ""))
+            if cond and cond != publish_if:
+                problems.append(
+                    f"gating job `{name}` has an `if:` that differs from publish's. "
+                    f"They must match, or publish silently skips on events where "
+                    f"the gate does not run.\n"
+                    f"    {name}: {cond}\n"
+                    f"    publish: {publish_if}"
                 )
 
     for p in problems:

@@ -31,6 +31,7 @@ Load reference files on demand — do not read them all up front.
 | File | Read when |
 |---|---|
 | `concepts.md` | **Always first.** The mental model, the category line, the eight doctrines, the object model at a glance, the **data boundary** (what "commercial facts" may and may not carry — no PII, by construction), "no HTTP endpoint required," the review invariant. ~5 min. |
+| `bindings/coverage.md` | **Before promising payments works in a given language.** Payments is a three-binding subsystem: Rust, Node and Python only, and Node/Python reach it solely through the low-level package. Go and C have no payments API at all. |
 | `object-model.md` | When touching the five Net envelopes — exact fields, the canonical signing regime, versioning, idempotency, amounts. |
 | `x402.md` | When touching x402 structures — `X402Carry` byte-preservation, `PaymentRequirements`/`PaymentPayload`/settlement views, CAIP ids, the `exact` EVM scheme. |
 | `provider.md` | When the user **charges for a capability** — `PaymentEngine` lifecycle (quote → verify → settle → serve → bill), provider admission policy, pricing at publish, `serve_payments` over the mesh. |
@@ -43,7 +44,7 @@ Load reference files on demand — do not read them all up front.
 | `billing.md` | When the user wants **usage records / a billing stream** — `BillingLog` (subscribe/read/export), immutability, the lifecycle-hooks doctrine, what billing is NOT. |
 | `http402.md` | When a Net agent **pays an external x402 HTTP API** — the outbound `X402HttpFlow` + the Python / Node `PaymentHttpClient`, the header-only v2 transport, why it's the same objects (the two-way door). |
 | `failure-schematic.md` | When handling **denials / refusals** — the `net.payment.failure@1` object that rides beside the human error, the reason→recovery mapping, the header discipline, its **payment-only scope** (`code: "payment"`; non-payment admission failures don't ride it), and how each surface (MCP / Python `failure` field / tracing) projects it. |
-| `bindings.md` | When the language matters — the per-language table (**Rust, Python, AND Node** all have a full demand+supply flow; Go is verifier-only), the `CapabilityGateway` (demand) + `PaymentProvider`/`buildPricingTerms` (supply) + HTTP-402 + signer surfaces, and Node's `close()` / `permissiveChannels` gotchas. |
+| `bindings.md` | **First, when any code is going to be written.** The routing page: which companion to load, and the two facts that decide whether there is code to write at all — payments is Rust/Python/Node only, and in Node and Python it lives in the low-level package (`@net-mesh/core`, `net`), never the wrapper. Then load exactly one of `bindings/{rust,typescript,python,go,c}.md`. |
 | `testing.md` | When writing/running tests — cross-language golden vectors, the mock conformance suite, the key-invariant negative test, feature-gated suites, the env-gated live run. |
 | `gotchas.md` | When the user's framing carries a wrong mental model, when migrating, or before merging — the review invariant, "what not to build," the byte-preservation trap, common mistakes. |
 
@@ -83,13 +84,29 @@ carrying a mental model that produces compiling-but-rejected code.
 
 ## Workflow when integrating
 
-1. **Identify the language.** **Rust, Python, AND Node/TS** all have a full
-   native **demand + supply** flow — `CapabilityGateway` (pay to invoke),
-   `PaymentProvider` + `buildPricingTerms` (price + charge), the HTTP-402
-   client, eip155/svm/xrpl signers, approval verbs, and a free `publishTools`
-   path. **Go** has a golden-vector verifier but no flow; no native C payment
-   flow exists. Check `bindings.md` before promising a flow — especially Node's
-   `close()` / `permissiveChannels` requirements.
+1. **Select the binding, then load exactly one — and answer "is there a payments
+   API at all" before anything else.** Payments is a three-binding subsystem.
+   - **Read the language off the project**: `Cargo.toml` → Rust, `package.json`
+     → Node/TS, `pyproject.toml` or `requirements.txt` → Python, `go.mod` → Go,
+     `Makefile`/`CMakeLists.txt` beside `.c`/`.h` → C.
+   - **Rust, Python and Node/TS** have a full native demand + supply flow.
+     **Go and C have no payments API at all** — not partial, not reduced. Go has
+     a golden-vector conformance test and nothing else; C does not even have
+     that. If the task is "add x402 payments to our Go service", that is a
+     language choice or a feature request, not a coding task. Say so first.
+   - **Then read `bindings.md` (routing) and exactly one companion** —
+     `bindings/rust.md`, `bindings/typescript.md`, `bindings/python.md`,
+     `bindings/go.md`, `bindings/c.md`. `bindings/coverage.md` is the
+     per-operation matrix and the authoritative answer to "does this language
+     have X".
+   - **Payments is not in the ergonomic wrapper.** Neither `@net-mesh/sdk` nor
+     `net_sdk` contains a line of it. Every payments symbol in Node and Python
+     is in `@net-mesh/core` and `net` respectively, and there is no
+     `@net-mesh/payments` package. An import from the wrapper fails in a way
+     that looks like a missing feature.
+   - **Never default to Rust because the substrate is Rust. With no project
+     context and no language named, ask** — the answer decides whether there is
+     any code to write.
 2. **Read `concepts.md`** if this is your first invocation this session.
 3. **Which side is the user on?**
    - *Charging for a capability* (provider) → `provider.md`. Price at publish

@@ -342,12 +342,20 @@ with server_rpc.serve("echo_sum", echo_sum):
 
 **GIL note:** synchronous calls release the GIL across `runtime.block_on(...)` so other Python threads can run. Handler callbacks dispatch under `tokio::task::spawn_blocking` so GIL acquisition doesn't starve the runtime. The typed surface defaults to JSON; if you want zero-copy bytes, use `net.MeshRpc` directly (the raw layer the typed wrapper sits on).
 
-### Go (downstream — reference at `bindings/go/net/`)
+### Go
 
-The Go binding ships **downstream** (no Go module in the upstream net repo). The C-ABI cdylib `libnet_rpc` lives at `bindings/go/rpc-ffi/`; the reference cgo wrapper at `bindings/go/net/mesh_rpc.go` documents the consumer-side API:
+Two Go trees exist and they are not the same thing:
+
+- **The shipped module**, `github.com/ai-2070/net/go`, source at `go/`. This is
+  what `go get` gives you, and `go/mesh_rpc_typed.go` carries the typed surface.
+- **A reference implementation** at `net/crates/net/bindings/go/net/`, with no
+  `go.mod` — meant to be vendored or copied into your own module. It covers
+  some surfaces the shipped module does not.
+
+The C-ABI cdylib `libnet_rpc` is built from `net/crates/net/bindings/go/rpc-ffi/`.
 
 ```go
-import "ai2070.com/net"
+import "github.com/ai-2070/net/go"
 
 rpc, _ := net.NewMeshRpc(nodeArc)           // takes Arc<MeshNode> from compute-ffi
 defer rpc.Close()
@@ -382,11 +390,15 @@ for {
 }
 ```
 
-Pure-Go resilience helpers (`RetryPolicy` + `CallWithRetry`, `HedgePolicy` + `CallWithHedge`, `CircuitBreaker`) live in `bindings/go/net/resilience.go`. ABI version drift is detected via `net.ABIVersion()` vs `net.ExpectedABIVersion = 0x0001`.
+Pure-Go resilience helpers (`RetryPolicy` + `CallWithRetry`, `HedgePolicy` + `CallWithHedge`, `CircuitBreaker`) live in `net/crates/net/bindings/go/net/resilience.go` — the reference tree, **not** the shipped module, so `go get github.com/ai-2070/net/go` does not bring them. Vendor that file or write your own. ABI version drift is detected via `net.ABIVersion()` vs `net.ExpectedABIVersion`, currently `0x0004`.
 
-### C — not exposed in `net.h`
+### C — a separate header and a separate library
 
-The C SDK at `net.h` does **not** expose the nRPC surface. The C ABI lives in a separate cdylib (`libnet_rpc` from `bindings/go/rpc-ffi/`) primarily consumed by the Go binding but callable from any C-ABI consumer. There's no shipped `.h` today — the canonical signatures live in `bindings/go/net/mesh_rpc.go` (cgo include block, drop-in template) and `bindings/go/rpc-ffi/src/lib.rs`. See `net/crates/net/include/README.md` § nRPC for the entry-point listing + error codes.
+nRPC is **not** in `net.h`, and that is a header-layout fact rather than a gap: the C SDK is ten headers over six cdylibs. nRPC lives in its own pair.
+
+Include `net/crates/net/include/net_rpc.h` and link `libnet_rpc`, built with `cargo build --release -p net-rpc-ffi`. The header is the canonical drop-in for C, C++, Zig, Swift, JNI and anything else with a C ABI — it is not Go-specific, though the Go binding is its most-exercised consumer. It carries the full surface: `net_rpc_call` and the service/header/streaming/cancellable variants, `net_rpc_serve_streaming`, `net_rpc_find_service_nodes`, plus `net_rpc_abi_version()` / `net_rpc_check_abi_version()` for the version handshake.
+
+Call `net_rpc_check_abi_version(NET_RPC_ABI_VERSION)` at process init and refuse to continue on mismatch. See `net/crates/net/include/README.md` § nRPC for the entry-point listing and error codes.
 
 ---
 

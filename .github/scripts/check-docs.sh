@@ -29,7 +29,10 @@ DOCS="web/src/content/docs"
 EXCLUDE="/releases/"
 fail=0
 
-note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=1; }
+# A counter, not a flag — each section's success line compares `fail` against
+# `before`, and as a 0/1 flag the first failure made every later section print a
+# green tick it had not earned.
+note() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 
 docs_files() {
@@ -91,7 +94,7 @@ echo
 if [ "$fail" -eq 0 ]; then
   echo "Docs agree with the tree."
   echo "(Release notes excluded — they are dated records, not current claims.)"
-else
-  echo "Docs drifted from the tree — see above."
+  exit 0
 fi
-exit "$fail"
+echo "Docs drifted from the tree — $fail problem(s) above."
+exit 1
