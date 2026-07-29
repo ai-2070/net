@@ -632,7 +632,7 @@ is the §19 defect class this process has already caught once.
 | Items | Status | Head |
 |---|---|---|
 | **1–3** — non-aliasing installation identity | **SIGNED** 2026-07-28 | `OLB_2B3C_PRE_STEP1_SIGNED_HEAD = 300e80f6c` |
-| 4–9, 12–14 — scope stamp + Grant source service | **IMPLEMENTED + CORRECTED + WITNESSED — NOT INDEPENDENTLY REVIEWED — NOT SIGNED** | implemented `8189676a7`, corrected through `c7add787c`, witnessed at `bd225acdd` |
+| 4–9, 12–14 — scope stamp + Grant source service | **IMPLEMENTED + CORRECTED + WITNESSED — REVIEWED ONCE, HELD, REPAIRED — NOT SIGNED** | implemented `8189676a7`, corrected through `c7add787c`, witnessed at `bd225acdd`, held at `df32cbd7d` and repaired through `224c9ea48` |
 | 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | not started / not authorized | — |
 
 **Read the middle row precisely.** "Implemented" is an implementation-state
@@ -650,14 +650,14 @@ installation and the production read seam.
 
 | Witness | Property | Dies to | Commit |
 |---|---|---|---|
-| `a_same_id_grant_replacement_cannot_reauthorize_captured_facts` | W-G3 — a same-ID replacement cannot reauthorize captured facts | compare `grant_id` only | `bd225acdd` |
+| `a_same_id_grant_replacement_cannot_reauthorize_captured_facts` | W-G3 — a same-ID replacement cannot reauthorize captured facts | compare `grant_id` only; drop `install_seq` alone | `e534b7b01` |
 | `the_signed_grant_identity_is_part_of_scope_currentness` | W-G4 — the signed authority is a component in its own right | drop the signature from the comparison | `bd225acdd` |
 | `the_audience_handle_is_part_of_scope_currentness` | W-G5 — the handle is bound, single-key, at BOTH seams | drop the handle at capture, or at the read seam | `bd225acdd` |
 | `a_stale_audience_handle_is_unserved_beside_its_installed_sibling` | W-G5b — a sibling scope sharing a grant id cannot alias through the stamp map | key the stamp map by `grant_id` alone | `cbbd448b3` |
 | `a_grant_install_between_capture_and_commit_refuses_publication` | W-G6 — an install across capture→commit refuses publication | omit the identities from `SourceToken` | `bd225acdd` |
 | `a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_settlement` | W-G7 — removal cannot cross the validation→settlement seam | release the Grant gate before phase 5 | `89932538f` |
 | `unrelated_grant_movement_preserves_the_exact_slot` | W-G8 — unrelated movement preserves the EXACT artifact | a global "some Grant moved" bit | `bd225acdd` |
-| `an_installed_grants_expiry_colds_its_facts_with_zero_providers` | W-G13 — installed-Grant expiry, with ZERO providers | omit the installed-Grant deadline from the source | `bd225acdd` |
+| `an_installed_grants_expiry_colds_its_facts_with_zero_providers` | W-G13 — installed-Grant expiry, with ZERO providers, retired by the ACTOR's own arm | rows-only artifact deadline; omit the deadline at the source; delete the actor's arm | `224c9ea48` |
 
 Three of these are worth reading before the independent pass, because each
 records something the set would otherwise have missed:
@@ -677,11 +677,21 @@ records something the set would otherwise have missed:
   it", every other assertion in it is satisfied by a comparison that never
   fails.
 
+**Item 12 was under-delivered until `224c9ea48`.** `8189676a7` implemented the
+installed-Grant validity CHECK but not the DEADLINE, so with zero provider rows
+the deadline reached neither `SlotBaseFacts.earliest_expiry` nor
+`ScopedDiscoveryState::next_visible_expiry`, armed nothing, and woke nobody —
+retirement was reader-triggered. The source now carries `authority_deadline`,
+phase 5 folds it in with `min`, and the actor arms on the registry's earliest
+artifact deadline. Found by Kyra's independent review, not by the author.
+
 W-G5b and W-G7 were written because
 [`../misc/CODE_REVIEW_2026_07_29_OLB_2B3C_PRE.md`](../misc/CODE_REVIEW_2026_07_29_OLB_2B3C_PRE.md)
-found the corresponding defects. **Every RED above is the author's own.** They
-are corrective and design evidence; they are **not** an independent mutation
-run, and step 2 is not signed.
+found the corresponding defects. W-G3 and W-G13 were REPAIRED because Kyra's
+independent review found each asserting a property it did not exercise —
+the failure mode that reads as covered. **Every RED above is the author's own.**
+They are corrective and design evidence; they are **not** an independent
+mutation run, and step 2 is not signed.
 
 Items 10, 11, 15 and 16 remain unauthorized until step 2 is independently
 reviewed and signed. Item 15's normative

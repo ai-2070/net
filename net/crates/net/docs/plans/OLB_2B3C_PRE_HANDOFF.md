@@ -4,8 +4,9 @@
 signs** — a stale handoff in `docs/plans/` is exactly the drift this project has
 already been bitten by twice.
 
-Written at `8189676a7`; **updated at `bd225acdd`**, which closes step 2's
-witness debt. Branch `load-balancing-2`.
+Written at `8189676a7`; **updated at `224c9ea48`**, after Kyra's independent
+review of `df32cbd7d` returned HOLD on two findings (§2b). Branch
+`load-balancing-2`.
 
 ---
 
@@ -17,7 +18,7 @@ witness debt. Branch `load-balancing-2`.
 | OLB-2B.3a — per-slot `ArcSwap` publication cell | `fd05a89ba` | SIGNED (`OLB_2B3A_SIGNED_HEAD`) |
 | OLB-2B.3 boundary design (rev 5 + addenda) | `1c1b652e6` | SIGNED **as a design only** |
 | 2B.3c-pre **step 1** — installation identity (items 1–3) | `300e80f6c` | SIGNED |
-| 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `8189676a7` → `bd225acdd` | **IMPLEMENTED + CORRECTED + WITNESSED — NOT INDEPENDENTLY REVIEWED — NOT SIGNED.** Witness debt closed at `bd225acdd`; see §2a |
+| 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `8189676a7` → `224c9ea48` | **IMPLEMENTED + CORRECTED + WITNESSED — INDEPENDENTLY REVIEWED ONCE, HELD, REPAIRED — NOT SIGNED.** Kyra HOLD on `df32cbd7d`; both findings closed at `224c9ea48`; see §2b |
 | 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | — | not started / **not authorized** until step 2 signs |
 | `SAFE_LIVE_HEAD` | — | **not established**, still reserved for provider-free leader lighting |
 
@@ -29,14 +30,15 @@ proof, the exclusions, and the closure gate. §2A is the substrate spec.
 
 ## 2. Do this first
 
-**The witness debt is closed. The next authorized work is Kyra's independent
-review of step 2 — not more implementation.**
+**The next authorized work is Kyra's re-run of the independent mutation matrix
+against `224c9ea48` — not more implementation.**
 
-The Grant-currentness set (design §12) is complete and mutation-proven at
-`bd225acdd`. §2a records what was found and what each witness kills. Every RED
-in this branch is the AUTHOR's; none of it substitutes for the independent
-mutation run, and step 3 (items 10, 11, 15, 16) stays unauthorized until step 2
-is signed.
+The first independent review (of `df32cbd7d`) returned **HOLD** on two findings,
+both now closed: W-G3 did not prove what it claimed, and W-G13's actor-armed
+deadline did not exist. §2b records both. §2a records the earlier author review.
+
+Every RED in this branch is still the AUTHOR's. Step 3 (items 10, 11, 15, 16)
+stays unauthorized until step 2 signs.
 
 | # | Witness | Dies to |
 |---|---|---|
@@ -49,7 +51,7 @@ is signed.
 | W-G8 | `unrelated_grant_movement_preserves_the_exact_slot` | a global "some Grant moved" bit |
 | W-G13 | `an_installed_grants_expiry_colds_its_facts_with_zero_providers` | omit the installed-Grant deadline from the source |
 
-Three notes for whoever re-runs these mutations independently:
+Four notes for whoever re-runs these mutations independently:
 
 - **W-G4 is a direct comparison witness**, and is labelled so in-tree. Equal
   `install_seq` with a different signature is not production-reachable —
@@ -63,6 +65,44 @@ Three notes for whoever re-runs these mutations independently:
   it, every other assertion in W-G8 is satisfied by a comparison that never
   fails. Note also that W-G8 correctly SURVIVES the W-G3 mutation, because
   presence-by-id is still checked there; it needs its own.
+- **W-G13 runs a read-seam probe on a SECOND slot**, because
+  `org_routing_base_facts_at` invalidates what it refuses. Probing the actor's
+  own slot makes a reader the thing that retired the artifact, and the
+  actor-arm assertions then pass with the actor arm deleted entirely. That was
+  found by running the mutation, not by reading the test.
+
+## 2b. Kyra's independent review of `df32cbd7d` — HOLD, and what closed it
+
+Two blockers. Both were places where a witness asserted a property it did not
+exercise, which is worse than an absent witness: it reads as covered.
+
+**Finding 1 — W-G3 did not prove installation identity.** Case 1 claimed to
+reinstall the byte-identical grant, but called `mint(.., Some(grant_id), ..)`,
+whose explicit-id branch mints a fresh audience secret and nonce. So the
+"reinstalled" grant had a different signature and handle — and the test asserted
+exactly that, four lines below the claim. Case 1 was therefore a second copy of
+case 2, and the stale artifact was retired by the signature and handle checks
+with the installation-identity comparison never exercised. Kyra's inverse
+mutation (remove `record.install_seq() == *install_seq`, preserve everything
+else) left the ENTIRE 54-witness gate green.
+
+Repaired at `e534b7b01`: case 1 retains the exact grant and a byte-identical
+copy of its secret, and asserts what is held EQUAL as hard as what differs.
+Under the same mutation it is now the only witness in the set that fails.
+
+**Finding 2 — W-G13 did not prove actor-armed expiry.** The witness proved
+future-clock capture and read behaviour only. The production trace confirmed the
+gap: the installed Grant's deadline reached neither `SlotBaseFacts.earliest_expiry`
+(rows only, `u64::MAX` with zero providers) nor
+`ScopedDiscoveryState::next_visible_expiry` (not a scoped row), so it armed
+nothing and woke nobody. Retirement was reader-triggered.
+
+That was an **implementation** gap, not just witness debt — scope item 12 was
+under-delivered. Closed at `224c9ea48`: `authority_deadline` in the source,
+`min` into `earliest_expiry`, and a deadline arm in the actor's park. W-G13 now
+drives a live supervisor end to end.
+
+---
 
 ## 2a. What review 2026-07-29 found, and what closed it
 
@@ -123,7 +163,9 @@ net/crates/net/src/adapter/net/
                                         and HOLDS the Grant gate until settlement
     MeshNode::scope_authority_is_current  read-seam revalidation (the security half)
     MeshNode::org_routing_base_facts    the 9-check read contract
-    MeshNode::org_routing_base_facts_at   the same, at an explicit clock (W-G13)
+    MeshNode::org_routing_base_facts_at   the same, at an explicit clock. NOTE:
+                                        it INVALIDATES what it refuses, so a
+                                        witness probing with it retires the slot
     ConsumerGrantGate                   the SHARED consumer-Grant writer gate;
                                         the commit pin holds it (review 07-29 §1)
     MeshNode::install_consumer_grant_audience_leased
@@ -135,7 +177,16 @@ net/crates/net/src/adapter/net/
   behavior/org_routing_registry.rs
     ScopedDiscoveryAuthorityStamp       Owner | Grant{id, install_seq, signature, handle}
     ScopedSourceFacts                   facts + the authority that produced them
+                                        + that authority's OWN deadline (item 12)
+    next_artifact_deadline              earliest deadline any retained artifact
+                                        carries; what the actor arms to
+    retire_expired                      retire + REQUEUE at the deadline
     SlotBaseFacts.authority             per-key stamp, NEVER the batch vector
+  behavior/org_routing.rs
+    DirtyApply::next_deadline           the arm, defaulted to None
+    DirtyApply::retire_expired          the fire, defaulted to a no-op
+    run_incarnation                     recomputes the arm at EVERY park, so it
+                                        is always current with the last install
   behavior/org_scoped_store.rs
     find_grant_exact_private_providers  capability-narrowed via declarations index
   behavior/org_grant_registry.rs
