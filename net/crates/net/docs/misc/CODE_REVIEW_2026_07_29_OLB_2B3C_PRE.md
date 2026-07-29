@@ -1,9 +1,16 @@
 # CODE REVIEW 2026-07-29 — OLB-2B.3a / 2B.3c-pre / OLB-2C (`load-balancing-2`)
 
-> **STATUS: OPEN.** Two findings are structural (§1, §2) and both sit inside the
-> region [`OLB_2B3C_PRE_HANDOFF.md`](../plans/OLB_2B3C_PRE_HANDOFF.md) itself
-> marks **"CODE ONLY — NO WITNESSES"**. Neither is caught by the witness set that
-> handoff owes, as those witnesses are specified there. This is not a sign-off.
+> **STATUS: ALL FINDINGS ADDRESSED at `ac5111a14` (2026-07-29).** Every finding
+> below has a landed fix; the two structural ones (§1, §2) have RED-verified
+> witnesses. See [Closure](#closure) for the finding-to-commit map.
+>
+> **This is NOT a sign-off, and it does not discharge the handoff's witness
+> debt.** §1 and §2 were the two defects this pass found in the region
+> [`OLB_2B3C_PRE_HANDOFF.md`](../plans/OLB_2B3C_PRE_HANDOFF.md) marks **"CODE
+> ONLY — NO WITNESSES"**; W-G3, W-G4, W-G6, W-G8 and W-G13 are still owed, and
+> nothing here stands in for them. Neither fix is self-certifiable by its author:
+> both were "the guarantee is not where it looks like it is" defects, and the
+> RED runs recorded below are the author's own.
 
 **Scope:** the full branch diff `master..6eec8d34d` (merge base `80bb06b5a`),
 tree clean. 12 files, +3014/−183.
@@ -51,6 +58,7 @@ with no witnesses at all.
 4. [§4 — Smaller notes](#4--smaller-notes)
 5. [§5 — What holds up](#5--what-holds-up)
 6. [Disposition](#disposition)
+7. [Closure](#closure)
 
 ---
 
@@ -400,3 +408,75 @@ Neither §1 nor §2 is self-certifiable by the author of the fix: both are
 "the guarantee is not where it looks like it is" defects, and both need the
 mutation-first discipline (write the witness, watch it fail, then fix) rather
 than a fix followed by a confirming test.
+
+---
+
+## Closure
+
+Every finding above has a landed fix. Branch head at closure: `ac5111a14`.
+
+| § | Finding | Commit | Witness |
+|---|---|---|---|
+| 1 | Commit pin did not cover consumer-Grant movement | `89932538f` | `a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_settlement` — **W-G7** |
+| 2 | Grant stamp map keyed by `grant_id` alone | `cbbd448b3` | `a_stale_audience_handle_is_unserved_beside_its_installed_sibling` — **W-G5b** |
+| 3 | Redundant `pin_keys` clone | `89932538f` | covered by the existing apply-path witnesses |
+| 4a | Unreachable `Stamped` arm in `PreparedSlot` | `7e4f2e868` | behaviour unchanged; W-G9 / W-G10 / W-G10b stand |
+| 4b | `Relaxed`/`Acquire` counter pairing; half-mutated `demand` refusal | `ac5111a14` | shape fixes, no behaviour change |
+| 4c | Grant-install wake edge | — | out of scope; handoff step 3, items 10/11 |
+
+### RED evidence
+
+Both structural fixes were verified by mutation before being kept. Neither
+witness passes against the defect it names.
+
+**§1 / W-G7** — mutation: drop the gate guard from `ScopedCommitPin` (field to
+`Option`, store `None`).
+
+```
+the remover's try_lock must FAIL, proving the commit pin holds the
+consumer-Grant gate; no signal means Grant movement is free to land between
+the validation and the settlement: Timeout
+test result: FAILED. 0 passed; 1 failed
+```
+
+It fails at its WAIT, not at a later assertion — which is the intended shape:
+with the gate gone the remover's `try_lock` succeeds, so no contention
+acknowledgement is ever sent. Restored: passes.
+
+**§2 / W-G5b** — mutation: collapse `audience_handle` back out of the stamp key,
+in the dedup, the insert and the Grant-arm lookup.
+
+```
+a scope whose audience handle is not the installed one has NO evidence —
+serving it here hands the caller rows the installed handle authorizes under
+a scope the node has rotated away from
+test result: FAILED. 0 passed; 1 failed
+```
+
+Restored: passes, under both key orderings.
+
+### Test evidence at closure
+
+```
+cargo test --lib --features "$UNIT_FEATURES"          -> 5454 passed; 0 failed; 1 ignored
+cargo test --lib ... org_routing_wiring_tests          -> 48 passed; 0 failed
+```
+
+The wiring gate's `MIN` moves 46 → 48 in `.github/workflows/ci.yml`, and both
+new witness names are pinned in `REQUIRED` — they carry security properties
+outright, so cardinality alone must not be what protects them.
+
+One unrelated flake was observed once and did not reproduce across two
+subsequent full runs: `org_authority::tests::a_deny_ace_does_not_make_an_owner_only_dir_invalid`,
+a Windows ACL test that shells out to `icacls` against a PID-scoped temp
+directory. It touches nothing in this branch's diff. Recorded rather than
+chased, and NOT claimed as diagnosed.
+
+### What is still owed
+
+Unchanged by this closure. Step 2 remains witness-debt-bearing: **W-G3, W-G4,
+W-G6, W-G8 and W-G13** are still owed per handoff §2. W-G5 as originally
+specified is now redundant with W-G5b's first assertion, but W-G5b was written
+for the two-key case and does not exercise the single-key one under a
+"drop the handle from the stamp" mutation — write W-G5 anyway rather than
+crossing it off.

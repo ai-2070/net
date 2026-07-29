@@ -4135,7 +4135,10 @@ async fn a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_s
                  withdrawn by the time the facts stamped with it are installed"
             );
             assert!(
-                node.consumer_grant_audiences.load().get(&grant_id).is_some(),
+                node.consumer_grant_audiences
+                    .load()
+                    .get(&grant_id)
+                    .is_some(),
                 "and the snapshot the settlement stamps against must still name \
                  the installation the pin validated"
             );
@@ -4181,7 +4184,10 @@ async fn a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_s
         handle.join().expect("remover thread");
     }
     assert!(
-        node.consumer_grant_audiences.load().get(&grant_id).is_none(),
+        node.consumer_grant_audiences
+            .load()
+            .get(&grant_id)
+            .is_none(),
         "the removal must actually have removed the grant"
     );
     drop(held);
