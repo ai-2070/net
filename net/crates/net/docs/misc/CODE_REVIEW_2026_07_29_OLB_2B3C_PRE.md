@@ -42,11 +42,16 @@ cargo test --lib --features "$UNIT_FEATURES" oa34b2_query_currentness_tests
   -> test result: ok. 5 passed; 0 failed
 ```
 
-46 matches the new CI floor `MIN=46` in `.github/workflows/ci.yml` exactly
-(41 + the five witnesses this branch adds), and all three newly pinned witness
-names are present and passing. **This is evidence for the pre-existing witnesses
-and for step 1 / OLB-2C / 2B.3a — it is not evidence for step 2**, which ships
-with no witnesses at all.
+46 matched the CI floor `MIN=46` as it stood at `6eec8d34d` (41 + the five
+witnesses that head adds), and all three newly pinned witness names were present
+and passing. **This is evidence for the pre-existing witnesses and for step 1 /
+OLB-2C / 2B.3a — it is not evidence for step 2**, which ships with no witnesses
+at all.
+
+> **These numbers are HISTORICAL — do not execute them as a gate.** They record
+> the reviewed head. The current floor and counts are in
+> [Closure](#closure); `docs/plans/OLB_2B3C_PRE_HANDOFF.md` §5 carries the
+> runnable commands.
 
 ---
 

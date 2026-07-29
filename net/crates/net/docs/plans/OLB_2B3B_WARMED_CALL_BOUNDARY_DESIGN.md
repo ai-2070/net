@@ -632,8 +632,38 @@ is the §19 defect class this process has already caught once.
 | Items | Status | Head |
 |---|---|---|
 | **1–3** — non-aliasing installation identity | **SIGNED** 2026-07-28 | `OLB_2B3C_PRE_STEP1_SIGNED_HEAD = 300e80f6c` |
-| 4–9, 12–14 — scope stamp + Grant source service | not started | — |
-| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | not started | — |
+| 4–9, 12–14 — scope stamp + Grant source service | **IMPLEMENTED + CORRECTED — PARTIALLY WITNESSED — NOT SIGNED** | implemented `8189676a7`, corrected through `c7add787c` |
+| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | not started / not authorized | — |
+
+**Read the middle row precisely.** "Implemented" is an implementation-state
+description and nothing more. It is NOT a signature, NOT an independent review,
+and NOT a claim that the behaviour is evidenced. The row said "not started"
+until 2026-07-29, which was accurate about the signature and inaccurate about
+the code — the exact plan/code disagreement §19 exists to catch, in the
+direction that understates rather than overstates, which is the safer error but
+still an error (Kyra, 2026-07-29).
+
+What "partially witnessed" covers, and only this:
+
+| Witness | Property | Commit |
+|---|---|---|
+| `a_stale_audience_handle_is_unserved_beside_its_installed_sibling` | W-G5b — a sibling scope sharing a grant id cannot alias through the stamp map | `cbbd448b3` |
+| `a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_settlement` | W-G7 — removal cannot cross the validation→settlement seam | `89932538f` |
+
+Both were written because
+[`../misc/CODE_REVIEW_2026_07_29_OLB_2B3C_PRE.md`](../misc/CODE_REVIEW_2026_07_29_OLB_2B3C_PRE.md)
+found the corresponding defects; both have author REDs, which are corrective
+evidence and **not** an independent mutation run.
+
+**Still owed before step 2 may be reviewed for signature:** W-G3, W-G4, W-G5,
+W-G6, W-G8, W-G13. W-G5 is not discharged by W-G5b — the two kill different
+mutations (single-key handle removal from the stamp/currentness comparison
+versus sibling aliasing through a `grant_id`-keyed map).
+
+Items 10, 11, 15 and 16 remain unauthorized until step 2 is independently
+reviewed and signed. Item 15's normative
+`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md` correction stays deferred with them,
+and is a separate question from this progress bookkeeping.
 
 Step 1's corrective lineage, kept because each turn found a distinct defect class
 and the sequence is the useful record:

@@ -170,8 +170,8 @@ cd net/crates/net
 export UNIT_FEATURES="net redex redex-disk cortex netdb meshdb meshos dataforts \
 nat-traversal port-mapping tool batched-ingress cli regex"
 
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,452 expected
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 46, MIN 46
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,454 expected
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 48, MIN 48
 CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" behavior::org_routing::     # 24, MIN 24
 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo clippy --all-features --all-targets -- -D warnings \
