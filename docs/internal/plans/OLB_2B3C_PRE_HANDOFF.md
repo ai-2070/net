@@ -242,7 +242,7 @@ cd net/crates/net
 export UNIT_FEATURES="net redex redex-disk cortex netdb meshdb meshos dataforts \
 nat-traversal port-mapping tool batched-ingress cli regex"
 
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,460 expected
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,469 expected
 CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 54, MIN 54
 CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" behavior::org_routing::     # 24, MIN 24
 cargo fmt --all -- --check
@@ -256,9 +256,12 @@ git diff --check
   workspace once (disk-full → zero-byte rlibs → rustc ICEs).
 - Adding a wiring witness means raising `MIN` in `.github/workflows/ci.yml` in
   the **same commit**, and name-pinning anything carrying a security property.
-- Known flake, unrelated: `org_authority::tests::a_deny_ace_does_not_make_an_
-  owner_only_dir_invalid` shells out to `icacls` and fails under parallel load.
-  Passes in isolation.
+- `org_authority::tests::a_deny_ace_does_not_make_an_owner_only_dir_invalid`
+  failed once on 2026-07-29 and **did not reproduce under a controlled run**:
+  10 isolated repeats plus 5 full-suite repeats under parallel load, all clean.
+  It shells out to `icacls` against a PID-scoped temp dir. Kept recorded rather
+  than dismissed — a once-seen failure with no reproduction is still a data
+  point — but no action is warranted on the evidence available.
 
 ---
 

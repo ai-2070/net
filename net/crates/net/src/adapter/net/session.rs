@@ -1757,22 +1757,40 @@ mod heartbeat_api_drift_check {
     //! way to build a heartbeat for a manually-constructed
     //! peer session.
 
-    fn production_prefix(src: &str) -> &str {
-        // Top-level test modules are tagged with a column-0
-        // `#[cfg(test)]` immediately followed by `mod`. Find the
-        // first such marker and treat everything before it as
-        // production code. Nested `#[cfg(test)]` mods (indented
-        // inside an `impl` or inline `mod` block) are NOT cut
-        // here, so production code in those files that follows
-        // a nested test mod is still checked. False positives
-        // from nested-test-mod content are unlikely because none
-        // of the nested test mods in this codebase reference
-        // `build_heartbeat`.
-        let needle = "\n#[cfg(test)]\nmod ";
-        match src.find(needle) {
-            Some(idx) => &src[..idx],
-            None => src,
+    /// Everything before the first column-0 `#[cfg(test)] mod`.
+    ///
+    /// Top-level test modules are tagged with a column-0 `#[cfg(test)]`
+    /// immediately followed by `mod`. Nested `#[cfg(test)]` mods (indented
+    /// inside an `impl` or inline `mod` block) are deliberately NOT cut here, so
+    /// production code following a nested test mod is still checked. False
+    /// positives from nested-test-mod content are unlikely because none of the
+    /// nested test mods in this codebase reference `build_heartbeat`.
+    ///
+    /// **Scanned line by line, not by substring.** This used to search for the
+    /// literal `"\n#[cfg(test)]\nmod "`, which silently fails on CRLF: the
+    /// needle never matches, the whole file is treated as production, and the
+    /// allowlist assertion then reports every TEST caller as a drifted
+    /// production one. That is a confusing failure a long way from its cause —
+    /// it cost a real debugging detour during OLB-2B.3c-pre, where an editor
+    /// rewrote `mesh.rs` with CRLF and this guard blamed eight test call sites.
+    /// `str::lines` strips a trailing `\r`, so a line-based scan cannot regress
+    /// that way. Witnessed by `production_prefix_is_line_ending_agnostic`.
+    fn production_prefix(src: &str) -> String {
+        let mut prefix = String::with_capacity(src.len());
+        let mut lines = src.lines().peekable();
+        while let Some(line) = lines.next() {
+            // Column 0 for BOTH lines, matching the original substring form:
+            // `line == "#[cfg(test)]"` rejects an indented attribute, and
+            // `starts_with("mod ")` rejects an indented or re-exported module.
+            let opens_test_mod =
+                line == "#[cfg(test)]" && lines.peek().is_some_and(|next| next.starts_with("mod "));
+            if opens_test_mod {
+                break;
+            }
+            prefix.push_str(line);
+            prefix.push('\n');
         }
+        prefix
     }
 
     fn count_build_heartbeat_callers(src: &str) -> Vec<String> {
@@ -1789,10 +1807,86 @@ mod heartbeat_api_drift_check {
             .collect()
     }
 
+    /// The prefix scan must not care about line endings.
+    ///
+    /// This is the regression that actually happened. `production_prefix`
+    /// searched for the literal `"\n#[cfg(test)]\nmod "`; an editor rewrote
+    /// `mesh.rs` with CRLF during OLB-2B.3c-pre, the needle stopped matching,
+    /// the whole file was treated as production, and this guard reported eight
+    /// TEST call sites as drifted production callers. The real change was a
+    /// line ending, and the failure pointed at `build_heartbeat`.
+    ///
+    /// A guard whose false-positive mode is that confusing has to prove it
+    /// cannot do that again. Both fixtures below carry the SAME code, so both
+    /// must yield the same single production caller.
+    #[test]
+    fn production_prefix_is_line_ending_agnostic() {
+        const SRC: &str = "\
+fn production() {
+    let a = session.build_heartbeat();
+}
+
+#[cfg(test)]
+mod tests {
+    fn t() {
+        let b = builder.build_heartbeat();
+    }
+}
+";
+        let lf = production_prefix(SRC);
+        let crlf = production_prefix(&SRC.replace('\n', "\r\n"));
+
+        let expected = vec!["let a = session.build_heartbeat();".to_string()];
+        assert_eq!(
+            count_build_heartbeat_callers(&lf),
+            expected,
+            "LF: the test-module caller must be cut"
+        );
+        assert_eq!(
+            count_build_heartbeat_callers(&crlf),
+            expected,
+            "CRLF: the same source with CRLF endings must cut the same test \
+             module. Leaking `builder.build_heartbeat()` here means the prefix \
+             scan is substring-based again, and the allowlist assertion will \
+             blame test call sites for a line-ending change"
+        );
+    }
+
+    /// The cut is column-0-only, in both endings.
+    ///
+    /// Pinned because the line-based rewrite could easily have loosened it: a
+    /// `trim()` on either line would start cutting at NESTED `#[cfg(test)] mod`
+    /// blocks, silently shrinking the production surface this guard inspects.
+    /// That failure is invisible — the assertion just stops seeing callers.
+    #[test]
+    fn production_prefix_cuts_only_column_zero_test_mods() {
+        const SRC: &str = "\
+impl Thing {
+    #[cfg(test)]
+    mod nested {
+        fn t() {}
+    }
+}
+
+fn still_production() {
+    let a = session.build_heartbeat();
+}
+";
+        for (label, src) in [("LF", SRC.to_string()), ("CRLF", SRC.replace('\n', "\r\n"))] {
+            let prod = production_prefix(&src);
+            assert_eq!(
+                count_build_heartbeat_callers(&prod),
+                vec!["let a = session.build_heartbeat();".to_string()],
+                "{label}: an INDENTED `#[cfg(test)] mod` must not cut the scan — \
+                 production code after a nested test mod is still checked"
+            );
+        }
+    }
+
     #[test]
     fn mod_rs_production_callers_match_allowlist() {
         let prod = production_prefix(include_str!("mod.rs"));
-        let callers = count_build_heartbeat_callers(prod);
+        let callers = count_build_heartbeat_callers(&prod);
         // The only approved production caller in mod.rs:
         //   `let packet = session.build_heartbeat();`
         // inside `spawn_heartbeat`. Pre-fix this read
@@ -1812,7 +1906,7 @@ mod heartbeat_api_drift_check {
     #[test]
     fn mesh_rs_production_callers_match_allowlist() {
         let prod = production_prefix(include_str!("mesh.rs"));
-        let callers = count_build_heartbeat_callers(prod);
+        let callers = count_build_heartbeat_callers(&prod);
         let approved = ["let packet = session.build_heartbeat();"];
         assert_eq!(
             callers,
