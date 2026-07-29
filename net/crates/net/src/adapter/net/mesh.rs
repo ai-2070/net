@@ -5443,6 +5443,15 @@ struct ScopedSlotSource {
         Arc<parking_lot::Mutex<super::behavior::org_scoped_store::ScopedDiscoveryState>>,
     publication: Arc<ScopedMutationPublication>,
     org_revocation: Arc<ArcSwapOption<super::behavior::org_revocation::OrgRevocationStore>>,
+    /// The installed consumer Grants. Grant-scoped rows are query-visible only
+    /// while an exact one is installed, so this is AUTHORITY for that plane, not
+    /// a decryption convenience (OLB-2B.3c-pre).
+    consumer_grants:
+        Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
+    /// The WRITER gate for the slot above, shared with the node that mutates it
+    /// (review 2026-07-29 §1). The commit pin holds it, so a Grant install or
+    /// removal cannot land between the pin's validation and the settlement.
+    consumer_grant_gate: Arc<ConsumerGrantGate>,
     authority: Arc<RoutingAuthority>,
     /// Test-only: fires INSIDE `settle_if_current`, after the validation has
     /// succeeded and before the settlement — the exact gap a publication must not
@@ -5454,15 +5463,123 @@ struct ScopedSlotSource {
     unserved_scope: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// One batch's Grant authority stamps, keyed by the WHOLE scope —
+/// `(grant_id, audience_handle)`, never `grant_id` alone (review 2026-07-29 §2).
+///
+/// The pair key is the type-level statement of that fix: two live scopes can
+/// share a grant id across an audience-secret rotation, and they are different
+/// slots. Narrowing this alias back to `[u8; 32]` reintroduces the aliasing
+/// `a_stale_audience_handle_is_unserved_beside_its_installed_sibling` exists to
+/// refuse.
+type GrantStampsByScope = std::collections::BTreeMap<([u8; 32], [u8; 32]), GrantAuthority>;
+
+/// One scope's installed-Grant authority: the exact identity it is compared
+/// against, AND the instant that identity stops authorizing anything.
+///
+/// The two travel together because they come from the same record and must
+/// never be read from different ones. The deadline is scope item 12 — without
+/// it, an artifact's `earliest_expiry` is derived from provider rows alone, and
+/// with ZERO providers that is `u64::MAX`: the authority expires and nothing in
+/// the artifact can say so.
+#[derive(Clone, Copy, Debug)]
+struct GrantAuthority {
+    stamp: super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
+    /// `not_after + MAX_TOKEN_CLOCK_SKEW_SECS` — the FIRST instant the grant is
+    /// no longer valid, matching both `check_time_bounds_at`'s
+    /// `now >= not_after + skew ⇒ expired` and the read seam's
+    /// `now >= earliest_expiry ⇒ cold`.
+    deadline: u64,
+}
+
+/// The ONE writer gate for the installed consumer-Grant snapshot.
+///
+/// Shared between [`MeshNode`] — which serializes every install and removal
+/// behind it — and [`ScopedSlotSource`], whose commit pin holds it across the
+/// installation beneath the pin (review 2026-07-29 §1).
+///
+/// Before this it was a bare `Mutex<()>` owned by the node. The routing gates
+/// exclude scoped mutation and node-mediated authority movement, and
+/// `ScopedCommitPin::settle_if_current` re-verifies the revocation store — but
+/// nothing covered consumer Grants, so a removal landing between
+/// `pin_if_current` and the phase-5 install settled `Current` over an
+/// installation that was already withdrawn. The read seam refused the resulting
+/// artifact, so it never served withdrawn authority; what it did was assert
+/// currentness that was not true, which is the defect class E3c closed for
+/// floor publications.
+///
+/// A LEAF lock: every writer takes this and nothing else, and readers use
+/// `ArcSwap::load` rather than the gate. So the pin may take it innermost —
+/// after the authority and publication gates, above the registry lock — without
+/// creating an inversion.
+struct ConsumerGrantGate {
+    mu: parking_lot::Mutex<()>,
+    /// Test-only: fired ONLY when a `try_lock` has actually FAILED, immediately
+    /// before blocking on `lock()`.
+    ///
+    /// Named `contended`, not `blocking`, for the reason the poison gate and the
+    /// revocation store's publication hook already carry: this is EVIDENCE, and
+    /// it is only evidence because the acquisition provably lost. A hook fired
+    /// before the attempt proves nothing — the acquisition may simply succeed,
+    /// and an observer sequenced after it would be asserting against a writer
+    /// that already ran (Kyra, independent E3c RED pass 2026-07-27).
+    #[cfg(test)]
+    contended_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl ConsumerGrantGate {
+    fn new() -> Self {
+        Self {
+            mu: parking_lot::Mutex::new(()),
+            #[cfg(test)]
+            contended_hook: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Take the gate, acknowledging PROVEN contention on the way.
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        #[cfg(test)]
+        {
+            // Uncontended. Deliberately silent: acknowledging here would make the
+            // signal mean "a writer was scheduled" rather than "a writer is
+            // provably blocked", which is not evidence of a barrier.
+            if let Some(guard) = self.mu.try_lock() {
+                return guard;
+            }
+            let hook = self.contended_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        self.mu.lock()
+    }
+
+    /// Test-only: arm the CONTENDED acknowledgment, so a witness can prove a
+    /// Grant writer reached a HELD gate rather than that it was merely spawned.
+    #[cfg(test)]
+    fn arm_contended_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.contended_hook.lock() = Some(hook);
+    }
+}
+
 /// Owned, bounded material for ONE quantum: the exact rows for the exact keys the
 /// registry selected, captured at `generation`.
 struct ScopedSourceSnapshot {
     token: super::behavior::org_routing_registry::SourceToken,
     /// ONLY the keys this source can actually speak for. A key absent here
     /// reconstructs as `SourceFacts::Unserved`, never as an empty provider set.
+    ///
+    /// Each entry carries the EXACT scope authority its rows were captured
+    /// under, so the per-key stamp cannot drift from the rows it authorizes
+    /// (OLB-2B.3c-pre).
     rows: std::collections::BTreeMap<
         super::behavior::org_routing_registry::SlotKey,
-        Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider>,
+        (
+            Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider>,
+            super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
+            // The authority's OWN deadline, captured with the rows it
+            // authorizes (scope item 12).
+            u64,
+        ),
     >,
 }
 
@@ -5501,7 +5618,32 @@ fn move_routing_authority<R>(
         // the epoch moves (Kyra OLB-2B-E3c).
         let advance = authority.advance();
         let live = authority.epoch();
+        // Test-only, under the gate, AFTER the advance and BEFORE the
+        // publication: nothing this transaction publishes may be visible yet.
+        // The post-publication hook proves "not too late"; only this one proves
+        // "not too early", which is the half the epoch-first ordering exists for.
+        #[cfg(test)]
+        {
+            let hook = authority.pre_publish_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(live);
+            }
+        }
         let result = publish();
+        // Test-only, fired STILL UNDER THE GATE and after the whole publication:
+        // the one instant at which "everything this epoch names is visible" must
+        // already be true. An observer here that can still see a stale half has
+        // found a publication outside the epoch's synchronization — which is
+        // precisely how the node-authority swap escaped before OLB-2C, and it is
+        // not observable from outside the gate because the window closes a few
+        // instructions later.
+        #[cfg(test)]
+        {
+            let hook = authority.post_publish_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(live);
+            }
+        }
         (result, live, advance)
     };
     // Outside the gate: the registry takes its own lock, and the frozen order is
@@ -5584,7 +5726,33 @@ struct RoutingAuthority {
     /// witnesses wait on instead of inferring from elapsed time.
     #[cfg(test)]
     contention_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: fired inside [`move_routing_authority`] with the gate still
+    /// HELD, immediately after the publication closure returns. Receives the
+    /// epoch the publication was made under (OLB-2C).
+    ///
+    /// This alone witnesses only "not published too LATE". Its sibling below is
+    /// the other direction, and both are needed.
+    #[cfg(test)]
+    post_publish_hook: parking_lot::Mutex<Option<PublishPhaseHook>>,
+    /// Test-only: fired inside [`move_routing_authority`] with the gate HELD,
+    /// after the epoch advance and BEFORE the publication closure runs.
+    ///
+    /// The epoch-first discipline has two halves, and `post_publish_hook` proves
+    /// only one of them. Publishing EARLY — before the advance — is the hazard
+    /// `move_routing_authority`'s own doc comment describes: a reader observes
+    /// the new object under the OLD epoch identity and serves it as
+    /// old-authoritative. At this instant nothing the transaction publishes may
+    /// be visible yet, so a witness that samples here catches exactly that
+    /// (found by an adversarial re-read of the OLB-2C witnesses, 2026-07-27:
+    /// all four passed under a publish-before-advance mutation).
+    #[cfg(test)]
+    pre_publish_hook: parking_lot::Mutex<Option<PublishPhaseHook>>,
 }
+
+/// Test-only observer of one phase of an authority publication, still under the
+/// gate. Receives the epoch the transaction advanced to.
+#[cfg(test)]
+type PublishPhaseHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 impl RoutingAuthority {
     fn new() -> Self {
@@ -5594,6 +5762,10 @@ impl RoutingAuthority {
             exhausted: AtomicBool::new(false),
             #[cfg(test)]
             contention_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            post_publish_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            pre_publish_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -5720,14 +5892,115 @@ impl ScopedSlotSource {
         &self,
         epoch: super::behavior::org_routing_registry::SourceEpoch,
         exhausted: bool,
+        grant_identities: &[u64],
     ) -> super::behavior::org_routing_registry::SourceToken {
-        super::behavior::org_routing_registry::SourceToken::new(vec![
+        let mut words = vec![
             epoch.generation,
             epoch.authority,
             epoch.floor_generation,
             u64::from(epoch.poisoned),
             u64::from(exhausted),
-        ])
+        ];
+        // The DETERMINISTIC vector of exact selected Grant installation
+        // identities, not one global "some Grant moved" bit (OLB-2B.3c-pre).
+        // A global bit would make unrelated Grant movement defeat every commit
+        // pin in flight; the vector moves only when a grant THIS batch selected
+        // moves. Length is included so a batch selecting a strict prefix cannot
+        // compare equal to one selecting more.
+        words.push(grant_identities.len() as u64);
+        words.extend_from_slice(grant_identities);
+        super::behavior::org_routing_registry::SourceToken::new(words)
+    }
+
+    /// The exact installed-Grant authority for every Grant key in `keys`, from
+    /// ONE consumer snapshot (OLB-2B.3c-pre).
+    ///
+    /// Returns the per-key stamps AND the deterministic identity vector for the
+    /// token. Both come from the same `load_full`, so they cannot name different
+    /// installations.
+    ///
+    /// A grant is omitted — leaving its key structurally `Unserved` — when it is
+    /// not installed, when the scope's audience handle does not match the
+    /// installed record, or when the installed grant is not currently valid.
+    /// That last one is why the deadline cannot be derived from provider rows
+    /// alone: an installed Grant with zero visible providers would otherwise
+    /// yield `Served(empty)` bounded by `u64::MAX` and cache expired Grant
+    /// authority indefinitely (W-G13).
+    ///
+    /// Keyed by the WHOLE scope — `(grant_id, audience_handle)` — never by
+    /// `grant_id` alone (review 2026-07-29 §2). Two live scopes can share a grant
+    /// id across an audience-secret rotation, and they are different slots by
+    /// construction ([`SlotKey`] carries the whole scope). An id-keyed map made
+    /// the dedup short-circuit fire BEFORE the per-key handle comparison, so
+    /// whichever of the pair the batch reached first decided the other's fate:
+    /// with the installed scope first, the stale-handle scope fetched the
+    /// installed stamp and was SERVED. The pair key makes the dedup and the
+    /// comparison agree about what "already decided" means.
+    ///
+    /// [`SlotKey`]: super::behavior::org_routing_registry::SlotKey
+    fn grant_installations_for(
+        slot: &Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
+        keys: &[super::behavior::org_routing_registry::SlotKey],
+        now_secs: u64,
+    ) -> (GrantStampsByScope, Vec<u64>) {
+        use super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp;
+        use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
+        use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+        let installed = slot.load_full();
+        let mut stamps = std::collections::BTreeMap::new();
+        for key in keys {
+            let CapabilityAudienceScope::Grant {
+                grant_id,
+                audience_handle,
+            } = key.scope.scope()
+            else {
+                continue;
+            };
+            if stamps.contains_key(&(*grant_id, *audience_handle)) {
+                continue;
+            }
+            let Some(record) = installed.get(grant_id) else {
+                continue;
+            };
+            if record.audience_handle() != audience_handle {
+                continue;
+            }
+            // An installed-but-expired Grant authorizes nothing. Checked here so
+            // the key falls to `Unserved` rather than being served under dead
+            // authority.
+            if record
+                .grant()
+                .is_valid_at_with_skew(now_secs, MAX_TOKEN_CLOCK_SKEW_SECS)
+                .is_err()
+            {
+                continue;
+            }
+            stamps.insert(
+                (*grant_id, *audience_handle),
+                GrantAuthority {
+                    stamp: ScopedDiscoveryAuthorityStamp::Grant {
+                        grant_id: *grant_id,
+                        install_seq: record.install_seq(),
+                        grant_signature: record.grant().signature,
+                        audience_handle: *record.audience_handle(),
+                    },
+                    deadline: record
+                        .grant()
+                        .not_after
+                        .saturating_add(MAX_TOKEN_CLOCK_SKEW_SECS),
+                },
+            );
+        }
+        // BTreeMap iteration is `(grant_id, audience_handle)` ascending, so the
+        // vector is deterministic without an explicit sort.
+        let identities = stamps
+            .values()
+            .filter_map(|authority| match authority.stamp {
+                ScopedDiscoveryAuthorityStamp::Grant { install_seq, .. } => Some(install_seq),
+                ScopedDiscoveryAuthorityStamp::Owner => None,
+            })
+            .collect();
+        (stamps, identities)
     }
 }
 
@@ -5739,16 +6012,31 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
     fn providers(
         &self,
         key: &super::behavior::org_routing_registry::SlotKey,
-    ) -> super::behavior::org_routing_registry::SourceFacts {
-        use super::behavior::org_routing_registry::SourceFacts;
+    ) -> super::behavior::org_routing_registry::ScopedSourceFacts {
+        use super::behavior::org_routing_registry::{
+            ScopedDiscoveryAuthorityStamp, ScopedSourceFacts, SourceFacts,
+        };
         // Reconstruction proper: no lock of any kind, no await. Ordering is
         // imposed HERE rather than at capture, so the deterministic projection is
         // off-lock work.
-        let Some(rows) = self.rows.get(key) else {
+        let Some((rows, authority, authority_deadline)) = self.rows.get(key) else {
             // Not captured => this source cannot speak for the scope at all.
             // Deliberately NOT an empty provider set: see `SourceFacts`.
-            return SourceFacts::Unserved;
+            //
+            // The stamp is `Owner` because there is nothing to be current
+            // ABOUT: an unserved reconstruction carries no rows, and the read
+            // seam refuses it structurally before any authority comparison. The
+            // deadline is `u64::MAX` for the same reason — there is no authority
+            // here to expire, and an `Unserved` artifact is cold at every read
+            // regardless.
+            return ScopedSourceFacts {
+                facts: SourceFacts::Unserved,
+                authority: ScopedDiscoveryAuthorityStamp::Owner,
+                authority_deadline: u64::MAX,
+            };
         };
+        let authority = *authority;
+        let authority_deadline = *authority_deadline;
         let mut providers = rows.clone();
         // Provider ascending (the deterministic projection order), generation
         // DESCENDING within a provider. `Vec::dedup_by` passes elements in
@@ -5765,7 +6053,11 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
                 .then_with(|| b.generation.cmp(&a.generation))
         });
         providers.dedup_by(|a, b| a.provider == b.provider);
-        SourceFacts::Served(providers.into())
+        ScopedSourceFacts {
+            facts: SourceFacts::Served(providers.into()),
+            authority,
+            authority_deadline,
+        }
     }
 }
 
@@ -5783,6 +6075,10 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
 struct ScopedCommitPin<'a> {
     _authority_gate: parking_lot::MutexGuard<'a, ()>,
     _publication_gate: parking_lot::MutexGuard<'a, ()>,
+    /// The consumer-Grant writer gate, held for the same reason as the two above
+    /// (review 2026-07-29 §1): the pin's Grant identity comparison is only worth
+    /// anything if the thing it compared cannot move before the settlement.
+    _consumer_grant_gate: parking_lot::MutexGuard<'a, ()>,
     /// The installed store, so settlement can take its publication barrier.
     store: Option<Arc<super::behavior::org_revocation::OrgRevocationStore>>,
     epoch: super::behavior::org_routing_registry::SourceEpoch,
@@ -5812,7 +6108,11 @@ impl super::behavior::org_routing_registry::SourceCommitPin for ScopedCommitPin<
         self.epoch
     }
 
-    /// The gates exclude scoped mutation and node-mediated authority movement.
+    /// The gates exclude scoped mutation, node-mediated authority movement, and
+    /// consumer-Grant install/removal — the last one added by review 2026-07-29
+    /// §1, which is why nothing below re-derives the Grant identity vector: it
+    /// cannot have moved.
+    ///
     /// They do NOT exclude the revocation store's own publication — floors and
     /// poison publish through `StoreCore`'s internal synchronization, which no
     /// routing gate reaches. So the pin completes its guarantee by RE-VERIFYING
@@ -5847,6 +6147,8 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         keys: &[super::behavior::org_routing_registry::SlotKey],
     ) -> Box<dyn super::behavior::org_routing_registry::SourceSnapshot> {
         use super::behavior::org_revocation::OrgRevocationState;
+        use super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp;
+        use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
         let now_secs = super::behavior::org::current_timestamp();
 
         // Revocation authority FIRST, and the floors come from exactly the store
@@ -5874,6 +6176,19 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         let floors_snapshot = store.as_ref().map(|s| s.snapshot());
         let floors: &OrgRevocationState = floors_snapshot.as_deref().unwrap_or(&empty_floors);
 
+        // ONE consumer-Grant snapshot for the whole batch, captured BEFORE the
+        // store lock. Every Grant key is stamped and filtered from this one
+        // snapshot, so a concurrent install/remove cannot leave one key's rows
+        // authorized by an installation another key's stamp does not name
+        // (OLB-2B.3c-pre).
+        //
+        // Two products, two jobs: the per-key STAMP goes into the artifact and
+        // protects it from unrelated Grant movement; the deterministic VECTOR of
+        // selected identities goes into the token and protects this
+        // capture/commit transaction.
+        let (grant_installations, grant_identity_vector) =
+            Self::grant_installations_for(&self.consumer_grants, keys, now_secs);
+
         let mut unserved = 0u64;
         let (generation, rows, generations_exhausted) = {
             let state = self.scoped_discovery.lock();
@@ -5886,28 +6201,93 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             let mut rows = std::collections::BTreeMap::new();
             for key in keys {
                 let scope = key.scope.scope();
-                if !matches!(
-                    scope,
-                    super::behavior::org_scoped_ingest::CapabilityAudienceScope::Owner { .. }
-                ) || poisoned
-                    || exhausted
-                {
-                    // Absent from `rows` => reconstructed as `Unserved`. A
-                    // POISONED revocation authority makes every scope unserved:
-                    // there is no usable floor view to filter against, and
-                    // serving unfiltered rows is worse than serving none.
+                // A POISONED or EXHAUSTED revocation authority makes EVERY scope
+                // unserved: there is no usable floor view to filter against, and
+                // serving unfiltered rows is worse than serving none.
+                if poisoned || exhausted {
                     unserved += 1;
                     continue;
                 }
-                rows.insert(
-                    key.clone(),
-                    state.find_scope_exact_private_providers(
-                        scope,
-                        &key.capability,
-                        now_secs,
-                        floors,
-                    ),
-                );
+                match scope {
+                    CapabilityAudienceScope::Owner { .. } => {
+                        rows.insert(
+                            key.clone(),
+                            (
+                                state.find_scope_exact_private_providers(
+                                    scope,
+                                    &key.capability,
+                                    now_secs,
+                                    floors,
+                                ),
+                                ScopedDiscoveryAuthorityStamp::Owner,
+                                // No deadline of its own: the owner plane's
+                                // authority is the node's own org, already
+                                // covered by the routing epoch and the floors.
+                                u64::MAX,
+                            ),
+                        );
+                    }
+                    // OLB-2B.3c-pre: the grant plane, served ONLY under the exact
+                    // installed consumer Grant. The stamps were captured from ONE
+                    // snapshot before this lock, so the stamp, the row filter and
+                    // the token cannot disagree about which installation
+                    // authorized these rows.
+                    //
+                    // Looked up by the WHOLE scope, never by `grant_id` alone
+                    // (review 2026-07-29 §2): a sibling key sharing this grant id
+                    // under a DIFFERENT audience handle is a different slot, and
+                    // fetching by id let it borrow this one's stamp.
+                    CapabilityAudienceScope::Grant {
+                        grant_id,
+                        audience_handle: key_handle,
+                    } => {
+                        let Some(GrantAuthority {
+                            stamp:
+                                stamp @ ScopedDiscoveryAuthorityStamp::Grant {
+                                    grant_signature,
+                                    audience_handle,
+                                    ..
+                                },
+                            deadline,
+                        }) = grant_installations.get(&(*grant_id, *key_handle)).copied()
+                        else {
+                            // Absent, expired, or handle-mismatched installed
+                            // Grant: no evidence at all. Deliberately NOT an
+                            // empty provider set.
+                            unserved += 1;
+                            continue;
+                        };
+                        rows.insert(
+                            key.clone(),
+                            (
+                                state.find_grant_exact_private_providers(
+                                    grant_id,
+                                    &key.capability,
+                                    now_secs,
+                                    floors,
+                                    |c| {
+                                        // EXACTLY the live query's predicate. A
+                                        // cached path comparing less would serve
+                                        // rows the uncached path refuses.
+                                        c.grant_signature() == Some(&grant_signature)
+                                            && matches!(
+                                                c.scope(),
+                                                CapabilityAudienceScope::Grant {
+                                                    audience_handle: h, ..
+                                                } if h == &audience_handle
+                                            )
+                                    },
+                                ),
+                                stamp,
+                                deadline,
+                            ),
+                        );
+                    }
+                    // Public and anything else: not a private routing plane.
+                    _ => {
+                        unserved += 1;
+                    }
+                }
             }
             (generation, rows, generations_exhausted)
         };
@@ -5921,25 +6301,41 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             floor_generation,
             poisoned,
         };
-        let token = self.token(epoch, exhausted || generations_exhausted);
+        let token = self.token(
+            epoch,
+            exhausted || generations_exhausted,
+            &grant_identity_vector,
+        );
         Box::new(ScopedSourceSnapshot { token, rows })
     }
 
     fn pin_if_current(
         &self,
+        keys: &[super::behavior::org_routing_registry::SlotKey],
         expected: &super::behavior::org_routing_registry::SourceToken,
     ) -> Option<Box<dyn super::behavior::org_routing_registry::SourceCommitPin + '_>> {
-        // BOTH gates, and both are held through the conditional installation
-        // beneath this pin. The publication gate stops scoped mutation; the
-        // authority gate stops revocation installs and floor movement. Verifying
-        // the token and then holding only the scoped gate would leave authority
-        // free to move between acceptance and installation — the install would
-        // land against an authority that is already gone (Kyra OLB-2B-E3c).
+        // ALL THREE gates, and all three are held through the conditional
+        // installation beneath this pin. The publication gate stops scoped
+        // mutation; the authority gate stops revocation installs and floor
+        // movement; the consumer-Grant gate stops Grant install/removal.
+        // Verifying the token and then holding only the scoped gate would leave
+        // authority free to move between acceptance and installation — the
+        // install would land against an authority that is already gone (Kyra
+        // OLB-2B-E3c).
         //
-        // Order is fixed: authority gate, then publication gate. Every authority
-        // mutation takes only the authority gate, so no inversion is reachable.
+        // The Grant gate is the same argument applied to the plane 2B.3c-pre
+        // added (review 2026-07-29 §1). Re-deriving the Grant identities below
+        // and then releasing them would make this a snapshot-to-PIN check while
+        // every other input gets a snapshot-to-SETTLEMENT one, and a removal in
+        // that window settles `Current` over a withdrawn installation.
+        //
+        // Order is fixed: authority gate, then publication gate, then the Grant
+        // gate. Every authority mutation takes only the authority gate, and
+        // every Grant mutation takes only the Grant gate — which is also why the
+        // Grant gate can be innermost — so no inversion is reachable.
         let authority_gate = self.authority.lock_gate();
         let publication_gate = self.publication.lock_gate();
+        let consumer_grant_gate = self.consumer_grant_gate.lock();
         let (poisoned, floor_generation, store) = self.revocation_view();
         let (generation, generations_exhausted) = {
             let state = self.scoped_discovery.lock();
@@ -5955,12 +6351,27 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             floor_generation,
             poisoned,
         };
-        if exhausted || self.token(epoch, exhausted) != *expected {
+        // Re-derived under ALL THREE gates, from the same keys, so a
+        // consumer-Grant install/remove between the snapshot and here defeats
+        // the pin. Checking the scoped and revocation halves but not this one
+        // would let a WITHDRAWN Grant's rows install as current (OLB-2B.3c-pre).
+        //
+        // The comparison covers snapshot → here; the gate held across the return
+        // covers here → settlement. Both halves are needed, and the gate is why
+        // no re-verification is owed at settlement the way the revocation store
+        // owes one — that store publishes through `StoreCore`'s own
+        // synchronization, which no routing gate reaches, whereas every consumer
+        // Grant writer takes the gate above.
+        let now_secs = super::behavior::org::current_timestamp();
+        let (_, grant_identities) =
+            Self::grant_installations_for(&self.consumer_grants, keys, now_secs);
+        if exhausted || self.token(epoch, exhausted, &grant_identities) != *expected {
             return None;
         }
         Some(Box::new(ScopedCommitPin {
             _authority_gate: authority_gate,
             _publication_gate: publication_gate,
+            _consumer_grant_gate: consumer_grant_gate,
             store,
             epoch,
             #[cfg(test)]
@@ -6374,7 +6785,7 @@ pub struct MeshNode {
     /// record up by `grant_id` (confirming the envelope's audience handle) to
     /// build the granted authority a cross-org envelope verifies against. Role-
     /// separated from the provider registry: one registry's mutation can never
-    /// invalidate the other. Serialized by `consumer_grant_mu`.
+    /// invalidate the other. Serialized by `consumer_grant_gate`.
     consumer_grant_audiences:
         Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
     /// Serializes provider grant-audience install/remove so two concurrent
@@ -6382,8 +6793,11 @@ pub struct MeshNode {
     /// lock-free off the `ArcSwap` above.
     provider_grant_mu: parking_lot::Mutex<()>,
     /// Serializes consumer grant-audience install/remove (see
-    /// `provider_grant_mu`).
-    consumer_grant_mu: parking_lot::Mutex<()>,
+    /// `provider_grant_mu`), and — unlike its provider twin — is SHARED with the
+    /// routing source's commit pin, because the consumer registry is authority
+    /// for the Grant routing plane (review 2026-07-29 §1). See
+    /// [`ConsumerGrantGate`].
+    consumer_grant_gate: Arc<ConsumerGrantGate>,
     /// Reference-counted consumer-audience leases (OSDK S0, rehomed here from
     /// the SDK's `Mesh` wrapper). Keyed to the NODE because that is what the
     /// consumer registry belongs to: two `Mesh` wrappers over one node share
@@ -6446,9 +6860,22 @@ pub struct MeshNode {
     /// [`ConsumerAudienceLease`](super::behavior::org_grant_registry::ConsumerAudienceLease)
     /// names ONE installation rather than a grant id that a later
     /// remove-then-install could silently rebind. Node-local and never on the
-    /// wire; monotone for the process lifetime (wrapping would take ~5.8e11
-    /// years at one install per nanosecond).
+    /// wire; strictly monotone and CHECKED (OLB-2B.3c-pre).
+    ///
+    /// This previously wrapped, defended by "wrapping would take ~5.8e11 years
+    /// at one install per nanosecond". That is a DENSITY argument, and density
+    /// arguments do not survive a counter becoming an authority identity:
+    /// equality against it decides whether a stale lease may remove the current
+    /// installation, and (from 2B.3c-pre) whether cached Grant-scoped routing
+    /// facts were built under the still-installed grant. Allocation is now
+    /// `checked_add`, exhaustion is terminal and refuses fail-closed, and an
+    /// idempotent install consumes nothing — see
+    /// [`Self::allocate_consumer_grant_install_seq`].
     consumer_grant_install_seq: std::sync::atomic::AtomicU64,
+    /// Test-only: consumer-Grant snapshot publications, so a witness can prove
+    /// a refusal published NOTHING — including transiently.
+    #[cfg(test)]
+    consumer_grant_publications: std::sync::atomic::AtomicU64,
     /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
     /// shared across EVERY protected `serve_rpc_protected` registration on this
     /// node. Node-owned (not per-registration) so `(caller, call_id)` uniqueness
@@ -7833,12 +8260,22 @@ impl MeshNode {
         let routing_registry_metrics: Arc<super::behavior::org_routing_registry::RegistryMetrics> =
             Arc::default();
         let routing_unserved_scope = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Hoisted: the routing source shares this exact slot, because installed
+        // consumer Grants are AUTHORITY for the grant plane (OLB-2B.3c-pre) —
+        // and the exact WRITER gate with it, so the commit pin can exclude Grant
+        // movement for the life of an installation (review 2026-07-29 §1).
+        let consumer_grant_audiences = Arc::new(arc_swap::ArcSwap::from_pointee(
+            super::behavior::org_grant_registry::ConsumerGrantSnapshot::empty(),
+        ));
+        let consumer_grant_gate = Arc::new(ConsumerGrantGate::new());
         let routing_authority = Arc::new(RoutingAuthority::new());
         let routing_registry = super::behavior::org_routing_registry::NodeOrgRoutingRegistry::new(
             Arc::new(ScopedSlotSource {
                 scoped_discovery: scoped_discovery.clone(),
                 publication: scoped_publication.clone(),
                 org_revocation: org_revocation.clone(),
+                consumer_grants: consumer_grant_audiences.clone(),
+                consumer_grant_gate: consumer_grant_gate.clone(),
                 authority: routing_authority.clone(),
                 #[cfg(test)]
                 settle_gap_hook: parking_lot::Mutex::new(None),
@@ -7915,11 +8352,9 @@ impl MeshNode {
             provider_grant_audiences: Arc::new(arc_swap::ArcSwap::from_pointee(
                 super::behavior::org_grant_registry::ProviderGrantSnapshot::empty(),
             )),
-            consumer_grant_audiences: Arc::new(arc_swap::ArcSwap::from_pointee(
-                super::behavior::org_grant_registry::ConsumerGrantSnapshot::empty(),
-            )),
+            consumer_grant_audiences,
             provider_grant_mu: parking_lot::Mutex::new(()),
-            consumer_grant_mu: parking_lot::Mutex::new(()),
+            consumer_grant_gate,
             org_audience_leases: Arc::new(
                 super::behavior::org_grant_registry::OrgAudienceLeases::default(),
             ),
@@ -7929,6 +8364,8 @@ impl MeshNode {
             #[cfg(feature = "fixtures")]
             sensing_projection_contention_hook: parking_lot::Mutex::new(None),
             consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
+            #[cfg(test)]
+            consumer_grant_publications: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "cortex")]
             rpc_admission_rate_limit: Arc::new(
                 // The envelope was validated (and panicked on) above, so this
@@ -9882,7 +10319,7 @@ impl MeshNode {
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
-        if self.install_org_revocation_store_locked(store, false, None)? {
+        if self.install_org_revocation_store_locked(store, false, None, None)? {
             advance_fenced_generation(&self.org_install_generation, "org_install_generation");
         }
         Ok(())
@@ -9901,7 +10338,7 @@ impl MeshNode {
         pause: &(dyn Fn() + Sync),
     ) -> Result<(), super::behavior::org_revocation::OrgRevocationError> {
         let _install = self.org_install.lock();
-        if self.install_org_revocation_store_locked(store, false, Some(pause))? {
+        if self.install_org_revocation_store_locked(store, false, Some(pause), None)? {
             advance_fenced_generation(&self.org_install_generation, "org_install_generation");
         }
         Ok(())
@@ -9925,11 +10362,33 @@ impl MeshNode {
     /// `org_install_generation` bump at the complete transaction boundary — the
     /// helper never bumps, so an authority+store transaction publishes one
     /// generation change, not an intermediate store bump then an authority bump.
+    ///
+    /// `also_publish` (OLB-2C) is a SECOND publication belonging to the same
+    /// authority transaction — in practice the node-authority swap. It runs
+    /// inside the very same [`move_routing_authority`] as the store swap, so the
+    /// complete transaction becomes visible under exactly ONE routing epoch
+    /// advance. It is threaded in here rather than performed by the caller
+    /// because the caller cannot compose: [`move_routing_authority`] takes the
+    /// non-reentrant authority gate, so a caller-side wrapper around this call
+    /// would deadlock against the store swap's own.
+    ///
+    /// It runs on BOTH publication paths, including the `Ok(false)` no-visible-
+    /// store-change return — an authority rotation over an unchanged store is
+    /// still an authority movement, so skipping the bump there would be a hole.
+    ///
+    /// That second path is FAIL-CLOSED, not production-reachable: this helper's
+    /// only `Some` caller is `install_node_authority_inner`, which always passes
+    /// `authority.revocation` as the store, so `authority_changed &&
+    /// !store_changed` would need two `NodeAuthority`s sharing one store `Arc` —
+    /// which no constructor produces. It is witnessed structurally
+    /// (`an_authority_rotation_over_the_same_store_still_publishes_inside_the_epoch`)
+    /// precisely because nothing else exercises it.
     fn install_org_revocation_store_locked(
         &self,
         store: Arc<super::behavior::org_revocation::OrgRevocationStore>,
         pin_held: bool,
         pause_before_swap: Option<&(dyn Fn() + Sync)>,
+        also_publish: Option<&(dyn Fn() + Sync)>,
     ) -> Result<bool, super::behavior::org_revocation::OrgRevocationError> {
         // Fast poison reject (rechecked UNDER the pin below — a
         // candidate can be poisoned between here and the swap).
@@ -9943,7 +10402,17 @@ impl MeshNode {
         let current = self.org_revocation.load_full();
         if let Some(cur) = &current {
             if Arc::ptr_eq(cur, &store) {
-                // Exact same installed store — no visible change, no bump.
+                // Exact same installed store — no visible STORE change, so no
+                // store bump. But a companion publication in the same
+                // transaction (the node-authority swap) is still an authority
+                // movement, and it must not become visible outside the epoch
+                // that names it just because the store half was a no-op
+                // (OLB-2C).
+                if let Some(publish) = also_publish {
+                    move_routing_authority(&self.routing_authority, &self.routing_registry, || {
+                        publish();
+                    });
+                }
                 return Ok(false);
             }
         }
@@ -10113,12 +10582,20 @@ impl MeshNode {
         // an install cannot become visible while a pin is alive.
         move_routing_authority(&self.routing_authority, &self.routing_registry, || {
             self.org_revocation.store(Some(store.clone()));
+            // Same gate, same epoch advance: an authority+store transaction is
+            // ONE authority movement, so the node authority must not be
+            // published in a separate ordered unit that routing would see as a
+            // second, later epoch — or worse, as no epoch at all (OLB-2C).
+            if let Some(publish) = also_publish {
+                publish();
+            }
         });
         drop(_pin);
 
-        // No epoch bump: the installed store's IDENTITY changed, and
-        // the send-path [`SendStamp`] captures store identity
-        // directly (review-11 P1).
+        // No `org_install_generation` bump: the installed store's IDENTITY
+        // changed, and the send-path [`SendStamp`] captures store identity
+        // directly (review-11 P1). The ROUTING epoch above is a different
+        // question and is advanced unconditionally by the swap.
 
         // Reconcile the candidate's floors against projections that
         // already exist in the fold: a store installed AFTER its
@@ -10327,13 +10804,44 @@ impl MeshNode {
             .as_ref()
             .map(|current| !Arc::ptr_eq(current, &authority))
             .unwrap_or(true);
+        // OLB-2C: the authority publication is handed to the store install so
+        // BOTH halves land inside one `move_routing_authority` — one gate, one
+        // epoch advance, and the new authority cannot be query-visible under an
+        // epoch that predates it.
+        //
+        // Before this, `node_authority.store` ran here, after the store install
+        // had already released the authority gate. That is the same defect class
+        // E3c closed for the revocation store itself ("publication outside the
+        // epoch's synchronization"): an authority-only rotation advanced NO
+        // routing epoch at all, and a combined authority+store install published
+        // the authority in a window the epoch did not cover.
+        //
+        // Routing does not read the authority object today — the source filters
+        // by revocation floors, not by the installed cert — so this is a
+        // protocol correction rather than a live serving bug. It is landed with
+        // the protocol rather than with its consumer because the consumer is the
+        // warmed proof path (2B.3), which builds `OrgProofIntent` FROM the
+        // authority: an epoch that does not cover the authority is exactly what
+        // would let a cached route set produce a proof under a rotated key.
+        //
+        // `Fn`, not `FnOnce`: the callee takes `&dyn Fn` so it can sit on either
+        // publication path. It is invoked at most once on each.
+        let publish_authority = authority_changed.then(|| {
+            let authority = authority.clone();
+            let slot = &self.node_authority;
+            move || slot.store(Some(authority.clone()))
+        });
         // The pin is already held over both cores → `pin_held = true`.
         let store_changed = self
-            .install_org_revocation_store_locked(candidate_store.clone(), true, None)
+            .install_org_revocation_store_locked(
+                candidate_store.clone(),
+                true,
+                None,
+                publish_authority
+                    .as_ref()
+                    .map(|publish| publish as &(dyn Fn() + Sync)),
+            )
             .map_err(super::behavior::org_authority::OrgAuthorityError::Revocation)?;
-        if authority_changed {
-            self.node_authority.store(Some(authority));
-        }
         // One generation transition for the COMPLETE authority+store
         // transaction (never one for the store then one for the authority).
         if authority_changed || store_changed {
@@ -10599,6 +11107,83 @@ impl MeshNode {
         )
     }
 
+    /// The ONE place a consumer-Grant snapshot becomes visible (OLB-2B.3c-pre).
+    ///
+    /// Centralized so "this outcome published nothing" is OBSERVABLE rather than
+    /// inferred. A witness that checks only the final pointer cannot see a
+    /// transient publish-and-restore, and lock-free readers can observe that
+    /// transient snapshot — so the counter, not the pointer, is what makes the
+    /// negative claim provable (Kyra, 2B.3c-pre step-1 re-review).
+    fn publish_consumer_grant_snapshot(
+        &self,
+        next: Arc<super::behavior::org_grant_registry::ConsumerGrantSnapshot>,
+    ) {
+        // `AcqRel`, not `Relaxed`: the counter exists precisely so a transient
+        // publication is observable, which invites a witness that samples it from
+        // ANOTHER thread while one is in flight. Paired with the `Acquire` load
+        // in `consumer_grant_publications_for_test`, a relaxed RMW would not have
+        // meant what the pairing looks like it means (review 2026-07-29 §4).
+        // Counted BEFORE the store, so an observer that sees the new snapshot has
+        // necessarily already seen the count that names it.
+        #[cfg(test)]
+        self.consumer_grant_publications
+            .fetch_add(1, Ordering::AcqRel);
+        self.consumer_grant_audiences.store(next);
+    }
+
+    /// Test-only: how many consumer-Grant snapshot publications have occurred.
+    #[cfg(test)]
+    fn consumer_grant_publications_for_test(&self) -> u64 {
+        self.consumer_grant_publications.load(Ordering::Acquire)
+    }
+
+    /// Allocate the next consumer-Grant installation identity, or refuse
+    /// (OLB-2B.3c-pre).
+    ///
+    /// Checked, never wrapping, never saturating. The identity is compared for
+    /// EQUALITY to decide whether a stale lease may remove the CURRENT
+    /// installation, so wrapping lets an ancient lease alias a later
+    /// installation, and saturating gives every later installation the same
+    /// identity — the same defect wearing a safer-looking operator. Exhaustion
+    /// is terminal by construction: the counter only ever increases, so once
+    /// `checked_add` fails it fails forever (review-pass-3 §12 discipline).
+    fn allocate_consumer_grant_install_seq(
+        &self,
+    ) -> Result<u64, super::behavior::org_grant_registry::GrantAudienceInstallError> {
+        let mut observed = self.consumer_grant_install_seq.load(Ordering::Acquire);
+        loop {
+            let Some(next) = observed.checked_add(1) else {
+                return Err(
+                    super::behavior::org_grant_registry::GrantAudienceInstallError::IdSpaceExhausted,
+                );
+            };
+            match self.consumer_grant_install_seq.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(observed),
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    /// Test-only: drive the installation-identity allocator to its ceiling, so
+    /// exhaustion is reachable without 2^64 installs.
+    #[cfg(test)]
+    fn exhaust_consumer_grant_install_ids_for_test(&self) {
+        self.consumer_grant_install_seq
+            .store(u64::MAX, Ordering::Release);
+    }
+
+    /// Test-only: the allocator's current position, for proving that an
+    /// idempotent install consumed nothing.
+    #[cfg(test)]
+    fn consumer_grant_install_seq_for_test(&self) -> u64 {
+        self.consumer_grant_install_seq.load(Ordering::Acquire)
+    }
+
     /// OSDK S0: [`install_consumer_grant_audience`] returning an ownership proof.
     ///
     /// Identical validation, idempotency, conflict, and capacity semantics; the
@@ -10624,7 +11209,7 @@ impl MeshNode {
     > {
         use super::behavior::org_grant_registry::{
             validate_consumer_record, ConsumerAudienceInstall, ConsumerAudienceLease,
-            GrantAudienceInstallError,
+            ConsumerGrantSnapshot, GrantAudienceInstallError, PreparedInstall,
         };
         let authority = self
             .node_authority
@@ -10639,25 +11224,40 @@ impl MeshNode {
             authority.config.verification_skew_secs,
         )?;
         let grant_id = *record.grant_id();
-        // Claim the stamp before the store so the published record and the
-        // returned lease carry the same value; a claimed-but-unused stamp on the
-        // idempotent path is harmless (the counter is only ever compared for
-        // equality, never for density).
-        let install_seq = self
-            .consumer_grant_install_seq
-            .fetch_add(1, Ordering::Relaxed);
-        let record = record.with_install_seq(install_seq);
-        let _guard = self.consumer_grant_mu.lock();
+        // Settle every ordinary refusal first, then allocate — both under one
+        // guard (OLB-2B.3c-pre).
+        //
+        // This used to claim the stamp before the store, justified by "a
+        // claimed-but-unused stamp on the idempotent path is harmless (the
+        // counter is only ever compared for equality, never for density)". That
+        // reasoning was sound only while the counter was pure bookkeeping. The
+        // identity is now checked and TERMINAL, so density is exactly what
+        // matters: repeated idempotent installs would burn a finite space while
+        // publishing nothing, and the space cannot be recovered.
+        let _guard = self.consumer_grant_gate.lock();
         let current = self.consumer_grant_audiences.load_full();
-        match current.with_record(Arc::new(record), now_secs)? {
-            Some(next) => {
-                self.consumer_grant_audiences.store(Arc::new(next));
-                Ok(ConsumerAudienceInstall::Installed(
-                    ConsumerAudienceLease::new(grant_id, install_seq),
-                ))
+        // Settle EVERY ordinary refusal before allocation — idempotence,
+        // conflict AND capacity. Settling only idempotence left `AtCapacity`
+        // behind the allocator, so repeated distinct installs against a full
+        // registry would drain a finite, terminal authority space while
+        // publishing nothing (Kyra, 2B.3c-pre step-1 review).
+        let prepared = match current.prepare_install(record, now_secs)? {
+            PreparedInstall::Noop => {
+                // Valid, publishes nothing, consumes no identity — including
+                // after the allocator is exhausted, which is why this precedes
+                // it.
+                return Ok(ConsumerAudienceInstall::AlreadyPresent);
             }
-            None => Ok(ConsumerAudienceInstall::AlreadyPresent),
-        }
+            PreparedInstall::Ready(slot) => *slot,
+        };
+        // Past this point publication is certain, so claiming the identity
+        // cannot be wasted.
+        let install_seq = self.allocate_consumer_grant_install_seq()?;
+        let next = ConsumerGrantSnapshot::finish_install(prepared, install_seq);
+        self.publish_consumer_grant_snapshot(Arc::new(next));
+        Ok(ConsumerAudienceInstall::Installed(
+            ConsumerAudienceLease::new(grant_id, install_seq),
+        ))
     }
 
     /// OA3-4b2: remove a CONSUMER grant-audience record by `grant_id`. Returns
@@ -10671,11 +11271,11 @@ impl MeshNode {
     ///
     /// [`remove_consumer_grant_audience_if_current`]: Self::remove_consumer_grant_audience_if_current
     pub fn remove_consumer_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
-        let _guard = self.consumer_grant_mu.lock();
+        let _guard = self.consumer_grant_gate.lock();
         let current = self.consumer_grant_audiences.load_full();
         match current.without(grant_id) {
             Some(next) => {
-                self.consumer_grant_audiences.store(Arc::new(next));
+                self.publish_consumer_grant_snapshot(Arc::new(next));
                 true
             }
             None => false,
@@ -10686,7 +11286,7 @@ impl MeshNode {
     /// installed record is the exact one this lease owns. Returns `true` iff that
     /// record was removed.
     ///
-    /// The compare and the removal happen under one `consumer_grant_mu` hold, so
+    /// The compare and the removal happen under one `consumer_grant_gate` hold, so
     /// a concurrent remove-then-install cannot slip a different record in between
     /// the two: a stale lease (its installation already replaced, or already
     /// removed) removes NOTHING and reports `false`. This is what makes an SDK
@@ -10696,7 +11296,7 @@ impl MeshNode {
         &self,
         lease: &super::behavior::org_grant_registry::ConsumerAudienceLease,
     ) -> bool {
-        let _guard = self.consumer_grant_mu.lock();
+        let _guard = self.consumer_grant_gate.lock();
         let current = self.consumer_grant_audiences.load_full();
         match current.get(lease.grant_id()) {
             // Same grant id, different installation — the lease is stale and owns
@@ -10704,7 +11304,7 @@ impl MeshNode {
             Some(record) if record.install_seq() != lease.install_seq() => false,
             Some(_) => match current.without(lease.grant_id()) {
                 Some(next) => {
-                    self.consumer_grant_audiences.store(Arc::new(next));
+                    self.publish_consumer_grant_snapshot(Arc::new(next));
                     true
                 }
                 None => false,
@@ -12810,6 +13410,56 @@ impl MeshNode {
         None
     }
 
+    /// Whether a stamped scope authority is still EXACTLY the installed one
+    /// (OLB-2B.3c-pre).
+    ///
+    /// `Owner` is trivially current: the owner plane's authority is the node's
+    /// own org, already covered by the routing epoch, floors and poison bit in
+    /// [`SourceEpoch`], all compared separately above.
+    ///
+    /// The grant arm compares all four bound components. `grant_id` alone would
+    /// pass a remove-then-reinstall and a different signed grant reusing the id;
+    /// the installation identity catches the first and the signature the second,
+    /// and the handle mirrors the live query's own defense-in-depth check so the
+    /// cached path is never weaker than the uncached one. Expiry is included
+    /// because an installed-but-expired Grant authorizes nothing, and deriving
+    /// the deadline from provider rows alone would let an empty served bucket
+    /// sit at `u64::MAX` forever (W-G13).
+    ///
+    /// Takes `now_secs` explicitly rather than sampling the clock, matching
+    /// [`Self::granted_providers_at`]: the Grant deadline is one of the four
+    /// bound components, and a witness for it has to be able to name the instant
+    /// it is asserting about. `MAX_TOKEN_CLOCK_SKEW_SECS` is 300 s, so an expiry
+    /// witness that waited on the wall clock would take five minutes.
+    fn scope_authority_is_current(
+        &self,
+        stamped: &super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
+        now_secs: u64,
+    ) -> bool {
+        use super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp;
+        use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+        let ScopedDiscoveryAuthorityStamp::Grant {
+            grant_id,
+            install_seq,
+            grant_signature,
+            audience_handle,
+        } = stamped
+        else {
+            return true;
+        };
+        let installed = self.consumer_grant_audiences.load();
+        let Some(record) = installed.get(grant_id) else {
+            return false;
+        };
+        record.install_seq() == *install_seq
+            && record.grant().signature == *grant_signature
+            && record.audience_handle() == audience_handle
+            && record
+                .grant()
+                .is_valid_at_with_skew(now_secs, MAX_TOKEN_CLOCK_SKEW_SECS)
+                .is_ok()
+    }
+
     /// The registry's base facts for `key`, if a slot is retained, currently
     /// holds valid facts, AND the live health still allows the incarnation that
     /// built them.
@@ -12822,6 +13472,28 @@ impl MeshNode {
     pub(crate) fn org_routing_base_facts(
         &self,
         key: &super::behavior::org_routing_registry::SlotKey,
+    ) -> Option<Arc<super::behavior::org_routing_registry::SlotBaseFacts>> {
+        self.org_routing_base_facts_at(key, super::behavior::org::current_timestamp())
+    }
+
+    /// [`Self::org_routing_base_facts`] at an explicit clock.
+    ///
+    /// Split for the same reason [`Self::granted_providers_at`] is: two of the
+    /// nine checks below are DEADLINE checks — the artifact's `earliest_expiry`
+    /// and the installed Grant's own validity — and a witness for either has to
+    /// name the instant it asserts about rather than wait for it. The installed
+    /// Grant deadline in particular carries `MAX_TOKEN_CLOCK_SKEW_SECS` (300 s)
+    /// of tolerance, so a wall-clock witness would take five minutes to observe
+    /// a transition that must be exact.
+    ///
+    /// Production has exactly one caller, immediately above, which passes
+    /// `current_timestamp()`. Nothing else may pass a clock: a caller choosing
+    /// its own "now" for an authority decision is the defect this shape exists
+    /// to make visible, not to enable.
+    fn org_routing_base_facts_at(
+        &self,
+        key: &super::behavior::org_routing_registry::SlotKey,
+        now_secs: u64,
     ) -> Option<Arc<super::behavior::org_routing_registry::SlotBaseFacts>> {
         let facts = self.routing_registry.base_facts_unvalidated(key)?;
         // Revalidate the AUTHORITY these facts were built under against the live
@@ -12861,6 +13533,21 @@ impl MeshNode {
             self.routing_registry.invalidate_if_stale(key, &facts);
             return None;
         }
+        // OLB-2B.3c-pre: revalidate the EXACT scope authority these facts were
+        // reconstructed under. This is the security half of serving the grant
+        // plane: a consumer Grant removed after publication leaves the scoped
+        // revision, the routing epoch, the floors and the poison bit all
+        // unchanged, so without this the cached facts keep serving providers the
+        // node has WITHDRAWN discovery authority for.
+        //
+        // Compared, not re-read as a predicate — the same discipline poison
+        // needed. Any difference (removed, reinstalled, replaced under the same
+        // id, handle changed, now expired) fails equality and retires the exact
+        // artifact.
+        if !self.scope_authority_is_current(&facts.authority, now_secs) {
+            self.routing_registry.invalidate_if_stale(key, &facts);
+            return None;
+        }
         // A scope this source cannot speak for has NO evidence, so it must read
         // cold rather than as a proven-empty provider set (Kyra OLB-2B-E3c).
         // Reconciled is not usable: this is where Option A's `Current` over an
@@ -12878,7 +13565,7 @@ impl MeshNode {
         // reads are expiry-safe by filtering at query time; a cache is only
         // expiry-safe if its read seam does the same, so the timer governs
         // promptness rather than correctness.
-        if super::behavior::org::current_timestamp() >= facts.earliest_expiry {
+        if now_secs >= facts.earliest_expiry {
             return None;
         }
         self.routing_health
@@ -21541,7 +22228,7 @@ impl MeshNode {
                 // installed-consumer-grant snapshot, loaded lock-free here and
                 // handed to the store, so a capacity reclamation can tell a
                 // dormant grant row from a live one WITHOUT the raw store ever
-                // reaching for `consumer_grant_mu` — no new lock edge under the
+                // reaching for the consumer-Grant gate — no new lock edge under the
                 // publication gate. Captured before the mutation begins; both
                 // race directions against a concurrent install/remove are safe
                 // (see `reclaim_for_admission`).
@@ -33264,6 +33951,187 @@ mod oa34b2_query_currentness_tests {
             unsafe { std::ptr::write_volatile(b, 0) };
         }
         copy
+    }
+
+    // ---- OLB-2B.3c-pre: the installation identity is non-aliasing ----------
+
+    /// Everything a non-publishing outcome must leave untouched, captured as ONE
+    /// value so a witness cannot assert a subset by accident.
+    #[derive(Clone)]
+    struct GrantRegistryState {
+        snapshot: Arc<crate::adapter::net::behavior::org_grant_registry::ConsumerGrantSnapshot>,
+        publications: u64,
+        identity: u64,
+    }
+
+    fn grant_registry_state(node: &MeshNode) -> GrantRegistryState {
+        GrantRegistryState {
+            snapshot: node.consumer_grant_audiences.load_full(),
+            publications: node.consumer_grant_publications_for_test(),
+            identity: node.consumer_grant_install_seq_for_test(),
+        }
+    }
+
+    /// Assert an outcome changed NOTHING: no snapshot, no publication (even
+    /// transient), and no installation identity.
+    ///
+    /// All three are needed and none implies another. A path that publishes an
+    /// intermediate snapshot and restores the original leaves the final POINTER
+    /// unchanged, and lock-free readers can observe that transient. Terminal
+    /// exhaustion that moves the identity counter while still returning
+    /// `IdSpaceExhausted` is a real mutation behind a correct-looking error.
+    ///
+    /// The first version of this helper covered only the first two and left the
+    /// identity to each call site. Two independent reviews then found the same
+    /// gap: W-G9 and the post-exhaustion half of W-G10 had not repeated it, so a
+    /// mutation moving the identity passed a test named
+    /// `..._refuses_without_mutating`. A partial helper makes the omission the
+    /// default; a total one makes it unrepresentable.
+    fn assert_no_effect(node: &MeshNode, before: &GrantRegistryState) {
+        assert!(
+            Arc::ptr_eq(&before.snapshot, &node.consumer_grant_audiences.load_full()),
+            "a non-publishing outcome must leave the EXACT snapshot installed"
+        );
+        assert_eq!(
+            node.consumer_grant_publications_for_test(),
+            before.publications,
+            "a non-publishing outcome must not publish even transiently"
+        );
+        assert_eq!(
+            node.consumer_grant_install_seq_for_test(),
+            before.identity,
+            "a non-publishing outcome must not move the installation identity"
+        );
+    }
+
+    /// W-G9. Exhausting the installation-identity space refuses fail-closed and
+    /// mutates nothing.
+    ///
+    /// The identity is compared for EQUALITY to authorize removal of the current
+    /// installation, so an aliased identity is an authorization defect, not a
+    /// bookkeeping one. Wrapping or saturating would both keep this green.
+    #[tokio::test]
+    async fn grant_install_identity_exhaustion_refuses_without_mutating() {
+        let org_a = OrgKeypair::from_bytes([0xc1u8; 32]);
+        let org_b = OrgKeypair::from_bytes([0xc2u8; 32]);
+        let (c, _dir) = adopted_consumer(&org_a, "idspace").await;
+        let p = EntityKeypair::generate();
+        let (g, secret) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:idspace"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p.entity_id().clone()),
+            3600,
+        )
+        .expect("issue");
+        let secret = secret.expect("secret");
+
+        c.exhaust_consumer_grant_install_ids_for_test();
+        let before = grant_registry_state(&c);
+        let err = c
+            .install_consumer_grant_audience(g, copy_secret(&secret))
+            .expect_err("an exhausted identity space must refuse");
+        assert_eq!(
+            err,
+            crate::adapter::net::behavior::org_grant_registry::GrantAudienceInstallError::IdSpaceExhausted,
+            "refusal must be typed, not a fabricated identity or an abort"
+        );
+        assert_no_effect(&c, &before);
+    }
+
+    /// W-G10b. An `AtCapacity` refusal consumes no installation identity.
+    ///
+    /// Capacity refusal sits BEHIND idempotence, so settling idempotence alone
+    /// left it after the allocator: repeatedly requesting distinct installs
+    /// against a full active registry published nothing and permanently drained
+    /// a finite, terminal authority space. Found by an independent probe of the
+    /// production path after step 1 (Kyra), which is why the assertion is on the
+    /// identity rather than only on the error.
+    #[tokio::test]
+    async fn an_at_capacity_consumer_grant_install_consumes_no_identity() {
+        use crate::adapter::net::behavior::org_grant_registry::{
+            ConsumerGrantSnapshot, GrantAudienceInstallError,
+        };
+        let org_a = OrgKeypair::from_bytes([0xc5u8; 32]);
+        let org_b = OrgKeypair::from_bytes([0xc6u8; 32]);
+        let (c, _dir) = adopted_consumer(&org_a, "atcap").await;
+        let p = EntityKeypair::generate();
+
+        let mint = |tag: String| {
+            let (g, secret) = OrgCapabilityGrant::try_issue(
+                &org_b,
+                org_a.org_id(),
+                CapabilityAuthorityId::for_tag(&tag),
+                GrantRights::DISCOVER,
+                GrantTargetScope::ExactNode(p.entity_id().clone()),
+                3600,
+            )
+            .expect("issue");
+            (g, secret.expect("secret"))
+        };
+
+        // Fill the registry to its active ceiling.
+        for i in 0..ConsumerGrantSnapshot::CAPACITY {
+            let (g, secret) = mint(format!("nrpc:atcap-{i}"));
+            c.install_consumer_grant_audience(g, copy_secret(&secret))
+                .expect("fill install");
+        }
+        let before = grant_registry_state(&c);
+
+        let (overflow, secret) = mint("nrpc:atcap-overflow".to_string());
+        let err = c
+            .install_consumer_grant_audience(overflow, copy_secret(&secret))
+            .expect_err("a full active registry must refuse");
+        assert_eq!(
+            err,
+            GrantAudienceInstallError::AtCapacity,
+            "refusal must stay typed"
+        );
+        assert_no_effect(&c, &before);
+    }
+
+    /// W-G10. An idempotent install consumes no installation identity — and
+    /// therefore still succeeds after the allocator is exhausted.
+    ///
+    /// The allocation used to precede the idempotence decision, justified by the
+    /// counter being "only ever compared for equality, never for density". Once
+    /// the space is finite and terminal, density is exactly what matters:
+    /// re-installing the same grant in a loop would burn it while publishing
+    /// nothing.
+    #[tokio::test]
+    async fn an_idempotent_grant_install_consumes_no_identity() {
+        let org_a = OrgKeypair::from_bytes([0xc3u8; 32]);
+        let org_b = OrgKeypair::from_bytes([0xc4u8; 32]);
+        let (c, _dir) = adopted_consumer(&org_a, "idem").await;
+        let p = EntityKeypair::generate();
+        let (g, secret) = OrgCapabilityGrant::try_issue(
+            &org_b,
+            org_a.org_id(),
+            CapabilityAuthorityId::for_tag("nrpc:idem"),
+            GrantRights::DISCOVER,
+            GrantTargetScope::ExactNode(p.entity_id().clone()),
+            3600,
+        )
+        .expect("issue");
+        let secret = secret.expect("secret");
+
+        c.install_consumer_grant_audience(g.clone(), copy_secret(&secret))
+            .expect("first install");
+        let before = grant_registry_state(&c);
+
+        c.install_consumer_grant_audience(g.clone(), copy_secret(&secret))
+            .expect("idempotent reinstall");
+        assert_no_effect(&c, &before);
+
+        // And the ordering is load-bearing the other way round too: with the
+        // space exhausted, the idempotent path must still be VALID, because it
+        // never needed an identity.
+        c.exhaust_consumer_grant_install_ids_for_test();
+        let before = grant_registry_state(&c);
+        c.install_consumer_grant_audience(g, copy_secret(&secret))
+            .expect("an idempotent install must survive exhaustion");
+        assert_no_effect(&c, &before);
     }
 
     async fn adopted_consumer(org: &OrgKeypair, tag: &str) -> (Arc<MeshNode>, std::path::PathBuf) {

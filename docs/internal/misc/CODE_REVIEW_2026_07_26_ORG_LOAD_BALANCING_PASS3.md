@@ -1,17 +1,23 @@
 # CODE REVIEW 2026-07-26 — Org Capability Load Balancing, pass 3 (`load-balancing`)
 
-> **STATUS: all findings ADDRESSED; the closure RUN is incomplete.**
+> **STATUS: CLOSED AND SIGNED at `351f93480` (Kyra, 2026-07-27).** Every finding
+> addressed, the exact-head closure run executed, and the independent RED gate
+> discharged — including the three defects that gate found which the author's own
+> passes had not (see the two "Independent RED pass" sections and the
+> self-directed re-read below). OLB-2B.3 is authorized.
 >
 > Every finding in this document and in pass 2 has a landed fix and a witness —
 > see [Closure](#closure--every-finding-in-this-document-and-pass-2-is-now-addressed),
 > which maps each one to its commit. That includes the four **Fix now** gate
 > items and the two pass-2 items previously deferred by decision.
 >
-> This is NOT a sign-off. The adjudication below requires an exact-head closure
-> run before E3c / composed OLB-2B is signed, and three parts of it have not been
-> executed: the fourth clippy gate (`--all-features --all-targets`), the full
-> serial nextest matrices, and `cfg(unix)` verification under the Docker harness.
-> The mid-document
+> The exact-head run the adjudication demands is recorded in
+> [Exact-head closure run](#exact-head-closure-run--80bb06b5a) — including the
+> fourth clippy gate, which the previous revision of this banner listed as not
+> executed. What remains is stated there and is deliberately NOT dischargeable by
+> the author of the fixes.
+>
+> This is still NOT a sign-off. The mid-document
 > [Disposition](#disposition--corrective-descendant-of-2026-07-26-ceb88ed47--87aa71960--52c667d62)
 > section is historical and superseded; it is kept for the sequence, not the
 > state.
@@ -866,7 +872,11 @@ Run at the closure head, after the last finding landed.
   `--all-features --lib --bins -D warnings`, `--lib --bins -D warnings`, and
   `--no-default-features --lib --bins -D warnings` — all clean.
 
-**NOT verified on this host — do not read the above as covering it:**
+**NOT verified on this host — do not read the above as covering it.** *(Recorded
+as of the branch closure head. The first bullet is now SUPERSEDED: the fourth
+clippy gate ran clean at the final exact head — see
+[Exact-head closure run](#exact-head-closure-run--80bb06b5a). The other two
+bullets stand, and are carried into the outstanding list there.)*
 
 - **`cargo clippy --all-features --all-targets`** (the fourth gate, which lints
   the TEST surface with the four panic-hygiene lints `-A`'d). The host ran out of
@@ -889,10 +899,294 @@ clock it HUNG rather than failed, because the defect is an actor that is never
 idle. That is why that witness alone runs on the real clock: a regression must
 fail the job, not wedge it.
 
-### What is still owed before E3c / composed OLB-2B can be signed
+### Exact-head closure run — `80bb06b5a`
 
-The findings are closed; the CLOSURE RUN is not. Per the adjudication above, the
-signature needs an exact-head run with independent RED mutations, the serial
-broad matrices, the clippy/fmt/diff checks and a clean worktree. Outstanding from
-that list: the fourth clippy gate, the full serial matrices, and the `cfg(unix)`
-harness. The worktree is clean and the diff/fmt checks pass.
+The "Test evidence" block above was gathered at the closure head on the branch.
+The head then moved twice — `670bef6e0` (the `--all-targets` test surface) and
+`cd39fda69` (intra-doc links for the rustdoc gate) — before the branch merged to
+master as PR #655 at **`80bb06b5a`**. Kyra's closure condition names the FINAL
+exact head, so the run below was performed against `80bb06b5a` rather than
+inherited from the branch. Windows host, `CARGO_INCREMENTAL=0`, clean worktree.
+
+| Gate | Exact command | Result |
+|---|---|---|
+| Clippy gate 4 | `cargo clippy --all-features --all-targets -- -D warnings -A unwrap_used -A expect_used -A undocumented_unsafe_blocks -A multiple_unsafe_ops_per_block` | **clean** |
+| Lib suite | `cargo test --lib --features "$UNIT_FEATURES"` | **5,444 passed, 0 failed, 1 ignored** |
+| Wiring gate | `cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests` | **41** (MIN 41); 3 pinned names present |
+| Supervisor gate | `cargo test --lib --features "$UNIT_FEATURES" behavior::org_routing::` | **24** (MIN 24); all 9 pinned names present |
+| Doctests | `cargo test --doc --features "$UNIT_FEATURES"` | **4 passed, 0 failed, 31 ignored** |
+| Rustdoc gate | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | **clean** |
+| Formatting | `cargo fmt --all -- --check` (net crate + SDK) | clean |
+
+**Two closure conditions have been closed by this run.** The fourth clippy gate —
+which the previous banner listed as unexecuted, and which the disk exhaustion
+during the branch closure prevented from completing — is clean at the final head.
+And the `670bef6e0` defect it existed to catch is worth recording as the
+justification for the gate rather than as a footnote: a `--lib`-only clippy plus
+a `--lib`-only test run is structurally incapable of seeing a signature change
+that ripples into `#[cfg(test)]` modules and `tests/*.rs`, so the §3 correction
+compiled green locally and broke on CI. That is exactly the coverage hole gate 4
+closes.
+
+**Note both gates sit EXACTLY at their floor** (41/41 and 24/24). That is by
+construction — each MIN was raised to the count in the commit that added the
+witnesses — but it means neither gate has slack: any deletion trips it
+immediately, which is the intended behaviour, and any addition must raise MIN in
+the same commit.
+
+### What was still owed before E3c / composed OLB-2B could be signed
+
+*(SUPERSEDED — both items were discharged; see
+[Independent RED pass — final](#independent-red-pass--final-2026-07-27-signed).
+Kept for the sequence.)*
+
+The findings are closed and the local closure run is executed. Two items remain,
+and neither is dischargeable by the author of the fixes:
+
+1. **Independent RED mutations — STARTED 2026-07-27, result HOLD, not complete.**
+   See [Independent RED pass](#independent-red-pass--2026-07-27-hold) below: it
+   found one witness green under a mutation that broke the property it claims,
+   and the pass did not reach the end of its mutation schedule. The original
+   reasoning for requiring it stands and was vindicated:
+
+   Every RED probe recorded in this document was
+   authored, run and reverted by the same author as the fix it couples to. That
+   demonstrates the witnesses are coupled to *something*; it does not
+   demonstrate they are coupled to the property a different reader would attack.
+   Two findings in this very closure were witness defects rather than code
+   defects — §17's sort was unobservable because capability IDs are blake3
+   hashes, and the floor-publish race witness self-deadlocked and had therefore
+   never proven its property. Both were found by the author only because a probe
+   behaved oddly, not because the witness was reviewed. This step is where that
+   class gets caught deliberately.
+2. **The CI conclusion for `80bb06b5a`.** The Linux jobs own the full serial
+   nextest matrices and every `cfg(unix)` path; a Windows host does not
+   substitute for either. This was not read from the authoring host, which has no
+   `gh` on `PATH` — recorded as unread rather than assumed green, since a merged
+   PR is evidence about branch protection, not about a specific run's conclusion.
+
+Until both are discharged, E3c / composed OLB-2B remains HELD and OLB-2C remains
+unauthorized, notwithstanding the merge to master.
+
+---
+
+## Independent RED pass — 2026-07-27, HOLD
+
+Run by Kyra against the exact E3c head `80bb06b5ad6543098baf999ec0fe5d71095d8a9e`,
+in a disposable worktree, by an author other than the one who wrote the fixes.
+**Result: HOLD.** The gate did the thing it exists to do — it found a witness
+that was green without proving its claimed property.
+
+### The finding
+
+The mutation was the minimal one: release the publication pin before the
+settlement.
+
+```rust
+let pinned = store.pin_publication();
+if !self.matches(&pinned) { return None; }
+drop(pinned);                 // RED: release the barrier before settlement
+settle_gap_hook();
+Some(settle())
+```
+
+`a_publication_cannot_occupy_the_gap_between_validation_and_settlement` **passed
+anyway**, 1/1 and over 10 consecutive repetitions. The sibling poison witness
+failed under the same mutation, which is what proves the mutation was real and
+the failure was specific to this witness rather than to the harness.
+
+The defect was in the evidence, not the production code — the pin at
+`80bb06b5a` is held correctly. The floor-publication contender acknowledged
+immediately *before* attempting `live.write()`, so this schedule was admissible:
+
+```text
+pin wrongly released
+→ publisher sends "attempting" acknowledgement
+→ publisher ACQUIRES live.write()
+→ observer reads the proxy flag before the publisher stores it
+→ witness passes while a publication occupies the settlement gap
+```
+
+That is the forbidden "hook before the actual synchronization barrier" pattern.
+It is closure-blocking because floor exclusion is one of E3c's load-bearing
+claims: a witness that cannot fail is not evidence for it.
+
+**Note what this costs.** The E3c closure above cites this witness as proof of
+the settlement barrier. Until the repair below, that citation was unearned, and
+so is any conclusion drawn from it.
+
+### The repair
+
+`publish_blocking_hook` → **`publish_contended_hook`**, fired ONLY after
+`live.try_write()` has actually FAILED, immediately before blocking on `write()`.
+A failed acquisition is the one signal scheduling cannot fake: it means a holder
+is provably there at that instant, so the publisher is definitively blocked when
+the negative assertion runs. Under the same mutation `try_write` SUCCEEDS, no
+acknowledgement is ever sent, and the witness fails at its wait.
+
+The rename is not cosmetic. `StoreCore` already documented the distinction for
+the poison gate — a BLOCKING hook is a placement rendezvous, a CONTENDED hook is
+evidence — and the poison gap witness uses them correctly, staging on the first
+and sequencing its negative assertion after the second. The floor witness had
+only the placement hook and used it as evidence. Keeping the old name would have
+left the next reader the same trap.
+
+Verified at the repair head: the witness FAILS under Kyra's exact mutation, at
+the contention wait rather than anywhere else; passes 10/10 consecutively with
+the mutation reverted; the sibling poison witness still fails under it.
+
+### What this pass did NOT cover
+
+The pass stopped on a tool ceiling before mutation-testing:
+
+- terminal store/routing exhaustion;
+- empty and non-empty `Superseded` behaviour;
+- both poison transition directions;
+- the final reverted green state.
+
+**Repairing this witness therefore does not complete the independent RED gate.**
+The remaining schedule resumes from the repair head.
+
+### Coupling this pass DID confirm
+
+Independently verified as genuinely coupled: store/epoch ordering (publishing
+the store before advancing the epoch fails the ordering witness); slot
+incarnation fencing; identity exhaustion (restoring wrapping allocation breaks
+deterministic refusal); owner reservation (letting grants consume it admits
+8,192 rather than 7,168); dormant-only reclamation. Baseline focused results at
+`80bb06b5a`: routing wiring 41, routing registry units 28, owner reservation 1,
+dormant reclamation 1. Zero-test filtered invocations were rejected and rerun.
+
+### Independent RED pass, focused schedule — 2026-07-27 (second run)
+
+Run against `318e7ebcf`, focused named RED tests only, no broad local gates.
+**Eight claimed witnesses were independently confirmed genuinely coupled**, each
+failing under a property-breaking mutation and each mutation reverted:
+
+| Claim | Independent mutation | Result |
+|---|---|---|
+| Store-generation exhaustion | re-arm `RegistryWork` after terminal settlement refusal | failed on "must NOT re-arm itself" |
+| Routing-authority exhaustion | terminal retirement → strict-older invalidation | equal-MAX fact survived; failed |
+| Empty-selection wake | disable `mark_if_movement()` | failed on missing pin-refusal wake |
+| Non-empty refusal | omit reinsertion of selected live slots | failed on "live slot still owes work" |
+| Poison mark, `raised=[]` | suppress the authority notification | epoch stayed 4 instead of 5 |
+| Poison-clear exclusion | bypass `poison_gate` | gate-reached acknowledgement timed out |
+| Poison recovery observability | suppress the empty-floor notification | failed on missing authority movement |
+| Changed-store authority transaction | split authority/store into two gated epoch transactions | witness observed two publications |
+
+**One further gap found, in `efa746f2c`.** Mutating the NO-STORE-CHANGE branch to
+publish the authority outside `move_routing_authority` left
+`an_authority_install_publishes_the_authority_under_its_own_epoch` green (1
+passed, 5,336 skipped): that witness only ever exercises the changed-store
+branch. The commit had already stated that only one of its three witnesses was
+RED-coupled; this identified the exact missing half, which is the difference
+between disclosing a gap and closing it.
+
+Closed by `an_authority_rotation_over_the_same_store_still_publishes_inside_the_epoch`
+— a **direct structural branch witness**, labelled as such because today's
+constructor gives each `NodeAuthority` its own store, so the branch is
+fail-closed rather than reachable end-to-end. A production workflow that can
+rotate authority over one store will owe its own end-to-end witness. RED-verified
+against the exact mutation: fails at the epoch-advance-count assertion, and is
+the only witness that fails. Wiring gate 44 → 45, both OLB-2C names pinned.
+
+**Still owed before this schedule closes:** the finer empty-selection mutation —
+remove ONLY the settlement-refusal `mark_if_movement()` call while leaving the
+pin-refusal call intact, so the witness passes leg 1 and fails leg 2. The earlier
+mutation disabled the shared helper and stopped at the first assertion, which
+proves the helper but not both call sites. That mutation is the independent
+reviewer's to run.
+
+### Self-directed adversarial re-read of the OLB-2C witnesses — 2026-07-27
+
+Run at the user's request against `61211c9ed`, read-only (the mutation lane
+belongs to the independent reviewer). It does NOT count toward the independent
+gate — the brief was written by the author of the code under review — but it
+found a real defect, so it is recorded rather than discarded.
+
+**All four OLB-2C witnesses tested only ONE direction of the ordering.** They
+detect "published too late" and are blind to "published too EARLY". Confirmed by
+mutation, not by reading: with
+
+```rust
+publish();                                   // BEFORE the advance
+move_routing_authority(&authority, &registry, || {});
+```
+
+the wiring group ran **45 passed / 0 failed**. Every assertion is satisfied
+because the post-publication observer sees the new authority either way.
+
+Early publication is not a hypothetical: `move_routing_authority`'s own doc
+comment describes it as the hazard the epoch-first ordering exists to prevent — a
+reader observes the new object under the OLD epoch identity and serves it as
+old-authoritative. So the half of the ordering that the whole protocol is FOR was
+the unwitnessed half, in witnesses whose stated purpose is that ordering.
+
+**Closed** by `RoutingAuthority::pre_publish_hook`, fired under the gate after
+the advance and before the publication, where nothing the transaction publishes
+may be visible yet. Both authority witnesses now assert it. RED-verified
+separately on each branch: the changed-store witness fails under a publish-early
+mutation on its path, the unchanged-store witness fails under one on its path,
+and in each case it is the only witness that fails.
+
+Two lesser items from the same pass:
+
+- the unchanged-store witness's "store stays pointer-identical" assertion cannot
+  fail on any reachable path (the same `Arc` is both input and expected value).
+  Kept, relabelled as a PRECONDITION marker rather than counted as evidence.
+- the `also_publish` doc comment implied its second branch was
+  production-reachable. Corrected: it is fail-closed, since the only `Some`
+  caller always passes `authority.revocation`.
+
+**Generalisation worth keeping.** Three witness defects in this closure now share
+one shape: each proved a property in one direction and was blind to its inverse.
+The floor witness acknowledged before the barrier instead of after a proven
+failed acquisition; the OLB-2C witnesses caught late publication and not early.
+For any ordering claim "A must happen before B", a witness that only observes
+after B is at best half a proof.
+
+---
+
+## Independent RED pass — FINAL, 2026-07-27, SIGNED
+
+Reviewed head: **`351f93480ccd75f04cee305b5c53d8ab401e8724`**. Every mutation
+selected exactly one test with zero retries and was reverted between runs; no
+broad local matrices were duplicated.
+
+| Mutation | Exact failure |
+|---|---|
+| Remove ONLY the settlement-refusal `mark_if_movement()`, preserving the pin-refusal call | leg 1 completed, then "the empty-selection SETTLE refusal must mark for the same reason" — proving both call sites independently, not just the shared helper |
+| Unchanged store: publish outside the epoch transaction | "an authority-only rotation must still be ONE routing epoch transaction: 0 means the authority was published outside the epoch entirely" (left 0, right 1) |
+| Unchanged store: publish BEFORE the advance | the epoch still advanced once, so the advance-count evidence could not catch it; the inverse-order witness failed at "the replacement authority was already visible BEFORE the epoch advance" |
+| Changed store: publish authority before `move_routing_authority` | same early-visibility assertion, on the other branch |
+
+Every reverted baseline passed. **Both directions are now independently closed on
+both branches: publication cannot be too late, and cannot be too early.**
+
+Focused closure: empty-selection 1/1; unchanged-store authority 1/1;
+changed-store authority 1/1; repaired floor-publication 1/1; routing wiring
+45/45; `git diff --check` clean. Exact-SHA CI: 45 checks, 44 success, 1 neutral
+(non-gating reviewer), 0 failures — unit, integration, Loom, coverage, clippy,
+fmt, docs, Windows security, Rust/Python/TS/Node/Go/FFI, MCP, NAT matrix. No
+review artifact, worktree or target remained.
+
+### Verdict
+
+**E3c SIGNED. OLB-2B SIGNED through the completed substrate. OLB-2B.2 SIGNED,
+including the OLB-2C publication half. OLB-2B.3 AUTHORIZED.** The
+E3c / OLB-2B.2 hold is lifted.
+
+### What the independent gate actually bought
+
+Three defects that the author's own passes did not find, each a witness that was
+green without proving its claim:
+
+1. the floor-publication witness acknowledged before the barrier instead of after
+   a proven failed acquisition (found by the gate);
+2. the OLB-2C unchanged-store branch had no witness at all (found by the gate);
+3. the publish-too-early direction was unwitnessed on both branches (found by a
+   self-directed re-read the gate's second finding prompted).
+
+All three share one shape — **half a proof**: a property verified in one
+direction with its inverse invisible. That is the durable lesson from this
+closure, and it is why the gate is a process requirement rather than a formality.

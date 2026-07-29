@@ -7,8 +7,8 @@
 use super::*;
 use crate::adapter::net::behavior::org_grant::CapabilityAuthorityId;
 use crate::adapter::net::behavior::org_routing_registry::{
-    PrivateAudienceScope, SlotKey, SlotSource, SourceCommitPin, SourceFacts, SourceSnapshot,
-    SourceToken,
+    PrivateAudienceScope, ScopedDiscoveryAuthorityStamp, ScopedSourceFacts, SlotKey, SlotSource,
+    SourceCommitPin, SourceFacts, SourceSnapshot, SourceToken,
 };
 use crate::adapter::net::behavior::org_scoped_ingest::CapabilityAudienceScope;
 use crate::adapter::net::behavior::org_scoped_store::{
@@ -213,7 +213,7 @@ impl SourceSnapshot for PausingSnapshot {
     fn token(&self) -> SourceToken {
         self.inner.token()
     }
-    fn providers(&self, key: &SlotKey) -> SourceFacts {
+    fn providers(&self, key: &SlotKey) -> ScopedSourceFacts {
         let hook = self.during_build.lock().take();
         if let Some(hook) = hook {
             hook();
@@ -229,12 +229,16 @@ impl SlotSource for PausingSource {
             during_build: self.during_build.clone(),
         })
     }
-    fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>> {
+    fn pin_if_current(
+        &self,
+        _keys: &[SlotKey],
+        expected: &SourceToken,
+    ) -> Option<Box<dyn SourceCommitPin + '_>> {
         let hook = self.before_pin.lock().take();
         if let Some(hook) = hook {
             hook();
         }
-        let pin = self.inner.pin_if_current(expected)?;
+        let pin = self.inner.pin_if_current(_keys, expected)?;
         let hook = self.after_pin.lock().take();
         if let Some(hook) = hook {
             hook();
@@ -274,6 +278,8 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
                 scoped_discovery: scoped.clone(),
                 publication: publication.clone(),
                 org_revocation: node.org_revocation.clone(),
+                consumer_grants: node.consumer_grant_audiences.clone(),
+                consumer_grant_gate: node.consumer_grant_gate.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -379,6 +385,8 @@ async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -396,11 +404,11 @@ async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
 
     let snapshot = source.snapshot(&[owner_key.clone(), grant_key.clone()]);
     assert!(
-        matches!(snapshot.providers(&owner_key), SourceFacts::Served(ref p) if p.is_empty()),
+        matches!(snapshot.providers(&owner_key).facts, SourceFacts::Served(ref p) if p.is_empty()),
         "an owner scope with no rows is SERVED with exact empty evidence"
     );
     assert!(
-        matches!(snapshot.providers(&grant_key), SourceFacts::Unserved),
+        matches!(snapshot.providers(&grant_key).facts, SourceFacts::Unserved),
         "an unsupported scope is UNSERVED, not authoritatively empty"
     );
     assert_eq!(
@@ -413,12 +421,12 @@ async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
     let token = snapshot.token();
     assert!(
         source
-            .pin_if_current(&SourceToken::new(vec![u64::MAX]))
+            .pin_if_current(&[], &SourceToken::new(vec![u64::MAX]))
             .is_none(),
         "a token the source has left is refused"
     );
     assert!(
-        source.pin_if_current(&token).is_some(),
+        source.pin_if_current(&[], &token).is_some(),
         "the live token is accepted while the snapshot is still held"
     );
 }
@@ -549,6 +557,8 @@ async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -560,7 +570,7 @@ async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
     let token = snapshot.token();
     let scoped_before = node.scoped_discovery.lock().revision();
     assert!(
-        source.pin_if_current(&token).is_some(),
+        source.pin_if_current(&[], &token).is_some(),
         "nothing has moved yet"
     );
 
@@ -591,25 +601,25 @@ async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
     );
 
     assert!(
-        source.pin_if_current(&token).is_none(),
+        source.pin_if_current(&[], &token).is_none(),
         "a snapshot taken under the OLD revocation authority cannot commit"
     );
 
     // Re-snapshot under the now-current authority: it commits again.
     let fresh = source.snapshot(std::slice::from_ref(&key));
     let fresh_token = fresh.token();
-    assert!(source.pin_if_current(&fresh_token).is_some());
+    assert!(source.pin_if_current(&[], &fresh_token).is_some());
 
     // POISON alone defeats it too: an unusable floor view is unusable authority,
     // so every scope becomes UNSERVED rather than served unfiltered.
     store.mark_poisoned_for_test();
     assert!(
-        source.pin_if_current(&fresh_token).is_none(),
+        source.pin_if_current(&[], &fresh_token).is_none(),
         "poisoning the revocation authority invalidates a snapshot taken before it"
     );
     let poisoned = source.snapshot(std::slice::from_ref(&key));
     assert!(
-        matches!(poisoned.providers(&key), SourceFacts::Unserved),
+        matches!(poisoned.providers(&key).facts, SourceFacts::Unserved),
         "a poisoned revocation authority serves NOTHING rather than unfiltered rows"
     );
 
@@ -678,6 +688,7 @@ async fn cached_facts_that_crossed_their_expiry_read_cold() {
     // Install facts directly, as a quantum that raced the deadline would leave
     // them: valid at capture, expired by the time they are read.
     let expired = Arc::new(SlotBaseFacts {
+        authority: ScopedDiscoveryAuthorityStamp::Owner,
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: crate::adapter::net::behavior::org_routing_registry::SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -822,6 +833,8 @@ async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -834,7 +847,7 @@ async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
 
     let snapshot = source.snapshot(std::slice::from_ref(&key));
     let pin = source
-        .pin_if_current(&snapshot.token())
+        .pin_if_current(&[], &snapshot.token())
         .expect("nothing has moved");
 
     let installed = Arc::new(AtomicBool::new(false));
@@ -870,7 +883,7 @@ async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
     assert!(node.org_revocation.load().is_some());
 
     assert!(
-        source.pin_if_current(&snapshot.token()).is_none(),
+        source.pin_if_current(&[], &snapshot.token()).is_none(),
         "a token from the retired authority must be refused"
     );
 }
@@ -908,6 +921,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
     node.routing_registry.install_facts_for_test(
         key.clone(),
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -929,6 +943,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
     node.routing_registry.install_facts_for_test(
         key.clone(),
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -960,6 +975,8 @@ async fn an_exhausted_authority_epoch_fences_rather_than_aliasing() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -996,11 +1013,11 @@ async fn an_exhausted_authority_epoch_fences_rather_than_aliasing() {
 
     let snapshot = source.snapshot(std::slice::from_ref(&key));
     assert!(
-        matches!(snapshot.providers(&key), SourceFacts::Unserved),
+        matches!(snapshot.providers(&key).facts, SourceFacts::Unserved),
         "an exhausted authority serves nothing"
     );
     assert!(
-        source.pin_if_current(&snapshot.token()).is_none(),
+        source.pin_if_current(&[], &snapshot.token()).is_none(),
         "and commits nothing"
     );
 }
@@ -1022,6 +1039,8 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -1030,11 +1049,11 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
 
     let healthy = source.snapshot(std::slice::from_ref(&key));
     assert!(
-        matches!(healthy.providers(&key), SourceFacts::Served(_)),
+        matches!(healthy.providers(&key).facts, SourceFacts::Served(_)),
         "precondition: a usable authority serves the scope"
     );
     let healthy_token = healthy.token();
-    assert!(source.pin_if_current(&healthy_token).is_some());
+    assert!(source.pin_if_current(&[], &healthy_token).is_some());
 
     store.saturate_generation_for_test();
     store.republish_for_test();
@@ -1045,11 +1064,11 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
 
     let snapshot = source.snapshot(std::slice::from_ref(&key));
     assert!(
-        matches!(snapshot.providers(&key), SourceFacts::Unserved),
+        matches!(snapshot.providers(&key).facts, SourceFacts::Unserved),
         "an exhausted publication generation serves NOTHING"
     );
     assert!(
-        source.pin_if_current(&healthy_token).is_none(),
+        source.pin_if_current(&[], &healthy_token).is_none(),
         "and a token minted under the usable authority no longer commits"
     );
 }
@@ -1231,6 +1250,8 @@ async fn an_exhausted_store_generation_parks_apply_without_spinning_and_recovers
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -1336,6 +1357,8 @@ async fn an_empty_registry_whose_authority_moves_under_the_probe_is_redriven() {
                 scoped_discovery: node.scoped_discovery.clone(),
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
+                consumer_grants: node.consumer_grant_audiences.clone(),
+                consumer_grant_gate: node.consumer_grant_gate.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1470,6 +1493,8 @@ async fn an_exhausted_scoped_generation_fences_the_routing_source() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -1479,7 +1504,7 @@ async fn an_exhausted_scoped_generation_fences_the_routing_source() {
     let healthy = source.snapshot(std::slice::from_ref(&key));
     let healthy_token = healthy.token();
     assert!(
-        matches!(healthy.providers(&key), SourceFacts::Served(_)),
+        matches!(healthy.providers(&key).facts, SourceFacts::Served(_)),
         "precondition: a usable generation serves the scope"
     );
     drop(healthy);
@@ -1511,17 +1536,17 @@ async fn an_exhausted_scoped_generation_fences_the_routing_source() {
 
     let fenced = source.snapshot(std::slice::from_ref(&key));
     assert!(
-        matches!(fenced.providers(&key), SourceFacts::Unserved),
+        matches!(fenced.providers(&key).facts, SourceFacts::Unserved),
         "an exhausted change generation serves NOTHING"
     );
     let fenced_token = fenced.token();
     drop(fenced);
     assert!(
-        source.pin_if_current(&healthy_token).is_none(),
+        source.pin_if_current(&[], &healthy_token).is_none(),
         "a token minted under the usable generation no longer commits"
     );
     assert!(
-        source.pin_if_current(&fenced_token).is_none(),
+        source.pin_if_current(&[], &fenced_token).is_none(),
         "and neither does one minted UNDER the exhaustion — two exhausted samples \
          must never compare equal-and-current"
     );
@@ -1620,6 +1645,7 @@ async fn a_delayed_reader_does_not_delete_a_newer_artifact() {
     let key = slot(13, "nrpc:delayed-reader");
     let facts = |authority: u64| {
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -1684,6 +1710,7 @@ async fn the_read_seam_fences_a_dead_incarnations_facts() {
     let node = node().await;
     let key = slot(29, "nrpc:incarnation-fence");
     let facts = Arc::new(SlotBaseFacts {
+        authority: ScopedDiscoveryAuthorityStamp::Owner,
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -1760,6 +1787,7 @@ async fn the_read_seams_authority_sample_cannot_straddle_a_store_install() {
     assert!(node.org_revocation.load().is_none());
     let key = slot(30, "nrpc:coherent-sample");
     let facts = Arc::new(SlotBaseFacts {
+        authority: ScopedDiscoveryAuthorityStamp::Owner,
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -1844,6 +1872,7 @@ async fn poisoning_authority_colds_already_cached_facts() {
     node.routing_registry.install_facts_for_test(
         key.clone(),
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -1896,6 +1925,7 @@ async fn authority_only_movement_invalidates_and_requeues_everything() {
     node.routing_registry.install_facts_for_test(
         key.clone(),
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: scoped_before,
@@ -1958,6 +1988,8 @@ async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
             scoped_discovery: node.scoped_discovery.clone(),
             publication: node.scoped_publication.clone(),
             org_revocation: node.org_revocation.clone(),
+            consumer_grants: node.consumer_grant_audiences.clone(),
+            consumer_grant_gate: node.consumer_grant_gate.clone(),
             authority: node.routing_authority.clone(),
             settle_gap_hook: parking_lot::Mutex::new(None),
             unserved_scope: node.routing_unserved_scope.clone(),
@@ -2066,6 +2098,8 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -2112,6 +2146,8 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
                     scoped_discovery: node.scoped_discovery.clone(),
                     publication: node.scoped_publication.clone(),
                     org_revocation: node.org_revocation.clone(),
+                    consumer_grants: node.consumer_grant_audiences.clone(),
+                    consumer_grant_gate: node.consumer_grant_gate.clone(),
                     authority: node.routing_authority.clone(),
                     settle_gap_hook: parking_lot::Mutex::new(None),
                     unserved_scope: node.routing_unserved_scope.clone(),
@@ -2143,7 +2179,7 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
 
     // Whatever it sampled is COHERENT: it commits against the live authority.
     assert!(
-        source.pin_if_current(&token).is_some(),
+        source.pin_if_current(&[], &token).is_some(),
         "the snapshot must have sampled one side of the transition, not a mix"
     );
 }
@@ -2170,6 +2206,7 @@ async fn the_epoch_advances_before_the_store_becomes_visible() {
     node.routing_registry.install_facts_for_test(
         key.clone(),
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -2249,6 +2286,8 @@ async fn a_floor_publication_under_the_pin_cannot_settle_current() {
                 scoped_discovery: node.scoped_discovery.clone(),
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
+                consumer_grants: node.consumer_grant_audiences.clone(),
+                consumer_grant_gate: node.consumer_grant_gate.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2359,6 +2398,7 @@ async fn authority_invalidation_spares_successor_facts() {
 
     let facts = |authority: u64| {
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -2405,6 +2445,21 @@ async fn authority_invalidation_spares_successor_facts() {
 /// land, because `Current` is what causes the supervisor to publish `Healthy` —
 /// sampling and then settling as two steps would make that claim false with
 /// nothing left to detect it.
+///
+/// REPAIRED after an independent RED pass (Kyra, 2026-07-27, at `80bb06b5a`)
+/// showed this witness green under a mutation that released the publication pin
+/// before the settlement — i.e. it did not prove the property it claims. The
+/// acknowledgement fired immediately BEFORE `live.write()`, so with the pin
+/// wrongly released the publisher could signal, acquire the lock, and have this
+/// observer read `published` before the publisher stored it. Elapsed time was
+/// already ruled out as evidence; "about to attempt" turns out to be no better,
+/// for the same reason.
+///
+/// The acknowledgement now fires only after a `try_write` has ACTUALLY FAILED,
+/// which is the one thing scheduling cannot fake: it means a holder is provably
+/// there at that instant, so the publisher is definitively blocked when the
+/// negative assertion below runs. Under the same mutation `try_write` succeeds,
+/// no acknowledgement is ever sent, and this witness fails at its wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement() {
     use crate::adapter::net::behavior::org_routing::{
@@ -2425,6 +2480,8 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2439,7 +2496,7 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
     // Bounded completion signal, so neither the negative assertion below nor the
     // join afterwards can hang the suite instead of failing it.
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    store.arm_publish_blocking_hook(Arc::new(move || {
+    store.arm_publish_contended_hook(Arc::new(move || {
         let _ = reached_tx.try_send(());
     }));
     {
@@ -2458,16 +2515,22 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
                 landed.store(true, Ordering::Release);
                 let _ = done.send(());
             }));
-            // Wait for the publisher to REACH the blocked `live.write()`, not for
-            // an interval — elapsed time also "passes" on a scheduler that never
-            // got there (Kyra OLB-2B-E3c).
-            reached
-                .lock()
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the publisher must reach the blocked live.write()");
+            // Wait for PROVEN contention: the publisher's `try_write` failed, so
+            // the settlement pin is demonstrably holding `live` right now.
+            // Neither an interval nor an "about to attempt" signal is evidence —
+            // both also occur when the barrier is absent.
+            reached.lock().recv_timeout(Duration::from_secs(10)).expect(
+                "the publisher's try_write must FAIL, proving the settlement pin \
+                     holds the publication barrier; no signal means the barrier was \
+                     released before the settlement",
+            );
+            // Sound only because of the line above: a failed `try_write` means the
+            // publisher is blocked inside `publish`, so it cannot yet have stored
+            // this flag.
             assert!(
                 !published.load(Ordering::Acquire),
-                "a floor publication landed between the validation and the                  settlement — they are separately interleavable"
+                "a floor publication landed between the validation and the \
+                 settlement — they are separately interleavable"
             );
         }));
     }
@@ -2538,6 +2601,8 @@ async fn poison_cannot_occupy_the_gap_between_validation_and_settlement() {
         scoped_discovery: node.scoped_discovery.clone(),
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2673,6 +2738,8 @@ async fn poison_before_the_validation_is_detected() {
                 scoped_discovery: node.scoped_discovery.clone(),
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
+                consumer_grants: node.consumer_grant_audiences.clone(),
+                consumer_grant_gate: node.consumer_grant_gate.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3201,6 +3268,7 @@ async fn a_reader_retires_unserved_facts_once_their_poison_clears() {
 
     let poisoned_facts = |floor_generation: u64| {
         Arc::new(SlotBaseFacts {
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
             providers: SourceFacts::Unserved,
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -3382,12 +3450,19 @@ async fn duplicate_provider_rows_collapse_to_the_newest_generation() {
     // because the input happened to be sorted the right way.
     let snapshot = ScopedSourceSnapshot {
         token: SourceToken::default(),
-        rows: [(key.clone(), vec![row(3, 300), row(9, 900), row(5, 500)])]
-            .into_iter()
-            .collect(),
+        rows: [(
+            key.clone(),
+            (
+                vec![row(3, 300), row(9, 900), row(5, 500)],
+                ScopedDiscoveryAuthorityStamp::Owner,
+                u64::MAX,
+            ),
+        )]
+        .into_iter()
+        .collect(),
     };
 
-    let SourceFacts::Served(providers) = snapshot.providers(&key) else {
+    let SourceFacts::Served(providers) = snapshot.providers(&key).facts else {
         panic!("a captured scope must reconstruct as Served");
     };
     assert_eq!(providers.len(), 1, "one row per provider survives");
@@ -3398,5 +3473,1546 @@ async fn duplicate_provider_rows_collapse_to_the_newest_generation() {
     assert_eq!(
         providers[0].expires_at, 900,
         "and the surviving row must be that announcement's, not a mix"
+    );
+}
+
+// ---- OLB-2C: the org authority swap is published INSIDE the routing epoch ----
+
+/// A distinct `NodeAuthority` `Arc` for this node under `org`, via the real
+/// adoption ceremony into a fresh tempdir.
+fn adopt_authority(
+    node: &MeshNode,
+    org: &crate::adapter::net::behavior::org::OrgKeypair,
+    tag: &str,
+) -> Arc<crate::adapter::net::behavior::org_authority::NodeAuthority> {
+    use crate::adapter::net::behavior::org::OrgMembershipCert;
+    use crate::adapter::net::behavior::org_authority::NodeAuthority;
+    let entity = node.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("issue cert");
+    // Deliberately SHORT: the ceremony writes `<dir>/authority.lock`, and a
+    // full entity id in the path overruns the Windows path limit — the failure
+    // surfaces as a bare "cannot find the path specified", not as a length
+    // error. A process-scoped sequence keeps it unique without the length.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("net-olb2c-{tag}-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    Arc::new(NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt authority"))
+}
+
+/// OLB-2C. The load-bearing one: at the instant the routing epoch's publication
+/// completes — still under the authority gate — the node authority the
+/// transaction installs is ALREADY visible.
+///
+/// Before OLB-2C, `install_node_authority_inner` published `node_authority`
+/// after `install_org_revocation_store_locked` had returned, which means after
+/// the authority gate was released. The epoch therefore advanced, and the store
+/// became query-visible, while the authority half of the very same transaction
+/// was still the old object. That is the same defect class E3c closed for the
+/// store itself, and it is invisible from outside the gate because the window is
+/// a few instructions wide — hence the observation runs INSIDE it.
+#[tokio::test]
+async fn an_authority_install_publishes_the_authority_under_its_own_epoch() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x2cu8; 32]);
+
+    // First install establishes a baseline authority so the transition under
+    // test is a genuine A -> B replacement rather than None -> A.
+    node.install_node_authority(adopt_authority(&node, &org, "a"))
+        .expect("install A");
+    let a = node.node_authority().expect("A is installed");
+
+    let next = adopt_authority(&node, &org, "b");
+
+    // The OTHER half of the ordering: at the instant AFTER the epoch advance and
+    // BEFORE the publication, nothing this transaction publishes may be visible
+    // yet. Without it, a mutation that publishes the authority BEFORE the advance
+    // leaves every other assertion satisfied — the post-publication observer sees
+    // the new authority either way. Publishing early is the hazard
+    // `move_routing_authority` documents: a reader observes the new object under
+    // the OLD epoch identity and serves it as old-authoritative.
+    let early = Arc::new(AtomicBool::new(false));
+    {
+        let early = early.clone();
+        let premature = next.clone();
+        let weak = Arc::downgrade(&node);
+        *node.routing_authority.pre_publish_hook.lock() = Some(Arc::new(move |_epoch| {
+            if let Some(node) = weak.upgrade() {
+                if node
+                    .node_authority()
+                    .is_some_and(|live| Arc::ptr_eq(&live, &premature))
+                {
+                    early.store(true, Ordering::Release);
+                }
+            }
+        }));
+    }
+
+    // Sample the authority the node exposes at the publication instant.
+    let observed: Arc<parking_lot::Mutex<Vec<(u64, bool)>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    {
+        let sink = observed.clone();
+        let weak = Arc::downgrade(&node);
+        // The expected authority is captured as the `Arc` itself, not as a raw
+        // pointer: a `*const` is not `Sync`, and `Arc::ptr_eq` is the identity
+        // comparison the install path itself uses.
+        let expected = next.clone();
+        *node.routing_authority.post_publish_hook.lock() = Some(Arc::new(move |epoch| {
+            let Some(node) = weak.upgrade() else {
+                return;
+            };
+            let live_is_next = node
+                .node_authority()
+                .is_some_and(|live| Arc::ptr_eq(&live, &expected));
+            sink.lock().push((epoch, live_is_next));
+        }));
+    }
+
+    node.install_node_authority(next.clone())
+        .expect("install B");
+    *node.routing_authority.post_publish_hook.lock() = None;
+    *node.routing_authority.pre_publish_hook.lock() = None;
+
+    assert!(
+        !early.load(Ordering::Acquire),
+        "the replacement authority was already visible BEFORE the epoch advance          — a reader in that window observes it under the OLD epoch identity"
+    );
+    let observed = observed.lock().clone();
+    assert_eq!(
+        observed.len(),
+        1,
+        "the complete authority+store transaction must publish under exactly ONE \
+         epoch advance, not one per half"
+    );
+    assert!(
+        observed[0].1,
+        "at the publication instant the new authority must already be live; \
+         observing the OLD one here means the authority swap escaped the epoch \
+         that names it"
+    );
+    assert!(
+        !Arc::ptr_eq(&a, &node.node_authority().expect("B is installed")),
+        "the transition under test must actually have replaced the authority"
+    );
+}
+
+/// OLB-2C, the other half: the transaction is ONE authority movement, so it
+/// advances the routing epoch exactly once and retires facts stamped before it.
+///
+/// A cached routing artifact built under authority A must not survive into B.
+/// Routing does not read the authority object today — it filters by revocation
+/// floors — so this asserts the epoch/retirement protocol rather than a change
+/// in which providers are served, which is exactly the property 2B.3's warmed
+/// proof path will depend on.
+#[tokio::test]
+async fn an_authority_install_advances_the_routing_epoch_exactly_once() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x2du8; 32]);
+
+    node.install_node_authority(adopt_authority(&node, &org, "c"))
+        .expect("install A");
+    let before = node.routing_authority.epoch();
+
+    let advances: Arc<std::sync::atomic::AtomicU64> =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let counter = advances.clone();
+        *node.routing_authority.post_publish_hook.lock() = Some(Arc::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }));
+    }
+    node.install_node_authority(adopt_authority(&node, &org, "d"))
+        .expect("install B");
+    *node.routing_authority.post_publish_hook.lock() = None;
+
+    assert_eq!(
+        advances.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "an authority+store install is ONE authority movement; a second advance \
+         means the two halves were published as separate ordered units"
+    );
+    let after = node.routing_authority.epoch();
+    assert!(
+        after > before,
+        "the routing epoch must move: {before} -> {after}"
+    );
+}
+
+/// OLB-2C. A REFUSED install publishes neither half.
+///
+/// The one-owner preflight rejects a foreign org before any publication, so the
+/// authority must not move and the epoch must not advance — a failed
+/// transaction that still bumped the epoch would retire every retained routing
+/// fact for nothing.
+#[tokio::test]
+async fn a_refused_authority_install_publishes_neither_half() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x2eu8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, "e"))
+        .expect("install A");
+    let installed = node.node_authority().expect("A is installed");
+    let before = node.routing_authority.epoch();
+
+    let foreign = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x9fu8; 32]);
+    node.install_node_authority(adopt_authority(&node, &foreign, "f"))
+        .expect_err("a foreign owner org must be refused at the one-owner preflight");
+
+    assert!(
+        Arc::ptr_eq(
+            &installed,
+            &node.node_authority().expect("A is still installed")
+        ),
+        "a refused install must not publish its authority"
+    );
+    assert_eq!(
+        node.routing_authority.epoch(),
+        before,
+        "a refused install must not advance the routing epoch"
+    );
+}
+
+/// OLB-2C, the branch the changed-store witness does NOT reach: an authority
+/// rotation over the SAME revocation store `Arc`.
+///
+/// A **direct structural branch witness**, and labelled as such deliberately.
+/// Today's production constructor gives every `NodeAuthority` its own store, so
+/// `authority_changed` and `store_changed` move together and this branch is
+/// unreachable end-to-end — it exists fail-closed. An independent RED pass
+/// (Kyra, 2026-07-27) showed the consequence: mutating this branch to publish
+/// the authority OUTSIDE `move_routing_authority` left
+/// `an_authority_install_publishes_the_authority_under_its_own_epoch` green,
+/// because that witness only ever exercises the changed-store branch. So the
+/// branch was code with no evidence behind it.
+///
+/// This drives `install_org_revocation_store_locked` directly with the exact
+/// installed store `Arc`, which is the only way to reach the branch at all.
+/// **When a production workflow can rotate authority over one store, that
+/// workflow owes its own end-to-end witness — this one does not stand in for it.**
+#[tokio::test]
+async fn an_authority_rotation_over_the_same_store_still_publishes_inside_the_epoch() {
+    let node = node().await;
+    let org = crate::adapter::net::behavior::org::OrgKeypair::from_bytes([0x2fu8; 32]);
+
+    node.install_node_authority(adopt_authority(&node, &org, "g"))
+        .expect("install A");
+    // The EXACT installed `Arc` — passing it back is what makes the helper take
+    // its `Arc::ptr_eq` no-visible-change path.
+    let installed_store = node
+        .org_revocation
+        .load_full()
+        .expect("A's store is installed");
+    let replacement = adopt_authority(&node, &org, "h");
+
+    let advances = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let visible_in_callback = Arc::new(AtomicBool::new(false));
+    // The OTHER half of the ordering: at the instant AFTER the epoch advance and
+    // BEFORE the publication, nothing this transaction publishes may be visible
+    // yet. Without it, a mutation that publishes the authority BEFORE the advance
+    // leaves every other assertion satisfied — the post-publication observer sees
+    // the new authority either way. Publishing early is the hazard
+    // `move_routing_authority` documents: a reader observes the new object under
+    // the OLD epoch identity and serves it as old-authoritative.
+    let early = Arc::new(AtomicBool::new(false));
+    {
+        let early = early.clone();
+        let premature = replacement.clone();
+        let weak = Arc::downgrade(&node);
+        *node.routing_authority.pre_publish_hook.lock() = Some(Arc::new(move |_epoch| {
+            if let Some(node) = weak.upgrade() {
+                if node
+                    .node_authority()
+                    .is_some_and(|live| Arc::ptr_eq(&live, &premature))
+                {
+                    early.store(true, Ordering::Release);
+                }
+            }
+        }));
+    }
+    {
+        let advances = advances.clone();
+        let visible = visible_in_callback.clone();
+        let expected = replacement.clone();
+        let weak = Arc::downgrade(&node);
+        *node.routing_authority.post_publish_hook.lock() = Some(Arc::new(move |_epoch| {
+            advances.fetch_add(1, Ordering::AcqRel);
+            if let Some(node) = weak.upgrade() {
+                if node
+                    .node_authority()
+                    .is_some_and(|live| Arc::ptr_eq(&live, &expected))
+                {
+                    visible.store(true, Ordering::Release);
+                }
+            }
+        }));
+    }
+
+    let before = node.routing_authority.epoch();
+    let publish = {
+        let replacement = replacement.clone();
+        let slot = &node.node_authority;
+        move || slot.store(Some(replacement.clone()))
+    };
+    // Under `org_install`, as every production caller of the `_locked` helper is.
+    let store_changed = {
+        let _install = node.org_install.lock();
+        node.install_org_revocation_store_locked(
+            installed_store.clone(),
+            false,
+            None,
+            Some(&publish as &(dyn Fn() + Sync)),
+        )
+        .expect("re-installing the exact same store is accepted")
+    };
+    *node.routing_authority.post_publish_hook.lock() = None;
+    *node.routing_authority.pre_publish_hook.lock() = None;
+
+    assert!(
+        !early.load(Ordering::Acquire),
+        "the replacement authority was already visible BEFORE the epoch advance          — a reader in that window observes it under the OLD epoch identity"
+    );
+    assert!(
+        !store_changed,
+        "precondition: the same store `Arc` is not a visible store change — \
+         without this the test would silently be exercising the OTHER branch"
+    );
+    // Cannot fail on any reachable path — the same `Arc` is both the input and
+    // what the other branch would store — so it is kept as a PRECONDITION marker
+    // for the reader, not counted as evidence.
+    assert!(
+        Arc::ptr_eq(
+            &installed_store,
+            &node
+                .org_revocation
+                .load_full()
+                .expect("store still installed")
+        ),
+        "precondition marker: the store is pointer-identical on this branch"
+    );
+    assert_eq!(
+        advances.load(Ordering::Acquire),
+        1,
+        "an authority-only rotation must still be ONE routing epoch transaction: \
+         0 means the authority was published outside the epoch entirely"
+    );
+    assert!(
+        visible_in_callback.load(Ordering::Acquire),
+        "at the publication instant the replacement authority must already be \
+         live; observing the old one means the swap escaped the epoch naming it"
+    );
+    assert!(
+        node.routing_authority.epoch() > before,
+        "the routing epoch must advance even though no store changed"
+    );
+    assert!(
+        Arc::ptr_eq(&replacement, &node.node_authority().expect("authority")),
+        "the rotation must actually have landed"
+    );
+}
+
+// ---- OLB-2B.3a: the lock-free per-slot publication cell ------------------
+
+/// OLB-2B.3a. A handle's lock-free read observes exactly what the REAL actor
+/// installation publishes — the same artifact `Arc` the locked registry seam
+/// returns.
+///
+/// Drives `DirtyApply::apply` so the phase-5 installation runs for real. An
+/// earlier version of this witness used `install_facts_for_test`, which stores
+/// into the cell that already exists, and was therefore blind to the defect that
+/// matters most here: a production install that REPLACES the cell
+/// (`slot.facts = Arc::new(ArcSwapOption::from(..))` instead of
+/// `slot.facts.store(..)`) would leave every live `DemandHandle` holding the old
+/// cell — silently cold forever — while the locked seam happily reported the new
+/// artifact. The two seams diverging is the whole hazard of publishing through a
+/// cloned cell, so the witness must compare them after a real install
+/// (Kyra, 2B.3a review).
+#[tokio::test]
+async fn a_handles_lockfree_read_observes_the_registrys_published_artifact() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let node = node().await;
+    let scratch = Scratch::new("lockfree-cell", &node);
+    node.install_org_revocation_store(scratch.store())
+        .expect("install");
+
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
+        authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
+        unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    };
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(Arc::new(source), work, Arc::default());
+    registry.activate_incarnation(1);
+
+    let family = registry.new_family().expect("family");
+    let key = slot(31, "nrpc:lockfree");
+    let held = family.demand(key.clone()).expect("demand");
+
+    assert!(
+        held.base_facts_unvalidated().is_none(),
+        "cold before the actor has installed anything"
+    );
+
+    // The REAL installation path: first demand queued the slot, so one apply
+    // pass reconstructs and installs it through phase 5 under the commit pin.
+    let outcome = registry.apply(
+        1,
+        ApplyRequest {
+            batch: PrivateDiscoveryChangeBatch {
+                generation: 0,
+                dirty: DirtyCapabilities::Clean,
+            },
+            registry_work: true,
+        },
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Current { .. }),
+        "the install pass must settle: {outcome:?}"
+    );
+
+    let via_registry = registry
+        .base_facts_unvalidated(&key)
+        .expect("the actor installed an artifact");
+    let via_handle = held
+        .base_facts_unvalidated()
+        .expect("the handle must observe the actor's install; `None` here means                  the handle holds a cell the production install no longer writes to");
+    assert!(
+        Arc::ptr_eq(&via_handle, &via_registry),
+        "the lock-free and locked seams must return the SAME artifact — divergence          means the install replaced the cell instead of storing into it, leaving          every live handle permanently and silently cold"
+    );
+
+    // Invalidation must reach the handle through the same cell.
+    registry.invalidate_if_stale(&key, &via_registry);
+    assert!(
+        held.base_facts_unvalidated().is_none(),
+        "an invalidation must be visible through the handle, or the warmed path          would keep serving retired facts"
+    );
+    assert!(
+        registry.base_facts_unvalidated(&key).is_none(),
+        "and both seams must agree about the invalidation too"
+    );
+}
+
+// ---- review 2026-07-29 §2: the Grant stamp is keyed by the WHOLE scope ----
+
+/// A node adopted into one org with exactly one consumer Grant installed.
+/// Returns the node, the grant id, and the audience handle the INSTALLED record
+/// carries — read off the record rather than the secret, because the installed
+/// record is what the source compares against.
+async fn consumer_with_installed_grant(tag: &str) -> (Arc<MeshNode>, [u8; 32], [u8; 32]) {
+    use crate::adapter::net::behavior::org::OrgKeypair;
+    use crate::adapter::net::behavior::org_grant::{
+        GrantRights, GrantTargetScope, OrgCapabilityGrant,
+    };
+    let node = node().await;
+    let org = OrgKeypair::from_bytes([0xa1u8; 32]);
+    let issuer = OrgKeypair::from_bytes([0xa2u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, tag))
+        .expect("install authority");
+
+    let provider = EntityKeypair::generate();
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &issuer,
+        org.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:pair-key"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::ExactNode(provider.entity_id().clone()),
+        3600,
+    )
+    .expect("issue grant");
+    let secret = secret.expect("a DISCOVER grant mints a secret");
+    let grant_id = grant.grant_id;
+    node.install_consumer_grant_audience(grant, secret)
+        .expect("install consumer grant");
+
+    let handle = *node
+        .consumer_grant_audiences
+        .load()
+        .get(&grant_id)
+        .expect("the grant is installed")
+        .audience_handle();
+    (node, grant_id, handle)
+}
+
+/// W-G5b. A Grant scope whose audience handle is NOT the installed one reads
+/// `Unserved` — even when a SIBLING key in the same batch shares its grant id
+/// and does match.
+///
+/// The two are different slots by construction: `SlotKey` carries the whole
+/// scope, and an audience-secret rotation leaves both live at once. The stamp
+/// map was keyed by `grant_id` alone, so its dedup short-circuit fired before
+/// the per-key handle comparison — whichever of the pair the batch reached first
+/// decided the other's fate. With the installed scope first (the ordering
+/// asserted below, and one of the two `SlotKey`-ascending orders production
+/// produces) the stale scope fetched the installed stamp and was SERVED,
+/// stamped as current, and passed the read seam.
+///
+/// Dies to keying `stamps` — or the Grant arm's lookup — by `grant_id` alone.
+/// A single-key witness cannot catch it: with one key the handle comparison IS
+/// reached, which is why W-G5 as originally specified passes either way.
+#[tokio::test]
+async fn a_stale_audience_handle_is_unserved_beside_its_installed_sibling() {
+    let (node, grant_id, installed_handle) = consumer_with_installed_grant("pairkey").await;
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
+        authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
+        unserved_scope: node.routing_unserved_scope.clone(),
+    };
+
+    let grant_slot = |audience_handle: [u8; 32]| SlotKey {
+        scope: PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
+            grant_id,
+            audience_handle,
+        })
+        .expect("grant scopes are private"),
+        capability: CapabilityAuthorityId::for_tag("nrpc:pair-key"),
+    };
+    let installed_key = grant_slot(installed_handle);
+    // A handle the installed record does NOT carry — a rotated-away audience.
+    let mut stale_handle = installed_handle;
+    stale_handle[0] ^= 0xff;
+    let stale_key = grant_slot(stale_handle);
+    assert_ne!(
+        installed_handle, stale_handle,
+        "precondition: the two scopes must differ in the handle ONLY"
+    );
+
+    // The installed scope FIRST — the order under which the id-keyed dedup let
+    // the stale one borrow this key's stamp. `grant_installations_for` walks
+    // `keys` in slice order, so this is the exact adversarial ordering rather
+    // than a hope about how the pair sorts.
+    let snapshot = source.snapshot(&[installed_key.clone(), stale_key.clone()]);
+    assert!(
+        matches!(
+            snapshot.providers(&installed_key).facts,
+            SourceFacts::Served(_)
+        ),
+        "precondition: the scope whose handle IS installed must be served, or \
+         this witness proves nothing about the sibling"
+    );
+    assert!(
+        matches!(snapshot.providers(&stale_key).facts, SourceFacts::Unserved),
+        "a scope whose audience handle is not the installed one has NO evidence \
+         — serving it here hands the caller rows the installed handle authorizes \
+         under a scope the node has rotated away from"
+    );
+
+    // And the reverse ordering, which the old shape happened to get right: the
+    // property must hold for BOTH, or it is an accident of iteration order.
+    let reversed = source.snapshot(&[stale_key.clone(), installed_key.clone()]);
+    assert!(
+        matches!(reversed.providers(&stale_key).facts, SourceFacts::Unserved),
+        "and the outcome must not depend on which sibling the batch reaches first"
+    );
+    assert!(
+        matches!(
+            reversed.providers(&installed_key).facts,
+            SourceFacts::Served(_)
+        ),
+        "the installed scope stays served under either ordering"
+    );
+}
+
+/// W-G7 (review 2026-07-29 §1). A consumer-Grant REMOVAL cannot occupy the gap
+/// between the commit pin's validation and the settlement.
+///
+/// The pin re-derives the Grant identity vector, which covers snapshot → pin.
+/// What it did not cover was pin → settlement: `ScopedCommitPin` held only the
+/// authority and publication gates, and `settle_if_current` re-verifies only the
+/// revocation store. Consumer-Grant mutation is serialized by its own gate,
+/// which neither of those reaches — so a removal landing in that window let
+/// phase 5 install facts stamped with a WITHDRAWN installation and still return
+/// `Current`. The read seam refuses those facts, so nothing withdrawn is ever
+/// served; what the defect produced was a currentness claim that was false, over
+/// a slot nothing then requeues.
+///
+/// The acknowledgement below fires ONLY after the remover's `try_lock` has
+/// actually FAILED — the one thing scheduling cannot fake, because it means the
+/// pin is provably holding the gate at that instant. Under the mutation (drop
+/// the gate from `ScopedCommitPin`) the `try_lock` SUCCEEDS, no acknowledgement
+/// is ever sent, and this witness fails at its wait instead of passing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_settlement() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let (node, grant_id, installed_handle) = consumer_with_installed_grant("wg7").await;
+    // Adopting the authority installed its revocation store. Without one,
+    // `settle_if_current` returns before the gap hook can fire at all, and this
+    // witness would pass vacuously.
+    assert!(
+        node.org_revocation.load().is_some(),
+        "precondition: a store must be installed or the settlement gap is unreachable"
+    );
+
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
+        authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
+        unserved_scope: node.routing_unserved_scope.clone(),
+    };
+    let key = SlotKey {
+        scope: PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
+            grant_id,
+            audience_handle: installed_handle,
+        })
+        .expect("grant scopes are private"),
+        capability: CapabilityAuthorityId::for_tag("nrpc:pair-key"),
+    };
+
+    let removed = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let remover: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    // `Receiver` is Send but not Sync, and the gap hook is an `Fn`.
+    let reached = Arc::new(parking_lot::Mutex::new(reached_rx));
+    // Bounded completion signal, so neither the negative assertion below nor the
+    // join afterwards can hang the suite instead of failing it.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    node.consumer_grant_gate
+        .arm_contended_hook(Arc::new(move || {
+            let _ = reached_tx.try_send(());
+        }));
+    {
+        let node = node.clone();
+        let removed = removed.clone();
+        let entered = entered.clone();
+        let remover = remover.clone();
+        let reached = reached.clone();
+        *source.settle_gap_hook.lock() = Some(Arc::new(move || {
+            entered.store(true, Ordering::Release);
+            // Spawned HERE, not before the quantum: a removal that lands before
+            // the pin legitimately defeats it, the quantum reports `Superseded`,
+            // and this gap is never entered. The window under test only exists
+            // once the pin has been granted.
+            let mover = node.clone();
+            let landed = removed.clone();
+            let done = done_tx.clone();
+            *remover.lock() = Some(std::thread::spawn(move || {
+                mover.remove_consumer_grant_audience(&grant_id);
+                landed.store(true, Ordering::Release);
+                let _ = done.send(());
+            }));
+            // Wait for PROVEN contention: the remover's `try_lock` failed, so the
+            // commit pin is demonstrably holding the consumer-Grant gate right
+            // now. Neither an interval nor an "about to attempt" signal is
+            // evidence — both also occur when the barrier is absent.
+            reached.lock().recv_timeout(Duration::from_secs(10)).expect(
+                "the remover's try_lock must FAIL, proving the commit pin holds \
+                 the consumer-Grant gate; no signal means Grant movement is free \
+                 to land between the validation and the settlement",
+            );
+            // Sound only because of the line above: a failed `try_lock` means the
+            // remover is blocked inside the gate, so it cannot yet have run.
+            assert!(
+                !removed.load(Ordering::Acquire),
+                "a consumer-Grant removal landed between the validation and the \
+                 settlement — the installation the pin validated is already \
+                 withdrawn by the time the facts stamped with it are installed"
+            );
+            assert!(
+                node.consumer_grant_audiences
+                    .load()
+                    .get(&grant_id)
+                    .is_some(),
+                "and the snapshot the settlement stamps against must still name \
+                 the installation the pin validated"
+            );
+        }));
+    }
+
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(Arc::new(source), work, Arc::default());
+    registry.activate_incarnation(1);
+    let family = registry.new_family().expect("family");
+    let held = family.demand(key.clone()).expect("demand");
+
+    let outcome = registry.apply(
+        1,
+        ApplyRequest {
+            batch: PrivateDiscoveryChangeBatch {
+                generation: 0,
+                dirty: DirtyCapabilities::Clean,
+            },
+            registry_work: true,
+        },
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Current { .. }),
+        "the install pass must settle: {outcome:?}"
+    );
+    assert!(
+        entered.load(Ordering::Acquire),
+        "the settlement gap must actually have been entered, or this witness \
+         asserted nothing"
+    );
+    assert!(
+        registry.base_facts_unvalidated(&key).is_some(),
+        "precondition: the quantum installed an artifact under the live grant"
+    );
+
+    // The pin dies with the quantum, so the removal completes: the gate DELAYS
+    // Grant movement for the length of one installation, it does not refuse it.
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the removal must proceed once the pin releases the gate");
+    if let Some(handle) = remover.lock().take() {
+        handle.join().expect("remover thread");
+    }
+    assert!(
+        node.consumer_grant_audiences
+            .load()
+            .get(&grant_id)
+            .is_none(),
+        "the removal must actually have removed the grant"
+    );
+    drop(held);
+}
+
+// ---- the Grant-currentness witness group (design §12) ---------------------
+//
+// Every witness below drives the PRODUCTION source, the production phase-5
+// installation and the production read seam. `install_facts_for_test` is
+// deliberately not used: it stores into a cell that already exists, and the
+// 2B.3a review showed that a witness built on it is blind to the class of defect
+// where the production path and the seam under test diverge.
+
+/// The two orgs and the provider the Grant witnesses share.
+///
+/// The grant is always issued by a DIFFERENT org than the node's own: a grant
+/// from one's own org would be the owner plane, and would witness nothing about
+/// the Grant plane's authority.
+struct GrantFixture {
+    node: Arc<MeshNode>,
+    /// The consumer's own org — the grantee.
+    org: crate::adapter::net::behavior::org::OrgKeypair,
+    /// The issuing org.
+    issuer: crate::adapter::net::behavior::org::OrgKeypair,
+    provider: EntityKeypair,
+}
+
+async fn grant_fixture(tag: &str) -> GrantFixture {
+    use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+    use crate::adapter::net::behavior::org_authority::NodeAuthority;
+    use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+    let node = node().await;
+    let org = OrgKeypair::from_bytes([0xa1u8; 32]);
+    let issuer = OrgKeypair::from_bytes([0xa2u8; 32]);
+
+    // Adopted at the FULL skew tolerance, unlike `adopt_authority`'s zero.
+    //
+    // Install validation uses this skew; the routing source and read seam use
+    // `MAX_TOKEN_CLOCK_SKEW_SECS`. Matching them is what lets a witness install a
+    // grant whose `not_after` has already passed but which is still valid within
+    // tolerance — the only way to place an installed Grant's EFFECTIVE deadline
+    // (`not_after + skew`) a few seconds out instead of five minutes.
+    let entity = node.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(&org, entity.clone(), 1, 3600).expect("issue cert");
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("net-grantfx-{tag}-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority = NodeAuthority::adopt(&dir, cert, &entity, MAX_TOKEN_CLOCK_SKEW_SECS, None)
+        .expect("adopt authority");
+    node.install_node_authority(Arc::new(authority))
+        .expect("install authority");
+    GrantFixture {
+        node,
+        org,
+        issuer,
+        provider: EntityKeypair::generate(),
+    }
+}
+
+/// A byte-identical copy of a secret — install CONSUMES the original, and a
+/// witness that reinstalls the same grant has to present the same bytes twice.
+/// The temporary key-bearing buffer is scrubbed after decode (OA2-F hygiene bar).
+fn copy_secret(
+    s: &crate::adapter::net::behavior::org_grant::OrgAudienceSecret,
+) -> crate::adapter::net::behavior::org_grant::OrgAudienceSecret {
+    use crate::adapter::net::behavior::org_grant::OrgAudienceSecret;
+    let mut buf = s.encode_config();
+    let copy = OrgAudienceSecret::decode_config(&buf).expect("copy secret");
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid mutable reference into the owned array.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    copy
+}
+
+impl GrantFixture {
+    /// Mint an issuer→own-org DISCOVER grant over the fixture's provider.
+    ///
+    /// `grant_id: Some(id)` REUSES that id, which is what a same-ID replacement
+    /// needs; `None` allocates a fresh one. `bounds: Some((nbf, exp))` sets the
+    /// validity window explicitly, which is what an expiry witness needs;
+    /// `None` is a comfortably-valid hour.
+    fn mint(
+        &self,
+        tag: &str,
+        grant_id: Option<[u8; 32]>,
+        bounds: Option<(u64, u64)>,
+    ) -> (
+        crate::adapter::net::behavior::org_grant::OrgCapabilityGrant,
+        crate::adapter::net::behavior::org_grant::OrgAudienceSecret,
+    ) {
+        use crate::adapter::net::behavior::org::current_timestamp;
+        use crate::adapter::net::behavior::org_grant::{
+            GrantRights, GrantTargetScope, OrgAudienceSecret, OrgCapabilityGrant,
+        };
+        let target = GrantTargetScope::ExactNode(self.provider.entity_id().clone());
+        let cap = CapabilityAuthorityId::for_tag(tag);
+        let Some(grant_id) = grant_id else {
+            let (grant, secret) = OrgCapabilityGrant::try_issue(
+                &self.issuer,
+                self.org.org_id(),
+                cap,
+                GrantRights::DISCOVER,
+                target,
+                bounds.map_or(3600, |(_, exp)| exp.saturating_sub(current_timestamp())),
+            )
+            .expect("issue grant");
+            return (grant, secret.expect("a DISCOVER grant mints a secret"));
+        };
+        // Reusing an id means minting the audience binding separately and
+        // issuing at explicit bounds — `try_issue` always allocates a fresh id.
+        let now = current_timestamp();
+        let (secret, binding) = OrgAudienceSecret::mint(grant_id);
+        let (not_before, not_after) = bounds.unwrap_or((now.saturating_sub(60), now + 3600));
+        let grant = OrgCapabilityGrant::issue_at(
+            &self.issuer,
+            grant_id,
+            self.org.org_id(),
+            cap,
+            GrantRights::DISCOVER,
+            target,
+            Some(binding),
+            not_before,
+            not_after,
+            // Nonce varies the canonical bytes, so a same-id replacement is a
+            // genuinely DIFFERENT signed authority rather than a re-issue that
+            // happens to be byte-identical.
+            u64::from(grant_id[0]) ^ not_after,
+        );
+        (grant, secret)
+    }
+
+    /// Install a consumer grant and return `(grant_id, installed audience
+    /// handle)`. The handle is read off the INSTALLED RECORD, because that is
+    /// what the source and the read seam compare against.
+    fn install(
+        &self,
+        grant: crate::adapter::net::behavior::org_grant::OrgCapabilityGrant,
+        secret: crate::adapter::net::behavior::org_grant::OrgAudienceSecret,
+    ) -> ([u8; 32], [u8; 32]) {
+        let grant_id = grant.grant_id;
+        self.node
+            .install_consumer_grant_audience(grant, secret)
+            .expect("install consumer grant");
+        let handle = *self
+            .node
+            .consumer_grant_audiences
+            .load()
+            .get(&grant_id)
+            .expect("the grant is installed")
+            .audience_handle();
+        (grant_id, handle)
+    }
+
+    fn key(&self, grant_id: [u8; 32], audience_handle: [u8; 32], tag: &str) -> SlotKey {
+        SlotKey {
+            scope: PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
+                grant_id,
+                audience_handle,
+            })
+            .expect("grant scopes are private"),
+            capability: CapabilityAuthorityId::for_tag(tag),
+        }
+    }
+
+    /// Warm `key` through the REAL actor path on the node's OWN registry, and
+    /// hand back the handle that keeps the slot retained.
+    ///
+    /// One `apply` pass: the demand queues the slot, phase 3 reconstructs it
+    /// through the production source, and phase 5 installs it beneath the commit
+    /// pin. Anything short of that would not produce a production stamp.
+    fn warm(
+        &self,
+        key: &SlotKey,
+    ) -> crate::adapter::net::behavior::org_routing_registry::DemandHandle {
+        use crate::adapter::net::behavior::org_routing::{
+            ApplyOutcome, ApplyRequest, DirtyApply, RoutingHealth,
+        };
+        use crate::adapter::net::behavior::org_scoped_store::{
+            DirtyCapabilities, PrivateDiscoveryChangeBatch,
+        };
+        self.node
+            .routing_health
+            .store(Arc::new(RoutingHealth::Healthy { incarnation: 1 }));
+        self.node.routing_registry.activate_incarnation(1);
+        let family = self.node.org_routing_family().expect("family");
+        let held = family.demand(key.clone()).expect("demand");
+        let outcome = self.node.routing_registry.apply(
+            1,
+            ApplyRequest {
+                batch: PrivateDiscoveryChangeBatch {
+                    generation: 0,
+                    dirty: DirtyCapabilities::Clean,
+                },
+                registry_work: true,
+            },
+        );
+        assert!(
+            matches!(outcome, ApplyOutcome::Current { .. }),
+            "the warming pass must settle, or nothing below is warm: {outcome:?}"
+        );
+        assert!(
+            self.node.org_routing_base_facts(key).is_some(),
+            "precondition: the slot must be WARM before the transition under test"
+        );
+        held
+    }
+
+    /// The production source over this node, for witnesses that assert on
+    /// capture rather than on the read seam.
+    fn source(&self) -> ScopedSlotSource {
+        ScopedSlotSource {
+            scoped_discovery: self.node.scoped_discovery.clone(),
+            publication: self.node.scoped_publication.clone(),
+            org_revocation: self.node.org_revocation.clone(),
+            consumer_grants: self.node.consumer_grant_audiences.clone(),
+            consumer_grant_gate: self.node.consumer_grant_gate.clone(),
+            authority: self.node.routing_authority.clone(),
+            settle_gap_hook: parking_lot::Mutex::new(None),
+            unserved_scope: self.node.routing_unserved_scope.clone(),
+        }
+    }
+}
+
+/// W-G3. A same-ID replacement cannot reauthorize facts captured under the
+/// PREVIOUS installed Grant.
+///
+/// Two adversarial cases, and they are distinguished by DIFFERENT components:
+///
+/// - **case 1 — the byte-identical grant, reinstalled.** Same `grant_id`, same
+///   signature, same audience handle. The installation identity is the ONLY
+///   thing that differs, so it is the only thing that can retire the artifact;
+/// - **case 2 — a differently signed grant reusing the id.** A fresh audience
+///   binding and nonce make it a different signed authority under the same name.
+///
+/// **Case 1 must reinstall the retained grant and a byte-identical copy of its
+/// secret**, not re-mint one. An earlier version of this witness called
+/// `mint(.., Some(grant_id), ..)`, whose explicit-id branch mints a fresh
+/// audience secret and nonce — so it produced a different signature and a
+/// different handle, and asserted so itself. That made case 1 a second copy of
+/// case 2: the artifact was retired by the signature and handle checks, and the
+/// installation-identity comparison was never exercised. Kyra's independent
+/// mutation run proved it — with `record.install_seq() == *install_seq` removed
+/// from the read seam, the entire 54-witness gate stayed green (2026-07-29).
+///
+/// The assertions below therefore pin what is held EQUAL as hard as what
+/// differs: a case-1 that does not assert equal signature and equal handle
+/// cannot tell the two cases apart.
+#[tokio::test]
+async fn a_same_id_grant_replacement_cannot_reauthorize_captured_facts() {
+    let f = grant_fixture("wg3").await;
+    let (grant, secret) = f.mint("nrpc:wg3", None, None);
+    // Retain the EXACT grant and a byte-identical copy of the secret: install
+    // consumes both, and case 1 has to present the same bytes a second time.
+    let retained_grant = grant.clone();
+    let retained_secret = copy_secret(&secret);
+    let signature = grant.signature;
+    let (grant_id, handle) = f.install(grant, secret);
+    let key = f.key(grant_id, handle, "nrpc:wg3");
+    let _held = f.warm(&key);
+
+    let warm = f.node.org_routing_base_facts(&key).expect("warm");
+    let ScopedDiscoveryAuthorityStamp::Grant {
+        grant_id: stamped_id,
+        install_seq: first_install_seq,
+        ..
+    } = warm.authority
+    else {
+        panic!("precondition: the artifact must carry a GRANT stamp");
+    };
+    assert_eq!(
+        stamped_id, grant_id,
+        "precondition: the stamp names the installed grant"
+    );
+
+    // --- case 1: the BYTE-IDENTICAL grant, removed and reinstalled ----------
+    assert!(
+        f.node.remove_consumer_grant_audience(&grant_id),
+        "precondition: the grant was installed"
+    );
+    let (reinstalled_id, reinstalled_handle) = f.install(retained_grant, retained_secret);
+
+    // Everything the currentness relation binds, EXCEPT the installation
+    // identity, is held equal — asserted, not assumed. Without these three the
+    // case cannot claim to isolate the identity.
+    let installed = f.node.consumer_grant_audiences.load();
+    let record = installed.get(&grant_id).expect("reinstalled");
+    assert_eq!(reinstalled_id, grant_id, "case 1: the SAME grant id");
+    assert_eq!(
+        record.grant().signature,
+        signature,
+        "case 1: the SAME signed authority — byte-identical, not a re-issue"
+    );
+    assert_eq!(
+        reinstalled_handle, handle,
+        "case 1: the SAME audience handle"
+    );
+    assert_ne!(
+        record.install_seq(),
+        first_install_seq,
+        "case 1: and a DIFFERENT installation identity — the only thing that \
+         differs, and therefore the only thing that can retire the artifact"
+    );
+    drop(installed);
+
+    assert!(
+        f.node.org_routing_base_facts(&key).is_none(),
+        "facts captured under the PREVIOUS installation must not survive a \
+         remove-then-reinstall of the byte-identical grant: the signature and \
+         the handle are unchanged, so ONLY the non-aliasing installation \
+         identity can tell the two installations apart"
+    );
+
+    // --- case 2: a DIFFERENTLY SIGNED grant reusing the id ------------------
+    // Re-warm under the current installation first, so case 2 retires something
+    // that was genuinely warm rather than inheriting case 1's cold slot.
+    let _held2 = f.warm(&key);
+    assert!(
+        f.node.org_routing_base_facts(&key).is_some(),
+        "precondition: re-warmed under the reinstalled grant"
+    );
+
+    let (distinct, distinct_secret) = f.mint("nrpc:wg3-other", Some(grant_id), None);
+    assert_eq!(distinct.grant_id, grant_id, "case 2: the SAME grant id");
+    assert_ne!(
+        distinct.signature, signature,
+        "case 2: a DIFFERENT signed authority under that id"
+    );
+    assert!(f.node.remove_consumer_grant_audience(&grant_id));
+    f.install(distinct, distinct_secret);
+    assert!(
+        f.node.org_routing_base_facts(&key).is_none(),
+        "a DISTINCT signed grant reusing the id must not reauthorize facts \
+         captured under the grant it replaced"
+    );
+}
+
+/// W-G4. The signed Grant identity is part of the currentness relation, on its
+/// own.
+///
+/// **A direct comparison witness, and labelled as such deliberately.** Equal
+/// installation identity with a different signature is not production-reachable
+/// — `install_seq` is strictly monotone, so any replacement that changes the
+/// signature also changes the identity. W-G3 covers the reachable composite;
+/// this covers the component, by holding `install_seq` and the handle EQUAL to
+/// the installed record and moving only the signature.
+///
+/// Without it, dropping the signature from the comparison leaves W-G3 green:
+/// W-G3's case 2 also moves the installation identity, so the identity check
+/// alone still retires the artifact. That is exactly the redundancy that hides a
+/// missing component.
+#[tokio::test]
+async fn the_signed_grant_identity_is_part_of_scope_currentness() {
+    use crate::adapter::net::behavior::org::current_timestamp;
+    let f = grant_fixture("wg4").await;
+    let (grant, secret) = f.mint("nrpc:wg4", None, None);
+    let (grant_id, handle) = f.install(grant, secret);
+
+    let installed = f.node.consumer_grant_audiences.load();
+    let record = installed.get(&grant_id).expect("installed");
+    let live = ScopedDiscoveryAuthorityStamp::Grant {
+        grant_id,
+        install_seq: record.install_seq(),
+        grant_signature: record.grant().signature,
+        audience_handle: handle,
+    };
+    let now = current_timestamp();
+    assert!(
+        f.node.scope_authority_is_current(&live, now),
+        "precondition: the exact installed authority is current"
+    );
+
+    // EVERY other component held equal — same id, same installation identity,
+    // same handle — so only the signature can be what fails.
+    let ScopedDiscoveryAuthorityStamp::Grant {
+        grant_signature, ..
+    } = live
+    else {
+        panic!("constructed as a Grant stamp");
+    };
+    let mut forged = grant_signature;
+    forged[0] ^= 0xff;
+    let tampered = ScopedDiscoveryAuthorityStamp::Grant {
+        grant_id,
+        install_seq: record.install_seq(),
+        grant_signature: forged,
+        audience_handle: handle,
+    };
+    assert!(
+        !f.node.scope_authority_is_current(&tampered, now),
+        "a stamp whose signed authority differs from the installed one is NOT \
+         current, even with the installation identity and handle equal — the \
+         signature binds the whole canonical grant, and dropping it from the \
+         comparison is invisible to every reachable-path witness"
+    );
+}
+
+/// W-G5. The audience handle is part of the authority stamp and the currentness
+/// comparison, for a SINGLE key.
+///
+/// Distinct from `a_stale_audience_handle_is_unserved_beside_its_installed_sibling`
+/// (W-G5b), which kills sibling aliasing through a `grant_id`-keyed stamp map.
+/// This kills removal of the handle from the comparison itself, and asserts it
+/// at BOTH seams the handle is checked at:
+///
+/// - capture: a lone key whose handle is not the installed one must not be
+///   served, with no sibling present to alias through;
+/// - the read seam: a stamp whose handle differs from the installed record's is
+///   not current, with every other component held equal.
+#[tokio::test]
+async fn the_audience_handle_is_part_of_scope_currentness() {
+    use crate::adapter::net::behavior::org::current_timestamp;
+    let f = grant_fixture("wg5").await;
+    let (grant, secret) = f.mint("nrpc:wg5", None, None);
+    let (grant_id, handle) = f.install(grant, secret);
+
+    let mut other = handle;
+    other[0] ^= 0xff;
+
+    // --- capture: ONE key, no sibling to alias through ----------------------
+    let source = f.source();
+    let stale_key = f.key(grant_id, other, "nrpc:wg5");
+    let snapshot = source.snapshot(std::slice::from_ref(&stale_key));
+    assert!(
+        matches!(snapshot.providers(&stale_key).facts, SourceFacts::Unserved),
+        "a lone Grant key whose audience handle is not the installed one has NO \
+         evidence — this is the single-key case, with nothing else in the batch"
+    );
+    drop(snapshot);
+    let installed_key = f.key(grant_id, handle, "nrpc:wg5");
+    let ok = source.snapshot(std::slice::from_ref(&installed_key));
+    assert!(
+        matches!(ok.providers(&installed_key).facts, SourceFacts::Served(_)),
+        "precondition: the same key with the INSTALLED handle is served, so the \
+         refusal above is about the handle and not about the fixture"
+    );
+    drop(ok);
+
+    // --- the read seam: every other component held equal --------------------
+    let installed = f.node.consumer_grant_audiences.load();
+    let record = installed.get(&grant_id).expect("installed");
+    let live = ScopedDiscoveryAuthorityStamp::Grant {
+        grant_id,
+        install_seq: record.install_seq(),
+        grant_signature: record.grant().signature,
+        audience_handle: handle,
+    };
+    let wrong_handle = ScopedDiscoveryAuthorityStamp::Grant {
+        grant_id,
+        install_seq: record.install_seq(),
+        grant_signature: record.grant().signature,
+        audience_handle: other,
+    };
+    let now = current_timestamp();
+    assert!(
+        f.node.scope_authority_is_current(&live, now),
+        "precondition: the exact installed authority is current"
+    );
+    assert!(
+        !f.node.scope_authority_is_current(&wrong_handle, now),
+        "a stamp whose audience handle differs from the installed record's is \
+         NOT current — the cached path must never compare less than the live \
+         query, which checks the handle as defence in depth"
+    );
+}
+
+/// W-G6. A consumer-Grant INSTALLATION between source capture and commit
+/// refuses publication.
+///
+/// Drives the production reconstruction and the production phase-5 path:
+/// `PausingSource` delegates every method to the real [`ScopedSlotSource`] and
+/// only adds a pause inside `providers()`, which is exactly the capture→commit
+/// window. The install landed there changes the batch's installation vector, so
+/// the token the pin re-derives no longer matches the one the snapshot minted.
+///
+/// Dies to omitting the Grant identities from `SourceToken`: without them the
+/// re-derived token compares equal, the pin is granted, and the quantum
+/// publishes facts for a batch whose Grant authority moved underneath it.
+#[tokio::test]
+async fn a_grant_install_between_capture_and_commit_refuses_publication() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork, RoutingHealth,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let f = grant_fixture("wg6").await;
+    // A is installed up front and is the key the quantum selects.
+    let (grant_a, secret_a) = f.mint("nrpc:wg6", None, None);
+    let (id_a, handle_a) = f.install(grant_a, secret_a);
+    let key_a = f.key(id_a, handle_a, "nrpc:wg6");
+
+    // B is NOT installed at capture. Its key is selected in the same batch, so
+    // installing it mid-capture moves THIS batch's vector — which is the
+    // movement the pin must catch, as opposed to the unrelated movement W-G8
+    // proves it must ignore.
+    let (grant_b, secret_b) = f.mint("nrpc:wg6-b", None, None);
+    let handle_b = secret_b.audience_handle;
+    let id_b = grant_b.grant_id;
+    let key_b = f.key(id_b, handle_b, "nrpc:wg6-b");
+
+    let during_build: Arc<parking_lot::Mutex<Option<BuildHook>>> = Arc::default();
+    let source = PausingSource {
+        inner: f.source(),
+        during_build: during_build.clone(),
+        after_pin: Arc::default(),
+        before_pin: Arc::default(),
+    };
+
+    let landed = Arc::new(AtomicBool::new(false));
+    {
+        let node = f.node.clone();
+        let landed = landed.clone();
+        let pending = parking_lot::Mutex::new(Some((grant_b, secret_b)));
+        *during_build.lock() = Some(Box::new(move || {
+            let Some((grant, secret)) = pending.lock().take() else {
+                return;
+            };
+            node.install_consumer_grant_audience(grant, secret)
+                .expect("the mid-capture install must itself succeed");
+            landed.store(true, Ordering::Release);
+        }));
+    }
+
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(Arc::new(source), work, Arc::default());
+    f.node
+        .routing_health
+        .store(Arc::new(RoutingHealth::Healthy { incarnation: 1 }));
+    registry.activate_incarnation(1);
+    let family = registry.new_family().expect("family");
+    let held_a = family.demand(key_a.clone()).expect("demand a");
+    let held_b = family.demand(key_b.clone()).expect("demand b");
+
+    let outcome = registry.apply(
+        1,
+        ApplyRequest {
+            batch: PrivateDiscoveryChangeBatch {
+                generation: 0,
+                dirty: DirtyCapabilities::Clean,
+            },
+            registry_work: true,
+        },
+    );
+
+    assert!(
+        landed.load(Ordering::Acquire),
+        "the mid-capture install must actually have run, or this witness \
+         asserted nothing"
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Superseded),
+        "an installation between capture and commit must defeat the pin: \
+         {outcome:?}"
+    );
+    assert!(
+        registry.base_facts_unvalidated(&key_a).is_none(),
+        "and NOTHING may be published — not even the key whose own Grant did \
+         not move, because the batch it was captured with is no longer current"
+    );
+    assert!(
+        registry.base_facts_unvalidated(&key_b).is_none(),
+        "least of all the key whose Grant arrived mid-capture"
+    );
+    drop(held_a);
+    drop(held_b);
+}
+
+/// W-G8. Movement of an UNRELATED Grant preserves the exact unaffected slot.
+///
+/// The inverse-direction proof for W-G6. The batch-wide installation vector in
+/// `SourceToken` protects one capture→commit transaction; the per-key stamp in
+/// `SlotBaseFacts` protects one cached artifact. If the transaction-wide value
+/// had leaked into the artifact stamp, every Grant install or removal anywhere
+/// on the node would cold every cached Grant artifact — and, because the owner
+/// plane is stamped `Owner` and compared trivially, the damage would be silent
+/// and Grant-only.
+///
+/// Dies to replacing the per-key stamp check with a global "some Grant moved"
+/// bit.
+#[tokio::test]
+async fn unrelated_grant_movement_preserves_the_exact_slot() {
+    let f = grant_fixture("wg8").await;
+    let (grant_a, secret_a) = f.mint("nrpc:wg8-a", None, None);
+    let (id_a, handle_a) = f.install(grant_a, secret_a);
+    let key_a = f.key(id_a, handle_a, "nrpc:wg8-a");
+    let _held = f.warm(&key_a);
+
+    let warm = f
+        .node
+        .org_routing_base_facts(&key_a)
+        .expect("precondition: A's slot is warm");
+
+    // A second, entirely unrelated grant: different id, different audience,
+    // different capability. Nothing about A's artifact depends on it.
+    let (grant_b, secret_b) = f.mint("nrpc:wg8-b", None, None);
+    let (id_b, _handle_b) = f.install(grant_b, secret_b);
+    assert_ne!(id_a, id_b, "precondition: the two grants are unrelated");
+
+    let after_install = f
+        .node
+        .org_routing_base_facts(&key_a)
+        .expect("installing an unrelated Grant must not cold A's slot");
+    assert!(
+        Arc::ptr_eq(&warm, &after_install),
+        "and must not merely leave it readable — it must be the EXACT same \
+         artifact, not a silently rebuilt one"
+    );
+
+    // Removal is the other direction of movement, and the one a global bit
+    // would be most tempting to implement.
+    assert!(
+        f.node.remove_consumer_grant_audience(&id_b),
+        "precondition: B was installed"
+    );
+    let after_removal = f
+        .node
+        .org_routing_base_facts(&key_a)
+        .expect("removing an unrelated Grant must not cold A's slot either");
+    assert!(
+        Arc::ptr_eq(&warm, &after_removal),
+        "still the exact same artifact"
+    );
+
+    // And the control: moving A's OWN grant must cold it, or the assertions
+    // above would also pass on a seam that checks nothing at all.
+    assert!(f.node.remove_consumer_grant_audience(&id_a));
+    assert!(
+        f.node.org_routing_base_facts(&key_a).is_none(),
+        "control: moving the slot's OWN Grant must cold it — without this the \
+         witness above is satisfied by a comparison that never fails"
+    );
+}
+
+/// W-G13. An installed Grant's own deadline retires its cached facts through
+/// the PRODUCTION expiry path — **including, and especially, with ZERO
+/// providers.**
+///
+/// The empty-provider case is the point, not an edge. With no provider rows the
+/// artifact has no deadline from its rows: `row_expiry` is `u64::MAX`. So a
+/// source that derives expiry from provider rows alone publishes an artifact
+/// that claims never to expire while the authority behind it expires shortly —
+/// and NOTHING else in the system can say otherwise. The installed Grant is not
+/// a scoped row, so it reaches neither `ScopedDiscoveryState::next_visible_expiry`
+/// nor the exact-expiry timer it drives.
+///
+/// That was the state at `df32cbd7d`. The read seam refused an expired Grant, so
+/// nothing withdrawn was ever served — but retirement was READER-TRIGGERED, and
+/// with no reader the artifact sat retained indefinitely with nothing armed to
+/// notice. Kyra's independent review named the gap and required the deadline to
+/// reach a production deadline/wake path (2026-07-29, finding 2). Scope item 12.
+///
+/// This drives the whole edge against a LIVE production supervisor:
+///
+/// 1. an installed, currently valid DISCOVER Grant with ZERO providers;
+/// 2. warmed through the real actor and `DirtyApply::apply`;
+/// 3. `Served(empty)` — proven-empty evidence, not `Unserved`;
+/// 4. the artifact's deadline IS the Grant's effective deadline, and the
+///    registry arms to exactly that;
+/// 5. the read seam refuses it past that instant (asserted at an explicit clock,
+///    so this half needs no waiting at all);
+/// 6. the deadline passes and the ACTOR's own arm fires — no reader touches the
+///    slot, and no scoped mutation wakes it;
+/// 7. the requeued rebuild settles `Unserved`;
+/// 8. shutdown joins every spawned task.
+///
+/// **On the timing.** The effective deadline is `not_after + MAX_TOKEN_CLOCK_SKEW_SECS`,
+/// and the skew is 300 s — so a grant issued to expire "soon" still arms five
+/// minutes out. Instead the grant is issued with `not_after` already PAST but
+/// still inside the skew tolerance, which is a legitimate installable state and
+/// places the effective deadline a few seconds away. That is why this witness
+/// needs neither a mocked clock nor a paused runtime: `start_paused` freezes
+/// time and a live node never goes idle, so its auto-advance never fires and the
+/// sleeps simply never complete. Every wait below is bounded and polls real
+/// state; none is used as ordering evidence.
+///
+/// Dies to deriving the artifact deadline from provider rows alone, and to
+/// omitting the installed-Grant deadline from the source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installed_grants_expiry_colds_its_facts_with_zero_providers() {
+    use crate::adapter::net::behavior::org::current_timestamp;
+    use crate::adapter::net::behavior::org_routing_registry::SourceFacts;
+    use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+
+    let f = grant_fixture("wg13").await;
+    let base = current_timestamp();
+    // `not_after` already past, still valid within tolerance — see the note
+    // above. The effective deadline lands `LEAD` seconds out.
+    const LEAD: u64 = 4;
+    let not_after = base + LEAD - MAX_TOKEN_CLOCK_SKEW_SECS;
+    let effective_deadline = not_after + MAX_TOKEN_CLOCK_SKEW_SECS;
+    assert_eq!(
+        effective_deadline,
+        base + LEAD,
+        "precondition: the arm is seconds away, not five minutes"
+    );
+    // An explicit id, because only that branch of `mint` issues at EXPLICIT
+    // bounds — the fresh-id branch derives a TTL from `now`, which is zero for a
+    // `not_after` already in the past.
+    let (grant, secret) = f.mint(
+        "nrpc:wg13",
+        Some([0x13u8; 32]),
+        Some((base.saturating_sub(3600), not_after)),
+    );
+    let (grant_id, handle) = f.install(grant, secret);
+    let key = f.key(grant_id, handle, "nrpc:wg13");
+    // A SECOND slot under the same grant, for the read-seam probe only — see
+    // the note at that probe for why it cannot share the actor's slot.
+    let probe_key = f.key(grant_id, handle, "nrpc:wg13-probe");
+
+    // The real production supervisor. ZERO providers are announced.
+    f.node.start();
+    assert!(
+        until(|| f.node.org_routing_ready()).await,
+        "precondition: the actor must reach Healthy before anything is demanded"
+    );
+
+    let family = f.node.org_routing_family().expect("family");
+    let held = family.demand(key.clone()).expect("demand");
+    let held_probe = family.demand(probe_key.clone()).expect("demand probe");
+    assert!(
+        until(|| f.node.org_routing_base_facts(&key).is_some()
+            && f.node.org_routing_base_facts(&probe_key).is_some())
+        .await,
+        "precondition: the actor must warm BOTH slots under a currently-valid Grant"
+    );
+
+    let warm = f.node.org_routing_base_facts(&key).expect("warm");
+    assert!(
+        matches!(&warm.providers, SourceFacts::Served(p) if p.is_empty()),
+        "an installed current Grant with no providers is SERVED with exact empty \
+         evidence, not Unserved"
+    );
+    assert_eq!(
+        warm.earliest_expiry, effective_deadline,
+        "THE point of this witness: with ZERO provider rows the artifact's only \
+         possible deadline is its AUTHORITY's. Derived from rows alone this is \
+         u64::MAX — an artifact claiming never to expire while the Grant behind \
+         it expires in seconds, with nothing armed to notice"
+    );
+    assert_eq!(
+        f.node.routing_registry.next_artifact_deadline(),
+        Some(effective_deadline),
+        "and the registry must ARM to it — this is what the actor sleeps on, so \
+         a deadline that never reaches here wakes nobody"
+    );
+
+    // The read-seam half, at an explicit clock and on the PROBE slot: no
+    // waiting, and it isolates "the seam refuses" from "the actor retires",
+    // which are different claims about different mechanisms.
+    //
+    // On the PROBE slot specifically, because `org_routing_base_facts_at`
+    // INVALIDATES what it refuses. Probing the actor's own slot would make a
+    // reader the thing that retired the artifact, and every actor-arm assertion
+    // below would then pass with no actor arm at all — the witness would be
+    // contaminating its own evidence.
+    assert!(
+        f.node
+            .org_routing_base_facts_at(&probe_key, effective_deadline.saturating_sub(1))
+            .is_some(),
+        "precondition: still current one second before the effective deadline"
+    );
+    assert!(
+        f.node
+            .org_routing_base_facts_at(&probe_key, effective_deadline)
+            .is_none(),
+        "an installed-but-expired Grant authorizes NOTHING, and the boundary is          exact: `now >= not_after + skew`, matching `check_time_bounds_at`"
+    );
+    assert_eq!(
+        f.node.routing_registry.next_artifact_deadline(),
+        Some(effective_deadline),
+        "and the actor's OWN slot is still armed after that probe — proof the          read-seam half is not what retires it below"
+    );
+
+    // --- the ACTOR's own arm ------------------------------------------------
+    // Nothing below reads the slot or mutates scoped discovery. The only thing
+    // that can retire this artifact is the actor waking on the deadline it
+    // armed to.
+    assert!(
+        until(|| f.node.routing_registry.next_artifact_deadline().is_none()).await,
+        "the actor must wake on its OWN deadline arm and retire the expired \
+         artifact; a deadline still armed here means nothing consumed it"
+    );
+    assert!(
+        until(|| {
+            f.node
+                .routing_registry
+                .base_facts_unvalidated(&key)
+                .is_some_and(|facts| matches!(facts.providers, SourceFacts::Unserved))
+        })
+        .await,
+        "and the requeued rebuild must settle UNSERVED: past its deadline the \
+         installed Grant authorizes nothing, so the scope has no evidence at all"
+    );
+    assert!(
+        f.node.org_routing_base_facts(&key).is_none(),
+        "the read seam is cold — and now AGREES with the retained set rather \
+         than being the only thing that knew"
+    );
+
+    // NO SPIN. A deadline arm that fires, retires, and finds the same deadline
+    // waiting is a busy actor — the failure mode this arm most easily
+    // introduces. It converges because the rebuild installs `Unserved`, which
+    // carries no deadline; assert the convergence rather than trusting it.
+    let settled = f.node.org_routing_reconciliation_counts();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        f.node.org_routing_reconciliation_counts()[0],
+        settled[0],
+        "the actor must be QUIESCENT once the expired artifact is retired — a          climbing install count means the deadline arm re-fires on what it just          rebuilt"
+    );
+    assert!(
+        f.node.routing_registry.next_artifact_deadline().is_none(),
+        "and nothing is armed: `Unserved` carries no deadline, which is what          makes the retirement terminal rather than cyclic"
+    );
+
+    drop(held);
+    drop(held_probe);
+    let _ = f.node.shutdown().await;
+    assert!(
+        f.node.routing_task.lock().is_none(),
+        "every spawned task must be joined"
     );
 }

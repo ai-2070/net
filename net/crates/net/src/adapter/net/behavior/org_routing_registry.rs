@@ -28,6 +28,7 @@
 //! sorting or projection; and no registry method a source implementation could
 //! re-enter takes the commit pin.
 
+use arc_swap::ArcSwapOption;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -121,6 +122,10 @@ pub(crate) struct SlotBaseFacts {
     pub providers: SourceFacts,
     /// The WHOLE source epoch these facts were built and committed under.
     pub epoch: SourceEpoch,
+    /// The EXACT scope authority these facts were reconstructed under
+    /// (OLB-2B.3c-pre). Per-key: never the batch-wide Grant vector, or unrelated
+    /// Grant movement would invalidate Owner and unrelated Grant facts.
+    pub authority: ScopedDiscoveryAuthorityStamp,
     pub actor_incarnation: u64,
     pub slot_incarnation: u64,
     /// The earliest `expires_at` across the retained providers, or `u64::MAX`
@@ -176,6 +181,68 @@ pub(crate) struct SourceEpoch {
     pub poisoned: bool,
 }
 
+/// The EXACT authority under which one scope's rows are query-visible
+/// (OLB-2B.3c-pre).
+///
+/// Per-SLOT, never per-batch. The batch `SourceToken` protects the
+/// capture/commit transaction; this protects one cached artifact. Copying a
+/// batch-wide value into every `SlotBaseFacts` would make unrelated Grant
+/// movement invalidate Owner and unrelated Grant facts — exactly what W-G8
+/// forbids.
+///
+/// For the Grant plane the installed consumer Grant IS authority, not a
+/// decryption convenience: the live query admits a row only while the stored
+/// grant signature and audience handle equal the CURRENTLY INSTALLED ones, so a
+/// cached artifact must compare the same things. All four components are bound:
+///
+/// - `grant_id` alone is insufficient — remove-then-reinstall, and a DIFFERENT
+///   signed grant reusing the id, both leave it equal;
+/// - `install_seq` distinguishes remove/reinstall of the same grant. It is the
+///   checked, terminal, non-aliasing identity signed at `300e80f6c`; a wrapping
+///   one would let an old artifact match a later installation;
+/// - `grant_signature` distinguishes a different signed grant under the same id —
+///   the signature binds the whole canonical grant;
+/// - `audience_handle` mirrors the live query's defense-in-depth check, so the
+///   cached path is never weaker than the uncached one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScopedDiscoveryAuthorityStamp {
+    /// The owner plane: authority is the node's own org, already covered by the
+    /// routing authority epoch and revocation view in [`SourceEpoch`].
+    Owner,
+    /// The grant plane: exactly one installed consumer Grant.
+    Grant {
+        grant_id: [u8; 32],
+        install_seq: u64,
+        grant_signature: [u8; 64],
+        audience_handle: [u8; 32],
+    },
+}
+
+/// One scope's reconstructed facts TOGETHER with the exact authority that
+/// produced them (OLB-2B.3c-pre).
+///
+/// They travel as one value so a caller cannot stamp facts with an authority
+/// that did not produce them.
+#[derive(Clone, Debug)]
+pub(crate) struct ScopedSourceFacts {
+    pub facts: SourceFacts,
+    pub authority: ScopedDiscoveryAuthorityStamp,
+    /// The instant this scope's AUTHORITY stops authorizing anything, or
+    /// `u64::MAX` if it carries no deadline of its own (scope item 12).
+    ///
+    /// Separate from the provider rows' deadlines and folded in beside them,
+    /// because the two can disagree in the direction that matters: an installed
+    /// Grant with ZERO visible providers yields a row deadline of `u64::MAX`,
+    /// so an `earliest_expiry` derived from rows alone would say the artifact
+    /// never expires while its authority expires in an hour.
+    ///
+    /// Boundary convention matches the read seam's `now >= earliest_expiry` and
+    /// the grant family's `now >= not_after + skew ⇒ expired`, so this is
+    /// exactly `not_after + MAX_TOKEN_CLOCK_SKEW_SECS` — the first instant the
+    /// authority is no longer valid, not the last instant it is.
+    pub authority_deadline: u64,
+}
+
 /// An opaque, comparable summary of EVERY authority input a snapshot was taken
 /// under.
 ///
@@ -224,8 +291,9 @@ pub(crate) trait SourceSnapshot {
     /// that proved it current.
     fn token(&self) -> SourceToken;
 
-    /// Reconstruct `key`'s authority-scoped facts from the captured material.
-    fn providers(&self, key: &SlotKey) -> SourceFacts;
+    /// Reconstruct `key`'s authority-scoped facts, with the exact scope
+    /// authority that produced them.
+    fn providers(&self, key: &SlotKey) -> ScopedSourceFacts;
 }
 
 /// A SHORT currentness pin, held only across final validation and installation.
@@ -285,7 +353,18 @@ pub(crate) trait SlotSource: Send + Sync + 'static {
     /// `None` means something the reconstruction depended on moved, and the
     /// caller must install nothing. ALWAYS called before the registry lock is
     /// taken, never while holding it — see the module's frozen lock order.
-    fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>>;
+    /// `keys` is the SAME batch the snapshot was taken over.
+    ///
+    /// The token's Grant half is a vector of the exact installation identities
+    /// THIS batch selected, so re-deriving it requires knowing which grants
+    /// those were. Passing the keys lets the pin compare like with like instead
+    /// of falling back to a global "some Grant moved" bit, which would defeat
+    /// every commit pin in flight on unrelated Grant movement (OLB-2B.3c-pre).
+    fn pin_if_current(
+        &self,
+        keys: &[SlotKey],
+        expected: &SourceToken,
+    ) -> Option<Box<dyn SourceCommitPin + '_>>;
 
     /// Whether this source can still settle a commit, and if it cannot, whether
     /// that is recoverable (E3c blockers §2, review-pass-3 §1).
@@ -359,7 +438,20 @@ struct Slot {
     refs: usize,
     /// `None` until a recapture installs facts, and cleared the moment anything
     /// invalidates them. `None` IS the deterministic cold outcome.
-    facts: Option<Arc<SlotBaseFacts>>,
+    ///
+    /// An `ArcSwapOption` CELL rather than a plain field (OLB-2B.3): every
+    /// MUTATION still happens under the registry lock exactly as before, so the
+    /// install/invalidate ordering the E3c closure signed is unchanged. What the
+    /// cell adds is a lock-free READ — a `DemandHandle` clones this `Arc` at
+    /// demand time, so the warmed path loads the artifact with one atomic and
+    /// never contends with the actor's quantum. That is the hot-path contract
+    /// (plan pins 7/8: the warmed call is an ArcSwap load, not a lock).
+    ///
+    /// Cell identity is per SLOT INCARNATION: a retired slot's entry is dropped
+    /// with the slot, so a handle from a dead incarnation cannot be revived. It
+    /// cannot be stale either — a live handle is precisely what stops the slot
+    /// being retired.
+    facts: Arc<ArcSwapOption<SlotBaseFacts>>,
 }
 
 #[derive(Default)]
@@ -413,7 +505,7 @@ impl RegistryInner {
     fn invalidate(&mut self, key: &SlotKey) -> bool {
         self.slots
             .get_mut(key)
-            .is_some_and(|slot| slot.facts.take().is_some())
+            .is_some_and(|slot| slot.facts.swap(None).is_some())
     }
 
     /// Queue every retained slot and drop every fact — the expansion step of a
@@ -442,7 +534,7 @@ impl RegistryInner {
         self.slots
             .iter()
             .filter(|(_, slot)| {
-                !slot.facts.as_ref().is_some_and(|facts| {
+                !slot.facts.load().as_ref().is_some_and(|facts| {
                     facts.actor_incarnation == incarnation
                         && facts.slot_incarnation == slot.incarnation
                         && facts.epoch == epoch
@@ -559,6 +651,33 @@ pub(crate) struct DemandHandle {
     registry: Arc<NodeOrgRoutingRegistry>,
     family: FamilyId,
     key: SlotKey,
+    /// The slot's publication cell, cloned once at demand time (OLB-2B.3).
+    ///
+    /// This is what makes the warmed read lock-free: the handle already names
+    /// exactly one slot, so the hot path needs no map lookup and no registry
+    /// lock — one atomic load and it holds the immutable artifact. Holding the
+    /// cell is sound precisely because holding the handle is what prevents the
+    /// slot being retired, so the cell can never be a dead incarnation's.
+    facts: Arc<ArcSwapOption<SlotBaseFacts>>,
+}
+
+impl DemandHandle {
+    /// The slot's currently published artifact, or `None` for the cold outcome.
+    ///
+    /// UNVALIDATED, exactly like its registry-side twin: this returns whatever
+    /// is published, and authority revalidation is the NODE seam's job
+    /// (`MeshNode::org_routing_base_facts`). Named to say so — the review that
+    /// renamed `base_facts` to `base_facts_unvalidated` did it because an
+    /// accessor that looks authoritative and is not is a trap, and adding a
+    /// lock-free twin would re-lay it under a friendlier name.
+    ///
+    /// The allow is scoped to this ONE method and names its consumer: the warmed
+    /// call path (OLB-2B.3b), which is the next slice. Per the E3c discipline, a
+    /// leftover allow here after 2B.3b lands means that consumer never arrived.
+    #[allow(dead_code)]
+    pub(crate) fn base_facts_unvalidated(&self) -> Option<Arc<SlotBaseFacts>> {
+        self.facts.load_full()
+    }
 }
 
 impl Drop for DemandHandle {
@@ -617,7 +736,7 @@ impl NodeOrgRoutingRegistry {
         key: SlotKey,
     ) -> Result<DemandHandle, DemandRefused> {
         let mut queued = false;
-        {
+        let cell = {
             let mut inner = self.inner.lock();
             if inner.family_handles(family) >= MAX_HANDLES_PER_FAMILY {
                 self.metrics
@@ -633,7 +752,19 @@ impl NodeOrgRoutingRegistry {
                     .fetch_add(1, Ordering::AcqRel);
                 return Err(DemandRefused::NodeAtCapacity);
             }
-            if new_slot {
+            // Captured under the SAME lock acquisition that takes the reference,
+            // so the cell can only be the one belonging to the incarnation this
+            // handle is now keeping alive.
+            //
+            // The fresh path keeps the cell it INSERTED rather than looking the
+            // slot back up, so there is no post-mutation lookup left to fail
+            // (review 2026-07-29 §4). What remains is the pre-existing path,
+            // where `new_slot` was false under this same lock hold and nothing
+            // above removes a slot — and where, unlike before, the impossible
+            // branch is reached having mutated NOTHING: no reserved slot with no
+            // owner, no orphaned `pending` entry, no `queued` flag whose
+            // `work.mark()` the early return would skip.
+            let cell = if new_slot {
                 // Allocate BEFORE mutating anything, so exhaustion retains nothing.
                 let Some(incarnation) = inner.allocate_id() else {
                     self.metrics
@@ -641,12 +772,13 @@ impl NodeOrgRoutingRegistry {
                         .fetch_add(1, Ordering::AcqRel);
                     return Err(DemandRefused::IdSpaceExhausted);
                 };
+                let cell = Arc::new(ArcSwapOption::empty());
                 inner.slots.insert(
                     key.clone(),
                     Slot {
                         incarnation,
-                        refs: 0,
-                        facts: None,
+                        refs: 1,
+                        facts: cell.clone(),
                     },
                 );
                 inner
@@ -656,17 +788,28 @@ impl NodeOrgRoutingRegistry {
                     .insert(key.clone());
                 inner.pending.insert(key.clone());
                 queued = true;
-            }
-            if let Some(slot) = inner.slots.get_mut(&key) {
+                cell
+            } else {
+                let Some(slot) = inner.slots.get_mut(&key) else {
+                    // Unreachable. Fail closed rather than fabricating a detached
+                    // cell that no install would ever write to — a handle reading
+                    // a cell the registry does not own would be permanently,
+                    // silently cold. `NodeAtCapacity` is the most conservative of
+                    // the three refusals: it retains nothing and tells the caller
+                    // to take the cold path.
+                    return Err(DemandRefused::NodeAtCapacity);
+                };
                 slot.refs += 1;
-            }
+                slot.facts.clone()
+            };
             *inner
                 .families
                 .entry(family)
                 .or_default()
                 .entry(key.clone())
                 .or_insert(0) += 1;
-        }
+            cell
+        };
         if queued {
             // Private discovery did not move, so this is the ONLY thing that will
             // wake the actor for it.
@@ -676,6 +819,7 @@ impl NodeOrgRoutingRegistry {
             registry: self.clone(),
             family,
             key,
+            facts: cell,
         })
     }
 
@@ -732,7 +876,7 @@ impl NodeOrgRoutingRegistry {
     /// witnesses asserting on RETENTION specifically — several of them precisely
     /// to prove that the seam fences something the registry still holds.
     pub(crate) fn base_facts_unvalidated(&self, key: &SlotKey) -> Option<Arc<SlotBaseFacts>> {
-        self.inner.lock().slots.get(key)?.facts.clone()
+        self.inner.lock().slots.get(key)?.facts.load_full()
     }
 
     /// Authority moved to `live`: drop every fact stamped with an OLDER
@@ -758,6 +902,7 @@ impl NodeOrgRoutingRegistry {
                 .iter()
                 .filter(|(_, slot)| {
                     slot.facts
+                        .load()
                         .as_ref()
                         .is_some_and(|facts| facts.epoch.authority < live)
                 })
@@ -796,13 +941,14 @@ impl NodeOrgRoutingRegistry {
             };
             let still_observed = slot
                 .facts
+                .load()
                 .as_ref()
                 .is_some_and(|live| Arc::ptr_eq(live, observed));
             if !still_observed {
                 // Someone installed a newer artifact. Leave it alone.
                 return;
             }
-            slot.facts = None;
+            slot.facts.store(None);
             self.metrics
                 .facts_invalidated
                 .fetch_add(1, Ordering::AcqRel);
@@ -835,7 +981,7 @@ impl NodeOrgRoutingRegistry {
         let mut inner = self.inner.lock();
         let mut invalidated = 0u64;
         for slot in inner.slots.values_mut() {
-            if slot.facts.take().is_some() {
+            if slot.facts.swap(None).is_some() {
                 invalidated += 1;
             }
         }
@@ -844,6 +990,66 @@ impl NodeOrgRoutingRegistry {
         self.metrics
             .facts_invalidated
             .fetch_add(invalidated, Ordering::AcqRel);
+    }
+
+    /// The EARLIEST deadline any retained artifact carries, or `None` if none
+    /// carries one (scope item 12).
+    ///
+    /// This is what the actor arms its expiry wake to. `u64::MAX` means "no
+    /// deadline" and is deliberately excluded rather than returned — an
+    /// artifact with no deadline must not produce a wake at the end of time,
+    /// and `Option` says that where a sentinel would invite arithmetic on it.
+    pub(crate) fn next_artifact_deadline(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .slots
+            .values()
+            .filter_map(|slot| slot.facts.load().as_ref().map(|f| f.earliest_expiry))
+            .filter(|deadline| *deadline != u64::MAX)
+            .min()
+    }
+
+    /// Retire every retained artifact whose deadline `now_secs` has reached, and
+    /// RE-QUEUE its slot so the actor rebuilds it (scope item 12).
+    ///
+    /// The read seam already refuses an expired artifact, so this is not what
+    /// makes expiry safe — it is what makes it PROMPT, and what makes the
+    /// registry's retained set agree with what a reader would be told. Without
+    /// it, an artifact whose authority expired sits retained until some reader
+    /// happens by; with zero provider rows that reader is the only thing that
+    /// could ever retire it, because nothing else in the artifact carries a
+    /// deadline at all.
+    ///
+    /// Re-queuing is what closes the loop: the rebuilt reconstruction finds the
+    /// authority gone and installs `Unserved`, whose deadline is `u64::MAX`, so
+    /// the next arm finds nothing and the actor parks. That is also why this
+    /// cannot spin — a retired deadline is not reinstalled.
+    pub(crate) fn retire_expired(&self, now_secs: u64) -> u64 {
+        let mut inner = self.inner.lock();
+        let expired: Vec<SlotKey> = inner
+            .slots
+            .iter()
+            .filter(|(_, slot)| {
+                slot.facts
+                    .load()
+                    .as_ref()
+                    .is_some_and(|f| now_secs >= f.earliest_expiry)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut retired = 0u64;
+        for key in expired {
+            if let Some(slot) = inner.slots.get_mut(&key) {
+                if slot.facts.swap(None).is_some() {
+                    retired += 1;
+                }
+            }
+            inner.pending.insert(key);
+        }
+        self.metrics
+            .facts_invalidated
+            .fetch_add(retired, Ordering::AcqRel);
+        retired
     }
 
     /// Test-only: drop `key`'s facts and re-queue it, so a witness can drive
@@ -866,9 +1072,9 @@ impl NodeOrgRoutingRegistry {
         let slot = inner.slots.entry(key).or_insert(Slot {
             incarnation: 1,
             refs: 1,
-            facts: None,
+            facts: Arc::new(ArcSwapOption::empty()),
         });
-        slot.facts = Some(facts);
+        slot.facts.store(Some(facts));
     }
 
     pub(crate) fn retained_slots(&self) -> usize {
@@ -928,6 +1134,14 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         if inner.live_actor == Some(incarnation) {
             inner.live_actor = None;
         }
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        self.next_artifact_deadline()
+    }
+
+    fn retire_expired(&self, now_secs: u64) -> u64 {
+        NodeOrgRoutingRegistry::retire_expired(self, now_secs)
     }
 
     /// One bounded reconciliation quantum.
@@ -1051,7 +1265,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
             let probe = self.source.snapshot(&[]);
             let token = probe.token();
             drop(probe);
-            let Some(commit) = self.source.pin_if_current(&token) else {
+            let Some(commit) = self.source.pin_if_current(&[], &token) else {
                 // The refusal is REGISTRY-visible movement, exactly as it is on
                 // the non-empty path, and it must be marked for exactly the same
                 // reason (E3c blockers §3, review-pass-3 §2). What makes the
@@ -1124,7 +1338,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         // expensive part of a quantum, and blocking private-discovery ingest,
         // expiry and floor mutation behind it is exactly what the snapshot/commit
         // split exists to prevent (Kyra OLB-2B-E3b).
-        let built: Vec<(SlotKey, u64, SourceFacts)> = selected
+        let built: Vec<(SlotKey, u64, ScopedSourceFacts)> = selected
             .iter()
             .map(|(key, slot_incarnation)| {
                 (key.clone(), *slot_incarnation, snapshot.providers(key))
@@ -1133,7 +1347,11 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         drop(snapshot);
 
         // --- phase 4: the COMMIT pin, before the registry lock ---
-        let Some(commit) = self.source.pin_if_current(&snapshot_token) else {
+        // The SAME `keys` the snapshot was taken over, not an independently
+        // rebuilt copy: `pin_if_current`'s contract is that the two batches are
+        // identical, and two separately-constructed vectors is the shape in
+        // which that quietly stops being true (review 2026-07-29 §3).
+        let Some(commit) = self.source.pin_if_current(&keys, &snapshot_token) else {
             // An UNSETTLEABLE refusal is not movement (E3c blockers §2,
             // review-pass-3 §1): the mark below would spin the actor on
             // `Superseded` until shutdown, because nothing has to move for the
@@ -1220,7 +1438,12 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     slot_moved = true;
                     continue;
                 }
-                let earliest_expiry = match &facts {
+                let ScopedSourceFacts {
+                    facts,
+                    authority,
+                    authority_deadline,
+                } = facts;
+                let row_expiry = match &facts {
                     SourceFacts::Served(providers) => providers
                         .iter()
                         .map(|p| p.expires_at)
@@ -1229,13 +1452,22 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     // Cold at every read anyway; nothing to bound.
                     SourceFacts::Unserved => u64::MAX,
                 };
-                slot.facts = Some(Arc::new(SlotBaseFacts {
+                // The artifact expires at the EARLIER of what its rows say and
+                // what its authority says (scope item 12). Rows alone are not
+                // enough, and the zero-provider case is why: an installed Grant
+                // with no visible providers gives `row_expiry == u64::MAX`, so a
+                // rows-only deadline would claim the artifact never expires
+                // while the authority behind it expires in an hour — and nothing
+                // else in the artifact could ever retire it.
+                let earliest_expiry = row_expiry.min(authority_deadline);
+                slot.facts.store(Some(Arc::new(SlotBaseFacts {
                     providers: facts,
                     epoch,
+                    authority,
                     actor_incarnation: incarnation,
                     slot_incarnation,
                     earliest_expiry,
-                }));
+                })));
                 self.metrics.installs.fetch_add(1, Ordering::AcqRel);
             }
 
@@ -1456,7 +1688,7 @@ mod tests {
         fn token(&self) -> SourceToken {
             SourceToken::new(vec![self.generation])
         }
-        fn providers(&self, key: &SlotKey) -> SourceFacts {
+        fn providers(&self, key: &SlotKey) -> ScopedSourceFacts {
             self.state.queried.lock().push(key.clone());
             self.state
                 .assert_no_registry_lock("no registry lock may be held across reconstruction");
@@ -1468,7 +1700,11 @@ mod tests {
             if let Some(hook) = hook {
                 hook();
             }
-            SourceFacts::Served(Arc::from(Vec::new()))
+            ScopedSourceFacts {
+                facts: SourceFacts::Served(Arc::from(Vec::new())),
+                authority: ScopedDiscoveryAuthorityStamp::Owner,
+                authority_deadline: u64::MAX,
+            }
         }
     }
 
@@ -1521,7 +1757,11 @@ mod tests {
             })
         }
 
-        fn pin_if_current(&self, expected: &SourceToken) -> Option<Box<dyn SourceCommitPin + '_>> {
+        fn pin_if_current(
+            &self,
+            _keys: &[SlotKey],
+            expected: &SourceToken,
+        ) -> Option<Box<dyn SourceCommitPin + '_>> {
             self.0.assert_no_registry_lock(
                 "the commit pin must be acquired BEFORE the registry lock",
             );
@@ -2497,6 +2737,7 @@ mod tests {
         assert!(
             f.registry.inner.lock().slots.values().all(|slot| slot
                 .facts
+                .load()
                 .as_ref()
                 .is_some_and(|facts| facts.epoch.generation == generation)),
             "ONE coherent source generation across the whole retained set"

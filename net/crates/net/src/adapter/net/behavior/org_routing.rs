@@ -192,6 +192,25 @@ pub(crate) trait DirtyApply: Send + Sync + 'static {
     /// cancellation — from the actor's own fence guard, so a dead actor loses its
     /// authority synchronously.
     fn deactivate_incarnation(&self, _incarnation: u64) {}
+
+    /// The earliest deadline any retained artifact carries, or `None` for no
+    /// deadline at all (scope item 12).
+    ///
+    /// Recomputed at every park, so the arm is always current with whatever the
+    /// pass that just ran installed. `None` by default: an applier with no
+    /// deadlines arms nothing and behaves exactly as before.
+    fn next_deadline(&self) -> Option<u64> {
+        None
+    }
+
+    /// A deadline was reached: retire what it names and re-queue those slots.
+    /// Returns how many artifacts were retired.
+    ///
+    /// The default retires nothing, which is safe rather than merely
+    /// convenient — an applier that arms no deadline can never be called here.
+    fn retire_expired(&self, _now_secs: u64) -> u64 {
+        0
+    }
 }
 
 /// The shared applier — lock-free at this seam.
@@ -551,7 +570,39 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
         // `Superseded` persistently — each pass would synthesize another
         // `RebuildAll` and never yield. Parking makes the retry rate the rate of
         // actual source movement, which is exactly what `Superseded` reports.
+        // The ARTIFACT-DEADLINE arm (scope item 12). Recomputed here, at every
+        // park, so it is always current with whatever the pass that just ran
+        // installed — which is the property that makes a separate "a deadline
+        // changed" wake unnecessary.
+        //
+        // A deadline already reached is retired IMMEDIATELY rather than slept
+        // on, exactly as the exact-expiry timer does. That cannot spin: the
+        // rebuild a retirement queues reconstructs the scope under authority
+        // that is now gone, installs `Unserved`, and `Unserved` carries no
+        // deadline — so the next arm finds nothing.
+        let deadline_wait = it.apply.next_deadline().map(|deadline| {
+            Duration::from_secs(deadline.saturating_sub(super::org::current_timestamp()))
+        });
+        if deadline_wait.is_some_and(|wait| wait.is_zero()) {
+            let retired = it.apply.retire_expired(super::org::current_timestamp());
+            if retired > 0 {
+                // Re-queued by `retire_expired`; the mark is what tells the next
+                // pass it is registry work rather than a bare wake.
+                it.work.mark();
+                tracing::debug!(retired, "org routing: artifact deadline reached");
+            }
+            continue;
+        }
+
         tokio::select! {
+            // `Pending` when nothing carries a deadline, so this arm is inert
+            // rather than a wake at the end of time.
+            _ = async {
+                match deadline_wait {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
             _ = &mut work_signal => {}
             changed_result = it.changed.changed() => {
                 if changed_result.is_err() {

@@ -1,7 +1,14 @@
 # OLB-2B consumer entry — design for review (revision 2)
 
-**Status: ENTRY REVIEWED AND AUTHORIZED; E3a–E3c LANDED; phase sign-off HELD
-pending the review-pass-2/pass-3 closure.**
+**Status: SIGNED by Kyra 2026-07-27 at `351f93480`.** E3c SIGNED; OLB-2B SIGNED
+through the completed substrate; OLB-2B.2 SIGNED including the OLB-2C publication
+half; **OLB-2B.3 AUTHORIZED**. The hold recorded below is LIFTED — the section is
+kept for the sequence, not the state.
+
+The signature followed a complete independent RED pass that closed both
+directions of the authority-publication ordering on both branches, plus the
+settlement-leg empty-selection mutation, plus exact-SHA CI (45 checks, 44 success,
+1 non-gating neutral, 0 failures).
 
 Revision 1 (`84080310f`) was HELD: core direction approved, implementation NOT
 authorized. Revision 2 adopted every refinement from that review and recorded the
@@ -11,18 +18,34 @@ entry-boundary re-review was run against.
 **Entry-boundary review outcome (recorded here per review-pass-3 §19).** The
 re-review this document asked for was held and PASSED, and implementation of the
 E-slices was authorized on that basis; the E1 entry landed at `5bf661f2f` and
-E3a–E3c are landed at HEAD of the `load-balancing` branch. The audit trail
+E3a–E3c landed on the `load-balancing` branch, which merged to master at
+`80bb06b5a` (PR #655, 2026-07-27). The audit trail
 previously had a hole here: the document still read "no OLB-2B source
 implementation begins before that review" while the source it forbids was fully
 landed, and no in-tree record of the outcome existed.
 
-**What is still held.** Landing is not signing. Three adversarial branch reviews
+**What was still held** *(SUPERSEDED by the 2026-07-27 signature above; kept for
+the sequence)*. Landing is not signing. Three adversarial branch reviews
 followed the implementation —
 [2026-07-23](../misc/CODE_REVIEW_2026_07_23_ORG_LOAD_BALANCING.md),
 [pass 2](../misc/CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS2.md) and
 [pass 3](../misc/CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS3.md) — and E3c /
 composed OLB-2B stays HELD until their adjudicated gate is closed and an
 exact-head closure run is recorded. OLB-2C is not authorized before that.
+
+The adjudicated gate is now closed and the exact-head run is recorded at
+[pass 3 → Exact-head closure run](../misc/CODE_REVIEW_2026_07_26_ORG_LOAD_BALANCING_PASS3.md#exact-head-closure-run--80bb06b5a).
+**Merging did not discharge the hold**, and neither does that run. Two items are
+outstanding, and both are outstanding BY DESIGN rather than by omission — a
+closure run executed by whoever wrote the fixes proves the fixes still compile
+and pass, not that they are correct:
+
+1. **Independent RED mutations.** Every probe recorded in this closure was
+   authored and reverted by the same author as the fix it tests. A witness that
+   its own author cannot imagine failing is the failure mode this step exists to
+   catch, so these must be run by someone else.
+2. **The CI conclusion for `80bb06b5a`.** The Linux jobs own the serial nextest
+   matrices and all `cfg(unix)` coverage; no Windows run substitutes for them.
 
 OLB-2A composed is SIGNED at `65b9fe903`; that signature does not authorize this
 phase.
@@ -308,10 +331,103 @@ Application and bounds:
 | Slice | Content |
 |---|---|
 | **2B-entry** | §5 boundary: drain ownership + lease + supervisor + fencing + minimal registry + bounded application. |
-| **2B.2** | Coherent `OrgAuthorityEpoch` publication + mandatory per-call comparison before proof/send. |
-| **2B.3** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current + warmed-call consumption. |
+| **2B.2** | Coherent `OrgAuthorityEpoch` publication + mandatory per-call comparison before proof/send. **Publication half LANDED as OLB-2C** (see below); the per-call comparison waits on 2B.3's warmed route set, which is the thing there would be to compare. |
+| **2B.3** | `ArcSwap`-published generation-stamped `OrgRouteSet` + publish-if-current + warmed-call consumption. **2B.3a SIGNED** at `fd05a89ba` (the publication cell only — explicitly NOT a claim that `SlotBaseFacts` is the route set). Re-sliced into **2B.3c-pre / 2B.3b / 2B.3c / 2B.3d-pre / 2B.3d**; revision-5 design under review at [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md). Implementation NOT authorized. |
 | **2B.4** | Exact-provider lease acquire/release on route-slot lifecycle + node-global ttl/2 refresh owner (first holder arms, last disarms). |
 | **2B.5** | `sensed_candidates` join + §8 classification + granted-candidates-Unknown, inside the actor, never on the request path. |
+
+**OLB-2C (2B.2 publication half) — landed at the user's direction while E3c is
+unsigned.** `install_node_authority_inner` published `node_authority` after
+`install_org_revocation_store_locked` had already released the authority gate. So
+an authority+store install advanced the routing epoch and made the new store
+query-visible while the authority half of the SAME transaction was still the old
+object, and an authority rotation over an unchanged store advanced no routing
+epoch at all. That is the defect class E3c closed for the store itself —
+publication outside the epoch's synchronization — reappearing on the authority
+half.
+
+The authority publication is now threaded into the store install and runs inside
+the very same `move_routing_authority`: one gate, one epoch advance for the
+complete transaction, on both the swap path and the no-visible-store-change path.
+It is threaded in rather than wrapped by the caller because `move_routing_authority`
+takes the non-reentrant authority gate, so a caller-side wrapper would deadlock.
+
+**Reachability, stated honestly.** Routing does not read the authority object
+today — `ScopedSlotSource` filters by revocation floors, not by the installed
+cert — so this is a protocol correction, not a live serving bug. It is landed
+with the protocol rather than with its consumer because the consumer is 2B.3's
+warmed proof path, which builds `OrgProofIntent` FROM the authority: an epoch
+that does not cover the authority is exactly what would let a cached route set
+produce a proof under a rotated key. The `also_publish` no-store-change path is
+likewise fail-closed rather than currently reachable — a `NodeAuthority` owns its
+revocation store 1:1, so `authority_changed` and `store_changed` move together in
+practice.
+
+**The no-store-change branch now has its own witness, added after an independent
+RED pass found it unwitnessed** (Kyra, 2026-07-27). Mutating that branch to
+publish the authority outside `move_routing_authority` left the changed-store
+witness GREEN, because that witness never reaches the branch — so the branch was
+code with no evidence behind it, which is precisely the gap the "only one of the
+three is RED-coupled" note pointed at without closing.
+`an_authority_rotation_over_the_same_store_still_publishes_inside_the_epoch`
+drives `install_org_revocation_store_locked` directly with the exact installed
+store `Arc` and asserts: `store_changed == false`, the store stays
+pointer-identical, the epoch advances exactly once, and the replacement authority
+is already visible inside the publication callback. It is a **direct structural
+branch witness** and is labelled so in the source: today's constructor gives each
+`NodeAuthority` its own store, so the branch is fail-closed rather than reachable
+end-to-end. **When a production workflow can rotate authority over one store,
+that workflow owes its own end-to-end witness — this one does not stand in for
+it.** RED-verified against Kyra's exact mutation: it fails at the
+epoch-advance-count assertion, and it is the only witness that fails.
+
+Witnesses (wiring gate 41 → 45, two new pinned names):
+`an_authority_install_publishes_the_authority_under_its_own_epoch` is the
+load-bearing one and observes from INSIDE the gate through a new
+`post_publish_hook`, because the window it tests is a few instructions wide and
+is not observable from outside. RED-verified: restoring the pre-OLB-2C ordering
+fails it at exactly its coupled assertion. The other two —
+`..._advances_the_routing_epoch_exactly_once` and
+`a_refused_authority_install_publishes_neither_half` — are regression guards, not
+RED-coupled to this change: the old ordering satisfied both, and they exist to
+catch a future split of the two publications into separate ordered units.
+
+**OLB-2B.3a — the lock-free per-slot publication cell.** Two findings shaped the
+slice boundary, both from reading the signed substrate before writing anything:
+
+1. **The deterministic sort already exists.** `ScopedSourceSnapshot::providers`
+   sorts provider-ascending, generation-descending, off-lock at reconstruction.
+   Plan pin 9 ("the fallback vector is sorted once at rebuild") was therefore
+   already satisfied, so a "sort once at rebuild" slice would have been a no-op
+   dressed as progress.
+2. **What was actually missing is the LOCK.** Every read went through
+   `base_facts_unvalidated(&key)`, which takes the registry mutex and does a
+   `BTreeMap` lookup — so the warmed path would have contended with the actor's
+   quantum on every call. Plan pins 7/8 say the hot path is an `ArcSwap` load.
+
+`Slot.facts` is now an `Arc<ArcSwapOption<SlotBaseFacts>>` cell. Every MUTATION
+still happens under the registry lock exactly as before — the install/invalidate
+ordering E3c signed is untouched — and the cell adds only a lock-free read.
+`DemandHandle` clones the cell at demand time under the same lock acquisition
+that takes the reference, so the hot path needs no map lookup and no lock: one
+atomic load yields the immutable artifact. Holding the cell is sound precisely
+because holding the handle is what prevents the slot being retired, so a handle
+can never carry a dead incarnation's cell.
+
+The witness targets the trap this design could have laid: a handle wired to a
+DETACHED cell would read `None` forever, look exactly like the deterministic cold
+outcome, and never be attributed to a bug.
+`a_handles_lockfree_read_observes_the_registrys_published_artifact` asserts the
+handle observes the same artifact `Arc` the registry published, that the
+lock-free and locked seams agree, and that an invalidation is visible through the
+cell. RED-verified against a detached cell. Wiring gate 45 → 46.
+
+`DemandHandle::base_facts_unvalidated` is named for what it is — the review that
+renamed `base_facts` to `base_facts_unvalidated` did so because an accessor that
+looks authoritative and is not is a trap, and a friendlier-named lock-free twin
+would have re-laid it. Authority revalidation stays the node seam's job. Its one
+`#[allow(dead_code)]` names 2B.3b as its consumer; per the E3c discipline, an
+allow still there after 2B.3b lands means that consumer never arrived.
 
 The OLB-2 exit witnesses (warmed-call instrumentation, 1024-row bucket isolation,
 33+ provider truncation, epoch mismatch matrix, convergence/ghost-demand) attach to

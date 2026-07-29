@@ -516,11 +516,19 @@ struct StoreCore {
     /// / [`StoreCore::clear_poison`], never the raw path-registry helpers
     /// (Kyra OLB-2B-E3c closure).
     poison_gate: Mutex<()>,
-    /// Test-only: fired immediately before a publish attempts `live.write()`, so
-    /// a witness can acknowledge that a publisher REACHED the blocked
-    /// acquisition instead of inferring it from elapsed time.
+    /// Test-only: fired ONLY when a publish's `live.try_write()` has actually
+    /// FAILED, immediately before it blocks on `write()`.
+    ///
+    /// Named `contended`, not `blocking`, for the same reason the poison gate
+    /// distinguishes the two: this is EVIDENCE, and it is only evidence because
+    /// the acquisition provably lost. It was previously fired before the attempt,
+    /// which an independent RED pass showed proves nothing — with the settlement
+    /// pin wrongly released, a publisher could signal, acquire the lock, and have
+    /// the observer read a proxy flag before the publisher stored it, so the gap
+    /// witness passed while a publication was occupying the gap it claims is
+    /// closed (Kyra, independent E3c RED pass 2026-07-27).
     #[cfg(test)]
-    publish_blocking_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    publish_contended_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Test-only: the same acknowledgment for `poison_gate` — fired immediately
     /// before a poison transition attempts the lock. Elapsed time is not
     /// evidence that a contender reached the gate.
@@ -585,13 +593,36 @@ impl StoreCore {
     /// the per-key max with the outgoing view makes "an installed
     /// floor never lowers" structural rather than assumed.
     fn publish(&self, mut next: OrgRevocationState) -> Vec<RaisedFloor> {
+        // The acknowledgement fires ONLY after a `try_write` has actually
+        // failed, never merely before attempting the write.
+        //
+        // The earlier form — signal, then block on `write()` — was the forbidden
+        // "hook before the actual synchronization barrier" evidence pattern, and
+        // an independent RED pass proved it: with the settlement pin wrongly
+        // released, the publisher could signal, ACQUIRE the write lock, and have
+        // the observer inspect its proxy flag before the publisher stored the
+        // result — so the witness passed while a publication was occupying the
+        // very gap it claims is closed (Kyra, independent E3c RED pass
+        // 2026-07-27, at `80bb06b5a`).
+        //
+        // A failed `try_write` is the only evidence that cannot be faked by
+        // scheduling: it means some other holder is provably there right now.
+        // Under the same mutation `try_write` SUCCEEDS, no acknowledgement is
+        // ever sent, and the witness fails at its wait instead of passing.
         #[cfg(test)]
-        {
-            let hook = self.publish_blocking_hook.lock().clone();
-            if let Some(hook) = hook {
-                hook();
+        let mut live = match self.live.try_write() {
+            // Uncontended. Deliberately silent: acknowledging here would
+            // reintroduce exactly the defect above.
+            Some(guard) => guard,
+            None => {
+                let hook = self.publish_contended_hook.lock().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+                self.live.write()
             }
-        }
+        };
+        #[cfg(not(test))]
         let mut live = self.live.write();
         // §15 — the per-key max keeps the LIVE view safe, but silently
         // absorbing a weaker incoming state hides the fact that DISK is now
@@ -1200,7 +1231,7 @@ fn join_or_create_core(
         generation_exhausted: AtomicBool::new(false),
         poison_gate: Mutex::new(()),
         #[cfg(test)]
-        publish_blocking_hook: Mutex::new(None),
+        publish_contended_hook: Mutex::new(None),
         #[cfg(test)]
         poison_blocking_hook: Mutex::new(None),
         #[cfg(test)]
@@ -1647,13 +1678,13 @@ impl OrgRevocationStore {
         self.core.generation.store(u64::MAX, Ordering::Release);
     }
 
-    /// Test-only: arm the pre-`live.write()` acknowledgment hook, so a witness
-    /// can prove a publisher REACHED the blocked acquisition rather than
-    /// inferring it from elapsed time.
+    /// Test-only: arm the CONTENDED acknowledgment for `live` — fired only after
+    /// a publish's `try_write` has failed, so a witness can prove the barrier was
+    /// actually held rather than that a publisher was merely scheduled.
     #[doc(hidden)]
     #[cfg(test)]
-    pub(crate) fn arm_publish_blocking_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        *self.core.publish_blocking_hook.lock() = Some(hook);
+    pub(crate) fn arm_publish_contended_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.core.publish_contended_hook.lock() = Some(hook);
     }
 
     /// Test-only: force one publication of the current view.
