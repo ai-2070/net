@@ -110,7 +110,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=48
+          MIN=54
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -133,6 +133,12 @@ jobs:
           a_handles_lockfree_read_observes_the_registrys_published_artifact
           a_stale_audience_handle_is_unserved_beside_its_installed_sibling
           a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_settlement
+          a_same_id_grant_replacement_cannot_reauthorize_captured_facts
+          the_signed_grant_identity_is_part_of_scope_currentness
+          the_audience_handle_is_part_of_scope_currentness
+          a_grant_install_between_capture_and_commit_refuses_publication
+          unrelated_grant_movement_preserves_the_exact_slot
+          an_installed_grants_expiry_colds_its_facts_with_zero_providers
           a_publication_cannot_occupy_the_gap_between_validation_and_settlement
           poison_cannot_occupy_the_gap_between_validation_and_settlement
           a_recovery_poison_clear_cannot_land_under_a_publication_pin

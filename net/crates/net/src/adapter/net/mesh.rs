@@ -5340,6 +5340,19 @@ struct ScopedSlotSource {
     unserved_scope: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// One batch's Grant authority stamps, keyed by the WHOLE scope —
+/// `(grant_id, audience_handle)`, never `grant_id` alone (review 2026-07-29 §2).
+///
+/// The pair key is the type-level statement of that fix: two live scopes can
+/// share a grant id across an audience-secret rotation, and they are different
+/// slots. Narrowing this alias back to `[u8; 32]` reintroduces the aliasing
+/// `a_stale_audience_handle_is_unserved_beside_its_installed_sibling` exists to
+/// refuse.
+type GrantStampsByScope = std::collections::BTreeMap<
+    ([u8; 32], [u8; 32]),
+    super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
+>;
+
 /// The ONE writer gate for the installed consumer-Grant snapshot.
 ///
 /// Shared between [`MeshNode`] — which serializes every install and removal
@@ -5788,13 +5801,7 @@ impl ScopedSlotSource {
         slot: &Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
         keys: &[super::behavior::org_routing_registry::SlotKey],
         now_secs: u64,
-    ) -> (
-        std::collections::BTreeMap<
-            ([u8; 32], [u8; 32]),
-            super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
-        >,
-        Vec<u64>,
-    ) {
+    ) -> (GrantStampsByScope, Vec<u64>) {
         use super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp;
         use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
         use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
@@ -13236,9 +13243,16 @@ impl MeshNode {
     /// because an installed-but-expired Grant authorizes nothing, and deriving
     /// the deadline from provider rows alone would let an empty served bucket
     /// sit at `u64::MAX` forever (W-G13).
+    ///
+    /// Takes `now_secs` explicitly rather than sampling the clock, matching
+    /// [`Self::granted_providers_at`]: the Grant deadline is one of the four
+    /// bound components, and a witness for it has to be able to name the instant
+    /// it is asserting about. `MAX_TOKEN_CLOCK_SKEW_SECS` is 300 s, so an expiry
+    /// witness that waited on the wall clock would take five minutes.
     fn scope_authority_is_current(
         &self,
         stamped: &super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
+        now_secs: u64,
     ) -> bool {
         use super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp;
         use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
@@ -13260,10 +13274,7 @@ impl MeshNode {
             && record.audience_handle() == audience_handle
             && record
                 .grant()
-                .is_valid_at_with_skew(
-                    super::behavior::org::current_timestamp(),
-                    MAX_TOKEN_CLOCK_SKEW_SECS,
-                )
+                .is_valid_at_with_skew(now_secs, MAX_TOKEN_CLOCK_SKEW_SECS)
                 .is_ok()
     }
 
@@ -13279,6 +13290,28 @@ impl MeshNode {
     pub(crate) fn org_routing_base_facts(
         &self,
         key: &super::behavior::org_routing_registry::SlotKey,
+    ) -> Option<Arc<super::behavior::org_routing_registry::SlotBaseFacts>> {
+        self.org_routing_base_facts_at(key, super::behavior::org::current_timestamp())
+    }
+
+    /// [`Self::org_routing_base_facts`] at an explicit clock.
+    ///
+    /// Split for the same reason [`Self::granted_providers_at`] is: two of the
+    /// nine checks below are DEADLINE checks — the artifact's `earliest_expiry`
+    /// and the installed Grant's own validity — and a witness for either has to
+    /// name the instant it asserts about rather than wait for it. The installed
+    /// Grant deadline in particular carries `MAX_TOKEN_CLOCK_SKEW_SECS` (300 s)
+    /// of tolerance, so a wall-clock witness would take five minutes to observe
+    /// a transition that must be exact.
+    ///
+    /// Production has exactly one caller, immediately above, which passes
+    /// `current_timestamp()`. Nothing else may pass a clock: a caller choosing
+    /// its own "now" for an authority decision is the defect this shape exists
+    /// to make visible, not to enable.
+    fn org_routing_base_facts_at(
+        &self,
+        key: &super::behavior::org_routing_registry::SlotKey,
+        now_secs: u64,
     ) -> Option<Arc<super::behavior::org_routing_registry::SlotBaseFacts>> {
         let facts = self.routing_registry.base_facts_unvalidated(key)?;
         // Revalidate the AUTHORITY these facts were built under against the live
@@ -13329,7 +13362,7 @@ impl MeshNode {
         // needed. Any difference (removed, reinstalled, replaced under the same
         // id, handle changed, now expired) fails equality and retires the exact
         // artifact.
-        if !self.scope_authority_is_current(&facts.authority) {
+        if !self.scope_authority_is_current(&facts.authority, now_secs) {
             self.routing_registry.invalidate_if_stale(key, &facts);
             return None;
         }
@@ -13350,7 +13383,7 @@ impl MeshNode {
         // reads are expiry-safe by filtering at query time; a cache is only
         // expiry-safe if its read seam does the same, so the timer governs
         // promptness rather than correctness.
-        if super::behavior::org::current_timestamp() >= facts.earliest_expiry {
+        if now_secs >= facts.earliest_expiry {
             return None;
         }
         self.routing_health

@@ -4192,3 +4192,673 @@ async fn a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_s
     );
     drop(held);
 }
+
+// ---- the Grant-currentness witness group (design §12) ---------------------
+//
+// Every witness below drives the PRODUCTION source, the production phase-5
+// installation and the production read seam. `install_facts_for_test` is
+// deliberately not used: it stores into a cell that already exists, and the
+// 2B.3a review showed that a witness built on it is blind to the class of defect
+// where the production path and the seam under test diverge.
+
+/// The two orgs and the provider the Grant witnesses share.
+///
+/// The grant is always issued by a DIFFERENT org than the node's own: a grant
+/// from one's own org would be the owner plane, and would witness nothing about
+/// the Grant plane's authority.
+struct GrantFixture {
+    node: Arc<MeshNode>,
+    /// The consumer's own org — the grantee.
+    org: crate::adapter::net::behavior::org::OrgKeypair,
+    /// The issuing org.
+    issuer: crate::adapter::net::behavior::org::OrgKeypair,
+    provider: EntityKeypair,
+}
+
+async fn grant_fixture(tag: &str) -> GrantFixture {
+    use crate::adapter::net::behavior::org::OrgKeypair;
+    let node = node().await;
+    let org = OrgKeypair::from_bytes([0xa1u8; 32]);
+    let issuer = OrgKeypair::from_bytes([0xa2u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, tag))
+        .expect("install authority");
+    GrantFixture {
+        node,
+        org,
+        issuer,
+        provider: EntityKeypair::generate(),
+    }
+}
+
+impl GrantFixture {
+    /// Mint an issuer→own-org DISCOVER grant over the fixture's provider.
+    ///
+    /// `grant_id: Some(id)` REUSES that id, which is what a same-ID replacement
+    /// needs; `None` allocates a fresh one. `bounds: Some((nbf, exp))` sets the
+    /// validity window explicitly, which is what an expiry witness needs;
+    /// `None` is a comfortably-valid hour.
+    fn mint(
+        &self,
+        tag: &str,
+        grant_id: Option<[u8; 32]>,
+        bounds: Option<(u64, u64)>,
+    ) -> (
+        crate::adapter::net::behavior::org_grant::OrgCapabilityGrant,
+        crate::adapter::net::behavior::org_grant::OrgAudienceSecret,
+    ) {
+        use crate::adapter::net::behavior::org::current_timestamp;
+        use crate::adapter::net::behavior::org_grant::{
+            GrantRights, GrantTargetScope, OrgAudienceSecret, OrgCapabilityGrant,
+        };
+        let target = GrantTargetScope::ExactNode(self.provider.entity_id().clone());
+        let cap = CapabilityAuthorityId::for_tag(tag);
+        let Some(grant_id) = grant_id else {
+            let (grant, secret) = OrgCapabilityGrant::try_issue(
+                &self.issuer,
+                self.org.org_id(),
+                cap,
+                GrantRights::DISCOVER,
+                target,
+                bounds.map_or(3600, |(_, exp)| exp.saturating_sub(current_timestamp())),
+            )
+            .expect("issue grant");
+            return (grant, secret.expect("a DISCOVER grant mints a secret"));
+        };
+        // Reusing an id means minting the audience binding separately and
+        // issuing at explicit bounds — `try_issue` always allocates a fresh id.
+        let now = current_timestamp();
+        let (secret, binding) = OrgAudienceSecret::mint(grant_id);
+        let (not_before, not_after) = bounds.unwrap_or((now.saturating_sub(60), now + 3600));
+        let grant = OrgCapabilityGrant::issue_at(
+            &self.issuer,
+            grant_id,
+            self.org.org_id(),
+            cap,
+            GrantRights::DISCOVER,
+            target,
+            Some(binding),
+            not_before,
+            not_after,
+            // Nonce varies the canonical bytes, so a same-id replacement is a
+            // genuinely DIFFERENT signed authority rather than a re-issue that
+            // happens to be byte-identical.
+            u64::from(grant_id[0]) ^ not_after,
+        );
+        (grant, secret)
+    }
+
+    /// Install a consumer grant and return `(grant_id, installed audience
+    /// handle)`. The handle is read off the INSTALLED RECORD, because that is
+    /// what the source and the read seam compare against.
+    fn install(
+        &self,
+        grant: crate::adapter::net::behavior::org_grant::OrgCapabilityGrant,
+        secret: crate::adapter::net::behavior::org_grant::OrgAudienceSecret,
+    ) -> ([u8; 32], [u8; 32]) {
+        let grant_id = grant.grant_id;
+        self.node
+            .install_consumer_grant_audience(grant, secret)
+            .expect("install consumer grant");
+        let handle = *self
+            .node
+            .consumer_grant_audiences
+            .load()
+            .get(&grant_id)
+            .expect("the grant is installed")
+            .audience_handle();
+        (grant_id, handle)
+    }
+
+    fn key(&self, grant_id: [u8; 32], audience_handle: [u8; 32], tag: &str) -> SlotKey {
+        SlotKey {
+            scope: PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
+                grant_id,
+                audience_handle,
+            })
+            .expect("grant scopes are private"),
+            capability: CapabilityAuthorityId::for_tag(tag),
+        }
+    }
+
+    /// Warm `key` through the REAL actor path on the node's OWN registry, and
+    /// hand back the handle that keeps the slot retained.
+    ///
+    /// One `apply` pass: the demand queues the slot, phase 3 reconstructs it
+    /// through the production source, and phase 5 installs it beneath the commit
+    /// pin. Anything short of that would not produce a production stamp.
+    fn warm(
+        &self,
+        key: &SlotKey,
+    ) -> crate::adapter::net::behavior::org_routing_registry::DemandHandle {
+        use crate::adapter::net::behavior::org_routing::{
+            ApplyOutcome, ApplyRequest, DirtyApply, RoutingHealth,
+        };
+        use crate::adapter::net::behavior::org_scoped_store::{
+            DirtyCapabilities, PrivateDiscoveryChangeBatch,
+        };
+        self.node
+            .routing_health
+            .store(Arc::new(RoutingHealth::Healthy { incarnation: 1 }));
+        self.node.routing_registry.activate_incarnation(1);
+        let family = self.node.org_routing_family().expect("family");
+        let held = family.demand(key.clone()).expect("demand");
+        let outcome = self.node.routing_registry.apply(
+            1,
+            ApplyRequest {
+                batch: PrivateDiscoveryChangeBatch {
+                    generation: 0,
+                    dirty: DirtyCapabilities::Clean,
+                },
+                registry_work: true,
+            },
+        );
+        assert!(
+            matches!(outcome, ApplyOutcome::Current { .. }),
+            "the warming pass must settle, or nothing below is warm: {outcome:?}"
+        );
+        assert!(
+            self.node.org_routing_base_facts(key).is_some(),
+            "precondition: the slot must be WARM before the transition under test"
+        );
+        held
+    }
+
+    /// The production source over this node, for witnesses that assert on
+    /// capture rather than on the read seam.
+    fn source(&self) -> ScopedSlotSource {
+        ScopedSlotSource {
+            scoped_discovery: self.node.scoped_discovery.clone(),
+            publication: self.node.scoped_publication.clone(),
+            org_revocation: self.node.org_revocation.clone(),
+            consumer_grants: self.node.consumer_grant_audiences.clone(),
+            consumer_grant_gate: self.node.consumer_grant_gate.clone(),
+            authority: self.node.routing_authority.clone(),
+            settle_gap_hook: parking_lot::Mutex::new(None),
+            unserved_scope: self.node.routing_unserved_scope.clone(),
+        }
+    }
+}
+
+/// W-G3. A same-ID replacement cannot reauthorize facts captured under the
+/// PREVIOUS installed Grant.
+///
+/// Two adversarial cases, because the registry supports explicit
+/// remove-then-install replacement and the two differ in what distinguishes
+/// them:
+///
+/// - remove and reinstall the EXACT same signed grant. Every signed byte is
+///   identical, so only the installation identity separates the installations;
+/// - install a DIFFERENTLY SIGNED grant reusing the id. A fresh audience binding
+///   and nonce make it a different signed authority under the same name.
+///
+/// Both must retire the warm artifact. Dies to comparing `grant_id` only —
+/// which passes both cases, because the id is what is deliberately held equal.
+#[tokio::test]
+async fn a_same_id_grant_replacement_cannot_reauthorize_captured_facts() {
+    let f = grant_fixture("wg3").await;
+    let (grant, secret) = f.mint("nrpc:wg3", None, None);
+    let signature = grant.signature;
+    let (grant_id, handle) = f.install(grant, secret);
+    let key = f.key(grant_id, handle, "nrpc:wg3");
+    let _held = f.warm(&key);
+
+    let stamped = f.node.org_routing_base_facts(&key).expect("warm").authority;
+    assert!(
+        matches!(
+            stamped,
+            ScopedDiscoveryAuthorityStamp::Grant { grant_id: g, .. } if g == grant_id
+        ),
+        "precondition: the artifact must carry a GRANT stamp naming this id"
+    );
+
+    // --- case 1: remove and reinstall the EXACT same signed grant -----------
+    // Byte-identical authority. Only the installation identity moved, which is
+    // precisely the aliasing a `grant_id`-only comparison cannot see.
+    let (again, again_secret) = f.mint("nrpc:wg3", Some(grant_id), None);
+    let reissued_signature = again.signature;
+    assert!(
+        f.node.remove_consumer_grant_audience(&grant_id),
+        "precondition: the grant was installed"
+    );
+    let (_, reinstalled_handle) = f.install(again, again_secret);
+    assert_eq!(
+        grant_id, grant_id,
+        "precondition: the replacement reuses the id"
+    );
+    assert!(
+        f.node.org_routing_base_facts(&key).is_none(),
+        "facts captured under the PREVIOUS installation must not survive a \
+         remove-then-reinstall: the installed record is a new installation, and \
+         only the installation identity distinguishes it"
+    );
+
+    // --- case 2: a DIFFERENTLY SIGNED grant reusing the id ------------------
+    // Re-warm under the current installation first, so case 2 retires something
+    // that was genuinely warm rather than inheriting case 1's cold slot.
+    let key2 = f.key(grant_id, reinstalled_handle, "nrpc:wg3");
+    let _held2 = f.warm(&key2);
+    assert_ne!(
+        signature, reissued_signature,
+        "precondition: the fresh audience binding and nonce make this a \
+         DIFFERENT signed authority, not a byte-identical re-issue"
+    );
+
+    let (distinct, distinct_secret) = f.mint("nrpc:wg3-other", Some(grant_id), None);
+    assert_eq!(distinct.grant_id, grant_id, "precondition: same id");
+    assert_ne!(
+        distinct.signature, reissued_signature,
+        "precondition: distinct signed authority"
+    );
+    assert!(f.node.remove_consumer_grant_audience(&grant_id));
+    f.install(distinct, distinct_secret);
+    assert!(
+        f.node.org_routing_base_facts(&key2).is_none(),
+        "a DISTINCT signed grant reusing the id must not reauthorize facts \
+         captured under the grant it replaced"
+    );
+}
+
+/// W-G4. The signed Grant identity is part of the currentness relation, on its
+/// own.
+///
+/// **A direct comparison witness, and labelled as such deliberately.** Equal
+/// installation identity with a different signature is not production-reachable
+/// — `install_seq` is strictly monotone, so any replacement that changes the
+/// signature also changes the identity. W-G3 covers the reachable composite;
+/// this covers the component, by holding `install_seq` and the handle EQUAL to
+/// the installed record and moving only the signature.
+///
+/// Without it, dropping the signature from the comparison leaves W-G3 green:
+/// W-G3's case 2 also moves the installation identity, so the identity check
+/// alone still retires the artifact. That is exactly the redundancy that hides a
+/// missing component.
+#[tokio::test]
+async fn the_signed_grant_identity_is_part_of_scope_currentness() {
+    use crate::adapter::net::behavior::org::current_timestamp;
+    let f = grant_fixture("wg4").await;
+    let (grant, secret) = f.mint("nrpc:wg4", None, None);
+    let (grant_id, handle) = f.install(grant, secret);
+
+    let installed = f.node.consumer_grant_audiences.load();
+    let record = installed.get(&grant_id).expect("installed");
+    let live = ScopedDiscoveryAuthorityStamp::Grant {
+        grant_id,
+        install_seq: record.install_seq(),
+        grant_signature: record.grant().signature,
+        audience_handle: handle,
+    };
+    let now = current_timestamp();
+    assert!(
+        f.node.scope_authority_is_current(&live, now),
+        "precondition: the exact installed authority is current"
+    );
+
+    // EVERY other component held equal — same id, same installation identity,
+    // same handle — so only the signature can be what fails.
+    let ScopedDiscoveryAuthorityStamp::Grant {
+        grant_signature, ..
+    } = live
+    else {
+        panic!("constructed as a Grant stamp");
+    };
+    let mut forged = grant_signature;
+    forged[0] ^= 0xff;
+    let tampered = ScopedDiscoveryAuthorityStamp::Grant {
+        grant_id,
+        install_seq: record.install_seq(),
+        grant_signature: forged,
+        audience_handle: handle,
+    };
+    assert!(
+        !f.node.scope_authority_is_current(&tampered, now),
+        "a stamp whose signed authority differs from the installed one is NOT \
+         current, even with the installation identity and handle equal — the \
+         signature binds the whole canonical grant, and dropping it from the \
+         comparison is invisible to every reachable-path witness"
+    );
+}
+
+/// W-G5. The audience handle is part of the authority stamp and the currentness
+/// comparison, for a SINGLE key.
+///
+/// Distinct from `a_stale_audience_handle_is_unserved_beside_its_installed_sibling`
+/// (W-G5b), which kills sibling aliasing through a `grant_id`-keyed stamp map.
+/// This kills removal of the handle from the comparison itself, and asserts it
+/// at BOTH seams the handle is checked at:
+///
+/// - capture: a lone key whose handle is not the installed one must not be
+///   served, with no sibling present to alias through;
+/// - the read seam: a stamp whose handle differs from the installed record's is
+///   not current, with every other component held equal.
+#[tokio::test]
+async fn the_audience_handle_is_part_of_scope_currentness() {
+    use crate::adapter::net::behavior::org::current_timestamp;
+    let f = grant_fixture("wg5").await;
+    let (grant, secret) = f.mint("nrpc:wg5", None, None);
+    let (grant_id, handle) = f.install(grant, secret);
+
+    let mut other = handle;
+    other[0] ^= 0xff;
+
+    // --- capture: ONE key, no sibling to alias through ----------------------
+    let source = f.source();
+    let stale_key = f.key(grant_id, other, "nrpc:wg5");
+    let snapshot = source.snapshot(std::slice::from_ref(&stale_key));
+    assert!(
+        matches!(snapshot.providers(&stale_key).facts, SourceFacts::Unserved),
+        "a lone Grant key whose audience handle is not the installed one has NO \
+         evidence — this is the single-key case, with nothing else in the batch"
+    );
+    drop(snapshot);
+    let installed_key = f.key(grant_id, handle, "nrpc:wg5");
+    let ok = source.snapshot(std::slice::from_ref(&installed_key));
+    assert!(
+        matches!(ok.providers(&installed_key).facts, SourceFacts::Served(_)),
+        "precondition: the same key with the INSTALLED handle is served, so the \
+         refusal above is about the handle and not about the fixture"
+    );
+    drop(ok);
+
+    // --- the read seam: every other component held equal --------------------
+    let installed = f.node.consumer_grant_audiences.load();
+    let record = installed.get(&grant_id).expect("installed");
+    let live = ScopedDiscoveryAuthorityStamp::Grant {
+        grant_id,
+        install_seq: record.install_seq(),
+        grant_signature: record.grant().signature,
+        audience_handle: handle,
+    };
+    let wrong_handle = ScopedDiscoveryAuthorityStamp::Grant {
+        grant_id,
+        install_seq: record.install_seq(),
+        grant_signature: record.grant().signature,
+        audience_handle: other,
+    };
+    let now = current_timestamp();
+    assert!(
+        f.node.scope_authority_is_current(&live, now),
+        "precondition: the exact installed authority is current"
+    );
+    assert!(
+        !f.node.scope_authority_is_current(&wrong_handle, now),
+        "a stamp whose audience handle differs from the installed record's is \
+         NOT current — the cached path must never compare less than the live \
+         query, which checks the handle as defence in depth"
+    );
+}
+
+/// W-G6. A consumer-Grant INSTALLATION between source capture and commit
+/// refuses publication.
+///
+/// Drives the production reconstruction and the production phase-5 path:
+/// `PausingSource` delegates every method to the real [`ScopedSlotSource`] and
+/// only adds a pause inside `providers()`, which is exactly the capture→commit
+/// window. The install landed there changes the batch's installation vector, so
+/// the token the pin re-derives no longer matches the one the snapshot minted.
+///
+/// Dies to omitting the Grant identities from `SourceToken`: without them the
+/// re-derived token compares equal, the pin is granted, and the quantum
+/// publishes facts for a batch whose Grant authority moved underneath it.
+#[tokio::test]
+async fn a_grant_install_between_capture_and_commit_refuses_publication() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork, RoutingHealth,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let f = grant_fixture("wg6").await;
+    // A is installed up front and is the key the quantum selects.
+    let (grant_a, secret_a) = f.mint("nrpc:wg6", None, None);
+    let (id_a, handle_a) = f.install(grant_a, secret_a);
+    let key_a = f.key(id_a, handle_a, "nrpc:wg6");
+
+    // B is NOT installed at capture. Its key is selected in the same batch, so
+    // installing it mid-capture moves THIS batch's vector — which is the
+    // movement the pin must catch, as opposed to the unrelated movement W-G8
+    // proves it must ignore.
+    let (grant_b, secret_b) = f.mint("nrpc:wg6-b", None, None);
+    let handle_b = secret_b.audience_handle;
+    let id_b = grant_b.grant_id;
+    let key_b = f.key(id_b, handle_b, "nrpc:wg6-b");
+
+    let during_build: Arc<parking_lot::Mutex<Option<BuildHook>>> = Arc::default();
+    let source = PausingSource {
+        inner: f.source(),
+        during_build: during_build.clone(),
+        after_pin: Arc::default(),
+        before_pin: Arc::default(),
+    };
+
+    let landed = Arc::new(AtomicBool::new(false));
+    {
+        let node = f.node.clone();
+        let landed = landed.clone();
+        let pending = parking_lot::Mutex::new(Some((grant_b, secret_b)));
+        *during_build.lock() = Some(Box::new(move || {
+            let Some((grant, secret)) = pending.lock().take() else {
+                return;
+            };
+            node.install_consumer_grant_audience(grant, secret)
+                .expect("the mid-capture install must itself succeed");
+            landed.store(true, Ordering::Release);
+        }));
+    }
+
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(Arc::new(source), work, Arc::default());
+    f.node
+        .routing_health
+        .store(Arc::new(RoutingHealth::Healthy { incarnation: 1 }));
+    registry.activate_incarnation(1);
+    let family = registry.new_family().expect("family");
+    let held_a = family.demand(key_a.clone()).expect("demand a");
+    let held_b = family.demand(key_b.clone()).expect("demand b");
+
+    let outcome = registry.apply(
+        1,
+        ApplyRequest {
+            batch: PrivateDiscoveryChangeBatch {
+                generation: 0,
+                dirty: DirtyCapabilities::Clean,
+            },
+            registry_work: true,
+        },
+    );
+
+    assert!(
+        landed.load(Ordering::Acquire),
+        "the mid-capture install must actually have run, or this witness \
+         asserted nothing"
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Superseded),
+        "an installation between capture and commit must defeat the pin: \
+         {outcome:?}"
+    );
+    assert!(
+        registry.base_facts_unvalidated(&key_a).is_none(),
+        "and NOTHING may be published — not even the key whose own Grant did \
+         not move, because the batch it was captured with is no longer current"
+    );
+    assert!(
+        registry.base_facts_unvalidated(&key_b).is_none(),
+        "least of all the key whose Grant arrived mid-capture"
+    );
+    drop(held_a);
+    drop(held_b);
+}
+
+/// W-G8. Movement of an UNRELATED Grant preserves the exact unaffected slot.
+///
+/// The inverse-direction proof for W-G6. The batch-wide installation vector in
+/// `SourceToken` protects one capture→commit transaction; the per-key stamp in
+/// `SlotBaseFacts` protects one cached artifact. If the transaction-wide value
+/// had leaked into the artifact stamp, every Grant install or removal anywhere
+/// on the node would cold every cached Grant artifact — and, because the owner
+/// plane is stamped `Owner` and compared trivially, the damage would be silent
+/// and Grant-only.
+///
+/// Dies to replacing the per-key stamp check with a global "some Grant moved"
+/// bit.
+#[tokio::test]
+async fn unrelated_grant_movement_preserves_the_exact_slot() {
+    let f = grant_fixture("wg8").await;
+    let (grant_a, secret_a) = f.mint("nrpc:wg8-a", None, None);
+    let (id_a, handle_a) = f.install(grant_a, secret_a);
+    let key_a = f.key(id_a, handle_a, "nrpc:wg8-a");
+    let _held = f.warm(&key_a);
+
+    let warm = f
+        .node
+        .org_routing_base_facts(&key_a)
+        .expect("precondition: A's slot is warm");
+
+    // A second, entirely unrelated grant: different id, different audience,
+    // different capability. Nothing about A's artifact depends on it.
+    let (grant_b, secret_b) = f.mint("nrpc:wg8-b", None, None);
+    let (id_b, _handle_b) = f.install(grant_b, secret_b);
+    assert_ne!(id_a, id_b, "precondition: the two grants are unrelated");
+
+    let after_install = f
+        .node
+        .org_routing_base_facts(&key_a)
+        .expect("installing an unrelated Grant must not cold A's slot");
+    assert!(
+        Arc::ptr_eq(&warm, &after_install),
+        "and must not merely leave it readable — it must be the EXACT same \
+         artifact, not a silently rebuilt one"
+    );
+
+    // Removal is the other direction of movement, and the one a global bit
+    // would be most tempting to implement.
+    assert!(
+        f.node.remove_consumer_grant_audience(&id_b),
+        "precondition: B was installed"
+    );
+    let after_removal = f
+        .node
+        .org_routing_base_facts(&key_a)
+        .expect("removing an unrelated Grant must not cold A's slot either");
+    assert!(
+        Arc::ptr_eq(&warm, &after_removal),
+        "still the exact same artifact"
+    );
+
+    // And the control: moving A's OWN grant must cold it, or the assertions
+    // above would also pass on a seam that checks nothing at all.
+    assert!(f.node.remove_consumer_grant_audience(&id_a));
+    assert!(
+        f.node.org_routing_base_facts(&key_a).is_none(),
+        "control: moving the slot's OWN Grant must cold it — without this the \
+         witness above is satisfied by a comparison that never fails"
+    );
+}
+
+/// W-G13. An installed Grant's own deadline makes its cached facts `Unserved` —
+/// **including, and especially, with ZERO providers.**
+///
+/// The empty-provider case is the point of this witness, not an edge. With no
+/// providers the artifact's `earliest_expiry` is `u64::MAX`, so the artifact
+/// carries NO deadline of its own: the wall-clock expiry check in the read seam
+/// can never retire it, and neither can the exact-expiry timer, which is driven
+/// by provider rows. The installed Grant's deadline is the only thing left, and
+/// a source that derives expiry from provider rows alone has nothing.
+///
+/// Asserted at both seams, at an explicit clock — `MAX_TOKEN_CLOCK_SKEW_SECS` is
+/// 300 s, so waiting for this transition on the wall clock would take five
+/// minutes:
+///
+/// - capture: past the deadline the key reconstructs `Unserved`, not
+///   `Served(empty)`;
+/// - the read seam: the warm artifact, whose `earliest_expiry` is `u64::MAX`,
+///   is retired anyway.
+///
+/// Dies to omitting the installed-Grant deadline from the source, and to
+/// deriving the artifact's expiry from provider rows alone.
+#[tokio::test]
+async fn an_installed_grants_expiry_colds_its_facts_with_zero_providers() {
+    use crate::adapter::net::behavior::org::current_timestamp;
+    use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
+
+    let f = grant_fixture("wg13").await;
+    let now = current_timestamp();
+    // A short but currently-VALID window, so the install is accepted and the
+    // deadline is a named instant rather than something to wait for.
+    let not_after = now + 120;
+    let (grant, secret) = f.mint("nrpc:wg13", None, Some((now.saturating_sub(60), not_after)));
+    let (grant_id, handle) = f.install(grant, secret);
+    let key = f.key(grant_id, handle, "nrpc:wg13");
+
+    // ZERO providers announced. This is the normative case.
+    let _held = f.warm(&key);
+    let warm = f
+        .node
+        .org_routing_base_facts(&key)
+        .expect("precondition: the slot is warm under a currently-valid Grant");
+    assert!(
+        matches!(&warm.providers,
+            crate::adapter::net::behavior::org_routing_registry::SourceFacts::Served(p)
+                if p.is_empty()),
+        "precondition: an installed current Grant with no providers is SERVED \
+         with exact empty evidence, not Unserved"
+    );
+    assert_eq!(
+        warm.earliest_expiry,
+        u64::MAX,
+        "THE point of this witness: with zero providers the artifact carries no \
+         deadline of its own, so nothing but the installed Grant's own deadline \
+         can ever retire it"
+    );
+
+    // The instant the Grant's authority ends: past `not_after`, past the skew
+    // tolerance every other validity decision in the grant family applies.
+    let expired_at = not_after + MAX_TOKEN_CLOCK_SKEW_SECS + 1;
+
+    // --- the read seam ------------------------------------------------------
+    assert!(
+        f.node.org_routing_base_facts_at(&key, not_after).is_some(),
+        "precondition: still current at the deadline itself — the transition \
+         under test is the deadline PLUS the skew tolerance, not the deadline"
+    );
+    assert!(
+        f.node.org_routing_base_facts_at(&key, expired_at).is_none(),
+        "an installed-but-expired Grant authorizes NOTHING: the cached facts \
+         must be retired even though `earliest_expiry` is u64::MAX and the \
+         artifact's own expiry check therefore cannot fire"
+    );
+
+    // --- capture ------------------------------------------------------------
+    // The source decides this in `grant_installations_for`, whose only clock
+    // input is the `now_secs` `snapshot` passes it from `current_timestamp()`.
+    // Naming that input is what lets the deadline be asserted exactly.
+    let (live_stamps, live_ids) = ScopedSlotSource::grant_installations_for(
+        &f.node.consumer_grant_audiences,
+        std::slice::from_ref(&key),
+        not_after,
+    );
+    assert_eq!(
+        live_stamps.len(),
+        1,
+        "precondition: at the deadline the Grant still stamps its key"
+    );
+    assert_eq!(live_ids.len(), 1, "and still contributes its identity");
+
+    let (expired_stamps, expired_ids) = ScopedSlotSource::grant_installations_for(
+        &f.node.consumer_grant_audiences,
+        std::slice::from_ref(&key),
+        expired_at,
+    );
+    assert!(
+        expired_stamps.is_empty(),
+        "past the deadline the Grant stamps NOTHING, which is what makes its \
+         key reconstruct as Unserved rather than as a proven-empty provider set"
+    );
+    assert!(
+        expired_ids.is_empty(),
+        "and contributes no identity, so a pin taken before the deadline \
+         cannot settle after it"
+    );
+}
