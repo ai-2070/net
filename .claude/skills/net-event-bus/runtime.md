@@ -99,7 +99,7 @@ Bus-level (`NetNode`) errors are not thrown for backpressure — `emit` / `emitR
 ### Python
 
 Same shape as TS:
-- Bus emit is silent on ring-buffer drops (visible only in `node.stats().events_dropped`). With `backpressure='fail_producer'`, the underlying PyO3 binding raises an exception — handle it at the call site.
+- Bus emit is silent on ring-buffer drops, and `node.stats().events_dropped` only sees the ones where the *producer* was refused — under the default `drop_oldest` it stays at zero while events are evicted. With `backpressure='fail_producer'`, the underlying PyO3 binding raises an exception — handle it at the call site.
 - `BackpressureError` / `NotConnectedError` are **mesh-stream exceptions** raised by `MeshNode.send(...)`. The `send_with_retry` helper (5–200 ms exponential) and `send_blocking` (releases the GIL) live on `MeshNode`, not on `NetNode`.
 
 ### Go

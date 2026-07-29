@@ -25,7 +25,7 @@
       "id": "hello",
       "skill": "net-event-bus",
       "title": "Hello, mesh",
-      "route": "construct \u00b7 publish \u00b7 subscribe \u00b7 shutdown",
+      "route": "construct \u00b7 publish \u00b7 verify the bus accepted it \u00b7 shutdown",
       "dir": ".claude/skills/net-event-bus/examples",
       "files": {
         "rust": "hello.rs",
@@ -39,8 +39,8 @@
     {
       "id": "observe",
       "skill": "net-event-bus",
-      "title": "Observe a drop",
-      "route": "ingest under backpressure \u00b7 read stats \u00b7 handle one failure \u00b7 shutdown",
+      "title": "What the drop counters tell you",
+      "route": "push past capacity in all three backpressure modes \u00b7 read the producer-side counters",
       "dir": ".claude/skills/net-event-bus/examples",
       "files": {
         "rust": "observe.rs",

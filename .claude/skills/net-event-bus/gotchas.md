@@ -65,7 +65,7 @@ What to do: a few options.
 - Switch to `Backpressure::FailProducer` so the producer learns about the failure and can react.
 - If they need lossless delivery, switch to mesh transport with `Reliability::Reliable` per stream, or use a persistence adapter.
 
-Drops in Net are loud-by-stats, silent-by-protocol. Check `node.stats().events_dropped`.
+Drops in Net are silent-by-protocol, and **only partly loud-by-stats**: `events_dropped` counts producer-boundary refusals, so it moves under `drop_newest` / `fail_producer` and stays at zero under the default `drop_oldest`, which evicts silently.
 
 ## "How do I do request/reply (RPC)?"
 
