@@ -4,9 +4,14 @@
 signs** — a stale handoff in `docs/plans/` is exactly the drift this project has
 already been bitten by twice.
 
-Written at `8189676a7`; **updated at `224c9ea48`**, after Kyra's independent
-review of `df32cbd7d` returned HOLD on two findings (§2b). Branch
-`load-balancing-2`.
+Written at `8189676a7`. **Step 2 SIGNED by Kyra 2026-07-29 at `a788232bd`**
+(`OLB_2B3C_PRE_STEP2_SIGNED_HEAD`), after one HOLD and its repair (§2b).
+Branch `load-balancing-2`.
+
+**This handoff is now nearly spent.** Its remaining job is the step-3 boundary
+and the two HOLD lessons in §2b/§4. Delete it when step 3 signs — steps 1 and 2
+are both recorded in the authoritative design's §16.0, which is where they
+belong.
 
 ---
 
@@ -18,8 +23,8 @@ review of `df32cbd7d` returned HOLD on two findings (§2b). Branch
 | OLB-2B.3a — per-slot `ArcSwap` publication cell | `fd05a89ba` | SIGNED (`OLB_2B3A_SIGNED_HEAD`) |
 | OLB-2B.3 boundary design (rev 5 + addenda) | `1c1b652e6` | SIGNED **as a design only** |
 | 2B.3c-pre **step 1** — installation identity (items 1–3) | `300e80f6c` | SIGNED |
-| 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `8189676a7` → `224c9ea48` | **IMPLEMENTED + CORRECTED + WITNESSED — INDEPENDENTLY REVIEWED ONCE, HELD, REPAIRED — NOT SIGNED.** Kyra HOLD on `df32cbd7d`; both findings closed at `224c9ea48`; see §2b |
-| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | — | not started / **not authorized** until step 2 signs |
+| 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `a788232bd` | **SIGNED** (`OLB_2B3C_PRE_STEP2_SIGNED_HEAD`) — held once at `df32cbd7d`, repaired, signed 2026-07-29; see §2b |
+| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15) | — | **DEFERRED / NOT AUTHORIZED.** The step-2 signature explicitly does not extend to them |
 | `SAFE_LIVE_HEAD` | — | **not established**, still reserved for provider-free leader lighting |
 
 Authoritative design: [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md).
@@ -30,15 +35,18 @@ proof, the exclusions, and the closure gate. §2A is the substrate spec.
 
 ## 2. Do this first
 
-**The next authorized work is Kyra's re-run of the independent mutation matrix
-against `224c9ea48` — not more implementation.**
+**Step 2 is signed. There is no authorized work in this handoff's scope.**
 
-The first independent review (of `df32cbd7d`) returned **HOLD** on two findings,
-both now closed: W-G3 did not prove what it claimed, and W-G13's actor-armed
-deadline did not exist. §2b records both. §2a records the earlier author review.
+Items 10, 11 and 15 are DEFERRED and NOT AUTHORIZED; the step-2 signature
+explicitly does not extend to them. `SAFE_LIVE_HEAD` remains unestablished and
+still reserved for the provider-free leader path.
 
-Every RED in this branch is still the AUTHOR's. Step 3 (items 10, 11, 15, 16)
-stays unauthorized until step 2 signs.
+Kyra's independent matrix at `a788232bd`: all eight Grant filters selected
+exactly one test, 1 passed / 5,460 skipped / retries 0 each; the focused gate
+selected 54 and passed 54; every security claim went RED under its own inverse
+mutation; the source was restored to the exact SHA before final GREEN.
+
+What follows is kept for whoever picks up step 3.
 
 | # | Witness | Dies to |
 |---|---|---|
@@ -51,7 +59,7 @@ stays unauthorized until step 2 signs.
 | W-G8 | `unrelated_grant_movement_preserves_the_exact_slot` | a global "some Grant moved" bit |
 | W-G13 | `an_installed_grants_expiry_colds_its_facts_with_zero_providers` | omit the installed-Grant deadline from the source |
 
-Four notes for whoever re-runs these mutations independently:
+Four notes carried forward — each was load-bearing in the independent run:
 
 - **W-G4 is a direct comparison witness**, and is labelled so in-tree. Equal
   `install_seq` with a different signature is not production-reachable —

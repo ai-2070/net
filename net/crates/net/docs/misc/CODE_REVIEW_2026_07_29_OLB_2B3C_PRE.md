@@ -1,20 +1,26 @@
 # CODE REVIEW 2026-07-29 — OLB-2B.3a / 2B.3c-pre / OLB-2C (`load-balancing-2`)
 
-> **STATUS: ALL FINDINGS ADDRESSED at `ac5111a14`; step 2's full witness set
-> landed at `bd225acdd` (2026-07-29).** Every finding below has a landed fix;
-> the two structural ones (§1, §2) have RED-verified witnesses. See
-> [Closure](#closure) for the finding-to-commit map.
+> **STATUS: CLOSED. The slice this pass reviewed is SIGNED at `a788232bd`**
+> (Kyra, 2026-07-29 — OLB-2B.3c-pre step 2, items 4–9 and 12–14;
+> `OLB_2B3C_PRE_STEP2_SIGNED_HEAD`). Every finding below has a landed fix, and
+> the two structural ones (§1, §2) have witnesses that Kyra independently
+> mutation-proved. See [Closure](#closure) for the finding-to-commit map.
 >
-> **This is NOT a sign-off.** §1 and §2 were the two defects this pass found in
-> the region [`OLB_2B3C_PRE_HANDOFF.md`](../plans/OLB_2B3C_PRE_HANDOFF.md) then
-> marked **"CODE ONLY — NO WITNESSES"**. The rest of that debt — W-G3, W-G4,
-> W-G5, W-G6, W-G8, W-G13 — closed separately at `bd225acdd`; see
+> **The signature does not extend to this document's judgement.** Two witnesses
+> written during this pass's closure — W-G3 and W-G13 — were later HELD by the
+> independent review for asserting properties they did not exercise. That is
+> recorded in `docs/plans/OLB_2B3C_PRE_HANDOFF.md` §2b, and it is the more
+> useful lesson than anything in the findings below.
+>
+> §1 and §2 were the two defects this pass found in the region
+> [`OLB_2B3C_PRE_HANDOFF.md`](../plans/OLB_2B3C_PRE_HANDOFF.md) then marked
+> **"CODE ONLY — NO WITNESSES"**. The rest of that debt — W-G3, W-G4, W-G5,
+> W-G6, W-G8, W-G13 — closed separately at `bd225acdd` and was repaired through
+> `224c9ea48`; see
 > [What was still owed](#what-was-still-owed--closed-at-bd225acdd).
 >
-> Neither fix is self-certifiable by its author: both were "the guarantee is not
-> where it looks like it is" defects, and **every RED recorded in this document
-> is the author's own.** Step 2 remains NOT INDEPENDENTLY REVIEWED and NOT
-> SIGNED.
+> **Every RED recorded in this document is the author's own.** What made the
+> slice signable was Kyra's independent matrix at `a788232bd`, not these.
 
 **Scope:** the full branch diff `master..6eec8d34d` (merge base `80bb06b5a`),
 tree clean. 12 files, +3014/−183.
@@ -513,5 +519,9 @@ cargo clippy --all-features --all-targets -D warnings   clean
 git diff --check                                        clean
 ```
 
-**Step 2 is still NOT SIGNED and NOT INDEPENDENTLY REVIEWED.** Every RED in this
-branch is the author's own.
+**Superseded by the independent review.** Two of the witnesses this section
+reports as landed — W-G3 and W-G13 — did not hold up: Kyra's mutation matrix
+against `df32cbd7d` showed W-G3's first case exercising the wrong property and
+W-G13's actor-armed deadline not existing at all. Both were repaired
+(`e534b7b01`, `224c9ea48`), and step 2 signed at `a788232bd`. The lesson is in
+`docs/plans/OLB_2B3C_PRE_HANDOFF.md` §2b.

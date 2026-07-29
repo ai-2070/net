@@ -632,19 +632,39 @@ is the §19 defect class this process has already caught once.
 | Items | Status | Head |
 |---|---|---|
 | **1–3** — non-aliasing installation identity | **SIGNED** 2026-07-28 | `OLB_2B3C_PRE_STEP1_SIGNED_HEAD = 300e80f6c` |
-| 4–9, 12–14 — scope stamp + Grant source service | **IMPLEMENTED + CORRECTED + WITNESSED — REVIEWED ONCE, HELD, REPAIRED — NOT SIGNED** | implemented `8189676a7`, corrected through `c7add787c`, witnessed at `bd225acdd`, held at `df32cbd7d` and repaired through `224c9ea48` |
+| **4–9, 12–14** — scope stamp + Grant source service | **SIGNED** 2026-07-29 | `OLB_2B3C_PRE_STEP2_SIGNED_HEAD = a788232bd` |
 | 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | not started / not authorized | — |
 
-**Read the middle row precisely.** "Implemented" is an implementation-state
-description and nothing more. It is NOT a signature, NOT an independent review,
-and NOT a claim that the behaviour is evidenced. The row said "not started"
-until 2026-07-29, which was accurate about the signature and inaccurate about
-the code — the exact plan/code disagreement §19 exists to catch, in the
-direction that understates rather than overstates, which is the safer error but
-still an error (Kyra, 2026-07-29).
+**Step 2 signed by Kyra 2026-07-29 at `a788232bd`**, after an independent
+mutation matrix in a detached worktree: every security claim below went RED
+under its own inverse mutation with zero retries, and the source was restored to
+the exact SHA before the final GREEN and adjudication.
 
-The Grant-currentness witness set, complete as of `bd225acdd`. Every one is
-mutation-proven — it fails under the named mutation and passes again on
+The corrective lineage is the useful record, because two of its turns were
+HOLDs:
+
+```text
+8189676a7  Grant-plane implementation
+c7add787c  author review corrections (§1 commit pin, §2 stamp key, §3, §4)
+f2f6a249f  bookkeeping reconciliation
+bd225acdd  first complete witness delivery
+df32cbd7d  witness bookkeeping                     <- HELD here
+e534b7b01  repaired byte-identical W-G3
+224c9ea48  completed item 12 + repaired W-G13
+a788232bd  final witness bookkeeping               <- SIGNED here
+```
+
+The two HOLD findings are worth carrying forward, because they are the same
+failure mode in different clothes: **a witness that asserts a property it does
+not exercise**, which is worse than an absent witness because it reads as
+covered. W-G3 claimed a byte-identical reinstall and performed a differently
+signed one — and asserted the contradiction itself. W-G13 claimed actor-armed
+expiry against an implementation where the installed-Grant deadline armed
+nothing at all (item 12 under-delivered). Neither was visible from the code's
+own comments, which described the intended property accurately in both cases.
+
+The Grant-currentness witness set as signed. Every one is mutation-proven
+INDEPENDENTLY — it fails under the named mutation and passes again on
 restoration — and every one drives the production source, the production phase-5
 installation and the production read seam.
 
@@ -688,15 +708,23 @@ artifact deadline. Found by Kyra's independent review, not by the author.
 W-G5b and W-G7 were written because
 [`../misc/CODE_REVIEW_2026_07_29_OLB_2B3C_PRE.md`](../misc/CODE_REVIEW_2026_07_29_OLB_2B3C_PRE.md)
 found the corresponding defects. W-G3 and W-G13 were REPAIRED because Kyra's
-independent review found each asserting a property it did not exercise —
-the failure mode that reads as covered. **Every RED above is the author's own.**
-They are corrective and design evidence; they are **not** an independent
-mutation run, and step 2 is not signed.
+independent review found each asserting a property it did not exercise.
 
-Items 10, 11, 15 and 16 remain unauthorized until step 2 is independently
-reviewed and signed. Item 15's normative
-`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md` correction stays deferred with them,
-and is a separate question from this progress bookkeeping.
+**What the signed slice now proves:** a same-ID reinstall cannot alias the
+previous installation; signature identity binds independently; the audience
+handle binds independently at capture AND at cached currentness; sibling scopes
+cannot alias through a `grant_id`-keyed batch map; selected-Grant movement
+defeats capture-to-commit publication; Grant removal cannot occupy
+validation-to-settlement; unrelated Grant movement preserves the exact
+unaffected artifact; zero-provider Grant facts carry the installed authority
+deadline; and the production actor arms that deadline, retires the artifact,
+rebuilds `Unserved`, and converges without spinning.
+
+**The boundary stays frozen.** This signature does NOT authorize or include
+item 10 (the install/remove wake and invalidation edge), item 11 (related step-3
+implementation), or item 15 (the same-commit normative
+`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md` correction). They remain DEFERRED /
+NOT AUTHORIZED.
 
 Step 1's corrective lineage, kept because each turn found a distinct defect class
 and the sequence is the useful record:
