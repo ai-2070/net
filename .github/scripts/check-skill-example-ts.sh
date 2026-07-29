@@ -97,11 +97,19 @@ else
   echo "      (tsc names the file above; the copies are skill-example-<id>.ts)"
 fi
 
+# Type-checking is not enough, and hello.ts is the proof: it type-checked clean
+# for months while hanging forever on a subscribe that could never yield. The
+# napi module needed to run it is already built by both callers, so executing it
+# here costs almost nothing and catches the failure the type-check cannot see.
+if [ "$fail" -eq 0 ]; then
+  echo
+  "$ROOT/.github/scripts/run-skill-examples.sh" --lang typescript || fail=$((fail + 1))
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
-  echo "The TypeScript example type-checks."
-  echo "(Type-check only — nothing here proves it runs.)"
+  echo "The TypeScript examples type-check, run, and match their contracts."
   exit 0
 fi
-echo "The TypeScript example drifted from the SDK — see above."
+echo "The TypeScript examples drifted from the SDK — see above."
 exit 1

@@ -51,6 +51,7 @@ on:
       - ".github/scripts/check-skill-workflow.py"
       - ".github/scripts/check-skill-examples.sh"
       - ".github/scripts/skill_examples.py"
+      - ".github/scripts/run-skill-examples.sh"
       - ".github/skill-examples.json"
       - ".github/scripts/check-skill-example-ts.sh"
       - ".github/scripts/check-skill-vocab.py"
@@ -93,6 +94,7 @@ on:
       - ".github/scripts/check-skill-workflow.py"
       - ".github/scripts/check-skill-examples.sh"
       - ".github/scripts/skill_examples.py"
+      - ".github/scripts/run-skill-examples.sh"
       - ".github/skill-examples.json"
       - ".github/scripts/check-skill-example-ts.sh"
       - ".github/scripts/check-skill-vocab.py"
@@ -199,6 +201,21 @@ jobs:
         env:
           REQUIRE_ALL: "1"
         run: .github/scripts/check-skill-examples.sh
+
+      # The step above is a compile floor, and a compile floor cannot catch an
+      # example that builds and then hangs. `hello.rs` and `hello.ts` did
+      # exactly that for months: clean compile, blocked forever on a subscribe
+      # that could never yield, while the README promised "prints exactly one
+      # line". Only running them finds that.
+      #
+      # Rust runs here because the step above already built it — the marginal
+      # cost is the execution itself. The other four need artifacts this job
+      # does not have (napi module, maturin wheel, libnet cdylib) and are
+      # executed in the ci.yml jobs that do; `run.not_wired` in the manifest
+      # records which, and `--report` prints ▶ for executed against ✓ for
+      # compiled-only so the difference is never invisible.
+      - name: Run the Rust examples and check their output
+        run: .github/scripts/run-skill-examples.sh --lang rust
 
   snippets:
     name: Snippets compile

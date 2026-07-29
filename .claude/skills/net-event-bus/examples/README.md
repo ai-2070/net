@@ -51,8 +51,28 @@ where they differ most:
 
 ## What CI checks here
 
-Every file in this directory is **compiled or type-checked** on each pull request against the current tree — so a renamed method or a changed signature breaks the build rather than reaching you. `hello.c`, `hello.go`, `hello.rs` and `hello.py` run through `.github/scripts/check-skill-examples.sh`; `hello.ts` goes through `.github/scripts/check-skill-example-ts.sh`, run by the two jobs that build the napi type declarations it needs.
+Every file here is **compiled or type-checked** on each pull request against the
+current tree, so a renamed method or a changed signature breaks the build rather
+than reaching you. `hello.c`, `hello.go`, `hello.rs` and `hello.py` go through
+`.github/scripts/check-skill-examples.sh`; the `.ts` files go through
+`.github/scripts/check-skill-example-ts.sh`, run by the two jobs that build the
+napi type declarations it needs.
 
-Both are driven from `.github/skill-examples.json`, which requires every binding to be listed for every route as either a checked file or an explicit, reasoned absence. A source file sitting in this directory but missing from that manifest is an error — otherwise it would ship to users with nothing compiling it.
+**The Rust and TypeScript examples are also executed**, and their stdout is
+matched against a contract, with a timeout. That is not belt-and-braces: a compile floor cannot
+catch an example that builds and then hangs, and both `hello.rs` and `hello.ts`
+did exactly that for months — clean compile, blocked forever on a subscribe that
+could never yield — while this README promised they printed one line. Nothing
+short of running them would have found it.
 
-That is a compile floor, not a promise that the commands above run. Executing them needs built artifacts (the napi module, the Python wheel, the C shared library), so the "prints exactly one line" claim is verified in the release pipelines rather than per-PR. If one of these fails to run for you against a released build, that is a bug worth reporting.
+Python, Go and C are **not executed anywhere yet** — they need a maturin wheel
+and the `libnet` cdylib, which live in other CI jobs. The manifest records that
+gap with a reason rather than leaving it implicit.
+
+Both are driven from `.github/skill-examples.json`, which requires every binding
+to be listed for every route as either a checked file or an explicit, reasoned
+absence — and, for execution, records which bindings run where. Its coverage
+report prints **▶** for executed against **✓** for compiled-only, so a partially
+executed route can never read as a fully executed one. A source file sitting in
+this directory but missing from that manifest is an error; otherwise it would
+ship to users with nothing compiling it.

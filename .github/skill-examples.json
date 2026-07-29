@@ -11,7 +11,14 @@
     "",
     "`absent` is for a binding that will not get this example, with the reason.",
     "It is not a to-do list \u2014 a route that is merely unwritten yet should say",
-    "so in its reason."
+    "so in its reason.",
+    "",
+    "`run` holds the execution contract: the stdout regex the example must match",
+    "and the timeout. A compile floor cannot catch an example that builds and then",
+    "hangs \u2014 which is exactly what hello.* did \u2014 so anything listed here is also",
+    "executed. `run.not_wired` names bindings whose artifacts are not available in",
+    "the job that runs the others, with the reason; same rule as `absent`, so a",
+    "partially-executed route can never read as a fully-executed one."
   ],
   "bindings": [
     "rust",
@@ -34,7 +41,16 @@
         "go": "hello.go",
         "c": "hello.c"
       },
-      "absent": {}
+      "absent": {},
+      "run": {
+        "expect": "accepted: .*ingested=1",
+        "timeout_s": 60,
+        "not_wired": {
+          "python": "needs the maturin-built binding; not executed anywhere yet \u2014 ci.yml's sdk-py-tests is where it belongs",
+          "go": "cgo \u2014 needs the libnet cdylib; not executed anywhere yet \u2014 ci.yml's go-tests is where it belongs",
+          "c": "needs libnet built and linked; not executed anywhere yet \u2014 ci.yml's ffi-tests is where it belongs"
+        }
+      }
     },
     {
       "id": "observe",
@@ -49,7 +65,16 @@
         "go": "observe.go",
         "c": "observe.c"
       },
-      "absent": {}
+      "absent": {},
+      "run": {
+        "expect": "loses events silently",
+        "timeout_s": 120,
+        "not_wired": {
+          "python": "needs the maturin-built binding; not executed anywhere yet \u2014 ci.yml's sdk-py-tests is where it belongs",
+          "go": "cgo \u2014 needs the libnet cdylib; not executed anywhere yet \u2014 ci.yml's go-tests is where it belongs",
+          "c": "needs libnet built and linked; not executed anywhere yet \u2014 ci.yml's ffi-tests is where it belongs"
+        }
+      }
     }
   ]
 }
