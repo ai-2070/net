@@ -10951,9 +10951,16 @@ impl MeshNode {
         &self,
         next: Arc<super::behavior::org_grant_registry::ConsumerGrantSnapshot>,
     ) {
+        // `AcqRel`, not `Relaxed`: the counter exists precisely so a transient
+        // publication is observable, which invites a witness that samples it from
+        // ANOTHER thread while one is in flight. Paired with the `Acquire` load
+        // in `consumer_grant_publications_for_test`, a relaxed RMW would not have
+        // meant what the pairing looks like it means (review 2026-07-29 §4).
+        // Counted BEFORE the store, so an observer that sees the new snapshot has
+        // necessarily already seen the count that names it.
         #[cfg(test)]
         self.consumer_grant_publications
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, Ordering::AcqRel);
         self.consumer_grant_audiences.store(next);
     }
 

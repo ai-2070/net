@@ -738,7 +738,19 @@ impl NodeOrgRoutingRegistry {
                     .fetch_add(1, Ordering::AcqRel);
                 return Err(DemandRefused::NodeAtCapacity);
             }
-            if new_slot {
+            // Captured under the SAME lock acquisition that takes the reference,
+            // so the cell can only be the one belonging to the incarnation this
+            // handle is now keeping alive.
+            //
+            // The fresh path keeps the cell it INSERTED rather than looking the
+            // slot back up, so there is no post-mutation lookup left to fail
+            // (review 2026-07-29 §4). What remains is the pre-existing path,
+            // where `new_slot` was false under this same lock hold and nothing
+            // above removes a slot — and where, unlike before, the impossible
+            // branch is reached having mutated NOTHING: no reserved slot with no
+            // owner, no orphaned `pending` entry, no `queued` flag whose
+            // `work.mark()` the early return would skip.
+            let cell = if new_slot {
                 // Allocate BEFORE mutating anything, so exhaustion retains nothing.
                 let Some(incarnation) = inner.allocate_id() else {
                     self.metrics
@@ -746,12 +758,13 @@ impl NodeOrgRoutingRegistry {
                         .fetch_add(1, Ordering::AcqRel);
                     return Err(DemandRefused::IdSpaceExhausted);
                 };
+                let cell = Arc::new(ArcSwapOption::empty());
                 inner.slots.insert(
                     key.clone(),
                     Slot {
                         incarnation,
-                        refs: 0,
-                        facts: Arc::new(ArcSwapOption::empty()),
+                        refs: 1,
+                        facts: cell.clone(),
                     },
                 );
                 inner
@@ -761,19 +774,20 @@ impl NodeOrgRoutingRegistry {
                     .insert(key.clone());
                 inner.pending.insert(key.clone());
                 queued = true;
-            }
-            // Captured under the SAME lock acquisition that takes the reference,
-            // so the cell can only be the one belonging to the incarnation this
-            // handle is now keeping alive.
-            let Some(slot) = inner.slots.get_mut(&key) else {
-                // Unreachable: the block above inserts it when absent. Fail
-                // closed rather than fabricating a detached cell that no install
-                // would ever write to — a handle reading a cell the registry
-                // does not own would be permanently, silently cold.
-                return Err(DemandRefused::NodeAtCapacity);
+                cell
+            } else {
+                let Some(slot) = inner.slots.get_mut(&key) else {
+                    // Unreachable. Fail closed rather than fabricating a detached
+                    // cell that no install would ever write to — a handle reading
+                    // a cell the registry does not own would be permanently,
+                    // silently cold. `NodeAtCapacity` is the most conservative of
+                    // the three refusals: it retains nothing and tells the caller
+                    // to take the cold path.
+                    return Err(DemandRefused::NodeAtCapacity);
+                };
+                slot.refs += 1;
+                slot.facts.clone()
             };
-            slot.refs += 1;
-            let cell = slot.facts.clone();
             *inner
                 .families
                 .entry(family)
