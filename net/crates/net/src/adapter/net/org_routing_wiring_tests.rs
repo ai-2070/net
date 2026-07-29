@@ -3455,6 +3455,7 @@ async fn duplicate_provider_rows_collapse_to_the_newest_generation() {
             (
                 vec![row(3, 300), row(9, 900), row(5, 500)],
                 ScopedDiscoveryAuthorityStamp::Owner,
+                u64::MAX,
             ),
         )]
         .into_iter()
@@ -4216,11 +4217,29 @@ struct GrantFixture {
 }
 
 async fn grant_fixture(tag: &str) -> GrantFixture {
-    use crate::adapter::net::behavior::org::OrgKeypair;
+    use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+    use crate::adapter::net::behavior::org_authority::NodeAuthority;
+    use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
     let node = node().await;
     let org = OrgKeypair::from_bytes([0xa1u8; 32]);
     let issuer = OrgKeypair::from_bytes([0xa2u8; 32]);
-    node.install_node_authority(adopt_authority(&node, &org, tag))
+
+    // Adopted at the FULL skew tolerance, unlike `adopt_authority`'s zero.
+    //
+    // Install validation uses this skew; the routing source and read seam use
+    // `MAX_TOKEN_CLOCK_SKEW_SECS`. Matching them is what lets a witness install a
+    // grant whose `not_after` has already passed but which is still valid within
+    // tolerance — the only way to place an installed Grant's EFFECTIVE deadline
+    // (`not_after + skew`) a few seconds out instead of five minutes.
+    let entity = node.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(&org, entity.clone(), 1, 3600).expect("issue cert");
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("net-grantfx-{tag}-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority = NodeAuthority::adopt(&dir, cert, &entity, MAX_TOKEN_CLOCK_SKEW_SECS, None)
+        .expect("adopt authority");
+    node.install_node_authority(Arc::new(authority))
         .expect("install authority");
     GrantFixture {
         node,
@@ -4807,108 +4826,193 @@ async fn unrelated_grant_movement_preserves_the_exact_slot() {
     );
 }
 
-/// W-G13. An installed Grant's own deadline makes its cached facts `Unserved` —
-/// **including, and especially, with ZERO providers.**
+/// W-G13. An installed Grant's own deadline retires its cached facts through
+/// the PRODUCTION expiry path — **including, and especially, with ZERO
+/// providers.**
 ///
-/// The empty-provider case is the point of this witness, not an edge. With no
-/// providers the artifact's `earliest_expiry` is `u64::MAX`, so the artifact
-/// carries NO deadline of its own: the wall-clock expiry check in the read seam
-/// can never retire it, and neither can the exact-expiry timer, which is driven
-/// by provider rows. The installed Grant's deadline is the only thing left, and
-/// a source that derives expiry from provider rows alone has nothing.
+/// The empty-provider case is the point, not an edge. With no provider rows the
+/// artifact has no deadline from its rows: `row_expiry` is `u64::MAX`. So a
+/// source that derives expiry from provider rows alone publishes an artifact
+/// that claims never to expire while the authority behind it expires shortly —
+/// and NOTHING else in the system can say otherwise. The installed Grant is not
+/// a scoped row, so it reaches neither `ScopedDiscoveryState::next_visible_expiry`
+/// nor the exact-expiry timer it drives.
 ///
-/// Asserted at both seams, at an explicit clock — `MAX_TOKEN_CLOCK_SKEW_SECS` is
-/// 300 s, so waiting for this transition on the wall clock would take five
-/// minutes:
+/// That was the state at `df32cbd7d`. The read seam refused an expired Grant, so
+/// nothing withdrawn was ever served — but retirement was READER-TRIGGERED, and
+/// with no reader the artifact sat retained indefinitely with nothing armed to
+/// notice. Kyra's independent review named the gap and required the deadline to
+/// reach a production deadline/wake path (2026-07-29, finding 2). Scope item 12.
 ///
-/// - capture: past the deadline the key reconstructs `Unserved`, not
-///   `Served(empty)`;
-/// - the read seam: the warm artifact, whose `earliest_expiry` is `u64::MAX`,
-///   is retired anyway.
+/// This drives the whole edge against a LIVE production supervisor:
 ///
-/// Dies to omitting the installed-Grant deadline from the source, and to
-/// deriving the artifact's expiry from provider rows alone.
-#[tokio::test]
+/// 1. an installed, currently valid DISCOVER Grant with ZERO providers;
+/// 2. warmed through the real actor and `DirtyApply::apply`;
+/// 3. `Served(empty)` — proven-empty evidence, not `Unserved`;
+/// 4. the artifact's deadline IS the Grant's effective deadline, and the
+///    registry arms to exactly that;
+/// 5. the read seam refuses it past that instant (asserted at an explicit clock,
+///    so this half needs no waiting at all);
+/// 6. the deadline passes and the ACTOR's own arm fires — no reader touches the
+///    slot, and no scoped mutation wakes it;
+/// 7. the requeued rebuild settles `Unserved`;
+/// 8. shutdown joins every spawned task.
+///
+/// **On the timing.** The effective deadline is `not_after + MAX_TOKEN_CLOCK_SKEW_SECS`,
+/// and the skew is 300 s — so a grant issued to expire "soon" still arms five
+/// minutes out. Instead the grant is issued with `not_after` already PAST but
+/// still inside the skew tolerance, which is a legitimate installable state and
+/// places the effective deadline a few seconds away. That is why this witness
+/// needs neither a mocked clock nor a paused runtime: `start_paused` freezes
+/// time and a live node never goes idle, so its auto-advance never fires and the
+/// sleeps simply never complete. Every wait below is bounded and polls real
+/// state; none is used as ordering evidence.
+///
+/// Dies to deriving the artifact deadline from provider rows alone, and to
+/// omitting the installed-Grant deadline from the source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_installed_grants_expiry_colds_its_facts_with_zero_providers() {
     use crate::adapter::net::behavior::org::current_timestamp;
+    use crate::adapter::net::behavior::org_routing_registry::SourceFacts;
     use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
 
     let f = grant_fixture("wg13").await;
-    let now = current_timestamp();
-    // A short but currently-VALID window, so the install is accepted and the
-    // deadline is a named instant rather than something to wait for.
-    let not_after = now + 120;
-    let (grant, secret) = f.mint("nrpc:wg13", None, Some((now.saturating_sub(60), not_after)));
+    let base = current_timestamp();
+    // `not_after` already past, still valid within tolerance — see the note
+    // above. The effective deadline lands `LEAD` seconds out.
+    const LEAD: u64 = 4;
+    let not_after = base + LEAD - MAX_TOKEN_CLOCK_SKEW_SECS;
+    let effective_deadline = not_after + MAX_TOKEN_CLOCK_SKEW_SECS;
+    assert_eq!(
+        effective_deadline,
+        base + LEAD,
+        "precondition: the arm is seconds away, not five minutes"
+    );
+    // An explicit id, because only that branch of `mint` issues at EXPLICIT
+    // bounds — the fresh-id branch derives a TTL from `now`, which is zero for a
+    // `not_after` already in the past.
+    let (grant, secret) = f.mint(
+        "nrpc:wg13",
+        Some([0x13u8; 32]),
+        Some((base.saturating_sub(3600), not_after)),
+    );
     let (grant_id, handle) = f.install(grant, secret);
     let key = f.key(grant_id, handle, "nrpc:wg13");
+    // A SECOND slot under the same grant, for the read-seam probe only — see
+    // the note at that probe for why it cannot share the actor's slot.
+    let probe_key = f.key(grant_id, handle, "nrpc:wg13-probe");
 
-    // ZERO providers announced. This is the normative case.
-    let _held = f.warm(&key);
-    let warm = f
-        .node
-        .org_routing_base_facts(&key)
-        .expect("precondition: the slot is warm under a currently-valid Grant");
+    // The real production supervisor. ZERO providers are announced.
+    f.node.start();
     assert!(
-        matches!(&warm.providers,
-            crate::adapter::net::behavior::org_routing_registry::SourceFacts::Served(p)
-                if p.is_empty()),
-        "precondition: an installed current Grant with no providers is SERVED \
-         with exact empty evidence, not Unserved"
+        until(|| f.node.org_routing_ready()).await,
+        "precondition: the actor must reach Healthy before anything is demanded"
+    );
+
+    let family = f.node.org_routing_family().expect("family");
+    let held = family.demand(key.clone()).expect("demand");
+    let held_probe = family.demand(probe_key.clone()).expect("demand probe");
+    assert!(
+        until(|| f.node.org_routing_base_facts(&key).is_some()
+            && f.node.org_routing_base_facts(&probe_key).is_some())
+        .await,
+        "precondition: the actor must warm BOTH slots under a currently-valid Grant"
+    );
+
+    let warm = f.node.org_routing_base_facts(&key).expect("warm");
+    assert!(
+        matches!(&warm.providers, SourceFacts::Served(p) if p.is_empty()),
+        "an installed current Grant with no providers is SERVED with exact empty \
+         evidence, not Unserved"
     );
     assert_eq!(
-        warm.earliest_expiry,
-        u64::MAX,
-        "THE point of this witness: with zero providers the artifact carries no \
-         deadline of its own, so nothing but the installed Grant's own deadline \
-         can ever retire it"
-    );
-
-    // The instant the Grant's authority ends: past `not_after`, past the skew
-    // tolerance every other validity decision in the grant family applies.
-    let expired_at = not_after + MAX_TOKEN_CLOCK_SKEW_SECS + 1;
-
-    // --- the read seam ------------------------------------------------------
-    assert!(
-        f.node.org_routing_base_facts_at(&key, not_after).is_some(),
-        "precondition: still current at the deadline itself — the transition \
-         under test is the deadline PLUS the skew tolerance, not the deadline"
-    );
-    assert!(
-        f.node.org_routing_base_facts_at(&key, expired_at).is_none(),
-        "an installed-but-expired Grant authorizes NOTHING: the cached facts \
-         must be retired even though `earliest_expiry` is u64::MAX and the \
-         artifact's own expiry check therefore cannot fire"
-    );
-
-    // --- capture ------------------------------------------------------------
-    // The source decides this in `grant_installations_for`, whose only clock
-    // input is the `now_secs` `snapshot` passes it from `current_timestamp()`.
-    // Naming that input is what lets the deadline be asserted exactly.
-    let (live_stamps, live_ids) = ScopedSlotSource::grant_installations_for(
-        &f.node.consumer_grant_audiences,
-        std::slice::from_ref(&key),
-        not_after,
+        warm.earliest_expiry, effective_deadline,
+        "THE point of this witness: with ZERO provider rows the artifact's only \
+         possible deadline is its AUTHORITY's. Derived from rows alone this is \
+         u64::MAX — an artifact claiming never to expire while the Grant behind \
+         it expires in seconds, with nothing armed to notice"
     );
     assert_eq!(
-        live_stamps.len(),
-        1,
-        "precondition: at the deadline the Grant still stamps its key"
+        f.node.routing_registry.next_artifact_deadline(),
+        Some(effective_deadline),
+        "and the registry must ARM to it — this is what the actor sleeps on, so \
+         a deadline that never reaches here wakes nobody"
     );
-    assert_eq!(live_ids.len(), 1, "and still contributes its identity");
 
-    let (expired_stamps, expired_ids) = ScopedSlotSource::grant_installations_for(
-        &f.node.consumer_grant_audiences,
-        std::slice::from_ref(&key),
-        expired_at,
+    // The read-seam half, at an explicit clock and on the PROBE slot: no
+    // waiting, and it isolates "the seam refuses" from "the actor retires",
+    // which are different claims about different mechanisms.
+    //
+    // On the PROBE slot specifically, because `org_routing_base_facts_at`
+    // INVALIDATES what it refuses. Probing the actor's own slot would make a
+    // reader the thing that retired the artifact, and every actor-arm assertion
+    // below would then pass with no actor arm at all — the witness would be
+    // contaminating its own evidence.
+    assert!(
+        f.node
+            .org_routing_base_facts_at(&probe_key, effective_deadline.saturating_sub(1))
+            .is_some(),
+        "precondition: still current one second before the effective deadline"
     );
     assert!(
-        expired_stamps.is_empty(),
-        "past the deadline the Grant stamps NOTHING, which is what makes its \
-         key reconstruct as Unserved rather than as a proven-empty provider set"
+        f.node
+            .org_routing_base_facts_at(&probe_key, effective_deadline)
+            .is_none(),
+        "an installed-but-expired Grant authorizes NOTHING, and the boundary is          exact: `now >= not_after + skew`, matching `check_time_bounds_at`"
+    );
+    assert_eq!(
+        f.node.routing_registry.next_artifact_deadline(),
+        Some(effective_deadline),
+        "and the actor's OWN slot is still armed after that probe — proof the          read-seam half is not what retires it below"
+    );
+
+    // --- the ACTOR's own arm ------------------------------------------------
+    // Nothing below reads the slot or mutates scoped discovery. The only thing
+    // that can retire this artifact is the actor waking on the deadline it
+    // armed to.
+    assert!(
+        until(|| f.node.routing_registry.next_artifact_deadline().is_none()).await,
+        "the actor must wake on its OWN deadline arm and retire the expired \
+         artifact; a deadline still armed here means nothing consumed it"
     );
     assert!(
-        expired_ids.is_empty(),
-        "and contributes no identity, so a pin taken before the deadline \
-         cannot settle after it"
+        until(|| {
+            f.node
+                .routing_registry
+                .base_facts_unvalidated(&key)
+                .is_some_and(|facts| matches!(facts.providers, SourceFacts::Unserved))
+        })
+        .await,
+        "and the requeued rebuild must settle UNSERVED: past its deadline the \
+         installed Grant authorizes nothing, so the scope has no evidence at all"
+    );
+    assert!(
+        f.node.org_routing_base_facts(&key).is_none(),
+        "the read seam is cold — and now AGREES with the retained set rather \
+         than being the only thing that knew"
+    );
+
+    // NO SPIN. A deadline arm that fires, retires, and finds the same deadline
+    // waiting is a busy actor — the failure mode this arm most easily
+    // introduces. It converges because the rebuild installs `Unserved`, which
+    // carries no deadline; assert the convergence rather than trusting it.
+    let settled = f.node.org_routing_reconciliation_counts();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        f.node.org_routing_reconciliation_counts()[0],
+        settled[0],
+        "the actor must be QUIESCENT once the expired artifact is retired — a          climbing install count means the deadline arm re-fires on what it just          rebuilt"
+    );
+    assert!(
+        f.node.routing_registry.next_artifact_deadline().is_none(),
+        "and nothing is armed: `Unserved` carries no deadline, which is what          makes the retirement terminal rather than cyclic"
+    );
+
+    drop(held);
+    drop(held_probe);
+    let _ = f.node.shutdown().await;
+    assert!(
+        f.node.routing_task.lock().is_none(),
+        "every spawned task must be joined"
     );
 }

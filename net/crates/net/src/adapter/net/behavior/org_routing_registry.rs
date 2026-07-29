@@ -227,6 +227,20 @@ pub(crate) enum ScopedDiscoveryAuthorityStamp {
 pub(crate) struct ScopedSourceFacts {
     pub facts: SourceFacts,
     pub authority: ScopedDiscoveryAuthorityStamp,
+    /// The instant this scope's AUTHORITY stops authorizing anything, or
+    /// `u64::MAX` if it carries no deadline of its own (scope item 12).
+    ///
+    /// Separate from the provider rows' deadlines and folded in beside them,
+    /// because the two can disagree in the direction that matters: an installed
+    /// Grant with ZERO visible providers yields a row deadline of `u64::MAX`,
+    /// so an `earliest_expiry` derived from rows alone would say the artifact
+    /// never expires while its authority expires in an hour.
+    ///
+    /// Boundary convention matches the read seam's `now >= earliest_expiry` and
+    /// the grant family's `now >= not_after + skew ⇒ expired`, so this is
+    /// exactly `not_after + MAX_TOKEN_CLOCK_SKEW_SECS` — the first instant the
+    /// authority is no longer valid, not the last instant it is.
+    pub authority_deadline: u64,
 }
 
 /// An opaque, comparable summary of EVERY authority input a snapshot was taken
@@ -978,6 +992,66 @@ impl NodeOrgRoutingRegistry {
             .fetch_add(invalidated, Ordering::AcqRel);
     }
 
+    /// The EARLIEST deadline any retained artifact carries, or `None` if none
+    /// carries one (scope item 12).
+    ///
+    /// This is what the actor arms its expiry wake to. `u64::MAX` means "no
+    /// deadline" and is deliberately excluded rather than returned — an
+    /// artifact with no deadline must not produce a wake at the end of time,
+    /// and `Option` says that where a sentinel would invite arithmetic on it.
+    pub(crate) fn next_artifact_deadline(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .slots
+            .values()
+            .filter_map(|slot| slot.facts.load().as_ref().map(|f| f.earliest_expiry))
+            .filter(|deadline| *deadline != u64::MAX)
+            .min()
+    }
+
+    /// Retire every retained artifact whose deadline `now_secs` has reached, and
+    /// RE-QUEUE its slot so the actor rebuilds it (scope item 12).
+    ///
+    /// The read seam already refuses an expired artifact, so this is not what
+    /// makes expiry safe — it is what makes it PROMPT, and what makes the
+    /// registry's retained set agree with what a reader would be told. Without
+    /// it, an artifact whose authority expired sits retained until some reader
+    /// happens by; with zero provider rows that reader is the only thing that
+    /// could ever retire it, because nothing else in the artifact carries a
+    /// deadline at all.
+    ///
+    /// Re-queuing is what closes the loop: the rebuilt reconstruction finds the
+    /// authority gone and installs `Unserved`, whose deadline is `u64::MAX`, so
+    /// the next arm finds nothing and the actor parks. That is also why this
+    /// cannot spin — a retired deadline is not reinstalled.
+    pub(crate) fn retire_expired(&self, now_secs: u64) -> u64 {
+        let mut inner = self.inner.lock();
+        let expired: Vec<SlotKey> = inner
+            .slots
+            .iter()
+            .filter(|(_, slot)| {
+                slot.facts
+                    .load()
+                    .as_ref()
+                    .is_some_and(|f| now_secs >= f.earliest_expiry)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut retired = 0u64;
+        for key in expired {
+            if let Some(slot) = inner.slots.get_mut(&key) {
+                if slot.facts.swap(None).is_some() {
+                    retired += 1;
+                }
+            }
+            inner.pending.insert(key);
+        }
+        self.metrics
+            .facts_invalidated
+            .fetch_add(retired, Ordering::AcqRel);
+        retired
+    }
+
     /// Test-only: drop `key`'s facts and re-queue it, so a witness can drive
     /// another quantum over the same slot.
     #[cfg(test)]
@@ -1060,6 +1134,14 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         if inner.live_actor == Some(incarnation) {
             inner.live_actor = None;
         }
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        self.next_artifact_deadline()
+    }
+
+    fn retire_expired(&self, now_secs: u64) -> u64 {
+        NodeOrgRoutingRegistry::retire_expired(self, now_secs)
     }
 
     /// One bounded reconciliation quantum.
@@ -1356,8 +1438,12 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     slot_moved = true;
                     continue;
                 }
-                let ScopedSourceFacts { facts, authority } = facts;
-                let earliest_expiry = match &facts {
+                let ScopedSourceFacts {
+                    facts,
+                    authority,
+                    authority_deadline,
+                } = facts;
+                let row_expiry = match &facts {
                     SourceFacts::Served(providers) => providers
                         .iter()
                         .map(|p| p.expires_at)
@@ -1366,6 +1452,14 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     // Cold at every read anyway; nothing to bound.
                     SourceFacts::Unserved => u64::MAX,
                 };
+                // The artifact expires at the EARLIER of what its rows say and
+                // what its authority says (scope item 12). Rows alone are not
+                // enough, and the zero-provider case is why: an installed Grant
+                // with no visible providers gives `row_expiry == u64::MAX`, so a
+                // rows-only deadline would claim the artifact never expires
+                // while the authority behind it expires in an hour — and nothing
+                // else in the artifact could ever retire it.
+                let earliest_expiry = row_expiry.min(authority_deadline);
                 slot.facts.store(Some(Arc::new(SlotBaseFacts {
                     providers: facts,
                     epoch,
@@ -1609,6 +1703,7 @@ mod tests {
             ScopedSourceFacts {
                 facts: SourceFacts::Served(Arc::from(Vec::new())),
                 authority: ScopedDiscoveryAuthorityStamp::Owner,
+                authority_deadline: u64::MAX,
             }
         }
     }

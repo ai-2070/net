@@ -5348,10 +5348,25 @@ struct ScopedSlotSource {
 /// slots. Narrowing this alias back to `[u8; 32]` reintroduces the aliasing
 /// `a_stale_audience_handle_is_unserved_beside_its_installed_sibling` exists to
 /// refuse.
-type GrantStampsByScope = std::collections::BTreeMap<
-    ([u8; 32], [u8; 32]),
-    super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
->;
+type GrantStampsByScope = std::collections::BTreeMap<([u8; 32], [u8; 32]), GrantAuthority>;
+
+/// One scope's installed-Grant authority: the exact identity it is compared
+/// against, AND the instant that identity stops authorizing anything.
+///
+/// The two travel together because they come from the same record and must
+/// never be read from different ones. The deadline is scope item 12 — without
+/// it, an artifact's `earliest_expiry` is derived from provider rows alone, and
+/// with ZERO providers that is `u64::MAX`: the authority expires and nothing in
+/// the artifact can say so.
+#[derive(Clone, Copy, Debug)]
+struct GrantAuthority {
+    stamp: super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
+    /// `not_after + MAX_TOKEN_CLOCK_SKEW_SECS` — the FIRST instant the grant is
+    /// no longer valid, matching both `check_time_bounds_at`'s
+    /// `now >= not_after + skew ⇒ expired` and the read seam's
+    /// `now >= earliest_expiry ⇒ cold`.
+    deadline: u64,
+}
 
 /// The ONE writer gate for the installed consumer-Grant snapshot.
 ///
@@ -5438,6 +5453,9 @@ struct ScopedSourceSnapshot {
         (
             Vec<super::behavior::org_scoped_store::PrivateCapabilityProvider>,
             super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
+            // The authority's OWN deadline, captured with the rows it
+            // authorizes (scope item 12).
+            u64,
         ),
     >,
 }
@@ -5836,11 +5854,17 @@ impl ScopedSlotSource {
             }
             stamps.insert(
                 (*grant_id, *audience_handle),
-                ScopedDiscoveryAuthorityStamp::Grant {
-                    grant_id: *grant_id,
-                    install_seq: record.install_seq(),
-                    grant_signature: record.grant().signature,
-                    audience_handle: *record.audience_handle(),
+                GrantAuthority {
+                    stamp: ScopedDiscoveryAuthorityStamp::Grant {
+                        grant_id: *grant_id,
+                        install_seq: record.install_seq(),
+                        grant_signature: record.grant().signature,
+                        audience_handle: *record.audience_handle(),
+                    },
+                    deadline: record
+                        .grant()
+                        .not_after
+                        .saturating_add(MAX_TOKEN_CLOCK_SKEW_SECS),
                 },
             );
         }
@@ -5848,8 +5872,8 @@ impl ScopedSlotSource {
         // vector is deterministic without an explicit sort.
         let identities = stamps
             .values()
-            .filter_map(|stamp| match stamp {
-                ScopedDiscoveryAuthorityStamp::Grant { install_seq, .. } => Some(*install_seq),
+            .filter_map(|authority| match authority.stamp {
+                ScopedDiscoveryAuthorityStamp::Grant { install_seq, .. } => Some(install_seq),
                 ScopedDiscoveryAuthorityStamp::Owner => None,
             })
             .collect();
@@ -5872,19 +5896,24 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
         // Reconstruction proper: no lock of any kind, no await. Ordering is
         // imposed HERE rather than at capture, so the deterministic projection is
         // off-lock work.
-        let Some((rows, authority)) = self.rows.get(key) else {
+        let Some((rows, authority, authority_deadline)) = self.rows.get(key) else {
             // Not captured => this source cannot speak for the scope at all.
             // Deliberately NOT an empty provider set: see `SourceFacts`.
             //
             // The stamp is `Owner` because there is nothing to be current
             // ABOUT: an unserved reconstruction carries no rows, and the read
-            // seam refuses it structurally before any authority comparison.
+            // seam refuses it structurally before any authority comparison. The
+            // deadline is `u64::MAX` for the same reason — there is no authority
+            // here to expire, and an `Unserved` artifact is cold at every read
+            // regardless.
             return ScopedSourceFacts {
                 facts: SourceFacts::Unserved,
                 authority: ScopedDiscoveryAuthorityStamp::Owner,
+                authority_deadline: u64::MAX,
             };
         };
         let authority = *authority;
+        let authority_deadline = *authority_deadline;
         let mut providers = rows.clone();
         // Provider ascending (the deterministic projection order), generation
         // DESCENDING within a provider. `Vec::dedup_by` passes elements in
@@ -5904,6 +5933,7 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
         ScopedSourceFacts {
             facts: SourceFacts::Served(providers.into()),
             authority,
+            authority_deadline,
         }
     }
 }
@@ -6067,6 +6097,10 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
                                     floors,
                                 ),
                                 ScopedDiscoveryAuthorityStamp::Owner,
+                                // No deadline of its own: the owner plane's
+                                // authority is the node's own org, already
+                                // covered by the routing epoch and the floors.
+                                u64::MAX,
                             ),
                         );
                     }
@@ -6084,13 +6118,15 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
                         grant_id,
                         audience_handle: key_handle,
                     } => {
-                        let Some(
-                            stamp @ ScopedDiscoveryAuthorityStamp::Grant {
-                                grant_signature,
-                                audience_handle,
-                                ..
-                            },
-                        ) = grant_installations.get(&(*grant_id, *key_handle)).copied()
+                        let Some(GrantAuthority {
+                            stamp:
+                                stamp @ ScopedDiscoveryAuthorityStamp::Grant {
+                                    grant_signature,
+                                    audience_handle,
+                                    ..
+                                },
+                            deadline,
+                        }) = grant_installations.get(&(*grant_id, *key_handle)).copied()
                         else {
                             // Absent, expired, or handle-mismatched installed
                             // Grant: no evidence at all. Deliberately NOT an
@@ -6120,6 +6156,7 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
                                     },
                                 ),
                                 stamp,
+                                deadline,
                             ),
                         );
                     }
