@@ -10,18 +10,22 @@
     "languages reads exactly like one that covers five.",
     "",
     "`absent` is for a binding that will not get this example, with the reason.",
-    "It is not a to-do list — a route that is merely unwritten yet should say",
+    "It is not a to-do list \u2014 a route that is merely unwritten yet should say",
     "so in its reason."
   ],
-
-  "bindings": ["rust", "typescript", "python", "go", "c"],
-
+  "bindings": [
+    "rust",
+    "typescript",
+    "python",
+    "go",
+    "c"
+  ],
   "examples": [
     {
       "id": "hello",
       "skill": "net-event-bus",
       "title": "Hello, mesh",
-      "route": "construct · publish · subscribe · shutdown",
+      "route": "construct \u00b7 publish \u00b7 subscribe \u00b7 shutdown",
       "dir": ".claude/skills/net-event-bus/examples",
       "files": {
         "rust": "hello.rs",
@@ -29,6 +33,21 @@
         "python": "hello.py",
         "go": "hello.go",
         "c": "hello.c"
+      },
+      "absent": {}
+    },
+    {
+      "id": "observe",
+      "skill": "net-event-bus",
+      "title": "Observe a drop",
+      "route": "ingest under backpressure \u00b7 read stats \u00b7 handle one failure \u00b7 shutdown",
+      "dir": ".claude/skills/net-event-bus/examples",
+      "files": {
+        "rust": "observe.rs",
+        "typescript": "observe.ts",
+        "python": "observe.py",
+        "go": "observe.go",
+        "c": "observe.c"
       },
       "absent": {}
     }

@@ -89,8 +89,9 @@ mixing them up is the standard TypeScript bug here.
 - **Authoritative source:** `net/crates/net/sdk-ts/src/` — `node.ts`,
   `channel.ts`, `stream.ts`, `types.ts` — over
   `net/crates/net/bindings/node/`, where the napi surface is declared in Rust.
-- **Checked example:** `../examples/hello.ts`, type-checked against the SDK
-  source in CI. Type-check only — nothing proves it runs.
+- **Checked examples:** `../examples/hello.ts` and `../examples/observe.ts` — the
+  second pins the `bigint` counters and the boolean-returning `publish` path.
+  Type-checked against the SDK source in CI; nothing proves they run.
 
 ## Never infer from another binding
 

@@ -103,8 +103,9 @@ and no payments cdylib.
 
 - **Authoritative source:** `net/crates/net/include/` — the headers are the
   contract, and `README.md` there carries the guard and library table above.
-- **Checked example:** `../examples/hello.c`, syntax-checked against the public
-  headers in CI. Not linked, not run.
+- **Checked examples:** `../examples/hello.c` and `../examples/observe.c` — the
+  second uses `net_stats_ex` and notes why it cannot also include `net.go.h`.
+  Syntax-checked against the public headers in CI. Not linked, not run.
 
 ## Never infer from another binding
 

@@ -278,6 +278,29 @@ that starts. If reading experience later proves excerpts are needed, add them
 mechanically (included from the file, or CI-verified as a literal contiguous
 region), never by hand.
 
+*Status: the checker generalisation is done (manifest, not directory
+conventions) and the **second** route shipped in all five bindings — but it is
+not the one named above.*
+
+`announce/discover/invoke` was attempted first and deliberately deferred. The
+canonical Rust version already exists at
+`net/crates/net/sdk/examples/nrpc_echo.rs`, and this plan forbids duplicating
+it; meanwhile Go and C have **no** existing announce+invoke reference anywhere
+in the tree to derive a correct example from. Writing one from the headers
+would have been exactly the invention this programme exists to prevent — the
+fabricated Rust predicate builder came from precisely that move.
+
+What shipped instead is the rest of the journey, which `hello.*` did not cover:
+**ingest under backpressure · read stats · handle one failure · shutdown**
+(`observe.*`). It was chosen because every API it needs is verifiable per
+binding, and because it checks the claim the skills repeat most and verified
+least — "drops are silent, watch `events_dropped`". That paid immediately:
+`observability.md` asserted "the Go binding mirrors `net_stats_ex` directly —
+same field names", which is false in two ways at once.
+
+`announce/discover/invoke` stays the next route. It needs a Go and a C
+reference first, or an accepted `absent` entry with that as the reason.
+
 **The checkers need extending, and that is the real cost.**
 `check-skill-snippets.py` supports Rust only *by design* — a non-Rust marker is
 a hard error — and `check-skill-examples.sh` is hardcoded around the five

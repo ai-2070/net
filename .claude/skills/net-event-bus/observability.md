@@ -58,7 +58,20 @@ Source: `net/crates/net/include/net.h:92-97`. Exposed via `net_stats(handle, buf
 | `events_dropped` | `uint64_t` | Same as Rust. |
 | `batches_dispatched` | `uint64_t` | Same as Rust. |
 
-The Go binding mirrors `net_stats_ex` directly — same field names.
+**The Go binding does *not* use these field names.** It mirrors `net_stats_ex`
+in *content*, but the struct is Go-cased and one field is misspelled:
+
+| Go field | Note |
+|---|---|
+| `EventsIngested` | — |
+| `EventsDropped` | — |
+| `BatchesDispathed` | **sic** — missing the second `c`. `stats.BatchesDispatched` does not compile. |
+
+The `json:` tags do carry the snake_case names, so a JSON round-trip looks like
+the C header; direct field access does not. `Stats()` also returns
+`(*Stats, error)` in Go, where the other bindings return the struct directly.
+
+`examples/observe.go` uses all three fields, so this stays true or CI breaks.
 
 ### Cross-SDK naming
 

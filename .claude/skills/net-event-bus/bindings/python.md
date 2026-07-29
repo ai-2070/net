@@ -90,8 +90,9 @@ explicitly — process exit is not enough.
 - **Authoritative source:** `net/crates/net/sdk-py/src/net_sdk/` — `node.py`,
   `channel.py`, `stream.py` — over `net/crates/net/bindings/python/`, where the
   PyO3 surface is declared in Rust.
-- **Checked example:** `../examples/hello.py`, type-checked with mypy against
-  the SDK source in CI. Type-check only — nothing proves it runs.
+- **Checked examples:** `../examples/hello.py` and `../examples/observe.py` — the
+  second reads `events_ingested` / `events_dropped`, the two stats fields this
+  binding surfaces. Type-checked with mypy in CI; nothing proves they run.
 
 ## Never infer from another binding
 

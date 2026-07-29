@@ -146,8 +146,10 @@ batches.
 
 - **Authoritative source:** `net/crates/net/sdk/src/` — `net.rs` for the emit
   and poll surface, `error.rs` for the error enum.
-- **Checked example:** `../examples/hello.rs`, built against the workspace SDK in
-  CI. It is a compile floor, not a behaviour proof.
+- **Checked examples:** `../examples/hello.rs` (construct · publish · subscribe ·
+  shutdown) and `../examples/observe.rs` (drops under backpressure, and the one
+  mode that reports them). Both built against the workspace SDK in CI — a
+  compile floor, not a behaviour proof.
 - **Canonical typed-emit example:** `net/crates/net/sdk/examples/channels.rs`.
 
 ## Never infer from another binding

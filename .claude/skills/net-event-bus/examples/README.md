@@ -4,6 +4,10 @@ Each file in this directory is a **minimal, runnable** example that proves insta
 
 All examples use the **memory transport** (no network, no peers needed) and run in a single process. Once these work, the developer knows the SDK is wired up correctly and can move on to mesh transport, channels, persistence, etc.
 
+Two routes, each in all five bindings.
+
+**`hello.*` — construct · publish · subscribe · shutdown.** The install check.
+
 | File | Install as | Import as | Run |
 |---|---|---|---|
 | `hello.ts` | `@net-mesh/sdk` | `@net-mesh/sdk` | `npx tsx hello.ts` |
@@ -11,6 +15,20 @@ All examples use the **memory transport** (no network, no peers needed) and run 
 | `hello.rs` | `net-mesh-sdk` | `net_sdk` | `cargo run --example hello` (drop into a crate's `examples/` dir) |
 | `hello.go` | `github.com/ai-2070/net/go` | `net` | `go run hello.go` |
 | `hello.c` | — | `net.h` | `gcc hello.c -lnet -lpthread -ldl -lm && ./a.out` |
+
+**`observe.*` — ingest under backpressure · read stats · handle one failure.**
+The counterpart, and the one worth reading before going to production: under the
+default backpressure modes drops are **silent**, and `events_dropped` is the only
+evidence you get. Each file also pins that binding's own stats shape, which is
+where they differ most:
+
+| Binding | The trap it pins |
+|---|---|
+| `observe.rs` | `FailProducer` is the one mode that returns a structured error instead of dropping quietly |
+| `observe.ts` | counters are `bigint` — compare against `0n`; no batch counter exists |
+| `observe.py` | `events_ingested` / `events_dropped` only; no batch counter |
+| `observe.go` | Go-cased fields, and `BatchesDispathed` is misspelled in the shipped module |
+| `observe.c` | `net_stats_ex`, and why `net.h` cannot be combined with `net.go.h` |
 
 **The Rust and Python packages publish under a different name than they import.** `cargo add net-mesh-sdk` then `use net_sdk::…`; `pip install net-mesh-sdk` then `from net_sdk import …`. There is no package called `net-sdk` — don't install one.
 

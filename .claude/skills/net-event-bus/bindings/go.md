@@ -99,8 +99,9 @@ Check `bindings/coverage.md` before promising anything. The three to know:
 
 - **Authoritative source:** `go/` — `net.go` for the bus, `mesh.go` for mesh,
   `mesh_rpc_typed.go` for nRPC.
-- **Checked example:** `../examples/hello.go`, type-checked with `go vet`
-  against the local module in CI. Not linked, not run.
+- **Checked examples:** `../examples/hello.go` and `../examples/observe.go` — the
+  second pins the Go-cased stats fields, including the misspelled
+  `BatchesDispathed`. Type-checked with `go vet` in CI. Not linked, not run.
 
 ## Never infer from another binding
 
