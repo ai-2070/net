@@ -23,14 +23,14 @@ interface Tick {
 }
 
 async function main(): Promise<void> {
-  const node = await NetNode.create({ shards: 1 });
+  const node = await NetNode.create({ shards: 1, bufferCapacity: 1024 });
   const ticks = node.channel<Tick>('ticks');
 
   // Far more events than the buffer holds, with nothing subscribed.
   // `publish` goes through the fire path: it returns a boolean and never
   // throws. A `false` means the bus rejected that event.
   let rejected = 0;
-  for (let seq = 0; seq < 1000; seq++) {
+  for (let seq = 0; seq < 5000; seq++) {
     if (!ticks.publish({ seq })) rejected++;
   }
 

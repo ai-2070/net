@@ -24,11 +24,11 @@ class Tick:
 
 
 def main() -> None:
-    with NetNode(shards=1) as node:
+    with NetNode(shards=1, buffer_capacity=1024) as node:
         ch = node.channel("ticks", Tick)
 
         # Far more events than the buffer holds, with nothing subscribed.
-        for seq in range(1000):
+        for seq in range(5000):
             # Returns without raising, even while events are being dropped.
             ch.publish(Tick(seq=seq))
 

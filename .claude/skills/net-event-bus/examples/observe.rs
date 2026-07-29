@@ -26,14 +26,14 @@ async fn main() -> net_sdk::error::Result<()> {
     // --- Silent drops: the default posture -------------------------------
     let node = Net::builder()
         .shards(1)
-        .buffer_capacity(64)
+        .buffer_capacity(1024)
         .backpressure(Backpressure::DropOldest)
         .memory()
         .build()
         .await?;
 
     // Far more events than the buffer holds, with nothing consuming them.
-    for seq in 0..1_000 {
+    for seq in 0..5_000 {
         // Note the `?`: this returns Ok even while events are being dropped.
         node.emit(&Tick { seq })?;
     }
@@ -48,14 +48,14 @@ async fn main() -> net_sdk::error::Result<()> {
     // --- FailProducer: the one mode that tells you -----------------------
     let strict = Net::builder()
         .shards(1)
-        .buffer_capacity(64)
+        .buffer_capacity(1024)
         .backpressure(Backpressure::FailProducer)
         .memory()
         .build()
         .await?;
 
     let mut refused = 0u32;
-    for seq in 0..1_000 {
+    for seq in 0..5_000 {
         if let Err(e) = strict.emit(&Tick { seq }) {
             // Structured, not a string: match the variant. `SdkError` is
             // #[non_exhaustive], so keep a catch-all arm.
@@ -65,7 +65,7 @@ async fn main() -> net_sdk::error::Result<()> {
             }
         }
     }
-    println!("FailProducer: refused {refused} of 1000");
+    println!("FailProducer: refused {refused} of 5000");
 
     strict.shutdown().await?;
     Ok(())

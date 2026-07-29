@@ -20,7 +20,7 @@
 #include <string.h>
 
 int main(void) {
-    net_handle_t node = net_init("{\"num_shards\": 1}");
+    net_handle_t node = net_init("{\"num_shards\": 1, \"ring_buffer_capacity\": 1024}");
     if (!node) {
         fprintf(stderr, "net_init failed\n");
         return 1;
@@ -30,7 +30,7 @@ int main(void) {
     const size_t len = strlen(json);
 
     /* Push far more than the buffer holds, with nothing polling. */
-    for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < 5000; i++) {
         /* Returns 0 even while events are being dropped. */
         if (net_ingest_raw(node, json, len) < 0) {
             fprintf(stderr, "ingest failed at %d\n", i);

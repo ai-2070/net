@@ -26,14 +26,14 @@ import (
 )
 
 func main() {
-	bus, err := net.New(&net.Config{NumShards: 1})
+	bus, err := net.New(&net.Config{NumShards: 1, RingBufferCapacity: 1024})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer bus.Shutdown()
 
 	// Push far more than the buffer holds, with nothing polling.
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 5000; i++ {
 		// Returns nil even while events are being dropped.
 		if err := bus.IngestRaw(`{"seq":1}`); err != nil {
 			log.Fatal(err)

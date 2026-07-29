@@ -76,6 +76,15 @@ These bite regardless of language.
 - **`shards` is a parallelism knob, not a partitioning scheme.** It does not
   give Kafka-style ordered partitions; it parallelizes ingestion. The default is
   fine for most workloads.
+- **Ring buffer capacity must be a power of two and at least 1024**, validated
+  in the shared core config at construction. No compile or type check catches a
+  bad value. The default is 1,048,576 events *per shard*, which is also why a
+  snippet meant to demonstrate backpressure has to lower it — a few thousand
+  events into a default node drop nothing. Each companion gives the spelling.
+- **Backpressure mode accepts either casing.** `"DropOldest"` and
+  `"drop_oldest"` both parse, so the Go docs' CamelCase and the TypeScript
+  type's snake_case are the same thing. An *unrecognised* value is rejected
+  outright rather than falling back to a default.
 
 ## When the bus surface is not enough
 

@@ -114,6 +114,16 @@ Convenience presets: `.high_throughput()`, `.low_latency()`, `.batch(BatchConfig
 - `Backpressure::{DropOldest (default), DropNewest, FailProducer, Sample(u32)}`
   is set at build time. `Sample(N)` keeps 1 in N events when overloaded.
 
+## The buffer-capacity rule no compiler enforces
+
+`ring_buffer_capacity` must be a **power of two and at least 1024**. It is
+validated in the shared core config at construction, so every binding raises the
+same way — and no compile or type check catches it. The default is 1,048,576
+(1M events per shard), which is also why a "demonstrate backpressure" snippet
+that emits a few thousand events into a default node drops nothing at all.
+
+Spelt `.buffer_capacity(1024)` in this binding.
+
 ## Errors
 
 Ingestion returns `Result`, and the failure cause is structured:
