@@ -60,7 +60,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Replaces the hand-rolled `actions/cache` block this job used to carry.
       # That block keyed solely on `hashFiles('**/Cargo.lock')` with NO
@@ -388,7 +388,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -492,7 +492,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -566,7 +566,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -687,7 +687,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -851,7 +851,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -956,7 +956,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # `sdk` and `payments` are members of the `net/crates/net` workspace, so
       # both build into the one shared `net/crates/net/target` — a single
