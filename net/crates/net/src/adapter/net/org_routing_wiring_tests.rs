@@ -4230,6 +4230,22 @@ async fn grant_fixture(tag: &str) -> GrantFixture {
     }
 }
 
+/// A byte-identical copy of a secret — install CONSUMES the original, and a
+/// witness that reinstalls the same grant has to present the same bytes twice.
+/// The temporary key-bearing buffer is scrubbed after decode (OA2-F hygiene bar).
+fn copy_secret(
+    s: &crate::adapter::net::behavior::org_grant::OrgAudienceSecret,
+) -> crate::adapter::net::behavior::org_grant::OrgAudienceSecret {
+    use crate::adapter::net::behavior::org_grant::OrgAudienceSecret;
+    let mut buf = s.encode_config();
+    let copy = OrgAudienceSecret::decode_config(&buf).expect("copy secret");
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid mutable reference into the owned array.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    copy
+}
+
 impl GrantFixture {
     /// Mint an issuer→own-org DISCOVER grant over the fixture's provider.
     ///
@@ -4382,77 +4398,111 @@ impl GrantFixture {
 /// W-G3. A same-ID replacement cannot reauthorize facts captured under the
 /// PREVIOUS installed Grant.
 ///
-/// Two adversarial cases, because the registry supports explicit
-/// remove-then-install replacement and the two differ in what distinguishes
-/// them:
+/// Two adversarial cases, and they are distinguished by DIFFERENT components:
 ///
-/// - remove and reinstall the EXACT same signed grant. Every signed byte is
-///   identical, so only the installation identity separates the installations;
-/// - install a DIFFERENTLY SIGNED grant reusing the id. A fresh audience binding
-///   and nonce make it a different signed authority under the same name.
+/// - **case 1 — the byte-identical grant, reinstalled.** Same `grant_id`, same
+///   signature, same audience handle. The installation identity is the ONLY
+///   thing that differs, so it is the only thing that can retire the artifact;
+/// - **case 2 — a differently signed grant reusing the id.** A fresh audience
+///   binding and nonce make it a different signed authority under the same name.
 ///
-/// Both must retire the warm artifact. Dies to comparing `grant_id` only —
-/// which passes both cases, because the id is what is deliberately held equal.
+/// **Case 1 must reinstall the retained grant and a byte-identical copy of its
+/// secret**, not re-mint one. An earlier version of this witness called
+/// `mint(.., Some(grant_id), ..)`, whose explicit-id branch mints a fresh
+/// audience secret and nonce — so it produced a different signature and a
+/// different handle, and asserted so itself. That made case 1 a second copy of
+/// case 2: the artifact was retired by the signature and handle checks, and the
+/// installation-identity comparison was never exercised. Kyra's independent
+/// mutation run proved it — with `record.install_seq() == *install_seq` removed
+/// from the read seam, the entire 54-witness gate stayed green (2026-07-29).
+///
+/// The assertions below therefore pin what is held EQUAL as hard as what
+/// differs: a case-1 that does not assert equal signature and equal handle
+/// cannot tell the two cases apart.
 #[tokio::test]
 async fn a_same_id_grant_replacement_cannot_reauthorize_captured_facts() {
     let f = grant_fixture("wg3").await;
     let (grant, secret) = f.mint("nrpc:wg3", None, None);
+    // Retain the EXACT grant and a byte-identical copy of the secret: install
+    // consumes both, and case 1 has to present the same bytes a second time.
+    let retained_grant = grant.clone();
+    let retained_secret = copy_secret(&secret);
     let signature = grant.signature;
     let (grant_id, handle) = f.install(grant, secret);
     let key = f.key(grant_id, handle, "nrpc:wg3");
     let _held = f.warm(&key);
 
-    let stamped = f.node.org_routing_base_facts(&key).expect("warm").authority;
-    assert!(
-        matches!(
-            stamped,
-            ScopedDiscoveryAuthorityStamp::Grant { grant_id: g, .. } if g == grant_id
-        ),
-        "precondition: the artifact must carry a GRANT stamp naming this id"
+    let warm = f.node.org_routing_base_facts(&key).expect("warm");
+    let ScopedDiscoveryAuthorityStamp::Grant {
+        grant_id: stamped_id,
+        install_seq: first_install_seq,
+        ..
+    } = warm.authority
+    else {
+        panic!("precondition: the artifact must carry a GRANT stamp");
+    };
+    assert_eq!(
+        stamped_id, grant_id,
+        "precondition: the stamp names the installed grant"
     );
 
-    // --- case 1: remove and reinstall the EXACT same signed grant -----------
-    // Byte-identical authority. Only the installation identity moved, which is
-    // precisely the aliasing a `grant_id`-only comparison cannot see.
-    let (again, again_secret) = f.mint("nrpc:wg3", Some(grant_id), None);
-    let reissued_signature = again.signature;
+    // --- case 1: the BYTE-IDENTICAL grant, removed and reinstalled ----------
     assert!(
         f.node.remove_consumer_grant_audience(&grant_id),
         "precondition: the grant was installed"
     );
-    let (_, reinstalled_handle) = f.install(again, again_secret);
+    let (reinstalled_id, reinstalled_handle) = f.install(retained_grant, retained_secret);
+
+    // Everything the currentness relation binds, EXCEPT the installation
+    // identity, is held equal — asserted, not assumed. Without these three the
+    // case cannot claim to isolate the identity.
+    let installed = f.node.consumer_grant_audiences.load();
+    let record = installed.get(&grant_id).expect("reinstalled");
+    assert_eq!(reinstalled_id, grant_id, "case 1: the SAME grant id");
     assert_eq!(
-        grant_id, grant_id,
-        "precondition: the replacement reuses the id"
+        record.grant().signature,
+        signature,
+        "case 1: the SAME signed authority — byte-identical, not a re-issue"
     );
+    assert_eq!(
+        reinstalled_handle, handle,
+        "case 1: the SAME audience handle"
+    );
+    assert_ne!(
+        record.install_seq(),
+        first_install_seq,
+        "case 1: and a DIFFERENT installation identity — the only thing that \
+         differs, and therefore the only thing that can retire the artifact"
+    );
+    drop(installed);
+
     assert!(
         f.node.org_routing_base_facts(&key).is_none(),
         "facts captured under the PREVIOUS installation must not survive a \
-         remove-then-reinstall: the installed record is a new installation, and \
-         only the installation identity distinguishes it"
+         remove-then-reinstall of the byte-identical grant: the signature and \
+         the handle are unchanged, so ONLY the non-aliasing installation \
+         identity can tell the two installations apart"
     );
 
     // --- case 2: a DIFFERENTLY SIGNED grant reusing the id ------------------
     // Re-warm under the current installation first, so case 2 retires something
     // that was genuinely warm rather than inheriting case 1's cold slot.
-    let key2 = f.key(grant_id, reinstalled_handle, "nrpc:wg3");
-    let _held2 = f.warm(&key2);
-    assert_ne!(
-        signature, reissued_signature,
-        "precondition: the fresh audience binding and nonce make this a \
-         DIFFERENT signed authority, not a byte-identical re-issue"
+    let _held2 = f.warm(&key);
+    assert!(
+        f.node.org_routing_base_facts(&key).is_some(),
+        "precondition: re-warmed under the reinstalled grant"
     );
 
     let (distinct, distinct_secret) = f.mint("nrpc:wg3-other", Some(grant_id), None);
-    assert_eq!(distinct.grant_id, grant_id, "precondition: same id");
+    assert_eq!(distinct.grant_id, grant_id, "case 2: the SAME grant id");
     assert_ne!(
-        distinct.signature, reissued_signature,
-        "precondition: distinct signed authority"
+        distinct.signature, signature,
+        "case 2: a DIFFERENT signed authority under that id"
     );
     assert!(f.node.remove_consumer_grant_audience(&grant_id));
     f.install(distinct, distinct_secret);
     assert!(
-        f.node.org_routing_base_facts(&key2).is_none(),
+        f.node.org_routing_base_facts(&key).is_none(),
         "a DISTINCT signed grant reusing the id must not reauthorize facts \
          captured under the grant it replaced"
     );
