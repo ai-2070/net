@@ -3885,3 +3885,127 @@ async fn a_handles_lockfree_read_observes_the_registrys_published_artifact() {
         "and both seams must agree about the invalidation too"
     );
 }
+
+// ---- review 2026-07-29 §2: the Grant stamp is keyed by the WHOLE scope ----
+
+/// A node adopted into one org with exactly one consumer Grant installed.
+/// Returns the node, the grant id, and the audience handle the INSTALLED record
+/// carries — read off the record rather than the secret, because the installed
+/// record is what the source compares against.
+async fn consumer_with_installed_grant(tag: &str) -> (Arc<MeshNode>, [u8; 32], [u8; 32]) {
+    use crate::adapter::net::behavior::org::OrgKeypair;
+    use crate::adapter::net::behavior::org_grant::{
+        GrantRights, GrantTargetScope, OrgCapabilityGrant,
+    };
+    let node = node().await;
+    let org = OrgKeypair::from_bytes([0xa1u8; 32]);
+    let issuer = OrgKeypair::from_bytes([0xa2u8; 32]);
+    node.install_node_authority(adopt_authority(&node, &org, tag))
+        .expect("install authority");
+
+    let provider = EntityKeypair::generate();
+    let (grant, secret) = OrgCapabilityGrant::try_issue(
+        &issuer,
+        org.org_id(),
+        CapabilityAuthorityId::for_tag("nrpc:pair-key"),
+        GrantRights::DISCOVER,
+        GrantTargetScope::ExactNode(provider.entity_id().clone()),
+        3600,
+    )
+    .expect("issue grant");
+    let secret = secret.expect("a DISCOVER grant mints a secret");
+    let grant_id = grant.grant_id;
+    node.install_consumer_grant_audience(grant, secret)
+        .expect("install consumer grant");
+
+    let handle = *node
+        .consumer_grant_audiences
+        .load()
+        .get(&grant_id)
+        .expect("the grant is installed")
+        .audience_handle();
+    (node, grant_id, handle)
+}
+
+/// W-G5b. A Grant scope whose audience handle is NOT the installed one reads
+/// `Unserved` — even when a SIBLING key in the same batch shares its grant id
+/// and does match.
+///
+/// The two are different slots by construction: `SlotKey` carries the whole
+/// scope, and an audience-secret rotation leaves both live at once. The stamp
+/// map was keyed by `grant_id` alone, so its dedup short-circuit fired before
+/// the per-key handle comparison — whichever of the pair the batch reached first
+/// decided the other's fate. With the installed scope first (the ordering
+/// asserted below, and one of the two `SlotKey`-ascending orders production
+/// produces) the stale scope fetched the installed stamp and was SERVED,
+/// stamped as current, and passed the read seam.
+///
+/// Dies to keying `stamps` — or the Grant arm's lookup — by `grant_id` alone.
+/// A single-key witness cannot catch it: with one key the handle comparison IS
+/// reached, which is why W-G5 as originally specified passes either way.
+#[tokio::test]
+async fn a_stale_audience_handle_is_unserved_beside_its_installed_sibling() {
+    let (node, grant_id, installed_handle) = consumer_with_installed_grant("pairkey").await;
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
+        unserved_scope: node.routing_unserved_scope.clone(),
+    };
+
+    let grant_slot = |audience_handle: [u8; 32]| SlotKey {
+        scope: PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
+            grant_id,
+            audience_handle,
+        })
+        .expect("grant scopes are private"),
+        capability: CapabilityAuthorityId::for_tag("nrpc:pair-key"),
+    };
+    let installed_key = grant_slot(installed_handle);
+    // A handle the installed record does NOT carry — a rotated-away audience.
+    let mut stale_handle = installed_handle;
+    stale_handle[0] ^= 0xff;
+    let stale_key = grant_slot(stale_handle);
+    assert_ne!(
+        installed_handle, stale_handle,
+        "precondition: the two scopes must differ in the handle ONLY"
+    );
+
+    // The installed scope FIRST — the order under which the id-keyed dedup let
+    // the stale one borrow this key's stamp. `grant_installations_for` walks
+    // `keys` in slice order, so this is the exact adversarial ordering rather
+    // than a hope about how the pair sorts.
+    let snapshot = source.snapshot(&[installed_key.clone(), stale_key.clone()]);
+    assert!(
+        matches!(
+            snapshot.providers(&installed_key).facts,
+            SourceFacts::Served(_)
+        ),
+        "precondition: the scope whose handle IS installed must be served, or \
+         this witness proves nothing about the sibling"
+    );
+    assert!(
+        matches!(snapshot.providers(&stale_key).facts, SourceFacts::Unserved),
+        "a scope whose audience handle is not the installed one has NO evidence \
+         — serving it here hands the caller rows the installed handle authorizes \
+         under a scope the node has rotated away from"
+    );
+
+    // And the reverse ordering, which the old shape happened to get right: the
+    // property must hold for BOTH, or it is an accident of iteration order.
+    let reversed = source.snapshot(&[stale_key.clone(), installed_key.clone()]);
+    assert!(
+        matches!(reversed.providers(&stale_key).facts, SourceFacts::Unserved),
+        "and the outcome must not depend on which sibling the batch reaches first"
+    );
+    assert!(
+        matches!(
+            reversed.providers(&installed_key).facts,
+            SourceFacts::Served(_)
+        ),
+        "the installed scope stays served under either ordering"
+    );
+}

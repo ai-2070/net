@@ -5698,13 +5698,25 @@ impl ScopedSlotSource {
     /// alone: an installed Grant with zero visible providers would otherwise
     /// yield `Served(empty)` bounded by `u64::MAX` and cache expired Grant
     /// authority indefinitely (W-G13).
+    ///
+    /// Keyed by the WHOLE scope — `(grant_id, audience_handle)` — never by
+    /// `grant_id` alone (review 2026-07-29 §2). Two live scopes can share a grant
+    /// id across an audience-secret rotation, and they are different slots by
+    /// construction ([`SlotKey`] carries the whole scope). An id-keyed map made
+    /// the dedup short-circuit fire BEFORE the per-key handle comparison, so
+    /// whichever of the pair the batch reached first decided the other's fate:
+    /// with the installed scope first, the stale-handle scope fetched the
+    /// installed stamp and was SERVED. The pair key makes the dedup and the
+    /// comparison agree about what "already decided" means.
+    ///
+    /// [`SlotKey`]: super::behavior::org_routing_registry::SlotKey
     fn grant_installations_for(
         slot: &Arc<arc_swap::ArcSwap<super::behavior::org_grant_registry::ConsumerGrantSnapshot>>,
         keys: &[super::behavior::org_routing_registry::SlotKey],
         now_secs: u64,
     ) -> (
         std::collections::BTreeMap<
-            [u8; 32],
+            ([u8; 32], [u8; 32]),
             super::behavior::org_routing_registry::ScopedDiscoveryAuthorityStamp,
         >,
         Vec<u64>,
@@ -5722,7 +5734,7 @@ impl ScopedSlotSource {
             else {
                 continue;
             };
-            if stamps.contains_key(grant_id) {
+            if stamps.contains_key(&(*grant_id, *audience_handle)) {
                 continue;
             }
             let Some(record) = installed.get(grant_id) else {
@@ -5742,7 +5754,7 @@ impl ScopedSlotSource {
                 continue;
             }
             stamps.insert(
-                *grant_id,
+                (*grant_id, *audience_handle),
                 ScopedDiscoveryAuthorityStamp::Grant {
                     grant_id: *grant_id,
                     install_seq: record.install_seq(),
@@ -5751,8 +5763,8 @@ impl ScopedSlotSource {
                 },
             );
         }
-        // BTreeMap iteration is grant-id ascending, so the vector is
-        // deterministic without an explicit sort.
+        // BTreeMap iteration is `(grant_id, audience_handle)` ascending, so the
+        // vector is deterministic without an explicit sort.
         let identities = stamps
             .values()
             .filter_map(|stamp| match stamp {
@@ -5974,14 +5986,22 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
                     // snapshot before this lock, so the stamp, the row filter and
                     // the token cannot disagree about which installation
                     // authorized these rows.
-                    CapabilityAudienceScope::Grant { grant_id, .. } => {
+                    //
+                    // Looked up by the WHOLE scope, never by `grant_id` alone
+                    // (review 2026-07-29 §2): a sibling key sharing this grant id
+                    // under a DIFFERENT audience handle is a different slot, and
+                    // fetching by id let it borrow this one's stamp.
+                    CapabilityAudienceScope::Grant {
+                        grant_id,
+                        audience_handle: key_handle,
+                    } => {
                         let Some(
                             stamp @ ScopedDiscoveryAuthorityStamp::Grant {
                                 grant_signature,
                                 audience_handle,
                                 ..
                             },
-                        ) = grant_installations.get(grant_id).copied()
+                        ) = grant_installations.get(&(*grant_id, *key_handle)).copied()
                         else {
                             // Absent, expired, or handle-mismatched installed
                             // Grant: no evidence at all. Deliberately NOT an
