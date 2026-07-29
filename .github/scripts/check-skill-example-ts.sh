@@ -42,17 +42,35 @@ if [ ! -d "$SDK_TS/node_modules" ]; then
   exit 1
 fi
 
-cleanup() { rm -f "$SDK_TS/skill-hello.ts" "$SDK_TS/tsconfig.skill-example.json"; }
+cleanup() { rm -f "$SDK_TS"/skill-example-*.ts "$SDK_TS/tsconfig.skill-example.json"; }
 trap cleanup EXIT
 
-cp "$ROOT/.claude/skills/net-event-bus/examples/hello.ts" "$SDK_TS/skill-hello.ts"
+# Driven from the same manifest as check-skill-examples.sh, so the two cannot
+# disagree about which examples exist.
+TS_FILES=$(python3 "$ROOT/.github/scripts/skill_examples.py" --list \
+           | awk -F'\t' '$1 == "typescript" { print $2 "\t" $3 }')
+
+if [ -z "$TS_FILES" ]; then
+  ok "no TypeScript examples in the manifest"
+  echo
+  echo "Nothing to check."
+  exit 0
+fi
+
+INCLUDE=""
+while IFS=$'\t' read -r path id; do
+  [ -z "$path" ] && continue
+  cp "$ROOT/$path" "$SDK_TS/skill-example-$id.ts"
+  INCLUDE="$INCLUDE\"skill-example-$id.ts\", "
+done <<< "$TS_FILES"
+INCLUDE=${INCLUDE%, }
 
 # `extends` the SDK's own tsconfig so `types: ["node"]` and the installed
 # @types/node resolve naturally. Two overrides are load-bearing: `rootDir` must
 # widen to `..` (the example and `bindings/node/*.ts` both sit outside `src/`),
 # and `baseUrl` is deliberately absent — TypeScript 6 makes it a hard error, and
 # the `paths` below are already relative to this file.
-cat > "$SDK_TS/tsconfig.skill-example.json" <<'JSON'
+cat > "$SDK_TS/tsconfig.skill-example.json" <<JSON
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
@@ -64,14 +82,19 @@ cat > "$SDK_TS/tsconfig.skill-example.json" <<'JSON'
       "@net-mesh/core/*": ["../bindings/node/*"]
     }
   },
-  "include": ["skill-hello.ts"]
+  "include": [$INCLUDE]
 }
 JSON
 
+# One tsc invocation over every example: they share the compiler options, and a
+# per-file loop would pay npx startup once per example for no extra signal.
 if ( cd "$SDK_TS" && npx tsc --noEmit -p tsconfig.skill-example.json ); then
-  ok "hello.ts"
+  while IFS=$'\t' read -r path id; do
+    [ -n "$path" ] && ok "$id: $(basename "$path")"
+  done <<< "$TS_FILES"
 else
-  note "hello.ts does not type-check against the SDK source"
+  note "one or more TypeScript examples do not type-check against the SDK source"
+  echo "      (tsc names the file above; the copies are skill-example-<id>.ts)"
 fi
 
 echo
