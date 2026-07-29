@@ -1251,8 +1251,11 @@ impl DirtyApply for NodeOrgRoutingRegistry {
         drop(snapshot);
 
         // --- phase 4: the COMMIT pin, before the registry lock ---
-        let pin_keys: Vec<SlotKey> = selected.iter().map(|(key, _)| key.clone()).collect();
-        let Some(commit) = self.source.pin_if_current(&pin_keys, &snapshot_token) else {
+        // The SAME `keys` the snapshot was taken over, not an independently
+        // rebuilt copy: `pin_if_current`'s contract is that the two batches are
+        // identical, and two separately-constructed vectors is the shape in
+        // which that quietly stops being true (review 2026-07-29 §3).
+        let Some(commit) = self.source.pin_if_current(&keys, &snapshot_token) else {
             // An UNSETTLEABLE refusal is not movement (E3c blockers §2,
             // review-pass-3 §1): the mark below would spin the actor on
             // `Superseded` until shutdown, because nothing has to move for the

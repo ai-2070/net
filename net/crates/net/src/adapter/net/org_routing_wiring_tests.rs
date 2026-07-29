@@ -279,6 +279,7 @@ async fn a_mutation_during_reconstruction_defeats_the_production_commit_pin() {
                 publication: publication.clone(),
                 org_revocation: node.org_revocation.clone(),
                 consumer_grants: node.consumer_grant_audiences.clone(),
+                consumer_grant_gate: node.consumer_grant_gate.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -385,6 +386,7 @@ async fn the_production_source_is_scope_exact_and_counts_unserved_scopes() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -556,6 +558,7 @@ async fn revocation_authority_movement_alone_defeats_the_commit_pin() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -831,6 +834,7 @@ async fn a_production_store_swap_cannot_publish_while_a_commit_pin_is_alive() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -972,6 +976,7 @@ async fn an_exhausted_authority_epoch_fences_rather_than_aliasing() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -1035,6 +1040,7 @@ async fn an_exhausted_store_generation_makes_every_scope_unserved() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -1245,6 +1251,7 @@ async fn an_exhausted_store_generation_parks_apply_without_spinning_and_recovers
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -1351,6 +1358,7 @@ async fn an_empty_registry_whose_authority_moves_under_the_probe_is_redriven() {
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
                 consumer_grants: node.consumer_grant_audiences.clone(),
+                consumer_grant_gate: node.consumer_grant_gate.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1486,6 +1494,7 @@ async fn an_exhausted_scoped_generation_fences_the_routing_source() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -1980,6 +1989,7 @@ async fn a_recapture_across_two_authority_epochs_does_not_settle_current() {
             publication: node.scoped_publication.clone(),
             org_revocation: node.org_revocation.clone(),
             consumer_grants: node.consumer_grant_audiences.clone(),
+            consumer_grant_gate: node.consumer_grant_gate.clone(),
             authority: node.routing_authority.clone(),
             settle_gap_hook: parking_lot::Mutex::new(None),
             unserved_scope: node.routing_unserved_scope.clone(),
@@ -2089,6 +2099,7 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -2136,6 +2147,7 @@ async fn a_snapshot_cannot_straddle_a_store_publication() {
                     publication: node.scoped_publication.clone(),
                     org_revocation: node.org_revocation.clone(),
                     consumer_grants: node.consumer_grant_audiences.clone(),
+                    consumer_grant_gate: node.consumer_grant_gate.clone(),
                     authority: node.routing_authority.clone(),
                     settle_gap_hook: parking_lot::Mutex::new(None),
                     unserved_scope: node.routing_unserved_scope.clone(),
@@ -2275,6 +2287,7 @@ async fn a_floor_publication_under_the_pin_cannot_settle_current() {
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
                 consumer_grants: node.consumer_grant_audiences.clone(),
+                consumer_grant_gate: node.consumer_grant_gate.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2468,6 +2481,7 @@ async fn a_publication_cannot_occupy_the_gap_between_validation_and_settlement()
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2588,6 +2602,7 @@ async fn poison_cannot_occupy_the_gap_between_validation_and_settlement() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2724,6 +2739,7 @@ async fn poison_before_the_validation_is_detected() {
                 publication: node.scoped_publication.clone(),
                 org_revocation: node.org_revocation.clone(),
                 consumer_grants: node.consumer_grant_audiences.clone(),
+                consumer_grant_gate: node.consumer_grant_gate.clone(),
                 authority: node.routing_authority.clone(),
                 settle_gap_hook: parking_lot::Mutex::new(None),
                 unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3829,6 +3845,7 @@ async fn a_handles_lockfree_read_observes_the_registrys_published_artifact() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3951,6 +3968,7 @@ async fn a_stale_audience_handle_is_unserved_beside_its_installed_sibling() {
         publication: node.scoped_publication.clone(),
         org_revocation: node.org_revocation.clone(),
         consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
         authority: node.routing_authority.clone(),
         settle_gap_hook: parking_lot::Mutex::new(None),
         unserved_scope: node.routing_unserved_scope.clone(),
@@ -4008,4 +4026,163 @@ async fn a_stale_audience_handle_is_unserved_beside_its_installed_sibling() {
         ),
         "the installed scope stays served under either ordering"
     );
+}
+
+/// W-G7 (review 2026-07-29 §1). A consumer-Grant REMOVAL cannot occupy the gap
+/// between the commit pin's validation and the settlement.
+///
+/// The pin re-derives the Grant identity vector, which covers snapshot → pin.
+/// What it did not cover was pin → settlement: `ScopedCommitPin` held only the
+/// authority and publication gates, and `settle_if_current` re-verifies only the
+/// revocation store. Consumer-Grant mutation is serialized by its own gate,
+/// which neither of those reaches — so a removal landing in that window let
+/// phase 5 install facts stamped with a WITHDRAWN installation and still return
+/// `Current`. The read seam refuses those facts, so nothing withdrawn is ever
+/// served; what the defect produced was a currentness claim that was false, over
+/// a slot nothing then requeues.
+///
+/// The acknowledgement below fires ONLY after the remover's `try_lock` has
+/// actually FAILED — the one thing scheduling cannot fake, because it means the
+/// pin is provably holding the gate at that instant. Under the mutation (drop
+/// the gate from `ScopedCommitPin`) the `try_lock` SUCCEEDS, no acknowledgement
+/// is ever sent, and this witness fails at its wait instead of passing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_settlement() {
+    use crate::adapter::net::behavior::org_routing::{
+        ApplyOutcome, ApplyRequest, DirtyApply, RegistryWork,
+    };
+    use crate::adapter::net::behavior::org_routing_registry::NodeOrgRoutingRegistry;
+    use crate::adapter::net::behavior::org_scoped_store::{
+        DirtyCapabilities, PrivateDiscoveryChangeBatch,
+    };
+
+    let (node, grant_id, installed_handle) = consumer_with_installed_grant("wg7").await;
+    // Adopting the authority installed its revocation store. Without one,
+    // `settle_if_current` returns before the gap hook can fire at all, and this
+    // witness would pass vacuously.
+    assert!(
+        node.org_revocation.load().is_some(),
+        "precondition: a store must be installed or the settlement gap is unreachable"
+    );
+
+    let source = ScopedSlotSource {
+        scoped_discovery: node.scoped_discovery.clone(),
+        publication: node.scoped_publication.clone(),
+        org_revocation: node.org_revocation.clone(),
+        consumer_grants: node.consumer_grant_audiences.clone(),
+        consumer_grant_gate: node.consumer_grant_gate.clone(),
+        authority: node.routing_authority.clone(),
+        settle_gap_hook: parking_lot::Mutex::new(None),
+        unserved_scope: node.routing_unserved_scope.clone(),
+    };
+    let key = SlotKey {
+        scope: PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
+            grant_id,
+            audience_handle: installed_handle,
+        })
+        .expect("grant scopes are private"),
+        capability: CapabilityAuthorityId::for_tag("nrpc:pair-key"),
+    };
+
+    let removed = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let remover: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    // `Receiver` is Send but not Sync, and the gap hook is an `Fn`.
+    let reached = Arc::new(parking_lot::Mutex::new(reached_rx));
+    // Bounded completion signal, so neither the negative assertion below nor the
+    // join afterwards can hang the suite instead of failing it.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    node.consumer_grant_gate
+        .arm_contended_hook(Arc::new(move || {
+            let _ = reached_tx.try_send(());
+        }));
+    {
+        let node = node.clone();
+        let removed = removed.clone();
+        let entered = entered.clone();
+        let remover = remover.clone();
+        let reached = reached.clone();
+        *source.settle_gap_hook.lock() = Some(Arc::new(move || {
+            entered.store(true, Ordering::Release);
+            // Spawned HERE, not before the quantum: a removal that lands before
+            // the pin legitimately defeats it, the quantum reports `Superseded`,
+            // and this gap is never entered. The window under test only exists
+            // once the pin has been granted.
+            let mover = node.clone();
+            let landed = removed.clone();
+            let done = done_tx.clone();
+            *remover.lock() = Some(std::thread::spawn(move || {
+                mover.remove_consumer_grant_audience(&grant_id);
+                landed.store(true, Ordering::Release);
+                let _ = done.send(());
+            }));
+            // Wait for PROVEN contention: the remover's `try_lock` failed, so the
+            // commit pin is demonstrably holding the consumer-Grant gate right
+            // now. Neither an interval nor an "about to attempt" signal is
+            // evidence — both also occur when the barrier is absent.
+            reached.lock().recv_timeout(Duration::from_secs(10)).expect(
+                "the remover's try_lock must FAIL, proving the commit pin holds \
+                 the consumer-Grant gate; no signal means Grant movement is free \
+                 to land between the validation and the settlement",
+            );
+            // Sound only because of the line above: a failed `try_lock` means the
+            // remover is blocked inside the gate, so it cannot yet have run.
+            assert!(
+                !removed.load(Ordering::Acquire),
+                "a consumer-Grant removal landed between the validation and the \
+                 settlement — the installation the pin validated is already \
+                 withdrawn by the time the facts stamped with it are installed"
+            );
+            assert!(
+                node.consumer_grant_audiences.load().get(&grant_id).is_some(),
+                "and the snapshot the settlement stamps against must still name \
+                 the installation the pin validated"
+            );
+        }));
+    }
+
+    let work: Arc<RegistryWork> = Arc::default();
+    let registry = NodeOrgRoutingRegistry::new(Arc::new(source), work, Arc::default());
+    registry.activate_incarnation(1);
+    let family = registry.new_family().expect("family");
+    let held = family.demand(key.clone()).expect("demand");
+
+    let outcome = registry.apply(
+        1,
+        ApplyRequest {
+            batch: PrivateDiscoveryChangeBatch {
+                generation: 0,
+                dirty: DirtyCapabilities::Clean,
+            },
+            registry_work: true,
+        },
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Current { .. }),
+        "the install pass must settle: {outcome:?}"
+    );
+    assert!(
+        entered.load(Ordering::Acquire),
+        "the settlement gap must actually have been entered, or this witness \
+         asserted nothing"
+    );
+    assert!(
+        registry.base_facts_unvalidated(&key).is_some(),
+        "precondition: the quantum installed an artifact under the live grant"
+    );
+
+    // The pin dies with the quantum, so the removal completes: the gate DELAYS
+    // Grant movement for the length of one installation, it does not refuse it.
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the removal must proceed once the pin releases the gate");
+    if let Some(handle) = remover.lock().take() {
+        handle.join().expect("remover thread");
+    }
+    assert!(
+        node.consumer_grant_audiences.load().get(&grant_id).is_none(),
+        "the removal must actually have removed the grant"
+    );
+    drop(held);
 }
