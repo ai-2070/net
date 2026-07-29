@@ -1,16 +1,20 @@
 # CODE REVIEW 2026-07-29 — OLB-2B.3a / 2B.3c-pre / OLB-2C (`load-balancing-2`)
 
-> **STATUS: ALL FINDINGS ADDRESSED at `ac5111a14` (2026-07-29).** Every finding
-> below has a landed fix; the two structural ones (§1, §2) have RED-verified
-> witnesses. See [Closure](#closure) for the finding-to-commit map.
+> **STATUS: ALL FINDINGS ADDRESSED at `ac5111a14`; step 2's full witness set
+> landed at `bd225acdd` (2026-07-29).** Every finding below has a landed fix;
+> the two structural ones (§1, §2) have RED-verified witnesses. See
+> [Closure](#closure) for the finding-to-commit map.
 >
-> **This is NOT a sign-off, and it does not discharge the handoff's witness
-> debt.** §1 and §2 were the two defects this pass found in the region
-> [`OLB_2B3C_PRE_HANDOFF.md`](../plans/OLB_2B3C_PRE_HANDOFF.md) marks **"CODE
-> ONLY — NO WITNESSES"**; W-G3, W-G4, W-G6, W-G8 and W-G13 are still owed, and
-> nothing here stands in for them. Neither fix is self-certifiable by its author:
-> both were "the guarantee is not where it looks like it is" defects, and the
-> RED runs recorded below are the author's own.
+> **This is NOT a sign-off.** §1 and §2 were the two defects this pass found in
+> the region [`OLB_2B3C_PRE_HANDOFF.md`](../plans/OLB_2B3C_PRE_HANDOFF.md) then
+> marked **"CODE ONLY — NO WITNESSES"**. The rest of that debt — W-G3, W-G4,
+> W-G5, W-G6, W-G8, W-G13 — closed separately at `bd225acdd`; see
+> [What was still owed](#what-was-still-owed--closed-at-bd225acdd).
+>
+> Neither fix is self-certifiable by its author: both were "the guarantee is not
+> where it looks like it is" defects, and **every RED recorded in this document
+> is the author's own.** Step 2 remains NOT INDEPENDENTLY REVIEWED and NOT
+> SIGNED.
 
 **Scope:** the full branch diff `master..6eec8d34d` (merge base `80bb06b5a`),
 tree clean. 12 files, +3014/−183.
@@ -414,6 +418,12 @@ Neither §1 nor §2 is self-certifiable by the author of the fix: both are
 mutation-first discipline (write the witness, watch it fail, then fix) rather
 than a fix followed by a confirming test.
 
+> **This table is the judgement as of the review, kept as written.** Both gates
+> are now discharged — §1 at `89932538f`, §2 at `cbbd448b3`, and the full
+> W-G3…W-G8 / W-G13 set at `bd225acdd`. What is NOT discharged is the last
+> paragraph: the mutation-first discipline was followed, but by the author.
+> Step 2 still owes an independent review.
+
 ---
 
 ## Closure
@@ -477,11 +487,31 @@ a Windows ACL test that shells out to `icacls` against a PID-scoped temp
 directory. It touches nothing in this branch's diff. Recorded rather than
 chased, and NOT claimed as diagnosed.
 
-### What is still owed
+### What was still owed — closed at `bd225acdd`
 
-Unchanged by this closure. Step 2 remains witness-debt-bearing: **W-G3, W-G4,
-W-G6, W-G8 and W-G13** are still owed per handoff §2. W-G5 as originally
-specified is now redundant with W-G5b's first assertion, but W-G5b was written
-for the two-key case and does not exercise the single-key one under a
-"drop the handle from the stamp" mutation — write W-G5 anyway rather than
-crossing it off.
+At the time this section was first written, W-G3, W-G4, W-G5, W-G6, W-G8 and
+W-G13 were owed. All six landed at `bd225acdd`, each mutation-proven. The set,
+what each kills, and the three notes worth carrying into the independent pass
+are in `docs/plans/OLB_2B3C_PRE_HANDOFF.md` §2 and the design's §16.0.
+
+One prediction in the paragraph this replaces was wrong and is worth recording:
+it said W-G5 was "now redundant with W-G5b's first assertion". It is not — and
+not only for the two-key/single-key reason given. Dropping the handle at the
+CAPTURE seam and dropping it at the READ seam are separate mutations, and W-G5
+had to assert both. A witness set is not covered because one of its members
+happens to touch the same field.
+
+Gates at `bd225acdd` (`CARGO_INCREMENTAL=0`, exact selection, zero retries):
+
+```
+full lib                5460 passed; 0 failed; 1 ignored
+org_routing_wiring        54 passed; 0 failed; 5407 filtered
+behavior::org_routing     24 passed; 0 failed; 5437 filtered
+each new witness           1 selected, 1 passed, 0 retries
+cargo fmt --all -- --check                              clean
+cargo clippy --all-features --all-targets -D warnings   clean
+git diff --check                                        clean
+```
+
+**Step 2 is still NOT SIGNED and NOT INDEPENDENTLY REVIEWED.** Every RED in this
+branch is the author's own.

@@ -4,8 +4,8 @@
 signs** — a stale handoff in `docs/plans/` is exactly the drift this project has
 already been bitten by twice.
 
-Written at `8189676a7`; **updated at `ac5111a14`** after code review 2026-07-29
-landed fixes for two step-2 defects (§2a). Branch `load-balancing-2`.
+Written at `8189676a7`; **updated at `bd225acdd`**, which closes step 2's
+witness debt. Branch `load-balancing-2`.
 
 ---
 
@@ -17,8 +17,8 @@ landed fixes for two step-2 defects (§2a). Branch `load-balancing-2`.
 | OLB-2B.3a — per-slot `ArcSwap` publication cell | `fd05a89ba` | SIGNED (`OLB_2B3A_SIGNED_HEAD`) |
 | OLB-2B.3 boundary design (rev 5 + addenda) | `1c1b652e6` | SIGNED **as a design only** |
 | 2B.3c-pre **step 1** — installation identity (items 1–3) | `300e80f6c` | SIGNED |
-| 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `8189676a7` | **PARTIALLY WITNESSED.** Two defects found and fixed by review 2026-07-29 (see §2a); W-G3/W-G4/W-G6/W-G8/W-G13 still owed |
-| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | — | not started |
+| 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `8189676a7` → `bd225acdd` | **IMPLEMENTED + CORRECTED + WITNESSED — NOT INDEPENDENTLY REVIEWED — NOT SIGNED.** Witness debt closed at `bd225acdd`; see §2a |
+| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | — | not started / **not authorized** until step 2 signs |
 | `SAFE_LIVE_HEAD` | — | **not established**, still reserved for provider-free leader lighting |
 
 Authoritative design: [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md).
@@ -29,42 +29,46 @@ proof, the exclusions, and the closure gate. §2A is the substrate spec.
 
 ## 2. Do this first
 
-**`8189676a7` was code awaiting its witnesses, and review 2026-07-29 found two
-defects in it (see §2a).** The rest is still unwitnessed: a green suite proves
-the *pre-existing* witnesses plus W-G5b and W-G7, not the remaining new
-behaviour. Do not build step 3 on it and do not let it be reviewed as a slice
-until the witness set below exists.
+**The witness debt is closed. The next authorized work is Kyra's independent
+review of step 2 — not more implementation.**
 
-Write these (design §12, Grant-currentness group):
+The Grant-currentness set (design §12) is complete and mutation-proven at
+`bd225acdd`. §2a records what was found and what each witness kills. Every RED
+in this branch is the AUTHOR's; none of it substitutes for the independent
+mutation run, and step 3 (items 10, 11, 15, 16) stays unauthorized until step 2
+is signed.
 
-| # | Property | Mutation it must die to |
+| # | Witness | Dies to |
 |---|---|---|
-| W-G3 | a same-ID replacement cannot reauthorize old rows | compare `grant_id` only |
-| W-G4 | signature is part of installation identity | drop it from the stamp/compare |
-| W-G5 | audience handle is part of installation identity | drop it |
-| W-G6 | install between snapshot and commit refuses publication | omit the Grant identities from `SourceToken` |
-| ~~W-G7~~ | ~~removal between validation and settlement cannot settle `Current`~~ | **WRITTEN** — see §2a |
-| W-G8 | unrelated Grant movement preserves an unaffected exact slot | use a global "some Grant moved" bit |
-| W-G13 | installed-Grant expiry ⇒ `Unserved`, **including with zero providers** | derive the deadline from provider rows only |
+| W-G3 | `a_same_id_grant_replacement_cannot_reauthorize_captured_facts` | compare `grant_id` only |
+| W-G4 | `the_signed_grant_identity_is_part_of_scope_currentness` | drop the signature from the comparison |
+| W-G5 | `the_audience_handle_is_part_of_scope_currentness` | drop the handle, at capture OR at the read seam |
+| W-G5b | `a_stale_audience_handle_is_unserved_beside_its_installed_sibling` | key the stamp map by `grant_id` alone |
+| W-G6 | `a_grant_install_between_capture_and_commit_refuses_publication` | omit the identities from `SourceToken` |
+| W-G7 | `a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_settlement` | release the Grant gate before phase 5 |
+| W-G8 | `unrelated_grant_movement_preserves_the_exact_slot` | a global "some Grant moved" bit |
+| W-G13 | `an_installed_grants_expiry_colds_its_facts_with_zero_providers` | omit the installed-Grant deadline from the source |
 
-W-G5 is still owed even though §2a's W-G5b subsumes its assertion: W-G5b was
-written for the TWO-key case, and the single-key "drop the handle from the
-stamp" mutation is a different thing to kill. Write it anyway.
+Three notes for whoever re-runs these mutations independently:
 
-The settlement-gap shape is proven in-tree twice over now:
-`a_publication_cannot_occupy_the_gap_between_validation_and_settlement` and
-`a_consumer_grant_removal_cannot_occupy_the_gap_between_validation_and_settlement`
-in `org_routing_wiring_tests.rs` — copy either structure, including the
-contention rule in §4 below.
+- **W-G4 is a direct comparison witness**, and is labelled so in-tree. Equal
+  `install_seq` with a different signature is not production-reachable —
+  `install_seq` is strictly monotone. Under "drop the signature", **W-G3 stays
+  green**, because its same-ID case also moves the installation identity. That
+  is why W-G4 holds every other component equal instead of relying on a
+  reachable path.
+- **W-G5 and W-G5b kill different mutations.** Both halves of W-G5 (capture and
+  read seam) were separately proven; dropping the handle at either seam reds it.
+- **W-G8 carries a control** — moving the slot's OWN grant must cold it. Without
+  it, every other assertion in W-G8 is satisfied by a comparison that never
+  fails. Note also that W-G8 correctly SURVIVES the W-G3 mutation, because
+  presence-by-id is still checked there; it needs its own.
 
-W-G13's **empty-provider case is the point of it**, not an edge: with zero
-providers, `earliest_expiry` is `u64::MAX`, so nothing else in the artifact can
-ever expire it.
-
-## 2a. What review 2026-07-29 already did
+## 2a. What review 2026-07-29 found, and what closed it
 
 Full record: [`../misc/CODE_REVIEW_2026_07_29_OLB_2B3C_PRE.md`](../misc/CODE_REVIEW_2026_07_29_OLB_2B3C_PRE.md).
-Two defects in step 2, both fixed with RED-verified witnesses.
+Two defects in step 2, both fixed with RED-verified witnesses; the remaining six
+witnesses then landed at `bd225acdd`.
 
 **W-G7 is written, and the property it names did not hold.** The prediction
 above — "the one to write first and trust least ... believed by construction
@@ -92,7 +96,15 @@ guarantee looked like it was somewhere it was not. Neither was visible from the
 code's own comments, which described the intended property accurately in both
 cases.
 
-The wiring gate is now `MIN=48` with both names pinned in `REQUIRED`.
+**W-G13 needed a clock seam.** `MAX_TOKEN_CLOCK_SKEW_SECS` is 300 s, so a
+wall-clock witness for an installed Grant's deadline would take five minutes to
+observe a transition that must be exact. `scope_authority_is_current` and a new
+private `org_routing_base_facts_at` now take `now_secs` explicitly, exactly as
+`granted_providers_at` already did; production has one caller, which passes
+`current_timestamp()`.
+
+The wiring gate is now `MIN=54` with all eight Grant-currentness names pinned in
+`REQUIRED`.
 
 ---
 
@@ -111,6 +123,7 @@ net/crates/net/src/adapter/net/
                                         and HOLDS the Grant gate until settlement
     MeshNode::scope_authority_is_current  read-seam revalidation (the security half)
     MeshNode::org_routing_base_facts    the 9-check read contract
+    MeshNode::org_routing_base_facts_at   the same, at an explicit clock (W-G13)
     ConsumerGrantGate                   the SHARED consumer-Grant writer gate;
                                         the commit pin holds it (review 07-29 §1)
     MeshNode::install_consumer_grant_audience_leased
@@ -118,7 +131,7 @@ net/crates/net/src/adapter/net/
     MeshNode::publish_consumer_grant_snapshot
                                         the ONE consumer publication seam (counted in test)
     oa34b2_query_currentness_tests      W-G9 / W-G10 / W-G10b + assert_no_effect
-  org_routing_wiring_tests.rs           48 witnesses; CI floor MIN=48
+  org_routing_wiring_tests.rs           54 witnesses; CI floor MIN=54
   behavior/org_routing_registry.rs
     ScopedDiscoveryAuthorityStamp       Owner | Grant{id, install_seq, signature, handle}
     ScopedSourceFacts                   facts + the authority that produced them
@@ -170,8 +183,8 @@ cd net/crates/net
 export UNIT_FEATURES="net redex redex-disk cortex netdb meshdb meshos dataforts \
 nat-traversal port-mapping tool batched-ingress cli regex"
 
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,454 expected
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 48, MIN 48
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,460 expected
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 54, MIN 54
 CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" behavior::org_routing::     # 24, MIN 24
 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo clippy --all-features --all-targets -- -D warnings \
