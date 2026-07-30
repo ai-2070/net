@@ -7,7 +7,10 @@
 # States
 #   universal         one URL, no language segment
 #   adaptive          universal body + per-binding fragments (D2 composition)
-#   adaptive_pending  legacy Rust-only page, acknowledged; see the allowlist
+#   adaptive_pending  not yet composed; acknowledged, see the allowlist. NOT
+#                     necessarily Rust-only — `reference/redis-dedup` already
+#                     carries all five languages as per-language sections, which
+#                     is the pre-composition shape rather than a Rust-only page.
 #   sdk_native        per-language by construction (the SDK spine)
 #   boundary_native   the C ABI surface, its own shape
 #
@@ -18,7 +21,7 @@
 #   - Rust-native reference pages                -> sdk_native (nav owner only;
 #     D7 keeps their physical path and canonical URL unchanged)
 #
-# Counts: adaptive=1 adaptive_pending=28 boundary_native=5 sdk_native=36 universal=79, total=149
+# Counts: adaptive=1 adaptive_pending=29 boundary_native=5 sdk_native=34 universal=80, total=149
 #
 # Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
 
@@ -130,8 +133,8 @@ pages:
   reference/filter-dsl: universal
   reference/glossary: universal
   reference/mcp-bridge: universal
-  reference/redis-dedup: sdk_native
-  reference/replication-config: sdk_native
+  reference/redis-dedup: adaptive_pending
+  reference/replication-config: universal
   reference/subprotocol-ids: universal
   reference/versioning: universal
   reference/wire-format: universal
@@ -178,7 +181,7 @@ pages:
 # another converts in the same change, netting zero. So the exact list is
 # committed, and shrinking it is visible in the diff.
 adaptive_pending:
-  max: 28
+  max: 29
   pages:
     - agent-briefs/build-a-recoverable-capability
     - agent-briefs/generate-typed-tool-bindings
@@ -204,6 +207,7 @@ adaptive_pending:
     - payments/failure-schematic
     - payments/non-custodial-signing
     - payments/spend-policy-and-approvals
+    - reference/redis-dedup
     - start/quickstart
     - tutorials/distributed-daemon
     - tutorials/event-sourced-service

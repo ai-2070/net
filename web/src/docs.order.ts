@@ -213,6 +213,19 @@ export const DOCS_ORDER: DocsOrderConfig = {
     sdk: "SDKs",
   },
   languages: {
+    // D7 — two reference pages are Rust-native content sitting in a
+    // language-neutral section. `adapter-trait` documents a Rust trait you cannot
+    // implement from Go or TypeScript; `eventbus-api` documents the Rust types.
+    // Their physical path and canonical URL do not move (inbound links, and three
+    // reference pages were ported into the skill corpus) — only the navigation
+    // owner changes, which is exactly the mechanism DOCS_STRATEGY_PLAN.md
+    // prescribes for a reclassification.
+    //
+    // NOT gated, deliberately: `redis-dedup` carries per-language helpers for all
+    // five bindings, and `replication-config` documents protocol-level knobs. Both
+    // read as Rust-native by fence count and are not.
+    "reference/adapter-trait": ["rust"],
+    "reference/eventbus-api": ["rust"],
     // Each SDK spine is visible under its language pill. Rust is the default.
     "sdk/rust": ["rust"],
     "sdk/typescript": ["ts"],

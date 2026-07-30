@@ -53,13 +53,13 @@ a private key. Three steps:
 invite  →  join  →  approve
 ```
 
-- **`InviteToken::mint(root, rendezvous, ttl)`** — the operator mints a
-  short-lived invite naming a rendezvous point. It encodes to a string you can
-  transport out of band, and carries a `root_fingerprint()` so the joiner can
-  confirm which root it's about to join.
-- **`JoinRequest::create(..)`** — the device generates its own keypair and
-  self-signs a request. `verify_self_signature()` proves the request wasn't
-  tampered with in transit.
+- **Invite** — the operator mints a short-lived invite naming a rendezvous point,
+  scoped to a root and an expiry. It encodes to a string you can carry out of band
+  (a QR code, a chat message), and it carries a fingerprint of the root so the
+  joiner can confirm which root it is about to join before committing to it.
+- **Join** — the device generates its own keypair and self-signs a request. The
+  self-signature is what proves the request was not tampered with in transit;
+  without it, an invite in the open could be redeemed by whoever intercepted it.
 - **Approve** — the root issues the delegation chain, and the device now holds
   an identity it derived itself.
 
