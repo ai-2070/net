@@ -55,11 +55,14 @@ use net::adapter::net::behavior::capability::CapabilityFilter;
 // is a long-lived offline key, distributed to nodes as a public EntityId.
 let fleet_root_entity_id = fleet_root_keypair.entity_id().clone();
 
-let telemetry_cfg = ChannelConfig::new(ChannelName::new("vehicles/v-001/telemetry/imu")?.id())
+let channel = ChannelName::new("vehicles/v-001/telemetry/imu")?;
+let telemetry_cfg = ChannelConfig::new(channel.id())
     .with_visibility(Visibility::Exported)
     .with_publish_caps(CapabilityFilter::new().require_tag("role.vehicle"))
     .with_subscribe_caps(
-        CapabilityFilter::new().require_tag("role.operator").require_tag("tier.production"),
+        CapabilityFilter::new()
+            .require_tag("role.operator")
+            .require_tag("tier.production"),
     )
     // Anchors the root of trust AND turns on token enforcement.
     .with_token_roots(vec![fleet_root_entity_id])
@@ -170,7 +173,8 @@ struct VehicleSummary {
 struct FleetFold;
 
 impl RedexFold<FleetState> for FleetFold {
-    fn apply(&self, state: &mut FleetState, event: &CausalEvent) -> Result<(), FoldError> {
+    fn apply(&self, state: &mut FleetState, event: &CausalEvent)
+        -> Result<(), FoldError> {
         let parsed: VehicleEvent = serde_json::from_slice(&event.payload)
             .map_err(|e| FoldError::InvalidPayload(e.to_string()))?;
         let summary = state.vehicles.entry(parsed.vehicle_id).or_default();
@@ -202,7 +206,8 @@ The fold task subscribes to the RedEX tail, applies events as they arrive, and p
 ```rust
 let snapshot = fleet_adapter.state().read();
 for (vehicle_id, summary) in &snapshot.vehicles {
-    println!("{}: battery {}%, health {:.2}", vehicle_id, summary.battery_pct, summary.health_score);
+    println!("{}: battery {}%, health {:.2}",
+             vehicle_id, summary.battery_pct, summary.health_score);
 }
 ```
 

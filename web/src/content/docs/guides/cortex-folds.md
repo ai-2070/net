@@ -24,7 +24,8 @@ struct TaskCount {
 struct TaskCountFold;
 
 impl RedexFold<TaskCount> for TaskCountFold {
-    fn apply(&mut self, ev: &RedexEvent, state: &mut TaskCount) -> Result<(), RedexError> {
+    fn apply(&mut self, ev: &RedexEvent, state: &mut TaskCount)
+        -> Result<(), RedexError> {
         // Decode `ev.payload` into your domain event and update the state.
         // `DomainEvent`/`decode` here are illustrative — RedEX is agnostic
         // to the payload's shape, so the decode is yours to define.

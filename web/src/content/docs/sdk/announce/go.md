@@ -70,7 +70,9 @@ one is a compile error, and it is the most common way this page goes wrong.
 `AddToolCapabilitiesToAnnounce` builds the merged announcement:
 
 ```go
-wire := net.AddToolCapabilitiesToAnnounce(net.CapabilitySetWire{}, []net.ToolDescriptor{desc})
+wire := net.AddToolCapabilitiesToAnnounce(
+    net.CapabilitySetWire{}, []net.ToolDescriptor{desc},
+)
 ```
 
 **Then there is a seam.** `wire` is a `CapabilitySetWire` — `Tags` plus a flat
@@ -101,7 +103,9 @@ merge helpers are unit-tested, the round trip is not.
 From a peer that folded the announcement:
 
 ```go
-peers, err := agent.FindNodes(net.CapabilityFilter{RequireTags: []string{"ai-tool:web_search"}})
+peers, err := agent.FindNodes(net.CapabilityFilter{
+    RequireTags: []string{"ai-tool:web_search"},
+})
 if err != nil {
     log.Fatal(err)
 }

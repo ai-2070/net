@@ -45,7 +45,8 @@ use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize)]
 enum OrderEvent {
-    Placed     { order_id: u64, customer: String, items: Vec<LineItem>, total_cents: u64 },
+    Placed     { order_id: u64, customer: String, items: Vec<LineItem>,
+                 total_cents: u64 },
     Confirmed  { order_id: u64, confirmed_at: u64 },
     Shipped    { order_id: u64, carrier: String, tracking: String, shipped_at: u64 },
     Delivered  { order_id: u64, delivered_at: u64 },
@@ -114,8 +115,12 @@ impl RedexFold<OrderBook> for OrderFold {
             }
             OrderEvent::Shipped { order_id, carrier, tracking, shipped_at } => {
                 if let Some(order) = state.orders.get_mut(&order_id) {
-                    order.status = OrderStatus::Shipped { carrier: carrier.clone(), tracking: tracking.clone() };
-                    order.history.push(HistoryEntry::Shipped { at: shipped_at, carrier, tracking });
+                    order.status = OrderStatus::Shipped {
+                        carrier: carrier.clone(), tracking: tracking.clone(),
+                    };
+                    order.history.push(HistoryEntry::Shipped {
+                        at: shipped_at, carrier, tracking,
+                    });
                 }
             }
             OrderEvent::Delivered { order_id, delivered_at } => {
@@ -127,7 +132,8 @@ impl RedexFold<OrderBook> for OrderFold {
             OrderEvent::Cancelled { order_id, reason, cancelled_at } => {
                 if let Some(order) = state.orders.get_mut(&order_id) {
                     order.status = OrderStatus::Cancelled { reason: reason.clone() };
-                    order.history.push(HistoryEntry::Cancelled { at: cancelled_at, reason });
+                    order.history.push(
+                        HistoryEntry::Cancelled { at: cancelled_at, reason });
                 }
             }
         }

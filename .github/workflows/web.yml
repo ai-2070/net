@@ -17,6 +17,7 @@ on:
       - "docs/data/**"
       - ".github/scripts/check-docs-tiers.py"
       - ".github/scripts/check-spine-symbols.py"
+      - ".github/scripts/check-doc-code-width.py"
   pull_request:
     paths:
       - "web/**"
@@ -28,6 +29,7 @@ on:
       - "docs/data/**"
       - ".github/scripts/check-docs-tiers.py"
       - ".github/scripts/check-spine-symbols.py"
+      - ".github/scripts/check-doc-code-width.py"
 
 jobs:
   check:
@@ -95,6 +97,19 @@ jobs:
       - name: Check the spine-symbol checker still catches defects
         working-directory: .
         run: .github/scripts/check-spine-symbols.py --self-test
+
+      # Phase 1A made code blocks scroll rather than wrap, which was right and
+      # has a cost nobody was watching: a line wider than the column silently
+      # runs off the right edge, and a reader who does not think to scroll
+      # sideways reads a truncated statement as the whole thing. 94 characters
+      # fit at the widest layout (measured, not guessed); the limit is 90.
+      - name: Check no code line is wider than the column that renders it
+        working-directory: .
+        run: .github/scripts/check-doc-code-width.py
+
+      - name: Check the width checker still catches defects
+        working-directory: .
+        run: .github/scripts/check-doc-code-width.py --self-test
 
       # No lint or format step, and both omissions are deliberate:
       #

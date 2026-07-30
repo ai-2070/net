@@ -47,10 +47,12 @@ pub trait SchemeSigner: Send + Sync {
     async fn sign_typed_data(&self, typed_data: &Value) -> Result<String, SignerError>;
 
     /// SPL transfer intent in, base64 partially-signed transaction out.
-    async fn sign_svm_transfer(&self, intent: &SvmTransferIntent) -> Result<String, SignerError>;
+    async fn sign_svm_transfer(&self, intent: &SvmTransferIntent)
+        -> Result<String, SignerError>;
 
     /// XRPL payment intent in, presigned Payment blob out.
-    async fn sign_xrpl_payment(&self, intent: &XrplPaymentIntent) -> Result<String, SignerError>;
+    async fn sign_xrpl_payment(&self, intent: &XrplPaymentIntent)
+        -> Result<String, SignerError>;
 }
 ```
 

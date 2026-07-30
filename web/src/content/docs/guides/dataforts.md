@@ -13,7 +13,9 @@ A blob in Dataforts is referenced by its content hash. Producers put bytes in an
 The simplest possible blob flow:
 
 ```rust
-use net_sdk::transport::{store_blob_reader, fetch_blob_discovered, Encoding, MeshBlobAdapter, BlobRef};
+use net_sdk::transport::{
+    store_blob_reader, fetch_blob_discovered, Encoding, MeshBlobAdapter, BlobRef,
+};
 
 // A per-node blob adapter over a Redex manager (`redex: Arc<Redex>`).
 let adapter = MeshBlobAdapter::new("blobs", redex.clone());

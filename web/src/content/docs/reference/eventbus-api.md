@@ -114,7 +114,8 @@ pub struct RawEvent { /* opaque */ }
 
 impl RawEvent {
     pub fn from_bytes(bytes: impl Into<Bytes>) -> Self;
-    pub fn from_bytes_validated(bytes: impl Into<Bytes>) -> Result<Self, serde_json::Error>;
+    pub fn from_bytes_validated(bytes: impl Into<Bytes>)
+        -> Result<Self, serde_json::Error>;
     pub fn from_bytes_with_hash(bytes: impl Into<Bytes>, hash: u64) -> Self;
     pub fn from_value(value: JsonValue) -> Self;
 }
@@ -143,15 +144,15 @@ impl ConsumeRequest {
 
 pub struct ConsumeResponse {
     pub events: Vec<StoredEvent>,
-    pub next_id: Option<String>,          // cursor for the next poll; None if no events returned
+    pub next_id: Option<String>,          // next poll's cursor; None if empty
     pub has_more: bool,
-    pub truncated_at_per_shard_cap: bool, // per-shard fetch was clamped by the internal cap
-    pub stalled_shards: Vec<u16>,         // shards that reported more but contributed nothing
+    pub truncated_at_per_shard_cap: bool, // per-shard fetch hit the cap
+    pub stalled_shards: Vec<u16>,         // reported more, contributed none
     pub failed_shards: Vec<u16>,          // shards whose adapter call errored this poll
 }
 
 pub enum Ordering {
-    None,        // default — arbitrary cross-shard order (fastest; per-shard order preserved)
+    None,        // default — arbitrary cross-shard order (per-shard preserved)
     InsertionTs, // sort by insertion timestamp (cross-shard merge)
 }
 ```

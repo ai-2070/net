@@ -78,7 +78,8 @@ is a thin wrapper over `TypedCallService`.
 ### A typed application error
 
 ```go
-return SummarizeResp{}, net.AppError(net.NrpcTypedBadRequest, []byte(`{"error":"invalid_request"}`))
+body := []byte(`{"error":"invalid_request"}`)
+return SummarizeResp{}, net.AppError(net.NrpcTypedBadRequest, body)
 ```
 
 `AppError(code, body)` is how a handler returns a typed application status rather
@@ -95,7 +96,9 @@ on this spine implements.
 ### Verify it worked
 
 ```go
-resp, err := net.CallTool[WebSearchReq, WebSearchResp](ctx, rpc, "web_search", WebSearchReq{Query: "ping"})
+resp, err := net.CallTool[WebSearchReq, WebSearchResp](
+    ctx, rpc, "web_search", WebSearchReq{Query: "ping"},
+)
 if err != nil {
     log.Fatal(err)
 }

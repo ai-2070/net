@@ -17,7 +17,7 @@ For the how-to, see [Wrap an MCP Server](/docs/guides/wrap-mcp-server) and
 
 ```bash
 cargo install net-cli    # the `net-cli` crate builds the `net-mesh` binary
-                         # (net-mesh wrap / net-mesh mcp serve / net-mesh mcp pin / net-mesh forwarding)
+                         # (net-mesh wrap / mcp serve / mcp pin / forwarding)
 ```
 
 (The operator CLI binary `net-mesh` is produced by the separate `net-cli` crate,

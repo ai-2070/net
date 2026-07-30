@@ -40,7 +40,8 @@ impl MeshDaemon for CounterDaemon {
 
     fn restore(&mut self, state: Bytes) -> Result<(), DaemonError> {
         let bytes: [u8; 8] = state[..8].try_into()
-            .map_err(|_| DaemonError::RestoreFailed("expected 8-byte counter state".into()))?;
+            .map_err(|_| DaemonError::RestoreFailed(
+                "expected 8-byte counter state".into()))?;
         self.count = u64::from_le_bytes(bytes);
         Ok(())
     }
@@ -295,7 +296,8 @@ use net::adapter::net::behavior::loadbalance::Strategy;
 
 runtime.register_factory("strategy", || Box::new(StrategyDaemon::new()))?;
 
-let group = ForkGroup::fork(&runtime, "strategy", parent_origin, fork_seq, ForkGroupConfig {
+let group = ForkGroup::fork(&runtime, "strategy", parent_origin, fork_seq,
+                            ForkGroupConfig {
     fork_count: 3,
     lb_strategy: Strategy::RoundRobin,
     host_config: DaemonHostConfig::default(),

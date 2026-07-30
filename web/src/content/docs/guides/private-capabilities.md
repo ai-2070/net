@@ -149,7 +149,9 @@ All five surfaces are at parity on the two verbs. The codec is JSON everywhere.
 **TypeScript / Node** (`@net-mesh/core/org`):
 
 ```ts
-import { OrgAccess, OrgCredentials, TypedOrgClient, serveOrgTyped } from '@net-mesh/core/org'
+import {
+  OrgAccess, OrgCredentials, TypedOrgClient, serveOrgTyped,
+} from '@net-mesh/core/org'
 
 const handle = serveOrgTyped(mesh, 'customer.read', OrgAccess.Granted,
   async (caller, req: GetCustomer) => readCustomer(caller, req))

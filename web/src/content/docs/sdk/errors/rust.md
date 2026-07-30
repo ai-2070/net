@@ -102,7 +102,9 @@ chains and `?` composes:
 ### Recover a call
 
 ```rust
-use net_sdk::mesh_rpc_resilience::{RetryPolicy, HedgePolicy, CircuitBreaker, CircuitBreakerConfig};
+use net_sdk::mesh_rpc_resilience::{
+    RetryPolicy, HedgePolicy, CircuitBreaker, CircuitBreakerConfig,
+};
 
 let resp: Resp = caller
     .call_typed_with_retry(node_id, "svc", &req, opts, &RetryPolicy::default())
