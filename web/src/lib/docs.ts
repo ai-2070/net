@@ -20,7 +20,15 @@ export {
   type Language,
 } from "./docs-language";
 import type { Language, Lens } from "./docs-language";
-import { LENSES, LENS_SLUG, isBoundarySlug, lensFromSlug } from "./docs-language";
+import {
+  LANGUAGES,
+  LENSES,
+  LENS_SLUG,
+  entryVisibleIn,
+  isBoundarySlug,
+  lensFromSlug,
+  slugLanguage,
+} from "./docs-language";
 
 export type DocsOrderConfig = {
   /** Order of top-level folders (sections). Unlisted append alpha after. */
@@ -618,18 +626,22 @@ export type LinearDoc = {
 // Auto-generated folder-index pages (folders without a README) are skipped
 // since they're just listings; folder READMEs are included as the section's
 // landing page.
-function flattenForLinearOrder(tree: DocTree): LinearDoc[] {
+function flattenForLinearOrder(
+  tree: DocTree,
+  lang?: Language,
+): LinearDoc[] {
   const out: LinearDoc[] = [];
 
   if (tree.rootReadme) {
     out.push({ slug: [], title: tree.rootReadme.title });
   }
   for (const f of tree.rootFiles) {
+    if (lang && !entryVisibleIn(f, lang)) continue;
     out.push({ slug: f.slug, title: f.title });
   }
   for (const folder of tree.folders) {
     // Top-level folders have no parent section to label them with.
-    addFolder(folder, out, undefined);
+    addFolder(folder, out, undefined, lang);
   }
   return out;
 }
@@ -638,7 +650,12 @@ function addFolder(
   folder: DocFolder,
   out: LinearDoc[],
   parentSection: string | undefined,
+  lang?: Language,
 ): void {
+  // A folder gated to other languages takes its whole subtree with it, exactly
+  // as the sidebar does. Without this the linear order and the sidebar disagree,
+  // and prev/next walks into pages the reader cannot see in the nav.
+  if (lang && !entryVisibleIn(folder, lang)) return;
   // A folder README IS the section landing — its context label is the
   // *parent* folder's title (if any), not its own. Using its own title would
   // render the section line and the page title as the same string.
@@ -652,31 +669,63 @@ function addFolder(
   for (const child of folder.children) {
     if (child.kind === "file") {
       if (folder.readme && child === folder.readme) continue;
+      if (lang && !entryVisibleIn(child, lang)) continue;
       // Children get the *containing* folder's title as their section
       // context, regardless of how deeply nested the folder is.
       out.push({ slug: child.slug, title: child.title, section: folder.title });
     } else {
-      addFolder(child, out, folder.title);
+      addFolder(child, out, folder.title, lang);
     }
   }
 }
 
-let cachedLinear: LinearDoc[] | null = null;
-function getLinearDocs(): LinearDoc[] {
-  if (!IS_DEV && cachedLinear) return cachedLinear;
-  const linear = flattenForLinearOrder(getDocTree());
-  if (!IS_DEV) cachedLinear = linear;
+const cachedLinear = new Map<string, LinearDoc[]>();
+function getLinearDocs(lang?: Language): LinearDoc[] {
+  const key = lang ?? "*";
+  if (!IS_DEV) {
+    const hit = cachedLinear.get(key);
+    if (hit) return hit;
+  }
+  const linear = flattenForLinearOrder(getDocTree(), lang);
+  if (!IS_DEV) cachedLinear.set(key, linear);
   return linear;
 }
 
 // Look up the previous + next page in the sidebar order for a given slug.
 // `currentSlug` is the URL slug ([] for /docs root, ["foo"] for /docs/foo).
 // Returns nulls when there is no neighbor in that direction.
-export function getPrevNext(currentSlug: string[]): {
+/** Prev/next for every language, resolved at build time.
+ *
+ * The reader's language lives in a client store and the pages are static, so the
+ * only way for prev/next to respect it is to bake all five answers and let the
+ * client pick. It is five small objects per page.
+ *
+ * This is the fix for the sharpest of the three language defects: the single
+ * language-blind order delivered a Python reader who finished
+ * `sdk/python/errors` into `sdk/go/quickstart` — a language they did not choose,
+ * in a section their own sidebar hides.
+ */
+export function getPrevNextByLanguage(
+  currentSlug: string[],
+): Record<Language, { prev: LinearDoc | null; next: LinearDoc | null }> {
+  const out = {} as Record<
+    Language,
+    { prev: LinearDoc | null; next: LinearDoc | null }
+  >;
+  for (const lang of LANGUAGES) {
+    out[lang] = getPrevNext(currentSlug, lang);
+  }
+  return out;
+}
+
+export function getPrevNext(
+  currentSlug: string[],
+  lang?: Language,
+): {
   prev: LinearDoc | null;
   next: LinearDoc | null;
 } {
-  const list = getLinearDocs();
+  const list = getLinearDocs(lang);
   const key = currentSlug.join("/");
   const idx = list.findIndex((d) => d.slug.join("/") === key);
   if (idx < 0) return { prev: null, next: null };
@@ -794,4 +843,38 @@ export function getDocsVersion(): string {
     if (!best || v[0] > best[0] || (v[0] === best[0] && v[1] > best[1])) best = v;
   }
   return best ? `v${best[0]}.${best[1]}` : "";
+}
+
+/** Build-time proof that prev/next never crosses a language boundary.
+ *
+ * The acceptance criterion for this fix is a test rather than an inspection, and
+ * the thing under test is server-only code in a package with no test runner. So
+ * the assertion runs where it cannot be skipped: `generateStaticParams` calls it,
+ * which means every `next build` — and therefore every CI run — either proves the
+ * invariant or fails.
+ *
+ * The invariant: walking the order a reader of language L actually sees, every
+ * page is either universal or L's. A neighbour belonging to another language is
+ * exactly the defect this replaced — a Python reader finishing `sdk/python/errors`
+ * was handed `sdk/go/quickstart`.
+ */
+export function assertNoCrossLanguageNeighbours(): void {
+  const problems: string[] = [];
+  for (const lang of LANGUAGES) {
+    for (const doc of getLinearDocs(lang)) {
+      const owner = slugLanguage(doc.slug);
+      if (owner !== null && owner !== lang) {
+        problems.push(
+          `reading as \`${lang}\`, the order contains \`/docs/${doc.slug.join("/")}\`, ` +
+            `which belongs to \`${owner}\``,
+        );
+      }
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(
+      `prev/next crosses a language boundary (${problems.length} case(s)):\n  ` +
+        problems.slice(0, 10).join("\n  "),
+    );
+  }
 }

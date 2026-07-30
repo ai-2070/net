@@ -59,3 +59,24 @@ export function entryVisibleIn(
   if (!entry.languages || entry.languages.length === 0) return true;
   return entry.languages.includes(current);
 }
+
+/** The language a docs slug belongs to, or null when it is universal.
+ *
+ * Two shapes carry a language: the SDK spine (`sdk/<lang>/…`) and an adaptive
+ * page's rendition (`…/<page>/<lens>`). Used to keep search from answering
+ * "invoke" with five near-identical hits and no clue which one is the reader's.
+ */
+export function slugLanguage(slug: readonly string[]): Language | null {
+  if (slug.length >= 2 && slug[0] === "sdk") {
+    for (const lang of LANGUAGES) {
+      if (LENS_SLUG[lang] === slug[1]) return lang;
+    }
+  }
+  const last = slug[slug.length - 1];
+  if (last !== undefined && slug.length >= 2) {
+    for (const lang of LANGUAGES) {
+      if (LENS_SLUG[lang] === last) return lang;
+    }
+  }
+  return null;
+}

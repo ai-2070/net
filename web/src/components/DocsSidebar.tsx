@@ -58,17 +58,34 @@ function countDocs(folder: ClientDocFolder): number {
 // whole subtree collapsed (no readme + no surviving children). The same
 // filter runs on the inline sidebar and the mobile drawer because both
 // share this component.
+/** True when `slug` is the page being read, or an ancestor of it.
+ *
+ * Language gating hides pages, and hiding the page the reader is ON strands
+ * them: `/docs/sdk/go/invoke` renders fine with `rust` selected while the sidebar
+ * has no entry for where they are, so there is nothing to navigate from and no
+ * indication anything is missing. A gated entry on the active path is kept
+ * regardless of language — the reader followed a link there deliberately, or
+ * arrived from a search engine, and either way the nav should admit it exists. */
+function onActivePath(slug: readonly string[], active: string): boolean {
+  const here = slug.join("/");
+  return active === here || active.startsWith(`${here}/`);
+}
+
 function filterFolder(
   folder: ClientDocFolder,
   lang: Language,
+  active: string,
 ): ClientDocFolder | null {
-  if (!entryVisibleIn(folder, lang)) return null;
+  const pinned = onActivePath(folder.slug, active);
+  if (!pinned && !entryVisibleIn(folder, lang)) return null;
   const children: ClientDocNode[] = [];
   for (const child of folder.children) {
     if (child.kind === "file") {
-      if (entryVisibleIn(child, lang)) children.push(child);
+      if (entryVisibleIn(child, lang) || onActivePath(child.slug, active)) {
+        children.push(child);
+      }
     } else {
-      const kept = filterFolder(child, lang);
+      const kept = filterFolder(child, lang, active);
       if (kept) children.push(kept);
     }
   }
@@ -76,15 +93,21 @@ function filterFolder(
   return { ...folder, children };
 }
 
-function filterTree(tree: ClientDocTree, lang: Language): ClientDocTree {
+function filterTree(
+  tree: ClientDocTree,
+  lang: Language,
+  active: string,
+): ClientDocTree {
   const folders: ClientDocFolder[] = [];
   for (const f of tree.folders) {
-    const kept = filterFolder(f, lang);
+    const kept = filterFolder(f, lang, active);
     if (kept) folders.push(kept);
   }
   return {
     hasRootReadme: tree.hasRootReadme,
-    rootFiles: tree.rootFiles.filter((f) => entryVisibleIn(f, lang)),
+    rootFiles: tree.rootFiles.filter(
+      (f) => entryVisibleIn(f, lang) || onActivePath(f.slug, active),
+    ),
     folders,
   };
 }
@@ -372,8 +395,8 @@ export function DocsSidebar({
   const active = activeFromPath(pathname);
   const language = useLanguageStore((s) => s.language);
   const visibleTree = useMemo(
-    () => filterTree(tree, language),
-    [tree, language],
+    () => filterTree(tree, language, active.join("/")),
+    [tree, language, active],
   );
   const totalDocs =
     visibleTree.rootFiles.length +

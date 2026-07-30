@@ -7,7 +7,8 @@ import {
   readDocSource,
   composeRendition,
   extractToc,
-  getPrevNext,
+  getPrevNextByLanguage,
+  assertNoCrossLanguageNeighbours,
   type AdaptivePage,
   type DocFolder,
   type TocEntry,
@@ -33,6 +34,10 @@ export const dynamicParams = false;
 export const revalidate = false;
 
 export function generateStaticParams(): Array<{ slug: string[] }> {
+  // Runs once per build, and throws rather than warns. See the function's
+  // comment: this is the acceptance test for language-aware prev/next, placed
+  // where it cannot be skipped or forgotten.
+  assertNoCrossLanguageNeighbours();
   return getAllSlugs().map((slug) => ({ slug }));
 }
 
@@ -489,7 +494,7 @@ export default async function DocPage({ params }: PageProps) {
       lens !== undefined
         ? composeRendition(page, lens)
         : { source: readDocSource(page.shared), hasFragment: false };
-    const { prev, next } = getPrevNext(folder.slug);
+    const neighbours = getPrevNextByLanguage(folder.slug);
     return (
       <>
         <main className="min-w-0 max-w-[740px]">
@@ -504,7 +509,7 @@ export default async function DocPage({ params }: PageProps) {
             }
             section={folder.slug[0]}
           />
-          <DocsPrevNextTop prev={prev} next={next} />
+          <DocsPrevNextTop neighbours={neighbours} />
           <DocsContent
             source={composed.source}
             format="md"
@@ -519,7 +524,7 @@ export default async function DocPage({ params }: PageProps) {
             page={page}
             current={resolved.kind === "boundary" ? "c" : lens}
           />
-          <DocsPrevNextBottom prev={prev} next={next} />
+          <DocsPrevNextBottom neighbours={neighbours} />
         </main>
         <TocRail entries={extractToc(composed.source)} />
       </>
@@ -539,7 +544,7 @@ export default async function DocPage({ params }: PageProps) {
   const lookupSlug = isFolderReadme
     ? resolved.folder!.slug
     : resolved.file.slug;
-  const { prev, next } = getPrevNext(lookupSlug);
+  const neighbours = getPrevNextByLanguage(lookupSlug);
   return (
     <>
       <main className="min-w-0 max-w-[740px]">
@@ -547,13 +552,13 @@ export default async function DocPage({ params }: PageProps) {
           slug={resolved.file.slug}
           section={resolved.file.slug[0]}
         />
-        <DocsPrevNextTop prev={prev} next={next} />
+        <DocsPrevNextTop neighbours={neighbours} />
         <DocsContent
           source={source}
           format={resolved.file.ext}
           baseDir={resolved.file.slug.slice(0, -1)}
         />
-        <DocsPrevNextBottom prev={prev} next={next} />
+        <DocsPrevNextBottom neighbours={neighbours} />
       </main>
       <TocRail entries={toc} />
     </>

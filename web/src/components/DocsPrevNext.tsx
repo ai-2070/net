@@ -1,5 +1,27 @@
+"use client";
+
 import Link from "next/link";
 import type { LinearDoc } from "@/lib/docs";
+import { DEFAULT_LANGUAGE, type Language } from "@/lib/docs-language";
+import { useLanguageStore } from "@/store/useLanguageStore";
+
+/** Neighbours for every language, baked at build time. */
+export type NeighboursByLanguage = Record<
+  Language,
+  { prev: LinearDoc | null; next: LinearDoc | null }
+>;
+
+/** The reader's neighbours.
+ *
+ * Gated on `hydrated` so the server-rendered HTML and the client's first paint
+ * agree on DEFAULT_LANGUAGE — the same discipline the switcher uses. Without it,
+ * a Python reader gets a hydration mismatch on every page.
+ */
+function useNeighbours(all: NeighboursByLanguage) {
+  const language = useLanguageStore((s) => s.language);
+  const hydrated = useLanguageStore((s) => s.hydrated);
+  return all[hydrated ? language : DEFAULT_LANGUAGE];
+}
 
 function hrefFor(slug: string[]): string {
   return slug.length === 0 ? "/docs" : `/docs/${slug.join("/")}`;
@@ -9,12 +31,11 @@ function hrefFor(slug: string[]): string {
 // Sits below the breadcrumb so readers know where they came from / where
 // they're headed without taking up much vertical space.
 export function DocsPrevNextTop({
-  prev,
-  next,
+  neighbours,
 }: {
-  prev: LinearDoc | null;
-  next: LinearDoc | null;
+  neighbours: NeighboursByLanguage;
 }) {
+  const { prev, next } = useNeighbours(neighbours);
   if (!prev && !next) return null;
   return (
     <div className="flex items-center justify-between gap-4 mb-8 font-mono text-[11px] tracking-[0.02em]">
@@ -51,12 +72,11 @@ export function DocsPrevNextTop({
 // Bottom cards — full surface with section context + title, more prominent
 // after a long read. Lights the border accent on hover.
 export function DocsPrevNextBottom({
-  prev,
-  next,
+  neighbours,
 }: {
-  prev: LinearDoc | null;
-  next: LinearDoc | null;
+  neighbours: NeighboursByLanguage;
 }) {
+  const { prev, next } = useNeighbours(neighbours);
   if (!prev && !next) return null;
   return (
     <div className="mt-14 pt-8 border-t border-line grid grid-cols-1 sm:grid-cols-2 gap-4">

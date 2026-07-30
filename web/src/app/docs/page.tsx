@@ -3,7 +3,7 @@ import {
   getDocTree,
   readDocSource,
   extractToc,
-  getPrevNext,
+  getPrevNextByLanguage,
   type DocFolder,
   type TocEntry,
 } from "@/lib/docs";
@@ -52,13 +52,13 @@ export default function DocsRootPage() {
   if (tree.rootReadme) {
     const source = readDocSource(tree.rootReadme);
     const toc = extractToc(source);
-    const { prev, next } = getPrevNext([]);
+    const neighbours = getPrevNextByLanguage([]);
     return (
       <>
         <main className="min-w-0 max-w-[740px]">
-          <DocsPrevNextTop prev={prev} next={next} />
+          <DocsPrevNextTop neighbours={neighbours} />
           <DocsContent source={source} format={tree.rootReadme.ext} />
-          <DocsPrevNextBottom prev={prev} next={next} />
+          <DocsPrevNextBottom neighbours={neighbours} />
         </main>
         <TocRail entries={toc} />
       </>
