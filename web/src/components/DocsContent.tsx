@@ -412,6 +412,31 @@ function splitCaption(children: ReactNode): {
   return { caption, rest };
 }
 
+/** The fence language, read off the `<pre>` rather than the `<figure>`.
+ *
+ * rehype-pretty-code puts `data-language` on the `<pre>` and `<code>` it emits,
+ * NOT on the wrapping figure. Reading it from the figure's own props therefore
+ * always produced `undefined`, and every block on the site rendered its chrome
+ * label as the fallback "CODE" — including a Rust block on the first page a
+ * self-serve reader opens, which is exactly the ambiguity the label exists to
+ * remove.
+ */
+function langOf(children: ReactNode): string | undefined {
+  for (const child of Children.toArray(children)) {
+    if (!isValidElement(child)) continue;
+    const props = child.props as {
+      "data-language"?: string;
+      children?: ReactNode;
+    };
+    if (typeof props["data-language"] === "string") {
+      return props["data-language"];
+    }
+    const nested = langOf(props.children);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
 /** A diagram: captioned, scrollable, and not pretending to be code.
  *
  * No copy button — copying box-drawing characters is not a thing anyone wants —
@@ -548,7 +573,12 @@ const mdxComponents = {
     "data-language"?: string;
   }) => {
     if ("data-rehype-pretty-code-figure" in rest) {
-      const lang = (rest as { "data-language"?: string })["data-language"];
+      // The figure carries no `data-language` — see `langOf`. Fall back to the
+      // figure's own prop anyway, so this keeps working if a future
+      // rehype-pretty-code starts setting it there too.
+      const lang =
+        langOf(children) ??
+        (rest as { "data-language"?: string })["data-language"];
       // A titled `text` block is a DIAGRAM, not code. rehype-pretty-code turns
       // ```text title="…" into a figcaption beside the pre, and that title is the
       // only signal available — the corpus writes diagrams as bare fences, which
