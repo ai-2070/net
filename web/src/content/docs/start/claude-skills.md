@@ -49,7 +49,15 @@ npx skills add ai-2070/net-claude-skill --skill '*' -a '*' -g           # every 
 
 These are plain Agent Skills, so `-a '*'` covers Codex, Cursor, Copilot, Cline, and the rest. The CLI symlinks each agent's skills directory to one canonical copy, so one `npx skills update` refreshes them all — pass `--copy` if symlinks aren't an option.
 
-### Without the CLI
+## Give the agent the source too
+
+[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
+
+```bash
+npx -y opensrc@latest path ai-2070/net
+```
+
+## Installation without the CLI
 
 A skill is just a directory containing a `SKILL.md`, so copying the folders in works:
 
@@ -94,13 +102,7 @@ Skills load automatically when a request matches. To see one fire, ask for somet
 
 `net-event-bus` triggers on imports of `@net-mesh/sdk` or `net-sdk` and on phrases like *pub/sub with Net*, *nRPC*, *mesh RPC*, *RedEX*, *CortEX*, *Dataforts*, *gang scheduler*, *net-mesh wrap*, *serve_org*. `net-payments` triggers on `net-payments` / `net_payments` imports and on *price a capability*, *pay to invoke*, *x402*, *settle on Base/Solana/XRPL*, *spend limit*.
 
-## Give the agent the source too
-
-[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
-
-```bash
-npx -y opensrc@latest path ai-2070/net
-```
+## Opensrc
 
 The skills carry the mental model, the per-binding surface, and runnable examples. What they can't carry is all of Net — a few thousand lines of guidance over a protocol implementation of several hundred thousand. So when the question turns to *mechanism*, the agent either has the source or it guesses:
 
