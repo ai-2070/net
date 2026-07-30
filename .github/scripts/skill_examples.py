@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read and validate `.github/skill-examples.json`.
+"""Read and validate `docs/data/examples.yaml`.
 
 One place that knows which examples exist, so the shell checkers do not each
 carry their own hardcoded list and drift apart. Three modes:
@@ -21,14 +21,26 @@ where support is recorded, and the two answer different questions.
 """
 
 import argparse
-import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
 
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover
+    sys.exit("PyYAML is required: python3 -m pip install pyyaml")
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-MANIFEST = ROOT / ".github" / "skill-examples.json"
+# The index moved out of `.github/` and became YAML. It is product metadata, not
+# CI configuration: the docs transclude from the paths it names, and the skills
+# consume it rather than owning it. YAML because the prose that explains a level
+# or an absence belongs beside the entry, and JSON needed a fake `_comment` array
+# to carry any of it.
+MANIFEST = pathlib.Path(
+    os.environ.get("EXAMPLES_MANIFEST", ROOT / "docs" / "data" / "examples.yaml")
+)
 
 # Extension per binding, so a manifest cannot list `hello.py` under `go`.
 EXT = {
@@ -41,7 +53,7 @@ EXT = {
 
 
 def load():
-    return json.loads(MANIFEST.read_text())
+    return yaml.safe_load(MANIFEST.read_text())
 
 
 def tracked():
@@ -75,6 +87,46 @@ def validate(m):
         for key in ("skill", "route", "dir"):
             if not ex.get(key):
                 problems.append(f"{where}: missing `{key}`")
+
+        # Evidence level. A level below `run` is a weaker claim about the same
+        # example, so it has to be argued rather than chosen — otherwise levels
+        # drift down to whatever was convenient that week.
+        levels = set(m.get("levels") or [])
+        level = ex.get("level")
+        if not level:
+            problems.append(f"{where}: missing `level` (one of {sorted(levels)})")
+        elif level not in levels:
+            problems.append(
+                f"{where}: unknown level `{level}` (closed set: {sorted(levels)})"
+            )
+        overrides = ex.get("level_overrides") or {}
+        reasons = ex.get("level_reasons") or {}
+        for binding, lv in overrides.items():
+            if binding not in bindings:
+                problems.append(f"{where}: level override for unknown binding "
+                                f"`{binding}`")
+            if lv not in levels:
+                problems.append(f"{where}: unknown level `{lv}` for `{binding}`")
+        for binding, lv in sorted(overrides.items()):
+            if lv != "run" and not reasons.get(binding):
+                problems.append(
+                    f"{where}: `{binding}` is at level `{lv}`, below `run`, with "
+                    f"no `level_reasons.{binding}` — say why it is not executed"
+                )
+        if level and level != "run" and not ex.get("level_reason"):
+            problems.append(
+                f"{where}: level `{level}` is below `run` with no `level_reason`"
+            )
+        if level == "run" and not (ex.get("run") or {}).get("expect"):
+            problems.append(
+                f"{where}: level `run` needs a `run.expect` contract — executing "
+                f"without asserting output proves only that it did not crash"
+            )
+        if level != "run" and ex.get("run"):
+            problems.append(
+                f"{where}: level `{level}` but a `run` block is present — one of "
+                f"the two is wrong"
+            )
 
         files = ex.get("files") or {}
         absent = ex.get("absent") or {}
@@ -220,18 +272,98 @@ def report(m):
             print(f"    ✓ compiled, not executed here: {b} — {reason}")
 
 
+
+def self_test():
+    """Plant manifest defects and require each to be reported.
+
+    The evidence-level rules are new in this phase, and a rule nobody has watched
+    fail is not known to work. The last case is the control: the unmodified
+    manifest must validate, or six probes that all report problems prove nothing.
+    """
+    import copy
+    import tempfile
+
+    cases = [
+        ("a missing level", "missing `level`",
+         lambda m: m["examples"][0].pop("level")),
+        ("an unknown level", "unknown level",
+         lambda m: m["examples"][0].update(level="mostly-works")),
+        ("level run with no output contract", "needs a `run.expect` contract",
+         lambda m: m["examples"][0]["run"].pop("expect")),
+        ("a level below run with no reason", "with no `level_reason`",
+         lambda m: (m["examples"][0].update(level="compile"),
+                    m["examples"][0].pop("run"))),
+        ("a run block on a non-run level", "but a `run` block is present",
+         lambda m: m["examples"][0].update(level="compile")),
+        ("a per-binding override below run with no reason",
+         "with no `level_reasons.c`",
+         lambda m: m["examples"][0].update(level_overrides={"c": "link"})),
+        ("an override for an unknown binding", "unknown binding",
+         lambda m: m["examples"][0].update(level_overrides={"fortran": "compile"},
+                                          level_reasons={"fortran": "why not"})),
+    ]
+
+    print("==> Self-test — planting manifest defects")
+    failures = 0
+    base = load()
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, needle, mutate in cases:
+            m = copy.deepcopy(base)
+            mutate(m)
+            path = pathlib.Path(tmp) / "examples.yaml"
+            path.write_text(yaml.safe_dump(m, sort_keys=False))
+            proc = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), "--validate"],
+                capture_output=True, text=True, cwd=ROOT,
+                env={**os.environ, "EXAMPLES_MANIFEST": str(path)},
+            )
+            out = proc.stdout + proc.stderr
+            if proc.returncode != 0 and needle in out:
+                print(f"  \033[32m✓\033[0m reported {label}")
+            else:
+                print(f"  \033[31m✗\033[0m MISSED {label} "
+                      f"(rc={proc.returncode}, wanted {needle!r})")
+                failures += 1
+
+        path = pathlib.Path(tmp) / "examples.yaml"
+        path.write_text(yaml.safe_dump(base, sort_keys=False))
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--validate"],
+            capture_output=True, text=True, cwd=ROOT,
+            env={**os.environ, "EXAMPLES_MANIFEST": str(path)},
+        )
+        if proc.returncode == 0:
+            print("  \033[32m✓\033[0m the unmodified manifest validates")
+        else:
+            print("  \033[31m✗\033[0m the UNMODIFIED manifest fails — every "
+                  "result above proves nothing")
+            print(proc.stdout + proc.stderr)
+            failures += 1
+
+    print()
+    if failures:
+        print(f"{failures} self-test failure(s).")
+        return 1
+    print("The validator reports every planted defect.")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--run-spec", metavar="LANG",
                     help="tab-separated run contracts for LANG")
     args = ap.parse_args()
 
+    if args.self_test:
+        return self_test()
+
     try:
         m = load()
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, yaml.YAMLError) as e:
         print(f"cannot read {MANIFEST}: {e}")
         return 1
 

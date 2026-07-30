@@ -19,7 +19,7 @@ on:
       # example would not run the checks that execute it, and a hang could land
       # green. `skills.yml` fires on the same files for the compile floor.
       - ".claude/skills/net-event-bus/examples/**"
-      - ".github/skill-examples.json"
+      - "docs/data/examples.yaml"
       - ".github/scripts/run-skill-examples.sh"
       - ".github/scripts/skill_examples.py"
 

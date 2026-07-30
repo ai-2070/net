@@ -17,7 +17,7 @@ different answers to "does Go support this" and no way to tell which is current.
 | File | Is the record for | Consumed by |
 |---|---|---|
 | `capabilities/<domain>.yaml` | which binding supports which operation, and why not when it does not | the docs' support badges and absence states, each skill's `bindings/coverage.md`, later a public parity page |
-| `examples.yaml` | which examples exist, where their source lives, and what CI proves about each | the docs' transcluded snippets, `.github/skill-examples.json`, `run-skill-examples.sh` |
+| `examples.yaml` | which examples exist, where their source lives, and what CI proves about each | the docs' transcluded snippets, `check-skill-examples.sh`, `run-skill-examples.sh` |
 | `tiers.yaml` | every docs page's migration state, plus the `adaptive_pending` allowlist | the polyglot-lens checkers, the information-model table in the plan |
 
 **Example source does not live here.** Only the index does. Runnable examples stay
