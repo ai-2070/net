@@ -622,6 +622,14 @@ const mdxComponents = {
     className?: string;
   }) => {
     const inFigure = typeof props["data-language"] === "string";
+    // THREE VALUES HERE DECIDE HOW WIDE A CODE LINE MAY BE, and a checker
+    // depends on them: `text-[12.5px]` and `font-mono` give 7.5px per character,
+    // and `px-4` against the 740px reading column leaves a 706px box — so 94
+    // characters fit and `.github/scripts/check-doc-code-width.py` enforces 90.
+    //
+    // Change the type scale or the column and that limit goes stale silently:
+    // the checker keeps passing while lines start running off the edge again, or
+    // starts failing lines that now fit. Re-measure and update MAX_WIDTH there.
     if (inFigure) {
       return (
         <pre

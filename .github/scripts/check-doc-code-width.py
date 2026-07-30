@@ -34,6 +34,24 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DOCS = os.environ.get("DOCS_CONTENT_DIR", "web/src/content/docs")
 
 # 94 characters fit; 90 leaves margin. See the module docstring.
+#
+# DERIVED FROM CSS, so it can go stale. The three values that produce it are the
+# `text-[12.5px]`, `font-mono` and `px-4` on the `pre` in
+# `web/src/components/DocsContent.tsx`, against the `max-w-[740px]` reading
+# column. That site carries the same note pointing back here. Re-measure in a
+# browser after changing either:
+#
+#   const pre = document.querySelector('pre[data-language]');
+#   const cs = getComputedStyle(pre);
+#   const probe = document.createElement('span');
+#   probe.style.cssText =
+#     `position:absolute;visibility:hidden;white-space:pre;font:${cs.font}`;
+#   probe.textContent = 'M'.repeat(100);
+#   pre.appendChild(probe);
+#   const ch = probe.getBoundingClientRect().width / 100;
+#   probe.remove();
+#   Math.floor((pre.clientWidth - parseFloat(cs.paddingLeft)
+#               - parseFloat(cs.paddingRight)) / ch);   // -> 94
 MAX_WIDTH = int(os.environ.get("DOC_CODE_MAX_WIDTH", "90"))
 
 # `text` fences are diagrams, not code. They are box-drawing art whose width is
