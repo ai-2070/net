@@ -40,7 +40,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     sys.exit("PyYAML is required: python3 -m pip install pyyaml")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from docs_pages import DEFAULT_DOCS, page_slugs  # noqa: E402  (after sys.path)
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DOCS = os.environ.get("DOCS_CONTENT_DIR", DEFAULT_DOCS)
 RECORDS = os.environ.get("CAPABILITY_RECORDS", "docs/data/capabilities")
 SKILLS = os.environ.get("SKILLS_DIR", ".claude/skills")
 
@@ -249,6 +253,7 @@ def tracked_blobs() -> tuple[dict[str, str], set[str]]:
 def check() -> int:
     fail = 0
     blobs, tracked = tracked_blobs()
+    pages = page_slugs(os.path.join(ROOT, DOCS))
 
     for domain, skill in sorted(DOMAIN_SKILL.items()):
         record = load_record(domain)
@@ -315,7 +320,44 @@ def check() -> int:
             print(f"  {GREEN}✓{OFF} {resolved}/{anchored} positive-cell anchors "
                   f"resolve")
 
-        # 3. the generated copy matches what is committed
+        # 3. absence links resolve. D5 renders the generated absence state from
+        #    `alternative.href`, which makes a docs link live inside a data file —
+        #    the one place a broken link could hide from `check-doc-links.mjs`,
+        #    which only reads markdown. Validated here rather than there because
+        #    the record checker already owns record validation and the site has no
+        #    YAML parser; `docs_pages.page_slugs` is shared so the two checkers
+        #    cannot disagree about what a page is.
+        hrefs = 0
+        for op in record["operations"]:
+            for binding, b in op["bindings"].items():
+                alt = b.get("alternative") or {}
+                href = alt.get("href")
+                if not href:
+                    continue
+                hrefs += 1
+                if href.startswith(("http://", "https://")):
+                    continue  # external; a link checker does not fetch
+                target = href.split("#")[0].rstrip("/")
+                if not target.startswith("/docs"):
+                    print(f"  {RED}✗{OFF} {op['operation']} / {binding}: "
+                          f"alternative.href must be a /docs path or an absolute "
+                          f"URL: {href}")
+                    fail += 1
+                    continue
+                slug = target[len("/docs"):].strip("/") or "index"
+                if slug not in pages:
+                    print(f"  {RED}✗{OFF} {op['operation']} / {binding}: "
+                          f"alternative.href points at a page that does not "
+                          f"exist: {href}")
+                    fail += 1
+        if hrefs:
+            print(f"  {GREEN}✓{OFF} {hrefs} absence link(s) resolve "
+                  f"{DIM}(the page, not the #fragment){OFF}")
+        else:
+            print(f"  {DIM}    no absence links yet — `alternative` is unpopulated "
+                  f"until D5 renders it{OFF}")
+
+        # 4. the generated copy matches what is committed
         md_path = os.path.join(ROOT, SKILLS, skill, "bindings", "coverage.md")
         current = open(md_path, encoding="utf-8").read()
         status_tbl, anchor_tbl = render(record)
@@ -383,6 +425,14 @@ def self_test() -> int:
              status="not exposed", anchor="emit")),
         ("a record the skill copy no longer matches", "has drifted",
          lambda r: r["operations"][0].update(operation="Renamed operation")),
+        ("an absence link to a page that does not exist",
+         "points at a page that does not exist",
+         lambda r: r["operations"][8]["bindings"]["Go"].update(
+             alternative={"label": "Use something else",
+                          "href": "/docs/sdk/go/no-such-page"})),
+        ("an absence link that is not a /docs path", "must be a /docs path",
+         lambda r: r["operations"][8]["bindings"]["Go"].update(
+             alternative={"label": "Elsewhere", "href": "sdk/go/watch"})),
     ]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:

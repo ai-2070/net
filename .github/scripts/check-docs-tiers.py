@@ -40,6 +40,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - environment problem, not a defect
     sys.exit("PyYAML is required: python3 -m pip install pyyaml")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from docs_pages import page_slugs  # noqa: E402  (after sys.path fix-up)
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DOCS = os.environ.get("DOCS_CONTENT_DIR", "web/src/content/docs")
 TIERS = os.environ.get("TIERS_FILE", "docs/data/tiers.yaml")
@@ -53,35 +56,6 @@ STATES = {
 }
 
 RED, GREEN, DIM, OFF = "\033[31m", "\033[32m", "\033[2m", "\033[0m"
-
-
-def page_slugs(docs_dir: str) -> set[str]:
-    """Every page, as the slug its URL uses.
-
-    A folder README renders at the folder's URL (`start/README.md` is served at
-    `/docs/start`), so it is keyed by the folder — matching `lib/docs.ts` rather
-    than the filesystem.
-    """
-    out = set()
-    for dirpath, _dirs, files in os.walk(docs_dir):
-        rel_dir = os.path.relpath(dirpath, docs_dir)
-        # Skip dot directories (`.next` lives under the content tree). Tested per
-        # path COMPONENT, not as a substring: `os.sep + "." in dirpath` also
-        # matches the `/..` in a relative path, which silently pruned the entire
-        # walk when the content dir was reached relatively — found by the
-        # self-test below, which reported every page as missing.
-        if any(part.startswith(".") and part not in (".", "..")
-               for part in rel_dir.split(os.sep)):
-            continue
-        for name in files:
-            if not name.endswith(".md"):
-                continue
-            rel = os.path.relpath(os.path.join(dirpath, name), docs_dir)
-            parts = rel[:-3].split(os.sep)
-            if parts[-1] == "README":
-                parts = parts[:-1]
-            out.add("/".join(parts) or "index")
-    return out
 
 
 def run() -> int:
