@@ -47,6 +47,12 @@ npx skills update -g
 
 Restart Claude Code and run `/skills` Source: [ai-2070/net-claude-skill](https://github.com/ai-2070/net-claude-skill). Full install options in [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
+Pair them with [`opensrc`](https://github.com/vercel-labs/opensrc) so the agent can read Net's real source instead of guessing a signature — one fetch covers all five bindings:
+
+```bash
+npx -y opensrc@latest path ai-2070/net
+```
+
 ## Contents
 
 - [Install](#install)

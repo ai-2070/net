@@ -94,6 +94,40 @@ Skills load automatically when a request matches. To see one fire, ask for somet
 
 `net-event-bus` triggers on imports of `@net-mesh/sdk` or `net-sdk` and on phrases like *pub/sub with Net*, *nRPC*, *mesh RPC*, *RedEX*, *CortEX*, *Dataforts*, *gang scheduler*, *net-mesh wrap*, *serve_org*. `net-payments` triggers on `net-payments` / `net_payments` imports and on *price a capability*, *pay to invoke*, *x402*, *settle on Base/Solana/XRPL*, *spend limit*.
 
+## Give the agent the source too
+
+The skills carry the mental model, the per-binding surface, and runnable examples. What they can't carry is all of Net — a few thousand lines of guidance over a protocol implementation of several hundred thousand. So when the question turns to *mechanism*, the agent either has the source or it guesses:
+
+- an exact signature, a serialized field name, whether an enum has that variant;
+- how something actually works — the drain path, framing, how verification escalates through its tiers;
+- why observed behaviour differs from what you expected;
+- whether a symbol exists in the binding you're writing, or in any binding at all;
+- anything the skills don't cover, which for a protocol this size is most of it.
+
+Net is Apache/MIT-licensed and readable end to end. Reading it beats inferring from type signatures — which is the whole premise of the tool below.
+
+[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
+
+```bash
+npx -y opensrc@latest path ai-2070/net
+```
+
+That prints an absolute path to a cached checkout — about 46 MB, fetched once, returned instantly after that. **One fetch covers all five bindings.** opensrc resolves registry metadata to the repository rather than unpacking the published tarball, so `crates:net-mesh-sdk`, `@net-mesh/sdk` and `pypi:net-mesh-sdk` all land on the same directory, and Go and C come along with it. That's also why you get real TypeScript source: the npm package publishes only its built `dist`, while the checkout has `sdk-ts/src/`.
+
+You don't need to teach the agent how to use it. Each skill ships a `source-access.md` covering when to reach for source (and when not to — the model comes from the skill, the mechanism from the tree), which tests to read first, how to root the paths the skill cites, and three things the checkout won't have:
+
+- **Anything newer than the last release.** The checkout is the published tag, not `master`.
+- **`bindings/node/index.d.ts`**, which is napi-generated and gitignored. The declaration site is the `#[napi]` attributes in `bindings/node/src/*.rs`.
+- **`net-payments` on crates.io** — `opensrc path crates:net-payments` fails with *not found*. The crate is unpublished and lives in the repo; the Python and Node payment surfaces ship inside the core binding packages. That error is not a missing feature.
+
+If you'd rather not add a tool, a shallow clone is equivalent:
+
+```bash
+git clone --depth 1 https://github.com/ai-2070/net /tmp/net
+```
+
+Every source path the skills cite is resolved against the repository in CI, so a citation that goes stale fails the build rather than sending an agent to a file that moved.
+
 ## Updating and removing
 
 `npx skills update -g` updates to the latest version, as above. To uninstall:
