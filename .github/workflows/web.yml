@@ -16,6 +16,7 @@ on:
       # green skills publish.
       - "docs/data/**"
       - ".github/scripts/check-docs-tiers.py"
+      - ".github/scripts/check-spine-symbols.py"
   pull_request:
     paths:
       - "web/**"
@@ -26,6 +27,7 @@ on:
       # green skills publish.
       - "docs/data/**"
       - ".github/scripts/check-docs-tiers.py"
+      - ".github/scripts/check-spine-symbols.py"
 
 jobs:
   check:
@@ -77,6 +79,22 @@ jobs:
       - name: Check the tier checker still catches defects
         working-directory: .
         run: .github/scripts/check-docs-tiers.py --self-test
+
+      # Every API symbol the composed SDK spine names resolves in its binding's
+      # own tree, and appears on the page that claims it. Evidence level
+      # source-match: the name exists — NOT that the example compiles or runs.
+      #
+      # It exists because reading a page cannot catch this class of defect. The
+      # spine shipped `serve_tool(node, …)` in two bindings where the argument is
+      # an RPC handle, and a Rust deadline builder that was never written. Both
+      # read correctly. Both were found by opening the source.
+      - name: Check every symbol the SDK spine names exists
+        working-directory: .
+        run: .github/scripts/check-spine-symbols.py
+
+      - name: Check the spine-symbol checker still catches defects
+        working-directory: .
+        run: .github/scripts/check-spine-symbols.py --self-test
 
       # No lint or format step, and both omissions are deliberate:
       #
