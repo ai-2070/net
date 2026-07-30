@@ -194,7 +194,11 @@ function AbsenceNotice({ lens }: { lens: Lens }) {
 }
 
 /** The C segment. A generated projection, never an authored fragment. */
-function BoundaryNotice() {
+function BoundaryNotice({
+  boundary,
+}: {
+  boundary?: { href: string; label: string };
+}) {
   return (
     <div className="border border-line border-l-2 border-l-cyan bg-cyan/[0.03] px-5 py-4 my-6">
       <div className="font-mono text-[10px] tracking-[0.18em] uppercase text-cyan mb-2">
@@ -207,10 +211,10 @@ function BoundaryNotice() {
         this page has no C rendition and will not grow one.
       </p>
       <Link
-        href="/docs/sdk/c"
+        href={boundary?.href ?? "/docs/sdk/c"}
         className="font-mono text-[12px] text-accent hover:underline"
       >
-        → The C ABI section
+        → {boundary?.label ?? "The C ABI section"}
       </Link>
       {/* Per-operation support status belongs here, generated from
           docs/data/capabilities/*.yaml. It is not wired yet: the site has no YAML
@@ -515,7 +519,9 @@ export default async function DocPage({ params }: PageProps) {
             format="md"
             baseDir={folder.slug}
           />
-          {resolved.kind === "boundary" ? <BoundaryNotice /> : null}
+          {resolved.kind === "boundary" ? (
+            <BoundaryNotice boundary={page.boundary} />
+          ) : null}
           {lens !== undefined && !composed.hasFragment ? (
             <AbsenceNotice lens={lens} />
           ) : null}

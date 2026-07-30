@@ -1,6 +1,8 @@
 ---
 title: Redis Streams Deduplication
-description: Why the Redis adapter can write an entry twice, how the persistent producer nonce closes the restart hole, and the consumer-side dedup helper in all five languages.
+description: Why the Redis adapter can write an entry twice, how the persistent producer nonce closes the restart hole, and the consumer-side dedup helper in every binding.
+boundary: /docs/sdk/c/memory-and-threading#dedup-handles
+boundaryLabel: "Dedup handles in C — memory and threading"
 ---
 
 # Redis Streams Deduplication
@@ -62,98 +64,6 @@ dedup window: a consumer at ~10k events/sec wanting a one-minute window picks
 Use **one helper per consumer thread** — the helpers are not shared-thread-safe
 — and call `clear()` after a consumer-group rebalance to reset the window
 without discarding the instance.
-
-### Rust
-
-```rust
-use net_sdk::RedisStreamDedup;
-
-let mut dedup = RedisStreamDedup::with_capacity(600_000);
-
-for entry in stream {
-    let id = entry.fields["dedup_id"].as_str();
-    if !dedup.is_duplicate(id) {
-        process(entry);
-    }
-}
-```
-
-`with_capacity(n)`, `new()` (default capacity), `is_duplicate(&str) -> bool`
-(test-and-insert), `len()`, `capacity()`, `is_empty()`, `clear()`. Re-exported
-as `net_sdk::RedisStreamDedup`; the canonical implementation is
-`net::adapter::RedisStreamDedup`.
-
-### TypeScript
-
-```typescript
-import { RedisStreamDedup } from '@net-mesh/sdk';
-
-const dedup = new RedisStreamDedup(600_000);
-
-for (const entry of entries) {
-  const dedupId = entry.fields.dedup_id;
-  if (dedupId && dedup.isDuplicate(dedupId)) continue;
-  process(entry);
-}
-```
-
-`new RedisStreamDedup(capacity?)` — omitted defaults to 4096, `0` is clamped
-to 1. Then `isDuplicate(dedupId): boolean`, and the getters `len`, `capacity`,
-`isEmpty`, plus `clear()`.
-
-### Python
-
-The helper lives on the underlying `net` PyO3 module. `net_sdk`'s `NetNode`
-wrapper does not re-export it, so import it directly:
-
-```python
-from net import RedisStreamDedup
-
-dedup = RedisStreamDedup(capacity=600_000)
-
-for entry_id, fields in r.xrange("net:shard:0", "0", "+"):
-    if not dedup.is_duplicate(fields[b"dedup_id"].decode()):
-        process(entry_id, fields)
-```
-
-`RedisStreamDedup(capacity=None)`, `is_duplicate(dedup_id) -> bool`, `len()`,
-`capacity()`. The hot path releases the GIL.
-
-### Go
-
-```go
-d := net.NewRedisStreamDedup(600_000)
-defer d.Close()
-
-for _, entry := range entries {
-    if d.IsDuplicate(entry["dedup_id"]) {
-        continue
-    }
-    process(entry)
-}
-```
-
-`NewRedisStreamDedup(capacity uint)` — `0` selects the default. Then
-`IsDuplicate(string) bool`, `IsDuplicateChecked(string) (bool, error)` (which
-reports a closed handle or an embedded NUL rather than swallowing it), `Len()`,
-`Capacity()`, `IsEmpty()`, `Clear()`, and `Close()`. A finalizer calls `Close`,
-but close it explicitly.
-
-### C
-
-```c
-net_redis_dedup_t *dedup = net_redis_dedup_new(600000);   /* 0 → default 4096 */
-
-if (net_redis_dedup_is_duplicate(dedup, dedup_id) != 1) {
-    process(entry);
-}
-
-net_redis_dedup_free(dedup);
-```
-
-`net_redis_dedup_new(size_t capacity)` never returns NULL. `is_duplicate`
-returns `1` for a duplicate the caller should skip, `0` for first sight. Also
-`net_redis_dedup_len`, `net_redis_dedup_capacity`, and `net_redis_dedup_free`.
 
 ## What this does not cover
 

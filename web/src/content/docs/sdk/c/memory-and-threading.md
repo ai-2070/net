@@ -53,6 +53,32 @@ this loop on an interval.
 `count` / `has_more`, so a second call is a no-op and `NULL` is a no-op. If you
 wrote defensive field-nulling around it, you can drop it.
 
+## Dedup handles
+
+The Redis consumer-side dedup helper is a handle you allocate and free, which is
+why it is documented here rather than beside the other bindings' versions: in C it
+is an ownership question, not a capability question. What duplicates are and why
+they occur is in
+[Redis Streams Deduplication](/docs/reference/redis-dedup).
+
+```c
+net_redis_dedup_t *dedup = net_redis_dedup_new(600000);   /* 0 → default 4096 */
+
+if (net_redis_dedup_is_duplicate(dedup, dedup_id) != 1) {
+    process(entry);
+}
+
+net_redis_dedup_free(dedup);
+```
+
+`net_redis_dedup_new(size_t capacity)` never returns NULL. `is_duplicate`
+returns `1` for a duplicate the caller should skip, `0` for first sight. Also
+`net_redis_dedup_len`, `net_redis_dedup_capacity`, and `net_redis_dedup_free`.
+
+It follows the three rules above: you own the handle, `free` exactly once, and do
+not touch it afterwards. It is not internally synchronised — one handle per
+consumer thread, or your own lock around it.
+
 ## Threading
 
 All functions are thread-safe, and handles can be shared across threads.

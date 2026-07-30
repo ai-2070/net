@@ -175,6 +175,8 @@ export type DocFolder = {
  * anywhere proving the copies match: there are no copies. */
 export type AdaptivePage = {
   shared: DocFile;
+  /** From the universal body's frontmatter — see `DocFrontmatter.boundary`. */
+  boundary?: { href: string; label: string };
   /** Present lenses only. A lens with nothing to teach has no fragment, and the
    *  route renders the honest absence state rather than a Rust fallback. */
   fragments: Partial<Record<Lens, DocFile>>;
@@ -251,6 +253,19 @@ function isReadme(name: string): boolean {
 export type DocFrontmatter = {
   title?: string;
   description?: string;
+  /** Where an adaptive page's C content lives in the boundary annex.
+   *
+   *  C never gets an authored fragment — it is a boundary surface documented by
+   *  boundary concern, not by capability. But a page whose C material moved into
+   *  the annex should send the reader to the RIGHT annex page rather than to the
+   *  section index, and only the page knows where that is.
+   *
+   *  This is the seam the capability record fills later: D5 renders the absence
+   *  state from `alternative.href`, and the site cannot read YAML yet. Until then
+   *  the page declares it.
+   */
+  boundary?: string;
+  boundaryLabel?: string;
 };
 
 const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
@@ -267,7 +282,14 @@ function parseFrontmatter(source: string): {
     const at = line.indexOf(":");
     if (at < 0) continue;
     const key = line.slice(0, at).trim();
-    if (key !== "title" && key !== "description") continue;
+    if (
+      key !== "title" &&
+      key !== "description" &&
+      key !== "boundary" &&
+      key !== "boundaryLabel"
+    ) {
+      continue;
+    }
     let value = line.slice(at + 1).trim();
     // Strip one layer of matching quotes; a description with a colon in it
     // has to be quoted, and we shouldn't hand the quotes to the renderer.
@@ -338,7 +360,14 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
       );
       if (match) fragments[lens] = match;
     }
-    adaptive = { shared, fragments };
+    const fm = sharedFm(shared);
+    adaptive = {
+      shared,
+      fragments,
+      boundary: fm?.boundary
+        ? { href: fm.boundary, label: fm.boundaryLabel ?? "the C ABI section" }
+        : undefined,
+    };
     // The page is one sidebar entry, not five. Its parts are reached through
     // `adaptive`, so drop them from `children` — otherwise every adaptive page
     // would expand into `_shared`, `rust`, `typescript`, `python`, `go` in the
