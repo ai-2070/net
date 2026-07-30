@@ -1,6 +1,8 @@
 # Documentation — The Polyglot Lens
 
-**Status:** REVISED ×3 (2026-07-30). Kyra reviewed the 2026-07-29 draft, then
+**Status:** REVISED ×3 (2026-07-30). **Phases 1A, 2 and 3 are EXECUTED** — see
+*Execution log* below for what landed and the two findings that change Phase 5's
+cost model. Kyra reviewed the 2026-07-29 draft, then
 reviewed the revision and **signed Phase 1A and Phase 2 for execution** subject to
 seven corrections. A third pass cleared six stale contradictions and decided D8.
 All applied below. **Phase 1A and Phase 2 are signed; Phase 3 is specified; Phase 4
@@ -98,6 +100,76 @@ universal. The rules are given; overrule them and the manifest moves the pages.
 **D8 decided: compose the existing SDK spine in place**, and keep it classified
 `sdk_native` — composition is a storage mechanism, `sdk_native` is an IA
 classification, and they do not collapse into one concept.
+
+---
+
+## Execution log
+
+**Phase 1A** — reading surface. Code blocks scroll instead of wrapping (at 375px a
+53-char ASCII diagram line needed ~400px in a ~311px column, so every diagram
+wrapped mid-box). Language selector is persistent chrome at every breakpoint. Found
+en route: the sidebar footer hardcoded `v0.17` on all 149 pages while the newest
+release note was v0.33 — now derived.
+
+**Phase 2** — `docs/data/` established as public product metadata, holding three
+records with generated, equality-checked derivatives: `capabilities/*.yaml` (145
+cells, 119/119 anchors resolving, skill copies byte-matching),
+`examples.yaml` (evidence levels declared and enforced), `tiers.yaml` (149/149
+pages, exhaustive and disjoint, allowlist ratchet). `check-skill-coverage.py`
+retired — two of its structural assertions became impossible to violate rather than
+unchecked. Found en route: the payments matrix told Rust callers to install
+`net-mesh-payments`, which does not exist on crates.io under that name or its own.
+
+**Phase 3** — composition, per-language routing, the three live defects fixed, and
+concepts measured clean (five Rust-idiom hits → zero). `assertNoCrossLanguageNeighbours()`
+runs inside `generateStaticParams`, so every build proves prev/next never crosses a
+language boundary; verified non-vacuous by regressing the `sdk/go` gate and watching
+the build fail with 32 named cases.
+
+Found en route, in the page the plan chose as its tracer: `start/install` shipped a
+version pin for an unpublished release, `EventBus` as the Node and Python entry
+point when the export is `Net`, and three C symbols (`net_bus_new`,
+`net_bus_ingest`, `net_bus_shutdown`) that exist in no header. Wrong
+install-and-first-call code in three of five languages, on the first page a
+self-serve reader opens.
+
+### Two findings that change the cost model
+
+**1. The universal share varies enormously by page type.** Measured on the two
+converted pages, non-blank lines:
+
+| Page | Universal | Fragments | Authored | 4 standalone copies would be | Universal share |
+|---|---|---|---|---|---|
+| `start/install` | 51 | 223 | 274 | ~504 | **19%** |
+| `reference/redis-dedup` | 55 | 56 | 111 | ~284 | **50%** |
+
+Composition saves roughly `(lenses − 1) × universal`. So the saving is a function of
+how much of a page is genuinely language-specific — and **installing is almost
+entirely a per-language act**, which makes `start/install` close to the worst case.
+The tracer therefore under-sells the model rather than flattering it; a broader
+sample should land higher than 19%. Phase 4 should report this table per page rather
+than a single average.
+
+**2. A page carrying real C content costs more than its line count.** The tracer
+converted cleanly only because its C material was already covered by `sdk/c`.
+`redis-dedup`'s C section was 22 live lines — allocation, `never returns NULL`,
+return codes, `free` — and since C gets no authored fragment by design, converting
+would have deleted it. **Every conversion of a page with real C content needs an
+annex home first.** Phase 5's demand ordering should weight that in: two pages of
+equal length are not equal work if one of them has a C section.
+
+Here the annex was already the right shape — a handle you allocate and free is an
+ownership question, so it belongs beside the three memory rules in
+`sdk/c/memory-and-threading` — which is the annex's organising principle working
+rather than being worked around.
+
+### One seam to remove later
+
+The boundary route needs to point at a specific annex page, not the section index.
+Until the capability record can be read by the site, the universal body declares its
+target in frontmatter (`boundary` / `boundaryLabel`). D5 replaces this with
+`alternative.href` from the record once a generated, equality-checked JSON bridge
+exists; the code says so at the seam.
 
 ---
 
@@ -926,9 +998,13 @@ are `core-only` in Node and Python.
 
 #### The publishing measurement
 
-- authored lines, universal vs per-fragment — the ratio the scope arithmetic needs;
+- authored lines, universal vs per-fragment, **per page rather than averaged** —
+  the two conversions so far came out at 19% and 50% universal, so a single mean
+  would hide the thing that predicts cost;
 - authoring effort per fragment;
 - how much content turned out to be genuinely language-specific;
+- **annex work required**: pages carrying real C content need a home in the C annex
+  before they can be converted at all;
 - binding gaps hit that the record did not predict;
 - maintenance burden: what one API change costs across four fragments.
 
