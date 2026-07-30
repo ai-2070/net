@@ -1,0 +1,67 @@
+---
+title: Invoke
+description: Discovery tells you who can; invoking does the work and returns a typed result — and it is the point where authority is actually checked.
+capability: nRPC — typed request/response + streaming
+boundary: /docs/sdk/c/headers-and-linking
+boundaryLabel: C — nRPC in net_rpc.h
+---
+# Invoke a Capability
+
+Discovery tells you who *can*. Invoking does the work and hands back a typed
+result. It is also the one place on this spine where authority is checked, which
+makes it the most important page of the seven.
+
+## Two ways to address a call
+
+**By node id.** You pin a specific provider. Deterministic, and useless the moment
+that node dies.
+
+**By service or tool name.** The mesh picks a provider that advertises it. This is
+the basis of failover: a substitutable capability keeps working when the primary
+goes away, without your code learning a new address.
+
+Prefer name-addressed calls unless you have a reason to pin. The reason is usually
+state — a provider holding a session you already started.
+
+## The tool call and the RPC call are the same call
+
+`call_tool` and its equivalents are sugar over nRPC. A tool call is a
+name-addressed, JSON-coded nRPC request whose service name is the tool id. When you
+want request/response without the tool abstraction — your own service name, your
+own codec — use nRPC directly. Nothing is lost by dropping down and nothing extra
+is gained by staying up.
+
+Both paths carry deadlines. Both surface the same typed failures.
+
+## Deadlines are a caller-side promise about waiting, not a cancel
+
+A deadline bounds how long *you* wait. When it elapses the caller does emit a
+cancel for that call id, so a cooperating provider can drop the in-flight handler —
+but "can drop" is not "did not run." When a deadline elapses you learn that no
+answer arrived in time. You do not learn whether the work happened.
+
+That distinction is the whole of **ambiguous execution**, and it is the reason a
+retry is not free: retrying a call whose deadline elapsed may run the work a second
+time. Make the operation idempotent, or carry an idempotency key, or accept the
+duplicate. This is not a Net peculiarity; it is what a network deadline means
+everywhere, stated here because the typed API makes it easy to forget.
+
+## Policy: invocation is authorized, discovery is not
+
+Seeing a capability does not grant the right to invoke it.
+
+The provider enforces scope **at call time**, against the authenticated caller
+origin. An owner-only capability refuses a caller outside its scope regardless of
+who can see it in the fold. A grant that has expired or been revoked stops working
+at the next call, not at the next announcement — there is no cached permission to
+go stale.
+
+What a caller gets back is a **typed denial**, not a silence and not a generic
+error: a distinct failure that says the authority check refused, so your code can
+tell "you may not" apart from "nobody answered." The four bindings name it
+differently; [Errors](/docs/sdk/errors) has each one and demonstrates the refusal.
+
+For wrapped MCP tools this is the owner-scope and consent model in
+[Wrap an MCP Server](/docs/guides/wrap-mcp-server) and
+[Expose Net as MCP](/docs/guides/expose-net-as-mcp). Deadlines, cancellation and
+streaming in depth are in [Typed RPC with nRPC](/docs/guides/nrpc).

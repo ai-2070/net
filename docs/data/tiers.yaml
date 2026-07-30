@@ -21,7 +21,7 @@
 #   - Rust-native reference pages                -> sdk_native (nav owner only;
 #     D7 keeps their physical path and canonical URL unchanged)
 #
-# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=34 universal=80, total=149
+# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=13 universal=80, total=128
 #
 # Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
 
@@ -138,38 +138,24 @@ pages:
   reference/subprotocol-ids: universal
   reference/versioning: universal
   reference/wire-format: universal
+  # The composed spine. Seven pages, each one universal body plus four
+  # fragments, served at the URLs they always had (`/docs/sdk/python/announce`).
+  # They stay `sdk_native` because composition is a storage and authoring
+  # mechanism while `sdk_native` is an information-architecture classification —
+  # a composed spine page is still SDK reference, it has simply stopped being
+  # written out four times. See D8.
+  sdk/announce: sdk_native
+  sdk/artifacts: sdk_native
+  sdk/discover: sdk_native
+  sdk/errors: sdk_native
+  sdk/invoke: sdk_native
+  sdk/quickstart: sdk_native
+  sdk/watch: sdk_native
+  # The lens sections keep their READMEs — nav owners for the composed pages.
   sdk/rust: sdk_native
-  sdk/rust/announce: sdk_native
-  sdk/rust/artifacts: sdk_native
-  sdk/rust/discover: sdk_native
-  sdk/rust/errors: sdk_native
-  sdk/rust/invoke: sdk_native
-  sdk/rust/quickstart: sdk_native
-  sdk/rust/watch: sdk_native
   sdk/typescript: sdk_native
-  sdk/typescript/announce: sdk_native
-  sdk/typescript/artifacts: sdk_native
-  sdk/typescript/discover: sdk_native
-  sdk/typescript/errors: sdk_native
-  sdk/typescript/invoke: sdk_native
-  sdk/typescript/quickstart: sdk_native
-  sdk/typescript/watch: sdk_native
   sdk/python: sdk_native
-  sdk/python/announce: sdk_native
-  sdk/python/artifacts: sdk_native
-  sdk/python/discover: sdk_native
-  sdk/python/errors: sdk_native
-  sdk/python/invoke: sdk_native
-  sdk/python/quickstart: sdk_native
-  sdk/python/watch: sdk_native
   sdk/go: sdk_native
-  sdk/go/announce: sdk_native
-  sdk/go/artifacts: sdk_native
-  sdk/go/discover: sdk_native
-  sdk/go/errors: sdk_native
-  sdk/go/invoke: sdk_native
-  sdk/go/quickstart: sdk_native
-  sdk/go/watch: sdk_native
   sdk/c: boundary_native
   sdk/c/errors: boundary_native
   sdk/c/headers-and-linking: boundary_native
