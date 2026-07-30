@@ -1,12 +1,21 @@
 # Reading the payments source
 
-Every chapter in this skill cites source paths — `core/quote.rs`,
+Two reasons to be here.
+
+**A citation.** Every chapter cites source paths — `core/quote.rs`,
 `x402/schemes/exact_evm.rs`, `net/crates/net/bindings/node/src/payment_provider.rs`.
 Those citations are the evidence behind the claims, and they are only useful if
 you can open them.
 
-**If you are working inside the Net repository**, they are repo-relative (see the
-root table below). Read and grep them directly; skip to *Line anchors*.
+**A question this skill does not answer.** When the question is *mechanism* rather
+than model — the exact bytes a signed object serializes to, how verification
+escalates through its tiers, what a facilitator actually receives, whether a
+surface exists in the binding being written — the answer is in the crate, and
+often in its tests or its golden vectors.
+
+Either way: **if you are working inside the Net repository**, paths are
+repo-relative (see the root table below). Read and grep them directly; skip to
+*Line anchors*.
 
 **If you are not** — the normal case, because this skill's job is helping someone
 charge for a capability in their own application — the source is not on your
@@ -109,17 +118,35 @@ the text says.
 So **navigate by the symbol, confirm with the line number.** If they disagree,
 the symbol is right and the anchor has drifted.
 
+## Start with the tests and the vectors
+
+25 test files sit under `net/crates/net/payments/tests/` — signing, scheme flows,
+checker verification, reorg, adversarial cases — and they are the most direct
+statement of behaviour in the crate: a test asserts what happens, where a comment
+only claims it.
+
+For anything about the *wire*, go one better and read the fixtures:
+`net/crates/net/tests/cross_lang_payments/fixtures/x402/v2.0/` holds the golden
+JSON every binding is checked against. When a struct definition and your mental
+model of the wire format disagree, the fixture is the arbiter — it is what a real
+facilitator sees.
+
 ## What the source does and does not settle
 
-Reach for it to resolve a *specific factual question*: an exact signature, a
-serialized field name, an enum's variants, whether a symbol exists in the binding
-the user is actually writing.
+**It settles mechanism and fact:** an exact signature, a serialized field name, an
+enum's variants, the order in which verification escalates, whether a symbol
+exists in the binding the user is actually writing.
 
-Do not reach for it instead of this skill. The source will not tell you that a
-quote is a commercial fact rather than a movement of money, that verification is
-tiered and `observed` is not `final`, or that keys never cross the signer
-boundary. That is what `concepts.md`, `verification.md` and `signer.md` are for,
-and a signature read correctly out of that context still produces wrong code.
+**It does not settle judgement.** The source will not tell you that a quote is a
+commercial fact rather than a movement of money, that verification is tiered and
+`observed` is not `final`, that keys never cross the signer boundary, or that a
+payments feature is out of scope by design. That is what `concepts.md`,
+`verification.md`, `signer.md` and `gotchas.md` are for — and a signature read
+correctly, out of that context, still produces a rejected PR.
+
+So: model first, source second. Reading the implementation to *explain* behaviour
+is right; reading it to decide what to build is how a non-custodial system
+acquires a feature that custodies funds.
 
 Two specific traps:
 

@@ -1,11 +1,21 @@
 # Reading Net's real source
 
-Every chapter in this skill cites source paths — `net/crates/net/sdk/src/mesh.rs`,
-`x402/mod.rs`, `bindings/python/src/lib.rs:1402`. Those citations are the evidence
-behind the claims, and they are only useful if you can open them.
+Two reasons to be here.
 
-**If you are working inside the Net repository**, they are repo-relative. Read and
-grep them directly; skip the rest of this page.
+**A citation.** Every chapter cites source paths — `net/crates/net/sdk/src/mesh.rs`,
+`bindings/python/src/lib.rs:1402`. Those citations are the evidence behind the
+claims, and they are only useful if you can open them.
+
+**A question this skill does not answer.** These chapters are a few thousand lines
+about a protocol implementation of several hundred thousand. When the question is
+*mechanism* rather than model — how framing or the drain path actually works, why
+a subscriber saw nothing, what a struct really serializes to, whether a symbol
+exists in the binding being written, what a surface this skill never mentions does
+— the answer is in the tree, and often in its tests.
+
+Either way: **if you are working inside the Net repository**, paths are
+repo-relative. Read and grep them directly; skip to *Rooting a shorthand
+citation*.
 
 **If you are not** — the normal case, because this skill's job is helping someone
 build an *application* against Net — the source is not on your disk. Fetch it:
@@ -113,17 +123,38 @@ line still holds what the text says.
 So **navigate by the symbol, confirm with the line number.** If they disagree,
 the symbol is right and the anchor has drifted.
 
+## Start with the tests
+
+129 integration tests live under `net/crates/net/tests/`, and they are the most
+direct statement of behaviour in the repository — a test asserts what happens,
+where a comment only claims it. When behaviour surprises you, look for the test
+covering it before reading the implementation.
+
+This is not a general preference; it is how the sharpest correction in this skill
+was found. `hello.rs` and `hello.ts` published a subscribe-and-receive loop on
+memory transport for months. It could never work:
+`net/crates/net/src/adapter/noop.rs` discards batches rather than storing them,
+and `net/crates/net/tests/bus_shutdown_drain.rs` installs its own counting
+adapter precisely because the built-in one retains nothing — which is also where
+`events_ingested` is shown to count at the *producer* boundary, not at delivery.
+Two files answered a question the prose had been getting wrong.
+
 ## What the source does and does not settle
 
-Reach for it to resolve a *specific factual question*: an exact signature, a
-field name, an enum's variants, whether a symbol exists in the binding the user
-is actually writing.
+**It settles mechanism and fact:** an exact signature, a serialized field name, an
+enum's variants, the order in which something happens, whether a symbol exists in
+the binding the user is actually writing.
 
-Do not reach for it instead of this skill. The source will not tell you that
-`.memory()` selects an adapter that discards events, that backpressure shows up
-as silence rather than an error, or which of five bindings the person you are
-helping is in. That is what `concepts.md` and `bindings/coverage.md` are for, and
-a signature read correctly out of that context still produces wrong code.
+**It does not settle judgement.** The source will not tell you that `.memory()`
+selects an adapter that discards events, that backpressure shows up as silence
+rather than an error, which of the four surfaces suits the task, or which of five
+bindings the person you are helping is in. That is what `concepts.md`, `apis.md`
+and `bindings/coverage.md` are for — and a signature read correctly, out of that
+context, still produces wrong code.
+
+So: model first, source second. Reading the implementation to *explain* behaviour
+is right; reading it to decide what to build is how you end up recommending an
+internal API.
 
 Two specific traps:
 
