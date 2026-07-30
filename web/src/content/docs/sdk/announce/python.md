@@ -47,7 +47,8 @@ that emits multiple chunks.
 ```python
 caps = add_tool_capabilities_to_announce(
     {"tags": []},
-    [descriptor_for("web_search", description="Search the web.", tags=["web", "research"])],
+    [descriptor_for("web_search", description="Search the web.",
+                    tags=["web", "research"])],
 )
 native.announce_capabilities(caps)
 ```

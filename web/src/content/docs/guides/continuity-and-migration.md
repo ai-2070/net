@@ -130,7 +130,8 @@ use net::adapter::net::behavior::loadbalance::Strategy;
 
 runtime.register_factory("strategy", || Box::new(StrategyDaemon::new()))?;
 
-let group = ForkGroup::fork(&runtime, "strategy", parent_origin, fork_seq, ForkGroupConfig {
+let group = ForkGroup::fork(&runtime, "strategy", parent_origin, fork_seq,
+                            ForkGroupConfig {
     fork_count: 3,
     lb_strategy: Strategy::RoundRobin,
     host_config: DaemonHostConfig::default(),

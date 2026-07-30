@@ -78,7 +78,9 @@ between readers. If you need multiple producers, they get multiple chains.
 For map-reduce shapes, derive shard ids, fan them out, and join:
 
 ```rust
-use net_sdk::cortex::workflow::{derive_shard_ids, fan_out, try_join_with, Join, JoinPolicy};
+use net_sdk::cortex::workflow::{
+    derive_shard_ids, fan_out, try_join_with, Join, JoinPolicy,
+};
 
 let shards = derive_shard_ids(parent_id, 16);
 fan_out(&wf, parent_id, &shards)?;

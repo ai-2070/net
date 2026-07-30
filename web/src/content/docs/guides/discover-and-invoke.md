@@ -47,7 +47,9 @@ From the SDK, the same query returns node ids you can call directly:
 ```rust
 use net_sdk::capabilities::CapabilityFilter;
 
-let filter = CapabilityFilter { require_gpu: true, min_vram_gb: Some(24), ..Default::default() };
+let filter = CapabilityFilter {
+    require_gpu: true, min_vram_gb: Some(24), ..Default::default()
+};
 let nodes: Vec<u64> = mesh.find_nodes(&filter);   // sync — node ids that match, right now
 ```
 
@@ -73,7 +75,8 @@ struct SummarizeResp { summary: String }
 
 // Provider side: announce + serve a capability.
 let provider = MeshBuilder::new("127.0.0.1:0", &psk)?.build().await?;
-let _handle = provider.serve_rpc_typed("summarize", Codec::Json, |req: SummarizeReq| async move {
+let _handle = provider.serve_rpc_typed("summarize", Codec::Json,
+                                       |req: SummarizeReq| async move {
     Ok::<_, String>(SummarizeResp { summary: summarize(&req.text) })
 })?;
 
@@ -85,7 +88,10 @@ let resp: SummarizeResp = caller.call_typed(
     "summarize",
     &SummarizeReq { text: "…".into() },
     CallOptionsTyped {
-        raw: CallOptions { deadline: Some(Instant::now() + Duration::from_millis(500)), ..Default::default() },
+        raw: CallOptions {
+            deadline: Some(Instant::now() + Duration::from_millis(500)),
+            ..Default::default()
+        },
         ..Default::default()
     },
 ).await?;

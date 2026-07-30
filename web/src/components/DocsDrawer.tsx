@@ -3,7 +3,6 @@
 import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import { DocsSidebar } from "@/components/DocsSidebar";
-import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import type { ClientDocTree } from "@/lib/docs";
 
 // Mobile + tablet docs nav. Renders a sticky toggle bar below the main
@@ -76,22 +75,22 @@ export function DocsDrawer({
           </span>
         </button>
 
-        {/* Reader context, persistent. The language selection used to be
-            reachable only by opening this drawer, which made the one thing the
-            docs are supposed to remember the one thing you could not see. It
-            sits in the bar itself now, at every breakpoint, beside the version
-            slot D6 leaves empty of behaviour. */}
-        <div className="flex items-center gap-3 border-t border-line px-6 py-1.5">
-          <span className="font-mono text-[9px] tracking-[0.22em] uppercase text-ink-faint shrink-0">
-            <span className="text-accent">$</span> lang
-          </span>
-          <LanguageSwitcher variant="bar" className="min-w-0 overflow-x-auto" />
-          {version ? (
+        {/* The language selection has moved to the floating dock, which is
+            fixed at every breakpoint and therefore persistent in the way this
+            bar was trying to be. Three controls for one piece of state is worse
+            than one: at 375px this bar, the drawer panel and the dock were all
+            `role="radiogroup"` with the same accessible name, so a screen
+            reader met "Documentation language" three times on one page.
+
+            The version slot stays — D6 leaves it empty of behaviour, not of
+            presence. */}
+        {version ? (
+          <div className="flex items-center border-t border-line px-6 py-1.5">
             <span className="ml-auto font-mono text-[9px] tracking-[0.14em] uppercase text-ink-faint shrink-0">
               {version}
             </span>
-          ) : null}
-        </div>
+          </div>
+        ) : null}
       </div>
 
       {/* Drawer overlay (backdrop + panel). Always rendered so the slide
@@ -140,7 +139,6 @@ export function DocsDrawer({
             </button>
           </div>
           <div className="overflow-y-auto px-5 py-5 grow">
-            <LanguageSwitcher className="mb-4" />
             <DocsSidebar tree={tree} chrome={false} />
           </div>
         </aside>

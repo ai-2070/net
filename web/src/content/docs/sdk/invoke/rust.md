@@ -9,7 +9,9 @@ struct WebSearchReq { query: String }
 struct WebSearchResp { results: Vec<String> }
 
 let resp: WebSearchResp = agent
-    .call_tool("web_search", &WebSearchReq { query: "how does the capability fold work".into() })
+    .call_tool("web_search", &WebSearchReq {
+        query: "how does the capability fold work".into(),
+    })
     .await?;
 println!("{resp:?}");
 ```

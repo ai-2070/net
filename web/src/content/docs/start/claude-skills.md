@@ -42,9 +42,12 @@ npx skills update -g
 A few flags for when you don't want the prompts:
 
 ```bash
-npx skills add ai-2070/net-claude-skill --skill '*' -a claude-code -g   # both skills, Claude Code
-npx skills add ai-2070/net-claude-skill --skill net-payments -g         # just one skill
-npx skills add ai-2070/net-claude-skill --skill '*' -a '*' -g           # every agent it supports
+# both skills, Claude Code
+npx skills add ai-2070/net-claude-skill --skill '*' -a claude-code -g
+# just one skill
+npx skills add ai-2070/net-claude-skill --skill net-payments -g
+# every agent it supports
+npx skills add ai-2070/net-claude-skill --skill '*' -a '*' -g
 ```
 
 These are plain Agent Skills, so `-a '*'` covers Codex, Cursor, Copilot, Cline, and the rest. The CLI symlinks each agent's skills directory to one canonical copy, so one `npx skills update` refreshes them all — pass `--copy` if symlinks aren't an option.
@@ -64,16 +67,18 @@ A skill is just a directory containing a `SKILL.md`, so copying the folders in w
 ```bash
 git clone https://github.com/ai-2070/net-claude-skill.git /tmp/net-claude-skill
 mkdir -p ~/.claude/skills
-cp -R /tmp/net-claude-skill/net-event-bus /tmp/net-claude-skill/net-payments ~/.claude/skills/
+cp -R /tmp/net-claude-skill/net-event-bus ~/.claude/skills/
+cp -R /tmp/net-claude-skill/net-payments  ~/.claude/skills/
 ```
 
 On Windows, in PowerShell:
 
 ```powershell
 git clone https://github.com/ai-2070/net-claude-skill.git $env:TEMP\net-claude-skill
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills" | Out-Null
-Copy-Item -Recurse "$env:TEMP\net-claude-skill\net-event-bus" "$env:USERPROFILE\.claude\skills\"
-Copy-Item -Recurse "$env:TEMP\net-claude-skill\net-payments" "$env:USERPROFILE\.claude\skills\"
+$dest = "$env:USERPROFILE\.claude\skills"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Copy-Item -Recurse "$env:TEMP\net-claude-skill\net-event-bus" "$dest\"
+Copy-Item -Recurse "$env:TEMP\net-claude-skill\net-payments" "$dest\"
 ```
 
 Swap `~/.claude/skills/` for `<your-repo>/.claude/skills/` to install into a single project, then commit the two directories. To hack on the skills locally, clone once somewhere permanent and symlink so `git pull` updates them in place:

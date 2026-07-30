@@ -17,6 +17,7 @@ import {
   type TocEntry,
 } from "@/lib/docs";
 import { capabilityRow, type CapabilityRow } from "@/lib/capability-record";
+import { RenditionLinks } from "@/components/RenditionLinks";
 import {
   LENSES,
   LENS_SLUG,
@@ -584,8 +585,25 @@ export default async function DocPage({ params }: PageProps) {
     // only thing making a screenshot of the header unambiguous.
     const lensInPath = folder.projected === true;
     const parity = capabilityRow(page.capability);
+    // Published for the floating dock, so switching language on an adaptive
+    // page navigates to the reader's rendition instead of only changing which
+    // sidebar entries are visible. Computed here rather than pattern-matched in
+    // the client because `renditionPath` and `boundaryPath` are the same two
+    // functions the chooser uses — one source for "where does this lens live".
+    const renditionLinks: Partial<Record<Lens | "c", string>> = {
+      ...Object.fromEntries(
+        LENSES.map((l) => [l, renditionPath(folder, LENS_SLUG[l])]),
+      ),
+      c: boundaryPath(folder, page),
+    };
     return (
       <>
+        <RenditionLinks
+          links={renditionLinks}
+          current={
+            resolved.kind === "boundary" ? "c" : (lens ?? undefined)
+          }
+        />
         <main className="min-w-0 max-w-[740px]">
           <Breadcrumb
             slug={lensInPath ? slug : folder.slug}

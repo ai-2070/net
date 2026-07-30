@@ -28,13 +28,15 @@ not the `MeshNode`. This is the same handle `serveTool` takes on the
 interface SummarizeReq  { text: string }
 interface SummarizeResp { summary: string }
 
-const serverRpc = TypedMeshRpc.fromMesh((server as unknown as { _native: object })._native);
+const serverNative = (server as unknown as { _native: object })._native;
+const serverRpc = TypedMeshRpc.fromMesh(serverNative);
 const handle = serverRpc.serve<SummarizeReq, SummarizeResp>(
   'summarize',
   async (req) => ({ summary: req.text.slice(0, 40) }),
 );
 
-const clientRpc = TypedMeshRpc.fromMesh((client as unknown as { _native: object })._native);
+const clientNative = (client as unknown as { _native: object })._native;
+const clientRpc = TypedMeshRpc.fromMesh(clientNative);
 const reply = await clientRpc.call<SummarizeReq, SummarizeResp>(
   server.nodeId(),
   'summarize',

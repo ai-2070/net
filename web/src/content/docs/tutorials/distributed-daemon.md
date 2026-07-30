@@ -83,14 +83,18 @@ impl MeshDaemon for TaskTracker {
                 serde_json::to_vec(&TaskEvent::Created { task_id })?
             }
             TaskCommand::Start { task_id, worker } => {
-                let state = TaskState::Running { worker: worker.clone(), started_at: now_ms() };
+                let state = TaskState::Running {
+                    worker: worker.clone(), started_at: now_ms(),
+                };
                 self.tasks.insert(task_id, state);
                 serde_json::to_vec(&TaskEvent::Started { task_id, worker })?
             }
             TaskCommand::Finish { task_id, result } => {
                 let final_state = match &result {
-                    TaskResult::Ok { duration_ms } => TaskState::Completed { duration_ms: *duration_ms },
-                    TaskResult::Err { reason }     => TaskState::Failed   { reason: reason.clone() },
+                    TaskResult::Ok { duration_ms } =>
+                        TaskState::Completed { duration_ms: *duration_ms },
+                    TaskResult::Err { reason } =>
+                        TaskState::Failed { reason: reason.clone() },
                 };
                 self.tasks.insert(task_id, final_state);
                 serde_json::to_vec(&TaskEvent::Finished { task_id, result })?

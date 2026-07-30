@@ -11,8 +11,22 @@ import {
 
 const STORAGE_KEY = "net-docs-lang";
 
+/** Where each language's reading of the CURRENT page lives, when the current
+ *  page has per-language readings at all.
+ *
+ *  Published by the page rather than derived from the URL, because two URL
+ *  shapes are in play (D1's `<page>/<lens>` suffix and D8's `sdk/<lens>/<page>`
+ *  prefix) and one of them has holes: there is no `/docs/sdk/c/announce`. A dock
+ *  that rewrote the path by pattern would hand a C reader a 404 on five of seven
+ *  spine pages. The page already computes these hrefs for its own chooser, so it
+ *  publishes them and nothing has to guess. */
+export type RenditionLinks = Partial<Record<Language, string>>;
+
 export interface LanguageState {
   language: Language;
+  /** Null on a page with one reading for everyone. */
+  renditions: RenditionLinks | null;
+  setRenditions: (r: RenditionLinks | null) => void;
   /** True once the client has resolved the real preference from URL /
    * localStorage. Gate first-paint-sensitive render on this so the server
    * and the client's first paint agree on DEFAULT_LANGUAGE. */
@@ -32,7 +46,9 @@ export const useLanguageStore = create<LanguageState>()(
       // client's first paint. `hydrate()` loads the real preference post-mount
       // (persist runs with skipHydration, so nothing loads before then).
       language: DEFAULT_LANGUAGE,
+      renditions: null,
       hydrated: false,
+      setRenditions: (r: RenditionLinks | null) => set({ renditions: r }),
       // persist auto-writes the new language to superjson storage on change.
       setLanguage: (l: Language) => set({ language: l }),
       hydrate: async () => {

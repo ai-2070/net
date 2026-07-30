@@ -30,10 +30,13 @@ let resp: SummarizeResp = caller.call_typed_with_retry(
     "summarize",
     &req,
     CallOptionsTyped {
-        raw: CallOptions { deadline: Some(Instant::now() + Duration::from_millis(500)), ..Default::default() },
+        raw: CallOptions {
+            deadline: Some(Instant::now() + Duration::from_millis(500)),
+            ..Default::default()
+        },
         ..Default::default()
     },
-    &RetryPolicy::default(),          // bounded attempts + backoff; retries only retryable errors
+    &RetryPolicy::default(),          // bounded attempts + backoff, retryable only
 ).await?;
 ```
 
@@ -68,7 +71,8 @@ whole workflow down:
 use net_sdk::mesh_rpc_resilience::{CircuitBreaker, CircuitBreakerConfig};
 
 let breaker = CircuitBreaker::new(CircuitBreakerConfig::default());
-// wrap calls through the breaker; when open, calls fail fast instead of waiting on the deadline
+// wrap calls through the breaker; when open, calls fail fast instead of
+// waiting on the deadline
 ```
 
 ## Failover — let the mesh pick another provider
@@ -84,7 +88,9 @@ mid-run and the next invoke lands on the standby.
 Call by service name (not a pinned node id) to get this for free:
 
 ```rust
-let resp: SummarizeResp = caller.call_service_typed("summarize", &req, CallOptionsTyped::default()).await?;
+let resp: SummarizeResp = caller
+    .call_service_typed("summarize", &req, CallOptionsTyped::default())
+    .await?;
 ```
 
 ## Multi-step work: the task lifecycle
