@@ -1,0 +1,21 @@
+.github/scripts/check-doc-code-width.py
+  s_a85d4c545303aa::t_a0a9afe7cb3fb9 37-54
+web/src/components/DocsContent.tsx
+  s_a85d4c545303aa::t_9bdbfa113214c6 625-632
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "923044eb5975be4f582b60b1668ef2c9075efa7f",
+  "prompts": {},
+  "sessions": {
+    "s_a85d4c545303aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "36284d49-c490-4d4d-bc20-5d2a1a6841ad",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
