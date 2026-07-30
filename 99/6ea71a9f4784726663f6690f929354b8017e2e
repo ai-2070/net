@@ -1,0 +1,20 @@
+docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
+  s_4e844c75f3aded::t_7ba42a381e7555 3-5,106-172
+  s_4e844c75f3aded::t_b29a0d649364ac 173-175,1001-1003,1006-1007
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "996ea71a9f4784726663f6690f929354b8017e2e",
+  "prompts": {},
+  "sessions": {
+    "s_4e844c75f3aded": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a15fe99c-1910-4f73-ae09-8a2ba5b4ff55",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
