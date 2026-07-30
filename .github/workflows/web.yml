@@ -10,10 +10,22 @@ on:
     paths:
       - "web/**"
       - ".github/workflows/web.yml"
+      # The tier manifest and its checker live outside web/. Without these the
+      # manifest could stop describing the tree with nothing going red — the
+      # same trigger-coverage gap that let a red TypeScript job sit beside a
+      # green skills publish.
+      - "docs/data/**"
+      - ".github/scripts/check-docs-tiers.py"
   pull_request:
     paths:
       - "web/**"
       - ".github/workflows/web.yml"
+      # The tier manifest and its checker live outside web/. Without these the
+      # manifest could stop describing the tree with nothing going red — the
+      # same trigger-coverage gap that let a red TypeScript job sit beside a
+      # green skills publish.
+      - "docs/data/**"
+      - ".github/scripts/check-docs-tiers.py"
 
 jobs:
   check:
@@ -48,6 +60,23 @@ jobs:
 
       - name: Typecheck
         run: npm run check:types
+
+      # Every page declares a migration state, the states are exhaustive and
+      # disjoint over the tree, and the adaptive_pending allowlist only shrinks.
+      # Runs from the repo root because the manifest is product metadata under
+      # docs/data/, not part of the site.
+      - name: Check the docs tier manifest and the migration ratchet
+        working-directory: .
+        run: |
+          python3 -m pip install --quiet pyyaml
+          .github/scripts/check-docs-tiers.py
+
+      # Guards the checker rather than the manifest: plants one defect per rule
+      # and requires each to be reported. It has already earned this — the first
+      # run caught a path-guard bug that made the walk skip every page.
+      - name: Check the tier checker still catches defects
+        working-directory: .
+        run: .github/scripts/check-docs-tiers.py --self-test
 
       # No lint or format step, and both omissions are deliberate:
       #
