@@ -16,6 +16,40 @@ export function isLanguage(s: string | null | undefined): s is Language {
   return (LANGUAGES as readonly string[]).includes(s ?? "");
 }
 
+/** URL segment and fragment filename per language.
+ *
+ * Deliberately not the same string as the `Language` id: the store and the
+ * switcher have used `ts` since the SDK spine shipped, but `…/typescript` reads
+ * as a language and `…/ts` reads as an abbreviation, and the existing spine
+ * folder is already `sdk/typescript`. One mapping, so a URL cannot disagree with
+ * a fragment filename. */
+export const LENS_SLUG: Record<Language, string> = {
+  rust: "rust",
+  ts: "typescript",
+  python: "python",
+  go: "go",
+  c: "c",
+};
+
+/** The lenses an adaptive page may carry a fragment for.
+ *
+ * C is absent BY DESIGN and this is the type that enforces it: the C ABI is a
+ * boundary surface, not a fifth ergonomic SDK, so `/…/c` is a generated
+ * projection rather than an authored rendition. Reader contexts are five;
+ * authorable fragment languages are four. */
+export const LENSES = ["rust", "ts", "python", "go"] as const;
+export type Lens = (typeof LENSES)[number];
+
+export function lensFromSlug(segment: string): Lens | null {
+  for (const lens of LENSES) if (LENS_SLUG[lens] === segment) return lens;
+  return null;
+}
+
+/** True for the C boundary segment — a route that exists but is never authored. */
+export function isBoundarySlug(segment: string): boolean {
+  return segment === LENS_SLUG.c;
+}
+
 /** Returns true if an entry is visible under the current language. An
  * entry with no `languages` field (or an empty array) is universal. */
 export function entryVisibleIn(

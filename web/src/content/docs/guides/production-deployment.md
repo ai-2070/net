@@ -25,7 +25,7 @@ Treat the PSK as a mesh-membership secret. See
 **Feature flags.** The default set is the full stack. Pare it down for smaller
 builds, but know which choices are behavioural rather than cosmetic: `regex`
 fails closed when absent, and `port-mapping` is off because it modifies router
-state. See [Install](/docs/start/install#feature-flags).
+state. See [Install](/docs/start/install/rust#feature-flags).
 
 ## Capacity knobs that matter
 

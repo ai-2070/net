@@ -181,7 +181,12 @@ def self_test() -> int:
             doc["pages"]["concepts/channels"] = "adaptive_pending"
 
         def stale_allowlist(doc):
-            doc["pages"]["start/install"] = "adaptive"
+            # Take a page from the committed allowlist rather than naming one:
+            # this probe hardcoded `start/install`, and the moment that page was
+            # converted the mutation became a no-op and the case silently stopped
+            # testing anything.
+            first = doc["adaptive_pending"]["pages"][0]
+            doc["pages"][first] = "adaptive"
 
         def over_max(doc):
             doc["adaptive_pending"]["max"] = 3

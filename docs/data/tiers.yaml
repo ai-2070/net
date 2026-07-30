@@ -18,7 +18,7 @@
 #   - Rust-native reference pages                -> sdk_native (nav owner only;
 #     D7 keeps their physical path and canonical URL unchanged)
 #
-# Counts: adaptive_pending=29 boundary_native=5 sdk_native=36 universal=79, total=149
+# Counts: adaptive=1 adaptive_pending=28 boundary_native=5 sdk_native=36 universal=79, total=149
 #
 # Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
 
@@ -77,7 +77,7 @@ pages:
   releases/RELEASE_v0.9_FIRST_BLOOD: universal
   start: universal
   start/claude-skills: universal
-  start/install: adaptive_pending
+  start/install: adaptive
   start/quickstart: adaptive_pending
   start/what-is-net: universal
   guides: universal
@@ -178,7 +178,7 @@ pages:
 # another converts in the same change, netting zero. So the exact list is
 # committed, and shrinking it is visible in the diff.
 adaptive_pending:
-  max: 29
+  max: 28
   pages:
     - agent-briefs/build-a-recoverable-capability
     - agent-briefs/generate-typed-tool-bindings
@@ -204,7 +204,6 @@ adaptive_pending:
     - payments/failure-schematic
     - payments/non-custodial-signing
     - payments/spend-policy-and-approvals
-    - start/install
     - start/quickstart
     - tutorials/distributed-daemon
     - tutorials/event-sourced-service

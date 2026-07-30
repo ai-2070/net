@@ -16,10 +16,25 @@ import os
 DEFAULT_DOCS = "web/src/content/docs"
 
 
+SHARED_BODY = "_shared.md"
+
+
 def page_slugs(docs_dir: str) -> set[str]:
-    """Every page, keyed by the slug its URL uses."""
+    """Every page, keyed by the slug its URL uses.
+
+    An adaptive page is ONE page with internal structure, not five. A directory
+    holding `_shared.md` is the page; its per-lens fragments are parts of it and
+    are not separately routable, which mirrors `lib/docs.ts` pulling them out of
+    `children`. Counting them as pages would inflate the corpus by four per
+    conversion and make the migration ratchet report progress backwards.
+    """
     out: set[str] = set()
     for dirpath, _dirs, files in os.walk(docs_dir):
+        if SHARED_BODY in files:
+            rel = os.path.relpath(dirpath, docs_dir)
+            out.add(rel.replace(os.sep, "/"))
+            _dirs.clear()  # nothing below an adaptive page is a page
+            continue
         rel_dir = os.path.relpath(dirpath, docs_dir)
         # Dot directories (`.next` lives under the content tree), tested per path
         # COMPONENT. A substring test for `os.sep + "."` also matches the `/..` in

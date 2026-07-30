@@ -19,7 +19,8 @@ export {
   isLanguage,
   type Language,
 } from "./docs-language";
-import type { Language } from "./docs-language";
+import type { Language, Lens } from "./docs-language";
+import { LENSES, LENS_SLUG, isBoundarySlug, lensFromSlug } from "./docs-language";
 
 export type DocsOrderConfig = {
   /** Order of top-level folders (sections). Unlisted append alpha after. */
@@ -152,6 +153,23 @@ export type DocFolder = {
    * folder hides its whole subtree when the current language doesn't
    * match. */
   languages?: Language[];
+  /** Set when this folder is an adaptive page rather than a section: a
+   *  `_shared.md` universal body plus one fragment per lens. Its renditions are
+   *  deliberately NOT in `children` — the sidebar shows one entry for the page,
+   *  not five for its language variants. */
+  adaptive?: AdaptivePage;
+};
+
+/** An adaptive page: one universal body, composed with a selected fragment.
+ *
+ * The universal text exists ONCE. That is the whole cost model — five authored
+ * copies of a page is what this replaces — and it is why there is no hash
+ * anywhere proving the copies match: there are no copies. */
+export type AdaptivePage = {
+  shared: DocFile;
+  /** Present lenses only. A lens with nothing to teach has no fragment, and the
+   *  route renders the honest absence state rather than a Rust fallback. */
+  fragments: Partial<Record<Lens, DocFile>>;
 };
 
 export type DocNode = DocFile | DocFolder;
@@ -164,7 +182,16 @@ export type DocTree = {
 
 export type ResolvedDoc =
   | { kind: "file"; file: DocFile; folder?: DocFolder }
-  | { kind: "folder-index"; folder: DocFolder };
+  | { kind: "folder-index"; folder: DocFolder }
+  /** One language's reading of an adaptive page: shared body + fragment. */
+  | { kind: "rendition"; folder: DocFolder; page: AdaptivePage; lens: Lens }
+  /** The C segment. Never an authored fragment — a generated projection over the
+   *  universal body, because C is a boundary surface and not a fifth lens. */
+  | { kind: "boundary"; folder: DocFolder; page: AdaptivePage }
+  /** The bare adaptive URL. A neutral router, NOT the Rust rendition: rendering
+   *  Rust here would keep Rust as the page's privileged public meaning, which is
+   *  the framing this whole project removes. */
+  | { kind: "adaptive-router"; folder: DocFolder; page: AdaptivePage };
 
 function stripMdExt(name: string): string {
   return name.replace(DOC_EXT_RE, "");
@@ -262,7 +289,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
   const folderName = slugChain[slugChain.length - 1] ?? "";
   const entries = readdirSync(absPath).sort((a, b) => a.localeCompare(b));
   const folders: DocFolder[] = [];
-  const files: DocFile[] = [];
+  let files: DocFile[] = [];
   let readme: DocFile | null = null;
 
   for (const entry of entries) {
@@ -290,6 +317,28 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     }
   }
 
+  // Adaptive shape: a `_shared.md` universal body beside one file per lens.
+  // Detected structurally rather than declared in frontmatter, so a directory
+  // cannot claim to be an adaptive page while missing its universal body.
+  const shared = files.find((f) => baseName(f.filePath) === SHARED_BODY);
+  let adaptive: AdaptivePage | undefined;
+  if (shared) {
+    const fragments: Partial<Record<Lens, DocFile>> = {};
+    for (const lens of LENSES) {
+      const match = files.find(
+        (f) => baseName(f.filePath) === `${LENS_SLUG[lens]}.md`,
+      );
+      if (match) fragments[lens] = match;
+    }
+    adaptive = { shared, fragments };
+    // The page is one sidebar entry, not five. Its parts are reached through
+    // `adaptive`, so drop them from `children` — otherwise every adaptive page
+    // would expand into `_shared`, `rust`, `typescript`, `python`, `go` in the
+    // nav, which is the five-manuals shape in navigation form.
+    const parts = new Set<DocFile>([shared, ...Object.values(fragments)]);
+    files = files.filter((f) => !parts.has(f));
+  }
+
   const folderKey = slugChain.join("/");
   const orderedChildren = applyOrder<DocNode>(
     [...folders, ...files],
@@ -305,11 +354,24 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     kind: "folder",
     slug: slugChain,
     title: resolveTitle(slugChain, folderName, readmeFm),
-    description: readmeFm?.description,
+    // An adaptive page's title and description come from its universal body,
+    // which is the only part every reader sees.
+    description: readmeFm?.description ?? sharedFm(shared)?.description,
     readme,
     children: orderedChildren,
     languages: lookupLanguages(slugChain),
+    adaptive,
   };
+}
+
+const SHARED_BODY = "_shared.md";
+
+function baseName(filePath: string): string {
+  return filePath.slice(filePath.lastIndexOf("/") + 1);
+}
+
+function sharedFm(shared: DocFile | undefined): DocFrontmatter | undefined {
+  return shared ? readFrontmatter(shared.filePath) : undefined;
 }
 
 // In production every doc path is enumerated at build time, so the tree is
@@ -374,12 +436,61 @@ function lastSlug(n: DocNode): string {
   return n.slug[n.slug.length - 1] ?? "";
 }
 
+/** Walk folders only, returning the folder at `slug` if there is one. */
+function folderAt(slug: string[]): DocFolder | null {
+  const tree = getDocTree();
+  let folders = tree.folders;
+  let found: DocFolder | null = null;
+  for (const raw of slug) {
+    const segment = normalizeSlug(raw);
+    const next: DocFolder | undefined = folders.find(
+      (f) => lastSlug(f) === segment,
+    );
+    if (!next) return null;
+    found = next;
+    folders = next.children.filter((c): c is DocFolder => c.kind === "folder");
+  }
+  return found;
+}
+
+/** Adaptive routes, resolved before the generic file/folder walk.
+ *
+ * Three shapes at one folder: the bare URL (a neutral router), a lens segment
+ * (shared body + that fragment), and `c` (a generated boundary projection).
+ * Handled here rather than inside the generic loop because an adaptive page's
+ * parts are intentionally absent from `children`.
+ */
+function resolveAdaptive(slug: string[]): ResolvedDoc | null {
+  const whole = folderAt(slug);
+  if (whole?.adaptive) {
+    return { kind: "adaptive-router", folder: whole, page: whole.adaptive };
+  }
+  if (slug.length < 2) return null;
+  const parent = folderAt(slug.slice(0, -1));
+  if (!parent?.adaptive) return null;
+  const last = normalizeSlug(slug[slug.length - 1]!);
+  if (isBoundarySlug(last)) {
+    return { kind: "boundary", folder: parent, page: parent.adaptive };
+  }
+  const lens = lensFromSlug(last);
+  // A lens with no fragment is not a 404 — the route exists and renders the
+  // honest absence state. Falling back to another language here is the specific
+  // failure the doctrine forbids.
+  if (lens) {
+    return { kind: "rendition", folder: parent, page: parent.adaptive, lens };
+  }
+  return null;
+}
+
 export function resolveDoc(slug: string[]): ResolvedDoc | null {
   const tree = getDocTree();
   if (slug.length === 0) {
     if (tree.rootReadme) return { kind: "file", file: tree.rootReadme };
     return null;
   }
+
+  const adaptive = resolveAdaptive(slug);
+  if (adaptive) return adaptive;
 
   // Normalize incoming segments so callers can pass either underscore or
   // dash forms (defensive — static-param-generated URLs are already
@@ -424,6 +535,13 @@ export function getAllSlugs(): string[][] {
 
   const walkFolder = (folder: DocFolder): void => {
     out.push(folder.slug);
+    if (folder.adaptive) {
+      // One route per lens WHETHER OR NOT it has a fragment: an absent lens gets
+      // a real URL that says so. A missing route would 404 a language the
+      // switcher offers, which reads as the docs having forgotten the selection.
+      for (const lens of LENSES) out.push([...folder.slug, LENS_SLUG[lens]]);
+      out.push([...folder.slug, LENS_SLUG.c]);
+    }
     for (const child of folder.children) {
       if (child.kind === "file") {
         // Don't double-count READMEs (they ARE the folder index).
@@ -446,6 +564,27 @@ export function getAllSlugs(): string[][] {
 // the top of every page, and would feed the search index too.
 export function readDocSource(file: DocFile): string {
   return parseFrontmatter(readFileSync(file.filePath, "utf8")).body;
+}
+
+/** The composed source for one rendition: universal body, then the fragment.
+ *
+ * Composed at render time from two files rather than stored as a fifth copy, so
+ * editing the universal text updates every rendition and there is nothing to
+ * keep in sync. Headings therefore appear once per document, which is what keeps
+ * `rehype-slug` from emitting `verify-it-worked-3` and the TOC from listing the
+ * same section four times.
+ */
+export function composeRendition(
+  page: AdaptivePage,
+  lens: Lens,
+): { source: string; hasFragment: boolean } {
+  const shared = readDocSource(page.shared);
+  const fragment = page.fragments[lens];
+  if (!fragment) return { source: shared, hasFragment: false };
+  return {
+    source: `${shared.trimEnd()}\n\n${readDocSource(fragment).trimStart()}`,
+    hasFragment: true,
+  };
 }
 
 // Table-of-contents entry for one heading in a doc.
