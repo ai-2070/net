@@ -2,7 +2,7 @@
 
 import { JSX } from "react";
 import { MeshOsSection } from "@/components/MeshOsSection";
-import { SeedBanner } from "@/components/SeedBanner";
+// import { SeedBanner } from "@/components/SeedBanner";
 import { HeroSection } from "@/components/HeroSection";
 import { MikoshiSection } from "@/components/MikoshiSection";
 import { DatafortsSection } from "@/components/DatafortsSection";
@@ -27,7 +27,7 @@ export default function Home(): JSX.Element {
     <PageContainer>
       <NavBar />
       <main className="pt-20 max-w-[1440px] mx-auto">
-        <SeedBanner />
+        {/*<SeedBanner />*/}
         <HeroSection />
         <WhyNotBestEffortSection />
         <TopologyClassesSection />
