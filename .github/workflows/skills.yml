@@ -56,7 +56,8 @@ on:
       - ".github/skill-examples.json"
       - ".github/scripts/check-skill-example-ts.sh"
       - ".github/scripts/check-skill-vocab.py"
-      - ".github/scripts/check-skill-coverage.py"
+      - ".github/scripts/capability_records.py"
+      - "docs/data/capabilities/**"
       - ".github/scripts/check-skill-snippets.py"
       - ".github/skill-snippets/**"
       # Every surface the skills document. Broad roots on purpose: the previous
@@ -100,7 +101,8 @@ on:
       - ".github/skill-examples.json"
       - ".github/scripts/check-skill-example-ts.sh"
       - ".github/scripts/check-skill-vocab.py"
-      - ".github/scripts/check-skill-coverage.py"
+      - ".github/scripts/capability_records.py"
+      - "docs/data/capabilities/**"
       - ".github/scripts/check-skill-snippets.py"
       - ".github/skill-snippets/**"
       # Every surface the skills document. Broad roots on purpose: the previous
@@ -178,6 +180,19 @@ jobs:
       # resolver is broken, not merely to pass when it is not.
       - name: Check the citation checker still catches defects
         run: .github/scripts/check-skill-source-paths.py --self-test
+
+      # The capability records are the canonical answer to "does binding X
+      # support operation Y"; each skill's bindings/coverage.md is generated from
+      # them. This validates the record and proves the copies match — a
+      # hand-edited matrix fails as drift rather than becoming a second truth.
+      # (check-skills.sh above also calls it; this step names the failure.)
+      - name: Check the capability records and their generated copies
+        run: |
+          python3 -m pip install --quiet pyyaml
+          .github/scripts/capability_records.py --check
+
+      - name: Check the capability-record checker still catches defects
+        run: .github/scripts/capability_records.py --self-test
 
   examples:
     name: Examples compile

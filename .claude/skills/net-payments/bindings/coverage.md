@@ -13,11 +13,19 @@ yet; it is a language choice or a feature request. Say so before writing code.
 
 | Binding | Install as | Import as | Payments source |
 |---|---|---|---|
-| Rust | `net-mesh-payments` | `net_payments` | `net/crates/net/payments/src/` |
+| Rust | — (unpublished) | `net_payments` | `net/crates/net/payments/src/` |
 | Node / TS | `@net-mesh/core` | `@net-mesh/core` | `net/crates/net/bindings/node/src/payment_*.rs` |
 | Python | `net-mesh` | `net` | `net/crates/net/bindings/python/src/payment_*.rs` |
 | Go | — | — | — |
 | C | — | — | — |
+
+**The Rust payments crate is not published.** Its `Cargo.toml` name is
+`net-payments`, and neither that nor `net-mesh-payments` exists on crates.io —
+`release-crates.yml` publishes `net-mesh`, `net-mesh-sdk-macros`, `net-mesh-sdk`
+and `net-mesh-mcp`, and payments is not in that list. So there is no
+`cargo add` line to give a Rust caller: it is consumed from the repository (a path
+or git dependency). If an agent reads `crates:net-payments` → *not found* as
+"payments does not exist", that is the wrong conclusion; see `source-access.md`.
 
 **Node and Python payments are `core-only`, without exception.** Neither
 ergonomic wrapper carries any of it: `net/crates/net/sdk-ts/src/` and

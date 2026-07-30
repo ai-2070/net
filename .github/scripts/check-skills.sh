@@ -232,12 +232,21 @@ done < <(python3 "$(dirname "$0")/check-skill-vocab.py" || true)
 # operation Y" is maintained. This verifies their declared evidence anchors and
 # holds the status/mode vocabulary closed — it does not, and cannot, verify
 # completeness. See the script's docstring for why absence is not inferred.
+#
+# The matrices are now GENERATED from `docs/data/capabilities/*.yaml`, so this
+# defers to `capability_records.py --check`, which validates the record and then
+# proves each skill's copy still matches it. Two structural checks the old
+# file-only checker made — that both tables carry the same columns, and the same
+# operations in the same order — became impossible to violate rather than
+# unchecked: one record renders both tables.
 echo "==> Binding coverage matrices"
 before=$fail
-while read -r line; do
-  [ -n "$line" ] && note "$line"
-done < <(python3 "$(dirname "$0")/check-skill-coverage.py" || true)
-[ "$fail" -eq "$before" ] && ok "coverage anchors resolve; vocabulary is closed"
+if ! python3 "$(dirname "$0")/capability_records.py" --check >/tmp/cap.$$ 2>&1; then
+  sed 's/^/  /' /tmp/cap.$$
+  fail=$((fail + 1))
+fi
+rm -f /tmp/cap.$$
+[ "$fail" -eq "$before" ] && ok "coverage records validate; every generated copy matches"
 
 # ------------------------------------------------------------------ CLI verbs
 # The single installed binary is `net-mesh` (cli/Cargo.toml [[bin]]). A bare

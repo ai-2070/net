@@ -1,0 +1,341 @@
+# Capability record — event-bus
+#
+# CANONICAL. This is the only authored answer to "does binding X support
+# operation Y" for this domain. `.claude/skills/net-event-bus/bindings/coverage.md`
+# is GENERATED from this file; edit here, run
+# `.github/scripts/capability_records.py --check` to see the diff, and commit
+# both.
+#
+# status  supported | partial | experimental | not exposed | n/a
+#           `n/a` means the operation makes no sense on this binding — a
+#           permanent non-concept, not a gap. `not exposed` means buildable and
+#           not built: a roadmap entry. The difference decides whether a reader
+#           should stop asking.
+# mode    poll | verify-only | core-only        (qualifies a status)
+#           `core-only` is the most load-bearing: the operation exists, but only
+#           on the low-level binding (`@net-mesh/core`, `net`), not the
+#           ergonomic wrapper. It is the single most common way to be wrong
+#           about Net in Node and Python.
+# anchor  one symbol CI resolves in that binding's tree. Positive cells must
+#           carry one; negative cells must not. An anchor proves a symbol
+#           exists, NOT that the operation is supported — the status is
+#           editorial, the anchor is its evidence.
+#
+# NOT YET POPULATED: `reason` and `alternative` per negative cell, which D5's
+# generated absence state needs. Until Phase 3/4 renders that state, the prose
+# rationale still lives in the skill's own "Why the negative cells are negative"
+# section, which is authored and not generated.
+#
+# Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
+
+domain: event-bus
+skill: net-event-bus
+operations:
+- operation: Event bus — ingest + poll
+  bindings:
+    Rust:
+      status: supported
+      anchor: emit
+    Node / TS:
+      status: supported
+      anchor: ingestFire
+    Python:
+      status: supported
+      anchor: ingest
+    Go:
+      status: supported
+      anchor: Ingest
+    C:
+      status: supported
+      mode: poll
+      anchor: net_ingest_raw
+- operation: Consumer-side filter DSL
+  bindings:
+    Rust:
+      status: supported
+      anchor: pred
+    Node / TS:
+      status: supported
+      anchor: predicateDebugReport
+    Python:
+      status: supported
+      anchor: evaluate_predicate
+    Go:
+      status: not exposed
+    C:
+      status: supported
+      anchor: net_predicate_evaluate
+- operation: Channels — pub/sub with capability auth
+  bindings:
+    Rust:
+      status: supported
+      anchor: subscribe_channel
+    Node / TS:
+      status: supported
+      anchor: subscribeChannel
+    Python:
+      status: supported
+      anchor: subscribe_channel
+    Go:
+      status: supported
+      anchor: SubscribeChannel
+    C:
+      status: supported
+      anchor: net_mesh_subscribe_channel_with_token
+- operation: Mesh streams
+  bindings:
+    Rust:
+      status: supported
+      anchor: open_stream
+    Node / TS:
+      status: supported
+      anchor: openStream
+    Python:
+      status: supported
+      anchor: open_stream
+    Go:
+      status: supported
+      anchor: OpenStream
+    C:
+      status: supported
+      anchor: net_mesh_open_stream
+- operation: Capability announce
+  bindings:
+    Rust:
+      status: supported
+      anchor: announce_capabilities
+    Node / TS:
+      status: supported
+      anchor: announceCapabilities
+    Python:
+      status: supported
+      anchor: announce_capabilities
+    Go:
+      status: supported
+      anchor: AnnounceCapabilities
+    C:
+      status: supported
+      anchor: net_mesh_announce_capabilities
+- operation: Capability discovery
+  bindings:
+    Rust:
+      status: supported
+      anchor: find_best_node
+    Node / TS:
+      status: supported
+      anchor: findNodes
+    Python:
+      status: supported
+      anchor: find_nodes
+    Go:
+      status: supported
+      anchor: FindBestNode
+    C:
+      status: supported
+      anchor: net_mesh_find_best_node
+- operation: nRPC — typed request/response + streaming
+  bindings:
+    Rust:
+      status: supported
+      anchor: call_typed
+    Node / TS:
+      status: supported
+      anchor: TypedMeshRpc
+    Python:
+      status: supported
+      anchor: call_streaming
+    Go:
+      status: supported
+      anchor: NewTypedMeshRpc
+    C:
+      status: supported
+      anchor: net_rpc_call
+- operation: Gang-claim scheduler
+  bindings:
+    Rust:
+      status: supported
+      anchor: claim_island
+    Node / TS:
+      status: supported
+      anchor: claimIsland
+    Python:
+      status: supported
+      anchor: claim_island
+    Go:
+      status: supported
+      anchor: ClaimIsland
+    C:
+      status: supported
+      anchor: net_mesh_claim_island
+- operation: A2A — agent task handoff
+  bindings:
+    Rust:
+      status: supported
+      anchor: serve_a2a
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: serveA2a
+    Python:
+      status: supported
+      mode: core-only
+      anchor: serve_a2a
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Organization capability auth
+  bindings:
+    Rust:
+      status: supported
+      anchor: serve_org
+    Node / TS:
+      status: supported
+      anchor: serveOrgTyped
+    Python:
+      status: supported
+      anchor: serve_org_typed
+    Go:
+      status: supported
+      anchor: ServeOrgBytes
+    C:
+      status: supported
+      anchor: net_org_call
+- operation: MCP bridge
+  bindings:
+    Rust:
+      status: supported
+      anchor: serve_tool
+    Node / TS:
+      status: supported
+      anchor: tool
+    Python:
+      status: supported
+      anchor: tool
+    Go:
+      status: supported
+      anchor: McpError
+    C:
+      status: supported
+      anchor: net_mcp_classify
+- operation: Dataforts — blobs
+  bindings:
+    Rust:
+      status: supported
+      anchor: fetch_blob
+    Node / TS:
+      status: supported
+      anchor: fetchBlob
+    Python:
+      status: supported
+      anchor: fetch_blob
+    Go:
+      status: partial
+      anchor: NewMeshBlobAdapter
+    C:
+      status: supported
+      anchor: net_fetch_blob
+- operation: RedEX — durable log
+  bindings:
+    Rust:
+      status: supported
+      anchor: redex
+    Node / TS:
+      status: supported
+      anchor: RedexFile
+    Python:
+      status: supported
+      anchor: redex
+    Go:
+      status: supported
+      anchor: NewRedex
+    C:
+      status: supported
+      anchor: net_redex_file_append
+- operation: CortEX folds / NetDB
+  bindings:
+    Rust:
+      status: supported
+      anchor: cortex
+    Node / TS:
+      status: supported
+      anchor: cortex
+    Python:
+      status: supported
+      anchor: netdb
+    Go:
+      status: supported
+      anchor: OpenNetDb
+    C:
+      status: supported
+      anchor: net_fold_query_client_query_latest
+- operation: MeshDB — federated queries
+  bindings:
+    Rust:
+      status: supported
+      anchor: meshdb
+    Node / TS:
+      status: supported
+      anchor: meshdb
+    Python:
+      status: supported
+      anchor: meshdb
+    Go:
+      status: supported
+      anchor: MeshDB
+    C:
+      status: supported
+      anchor: net_meshdb_decode_payload_json
+- operation: Compute / groups / daemons
+  bindings:
+    Rust:
+      status: supported
+      anchor: groups
+    Node / TS:
+      status: supported
+      anchor: groups
+    Python:
+      status: supported
+      mode: core-only
+      anchor: daemon_count
+    Go:
+      status: supported
+      anchor: Groups
+    C:
+      status: supported
+      anchor: net_compute_fork_group_fork_count
+- operation: Deck — operator surface
+  bindings:
+    Rust:
+      status: supported
+      anchor: deck
+    Node / TS:
+      status: supported
+      anchor: deck
+    Python:
+      status: supported
+      anchor: deck
+    Go:
+      status: supported
+      anchor: Deck
+    C:
+      status: supported
+      anchor: net_deck_admin_cordon
+- operation: Redis Streams dedup
+  bindings:
+    Rust:
+      status: supported
+      anchor: RedisStreamDedup
+    Node / TS:
+      status: supported
+      anchor: RedisStreamDedup
+    Python:
+      status: supported
+      mode: core-only
+      anchor: RedisStreamDedup
+    Go:
+      status: supported
+      anchor: RedisStreamDedup
+    C:
+      status: supported
+      anchor: net_redis_dedup_new
