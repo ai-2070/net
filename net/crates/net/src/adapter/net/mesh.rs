@@ -5754,6 +5754,11 @@ struct RoutingAuthority {
 #[cfg(test)]
 type PublishPhaseHook = Arc<dyn Fn(u64) + Send + Sync>;
 
+/// Test-only observer of the consumer-Grant routing notification instant.
+/// Receives the `grant_id` that moved (OLB-2B.3c-pre items 10/11).
+#[cfg(test)]
+type GrantMovementHook = Arc<dyn Fn(&[u8; 32]) + Send + Sync>;
+
 impl RoutingAuthority {
     fn new() -> Self {
         Self {
@@ -6876,6 +6881,19 @@ pub struct MeshNode {
     /// a refusal published NOTHING — including transiently.
     #[cfg(test)]
     consumer_grant_publications: std::sync::atomic::AtomicU64,
+    /// Test-only: routing notifications raised for consumer-Grant movement, so a
+    /// witness can prove a NON-publishing outcome woke nothing (items 10/11).
+    #[cfg(test)]
+    consumer_grant_movements: std::sync::atomic::AtomicU64,
+    /// Test-only: fired INSIDE [`Self::note_consumer_grant_movement`], before it
+    /// touches the registry.
+    ///
+    /// The one instant at which item 10's two ordering claims are both checkable:
+    /// the gate must already be released, and the snapshot must already carry the
+    /// transition. Neither is observable from outside — the window closes a few
+    /// instructions later.
+    #[cfg(test)]
+    grant_movement_hook: parking_lot::Mutex<Option<GrantMovementHook>>,
     /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
     /// shared across EVERY protected `serve_rpc_protected` registration on this
     /// node. Node-owned (not per-registration) so `(caller, call_id)` uniqueness
@@ -8366,6 +8384,10 @@ impl MeshNode {
             consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
             #[cfg(test)]
             consumer_grant_publications: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            consumer_grant_movements: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            grant_movement_hook: parking_lot::Mutex::new(None),
             #[cfg(feature = "cortex")]
             rpc_admission_rate_limit: Arc::new(
                 // The envelope was validated (and panicked on) above, so this
@@ -11137,6 +11159,60 @@ impl MeshNode {
         self.consumer_grant_publications.load(Ordering::Acquire)
     }
 
+    /// Test-only: how many routing notifications consumer-Grant movement raised.
+    #[cfg(test)]
+    fn consumer_grant_movements_for_test(&self) -> u64 {
+        self.consumer_grant_movements.load(Ordering::Acquire)
+    }
+
+    /// Test-only: observe the notification instant (items 10/11).
+    #[cfg(test)]
+    fn arm_grant_movement_hook(&self, hook: GrantMovementHook) {
+        *self.grant_movement_hook.lock() = Some(hook);
+    }
+
+    /// Routing movement for a consumer-Grant transition (OLB-2B.3c-pre items
+    /// 10/11).
+    ///
+    /// Called with the consumer-Grant gate **already released**, which is item
+    /// 10's literal requirement and also the lock-order one: `pin_if_current`
+    /// takes that gate and then the registry lock, so touching the registry
+    /// beneath the gate would invert the frozen order. The `debug_assert` below
+    /// makes the release observable rather than assumed.
+    ///
+    /// Ordering, per design §2A.2:
+    ///
+    /// ```text
+    /// publish the new consumer-Grant snapshot
+    /// -> RELEASE the gate
+    /// -> invalidate the affected retained Grant slots   <- here
+    /// -> mark routing work                              <- and here
+    /// ```
+    ///
+    /// Publishing first is what makes the wake safe to act on: the actor's
+    /// recapture reads `consumer_grant_audiences` lock-free, so a wake that
+    /// arrived BEFORE publication could reconstruct against the old snapshot and
+    /// install exactly the staleness this exists to clear. A wake that arrives
+    /// late is merely late; a wake that arrives early is wrong.
+    ///
+    /// A demand landing after publication needs no notification of its own —
+    /// first demand already enqueues the slot and marks work.
+    fn note_consumer_grant_movement(&self, grant_id: &[u8; 32]) {
+        debug_assert!(
+            self.consumer_grant_gate.mu.try_lock().is_some(),
+            "the consumer-Grant gate must be RELEASED before routing is              notified (item 10); holding it here inverts the commit pin's              gate -> registry lock order"
+        );
+        #[cfg(test)]
+        {
+            self.consumer_grant_movements.fetch_add(1, Ordering::AcqRel);
+            let hook = self.grant_movement_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(grant_id);
+            }
+        }
+        self.routing_registry.invalidate_grant_scope(grant_id);
+    }
+
     /// Allocate the next consumer-Grant installation identity, or refuse
     /// (OLB-2B.3c-pre).
     ///
@@ -11234,27 +11310,41 @@ impl MeshNode {
         // identity is now checked and TERMINAL, so density is exactly what
         // matters: repeated idempotent installs would burn a finite space while
         // publishing nothing, and the space cannot be recovered.
-        let _guard = self.consumer_grant_gate.lock();
-        let current = self.consumer_grant_audiences.load_full();
-        // Settle EVERY ordinary refusal before allocation — idempotence,
-        // conflict AND capacity. Settling only idempotence left `AtCapacity`
-        // behind the allocator, so repeated distinct installs against a full
-        // registry would drain a finite, terminal authority space while
-        // publishing nothing (Kyra, 2B.3c-pre step-1 review).
-        let prepared = match current.prepare_install(record, now_secs)? {
-            PreparedInstall::Noop => {
-                // Valid, publishes nothing, consumes no identity — including
-                // after the allocator is exhausted, which is why this precedes
-                // it.
-                return Ok(ConsumerAudienceInstall::AlreadyPresent);
-            }
-            PreparedInstall::Ready(slot) => *slot,
+        //
+        // Scoped so the gate is RELEASED before routing is notified (item 10).
+        // Every `return` inside this block is a non-publishing outcome, so each
+        // one deliberately leaves without waking anything.
+        let install_seq = {
+            let _guard = self.consumer_grant_gate.lock();
+            let current = self.consumer_grant_audiences.load_full();
+            // Settle EVERY ordinary refusal before allocation — idempotence,
+            // conflict AND capacity. Settling only idempotence left `AtCapacity`
+            // behind the allocator, so repeated distinct installs against a full
+            // registry would drain a finite, terminal authority space while
+            // publishing nothing (Kyra, 2B.3c-pre step-1 review).
+            let prepared = match current.prepare_install(record, now_secs)? {
+                PreparedInstall::Noop => {
+                    // Valid, publishes nothing, consumes no identity — including
+                    // after the allocator is exhausted, which is why this precedes
+                    // it. Publishes nothing, so it is not routing movement and
+                    // must wake nothing.
+                    return Ok(ConsumerAudienceInstall::AlreadyPresent);
+                }
+                PreparedInstall::Ready(slot) => *slot,
+            };
+            // Past this point publication is certain, so claiming the identity
+            // cannot be wasted.
+            let install_seq = self.allocate_consumer_grant_install_seq()?;
+            let next = ConsumerGrantSnapshot::finish_install(prepared, install_seq);
+            self.publish_consumer_grant_snapshot(Arc::new(next));
+            install_seq
         };
-        // Past this point publication is certain, so claiming the identity
-        // cannot be wasted.
-        let install_seq = self.allocate_consumer_grant_install_seq()?;
-        let next = ConsumerGrantSnapshot::finish_install(prepared, install_seq);
-        self.publish_consumer_grant_snapshot(Arc::new(next));
+        // An INSTALL is routing movement in the availability direction: a
+        // Grant-scoped slot reconstructed `Unserved` because this grant was not
+        // installed holds no artifact to invalidate and would otherwise stay
+        // cold forever — the read seam returns cold for `Unserved` WITHOUT
+        // invalidating, so no reader can rescue it either (design §0.1).
+        self.note_consumer_grant_movement(&grant_id);
         Ok(ConsumerAudienceInstall::Installed(
             ConsumerAudienceLease::new(grant_id, install_seq),
         ))
@@ -11271,15 +11361,24 @@ impl MeshNode {
     ///
     /// [`remove_consumer_grant_audience_if_current`]: Self::remove_consumer_grant_audience_if_current
     pub fn remove_consumer_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
-        let _guard = self.consumer_grant_gate.lock();
-        let current = self.consumer_grant_audiences.load_full();
-        match current.without(grant_id) {
-            Some(next) => {
-                self.publish_consumer_grant_snapshot(Arc::new(next));
-                true
+        // Scoped so the gate is RELEASED before routing is notified (item 10).
+        let removed = {
+            let _guard = self.consumer_grant_gate.lock();
+            let current = self.consumer_grant_audiences.load_full();
+            match current.without(grant_id) {
+                Some(next) => {
+                    self.publish_consumer_grant_snapshot(Arc::new(next));
+                    true
+                }
+                None => false,
             }
-            None => false,
+        };
+        // Only a real publication is routing movement. A no-op removal changed
+        // nothing, so it must wake nothing.
+        if removed {
+            self.note_consumer_grant_movement(grant_id);
         }
+        removed
     }
 
     /// OSDK S0: remove a CONSUMER grant-audience record ONLY if the currently
@@ -11296,21 +11395,31 @@ impl MeshNode {
         &self,
         lease: &super::behavior::org_grant_registry::ConsumerAudienceLease,
     ) -> bool {
-        let _guard = self.consumer_grant_gate.lock();
-        let current = self.consumer_grant_audiences.load_full();
-        match current.get(lease.grant_id()) {
-            // Same grant id, different installation — the lease is stale and owns
-            // nothing here.
-            Some(record) if record.install_seq() != lease.install_seq() => false,
-            Some(_) => match current.without(lease.grant_id()) {
-                Some(next) => {
-                    self.publish_consumer_grant_snapshot(Arc::new(next));
-                    true
-                }
+        // Scoped so the gate is RELEASED before routing is notified (item 10).
+        let removed = {
+            let _guard = self.consumer_grant_gate.lock();
+            let current = self.consumer_grant_audiences.load_full();
+            match current.get(lease.grant_id()) {
+                // Same grant id, different installation — the lease is stale and
+                // owns nothing here.
+                Some(record) if record.install_seq() != lease.install_seq() => false,
+                Some(_) => match current.without(lease.grant_id()) {
+                    Some(next) => {
+                        self.publish_consumer_grant_snapshot(Arc::new(next));
+                        true
+                    }
+                    None => false,
+                },
                 None => false,
-            },
-            None => false,
+            }
+        };
+        // A STALE lease publishes nothing and must therefore wake nothing —
+        // otherwise a caller holding a superseded lease could churn the exact
+        // slots the current installation is serving.
+        if removed {
+            self.note_consumer_grant_movement(lease.grant_id());
         }
+        removed
     }
 
     /// Whether the caller explicitly supplied this node's identity (OSDK-L N).

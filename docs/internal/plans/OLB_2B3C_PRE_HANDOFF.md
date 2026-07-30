@@ -24,7 +24,7 @@ belong.
 | OLB-2B.3 boundary design (rev 5 + addenda) | `1c1b652e6` | SIGNED **as a design only** |
 | 2B.3c-pre **step 1** — installation identity (items 1–3) | `300e80f6c` | SIGNED |
 | 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `a788232bd` | **SIGNED** (`OLB_2B3C_PRE_STEP2_SIGNED_HEAD`) — held once at `df32cbd7d`, repaired, signed 2026-07-29; see §2b |
-| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15) | — | **DEFERRED / NOT AUTHORIZED.** The step-2 signature explicitly does not extend to them |
+| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | — | **IMPLEMENTED + WITNESSED — NOT INDEPENDENTLY REVIEWED — NOT SIGNED.** Authorized by the user after the step-2 signature; see the design's §16.0 |
 | `SAFE_LIVE_HEAD` | — | **not established**, still reserved for provider-free leader lighting |
 
 Authoritative design: [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md).
@@ -35,11 +35,16 @@ proof, the exclusions, and the closure gate. §2A is the substrate spec.
 
 ## 2. Do this first
 
-**Step 2 is signed. There is no authorized work in this handoff's scope.**
+**Step 2 is signed. Step 3 is implemented and witnessed, and owes an independent
+mutation run.**
 
-Items 10, 11 and 15 are DEFERRED and NOT AUTHORIZED; the step-2 signature
-explicitly does not extend to them. `SAFE_LIVE_HEAD` remains unestablished and
-still reserved for the provider-free leader path.
+Step 3 (items 10, 11, 15, 16 — the consumer-Grant wake/invalidation edge and the
+normative plan correction) was authorized by the user AFTER the step-2 signature;
+that signature did not cover it. The five step-3 witnesses and the mutation each
+dies to are tabulated in the design's §16.0. Every RED is the author's own.
+
+`SAFE_LIVE_HEAD` remains unestablished and still reserved for the provider-free
+leader path.
 
 Kyra's independent matrix at `a788232bd`: all eight Grant filters selected
 exactly one test, 1 passed / 5,460 skipped / retries 0 each; the focused gate
@@ -181,7 +186,7 @@ net/crates/net/src/adapter/net/
     MeshNode::publish_consumer_grant_snapshot
                                         the ONE consumer publication seam (counted in test)
     oa34b2_query_currentness_tests      W-G9 / W-G10 / W-G10b + assert_no_effect
-  org_routing_wiring_tests.rs           54 witnesses; CI floor MIN=54
+  org_routing_wiring_tests.rs           59 witnesses; CI floor MIN=59
   behavior/org_routing_registry.rs
     ScopedDiscoveryAuthorityStamp       Owner | Grant{id, install_seq, signature, handle}
     ScopedSourceFacts                   facts + the authority that produced them
@@ -242,8 +247,8 @@ cd net/crates/net
 export UNIT_FEATURES="net redex redex-disk cortex netdb meshdb meshos dataforts \
 nat-traversal port-mapping tool batched-ingress cli regex"
 
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,469 expected
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 54, MIN 54
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,474 expected
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 59, MIN 59
 CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" behavior::org_routing::     # 24, MIN 24
 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo clippy --all-features --all-targets -- -D warnings \

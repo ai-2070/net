@@ -891,6 +891,10 @@ struct RouteSourceGeneration {
     sensing: u64,
     topology: u64,
     watch_population: u64,
+    // A GRANT-scoped source is current only under the EXACT installed consumer
+    // Grant authority. See the §2A divergence note below — this member is not a
+    // generation counter and cannot be one.
+    consumer_grant_authority: ExactInstalledGrantAuthority,
 }
 
 /// Opaque crate-internal equality token, coherently published with authority.
@@ -902,6 +906,68 @@ struct OrgAuthorityEpoch {
     poisoned: bool,
 }
 ```
+
+> ### §2A divergence — the exact installed consumer Grant (CORRECTED)
+>
+> **Corrected by OLB-2B.3c-pre**, signed in two steps: `300e80f6c` (installation
+> identity) and `a788232bd` (Grant source service). The wake/invalidation edge
+> below landed with step 3. Authoritative design:
+> [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md)
+> §2A and §16.
+>
+> **What this plan got wrong.** The source/currentness vector above omitted the
+> installed consumer Grant entirely, and consumer-Grant publication was absent
+> from routing wake and invalidation. Both are load-bearing, because a
+> Grant-scoped row is query-visible ONLY while an exact consumer Grant is
+> installed — that installation is **authority**, not a decryption convenience.
+>
+> **A Grant-scoped source is current only under the exact installed consumer
+> Grant authority.** All five components bind, and each catches something the
+> others do not:
+>
+> | Component | Catches |
+> |---|---|
+> | `grant_id` | a different grant entirely |
+> | installation identity (non-aliasing, checked, terminal) | remove-then-reinstall of the byte-identical grant |
+> | signed Grant identity (the signature) | a DIFFERENT signed grant reusing the same `grant_id` |
+> | audience handle | a rotated-away audience under the same grant |
+> | Grant authority deadline | an installed-but-EXPIRED grant, which authorizes nothing |
+>
+> `grant_id` equality alone is insufficient: the live query already compares the
+> signature and the handle, so a cached slot comparing less would serve rows the
+> uncached path refuses.
+>
+> **This is a per-slot stamp, NOT a generation.** It cannot be folded into
+> `OrgAuthorityEpoch` or reduced to a counter. A transaction-wide "some Grant
+> moved" value copied into every artifact would make unrelated Grant movement
+> invalidate Owner and unrelated Grant facts. The batch-wide vector of selected
+> installation identities protects the capture/commit transaction; the per-slot
+> stamp protects one cached artifact; the two must stay separate.
+>
+> **Install, remove, remove-if-current and same-ID replacement are SOURCE
+> MOVEMENT** and invalidate the affected Grant-scoped retained work. Three
+> consequences the original text missed:
+>
+> - the notification must fire only AFTER the snapshot is published and its
+>   mutation synchronization RELEASED — an early wake lets the rebuild read the
+>   old snapshot and reinstall the staleness it was woken to clear, and holding
+>   that lock across the registry inverts the commit pin's own lock order;
+> - it must NOT be keyed on the scoped-discovery revision, which a Grant
+>   transition does not move at all;
+> - an outcome that publishes nothing — an idempotent install, a stale lease, a
+>   no-op removal — is not movement and must wake nothing.
+>
+> **An INSTALL is movement too, in the availability direction.** A Grant-scoped
+> slot reconstructed `Unserved` because the grant was absent holds no artifact to
+> invalidate, and the read seam returns cold for `Unserved` WITHOUT invalidating —
+> so without an install wake the slot stays cold permanently and no reader can
+> rescue it.
+>
+> **The Grant authority deadline must reach a real deadline path.** With ZERO
+> visible providers a Grant artifact's row-derived expiry is `u64::MAX`, so the
+> installed Grant's own deadline is the only thing that can retire it; deriving
+> the artifact deadline from provider rows alone leaves it permanently warm under
+> dead authority.
 
 `OrgAuthorityEpoch` is the SDK-facing INTERNAL analogue of the sensing gate's
 `SensingAuthorityStamp`: it includes authority/store identity, installation
@@ -915,6 +981,11 @@ an input changes:
 
 - global private-discovery generation (Owner or Grant), including the shared
   node-owned exact-expiry wake;
+- **consumer-Grant movement** — install / remove / remove-if-current / same-ID
+  replacement. NOT reachable from the scoped-discovery generation above: a Grant
+  transition mutates the grant registry, not the scoped store (§2A divergence);
+- **the installed Grant authority deadline**, which is a distinct deadline from
+  any provider row's and is the ONLY one a zero-provider Grant artifact has;
 - membership/dispatcher/grant validity edges;
 - direct-session generation;
 - sensing generation (`subscribe_sensing_overlay_changes`);

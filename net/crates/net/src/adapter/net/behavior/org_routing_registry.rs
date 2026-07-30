@@ -960,6 +960,71 @@ impl NodeOrgRoutingRegistry {
         }
     }
 
+    /// A consumer Grant moved: retire every retained artifact whose scope names
+    /// that `grant_id`, re-queue exactly those slots, and wake the actor
+    /// (OLB-2B.3c-pre items 10/11).
+    ///
+    /// Returns the number of artifacts retired. A slot that is retained but
+    /// already cold is still RE-QUEUED — that is the whole point of the install
+    /// direction: a Grant-scoped slot reconstructed `Unserved` because the grant
+    /// was not installed holds no artifact to invalidate, and without a re-queue
+    /// it stays cold forever. The read seam cannot rescue it either, because
+    /// `Unserved` returns cold WITHOUT invalidating.
+    ///
+    /// **Not keyed on `ScopedDiscoveryState::revision`** (item 11, design §2A.2).
+    /// A consumer-Grant transition mutates the grant registry, not the scoped
+    /// store, so the scoped revision does not move and cannot be the trigger.
+    /// This is the trigger.
+    ///
+    /// Matched by `grant_id` alone, not by the whole scope. Every scope naming
+    /// that id is affected by the transition: an install of `Grant{G, H_new}`
+    /// makes `Grant{G, H_new}` serveable AND leaves `Grant{G, H_old}`
+    /// definitively unserved, and a removal of `G` retires both. Handle-exact
+    /// matching would leave the sibling scope holding a stale artifact that only
+    /// a reader would retire. Unrelated grants and the whole Owner plane are
+    /// untouched — that separation is what W-G8 pins, and widening this to "all
+    /// slots" would break it.
+    ///
+    /// The caller must NOT hold the consumer-Grant gate here: the commit pin
+    /// takes that gate and then the registry lock, so acquiring the registry lock
+    /// beneath the gate would invert the frozen order. Item 10 states the same
+    /// requirement as an ordering rule — notify only after publication
+    /// synchronization is released.
+    pub(crate) fn invalidate_grant_scope(&self, grant_id: &[u8; 32]) -> u64 {
+        let (retired, owed) = {
+            let mut inner = self.inner.lock();
+            let affected: Vec<SlotKey> = inner
+                .slots
+                .keys()
+                .filter(|key| {
+                    matches!(
+                        key.scope.scope(),
+                        CapabilityAudienceScope::Grant { grant_id: g, .. } if g == grant_id
+                    )
+                })
+                .cloned()
+                .collect();
+            let mut retired = 0u64;
+            for key in affected {
+                if let Some(slot) = inner.slots.get_mut(&key) {
+                    if slot.facts.swap(None).is_some() {
+                        retired += 1;
+                    }
+                }
+                // Re-queued whether or not it held an artifact — see above.
+                inner.pending.insert(key);
+            }
+            self.metrics
+                .facts_invalidated
+                .fetch_add(retired, Ordering::AcqRel);
+            (retired, !inner.pending.is_empty())
+        };
+        if owed {
+            self.work.mark();
+        }
+        retired
+    }
+
     /// The authority epoch space is terminally exhausted: retire every retained
     /// fact and every queued identity, and do NOT wake the actor (E3c blockers
     /// §2). Called exactly once, at the `NewlyExhausted` transition.

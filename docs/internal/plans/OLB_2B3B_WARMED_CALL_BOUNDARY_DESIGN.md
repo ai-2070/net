@@ -613,7 +613,7 @@ it true:
 | `max warmed capabilities per OrgRoutingState clone family: 64` — **both** detailed bound blocks (§7, §13) **and the earlier summary wording near the top** (pin 10) | **2B.3b** |
 | Node-shared `OrgRouteSet` with a single `next_authority_deadline` → scoped node-owned pool deadlines + family route deadlines + **no family timer** | **2B.3c** (pool half) and **2B.3d** (family half) |
 | `RouteSourceGeneration` as one flat vector → split across `ScopedUnsensedRoutePool` and family `OrgRouteSet` | **2B.3c** |
-| The complete source/currentness vector omits the **exact installed consumer Grant identity**, and consumer-Grant publication is absent from routing wake/invalidation | **2B.3c-pre** |
+| The complete source/currentness vector omits the **exact installed consumer Grant identity**, and consumer-Grant publication is absent from routing wake/invalidation | **2B.3c-pre** — **DONE**, step 3 |
 
 The 2B.3c-pre edit must state that a Grant-scoped source is current **only** under
 the exact installed consumer Grant authority — grant ID, installation identity,
@@ -633,7 +633,7 @@ is the §19 defect class this process has already caught once.
 |---|---|---|
 | **1–3** — non-aliasing installation identity | **SIGNED** 2026-07-28 | `OLB_2B3C_PRE_STEP1_SIGNED_HEAD = 300e80f6c` |
 | **4–9, 12–14** — scope stamp + Grant source service | **SIGNED** 2026-07-29 | `OLB_2B3C_PRE_STEP2_SIGNED_HEAD = a788232bd` |
-| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | not started / not authorized | — |
+| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | **IMPLEMENTED + WITNESSED — NOT INDEPENDENTLY REVIEWED — NOT SIGNED** | step 3 |
 
 **Step 2 signed by Kyra 2026-07-29 at `a788232bd`**, after an independent
 mutation matrix in a detached worktree: every security claim below went RED
@@ -720,11 +720,48 @@ unaffected artifact; zero-provider Grant facts carry the installed authority
 deadline; and the production actor arms that deadline, retires the artifact,
 rebuilds `Unserved`, and converges without spinning.
 
-**The boundary stays frozen.** This signature does NOT authorize or include
-item 10 (the install/remove wake and invalidation edge), item 11 (related step-3
-implementation), or item 15 (the same-commit normative
-`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md` correction). They remain DEFERRED /
-NOT AUTHORIZED.
+**Step 3 — items 10, 11, 15, 16 — was authorized by the user after the step-2
+signature and is implemented and witnessed, NOT signed.** The step-2 signature
+of `a788232bd` did not cover it; nothing here retroactively extends that.
+
+What step 3 closes, both directions of design §0.1:
+
+```text
+INSTALL after an Unserved publication -> nothing moved -> the slot stayed
+                                        Unserved indefinitely   [availability]
+REMOVE after a Served publication     -> facts stayed retained until a reader
+                                        happened by             [promptness]
+```
+
+Neither was reachable from `ScopedDiscoveryState::revision` (item 11): a Grant
+transition mutates the grant registry, not the scoped store. And the read seam
+could not close the install direction at all, because it returns cold for
+`Unserved` WITHOUT invalidating, so it never re-queues.
+
+| Witness | Property | Dies to |
+|---|---|---|
+| `installing_a_consumer_grant_wakes_the_affected_grant_slot` | W-W1 — install re-serves an `Unserved` slot, no scoped mutation | drop the install notification |
+| `removing_a_consumer_grant_wakes_the_affected_grant_slot` | W-W2 — removal retires + rebuilds `Unserved`, no reader | drop the removal notification |
+| `consumer_grant_movement_wakes_only_the_affected_scope` | W-W3 — unrelated Grant AND the whole Owner plane untouched | widen the invalidation to all retained slots |
+| `a_grant_movement_notification_runs_after_publication_and_after_release` | W-W4 — item 10's ordering, both halves | notify under the guard; notify before publication |
+| `a_non_publishing_grant_outcome_wakes_nothing` | W-W5 — idempotent install / stale lease / no-op removal wake nothing | notify unconditionally |
+
+W-W3 is the one that constrains the design rather than confirming it: "invalidate
+everything on any Grant movement" satisfies W-W1 and W-W2 perfectly and makes
+routine grant churn globally destructive. It is also the only witness that
+catches that mutation.
+
+Item 16 holds by construction — no public surface changed and
+`OrgCapabilityRegistration` is untouched.
+
+**Item 15 is discharged in the same commit as the code**, as §15 requires:
+`ORG_CAPABILITY_LOAD_BALANCING_PLAN.md` now carries the §2A divergence note (the
+five binding components with what each one catches, the per-slot-stamp-not-a-
+generation rule, install/remove/replacement as source movement with the ordering
+constraints, and the zero-provider deadline), plus the two new reconciler inputs.
+
+**Every RED for step 3 is the author's own.** It owes an independent mutation
+run before any signature.
 
 Step 1's corrective lineage, kept because each turn found a distinct defect class
 and the sequence is the useful record:
