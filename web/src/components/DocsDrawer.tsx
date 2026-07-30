@@ -9,7 +9,13 @@ import type { ClientDocTree } from "@/lib/docs";
 // Mobile + tablet docs nav. Renders a sticky toggle bar below the main
 // NavBar and a slide-in drawer panel. Hidden at `lg` and above (the
 // layout shows the sidebar inline at that breakpoint).
-export function DocsDrawer({ tree }: { tree: ClientDocTree }) {
+export function DocsDrawer({
+  tree,
+  version,
+}: {
+  tree: ClientDocTree;
+  version?: string;
+}) {
   const [open, setOpen] = useState(false);
   const pathname = usePathname() ?? "/docs";
 
@@ -69,6 +75,23 @@ export function DocsDrawer({ tree }: { tree: ClientDocTree }) {
             <span aria-hidden>≡</span> nav
           </span>
         </button>
+
+        {/* Reader context, persistent. The language selection used to be
+            reachable only by opening this drawer, which made the one thing the
+            docs are supposed to remember the one thing you could not see. It
+            sits in the bar itself now, at every breakpoint, beside the version
+            slot D6 leaves empty of behaviour. */}
+        <div className="flex items-center gap-3 border-t border-line px-6 py-1.5">
+          <span className="font-mono text-[9px] tracking-[0.22em] uppercase text-ink-faint shrink-0">
+            <span className="text-accent">$</span> lang
+          </span>
+          <LanguageSwitcher variant="bar" className="min-w-0 overflow-x-auto" />
+          {version ? (
+            <span className="ml-auto font-mono text-[9px] tracking-[0.14em] uppercase text-ink-faint shrink-0">
+              {version}
+            </span>
+          ) : null}
+        </div>
       </div>
 
       {/* Drawer overlay (backdrop + panel). Always rendered so the slide

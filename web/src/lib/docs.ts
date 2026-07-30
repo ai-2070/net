@@ -634,3 +634,25 @@ export function getClientDocTree(): ClientDocTree {
     folders: t.folders.map(toClientFolder),
   };
 }
+
+// The version the docs describe — derived, not typed.
+//
+// This existed as a hardcoded `v0.17` in the sidebar footer while the newest
+// release page was v0.33: a wrong version on all 149 pages, and precisely the
+// kind of claim that rots because nothing points at it. The newest release note
+// *is* the version the docs describe, so read it.
+//
+// Numeric compare, not string: `0.9` sorts above `0.33` lexically, so a string
+// max would have reported v0.9 the moment 0.10 shipped.
+export function getDocsVersion(): string {
+  let best: [number, number] | null = null;
+  const dir = join(DOCS_ROOT, "releases");
+  if (!existsSync(dir)) return "";
+  for (const entry of readdirSync(dir)) {
+    const m = /^release[_-]v(\d+)\.(\d+)/i.exec(entry);
+    if (!m) continue;
+    const v: [number, number] = [Number(m[1]), Number(m[2])];
+    if (!best || v[0] > best[0] || (v[0] === best[0] && v[1] > best[1])) best = v;
+  }
+  return best ? `v${best[0]}.${best[1]}` : "";
+}

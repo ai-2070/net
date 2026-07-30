@@ -359,9 +359,14 @@ function SidebarBody({
 export function DocsSidebar({
   tree,
   chrome = true,
+  version,
 }: {
   tree: ClientDocTree;
   chrome?: boolean;
+  /** Derived from the newest release note by `getDocsVersion()`. This footer
+   *  used to print a hardcoded `v0.17` on all 149 pages while the newest
+   *  release page was v0.33 — a stale claim nothing pointed at. */
+  version?: string;
 }) {
   const pathname = usePathname() ?? "/docs";
   const active = activeFromPath(pathname);
@@ -430,7 +435,7 @@ export function DocsSidebar({
               <span className="text-accent-dim">/</span>find
             </span>
             <span className="text-[9px] tracking-[0.14em] uppercase text-ink-faint">
-              v0.17
+              {version}
             </span>
           </div>
         </div>

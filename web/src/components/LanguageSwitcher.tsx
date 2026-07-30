@@ -11,9 +11,48 @@ const LABELS: Record<Language, string> = {
   c: "C",
 };
 
-export function LanguageSwitcher({ className = "" }: { className?: string }) {
+/** `panel` is the bordered block in the sidebar and drawer. `bar` is the bare
+ *  pill row for the persistent context strip, where the surrounding chrome
+ *  already provides the border and the label would be noise. */
+export function LanguageSwitcher({
+  className = "",
+  variant = "panel",
+}: {
+  className?: string;
+  variant?: "panel" | "bar";
+}) {
   const language = useLanguageStore((s) => s.language);
   const setLanguage = useLanguageStore((s) => s.setLanguage);
+
+  if (variant === "bar") {
+    return (
+      <div
+        className={`flex items-center gap-1 ${className}`}
+        role="radiogroup"
+        aria-label="Documentation language"
+      >
+        {LANGUAGES.map((l) => {
+          const on = l === language;
+          return (
+            <button
+              key={l}
+              type="button"
+              role="radio"
+              aria-checked={on}
+              onClick={() => setLanguage(l)}
+              className={`cursor-pointer font-mono text-[10px] tracking-[0.06em] px-1.5 py-0.5 border transition-colors ${
+                on
+                  ? "border-accent text-accent bg-accent/[0.08]"
+                  : "border-transparent text-ink-faint hover:text-ink"
+              }`}
+            >
+              {LABELS[l]}
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
 
   return (
     <div

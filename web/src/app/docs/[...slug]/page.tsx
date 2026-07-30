@@ -236,6 +236,34 @@ function FolderIndex({ folder }: { folder: DocFolder }) {
   );
 }
 
+// What kind of page this is, from its section. Concept, guide, tutorial,
+// reference and agent brief are read differently — a tutorial is followed once,
+// a reference is returned to — and until now the only signal was the URL.
+// Section-derived rather than frontmatter-declared so it needs no content edit
+// and cannot disagree with where the page actually lives.
+const PAGE_KIND: Record<string, string> = {
+  start: "getting started",
+  worldview: "worldview",
+  concepts: "concept",
+  guides: "guide",
+  tutorials: "tutorial",
+  "agent-briefs": "agent brief",
+  payments: "payments",
+  reference: "reference",
+  sdk: "sdk",
+  releases: "release note",
+};
+
+function KindBadge({ section }: { section?: string }) {
+  const kind = section ? PAGE_KIND[section] : undefined;
+  if (!kind) return null;
+  return (
+    <span className="font-mono text-[9px] tracking-[0.18em] uppercase text-accent-dim border border-line px-1.5 py-0.5">
+      {kind}
+    </span>
+  );
+}
+
 export default async function DocPage({ params }: PageProps) {
   const { slug } = await params;
   const resolved = resolveDoc(slug);
@@ -269,21 +297,26 @@ export default async function DocPage({ params }: PageProps) {
   return (
     <>
       <main className="min-w-0 max-w-[740px]">
-        <div className="text-[11px] text-ink-faint font-mono mb-4 tracking-[0.06em]">
-          <Link href="/docs" className="hover:text-accent">
-            docs
-          </Link>
-          {resolved.file.slug.slice(0, -1).map((seg, i) => {
-            const path = resolved.file.slug.slice(0, i + 1).join("/");
-            return (
-              <span key={path}>
-                <span className="text-ink-faint mx-1.5">/</span>
-                <Link href={`/docs/${path}`} className="hover:text-accent">
-                  {seg}
-                </Link>
-              </span>
-            );
-          })}
+        <div className="flex items-center gap-3 mb-4">
+          <div className="text-[11px] text-ink-faint font-mono tracking-[0.06em] min-w-0 truncate">
+            <Link href="/docs" className="hover:text-accent">
+              docs
+            </Link>
+            {resolved.file.slug.slice(0, -1).map((seg, i) => {
+              const path = resolved.file.slug.slice(0, i + 1).join("/");
+              return (
+                <span key={path}>
+                  <span className="text-ink-faint mx-1.5">/</span>
+                  <Link href={`/docs/${path}`} className="hover:text-accent">
+                    {seg}
+                  </Link>
+                </span>
+              );
+            })}
+          </div>
+          <span className="ml-auto shrink-0">
+            <KindBadge section={resolved.file.slug[0]} />
+          </span>
         </div>
         <DocsPrevNextTop prev={prev} next={next} />
         <DocsContent

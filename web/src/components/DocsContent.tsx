@@ -503,10 +503,19 @@ const mdxComponents = {
   // padding). Pre WITHOUT data-language is a standalone block (raw HTML
   // `<pre>`, no fence) — apply full container styling.
   //
-  // Both variants use `whitespace-pre-wrap break-words` so long lines wrap at
-  // the column edge instead of forcing horizontal scroll. Indentation is
-  // preserved because pre-wrap respects whitespace; break-words handles
-  // unbroken tokens (long hex addresses, urls) that exceed the column.
+  // Both variants scroll horizontally rather than wrapping. They used to use
+  // `whitespace-pre-wrap break-words`, on the reasoning that wrapping beats
+  // horizontal scroll — which is true for prose and wrong for anything where
+  // column position carries meaning.
+  //
+  // The measurable failure is the ASCII diagrams. Six concept pages draw box
+  // diagrams in bare fences: at 12.5px mono a 53-character line needs ~400px,
+  // and the content column at a 375px viewport gives ~311px after padding — so
+  // about 41 characters fit and every diagram wrapped mid-box, which reads as
+  // corruption rather than as a wide figure. Code had a quieter version of the
+  // same problem: a wrapped continuation line looks like a second statement.
+  //
+  // Scroll containers are per-block, so a wide diagram does not widen the page.
   pre: (props: {
     children?: ReactNode;
     "data-language"?: string;
@@ -518,13 +527,13 @@ const mdxComponents = {
       return (
         <pre
           {...props}
-          className="px-4 py-3 m-0 text-[12.5px] leading-[1.6] font-mono whitespace-pre-wrap break-words"
+          className="px-4 py-3 m-0 text-[12.5px] leading-[1.6] font-mono whitespace-pre overflow-x-auto"
         />
       );
     }
     return (
       <pre
-        className="my-6 border border-line bg-bg-2 px-4 py-3 text-[12.5px] leading-[1.6] font-mono whitespace-pre-wrap break-words"
+        className="my-6 border border-line bg-bg-2 px-4 py-3 text-[12.5px] leading-[1.6] font-mono whitespace-pre overflow-x-auto"
         {...props}
       />
     );
