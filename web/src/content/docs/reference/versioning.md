@@ -63,7 +63,7 @@ be replayed across versions.
 **Feature flags change what's on the wire.** A node built without `regex` still
 receives regex patterns from peers and fails them closed. Enabling or disabling
 a feature is a compatibility decision, not just a build-size one — see
-[Install](/docs/start/install#feature-flags).
+[Install](/docs/start/install/rust#feature-flags).
 
 ## Cross-language parity
 

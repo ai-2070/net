@@ -1,0 +1,216 @@
+# Capability record — payments
+#
+# CANONICAL. This is the only authored answer to "does binding X support
+# operation Y" for this domain. `.claude/skills/net-payments/bindings/coverage.md`
+# is GENERATED from this file; edit here, run
+# `.github/scripts/capability_records.py --check` to see the diff, and commit
+# both.
+#
+# status  supported | partial | experimental | not exposed | n/a
+#           `n/a` means the operation makes no sense on this binding — a
+#           permanent non-concept, not a gap. `not exposed` means buildable and
+#           not built: a roadmap entry. The difference decides whether a reader
+#           should stop asking.
+# mode    poll | verify-only | core-only        (qualifies a status)
+#           `core-only` is the most load-bearing: the operation exists, but only
+#           on the low-level binding (`@net-mesh/core`, `net`), not the
+#           ergonomic wrapper. It is the single most common way to be wrong
+#           about Net in Node and Python.
+# anchor  one symbol CI resolves in that binding's tree. Positive cells must
+#           carry one; negative cells must not. An anchor proves a symbol
+#           exists, NOT that the operation is supported — the status is
+#           editorial, the anchor is its evidence.
+#
+# NOT YET POPULATED: `reason` and `alternative` per negative cell, which D5's
+# generated absence state needs. Until Phase 3/4 renders that state, the prose
+# rationale still lives in the skill's own "Why the negative cells are negative"
+# section, which is authored and not generated.
+#
+# Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
+
+domain: payments
+skill: net-payments
+operations:
+- operation: x402 envelopes and carry
+  bindings:
+    Rust:
+      status: supported
+      anchor: X402Carry
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: payment_http
+    Python:
+      status: supported
+      mode: core-only
+      anchor: payment_http
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Provider — author pricing terms
+  bindings:
+    Rust:
+      status: supported
+      anchor: PricingTerms
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: author_pricing_terms
+    Python:
+      status: supported
+      mode: core-only
+      anchor: author_pricing_terms
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Provider — publish a paid capability
+  bindings:
+    Rust:
+      status: supported
+      anchor: serve_payments
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: publish_paid_tools
+    Python:
+      status: supported
+      mode: core-only
+      anchor: publish_paid_tools
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Provider — gate an invocation
+  bindings:
+    Rust:
+      status: supported
+      anchor: PaymentEngine
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: payment_provider
+    Python:
+      status: supported
+      mode: core-only
+      anchor: payment_provider
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Provider — read billing
+  bindings:
+    Rust:
+      status: supported
+      anchor: publish_billing
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: read_billing
+    Python:
+      status: supported
+      mode: core-only
+      anchor: read_billing
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Caller — payment flow
+  bindings:
+    Rust:
+      status: supported
+      anchor: CallerPaymentFlow
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: build_flow
+    Python:
+      status: supported
+      mode: core-only
+      anchor: build_flow
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Caller — spend policy and approval
+  bindings:
+    Rust:
+      status: supported
+      anchor: SpendPolicyEngine
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: requires_payment_approval
+    Python:
+      status: supported
+      mode: core-only
+      anchor: collect_required
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Facilitator — verify / settle
+  bindings:
+    Rust:
+      status: supported
+      anchor: Facilitator
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: payment_http
+    Python:
+      status: supported
+      mode: core-only
+      anchor: fetch_paid
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Verification tiers / chain checker
+  bindings:
+    Rust:
+      status: supported
+      anchor: ChainChecker
+    Node / TS:
+      status: not exposed
+    Python:
+      status: not exposed
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Signer boundary
+  bindings:
+    Rust:
+      status: supported
+      anchor: SchemeSigner
+    Node / TS:
+      status: supported
+      mode: core-only
+      anchor: payment_signer
+    Python:
+      status: supported
+      mode: core-only
+      anchor: payment_signer
+    Go:
+      status: not exposed
+    C:
+      status: not exposed
+- operation: Canonical-encoding conformance
+  bindings:
+    Rust:
+      status: supported
+      anchor: net/crates/net/payments/tests/payments_golden_vectors.rs
+    Node / TS:
+      status: supported
+      anchor: net/crates/net/bindings/node/test/payments_golden_vectors.test.ts
+    Python:
+      status: supported
+      anchor: net/crates/net/bindings/python/tests/test_payments_golden_vectors.py
+    Go:
+      status: supported
+      mode: verify-only
+      anchor: go/payments_golden_vectors_test.go
+    C:
+      status: not exposed

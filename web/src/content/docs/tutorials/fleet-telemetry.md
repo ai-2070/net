@@ -10,7 +10,7 @@ By the end you'll have a working three-tier deployment — edge devices, a regio
 
 ## The shape
 
-```
+```text title="What you are building"
 ┌─────────────────────────────────────────────┐
 │       Operations cluster (region: ops)      │
 │  ┌──────────────────┐ ┌──────────────────┐  │

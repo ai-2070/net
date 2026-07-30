@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Compile floor for the checked skill examples listed in
-# `.github/skill-examples.json`.
+# `docs/data/examples.yaml`.
 #
 # The examples README calls these "the first thing a developer runs after
 # install." Nothing built them until this script. A broken hello-world is the
@@ -37,7 +37,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
-MANIFEST="$ROOT/.github/skill-examples.json"
+MANIFEST="$ROOT/docs/data/examples.yaml"
 REQUIRE_ALL="${REQUIRE_ALL:-0}"
 
 WORK=$(mktemp -d)

@@ -1,0 +1,89 @@
+# Example index — what exists, where it lives, and what CI proves about it.
+#
+# NEUTRAL BY DESIGN, IN THE INDEX ONLY. This file is the contract; the runnable
+# source stays where each language's tooling expects it. Relocating source into
+# one language-neutral directory for conceptual symmetry would cost package-local
+# discoverability, native build integration, release coupling, IDE behaviour and
+# first-party provenance — and buy nothing. So: neutralize the index, not the
+# files. `.github/scripts/skill_examples.py` reads this; the docs transclude from
+# the paths it names.
+#
+# THE RULE THAT EARNS THE MANIFEST: every binding in `bindings` must appear in
+# either `files` or `absent`, for every example. A binding named in neither is an
+# error, not a skip — otherwise an example that quietly covers three languages
+# reads exactly like one that covers five.
+#
+# `absent` is for a binding that will not get this example, with the reason. It is
+# not a to-do list: an example that is merely unwritten should say so in its
+# reason.
+#
+# EVIDENCE LEVELS. Every example declares what CI actually proves, because
+# "everything is executed" is a promise the machinery cannot keep — a C lifecycle
+# example needs a link step, an expected-compile-failure must not pass, a wire
+# dump cannot run at all. Declaring the truth is stronger than claiming the
+# maximum and quietly making exceptions.
+#
+#   run              executes, exits 0, stdout matches its contract
+#   compile          compiles
+#   link             compiles and links against the real cdylib
+#   typecheck        type-checks against the SDK source
+#   source-match     the quoted text matches the named source
+#   expected-failure fails, in the named way
+#   illustrative     nothing — and says so
+#
+# A binding at any level BELOW `run` needs a reason in `level_reasons`. Same
+# discipline as `absent`: the weaker claim has to be argued, or the levels drift
+# down to whatever was convenient. `run.not_wired` names bindings whose artifacts
+# are missing from the job that runs the others, so a partially-executed example
+# can never read as a fully-executed one.
+#
+# Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
+
+bindings: [rust, typescript, python, go, c]
+
+levels: [run, compile, link, typecheck, source-match, expected-failure, illustrative]
+
+examples:
+  - id: hello
+    skill: net-event-bus
+    title: Hello, mesh
+    route: construct · publish · verify the bus accepted it · shutdown
+    dir: .claude/skills/net-event-bus/examples
+    # All five bindings execute: Rust and TypeScript in skills.yml, Python, Go
+    # and C in ci.yml, each riding the job that already holds the artifacts.
+    level: run
+    files:
+      rust: hello.rs
+      typescript: hello.ts
+      python: hello.py
+      go: hello.go
+      c: hello.c
+    absent: {}
+    run:
+      # Asserts observable state rather than snapshotting a transcript: the shard
+      # id is nondeterministic, the ingest count is the contract.
+      expect: "accepted: .*ingested=1"
+      timeout_s: 60
+      not_wired: {}
+
+  - id: observe
+    skill: net-event-bus
+    title: What the drop counters tell you
+    route: push past capacity in all three backpressure modes · read the producer-side counters
+    dir: .claude/skills/net-event-bus/examples
+    level: run
+    files:
+      rust: observe.rs
+      typescript: observe.ts
+      python: observe.py
+      go: observe.go
+      c: observe.c
+    absent: {}
+    run:
+      # DropOldest is the one mode that loses events without reporting it, which
+      # is the whole point of the example. Measured, not assumed: 20,000 events
+      # into a 1024-slot buffer gave ingested=20000/dropped=0 for DropOldest and
+      # 1023/18977 for both DropNewest and FailProducer.
+      expect: "loses events silently"
+      timeout_s: 120
+      not_wired: {}

@@ -118,6 +118,14 @@ Restart Claude Code and run `/skills` — **net-event-bus** and **net-payments**
 should be listed. Full install options in
 [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
+### Give the agent the source too
+
+[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
+
+```bash
+npx -y opensrc@latest path ai-2070/net
+```
+
 ## Links
 
 [Docs](https://ai2070.net/docs) ·

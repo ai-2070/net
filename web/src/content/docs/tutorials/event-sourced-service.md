@@ -10,7 +10,7 @@ By the end you'll have an end-to-end implementation of the storage stack pattern
 
 ## The shape
 
-```
+```text title="What you are building"
 ┌──────────────────────────────────────────────────────┐
 │                                                      │
 │  Producer ─►  Event  ─►  Channel  ─►  RedEX file     │

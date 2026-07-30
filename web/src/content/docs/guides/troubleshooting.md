@@ -59,7 +59,7 @@ On a genuinely isolated node, only self-hosted entries will ever match.
 The `regex` feature is **off by default**, and it **fails closed**. A peer can
 still send you a regex pattern, but a node built without the feature treats it
 as matching nothing — no error, no warning. If you rely on regex predicates,
-enable the feature explicitly. See [Install](/docs/start/install#feature-flags).
+enable the feature explicitly. See [Install](/docs/start/install/rust#feature-flags).
 
 ## A capability call fails with `NoRoute`
 

@@ -1,0 +1,118 @@
+# The API symbols the composed SDK spine names, per page and lens.
+#
+# EVIDENCE LEVEL: source-match. Every symbol below resolves in its binding's own
+# tree, and appears on the page that claims it. That is all this proves. It is
+# NOT a claim that the surrounding example compiles, that the argument order is
+# right, or that anything runs — `docs/data/examples.yaml` carries the levels
+# above this one, for code CI actually executes.
+#
+# WHY IT IS AUTHORED RATHER THAN EXTRACTED. A regex over code fences cannot tell
+# an SDK symbol from a local variable or a user's own type. A checker that
+# guesses produces noise nobody reads. So the list is written down, and
+# `check-spine-symbols.py --self-test` proves the checker fails when it should.
+#
+# WHAT THIS CATCHES. The Phase 4 conversion found, in the shipped spine:
+#   - `serve_tool(node, …)` in Python and TypeScript, where the first argument is
+#     a TypedMeshRpc — a working tool nobody can discover;
+#   - `CallOptions::default().with_deadline(…)` in Rust, where no such builder
+#     method exists;
+#   - `serve_rpc_typed("summarize", handler)` in Rust, which takes three
+#     arguments — service, codec, handler;
+#   - `net.WatchTools(ctx, rpc, …)` in Go handed a `*MeshRpc` where the signature
+#     wants a `*TypedMeshRpc`.
+# Four of those five are name-level errors this file would have caught. The
+# argument-order ones it would not — which is exactly why the level says
+# source-match and stops there.
+#
+# Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
+
+pages:
+  quickstart:
+    rust: [Net, MeshBuilder, Backpressure, shutdown, local_addr, public_key, node_id]
+    typescript: [NetNode, MeshNode, emitRaw, emitBatch, nodeId, publicKey]
+    python: [NetNode, MeshNode, emit_raw, emit_batch, node_id, public_key]
+    go: [NewMeshNode, MeshConfig, PskHex, IngestRaw, NodeID, PublicKey]
+
+  announce:
+    rust: [MeshBuilder, announce_capabilities, CapabilitySet, add_tag]
+    typescript:
+      - MeshNode
+      - announceCapabilities
+      - TypedMeshRpc
+      - serveTool
+      - descriptorFrom
+      - addToolCapabilitiesToAnnounce
+      - listTools
+    python:
+      - MeshNode
+      - TypedMeshRpc
+      - from_mesh
+      - serve_tool
+      - descriptor_for
+      - add_tool_capabilities_to_announce
+      - list_tools
+      - announce_capabilities
+    go:
+      - AnnounceCapabilities
+      - CapabilitySet
+      - NewMeshRpc
+      - NewTypedMeshRpc
+      - DescriptorFor
+      - ToolOptions
+      - RegisterTool
+      - AddToolCapabilitiesToAnnounce
+      - CapabilitySetWire
+      - FindNodes
+      - CapabilityFilter
+
+  discover:
+    rust: [list_tools, watch_tools, find_nodes, CapabilityFilter, find_best_node,
+           find_nodes_scoped, to_openai_tool]
+    typescript: [findNodes, findNodesScoped, listTools, watchTools, toOpenaiTool,
+                 inputSchema]
+    python: [list_tools, watch_tools, find_nodes, tool_id, node_count]
+    go: [FindNodes, CapabilityFilter, NewMeshRpc, NewTypedMeshRpc, ListTools,
+         WatchTools, WatchOptions, ToolID]
+
+  invoke:
+    rust: [call_tool, serve_rpc_typed, call_typed, call_service_typed,
+           CallOptionsTyped, Codec]
+    typescript: [callTool, TypedMeshRpc, fromMesh, callService, classifyError,
+                 RpcServerError, NRPC_TYPED_BAD_REQUEST]
+    python: [call_tool, call_tool_async, call_tool_streaming, TypedMeshRpc,
+             call_service, RpcServerError, NRPC_TYPED_BAD_REQUEST]
+    go: [CallTool, CallToolStreaming, NewTypedMeshRpc, TypedServe, TypedCall,
+         TypedCallService, AppError, NrpcTypedBadRequest]
+
+  watch:
+    rust: [subscribe_typed, SubscribeOpts, subscribe_channel, recv, recv_shard]
+    typescript: [subscribeTyped, subscribe, poll, pollOne, eventsIngested]
+    python: [subscribe_typed, subscribe, events_ingested]
+    go: [Poll, PollResponse, NextID, Stats, EventsIngested]
+
+  artifacts:
+    rust: [serve_blob_transfer, fetch_blob, fetch_blob_discovered, fetch_dir,
+           TransferError, AllPeersFailed]
+    typescript: [serveBlobTransfer, fetchBlob, fetchBlobDiscovered, storeDir,
+                 fetchDir, TransferControl, TransferHeader]
+    python: [serve_blob_transfer, fetch_blob, fetch_blob_discovered, store_dir,
+             fetch_dir]
+    # Go names the ABSENCE of the transfer surface, so the symbols it can claim
+    # are the local adapter ones — which is the honest list, and shorter than the
+    # others for a reason the page states.
+    go: [NewMeshBlobAdapter, MeshBlobAdapter, ErrBlob]
+
+  errors:
+    rust: [RpcError, CapabilityDenied, CodecDirection, SdkError, Backpressure,
+           Unrouted, RetryPolicy, HedgePolicy, CircuitBreaker]
+    typescript: [RpcError, RpcCapabilityDeniedError, RpcTimeoutError,
+                 RpcServerError, RpcCodecError, RpcCancelledError, classifyError,
+                 BackpressureError, NotConnectedError, RetryPolicy, HedgePolicy,
+                 CircuitBreaker]
+    python: [RpcError, RpcCapabilityDeniedError, RpcTimeoutError, RpcServerError,
+             RpcCodecError, RpcCancelledError, RpcAppError, BackpressureError,
+             NotConnectedError, send_with_retry, NRPC_TYPED_BAD_REQUEST]
+    go: [RpcError, RpcKindCapabilityDenied, RpcKindTimeout, RpcKindServerError,
+         RpcKindNoRoute, RpcKindCodecEncode, RpcKindCodecDecode,
+         RpcKindTransport, RpcKindUnknown, ErrBackpressure, ErrTokenExpired,
+         GroupError, AppError, NrpcTypedBadRequest]

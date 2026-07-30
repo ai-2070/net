@@ -10,7 +10,7 @@
 # nothing. The examples README meanwhile promised "prints exactly one line".
 #
 # Nothing short of running them would have found it. So: run them, match stdout
-# against the contract in `.github/skill-examples.json`, and bound every run
+# against the contract in `docs/data/examples.yaml`, and bound every run
 # with a timeout — a hang is the specific failure this exists to catch, and an
 # unbounded run would reproduce it rather than report it.
 #
@@ -48,7 +48,7 @@ ok()   { printf '  \033[32m▶\033[0m %s\n' "$1"; }
 SPEC=$(python3 "$ROOT/.github/scripts/skill_examples.py" --run-spec "$LANG_ARG")
 if [ -z "$SPEC" ]; then
   echo "==> No $LANG_ARG examples are wired to run here."
-  echo "    (See run.not_wired in .github/skill-examples.json.)"
+  echo "    (See run.not_wired in docs/data/examples.yaml.)"
   exit 0
 fi
 

@@ -71,7 +71,7 @@ jobs that build the napi module, Python in `ci.yml`'s `python-tests` (the only
 job with both the maturin binding and the `net_sdk` wrapper), and Go and C in
 `ci.yml`'s `go-tests`, the only job that produces a linkable `libnet`.
 
-Both are driven from `.github/skill-examples.json`, which requires every binding
+Both are driven from `docs/data/examples.yaml`, which requires every binding
 to be listed for every route as either a checked file or an explicit, reasoned
 absence — and, for execution, records which bindings run where. Its coverage
 report prints **▶** for executed against **✓** for compiled-only, so a partially

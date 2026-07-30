@@ -156,6 +156,14 @@ auth, the gang-claim scheduler, and RedEX / CortEX / Dataforts.
 `net-payments` covers x402 pricing, quotes, settlement and spend policy. Full
 install options in [Claude Skills](https://ai2070.net/docs/start/claude-skills).
 
+### Give the agent the source too
+
+[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
+
+```bash
+npx -y opensrc@latest path ai-2070/net
+```
+
 ## Submodules and the Cargo features behind them
 
 Every wrapper dispatches into `@net-mesh/core`. **Published artifacts ship

@@ -10,6 +10,8 @@ import {
 import type Fuse from "fuse.js";
 import type { FuseResultMatch, IFuseOptions } from "fuse.js";
 import { useRouter } from "next/navigation";
+import { slugLanguage, type Language } from "@/lib/docs-language";
+import { useLanguageStore } from "@/store/useLanguageStore";
 
 // Mirror of `SearchEntry` / `SearchBlock` from `@/lib/search-index` — declared
 // here to avoid pulling the server-only module into the client bundle.
@@ -39,12 +41,21 @@ type FuseItem = {
 };
 
 type Result = {
+  language: Language | null;
   slug: string[];
   title: string;
   section?: string;
   heading?: string;
   headingId?: string;
   snippet: string;
+};
+
+const LANG_TAG: Record<Language, string> = {
+  rust: "Rust",
+  ts: "TS",
+  python: "Python",
+  go: "Go",
+  c: "C",
 };
 
 const MAX_RESULTS = 20;
@@ -127,7 +138,11 @@ function snippetFromMatches(
   return prefix + text.slice(start, end) + suffix;
 }
 
-function runSearch(fuse: Fuse<FuseItem>, query: string): Result[] {
+function runSearch(
+  fuse: Fuse<FuseItem>,
+  query: string,
+  language: Language,
+): Result[] {
   const q = query.trim();
   if (q.length < 2) return [];
   const raw = fuse.search(q);
@@ -145,10 +160,21 @@ function runSearch(fuse: Fuse<FuseItem>, query: string): Result[] {
       heading: r.item.heading,
       headingId: r.item.headingId,
       snippet: snippetFromMatches(r.item.text, r.matches, SNIPPET_LEN),
+      language: slugLanguage(r.item.slug),
     });
     if (out.length >= MAX_RESULTS) break;
   }
-  return out;
+  // Demote other languages' surfaces rather than dropping them.
+  //
+  // Searching `invoke` used to return five near-identical hits — one per SDK
+  // spine — with nothing to say which was the reader's. Dropping the other four
+  // would be worse than the noise: a Go reader who genuinely wants to compare
+  // against Rust should still find it. So: the reader's own and universal pages
+  // first, everything else after, relative order preserved inside each group, and
+  // the foreign ones carry their language as a visible tag.
+  const mine = out.filter((r) => r.language === null || r.language === language);
+  const theirs = out.filter((r) => r.language !== null && r.language !== language);
+  return [...mine, ...theirs];
 }
 
 export function DocsSearchModal() {
@@ -255,10 +281,11 @@ export function DocsSearchModal() {
     setSelected(0);
   }, [query]);
 
+  const language = useLanguageStore((s) => s.language);
   const results = useMemo(() => {
     if (!fuse) return [];
-    return runSearch(fuse, query);
-  }, [fuse, query]);
+    return runSearch(fuse, query, language);
+  }, [fuse, query, language]);
 
   // Keep the selected row visible while arrow-keying through a long list.
   useEffect(() => {
@@ -372,9 +399,19 @@ export function DocsSearchModal() {
                   on ? "bg-accent/[0.08]" : "hover:bg-bg-2/60"
                 }`}
               >
-                <div className="font-mono text-[10px] text-ink-faint tracking-[0.06em] mb-0.5 truncate">
-                  {r.section ? `${r.section} · ` : ""}
-                  {r.title}
+                <div className="font-mono text-[10px] text-ink-faint tracking-[0.06em] mb-0.5 truncate flex items-center gap-1.5">
+                  <span className="truncate">
+                    {r.section ? `${r.section} · ` : ""}
+                    {r.title}
+                  </span>
+                  {/* Only on results from a language the reader did not select.
+                      Their own language needs no label; a foreign one without a
+                      label is what made five near-identical hits confusing. */}
+                  {r.language && r.language !== language ? (
+                    <span className="shrink-0 border border-line px-1 text-[9px] tracking-[0.14em] uppercase text-accent-dim">
+                      {LANG_TAG[r.language]}
+                    </span>
+                  ) : null}
                 </div>
                 <div
                   className={`font-mono text-[13px] leading-snug truncate ${

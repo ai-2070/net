@@ -6,6 +6,7 @@ import rehypePrettyCode, {
 } from "rehype-pretty-code";
 import rehypeSlug from "rehype-slug";
 import rehypeAutolinkHeadings from "rehype-autolink-headings";
+import { Children, isValidElement } from "react";
 import type { ReactNode, AnchorHTMLAttributes } from "react";
 import { CodeBlock } from "@/components/CodeBlock";
 
@@ -389,6 +390,61 @@ function makeAnchor(baseDir: readonly string[] = []) {
   };
 }
 
+
+/** Pull a rehype-pretty-code `<figcaption>` out of a figure's children.
+ *
+ * The caption is emitted as a plain `figcaption` element (we deliberately do not
+ * map one in `mdxComponents`, so its type is the string), which makes it
+ * detectable without reaching into rehype internals. */
+function splitCaption(children: ReactNode): {
+  caption: ReactNode | null;
+  rest: ReactNode[];
+} {
+  let caption: ReactNode | null = null;
+  const rest: ReactNode[] = [];
+  for (const child of Children.toArray(children)) {
+    if (isValidElement(child) && child.type === "figcaption") {
+      caption = (child.props as { children?: ReactNode }).children ?? null;
+    } else {
+      rest.push(child);
+    }
+  }
+  return { caption, rest };
+}
+
+/** A diagram: captioned, scrollable, and not pretending to be code.
+ *
+ * No copy button — copying box-drawing characters is not a thing anyone wants —
+ * and no language chrome, because "TEXT" tells a reader nothing. The scroll hint
+ * is shown unconditionally rather than measured: these are wider than a phone
+ * column by construction (a 53-character line needs ~400px at this size against
+ * ~311px available at 375px), and a hint that appears only sometimes is worse
+ * than one that is always true. */
+function Diagram({
+  caption,
+  children,
+}: {
+  caption: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <figure className="my-6 border border-line bg-bg-2/20">
+      <figcaption className="flex items-baseline justify-between gap-3 border-b border-line px-3 py-1.5">
+        <span className="font-mono text-[10px] tracking-[0.14em] uppercase text-cyan">
+          <span className="text-accent">◇</span> {caption}
+        </span>
+        <span
+          aria-hidden
+          className="font-mono text-[9px] tracking-[0.1em] uppercase text-ink-faint sm:hidden"
+        >
+          scroll →
+        </span>
+      </figcaption>
+      {children}
+    </figure>
+  );
+}
+
 const mdxComponents = {
   // Heading hierarchy
   // - H1: site's signature display font (Major Mono Display) at a small
@@ -493,6 +549,19 @@ const mdxComponents = {
   }) => {
     if ("data-rehype-pretty-code-figure" in rest) {
       const lang = (rest as { "data-language"?: string })["data-language"];
+      // A titled `text` block is a DIAGRAM, not code. rehype-pretty-code turns
+      // ```text title="…" into a figcaption beside the pre, and that title is the
+      // only signal available — the corpus writes diagrams as bare fences, which
+      // are indistinguishable from plain output blocks.
+      //
+      // Why a fence info string and not an MDX component: docs content is read
+      // raw by agents and three reference pages have been ported verbatim into
+      // the skill corpus. JSX in content would make it stop being portable
+      // markdown. A title on a fence stays valid markdown everywhere.
+      const { caption, rest: body } = splitCaption(children);
+      if (caption !== null && (lang === "text" || lang === undefined)) {
+        return <Diagram caption={caption}>{body}</Diagram>;
+      }
       return <CodeBlock lang={lang}>{children}</CodeBlock>;
     }
     return <figure {...rest}>{children}</figure>;
@@ -503,10 +572,19 @@ const mdxComponents = {
   // padding). Pre WITHOUT data-language is a standalone block (raw HTML
   // `<pre>`, no fence) — apply full container styling.
   //
-  // Both variants use `whitespace-pre-wrap break-words` so long lines wrap at
-  // the column edge instead of forcing horizontal scroll. Indentation is
-  // preserved because pre-wrap respects whitespace; break-words handles
-  // unbroken tokens (long hex addresses, urls) that exceed the column.
+  // Both variants scroll horizontally rather than wrapping. They used to use
+  // `whitespace-pre-wrap break-words`, on the reasoning that wrapping beats
+  // horizontal scroll — which is true for prose and wrong for anything where
+  // column position carries meaning.
+  //
+  // The measurable failure is the ASCII diagrams. Six concept pages draw box
+  // diagrams in bare fences: at 12.5px mono a 53-character line needs ~400px,
+  // and the content column at a 375px viewport gives ~311px after padding — so
+  // about 41 characters fit and every diagram wrapped mid-box, which reads as
+  // corruption rather than as a wide figure. Code had a quieter version of the
+  // same problem: a wrapped continuation line looks like a second statement.
+  //
+  // Scroll containers are per-block, so a wide diagram does not widen the page.
   pre: (props: {
     children?: ReactNode;
     "data-language"?: string;
@@ -518,13 +596,13 @@ const mdxComponents = {
       return (
         <pre
           {...props}
-          className="px-4 py-3 m-0 text-[12.5px] leading-[1.6] font-mono whitespace-pre-wrap break-words"
+          className="px-4 py-3 m-0 text-[12.5px] leading-[1.6] font-mono whitespace-pre overflow-x-auto"
         />
       );
     }
     return (
       <pre
-        className="my-6 border border-line bg-bg-2 px-4 py-3 text-[12.5px] leading-[1.6] font-mono whitespace-pre-wrap break-words"
+        className="my-6 border border-line bg-bg-2 px-4 py-3 text-[12.5px] leading-[1.6] font-mono whitespace-pre overflow-x-auto"
         {...props}
       />
     );

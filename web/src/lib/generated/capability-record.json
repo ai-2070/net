@@ -1,0 +1,618 @@
+{
+  "_generated": "docs/data/capabilities/*.yaml via .github/scripts/capability_records.py --write. Do not edit; the check fails on drift.",
+  "bindings": [
+    "Rust",
+    "Node / TS",
+    "Python",
+    "Go",
+    "C"
+  ],
+  "operations": {
+    "A2A — agent task handoff": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Caller — payment flow": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    },
+    "Caller — spend policy and approval": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    },
+    "Canonical-encoding conformance": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "mode": "verify-only",
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    },
+    "Capability announce": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Capability discovery": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Channels — pub/sub with capability auth": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Compute / groups / daemons": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Consumer-side filter DSL": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "CortEX folds / NetDB": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Dataforts — blobs": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "partial"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Deck — operator surface": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Event bus — ingest + poll": {
+      "bindings": {
+        "C": {
+          "mode": "poll",
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Facilitator — verify / settle": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    },
+    "Gang-claim scheduler": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "MCP bridge": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Mesh streams": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "MeshDB — federated queries": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Organization capability auth": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Provider — author pricing terms": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    },
+    "Provider — gate an invocation": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    },
+    "Provider — publish a paid capability": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    },
+    "Provider — read billing": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    },
+    "RedEX — durable log": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Redis Streams dedup": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "Signer boundary": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    },
+    "Verification tiers / chain checker": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "status": "not exposed"
+        },
+        "Python": {
+          "status": "not exposed"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    },
+    "nRPC — typed request/response + streaming": {
+      "bindings": {
+        "C": {
+          "status": "supported"
+        },
+        "Go": {
+          "status": "supported"
+        },
+        "Node / TS": {
+          "status": "supported"
+        },
+        "Python": {
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "event-bus"
+    },
+    "x402 envelopes and carry": {
+      "bindings": {
+        "C": {
+          "status": "not exposed"
+        },
+        "Go": {
+          "status": "not exposed"
+        },
+        "Node / TS": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Python": {
+          "mode": "core-only",
+          "status": "supported"
+        },
+        "Rust": {
+          "status": "supported"
+        }
+      },
+      "domain": "payments"
+    }
+  }
+}

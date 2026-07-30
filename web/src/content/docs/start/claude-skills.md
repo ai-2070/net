@@ -49,7 +49,15 @@ npx skills add ai-2070/net-claude-skill --skill '*' -a '*' -g           # every 
 
 These are plain Agent Skills, so `-a '*'` covers Codex, Cursor, Copilot, Cline, and the rest. The CLI symlinks each agent's skills directory to one canonical copy, so one `npx skills update` refreshes them all — pass `--copy` if symlinks aren't an option.
 
-### Without the CLI
+## Give the agent the source too
+
+[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
+
+```bash
+npx -y opensrc@latest path ai-2070/net
+```
+
+## Skills installation without the CLI
 
 A skill is just a directory containing a `SKILL.md`, so copying the folders in works:
 
@@ -94,7 +102,7 @@ Skills load automatically when a request matches. To see one fire, ask for somet
 
 `net-event-bus` triggers on imports of `@net-mesh/sdk` or `net-sdk` and on phrases like *pub/sub with Net*, *nRPC*, *mesh RPC*, *RedEX*, *CortEX*, *Dataforts*, *gang scheduler*, *net-mesh wrap*, *serve_org*. `net-payments` triggers on `net-payments` / `net_payments` imports and on *price a capability*, *pay to invoke*, *x402*, *settle on Base/Solana/XRPL*, *spend limit*.
 
-## Give the agent the source too
+## Opensrc
 
 The skills carry the mental model, the per-binding surface, and runnable examples. What they can't carry is all of Net — a few thousand lines of guidance over a protocol implementation of several hundred thousand. So when the question turns to *mechanism*, the agent either has the source or it guesses:
 
@@ -104,15 +112,7 @@ The skills carry the mental model, the per-binding surface, and runnable example
 - whether a symbol exists in the binding you're writing, or in any binding at all;
 - anything the skills don't cover, which for a protocol this size is most of it.
 
-Net is Apache/MIT-licensed and readable end to end. Reading it beats inferring from type signatures — which is the whole premise of the tool below.
-
-[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
-
-```bash
-npx -y opensrc@latest path ai-2070/net
-```
-
-That prints an absolute path to a cached checkout — about 46 MB, fetched once, returned instantly after that. **One fetch covers all five bindings.** opensrc resolves registry metadata to the repository rather than unpacking the published tarball, so `crates:net-mesh-sdk`, `@net-mesh/sdk` and `pypi:net-mesh-sdk` all land on the same directory, and Go and C come along with it. That's also why you get real TypeScript source: the npm package publishes only its built `dist`, while the checkout has `sdk-ts/src/`.
+Opensrc resolves registry metadata to the repository rather than unpacking the published tarball, so `crates:net-mesh-sdk`, `@net-mesh/sdk` and `pypi:net-mesh-sdk` all land on the same directory, and Go and C come along with it. That's also why you get real TypeScript source: the npm package publishes only its built `dist`, while the checkout has `sdk-ts/src/`.
 
 You don't need to teach the agent how to use it. Each skill ships a `source-access.md` covering when to reach for source (and when not to — the model comes from the skill, the mechanism from the tree), which tests to read first, how to root the paths the skill cites, and three things the checkout won't have:
 

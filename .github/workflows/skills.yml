@@ -53,10 +53,13 @@ on:
       - ".github/scripts/check-skill-examples.sh"
       - ".github/scripts/skill_examples.py"
       - ".github/scripts/run-skill-examples.sh"
-      - ".github/skill-examples.json"
+      - "docs/data/examples.yaml"
       - ".github/scripts/check-skill-example-ts.sh"
       - ".github/scripts/check-skill-vocab.py"
-      - ".github/scripts/check-skill-coverage.py"
+      - ".github/scripts/capability_records.py"
+      - ".github/scripts/docs_pages.py"
+      - "docs/data/capabilities/**"
+      - "web/src/content/docs/**"
       - ".github/scripts/check-skill-snippets.py"
       - ".github/skill-snippets/**"
       # Every surface the skills document. Broad roots on purpose: the previous
@@ -97,10 +100,13 @@ on:
       - ".github/scripts/check-skill-examples.sh"
       - ".github/scripts/skill_examples.py"
       - ".github/scripts/run-skill-examples.sh"
-      - ".github/skill-examples.json"
+      - "docs/data/examples.yaml"
       - ".github/scripts/check-skill-example-ts.sh"
       - ".github/scripts/check-skill-vocab.py"
-      - ".github/scripts/check-skill-coverage.py"
+      - ".github/scripts/capability_records.py"
+      - ".github/scripts/docs_pages.py"
+      - "docs/data/capabilities/**"
+      - "web/src/content/docs/**"
       - ".github/scripts/check-skill-snippets.py"
       - ".github/skill-snippets/**"
       # Every surface the skills document. Broad roots on purpose: the previous
@@ -179,6 +185,19 @@ jobs:
       - name: Check the citation checker still catches defects
         run: .github/scripts/check-skill-source-paths.py --self-test
 
+      # The capability records are the canonical answer to "does binding X
+      # support operation Y"; each skill's bindings/coverage.md is generated from
+      # them. This validates the record and proves the copies match — a
+      # hand-edited matrix fails as drift rather than becoming a second truth.
+      # (check-skills.sh above also calls it; this step names the failure.)
+      - name: Check the capability records and their generated copies
+        run: |
+          python3 -m pip install --quiet pyyaml
+          .github/scripts/capability_records.py --check
+
+      - name: Check the capability-record checker still catches defects
+        run: .github/scripts/capability_records.py --self-test
+
   examples:
     name: Examples compile
     runs-on: ubuntu-latest
@@ -203,8 +222,24 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install mypy
-        run: python -m pip install --upgrade mypy
+      # PyYAML, not just mypy: `check-skill-examples.sh` and
+      # `run-skill-examples.sh` both read `docs/data/examples.yaml` through
+      # `skill_examples.py`, which imports yaml and exits 1 without it.
+      #
+      # This job is the only one in the file that needs the explicit install,
+      # and the reason is `setup-python` above: it puts a fresh 3.12 ahead of
+      # the runner's system python3, and the system one is where ubuntu-latest's
+      # preinstalled PyYAML lives. The `drift` and `typescript` jobs call the
+      # same scripts and pass — not because they are correct, but because they
+      # never shadow the interpreter that happens to carry the dependency.
+      #
+      # It stayed latent because this job's trigger paths are narrower than the
+      # set of changes that can reach these scripts; it went red the first time
+      # a commit touched `docs/data/capabilities/**` and `.claude/skills/**`
+      # together. Pinning the dependency here is the fix; not relying on a
+      # runner image's preinstalled packages is the lesson.
+      - name: Install mypy and PyYAML
+        run: python -m pip install --upgrade mypy pyyaml
 
       # A compile floor, not an execution proof: it answers "does this still
       # build against the tree?", never "does it print one line?" — that needs

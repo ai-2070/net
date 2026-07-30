@@ -2,6 +2,7 @@ import "server-only";
 import GithubSlugger from "github-slugger";
 import {
   getDocTree,
+  navChildren,
   readDocSource,
   type DocFile,
   type DocFolder,
@@ -128,7 +129,10 @@ function visitFolder(
       blocks: extractBlocks(source),
     });
   }
-  for (const child of folder.children) {
+  // `navChildren` rather than `children`: a projected adaptive page has no URL
+  // of its own, so indexing it would answer a query with a link that 404s. Its
+  // text is indexed once per lens, under the rendition URLs.
+  for (const child of navChildren(folder)) {
     if (child.kind === "file") {
       if (folder.readme && child === folder.readme) continue;
       const source = readFileText(child);
