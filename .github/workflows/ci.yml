@@ -143,7 +143,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=59
+          MIN=61
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -177,6 +177,8 @@ jobs:
           consumer_grant_movement_wakes_only_the_affected_scope
           a_grant_movement_notification_runs_after_publication_and_after_release
           a_non_publishing_grant_outcome_wakes_nothing
+          a_delayed_grant_notification_cannot_retire_a_successor_installation
+          consumer_grant_movement_preserves_same_id_unaffected_scopes
           a_publication_cannot_occupy_the_gap_between_validation_and_settlement
           poison_cannot_occupy_the_gap_between_validation_and_settlement
           a_recovery_poison_clear_cannot_land_under_a_publication_pin

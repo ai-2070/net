@@ -6,7 +6,7 @@ already been bitten by twice.
 
 Written at `8189676a7`. **Step 2 SIGNED by Kyra 2026-07-29 at `a788232bd`**
 (`OLB_2B3C_PRE_STEP2_SIGNED_HEAD`), after one HOLD and its repair (§2b).
-Branch `load-balancing-2`.
+Branch **`load-balancing-3`** since the step-2 merge to master.
 
 **This handoff is now nearly spent.** Its remaining job is the step-3 boundary
 and the two HOLD lessons in §2b/§4. Delete it when step 3 signs — steps 1 and 2
@@ -24,7 +24,7 @@ belong.
 | OLB-2B.3 boundary design (rev 5 + addenda) | `1c1b652e6` | SIGNED **as a design only** |
 | 2B.3c-pre **step 1** — installation identity (items 1–3) | `300e80f6c` | SIGNED |
 | 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `a788232bd` | **SIGNED** (`OLB_2B3C_PRE_STEP2_SIGNED_HEAD`) — held once at `df32cbd7d`, repaired, signed 2026-07-29; see §2b |
-| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | — | **IMPLEMENTED + WITNESSED — NOT INDEPENDENTLY REVIEWED — NOT SIGNED.** Authorized by the user after the step-2 signature; see the design's §16.0 |
+| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | `fa0b9ddd5` → repaired | **HELD at `fa0b9ddd5`, REPAIRED — NOT SIGNED.** Kyra's P1 (delayed notification retiring a successor) and P2 (invalidation broader than the exact scope); see §2c |
 | `SAFE_LIVE_HEAD` | — | **not established**, still reserved for provider-free leader lighting |
 
 Authoritative design: [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md).
@@ -35,13 +35,15 @@ proof, the exclusions, and the closure gate. §2A is the substrate spec.
 
 ## 2. Do this first
 
-**Step 2 is signed. Step 3 is implemented and witnessed, and owes an independent
-mutation run.**
+**Step 2 is signed. Step 3 was HELD at `fa0b9ddd5` and is repaired; it owes
+Kyra's re-run.**
 
 Step 3 (items 10, 11, 15, 16 — the consumer-Grant wake/invalidation edge and the
 normative plan correction) was authorized by the user AFTER the step-2 signature;
-that signature did not cover it. The five step-3 witnesses and the mutation each
-dies to are tabulated in the design's §16.0. Every RED is the author's own.
+that signature did not cover it. Kyra's independent review confirmed the five
+original witnesses are real and mutation-sensitive, and found two defects they do
+not cover — see §2c. The full witness table and the mutation each one dies to is
+in the design's §16.0. Every RED is the author's own.
 
 `SAFE_LIVE_HEAD` remains unestablished and still reserved for the provider-free
 leader path.
@@ -51,7 +53,7 @@ exactly one test, 1 passed / 5,460 skipped / retries 0 each; the focused gate
 selected 54 and passed 54; every security claim went RED under its own inverse
 mutation; the source was restored to the exact SHA before final GREEN.
 
-What follows is kept for whoever picks up step 3.
+What follows is the step-3 record and the carried-forward lessons.
 
 | # | Witness | Dies to |
 |---|---|---|
@@ -83,6 +85,50 @@ Four notes carried forward — each was load-bearing in the independent run:
   own slot makes a reader the thing that retired the artifact, and the
   actor-arm assertions then pass with the actor arm deleted entirely. That was
   found by running the mutation, not by reading the test.
+
+## 2c. Kyra's independent review of `fa0b9ddd5` — HOLD, and what closed it
+
+Two defects, both in the notification edge. She independently drove all six
+inverse mutations for W-W1..W-W5 and confirmed them RED, so the original
+witnesses are real — they simply did not cover reordered notifications for
+successive installations of the same Grant id.
+
+**P1 — a delayed notification could retire a SUCCESSOR.** The notification
+carried only `grant_id`, and the invalidation cleared unconditionally. Because
+the gate is released before the registry work — correctly — an obsolete
+transition can arrive arbitrarily late:
+
+```text
+A: remove N    publish absence, release gate, [stall]
+B: install N+1                 publish, notify, actor warms the N+1 artifact
+A: [resumes]   clear by grant_id  ->  destroys the N+1 artifact
+```
+
+Fail-closed at the read seam, but an obsolete transition retiring CURRENT work is
+the defect class `invalidate_if_stale` already guards one layer up. The
+notification now carries `superseded_through`, and the decision is made per
+artifact **under the registry lock** — a pre-lock currentness check is
+insufficient, because a publication can land between the check and the clear.
+Witness `a_delayed_grant_notification_cannot_retire_a_successor_installation`.
+
+**P2 — selection was broader than the moved scope.** `grant_id` alone churns the
+same id under a rotated-away audience handle. Now exact on
+`(grant_id, audience_handle)`. Witness
+`consumer_grant_movement_preserves_same_id_unaffected_scopes`.
+
+**Capability narrowing was NOT adopted, and that is a decision.** Kyra also asked
+for narrowing by the grant's capability. Verified directly first: a Grant slot
+for a capability the grant does not cover reconstructs as `Served(0 providers)`,
+stamped `Grant` — the source answers ANY capability under an installed
+`(grant_id, audience_handle)`, whatever the grant's capability scope says. So the
+grant's movement genuinely affects those slots, and narrowing would leave a
+Grant-stamped artifact behind after removal and a permanently `Unserved` slot
+after install — the two defects this edge exists to close, reintroduced for a
+subset. W-W7 pins the current behaviour with an assertion that fails loudly if
+the source is ever narrowed, forcing the invalidation to be narrowed in the same
+change. **Flagged for Kyra's adjudication rather than decided unilaterally.**
+
+---
 
 ## 2b. Kyra's independent review of `df32cbd7d` — HOLD, and what closed it
 
@@ -186,7 +232,7 @@ net/crates/net/src/adapter/net/
     MeshNode::publish_consumer_grant_snapshot
                                         the ONE consumer publication seam (counted in test)
     oa34b2_query_currentness_tests      W-G9 / W-G10 / W-G10b + assert_no_effect
-  org_routing_wiring_tests.rs           59 witnesses; CI floor MIN=59
+  org_routing_wiring_tests.rs           61 witnesses; CI floor MIN=61
   behavior/org_routing_registry.rs
     ScopedDiscoveryAuthorityStamp       Owner | Grant{id, install_seq, signature, handle}
     ScopedSourceFacts                   facts + the authority that produced them
@@ -247,8 +293,8 @@ cd net/crates/net
 export UNIT_FEATURES="net redex redex-disk cortex netdb meshdb meshos dataforts \
 nat-traversal port-mapping tool batched-ingress cli regex"
 
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,474 expected
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 59, MIN 59
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,476 expected
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 61, MIN 61
 CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" behavior::org_routing::     # 24, MIN 24
 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo clippy --all-features --all-targets -- -D warnings \
@@ -262,19 +308,38 @@ git diff --check
 - Adding a wiring witness means raising `MIN` in `.github/workflows/ci.yml` in
   the **same commit**, and name-pinning anything carrying a security property.
 - `org_authority::tests::a_deny_ace_does_not_make_an_owner_only_dir_invalid`
-  failed once on 2026-07-29 and **did not reproduce under a controlled run**:
-  10 isolated repeats plus 5 full-suite repeats under parallel load, all clean.
-  It shells out to `icacls` against a PID-scoped temp dir. Kept recorded rather
-  than dismissed — a once-seen failure with no reproduction is still a data
-  point — but no action is warranted on the evidence available.
+  **HAS now reproduced, and therefore meets Kyra's threshold for action.**
+  Tally so far, all under full-suite parallel load and all on Windows:
+
+  ```text
+  2026-07-29  failed once, then 10 isolated + 5 full-suite repeats all clean
+  2026-07-30  failed once more, then 8 further full-suite repeats all clean
+  ```
+
+  So roughly 2 in ~25 full-load runs, and 0 in 10 isolated runs. The earlier
+  "did not reproduce" note was accurate about those 15 runs and is now
+  superseded: the correct statement is that it is a genuine low-frequency flake
+  under parallel load, not a one-off.
+
+  It shells out to `icacls` against a PID-scoped temp dir, so the likely shape is
+  contention on the external process or on the directory rather than anything in
+  the ACL logic — but that is a HYPOTHESIS, not a diagnosis, and no failure
+  message has been captured yet (both observed failures were in runs whose output
+  was not retained). It touches nothing in any OLB slice. **Not diagnosed, not
+  fixed, and deliberately not chased inside this slice** — raised for Kyra to
+  schedule, since it now clears the bar she set.
 
 ---
 
 ## 6. Open, tracked elsewhere
 
-- **Step 3 owes a same-commit plan correction** (design §15): the normative plan
-  must state that a Grant-scoped source is current only under the exact installed
-  consumer Grant, and must name install/remove/replacement as source movement.
+- ~~Step 3 owes a same-commit plan correction~~ — **DELIVERED at `fa0b9ddd5`**
+  and independently confirmed correct by Kyra: all five installed-Grant authority
+  components named, the per-slot stamp kept distinct from a global generation,
+  install/remove/remove-if-current/replacement named as source movement,
+  publication-before-notification and release-before-notification explicit, the
+  scoped-discovery revision correctly rejected as the wake source, and
+  zero-provider Grant expiry represented.
 - **2B.3b owes** the `max warmed capabilities per OrgRoutingState clone family:
   64` rewording — **three** places, including the summary near the top of the
   plan, not just the two bound blocks.

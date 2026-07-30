@@ -686,6 +686,72 @@ impl Drop for DemandHandle {
     }
 }
 
+/// One consumer-Grant transition, carried to routing with enough identity to
+/// invalidate CONDITIONALLY (OLB-2B.3c-pre items 10/11).
+///
+/// A bare `grant_id` is not enough, and the gap is a real race rather than a
+/// tidiness point: a notification can be delayed arbitrarily between its
+/// publication and its registry work, so an OBSOLETE transition can arrive after
+/// a newer installation has already been published, rebuilt and warmed. Clearing
+/// by id alone destroys that successor.
+///
+/// ```text
+/// A: remove N    publish absence, release gate, [stall]
+/// B: install N+1                 publish, notify, actor warms the N+1 artifact
+/// A: [resumes]   clear by grant_id  ->  destroys the N+1 artifact
+/// ```
+///
+/// It never resurrects withdrawn authority — the read seam stays fail-closed —
+/// but it lets an obsolete transition retire current work, which is the defect
+/// class `invalidate_if_stale` already guards one layer up: **a delayed
+/// invalidator must not delete a successor.**
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GrantScopeMovement {
+    pub grant_id: [u8; 32],
+    /// The EXACT audience scope this transition is about. A grant id can name two
+    /// live scopes across an audience rotation, and the one that did not move
+    /// must not be churned.
+    pub audience_handle: [u8; 32],
+    /// Every artifact built under an installation identity `<=` this is obsolete;
+    /// anything stamped higher is a SUCCESSOR and must survive.
+    ///
+    /// One number rather than an identity plus a kind, because the two transition
+    /// kinds differ only in where the boundary sits:
+    ///
+    /// - install of `k` supersedes everything BEFORE it — `k - 1`;
+    /// - removal of `k` supersedes `k` itself as well — `k`.
+    ///
+    /// `install_seq` is the checked, terminal, strictly monotone identity signed
+    /// at `300e80f6c`, so this comparison cannot alias.
+    pub superseded_through: u64,
+}
+
+impl GrantScopeMovement {
+    /// Does this transition cover `key`'s scope?
+    ///
+    /// Exact on `(grant_id, audience_handle)`. Deliberately NOT narrowed by
+    /// capability: the Grant source answers ANY capability under an installed
+    /// `(grant_id, audience_handle)` with `Served(empty)` rather than `Unserved`,
+    /// regardless of the grant's own capability scope — verified directly, a slot
+    /// for a capability the grant does not cover reconstructs as
+    /// `Served(0 providers)` and is stamped `Grant`. So the grant's movement
+    /// genuinely affects every capability under its audience scope, and narrowing
+    /// here would leave those slots holding a Grant-stamped artifact after
+    /// removal and stuck `Unserved` after install — the exact two defects this
+    /// edge exists to close, reintroduced for a subset. Narrowing becomes correct
+    /// only once the source refuses uncovered capabilities structurally, which is
+    /// not in this slice's scope.
+    fn covers(&self, key: &SlotKey) -> bool {
+        matches!(
+            key.scope.scope(),
+            CapabilityAudienceScope::Grant {
+                grant_id,
+                audience_handle,
+            } if grant_id == &self.grant_id && audience_handle == &self.audience_handle
+        )
+    }
+}
+
 impl NodeOrgRoutingRegistry {
     pub(crate) fn new(
         source: Arc<dyn SlotSource>,
@@ -960,58 +1026,66 @@ impl NodeOrgRoutingRegistry {
         }
     }
 
-    /// A consumer Grant moved: retire every retained artifact whose scope names
-    /// that `grant_id`, re-queue exactly those slots, and wake the actor
-    /// (OLB-2B.3c-pre items 10/11).
+    /// A consumer Grant moved: retire every retained artifact of that exact
+    /// audience scope which the transition SUPERSEDES, re-queue exactly those
+    /// slots, and wake the actor (items 10/11).
     ///
-    /// Returns the number of artifacts retired. A slot that is retained but
-    /// already cold is still RE-QUEUED — that is the whole point of the install
-    /// direction: a Grant-scoped slot reconstructed `Unserved` because the grant
-    /// was not installed holds no artifact to invalidate, and without a re-queue
-    /// it stays cold forever. The read seam cannot rescue it either, because
-    /// `Unserved` returns cold WITHOUT invalidating.
+    /// Returns the number of artifacts retired.
+    ///
+    /// **Conditional, and decided under the registry lock.** Each slot is judged
+    /// against the artifact it actually holds, at the mutation boundary — not
+    /// against a snapshot read before the lock. A pre-lock "is this still
+    /// current?" check would be insufficient on its own: a newer publication can
+    /// land between the check and the clear, and the decision to preserve a
+    /// successor has to still be true when the clear happens.
+    ///
+    /// A slot that is retained but holds NO artifact is still re-queued — that is
+    /// the whole install direction. A Grant-scoped slot reconstructed `Unserved`
+    /// holds an `Owner`-stamped artifact, which names no installation at all and
+    /// therefore cannot be a successor; it is retired and rebuilt. Only a
+    /// `Grant`-stamped artifact from a LATER installation is preserved.
     ///
     /// **Not keyed on `ScopedDiscoveryState::revision`** (item 11, design §2A.2).
     /// A consumer-Grant transition mutates the grant registry, not the scoped
     /// store, so the scoped revision does not move and cannot be the trigger.
-    /// This is the trigger.
     ///
-    /// Matched by `grant_id` alone, not by the whole scope. Every scope naming
-    /// that id is affected by the transition: an install of `Grant{G, H_new}`
-    /// makes `Grant{G, H_new}` serveable AND leaves `Grant{G, H_old}`
-    /// definitively unserved, and a removal of `G` retires both. Handle-exact
-    /// matching would leave the sibling scope holding a stale artifact that only
-    /// a reader would retire. Unrelated grants and the whole Owner plane are
-    /// untouched — that separation is what W-G8 pins, and widening this to "all
-    /// slots" would break it.
-    ///
-    /// The caller must NOT hold the consumer-Grant gate here: the commit pin
-    /// takes that gate and then the registry lock, so acquiring the registry lock
-    /// beneath the gate would invert the frozen order. Item 10 states the same
-    /// requirement as an ordering rule — notify only after publication
-    /// synchronization is released.
-    pub(crate) fn invalidate_grant_scope(&self, grant_id: &[u8; 32]) -> u64 {
+    /// The caller must NOT hold the consumer-Grant gate: the commit pin takes
+    /// that gate and then this lock, so acquiring this beneath it would invert
+    /// the frozen order. Item 10 states the same thing as an ordering rule.
+    pub(crate) fn invalidate_grant_scope(&self, movement: &GrantScopeMovement) -> u64 {
         let (retired, owed) = {
             let mut inner = self.inner.lock();
             let affected: Vec<SlotKey> = inner
                 .slots
                 .keys()
-                .filter(|key| {
-                    matches!(
-                        key.scope.scope(),
-                        CapabilityAudienceScope::Grant { grant_id: g, .. } if g == grant_id
-                    )
-                })
+                .filter(|key| movement.covers(key))
                 .cloned()
                 .collect();
             let mut retired = 0u64;
             for key in affected {
-                if let Some(slot) = inner.slots.get_mut(&key) {
-                    if slot.facts.swap(None).is_some() {
-                        retired += 1;
-                    }
+                let Some(cell) = inner.slots.get(&key).map(|slot| slot.facts.clone()) else {
+                    continue;
+                };
+                let superseded = match cell.load().as_ref() {
+                    // Nothing to preserve, and the slot still owes work.
+                    None => true,
+                    Some(facts) => match facts.authority {
+                        ScopedDiscoveryAuthorityStamp::Grant { install_seq, .. } => {
+                            install_seq <= movement.superseded_through
+                        }
+                        // An `Unserved` reconstruction names NO installation, so
+                        // it cannot be the successor this transition must spare.
+                        ScopedDiscoveryAuthorityStamp::Owner => true,
+                    },
+                };
+                if !superseded {
+                    // A LATER installation already published here. Leave it
+                    // entirely alone — no clear, and no re-queue either.
+                    continue;
                 }
-                // Re-queued whether or not it held an artifact — see above.
+                if cell.swap(None).is_some() {
+                    retired += 1;
+                }
                 inner.pending.insert(key);
             }
             self.metrics

@@ -4398,6 +4398,53 @@ impl GrantFixture {
         held
     }
 
+    /// Drive the actor for `key` and require only that an ARTIFACT exists —
+    /// not that it reads.
+    ///
+    /// A Grant scope whose audience handle is not the installed one reconstructs
+    /// `Unserved`, which is a real retained artifact but reads cold. [`Self::warm`]
+    /// would reject it at its own precondition, so a witness about what
+    /// invalidation SPARES needs this weaker form.
+    fn retain(
+        &self,
+        key: &SlotKey,
+    ) -> crate::adapter::net::behavior::org_routing_registry::DemandHandle {
+        use crate::adapter::net::behavior::org_routing::{
+            ApplyOutcome, ApplyRequest, DirtyApply, RoutingHealth,
+        };
+        use crate::adapter::net::behavior::org_scoped_store::{
+            DirtyCapabilities, PrivateDiscoveryChangeBatch,
+        };
+        self.node
+            .routing_health
+            .store(Arc::new(RoutingHealth::Healthy { incarnation: 1 }));
+        self.node.routing_registry.activate_incarnation(1);
+        let family = self.node.org_routing_family().expect("family");
+        let held = family.demand(key.clone()).expect("demand");
+        let outcome = self.node.routing_registry.apply(
+            1,
+            ApplyRequest {
+                batch: PrivateDiscoveryChangeBatch {
+                    generation: 0,
+                    dirty: DirtyCapabilities::Clean,
+                },
+                registry_work: true,
+            },
+        );
+        assert!(
+            matches!(outcome, ApplyOutcome::Current { .. }),
+            "the retaining pass must settle: {outcome:?}"
+        );
+        assert!(
+            self.node
+                .routing_registry
+                .base_facts_unvalidated(key)
+                .is_some(),
+            "precondition: the slot must hold an ARTIFACT before the transition"
+        );
+        held
+    }
+
     /// The production source over this node, for witnesses that assert on
     /// capture rather than on the read seam.
     fn source(&self) -> ScopedSlotSource {
@@ -5280,14 +5327,18 @@ async fn a_grant_movement_notification_runs_after_publication_and_after_release(
     {
         let sink = observations.clone();
         let weak = Arc::downgrade(&f.node);
-        f.node.arm_grant_movement_hook(Arc::new(move |grant_id| {
+        f.node.arm_grant_movement_hook(Arc::new(move |movement| {
             let Some(node) = weak.upgrade() else {
                 return;
             };
             // A parking_lot mutex is not reentrant, so `try_lock` fails when THIS
             // thread holds it — which is exactly the case being ruled out.
             let gate_released = node.consumer_grant_gate.mu.try_lock().is_some();
-            let published = node.consumer_grant_audiences.load().get(grant_id).is_some();
+            let published = node
+                .consumer_grant_audiences
+                .load()
+                .get(&movement.grant_id)
+                .is_some();
             sink.lock().push((gate_released, published));
         }));
     }
@@ -5386,5 +5437,249 @@ async fn a_non_publishing_grant_outcome_wakes_nothing() {
         after_install + 1,
         "control: a real publication DOES wake — without this the assertions \
          above pass against a counter that never moves"
+    );
+}
+
+/// W-W6. A DELAYED notification for installation N cannot retire an artifact
+/// built under N+1.
+///
+/// A notification can be arbitrarily delayed between its publication and its
+/// registry work — the gate is released in between, precisely so it is not held
+/// across the registry lock. So an OBSOLETE transition can arrive after a newer
+/// installation has already been published, notified, rebuilt and warmed:
+///
+/// ```text
+/// A: remove N    publish absence, release gate, [stalled here]
+/// B: install N+1                 publish, notify, actor warms the N+1 artifact
+/// A: [resumes]   invalidate      <- must NOT touch the N+1 artifact
+/// ```
+///
+/// Clearing by `grant_id` alone destroys the successor. It never resurrects
+/// withdrawn authority — the read seam stays fail-closed — but it lets an
+/// obsolete transition retire CURRENT work, which is the defect class
+/// `invalidate_if_stale` already guards one layer up: a delayed invalidator must
+/// not delete a successor.
+///
+/// The decision has to hold at the registry mutation boundary, not merely before
+/// it: a "is this snapshot still current?" check taken before the lock can be
+/// invalidated by a publication landing between the check and the clear. This
+/// witness therefore asserts on the ARTIFACT, by pointer identity.
+///
+/// Found by Kyra's independent review of `fa0b9ddd5` (P1). Dies to comparing
+/// `grant_id` alone — i.e. to the implementation at that head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delayed_grant_notification_cannot_retire_a_successor_installation() {
+    let f = grant_fixture("ww6").await;
+    let (grant, secret) = f.mint("nrpc:ww6", Some([0xa6u8; 32]), None);
+    // Retained so the reinstall below is BYTE-IDENTICAL: same signature, same
+    // handle, same id. Only the installation identity separates N from N+1,
+    // which is exactly what the invalidation must key on.
+    let retained_grant = grant.clone();
+    let retained_secret = copy_secret(&secret);
+    let (grant_id, handle) = f.install(grant, secret);
+    let key = f.key(grant_id, handle, "nrpc:ww6");
+
+    f.node.start();
+    assert!(until(|| f.node.org_routing_ready()).await, "healthy");
+    let family = f.node.org_routing_family().expect("family");
+    let held = family.demand(key.clone()).expect("demand");
+    assert!(
+        until(|| f.node.org_routing_base_facts(&key).is_some()).await,
+        "precondition: warm under installation N"
+    );
+
+    // Park the REMOVAL's notification after publication and gate release, before
+    // its registry work. The install's notification must pass through freely, or
+    // there is no successor to protect.
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
+    {
+        let release_rx = release_rx.clone();
+        // A one-shot latch, NOT a predicate on the movement: remove(N) and
+        // install(N+1) both carry `superseded_through == N` — the removal
+        // supersedes its own installation, the install supersedes everything
+        // before it — so they are indistinguishable by value. The removal's
+        // notification is guaranteed first, because nothing installs until
+        // `reached` has been observed.
+        let parked = Arc::new(AtomicBool::new(false));
+        f.node.arm_grant_movement_hook(Arc::new(move |_movement| {
+            if parked.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let _ = reached_tx.try_send(());
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the witness must release the parked notification");
+        }));
+    }
+
+    let remover = {
+        let node = f.node.clone();
+        std::thread::spawn(move || node.remove_consumer_grant_audience(&grant_id))
+    };
+    reached_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the removal must reach its notification and park there");
+
+    // The removal has PUBLISHED absence. Reinstall the byte-identical grant: it
+    // takes a fresh installation identity, notifies, and the actor rebuilds.
+    f.node
+        .install_consumer_grant_audience(retained_grant, retained_secret)
+        .expect("reinstall");
+    assert!(
+        until(|| f.node.org_routing_base_facts(&key).is_some()).await,
+        "the successor installation must warm the slot again"
+    );
+    let successor = f
+        .node
+        .org_routing_base_facts(&key)
+        .expect("successor artifact");
+    let counts_before = f.node.org_routing_reconciliation_counts();
+
+    // Now let the obsolete removal notification run.
+    let _ = release_tx.send(());
+    assert!(
+        remover.join().expect("remover thread"),
+        "precondition: the removal itself did publish"
+    );
+
+    assert!(
+        f.node
+            .routing_registry
+            .base_facts_unvalidated(&key)
+            .is_some_and(|live| Arc::ptr_eq(&live, &successor)),
+        "the delayed notification for the SUPERSEDED installation must leave the \
+         successor artifact exactly as it was — pointer identity, not merely \
+         eventual readability"
+    );
+    let counts_after = f.node.org_routing_reconciliation_counts();
+    assert_eq!(
+        counts_after[2], counts_before[2],
+        "and must invalidate nothing: an obsolete transition retiring current \
+         work is the defect, even though the read seam would stay fail-closed"
+    );
+    assert_eq!(
+        counts_after[0], counts_before[0],
+        "and must not have re-queued it either — a rebuild here means the \
+         successor was needlessly cold-pathed by an obsolete transition"
+    );
+
+    drop(held);
+    let _ = f.node.shutdown().await;
+}
+
+/// W-W7. A Grant transition churns only its OWN audience scope.
+///
+/// Three controls, each a different way the selection could be too broad:
+///
+/// - the same grant id under a STALE audience handle — the rotated-away scope,
+///   which this transition says nothing about;
+/// - an unrelated grant entirely;
+/// - the Owner plane, which has no consumer Grant at all.
+///
+/// All three must keep their EXACT artifact.
+///
+/// **The same grant id under a different CAPABILITY is deliberately NOT spared**,
+/// and that is a decision rather than an oversight. The Grant source answers any
+/// capability under an installed `(grant_id, audience_handle)` with
+/// `Served(empty)` rather than `Unserved`, whatever the grant's own capability
+/// scope says — verified directly: a slot for a capability the grant does not
+/// cover reconstructs as `Served(0 providers)` and is stamped `Grant`. So the
+/// grant's movement genuinely does affect it, and sparing it would leave a
+/// Grant-stamped artifact behind after removal and a permanently `Unserved` slot
+/// after install — the two defects this whole edge exists to close, reintroduced
+/// for a subset. The assertion below pins the current behaviour so that if the
+/// source is ever narrowed to refuse uncovered capabilities, this fails loudly
+/// and the invalidation is narrowed in the same change.
+///
+/// Found by Kyra's independent review of `fa0b9ddd5` (P2). Dies to selecting by
+/// `grant_id` alone.
+#[tokio::test]
+async fn consumer_grant_movement_preserves_same_id_unaffected_scopes() {
+    let f = grant_fixture("ww7").await;
+    let (grant, secret) = f.mint("nrpc:ww7", Some([0xa7u8; 32]), None);
+    let (grant_id, handle) = f.install(grant, secret);
+
+    // The scope that moves.
+    let moved = f.key(grant_id, handle, "nrpc:ww7");
+    // Same grant id, a rotated-away audience handle: a different slot entirely.
+    let mut stale_handle = handle;
+    stale_handle[0] ^= 0xff;
+    let stale_scope = f.key(grant_id, stale_handle, "nrpc:ww7");
+    // Same grant id and handle, a different capability — see the note above.
+    let other_capability = f.key(grant_id, handle, "nrpc:ww7-other-capability");
+    // An unrelated grant, and the Owner plane.
+    let (grant_b, secret_b) = f.mint("nrpc:ww7-b", None, None);
+    let (id_b, handle_b) = f.install(grant_b, secret_b);
+    let unrelated = f.key(id_b, handle_b, "nrpc:ww7-b");
+    let owner = slot(45, "nrpc:ww7-owner");
+
+    let _h1 = f.warm(&moved);
+    // RETAINED, not warm: a rotated-away handle reconstructs `Unserved`, which is
+    // a real artifact that reads cold. That is precisely the shape this control
+    // needs — an artifact the transition must not touch.
+    let _h2 = f.retain(&stale_scope);
+    let _h3 = f.warm(&other_capability);
+    let _h4 = f.warm(&unrelated);
+    let _h5 = f.warm(&owner);
+
+    let before_stale = f.node.routing_registry.base_facts_unvalidated(&stale_scope);
+    let before_unrelated = f
+        .node
+        .org_routing_base_facts(&unrelated)
+        .expect("unrelated warm");
+    let before_owner = f.node.org_routing_base_facts(&owner).expect("owner warm");
+    assert!(
+        f.node.org_routing_base_facts(&other_capability).is_some(),
+        "precondition: an uncovered capability under an installed Grant is \
+         SERVED (empty), which is why it is treated as affected below"
+    );
+
+    // Move the exact installed scope.
+    assert!(f.node.remove_consumer_grant_audience(&grant_id));
+
+    assert!(
+        f.node
+            .routing_registry
+            .base_facts_unvalidated(&moved)
+            .is_none(),
+        "precondition: the scope that actually moved IS retired"
+    );
+    assert!(
+        f.node
+            .org_routing_base_facts(&unrelated)
+            .is_some_and(|live| Arc::ptr_eq(&live, &before_unrelated)),
+        "an unrelated Grant keeps its EXACT artifact"
+    );
+    assert!(
+        f.node
+            .org_routing_base_facts(&owner)
+            .is_some_and(|live| Arc::ptr_eq(&live, &before_owner)),
+        "and the Owner plane is untouched"
+    );
+    match before_stale {
+        Some(before) => assert!(
+            f.node
+                .routing_registry
+                .base_facts_unvalidated(&stale_scope)
+                .is_some_and(|live| Arc::ptr_eq(&live, &before)),
+            "the SAME grant id under a rotated-away audience handle is a \
+             different scope: this transition says nothing about it, so its \
+             exact artifact must survive"
+        ),
+        None => panic!("precondition: the stale-handle slot must be retained"),
+    }
+    assert!(
+        f.node
+            .routing_registry
+            .base_facts_unvalidated(&other_capability)
+            .is_none(),
+        "and the same scope under a different capability IS retired — see this \
+         witness's doc: the source serves it, so the grant's movement affects \
+         it. If the source is ever narrowed to refuse uncovered capabilities, \
+         THIS assertion is the one that must fail and force the invalidation to \
+         be narrowed with it"
     );
 }

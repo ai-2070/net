@@ -633,7 +633,7 @@ is the §19 defect class this process has already caught once.
 |---|---|---|
 | **1–3** — non-aliasing installation identity | **SIGNED** 2026-07-28 | `OLB_2B3C_PRE_STEP1_SIGNED_HEAD = 300e80f6c` |
 | **4–9, 12–14** — scope stamp + Grant source service | **SIGNED** 2026-07-29 | `OLB_2B3C_PRE_STEP2_SIGNED_HEAD = a788232bd` |
-| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | **IMPLEMENTED + WITNESSED — NOT INDEPENDENTLY REVIEWED — NOT SIGNED** | step 3 |
+| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | **IMPLEMENTED + WITNESSED — REVIEWED ONCE, HELD, REPAIRED — NOT SIGNED** | step 3: `fa0b9ddd5`, held, repaired |
 
 **Step 2 signed by Kyra 2026-07-29 at `a788232bd`**, after an independent
 mutation matrix in a detached worktree: every security claim below went RED
@@ -745,6 +745,8 @@ could not close the install direction at all, because it returns cold for
 | `consumer_grant_movement_wakes_only_the_affected_scope` | W-W3 — unrelated Grant AND the whole Owner plane untouched | widen the invalidation to all retained slots |
 | `a_grant_movement_notification_runs_after_publication_and_after_release` | W-W4 — item 10's ordering, both halves | notify under the guard; notify before publication |
 | `a_non_publishing_grant_outcome_wakes_nothing` | W-W5 — idempotent install / stale lease / no-op removal wake nothing | notify unconditionally |
+| `a_delayed_grant_notification_cannot_retire_a_successor_installation` | W-W6 — a delayed transition for N cannot retire an artifact stamped N+1 | clear unconditionally |
+| `consumer_grant_movement_preserves_same_id_unaffected_scopes` | W-W7 — the same id under a rotated-away handle is a different scope | select by `grant_id` alone |
 
 W-W3 is the one that constrains the design rather than confirming it: "invalidate
 everything on any Grant movement" satisfies W-W1 and W-W2 perfectly and makes
@@ -759,6 +761,35 @@ Item 16 holds by construction — no public surface changed and
 five binding components with what each one catches, the per-slot-stamp-not-a-
 generation rule, install/remove/replacement as source movement with the ordering
 constraints, and the zero-provider deadline), plus the two new reconciler inputs.
+
+**W-W6 and W-W7 exist because Kyra's independent review of `fa0b9ddd5` found two
+defects the first five do not cover.** She confirmed W-W1..W-W5 are real and
+mutation-sensitive — they simply say nothing about reordered notifications for
+successive installations of the same Grant id.
+
+- **P1.** The notification carried only `grant_id` and the invalidation cleared
+  unconditionally. Since the gate is released before the registry work —
+  correctly — an obsolete transition can arrive after a newer installation has
+  been published, notified and warmed, and destroy it. Fail-closed at the read
+  seam, but an obsolete transition retiring CURRENT work is the class
+  `invalidate_if_stale` already guards. The movement now carries
+  `superseded_through`, and the decision is made per artifact **under the
+  registry lock** — a pre-lock currentness check cannot hold, because a
+  publication can land between the check and the clear.
+- **P2.** Selection by `grant_id` churned the same id under a rotated-away
+  audience handle. Now exact on `(grant_id, audience_handle)`.
+
+The two are orthogonal: W-W6 dies only to the unconditional clear, W-W7 only to
+the broad selection.
+
+**Capability narrowing was asked for and NOT adopted.** Verified first: a Grant
+slot for a capability the grant does not cover reconstructs as
+`Served(0 providers)`, stamped `Grant` — the source answers ANY capability under
+an installed `(grant_id, audience_handle)`. So that grant's movement genuinely
+affects those slots, and narrowing would leave a Grant-stamped artifact after
+removal and a permanently `Unserved` slot after install. W-W7 pins the current
+behaviour with an assertion designed to fail if the source is ever narrowed,
+forcing both to change together. Flagged for adjudication, not decided.
 
 **Every RED for step 3 is the author's own.** It owes an independent mutation
 run before any signature.

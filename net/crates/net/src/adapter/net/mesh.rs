@@ -5755,9 +5755,14 @@ struct RoutingAuthority {
 type PublishPhaseHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// Test-only observer of the consumer-Grant routing notification instant.
-/// Receives the `grant_id` that moved (OLB-2B.3c-pre items 10/11).
+///
+/// Receives the exact transition (OLB-2B.3c-pre items 10/11). The WHOLE movement
+/// rather than the grant id, so a witness can tell an install from the removal it
+/// superseded — which is what a delayed-notification race needs in order to park
+/// one and let the other through.
 #[cfg(test)]
-type GrantMovementHook = Arc<dyn Fn(&[u8; 32]) + Send + Sync>;
+type GrantMovementHook =
+    Arc<dyn Fn(&super::behavior::org_routing_registry::GrantScopeMovement) + Send + Sync>;
 
 impl RoutingAuthority {
     fn new() -> Self {
@@ -11197,7 +11202,10 @@ impl MeshNode {
     ///
     /// A demand landing after publication needs no notification of its own —
     /// first demand already enqueues the slot and marks work.
-    fn note_consumer_grant_movement(&self, grant_id: &[u8; 32]) {
+    fn note_consumer_grant_movement(
+        &self,
+        movement: &super::behavior::org_routing_registry::GrantScopeMovement,
+    ) {
         debug_assert!(
             self.consumer_grant_gate.mu.try_lock().is_some(),
             "the consumer-Grant gate must be RELEASED before routing is              notified (item 10); holding it here inverts the commit pin's              gate -> registry lock order"
@@ -11207,10 +11215,10 @@ impl MeshNode {
             self.consumer_grant_movements.fetch_add(1, Ordering::AcqRel);
             let hook = self.grant_movement_hook.lock().clone();
             if let Some(hook) = hook {
-                hook(grant_id);
+                hook(movement);
             }
         }
-        self.routing_registry.invalidate_grant_scope(grant_id);
+        self.routing_registry.invalidate_grant_scope(movement);
     }
 
     /// Allocate the next consumer-Grant installation identity, or refuse
@@ -11300,6 +11308,10 @@ impl MeshNode {
             authority.config.verification_skew_secs,
         )?;
         let grant_id = *record.grant_id();
+        // Captured BEFORE `prepare_install` consumes the record: the transition's
+        // exact audience scope, which the notification below needs and which is
+        // otherwise gone by then.
+        let audience_handle = *record.audience_handle();
         // Settle every ordinary refusal first, then allocate — both under one
         // guard (OLB-2B.3c-pre).
         //
@@ -11344,7 +11356,17 @@ impl MeshNode {
         // installed holds no artifact to invalidate and would otherwise stay
         // cold forever — the read seam returns cold for `Unserved` WITHOUT
         // invalidating, so no reader can rescue it either (design §0.1).
-        self.note_consumer_grant_movement(&grant_id);
+        //
+        // Supersedes everything BEFORE this installation: an artifact already
+        // stamped `install_seq` is this installation's own and must survive, so
+        // a concurrent rebuild that beat this notification is not undone.
+        self.note_consumer_grant_movement(
+            &super::behavior::org_routing_registry::GrantScopeMovement {
+                grant_id,
+                audience_handle,
+                superseded_through: install_seq.saturating_sub(1),
+            },
+        );
         Ok(ConsumerAudienceInstall::Installed(
             ConsumerAudienceLease::new(grant_id, install_seq),
         ))
@@ -11362,23 +11384,35 @@ impl MeshNode {
     /// [`remove_consumer_grant_audience_if_current`]: Self::remove_consumer_grant_audience_if_current
     pub fn remove_consumer_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
         // Scoped so the gate is RELEASED before routing is notified (item 10).
-        let removed = {
+        // The transition's exact identity is read from the record being removed,
+        // under the gate, so it names precisely the installation this removal
+        // supersedes — and nothing later.
+        let movement = {
             let _guard = self.consumer_grant_gate.lock();
             let current = self.consumer_grant_audiences.load_full();
+            let removing = current.get(grant_id).map(|record| {
+                super::behavior::org_routing_registry::GrantScopeMovement {
+                    grant_id: *grant_id,
+                    audience_handle: *record.audience_handle(),
+                    // A removal supersedes its OWN installation as well.
+                    superseded_through: record.install_seq(),
+                }
+            });
             match current.without(grant_id) {
                 Some(next) => {
                     self.publish_consumer_grant_snapshot(Arc::new(next));
-                    true
+                    removing
                 }
-                None => false,
+                None => None,
             }
         };
         // Only a real publication is routing movement. A no-op removal changed
         // nothing, so it must wake nothing.
-        if removed {
-            self.note_consumer_grant_movement(grant_id);
+        if let Some(movement) = movement {
+            self.note_consumer_grant_movement(&movement);
+            return true;
         }
-        removed
+        false
     }
 
     /// OSDK S0: remove a CONSUMER grant-audience record ONLY if the currently
@@ -11396,30 +11430,40 @@ impl MeshNode {
         lease: &super::behavior::org_grant_registry::ConsumerAudienceLease,
     ) -> bool {
         // Scoped so the gate is RELEASED before routing is notified (item 10).
-        let removed = {
+        let movement = {
             let _guard = self.consumer_grant_gate.lock();
             let current = self.consumer_grant_audiences.load_full();
             match current.get(lease.grant_id()) {
                 // Same grant id, different installation — the lease is stale and
                 // owns nothing here.
-                Some(record) if record.install_seq() != lease.install_seq() => false,
-                Some(_) => match current.without(lease.grant_id()) {
-                    Some(next) => {
-                        self.publish_consumer_grant_snapshot(Arc::new(next));
-                        true
+                Some(record) if record.install_seq() != lease.install_seq() => None,
+                Some(record) => {
+                    let removing = super::behavior::org_routing_registry::GrantScopeMovement {
+                        grant_id: *lease.grant_id(),
+                        audience_handle: *record.audience_handle(),
+                        // The lease matched this record, so its identity IS the
+                        // installation being superseded.
+                        superseded_through: record.install_seq(),
+                    };
+                    match current.without(lease.grant_id()) {
+                        Some(next) => {
+                            self.publish_consumer_grant_snapshot(Arc::new(next));
+                            Some(removing)
+                        }
+                        None => None,
                     }
-                    None => false,
-                },
-                None => false,
+                }
+                None => None,
             }
         };
         // A STALE lease publishes nothing and must therefore wake nothing —
         // otherwise a caller holding a superseded lease could churn the exact
         // slots the current installation is serving.
-        if removed {
-            self.note_consumer_grant_movement(lease.grant_id());
+        if let Some(movement) = movement {
+            self.note_consumer_grant_movement(&movement);
+            return true;
         }
-        removed
+        false
     }
 
     /// Whether the caller explicitly supplied this node's identity (OSDK-L N).
