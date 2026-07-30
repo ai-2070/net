@@ -109,6 +109,7 @@ operations:
       anchor: announceCapabilities
     Python:
       status: supported
+      mode: core-only
       anchor: announce_capabilities
     Go:
       status: supported
@@ -126,6 +127,7 @@ operations:
       anchor: findNodes
     Python:
       status: supported
+      mode: core-only
       anchor: find_nodes
     Go:
       status: supported

@@ -47,6 +47,12 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DOCS = os.environ.get("DOCS_CONTENT_DIR", DEFAULT_DOCS)
 RECORDS = os.environ.get("CAPABILITY_RECORDS", "docs/data/capabilities")
 SKILLS = os.environ.get("SKILLS_DIR", ".claude/skills")
+# Generated, equality-checked JSON so the static site can read the record.
+# The site has no YAML parser and the docs build is fully static, so this is
+# the bridge D5 needs to render an absence state from the record rather than
+# from prose a page author typed.
+BRIDGE = os.environ.get("CAPABILITY_BRIDGE",
+                        "web/src/lib/generated/capability-record.json")
 
 # domain -> the skill whose bindings/coverage.md is generated from it.
 DOMAIN_SKILL = {
@@ -374,11 +380,109 @@ def check() -> int:
             fail += 1
         print()
 
+    # 5. the site's JSON bridge matches. The site is a static Next build with no
+    #    YAML parser, so a rendition that wants to show a parity badge needs the
+    #    record as JSON. Generating it and checking equality here is the same
+    #    discipline as the skill copies: one authored source, every derivative
+    #    proved rather than trusted.
+    print("==> Site bridge (web/src/lib/generated/capability-record.json)")
+    want = bridge_json()
+    bridge_path = os.path.join(ROOT, BRIDGE)
+    if not os.path.exists(bridge_path):
+        print(f"  {RED}✗{OFF} the bridge is missing")
+        print(f"      Generate: capability_records.py --write")
+        fail += 1
+    else:
+        current = open(bridge_path, encoding="utf-8").read()
+        if current == want:
+            ops = sum(len(load_record(d)["operations"]) for d in DOMAIN_SKILL)
+            print(f"  {GREEN}✓{OFF} {ops} operations readable by the site, "
+                  f"byte-identical to the record")
+        else:
+            print(f"  {RED}✗{OFF} the bridge has drifted from the record")
+            print(f"      Regenerate: capability_records.py --write")
+            for line in _diff(current, want)[:12]:
+                print(f"      {line}")
+            fail += 1
+
+    # 6. every `capability:` a page declares names a real operation. A page that
+    #    points at an operation the record does not have would render an empty
+    #    badge row, which reads as "no support anywhere" rather than as a typo.
+    known = {op["operation"] for d in DOMAIN_SKILL
+             for op in load_record(d)["operations"]}
+    declared = page_capabilities(os.path.join(ROOT, DOCS))
+    bad = sorted((page, cap) for page, cap in declared.items() if cap not in known)
+    for page, cap in bad:
+        print(f"  {RED}✗{OFF} {page} declares capability {cap!r}, which is not "
+              f"an operation in any record")
+        fail += 1
+    if declared and not bad:
+        print(f"  {GREEN}✓{OFF} {len(declared)} page(s) declare a capability, "
+              f"all resolving")
+    print()
+
     if fail == 0:
         print("Capability records are the source, and every copy matches.")
         return 0
     print(f"{fail} capability-record problem(s).")
     return 1
+
+
+def bridge_json() -> str:
+    """The record, flattened for a site that cannot read YAML.
+
+    Keyed by operation rather than by domain: a docs page cites one operation and
+    does not care which skill's record happens to hold it. Sorted and
+    2-space-indented so the equality check compares content, not formatting.
+    """
+    import json
+    ops: dict[str, dict] = {}
+    for domain in sorted(DOMAIN_SKILL):
+        for op in load_record(domain)["operations"]:
+            cells = {}
+            for binding in BINDINGS:
+                b = op["bindings"].get(binding)
+                if not b:
+                    continue
+                cell = {"status": b["status"]}
+                if b.get("mode"):
+                    cell["mode"] = b["mode"]
+                cells[binding] = cell
+            ops[op["operation"]] = {"domain": domain, "bindings": cells}
+    payload = {
+        "_generated": "docs/data/capabilities/*.yaml via "
+                      ".github/scripts/capability_records.py --write. "
+                      "Do not edit; the check fails on drift.",
+        "bindings": BINDINGS,
+        "operations": ops,
+    }
+    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def page_capabilities(docs_dir: str) -> dict[str, str]:
+    """`capability:` declared in an adaptive page's universal body, by page slug.
+
+    Read with a line scan rather than a YAML parser because `lib/docs.ts` reads
+    the same frontmatter with a twenty-line scanner — a checker that accepted
+    shapes the site cannot parse would pass a page that renders nothing.
+    """
+    out: dict[str, str] = {}
+    for dirpath, _dirs, files in os.walk(docs_dir):
+        if "_shared.md" not in files:
+            continue
+        rel = os.path.relpath(dirpath, docs_dir).replace(os.sep, "/")
+        with open(os.path.join(dirpath, "_shared.md"), encoding="utf-8") as fh:
+            in_fm = False
+            for line in fh:
+                if line.strip() == "---":
+                    if in_fm:
+                        break
+                    in_fm = True
+                    continue
+                if in_fm and line.startswith("capability:"):
+                    out[rel] = line.split(":", 1)[1].strip()
+        _dirs.clear()
+    return out
 
 
 def _diff(a: str, b: str) -> list[str]:
@@ -402,6 +506,17 @@ def write() -> int:
             print(f"  regenerated {skill}/bindings/coverage.md")
         else:
             print(f"  {skill}/bindings/coverage.md already current")
+
+    bridge_path = os.path.join(ROOT, BRIDGE)
+    os.makedirs(os.path.dirname(bridge_path), exist_ok=True)
+    want = bridge_json()
+    current = open(bridge_path, encoding="utf-8").read() if os.path.exists(bridge_path) else None
+    if current != want:
+        with open(bridge_path, "w", encoding="utf-8") as fh:
+            fh.write(want)
+        print(f"  regenerated {BRIDGE}")
+    else:
+        print(f"  {BRIDGE} already current")
     return 0
 
 

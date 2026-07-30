@@ -83,8 +83,8 @@ A mode is written after the status: `supported · core-only`.
 | Consumer-side filter DSL | supported | supported | supported | not exposed | supported |
 | Channels — pub/sub with capability auth | supported | supported | supported | supported | supported |
 | Mesh streams | supported | supported | supported | supported | supported |
-| Capability announce | supported | supported | supported | supported | supported |
-| Capability discovery | supported | supported | supported | supported | supported |
+| Capability announce | supported | supported | supported · core-only | supported | supported |
+| Capability discovery | supported | supported | supported · core-only | supported | supported |
 | nRPC — typed request/response + streaming | supported | supported | supported | supported | supported |
 | Gang-claim scheduler | supported | supported | supported | supported | supported |
 | A2A — agent task handoff | supported | supported · core-only | supported · core-only | not exposed | not exposed |
