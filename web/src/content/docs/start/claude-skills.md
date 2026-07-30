@@ -57,7 +57,7 @@ These are plain Agent Skills, so `-a '*'` covers Codex, Cursor, Copilot, Cline, 
 npx -y opensrc@latest path ai-2070/net
 ```
 
-## Installation without the CLI
+## Skill installation without the CLI
 
 A skill is just a directory containing a `SKILL.md`, so copying the folders in works:
 
