@@ -136,11 +136,19 @@ done < <(skill_md)
 # tracked `.ts` — so an `[ -e ]` test passes locally and fails on a clean CI
 # checkout, which is exactly backwards: it lets a citation to a generated file
 # through on the machine where it was written.
+#
+# Files a build produces are the one legitimate exception, and the list of them
+# lives in `check-skill-source-paths.py` (GENERATED) so there is a single record
+# with a reason attached to each. Before this was shared, the same file got two
+# verdicts: cited with a line anchor it passed here (the regex below cannot match
+# a `:`), cited without one it failed.
 echo "==> Source paths cited by the skills"
 before=$fail
+GENERATED=$(python3 "$(dirname "$0")/check-skill-source-paths.py" --generated)
 while read -r p; do
   git ls-files --error-unmatch "$p" >/dev/null 2>&1 && continue   # tracked file
   [ -n "$(git ls-files "$p" | head -1)" ] && continue             # tracked directory
+  printf '%s\n' "$GENERATED" | grep -qxF "$p" && continue         # build-generated
   if [ -e "$p" ]; then
     note "cited path is not tracked by git (build artifact?): $p"
   else
