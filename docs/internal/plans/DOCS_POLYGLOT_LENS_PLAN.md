@@ -1,9 +1,10 @@
 # Documentation — The Polyglot Lens
 
-**Status:** REVISED ×2 (2026-07-30). Kyra reviewed the 2026-07-29 draft, then
+**Status:** REVISED ×3 (2026-07-30). Kyra reviewed the 2026-07-29 draft, then
 reviewed the revision and **signed Phase 1A and Phase 2 for execution** subject to
-seven corrections, all of which are applied below. Nothing executed yet. One item
-(D8) needs a decision before Phase 4 is scheduled.
+seven corrections. A third pass cleared six stale contradictions and decided D8.
+All applied below. **Phase 1A and Phase 2 are signed; Phase 3 is specified; Phase 4
+is gated on real self-serve evidence.** Nothing executed yet.
 
 This plan turns Kyra's 36,000-foot concept into a decision list, a phase order, and
 the CI gates each phase has to pass. It supersedes nothing:
@@ -77,16 +78,26 @@ resolved by freezing the static router.
 | capability records | `docs/data/capabilities/` |
 | example manifest | `docs/data/examples.yaml` |
 | example source | stays in native SDK / build locations |
-| record prose ownership | domain owner + docs review + affected binding review, **no CODEOWNERS** |
+| record prose ownership | reviewed in the same change as the status it explains; no owner registry |
 
-Two departures from the review text, both stated where they occur: the **adaptive
-count is 29 rather than 36** (section READMEs and four measured zero-code guides are
-universal — rules given, overrule and the manifest moves them), and **CODEOWNERS is
-not used at all** per Laz, so ownership is carried as record fields plus a
-convention rather than a file.
+One departure from the review text, stated where it occurs: the **adaptive count is
+29 rather than 36** — section READMEs and four measured zero-code guides are
+universal. The rules are given; overrule them and the manifest moves the pages.
 
-One new item this revision raises: **D8**, because computing the taxonomy showed
-the critical path already exists as four parallel manuals.
+### Third review — stale contradictions cleared
+
+| Fix | Where |
+|---|---|
+| Drop the `semantic_owner` field and review matrix | D4 — two sentences, no ceremony |
+| `sdk/c` is five pages, not a "2-page spine" | information model |
+| Examples are *indexed* neutrally, not relocated | Phase 2 |
+| No cookie/middleware language left in Phase 3 | Phase 3, and the risk it replaced |
+| Phase 4 arithmetic is 7 bodies / 28 fragments | scope arithmetic + Phase 4 |
+| "four lenses project four syntaxes" | Phase 4 |
+
+**D8 decided: compose the existing SDK spine in place**, and keep it classified
+`sdk_native` — composition is a storage mechanism, `sdk_native` is an IA
+classification, and they do not collapse into one concept.
 
 ---
 
@@ -246,8 +257,8 @@ are present, not that headings match a string.
 **Four adaptive lenses: Rust, TypeScript, Python, Go. C is a boundary annex.**
 
 Review rejected C as a fifth lens, and the draft's own evidence supports it: the
-C ABI is bus-only, `sdk/c` is an honest 2-page spine for that reason, and
-`guides/` contains **zero** C fences today. Minting 34 C renditions that mostly
+C ABI has a **five-page boundary-native section and no general capability lens**,
+because the ABI is bus-only, and `guides/` contains **zero** C fences today. Minting 34 C renditions that mostly
 read "not exposed" does not make the docs more honest — it makes the information
 architecture assert that C is a product shape it is not.
 
@@ -310,8 +321,8 @@ only the part that is genuinely language-specific: install line, construction,
 runtime caveat, verification. A fragment is a fraction of a page.
 
 **What I will not do is guess the ratio.** The honest number is unknown until
-something is built, so Phase 4 measures it: 8 universal bodies and up to **32
-fragments**, reporting authored lines universal vs per-fragment. That ratio is the
+something is built, so Phase 4 measures it: 7 universal bodies and up to **28
+fragments** (D8), reporting authored lines universal vs per-fragment. That ratio is the
 input to the Phase 5 decision, not a number picked now.
 
 Two further reductions fall out of the model: a fragment exists only where the
@@ -342,39 +353,51 @@ construction they are the same content in four syntaxes:
 Every SDK page teaches the same agentic step in the same order." Per-page
 renditions run 34–123 lines.
 
-So Phase 4 has two possible shapes:
+**D8, decided: compose the existing spine in place.** Not eight new guide pages
+describing the same journey. The spine is the single best target the corpus has for
+the composition model — it removes duplication that already exists rather than
+creating more, it is small enough to convert inside one phase, and it proves the
+model on content four authors already agreed teaches the same thing.
 
-**(a) Compose the existing spine in place — recommended.** The spine is the single
-best target the corpus has for the composition model: it removes duplication that
-already exists rather than creating new pages, it is small enough to convert
-inside one phase, and it proves the model on content four authors have already
-agreed teaches the same thing. `28 pages → 7 universal bodies + 28 fragments`.
+```
+28 pages  →  7 universal bodies + 28 fragments
+```
 
-Critically, **it costs no URLs.** `/docs/sdk/python/announce` already carries the
-language segment — as a prefix rather than a suffix — so composition can be applied
-underneath the existing routes with zero churn, satisfying
-`DOCS_STRATEGY_PLAN.md`'s "never by moving files out from under inbound links"
-without a single redirect. The price is two URL shapes for adaptive content:
-prefix for the SDK spine, suffix (D1) for guides. That inconsistency is real, and
-it is cheaper than breaking 28 indexed URLs — and arguably honest, since
+**It costs no URLs.** `/docs/sdk/python/announce` already carries the language
+segment — as a prefix rather than a suffix — so composition applies underneath the
+existing routes with zero churn, satisfying `DOCS_STRATEGY_PLAN.md`'s "never by
+moving files out from under inbound links" without a single redirect. The price is
+two URL shapes for adaptive content: prefix for the spine, suffix (D1) for guides.
+Cheaper than breaking 28 indexed URLs, and arguably honest —
 `sdk/python/announce` means "the Python SDK's announce page" while
 `guides/event-bus/python` means "this guide, read in Python."
 
-**(b) Author 8 new adaptive journey pages under `guides/`.** Leaves the spine's
-4× duplication in place and adds a second description of the same eight steps
-beside it. Not recommended.
+**The spine stays classified `sdk_native`.** Review's refinement, and it is the
+right distinction: **composition is a storage and authoring mechanism;
+`sdk_native` is an information-architecture classification.** They do not collapse
+into one concept. A composed spine page is still SDK reference — it has simply
+stopped being written out four times:
 
-Under (a) the ratchet arithmetic is:
+```
+/docs/sdk/python/announce
+  = shared announce model  +  Python binding fragment
+```
+
+So the tier table does not move a single page, and the ratchet arithmetic is
+untouched by Phase 4's main work:
 
 ```
 adaptive_pending at end of Phase 2:  29
 Phase 3 converts start/install:      28
-Phase 4 converts start/quickstart:   27          (pending tier)
-Phase 4 also collapses the spine:    28 sdk_native → 7 adaptive + 28 fragments
+Phase 4 composes the spine:          28 sdk_native pages, still sdk_native
 ```
 
-This is **D8**, and it needs a decision before Phase 4 is scheduled — it is the
-one item where the phase's scope is still open.
+**One consequence to name rather than absorb.** `start/quickstart` is
+`adaptive_pending` and stays that way, so after Phase 4 a Rust-only
+`start/quickstart` sits beside a composed `sdk/<lang>/quickstart`. That is the
+highest-traffic page in the corpus reading Rust-only while its SDK twin speaks four
+languages — not fake parity (its state is declared), but the most visible remaining
+gap. It is therefore first in Phase 5's demand order, not an expansion of Phase 4.
 
 ---
 
@@ -394,7 +417,7 @@ language-aware link validation needs the URL shape.
 | D5 absence generation | Phase 2 | frozen |
 | D6 version context | — | unchanged (out of scope) |
 | D7 predecessor-plan resolution | Phase 3 | clarified |
-| D8 what Phase 4 converts | **Phase 4** | **open — needs a decision** |
+| D8 what Phase 4 converts | Phase 4 | **frozen** — compose the spine in place, keep it `sdk_native` |
 
 ### D1 — URL shape for adaptive pages
 
@@ -649,28 +672,15 @@ Under the corrected model it does, and that copy is mechanical.
   `alternative.href`), so it needs an owner and its links need checking. Both are
   named in Phase 2.
 
-**Ownership. FROZEN, and deliberately without CODEOWNERS.** The record declares its
-own owner as data:
+**Ownership. FROZEN, and deliberately without ceremony.** No CODEOWNERS, no owner
+registry, no review matrix. `domain: event-bus` already identifies what the record
+describes.
 
-```yaml
-domain: event-bus
-semantic_owner: net-event-bus
-```
+> Reader-facing rationale is reviewed in the same change as the semantic status it
+> describes. Generated copies have no independent authorship or review path.
 
-| Change | Reviewed by |
-|---|---|
-| `status` / `mode` / symbol anchor | the subsystem, plus the affected binding |
-| `reason` / `alternative` text | the subsystem, plus docs review |
-| the generated skill matrix | nobody — it is a generated artifact with no authorship |
-
-No CODEOWNERS file, by decision. The checker enforces what a file can enforce —
-`domain` and `semantic_owner` are present and drawn from a closed set, so every
-change names the subsystem it speaks for — and the review split above is
-convention, carried in this plan and in the record's own header comment.
-
-There is no separate copywriting workflow for sentences inside YAML: `reason` and
-`alternative.label` are product-contract prose and are reviewed in the same change
-as the semantic status they explain.
+The previous revision replaced a CODEOWNERS file with a `semantic_owner` field and a
+review table, which is the same ceremony in a different format.
 
 The vocabulary is already designed and in use: Status `supported · partial ·
 experimental · not exposed · n/a`, plus an orthogonal Mode `poll · verify-only ·
@@ -801,8 +811,9 @@ Requires D1–D5 frozen.
 - **Capability records** (D4) authored per domain under `docs/data/capabilities/`;
   generation plus equality check for each skill's `bindings/coverage.md`; anchor
   and vocabulary validation moved onto the canonical record.
-- **Canonical examples** relocated to the neutral location (D3), with an
-  evidence-level field in the manifest and each level enforced by the existing
+- **Canonical examples** indexed by `docs/data/examples.yaml` (D3), while the
+  source stays in each binding's native SDK / build location. The manifest carries
+  the evidence level per block, and each level is enforced by the existing
   per-language CI wiring.
 - **Migration states.** Every page declares one:
 
@@ -857,7 +868,7 @@ pending count at the end of Phase 2 is **29** — a pass, not a failure.
 Requires D1, D2, D7.
 
 - Routing for adaptive pages; an explicit language segment per rendition; the bare
-  route as a neutral router (D1), by cookie/middleware or static fallback.
+  route as the neutral static router defined by D1.
 - Per-rendition canonical plus `alternates.languages` (the D1 obligation).
 - **Fix the three live defects:** language-aware `getPrevNext` (a Python reader
   never falls into Go), sidebar/page agreement (no stranded pages), language-aware
@@ -904,7 +915,7 @@ sufficient for an authority boundary; the tracer must witness, at minimum:
 - a **typed remote error** crossing the binding boundary;
 - **ambiguous execution** guidance, where the binding exposes it.
 
-Without those, four lenses project five syntaxes for the happy path rather than one
+Without those, four lenses project four syntaxes for the happy path rather than one
 Net model. See D8 for which pages this phase touches.
 
 Every fragment carries its runtime caveat, ends in a verification step, and takes
@@ -975,12 +986,13 @@ demonstration, ~2–5 hours to a conventional minimal integration. These are
 hypotheses this phase tests. They do not go into public copy until a run has met
 them.
 
-**Acceptance:** 7 universal bodies and up to 28 fragments build (D8(a)); every
-critical-path block enforced at its declared level; every parity badge rendered
-from the record and none typed by hand; the five failure witnesses demonstrated in
-each lens that exposes them; `start/install` and `start/quickstart` off the pending
-allowlist (27 remaining); the publishing measurement and the self-serve run both
-written up.
+**Acceptance:** 7 universal bodies and up to 28 fragments build, replacing 28
+authored spine pages that stay classified `sdk_native` (D8); every critical-path
+block enforced at its declared level; every parity badge rendered from the record
+and none typed by hand; the five failure witnesses demonstrated in each lens that
+exposes them; the pending allowlist unchanged at 28, because this phase touches the
+spine rather than the pending tier; the publishing measurement and the self-serve
+run both written up.
 
 ### Phase 5 — Expand by demand, not by taxonomy
 
@@ -988,9 +1000,11 @@ written up.
 ordered by evidence rather than page count — review's criteria: traffic, support
 burden, agent-failure frequency, commercial relevance, binding demand.
 
-The likely head of that order, for the self-serve wedge: install, capability
-declaration, discovery, invocation, identity and grants, revocation, watches,
-artifacts, intermittent failure, debugging and evidence. A rarely-read Rust tuning
+**First in that order, regardless of what the traffic says: `start/quickstart`.**
+After Phase 4 it is the corpus's most-visited page still reading Rust-only while its
+composed SDK twin speaks four languages (see D8). Then, for the self-serve wedge:
+capability declaration, discovery, invocation, identity and grants, revocation,
+watches, artifacts, intermittent failure, debugging and evidence. A rarely-read Rust tuning
 guide does not earn four fragments because the taxonomy called it adaptive — it can
 stay `adaptive_pending`, visibly, with its state declared.
 
@@ -1040,10 +1054,11 @@ selected a boundary surface, not a fifth SDK lens.
   positive cells; nothing can prove a `not_exposed` that is really `supported`.
   Human review of negative cells stays required — and under D5 those cells now
   render reader-facing prose, which raises the cost of getting one wrong.
-- **The bare-route decision has a runtime tail.** Option 1 introduces middleware
-  and a cookie to a site with neither. If that proves unwelcome, option 2 is a
-  complete answer and costs nothing — but it has to be built as the fallback path
-  from the start, not bolted on.
+- **Internal links must carry the selected language.** With the bare route as a
+  static router, the reader's selection is preserved by every in-app link — sidebar,
+  prev/next, in-body cross-reference. One link that drops the segment sends a Python
+  reader back to the router, or worse to a Rust rendition, and it will read as the
+  selection having been forgotten. This is a Phase 3 test, not a code-review habit.
 - **Phase 1A chrome vs Phase 3 chrome.** Split so the routing decision does not
   invalidate typography work.
 
@@ -1051,36 +1066,25 @@ selected a boundary surface, not a fifth SDK lens.
 
 ## Open items
 
-Everything from both rounds is settled except one.
+**Nothing blocking. Every decision is frozen.**
 
-**Answered in round one:** trailing language segment **yes**; bare-route-as-Rust
-**no**; phase order **yes**, with D2–D5 frozen before Phase 2 and a tracer page in
-Phase 3; the 170 renditions **not committed**; C **not a fifth lens**.
+**Round one:** trailing language segment **yes**; bare-route-as-Rust **no**; phase
+order **yes**, with D2–D5 frozen before Phase 2 and a tracer page in Phase 3; the
+170 renditions **not committed**; C **not a fifth lens**.
 
-**Answered in round two, now frozen:** the bare route is a **static neutral
-router** with no middleware and no cookie; capability records live in
-`docs/data/capabilities/`; the example manifest is `docs/data/examples.yaml`;
-example **source stays in native SDK and build locations**; record prose is owned by
-the domain owner with docs review and affected-binding review, **without
-CODEOWNERS**.
+**Round two:** the bare route is a **static neutral router**, no middleware and no
+cookie; capability records in `docs/data/capabilities/`; the example manifest is
+`docs/data/examples.yaml`; example **source stays in native SDK and build
+locations**; reader-facing rationale is reviewed in the same change as the semantic
+status it describes, with no owner registry and no CODEOWNERS.
 
-### D8 — what Phase 4 converts *(open)*
+**Round three:** **D8 — compose the existing SDK spine in place**, `28 → 7 universal
+bodies + 28 fragments`, and **keep those pages classified `sdk_native`**. No new
+guide pages describing the same journey. Composition is a storage mechanism;
+`sdk_native` is an IA classification; they stay separate.
 
-The one item still needing a decision, raised by computing the taxonomy rather than
-by either review. The eight tracer steps already exist as the SDK spine — 7 pages ×
-4 languages, 28 pages, 1,922 lines, authored from one template by
-`DOCS_SDK_SPINE_PLAN.md`.
-
-- **(a) Compose the spine in place — recommended.** `28 → 7 universal bodies + 28
-  fragments`, no new pages, no URL churn (the language segment is already in
-  `/docs/sdk/python/announce`, as a prefix). Price: two URL shapes for adaptive
-  content, prefix for the spine and suffix for guides.
-- **(b) Author 8 new adaptive pages under `guides/`.** Leaves the spine's 4×
-  duplication in place and describes the same eight steps twice.
-
-Choosing (a) also means Phase 4's headline deliverable is *removing* existing
-duplication, which is a stronger test of the composition model than writing new
-pages — and a stronger argument for Phase 5 if the ratio comes out well.
+Execution can start: **Phase 1A** (reading surface, chrome only) and **Phase 2**
+(records, harness, migration-aware checker) are signed and touch disjoint files.
 
 ### Two things worth watching, not blocking
 
