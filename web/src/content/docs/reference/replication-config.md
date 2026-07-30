@@ -137,7 +137,7 @@ Tune it per channel against what the channel is for: hot channels set it low (a 
 
 ## Lifecycle
 
-```
+```text title="Replication decision flow"
 open_file(channel, cfg with replication=Some(_))
     │
     ▼

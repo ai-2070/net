@@ -8,7 +8,7 @@ The storage layer turns the ephemeral event bus into something you can build a s
 
 The layering follows the same logic as the rest of Net. Each layer adds exactly one capability, and the capability above is expressed in terms of the layer below.
 
-```
+```text title="The storage stack"
 ┌─────────────────────────────────────────┐
 │  NetDB    query plane, federated views  │
 ├─────────────────────────────────────────┤

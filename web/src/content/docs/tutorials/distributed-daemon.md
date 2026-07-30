@@ -10,7 +10,7 @@ The daemon we'll build is a small one — it tracks running tasks and emits stat
 
 ## The shape
 
-```
+```text title="What you are building"
 ┌───────────────────────────────────────────────────┐
 │              StandbyGroup (3 members)             │
 │                                                   │
