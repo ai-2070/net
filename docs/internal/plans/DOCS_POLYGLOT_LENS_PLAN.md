@@ -868,13 +868,26 @@ at 375px; **zero changes under `src/content/docs/`**. This phase is chrome only 
 the draft contradicted itself by promising no content edits while converting six
 diagrams.
 
-### Phase 1B — The diagram system *(decoupled, blocks nothing)*
+### Phase 1B — The diagram system *(EXECUTED)*
 
-Pick one representation (inline SVG authored beside the page, or a diagram
-component) and convert the six pages carrying box drawings today:
-`concepts/architecture`, `capabilities`, `channels`, `subnets`, `storage-stack`,
-`agent-identity`. This is content work and a design project; it must not gate the
-records, the route model, or the critical-path proof.
+**The page list above was wrong and is corrected here.** It named six pages derived
+from "files containing fenced blocks" — a proxy for something else. Measured
+against box-drawing characters, four of the six have no diagram (`capabilities`,
+`channels`, `subnets`, `agent-identity`); the real set is `concepts/architecture`,
+`concepts/storage-stack`, `reference/replication-config` and the three tutorials.
+Seven, with two in common.
+
+Neither option the plan offered was taken, and the reason is a constraint the plan
+did not weigh: **docs content is read raw by agents and three reference pages have
+been ported verbatim into the skill corpus.** A `<Diagram>` MDX component would end
+that portability, and seven hand-maintained SVGs would drift from the text they
+illustrate. So the diagrams stay text and gain a fence info string —
+```text title="…" — which renders as a captioned figure with no copy button and a
+scroll affordance, and stays valid markdown in every other viewer.
+
+Generalisable: **a presentational change that requires a syntax the rest of the
+ecosystem cannot read is more expensive than it looks in a corpus that is
+deliberately portable.**
 
 ### Phase 2 — The record, the harness, and a migration-aware checker
 
