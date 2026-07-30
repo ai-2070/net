@@ -133,6 +133,52 @@ point when the export is `Net`, and three C symbols (`net_bus_new`,
 install-and-first-call code in three of five languages, on the first page a
 self-serve reader opens.
 
+**Phase 4** — the spine composed in place: 7 universal bodies + 28 fragments at the
+URLs they already had, 149 pages → 128, `sdk_native` 34 → 13, pending allowlist
+untouched at 28. Parity badges render from a generated, equality-checked JSON
+bridge over the capability record — the seam the Phase 3 log flagged for later is
+gone. `check-spine-symbols.py` holds 194 symbols at evidence level `source-match`,
+with a planted-defect test. Measurement in
+`docs/internal/misc/DOCS_POLYGLOT_PHASE_4_MEASUREMENT.md`; the self-serve gate is
+specified and **not run**, in `DOCS_POLYGLOT_PHASE_4_GATE.md`.
+
+Found en route: nine defects, all on the critical path, all of one shape — see
+*Three findings from the spine* below. Also that adaptive pages had no prev/next
+at all: `addFolder` pushed a folder entry only for folders with a README, and an
+adaptive page has `_shared.md`, so `start/install` had been absent from every
+reading order since Phase 3.
+
+### Three findings from the spine
+
+**1. The universal share is lower than the plan predicted, and the predictor is
+different from the one the plan named.** Phase 3 expected a broader sample to land
+above 19%. Seven of seven spine pages landed at or below it; the mean is 16%. The
+predictor is not how much of a page is prose — it is whether the page teaches a
+**decision** (universal, so composition pays: `redis-dedup`, 50%) or a **surface**
+(constructors, handle types, error types — irreducibly per-binding, so it does not:
+every spine page, 14–19%). Phase 5's ordering should stop expecting savings from
+SDK-surface pages and convert them for correctness instead.
+
+**2. The composed spine is 71% larger than what it replaced, and none of it is
+duplication.** 2187 authored lines against 1277. The growth is nine corrections,
+two declared absences, 28 verification steps, the five failure witnesses and the
+handshake — content the old pages did not have. "Saved 1053 lines" is true against
+writing that content four times and misleading as a claim about the diff. The
+honest framing: composition did not shrink the corpus, it made a 71% content
+increase cost 71% instead of 300%.
+
+**3. The strongest argument for composition is not the one this plan made.** The
+nine defects were not four syntaxes drifting apart. They were **one object model —
+Rust's — projected onto three bindings where it does not hold**: in Rust the tool
+API hangs off the `Mesh` node, everywhere else off a typed RPC surface the
+ergonomic wrapper does not carry. Four pages made the same error four times
+because they were written from one Rust original by translators who changed the
+syntax and kept the object graph. The plan's argument for composition was cost.
+The real payoff is that a universal body is a *place to say the model once, at the
+level where it is true*, which forces the fragment underneath to show its own
+constructor rather than inherit an assumption. Four parallel manuals have no such
+place, which is why they drifted in the same direction.
+
 ### Two findings that change the cost model
 
 **1. The universal share varies enormously by page type.** Measured on the two
@@ -170,6 +216,14 @@ Until the capability record can be read by the site, the universal body declares
 target in frontmatter (`boundary` / `boundaryLabel`). D5 replaces this with
 `alternative.href` from the record once a generated, equality-checked JSON bridge
 exists; the code says so at the seam.
+
+**Phase 4 built the bridge** (`web/src/lib/generated/capability-record.json`,
+generated and equality-checked by `capability_records.py`), so the site can now
+read the record and a page declares its operation with `capability:` instead of
+typing a support claim. **`boundary` stays for now**, because the record's
+`alternative` field is still unpopulated — the bridge removed the obstacle, not
+the authoring. Populating `reason` and `alternative` per negative cell is what
+retires `boundary`, and it is a Phase 6 job now that nothing blocks it.
 
 ---
 
@@ -974,7 +1028,24 @@ reader (a test, not an inspection); every gated page reachable from the nav of a
 least one language; `start/install` renders in four languages from one universal
 body; pending allowlist down to 28.
 
-### Phase 4 — The critical path, the measurement, and the self-serve proof
+### Phase 4 — The critical path, the measurement, and the self-serve proof *(EXECUTED, except the gate)*
+
+**D8's "it costs no URLs" needed one correction in execution, not in substance.**
+The resolver built in Phase 3 understands only D1's suffix shape
+(`<page>/<lens>`), while the spine's URLs are the prefix (`sdk/python/announce`).
+D8 had already named the price — "two URL shapes for adaptive content" — so the
+decision stood and the second shape got built: a section holding both lens folders
+and adaptive page folders projects each page into each lens section. Zero URLs
+moved. The handoff brief read D8 as having assumed this was free and recommended
+moving 28 indexed URLs instead; the plan text had priced it, so the frozen
+decision held.
+
+Two consequences of the prefix shape, decided here: a projected page keeps its
+bare route as D1's neutral router (the only language-neutral URL a universal body
+can link a sibling at) and does **not** also get suffix routes; and it has no `/c`
+route, because `sdk/c` is a real five-page annex that would collide by name. The C
+pill points into the annex instead of at a generated absence beside it.
+
 
 Eight steps, four lenses, one universal body each. Reframed per review so the
 public developer model (**define → provide → resolve**) stays visible and the
