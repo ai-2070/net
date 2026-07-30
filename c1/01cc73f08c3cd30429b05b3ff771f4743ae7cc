@@ -1,0 +1,29 @@
+.claude/skills/net-event-bus/bindings/coverage.md
+  s_a85d4c545303aa::t_ea3b091929ee33 86-87
+docs/data/capabilities/event-bus.yaml
+  s_a85d4c545303aa::t_b15d8e6f888bde 112,130
+.github/scripts/capability_records.py
+  s_a85d4c545303aa::t_3bfd1aaef74992 383-423,431-485
+  s_a85d4c545303aa::t_b9b280793ebb04 50-55,509-519
+  s_a85d4c545303aa::t_844e0b8ebc8299 486-487
+web/src/lib/capability-record.ts
+  s_a85d4c545303aa::t_256e86772b592e 1-85
+web/src/lib/generated/capability-record.json
+  s_a85d4c545303aa::t_b9b280793ebb04 1-618
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "c101cc73f08c3cd30429b05b3ff771f4743ae7cc",
+  "prompts": {},
+  "sessions": {
+    "s_a85d4c545303aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "36284d49-c490-4d4d-bc20-5d2a1a6841ad",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
