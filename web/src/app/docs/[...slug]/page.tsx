@@ -9,10 +9,14 @@ import {
   extractToc,
   getPrevNextByLanguage,
   assertNoCrossLanguageNeighbours,
+  navChildren,
+  renditionPath,
+  boundaryPath,
   type AdaptivePage,
   type DocFolder,
   type TocEntry,
 } from "@/lib/docs";
+import { capabilityRow, type CapabilityRow } from "@/lib/capability-record";
 import {
   LENSES,
   LENS_SLUG,
@@ -70,14 +74,19 @@ export async function generateMetadata({
   // routes carry a lot of identical text by design. Each is canonical for itself
   // and declares its siblings; without that the set reads as duplicate content
   // and a crawler picks a winner for us.
-  const base =
+  const siblingsOf =
     resolved.kind === "rendition" || resolved.kind === "boundary"
-      ? `/docs/${slug.slice(0, -1).join("/")}`
+      ? resolved.folder
       : null;
-  const languages = base
+  const languages = siblingsOf
     ? Object.fromEntries([
-        ...LENSES.map((l) => [LENS_HREFLANG[l], `${base}/${LENS_SLUG[l]}`]),
-        ["x-default", base],
+        ...LENSES.map((l) => [
+          LENS_HREFLANG[l],
+          renditionPath(siblingsOf, LENS_SLUG[l]),
+        ]),
+        // x-default is the bare route in both shapes: the neutral router that
+        // states the objective and offers the lenses, never one of them.
+        ["x-default", `/docs/${siblingsOf.slug.join("/")}`],
       ])
     : undefined;
 
@@ -126,11 +135,11 @@ const LENS_HREFLANG: Record<Lens, string> = {
  * rather than being silently omitted, because an omitted lens is
  * indistinguishable from a lens nobody has looked at. */
 function LensChooser({
-  base,
+  folder,
   page,
   current,
 }: {
-  base: string;
+  folder: DocFolder;
   page: AdaptivePage;
   current?: Lens | "c";
 }) {
@@ -146,7 +155,7 @@ function LensChooser({
           return (
             <Link
               key={lens}
-              href={`${base}/${LENS_SLUG[lens]}`}
+              href={renditionPath(folder, LENS_SLUG[lens])}
               className={`font-mono text-[11px] tracking-[0.04em] px-2 py-1 border transition-colors ${
                 on
                   ? "border-accent text-accent bg-accent/[0.08]"
@@ -161,7 +170,7 @@ function LensChooser({
           );
         })}
         <Link
-          href={`${base}/${LENS_SLUG.c}`}
+          href={boundaryPath(folder, page)}
           className={`font-mono text-[11px] tracking-[0.04em] px-2 py-1 border transition-colors ${
             current === "c"
               ? "border-accent text-accent bg-accent/[0.08]"
@@ -171,6 +180,73 @@ function LensChooser({
           C<span className="ml-1.5 text-[9px]">boundary</span>
         </Link>
       </div>
+    </div>
+  );
+}
+
+/** The parity row for this page's operation, RENDERED FROM THE RECORD.
+ *
+ * Nothing here is typed into a docs page. `docs/data/capabilities/*.yaml` is the
+ * one authored answer to "does binding X support operation Y", every positive
+ * cell resolves a real symbol in that binding's tree under CI, and the JSON this
+ * reads is generated from it and equality-checked. A page therefore cannot
+ * disagree with the record about what a binding does — which is the whole point,
+ * because a page that is confidently wrong about a binding costs a reader more
+ * than a page that says nothing.
+ *
+ * `core-only` is called out rather than folded into "supported": it is the
+ * single most common way to be wrong about Net in Node and Python, and a reader
+ * who sees "supported" and reaches for the ergonomic wrapper has been misled by
+ * a technically true badge.
+ */
+function ParityRow({
+  row,
+  current,
+}: {
+  row: CapabilityRow;
+  current?: Lens | "c";
+}) {
+  const tone: Record<string, string> = {
+    supported: "text-accent",
+    partial: "text-cyan",
+    experimental: "text-cyan",
+    "not exposed": "text-ink-faint",
+    "n/a": "text-ink-faint",
+  };
+  return (
+    <div className="border border-line bg-bg-2/30 px-4 py-3 my-6">
+      <div className="font-mono text-[9px] tracking-[0.22em] uppercase text-ink-faint mb-2.5">
+        <span className="text-accent">§</span> parity · {row.operation}
+        <span className="ml-2 text-ink-faint normal-case tracking-normal">
+          from the capability record
+        </span>
+      </div>
+      <div className="flex flex-wrap gap-x-5 gap-y-1.5">
+        {row.cells.map(({ binding, lang, cell }) => {
+          const mine = lang !== null && lang === current;
+          return (
+            <span
+              key={binding}
+              className={`font-mono text-[11px] ${mine ? "text-ink" : "text-ink-dim"}`}
+            >
+              <span className={mine ? "text-accent" : ""}>{binding}</span>{" "}
+              <span className={tone[cell.status] ?? "text-ink-dim"}>
+                {cell.status}
+              </span>
+              {cell.mode ? (
+                <span className="text-cyan"> · {cell.mode}</span>
+              ) : null}
+            </span>
+          );
+        })}
+      </div>
+      {row.cells.some((c) => c.cell.mode === "core-only") ? (
+        <p className="font-mono font-light text-[12px] text-ink-dim leading-[1.7] mt-2.5 mb-0">
+          <span className="text-cyan">core-only</span> means the operation exists
+          on the low-level binding but not on the ergonomic SDK wrapper. Reach one
+          layer down; it is not a gap.
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -262,7 +338,8 @@ function fakeMtime(i: number): string {
 }
 
 function FolderIndex({ folder }: { folder: DocFolder }) {
-  const childCount = folder.children.length;
+  const children = navChildren(folder);
+  const childCount = children.length;
 
   return (
     <div>
@@ -302,7 +379,7 @@ function FolderIndex({ folder }: { folder: DocFolder }) {
         </p>
       ) : (
         <div className="space-y-px">
-          {folder.children.map((child, i) => {
+          {children.map((child, i) => {
             const slugKey = child.slug.join("/");
             const isFolder = child.kind === "folder";
             const size = fakeSize(slugKey);
@@ -492,20 +569,28 @@ export default async function DocPage({ params }: PageProps) {
     resolved.kind === "adaptive-router"
   ) {
     const { folder, page } = resolved;
-    const base = `/docs/${folder.slug.join("/")}`;
     const lens = resolved.kind === "rendition" ? resolved.lens : undefined;
     const composed =
       lens !== undefined
         ? composeRendition(page, lens)
         : { source: readDocSource(page.shared), hasFragment: false };
-    const neighbours = getPrevNextByLanguage(folder.slug);
+    // Prev/next is looked up at the URL the reader is on, not at the page's
+    // bare slug — under the lens-prefix shape those are different folders, and
+    // the bare slug is not a route at all.
+    const neighbours = getPrevNextByLanguage(slug);
+    // Under the lens prefix the language is already a path segment, so the
+    // breadcrumb reads `docs / sdk / python` and needs no trailing lens label.
+    // Under the suffix shape the lens is not in the crumbs, and the label is the
+    // only thing making a screenshot of the header unambiguous.
+    const lensInPath = folder.projected === true;
+    const parity = capabilityRow(page.capability);
     return (
       <>
         <main className="min-w-0 max-w-[740px]">
           <Breadcrumb
-            slug={folder.slug}
+            slug={lensInPath ? slug : folder.slug}
             trailing={
-              resolved.kind === "adaptive-router"
+              lensInPath || resolved.kind === "adaptive-router"
                 ? undefined
                 : lens
                   ? LENS_LABEL[lens]
@@ -517,8 +602,14 @@ export default async function DocPage({ params }: PageProps) {
           <DocsContent
             source={composed.source}
             format="md"
-            baseDir={folder.slug}
+            baseDir={lensInPath ? slug.slice(0, -1) : folder.slug}
           />
+          {parity ? (
+            <ParityRow
+              row={parity}
+              current={resolved.kind === "boundary" ? "c" : lens}
+            />
+          ) : null}
           {resolved.kind === "boundary" ? (
             <BoundaryNotice boundary={page.boundary} />
           ) : null}
@@ -526,7 +617,7 @@ export default async function DocPage({ params }: PageProps) {
             <AbsenceNotice lens={lens} />
           ) : null}
           <LensChooser
-            base={base}
+            folder={folder}
             page={page}
             current={resolved.kind === "boundary" ? "c" : lens}
           />

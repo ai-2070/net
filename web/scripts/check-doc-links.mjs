@@ -78,25 +78,56 @@ const headingsOf = (src) => {
 const pages = new Map();
 const sources = new Map();
 
+// Two URL shapes, and this checker has to know both or it validates links
+// against routes that do not exist. D8 froze the second one: the SDK spine
+// composes in place, so `/docs/sdk/python/announce` keeps its URL while its
+// source moved to `sdk/announce/`.
+//
+// The rule mirrors `projectLensSections` in `web/src/lib/docs.ts`: an adaptive
+// page whose parent section ALSO holds lens-named directories is projected, and
+// its renditions live under the lens prefix instead of the page suffix. If those
+// two rules ever disagree, this checker passes links the router will 404.
+const sectionHasLensDirs = (dir) => {
+  const section = dir.includes("/") ? dir.slice(0, dir.lastIndexOf("/")) : "";
+  return LENS_SLUGS.some((lens) =>
+    existsSync(join(DOCS, section, lens)),
+  );
+};
+
 for (const dir of adaptiveDirs) {
   const sharedSrc = readFileSync(join(DOCS, dir, SHARED_BODY), "utf8");
   const base = `/docs/${toSlug(dir)}`;
-  // The bare route is the neutral router: universal body only.
+  const projected = sectionHasLensDirs(dir);
+  const section = dir.includes("/") ? dir.slice(0, dir.lastIndexOf("/")) : "";
+  const page = dir.slice(dir.lastIndexOf("/") + 1);
+  const renditionUrl = (lens) =>
+    projected
+      ? `/docs/${toSlug(`${section}/${lens}/${page}`)}`
+      : `${base}/${lens}`;
+
+  // The bare route is the neutral router in both shapes: universal body only.
   pages.set(base, headingsOf(sharedSrc));
   sources.set(`${dir}/${SHARED_BODY}`, { src: sharedSrc, url: base });
-  // The C route is a generated projection over the same universal body.
-  pages.set(`${base}/${BOUNDARY_SLUG}`, headingsOf(sharedSrc));
+
+  // A projected page has NO `/c` route — the spine's C reader is served by the
+  // annex, which has real pages of its own. Only the suffix shape generates a
+  // boundary projection over the universal body.
+  if (!projected) {
+    pages.set(`${base}/${BOUNDARY_SLUG}`, headingsOf(sharedSrc));
+  }
+
   for (const lens of LENS_SLUGS) {
     const fragPath = join(DOCS, dir, `${lens}.md`);
+    const url = renditionUrl(lens);
     let composed = sharedSrc;
     if (existsSync(fragPath)) {
       const fragSrc = readFileSync(fragPath, "utf8");
       composed = `${sharedSrc}\n\n${fragSrc}`;
-      sources.set(`${dir}/${lens}.md`, { src: fragSrc, url: `${base}/${lens}` });
+      sources.set(`${dir}/${lens}.md`, { src: fragSrc, url });
     }
     // A lens with no fragment still has a route — it renders the absence state
     // over the universal body — so register it either way.
-    pages.set(`${base}/${lens}`, headingsOf(composed));
+    pages.set(url, headingsOf(composed));
   }
 }
 

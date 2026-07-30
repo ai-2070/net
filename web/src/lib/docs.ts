@@ -147,6 +147,16 @@ export type DocFile = {
   /** Languages this doc is gated to, per `DocsOrderConfig.languages`.
    * Absent = universal (visible in every language). */
   languages?: Language[];
+  /** Set when this entry is a PROJECTED rendition rather than a file on disk:
+   *  one lens's reading of a sibling adaptive page, served at the lens-prefix
+   *  URL (`sdk/python/announce`) while the source lives at `sdk/announce/`.
+   *
+   *  It is a `DocFile` so the nav, the linear order, the static params and the
+   *  search index keep working unchanged — projection is a routing concern, and
+   *  none of those walkers should have to learn about it. `readDocSource`
+   *  composes; `filePath` names the universal body so an error message points
+   *  somewhere real. */
+  rendition?: { page: AdaptivePage; lens: Lens };
 };
 
 export type DocFolder = {
@@ -166,6 +176,17 @@ export type DocFolder = {
    *  deliberately NOT in `children` — the sidebar shows one entry for the page,
    *  not five for its language variants. */
   adaptive?: AdaptivePage;
+  /** Set on an adaptive page whose renditions are served under a lens PREFIX
+   *  (`sdk/<lens>/<page>`) rather than the D1 suffix (`<page>/<lens>`).
+   *
+   *  D8 froze "compose the spine in place": `/docs/sdk/python/announce` already
+   *  carries the language segment, so composing underneath it costs no URLs.
+   *  The price D8 named is exactly this — two URL shapes for adaptive content —
+   *  and this flag is where the second one lives. A projected page is reached
+   *  only through its lens sections, so it is filtered out of the nav, the
+   *  linear order and the static params: minting `/docs/sdk/announce` as well
+   *  would publish a fifth near-duplicate of every spine page. */
+  projected?: boolean;
 };
 
 /** An adaptive page: one universal body, composed with a selected fragment.
@@ -177,6 +198,9 @@ export type AdaptivePage = {
   shared: DocFile;
   /** From the universal body's frontmatter — see `DocFrontmatter.boundary`. */
   boundary?: { href: string; label: string };
+  /** The capability-record operation this page documents, if it names one.
+   *  Its parity row is rendered from the record — see `DocFrontmatter.capability`. */
+  capability?: string;
   /** Present lenses only. A lens with nothing to teach has no fragment, and the
    *  route renders the honest absence state rather than a Rust fallback. */
   fragments: Partial<Record<Lens, DocFile>>;
@@ -266,6 +290,17 @@ export type DocFrontmatter = {
    */
   boundary?: string;
   boundaryLabel?: string;
+  /** The capability-record operation this page documents.
+   *
+   *  D4's record is the one authored answer to "does binding X support operation
+   *  Y". A page that names its operation gets its parity row RENDERED from that
+   *  record — nobody types a support claim into a docs page, so a page cannot
+   *  disagree with the record about what a binding does.
+   *
+   *  Validated by `capability_records.py --check`: a value that names no real
+   *  operation fails there rather than rendering an empty row, which would read
+   *  as "supported nowhere". */
+  capability?: string;
 };
 
 const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
@@ -286,7 +321,8 @@ function parseFrontmatter(source: string): {
       key !== "title" &&
       key !== "description" &&
       key !== "boundary" &&
-      key !== "boundaryLabel"
+      key !== "boundaryLabel" &&
+      key !== "capability"
     ) {
       continue;
     }
@@ -367,6 +403,7 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
       boundary: fm?.boundary
         ? { href: fm.boundary, label: fm.boundaryLabel ?? "the C ABI section" }
         : undefined,
+      capability: fm?.capability,
     };
     // The page is one sidebar entry, not five. Its parts are reached through
     // `adaptive`, so drop them from `children` — otherwise every adaptive page
@@ -375,6 +412,8 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     const parts = new Set<DocFile>([shared, ...Object.values(fragments)]);
     files = files.filter((f) => !parts.has(f));
   }
+
+  projectLensSections(folders, slugChain);
 
   const folderKey = slugChain.join("/");
   const orderedChildren = applyOrder<DocNode>(
@@ -399,6 +438,83 @@ function buildFolder(absPath: string, slugChain: string[]): DocFolder {
     languages: lookupLanguages(slugChain),
     adaptive,
   };
+}
+
+/** Project sibling adaptive pages into the lens sections beside them.
+ *
+ * The shape this handles is the SDK spine, and only that shape: a section that
+ * holds BOTH lens-named subfolders (`sdk/rust`, `sdk/python`, …) and adaptive
+ * page folders (`sdk/announce`, `sdk/invoke`, …). Detected structurally, like
+ * the adaptive shape itself, so a section cannot declare itself lens-projecting
+ * while missing one half of the arrangement.
+ *
+ * Each lens section gains one entry per adaptive sibling, at the URL it already
+ * had before composition. The page folder is marked `projected` and disappears
+ * from every walker that would otherwise publish it in its own right.
+ *
+ * C is deliberately NOT projected. The annex is organised by boundary concern —
+ * handles, buffers, teardown — not by the announce/discover/invoke spine, and it
+ * has real pages of its own that would collide by name (`quickstart`, `errors`).
+ * A C reader gets the annex; the C pill on a rendition points into it.
+ */
+function projectLensSections(folders: DocFolder[], slugChain: string[]): void {
+  const pages = folders.filter((f) => f.adaptive);
+  if (pages.length === 0) return;
+  const lensSections = folders.filter(
+    (f) => lensFromSlug(lastSlug(f)) !== null,
+  );
+  if (lensSections.length === 0) return;
+
+  for (const section of lensSections) {
+    const lens = lensFromSlug(lastSlug(section))!;
+    const projected: DocFile[] = pages.map((page) => ({
+      kind: "file",
+      slug: [...section.slug, lastSlug(page)],
+      title: page.title,
+      description: page.description,
+      filePath: page.adaptive!.shared.filePath,
+      ext: "md",
+      languages: lookupLanguages([...section.slug, lastSlug(page)]),
+      rendition: { page: page.adaptive!, lens },
+    }));
+    section.children = applyOrder<DocNode>(
+      [...section.children, ...projected],
+      folderOrder(section.slug.join("/")),
+      (n) => n.slug[n.slug.length - 1] ?? "",
+    );
+  }
+
+  for (const page of pages) page.projected = true;
+}
+
+/** Children a reader should see. Projected adaptive pages are reachable only
+ *  through their lens sections, so every nav surface filters them out. */
+export function navChildren(folder: DocFolder): DocNode[] {
+  return folder.children.filter((c) => c.kind === "file" || !c.projected);
+}
+
+/** The URL for one lens's reading of an adaptive page.
+ *
+ * The single place the two URL shapes are reconciled. Everything that links to a
+ * rendition — the chooser, the hreflang alternates, the link checker's mirror of
+ * this rule — goes through here, so a page cannot be advertised at a URL it is
+ * not served at. */
+export function renditionPath(folder: DocFolder, lensSlug: string): string {
+  const slug = folder.projected
+    ? [...folder.slug.slice(0, -1), lensSlug, lastSlug(folder)]
+    : [...folder.slug, lensSlug];
+  return `/docs/${slug.join("/")}`;
+}
+
+/** Where the C pill goes from an adaptive page.
+ *
+ * A projected spine page has no `/c` route and does not need one: C already has
+ * a real section under `sdk/c`, organised by boundary concern. Sending a reader
+ * to a generated absence page while a hand-written annex sits one folder over
+ * would be the machinery talking over the documentation. */
+export function boundaryPath(folder: DocFolder, page: AdaptivePage): string {
+  if (folder.projected) return page.boundary?.href ?? "/docs/sdk/c";
+  return renditionPath(folder, LENS_SLUG.c);
 }
 
 const SHARED_BODY = "_shared.md";
@@ -502,6 +618,24 @@ function resolveAdaptive(slug: string[]): ResolvedDoc | null {
   if (whole?.adaptive) {
     return { kind: "adaptive-router", folder: whole, page: whole.adaptive };
   }
+  // Lens-prefix shape (the SDK spine, D8): `<section>/<lens>/<page>` renders the
+  // adaptive page stored one level up at `<section>/<page>`. Checked before the
+  // suffix shape because the two cannot both match, and this one is the reason
+  // 28 indexed spine URLs did not have to move.
+  if (slug.length >= 3) {
+    const lens = lensFromSlug(normalizeSlug(slug[slug.length - 2]!));
+    if (lens) {
+      const pageSlug = [
+        ...slug.slice(0, -2).map(normalizeSlug),
+        normalizeSlug(slug[slug.length - 1]!),
+      ];
+      const page = folderAt(pageSlug);
+      if (page?.adaptive && page.projected) {
+        return { kind: "rendition", folder: page, page: page.adaptive, lens };
+      }
+    }
+  }
+
   if (slug.length < 2) return null;
   const parent = folderAt(slug.slice(0, -1));
   if (!parent?.adaptive) return null;
@@ -572,6 +706,12 @@ export function getAllSlugs(): string[][] {
 
   const walkFolder = (folder: DocFolder): void => {
     out.push(folder.slug);
+    // A projected page keeps its bare route — D1's neutral router — because that
+    // is the only language-neutral URL its own universal body can link a sibling
+    // page at. What it does NOT get is the suffix rendition routes: those are
+    // served under the lens sections, and minting both shapes would publish
+    // every spine page at eight URLs instead of five.
+    if (folder.projected) return;
     if (folder.adaptive) {
       // One route per lens WHETHER OR NOT it has a fragment: an absent lens gets
       // a real URL that says so. A missing route would 404 a language the
@@ -600,6 +740,13 @@ export function getAllSlugs(): string[][] {
 // leaving it in would render a stray `---` rule and a line of `title: …` at
 // the top of every page, and would feed the search index too.
 export function readDocSource(file: DocFile): string {
+  // A projected rendition has no file of its own — it is the composition of the
+  // universal body and one fragment. Composing here rather than at each call
+  // site is what keeps the search index, the TOC and the renderer agreeing about
+  // what is on the page.
+  if (file.rendition) {
+    return composeRendition(file.rendition.page, file.rendition.lens).source;
+  }
   return parseFrontmatter(readFileSync(file.filePath, "utf8")).body;
 }
 
@@ -685,6 +832,22 @@ function addFolder(
   // as the sidebar does. Without this the linear order and the sidebar disagree,
   // and prev/next walks into pages the reader cannot see in the nav.
   if (lang && !entryVisibleIn(folder, lang)) return;
+  // Projected pages appear in the order under their lens sections, never in
+  // their own right — otherwise every reader, in every language, would walk
+  // through a language-neutral copy of the spine on the way past it.
+  if (folder.projected) return;
+  // A suffix-shape adaptive page is one entry in the order, at the URL the
+  // reader is actually on — their own lens's rendition. The bare folder slug is
+  // a route nobody reads from, and it is not what `_shared.md` gets served at,
+  // so using it here dropped every adaptive page out of prev/next entirely.
+  if (folder.adaptive) {
+    out.push({
+      slug: lang ? [...folder.slug, LENS_SLUG[lang]] : folder.slug,
+      title: folder.title,
+      section: parentSection,
+    });
+    return;
+  }
   // A folder README IS the section landing — its context label is the
   // *parent* folder's title (if any), not its own. Using its own title would
   // render the section line and the page title as the same string.
@@ -836,7 +999,7 @@ function toClientFolder(f: DocFolder): ClientDocFolder {
     slug: f.slug,
     title: f.title,
     hasReadme: f.readme !== null,
-    children: f.children.map((c) =>
+    children: navChildren(f).map((c) =>
       c.kind === "file" ? toClientFile(c) : toClientFolder(c),
     ),
     languages: f.languages,
