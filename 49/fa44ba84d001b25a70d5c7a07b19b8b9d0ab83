@@ -1,0 +1,25 @@
+.github/workflows/web.yml
+  s_a85d4c545303aa::t_cd0f98c04b6b03 19,30,83-97
+  s_a85d4c545303aa::t_ede9db85f28595 98
+.github/scripts/check-spine-symbols.py
+  s_a85d4c545303aa::t_0cb137ec651de8 1-220
+docs/data/spine-symbols.yaml
+  s_a85d4c545303aa::t_6991aeee134760 1-30,32-118
+  s_a85d4c545303aa::t_204ca281040347 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "49fa44ba84d001b25a70d5c7a07b19b8b9d0ab83",
+  "prompts": {},
+  "sessions": {
+    "s_a85d4c545303aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "36284d49-c490-4d4d-bc20-5d2a1a6841ad",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
