@@ -84,6 +84,46 @@ the billing event has durably landed in the attached `BillingLog` — the real a
 decision below supplies the rest of the predicate, which needs one new persisted field and
 a hard expiry floor.
 
+### Authorization (2026-07-31, Kyra)
+
+> **Implementation authorized:** terminal `QuoteRecord` retention and atomic
+> payload-guard pruning under the §1 predicate. **Settlement-identity tombstone
+> expiration remains prohibited.**
+
+Authorized specifically as a **narrow lifecycle-compaction policy**, not generic
+configurable retention — it is orthogonal to the future storage replacement,
+security-preserving under the agreed predicate, and necessary regardless of which indexed
+store eventually lands.
+
+**Compaction is default-on at six hours, with an explicit opt-out.** Opt-in would leave
+most deployments silently accumulating multi-kilobyte terminal records forever and
+degrading continuously; past expiry, durable billing publication, and redemption the full
+record is redundant lifecycle material, not active authority state.
+
+```rust
+terminal_record_retention_ns: Option<u64>   // default Some(6h)
+pub fn with_terminal_record_retention_ns(self, retention_ns: Option<u64>) -> Self
+```
+
+| value | meaning |
+|---|---|
+| `Some(6h)` | the default |
+| `Some(longer)` | a larger local re-verification / forensic window |
+| `None` | keep full terminal records indefinitely (the opt-out) |
+| `Some(0)` | **refused** — normalized to the default, logged |
+
+`Some(0)` is refused rather than honored because zero conventionally reads as "off", while
+here it would mean the *most* aggressive setting — compaction the instant a quote expires.
+An operator reaching for "disable this" would get the opposite of what they meant. (The
+authorized signature returns `Self`, leaving no way to reject a value except by panicking;
+refuse-normalize-and-log preserves the signature while keeping the footgun unreachable.)
+
+**Not configurable at any setting**, deliberately: the expiry floor, the terminal
+predicate, the owner-safe atomic payload-guard co-prune, the legacy-record exclusion, and
+settlement-transaction tombstone permanence. **There is no knob for tombstone expiry and
+none will be added** — exposing "retain transaction ids for N days" would turn a security
+invariant into a deployment preference.
+
 ### Decision (2026-07-31, Kyra): three retention policies, not two
 
 The audit originally proposed two horizons. That was wrong in one respect — it treated
@@ -216,8 +256,8 @@ The read-only-writes audit (`tests/read_only_writes_audit.rs`) must stay green t
 ### Implementation notes (landed 2026-07-31, `94469d244`)
 
 All six constraints and all six regressions landed, plus the flagged seventh
-(owner-checked co-prune). Tests are in `payments/tests/engine_retention.rs`; 172 crate
-tests pass, clippy clean on lib + tests. Three things worth recording:
+(owner-checked co-prune). Tests are in `payments/tests/engine_retention.rs` (15 in total, after the
+authorized API narrowing); 177 crate tests pass, clippy clean on lib + tests. Three things worth recording:
 
 - **Sweep sites.** Retention runs in `accept_payment`'s claim transaction — the operation
   that *mints* records also retires them, mirroring the spend engine's counter prune in
@@ -396,12 +436,13 @@ All landed 2026-07-31 on `performance-x402`, one commit each:
 | finding | commit | state |
 |---|---|---|
 | §1 engine retention | `94469d244` | implemented + 10 regressions |
+| §1 API narrowing | `bed1fa4de` | authorized shape + 5 regressions |
 | §2 compact store writes | `a0f21e849` | implemented + 1 regression |
 | §5 lazy `QuoteRecord` | `0c0d773be` | implemented |
 | §3 lazy `quote_b64` | `327c68b63` | implemented |
 | §4 folded spend read | `4f5ddedb8` | **withdrawn** — not implementable as described |
 
-172 crate tests pass; clippy clean on lib + tests. Two caveats on the verification, both
+177 crate tests pass; clippy clean on lib + tests. Two caveats on the verification, both
 environmental rather than about the changes:
 
 - The **unix-gated suites do not run on Windows** — `read_only_writes_audit.rs`,
