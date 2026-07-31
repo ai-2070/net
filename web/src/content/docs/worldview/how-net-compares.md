@@ -39,7 +39,7 @@ large class of work.
 | **Delivery** | request/response over the transport | core at-most-once; JetStream at-least-once or exactly-once | best-effort, or reliable over a TCP/QUIC session | fire-and-forget by default; reliability is opt-in |
 | **Ordering** | n/a | per-subject within a stream | reliable delivery is ordered | **not implied by reliability** — see below |
 | **Trust boundary** | host-local: the host decides what is wired in | server-enforced: NKeys, JWT, subject permissions | deployment-configured: ACL rules, mTLS | node-held: signed permission tokens with explicitly trusted roots |
-| **Cross-organisation** | not a primitive | accounts with subject import/export, server-mediated | not a primitive | organisation-scoped capabilities — invisible rather than refused |
+| **Cross-organisation** | not a primitive | accounts with subject import/export, server-mediated | not a primitive | native — organisation-scoped capabilities |
 | **Maturity** | young; large and fast-moving ecosystem | CNCF project, many client languages, very large production base | Eclipse project, ROS 2 middleware, robotics and industrial deployments | young |
 
 Two rows a previous draft of this table carried have been dropped rather than
