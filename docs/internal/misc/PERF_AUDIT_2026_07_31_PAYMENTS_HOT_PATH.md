@@ -18,7 +18,8 @@ marked otherwise. The byte figures in §2 are **modeled** — measured on a synt
 > *without* the storage replacement" — because the dominant bottleneck is already
 > characterized and explicitly gated. **§1 removes unbounded growth of fat lifecycle
 > records and sharply reduces the growth slope; settlement-uniqueness tombstones remain
-> unbounded by design until the partitioned/indexed store lands.** §2–§5 shave constants.
+> unbounded by design — indexing later bounds the work per operation, not their
+> cardinality.** §2–§5 shave constants.
 
 The headline conclusion, consistent with P2/P3/P4/P5: **payment admission is
 storage-bound, not crypto- or transport-bound**, and the whole-file JSON store under one
@@ -32,11 +33,13 @@ in *store bytes*, and **nothing today bounds that number on the engine side.** T
 term is attackable within authorized scope, independently of the locking term, and the
 win survives whichever store eventually lands.
 
-It does **not** make the store bounded, and this doc does not claim otherwise. Per the §1
-decision, settlement-uniqueness tombstones are permanent by design — so the change removes
-the fat and reduces the growth *slope*, while a genuinely bounded store needs the indexed
-uniqueness rows that belong to the future storage work. Bounded storage is not worth
-purchasing by silently weakening replay protection.
+It does **not** make total storage bounded, and this doc does not claim otherwise.
+Settlement-uniqueness tombstones are permanent by design. The change removes the fat and
+sharply reduces the growth slope; the future indexed store makes uniqueness lookup and
+mutation independent of total tombstone cardinality. Actually bounding tombstone storage
+would require an additional scheme-level invariant proving when a historical settlement
+identity can safely be forgotten. Bounded storage is not worth purchasing by silently
+weakening replay protection.
 
 Recommended order of attack is at the bottom.
 
@@ -153,9 +156,10 @@ trade for store size.
 
 The transaction map is therefore a **permanent uniqueness index**, not ordinary retention
 state. It stays small per entry relative to a full `QuoteRecord`, but it is the reason
-this change reduces the growth slope rather than making the store bounded. Making that
-index scale — unique indexed rows/keys instead of repeated whole-file parsing — belongs to
-the authorized future storage design.
+this change reduces the growth slope rather than bounding total storage. The future
+storage design makes uniqueness lookup and mutation independent of total tombstone
+cardinality — unique indexed rows/keys instead of repeated whole-file parsing — which
+bounds the *work per operation*, not the cardinality itself.
 
 The payload hash plays a different role: it protects claim-time concurrency *before* the
 settlement transaction is known. Once a successful terminal quote has an enduring
@@ -163,12 +167,34 @@ transaction tombstone, the payload entry can leave with the full record.
 
 ### Implementation constraints
 
-1. Add `expires_at_ns` to newly created `QuoteRecord`s.
+1. Persist expiry as an **optional migration field**:
+
+   ```rust
+   #[serde(default)]
+   expires_at_ns: Option<u64>,
+   ```
+
+   Fresh records store `Some(quote.expires_at_ns)`; pruning requires `Some(expiry)`. A
+   mandatory `u64` without a default would make existing stores fail deserialization
+   (`StoreError::Corrupt`, fail-closed — the store never silently resets); defaulting to
+   `0` would make every legacy record immediately eligible. Compute the deadline with
+   saturating arithmetic:
+
+   ```rust
+   expiry
+       .saturating_add(expiry_tolerance_ns)
+       .saturating_add(TERMINAL_RETENTION_NS)
+   ```
+
 2. Legacy records missing it remain **unprunable by default**. Do not infer authoritative
    expiry from x402's advisory `maxTimeoutSeconds` — the envelope's expiry governs, the
    x402 timeout is advisory.
 3. Prune the quote and its matching `consumed` payload entry in the **same locked
-   mutation**.
+   mutation**, and make the payload removal **owner-checked**: remove
+   `consumed[payload_hash]` only if it still maps to the quote being deleted
+   (`consumed[payload_hash] == quote_id`). If ownership differs — corruption, or an
+   unexpected migration state — fail closed or retain the entry. Never erase another
+   quote's replay guard merely because the retiring record names that payload hash.
 4. **Never** prune `consumed_transactions` in this change.
 5. A prune must mark an otherwise-clean operation **dirty**, preserving the P5e discipline
    (the pattern at `src/policy/spend.rs:292-297`).
