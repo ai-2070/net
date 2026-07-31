@@ -276,6 +276,20 @@ struct QuoteRecord {
     /// The exact bytes needed to re-verify later, byte-preserved.
     requirements_b64: String,
     payload_b64: String,
+    /// The quote's **authoritative** expiry — the envelope's, never x402's
+    /// advisory `maxTimeoutSeconds`. Retention's hard floor: a terminal
+    /// record is only ever removed well after the quote that minted it
+    /// stopped being redeemable (see [`QuoteRecord::is_prunable_at`]).
+    ///
+    /// Optional for migration, and deliberately so in both directions: a
+    /// record written by an older build carries no expiry, and a
+    /// mandatory `u64` would make those stores fail to deserialize
+    /// (`StoreError::Corrupt` — loud, but total). Defaulting to `0`
+    /// instead would be worse: every legacy record would look infinitely
+    /// expired and become immediately prunable. `None` therefore means
+    /// **never prunable** — retention fails closed rather than guessing.
+    #[serde(default)]
+    expires_at_ns: Option<u64>,
     in_flight: bool,
     /// When `in_flight` was last asserted (engine time, ns). A crash
     /// between claim and completion — verify/settle run with no lock held
@@ -324,6 +338,97 @@ struct EngineState {
     quotes: BTreeMap<String, QuoteRecord>,
 }
 
+impl QuoteRecord {
+    /// Whether retention may remove this record at `now_ns`.
+    ///
+    /// Terminal means the payment fully completed *and* its billing event
+    /// is already durable somewhere retention cannot destroy: the
+    /// `BillingLog` (`billing_published`), which is the audit surface.
+    /// The record itself is then engine bookkeeping, not evidence.
+    ///
+    /// The expiry floor is what keeps deletion from becoming
+    /// resurrection. If a record were removed while its signed quote were
+    /// still valid, re-presenting that quote would miss in `s.quotes` and
+    /// mint a *fresh* record (`accept_payment`'s claim closure), and the
+    /// lifecycle could eventually serve a second time — the replay maps
+    /// do not carry the terminal/idempotency outcome, so they cannot
+    /// stand in for the record here. (`accept_payment` also rejects an
+    /// expired quote before the claim transaction, so this is the second
+    /// of two independent guards, not the only one.)
+    fn is_prunable_at(&self, now_ns: u64, retention_ns: u64, tolerance_ns: u64) -> bool {
+        // A record with no authoritative expiry (written by a build
+        // before the field existed) has no floor to measure from and is
+        // never prunable. Fail closed; never infer one from the x402
+        // `maxTimeoutSeconds`, which is advisory.
+        let Some(expiry) = self.expires_at_ns else {
+            return false;
+        };
+        self.billing.is_some()
+            && self.billing_published
+            && self.redeemed
+            && !self.in_flight
+            && now_ns
+                >= expiry
+                    .saturating_add(tolerance_ns)
+                    .saturating_add(retention_ns)
+    }
+}
+
+/// Retention sweep: drop terminal quote records past the horizon, plus the
+/// payload replay entry each one owns. Returns whether anything was
+/// removed, so the caller can fold it into its `dirty` flag — a sweep is a
+/// real mutation and must persist even when the surrounding operation was
+/// otherwise read-only (the P5e discipline; see
+/// `docs/internal/performance/payments-spend-contention.md`).
+///
+/// **`consumed_transactions` is never touched.** It is a permanent
+/// uniqueness index, not retention state: a settlement that occurred stays
+/// a settlement that occurred, and the generic engine/checker path does not
+/// universally establish that a transaction fell inside a given quote's
+/// validity interval. Expiring these entries would mean one payment can
+/// serve twice provided the attacker waits long enough. Bounding *their*
+/// storage needs a scheme-level invariant about when a settlement identity
+/// may be forgotten, and bounding their *lookup cost* belongs to the
+/// indexed store — neither is retention's business.
+fn prune_terminal(
+    s: &mut EngineState,
+    now_ns: u64,
+    retention_ns: u64,
+    tolerance_ns: u64,
+) -> bool {
+    let retiring: Vec<String> = s
+        .quotes
+        .iter()
+        .filter(|(_, rec)| rec.is_prunable_at(now_ns, retention_ns, tolerance_ns))
+        .map(|(id, _)| id.clone())
+        .collect();
+    if retiring.is_empty() {
+        return false;
+    }
+    for quote_id in &retiring {
+        // Co-prune the payload guard this record owns — but only if it is
+        // still *this* record's. The payload hash protects claim-time
+        // concurrency before a settlement transaction is known; once the
+        // quote is terminal its enduring guard is the transaction
+        // tombstone, so the payload entry may retire with the record. If
+        // ownership has diverged (corruption, or an unexpected migration
+        // state) the entry belongs to some other quote's replay
+        // protection: leave it. Never erase another quote's guard merely
+        // because the retiring record names that hash.
+        if let Some(rec) = s.quotes.get(quote_id) {
+            let payload_hash = rec.payload_hash.clone();
+            if s.consumed
+                .get(&payload_hash)
+                .is_some_and(|owner| owner == quote_id)
+            {
+                s.consumed.remove(&payload_hash);
+            }
+        }
+        s.quotes.remove(quote_id);
+    }
+    true
+}
+
 enum Claim {
     Fresh,
     AlreadySettled,
@@ -363,11 +468,30 @@ pub struct PaymentEngine {
     /// a genuinely in-progress attempt is never reclaimed out from under
     /// itself, while a crashed one eventually frees up.
     in_flight_ttl_ns: u64,
+    /// How long a terminal quote record is kept past its authoritative
+    /// expiry before retention may remove it. Default 6 hours — see
+    /// [`DEFAULT_TERMINAL_RETENTION_NS`].
+    terminal_retention_ns: u64,
     /// Optional billing stream: every freshly-emitted billing event is
     /// appended (durable JSONL + in-process subscribers). Idempotent
     /// retries republish nothing — one event per idempotency key.
     billing_log: Option<Arc<BillingLog>>,
 }
+
+/// Default retention for terminal quote records: 6 hours past authoritative
+/// quote expiry (plus the engine's expiry tolerance).
+///
+/// Sized as an **operational re-verification grace**, not as proof that
+/// every reorg was observed — it is deliberately comfortably above the
+/// Base pack's ~1h final-depth posture (`FINAL_DEPTH_BASE` = 1800 L2 blocks
+/// ≈ 1h at 2s/block), while Solana and XRPL reach deterministic finality
+/// faster and configure no depth at all. Retention does not perform
+/// re-verification; it only declines to discard a record something might
+/// still want to re-check.
+///
+/// At 1 000 paid calls/day this retains ~250 records (~0.8 MB) instead of
+/// letting months of fat records ride every whole-file transaction.
+pub const DEFAULT_TERMINAL_RETENTION_NS: u64 = 6 * 3_600 * 1_000_000_000;
 
 impl PaymentEngine {
     pub fn new(
@@ -387,8 +511,20 @@ impl PaymentEngine {
             state_path: state_path.into(),
             expiry_tolerance_ns: 0,
             in_flight_ttl_ns: 300_000_000_000,
+            terminal_retention_ns: DEFAULT_TERMINAL_RETENTION_NS,
             billing_log: None,
         })
+    }
+
+    /// Set how long terminal quote records are retained past authoritative
+    /// quote expiry (default [`DEFAULT_TERMINAL_RETENTION_NS`], 6 hours).
+    ///
+    /// Only affects records that are already billed, published, redeemed,
+    /// and not in flight; nothing shortens the expiry floor itself, and
+    /// settlement tombstones are never removed at any setting.
+    pub fn with_terminal_retention_ns(mut self, retention_ns: u64) -> Self {
+        self.terminal_retention_ns = retention_ns;
+        self
     }
 
     /// Set the expiry comparison tolerance (default 0).
@@ -480,6 +616,8 @@ impl PaymentEngine {
         // any facilitator I/O.
         let quote_id = quote.quote_id.clone();
         let in_flight_ttl_ns = self.in_flight_ttl_ns;
+        let terminal_retention_ns = self.terminal_retention_ns;
+        let expiry_tolerance_ns = self.expiry_tolerance_ns;
         let claim = {
             let payload_hash = payload_hash.clone();
             // Only the three `Claim::Fresh` paths mutate state (insert a new
@@ -488,12 +626,29 @@ impl PaymentEngine {
             // `mutate_json_if_changed` therefore skips the durable write on
             // the read-only outcomes (Frozen / QuoteAlreadyPaid / AlreadyServed
             // / InProgress / AlreadySettled / ReplayOtherQuote). The dirty
-            // flag is `matches!(_, Fresh)`, derived from the SAME branch that
-            // mutated — so it can never diverge from the mutation. The later
-            // writes (completion, `release_claim`, billing republish) are
-            // separate calls and remain unconditional, so a `verify_rejected`
-            // still persists both its claim (a Fresh here) and its release.
+            // flag is `matches!(_, Fresh) || pruned`, each disjunct derived
+            // from the SAME branch that mutated — so it can never diverge from
+            // the mutation. The later writes (completion, `release_claim`,
+            // billing republish) are separate calls and remain unconditional,
+            // so a `verify_rejected` still persists both its claim (a Fresh
+            // here) and its release.
             mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
+                // Retention runs where records are minted, mirroring the spend
+                // engine's counter prune in `check_and_reserve`: the operation
+                // that grows the store is the one that retires from it. A
+                // sweep is a real mutation, so it makes an otherwise read-only
+                // outcome dirty (P5e) — a denial that pruned must persist.
+                //
+                // This cannot resurrect the quote being accepted: a record is
+                // only prunable well past its quote's authoritative expiry,
+                // and an expired quote was already rejected above, before this
+                // transaction. The two guards are independent.
+                let pruned = prune_terminal(
+                    s,
+                    now_ns,
+                    terminal_retention_ns,
+                    expiry_tolerance_ns,
+                );
                 let claim: Claim = 'claim: {
                     if let Some(rec) = s.quotes.get_mut(&quote_id) {
                         if let Some(reason) = &rec.frozen {
@@ -560,6 +715,7 @@ impl PaymentEngine {
                         caller_hex: hex::encode(quote.caller.as_bytes()),
                         requirements_b64: BASE64.encode(quote.requirements.bytes()),
                         payload_b64: BASE64.encode(payload.bytes()),
+                        expires_at_ns: Some(quote.expires_at_ns),
                         in_flight: true,
                         in_flight_since_ns: Some(now_ns),
                         frozen: None,
@@ -573,7 +729,7 @@ impl PaymentEngine {
                     s.quotes.insert(quote_id.clone(), record);
                     Claim::Fresh
                 };
-                let dirty = matches!(claim, Claim::Fresh);
+                let dirty = matches!(claim, Claim::Fresh) || pruned;
                 (claim, dirty)
             })
             .await?
@@ -1622,6 +1778,30 @@ impl PaymentEngine {
         })
         .await?;
         Ok(decision)
+    }
+
+    /// Run the retention sweep on demand, returning how many terminal
+    /// quote records were retired.
+    ///
+    /// [`accept_payment`](Self::accept_payment) already sweeps as it
+    /// claims, so a provider under steady load never needs this. It exists
+    /// for the provider that stops accepting but keeps redeeming (or stops
+    /// entirely) and would otherwise keep a full store forever, and for
+    /// operators who want the sweep at a known time rather than at the
+    /// next payment.
+    ///
+    /// Only terminal records past the horizon are affected, and settlement
+    /// tombstones are never removed — see [`prune_terminal`].
+    pub async fn prune_terminal_records(&self, now_ns: u64) -> Result<usize, EngineError> {
+        let retention_ns = self.terminal_retention_ns;
+        let tolerance_ns = self.expiry_tolerance_ns;
+        let removed = mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
+            let before = s.quotes.len();
+            let pruned = prune_terminal(s, now_ns, retention_ns, tolerance_ns);
+            (before - s.quotes.len(), pruned)
+        })
+        .await?;
+        Ok(removed)
     }
 
     /// Read-only lifecycle snapshot for gates and tests.
