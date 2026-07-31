@@ -1997,3 +1997,53 @@ fn both_index_hasher_aliases_are_the_same_mixer() {
     assert_ne!(once(1), once(2));
     assert_ne!(once(1), 1, "a pass-through would defeat the point");
 }
+
+/// Review §7 — the byte fallback's documented edge cases, pinned so
+/// the doc comment on `FxU64Hasher::write` is checkable rather than
+/// just asserted.
+///
+/// None of this is reachable from the `u64`-keyed sets the hasher
+/// serves (`Hash for u64` and `Hash for (u64, u64)` both call
+/// `write_u64` directly). It is pinned because the fallback exists
+/// precisely for the day some other key type does route through it,
+/// and that caller needs the behavior to be stated and stable.
+#[test]
+fn fx_u64_hasher_byte_fallback_matches_its_documented_edges() {
+    use std::hash::{BuildHasher, Hasher};
+
+    let via_bytes = |bytes: &[u8]| {
+        let mut h = BuildU64Hasher::default().build_hasher();
+        h.write(bytes);
+        h.finish()
+    };
+    let via_u64 = |v: u64| {
+        let mut h = BuildU64Hasher::default().build_hasher();
+        h.write_u64(v);
+        h.finish()
+    };
+
+    // Little-endian chunking, so a full 8-byte write is exactly the
+    // `u64` step. This is the property that makes the fallback a
+    // fallback rather than a second algorithm.
+    let v = 0x0123_4567_89AB_CDEFu64;
+    assert_eq!(via_bytes(&v.to_le_bytes()), via_u64(v));
+
+    // Documented edge 1: an empty slice mixes nothing.
+    assert_eq!(via_bytes(&[]), 0, "empty input leaves the Default state");
+
+    // Documented edge 2: short chunks are zero-padded, so a single
+    // zero byte is indistinguishable from `write_u64(0)` — the
+    // fallback does not domain-separate by length.
+    assert_eq!(via_bytes(&[0u8]), via_u64(0));
+    assert_eq!(via_bytes(&[0u8]), via_bytes(&[0u8, 0, 0]));
+
+    // But it does still MIX: a non-empty, non-zero input must not
+    // collapse to the input or to the empty digest.
+    assert_ne!(via_bytes(&[1u8]), 0);
+    assert_ne!(via_bytes(&[1u8]), via_bytes(&[2u8]));
+
+    // And multi-chunk input carries both chunks: 9 bytes is two
+    // `write_u64` steps, so it cannot equal either chunk alone.
+    let nine = [1u8, 2, 3, 4, 5, 6, 7, 8, 9];
+    assert_ne!(via_bytes(&nine), via_bytes(&nine[..8]));
+}

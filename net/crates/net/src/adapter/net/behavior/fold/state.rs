@@ -43,13 +43,32 @@ pub type NodeId = u64;
 /// matcher's `HostedByAny` scan probes once per topology entry, not
 /// once per candidate host.
 ///
+/// # What a key type must satisfy to use this
+///
+/// **Well-distributed in its LOW bits specifically** — not merely
+/// collision-free. There is no finalizer: for the single-write case
+/// (which is every real use here), [`Hasher::finish`] returns
+/// `v.wrapping_mul(FX_SEED)`, and multiplication only propagates
+/// entropy *upward* — bit `k` of the product depends only on bits
+/// `0..=k` of the input. `hashbrown` derives the bucket index from
+/// the low bits of the hash, so low-bit quality of the *input* is
+/// what carries the whole table.
+///
+/// That holds for the ids here because they are already digests
+/// (`NodeId` from identity bytes, `IslandId` = `hash(host, domain)`),
+/// where every bit is equidistributed. It would NOT hold for a
+/// counter, a left-shifted composite, a pointer, or anything with
+/// structural zeroes low down — those want a finalizer or a
+/// different hasher. This is the same trade `rustc-hash` makes, and
+/// the same caveat applies.
+///
 /// **One implementation, two aliases.** [`BuildU64Hasher`] here and
 /// `capability::BuildU64TupleHasher` both build this type; the
 /// arity lives in the alias names, not in the mixer, which only ever
 /// sees a sequence of `write_u64` calls. They were briefly two
 /// byte-identical copies — same constant, same fallback — which meant
-/// a correction to one would silently miss the other. Per-site
-/// rationale belongs on the aliases.
+/// a correction to one (this note being the obvious candidate) would
+/// silently miss the other. Per-site rationale belongs on the aliases.
 #[derive(Default, Clone)]
 pub struct FxU64Hasher(u64);
 
@@ -70,6 +89,18 @@ impl std::hash::Hasher for FxU64Hasher {
     /// Defensive byte fallback — `Hash for u64` calls `write_u64`
     /// directly, but routing an unexpected key type through here
     /// must still mix rather than silently collapse.
+    ///
+    /// Two properties a caller arriving here should know, both
+    /// harmless for the `u64`-keyed sets this serves and neither
+    /// reachable from them:
+    ///
+    /// - An **empty slice** mixes nothing — `chunks(8)` yields no
+    ///   chunks, so the state stays at its `Default` of 0.
+    /// - `write(&[0u8])` produces exactly the state `write_u64(0)`
+    ///   does, because the short chunk is zero-padded. So this
+    ///   fallback does not domain-separate by length, and a key type
+    ///   that mixes byte writes with `u64` writes could collide
+    ///   across the two.
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         for chunk in bytes.chunks(8) {
