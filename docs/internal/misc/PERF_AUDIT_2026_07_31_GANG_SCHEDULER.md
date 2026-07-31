@@ -14,15 +14,24 @@ used (Ed25519 sign ≈ 50 µs) is quoted from this repo's own
 `PERF_AUDIT_2026_06_10_FULL_CRATE.md`, not re-measured. Treat the ranking as a hypothesis
 ordered by expected leverage, not as a result.
 
-> **Review disposition (2026-07-31, Kyra), against `performance-gang-scheduler` @
-> `1c53f800a`.** §5, §6, §1, §3 and the lookup portions of §7 approved subject to the
-> scope and test corrections now folded into each section. **§2 is held behind read *and*
-> write evidence** — it is the only scaling-curve change and the only one that can regress
+> **Review disposition (2026-07-31, Kyra), first pass against `performance-gang-scheduler`
+> @ `1c53f800a`.** §5, §6, §1 and the lookup portions of §7 approved subject to the scope
+> and test corrections now folded into each section. **§2 is held behind read *and* write
+> evidence** — it is the only scaling-curve change and the only one that can regress
 > heartbeat writes. **§4 is returned for architectural revision and must not be coded as
 > an optimization** — it is a protocol/observability decision, and §4 below has been
 > rewritten as a decision point rather than a proposal. The benchmark mapping and the
 > `cd` for every command were also corrected; the original revision pointed §4 at two
 > benches that cannot characterize it.
+>
+> **Second pass, against `15ae0befe`.** Three conditions closed in this revision: §3's
+> snapshot semantics are now a **locked T1 decision** rather than a claim of mechanical
+> equivalence (§3, "Snapshot decision"); §7's borrowed holder read must **preserve query
+> accounting** rather than using unmetered `with_state`; and the evidence requirements are
+> now a **measurement contract** with an explicit acceptance rule, not "take a
+> before/after". Final disposition: §1 ready for `Composite`; §2 held behind evidence; §3
+> ready under the locked snapshot contract; §4 blocked on the protocol decision; §5 ready
+> as an isolated broad-fold change; §6 ready; §7 ready under query-count parity.
 
 The hot path in question is the read pipeline plus the commit — plan §2 steps 1–4:
 
@@ -37,7 +46,10 @@ Steps 1–3 (`match_islands`) run on **every retry round** of the synchronous
 `schedule_single` loop (`gang/schedule.rs:136`), and once per claim attempt on the node
 and Cortex paths — so constant-factor waste there is paid per round, not per job.
 
-The headline conclusion: **the matcher's cost is dominated by work it throws away.**
+**Inspection hypothesis:** a substantial part of matcher cost appears to be work whose
+results are immediately discarded. This is a reading of the code, not a profile — no
+component measurement exists yet to say what fraction, and the measurement contract below
+is what would establish it.
 Step 1 deep-clones capability payloads to extract a `u64` from each; step 2 scans the
 entire topology regardless of how few hosts matched; the sensed variant scans it a second
 time and clones all of it. Those three are ordinary optimizations. The fourth candidate —
@@ -48,7 +60,7 @@ Recommended order of attack is at the bottom.
 
 ---
 
-## 1. (Highest constant-factor leverage) `CapabilityQuery::Composite` matching deep-clones every matched payload, then discards it
+## 1. (Largest discarded-work term by inspection) `CapabilityQuery::Composite` matching deep-clones every matched payload, then discards it
 
 **Scope, stated up front:** this finding and its fix cover the **`Composite`** query shape
 only. That is the shape every in-repo `MatchCriteria` uses, but `match_islands` accepts
@@ -215,18 +227,41 @@ The `.map` immediately projects each cloned record down to a single `u64` field.
 **Why the existing rationale does not require it.** The comment (`gang/mod.rs:184-189`)
 defends this as deriving the band map from "ONE literal topology snapshot — a single `All`
 scan, not one `Get` per island", because separate fold reads "could interleave with
-concurrent updates and hand the sort a mixed-time view". That reasoning is sound and the
-fix strengthens rather than weakens it: `match_islands` *just* queried exactly the records
-needed, in one scan, one moment earlier, and `ordered` is by construction a subset of
-those candidates. Threading the filtered records out (an internal `match_islands_records`
+concurrent updates and hand the sort a mixed-time view". The concern is right; the fix
+satisfies it more directly. `match_islands` *just* queried exactly the records needed, in
+one scan, one moment earlier, and `ordered` is by construction a subset of those
+candidates. Threading the filtered records out (an internal `match_islands_records`
 returning `Vec<IslandRecord>`, with the public `match_islands` projecting to ids) gives the
-band map from data already in hand, from a **single** snapshot instead of two taken at
-different times.
+band map from data already in hand.
 
-**Invariant to preserve:** the selected record order out of step 3. The band sort is
-documented as stable so that within a band the selection policy's order survives
-(`gang/mod.rs:211`); an internal records variant must not perturb what
-`select_with_affinity` produced.
+**This is an observable semantic change, not a mechanical equivalence.** Today the two
+reads land at different times:
+
+| | selection | sensed band assignment |
+|---|---|---|
+| today | snapshot **T1** | snapshot **T2** (the second `All` scan) |
+| proposed | snapshot **T1** | snapshot **T1** |
+
+If an island is replaced (a heartbeat carrying a new `host`-irrelevant payload, or an
+eviction) between T1 and T2, today's banding sees the T2 world and the proposed banding
+sees T1. Those can rank differently. The right answer is T1 — but it has to be chosen, not
+asserted away:
+
+> **Snapshot decision.** Sensed band assignment uses the same topology snapshot that
+> produced the filtered and selected records. Topology replacements or evictions after
+> that snapshot affect the next matcher invocation, not the in-progress invocation. This
+> intentionally replaces today's mixed-time T1-selection / T2-banding behavior.
+
+**Required tests.**
+
+- island **replaced** between selection and banding
+- island **evicted** between selection and banding
+- empty sensed inputs ⇒ plain and sensed output identical (the existing contract at
+  `gang/mod.rs:164-166`)
+- stable within-band ordering — the selection policy's order survives inside a band
+  (`gang/mod.rs:211`), so an internal records variant must not perturb what
+  `select_with_affinity` produced
+- unsensed / `Unknown` hosts retained in the trailing band, never pruned (§4.9)
 
 **Two smaller ones in the same function.**
 
@@ -403,8 +438,34 @@ row (`fold/reservation.rs:274-277`). Three callers just want the holder:
 - **`MeshNode::release_island` (`mesh.rs:27282-27292`)** — the public async path, same
   allocating query, and missed by the original revision
 
-One borrowed holder lookup via `Fold::with_state` should serve all three. It is also the
-primitive a §4 implementation would want, if §4 is ever authorized.
+One borrowed holder lookup should serve all three. It is also the primitive a §4
+implementation would want, if §4 is ever authorized.
+
+**It must not be `Fold::with_state`.** That would silently change query telemetry:
+`Fold::query` (`fold/mod.rs:459`) and `with_state_and_index` (`fold/mod.rs:477`) both call
+`metrics.on_query()`; `with_state` (`fold/mod.rs:649-652`) does not, and its own doc says
+"production query paths should go through `Self::query`". Replacing a metered
+`ReservationQuery::State` call with an unmetered borrow drops the query count for
+synchronous release, the `try_acquire_gang` rollback, public `MeshNode::release_island`,
+and any future §4 classifier — all of which are counted today.
+
+Add a metric-counted borrowed API instead:
+
+```rust
+pub fn with_state_query<R>(&self, f: impl FnOnce(&FoldState<K>) -> R) -> R {
+    self.metrics.on_query();
+    let state = self.state.read();
+    f(&state)
+}
+```
+
+The name is negotiable; the accounting is not. **Required test: query-count deltas
+identical before and after** across all three call sites.
+
+(Note for whoever implements it: several existing lib paths — `capability_tags_for`,
+`capability_tags_for_all`, `nodes_with_capability_tag` — already read production state
+through unmetered `with_state`. That is a pre-existing inconsistency, not licence to add
+another; those calls were never `query` calls, whereas these three are.)
 
 ---
 
@@ -430,17 +491,60 @@ primitive a §4 implementation would want, if §4 is ever authorized.
 
 ---
 
+## Measurement contract
+
+"Take a before/after" is not an acceptance gate. Every slice below is measured under the
+same contract, and no slice lands without it.
+
+**Acceptance rule.** *The targeted mechanism must improve outside run-to-run noise, and
+unrelated rows must not regress outside the chosen confidence interval.* No public
+threshold is claimed at this stage — ICB-7 owns thresholds, and this audit deliberately
+sets none.
+
+**Environment, pinned and recorded with the results.**
+
+| axis | requirement |
+|---|---|
+| machine | one pinned host for a given slice's baseline and candidate; do not compare across machines |
+| toolchain | one pinned Rust version |
+| profile | the bench profile as configured, recorded explicitly |
+| features | the exact `--features` set per bench (they differ — ICB-5 needs `redex`) |
+
+**Run discipline.**
+
+- Baseline and candidate runs **interleaved**, not batched — a batched A-then-B run
+  attributes machine drift to the change.
+- Repeated to a stated sample count, with a stated warm-up count, both recorded.
+- Report the distribution, not a single number.
+
+**Per-finding evidence.**
+
+| finding | required evidence beyond wall-clock |
+|---|---|
+| §1 | **allocation counts** — the claim is discarded allocation, so alloc delta is the direct witness; wall-clock alone under-reports it |
+| §3 | scan count (two → one) plus the large sparse sensed row from §3, and exact result-ordering equality |
+| §5 | **allocation counts** across every fold kind, not just the island fold |
+| §6 | **allocation counts** on the verify path |
+| §7 | query-count parity (see §7) — this one is a *non*-regression witness, not a speed claim |
+| §2 | four separate result sets: read scaling, heartbeat-write, lifecycle (insert / evict / expiry / restore), and index memory at representative cardinality — reported separately, never averaged together |
+
+§2's four result sets are the whole point of holding it: a read win that hides a
+heartbeat-write regression inside one aggregate number is exactly the failure mode the
+hold exists to prevent.
+
+---
+
 ## Recommended order of attack
 
 Nothing is implemented. **Do not land these as one aggregate delta** — that destroys
-attribution. Five separately-measured slices:
+attribution. Five separately-measured slices, each under the measurement contract above:
 
 | slice | contents | gate |
 |---|---|---|
-| 1. generic fold/wire mechanics | §5 + §6 | full fold apply / audit / index suite |
-| 2. ordinary matcher | §1 + §7 hasher | ICB-1, equivalence tests across all query shapes |
-| 3. sensed matcher | §3 + §7 holder lookup | ICB-5 **plus the new large sparse sensed row** |
-| 4. topology scaling | §2 | read **and** heartbeat-write evidence; index-hook test |
+| 1. generic fold/wire mechanics | §5 + §6 | full fold apply / audit / index suite; allocation deltas |
+| 2. ordinary matcher | §1 + §7 hasher | ICB-1; equivalence tests across **all** query shapes; allocation deltas |
+| 3. sensed matcher | §3 + §7 holder lookup | ICB-5 **plus the new large sparse sensed row**; the locked T1 snapshot tests; query-count parity |
+| 4. topology scaling | §2 | all four §2 result sets; index-hook test proving steady heartbeats skip the index |
 | 5. claim behavior | §4 | **blocked** on the protocol decision |
 
 Slices 1–3 are constant-factor and mechanical. Slice 4 is the only scaling-curve change and
