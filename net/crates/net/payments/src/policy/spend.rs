@@ -267,14 +267,12 @@ impl SpendPolicyEngine {
         let capability = quote.capability.clone();
         let day = now_ns / NS_PER_DAY;
         let counter_key = format!("{day}|{network}|{}", requirements.asset);
-        // Held with the pending record so a post-approval retry redeems
-        // this exact provider-signed quote.
-        let quote_b64 = crate::core::canonical::canonical_bytes(quote)
-            .map(|b| {
-                use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD.encode(b)
-            })
-            .map_err(|e| SpendError::Malformed(e.to_string()))?;
+        // The quote's canonical bytes are held with a pending approval so a
+        // post-approval retry redeems this exact provider-signed quote. They
+        // are computed lazily inside `require` (below) — see the note there.
+        // A canonicalization failure has no error channel out of the store
+        // closure, so it parks here and is re-raised after the transaction.
+        let mut canonical_failure: Option<String> = None;
 
         let approve_hint =
             format!("approve quote {quote_id} via the payments consent API (operator surface)");
@@ -308,17 +306,42 @@ impl SpendPolicyEngine {
 
             // The model-reachable side writes a pending approval — but only
             // when one is not already recorded. Sets `*dirty` iff it inserts.
-            let require = |s: &mut SpendPolicyFile, dirty: &mut bool, policy_reason: String| {
+            //
+            // The quote is canonicalized HERE rather than before the
+            // transaction: a full `to_value` + recursive canonical write +
+            // base64 over the whole envelope is needed only to hold the exact
+            // provider-signed quote beside a NEW pending approval. On the
+            // allowed path — and on an already-pending observation, which is
+            // the common case under a duplicate storm — it was pure waste.
+            //
+            // `canonical_bytes` can only fail on a float-bearing or
+            // non-object envelope, unreachable for a `PaymentQuote`, but the
+            // failure is surfaced rather than swallowed: no approval is
+            // recorded (an approval holding no quote bytes is one a
+            // post-approval retry cannot redeem), the reason is parked in
+            // `failure`, and the caller re-raises it as `SpendError::Malformed`
+            // once the transaction ends. Nothing is reserved on that path.
+            let require = |s: &mut SpendPolicyFile,
+                           dirty: &mut bool,
+                           failure: &mut Option<String>,
+                           policy_reason: String| {
                 if !s.approvals.contains_key(&quote_id) {
-                    s.approvals.insert(
-                        quote_id.clone(),
-                        ApprovalRecord {
-                            state: ApprovalState::Pending,
-                            capability: capability.clone(),
-                            quote_b64: quote_b64.clone(),
-                        },
-                    );
-                    *dirty = true;
+                    match crate::core::canonical::canonical_bytes(quote) {
+                        Ok(bytes) => {
+                            use base64::Engine as _;
+                            s.approvals.insert(
+                                quote_id.clone(),
+                                ApprovalRecord {
+                                    state: ApprovalState::Pending,
+                                    capability: capability.clone(),
+                                    quote_b64: base64::engine::general_purpose::STANDARD
+                                        .encode(bytes),
+                                },
+                            );
+                            *dirty = true;
+                        }
+                        Err(e) => *failure = Some(e.to_string()),
+                    }
                 }
                 SpendDecision::RequiresPaymentApproval {
                     quote_id: quote_id.clone(),
@@ -350,6 +373,7 @@ impl SpendPolicyEngine {
                             break 'decision require(
                                 s,
                                 &mut dirty,
+                                &mut canonical_failure,
                                 "mock-network auto-allow requires a dev/test profile or the \
                                  explicit unsafe flag; production profile requires approval per \
                                  spend"
@@ -362,6 +386,7 @@ impl SpendPolicyEngine {
                             break 'decision require(
                                 s,
                                 &mut dirty,
+                                &mut canonical_failure,
                                 format!("network `{network}` is not in allowed_networks"),
                             );
                         }
@@ -372,6 +397,7 @@ impl SpendPolicyEngine {
                         break 'decision require(
                             s,
                             &mut dirty,
+                            &mut canonical_failure,
                             format!("asset `{asset_caip}` is not in allowed_assets"),
                         );
                     }
@@ -380,6 +406,7 @@ impl SpendPolicyEngine {
                             break 'decision require(
                                 s,
                                 &mut dirty,
+                                &mut canonical_failure,
                                 format!(
                                     "amount {amount} exceeds max_per_call {cap} for `{capability}`"
                                 ),
@@ -414,6 +441,7 @@ impl SpendPolicyEngine {
                             break 'decision require(
                                 s,
                                 &mut dirty,
+                                &mut canonical_failure,
                                 format!(
                                     "spending {amount} would take today's `{}` total on \
                                      `{network}` to {new_total}, over max_per_day {cap}",
@@ -432,6 +460,13 @@ impl SpendPolicyEngine {
             (decision, dirty)
         })
         .await?;
+        // Re-raise a parked canonicalization failure: `require` declined to
+        // record an approval it could not attach the quote bytes to, so the
+        // caller must see the error rather than a `RequiresPaymentApproval`
+        // pointing at a hold that was never taken.
+        if let Some(reason) = canonical_failure {
+            return Err(SpendError::Malformed(reason));
+        }
         Ok(decision)
     }
 
