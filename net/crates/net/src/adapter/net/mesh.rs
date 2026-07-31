@@ -1547,10 +1547,18 @@ struct DispatchCtx {
     /// task, so an O(peers) scan per routed data packet serialized
     /// ingress on relay-heavy topologies (PERF_AUDIT §2.4).
     session_id_to_node: Arc<DashMap<u64, u64>>,
-    /// Shared token cache, populated by subscriber-presented tokens
-    /// plus caller-side pre-installs. `None` disables the
-    /// `require_token` path — unset is equivalent to "no token is
-    /// ever valid."
+    /// Shared token cache, populated by caller-side pre-installs (the
+    /// local node's own credentials, e.g. the publish token
+    /// `publish_many` looks up via `get_for_action`).
+    ///
+    /// It is NOT populated by subscriber-presented tokens: since the
+    /// `TokenChain` migration a peer's credential is verified inline
+    /// against the channel's roots and retained in `subscriber_chains`,
+    /// never inserted here. On the subscribe path this cache supplies
+    /// only the `RevocationRegistry` and the clock-skew tolerance.
+    ///
+    /// `None` disables the `require_token` path — unset is equivalent
+    /// to "no token is ever valid" (enforced at subscribe since M4).
     token_cache: Option<Arc<TokenCache>>,
     /// Verified subscribe token chains, keyed by `(node_id,
     /// channel_hash)`. `authorize_subscribe` stores the chain a peer
@@ -19033,13 +19041,19 @@ impl MeshNode {
     /// Install a shared `TokenCache` used by the channel-auth path.
     /// When set, `authorize_subscribe` and `publish_many` consult
     /// it via `ChannelConfig::can_subscribe` / `can_publish`.
-    /// Subscribers that present a token on the wire have their
-    /// token installed into this cache (after signature
-    /// verification) before the ACL check runs.
     ///
-    /// When unset, `require_token` channels always reject —
-    /// without a cache there's no way to validate presented tokens
-    /// or find pre-cached ones.
+    /// A subscriber-presented credential is **not** installed here.
+    /// Since the `TokenChain` migration it is verified inline against
+    /// the channel's `token_roots` and retained in `subscriber_chains`;
+    /// on that path this cache supplies only the `RevocationRegistry`
+    /// and the clock-skew tolerance. What it does hold is the local
+    /// node's own pre-installed credentials — notably the PUBLISH token
+    /// `publish_many` looks up via `get_for_action`.
+    ///
+    /// When unset, `require_token` channels always reject. That is now
+    /// enforced where it is observable: `authorize_subscribe` refuses
+    /// the subscribe outright (M4) rather than accepting one that every
+    /// later publish would deny while the peer sat rostered forever.
     pub fn set_token_cache(&mut self, cache: Arc<TokenCache>) {
         self.token_cache = Some(cache);
     }
@@ -23413,11 +23427,26 @@ impl MeshNode {
     ///    it, reject with `UnknownChannel`.
     /// 3. Channel [`Visibility`] must permit the subscriber's subnet
     ///    — reject cross-subnet subscribes with `Unauthorized`.
-    /// 4. Channel auth — `publish_caps` / `subscribe_caps` /
+    /// 4. Origin binding — a channel family whose name encodes the
+    ///    subscriber's identity (`subscriber_origin_binding`) admits
+    ///    only the peer that identity belongs to, evaluated against the
+    ///    TOFU pin. Runs ahead of the cap/token gates because the
+    ///    families it protects are otherwise permissive.
+    /// 5. Token-gated channel with no `TokenCache` → `Unauthorized`.
+    /// 6. Channel auth — `publish_caps` / `subscribe_caps` /
     ///    `require_token` on `ChannelConfig` are honored via
-    ///    `ChannelConfig::can_subscribe`. A presented token is
-    ///    installed into the local `TokenCache` (after signature
-    ///    verification) before the check runs.
+    ///    `ChannelConfig::can_subscribe`.
+    ///
+    /// The presented credential is parsed here and verified **inline**
+    /// by `can_subscribe` → `TokenChain::verify_authorizes`, against
+    /// the channel's `token_roots`. It is NOT inserted into the
+    /// `TokenCache` — that stopped being true at the `TokenChain`
+    /// migration, and the stale claim pointed readers at the wrong
+    /// place for where peer-supplied credentials are validated, which
+    /// is the most important question on this path. A chain that
+    /// verifies is retained in `subscriber_chains` so the publish-time
+    /// re-check and the periodic sweep can re-evaluate expiry and
+    /// revocation without the peer re-presenting.
     fn authorize_subscribe(
         channel: &ChannelName,
         from_node: u64,

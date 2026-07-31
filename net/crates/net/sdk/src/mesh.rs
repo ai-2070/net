@@ -330,10 +330,17 @@ impl MeshBuilder {
         let channel_configs = Arc::new(ChannelConfigRegistry::new());
         node.set_channel_configs(channel_configs.clone());
         // Hand the caller's TokenCache to the mesh so channel auth
-        // (`require_token` / `can_subscribe` / `can_publish`) has a
-        // cache to consult + install incoming tokens into. Without
-        // an identity, no cache is installed and `require_token`
-        // channels will reject.
+        // (`require_token` / `can_subscribe` / `can_publish`) has one
+        // to consult: it supplies the RevocationRegistry, the
+        // clock-skew tolerance, and the local node's own credentials
+        // (the PUBLISH token the publish path resolves via
+        // `get_for_action`). Incoming subscriber tokens are NOT
+        // installed into it — they are verified inline against the
+        // channel's `token_roots` and retained as chains.
+        //
+        // Without an identity no cache is installed, and
+        // `require_token` channels reject — at subscribe, not silently
+        // at first publish (M4).
         if let Some(id) = sdk_identity.as_ref() {
             node.set_token_cache(id.token_cache().clone());
         }
