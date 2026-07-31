@@ -212,8 +212,16 @@ func (m *MeshNode) FindNodes(filter CapabilityFilter) ([]uint64, error) {
 //   - `"region"` — that region + Global; `Region` field required
 //   - `"regions"` — any of those + Global; `Regions` field required
 //
-// Unknown `Kind` values fall through to `"any"` defensively. Empty
-// strings or empty lists also collapse to `"any"`.
+// A filter that carries no usable selector is REJECTED with
+// `ErrInvalidArgument` — an unrecognized `Kind`, a missing or empty
+// required selector, or a list that is empty once empty entries are
+// removed. A list keeping at least one real entry still works, with the
+// empties stripped.
+//
+// These shapes used to collapse to `"any"`, which is the BROADEST
+// filter (every non-`SubnetLocal` node), so a caller whose tenant id
+// arrived empty silently queried the whole mesh and selected a provider
+// from it. A narrowing filter that cannot narrow now fails.
 type ScopeFilter struct {
 	Kind    string   `json:"kind"`
 	Tenant  string   `json:"tenant,omitempty"`
