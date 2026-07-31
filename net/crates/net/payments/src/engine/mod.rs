@@ -688,12 +688,8 @@ impl PaymentEngine {
                 // only prunable well past its quote's authoritative expiry,
                 // and an expired quote was already rejected above, before this
                 // transaction. The two guards are independent.
-                let pruned = prune_terminal(
-                    s,
-                    now_ns,
-                    terminal_record_retention_ns,
-                    expiry_tolerance_ns,
-                );
+                let pruned =
+                    prune_terminal(s, now_ns, terminal_record_retention_ns, expiry_tolerance_ns);
                 let claim: Claim = 'claim: {
                     if let Some(rec) = s.quotes.get_mut(&quote_id) {
                         if let Some(reason) = &rec.frozen {

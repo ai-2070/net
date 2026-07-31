@@ -221,7 +221,10 @@ async fn a_terminal_record_survives_until_the_horizon() {
 
     // One nanosecond before the horizon: still retained.
     let horizon = quote.expires_at_ns + DEFAULT_TERMINAL_RECORD_RETENTION_NS;
-    assert_eq!(f.engine.prune_terminal_records(horizon - 1).await.unwrap(), 0);
+    assert_eq!(
+        f.engine.prune_terminal_records(horizon - 1).await.unwrap(),
+        0
+    );
     assert!(
         f.engine.status(&quote.quote_id).await.unwrap().is_some(),
         "a record must not retire one tick early"
@@ -258,7 +261,13 @@ async fn an_unredeemed_record_is_never_pruned() {
         .await
         .unwrap();
     // Settled and billed, but never redeemed.
-    assert_eq!(f.engine.prune_terminal_records(past_horizon()).await.unwrap(), 0);
+    assert_eq!(
+        f.engine
+            .prune_terminal_records(past_horizon())
+            .await
+            .unwrap(),
+        0
+    );
     assert!(f.engine.status(&quote.quote_id).await.unwrap().is_some());
 }
 
@@ -427,7 +436,13 @@ async fn the_payload_guard_retires_with_its_record() {
         1
     );
 
-    assert_eq!(f.engine.prune_terminal_records(past_horizon()).await.unwrap(), 1);
+    assert_eq!(
+        f.engine
+            .prune_terminal_records(past_horizon())
+            .await
+            .unwrap(),
+        1
+    );
     assert!(
         raw_state(&f.path).await["consumed"]
             .as_object()
@@ -456,7 +471,13 @@ async fn a_payload_guard_owned_by_another_quote_survives_the_prune() {
         .await
         .unwrap();
 
-    assert_eq!(f.engine.prune_terminal_records(past_horizon()).await.unwrap(), 1);
+    assert_eq!(
+        f.engine
+            .prune_terminal_records(past_horizon())
+            .await
+            .unwrap(),
+        1
+    );
 
     let after = raw_state(&f.path).await;
     assert!(
@@ -484,7 +505,10 @@ async fn compaction_is_on_by_default_at_six_hours() {
     let f = fixture(); // constructed without touching retention
     let (quote, _) = terminal_quote(&f, "2500", "n1").await;
     assert_eq!(
-        f.engine.prune_terminal_records(past_horizon()).await.unwrap(),
+        f.engine
+            .prune_terminal_records(past_horizon())
+            .await
+            .unwrap(),
         1,
         "an engine nobody configured must still compact"
     );
@@ -513,7 +537,13 @@ async fn a_longer_window_is_honored() {
     let (quote, _) = terminal_quote(&f, "2500", "n1").await;
 
     // Past the default horizon, but well inside the configured one.
-    assert_eq!(f.engine.prune_terminal_records(past_horizon()).await.unwrap(), 0);
+    assert_eq!(
+        f.engine
+            .prune_terminal_records(past_horizon())
+            .await
+            .unwrap(),
+        0
+    );
     assert!(f.engine.status(&quote.quote_id).await.unwrap().is_some());
 
     assert_eq!(
@@ -547,7 +577,13 @@ async fn zero_is_refused_and_normalized_to_the_default() {
     assert!(f.engine.status(&quote.quote_id).await.unwrap().is_some());
 
     // It behaves exactly as the default does.
-    assert_eq!(f.engine.prune_terminal_records(past_horizon()).await.unwrap(), 1);
+    assert_eq!(
+        f.engine
+            .prune_terminal_records(past_horizon())
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 /// Settlement tombstones are permanent at **every** setting — including a
