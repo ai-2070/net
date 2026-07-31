@@ -13,11 +13,12 @@ marked otherwise. The byte figures in §2 are **modeled** — measured on a synt
 `EngineState` built to the real field shapes, not on a captured production store; the
 *ratio* is the claim, not the absolute size.
 
-> **Status: findings only (2026-07-31).** No fixes applied. This is a survey answering
-> "what payments hot-path headroom is available *without* the storage replacement" —
-> because the dominant bottleneck is already characterized and explicitly gated. Of the
-> five findings, §1 is the only one that changes a growth curve; §2–§5 shave constants.
-> §1 needs a decision (two retention horizons) before implementation.
+> **Status: findings only (2026-07-31). §1 decided 2026-07-31 (Kyra); not yet
+> implemented.** This is a survey answering "what payments hot-path headroom is available
+> *without* the storage replacement" — because the dominant bottleneck is already
+> characterized and explicitly gated. **§1 removes unbounded growth of fat lifecycle
+> records and sharply reduces the growth slope; settlement-uniqueness tombstones remain
+> unbounded by design until the partitioned/indexed store lands.** §2–§5 shave constants.
 
 The headline conclusion, consistent with P2/P3/P4/P5: **payment admission is
 storage-bound, not crypto- or transport-bound**, and the whole-file JSON store under one
@@ -30,6 +31,12 @@ What it does add: the measured cost of every state-touching operation is roughly
 in *store bytes*, and **nothing today bounds that number on the engine side.** The size
 term is attackable within authorized scope, independently of the locking term, and the
 win survives whichever store eventually lands.
+
+It does **not** make the store bounded, and this doc does not claim otherwise. Per the §1
+decision, settlement-uniqueness tombstones are permanent by design — so the change removes
+the fat and reduces the growth *slope*, while a genuinely bounded store needs the indexed
+uniqueness rows that belong to the future storage work. Bounded storage is not worth
+purchasing by silently weakening replay protection.
 
 Recommended order of attack is at the bottom.
 
@@ -67,35 +74,125 @@ calls/day adds ~3 MB/day permanently, and every subsequent accept and redeem is 
 than the last, forever. The P4 headline (paid invocation at ~23 admissions/s at c128) is
 measured at a fixed 450 records; in production that row degrades monotonically.
 
-**Why it is safe to fix now.** The predicate already exists in the record.
-`QuoteRecord.billing_published` (`src/engine/mod.rs:298-306`) is set only after the
-billing event has durably landed in the attached `BillingLog` — which is the real audit
-surface (durable JSONL + export). So "terminal and already durable elsewhere" is
-expressible today as `billing.is_some() && billing_published && redeemed`.
+**Why it is safe to fix now.** The durability half of the predicate already exists in the
+record: `QuoteRecord.billing_published` (`src/engine/mod.rs:298-306`) is set only after
+the billing event has durably landed in the attached `BillingLog` — the real audit surface
+(durable JSONL + export). So "already durable elsewhere" is expressible today. The
+decision below supplies the rest of the predicate, which needs one new persisted field and
+a hard expiry floor.
 
-**The decision this needs — two horizons, not one:**
+### Decision (2026-07-31, Kyra): three retention policies, not two
 
-- **Quote records** (`quotes`) carry the fat: the two byte-preserved carries, the signed
-  verification chain, the billing event. They can go once terminal, published, and past a
-  retention horizon. This is where essentially all the bytes are (see §2 composition).
-- **Replay guards** (`consumed`, `consumed_transactions`) are *security* state, not
-  bookkeeping — they enforce "one payload satisfies exactly one quote" and "one on-chain
-  settlement never serves twice". They must outlive quote expiry **plus the reorg
-  window**, so they need a separate, longer horizon. They are also cheap per entry
-  (two short strings), so pruning them buys little and risks much.
+The audit originally proposed two horizons. That was wrong in one respect — it treated
+both replay maps as one class of state with one (longer) horizon. They have different
+security roles and need different answers:
 
-Suggested shape, mirroring the pattern already accepted in spend: a horizon configured on
-`PaymentEngine` (alongside `expiry_tolerance_ns` / `in_flight_ttl_ns`), pruned
-opportunistically inside the existing locked mutation, with the prune folded into the
-`dirty` flag exactly as `src/policy/spend.rs:292-297` does — and the P5e trap respected
-(a prune makes an otherwise-clean pass dirty; the read-only-denial audit in
-`tests/read_only_writes_audit.rs` must stay green).
+| State | Retention decision |
+|---|---|
+| Terminal `QuoteRecord` | Prune **6 hours after authoritative quote expiry**, provided it is billed, published, redeemed, and not in flight |
+| `consumed` payload hash | Prune **atomically with its terminal quote record** |
+| `consumed_transactions` settlement identity | **Retain indefinitely** — a compact security tombstone |
+
+**Exact pruning predicate.** Persist `expires_at_ns` on `QuoteRecord`, then permit
+deletion only when:
+
+```text
+billing.is_some()
+&& billing_published
+&& redeemed
+&& !in_flight
+&& now_ns >= expires_at_ns + expiry_tolerance_ns + 6 hours
+```
+
+**Why expiry is the hard floor.** If the engine deletes a record while its signed quote is
+still valid, resubmitting that quote recreates the record — `accept_payment`'s claim
+closure falls through to a fresh insert when `s.quotes.get_mut(&quote_id)` misses
+(`src/engine/mod.rs:560-567`) — and the lifecycle can eventually permit a second
+redemption. The replay maps do not preserve the complete terminal/idempotency outcome, so
+they cannot substitute for the record here. Expiry plus tolerance is the floor; the 6
+hours sit on top of it.
+
+**Sizing.** At the audit's example volume of 1 000 calls/day, six hours retains ~250 full
+records ≈ **0.77 MB** at the observed 3.09 KB/record — instead of days or months of fat
+records riding every whole-file transaction.
+
+**Why six hours.** It is comfortably above the Base pack's ~1-hour final-depth posture
+(`FINAL_DEPTH_BASE = 1800` L2 blocks ≈ 1h at 2s/block,
+`src/facilitator/packs.rs:62-67`); Solana and XRPL reach deterministic finality faster and
+carry no depth knob at all (`final_depth` deliberately absent,
+`src/facilitator/packs.rs:144,171`). This is an **operational re-verification grace** — it
+is *not* a proof that every reorg was observed, and must not be described as one.
+
+### Why settlement guards get no finite horizon
+
+The audit's original claim — that replay guards need to outlive quote expiry plus the
+reorg window — misidentified the security boundary. A historical settlement is still a
+historical transfer after finality, and today the generic engine/checker path does not
+universally establish:
+
+```text
+settlement transaction occurred during this quote's validity interval
+```
+
+Nor do all schemes bind the transaction uniquely to `quote_id`:
+
+- **SVM** — the transaction is not quote-ID-bound (the payload is an opaque wallet blob;
+  the engine falls back to the facilitator's settle-time payer claim,
+  `src/engine/mod.rs:676-685`).
+- **EVM** — the EIP-3009 authorization has a validity window and nonce, but the
+  independent checker can still validate an old included transaction without comparing its
+  block time against the new quote.
+- **XRPL** — has an invoice binding, but the generic replay invariant must not depend on
+  every deployment generating globally unique invoice IDs correctly.
+- A malicious or defective facilitator could present an old settlement against a fresh
+  quote carrying otherwise identical requirements.
+
+So expiring `consumed_transactions` after 30, 90, or 365 days would mean: **one payment
+can serve twice, provided the attacker waits long enough.** That is not an acceptable
+trade for store size.
+
+The transaction map is therefore a **permanent uniqueness index**, not ordinary retention
+state. It stays small per entry relative to a full `QuoteRecord`, but it is the reason
+this change reduces the growth slope rather than making the store bounded. Making that
+index scale — unique indexed rows/keys instead of repeated whole-file parsing — belongs to
+the authorized future storage design.
+
+The payload hash plays a different role: it protects claim-time concurrency *before* the
+settlement transaction is known. Once a successful terminal quote has an enduring
+transaction tombstone, the payload entry can leave with the full record.
+
+### Implementation constraints
+
+1. Add `expires_at_ns` to newly created `QuoteRecord`s.
+2. Legacy records missing it remain **unprunable by default**. Do not infer authoritative
+   expiry from x402's advisory `maxTimeoutSeconds` — the envelope's expiry governs, the
+   x402 timeout is advisory.
+3. Prune the quote and its matching `consumed` payload entry in the **same locked
+   mutation**.
+4. **Never** prune `consumed_transactions` in this change.
+5. A prune must mark an otherwise-clean operation **dirty**, preserving the P5e discipline
+   (the pattern at `src/policy/spend.rs:292-297`).
+6. Horizon configured on `PaymentEngine` alongside `expiry_tolerance_ns` /
+   `in_flight_ttl_ns`, pruned opportunistically inside the existing locked mutation.
+
+### Required regressions
+
+- no terminal record is removed before quote expiry;
+- pruning persists during an otherwise read-only operation;
+- an expired, pruned quote cannot recreate lifecycle state;
+- an old transaction remains rejected against a fresh quote after the original full record
+  and payload hash are gone;
+- a second identical pass after pruning is clean (no repeat write);
+- legacy records without authoritative expiry remain intact.
+
+The read-only-writes audit (`tests/read_only_writes_audit.rs`) must stay green throughout.
 
 **Relationship to the storage disposition.** This is not a store replacement and does not
 pre-empt one. Partitioning attacks the *locking* term; retention attacks the *size* term.
 They are orthogonal, and a partitioned store still wants retention. Nothing in the
 disposition's "required non-decisions" list is touched — it names compaction strategy as
-out of scope for *that* document, not as forbidden work.
+out of scope for *that* document, not as forbidden work. The permanent uniqueness index
+is handed forward to that work as a stated requirement.
 
 ---
 
@@ -214,9 +311,11 @@ is free to remove — move the construction into the branch that inserts it.
 
 ## Recommended order of attack
 
-1. **§1 engine retention.** The only finding that changes the growth curve rather than
-   shaving a constant, and it reuses a pruning pattern the codebase already accepts.
-   Blocked on a decision: the two horizons (terminal records vs. replay guards).
+1. **§1 engine retention.** Decided 2026-07-31: 6-hour terminal-record horizon, payload
+   guards co-pruned, permanent settlement tombstones. The only finding that moves the
+   growth *slope* rather than shaving a constant, and it reuses a pruning pattern the
+   codebase already accepts. Unblocked — carries the six implementation constraints and
+   six regressions in §1.
 2. **§2 compact store writes** and **§3 lazy `quote_b64`.** Both near-zero-risk, both
    independent of §1, could land in one pass.
 3. **§4 folded spend-store read.** Slightly more invasive (moves a lookup inside a locked
@@ -224,8 +323,8 @@ is free to remove — move the construction into the branch that inserts it.
 4. **§5 lazy `QuoteRecord`.** Genuinely marginal; do it when next in that function.
 
 None of these move the c128 tail — that is the lock, and it is the storage disposition's
-problem. What they move is the per-operation constant and, in §1's case, whether that
-constant stays constant.
+problem. What they move is the per-operation constant and, in §1's case, how fast that
+constant grows.
 
 ## Reproduce
 
