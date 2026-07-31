@@ -32,6 +32,41 @@
 //!
 //! `allow_channel` populates both tiers so a caller granted storage
 //! access can also continue sending packets on that channel.
+//!
+//! # `origin_hash` is an UNTYPED key over two different derivations
+//!
+//! Read this before wiring a new reader of the exact ACL.
+//!
+//! The exact tier is one namespace shared by three subsystems: publish
+//! admission (`mesh.rs`), `Redex::open_file` (`redex/manager.rs`), and
+//! the blob pin / unpin / delete / repair gates
+//! (`dataforts/blob/mesh.rs`). Its only production **writer** is the
+//! subscribe handler, on *every* accepted `Subscribe` — including
+//! channels with no gates configured at all.
+//!
+//! And that writer stores a **node id**
+//! (`mesh.rs::subscriber_origin_hash` is the identity function), while
+//! the blob gates read an **entity origin hash**
+//! (`EntityId::origin_hash`). Those are different blake2s derivations
+//! (`b"net-node-id-v1"` vs `b"net-origin-v1"`) — but both are bare
+//! `u64` and both are spelled `origin_hash` at every boundary, so
+//! nothing in the type system keeps them apart.
+//!
+//! Today that separation is what prevents an escalation, and it holds
+//! only by accident: the peer-facing blob entry points have no
+//! production callers yet (`bin/net-blob.rs` notes they are reserved
+//! for the chain-fold). The day one of them resolves its caller by node
+//! id, "subscribed to an open channel" silently becomes "may pin,
+//! unpin, delete, and repair that channel's blobs".
+//!
+//! So: **a new reader of `is_authorized_full` must state which
+//! derivation it is passing, and must not assume an entry here implies
+//! any authorization beyond "this peer subscribed to this channel".**
+//! The durable fix is to newtype the key so `NodeId` and `OriginHash`
+//! stop being interchangeable, or to split the data-plane grant from
+//! the storage grant into separate maps; that refactor spans the blob
+//! and redex subsystems and is tracked separately.
+//! (2026-07-31 channel-auth audit, I1.)
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -351,6 +386,17 @@ impl AuthGuard {
     }
 
     /// Grant `origin_hash` full (control-plane) access to `name`.
+    ///
+    /// # Sole production writer
+    ///
+    /// This is called from exactly one production path — the inbound
+    /// `Subscribe` handler — on every accepted subscribe, including
+    /// channels with no gates configured. An entry here therefore means
+    /// only "this peer subscribed to this channel", NOT that it was
+    /// vetted for anything else, and the key it writes is a **node
+    /// id**. Readers in other subsystems key on an entity origin hash;
+    /// see the module docs for why that distinction is currently load
+    /// bearing and untyped.
     ///
     /// Populates both ACL tiers:
     /// - the exact canonical-name ACL that control-plane / storage

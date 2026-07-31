@@ -1469,6 +1469,11 @@ struct DispatchCtx {
     traversal_config: super::traversal::TraversalConfig,
     /// Max distinct channels a single peer may subscribe to.
     max_channels_per_peer: usize,
+    /// What to do with a `Subscribe` when `channel_configs` is `None`.
+    unregistered_channels: UnregisteredChannelPolicy,
+    /// Latches once the registry-less warning has been emitted, so a
+    /// subscribe storm doesn't turn an operator hint into a log flood.
+    unregistered_warned: Arc<AtomicBool>,
     /// Capability fold shared with `MeshNode`. Inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets land here via the
     /// bridge's `translate_announcement`.
@@ -1735,6 +1740,9 @@ pub struct MeshNodeConfig {
     /// a channel with an explicit registry entry always uses
     /// its configured visibility.
     pub default_visibility: Visibility,
+    /// What to do with a `Subscribe` when no [`ChannelConfigRegistry`]
+    /// is installed at all. See [`UnregisteredChannelPolicy`].
+    pub unregistered_channels: UnregisteredChannelPolicy,
     /// Minimum time between successive
     /// [`MeshNode::announce_capabilities`] broadcasts from this
     /// origin. Calls within the window coalesce: the local index
@@ -2055,6 +2063,7 @@ impl MeshNodeConfig {
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
             default_visibility: Visibility::Global,
+            unregistered_channels: UnregisteredChannelPolicy::default(),
             min_announce_interval: Duration::from_secs(10),
             configured_identity: false,
             announce_debounce: Duration::from_millis(100),
@@ -2364,6 +2373,19 @@ impl MeshNodeConfig {
     /// their configured visibility always wins.
     pub fn with_default_visibility(mut self, visibility: Visibility) -> Self {
         self.default_visibility = visibility;
+        self
+    }
+
+    /// Decide what a registry-less node does with an inbound
+    /// `Subscribe` — see [`UnregisteredChannelPolicy`].
+    ///
+    /// Setting this at all is the point: it turns "this mesh has no
+    /// ACL" from an accident of construction into a recorded decision.
+    /// Use [`UnregisteredChannelPolicy::Deny`] to fail closed, or
+    /// [`UnregisteredChannelPolicy::Allow`] to silence the warning on a
+    /// mesh that is open on purpose.
+    pub fn with_unregistered_channel_policy(mut self, policy: UnregisteredChannelPolicy) -> Self {
+        self.unregistered_channels = policy;
         self
     }
 }
@@ -2700,6 +2722,36 @@ fn keepalive_send_offsets(fire_at_ms: u64, now_ms: u64, deadline: Duration) -> [
         base_lead.saturating_add(Duration::from_millis(100)),
         base_lead.saturating_add(Duration::from_millis(250)),
     ]
+}
+
+/// What a node does with a `Subscribe` for a channel when it has no
+/// [`ChannelConfigRegistry`] installed at all.
+///
+/// Without a registry there is no ACL to consult, so every subscribe
+/// from any session peer is admitted and every channel publishes as
+/// open. That is a reasonable posture for a single-tenant or test mesh
+/// and a bad surprise otherwise — and pre-fix the two were
+/// indistinguishable, because permissiveness was a *consequence of an
+/// unset field* rather than a decision anyone recorded.
+///
+/// Every shipped construction path (Rust SDK, C FFI, Node, Python)
+/// installs a registry, so this only governs embedders driving
+/// `MeshNode` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnregisteredChannelPolicy {
+    /// Admit, and warn once that the mesh is running without an ACL.
+    ///
+    /// The default: it preserves historical behaviour exactly, while
+    /// making "I forgot to install a registry" observable instead of
+    /// silent. Distinguishing that from a deliberate open mesh is the
+    /// whole point of this knob.
+    #[default]
+    AllowWithWarning,
+    /// Admit silently — an intentionally open mesh.
+    Allow,
+    /// Reject with `Unauthorized`. Fail closed: a registry-less node
+    /// accepts no subscriptions at all.
+    Deny,
 }
 
 /// Rolling-window auth-failure tracker, one entry per peer.
@@ -7511,6 +7563,9 @@ pub struct MeshNode {
     /// signature verification. See
     /// [`docs/internal/plans/CHANNEL_AUTH_GUARD_PLAN.md`](../../../../../../docs/internal/plans/CHANNEL_AUTH_GUARD_PLAN.md).
     auth_guard: Arc<AuthGuard>,
+    /// Latches the one-shot "no channel registry installed" warning
+    /// (see `UnregisteredChannelPolicy::AllowWithWarning`).
+    unregistered_warned: Arc<AtomicBool>,
     /// Per-peer auth-failure tracker. Counts failed
     /// `authorize_subscribe` attempts per `auth_failure_window` and
     /// throttles bursts — peers that exceed
@@ -8523,6 +8578,7 @@ impl MeshNode {
             subscriber_chains,
             published_chains: Arc::new(DashMap::new()),
             auth_guard: Arc::new(AuthGuard::new()),
+            unregistered_warned: Arc::new(AtomicBool::new(false)),
             auth_failures: Arc::new(DashMap::new()),
             tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -14462,6 +14518,8 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
+            unregistered_channels: self.config.unregistered_channels,
+            unregistered_warned: self.unregistered_warned.clone(),
             capability_fold: self.capability_fold.clone(),
             ack_ranges_peer_cache: self.ack_ranges_peer_cache.clone(),
             #[cfg(feature = "dataforts")]
@@ -23496,8 +23554,29 @@ impl MeshNode {
             return (false, Some(AckReason::TooManyChannels));
         }
         let Some(ref configs) = ctx.channel_configs else {
-            // No registry → no ACL (test / permissive deployments).
-            return (true, None);
+            // No registry → no ACL at all. Which of the two situations
+            // that is — "open mesh on purpose" or "forgot to install a
+            // registry" — used to be indistinguishable, because
+            // permissiveness fell out of an unset field rather than a
+            // recorded decision. The policy makes it a decision (L1).
+            return match ctx.unregistered_channels {
+                UnregisteredChannelPolicy::Deny => (false, Some(AckReason::Unauthorized)),
+                UnregisteredChannelPolicy::Allow => (true, None),
+                UnregisteredChannelPolicy::AllowWithWarning => {
+                    // Latched so a subscribe storm can't turn an
+                    // operator hint into a log flood.
+                    if !ctx.unregistered_warned.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "channel auth: no ChannelConfigRegistry installed — every \
+                             Subscribe from any session peer is admitted and every \
+                             channel publishes as open. Install a registry via \
+                             `set_channel_configs`, or record the intent with \
+                             `MeshNodeConfig::with_unregistered_channel_policy(...)`."
+                        );
+                    }
+                    (true, None)
+                }
+            };
         };
         // `resolve_by_name` (not `get_by_name`) so we also learn WHICH
         // prefix matched — `subscriber_origin_binding` needs it to

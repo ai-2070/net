@@ -136,7 +136,7 @@ pub use identity::{
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
     ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingReadinessOverlay,
-    SensingRegistrationError, ACK_RANGES_CAPABILITY_TAG,
+    SensingRegistrationError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
 };
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};

@@ -528,6 +528,44 @@ async fn token_gated_subscribe_rejected_when_no_token_cache() {
     );
 }
 
+/// L1 (2026-07-31 audit): a registry-less node's permissiveness must be
+/// a recorded decision, not a consequence of an unset field.
+///
+/// `Deny` fails closed; the default still admits (so no existing
+/// embedder breaks) but now says so in the log exactly once.
+#[tokio::test]
+async fn unregistered_channel_policy_governs_registry_less_nodes() {
+    use net::adapter::net::UnregisteredChannelPolicy;
+
+    async fn subscribe_under(policy: UnregisteredChannelPolicy) -> bool {
+        // A deliberately registry-less publisher.
+        let keypair = EntityKeypair::generate();
+        let cfg = test_config().with_unregistered_channel_policy(policy);
+        let a = Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"));
+        let b = build_node().await;
+        handshake_no_start(&a, &b.mesh).await;
+        a.start();
+        b.mesh.start();
+
+        let name = ChannelName::new("lab/unregistered").unwrap();
+        b.mesh.subscribe_channel(a.node_id(), name).await.is_ok()
+    }
+
+    assert!(
+        !subscribe_under(UnregisteredChannelPolicy::Deny).await,
+        "Deny must fail closed on a node with no channel registry"
+    );
+    assert!(
+        subscribe_under(UnregisteredChannelPolicy::Allow).await,
+        "Allow is an intentionally open mesh"
+    );
+    assert!(
+        subscribe_under(UnregisteredChannelPolicy::AllowWithWarning).await,
+        "the default must preserve historical behaviour — permissive, but \
+         it now warns once so a forgotten registry is observable"
+    );
+}
+
 #[tokio::test]
 async fn tampered_announcement_signature_rejected() {
     use net::adapter::net::behavior::capability::CapabilityAnnouncement;
