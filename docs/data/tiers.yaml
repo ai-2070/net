@@ -21,14 +21,17 @@
 #   - Rust-native reference pages                -> sdk_native (nav owner only;
 #     D7 keeps their physical path and canonical URL unchanged)
 #
-# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=13 universal=80, total=128
+# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=13 universal=83, total=131
 #
 # Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
 
 pages:
   worldview: universal
   worldview/agentic-mesh: universal
+  worldview/how-net-compares: universal
   worldview/mcp-vs-net: universal
+  worldview/nats-vs-net: universal
+  worldview/zenoh-vs-net: universal
   worldview/rest-vs-net: universal
   worldview/right-and-wrong-use-cases: universal
   concepts: universal

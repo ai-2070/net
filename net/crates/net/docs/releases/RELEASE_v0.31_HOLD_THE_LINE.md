@@ -50,35 +50,35 @@ When a paid call is refused, the human gets an error string and an agent gets a 
 
 ## The MCP bridge — any host, tools across a trusted mesh
 
-v0.31 ships the **MCP bridge**. An existing MCP host (Claude Code, Cursor) can discover and use tools that live on *other machines* across a user's trusted mesh, and any local stdio MCP server can be published *onto* that mesh — in both cases without the host learning the mesh exists and without a credential ever leaving the machine that holds it. It arrives as a new `net-mesh-mcp` adapter crate plus three CLI commands: `net wrap`, `net mcp serve`, and `net mcp pin`. Discovery is the capability fold; invoke and describe are nRPC calls; owner-scoping is the AEAD-verified caller origin. The bridge rides `net-mesh-sdk` only — never the core crate — the same public surface the Python/TS bindings wrap, and a CI test fails the build if it ever reaches for core directly.
+v0.31 ships the **MCP bridge**. An existing MCP host (Claude Code, Cursor) can discover and use tools that live on *other machines* across a user's trusted mesh, and any local stdio MCP server can be published *onto* that mesh — in both cases without the host learning the mesh exists and without a credential ever leaving the machine that holds it. It arrives as a new `net-mesh-mcp` adapter crate plus three CLI commands: `net-mesh wrap`, `net-mesh mcp serve`, and `net-mesh mcp pin`. Discovery is the capability fold; invoke and describe are nRPC calls; owner-scoping is the AEAD-verified caller origin. The bridge rides `net-mesh-sdk` only — never the core crate — the same public surface the Python/TS bindings wrap, and a CI test fails the build if it ever reaches for core directly.
 
-### `net wrap` — publish a local server's tools onto the mesh
+### `net-mesh wrap` — publish a local server's tools onto the mesh
 
 ```bash
-net wrap github --identity ~/.net/id.toml -- npx -y @modelcontextprotocol/server-github
+net-mesh wrap github --identity ~/.net/id.toml -- npx -y @modelcontextprotocol/server-github
 ```
 
-`net wrap` spawns a stdio MCP server, reads `tools/list`, and lowers each tool to an **owner-scoped mesh capability** with an nRPC handler per tool plus a `describe` service. It is long-running: it streams a `wrapped` report, then a lifecycle event per `tools/list_changed` or server exit, reconciling the announced set live.
+`net-mesh wrap` spawns a stdio MCP server, reads `tools/list`, and lowers each tool to an **owner-scoped mesh capability** with an nRPC handler per tool plus a `describe` service. It is long-running: it streams a `wrapped` report, then a lifecycle event per `tools/list_changed` or server exit, reconciling the announced set live.
 
 - **Credentials never transit.** Env vars and tokens (`--env KEY=VALUE`) are set on the wrapped server's *child process* on the owning machine. Only tool *arguments* and *results* cross the wire — never the secret. A permanent CI regression test (`a_credential_env_never_appears_in_a_tool_result`) threads a sentinel token through a cross-machine invoke and asserts it appears nowhere on the wire, in logs, or in errors.
 - **Owner-only by default.** A wrapped tool is describable and invocable only by the root identity that wrapped it, checked against the transport-verified caller origin — not a self-claimed field. Widen deliberately with `--allow <origin>`. Credential detection is fail-safe: an unknown status is treated as credentialed until proven boring, and the downward `--no-credentials` override needs `--force`.
 
 Tools whose MCP name isn't a valid channel id (`createIssue`, spaced or punctuated names) are **sanitized to a stable channel-safe id and still bridged** — the original name kept for invocation — so wrapping real-world servers doesn't silently drop half their surface.
 
-### `net mcp serve` — front the mesh to a local MCP host
+### `net-mesh mcp serve` — front the mesh to a local MCP host
 
 ```json
 { "mcpServers": { "net": { "command": "net", "args": ["mcp", "serve"] } } }
 ```
 
-One line of host config and the model can reach the whole mesh. `net mcp serve` is a stdio MCP server that fronts the running `net` daemon as a **thin client** — N hosts on one machine are N shims sharing one daemon and one identity, never N embedded nodes. Its default surface is five **meta-tools** (search / describe / invoke / list-pinned / request-pin), which keeps the host's tool list small and the per-call schema accurate. Discovery and description never imply invocation: a capability that carries credentials — or reports *none*, since the demand side does not trust a wire-declared status — is search/describe-only until the operator allowlists it or approves a pin.
+One line of host config and the model can reach the whole mesh. `net-mesh mcp serve` is a stdio MCP server that fronts the running `net` daemon as a **thin client** — N hosts on one machine are N shims sharing one daemon and one identity, never N embedded nodes. Its default surface is five **meta-tools** (search / describe / invoke / list-pinned / request-pin), which keeps the host's tool list small and the per-call schema accurate. Discovery and description never imply invocation: a capability that carries credentials — or reports *none*, since the demand side does not trust a wire-declared status — is search/describe-only until the operator allowlists it or approves a pin.
 
 ### Pinning as promotion — and consent
 
 The model calls `net_request_pin(cap_id)`, which writes a **pending** request and grants nothing. A human approves out of band:
 
 ```bash
-net mcp pin approve <cap_id>     # or: reject / list
+net-mesh mcp pin approve <cap_id>     # or: reject / list
 ```
 
 An approved pin is **promoted to a first-class typed MCP tool** in the host's list, with its real input schema — restoring per-call schema accuracy and the host's own approval prompt — and it clears the shim's consent gate for that one capability, for that user, on that machine, and nothing wider. Two rules are absolute: **the model cannot approve its own future access** (consent happens outside the model loop), and the pin store is a per-user file, **owner-only `0600`**, written atomically under a cross-process lock so a stale snapshot can never resurrect a revoked approval. Promoted tool names are a pure function of the capability id, so approving or rejecting one pin never remaps a name a host cached onto a different capability.
@@ -90,7 +90,7 @@ The codename is the design. A bridge sits at the exact seam a confused-deputy at
 - **Consent is fail-closed.** An empty policy gates *everything*. A wire-declared `credential_status` — including `none` — is never trusted across the demand-side boundary; the gate reloads the pin store per invoke, so an out-of-band approval takes effect immediately with no stale-snapshot window.
 - **Owner scope gates both surfaces.** Describe and invoke both reject on the AEAD-verified origin, so a node outside the scope sees nothing in search *and* cannot invoke.
 - **Invoke is at-most-once for credentialed *and* paid tools.** A timeout does not prove the tool didn't run, so only a provably duplicate-safe (uncredentialed, unpaid) tool retries a timed-out call, expressed as a typed `InvokeSafety` flag; a credentialed, stateful, or *paid* one surfaces the timeout rather than re-running it, so a lost reply never becomes a duplicated issue or a double charge.
-- **Cross-provider collapse and failover are opt-in, off by default.** Bridging one tool from several nodes into one logical capability — and failing an invoke over between them — is powerful, but equivalence today is proven only from *wire-declared* attributes a peer controls, with no proof the peer shares your owner identity. So the safe default keeps every provider on its own node id; a single-owner mesh opts in with `net mcp serve --trust-equivalent-providers`. Collapse is additionally impossible across accounts by construction — the equivalence key folds the credential status, so a credentialed tool never merges.
+- **Cross-provider collapse and failover are opt-in, off by default.** Bridging one tool from several nodes into one logical capability — and failing an invoke over between them — is powerful, but equivalence today is proven only from *wire-declared* attributes a peer controls, with no proof the peer shares your owner identity. So the safe default keeps every provider on its own node id; a single-owner mesh opts in with `net-mesh mcp serve --trust-equivalent-providers`. Collapse is additionally impossible across accounts by construction — the equivalence key folds the credential status, so a credentialed tool never merges.
 
 Bridged tools carry `compat_tier: "mcp_bridge"`: request/response only — no streaming, artifacts, or migration. The bridge is the funnel, not the destination.
 
@@ -100,7 +100,7 @@ The consent vocabulary (`CapabilityId`, `CredentialStatus`, `ConsentPolicy`, `Co
 
 ### Building the boundary before it exists — credential forwarding
 
-v0.31 also lands the deny-by-default machinery for a *future* credential-forwarding path: sealed-context crypto (`X25519SealedBoxSealer`/`Opener`, an anonymous X25519 sealed box over XChaCha20-Poly1305, key derived from the ed25519 identity seed), a two-ended policy where the caller must allow *sending* and the destination must allow *accepting* (deny wins), secret values that live only in a `SecretBackend` and materialize as a redacted, unserializable, zeroize-on-drop handle, and a `net forwarding` CLI. But **no live path forwards anything this cycle** — forwarding needs an HTTP-facing capability the stdio-only adapter doesn't have, and the never-for-stdio doctrine means a wrapped stdio server's credentials stay in its child process, permanently. The machinery is built hostile-by-default and left inert until the HTTP subsystem it's for arrives.
+v0.31 also lands the deny-by-default machinery for a *future* credential-forwarding path: sealed-context crypto (`X25519SealedBoxSealer`/`Opener`, an anonymous X25519 sealed box over XChaCha20-Poly1305, key derived from the ed25519 identity seed), a two-ended policy where the caller must allow *sending* and the destination must allow *accepting* (deny wins), secret values that live only in a `SecretBackend` and materialize as a redacted, unserializable, zeroize-on-drop handle, and a `net-mesh forwarding` CLI. But **no live path forwards anything this cycle** — forwarding needs an HTTP-facing capability the stdio-only adapter doesn't have, and the never-for-stdio doctrine means a wrapped stdio server's credentials stay in its child process, permanently. The machinery is built hostile-by-default and left inert until the HTTP subsystem it's for arrives.
 
 ---
 
@@ -109,7 +109,7 @@ v0.31 also lands the deny-by-default machinery for a *future* credential-forward
 Where the MCP bridge federates *tools*, this track federates *identity and work*. It lands this cycle in Rust and Python (with a Hermes plugin), each piece tested in-process and over a two-node loopback mesh:
 
 - **Device enrollment** — an invite → join → approve handshake brings a new device into a root identity's fleet, with a device registry, an operator facade, silent auto-renewal, and an immediate revoke that survives a restart.
-- **Delegation chains** — a capability invoke is gated along a `root → machine → gateway` chain against a revocation store, so a delegated node acts only within the scope its parent actually granted (`net wrap --owner-root`).
+- **Delegation chains** — a capability invoke is gated along a `root → machine → gateway` chain against a revocation store, so a delegated node acts only within the scope its parent actually granted (`net-mesh wrap --owner-root`).
 - **Agent-to-agent (A2A)** — `serve_a2a` / submit / status / cancel hand a task from one agent to another over the mesh, with cancellation and artifact-ref results.
 - **Tool federation** — a provider publishes local tools with fail-closed approval routing (`approval_unreachable` denies rather than leaks), and a consumer surfaces them machine-namespaced and deduped.
 
@@ -157,7 +157,7 @@ Each landed track got a dedicated code review that ran independent finder angles
 v0.31 is **additive on the wire and on every existing transport, fold, reliability, and SDK path** — none of them changed shape. What a downstream feels is new surface and a dependency-major bump, not a behavior change to code it already ships.
 
 - **New crates:** `net-mesh-mcp` (the SDK-only bridge adapter) and `net-mcp-ffi` (the Go/C ABI). Both honor the SDK-only doctrine; a CI test fails the build if the adapter reaches for the core crate directly.
-- **New CLI:** `net wrap`, `net mcp serve`, `net mcp pin`, and `net forwarding` (inert this cycle). A node that never runs them is untouched.
+- **New CLI:** `net-mesh wrap`, `net-mesh mcp serve`, `net-mesh mcp pin`, and `net-mesh forwarding` (inert this cycle). A node that never runs them is untouched.
 - **New public SDK surface:** the `net-mesh-sdk` consent module (`CapabilityId`, `CredentialStatus`, `ConsentPolicy`, `ConsentDecision`) and `PinStore`; the enrollment / delegation / A2A modules; and a node's ability to read its own origin hash (the value the owner-scope gate keys on).
 - **New payments surface:** the signed `AssetRegistry` / `RegistryRef`, the `VerificationTier` / `ChainChecker` / `ChainVerdict` verification types, the `SchemeSigner` seam with `ExternalSvmSigner` / `ExternalXrplSigner` and the `SvmTransferIntent` / `XrplPaymentIntent` builders, facilitator config packs — plus the full `CapabilityGateway` / `PaymentProvider` / `PaymentHttpClient` and signer seams in Python and Node.
 - **New wire vocabulary, all additive and capability/header-gated:** `net.payment.asset_registry@1`, `net.payment.verification@1`, `net.payment.failure@1`, and `net.invoke.forwarded_context@1`. Old peers drop what they don't understand.
@@ -169,8 +169,8 @@ v0.31 is **additive on the wire and on every existing transport, fold, reliabili
 
 1. **Pull the release** — nothing changes unless you invoke the new commands or opt into a payment flow. Existing bus, stream, nRPC, and persistence code behaves exactly as before.
 2. **To take payments across a network**, add it to the caller's spend-policy `allowed_networks`, configure a facilitator from a config pack, and wire a namespace signer (`eip155` / `solana` / `xrpl`) — the key stays in your KMS/wallet. XRPL is off until you do all three. Providers author terms with `build_pricing_terms` and publish with `publish_paid_tools`; callers gate every charge through the `CapabilityGateway`, in Rust, Python, or Node.
-3. **To publish a tool onto the mesh**, run `net wrap <name> --identity <id> -- <stdio MCP server cmd>`. Put the tool's secrets in `--env`; they stay in the child. Use a *stable* identity, or owner-only scoping admits nobody.
-4. **To consume the mesh from an MCP host**, run `net mcp serve` and add the one-line host config above. Discover with `net_search_capabilities`, approve a capability out of band with `net mcp pin approve <cap_id>`, and it promotes to a first-class typed tool. Enable cross-provider failover with `--trust-equivalent-providers` only on a mesh where every peer is your own.
+3. **To publish a tool onto the mesh**, run `net-mesh wrap <name> --identity <id> -- <stdio MCP server cmd>`. Put the tool's secrets in `--env`; they stay in the child. Use a *stable* identity, or owner-only scoping admits nobody.
+4. **To consume the mesh from an MCP host**, run `net-mesh mcp serve` and add the one-line host config above. Discover with `net_search_capabilities`, approve a capability out of band with `net-mesh mcp pin approve <cap_id>`, and it promotes to a first-class typed tool. Enable cross-provider failover with `--trust-equivalent-providers` only on a mesh where every peer is your own.
 5. **Everyone else** gets the new surfaces with no behavior change to existing paths.
 
 ---

@@ -84,7 +84,10 @@ export const DOCS_ORDER: DocsOrderConfig = {
     worldview: [
       "agentic-mesh",
       "right-and-wrong-use-cases",
+      "how-net-compares",
       "mcp-vs-net",
+      "nats-vs-net",
+      "zenoh-vs-net",
       "rest-vs-net",
     ],
     payments: [
