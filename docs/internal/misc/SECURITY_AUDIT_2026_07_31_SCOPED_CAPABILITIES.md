@@ -16,10 +16,13 @@ exploit link re-checked against the live code path.
 `origin/master` at that commit). All line references below are against that SHA,
 not against a branch name.
 
-Revised following review (Kyra, 2026-07-31): the remediation for the two HIGH
-findings has been rewritten, two findings narrowed for precision, and the
-query-cost finding elevated. The exploit analysis and severity of the HIGH
-findings are unchanged.
+Revised twice following review (Kyra, 2026-07-31). First pass: the remediation
+for the two HIGH findings was rewritten, two findings narrowed for precision, and
+the query-cost finding elevated. Second pass: the multi-hop discovery repair was
+made generation-coherent — re-keying `peer_subnets` to `ann.node_id` is necessary
+but not sufficient, because the write precedes the authoritative fold apply and
+would otherwise admit stale-replay and reordering divergence. The exploit
+analysis and severity of the HIGH findings are unchanged throughout.
 
 The scope feature itself is well-scoped and honestly documented. The findings
 below cluster in two places: the *adjacent* enforcement gates that inherit
@@ -260,11 +263,75 @@ available and already authenticated on the forwarded announcement:
   reads are bound to the origin's key.
 
 So for **discovery-only** subnet resolution, derive `policy.assign(&ann.capabilities)`
-and store it under `ann.node_id` rather than `from_node`. The `hop_count == 0`
+and key it on `ann.node_id` rather than `from_node`. The `hop_count == 0`
 condition can then be dropped; `signature_verified` must be retained, because the
 node_id↔entity_id binding proves nothing when `entity_id` is itself unverified.
-This closes the forwarded-only unknown without pretending the relay is the
-origin, and lets the warm-up branch stop carrying peers it can never resolve.
+This closes the forwarded-only unknown without pretending the relay is the origin.
+
+**Re-keying alone is not sufficient — the write must be generation-coherent.**
+Keying by `ann.node_id` is necessary but does not by itself make `peer_subnets`
+agree with the fold, because the current write happens *before* the authoritative
+apply and its result is never consulted:
+
+- `mesh.rs:22428-22456` — the `peer_subnets` write.
+- `mesh.rs:22550-22555` — authoritative fold ingest, later in the same handler.
+- `mesh.rs:7601-7619` — `let _ = capability_fold.apply(fold_ann);` discards the
+  `ApplyOutcome`.
+- `fold/mod.rs:141-143` — the merge rule: `incoming.generation > existing =>
+  Replace`, otherwise `Reject`. `translate_announcement` supplies
+  `ann.version.max(1)` as the generation (`capability_bridge.rs:1074`).
+- `fold/state.rs:285-292` — `ApplyOutcome::{Inserted, Replaced, Rejected}`.
+- `mesh.rs:22315-22330` — the dedup key is `(ann.node_id, ann.version,
+  is_direct)`. It stops an exact duplicate; it does **not** establish that the
+  incoming version is current.
+
+Two divergence modes follow, both of which would leave discovery evaluating a
+current capability entry against stale subnet state:
+
+1. **Stale replay.** v10 is accepted and resolves subnet A. A valid replay of v9
+   carries a distinct dedup key, so it is processed; it overwrites
+   `peer_subnets[node]` with subnet B; the fold then rejects v9 as stale. The
+   sidecar now disagrees with the fold.
+2. **Delayed publication.** Even if the write is moved after `apply` and gated on
+   `Inserted | Replaced`, concurrent ingest can reorder: A applies gen 10 and
+   pauses before the sidecar write, B applies gen 11 and writes sidecar 11, A
+   resumes and overwrites with 10. `Fold::apply` serialises internally, but a
+   separate `DashMap` write is outside that lock.
+
+The requirement is therefore: **publish the derived subnet only as part of the
+same accepted-generation transition as the authoritative capability membership.**
+A rejected apply must produce zero `peer_subnets` mutation, and a delayed older
+accepted transition must not overwrite a newer value. Two implementations satisfy
+this:
+
+- **Derived field on the membership payload**, computed at
+  `translate_announcement` time and committed under the fold's mutation lock, so
+  it moves with the entry by construction. There is in-tree precedent: `region`
+  is already derived from the `scope:region:` tag this way
+  (`capability_bridge.rs:1066-1068`). *Constraint to verify first:*
+  `policy.assign` is a **receiver-local** computation — different receivers may
+  hold different policies — so this is only sound if the payload is not shared
+  across nodes. `Fold::snapshot` / `restore` exist (`fold/mod.rs:521`, `:554`)
+  and no cross-node use appears in `mesh.rs`, but that must be confirmed before
+  committing to this shape.
+- **Version-stamped conditional sidecar update** under a shared
+  ingest/publication serializer: store `(generation, SubnetId)` and apply the
+  write only when the accepted generation is strictly greater than the stored
+  one, after a successful apply.
+
+This composes with the query-cost finding below: canonical scope derivation and
+receiver-local subnet derivation are the same class of problem, and both belong
+as derived state tied to the accepted membership generation rather than written
+independently ahead of acceptance.
+
+**Required witnesses** for whichever shape is chosen:
+
+1. *Stale replay* — accept v10/subnet A → receive signed v9/subnet B → fold
+   remains v10 and peer subnet remains A.
+2. *Delayed publication* — v10 apply pauses before derived publication → v11
+   completes → release v10 → both fold and peer subnet reflect v11.
+3. *Rejected input* — a rejected fold apply produces zero `peer_subnets`
+   mutation.
 
 An earlier draft suggested instead admitting unknowns only for peers with a live
 direct session. **That suggestion has been withdrawn** — it does not bound the
@@ -349,8 +416,8 @@ mistake given the Python docs and the dual acceptance everywhere else — falls
 through to `_ => Any` and receives the entire mesh instead of unscoped peers
 only.
 
-Combined with the previous finding, there is no error surface to catch this in
-any language.
+Combined with the previous finding, none of the three native converters returns
+an error for these semantically invalid shapes.
 
 ### Fix
 Accept both spellings in the Node converter, matching its two siblings. Longer
@@ -485,9 +552,12 @@ reserved-prefix policy and apply it across all three bindings.
 4. **Make semantically invalid binding filters return errors**, and align the
    Node kind spellings. Independently shippable.
 5. **Resolve forwarded signed subnet discovery under `ann.node_id`**, dropping the
-   `hop_count` gate while retaining `signature_verified`. Fixes the discovery
-   leak; does not affect item 2 or 3.
+   `hop_count` gate while retaining `signature_verified` — and publish the derived
+   value only as part of the accepted-generation transition, with the three
+   witnesses listed under that finding. Fixes the discovery leak; does not affect
+   item 2 or 3.
 6. **Move scope derivation to verified ingest** so the query path stops parsing
-   under the fold locks.
+   under the fold locks. Same generation-coherence requirement as item 5; the two
+   are best done together.
 7. **Correct the docs**: `group.rs`'s value-as-secret claim, the `SubnetLocal`
    contract wording, and the scope boundary on the exported types.
