@@ -23477,11 +23477,10 @@ impl MeshNode {
         let cfg = cfg_ref.clone();
         drop(cfg_ref);
 
-        let peer_subnet = ctx
-            .peer_subnets
-            .get(&from_node)
-            .map(|e| *e.value())
-            .unwrap_or(SubnetId::GLOBAL);
+        // `None` when this peer's subnet has not been derived — passed
+        // through as unknown rather than coerced to GLOBAL, which used
+        // to open every `ParentVisible` channel to unresolved peers.
+        let peer_subnet = ctx.peer_subnets.get(&from_node).map(|e| *e.value());
         let visible = Self::subnet_visible(ctx.local_subnet, peer_subnet, cfg.visibility);
         if let Some(gw) = ctx.subnet_gateway.as_ref() {
             if visible {
@@ -23675,10 +23674,33 @@ impl MeshNode {
         }
     }
 
-    fn subnet_visible(source: SubnetId, dest: SubnetId, visibility: Visibility) -> bool {
+    /// `dest` is `None` when the peer's subnet has not been derived —
+    /// `peer_subnets` only populates when a `local_subnet_policy` is
+    /// installed and the peer has sent a signature-verified direct
+    /// announcement, so "unknown" is a real and common state.
+    ///
+    /// Unknown MUST NOT be coerced to a concrete `SubnetId`. It
+    /// previously resolved to [`SubnetId::GLOBAL`] at both call sites,
+    /// and `is_ancestor_of` short-circuits to `true` for a global
+    /// receiver — so every peer whose subnet had not been derived was
+    /// admitted to every `ParentVisible` channel, on an authorization
+    /// path that otherwise answers `AckReason::Unauthorized`
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md, HIGH #2).
+    ///
+    /// The unknown arms fall back to `source.is_global()`: a node that
+    /// holds no subnet identity of its own cannot express "same subnet
+    /// as me" or "ancestor of me" as a constraint, so a flat mesh keeps
+    /// its existing permissive behaviour. Once this node IS
+    /// subnet-scoped, an underivable peer fails closed. That pair of
+    /// arms reproduces the previous verdict for every input except the
+    /// vulnerable one.
+    fn subnet_visible(source: SubnetId, dest: Option<SubnetId>, visibility: Visibility) -> bool {
         match visibility {
             Visibility::Global => true,
-            Visibility::SubnetLocal => source.is_same_subnet(dest),
+            Visibility::SubnetLocal => match dest {
+                Some(dest) => source.is_same_subnet(dest),
+                None => source.is_global(),
+            },
             Visibility::ParentVisible => {
                 // "Visible to the parent subnet but not siblings" —
                 // strictly upward. A child's broadcast reaches its
@@ -23686,7 +23708,10 @@ impl MeshNode {
                 // subnet is its own ancestor) and any ancestor; a
                 // parent broadcasting down to descendants would leak
                 // region-scoped traffic and is rejected.
-                dest.is_ancestor_of(source)
+                match dest {
+                    Some(dest) => dest.is_ancestor_of(source),
+                    None => source.is_global(),
+                }
             }
             Visibility::Exported => false,
         }
@@ -23940,11 +23965,8 @@ impl MeshNode {
             // (1) Subnet visibility. Cheap check first — a peer in
             // the wrong subnet should short-circuit before any
             // auth-cache probing.
-            let peer_subnet = self
-                .peer_subnets
-                .get(peer_id)
-                .map(|e| *e.value())
-                .unwrap_or(SubnetId::GLOBAL);
+            // `None` = subnet not derived; see `subnet_visible`.
+            let peer_subnet = self.peer_subnets.get(peer_id).map(|e| *e.value());
             let visible = Self::subnet_visible(self.local_subnet, peer_subnet, visibility);
             if let Some(gw) = self.subnet_gateway.as_ref() {
                 if visible {
@@ -35901,3 +35923,102 @@ mod exact_expiry_timer_tests {
 #[cfg(test)]
 #[path = "org_routing_wiring_tests.rs"]
 mod org_routing_wiring_tests;
+
+#[cfg(test)]
+mod subnet_visible_unknown_tests {
+    //! Witnesses for the `ParentVisible` unknown-subnet fail-open
+    //! (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md, HIGH #2).
+    //!
+    //! `peer_subnets` only populates when a `local_subnet_policy` is
+    //! installed AND the peer sent a signature-verified direct
+    //! announcement, so an unresolved peer is routine. Coercing that
+    //! unknown to `SubnetId::GLOBAL` made it a universal ancestor,
+    //! admitting it to every `ParentVisible` channel — on the path that
+    //! otherwise answers `AckReason::Unauthorized`.
+    //!
+    //! In-crate because `subnet_visible` is private.
+    use super::*;
+
+    const SCOPED: fn() -> SubnetId = || SubnetId::new(&[3, 7]);
+
+    /// The vulnerability, pinned. A subnet-scoped node must not admit a
+    /// peer whose subnet it could not derive.
+    #[test]
+    fn parent_visible_rejects_unknown_peer_subnet_when_scoped() {
+        assert!(
+            !MeshNode::subnet_visible(SCOPED(), None, Visibility::ParentVisible),
+            "unknown peer subnet must fail closed under ParentVisible on a \
+             subnet-scoped node; coercing it to GLOBAL made every unresolved \
+             peer a universal ancestor"
+        );
+    }
+
+    /// The same coercion on the strict arm was already fail-closed;
+    /// pin it so a future refactor doesn't loosen it.
+    #[test]
+    fn subnet_local_rejects_unknown_peer_subnet_when_scoped() {
+        assert!(
+            !MeshNode::subnet_visible(SCOPED(), None, Visibility::SubnetLocal),
+            "unknown peer subnet must fail closed under SubnetLocal"
+        );
+    }
+
+    /// Flat mesh: a node with no subnet identity of its own cannot
+    /// express "same subnet as me" / "ancestor of me", so unknown peers
+    /// stay visible. This is the pre-fix behaviour and must be
+    /// preserved — breaking it would silently partition every
+    /// deployment that never configured subnets.
+    #[test]
+    fn unscoped_node_still_admits_unknown_peer_subnet() {
+        for visibility in [Visibility::SubnetLocal, Visibility::ParentVisible] {
+            assert!(
+                MeshNode::subnet_visible(SubnetId::GLOBAL, None, visibility),
+                "a node with no subnet of its own must keep admitting \
+                 unresolved peers under {visibility:?} (flat-mesh compat)"
+            );
+        }
+    }
+
+    /// Every known-subnet verdict is byte-for-byte what it was before
+    /// the `Option` change: only the unknown arms moved.
+    #[test]
+    fn known_subnet_verdicts_are_unchanged() {
+        let child = SubnetId::new(&[3, 7, 2]);
+        let parent = SubnetId::new(&[3, 7]);
+        let sibling = SubnetId::new(&[3, 8]);
+
+        assert!(MeshNode::subnet_visible(
+            child,
+            Some(child),
+            Visibility::SubnetLocal
+        ));
+        assert!(!MeshNode::subnet_visible(
+            child,
+            Some(sibling),
+            Visibility::SubnetLocal
+        ));
+        // ParentVisible is strictly upward: ancestor yes, sibling no.
+        assert!(MeshNode::subnet_visible(
+            child,
+            Some(parent),
+            Visibility::ParentVisible
+        ));
+        assert!(!MeshNode::subnet_visible(
+            child,
+            Some(sibling),
+            Visibility::ParentVisible
+        ));
+        // Global ignores subnets entirely, including unknown ones.
+        assert!(MeshNode::subnet_visible(
+            child,
+            None,
+            Visibility::Global
+        ));
+        // Exported is unconditionally closed here.
+        assert!(!MeshNode::subnet_visible(
+            child,
+            Some(parent),
+            Visibility::Exported
+        ));
+    }
+}
