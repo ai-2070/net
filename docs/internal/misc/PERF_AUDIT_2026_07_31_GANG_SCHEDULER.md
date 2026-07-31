@@ -751,6 +751,51 @@ The measurement contract is satisfied for slice 2 and for the allocation claims.
   (missing `sensing_consumer_cell_interval_for_test`). Pre-existing — confirmed with all
   slice changes stashed — and untouched.
 
+### Public surface changes (read this before cutting a release)
+
+This work is internally motivated but not internally contained: it changes the
+signature of two `pub` items in `net-mesh` 0.34.0. There is no `CHANGELOG.md` in this
+repository, so it is recorded here — release notes should pick it up from this section.
+
+**Breaking.** A downstream caller passing or binding a default-hasher
+`std::collections::HashSet<NodeId>` stops compiling:
+
+| item | before | after |
+|---|---|---|
+| `IslandQuery::HostedByAny` (`fold/island.rs`) | `HashSet<NodeId>` | `NodeIdSet` |
+| `gang::candidate_hosts` (`gang/filter.rs`) | `-> HashSet<NodeId>` | `-> NodeIdSet` |
+
+Migration is one type annotation — `NodeIdSet` is exported alongside from
+`behavior::fold`, and it is still a `HashSet`, only with `BuildU64Hasher` in place of
+`RandomState`:
+
+```rust
+// before
+let hosts: std::collections::HashSet<NodeId> = matched.iter().copied().collect();
+// after
+let hosts: net::adapter::net::behavior::fold::NodeIdSet = matched.iter().copied().collect();
+```
+
+The in-repo bench `benches/island_claim_match.rs` needed exactly this edit, which is
+the evidence that the surface is reachable from outside the crate rather than
+`pub`-in-name-only.
+
+**Why the type changed rather than staying `HashSet<NodeId>` and converting at the
+boundary:** the set is probed once per *topology entry* during the `HostedByAny` scan.
+Converting at the call boundary would reintroduce a per-call rebuild of the very set
+§7 exists to make cheap to probe.
+
+**Additive** (no migration; listed so release notes are complete):
+
+- `Fold::with_state_query` — metered borrow of live state, the counterpart a production
+  read reaches for when it replaces a `query` call. See the `with_state` caveat under
+  "Known-imperfect, left alone".
+- `fold::holder_of` — allocation-free holder lookup on the reservation fold.
+- `fold::FxU64Hasher` / `BuildU64Hasher` / `NodeIdSet`.
+
+`FxU64Hasher` was briefly named `U64Hasher`; both the introduction and the rename
+happened on this branch, so no released name is affected.
+
 ### Explicitly not claimed
 
 No threshold and no public performance claim is made anywhere in this document. ICB-7 owns
