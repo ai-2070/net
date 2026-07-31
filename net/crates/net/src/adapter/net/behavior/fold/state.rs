@@ -30,6 +30,61 @@ use super::FoldKind;
 /// cryptographic identity.
 pub type NodeId = u64;
 
+/// Fast multiplicative mixer for hash keys that are already a
+/// single well-distributed `u64` — [`NodeId`] and
+/// [`IslandId`](super::IslandId) being the ones the scheduler
+/// probes in bulk.
+///
+/// Same rationale as `capability::U64TupleHasher` (PERF_AUDIT §4.6),
+/// which mixes `(u64, u64)` index keys: these ids are derived from
+/// already-hashed identity bytes, so collision resistance exists at
+/// construction and SipHash's DoS resistance adds nothing — it just
+/// charges ~15-25 ns of mixing per probe. That cost is paid once per
+/// *topology entry* on the gang matcher's `HostedByAny` scan, not
+/// once per candidate host, which is what makes it worth removing
+/// (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+///
+/// Deliberately distinct from the tuple hasher rather than reusing
+/// it: that one is named and shaped for `(u64, u64)` keys and is
+/// private to the capability module.
+#[derive(Default, Clone)]
+pub struct U64Hasher(u64);
+
+impl std::hash::Hasher for U64Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        // FxHash-style step: rotate, xor, multiply by a large odd
+        // constant. Well-distributed for already-hashed input.
+        const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(FX_SEED);
+    }
+
+    /// Defensive byte fallback — `Hash for u64` calls `write_u64`
+    /// directly, but routing an unexpected key type through here
+    /// must still mix rather than silently collapse.
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(buf));
+        }
+    }
+}
+
+/// [`BuildHasher`](std::hash::BuildHasher) for [`U64Hasher`].
+pub type BuildU64Hasher = std::hash::BuildHasherDefault<U64Hasher>;
+
+/// A set of [`NodeId`]s hashed with [`U64Hasher`] — the candidate-host
+/// set the gang matcher builds and then probes once per topology
+/// entry.
+pub type NodeIdSet = HashSet<NodeId, BuildU64Hasher>;
+
 /// One entry in a fold: the payload most recently accepted for
 /// its key, plus the bookkeeping the runtime needs to expire,
 /// merge, and audit further announcements.

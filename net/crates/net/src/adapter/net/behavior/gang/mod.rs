@@ -61,8 +61,8 @@ pub use claim::{
 };
 pub use contention::claim_first_available;
 pub use filter::{
-    candidate_hosts, numeric_filter, select_islands, select_with_affinity, NumericFilter,
-    SelectionPolicy,
+    candidate_hosts, candidate_hosts_for, numeric_filter, select_islands, select_with_affinity,
+    NumericFilter, SelectionPolicy,
 };
 pub use multi::{acquire_gang, try_acquire_gang, AcquireAttempt, GangClaim, GangOutcome};
 #[cfg(feature = "redex")]
@@ -113,9 +113,13 @@ pub fn match_islands(
     criteria: &MatchCriteria,
     down_nodes: &HashSet<NodeId>,
 ) -> Vec<IslandId> {
-    // [1] coarse capability match → candidate hosts.
-    let matches = capability_fold.query(criteria.capability.clone());
-    let mut hosts = candidate_hosts(&matches);
+    // [1] coarse capability match → candidate hosts. Resolved
+    // straight to node ids: the matched `CapabilityMembership`
+    // payloads are never materialized, because this step keeps only
+    // the host out of each (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §1).
+    // Borrowing the query also drops the per-round `CapabilityFilter`
+    // clone — this runs on every retry round, not once per job.
+    let mut hosts = candidate_hosts_for(capability_fold, &criteria.capability);
     // Liveness gate (MeshOS ↔ Scheduler Projection 4): drop hosts MeshOS
     // currently observes as Unreachable *before* the island query, so
     // neither a dead host's capability match nor its islands can ever be

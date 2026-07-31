@@ -9,17 +9,74 @@
 //! so the scheduler runs them optimistically and re-runs them on a
 //! claim reject.
 
-use std::collections::HashSet;
-
-use crate::adapter::net::behavior::fold::{CapabilityMatch, IslandId, IslandRecord, NodeId};
+use crate::adapter::net::behavior::fold::capability::resolve_candidate_keys;
+use crate::adapter::net::behavior::fold::{
+    CapabilityFold, CapabilityMatch, CapabilityQuery, Fold, FoldKind, IslandId, IslandRecord,
+    NodeIdSet,
+};
 
 /// Step 1 bridge: the candidate *hosts* surfaced by a capability
 /// match. The capability fold is keyed by `(class, node)`; the node
 /// is the island host, so the matched node ids are exactly the hosts
 /// whose islands step 2 then inspects. Deduped across classes (a
 /// host in several capability classes is still one host).
-pub fn candidate_hosts(matches: &[CapabilityMatch]) -> HashSet<NodeId> {
+pub fn candidate_hosts(matches: &[CapabilityMatch]) -> NodeIdSet {
     matches.iter().map(|((_class, node), _)| *node).collect()
+}
+
+/// Step 1, without materializing what step 1 throws away.
+///
+/// [`candidate_hosts`] keeps one `u64` out of each
+/// [`CapabilityMatch`], but producing that match list means
+/// `composite_query` deep-clones a whole `CapabilityMembership` per
+/// matched host — tags Vec, metadata BTreeMap, three allow-list Vecs,
+/// hardware — and the matcher drops all of it on the next line. This
+/// resolves the same candidate set straight to node ids, cloning
+/// nothing (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §1).
+///
+/// **Scope:** the clone-free route covers
+/// [`CapabilityQuery::Composite`] — the shape every [`MatchCriteria`]
+/// in the tree uses. Every other query shape falls through to the
+/// ordinary `query` path and stays clone-heavy; this is a targeted
+/// fix, not a general one.
+///
+/// [`MatchCriteria`]: super::MatchCriteria
+pub fn candidate_hosts_for(
+    capability_fold: &Fold<CapabilityFold>,
+    query: &CapabilityQuery,
+) -> NodeIdSet {
+    capability_fold.with_state_and_index(|state, index| match query {
+        CapabilityQuery::Composite(filter) => {
+            let candidates = resolve_candidate_keys(state, index, filter);
+            // Two invariants carried over from `composite_query`:
+            //
+            // 1. The primary-store check is NOT redundant. That path
+            //    is `filter_map(|k| state.entries.get(&k)…)`, so an
+            //    index key with no live entry behind it is silently
+            //    dropped; reading node ids straight off the index
+            //    would resurrect it.
+            // 2. `limit` applies to KEYS, before host dedup — matching
+            //    today's order (take `limit` matches, then dedup).
+            //    Which keys survive is unspecified either way (set
+            //    iteration order), but the resulting host count must
+            //    not change.
+            let hosts = candidates
+                .as_set()
+                .iter()
+                .filter(|key| state.entries.contains_key(*key))
+                .map(|(_class, node)| *node);
+            if filter.limit > 0 {
+                hosts.take(filter.limit).collect()
+            } else {
+                hosts.collect()
+            }
+        }
+        other => candidate_hosts(&<CapabilityFold as FoldKind>::query(
+            state,
+            index,
+            other.clone(),
+        )),
+    })
 }
 
 /// Scheduler-side numeric constraints over the LIVE `IslandTopology`
@@ -174,7 +231,7 @@ pub fn select_with_affinity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::net::behavior::fold::{IslandRecord, UnitSet};
+    use crate::adapter::net::behavior::fold::{IslandRecord, NodeId, NodeState, UnitSet};
 
     fn rec(id: IslandId, host: NodeId, units: usize, load: f32, lat: u32) -> IslandRecord {
         IslandRecord {
@@ -184,6 +241,228 @@ mod tests {
             capabilities: vec!["model:a1".into()],
             load,
             p50_latency_us: lat,
+        }
+    }
+
+    /// Announce `node` into `class` carrying `tags`, in `state` /
+    /// `region`. The equivalence tests below need every indexed axis
+    /// populated so each `CapabilityQuery` shape selects something.
+    fn announce(
+        fold: &Fold<CapabilityFold>,
+        kp: &crate::adapter::net::identity::EntityKeypair,
+        node: NodeId,
+        class: u64,
+        tags: Vec<&str>,
+        state: NodeState,
+        region: Option<&str>,
+    ) {
+        use crate::adapter::net::behavior::fold::{
+            CapabilityMembership, EnvelopeMeta, SignedAnnouncement,
+        };
+        let membership = CapabilityMembership {
+            class_hash: class,
+            tags: tags.into_iter().map(String::from).collect(),
+            hardware: None,
+            state,
+            region: region.map(String::from),
+            price_quote: None,
+            reflex_addr: None,
+            allowed_nodes: Vec::new(),
+            allowed_subnets: Vec::new(),
+            allowed_groups: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            owner: None,
+        };
+        fold.apply(
+            SignedAnnouncement::sign(
+                kp,
+                CapabilityFold::KIND_ID,
+                class,
+                node,
+                1,
+                EnvelopeMeta::default(),
+                membership,
+            )
+            .expect("sign"),
+        )
+        .expect("apply");
+    }
+
+    /// The reference: what step 1 produced before §1 — materialize
+    /// every match, then project to hosts.
+    fn hosts_via_query(fold: &Fold<CapabilityFold>, q: &CapabilityQuery) -> NodeIdSet {
+        candidate_hosts(&fold.query(q.clone()))
+    }
+
+    /// A capability fold with three publishers spread across two
+    /// classes, two states and two regions, so every indexed axis
+    /// discriminates.
+    fn populated_fold() -> (
+        Fold<CapabilityFold>,
+        Vec<crate::adapter::net::identity::EntityKeypair>,
+        Vec<NodeId>,
+    ) {
+        use crate::adapter::net::identity::EntityKeypair;
+        let fold: Fold<CapabilityFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+        let kps: Vec<EntityKeypair> = (0..3).map(|_| EntityKeypair::generate()).collect();
+        let nodes: Vec<NodeId> = kps.iter().map(|k| k.entity_id().node_id()).collect();
+
+        announce(
+            &fold,
+            &kps[0],
+            nodes[0],
+            1,
+            vec!["gpu:h100", "nvlink"],
+            NodeState::Idle,
+            Some("us-east"),
+        );
+        announce(
+            &fold,
+            &kps[1],
+            nodes[1],
+            1,
+            vec!["gpu:h100"],
+            NodeState::Busy,
+            Some("us-west"),
+        );
+        announce(
+            &fold,
+            &kps[2],
+            nodes[2],
+            2,
+            vec!["gpu:a10", "nvlink"],
+            NodeState::Idle,
+            Some("us-east"),
+        );
+        (fold, kps, nodes)
+    }
+
+    /// §1: `candidate_hosts_for` must agree with the
+    /// materialize-then-project path for EVERY `CapabilityQuery`
+    /// shape — not just the `Composite` one it fast-paths. The
+    /// non-composite shapes fall through to `query`, so this pins
+    /// the fallback too.
+    #[test]
+    fn candidate_hosts_for_matches_the_query_path_on_every_shape() {
+        use crate::adapter::net::behavior::fold::CapabilityFilter;
+        let (fold, _kps, nodes) = populated_fold();
+
+        let shapes = vec![
+            CapabilityQuery::InClass(1),
+            CapabilityQuery::InClass(2),
+            CapabilityQuery::InClass(99), // selects nothing
+            CapabilityQuery::HasAllTags(vec!["gpu:h100".into()]),
+            CapabilityQuery::HasAllTags(vec!["gpu:h100".into(), "nvlink".into()]),
+            CapabilityQuery::HasAllTags(vec![]), // "no constraint"
+            CapabilityQuery::HasAnyTag(vec!["gpu:h100".into(), "gpu:a10".into()]),
+            CapabilityQuery::HasAnyTag(vec!["absent".into()]),
+            CapabilityQuery::InState(NodeState::Idle),
+            CapabilityQuery::InState(NodeState::Busy),
+            CapabilityQuery::InRegion("us-east".into()),
+            CapabilityQuery::InRegion("nowhere".into()),
+            // Composite: the fast-pathed shape, across its own
+            // sub-shapes (single-tag borrow, multi-axis, empty).
+            CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
+                ..Default::default()
+            }),
+            CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["nvlink".into()],
+                region: Some("us-east".into()),
+                ..Default::default()
+            }),
+            CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
+                state: Some(NodeState::Idle),
+                ..Default::default()
+            }),
+            CapabilityQuery::Composite(CapabilityFilter {
+                tags_any: vec!["gpu:h100".into(), "gpu:a10".into()],
+                ..Default::default()
+            }),
+            CapabilityQuery::Composite(CapabilityFilter {
+                class: Some(2),
+                ..Default::default()
+            }),
+            CapabilityQuery::Composite(CapabilityFilter::default()), // everything
+            CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["absent".into()],
+                ..Default::default()
+            }), // nothing
+        ];
+
+        for shape in shapes {
+            assert_eq!(
+                candidate_hosts_for(&fold, &shape),
+                hosts_via_query(&fold, &shape),
+                "candidate_hosts_for disagreed with the query path on {shape:?}",
+            );
+        }
+
+        // Sanity: the fixture actually discriminates, so the loop
+        // above is not comparing empty against empty.
+        let idle = candidate_hosts_for(&fold, &CapabilityQuery::InState(NodeState::Idle));
+        assert_eq!(idle.len(), 2, "fixture must not be degenerate");
+        assert!(idle.contains(&nodes[0]) && idle.contains(&nodes[2]));
+    }
+
+    /// §1 invariant 1: `composite_query` resolves candidates through
+    /// the index but materializes through the PRIMARY STORE, so an
+    /// index key with no live entry is dropped. Reading node ids
+    /// straight off the index would resurrect it. Evicting a node
+    /// leaves exactly that divergence, so it is the witness.
+    #[test]
+    fn candidate_hosts_for_drops_index_keys_with_no_live_entry() {
+        use crate::adapter::net::behavior::fold::CapabilityFilter;
+        let (fold, _kps, nodes) = populated_fold();
+        let shape = CapabilityQuery::Composite(CapabilityFilter {
+            tags_all: vec!["gpu:h100".into()],
+            ..Default::default()
+        });
+        assert_eq!(candidate_hosts_for(&fold, &shape).len(), 2);
+
+        // Evict one of the two matching publishers.
+        fold.evict_node(nodes[0], "test");
+
+        let via_new = candidate_hosts_for(&fold, &shape);
+        assert_eq!(
+            via_new,
+            hosts_via_query(&fold, &shape),
+            "an evicted publisher must drop out of both paths identically",
+        );
+        assert!(
+            !via_new.contains(&nodes[0]),
+            "an evicted node must not survive as a candidate host",
+        );
+        assert_eq!(via_new.len(), 1);
+    }
+
+    /// §1 invariant 2: `limit` applies to KEYS, before host dedup —
+    /// the same order `composite_query` + `candidate_hosts` used.
+    /// Which keys survive is unspecified (set iteration order), so
+    /// this pins the COUNT, which is the part that must not change.
+    #[test]
+    fn candidate_hosts_for_applies_limit_before_host_dedup() {
+        use crate::adapter::net::behavior::fold::CapabilityFilter;
+        let (fold, _kps, _nodes) = populated_fold();
+
+        for limit in [1usize, 2, 3] {
+            let shape = CapabilityQuery::Composite(CapabilityFilter {
+                tags_any: vec!["gpu:h100".into(), "gpu:a10".into()],
+                limit,
+                ..Default::default()
+            });
+            let got = candidate_hosts_for(&fold, &shape);
+            assert!(
+                got.len() <= limit,
+                "limit {limit} must bound the host count, got {}",
+                got.len(),
+            );
+            assert_eq!(
+                got.len(),
+                hosts_via_query(&fold, &shape).len(),
+                "limit {limit}: host COUNT must match the query path",
+            );
         }
     }
 

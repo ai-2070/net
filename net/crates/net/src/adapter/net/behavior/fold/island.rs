@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::state::{FoldEntry, FoldState, MergeAction, NoIndex, NodeId};
+use super::state::{FoldEntry, FoldState, MergeAction, NoIndex, NodeId, NodeIdSet};
 use super::{FoldKind, SignedAnnouncement};
 
 /// Island identifier — `hash(host, domain)`. The same `u64` space as
@@ -146,7 +146,12 @@ pub enum IslandQuery {
     /// candidate-host match. One scan clones only islands on candidate
     /// hosts, instead of cloning the whole topology and discarding the
     /// majority (the `All`-then-filter path it replaces).
-    HostedByAny(std::collections::HashSet<NodeId>),
+    ///
+    /// Takes a [`NodeIdSet`] rather than a default-hasher `HashSet`:
+    /// this set is probed once per *topology entry* during the scan,
+    /// so the hasher choice scales with total island count
+    /// (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+    HostedByAny(NodeIdSet),
 }
 
 /// One row in an [`IslandQuery`] result: the island id plus its
@@ -415,7 +420,7 @@ mod tests {
 
         // HostedByAny is the batched form: islands on any host in the
         // set, in one scan (review #12).
-        let hosts: std::collections::HashSet<NodeId> = [0xAA, 0xBB].into_iter().collect();
+        let hosts: NodeIdSet = [0xAA, 0xBB].into_iter().collect();
         let mut any: Vec<IslandId> = fold
             .query(IslandQuery::HostedByAny(hosts))
             .into_iter()
@@ -424,7 +429,7 @@ mod tests {
         any.sort();
         assert_eq!(any, vec![0x10, 0x11, 0x20]);
         // A host not in the set contributes nothing.
-        let only_b: std::collections::HashSet<NodeId> = [0xBB].into_iter().collect();
+        let only_b: NodeIdSet = [0xBB].into_iter().collect();
         assert_eq!(
             fold.query(IslandQuery::HostedByAny(only_b))
                 .into_iter()
