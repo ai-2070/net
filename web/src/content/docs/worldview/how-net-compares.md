@@ -21,7 +21,7 @@ large class of work.
 | **MCP** | a tool on a server the host was configured with |
 | **NATS** | a subject |
 | **Zenoh** | a key expression |
-| **Net** | a capability under an owner identity |
+| **Net** | a capability under an owner/org identity |
 
 > MCP makes tools callable. NATS routes subjects. Zenoh routes data.
 > Net routes authorized capabilities.
