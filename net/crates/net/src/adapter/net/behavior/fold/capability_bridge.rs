@@ -1277,11 +1277,14 @@ pub fn filter_by_predicate(
 /// filter. `same_subnet_lookup(node_id) -> bool` is supplied
 /// by the caller; the bridge has no native subnet state.
 ///
-/// **Warm-up semantics** match the legacy path: when the
-/// caller's subnet membership is unknown for a candidate, the
-/// caller's closure decides whether to admit (typically
-/// `true` once a subnet policy is installed, `false`
-/// otherwise).
+/// `same_subnet_lookup` is invoked ONLY for candidates whose verdict
+/// actually depends on subnet membership — a [`ScopeFilter::SameSubnet`]
+/// query, or a [`CapabilityScope::SubnetLocal`] candidate under any
+/// filter. Every other candidate short-circuits without calling it. The
+/// closure is potentially expensive (the `MeshNode` implementation may
+/// take its own fold read to derive a forwarded peer's subnet), and it
+/// used to run eagerly for every candidate of every scoped query even
+/// though `matches_scope` would discard the result.
 pub fn find_nodes_matching_scoped(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
@@ -1322,7 +1325,14 @@ pub fn find_nodes_matching_scoped(
     let mut out: Vec<NodeId> = scoped
         .into_iter()
         .filter(|(node_id, candidate_scope)| {
-            matches_scope(candidate_scope, scope, same_subnet_lookup(*node_id))
+            // `matches_scope` reads `same_subnet` only on these two
+            // arms; everywhere else the argument is ignored. Skipping
+            // the lookup otherwise keeps a potentially fold-touching
+            // closure off the path for candidates it cannot affect.
+            let subnet_decides = matches!(scope, ScopeFilter::SameSubnet)
+                || matches!(candidate_scope, CapabilityScope::SubnetLocal);
+            let same_subnet = subnet_decides && same_subnet_lookup(*node_id);
+            matches_scope(candidate_scope, scope, same_subnet)
         })
         .map(|(node_id, _)| node_id)
         .collect();

@@ -26445,16 +26445,49 @@ impl MeshNode {
     /// filter resolve same-subnet membership against
     /// `peer_subnets`.
     ///
-    /// **Warm-up rule.** When a peer's subnet is unknown:
-    /// - **With** a `local_subnet_policy`, the candidate is
-    ///   admitted (a fresh peer's announcement may not have
-    ///   landed yet — the policy will resolve it on receipt).
-    /// - **Without** a `local_subnet_policy`, `peer_subnets`
-    ///   stays permanently empty (the dispatch handler only
-    ///   writes it when a policy is installed), so "unknown"
-    ///   means "will never resolve" — admitting unknowns there
-    ///   leaks every peer through `SameSubnet`. The candidate
-    ///   is excluded.
+    /// **Subnet resolution.** A candidate's subnet is resolved in two
+    /// steps, and an unresolvable candidate is excluded:
+    ///
+    /// 1. `peer_subnets` — populated from a peer's own
+    ///    signature-verified DIRECT announcement.
+    /// 2. The capability fold — for a peer we only ever learned about
+    ///    through a relay. `peer_subnets` is deliberately not written
+    ///    for forwarded announcements, because `from_node` is the relay
+    ///    rather than the origin and writing the origin's subnet under
+    ///    the relay's id would let any last hop move a peer between
+    ///    subnets. But the origin's own tags ARE available on the
+    ///    indexed announcement, and `ann.node_id` is blake2s-bound to
+    ///    `ann.entity_id` at dispatch, so the fold entry is attributable
+    ///    to the origin. Running the local policy over those tags
+    ///    resolves the subnet without trusting the relay.
+    ///
+    /// This replaces a warm-up rule that admitted every unresolved
+    /// candidate whenever a policy was installed. That window never
+    /// closed for forwarded-only peers — the normal way peers are
+    /// learned beyond a direct session — so `SameSubnet` returned peers
+    /// from arbitrary subnets and `scope:subnet-local` providers were
+    /// visible mesh-wide
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    ///
+    /// Deriving at query time rather than caching into `peer_subnets` is
+    /// deliberate: the fold entry is the authoritative record and the
+    /// policy is read live, so there is no derived copy that can
+    /// disagree with the fold after an expiry, eviction, snapshot
+    /// restore, policy replacement, or a publisher restart that resets
+    /// its version counter. A candidate with no fold entry is
+    /// unresolvable and excluded — it is NOT treated as subnet
+    /// `GLOBAL`, which would otherwise match a `GLOBAL` local subnet.
+    ///
+    /// In signed mode (`require_signed_capabilities`, the secure
+    /// default) every fold entry came from a verified announcement, so
+    /// the derived subnet rests on the same signature the direct path
+    /// requires. A deployment that opts into unsigned discovery gets
+    /// unsigned tags here exactly as it does for every other axis of the
+    /// same query.
+    ///
+    /// Subnet membership remains SELF-ASSERTED — a peer picks its own
+    /// tags, so this is a discovery filter, not an access-control
+    /// boundary. See the audit's HIGH finding on self-asserted subnets.
     pub fn find_nodes_by_filter_scoped(
         &self,
         filter: &CapabilityFilter,
@@ -26463,9 +26496,8 @@ impl MeshNode {
         let my_subnet = self.local_subnet;
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
-        // See doc-comment: without a policy, an unresolvable
-        // "unknown" cannot be admitted as same-subnet.
-        let policy_installed = self.local_subnet_policy.is_some();
+        let policy = self.local_subnet_policy.clone();
+        let fold = self.capability_fold.clone();
         super::behavior::fold::capability_bridge::find_nodes_matching_scoped(
             &self.capability_fold,
             filter,
@@ -26474,9 +26506,25 @@ impl MeshNode {
                 if nid == local_node_id {
                     return true;
                 }
-                match peer_subnets.get(&nid).map(|e| *e.value()) {
-                    Some(s) => s == my_subnet,
-                    None => policy_installed,
+                if let Some(s) = peer_subnets.get(&nid).map(|e| *e.value()) {
+                    return s == my_subnet;
+                }
+                // Forwarded-only peer. Without a policy there is nothing
+                // to resolve tags with, so the candidate stays unknown
+                // and is excluded.
+                let Some(policy) = policy.as_ref() else {
+                    return false;
+                };
+                // `_if_known` (not the plain synthesize) so a candidate
+                // with no fold entry returns None rather than an empty
+                // `CapabilitySet`, which the policy would assign to
+                // `SubnetId::GLOBAL` and wrongly match a GLOBAL local
+                // subnet.
+                match super::behavior::fold::capability_bridge::synthesize_capability_set_if_known(
+                    &fold, nid,
+                ) {
+                    Some(caps) => policy.assign(&caps) == my_subnet,
+                    None => false,
                 }
             },
         )

@@ -460,16 +460,30 @@ async fn region_scope_filters_to_matching_region() {
 }
 
 // ============================================================================
-// Regression: P1 (Cubic) — `SameSubnet` permissive default leak
+// Regression: `SameSubnet` unresolved-peer leaks
 // ============================================================================
 //
-// `find_nodes_by_filter_scoped(SameSubnet)` previously returned
-// `true` for unknown peer subnets unconditionally. When a node
-// runs without `local_subnet_policy`, `peer_subnets` stays empty,
-// so every peer registered as "unknown" — and the closure leaked
-// every peer through `SameSubnet`. Fix: warm-up permissive only
-// when a policy is installed (`peer_subnets` *might* eventually
-// resolve the unknown). Without a policy, unknown is excluded.
+// Two rounds of the same defect.
+//
+// P1 (Cubic): `find_nodes_by_filter_scoped(SameSubnet)` returned
+// `true` for unknown peer subnets unconditionally. Without a
+// `local_subnet_policy`, `peer_subnets` stays empty, so every peer
+// registered as "unknown" and the closure leaked all of them. That fix
+// made the permissive branch conditional on a policy being installed.
+//
+// The security audit found the branch still open in the configuration
+// it was narrowed to: `peer_subnets` is only written for
+// `signature_verified && hop_count == 0`, so a peer learned through a
+// relay is unresolvable forever, and the policy-installed warm-up
+// admitted it. Multi-hop is how peers are normally learned, so the
+// strictest scope leaked by default.
+//
+// The subnet is now derived from the origin's own tags on the indexed
+// announcement using the local policy, which resolves forwarded peers
+// to their real subnet instead of guessing. The tests below pin both
+// directions — a cross-subnet forwarded peer is excluded, a
+// same-subnet one is admitted — so neither "admit unresolved" nor
+// "exclude unresolved" can pass the pair.
 
 #[tokio::test]
 async fn same_subnet_without_policy_excludes_unresolved_peers() {
@@ -524,94 +538,69 @@ async fn same_subnet_without_policy_excludes_unresolved_peers() {
 }
 
 #[tokio::test]
-async fn same_subnet_with_policy_admits_unresolved_peers_via_warm_up() {
-    // Genuine warm-up regression: exercises the
-    // `None => policy_installed` branch in the SameSubnet
-    // closure on `MeshNode::find_nodes_by_filter_scoped`.
+async fn same_subnet_resolves_forwarded_peers_from_the_fold() {
+    // Multi-hop subnet resolution. `peer_subnets` is written only for
+    // `signature_verified && hop_count == 0` — correctly, since on a
+    // forwarded announcement `from_node` is the relay, not the origin.
+    // The old code compensated with a warm-up branch that admitted
+    // EVERY unresolved candidate whenever a policy was installed. That
+    // window never closed for forwarded-only peers, so `SameSubnet`
+    // returned peers from arbitrary subnets.
     //
-    // The dispatch handler at `mesh.rs::handle_capability_announcement`
-    // gates the `peer_subnets.insert(from_node, ...)` call on
-    // `signature_verified && ann.hop_count == 0`. Forwarded
-    // announcements (`hop_count > 0`) skip that insert but still
-    // index the announcement — leaving an indexed candidate
-    // whose subnet is unknown to the receiver. That's the
-    // warm-up window the closure's `None` branch handles.
+    // The subnet is now derived from the origin's own tags on the
+    // indexed announcement, using the local policy, so a forwarded peer
+    // resolves to its real subnet.
     //
-    // Topology: A — B — D, no direct session between A and D.
-    //   - A announces with `region:eu` → A's policy assigns
-    //     subnet [4].
-    //   - B receives directly (hop_count=0), populates its own
-    //     peer_subnets[A] = [4], indexes A, then forwards to D
-    //     with hop_count=1.
-    //   - D receives forwarded (hop_count=1), skips the
-    //     peer_subnets.insert(A) gate, indexes A. Result: D's
-    //     index has A but D's peer_subnets has only B.
+    // Topology: A — B — D, no direct session between A and D, so A
+    // reaches D only through B's forward and is never in D's
+    // `peer_subnets`.
     //
-    // D is in subnet [3]. A is *actually* in [4] per the policy.
-    // If D's SameSubnet closure ran the policy-installed warm-up
-    // admit, A is returned (the warm-up admits unknowns). If the
-    // closure ran the strict path, A is excluded. We assert A is
-    // returned — that's the only way the `None` branch could
-    // have produced this result.
+    // A (`region:eu`) is really in [4]; D is in [3]. A must be
+    // EXCLUDED. The companion test covers the same-subnet direction, so
+    // that "exclude everything unresolved" cannot pass both.
     let policy = region_policy();
     let a = build_node_with_policy(SubnetId::new(&[4]), policy.clone()).await; // region:eu
-    let b = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await; // region:us
+    let b = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await; // relay
     let d = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await; // observer
 
-    // A↔B, B↔D — but NOT A↔D. Without a direct session, A's
-    // announcement reaches D only via B's forward.
     handshake(&a, &b).await;
     handshake(&b, &d).await;
 
     a.announce_capabilities(
         CapabilitySet::new()
             .add_tag("region:eu") // policy → subnet [4]
-            .add_tag("warm-up-canary"),
+            .add_tag("multihop-canary"),
     )
     .await
     .expect("A announce");
 
-    let filter = CapabilityFilter::new().require_tag("warm-up-canary");
+    let filter = CapabilityFilter::new().require_tag("multihop-canary");
     let a_id = a.node_id();
 
-    // Wait for the forwarded announcement to land at D. (B
-    // re-broadcasts on receipt; the indexing tick is quick but
-    // the test harness uses 200ms heartbeats so we allow up to
-    // 2s via wait_until.)
+    // The forwarded announcement must land at D first — the scope
+    // filter is a query concern, propagation is unchanged.
     let arrived = wait_until(&d, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await;
     assert!(
         arrived,
-        "forwarded announcement from A did not land at D — \
-         multi-hop forwarding regressed?"
+        "forwarded announcement did not land at D — multi-hop \
+         forwarding regressed?"
     );
 
-    // The load-bearing assertion: D returns A under SameSubnet
-    // even though A is *actually* in subnet [4] (different from
-    // D's [3]). The only way this can be true is if D's
-    // peer_subnets does NOT contain A (so the closure hits the
-    // `None` branch) AND `policy_installed` is true (so the
-    // branch returns admit). That's the warm-up regression
-    // path covered.
     let same = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
     assert!(
-        same.contains(&a_id),
-        "policy-installed warm-up branch must admit unresolved \
-         (forwarded-only) peers under SameSubnet; got {:?}. If \
-         this assertion fails the closure's `None` branch is \
-         running strict — the real-world warm-up window for \
-         late-arriving direct announcements would now exclude \
-         peers it shouldn't.",
+        !same.contains(&a_id),
+        "A is really in subnet [4], D is in [3] — a forwarded-only peer \
+         must NOT be admitted under SameSubnet just because its subnet \
+         wasn't in peer_subnets; got {:?}",
         same
     );
 
-    // Sanity: a B (whose subnet IS resolved in D's peer_subnets
-    // because B handshook with D directly and announced) is also
-    // included — this confirms the `Some(s) => s == my_subnet`
-    // path still works alongside the warm-up branch.
+    // The direct path still works alongside it: B handshook with D
+    // directly, so it resolves through `peer_subnets`.
     b.announce_capabilities(
         CapabilitySet::new()
             .add_tag("region:us") // policy → subnet [3], same as D
-            .add_tag("warm-up-canary"),
+            .add_tag("multihop-canary"),
     )
     .await
     .expect("B announce");
@@ -623,7 +612,105 @@ async fn same_subnet_with_policy_admits_unresolved_peers_via_warm_up() {
     .await;
     assert!(
         arrived,
-        "B (resolved same-subnet peer) must also appear under SameSubnet"
+        "B (direct peer, resolved via peer_subnets) must still appear \
+         under SameSubnet"
+    );
+}
+
+/// The other direction of the same fix: a forwarded-only peer that IS in
+/// the caller's subnet must still be returned. Without this, "exclude
+/// every unresolved candidate" would pass the exclusion test while
+/// silently making `SameSubnet` useless across more than one hop.
+#[tokio::test]
+async fn same_subnet_admits_forwarded_peer_in_the_same_subnet() {
+    let policy = region_policy();
+    // A is in [3] — the same subnet as the observer — but reaches it
+    // only through the relay, so it is absent from `peer_subnets`.
+    let a = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await; // region:us
+    let b = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await; // relay
+    let d = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await; // observer
+
+    handshake(&a, &b).await;
+    handshake(&b, &d).await;
+
+    a.announce_capabilities(
+        CapabilitySet::new()
+            .add_tag("region:us") // policy → subnet [3], same as D
+            .add_tag("multihop-sibling"),
+    )
+    .await
+    .expect("A announce");
+
+    let filter = CapabilityFilter::new().require_tag("multihop-sibling");
+    let a_id = a.node_id();
+
+    let arrived = wait_until(&d, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await;
+    assert!(arrived, "forwarded announcement did not land at D");
+
+    let admitted = wait_until(&d, |n| {
+        n.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet)
+            .contains(&a_id)
+    })
+    .await;
+    assert!(
+        admitted,
+        "A is really in subnet [3] like D and reached it only via a \
+         relay — it must resolve from its own announced tags rather \
+         than being dropped as unresolvable"
+    );
+}
+
+/// A `scope:subnet-local` provider learned only through a relay must not
+/// be visible to a cross-subnet caller. This is the leak the warm-up
+/// branch produced on the strictest scope — the one an operator reaches
+/// for precisely when they want isolation.
+#[tokio::test]
+async fn subnet_local_provider_is_not_visible_cross_subnet_via_relay() {
+    let policy = region_policy();
+    let provider = build_node_with_policy(SubnetId::new(&[4]), policy.clone()).await; // region:eu
+    let relay = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await;
+    let observer = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await;
+
+    handshake(&provider, &relay).await;
+    handshake(&relay, &observer).await;
+
+    provider
+        .announce_capabilities(
+            CapabilitySet::new()
+                .add_tag("region:eu") // policy → subnet [4]
+                .add_tag("software:photoshop")
+                .with_subnet_local_scope(),
+        )
+        .await
+        .expect("provider announce");
+
+    let filter = CapabilityFilter::new().require_tag("software:photoshop");
+    let provider_id = provider.node_id();
+
+    let arrived = wait_until(&observer, |n| {
+        n.find_nodes_by_filter(&filter).contains(&provider_id)
+    })
+    .await;
+    assert!(arrived, "forwarded announcement did not reach the observer");
+
+    // The observer is in [3], the provider in [4]. SubnetLocal requires
+    // same-subnet, and the observer can now derive the provider's real
+    // subnet from the forwarded announcement's own tags.
+    let same = observer.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+    assert!(
+        !same.contains(&provider_id),
+        "a scope:subnet-local provider in another subnet must not be \
+         visible to a cross-subnet observer that learned it via a relay; \
+         got {:?}",
+        same
+    );
+
+    // And it stays excluded from the permissive filters, as before.
+    let any = observer.find_nodes_by_filter_scoped(&filter, &ScopeFilter::Any);
+    assert!(
+        !any.contains(&provider_id),
+        "SubnetLocal must stay excluded from Any; got {:?}",
+        any
     );
 }
 
