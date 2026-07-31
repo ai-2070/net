@@ -739,6 +739,8 @@ f91cff2ab  total publication-generation fence + W-W8  <- HELD (exhaustion, equal
 d70810aa4  checked exhaustion + equality witnesses    <- HELD (terminal aliasing,
            reviewed as 46af3d625 (its docs commit)         public API, terminal
                                                            scope exactness)
+b226b2dbf  terminal artifact fence + public API revert
+           (candidate head = the docs commit immediately after it)
 d70810aa4  checked exhaustion + equality + remove-if-current witnesses
            (candidate head = the docs commit immediately after it)
 ```
