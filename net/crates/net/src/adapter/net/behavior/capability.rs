@@ -659,6 +659,11 @@ pub const RELAY_CAPABLE_TAG: &str = "relay-capable";
 /// Precedence: `SubnetLocal` > tenants/regions > `Global`. A node
 /// that tags itself with both `scope:subnet-local` and
 /// `scope:tenant:foo` resolves to `SubnetLocal` (strictest wins).
+///
+/// Constructed only by `scope_from_membership_tags`, which is now the
+/// reference definition behind [`tags_match_scope`] rather than a query
+/// path — see those two for why the materialized form is retained.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CapabilityScope {
     /// No `scope:*` tag, or `scope:global` only — visible to every
@@ -789,6 +794,13 @@ pub enum ScopeFilter<'a> {
 /// same-subnet membership). For the warm-up case where one
 /// side's subnet isn't known yet, callers default `same_subnet`
 /// to `true` (permissive).
+///
+/// No longer on the query path — [`tags_match_scope`] evaluates the same
+/// decision straight off the borrowed tags without allocating. This is
+/// kept as the readable reference definition and as the oracle the
+/// equivalence test checks the fast path against, so the scope matrix
+/// stays legible in one place.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn matches_scope(
     candidate_scope: &CapabilityScope,
     filter: &ScopeFilter<'_>,
@@ -842,6 +854,98 @@ pub(crate) fn matches_scope(
             rs.iter().any(|x| wanted.iter().any(|w| w == x))
         }
         (F::Regions(_), S::Tenants(_)) => false,
+    }
+}
+
+/// Allocation-free equivalent of
+/// `matches_scope(&scope_from_membership_tags(tags), filter, same_subnet)`,
+/// evaluated directly against a membership's borrowed tag strings.
+///
+/// The materializing form allocates a `String` per `scope:tenant:` /
+/// `scope:region:` tag and a `Vec` to hold them, per candidate, per
+/// query — and the query path runs it while the fold's state and index
+/// read locks are held, so the allocation extends lock hold time under
+/// input an announcer chooses. This streams the same decision in one
+/// pass with no allocation
+/// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+///
+/// `scope_from_membership_tags` is retained as the readable reference
+/// definition; `tags_match_scope_agrees_with_materialized_scope` pins
+/// the two to the same verdict across the matrix.
+pub(crate) fn tags_match_scope(
+    tags: &[String],
+    filter: &ScopeFilter<'_>,
+    same_subnet: bool,
+) -> bool {
+    use ScopeFilter as F;
+
+    // Under `SameSubnet` every arm of `matches_scope` reduces to
+    // `same_subnet` — including the `SubnetLocal` candidate arm — so the
+    // tags cannot change the verdict and we skip the scan entirely.
+    if matches!(filter, F::SameSubnet) {
+        return same_subnet;
+    }
+
+    // One pass: classify the candidate and test the filter's selectors
+    // against the borrowed bodies as we go.
+    let (mut has_tenant, mut has_region) = (false, false);
+    let (mut tenant_hit, mut region_hit) = (false, false);
+    for tag in tags {
+        let Some(body) = tag.strip_prefix("scope:") else {
+            continue;
+        };
+        if body == "subnet-local" {
+            // Strictest scope wins, and every non-`SameSubnet` filter
+            // rejects it — the announcer opted out of cross-subnet
+            // discovery.
+            return false;
+        }
+        if let Some(id) = body.strip_prefix("tenant:") {
+            if id.is_empty() {
+                continue; // matches the resolver: empty ids are not scopes
+            }
+            has_tenant = true;
+            tenant_hit |= match filter {
+                F::Tenant(t) => id == *t,
+                F::Tenants(wanted) => wanted.iter().any(|w| id == *w),
+                _ => false,
+            };
+        } else if let Some(name) = body.strip_prefix("region:") {
+            if name.is_empty() {
+                continue;
+            }
+            has_region = true;
+            region_hit |= match filter {
+                F::Region(r) => name == *r,
+                F::Regions(wanted) => wanted.iter().any(|w| name == *w),
+                _ => false,
+            };
+        }
+        // `scope:global` is the default; presence is a no-op.
+    }
+
+    match filter {
+        F::SameSubnet => unreachable!("handled above"),
+        F::Any => true,
+        // Global == carries no tenant or region scope.
+        F::GlobalOnly => !has_tenant && !has_region,
+        // A tenant query matches a tenant-tagged candidate on a hit, an
+        // untagged (Global) candidate permissively, and a region-only
+        // candidate never — the axes are independent.
+        F::Tenant(_) | F::Tenants(_) => {
+            if has_tenant {
+                tenant_hit
+            } else {
+                !has_region
+            }
+        }
+        F::Region(_) | F::Regions(_) => {
+            if has_region {
+                region_hit
+            } else {
+                !has_tenant
+            }
+        }
     }
 }
 
@@ -3880,6 +3984,70 @@ mod tests {
     // is tested in `behavior::fold::capability_bridge::tests` under
     // `scope_from_membership_tags`.
     // ========================================================================
+
+    /// `tags_match_scope` (allocation-free, used on the query path) must
+    /// agree with `matches_scope(&scope_from_membership_tags(..))` (the
+    /// readable reference) on every combination that matters. If these
+    /// ever diverge, the fast path silently changes who is discoverable.
+    #[test]
+    fn tags_match_scope_agrees_with_materialized_scope() {
+        use super::super::fold::capability_bridge::scope_from_membership_tags;
+
+        let tag_sets: Vec<Vec<String>> = vec![
+            vec![],                                          // Global
+            vec!["scope:global".into()],                     // Global (explicit)
+            vec!["gpu".into(), "hardware.gpu".into()],       // Global + noise
+            vec!["scope:subnet-local".into()],               // SubnetLocal
+            vec![
+                "scope:subnet-local".into(),
+                "scope:tenant:oem-123".into(),               // strictest wins
+            ],
+            vec!["scope:tenant:oem-123".into()],
+            vec![
+                "scope:tenant:oem-123".into(),
+                "scope:tenant:corp-acme".into(),
+            ],
+            vec!["scope:region:eu-west".into()],
+            vec![
+                "scope:region:eu-west".into(),
+                "scope:region:us-east".into(),
+            ],
+            vec![
+                "scope:tenant:oem-123".into(),
+                "scope:region:eu-west".into(),               // TenantsAndRegions
+            ],
+            vec!["scope:tenant:".into()],                    // empty id → not a scope
+            vec!["scope:region:".into()],
+        ];
+        let tenants_multi = ["oem-123", "other"];
+        let regions_multi = ["eu-west", "ap-south"];
+        let filters = vec![
+            ScopeFilter::Any,
+            ScopeFilter::GlobalOnly,
+            ScopeFilter::SameSubnet,
+            ScopeFilter::Tenant("oem-123"),
+            ScopeFilter::Tenant("nobody"),
+            ScopeFilter::Tenants(&tenants_multi),
+            ScopeFilter::Region("eu-west"),
+            ScopeFilter::Region("nowhere"),
+            ScopeFilter::Regions(&regions_multi),
+        ];
+
+        for tags in &tag_sets {
+            let materialized = scope_from_membership_tags(tags);
+            for filter in &filters {
+                for same_subnet in [false, true] {
+                    let reference = matches_scope(&materialized, filter, same_subnet);
+                    let fast = tags_match_scope(tags, filter, same_subnet);
+                    assert_eq!(
+                        fast, reference,
+                        "divergence for tags={tags:?} filter={filter:?} \
+                         same_subnet={same_subnet}: fast={fast} reference={reference}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn matches_scope_global_visible_to_tenant_filter() {

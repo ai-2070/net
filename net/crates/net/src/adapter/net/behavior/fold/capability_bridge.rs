@@ -25,7 +25,7 @@
 //!   replacement for the legacy `find_nodes_scoped`.
 
 use super::super::capability::{
-    matches_scope, CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope,
+    tags_match_scope, CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope,
     GpuVendor, ScopeFilter,
 };
 use super::super::org::OrgId;
@@ -1206,6 +1206,15 @@ pub fn target_matches_filter(
 /// `pub(crate)` because [`CapabilityScope`] is itself
 /// `pub(crate)`; downstream callers reach scope filtering
 /// through [`find_nodes_matching_scoped`].
+///
+/// No longer on the query path — that now runs
+/// [`tags_match_scope`](super::super::capability::tags_match_scope),
+/// which reaches the same verdict without allocating a `String` per
+/// scope tag while the fold's read locks are held. Retained as the
+/// readable reference definition and as the oracle for
+/// `tags_match_scope_agrees_with_materialized_scope`, which pins the
+/// two to identical verdicts across the scope matrix.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn scope_from_membership_tags(tags: &[String]) -> CapabilityScope {
     let mut tenants: Vec<String> = Vec::new();
     let mut regions: Vec<String> = Vec::new();
@@ -1294,18 +1303,30 @@ pub fn find_nodes_matching_scoped(
     let fold_filter = translate_filter(legacy);
     // Borrow-and-filter, same as `find_nodes_matching`: resolve
     // candidate keys via the index and run the range post-filter
-    // against borrowed payloads without cloning. We derive each
-    // survivor's scope here too (cheap, just parses the borrowed
-    // tags), but we do NOT call `same_subnet_lookup` under the
-    // lock — it's a caller-supplied closure opaque to the bridge,
-    // so running it while we hold the fold read locks risks lock
-    // contention or re-entrancy (a closure that itself queries the
-    // fold). Collect `(node, scope)` and apply the subnet/scope
-    // gate after the locks drop.
-    let scoped: Vec<(NodeId, CapabilityScope)> = fold.with_state_and_index(|state, index| {
+    // against borrowed payloads without cloning.
+    //
+    // The scope decision runs here too, but through
+    // [`tags_match_scope`], which streams the borrowed tag strings
+    // without materializing a `CapabilityScope`. The materializing
+    // form allocated a `String` per scope tag plus a `Vec` per
+    // candidate, per query, while these read locks were held — cost an
+    // announcer controls, paid by every peer on every scoped query.
+    //
+    // `same_subnet_lookup` still runs OUTSIDE the locks: it is a
+    // caller-supplied closure opaque to the bridge, and the `MeshNode`
+    // implementation takes its own fold read to resolve forwarded
+    // peers, so calling it here would risk contention or re-entrancy.
+    //
+    // Under `ScopeFilter::SameSubnet` every arm of the scope decision
+    // reduces to `same_subnet`, so the whole candidate set defers to
+    // the closure and the tags are not consulted at all. Under every
+    // other filter the verdict is fully determined here and nothing
+    // defers.
+    let defer_to_subnet_lookup = matches!(scope, ScopeFilter::SameSubnet);
+    let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
         let candidates = candidates.as_set();
-        let mut acc: Vec<(NodeId, CapabilityScope)> = Vec::with_capacity(candidates.len());
+        let mut acc: Vec<NodeId> = Vec::with_capacity(candidates.len());
         for &key in candidates {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
@@ -1316,26 +1337,18 @@ pub fn find_nodes_matching_scoped(
             if !membership_passes_range_filter(membership, legacy) {
                 continue;
             }
-            acc.push((key.1, scope_from_membership_tags(&membership.tags)));
+            // `same_subnet` is unread on every arm reachable here, so
+            // the placeholder never affects the verdict.
+            if defer_to_subnet_lookup || tags_match_scope(&membership.tags, scope, false) {
+                acc.push(key.1);
+            }
         }
         acc
     });
-    // Locks released: apply the scope gate, invoking the caller's
-    // subnet closure outside any fold lock.
-    let mut out: Vec<NodeId> = scoped
-        .into_iter()
-        .filter(|(node_id, candidate_scope)| {
-            // `matches_scope` reads `same_subnet` only on these two
-            // arms; everywhere else the argument is ignored. Skipping
-            // the lookup otherwise keeps a potentially fold-touching
-            // closure off the path for candidates it cannot affect.
-            let subnet_decides = matches!(scope, ScopeFilter::SameSubnet)
-                || matches!(candidate_scope, CapabilityScope::SubnetLocal);
-            let same_subnet = subnet_decides && same_subnet_lookup(*node_id);
-            matches_scope(candidate_scope, scope, same_subnet)
-        })
-        .map(|(node_id, _)| node_id)
-        .collect();
+    // Locks released. Only a `SameSubnet` query reaches the closure.
+    if defer_to_subnet_lookup {
+        out.retain(|node_id| same_subnet_lookup(*node_id));
+    }
     // Sort + dedup: deterministic order and one entry per publisher
     // (a publisher may match under multiple classes).
     out.sort_unstable();
