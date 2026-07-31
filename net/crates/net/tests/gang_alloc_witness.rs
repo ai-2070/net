@@ -64,12 +64,29 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static ALLOCATOR: CountingAlloc = CountingAlloc;
 
+/// Disarms counting on drop, so a panic inside a measured closure
+/// cannot leave the thread's counter armed for whatever runs next.
+///
+/// Not merely tidy: a `#[test]` that fails while counting is on would
+/// charge the harness's own unwinding — and any later measurement
+/// sharing the thread — to a counter nobody reset, turning one real
+/// failure into a second, misleading one. Cheap enough to be
+/// unconditional.
+struct CountingGuard;
+
+impl Drop for CountingGuard {
+    fn drop(&mut self) {
+        COUNTING.set(false);
+    }
+}
+
 /// Run `f` with allocation counting on, returning its allocation count.
 fn count_allocs<R>(f: impl FnOnce() -> R) -> (usize, R) {
     ALLOCS.set(0);
     COUNTING.set(true);
+    let _guard = CountingGuard;
     let out = f();
-    COUNTING.set(false);
+    drop(_guard);
     (ALLOCS.get(), out)
 }
 
@@ -212,6 +229,40 @@ fn matcher_allocations_do_not_scale_with_capability_payload_size() {
     println!(
         "§1 matcher allocations over {HOSTS} hosts: {lean_allocs} (1 tag) vs \
          {fat_allocs} (40 tags)",
+    );
+}
+
+/// Review §8: a panic inside a measured closure must not leave the
+/// thread's counter armed for whatever runs next.
+///
+/// Runs first in file order but the ordering is not relied on — the
+/// point is the assertion after the unwind, plus the demonstration
+/// that a following measurement is unpolluted.
+#[test]
+fn a_panicking_measurement_does_not_leave_counting_armed() {
+    // The default hook would print a panic + backtrace note for a
+    // panic this test is deliberately causing.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        count_allocs(|| panic!("deliberate panic inside a measured closure"));
+    }));
+    std::panic::set_hook(hook);
+
+    assert!(outcome.is_err(), "the closure must actually have panicked");
+    assert!(
+        !COUNTING.get(),
+        "counting stayed armed through an unwind — the next measurement on this \
+         thread would be charged for work it never ran",
+    );
+
+    // And the counter is usable again: one `Vec` allocation, from a
+    // counter that was reset rather than carried over.
+    let (allocs, v) = count_allocs(|| vec![0u8; 64]);
+    assert_eq!(v.len(), 64);
+    assert_eq!(
+        allocs, 1,
+        "a measurement after an unwind must start from a clean counter",
     );
 }
 
