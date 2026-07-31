@@ -113,6 +113,30 @@ pub fn match_islands(
     criteria: &MatchCriteria,
     down_nodes: &HashSet<NodeId>,
 ) -> Vec<IslandId> {
+    let candidates = match_island_records(capability_fold, topology_fold, criteria, down_nodes);
+    // [3] selection ordering (with soft capability affinity) → claim
+    // order.
+    select_with_affinity(
+        candidates,
+        criteria.selection,
+        criteria.prefer_capability.clone(),
+    )
+}
+
+/// Steps 1–2 of [`match_islands`], stopping before the selection
+/// ordering: the filter-passing island *records* from ONE topology
+/// read.
+///
+/// Split out so [`match_islands_sensed`] can derive its band map
+/// from the very records that produced the ordering, instead of
+/// taking a second whole-topology snapshot to recover a field it
+/// already had in hand (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §3).
+fn match_island_records(
+    capability_fold: &Fold<CapabilityFold>,
+    topology_fold: &Fold<IslandTopologyFold>,
+    criteria: &MatchCriteria,
+    down_nodes: &HashSet<NodeId>,
+) -> Vec<IslandRecord> {
     // [1] coarse capability match → candidate hosts. Resolved
     // straight to node ids: the matched `CapabilityMembership`
     // payloads are never materialized, because this step keeps only
@@ -137,19 +161,12 @@ pub fn match_islands(
     // HostedByAny query filters by host inside the fold's single scan,
     // so only candidate-host islands are cloned (not the whole
     // topology, then discarded) — this runs on every claim retry.
-    let candidates: Vec<IslandRecord> = topology_fold
+    topology_fold
         .query(IslandQuery::HostedByAny(hosts))
         .into_iter()
         .map(|(_, record)| record)
         .filter(|record| criteria.numeric.accepts(record))
-        .collect();
-    // [3] selection ordering (with soft capability affinity) → claim
-    // order.
-    select_with_affinity(
-        candidates,
-        criteria.selection,
-        criteria.prefer_capability.clone(),
-    )
+        .collect()
 }
 
 /// SI-6 (sensing plan §6/§4.9): [`match_islands`] with the sensed
@@ -168,6 +185,23 @@ pub fn match_islands(
 /// of an unsensed/potential host — keep the selection policy's
 /// order. Both inputs empty ⇒ byte-identical to [`match_islands`]:
 /// absence of evidence never prunes and never reorders.
+///
+/// # Snapshot contract (locked, PERF_AUDIT_2026_07_31_GANG_SCHEDULER §3)
+///
+/// Band assignment uses the **same topology snapshot that produced
+/// the filtered and selected records**. Topology replacements or
+/// evictions after that snapshot affect the next matcher invocation,
+/// not the in-progress one.
+///
+/// This intentionally replaced a mixed-time read: selection used
+/// snapshot T1 while banding re-read the fold for T2. Since banding
+/// consults only `IslandRecord::host`, an ordinary same-host
+/// heartbeat never moved a band either way; the observable
+/// difference was an island **evicted or expired** between T1 and
+/// T2, which T2 could no longer find and so dropped into the
+/// trailing band — and, if the same `IslandId` was reinserted under
+/// a different host, T2 banded it by the new host. One snapshot
+/// makes both cases rank by what the matcher actually selected.
 pub fn match_islands_sensed(
     capability_fold: &Fold<CapabilityFold>,
     topology_fold: &Fold<IslandTopologyFold>,
@@ -176,36 +210,42 @@ pub fn match_islands_sensed(
     sensed_non_viable: &HashSet<NodeId>,
     sensed_viable_order: &[NodeId],
 ) -> Vec<IslandId> {
-    let pruned: HashSet<NodeId> = if sensed_non_viable.is_empty() {
-        down_nodes.clone()
+    // Borrowed when there is no sensed prune — the common path, and
+    // the one the contract above calls "byte-identical to
+    // match_islands" (§3).
+    let pruned: std::borrow::Cow<'_, HashSet<NodeId>> = if sensed_non_viable.is_empty() {
+        std::borrow::Cow::Borrowed(down_nodes)
     } else {
-        down_nodes.union(sensed_non_viable).copied().collect()
+        std::borrow::Cow::Owned(down_nodes.union(sensed_non_viable).copied().collect())
     };
-    let mut ordered = match_islands(capability_fold, topology_fold, criteria, &pruned);
+    // ONE topology read (T1). `candidates` carries the host field
+    // banding needs, so no second scan is taken to recover it.
+    let candidates = match_island_records(capability_fold, topology_fold, criteria, &pruned);
+    let hosts: std::collections::HashMap<IslandId, NodeId> =
+        candidates.iter().map(|r| (r.id, r.host)).collect();
+    let mut ordered = select_with_affinity(
+        candidates,
+        criteria.selection,
+        criteria.prefer_capability.clone(),
+    );
     if sensed_viable_order.is_empty() || ordered.len() < 2 {
         return ordered;
     }
-    // SI-6 review (non-blocking note, taken) + SI-6.1 closure
-    // refinement: derive the island → band map from ONE literal
-    // topology snapshot — a single `All` scan, not one `Get` per
-    // island (separate fold reads could interleave with concurrent
-    // updates and hand the sort a mixed-time view). No fold queries
-    // inside the O(n log n) sort.
-    let snapshot: std::collections::HashMap<IslandId, NodeId> = topology_fold
-        .query(IslandQuery::All)
-        .into_iter()
-        .map(|(island, record)| (island, record.host))
-        .collect();
+    // Provider → rank, resolved once. The linear `position()` this
+    // replaces ran per island, making band derivation
+    // O(islands × providers). `or_insert` keeps first-occurrence
+    // wins, exactly as `position()` did for a duplicated provider.
+    let mut provider_rank: std::collections::HashMap<NodeId, usize> =
+        std::collections::HashMap::with_capacity(sensed_viable_order.len());
+    for (rank, provider) in sensed_viable_order.iter().enumerate() {
+        provider_rank.entry(*provider).or_insert(rank);
+    }
     let bands: std::collections::HashMap<IslandId, usize> = ordered
         .iter()
         .map(|island| {
-            let band = snapshot
+            let band = hosts
                 .get(island)
-                .and_then(|host| {
-                    sensed_viable_order
-                        .iter()
-                        .position(|provider| provider == host)
-                })
+                .and_then(|host| provider_rank.get(host).copied())
                 // Unsensed / potential hosts form the trailing
                 // band, in the selection policy's own order.
                 .unwrap_or(usize::MAX);
@@ -213,6 +253,7 @@ pub fn match_islands_sensed(
         })
         .collect();
     // Stable: within a band, the [3]-step selection order survives.
+    // No fold queries inside the O(n log n) sort.
     ordered.sort_by_key(|island| bands.get(island).copied().unwrap_or(usize::MAX));
     ordered
 }
@@ -276,6 +317,40 @@ mod tests {
         )
         .expect("sign cap");
         fold.apply(ann).expect("apply cap");
+    }
+
+    /// Announce island `id` hosted by `node` with `load`, at
+    /// `generation` — the heartbeat form, so a test can replace a
+    /// live entry (`merge` requires a strictly-higher generation
+    /// from the same publisher).
+    fn announce_island_gen(
+        fold: &Fold<IslandTopologyFold>,
+        kp: &EntityKeypair,
+        node: u64,
+        id: IslandId,
+        units: usize,
+        load: f32,
+        generation: u64,
+    ) {
+        let record = IslandRecord {
+            id,
+            units: UnitSet::new((0..units as u32).collect()),
+            host: node,
+            capabilities: vec!["model:a1".into()],
+            load,
+            p50_latency_us: 1_500,
+        };
+        let ann = SignedAnnouncement::sign(
+            kp,
+            IslandTopologyFold::KIND_ID,
+            0,
+            node,
+            generation,
+            EnvelopeMeta::default(),
+            record,
+        )
+        .expect("sign island");
+        fold.apply(ann).expect("apply island");
     }
 
     /// Announce island `id` hosted by `node` with `load`.
@@ -424,6 +499,205 @@ mod tests {
             match_islands(&caps, &topo, &criteria, &HashSet::new()),
             vec![0xA0, 0xB0, 0xC0],
             "one interest's NotReady never suspends the entry",
+        );
+    }
+
+    // -----------------------------------------------------------
+    // PERF_AUDIT_2026_07_31_GANG_SCHEDULER §3 — locked T1 snapshot.
+    // -----------------------------------------------------------
+
+    /// A three-host sensed fixture: A/B/C each carry the tag and
+    /// host one island, loads ascending so the plain selection
+    /// order is deterministic (A, B, C).
+    fn sensed_fixture() -> (
+        Fold<CapabilityFold>,
+        Fold<IslandTopologyFold>,
+        Vec<EntityKeypair>,
+        Vec<NodeId>,
+        MatchCriteria,
+    ) {
+        let caps: Fold<CapabilityFold> = new_fold();
+        let topo: Fold<IslandTopologyFold> = new_fold();
+        let kps: Vec<EntityKeypair> = (0..3).map(|_| EntityKeypair::generate()).collect();
+        let nodes: Vec<NodeId> = kps.iter().map(|k| k.entity_id().node_id()).collect();
+        for (i, (kp, node)) in kps.iter().zip(nodes.iter()).enumerate() {
+            announce_capability(&caps, kp, *node, vec!["gpu:h100".into()]);
+            announce_island(
+                &topo,
+                kp,
+                *node,
+                0xA0 + i as u64,
+                8,
+                0.1 + 0.1 * i as f32,
+            );
+        }
+        let criteria = MatchCriteria {
+            capability: CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
+                ..Default::default()
+            }),
+            numeric: NumericFilter {
+                min_units: 8,
+                ..Default::default()
+            },
+            selection: SelectionPolicy::LeastLoaded,
+            prefer_capability: None,
+        };
+        (caps, topo, kps, nodes, criteria)
+    }
+
+    /// §3, the direct witness: the sensed matcher must read the
+    /// topology fold EXACTLY ONCE. Pre-fix it took two snapshots —
+    /// `HostedByAny` for selection, then a whole-topology `All`
+    /// scan purely to recover `record.host` for banding — so this
+    /// asserted a delta of 2. The fold's own query counter is the
+    /// instrument, so the test cannot be satisfied by a faster
+    /// second scan; only by not taking one.
+    #[test]
+    fn sensed_match_takes_exactly_one_topology_snapshot() {
+        let (caps, topo, _kps, nodes, criteria) = sensed_fixture();
+
+        let before = topo.metrics().queries();
+        let order = match_islands_sensed(
+            &caps,
+            &topo,
+            &criteria,
+            &HashSet::new(),
+            &HashSet::new(),
+            // Non-empty and re-ranking, so the banding path runs.
+            &[nodes[2], nodes[0]],
+        );
+        let delta = topo.metrics().queries() - before;
+
+        assert_eq!(order.len(), 3, "the re-ranking path must have run");
+        assert_eq!(
+            delta, 1,
+            "sensed banding must reuse the selection snapshot, not take a second one",
+        );
+    }
+
+    /// §3 negative control: banding reads only `IslandRecord::host`,
+    /// so an ordinary same-host heartbeat — new generation, new
+    /// load, same host — must not move any band. This is the case
+    /// that does NOT differ between the old two-snapshot read and
+    /// the locked one-snapshot contract, and pinning it keeps the
+    /// contract's scope honest.
+    #[test]
+    fn same_host_heartbeat_does_not_change_band_assignment() {
+        let (caps, topo, kps, nodes, criteria) = sensed_fixture();
+        let viable = [nodes[2], nodes[0]];
+
+        let before = match_islands_sensed(
+            &caps,
+            &topo,
+            &criteria,
+            &HashSet::new(),
+            &HashSet::new(),
+            &viable,
+        );
+        // C's island re-announced by C at a higher generation with a
+        // different load — a heartbeat. Host is unchanged.
+        announce_island_gen(&topo, &kps[2], nodes[2], 0xA2, 8, 0.99, 2);
+
+        let after = match_islands_sensed(
+            &caps,
+            &topo,
+            &criteria,
+            &HashSet::new(),
+            &HashSet::new(),
+            &viable,
+        );
+        assert_eq!(
+            before, after,
+            "a same-host heartbeat must not change band assignment",
+        );
+    }
+
+    /// §3: an island evicted after a match affects the NEXT
+    /// invocation, not the completed one. The locked contract says
+    /// post-snapshot topology changes land on the next matcher run;
+    /// this pins that the completed result is unaffected and the
+    /// next one is.
+    #[test]
+    fn eviction_lands_on_the_next_invocation_not_the_completed_one() {
+        let (caps, topo, _kps, nodes, criteria) = sensed_fixture();
+        let viable = [nodes[2], nodes[0]];
+
+        let first = match_islands_sensed(
+            &caps,
+            &topo,
+            &criteria,
+            &HashSet::new(),
+            &HashSet::new(),
+            &viable,
+        );
+        // C leads (best-ranked viable), then A, then unsensed B.
+        assert_eq!(first, vec![0xA2, 0xA0, 0xA1]);
+
+        // Evict C's island entirely.
+        topo.evict_node(nodes[2], "test");
+
+        let second = match_islands_sensed(
+            &caps,
+            &topo,
+            &criteria,
+            &HashSet::new(),
+            &HashSet::new(),
+            &viable,
+        );
+        assert_eq!(
+            first,
+            vec![0xA2, 0xA0, 0xA1],
+            "the completed result must be unchanged by a later eviction",
+        );
+        assert_eq!(
+            second,
+            vec![0xA0, 0xA1],
+            "the next invocation must reflect the eviction",
+        );
+    }
+
+    /// §3: eviction followed by reinsertion of the same `IslandId`
+    /// under a DIFFERENT host — constructible because `merge`'s
+    /// first-writer pin only holds while the entry exists. The
+    /// island must band by its new host on the next invocation,
+    /// from the one snapshot that invocation takes.
+    #[test]
+    fn island_reinserted_under_a_new_host_bands_by_that_host() {
+        let (caps, topo, kps, nodes, criteria) = sensed_fixture();
+        // Rank B first, then A. C is unsensed (trailing band).
+        let viable = [nodes[1], nodes[0]];
+
+        assert_eq!(
+            match_islands_sensed(
+                &caps,
+                &topo,
+                &criteria,
+                &HashSet::new(),
+                &HashSet::new(),
+                &viable,
+            ),
+            vec![0xA1, 0xA0, 0xA2],
+            "B's island leads, then A's, then unsensed C's",
+        );
+
+        // C's island 0xA2 is evicted, then re-announced by B — the
+        // same island id under a new host.
+        topo.evict_node(nodes[2], "test");
+        announce_island_gen(&topo, &kps[1], nodes[1], 0xA2, 8, 0.35, 1);
+
+        let after = match_islands_sensed(
+            &caps,
+            &topo,
+            &criteria,
+            &HashSet::new(),
+            &HashSet::new(),
+            &viable,
+        );
+        assert_eq!(
+            after,
+            vec![0xA1, 0xA2, 0xA0],
+            "0xA2 must band by its NEW host B (leading band), not its old host C",
         );
     }
 

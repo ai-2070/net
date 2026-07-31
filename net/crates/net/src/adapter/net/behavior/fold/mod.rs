@@ -53,7 +53,7 @@ pub use island::{
 };
 pub use metrics::{FoldMetrics, FoldStats};
 pub use reservation::{
-    JobId, ReservationAnnouncement, ReservationFold, ReservationQuery, ReservationRow,
+    holder_of, JobId, ReservationAnnouncement, ReservationFold, ReservationQuery, ReservationRow,
     ReservationState, ResourceId,
 };
 pub use routing::{RouteAnnouncement, RouteRow, RoutingFold, RoutingQuery};
@@ -649,7 +649,31 @@ impl<K: FoldKind> Fold<K> {
     /// diagnostics use this; production query paths should go
     /// through [`Self::query`] so [`FoldKind::query`] can use
     /// the secondary index.
+    ///
+    /// Deliberately **not** metered. A production read that is
+    /// replacing a [`Self::query`] call must use
+    /// [`Self::with_state_query`] instead, or the fold's query
+    /// counter silently loses that traffic.
     pub fn with_state<R>(&self, f: impl FnOnce(&FoldState<K>) -> R) -> R {
+        let state = self.state.read();
+        f(&state)
+    }
+
+    /// Metered borrow of the live state — [`Self::with_state`] plus
+    /// the query counter [`Self::query`] and
+    /// [`Self::with_state_and_index`] both bump.
+    ///
+    /// This is what a production read reaches for when it wants to
+    /// answer a question from borrowed state instead of a
+    /// [`FoldKind::Result`] the caller would immediately throw away
+    /// — e.g. "who holds this reservation?", which via
+    /// `ReservationQuery::State` allocates a one-row `Vec` per call.
+    /// Swapping such a call to the unmetered [`Self::with_state`]
+    /// would drop it out of the fold's query telemetry, which is a
+    /// silent operational regression rather than an optimization
+    /// (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+    pub fn with_state_query<R>(&self, f: impl FnOnce(&FoldState<K>) -> R) -> R {
+        self.metrics.on_query();
         let state = self.state.read();
         f(&state)
     }

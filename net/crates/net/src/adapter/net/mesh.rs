@@ -27282,13 +27282,11 @@ impl MeshNode {
         &self,
         island: super::behavior::fold::IslandId,
     ) -> Result<super::behavior::gang::ClaimOutcome, AdapterError> {
-        use super::behavior::fold::ReservationQuery;
-        let held_by_us = self
-            .reservation_fold
-            .query(ReservationQuery::State(island))
-            .first()
-            .and_then(|(_, state)| state.holder())
-            == Some(self.node_id);
+        // Borrowed holder read — same metered query, without the
+        // one-row `Vec` `ReservationQuery::State` allocates
+        // (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+        let held_by_us =
+            super::behavior::fold::holder_of(&self.reservation_fold, island) == Some(self.node_id);
         if !held_by_us {
             return Ok(super::behavior::gang::ClaimOutcome::Lost);
         }

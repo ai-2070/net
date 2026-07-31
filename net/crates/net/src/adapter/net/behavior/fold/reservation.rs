@@ -151,6 +151,29 @@ pub enum ReservationQuery {
 /// Query result row.
 pub type ReservationRow = (ResourceId, ReservationState);
 
+/// Who currently holds `resource_id`, or `None` if it is unheld,
+/// `Free`, or absent.
+///
+/// The allocation-free counterpart to
+/// `query(ReservationQuery::State(id))` for the callers that only
+/// want the holder: that query wraps its single row in a `Vec`
+/// (`.map(|e| vec![…])`), so every holder check on the release /
+/// rollback paths allocated one throwaway `Vec`
+/// (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+///
+/// Goes through [`super::Fold::with_state_query`], **not**
+/// `with_state`: it replaces a metered `query` call, so it must keep
+/// bumping the fold's query counter or the swap silently changes
+/// operational telemetry.
+pub fn holder_of(fold: &super::Fold<ReservationFold>, resource_id: ResourceId) -> Option<NodeId> {
+    fold.with_state_query(|state| {
+        state
+            .entries
+            .get(&resource_id)
+            .and_then(|entry| entry.payload.state.holder())
+    })
+}
+
 /// Marker type for the [`FoldKind`] impl. `ReservationFold`
 /// itself carries no state — that lives in the
 /// [`super::Fold`] instance parameterized by this type.
