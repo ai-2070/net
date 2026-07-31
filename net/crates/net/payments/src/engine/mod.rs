@@ -531,7 +531,7 @@ pub struct PaymentEngine {
 /// still want to re-check.
 ///
 /// **The horizon IS the re-verification window, and it is the only gate.**
-/// [`QuoteRecord::is_prunable_at`] does not consult the record's verified
+/// `QuoteRecord::is_prunable_at` does not consult the record's verified
 /// tier, so a record served at `observed` — the facilitator's receipt
 /// alone, and the facilitator is deliberately not in the trust root —
 /// retires on the same clock as one an independent checker drove to
@@ -563,8 +563,7 @@ pub struct PaymentEngine {
 ///
 /// **What this does NOT bound.** That figure is the redeemed steady state,
 /// and compaction is not a bound on store size in general — two classes of
-/// record are permanent by construction (see
-/// [`QuoteRecord::is_prunable_at`]):
+/// record are permanent by construction (see `QuoteRecord::is_prunable_at`):
 ///
 /// - **settled, billed, published, never redeemed** — a normal outcome, not
 ///   an error: the caller pays and then crashes, times out, or simply never
@@ -1951,7 +1950,7 @@ impl PaymentEngine {
     /// next payment.
     ///
     /// Only terminal records past the horizon are affected, and settlement
-    /// tombstones are never removed — see [`prune_terminal`].
+    /// tombstones are never removed — see `prune_terminal`.
     pub async fn prune_terminal_records(&self, now_ns: u64) -> Result<usize, EngineError> {
         let retention_ns = self.terminal_record_retention_ns;
         let tolerance_ns = self.expiry_tolerance_ns;
