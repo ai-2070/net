@@ -8,9 +8,10 @@ reads and writes — `fold/capability.rs` (step 1), `fold/island.rs` (step 2),
 the Cortex claim pipeline in `adapter/net/cortex/workflow/step.rs`, and the existing
 island-claim bench suite (`benches/island_claim_*.rs`).
 
-**Status: slices 1–3 implemented (see "Recommended order of attack"); slice 4 held, slice 5
-blocked. Nothing here is measured** — the implemented slices landed on correctness and
-mechanism witnesses, not on benchmark evidence.
+**Status: slices 1–3 implemented and measured (see "Measured results"); slice 4 held,
+slice 5 blocked.** ICB-1's improvement is attributable entirely to slice 2; slices 1 and 3
+are not exercised by that bench and rest on allocation / snapshot-count witnesses instead.
+No threshold or public performance claim is made here — ICB-7 owns those.
 Every cost claim below is derived from reading the code; the one absolute latency figure
 used (Ed25519 sign ≈ 50 µs) is quoted from this repo's own
 `PERF_AUDIT_2026_06_10_FULL_CRATE.md`, not re-measured. Treat the ranking as a hypothesis
@@ -577,14 +578,129 @@ rather than merely passing alongside it:
 The §3 snapshot test asserts on the fold's own query counter, so it cannot be satisfied by
 a *faster* second scan — only by not taking one.
 
-**Performance evidence is NOT yet collected.** Slices 1–3 landed on correctness and
-mechanism witnesses alone. The measurement contract above still has to be run against them
-before any performance claim is made about this work; nothing here has been benchmarked,
-and no row of ICB-1 or ICB-5 has been compared before/after.
-
 **Pre-existing, unrelated:** `tests/sensing_origin_emitter.rs` does not compile under
 `--features net` alone (missing `sensing_consumer_cell_interval_for_test`). Confirmed
 present on this branch with all slice changes stashed.
+
+---
+
+## Measured results (2026-08-01)
+
+Run under the measurement contract above. **The headline: ICB-1's improvement is entirely
+slice 2. Slices 1 and 3 do not move it at all** — because ICB-1 does not exercise their
+code paths. Reporting an aggregate before/after would have credited all of it to "the gang
+scheduler work"; per-slice arms are what make that visible, and it is exactly the
+attribution loss the contract warns about.
+
+**Environment (pinned).** AMD Ryzen 9 5950X, 16C/32T · Windows 11 26100 · rustc 1.97.1
+(8bab26f4f) · `[profile.bench]` `lto = true`, `codegen-units = 1`, `panic = "unwind"` ·
+`--features net`.
+
+**Protocol.** 4 arms, one per slice boundary, each a separate git worktree built
+independently. 11 repetitions, 2 warm-up rounds discarded. Arms interleaved *within* each
+repetition and their order **rotated between** repetitions, so no arm systematically runs
+on a warmer machine. Each ICB-1 cell is 450 samples × 4 workers. Reported value is the
+median p50 across repetitions, with each arm's own observed min–max range. Runner:
+`net/crates/net/benches/icb1_interleave.py`.
+
+| arm | commit | contents |
+|---|---|---|
+| `base` | `d89ca13e7` | pre-slice |
+| `s1` | `a2bd969ed` | §5 payload move + §6 zero-check |
+| `s2` | `97e8457d2` | §1 clone-free step 1 + §7 hasher |
+| `s3` | `6b377f0c8` | §3 single snapshot + §7 holder lookup |
+
+**Output equality.** All 4 arms returned identical `viable_returned` across all 18 cells.
+ICB-1's own population discipline (exact counts asserted before *and* after every timed
+batch) held on every arm, so this is a like-for-like timing comparison.
+
+### ICB-1 — ordinary matcher (`match_islands`), median p50
+
+| cell | base | s1 | s2 | s3 |
+|---|---:|---:|---:|---:|
+| islands=10 units=1 sparse | 0.70 µs `[0.7–0.7]` | +0.0% | **−57.1%** | −57.1% |
+| islands=10 units=8 dense | 2.70 µs `[2.6–2.8]` | +0.0% | **−48.1%** | −48.1% |
+| islands=100 units=1 dense | 21.01 µs `[20.3–21.6]` | +0.0% | **−61.9%** | −61.9% |
+| islands=100 units=8 sparse | 3.60 µs `[3.5–3.6]` | +0.0% | **−61.1%** | −61.1% |
+| islands=100 units=72 dense | 24.91 µs `[24.5–25.6]` | −0.8% | **−50.6%** | −51.4% |
+| **islands=1000 units=1 sparse** | 36.51 µs `[35.8–37.1]` | −0.5% | **−72.9%** | −72.3% |
+| islands=1000 units=1 dense | 313.60 µs `[284.4–344.1]` | +1.8% | **−74.8%** | −75.0% |
+| islands=1000 units=8 sparse | 39.01 µs `[38.1–39.7]` | −1.2% | **−67.2%** | −67.4% |
+| islands=1000 units=8 dense | 262.01 µs `[255.2–284.9]` | +5.9% | **−54.0%** | −53.9% |
+| islands=1000 units=72 sparse | 40.70 µs `[39.7–42.9]` | +0.0% | **−64.4%** | −65.4% |
+| islands=1000 units=72 dense | 270.33 µs `[266.8–277.2]` | +0.2% | **−48.1%** | −48.4% |
+
+(Full 18-cell table reproducible with the command below; the 7 omitted rows follow the
+same pattern.)
+
+The **sparse-1000 row the audit singles out** — the one ICB-1's header identifies as
+dominated by the full topology scan — goes **36.51 µs → 9.90 µs**, with non-overlapping
+ranges (`35.8–37.1` vs `9.8–10.4`).
+
+### Reading the arms
+
+- **s1 (§5 + §6): no effect on ICB-1, as expected.** Every delta sits inside `base`'s own
+  run-to-run range. §5 is on the *apply* (write) path and §6 on *verify* (inbound
+  dispatch); ICB-1's timed region is `match_islands`, a pure read that touches neither.
+  The two apparent outliers are noise, not signal: `+20.0%` on a 0.5 µs cell is one tick
+  of the bench's 0.1 µs print granularity, and `+5.9%` on 1000/8/dense sits well inside
+  that cell's 11.6%-wide baseline spread.
+- **s2 (§1 + §7 hasher): the entire improvement**, −40% to −75%, far outside noise on
+  every cell.
+- **s3 (§3 + §7 holder lookup): indistinguishable from s2**, also as expected — §3 only
+  changes `match_islands_sensed`, which ICB-1 never calls.
+
+### Allocation witnesses
+
+`tests/gang_alloc_witness.rs`, per-thread counting global allocator. Both were run against
+the baseline worktree and **fail there**, so they witness the mechanism rather than passing
+alongside it.
+
+| witness | baseline | candidate |
+|---|---|---|
+| §1 matcher allocs, 50 hosts × 1 tag | 464 | **161** |
+| §1 matcher allocs, 50 hosts × 40 tags | 6 564 | **161** |
+| §6 allocs rejecting the placeholder sentinel | 1 | **0** |
+
+§1's claim was never "fewer allocations" in the abstract — it was that the matcher
+allocated *proportionally to capability payload size* for data it discarded. The witness
+holds host count fixed and scales only payload: baseline grows 14× from 1 to 40 tags per
+host, candidate is **flat**. §5's equivalent witness is the clone counter in
+`apply_moves_the_payload_instead_of_cloning_it` (zero clones across insert / replace /
+reject).
+
+### What remains unmeasured
+
+Stated plainly, because three of the seven findings now have numbers and the rest do not:
+
+- **§3 has no wall-clock evidence.** Its only measurement is the snapshot-count witness
+  (topology reads 2 → 1, verified falsifiable). ICB-1 cannot see it and ICB-5's fixture is
+  three named islands — the ~1000-island sensed scaling row this audit asks for has not
+  been built, so §3's benefit is demonstrated structurally, not empirically.
+- **§5 and §6 have allocation evidence but no wall-clock evidence.** Both are on write /
+  dispatch paths that no bench in the ICB suite times. Their value is argued from the
+  allocation counts plus the frequency of those paths, not measured end-to-end.
+- **§7's hasher is bundled into s2** and is not separated from §1 within that arm.
+- Nothing here is a threshold or a public performance claim — ICB-7 owns those.
+
+### Reproduce
+
+```bash
+# One worktree per slice boundary, each built independently.
+git worktree add /tmp/gs-base d89ca13e7 && git worktree add /tmp/gs-s1 a2bd969ed
+git worktree add /tmp/gs-s2 97e8457d2
+for w in /tmp/gs-base /tmp/gs-s1 /tmp/gs-s2 .; do
+  (cd $w/net/crates/net && cargo build --release --bench island_claim_match --features net)
+done
+cd net/crates/net
+python benches/icb1_interleave.py 11 2 base=<...> s1=<...> s2=<...> s3=<...>
+
+cargo test --features net --test gang_alloc_witness -- --nocapture
+```
+
+Caveat for anyone re-running: `cargo clippy` sharing a target directory **evicts release
+bench artifacts**, so an arm binary can vanish between building and measuring. The runner
+now checks every arm up front and names the missing one.
 
 ## Reproduce
 

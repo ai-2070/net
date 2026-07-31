@@ -41,7 +41,7 @@
 #[path = "bench_island_claim/mod.rs"]
 mod bench_island_claim;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
