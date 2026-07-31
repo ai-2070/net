@@ -522,8 +522,14 @@ pub fn with_scope_filter<R>(
 pub fn scope_filter_from_js(f: ScopeFilterJs) -> ScopeFilterOwned {
     match f.kind.as_str() {
         "any" => ScopeFilterOwned::Any,
-        "globalOnly" => ScopeFilterOwned::GlobalOnly,
-        "sameSubnet" => ScopeFilterOwned::SameSubnet,
+        // Both spellings, matching `scope_filter_from_py` and the C
+        // ABI's `scope_filter_from_json`. This converter previously
+        // took camelCase only, so a caller reaching the NAPI boundary
+        // with the snake_case spelling the other two bindings accept
+        // fell through to the `_ => Any` arm and silently queried the
+        // whole mesh.
+        "global_only" | "globalOnly" => ScopeFilterOwned::GlobalOnly,
+        "same_subnet" | "sameSubnet" => ScopeFilterOwned::SameSubnet,
         "tenant" => match f.tenant {
             Some(t) if !t.is_empty() => ScopeFilterOwned::Tenant(t),
             _ => ScopeFilterOwned::Any,
@@ -615,6 +621,42 @@ mod tests {
         let hw = hardware_from_js(h);
         assert_eq!(hw.cpu_cores, u16::MAX);
         assert_eq!(hw.cpu_threads, u16::MAX);
+    }
+
+    fn scope_kind(kind: &str) -> ScopeFilterJs {
+        ScopeFilterJs {
+            kind: kind.into(),
+            tenant: None,
+            tenants: None,
+            region: None,
+            regions: None,
+        }
+    }
+
+    /// Both spellings must resolve, matching `scope_filter_from_py`
+    /// and the C ABI. Pre-fix this converter accepted camelCase only,
+    /// so `global_only` hit the `_ => Any` arm and widened a
+    /// deliberately-narrow query to the entire mesh.
+    #[test]
+    fn scope_filter_accepts_snake_case_and_camel_case_kinds() {
+        for kind in ["global_only", "globalOnly"] {
+            assert!(
+                matches!(
+                    scope_filter_from_js(scope_kind(kind)),
+                    ScopeFilterOwned::GlobalOnly
+                ),
+                "kind {kind:?} must resolve to GlobalOnly, not silently widen"
+            );
+        }
+        for kind in ["same_subnet", "sameSubnet"] {
+            assert!(
+                matches!(
+                    scope_filter_from_js(scope_kind(kind)),
+                    ScopeFilterOwned::SameSubnet
+                ),
+                "kind {kind:?} must resolve to SameSubnet, not silently widen"
+            );
+        }
     }
 
     #[test]
