@@ -736,7 +736,8 @@ fa0b9ddd5  wake/invalidation edge + plan correction   <- HELD (P1 successor race
 7348529fb  conditional + scope-exact invalidation     <- HELD (P1b absence ordering)
 f91cff2ab  total publication-generation fence + W-W8  <- HELD (exhaustion, equality arm)
            reviewed as 91f1c2e11 (its docs commit)
-<next>     checked exhaustion + equality + remove-if-current witnesses
+d70810aa4  checked exhaustion + equality + remove-if-current witnesses
+           (candidate head = the docs commit immediately after it)
 ```
 
 What step 3 closes, both directions of design §0.1:
