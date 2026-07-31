@@ -437,33 +437,126 @@ mod tests {
         assert_eq!(via_new.len(), 1);
     }
 
+    /// A capability fold where ONE host publishes into several
+    /// classes, so the candidate KEY count strictly exceeds the HOST
+    /// count.
+    ///
+    /// [`populated_fold`] cannot exercise the limit ordering at all:
+    /// every node there sits in exactly one class, so key → host is
+    /// injective and "take N keys, then dedup" agrees with "dedup,
+    /// then take N" for every N. A test built on it passes under
+    /// either implementation (review §3).
+    ///
+    /// **Fixed node ids, not `entity_id().node_id()`.** Whether the
+    /// two limit orderings differ at a given limit depends on where
+    /// the candidate set happens to iterate B's key, and the set is
+    /// hashed by `FxU64Hasher` over the ids themselves — so ids from
+    /// freshly generated keypairs would make that a coin flip on every
+    /// run. `Fold::apply` trusts the caller for identity (verification
+    /// is the dispatch layer's job), so the announcements can carry
+    /// chosen ids and the iteration order becomes a fixed property of
+    /// the fixture.
+    const MULTI_CLASS_HOST: NodeId = 0xA1;
+    const SINGLE_CLASS_HOST: NodeId = 0xB2;
+
+    fn fold_with_a_multi_class_host() -> Fold<CapabilityFold> {
+        use crate::adapter::net::identity::EntityKeypair;
+        let fold: Fold<CapabilityFold> = Fold::with_sweep_interval(std::time::Duration::ZERO);
+        let kp = EntityKeypair::generate();
+
+        // A serves five classes — the ordinary shape for a host that
+        // publishes more than one model. B serves one.
+        for class in 1..=5u64 {
+            announce(
+                &fold,
+                &kp,
+                MULTI_CLASS_HOST,
+                class,
+                vec!["gpu:h100"],
+                NodeState::Idle,
+                Some("us-east"),
+            );
+        }
+        announce(
+            &fold,
+            &kp,
+            SINGLE_CLASS_HOST,
+            1,
+            vec!["gpu:h100"],
+            NodeState::Idle,
+            Some("us-east"),
+        );
+        fold
+    }
+
     /// §1 invariant 2: `limit` applies to KEYS, before host dedup —
     /// the same order `composite_query` + `candidate_hosts` used.
-    /// Which keys survive is unspecified (set iteration order), so
-    /// this pins the COUNT, which is the part that must not change.
+    ///
+    /// Applying it after dedup would let `candidate_hosts_for` return
+    /// MORE hosts than the path it replaced, from the same fold, for
+    /// any mesh where a host publishes into several capability
+    /// classes. So the fixture must be one where key count exceeds
+    /// host count, or the two orderings are indistinguishable.
+    ///
+    /// *Which* keys survive is unspecified (set iteration order), so
+    /// the oracle is the untouched `query` + `candidate_hosts` path
+    /// rather than a hard-coded set — but the assertion is now set
+    /// equality, not just count. The final `discriminated` check is
+    /// the guard against the fixture quietly going degenerate again:
+    /// under limit-after-dedup the host count would be exactly
+    /// `min(limit, hosts)` for EVERY limit, so at least one limit
+    /// coming in under that is the signature of the ordering this
+    /// test exists to pin.
     #[test]
     fn candidate_hosts_for_applies_limit_before_host_dedup() {
         use crate::adapter::net::behavior::fold::CapabilityFilter;
-        let (fold, _kps, _nodes) = populated_fold();
-
-        for limit in [1usize, 2, 3] {
-            let shape = CapabilityQuery::Composite(CapabilityFilter {
-                tags_any: vec!["gpu:h100".into(), "gpu:a10".into()],
+        let fold = fold_with_a_multi_class_host();
+        let shape = |limit: usize| {
+            CapabilityQuery::Composite(CapabilityFilter {
+                tags_all: vec!["gpu:h100".into()],
                 limit,
                 ..Default::default()
-            });
-            let got = candidate_hosts_for(&fold, &shape);
+            })
+        };
+
+        const KEYS: usize = 6;
+        assert_eq!(
+            fold.query(shape(0)).len(),
+            KEYS,
+            "fixture must carry more keys than hosts",
+        );
+        let all = candidate_hosts_for(&fold, &shape(0));
+        assert_eq!(
+            all,
+            [MULTI_CLASS_HOST, SINGLE_CLASS_HOST]
+                .into_iter()
+                .collect::<NodeIdSet>(),
+        );
+
+        let mut discriminated = false;
+        for limit in 1..=KEYS {
+            let got = candidate_hosts_for(&fold, &shape(limit));
+            assert_eq!(
+                got,
+                hosts_via_query(&fold, &shape(limit)),
+                "limit {limit}: the host SET must match the query path",
+            );
             assert!(
                 got.len() <= limit,
                 "limit {limit} must bound the host count, got {}",
                 got.len(),
             );
-            assert_eq!(
-                got.len(),
-                hosts_via_query(&fold, &shape).len(),
-                "limit {limit}: host COUNT must match the query path",
-            );
+            if got.len() < all.len().min(limit) {
+                discriminated = true;
+            }
         }
+        assert!(
+            discriminated,
+            "no limit returned fewer hosts than min(limit, {}) — the fixture no \
+             longer distinguishes limit-before-dedup from limit-after-dedup, so \
+             this test proves nothing; give one host more classes",
+            all.len(),
+        );
     }
 
     #[test]
