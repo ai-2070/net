@@ -170,14 +170,33 @@ anyone holding it can attempt a handshake with any node that accepts it. There i
 no credential expiry forcing rotation for you, and no server-side kill switch —
 revocation lives in delegation chains, higher up the stack.
 
-## An honest caveat about Net's own model
+## Two questions, two different answers
 
-Capability **filters are advisory**. They match against what a node says about
-itself, so a node that lies matches. Routing hints, not access control. The actual
-boundary is a signed permission token plus the roots a channel trusts, or
-organisation-scoped auth. If you read Net's capability predicates as a security
-mechanism you will build something unsafe — see
-[Channels](/docs/concepts/channels).
+A caveat about capability filters belongs here, but an earlier version of this page
+ran two questions together and made Net sound weaker than it is. They have
+different answers.
+
+**"Is what this provider claims about itself true?" — no guarantee, ever.**
+Capability predicates match self-advertised attributes. A node that advertises
+`gpu` and has none still matches `require_gpu`, inside an organisation or outside
+it. Predicates **select**; they do not attest. Read them as routing hints and build
+accordingly — see [Channels](/docs/concepts/channels).
+
+**"Who may see and call this capability?" — cryptographic, once scoped.** This is
+the part the old wording obscured. An organisation-scoped announcement is not
+broadcast and then filtered by well-behaved receivers: the capability descriptor is
+**sealed** with XChaCha20-Poly1305 under a per-audience discovery key, and the
+cleartext framing that routes the envelope is bound in as associated data. A
+non-member cannot open it, and a forwarder can neither read the descriptor nor
+transplant it onto different framing. The ciphertext is padded so its length does
+not leak the descriptor's size either. That is what "invisible rather than refused"
+means literally, and there are unit tests for each property — wrong key fails,
+transplanted AAD fails, length does not leak.
+
+So the honest summary is not "capability filters are advisory, therefore weak
+access control". It is: **plaintext announcements and their predicates are
+advisory; visibility and invocation are cryptographic once org-scoped**, and the
+attributes a provider asserts about itself are self-asserted in both cases.
 
 ## Choosing
 

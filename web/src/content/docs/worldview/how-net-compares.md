@@ -42,7 +42,7 @@ large class of work.
 | **What a secure link needs** | trust the local process | server config, accounts, NKeys or JWT, a `.creds` file per client | a CA, a cert and key per node, ACL rules in config | the peer's static public key and a shared 32-byte PSK |
 | **What you deploy** | the server process the host spawns | a NATS server (cluster, supercluster, leaf nodes) | peers need nothing; router mode runs `zenohd` | a **4.3 MB** library linked into your process — no broker |
 | **Trust boundary** | host-local: the host decides what is wired in | server-enforced: NKeys, JWT, subject permissions | deployment-configured: ACL rules, mTLS | node-held: signed permission tokens with explicitly trusted roots |
-| **Cross-organisation** | not a primitive | accounts with subject import/export, server-mediated | not a primitive | native — organisation-scoped capabilities |
+| **Cross-organisation** | not a primitive | accounts with subject import/export, server-mediated | not a primitive | native — the descriptor is sealed per audience, so it is unreadable to outsiders rather than filtered by them |
 | **Maturity** | young; large and fast-moving ecosystem | CNCF project, many client languages, very large production base | Eclipse project, ROS 2 middleware, robotics and industrial deployments | young |
 
 The 4.3 MB is measured, not estimated: `libnet.dylib`, release profile, default
@@ -133,6 +133,27 @@ it. There is no certificate expiry doing quiet rotation for you, and no CRL at t
 transport layer; revocation lives higher up, in delegation chains. If your
 organisation already runs a mature PKI, that machinery is an asset you have already
 paid for and Net does not use it.
+
+### Selection is advisory; visibility is cryptographic
+
+These are separate questions and it is easy to answer the wrong one.
+
+**What a provider claims about itself is self-asserted.** A node advertising `gpu`
+that has none still matches `require_gpu`. Predicates select, they do not attest —
+in Net, and equally in a NATS subject or a Zenoh key expression, none of which
+verify a publisher's claims about its own hardware either.
+
+**Who may see a capability is enforced by cryptography, not by receiver
+politeness.** An organisation-scoped announcement seals the capability descriptor
+with XChaCha20-Poly1305 under a per-audience discovery key, binding the routing
+framing in as associated data. A non-member cannot open it; a forwarder can neither
+read it nor transplant it onto different framing; the ciphertext is padded so its
+length does not leak the descriptor's size.
+
+That last property is the one worth comparing. An ACL is evaluated by the node
+enforcing it, so a misconfigured or compromised router can leak the existence of a
+resource it was supposed to hide. A sealed descriptor stays unreadable to everyone
+outside the audience no matter what the intermediate nodes do.
 
 ### Typing is a contract, not a wire format
 

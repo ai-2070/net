@@ -213,13 +213,38 @@ three and has had them longer. It is whether the unit you need to address is *da
 at a key* or *work behind an authority boundary*. If treating the world as a key
 space is sufficient, that is the simpler system and you should use it.
 
-## An honest caveat about Net's own model
+## Two questions, two different answers
 
-Capability **filters are advisory**. They match what a node advertises about
-itself, so a node that lies matches. They are routing hints, not access control;
-the real boundary is a signed permission token with explicitly trusted roots, or
-organisation-scoped auth. Reading Net's capability predicates as a security
-mechanism produces something unsafe — see [Channels](/docs/concepts/channels).
+A caveat about capability filters belongs here, but an earlier version of this page
+ran two questions together and made Net sound weaker than it is. They have
+different answers.
+
+**"Is what this provider claims about itself true?" — no guarantee, ever.**
+Capability predicates match self-advertised attributes. A node that advertises
+`gpu` and has none still matches `require_gpu`, inside an organisation or outside
+it. Predicates **select**; they do not attest. Read them as routing hints and build
+accordingly — see [Channels](/docs/concepts/channels).
+
+**"Who may see and call this capability?" — cryptographic, once scoped.** This is
+the part the old wording obscured, and it is the sharpest contrast with a
+configured ACL. An organisation-scoped announcement is not broadcast and then
+filtered by well-behaved receivers: the capability descriptor is **sealed** with
+XChaCha20-Poly1305 under a per-audience discovery key, with the cleartext framing
+that routes the envelope bound in as associated data. A non-member cannot open it,
+and a forwarder can neither read the descriptor nor transplant it onto different
+framing. The ciphertext is padded so its length does not leak the descriptor's size
+either. Each of those is a unit test — wrong key fails, transplanted AAD fails,
+length does not leak.
+
+That is a stronger property than an ACL rule can give you. An ACL is evaluated by
+the node enforcing it, so a misconfigured or compromised router can leak the
+existence of a resource; a sealed descriptor is unreadable to anyone outside the
+audience regardless of what the intermediate nodes do or are told to do.
+
+So the honest summary is not "capability filters are advisory, therefore weak
+access control". It is: **plaintext announcements and their predicates are
+advisory; visibility and invocation are cryptographic once org-scoped**, and the
+attributes a provider asserts about itself are self-asserted in both cases.
 
 And on maturity: Zenoh has years of field deployment in robotics and industrial
 settings. Net has deep semantics and a much shorter operational record. Semantics
