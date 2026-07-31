@@ -287,7 +287,13 @@ reaching for the first shape that compiles.
 
 ---
 
-## 4. Two full spend-file parses per payment
+## 4. Two full spend-file parses per payment — **WITHDRAWN (2026-07-31)**
+
+> **This finding does not hold.** It was withdrawn at implementation time; the proposed
+> fix is not viable and the two parses are structurally necessary. Recorded rather than
+> deleted so the reasoning is not rediscovered. The description below is the original
+> finding; the correction follows it.
+
 
 `CallerPaymentFlow::run` calls `approved_quote()` at `src/flow/mod.rs:594`, which does a
 lock-free whole-file `load_json` + parse (`src/policy/spend.rs:516-534`). It then calls
@@ -302,6 +308,28 @@ On the common path (no pending approval for this capability) the first read find
 and is pure overhead. Folding the approved-quote lookup into the same locked transaction
 removes it, and has the side benefit of closing the read-then-lock window between the two
 loads.
+
+**Correction — why this is wrong.** The two calls have a hard data dependency, in the
+wrong direction for folding:
+
+- `approved_quote` decides **which quote is used at all**. If it returns a held approved
+  quote that is still valid, that quote *is* the one paid, and the provider is never
+  contacted (`src/flow/mod.rs:594-622`); only on `None`, or on an expired/unparseable
+  hold, does the flow fetch a fresh provider-signed quote.
+- `check_and_reserve` takes that resulting quote as its **input**.
+
+So the second transaction cannot subsume a lookup that must complete before its own input
+exists — and before the provider call that might produce it.
+
+The second read is also not redundant: it must happen **inside** the lock. Reusing the
+snapshot from the first read would reintroduce exactly the lost-update race the store's
+regime exists to prevent (`concurrent_mutations_do_not_lose_updates`), and would break the
+no-overspend guarantee P5a asserts. Two parses are the correct cost of one lock-free
+lookup plus one atomic check-and-reserve.
+
+What remains true from the original finding: the spend file is fatter than it needs to be
+because `approvals` holds base64-encoded full quotes. That is a size observation, already
+covered by §3's laziness (fewer approvals written) and not a redundant-read one.
 
 ---
 
@@ -344,9 +372,10 @@ is free to remove — move the construction into the branch that inserts it.
    six regressions in §1.
 2. **§2 compact store writes** and **§3 lazy `quote_b64`.** Both near-zero-risk, both
    independent of §1, could land in one pass.
-3. **§4 folded spend-store read.** Slightly more invasive (moves a lookup inside a locked
-   transaction), so worth its own change.
-4. **§5 lazy `QuoteRecord`.** Genuinely marginal; do it when next in that function.
+3. **§5 lazy `QuoteRecord`.** Genuinely marginal; do it when next in that function.
+
+**§4 is withdrawn** — see the correction in that section. It was not implementable as
+described, and the two parses it flagged are structurally necessary.
 
 None of these move the c128 tail — that is the lock, and it is the storage disposition's
 problem. What they move is the per-operation constant and, in §1's case, how fast that
