@@ -2774,7 +2774,9 @@ fn sweep_expired_subscribers(
             // rather than trusting the publish path's cached flag.
             let authorized = subscriber_chains
                 .get(&(node_id, name.hash()))
-                .is_some_and(|r| cfg.reverify_subscribe(&r.chain, &entity_id, revocation, skew));
+                .is_some_and(|r| {
+                    cfg.reverify_subscribe(&r.chain, &entity_id, name.hash(), revocation, skew)
+                });
             if !authorized {
                 guard.revoke_channel(subscriber_origin_hash(node_id), name);
                 roster.remove(&channel_id, node_id);
@@ -23508,6 +23510,11 @@ impl MeshNode {
         };
         let cfg = resolved.config;
         let matched_prefix = resolved.matched_prefix;
+        // The hash of the channel the peer actually asked for. Every
+        // token gate and every retention key below uses THIS, never
+        // `cfg.channel_id.hash()` — for a prefix-matched config the
+        // latter is a sentinel that stands for the whole family (M1).
+        let requested_hash = channel.hash();
 
         let peer_subnet = ctx
             .peer_subnets
@@ -23660,7 +23667,14 @@ impl MeshNode {
             // cap match with a dummy id. The token gate is skipped
             // because the channel requires no token.
             let dummy = EntityId::from_bytes([0u8; 32]);
-            return if cfg.can_subscribe(&peer_caps, &dummy, None, revocation, skew_secs) {
+            return if cfg.can_subscribe(
+                &peer_caps,
+                &dummy,
+                requested_hash,
+                None,
+                revocation,
+                skew_secs,
+            ) {
                 (true, None)
             } else {
                 (false, Some(AckReason::Unauthorized))
@@ -23670,6 +23684,7 @@ impl MeshNode {
         if !cfg.can_subscribe(
             &peer_caps,
             &peer_entity,
+            requested_hash,
             presented_chain.as_ref(),
             revocation,
             skew_secs,
@@ -23688,10 +23703,17 @@ impl MeshNode {
             // re-check re-establishes it without trusting cross-path
             // state. (Marking it verified here would only save the one
             // first-publish verification.)
-            ctx.subscriber_chains.insert(
-                (from_node, cfg.channel_id.hash()),
-                RetainedChain::new(chain),
-            );
+            //
+            // Keyed on the REQUESTED channel's hash, not the config's.
+            // For a prefix-registered config those differ (the config
+            // carries a sentinel), and storing under the sentinel put
+            // the chain somewhere the publish path — which looks it up
+            // by the real channel — could never find, so every such
+            // subscriber was accepted and then revoked before its first
+            // delivery. `Unsubscribe` also removes by the real hash, so
+            // the sentinel-keyed entry leaked until peer failure.
+            ctx.subscriber_chains
+                .insert((from_node, requested_hash), RetainedChain::new(chain));
         }
         (true, None)
     }
@@ -23918,20 +23940,26 @@ impl MeshNode {
                 // when the node has no token cache configured — a held
                 // chain still publishes in that mode (nothing revoked,
                 // strict skew).
+                //
+                // All three lookups key on the channel being published
+                // to, NOT `cfg.channel_id.hash()`. For a prefix-matched
+                // config the latter is a sentinel, and using it meant
+                // `set_publish_chain(real_channel, chain)` — which
+                // stores under the real hash — could never satisfy a
+                // token-gated prefix publish, so the delegated-publish
+                // escape hatch was unreachable for that whole class of
+                // channel (M1).
+                let publish_hash = publisher.channel().hash();
                 let held = self
                     .published_chains
-                    .get(&cfg.channel_id.hash())
+                    .get(&publish_hash)
                     .map(|c| c.value().clone());
                 let transient_revocation;
                 let (revocation, skew, chain) = match self.token_cache.as_ref() {
                     Some(cache) => {
                         let chain = held.or_else(|| {
                             cache
-                                .get_for_action(
-                                    &self_entity,
-                                    TokenScope::PUBLISH,
-                                    cfg.channel_id.hash(),
-                                )
+                                .get_for_action(&self_entity, TokenScope::PUBLISH, publish_hash)
                                 .map(TokenChain::single)
                         });
                         (cache.revocation().as_ref(), cache.clock_skew_secs(), chain)
@@ -23941,7 +23969,14 @@ impl MeshNode {
                         (&transient_revocation, 0u64, held)
                     }
                 };
-                if !cfg.can_publish(&self_caps, &self_entity, chain.as_ref(), revocation, skew) {
+                if !cfg.can_publish(
+                    &self_caps,
+                    &self_entity,
+                    publish_hash,
+                    chain.as_ref(),
+                    revocation,
+                    skew,
+                ) {
                     return Err(AdapterError::Connection(
                         "channel: publish denied by channel ACL".into(),
                     ));
@@ -24108,8 +24143,20 @@ impl MeshNode {
                         // signature verifies per publish on a high-fanout
                         // channel.
                         if r.signatures_verified.load(Ordering::Relaxed) {
-                            cfg.reverify_subscribe_presigned(&r.chain, &entity, revocation, skew)
-                        } else if cfg.reverify_subscribe(&r.chain, &entity, revocation, skew) {
+                            cfg.reverify_subscribe_presigned(
+                                &r.chain,
+                                &entity,
+                                channel_hash,
+                                revocation,
+                                skew,
+                            )
+                        } else if cfg.reverify_subscribe(
+                            &r.chain,
+                            &entity,
+                            channel_hash,
+                            revocation,
+                            skew,
+                        ) {
                             r.signatures_verified.store(true, Ordering::Relaxed);
                             true
                         } else {
@@ -24127,6 +24174,23 @@ impl MeshNode {
             };
             if !chain_ok {
                 auth_guard.revoke_channel(origin, &channel_name);
+                // Evict from the roster too, not just the AuthGuard.
+                //
+                // Revoking only the guard left the peer rostered, and
+                // queue-group selection (`dispatch_recipients`) runs
+                // BEFORE this auth filter with no alternate-member
+                // retry — so a denied peer kept being selected as its
+                // group's recipient and that group's copy of each event
+                // was dropped rather than delivered to a working
+                // member. The periodic sweep eventually cleared it, but
+                // only if a sweep runs at all: it is a no-op without a
+                // TokenCache, and `token_sweep_interval = Duration::MAX`
+                // disables it outright. Dropping the roster entry here
+                // makes the denial self-clearing on the path that
+                // observed it.
+                self.roster
+                    .remove(&ChannelId::new(channel_name.clone()), *peer_id);
+                self.subscriber_chains.remove(&(*peer_id, channel_hash));
                 return false;
             }
             true

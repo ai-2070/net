@@ -583,6 +583,26 @@ async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
         !a.mesh.auth_guard().is_authorized_full(b_origin, &channel),
         "lazy expiry should have revoked the guard entry for the expired subscriber",
     );
+
+    // M1 (2026-07-31 audit): and it must be gone from the ROSTER too,
+    // not just the guard.
+    //
+    // Leaving it rostered was a standing denial of service on a
+    // queue-group channel: `dispatch_recipients` selects one member per
+    // group BEFORE the auth filter runs and there is no
+    // alternate-member retry, so a denied-but-rostered peer kept being
+    // chosen as its group's recipient and that group's copy of each
+    // event was dropped rather than delivered to a working member. With
+    // the sweep disabled — which this harness does deliberately, and
+    // which `token_sweep_interval = Duration::MAX` does in production —
+    // nothing else ever cleared it.
+    assert!(
+        !a.mesh
+            .roster()
+            .is_subscribed(b.mesh.node_id(), &ChannelId::new(channel.clone())),
+        "an expired-token subscriber denied at publish time must be evicted \
+         from the roster, not left selectable for queue-group dispatch",
+    );
 }
 
 // ============================================================================

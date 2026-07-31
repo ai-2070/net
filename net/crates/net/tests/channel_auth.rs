@@ -376,6 +376,83 @@ async fn unauth_channel_accepts_everyone() {
     assert_eq!(report.delivered, 1);
 }
 
+/// M1 (2026-07-31 audit): a token-gated **prefix** channel must work
+/// end to end — subscribe accepted AND the first publish delivered.
+///
+/// Pre-fix the gate and the chain retention both keyed on
+/// `cfg.channel_id.hash()`, which for a prefix config is a sentinel
+/// standing for the whole family. Two things went wrong at once:
+/// a token minted for the sentinel authorized every channel under the
+/// prefix, and the chain was retained under the sentinel key while the
+/// publish path looked it up by the real channel — so a legitimate
+/// subscriber was accepted with a successful Ack and then revoked
+/// before a single event reached it. Accept-then-fail-closed, reported
+/// to the peer as success.
+#[tokio::test]
+async fn token_gated_prefix_channel_subscribes_and_delivers() {
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
+
+    // Registered as a PREFIX, with a sentinel channel_id — the shape
+    // nRPC uses for its per-caller reply channels.
+    let sentinel = ChannelName::new("lab/pfx/sentinel").unwrap();
+    a.registry.insert_prefix(
+        "lab/pfx/",
+        ChannelConfig::new(ChannelId::new(sentinel))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
+
+    // The real, dynamically-named channel the peer asks for.
+    let name = ChannelName::new("lab/pfx/instance-one").unwrap();
+    let token = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        name.hash(), // scoped to the REAL channel, not the sentinel
+        300,
+        0,
+    );
+    b.mesh
+        .subscribe_channel_with_token(a.mesh.node_id(), name.clone(), token)
+        .await
+        .expect("token-gated prefix subscribe must be accepted");
+
+    // The part that used to fail: the publish path must find the
+    // retained chain and actually deliver.
+    let publisher = ChannelPublisher::new(
+        name.clone(),
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    );
+    // The publisher is the channel's own root, so it needs a PUBLISH
+    // grant to itself to clear its own gate.
+    let self_token = PermissionToken::issue(
+        &a.keypair,
+        a.keypair.entity_id().clone(),
+        TokenScope::PUBLISH,
+        name.hash(),
+        300,
+        0,
+    );
+    a.mesh.set_publish_chain(
+        &name,
+        net::adapter::net::identity::TokenChain::single(self_token),
+    );
+
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"payload"))
+        .await
+        .expect("publish must be authorized");
+    assert_eq!(
+        report.delivered, 1,
+        "a legitimately token-gated prefix subscriber must actually receive \
+         events, not be revoked before the first delivery"
+    );
+}
+
 /// M4 (2026-07-31 audit): a token-gated channel on a publisher with no
 /// `TokenCache` must reject the subscribe outright.
 ///

@@ -285,15 +285,17 @@ impl ChannelConfig {
         self
     }
 
-    /// Check if `entity_id` is authorized to publish on this channel,
+    /// Check if `entity_id` is authorized to publish on `channel_hash`,
     /// presenting `chain`.
     ///
-    /// See [`Self::can_subscribe`] for the chain-verification contract;
-    /// this is the `PUBLISH`-scope counterpart.
+    /// See [`Self::can_subscribe`] for the chain-verification contract
+    /// and for why `channel_hash` is a parameter; this is the
+    /// `PUBLISH`-scope counterpart.
     pub fn can_publish(
         &self,
         node_caps: &CapabilitySet,
         entity_id: &EntityId,
+        channel_hash: ChannelHash,
         chain: Option<&TokenChain>,
         revocation: &RevocationRegistry,
         skew_secs: u64,
@@ -303,22 +305,43 @@ impl ChannelConfig {
                 return false;
             }
         }
-        self.token_gate(TokenScope::PUBLISH, entity_id, chain, revocation, skew_secs)
+        self.token_gate(
+            TokenScope::PUBLISH,
+            entity_id,
+            channel_hash,
+            chain,
+            revocation,
+            skew_secs,
+        )
     }
 
-    /// Check if `entity_id` is authorized to subscribe to this channel,
-    /// presenting `chain`.
+    /// Check if `entity_id` is authorized to subscribe to
+    /// `channel_hash`, presenting `chain`.
     ///
     /// When `require_token` is set, `chain` must be a [`TokenChain`]
     /// that (a) roots at one of [`Self::token_roots`], (b) is bound at
     /// its leaf to `entity_id` (the AEAD-verified presenter), and (c)
-    /// authorizes `SUBSCRIBE` on this channel at every link with no
+    /// authorizes `SUBSCRIBE` on `channel_hash` at every link with no
     /// link revoked. A missing chain, an empty `token_roots`, or a
     /// chain that fails verification all reject — fail closed.
+    ///
+    /// # Why `channel_hash` is a parameter
+    ///
+    /// It is the hash of the channel the caller actually asked for, NOT
+    /// `self.channel_id.hash()`. Those coincide for an exact-match
+    /// config, but a **prefix**-registered config's `channel_id` is a
+    /// sentinel that `insert_prefix` itself documents as "not used for
+    /// hash lookups" — and verifying against it meant a token minted
+    /// for the sentinel authorized *every* channel under the prefix,
+    /// silently degrading a per-channel binding to a per-prefix one.
+    /// Taking the channel explicitly also removes the standing
+    /// temptation to reuse one config across many channels and get a
+    /// gate that answers about the wrong one.
     pub fn can_subscribe(
         &self,
         node_caps: &CapabilitySet,
         entity_id: &EntityId,
+        channel_hash: ChannelHash,
         chain: Option<&TokenChain>,
         revocation: &RevocationRegistry,
         skew_secs: u64,
@@ -331,6 +354,7 @@ impl ChannelConfig {
         self.token_gate(
             TokenScope::SUBSCRIBE,
             entity_id,
+            channel_hash,
             chain,
             revocation,
             skew_secs,
@@ -340,13 +364,14 @@ impl ChannelConfig {
     /// Shared token-chain gate for the publish / subscribe checks.
     /// Returns `true` when token enforcement is off (capability filters
     /// already applied by the caller), else verifies the presented
-    /// chain roots at one of `token_roots`. Fails closed when tokens
-    /// are required but no roots are configured or no chain is
-    /// presented.
+    /// chain roots at one of `token_roots` and authorizes
+    /// `channel_hash`. Fails closed when tokens are required but no
+    /// roots are configured or no chain is presented.
     fn token_gate(
         &self,
         action: TokenScope,
         entity_id: &EntityId,
+        channel_hash: ChannelHash,
         chain: Option<&TokenChain>,
         revocation: &RevocationRegistry,
         skew_secs: u64,
@@ -366,7 +391,7 @@ impl ChannelConfig {
         chain
             .verify_authorizes(
                 action,
-                self.channel_id.hash(),
+                channel_hash,
                 entity_id,
                 &self.token_roots,
                 revocation,
@@ -375,25 +400,33 @@ impl ChannelConfig {
             .is_ok()
     }
 
-    /// Re-verify a previously-presented `SUBSCRIBE` chain against the
-    /// current clock + revocation floors, anchored to this channel's
-    /// roots. Shared by the periodic expiry sweep and the publish-time
-    /// re-check so the root-anchoring contract (which roots, which
-    /// action, which channel hash) lives in exactly one place instead
-    /// of being re-threaded at each call site — where it had already
-    /// started to diverge (`token_roots` vs. an `unwrap_or(&[])`
-    /// fallback).
+    /// Re-verify a previously-presented `SUBSCRIBE` chain for
+    /// `channel_hash` against the current clock + revocation floors,
+    /// anchored to this channel's roots. Shared by the periodic expiry
+    /// sweep and the publish-time re-check so the root-anchoring
+    /// contract (which roots, which action, which channel hash) lives
+    /// in exactly one place instead of being re-threaded at each call
+    /// site — where it had already started to diverge (`token_roots`
+    /// vs. an `unwrap_or(&[])` fallback).
+    ///
+    /// `channel_hash` is the requested channel's — see
+    /// [`Self::can_subscribe`]. Passing the config's own hash here is
+    /// what made prefix-registered channels retain a chain under the
+    /// sentinel key that the publish path (keyed on the real channel)
+    /// could never find, so every such subscriber was accepted and then
+    /// revoked before its first delivery.
     pub fn reverify_subscribe(
         &self,
         chain: &TokenChain,
         entity_id: &EntityId,
+        channel_hash: ChannelHash,
         revocation: &RevocationRegistry,
         skew_secs: u64,
     ) -> bool {
         chain
             .verify_authorizes(
                 TokenScope::SUBSCRIBE,
-                self.channel_id.hash(),
+                channel_hash,
                 entity_id,
                 &self.token_roots,
                 revocation,
@@ -411,13 +444,14 @@ impl ChannelConfig {
         &self,
         chain: &TokenChain,
         entity_id: &EntityId,
+        channel_hash: ChannelHash,
         revocation: &RevocationRegistry,
         skew_secs: u64,
     ) -> bool {
         chain
             .verify_authorizes_presigned(
                 TokenScope::SUBSCRIBE,
-                self.channel_id.hash(),
+                channel_hash,
                 entity_id,
                 &self.token_roots,
                 revocation,
@@ -853,6 +887,7 @@ impl std::fmt::Debug for ChannelConfigRegistry {
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::{GpuInfo, GpuVendor, HardwareCapabilities};
+    use crate::adapter::net::channel::channel_hash;
     use crate::adapter::net::identity::{EntityKeypair, PermissionToken};
 
     fn make_caps(gpu: bool) -> CapabilitySet {
@@ -897,8 +932,22 @@ mod tests {
         let entity = EntityKeypair::generate();
         let rev = RevocationRegistry::new();
 
-        assert!(config.can_publish(&caps, entity.entity_id(), None, &rev, 0));
-        assert!(config.can_subscribe(&caps, entity.entity_id(), None, &rev, 0));
+        assert!(config.can_publish(
+            &caps,
+            entity.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
+        assert!(config.can_subscribe(
+            &caps,
+            entity.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
     }
 
     #[test]
@@ -911,10 +960,24 @@ mod tests {
         let rev = RevocationRegistry::new();
 
         let no_gpu = make_caps(false);
-        assert!(!config.can_publish(&no_gpu, entity.entity_id(), None, &rev, 0));
+        assert!(!config.can_publish(
+            &no_gpu,
+            entity.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
 
         let with_gpu = make_caps(true);
-        assert!(config.can_publish(&with_gpu, entity.entity_id(), None, &rev, 0));
+        assert!(config.can_publish(
+            &with_gpu,
+            entity.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
     }
 
     /// The C1 fix: a `require_token` channel anchored to an owner must
@@ -930,7 +993,14 @@ mod tests {
         let rev = RevocationRegistry::new();
 
         // No chain -> denied.
-        assert!(!config.can_publish(&caps, subject.entity_id(), None, &rev, 0));
+        assert!(!config.can_publish(
+            &caps,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
 
         // Self-issued (issuer == subject, NOT the channel owner) ->
         // denied. Pre-fix this was the privilege-escalation hole:
@@ -938,13 +1008,27 @@ mod tests {
         // token regardless of issuer.
         let self_chain = direct_chain(&subject, &subject, TokenScope::PUBLISH, id.hash());
         assert!(
-            !config.can_publish(&caps, subject.entity_id(), Some(&self_chain), &rev, 0),
+            !config.can_publish(
+                &caps,
+                subject.entity_id(),
+                config.channel_id.hash(),
+                Some(&self_chain),
+                &rev,
+                0
+            ),
             "self-issued token must be rejected: its issuer is not a channel root"
         );
 
         // Owner-issued -> allowed.
         let owner_chain = direct_chain(&owner, &subject, TokenScope::PUBLISH, id.hash());
-        assert!(config.can_publish(&caps, subject.entity_id(), Some(&owner_chain), &rev, 0));
+        assert!(config.can_publish(
+            &caps,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            Some(&owner_chain),
+            &rev,
+            0
+        ));
     }
 
     /// `with_require_token(true)` without any roots fails closed — there
@@ -959,8 +1043,22 @@ mod tests {
 
         // Even an otherwise-well-formed token can't anchor to nothing.
         let chain = direct_chain(&anyone, &anyone, TokenScope::SUBSCRIBE, id.hash());
-        assert!(!config.can_subscribe(&caps, anyone.entity_id(), Some(&chain), &rev, 0));
-        assert!(!config.can_subscribe(&caps, anyone.entity_id(), None, &rev, 0));
+        assert!(!config.can_subscribe(
+            &caps,
+            anyone.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
+        assert!(!config.can_subscribe(
+            &caps,
+            anyone.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
     }
 
     /// A config that names roots but never set the `require_token`
@@ -987,10 +1085,24 @@ mod tests {
         );
 
         // No chain -> denied (would have been silently admitted pre-fix).
-        assert!(!config.can_subscribe(&caps, subject.entity_id(), None, &rev, 0));
+        assert!(!config.can_subscribe(
+            &caps,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
         // Owner-issued chain -> allowed.
         let owner_chain = direct_chain(&owner, &subject, TokenScope::SUBSCRIBE, id.hash());
-        assert!(config.can_subscribe(&caps, subject.entity_id(), Some(&owner_chain), &rev, 0));
+        assert!(config.can_subscribe(
+            &caps,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            Some(&owner_chain),
+            &rev,
+            0
+        ));
     }
 
     /// The chain's leaf must be bound to the presenting entity — a peer
@@ -1008,9 +1120,23 @@ mod tests {
 
         // Owner issued this to `intended`; `attacker` presents it.
         let chain = direct_chain(&owner, &intended, TokenScope::SUBSCRIBE, id.hash());
-        assert!(!config.can_subscribe(&caps, attacker.entity_id(), Some(&chain), &rev, 0));
+        assert!(!config.can_subscribe(
+            &caps,
+            attacker.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
         // The intended subject is accepted.
-        assert!(config.can_subscribe(&caps, intended.entity_id(), Some(&chain), &rev, 0));
+        assert!(config.can_subscribe(
+            &caps,
+            intended.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
     }
 
     /// A valid owner → intermediate → leaf delegation chain is accepted;
@@ -1042,7 +1168,14 @@ mod tests {
         let chain = TokenChain {
             tokens: vec![root, child],
         };
-        assert!(config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+        assert!(config.can_subscribe(
+            &caps,
+            leaf.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
     }
 
     /// A chain whose links don't connect (`child.issuer != parent.subject`)
@@ -1081,7 +1214,14 @@ mod tests {
         let chain = TokenChain {
             tokens: vec![root, spliced],
         };
-        assert!(!config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+        assert!(!config.can_subscribe(
+            &caps,
+            leaf.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
     }
 
     /// A delegated child can't authorize a scope its parent lacked —
@@ -1121,7 +1261,14 @@ mod tests {
             tokens: vec![root, forged_child],
         };
         // The root link doesn't authorize PUBLISH, so the chain can't.
-        assert!(!config.can_publish(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+        assert!(!config.can_publish(
+            &caps,
+            leaf.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
     }
 
     /// The H1 fix: revoking the root issuer invalidates the whole chain,
@@ -1154,14 +1301,28 @@ mod tests {
         };
 
         // Accepted before revocation.
-        assert!(config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+        assert!(config.can_subscribe(
+            &caps,
+            leaf.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
 
         // Owner bumps its revocation floor above the chain's generation
         // (0). The root link falls below the floor → whole chain dies,
         // even though the delegated child's issuer is `mid`, not `owner`.
         rev.revoke_below(owner.entity_id(), 1);
         assert!(
-            !config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0),
+            !config.can_subscribe(
+                &caps,
+                leaf.entity_id(),
+                config.channel_id.hash(),
+                Some(&chain),
+                &rev,
+                0
+            ),
             "revoking the root must kill the delegated descendant"
         );
     }
@@ -1180,14 +1341,35 @@ mod tests {
 
         // Has GPU but no token -> denied.
         let with_gpu = make_caps(true);
-        assert!(!config.can_publish(&with_gpu, subject.entity_id(), None, &rev, 0));
+        assert!(!config.can_publish(
+            &with_gpu,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
 
         // Has token but no GPU -> denied.
         let no_gpu = make_caps(false);
-        assert!(!config.can_publish(&no_gpu, subject.entity_id(), Some(&owner_chain), &rev, 0));
+        assert!(!config.can_publish(
+            &no_gpu,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            Some(&owner_chain),
+            &rev,
+            0
+        ));
 
         // Has both -> allowed.
-        assert!(config.can_publish(&with_gpu, subject.entity_id(), Some(&owner_chain), &rev, 0));
+        assert!(config.can_publish(
+            &with_gpu,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            Some(&owner_chain),
+            &rev,
+            0
+        ));
     }
 
     #[test]
@@ -1456,6 +1638,128 @@ mod tests {
         assert_eq!(removed.priority, 7);
         assert_eq!(reg.len(), 0);
         assert!(reg.get(hash).is_none());
+    }
+
+    // ---- M1 (2026-07-31 audit): gates key on the REQUESTED channel ----
+
+    /// A token minted for one channel under a prefix must not authorize
+    /// a sibling under the same prefix.
+    ///
+    /// Pre-fix the gate verified against `self.channel_id.hash()`, and
+    /// for a prefix-registered config that is a sentinel standing for
+    /// the whole family — so one token minted for the sentinel
+    /// authorized every channel beneath it, silently degrading a
+    /// per-channel binding to a per-prefix one.
+    #[test]
+    fn prefix_config_gate_binds_to_the_requested_channel_not_the_sentinel() {
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        let sentinel = ChannelId::parse("svc.replies.prefix").unwrap();
+        let config =
+            ChannelConfig::new(sentinel.clone()).with_token_roots(vec![owner.entity_id().clone()]);
+
+        let mine = channel_hash("svc.replies.aaaa");
+        let theirs = channel_hash("svc.replies.bbbb");
+
+        // A token for MY channel authorizes my channel...
+        let chain = direct_chain(&owner, &subject, TokenScope::SUBSCRIBE, mine);
+        assert!(config.can_subscribe(&caps, subject.entity_id(), mine, Some(&chain), &rev, 0));
+        // ...and not a sibling under the same prefix.
+        assert!(
+            !config.can_subscribe(&caps, subject.entity_id(), theirs, Some(&chain), &rev, 0),
+            "a token for one channel must not authorize a sibling under the \
+             same prefix"
+        );
+
+        // A token minted for the SENTINEL authorizes nothing real —
+        // that was the per-prefix skeleton key.
+        let sentinel_chain = direct_chain(&owner, &subject, TokenScope::SUBSCRIBE, sentinel.hash());
+        assert!(
+            !config.can_subscribe(
+                &caps,
+                subject.entity_id(),
+                mine,
+                Some(&sentinel_chain),
+                &rev,
+                0
+            ),
+            "a sentinel-scoped token must not authorize a real channel"
+        );
+    }
+
+    /// The publish counterpart, and the reason `set_publish_chain` was
+    /// unreachable for token-gated prefix channels: it stores under the
+    /// real channel hash while the gate asked about the sentinel.
+    #[test]
+    fn prefix_config_publish_gate_binds_to_the_requested_channel() {
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        let sentinel = ChannelId::parse("svc.requests.prefix").unwrap();
+        let config = ChannelConfig::new(sentinel).with_token_roots(vec![owner.entity_id().clone()]);
+
+        let real = channel_hash("svc.requests.aaaa");
+        let chain = direct_chain(&owner, &subject, TokenScope::PUBLISH, real);
+
+        assert!(config.can_publish(&caps, subject.entity_id(), real, Some(&chain), &rev, 0));
+        assert!(
+            !config.can_publish(
+                &caps,
+                subject.entity_id(),
+                channel_hash("svc.requests.bbbb"),
+                Some(&chain),
+                &rev,
+                0
+            ),
+            "a publish token for one channel must not authorize a sibling"
+        );
+    }
+
+    /// `reverify_subscribe*` must ask about the same channel the
+    /// subscribe gate did, or the publish-time re-check and the sweep
+    /// disagree with the decision that admitted the peer.
+    #[test]
+    fn reverify_paths_bind_to_the_requested_channel() {
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+
+        let sentinel = ChannelId::parse("svc.replies.prefix").unwrap();
+        let config = ChannelConfig::new(sentinel).with_token_roots(vec![owner.entity_id().clone()]);
+
+        let mine = channel_hash("svc.replies.aaaa");
+        let chain = direct_chain(&owner, &subject, TokenScope::SUBSCRIBE, mine);
+
+        for reverify in [
+            ChannelConfig::reverify_subscribe as fn(&_, &_, &_, u64, &_, u64) -> bool,
+            ChannelConfig::reverify_subscribe_presigned,
+        ] {
+            assert!(reverify(
+                &config,
+                &chain,
+                subject.entity_id(),
+                mine,
+                &rev,
+                0
+            ));
+            assert!(
+                !reverify(
+                    &config,
+                    &chain,
+                    subject.entity_id(),
+                    channel_hash("svc.replies.bbbb"),
+                    &rev,
+                    0
+                ),
+                "re-verify must reject a chain that does not authorize the \
+                 channel being published to"
+            );
+        }
     }
 
     // ---- H3 (2026-07-31 audit): origin-bound channel families ----
