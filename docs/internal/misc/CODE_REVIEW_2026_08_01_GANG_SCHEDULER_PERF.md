@@ -1,10 +1,34 @@
 # CODE REVIEW 2026-08-01 — Gang-claim scheduler hot path (`performance-gang-scheduler`)
 
-> **STATUS: OPEN, not signed off.** Reviews the branch as it stands at
-> `1da5327d2`. Nothing below is a correctness defect — all four optimizations do
-> what `PERF_AUDIT_2026_07_31_GANG_SCHEDULER.md` claims, and I verified the two
-> equivalence-sensitive rewrites against their originals by hand. §1 is the only
-> finding I would call blocking, and it is a three-line move.
+> **STATUS: ADDRESSED at `5f22babee`, not signed off.** Every finding below has a
+> landed fix — see [Closure](#closure) for the commit against each. Originally
+> reviewed at `1da5327d2`.
+>
+> Nothing in the original pass was a correctness defect — all four optimizations
+> do what `PERF_AUDIT_2026_07_31_GANG_SCHEDULER.md` claims, and the two
+> equivalence-sensitive rewrites check out against their originals by hand. §1
+> was the only blocking finding, and it was a three-line move.
+>
+> **The fix pass turned up two things the review missed**, both filed below in
+> place rather than as new sections:
+>
+> - **§3's first fix was flaky.** The strengthened fixture used node ids from
+>   generated keypairs, and whether the two limit orderings diverge at a given
+>   limit depends on where the candidate set iterates one particular key — so it
+>   was a coin flip per run. Fixed ids make the iteration order a property of the
+>   fixture. See §3.
+> - **Four `clippy::undocumented_unsafe_blocks` hits**, branch-introduced, in the
+>   allocation witness's `GlobalAlloc` impl. They only surface under `--tests`,
+>   which the original pass did not run clippy against. Folded into §5. Writing
+>   the impl-level comment surfaced the load-bearing soundness argument that was
+>   stated nowhere: a counting `GlobalAlloc` is unsound if the counter can
+>   allocate or re-enter, and what rules that out is the *const-initialized* TLS
+>   `Cell`.
+>
+> Every fix that could be red-coupled was: §1, §3 and §8 each have a recorded
+> failure against the pre-fix code, and §3's additionally has a recorded *pass*
+> of the old test under the mutation, which is the claim that made §3 worth
+> filing.
 
 **Scope:** the full branch diff `master...1da5327d2` (merge base `fb0f5803e`) —
 10 commits, 14 files, +2166/−72. This discharges slices §1, §3, §5, §6 and the
@@ -93,6 +117,14 @@ run under `gang_alloc_witness.rs`'s counting allocator would pin that the
 empty-`sensed_viable_order` path allocates no more than `match_islands` does,
 which is the property the doc comment already asserts in prose.
 
+**Disposition: FIXED (`b0b61d6e1`).** Guard hoisted as above.
+`sensed_match_with_no_evidence_allocates_exactly_what_the_plain_matcher_does`
+pins it under the counting allocator — **161 allocations either way, against
+162 pre-fix** (recorded by running the new test against the old ordering). The
+assertion is equality rather than a ratio: with `sensed_non_viable` empty the
+prune set is `Cow::Borrowed`, so both matchers do literally the same work
+through the same calls, and any delta at all is a discarded allocation.
+
 ---
 
 ## Findings
@@ -126,6 +158,17 @@ SipHash) stays on the aliases, where it is actually site-specific. If the fork i
 kept deliberately, the comment needs to give the real reason, because the one
 there now will not survive the next reader checking it.
 
+**Disposition: FIXED (`1b6a34fd3`).** Collapsed to one `pub FxU64Hasher` in
+`fold/state.rs`, with `BuildU64Hasher` and `BuildU64TupleHasher` as
+`BuildHasherDefault` aliases over it.
+`both_index_hasher_aliases_are_the_same_mixer` pins it *behaviorally* rather
+than structurally — both aliases fed the same `write_u64` sequence must produce
+the same digest — so a future re-fork that changed the constant or the step
+fails, while a faithful copy (which cannot drift by definition) does not. Plus a
+guard that the mixer is not a pass-through. The rename is confined to this
+branch, so no released name is affected; recorded in the audit's new "Public
+surface changes" section anyway.
+
 ### §3 — `candidate_hosts_for_applies_limit_before_host_dedup` cannot fail
 
 `gang/filter.rs:445`. The docstring states the invariant precisely:
@@ -156,6 +199,29 @@ dedup can return fewer hosts than limit-after-dedup. Keep the count-only
 assertion — *which* keys survive is genuinely unspecified, and the existing
 docstring is right to say so.
 
+**Disposition: FIXED (`5a48d4789`).** The premise was verified rather than
+argued: with `candidate_hosts_for` mutated to dedup first and limit after, **the
+old test still passed** and the new one fails at limit 2. New
+`fold_with_a_multi_class_host` fixture — host A in five classes, host B in one,
+6 keys over 2 hosts — and the assertion was upgraded from count equality to
+**set** equality against the untouched `query` + `candidate_hosts` oracle, which
+is strictly better than the count-only assertion suggested above.
+
+Two things the fix pass had to add that this section did not anticipate:
+
+- **Fixed node ids.** The first attempt used `entity_id().node_id()` from
+  generated keypairs. Whether the two orderings diverge at a given limit depends
+  on where the candidate set iterates B's key, and the set is hashed over the
+  ids themselves — so it was a coin flip per run, and the first run failed the
+  `discriminated` guard. `Fold::apply` trusts the caller for identity
+  (verification is the dispatch layer's job), so the announcements now carry
+  chosen ids and the iteration order is a fixed property of the fixture.
+- **A `discriminated` guard.** Under limit-after-dedup the host count would be
+  exactly `min(limit, hosts)` at *every* limit, so at least one limit coming in
+  under that is the signature of the ordering under test. Without it the fixture
+  could silently degenerate back into the state this finding is about — which is
+  precisely how the original got there.
+
 ### §4 — Breaking public API change, recorded nowhere
 
 Two `pub` items in `net-mesh` 0.34.0 change signature:
@@ -180,6 +246,17 @@ migration. Two additive `pub` surfaces land in the same diff and want the same
 treatment: `Fold::with_state_query` (`fold/mod.rs:675`) and `holder_of`
 (`fold/reservation.rs:168`).
 
+**Disposition: FIXED (`1c2b0706e`).** There is no `CHANGELOG.md` in this
+repository and no `docs/releases/` yet, so the record went into the audit doc
+these commits discharge — a new "Public surface changes (read this before
+cutting a release)" section in
+`PERF_AUDIT_2026_07_31_GANG_SCHEDULER.md`. It carries the before/after table,
+the one-line migration, the three additive surfaces, and the reason the type
+changed rather than converting at the call boundary (the set is probed once per
+topology entry — a boundary conversion reintroduces the per-call rebuild audit
+§7 exists to avoid). If a changelog is added later this section is what it
+should be seeded from.
+
 ### §5 — `cargo fmt --check` fails in 3 places, all branch-added
 
 ```
@@ -195,6 +272,24 @@ cd net/crates/net && cargo fmt --check
 introduced here.
 
 **Fix:** `cargo fmt`. Formatting only, no behavior change.
+
+**Disposition: FIXED (`5f22babee`).** Two diffs by the time this ran — the
+import was already resolved by §1's commit, which added `match_islands_sensed`
+to it.
+
+**Found during the fix pass:** four `clippy::undocumented_unsafe_blocks` hits,
+also branch-introduced, on the witness's `unsafe impl GlobalAlloc` and its three
+forwarding blocks. The original pass ran clippy against `--lib` only, where they
+do not appear; under `--tests` the suite has 14, of which these 4 are new (the
+other 10, mostly `ffi_shutdown_race.rs`, are pre-existing). Fixed in the same
+commit.
+
+Writing the impl-level comment was worth more than silencing the lint: a
+counting `GlobalAlloc` is unsound if the counter can allocate or re-enter the
+allocator, and what rules that out here is that `ALLOCS` / `COUNTING` are
+**const-initialized** TLS `Cell`s — no lazy init on first touch. The module
+header mentions const-initialization as a measurement-hygiene detail; that it is
+also the soundness argument was stated nowhere.
 
 ---
 
@@ -217,6 +312,14 @@ key type would have to have before it could reuse `NodeIdSet`'s hasher. One
 sentence naming the low-bit requirement closes it. (Applies identically to
 `U64TupleHasher`; if §2 is taken, it is one edit.)
 
+**Disposition: FIXED (`0529bf521`).** It was one edit, §2 having landed first.
+The doc now carries a "What a key type must satisfy to use this" section stating
+the requirement as low-bit distribution specifically, why (no finalizer;
+multiplication propagates entropy only upward; hashbrown indexes on low bits),
+which key types qualify (`NodeId`, `IslandId` — both already digests) and which
+would not (counters, left-shifted composites, pointers — anything with
+structural zeroes low down).
+
 ### §7 — `U64Hasher::write` mixes nothing on an empty slice, and collides with `write_u64(0)`
 
 `fold/state.rs:71`. `bytes.chunks(8)` yields nothing for an empty slice, so the
@@ -226,6 +329,15 @@ unreachable today — the fallback exists only against a future `Hash` impl
 routing through `write` — and the comment says as much. Noted so a later pass
 does not have to re-derive it; no change requested.
 
+**Disposition: FIXED anyway (`0529bf521`).** Both edges are now stated on
+`write`'s doc comment and pinned by
+`fx_u64_hasher_byte_fallback_matches_its_documented_edges`, alongside the
+property that makes the fallback a fallback rather than a second algorithm:
+`write(&v.to_le_bytes())` equals `write_u64(v)`. The reasoning for going past
+"noted": the fallback exists precisely for the day another key type routes
+through it, and that caller needs the behavior stated *and stable*, which prose
+alone does not give.
+
 ### §8 — `count_allocs` leaves counting enabled if the closure panics
 
 `tests/gang_alloc_witness.rs:66`. `COUNTING.set(false)` is not on an unwind path,
@@ -234,6 +346,16 @@ today: each `#[test]` runs on its own thread, both tests call `count_allocs`
 once, and a panic fails the test regardless. If the file grows a third
 measurement that shares a thread with a fallible one, a drop guard makes it
 airtight.
+
+**Disposition: FIXED (`ab1677bb2`).** The file grew a third and fourth
+measurement in this very pass, so the hypothetical stopped being one. Drop
+guard, unconditional.
+`a_panicking_measurement_does_not_leave_counting_armed` red-couples it (the
+post-unwind assertion fails without the guard, verified) and additionally checks
+that the *next* measurement starts from a zeroed counter — "disarmed" and
+"reusable" being separate properties. The default panic hook is swapped out
+around the deliberate panic so the suite does not print a backtrace note for an
+expected failure.
 
 ---
 
@@ -309,7 +431,9 @@ Recorded so a later pass does not re-derive them:
 
 ## Verification
 
-Run on Windows 11 from `net/crates/net`, at `1da5327d2`.
+Run on Windows 11 from `net/crates/net`.
+
+**Original pass (`1da5327d2`):**
 
 | check | result |
 |---|---|
@@ -320,13 +444,36 @@ Run on Windows 11 from `net/crates/net`, at `1da5327d2`.
 | `cargo fmt --check` | **3 diffs** — see §5 |
 | `cargo fmt --check` on `master` (same host) | clean — confirms §5 is branch-introduced |
 
-**Not exercised here.** No ICB-1 run: `icb1_interleave.py` needs per-slice
-release arm binaries built from separate commits, and the audit's acceptance
-rule is a human comparison of deltas against ranges, not a threshold check this
-pass could discharge. The branch's own measured-results claims in
+**Fix pass (`5f22babee`):**
+
+| check | result |
+|---|---|
+| `cargo test --lib` | **5368 passed**, 0 failed, 1 ignored — the whole crate, not just the touched modules |
+| `cargo test --test gang_alloc_witness` | **4 passed**, 0 failed |
+| `cargo clippy --lib --tests --benches --all-features` | **0 errors.** The ~12k `unwrap`/`expect` restriction-lint hits are pre-existing repo-wide. The one new class the original pass had missed — 4 `undocumented_unsafe_blocks` in the witness — is fixed; the remaining 10 in the suite are pre-existing |
+| `cargo fmt --check` | clean |
+| `cargo test --lib candidate_hosts_for_applies_limit` ×5 | ok every run — the flakiness §3's first fix introduced is gone |
+
+**Not exercised in either pass.** No ICB-1 run: `icb1_interleave.py` needs
+per-slice release arm binaries built from separate commits, and the audit's
+acceptance rule is a human comparison of deltas against ranges, not a threshold
+check either pass could discharge. The branch's own measured-results claims in
 `PERF_AUDIT_2026_07_31_GANG_SCHEDULER.md` are therefore taken as reported, not
-reproduced. §1 above, if fixed, does not change any ICB-1 cell — that bench
-drives `match_islands`, not `match_islands_sensed`.
+reproduced.
+
+**Why the fix pass does not invalidate them.** No published ICB-1 cell moves.
+That bench drives `match_islands`, which §1 did not touch — the hoisted guard is
+inside `match_islands_sensed`. §2 is a rename plus one deleted duplicate type
+with an identical mixer, so hashing behavior is unchanged by construction (and
+`both_index_hasher_aliases_are_the_same_mixer` is the check). §3, §5, §7 and §8
+are tests, formatting and comments. §4 and §6 are documentation. The one
+measured number that *does* change is the §3 allocation witness, which is
+reported above and in the audit.
+
+**Still unexercised, carried forward from the branch's own notes.**
+`tests/sensing_origin_emitter.rs` does not compile under `--features net` alone
+(pre-existing, confirmed by the branch author with all slice changes stashed).
+Neither pass ran it, and neither pass made it worse.
 
 ---
 
@@ -334,11 +481,25 @@ drives `match_islands`, not `match_islands_sensed`.
 
 | # | disposition | commit |
 |---|---|---|
-| §1 | open — blocking | — |
-| §2 | open | — |
-| §3 | open | — |
-| §4 | open | — |
-| §5 | open | — |
-| §6 | open — nit | — |
-| §7 | open — nit, no change requested | — |
-| §8 | open — nit | — |
+| §1 | fixed — guard hoisted, red-coupled at 162 → 161 allocs | `b0b61d6e1` |
+| §2 | fixed — one `FxU64Hasher`, two aliases | `1b6a34fd3` |
+| §3 | fixed — non-injective fixture, set equality, fixed ids, degeneracy guard | `5a48d4789` |
+| §4 | fixed — recorded in the audit doc; no changelog exists to put it in | `1c2b0706e` |
+| §5 | fixed — 2 fmt diffs, plus 4 branch-added unsafe-comment lints found in the fix pass | `5f22babee` |
+| §6 | fixed — requirement restated as low-bit distribution | `0529bf521` |
+| §7 | fixed, though only noted — both edges documented and pinned | `0529bf521` |
+| §8 | fixed — drop guard, red-coupled | `ab1677bb2` |
+
+Four new tests plus one rewritten:
+
+| test | pins |
+|---|---|
+| `sensed_match_with_no_evidence_allocates_exactly_what_the_plain_matcher_does` | §1 — no-evidence path costs exactly `match_islands` |
+| `both_index_hasher_aliases_are_the_same_mixer` | §2 — the two aliases cannot drift |
+| `fx_u64_hasher_byte_fallback_matches_its_documented_edges` | §7 — the fallback's stated behavior |
+| `a_panicking_measurement_does_not_leave_counting_armed` | §8 — unwind safety of the measurement harness |
+| `candidate_hosts_for_applies_limit_before_host_dedup` (rewritten) | §3 — the limit ordering, now falsifiably |
+
+Three of these were red-coupled — run against the pre-fix code and observed to
+fail (§1, §8) or, for §3, run in both directions: the old test **passes** under a
+limit-after-dedup mutation and the new one fails at limit 2.
