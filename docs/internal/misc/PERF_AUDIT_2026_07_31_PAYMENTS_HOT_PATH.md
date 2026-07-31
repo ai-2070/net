@@ -351,6 +351,26 @@ channel — so the lazy version either routes a canonicalization failure into a 
 decision or hoists it behind a `OnceCell`. Worth deciding deliberately rather than
 reaching for the first shape that compiles.
 
+### The cost side, recorded on review (2026-07-31)
+
+This is not a pure win, and the landed comment now says so. Moving the work inside
+`require` also moves it **inside the cross-process advisory lock** — before, it ran ahead
+of the transaction. Every other mutator of the policy store waits behind the
+1ms-doubling poll loop (`payments-spend-contention.md`), so the *first-approval* path
+lengthens a critical section it previously stayed out of.
+
+Taken deliberately. An approval-required decision is operator-gated and rare, one quote's
+canonical bytes are small, and the two genuinely hot paths — `Allowed` and
+already-pending — now do none of this work at all. The alternative, hoisting it back out
+behind a speculative pre-check of `s.approvals`, costs a second read on every call to
+save a rare one.
+
+Landed shape: neither of the two options above. The failure is parked in a
+`canonical_failure: Option<String>` outside the closure and re-raised as
+`SpendError::Malformed` after the transaction, so no approval is ever recorded without
+the quote bytes a post-approval retry needs, and the caller never sees a
+`RequiresPaymentApproval` pointing at a hold that was not taken.
+
 ---
 
 ## 4. Two full spend-file parses per payment — **WITHDRAWN (2026-07-31)**

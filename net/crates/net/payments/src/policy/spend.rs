@@ -314,6 +314,20 @@ impl SpendPolicyEngine {
             // allowed path — and on an already-pending observation, which is
             // the common case under a duplicate storm — it was pure waste.
             //
+            // The tradeoff, stated because it is the one direction this is a
+            // regression: that work now happens INSIDE the cross-process
+            // advisory lock, whereas before it ran ahead of it. Every other
+            // mutator of this store waits behind a 1ms-doubling poll loop
+            // (see `payments-spend-contention.md`), so the first-approval
+            // path lengthens a critical section it used to stay out of. It
+            // is taken deliberately: an approval-required decision is
+            // operator-gated and rare, one quote's canonical bytes are
+            // small, and the paths that are actually hot — allowed, and
+            // already-pending — now do none of this work at all. Moving it
+            // back out would mean a speculative pre-check to guess whether
+            // an approval is coming, which costs a second read on every
+            // call to save a rare one.
+            //
             // `canonical_bytes` can only fail on a float-bearing or
             // non-object envelope, unreachable for a `PaymentQuote`, but the
             // failure is surfaced rather than swallowed: no approval is
