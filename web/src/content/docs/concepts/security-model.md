@@ -2,6 +2,7 @@
 title: Security Model
 description: What Net protects, how, and — more usefully — what it does not protect and where the trust actually bottoms out.
 ---
+
 # Security Model
 
 What Net protects, how, and — more usefully — what it does not protect and where
@@ -11,7 +12,7 @@ read the limits section before the guarantees section.
 ## The three layers of the claim
 
 **Transport.** Peer links are Noise `NKpsk0` sessions: ChaCha20-Poly1305 frames
-over a handshake authenticated by a pre-shared key *and* the responder's static
+over a handshake authenticated by a pre-shared key _and_ the responder's static
 public key. Every frame is encrypted and authenticated; a passive observer
 learns traffic patterns, not contents.
 
@@ -32,14 +33,14 @@ parent's — authority narrows as it travels, never widens.
 This is the part most often misread. **Tokens are verified at subscription and
 session time, not per packet.**
 
-The per-packet path is an `AuthGuard`: a 4 KB bloom filter (sized to sit in L1)
-plus a verified-positive cache, keyed on `(origin_hash, channel_hash)`. It
-answers Allowed / Denied in under ten nanoseconds, or `NeedsFullCheck` for
-anything it can't decide, which then runs full verification.
+The per-packet path is an `AuthGuard`: a 4 KB bloom filter plus a
+verified-positive cache, keyed on `(origin_hash, channel_hash)`. It answers
+`Allowed` / `Denied` from cached state or returns `NeedsFullCheck`, which then runs
+full verification. Performance depends on hardware, cache state, traffic shape,
+and build configuration.
 
-So "wire-speed authorization" means *the fast path is a cache of decisions
-already made cryptographically* — not that an ed25519 signature is checked per
-packet. An ed25519 verify is ~70 µs; nothing on a hot path can afford one.
+The fast path therefore uses decisions already made cryptographically rather than
+checking an Ed25519 signature on every packet.
 
 The corollary matters operationally: **revocation is not instant.** `revoke()`
 removes an entry from the verified cache, but bloom filters don't support
@@ -68,7 +69,7 @@ they're only as good as the grants you actually issue.
 For [payments](/docs/payments/non-custodial-signing), the separation is
 structural: the ed25519 entity key signs commercial facts (quotes,
 verifications, billing events) and never touches value. Settlement signing goes
-through a seam that takes a *typed document* and returns a signature, with no
+through a seam that takes a _typed document_ and returns a signature, with no
 raw-bytes path. Net cannot move funds because it never holds the ability to.
 
 ## What Net does not do
@@ -83,7 +84,7 @@ raw-bytes path. Net cannot move funds because it never holds the ability to.
   that lies within its authority is believed within its authority.
 - **No built-in rate limiting or DoS protection** at the application boundary.
   Backpressure protects the ring buffer, not your handler.
-- **No audit of *your* authorization decisions.** Net enforces the grants you
+- **No audit of _your_ authorization decisions.** Net enforces the grants you
   issue. It has no opinion about whether they were wise.
 
 ## Reporting a vulnerability

@@ -2,32 +2,28 @@
 title: Agent Briefs
 description: "Task briefs written for a coding agent to execute rather than for a human to read, each with a verifiable end state."
 ---
+
 # Agent Briefs
 
-Most docs are written for a human to read. These are written for an **agent to
-execute** — a coding agent (Claude Code or similar) that edits files, runs
-commands, checks output, and verifies its own work. Each brief is a single,
-self-contained task with a fixed shape:
+These briefs are task contracts for coding agents that edit files, run commands,
+inspect output, and verify an end state. Each brief uses the same structure:
 
 > **Goal · Prerequisites · Steps (files + commands) · Expected output · Verify
 > (acceptance) · Pitfalls**
 
-If a step's expected output doesn't appear, the agent stops and reports — it does
-not guess forward. That's the difference between a brief and a tutorial: a brief is
-*checkable*.
+If expected output does not appear, the agent should stop at that step and report
+the mismatch rather than infer success.
 
-## The standing reference: the Net Claude Code skill
+## Optional Net skill
 
-Before running a brief, install the **Net Claude Code skill** — the standing,
-always-loaded reference an agent uses while building against Net:
+The **Net Claude Code skill** provides additional Net-specific API context and
+examples:
 
 > **[github.com/ai-2070/net-claude-skill](https://github.com/ai-2070/net-claude-skill)** —
 > setup steps in [Claude Skills](/docs/start/claude-skills)
 
-The skill is the *reference* (the mental model, the per-SDK API templates, the
-migration gotchas, the event-representation doctrine); a brief here is a *one-shot
-task* that uses that reference. Skill = what you keep loaded; brief = what you run
-once. They compose: point your agent at the skill, then hand it a brief.
+The briefs are self-contained. The skill is useful for broader implementation work
+or when the brief leads into APIs not covered by its steps.
 
 ## The briefs
 
@@ -38,5 +34,5 @@ once. They compose: point your agent at the skill, then hand it a brief.
 3. **[Generate Typed Tool Bindings](/docs/agent-briefs/generate-typed-tool-bindings)** —
    turn a discovered tool into typed, compile-checked client code.
 
-Every command in these briefs is pinned to the shipped CLI and SDK on this branch.
-Where a step depends on a running mesh, the brief says so and how to satisfy it.
+Commands and expected output target the CLI and SDK documented on this branch.
+Where a step depends on a running mesh, the brief states that prerequisite.

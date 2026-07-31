@@ -2,15 +2,19 @@
 title: Task Lifecycle and Workflows
 description: A task in Net is a single-writer RedEX chain, and its state is the deterministic fold of the transitions written to it.
 ---
+
 # Task Lifecycle and Workflows
 
-A task in Net is a **single-writer RedEX chain**, and its state is the
-deterministic fold of the transitions written to it. That sentence is the whole
-design: there is no workflow engine, no orchestrator process, and no database of
-task rows. The log *is* the task, and the state is what you get by folding it.
+A task lifecycle is a durable record of transitions for one unit of work. RedEX
+stores the single-writer event chain; a deterministic fold derives the current
+status from those events.
+
+This surface records task state. It does not dispatch workers or make external
+effects exactly once. The application still executes actions, manages leases or
+idempotency where required, and records the resulting transition.
 
 This is the layer that runs on top of a claim. The [gang-claim
-scheduler](/docs/guides/gang-scheduler) decides *who* holds a contended
+scheduler](/docs/guides/gang-scheduler) decides _who_ holds a contended
 resource; this decides what happens once it's held, and how that survives a
 restart.
 
@@ -28,9 +32,9 @@ pub enum TaskStatus {
 ```
 
 `Waiting` and `Blocked` are distinct on purpose, and the distinction is
-operationally load-bearing. `Waiting` means *the task will retry by itself* — it
+operationally load-bearing. `Waiting` means _the task will retry by itself_ — it
 lost a gang claim, or it's parked on a trigger that hasn't fired. `Blocked`
-means *something else must finish first*. A queue full of `Waiting` tasks is a
+means _something else must finish first_. A queue full of `Waiting` tasks is a
 contention problem; a queue full of `Blocked` tasks is a dependency problem, and
 they want opposite responses from you.
 
@@ -62,12 +66,11 @@ returns once the fold has applied at least that far.
 The other transitions — `wait`, `block`, `fail` — mirror the enum. There is no
 "update task" call, because there is no task record to update.
 
-## Why this survives a restart for free
+## Restoring recorded state after restart
 
-The chain is durable and the fold is deterministic, so recovering task state is
-re-reading the log, not restoring a checkpoint someone remembered to take. A
-process that dies mid-task comes back, re-folds, and sees exactly the state it
-wrote — including the half-finished `Running` task it now has to decide about.
+When the chain is stored durably, a restarted process can rebuild task status by
+replaying it. A `Running` status means only that the transition was recorded; the
+process must still reconcile any in-flight or external work before continuing.
 
 Single-writer is the constraint that makes this safe. One writer per chain means
 transitions are totally ordered without consensus, and the fold can't diverge
@@ -128,13 +131,24 @@ for satisfied in engine.on_tick(now)? {
 }
 ```
 
-That the engine returns actions rather than performing them is the point. It
-stays testable as a pure function, and the decision about what "apply" means —
-start a task, claim an island, call out to something — stays yours.
+The engine returns actions rather than performing them. The caller decides how to
+start work, acquire a resource, invoke another system, retry, deduplicate, and
+record the result.
+
+## What the lifecycle does not provide
+
+- worker dispatch or process supervision;
+- distributed locking beyond a separately acquired claim or lease;
+- idempotency for an external side effect;
+- compensation after a partial effect;
+- reconciliation with an external system of record.
+
+Use the lifecycle to make those decisions and their outcomes visible, not as a
+substitute for executing them.
 
 ## Naming collision worth knowing
 
-The cortex module has a *separate* `Task` / `TaskStatus` pair in its tasks
+The cortex module has a _separate_ `Task` / `TaskStatus` pair in its tasks
 model. The workflow lifecycle types live under `cortex::workflow::` specifically
 to avoid colliding with them. If a `TaskStatus` doesn't have the variants above,
 you've imported the other one.

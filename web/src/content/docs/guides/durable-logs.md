@@ -2,9 +2,13 @@
 title: Durable Logs (RedEX)
 description: RedEX turns a channel into a durable, append-only log.
 ---
+
 # Durable Logs with RedEX
 
-RedEX turns a channel into a durable, append-only log. Once a channel is opened as a RedEX file, every event published on it is appended in causal order, persisted to disk if you ask for it, and made available to consumers as a tail subscription. RedEX is the foundation that everything else in the storage stack — folded state, queries, replication — composes against.
+RedEX provides an append-only log for channel events. Persistence and crash-loss
+bounds depend on `with_persistent` and the selected `FsyncPolicy`; the default
+policy does not fsync each append. Consumers can read retained ranges or follow a
+tail subscription.
 
 The mental model is unromantic. A RedEX file is a named log. Producers append; consumers read; consumers can subscribe to the tail and receive new events as they land. There's no schema, no compaction, no transaction. The simplicity is the point — RedEX does one thing and the higher layers compose against that one thing.
 
@@ -38,7 +42,7 @@ let seq = file.append(payload)?;
 
 `payload` is opaque bytes (`&[u8]`). RedEX doesn't decode it, doesn't validate it, doesn't transform it. Append is synchronous — it returns the assigned sequence number, which is what consumers reference when they want to resume from a specific point.
 
-For higher-throughput append paths, use the batched variant — it amortizes the index write and the fsync. It takes a slice of `Bytes` and returns the sequence of the *first* event in the batch (`None` for an empty batch):
+For higher-throughput append paths, use the batched variant — it amortizes the index write and the fsync. It takes a slice of `Bytes` and returns the sequence of the _first_ event in the batch (`None` for an empty batch):
 
 ```rust
 let first_seq = file.append_batch(&payloads)?;
@@ -76,17 +80,20 @@ while let Some(Ok(event)) = tail.next().await {
 let mut tail = file.tail(last_processed_seq);
 ```
 
-The cursor is just a sequence number. Persist it (in your own state, in another RedEX file, wherever fits) and you have at-least-once recovery for free.
+The cursor is a sequence number. Persist it only after the consumer has completed
+the corresponding work. On restart, resume from that checkpoint and make the
+consumer idempotent because an event may be processed again around the checkpoint
+boundary.
 
 ## Choosing durability
 
 `FsyncPolicy` controls when the log is fsynced to disk. Four options, each with a different trade-off:
 
-| Policy            | Worst-case loss on crash                  | Use for                                        |
-|-------------------|--------------------------------------------|------------------------------------------------|
-| `Never` (default) | Tail since last `close()` or `sync()`     | Telemetry, caches, best-effort logs            |
-| `EveryN(N)`       | ≤ N − 1 entries from the last sync point | Most application state (start with `EveryN(100)`) |
-| `Interval(d)`     | ≤ d seconds of writes                      | State that must survive kernel panics          |
+| Policy                                  | Worst-case loss on crash                                                 | Use for                                                               |
+| --------------------------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| `Never` (default)                       | Tail since last `close()` or `sync()`                                    | Telemetry, caches, best-effort logs                                   |
+| `EveryN(N)`                             | ≤ N − 1 entries from the last sync point                                 | Most application state (start with `EveryN(100)`)                     |
+| `Interval(d)`                           | ≤ d seconds of writes                                                    | State that must survive kernel panics                                 |
 | `IntervalOrBytes { period, max_bytes }` | ≤ whichever of `period` elapsing or `max_bytes` accumulating fires first | Bursty workloads that need a byte ceiling on unsynced data under load |
 
 Two invariants are worth committing to memory:
@@ -132,7 +139,10 @@ let file = redex.open_file(&ChannelName::new("sensors/lidar/front")?, cfg)?;
 
 `enable_replication` installs the per-`Redex` router on the mesh's replication subprotocol. After that, opening a channel with `replication: Some(_)` spawns a per-channel replication coordinator: leader election (deterministic by RTT and health), heartbeat-based liveness, and sync requests that bring replicas up to date.
 
-Replication is a deep enough topic that it gets its own [reference page](/docs/reference/replication-config) with the full list of knobs (placement strategies, bandwidth budgets, failure modes). The short version: turn it on per channel, set a replication factor, and the runtime handles the rest.
+Replication has its own [reference page](/docs/reference/replication-config) with
+placement strategies, bandwidth budgets, and failure modes. A configured factor
+still depends on eligible nodes, reachable routes, catch-up, and enough retained
+history to bring a replica current.
 
 ## When to reach for RedEX directly
 

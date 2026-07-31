@@ -1,40 +1,37 @@
 ---
 title: Python
-description: The Python SDK wraps the same Rust core as every binding, so this spine walks the same agentic loop as Rust and TypeScript.
+description: "Use net-mesh-sdk from Python and understand where the ergonomic tool API differs from the lower-level capability handle."
 ---
+
 # Python SDK
 
-The Python SDK wraps the same Rust core as every binding, so this spine walks the
-same agentic loop as [Rust](/docs/sdk/rust) and [TypeScript](/docs/sdk/typescript).
+Install the Python SDK for capability discovery, tool calls, event streams, and
+artifact transfer:
 
 ```bash
 pip install net-mesh-sdk
 ```
 
-The package installs as `net-mesh-sdk` but **imports as `net_sdk`** (the in-source
-module name is preserved). The native binding `net-mesh` is pulled in transitively.
+The package installs as `net-mesh-sdk` and imports as `net_sdk`. The native
+`net-mesh` binding is installed transitively.
 
-Two node classes:
+## Choose the entry point
 
-- **`NetNode`** — the event bus. `emit` / `subscribe_typed`. Transport is a
-  constructor choice (`memory` default, `redis_url=`, `jetstream_url=`).
-- **`MeshNode`** — the mesh node. Its ergonomic agentic surface is the **tool**
-  API (`serve_tool` / `call_tool` / `list_tools`).
+- **`NetNode`** is the event bus. Transport is selected in the constructor; memory
+  is the default.
+- **`MeshNode`** provides the ergonomic tool surface through `serve_tool`,
+  `call_tool`, and `list_tools`.
 
-## A binding note (asymmetry, stated up front)
+Python exposes the raw capability announce/query surface through the node's native
+handle rather than the same `MeshNode` methods used for tools. The pages below use
+the ergonomic path and identify the places that require the native handle.
 
-Python's `NetNode` bus surface is full parity with Rust/TS. On the mesh side, the
-ergonomic capability path in Python is the **tool** API and the blob-transfer
-functions; the lower-level raw capability announce/query surface is reached through
-the node's native handle rather than clean `MeshNode` methods. The pages below use
-the ergonomic path and flag where you drop to the handle.
+## Follow the capability path
 
-## The spine
-
-1. **[Quickstart](/docs/sdk/python/quickstart)**
-2. **[Announce](/docs/sdk/python/announce)** — serve a tool the mesh can discover.
-3. **[Discover](/docs/sdk/python/discover)** — list tools on the mesh.
-4. **[Invoke](/docs/sdk/python/invoke)** — call a tool, get a typed result.
-5. **[Watch](/docs/sdk/python/watch)** — consume the event stream.
-6. **[Artifacts](/docs/sdk/python/artifacts)** — move blobs and directories.
-7. **[Errors](/docs/sdk/python/errors)** — classify failures and recover.
+1. [Quickstart](/docs/sdk/python/quickstart)
+2. [Announce](/docs/sdk/python/announce)
+3. [Discover](/docs/sdk/python/discover)
+4. [Invoke](/docs/sdk/python/invoke)
+5. [Watch](/docs/sdk/python/watch)
+6. [Artifacts](/docs/sdk/python/artifacts)
+7. [Errors](/docs/sdk/python/errors)

@@ -2,6 +2,7 @@
 title: Wrap an MCP Server
 description: The fastest way to put a capability on the mesh is to wrap a tool you already have.
 ---
+
 # Wrap an MCP Server
 
 The fastest way to put a capability on the mesh is to wrap a tool you already
@@ -10,8 +11,8 @@ announces each tool as a discoverable Net capability, and translates incoming
 mesh calls back into MCP `tools/call` — all without the Net core ever learning
 that MCP exists.
 
-> **MCP made tools callable. `net-mesh wrap` makes them discoverable.** See
-> [MCP vs Net](/docs/worldview/mcp-vs-net) for where this fits.
+`net-mesh wrap` publishes tools from an existing MCP server as Net capabilities.
+[Net and MCP](/docs/worldview/mcp-vs-net) explains where the bridge fits.
 
 ## Prerequisite: a mesh to join
 
@@ -62,7 +63,7 @@ withdrawn from the mesh.
 
 Every wrapped tool is announced as **visible to the mesh but invocable only by the
 same root identity** — the owner. Discovery is not authorization: other nodes can
-*see* and *describe* the capability, but a call from outside the owner scope is
+_see_ and _describe_ the capability, but a call from outside the owner scope is
 rejected at the wrapper, verified against the AEAD-authenticated caller origin.
 
 To widen who may invoke, admit specific caller origins explicitly:
@@ -73,7 +74,7 @@ net-mesh wrap github --allow 0x<caller-origin> --allow 0x<other-origin> \
   -- npx -y @modelcontextprotocol/server-github
 ```
 
-`--allow` widens the *local* enforcement beyond the owner; the announced scope
+`--allow` widens the _local_ enforcement beyond the owner; the announced scope
 label stays the owner identity, so consumers read the reported `allowed_origins`
 to know who may actually invoke. There is no flag that grants blanket mesh-wide
 invocation — widening is always an explicit, per-origin decision.
@@ -91,14 +92,12 @@ Credential status flows into the descriptor a consumer sees, and into the consen
 gate on the demand side ([Expose Net as MCP](/docs/guides/expose-net-as-mcp)):
 anything credentialed is search/describe-only until a human approves it.
 
-## The honest limit: `mcp_bridge` tier
+## Limits of the `mcp_bridge` tier
 
 Wrapped tools carry `compat_tier: "mcp_bridge"` and are **request/response only —
-no streams, no migration, no artifacts**. The bridge is the funnel that gets
-existing supply onto the mesh fast; the richer surface (streams, recovery as typed
-events, artifact transfer, migration) belongs to **native** capabilities. Reach
-for a native capability ([Discover and Invoke](/docs/guides/discover-and-invoke))
-when a wrapped tool's request/response shape isn't enough.
+no streams, no migration, no artifacts**. Use a native capability
+([Discover and Invoke](/docs/guides/discover-and-invoke)) when the operation needs
+Net streams, typed task state, artifact transfer, or migration.
 
 ## Embedding it (library)
 

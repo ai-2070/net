@@ -1,28 +1,36 @@
 ---
-title: Quickstart
-description: This page gets you from zero to a working event bus in about five minutes.
+title: Core Event Bus Quickstart
+description: Run the lower-level Rust EventBus and understand adapters, asynchronous acceptance, backpressure, and shutdown.
 ---
-# Quickstart
 
-This page gets you from zero to a working event bus in about five minutes. We'll start a bus on a single process, publish a few events, see what the bus did with them, and then point at what changes when you want the same code to run across a real mesh.
+# Core event bus quickstart
 
-Every snippet below is compiled in CI as [`examples/docs_quickstart.rs`](https://github.com/ai-2070/net/blob/master/net/crates/net/examples/docs_quickstart.rs) — if the API moves, the build breaks before the page goes stale.
+This page runs Net's low-level Rust event bus in one process, then shows the
+transport boundary for a real mesh. If you are building an application that needs
+capability discovery and invocation, start with the
+[Rust SDK quickstart](/docs/sdk/rust/quickstart) instead.
 
-The examples are in Rust because the core crate is Rust, but the same surface exists for [Node, Python, and Go](/docs/start/install). If you're working in one of those bindings, swap the import line and the syntax — the call shapes match.
+Every snippet below is compiled in CI as [`examples/docs_quickstart.rs`](https://github.com/ai-2070/net/blob/master/net/crates/net/examples/docs_quickstart.rs).
+
+The examples are in Rust because this page documents the Rust-native core crate.
+Use the language-specific SDK pages for Node.js, Python, and Go; their lifecycles
+and coverage are not identical.
 
 ## First, which crate?
 
-Net ships two Rust entry points, and picking the wrong one is the most common way to lose an afternoon. They are layers, not alternatives:
+Net ships two Rust entry points. They are layers rather than alternatives:
 
-| | `net-mesh` (this page) | `net-mesh-sdk` ([SDK quickstart](/docs/sdk/rust/quickstart)) |
-|---|---|---|
-| Imports as | `net` | `net_sdk` |
-| You get | `EventBus` — shards, ring buffer, adapters, filters | `Net` (the bus, ergonomically) and `Mesh` (capabilities, nRPC, tools) |
+|                   | `net-mesh` (this page)                                                  | `net-mesh-sdk` ([SDK quickstart](/docs/sdk/rust/quickstart))                           |
+| ----------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Imports as        | `net`                                                                   | `net_sdk`                                                                              |
+| You get           | `EventBus` — shards, ring buffer, adapters, filters                     | `Net` (the bus, ergonomically) and `Mesh` (capabilities, nRPC, tools)                  |
 | Reach for it when | you're embedding the bus, writing an adapter, or tuning the ingest path | you're building an agent, a service, or anything that discovers and calls capabilities |
 
-**If you're new, you almost certainly want the SDK.** Capability discovery, typed RPC, daemons, and tool calling all live there, and its `Mesh` node finds peers by capability rather than by address. Read this page to understand the substrate underneath — it's short, and the mental model pays for itself the first time you tune a shard count or write an adapter.
+Start with the SDK for capability discovery, typed invocation, daemons, and tool
+calling. Use this page when embedding the bus, writing an adapter, or tuning the
+ingest path.
 
-The two share one runtime: `net_sdk::Net` *is* an `EventBus` with a friendlier surface, and both crates pin to the same version.
+The two share one runtime: `net_sdk::Net` _is_ an `EventBus` with a friendlier surface, and both crates pin to the same version.
 
 ## Install
 
@@ -66,8 +74,10 @@ Run it and you'll see `ingested=2 dispatched=2 dropped=0`. That's the whole inge
 A few things worth knowing about what just happened:
 
 - `EventBusConfig::default()` gives you a single-node bus backed by the **no-op adapter**, which accepts batches and discards them. It's the right shape for benchmarking the ingest path and the wrong shape for anything else.
-- `bus.ingest()` is non-blocking. It hashes the event onto a shard and returns; a background worker drains the shard into the adapter. Ingestion is built to sustain tens of millions of events per second on commodity hardware.
-- Because ingest is asynchronous, a receipt means *accepted into the local ring buffer* — not *delivered*, and not *processed*. Under backpressure it can drop, which is why `events_dropped` is worth printing. [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed) is the long version of that distinction.
+- `bus.ingest()` is non-blocking. It hashes the event onto a shard and returns; a
+  background worker drains the shard into the adapter. Throughput depends on the
+  adapter, payload, shard configuration, durability policy, build, and hardware.
+- Because ingest is asynchronous, a receipt means _accepted into the local ring buffer_ — not _delivered_, and not _processed_. Under backpressure it can drop, which is why `events_dropped` is worth printing. [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed) is the long version of that distinction.
 - `bus.shutdown()` drains in-flight ingests, flushes everything to the adapter, and stops the workers cleanly. Calling it is the contract — dropping the bus without shutting down will lose anything still in the ring buffer.
 
 ## Reading events back

@@ -2,11 +2,14 @@
 title: Subnets
 description: A subnet is a way of grouping nodes that should share scope.
 ---
+
 # Subnets
 
 A subnet is a way of grouping nodes that should share scope. Nodes in the same subnet see each other's local traffic by default; nodes in different subnets see each other only when a channel's visibility explicitly says they should. Gateways at subnet boundaries enforce this — without decrypting payloads, without per-flow state, without a central authority deciding what crosses.
 
-Subnets are how Net handles the question "which nodes can see what" at any scale beyond a single LAN. They're how you keep telemetry from one fleet from cross-contaminating another, how you keep a multi-tenant deployment honest, and how a vehicle's internal channels stay internal even when the vehicle is on a public mesh.
+Subnets define which channels may cross a topology boundary. They can separate
+fleet telemetry, tenant traffic, or a vehicle's internal channels while selected
+exports continue to a parent or peer subnet.
 
 ## The hierarchy
 
@@ -23,7 +26,7 @@ Parent, child, sibling, and distance relationships all resolve with bitwise oper
 
 ## Assignment
 
-Nodes are assigned to subnets by policy, not by hand. A `SubnetPolicy` is a list of `SubnetRule`s; each rule maps a capability-tag *prefix* to a hierarchy *level* (0–3) and a set of tag-value→byte mappings, and rules combine across levels to fill the subnet id. Any level no rule fills stays `0` — i.e. unrestricted (`GLOBAL`); there is no separate "default subnet."
+Nodes are assigned to subnets by policy, not by hand. A `SubnetPolicy` is a list of `SubnetRule`s; each rule maps a capability-tag _prefix_ to a hierarchy _level_ (0–3) and a set of tag-value→byte mappings, and rules combine across levels to fill the subnet id. Any level no rule fills stays `0` — i.e. unrestricted (`GLOBAL`); there is no separate "default subnet."
 
 This means subnet membership is data-driven and changes as capabilities change. Add a `fleet=west-coast` tag to a node and it moves into the west-coast fleet's subnet automatically; the matching gateway picks it up; the matching channel scopes start applying. There's no separate config to push, and there's no opportunity for the node's claimed subnet to disagree with its capability set.
 
@@ -31,12 +34,12 @@ This means subnet membership is data-driven and changes as capabilities change. 
 
 A subnet gateway is a node that sits between two subnets and applies channel visibility to packets crossing the boundary. The gateway reads only the header — `channel_hash` and `subnet_id` — and consults the channel's `Visibility`:
 
-| Visibility       | Decision                                                             |
-|------------------|----------------------------------------------------------------------|
-| `SubnetLocal`    | Always dropped at the boundary.                                      |
-| `ParentVisible`  | Forwarded only toward ancestor subnets.                              |
-| `Exported`       | Forwarded only to subnets named in the channel's export table.       |
-| `Global`         | Always forwarded.                                                    |
+| Visibility      | Decision                                                       |
+| --------------- | -------------------------------------------------------------- |
+| `SubnetLocal`   | Always dropped at the boundary.                                |
+| `ParentVisible` | Forwarded only toward ancestor subnets.                        |
+| `Exported`      | Forwarded only to subnets named in the channel's export table. |
+| `Global`        | Always forwarded.                                              |
 
 The gateway also enforces a TTL on every forwarded packet, so a loop in the mesh can't burn forever. Drop reasons are tracked with atomic counters, so you can see at a glance whether a gateway is rejecting traffic for visibility, for TTL, or for an unknown subnet (which usually means a configuration drift).
 
@@ -58,4 +61,4 @@ Subnets are about scope, not encryption. Two nodes in the same subnet still use 
 
 Subnets are also not consensus groups. There's no leader election within a subnet, no quorum decisions, no shared state that the subnet maintains. A subnet is a labeling convention plus a gateway-enforced visibility model — the heavyweight semantics live elsewhere, on the channels and the entities and the causal links.
 
-The right way to think about subnets is as the *spatial* dimension of the mesh, complementary to the *temporal* dimension that causal links provide. Subnets answer "who can see this"; causal links answer "what happened before this." Most operational questions about a Net deployment land somewhere in the intersection of those two.
+The right way to think about subnets is as the _spatial_ dimension of the mesh, complementary to the _temporal_ dimension that causal links provide. Subnets answer "who can see this"; causal links answer "what happened before this." Most operational questions about a Net deployment land somewhere in the intersection of those two.

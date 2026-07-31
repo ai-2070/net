@@ -1,12 +1,17 @@
 ---
 title: Event-Sourced Service
-description: "This tutorial walks through building a complete event-sourced service: a small order-tracking system where every state change is an immutable event in a durable log, the queryable"
+description: "A worked order-tracking example using a RedEX event log, a CortEX fold, snapshots, and a NetDB query handle."
 ---
+
 # An Event-Sourced Service
 
-This tutorial walks through building a complete event-sourced service: a small order-tracking system where every state change is an immutable event in a durable log, the queryable view is a fold materialized from the log, snapshots handle restarts without replaying from genesis, and the whole thing survives a node going away.
+This worked example builds the storage path for a small order-tracking service:
+immutable events in RedEX, a materialized CortEX fold, snapshots that reduce replay
+work, and a NetDB query handle.
 
-By the end you'll have an end-to-end implementation of the storage stack pattern that Net is built around — RedEX as the log, CortEX as the fold driver, NetDB as the query surface — and a worked example of how the layers compose.
+It demonstrates local log, fold, query, and snapshot composition. Replication,
+provider failover, and external-effect recovery require additional deployment and
+application work.
 
 ## The shape
 
@@ -58,7 +63,7 @@ A few principles:
 
 - **Events are facts.** Once written, they're never modified. An event-sourced system models change by appending new events, not by editing old ones.
 - **Events are self-contained.** The producer puts everything the fold needs into the event payload; the fold doesn't reach for external context.
-- **Events are at the level of intent.** `Placed` is what happened, not `INSERT INTO orders`. The fold decides what an order *means* at any given moment.
+- **Events are at the level of intent.** `Placed` is what happened, not `INSERT INTO orders`. The fold decides what an order _means_ at any given moment.
 
 ## The fold
 
@@ -291,9 +296,15 @@ NetDB bundles the folds under one handle and gives you whole-stack snapshot/rest
 
 The pattern is small, but the properties it gets you are substantial:
 
-- **Every state change is auditable.** The log is the source of truth; you can replay any range, time-travel to any point, and prove what happened from cryptographically chained primitives.
-- **Restart is fast.** Snapshots bound the recovery time; the log is durable; the fold is deterministic.
-- **Read scales independently of write.** Multiple consumers read the same state without affecting each other or affecting the producer.
+- **State can be reconstructed.** Retained events and valid snapshots let a reader
+  rebuild the fold and inspect prior transitions.
+- **Snapshots reduce replay.** Recovery still depends on snapshot availability,
+  retained later events, and the configured durability policy.
+- **Readers use derived state.** Multiple consumers can query the fold without
+  changing the producer's event model.
 - **Change is incremental.** Adding a new event variant is a fold update; the log doesn't need migration. Adding a new fold is one builder call; the existing folds don't change.
 
-This is event sourcing as a first-class shape. The pattern doesn't depend on Net specifically — you can do it on any append-only log with a fold runtime on top. What Net gives you is the substrate: identity-bound writes, encrypted transport, capability-aware access, and the ability to compose this single-node design into a distributed one (replicated logs, federated queries, daemon migration) without changing the application code.
+The event-sourcing pattern is not specific to Net. Net supplies identity,
+transport, capability-aware access, and optional replication or migration
+primitives around it. Adopting those distributed primitives adds topology,
+authority, durability, and failure-handling decisions to the application.

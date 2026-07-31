@@ -2,6 +2,7 @@
 title: x402 and Net
 description: "x402 is the payment wire; Net wraps it in signed envelopes and carries the original bytes unchanged so signatures survive the trip."
 ---
+
 # x402 and Net
 
 x402 is the payment wire: an HTTP-native protocol for demanding and settling a
@@ -20,17 +21,17 @@ This is the differentiator, so it leads:
 > is an adapter path for web APIs, not a requirement for a Net provider.**
 
 A Net provider does not run a web server to get paid. The `402` transport is one
-way to carry x402 (the two-way door — Net can also *pay* an external x402 HTTP
+way to carry x402 (the two-way door — Net can also _pay_ an external x402 HTTP
 API), but on the mesh the payment travels inside the ordinary typed invocation.
 
-## Byte-preservation is law
+## Preserve signed x402 bytes
 
 An x402 document — a `PaymentRequirements`, a `PaymentPayload`, a settlement
 response — is carried as **base64 of its original bytes** (an `X402Carry`), never
 re-serialized through a Net type.
 
-`X402Carry` is the type that enforces it. You *author* a document once, and from
-then on you only *view* it:
+`X402Carry` is the type that enforces it. You _author_ a document once, and from
+then on you only _view_ it:
 
 ```rust
 use net_payments::x402::requirements::PaymentRequirements;
@@ -72,7 +73,7 @@ around it:
   capability, and a reference to the signed asset registry.
 - **`net.payment.quote@1`** — a signed, expiring quote: the requirements the
   caller must satisfy, a `terms_hash`, `issued_at` / `expires_at`, and (crucially)
-  the invocation **`input_hash`** — the *hash* of the arguments, not the
+  the invocation **`input_hash`** — the _hash_ of the arguments, not the
   arguments — so a quote binds an invocation without carrying its payload.
 - **`net.settlement.ref@1`** — a reference to the settled on-chain transaction
   (the x402 settlement response, carried opaquely) plus the network and

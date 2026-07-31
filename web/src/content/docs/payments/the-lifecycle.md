@@ -2,6 +2,7 @@
 title: The Lifecycle
 description: One PaymentEngine runs the provider side of a paid capability; one CallerPaymentFlow runs the caller side.
 ---
+
 # The lifecycle
 
 One `PaymentEngine` runs the provider side of a paid capability; one
@@ -112,7 +113,7 @@ Announce `terms` with the capability and the price travels with discovery.
 
 If the provider refuses, the denial can carry a machine-actionable [failure
 schematic](/docs/payments/failure-schematic) beside the human error, so the caller's agent
-can branch on *why* and *what's safe to do next* rather than parse prose.
+can branch on _why_ and _what's safe to do next_ rather than parse prose.
 
 ### Calling a paid capability
 
@@ -153,9 +154,8 @@ The `ProviderChannel` parameter is where the machine boundary lives.
 the same process for tests; over a real mesh it's the nRPC channel to the
 provider.
 
-## One engine, one source of truth
+## Engine ownership
 
-The same `PaymentEngine` serves the quote/pay wire **and** gates the priced
-tools. That's the invariant that makes the lifecycle honest: there is no second
-place a payment could be "counted" — settled, verified, billed, and redeemed all
-run against one store under its lock, at-most-once.
+The same `PaymentEngine` serves the quote/pay wire and gates priced tools in the
+integrated path. Settlement, verification, billing, and redemption use one store
+under its lock, which is the boundary for the engine's at-most-once bookkeeping.

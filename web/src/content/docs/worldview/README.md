@@ -1,40 +1,45 @@
 ---
-title: Worldview
-description: "Before the machinery, the belief system. These pages explain why Net exists — the world agents are entering, when Net is the right tool and when it isn't, and how it relates to the"
+title: Where Net fits
+description: "What Net is for, how it relates to the systems you already use, and when another tool is the simpler choice."
 ---
-# Worldview
 
-Before the machinery, the belief system. These pages explain *why* Net exists —
-the world agents are entering, when Net is the right tool and when it isn't, and
-how it relates to the things you already use (MCP, REST) — before you learn how
-any of it works.
+# Where Net fits
 
-The one line to start from:
+Net connects capabilities across machines, runtimes, and organizations. An
+application asks for work to be done; Net discovers providers that announce the
+right capability, evaluates availability and authority, invokes one of them, and
+keeps the related streams, state, and artifacts attached to the work.
 
-> **Net is a discovery mesh for agentic capability** — agents find live
-> capabilities across a trusted mesh, invoke them safely, observe what happened,
-> and recover when work fails.
+That makes Net a substrate beneath applications, not a replacement for their user
+experience or business model. A workspace, fleet console, agent runtime, or
+industrial application can use Net while keeping its own workflows, approvals,
+and interface.
 
-Underneath that flagship use case, Net is a latency-first encrypted mesh:
-capability discovery, typed RPC, durable logs, folded state, and artifact
-transfer on one substrate. The agentic story is the fastest way in; the substrate
-is why it holds up. If you want the mechanism first, jump to
-[What is Net?](/docs/start/what-is-net).
+The shortest description is:
+
+> **Net addresses capabilities under identity and authority.**
+
+Other systems organize distributed work around different objects. HTTP addresses
+an endpoint or resource. MCP describes a tool that a configured host can call.
+NATS addresses a subject. Zenoh addresses data through a key expression. Net's
+unit is a capability offered by a provider, together with the authority and live
+state needed to use it.
 
 ## Read in this order
 
-1. **[The Agentic Mesh](/docs/worldview/agentic-mesh)** — the worldview: work is
-   distributed across tools, APIs, agents, GPUs, and humans, and agents need to
-   discover and coordinate it live.
-2. **[When to Use Net (and When Not To)](/docs/worldview/right-and-wrong-use-cases)** —
-   explicit right and wrong use cases. Net is infrastructure with discipline, not
-   "use us for everything."
-3. **[MCP vs Net](/docs/worldview/mcp-vs-net)** — MCP made tools callable; Net
-   makes capabilities discoverable. How the two compose (they do).
-4. **[REST vs Net](/docs/worldview/rest-vs-net)** — where request/response and
-   webhooks fit: the legacy edge, not the core.
+1. **[The Agentic Mesh](/docs/worldview/agentic-mesh)** explains the problem from
+   an application's point of view.
+2. **[When to use Net](/docs/worldview/right-and-wrong-use-cases)** gives the fit
+   boundary, including cases where HTTP, MCP, NATS, or a normal database is enough.
+3. **[How Net relates to other systems](/docs/worldview/how-net-compares)** gives
+   a compact comparison by abstraction, topology, and trust boundary.
+4. **[Net and MCP](/docs/worldview/mcp-vs-net)** explains how existing MCP tools
+   become discoverable capabilities.
+5. **[Connecting HTTP systems](/docs/worldview/rest-vs-net)** shows where REST and
+   webhooks sit at the application boundary.
+6. **[Net and NATS](/docs/worldview/nats-vs-net)** and **[Net and Zenoh](/docs/worldview/zenoh-vs-net)**
+   cover the closest messaging and data-centric comparisons.
 
-Then, in the guides:
-**[Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)** — why
-`200 OK` is not "work done," and what a system that tells the truth about work
-looks like. The clearest way in if you've never thought about an event bus.
+For the implementation model, continue to [What is Net?](/docs/start/what-is-net).
+For a concrete distinction between acceptance, execution, and verified outcome,
+read [Submitted is not completed](/docs/guides/submitted-is-not-completed).

@@ -1,55 +1,50 @@
 ---
-title: When to Use Net
-description: "Net is infrastructure with discipline, not \"use us for everything.\" The fastest way to trust a tool is to know where it doesn't belong — so this page is as explicit about the wrong"
+title: When to use Net
+description: "Use Net when capability discovery, authority, live execution state, or artifacts must cross machines. Use a smaller system when they do not."
 ---
-# When to Use Net (and When Not To)
 
-Net is infrastructure with discipline, not "use us for everything." The fastest
-way to trust a tool is to know where it *doesn't* belong — so this page is as
-explicit about the wrong cases as the right ones.
+# When to use Net
 
-The short rule:
-
-> **Use MCP/HTTP when the call is the whole story. Use Net when discovery and work
-> state matter.**
+Net earns its place when work crosses a machine or authority boundary and the
+caller cannot reduce the operation to one fixed endpoint.
 
 ## Use Net when
 
-- **Machines & agents need to discover and rebalance capabilities dynamically** — the set of available
-  tools, models, or services changes at runtime and isn't a fixed config.
-- **Tools live across multiple machines or organizations** — the work you need
-  isn't on the box you're running on.
-- **Credentials must stay local** — the node that holds a secret should run the
-  work; the caller should never see the credential.
-- **Agent-to-agent communication matters** — not just an app calling one API, but
-  peers coordinating.
-- **Capabilities need typed schemas** — callers should get typed requests and
-  responses, discovered at runtime.
-- **Work has live state** — failures, retries, artifacts, or streams that a single
-  status code can't express (see
-  [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
-- **Provider availability changes over time** — the GPU is busy, the model loads
-  and unloads, the service moves between hosts.
-- **Resources like GPUs should be exposed as capabilities** — discovered and
-  matched by what they can do, not addressed by a hostname.
-- **Business workflows need visibility and recovery** — you need to know which
-  step failed and be able to replay it, not reconcile it manually tomorrow.
-- **Payment / usage / account events may attach later** — the substrate should let
-  you grow those in without re-platforming.
+- Providers appear, disappear, move, or change availability while the application
+  is running.
+- Work spans personal devices, edge nodes, services, agents, or organizations.
+- The provider must keep its credentials and enforce policy locally.
+- Discovery authority and invocation authority need different rules.
+- The call produces streams, durable state, long-running task progress, or
+  content-addressed artifacts.
+- Several providers offer the same capability and selection depends on health,
+  locality, resources, organization, or request policy.
+- The application must distinguish transport acceptance, execution, and verified
+  outcome.
+- The same identity must remain attached to discovery, invocation, state, and
+  artifacts as topology changes.
 
-## Do NOT use Net when
+Typical examples include a personal agent using tools across trusted devices, a
+fleet application resolving equipment capabilities, a company invoking a partner's
+service without receiving its credentials, or a scheduler placing work near data
+and compute.
 
-- **One API call solves the problem.** If the whole task is "call this endpoint,
-  get an answer," you don't need discovery or work state.
-- **A single server and database are enough.** No mesh, no distribution, no
-  presence — just use them.
-- **HTTP/gRPC request-response is sufficient.** If there's no live state, no
-  discovery, and no recovery to model, the transport you have is fine.
-- **MCP directly is enough** because your tools are hand-wired and local. If
-  nothing needs to be *discovered*, MCP alone is simpler
-  ([MCP vs Net](/docs/worldview/mcp-vs-net)).
-- **A normal queue or job runner already matches the workflow.** If you have a
-  fixed producer, a fixed consumer, and a broker you're happy operating, Net's
-  discovery and presence aren't buying you anything.
-- **You don't need discovery, presence, policy, artifacts, streams, or recovery.**
-  If none of those words describe your problem, you don't need Net yet.
+## Use a smaller system when
+
+- A single server and database already solve the problem.
+- The caller knows one stable endpoint and request/response is the complete
+  lifecycle.
+- An MCP host has a fixed set of tools and no runtime discovery is needed.
+- A normal queue or job runner already matches a fixed producer/consumer workflow.
+- NATS or another messaging system already supplies the required subjects,
+  durability, and operational model inside one domain.
+- Zenoh or another data fabric already matches a system organized around keys,
+  telemetry, and distributed queries.
+- You only need one narrow feature that Net also happens to contain.
+
+The dividing question is not whether the system is distributed. It is whether the
+application needs to address **work under identity and authority**, rather than a
+known endpoint, subject, or data key.
+
+See [How Net relates to other systems](/docs/worldview/how-net-compares) for the
+models side by side.

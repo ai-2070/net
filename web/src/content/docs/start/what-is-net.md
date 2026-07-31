@@ -1,59 +1,134 @@
 ---
 title: What is Net?
-description: "Net's flagship use is agentic capability federation — agents discovering, invoking, observing, and recovering work across a trusted mesh."
+description: "Net is a capability substrate for applications that operate across machines, runtimes, and authority boundaries."
 ---
+
 # What is Net?
 
-Net's flagship use is **agentic capability federation** — agents discovering,
-invoking, observing, and recovering work across a trusted mesh. If you want that
-story first, start with [The Agentic Mesh](/docs/worldview/agentic-mesh). This
-page is the mechanism underneath it: what Net actually *is* as a system.
+Net is a capability substrate for applications that operate across machines,
+runtimes, and authority boundaries.
 
-Net is a distributed event bus that runs as a peer-to-peer mesh — no broker to provision, no central service to depend on. Producers and consumers connect directly through the mesh, and every event they exchange is encrypted end-to-end, signed by its origin, and ordered by cause rather than by clock.
+A provider announces something it can do: run a tool, query a service, process an
+artifact, operate a device, or provide compute. A caller discovers providers by
+that capability, applies its availability and authority requirements, invokes one,
+and follows the related execution state.
 
-If you've used Kafka, NATS, or Redis Streams, the surface will feel familiar: you publish to a channel, subscribe with a filter, replay from a cursor. What changes is everything underneath. There is no broker process to operate, there are no partitions to rebalance, and the identity and routing layers that normally live in a separate service mesh are folded into the bus itself.
-
-## The shape of it
-
+```text title="The core model"
+application requests a capability
+→ discover visible providers
+→ select an available and admissible provider
+→ invoke it under explicit authority
+→ receive typed execution state and artifacts
+→ verify the required outcome when a verifier exists
 ```
-your code  ─►  channel  ─►  mesh  ─►  channel  ─►  your code
+
+Net supplies the distributed machinery under this interaction: cryptographic
+identity, capability discovery, encrypted routing, typed RPC, streams, durable
+state, content-addressed artifacts, task lifecycle, and provider-local authority.
+Applications retain their own workflows, interfaces, and approval model.
+
+## The four objects to know
+
+### Nodes
+
+A node is a participant with a cryptographic identity. It may provide capabilities,
+consume them, relay traffic, hold state, or do several of those at once. Identity
+belongs to the participant rather than its current address.
+
+### Capabilities
+
+A capability is a typed operation a node offers. Its announcement can include a
+schema and properties used for discovery and selection. Provider properties are
+assertions unless backed by an external attestation; finding a match is not the
+same as proving the provider's claim.
+
+Visibility and invocation are separate. A caller may be allowed to discover a
+capability without being allowed to invoke it, and organization-scoped capabilities
+can be encrypted so callers outside the audience do not learn they exist.
+
+### Channels and events
+
+Channels carry events between participants. Events retain origin and causal
+lineage, which lets applications reason about related state without imposing one
+global clock across the mesh.
+
+The event bus is the common substrate used by higher layers. You can also embed it
+directly for pub/sub, durable logs, or adapter work.
+
+### Artifacts and state
+
+Work often produces more than a response. Net can attach content-addressed blobs
+and directories, durable event history, folded state, streams, and task progress
+to the same distributed identity model.
+
+## Layers you can adopt independently
+
+- **nRPC** provides typed request/response and streaming calls over the mesh.
+- **RedEX** stores append-only event history for deterministic replay.
+- **CortEX** folds logs into materialized state.
+- **NetDB** queries folded state.
+- **Dataforts** moves and caches content-addressed blobs and directories.
+- **MeshOS** places long-running stateful daemons and preserves their continuity
+  as hosts change.
+
+These layers share transport and identity, but an application does not need all of
+them. Start with the capability and invocation path, then add durable state,
+artifacts, or scheduling when the work requires them.
+
+## Authority stays with the provider
+
+The machine holding a credential or physical resource performs the operation. The
+caller receives the permitted result, not the provider's secret.
+
+Net authenticates participants and carries authority material, but each provider
+keeps the final admission decision. Transport membership, capability discovery,
+and invocation permission are different facts.
+
+## Accepted, executed, and verified
+
+A successful network exchange does not necessarily mean the requested outcome
+holds. Net models several layers separately:
+
+```text
+accepted by the transport
+received by the provider
+executed by the handler
+external effect observed
+postcondition independently verified
 ```
 
-A channel is a named endpoint — something like `vehicles/fleet-7/telemetry`, or `chat/lobby`, or `metrics/$node` — and it's the only abstraction you reach for in day-to-day code. You publish to it; anyone authorized subscribes to it. The mesh figures out how to get bytes from one side to the other, and Net's identity layer decides who is allowed to participate.
+Applications can carry typed outcomes and attach verification evidence to the
+result. The capability contract defines what counts as verified success. Calls
+without that evidence retain the narrower result they can actually prove. This
+also determines whether retry is safe when an external effect may already have
+occurred.
 
-Channels carry events, and each event has three things attached to it: an identity that says who produced it, a causal lineage that places it in relation to everything that came before, and a payload that's whatever your code put there. The mesh routes events to subscribers, and when you ask it to, it persists them as well.
+## How Net relates to existing systems
 
-That's the whole surface area. Everything else in Net — durable logs, materialized views, federated queries, distributed daemons — is built on top of channels and events.
+Net does not replace the systems around it:
 
-## What you get
+- MCP remains a useful tool interface; Net can publish MCP tools as discoverable
+  capabilities.
+- HTTP remains the boundary for web APIs and SaaS; adapters expose selected
+  operations to the mesh.
+- NATS remains a strong subject-oriented messaging system.
+- Zenoh remains a strong data-centric edge and robotics fabric.
 
-At the core of the bus you get pub/sub over hierarchical channel names with visibility scopes (local, parent-visible, exported, global), wire-speed authorization in which the packet header itself is enough to make routing and access decisions without decrypting the payload, causal ordering so that out-of-order delivery is recoverable rather than catastrophic, and encrypted transport using Noise NKpsk0 handshakes, ChaCha20-Poly1305 frames, and ed25519 identities — none of which you configure by hand.
+Net is different because the addressable object is **work offered by a provider
+under identity and authority**. See [Where Net fits](/docs/worldview) for the
+comparison.
 
-Built on top of the bus you'll find a stack of optional layers that share the same channel and identity primitives:
+## Which API should you start with?
 
-- **RedEX** turns a channel into a durable append-only log you can subscribe to from any cursor and replay deterministically.
-- **CortEX** runs reductions over those logs to materialize views, react to changes, and answer queries against folded state.
-- **NetDB** exposes a single query surface that federates across channels, nodes, and chains.
-- **Dataforts** provides content-addressed blob storage with a greedy LRU cache and gravity-based placement, so large payloads live near the code that reads them.
-- **MeshOS** runs long-lived stateful daemons that are placed by capability and migrate between nodes without losing causal continuity.
-- **nRPC** layers typed request/response semantics on top of channels, so you can call a service the same way you'd publish to a topic.
+Most applications should use `net-mesh-sdk` and its `Mesh` surface for capability
+discovery and invocation.
 
-You opt into the layers you need; the ones you don't compile away entirely.
+Use the lower-level `net-mesh` event bus when you are embedding the bus, writing an
+adapter, or tuning ingestion and consumption directly.
 
-## How Net thinks
+Next:
 
-The system is built in three layers, and you can reason about each one without the others.
-
-**Transport** is the bottom: encrypted bytes between nodes, mesh-routed, with NAT traversal and connection management handled for you. It's deliberately invisible — if you find yourself thinking about it, something is wrong.
-
-**Identity** sits in the middle and answers three questions about every packet on the wire: who sent it, what channel it claims, and what that sender is allowed to do. Identity lives in the 68-byte packet header so that forwarding nodes can make the call without ever touching the payload.
-
-**State** is the layer you actually program against. Channels carry causally-ordered events; persist a channel and it becomes a durable log; fold the log and it becomes the state your application reads from. Everything else — RPC handlers, materialized views, distributed workers — is some variation on that pattern.
-
-That's the entire mental model. The rest is API.
-
-## When to use Net
-
-Net fits when you need durable pub/sub but don't want to operate a broker, when your system spans devices or edge nodes or services that come and go and need to find each other, when you'd otherwise be gluing together a message bus and an identity service and a CRDT library to build event-sourced state, or when you need stateful workers that survive node failure and migrate cleanly.
-
-It's less of a fit when what you really want is a SQL database (use Postgres), or a one-shot HTTP request/response API with no event semantics (use HTTP), or a total order across unrelated channels — Net orders events within a channel, not across the mesh.
+1. [Quickstart](/docs/start/quickstart)
+2. [The Agentic Mesh](/docs/worldview/agentic-mesh)
+3. [Discover and invoke](/docs/guides/discover-and-invoke)
+4. [Architecture](/docs/concepts/architecture)

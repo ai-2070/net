@@ -1,10 +1,14 @@
 ---
 title: Daemon With Failover
-description: This tutorial walks through building a stateful daemon that runs across a standby group, with an active node processing events and passive replicas ready to take over when the active fails.
+description: A worked design for a stateful daemon with an active member, standby state, promotion, and replay after provider loss.
 ---
-# A Distributed Daemon That Survives Node Failures
 
-This tutorial walks through building a stateful daemon that runs across a standby group, with an active node processing events and passive replicas ready to take over when the active fails. By the end you'll have a working daemon, a working standby group, and a worked example of what failover actually looks like end to end.
+# Stateful daemon with a standby
+
+This worked example shows the pieces of a stateful daemon running in a standby
+group: active processing, standby snapshots, failure detection, promotion, and
+buffer replay. The snippets focus on the API and state transitions; a deployment
+still needs complete node configuration, identities, routing, and observability.
 
 The daemon we'll build is a small one — it tracks running tasks and emits state-change events as tasks transition through their lifecycle — but the pattern is the same one you'd use for any stateful work that needs fault tolerance: long-running ML inference, transaction processors, simulation engines, control planes.
 
@@ -150,7 +154,10 @@ Promotion is three steps:
 2. **Replay the buffered events.** The group keeps a buffer of events the active processed since the last sync. The promoting standby replays them in strict sequence order — same mechanism the runtime uses for daemon migration.
 3. **Activate.** The standby takes the active role. Routing flips to send new events to it. The daemon's `origin_hash` is unchanged (deterministic identity from the group seed), so peers routing to it don't see a different destination.
 
-In application code, none of this is visible. Calls to the daemon's `origin_hash` keep working; events keep flowing; the dashboard might see a brief gap (bounded by the time it takes to replay the buffer) before activity resumes.
+During promotion, callers may see delayed or failed operations until failure
+detection, replay, and routing convergence complete. Recovery depends on an
+eligible standby, available snapshot and buffered history, and successful
+promotion.
 
 ## Driving the demonstration
 
@@ -190,13 +197,15 @@ while let Some(state) = state_stream.next().await {
 }
 ```
 
-Now kill the active node (Ctrl-C on its process). What you'll see:
+In a complete demonstration, stop the active node and observe:
 
-- The watcher's stream pauses briefly — usually a second or two — as the runtime detects the failure and the standby promotes.
-- The producer keeps producing; events are buffered into the channel and replayed once the new active is ready.
-- The watcher resumes; the state has every event the producer sent, in order.
+- the watcher pauses while failure detection and promotion run;
+- events retained by the configured channel can be replayed to the promoted member;
+- the watcher resumes after routing and state catch-up complete.
 
-Total downtime in a typical run: under three seconds. No events lost. No client code knowing the move happened.
+Measure interruption and retained-event coverage under your actual heartbeat,
+snapshot, buffer, storage, and network settings. The snippets alone do not
+establish a recovery-time or zero-loss guarantee.
 
 ## Tuning the trade-off
 
@@ -206,10 +215,15 @@ Standby groups are not free. Each standby costs you memory for the snapshot but 
 - **Faster sync cadence** = smaller replay gap on promotion (less time spent recovering) but more snapshot bandwidth.
 - **Faster heartbeat** = faster failover (shorter detection window) but more wire traffic.
 
-Defaults are tuned for the typical case: three members, 500 ms heartbeat (1.5 s detection), sync on operator demand or every minute. If your workload's recovery target is sub-second, tighten the heartbeat to 100 ms and sync every 10 seconds; you'll see a measurable drop in event throughput but the recovery becomes nearly invisible.
+The shown values are starting points, not a universal recovery profile. Test
+heartbeat, snapshot cadence, buffer capacity, and promotion behavior against the
+workload's recovery objective.
 
 ## What this gets you
 
 The model is composable. A standby group of stateful daemons can run on a fleet where most nodes are also doing other work — the daemon doesn't take a node out of the rotation, it just shares it. Multiple standby groups can run on the same fleet without coordinating with each other. The daemon registry is a local primitive on each node; cross-group coordination happens through the capability index and the failure detector, both of which are already there.
 
-What you've built here is the substrate for stateful microservices that don't go down when a node does. The architecture isn't novel — active-passive is decades old — but the runtime's job here is to make it work without you wiring it up by hand: identity through the keypair model, state transport through the snapshot mechanism, routing through the daemon registry, failure detection through the existing peer monitoring. You wrote a `MeshDaemon` impl and registered a group; the runtime did everything else.
+The standby group supplies identity, snapshot transport, daemon routing, and peer
+failure signals for an active-passive design. The application and operator remain
+responsible for durable event ownership, effect reconciliation, capacity,
+provisioning, and recovery testing.

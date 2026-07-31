@@ -2,11 +2,15 @@
 title: Folded State (CortEX)
 description: CortEX is how you turn a log into queryable state.
 ---
+
 # Folded State with CortEX
 
 CortEX is how you turn a log into queryable state. You write a fold — a function that consumes events one at a time and updates a piece of state — and CortEX runs it against a RedEX log, persists the state, and exposes it to readers. The pattern is event sourcing, made first-class.
 
-The shape is small enough that the whole model fits in three pieces: a state type that holds the materialized view, a fold that says how each event updates the state, and an adapter that wires the two together against a RedEX file. The runtime does the rest.
+The model has three pieces: a state type that holds the materialized view, a fold
+that says how each event updates the state, and an adapter that wires the two
+together against a RedEX file. The application still owns event validity,
+external effects, and any recovery beyond rebuilding the fold.
 
 ## The fold
 
@@ -174,16 +178,16 @@ You don't have to use them. They live alongside any folds you write yourself; Co
 Both models ship as adapters you can open standalone against a `Redex`, or
 reach through a `NetDb` that composes them.
 
-| | Rust | TypeScript | Python | Go |
-|---|---|---|---|---|
-| Log manager | `cortex::Redex::new()`, `::with_persistent_dir(path)` | `new Redex(opts)` | `Redex(...)` | `NewRedex(...)` |
-| Open tasks | `cortex::TasksAdapter::open(redex, origin)` | `TasksAdapter` | `TasksAdapter.open(...)` | `OpenTasks(redex, originHash, persistent)` |
-| Open memories | `cortex::MemoriesAdapter::open(redex, origin)` | `MemoriesAdapter` | `MemoriesAdapter` | `OpenMemories(...)` |
-| Compose both | `cortex::NetDb::builder(redex)` | `NetDb.open(config)` | `NetDb` builder | `OpenNetDb(redex, cfg)` |
-| Typed handles | `db.tasks()` / `db.memories()` | same | same | `db.Tasks()` / `db.Memories()` |
-| Initial result + deltas | `adapter.snapshot_and_watch(watcher)` | `snapshotAndWatch` | `snapshot_and_watch_tasks` / `..._memories` | `SnapshotAndWatch` |
-| Persist | `db.snapshot()` → `NetDbSnapshot` | `snapshot()` | `snapshot()` | `db.Snapshot()` → `[]byte` |
-| Restore | `NetDbBuilder::build_from_snapshot(&bundle)` | `NetDb.openFromSnapshot(...)` | `build_from_snapshot` | `OpenNetDbFromSnapshot(redex, cfg, bundle)` |
+|                         | Rust                                                  | TypeScript                    | Python                                      | Go                                          |
+| ----------------------- | ----------------------------------------------------- | ----------------------------- | ------------------------------------------- | ------------------------------------------- |
+| Log manager             | `cortex::Redex::new()`, `::with_persistent_dir(path)` | `new Redex(opts)`             | `Redex(...)`                                | `NewRedex(...)`                             |
+| Open tasks              | `cortex::TasksAdapter::open(redex, origin)`           | `TasksAdapter`                | `TasksAdapter.open(...)`                    | `OpenTasks(redex, originHash, persistent)`  |
+| Open memories           | `cortex::MemoriesAdapter::open(redex, origin)`        | `MemoriesAdapter`             | `MemoriesAdapter`                           | `OpenMemories(...)`                         |
+| Compose both            | `cortex::NetDb::builder(redex)`                       | `NetDb.open(config)`          | `NetDb` builder                             | `OpenNetDb(redex, cfg)`                     |
+| Typed handles           | `db.tasks()` / `db.memories()`                        | same                          | same                                        | `db.Tasks()` / `db.Memories()`              |
+| Initial result + deltas | `adapter.snapshot_and_watch(watcher)`                 | `snapshotAndWatch`            | `snapshot_and_watch_tasks` / `..._memories` | `SnapshotAndWatch`                          |
+| Persist                 | `db.snapshot()` → `NetDbSnapshot`                     | `snapshot()`                  | `snapshot()`                                | `db.Snapshot()` → `[]byte`                  |
+| Restore                 | `NetDbBuilder::build_from_snapshot(&bundle)`          | `NetDb.openFromSnapshot(...)` | `build_from_snapshot`                       | `OpenNetDbFromSnapshot(redex, cfg, bundle)` |
 
 Python also exposes context managers that open an adapter and close it on scope
 exit, so you don't leak a handle on an exception path. Go returns
@@ -192,7 +196,7 @@ its mutation methods (`Create`, `Rename`, `Complete`, `Delete`) each return the
 sequence number of the event they appended, which is what you pass to
 `WaitForSeq` for read-your-writes.
 
-`snapshot_and_watch` is the important one: it hands back the current state *and*
+`snapshot_and_watch` is the important one: it hands back the current state _and_
 the delta stream as one atomic operation, so nothing lands between your initial
 read and the start of watching. Reaching for a separate list-then-subscribe is
 the bug it exists to prevent.
@@ -201,8 +205,8 @@ the bug it exists to prevent.
 
 Folds can fail. An event with a bad payload, a logic bug in the fold, an underflow on a counter — all of these manifest as an `Err` from `apply()`. The runtime's response is configurable:
 
-| `FoldErrorPolicy` | Behavior on `apply()` error                                                   |
-|-------------------|--------------------------------------------------------------------------------|
+| `FoldErrorPolicy` | Behavior on `apply()` error                                                    |
+| ----------------- | ------------------------------------------------------------------------------ |
 | `Stop` (default)  | Fold task exits. Subsequent `wait_for_seq` calls hang. Fail loudly.            |
 | `LogAndContinue`  | Event is skipped; state keeps advancing. Useful for survivable bad-data cases. |
 
@@ -241,7 +245,7 @@ on it.
 
 > **Tokens are not capabilities.** A `WriteToken` is plain in-process data with
 > public fields — unsigned, and forgeable by anything in the same process. The
-> guarantee comes from the *adapter*, not the token: an adapter bound to origin
+> guarantee comes from the _adapter_, not the token: an adapter bound to origin
 > X rejects any token whose `origin_hash` isn't X, with `WrongOrigin`. So a
 > token arriving over the wire is untrusted input that the receiving side
 > validates by virtue of which adapter it hands the token to. Don't synthesise

@@ -1,12 +1,16 @@
 ---
 title: Fleet Telemetry
-description: "This tutorial walks through a complete deployment: a fleet of edge nodes (think delivery vehicles, sensor stations, kiosks) publishing telemetry to a central operations cluster, wi"
+description: "A worked fleet-telemetry topology using hierarchical channels, subnet policy, permission tokens, a gateway, and an operations fold."
 ---
+
 # Fleet Telemetry
 
-This tutorial walks through a complete deployment: a fleet of edge nodes (think delivery vehicles, sensor stations, kiosks) publishing telemetry to a central operations cluster, with subnet boundaries keeping each vehicle's internal traffic isolated from every other vehicle, and a fold in the operations cluster materializing aggregate metrics for an operator dashboard.
-
-By the end you'll have a working three-tier deployment — edge devices, a regional gateway, an operations cluster — with the channel hierarchy, subnet rules, and fold logic that ties them together. The architecture is one any production fleet deployment would use; the code is small enough to follow in one sitting.
+This worked example connects edge publishers to an operations fold through a
+regional gateway. It uses hierarchical channels, subnet policy, and permission
+tokens to show where routing and authority decisions belong.
+The snippets describe the three roles and their configuration. A production fleet
+also needs provisioning, key rotation, route setup, capacity planning, monitoring,
+and a tested failure model.
 
 ## The shape
 
@@ -73,11 +77,11 @@ let telemetry_cfg = ChannelConfig::new(channel.id())
 mesh.register_channel(telemetry_cfg);   // synchronous; no await
 ```
 
-The capability filters are **routing, not enforcement**. `publish_caps` and `subscribe_caps` match a node's *self-advertised* capabilities, so a peer that wants past them can just advertise `role.vehicle` — they express which nodes this channel is *for*, not which nodes are *allowed* ([Channels](/docs/concepts/channels#capability-filters-are-advisory-tokens-are-the-boundary)).
+The capability filters are **routing, not enforcement**. `publish_caps` and `subscribe_caps` match a node's _self-advertised_ capabilities, so a peer that wants past them can just advertise `role.vehicle` — they express which nodes this channel is _for_, not which nodes are _allowed_ ([Channels](/docs/concepts/channels#capability-filters-are-advisory-tokens-are-the-boundary)).
 
 What actually restricts the channel is the token gate. Each vehicle holds a token, rooted at the fleet root, scoped to its own telemetry channels; the operations cluster holds tokens scoped to the export destinations. A presented chain must root at `fleet_root_entity_id`, bind at its leaf to the presenting entity, and authorize the action at every link.
 
-> **Don't call `with_require_token(true)` without also setting `token_roots`.** That combination is a valid fail-closed state — and therefore not an error — but with no root to anchor against, *nothing* can satisfy the gate and every publish and subscribe is denied. It's almost always a typo for `with_token_roots(...)`, which sets `require_token` for you. The substrate logs a warning at channel registration when it sees this; if telemetry goes silent right after you add auth, check for it.
+> **Don't call `with_require_token(true)` without also setting `token_roots`.** That combination is a valid fail-closed state — and therefore not an error — but with no root to anchor against, _nothing_ can satisfy the gate and every publish and subscribe is denied. It's almost always a typo for `with_token_roots(...)`, which sets `require_token` for you. The substrate logs a warning at channel registration when it sees this; if telemetry goes silent right after you add auth, check for it.
 
 ## Configuring subnets
 
@@ -239,18 +243,27 @@ The deployment has three roles, each with a small responsibility:
 - **Gateways** are configured with the export table for the fleet — they know which `Exported` channels can travel to which destination subnets, and they enforce the rules at packet-header speed.
 - **Operations** runs the fold, the watchers, and the dashboard. It subscribes to telemetry on the export, materializes per-vehicle state through the fold, and exposes live views to operators.
 
-Everything else falls out automatically. The mesh routes packets through the gateway because the gateway is the only path from the vehicle subnet to the operations subnet. The auth guards in the operations cluster reject any packet from an unauthorized origin because the operator's channel config required capability matching. The fold catches every event from every vehicle because it subscribes to a channel pattern, not to individual channels.
+The configured topology routes exported traffic through the gateway. Permission
+tokens rooted at `fleet_root_entity_id` enforce publish and subscribe authority;
+the capability filters remain advisory routing predicates. The operations fold
+receives events that reach its subscribed channel pattern and survive the
+configured transport, authorization, and retention boundaries.
 
 ## Adding a new vehicle
 
 The operational cost of adding a vehicle to the fleet is one provisioning step: give the new node a keypair, an `EntityKeypair`, a capability set including `role.vehicle` and `fleet.west`, and a token scoped to `vehicles/v-NNN/telemetry/*`. The subnet policy picks it up automatically (the rule matches on `vehicle` and `fleet.west`), the gateway picks up the new export automatically (channels marked `Exported` flow through to the operations subnet), and the operations fold picks up the new events automatically (it subscribes to the pattern, not to individual channels).
 
-No central registry to update, no service-discovery layer to ping, no configuration push to schedule. The capability advertisement is enough.
+The capability advertisement lets matching rules discover the new node. Provisioning
+still supplies its identity, token, subnet policy, peer connectivity, and operator
+records.
 
 ## What this gives you
 
-For a fleet deployment the size of this example, the runtime cost is small: one process per vehicle, one process per gateway, the operations cluster as you'd size it for the dashboard read load. The wire traffic per vehicle is bounded by the rate limit on each channel. The operational overhead is bounded by the subnet hierarchy — a problem in one vehicle's subnet doesn't propagate beyond the gateway, by construction.
+For this example, each vehicle publishes through a gateway and the operations
+cluster maintains the fold. Actual process placement, traffic, isolation, and read
+capacity depend on event size, rate limits, gateway topology, retention, and
+failure policy.
 
-The same shape scales up to hundreds of thousands of vehicles. Add more gateways (one per region, one per fleet-of-fleets); the subnet hierarchy already accommodates four levels. Add more fold instances in the operations cluster (a replica group running the same fold against the same RedEX log); the dashboard sees the union of their views.
-
-This is what the Net architecture is built for. The primitives compose; you don't outgrow them as you scale.
+Larger fleets can partition gateways and folds by region or fleet, but the required
+capacity and failure behavior must be measured for that deployment. The hierarchy
+organizes the topology; it does not remove the need to size and operate it.

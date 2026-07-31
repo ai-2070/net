@@ -2,6 +2,7 @@
 title: Claiming a Contended Resource
 description: "Some resources can't be shared. A GPU NVLink domain, an accelerator slot, a licensed seat — one holder at a time, and two nodes that both believe they hold it is a corruption bug,"
 ---
+
 # Claiming a Contended Resource
 
 Some resources can't be shared. A GPU NVLink domain, an accelerator slot, a
@@ -10,7 +11,7 @@ it is a corruption bug, not a performance problem.
 
 The gang-claim scheduler is the surface for that: publish what you have, match
 what you need, and claim it atomically under contention. It is deliberately
-*not* a job scheduler — it decides **who holds a resource**, and stops there.
+_not_ a job scheduler — it decides **who holds a resource**, and stops there.
 What runs once you hold it is the [task lifecycle](/docs/guides/task-lifecycle).
 
 ## Islands and units
@@ -39,7 +40,7 @@ publishes is invisible to matching, including its own.
 
 ## Match what you need
 
-Matching is read-only — it tells you what *could* be claimed, in preference
+Matching is read-only — it tells you what _could_ be claimed, in preference
 order, and takes no lock:
 
 ```rust
@@ -67,13 +68,13 @@ let candidates = mesh.match_islands(&criteria);
 
 The numeric axes are **live**, not static inventory: `max_load` and
 `max_p50_latency_us` filter on what the island is doing right now, and
-`tags_all` on the island side can require *resident* capabilities — a warm
+`tags_all` on the island side can require _resident_ capabilities — a warm
 `model:<hex>` that lets you skip a cold load.
 
 ### Selection policy is a scheduling decision
 
 `SelectionPolicy` is the knob that decides what your cluster looks like under
-load, and the four options pull in genuinely different directions:
+load, and the four options make different trade-offs:
 
 - **`LeastLoaded`** (default) — spread. Lowest-load island first, island id
   ascending as a deterministic tie-break.
@@ -129,14 +130,14 @@ and one side learns it lost. If double-booking across a partition is
 unacceptable for your resource, you need a quorum, and a bare gang claim is the
 wrong primitive.
 
-**Local view, converging.** `match_islands` and `claim_island` read *this
-node's* folds. A node sees its own announced capabilities and published islands
+**Local view, converging.** `match_islands` and `claim_island` read _this
+node's_ folds. A node sees its own announced capabilities and published islands
 immediately; peer-hosted islands appear only once their announcements converge
 over the mesh. On an isolated node, only self-hosted islands match — which is
 also why an empty match result on a freshly-started node usually means "not
 converged yet", not "nothing exists".
 
-**Advisory discovery, binding claim.** Matching tells you who *can*. Only the
+**Advisory discovery, binding claim.** Matching tells you who _can_. Only the
 claim is exclusive. Nothing stops a peer that ignores the scheduler entirely
 from using its own hardware.
 
@@ -147,4 +148,4 @@ from using its own hardware.
 - [Capabilities](/docs/concepts/capabilities) — the tag and filter model
   matching is built on.
 - [Daemons and placement](/docs/guides/daemons-and-placement) — for work that
-  should be *placed* rather than claimed.
+  should be _placed_ rather than claimed.

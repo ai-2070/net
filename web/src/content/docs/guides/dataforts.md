@@ -1,12 +1,18 @@
 ---
 title: Blob Storage (Dataforts)
-description: Dataforts is the layer in Net that handles large, content-addressed payloads — the things that are too big to live inline in events but too important to leave on a separate object store.
+description: Store and move large content-addressed blobs and directories while events carry compact references.
 ---
+
 # Blob Storage with Dataforts
 
-Dataforts is the layer in Net that handles large, content-addressed payloads — the things that are too big to live inline in events but too important to leave on a separate object store. Model weights, training data, video segments, generated artifacts, file trees, anything where you want deduplication, locality, and the same identity-bound access semantics the rest of Net gives you.
+Dataforts stores and transfers content-addressed payloads that should not travel
+inline in events: model weights, datasets, video segments, generated artifacts,
+and directory trees. Events and RPC calls carry a `BlobRef`; consumers fetch the
+bytes only when they need them.
 
-A blob in Dataforts is referenced by its content hash. Producers put bytes in and get back a `BlobRef`; consumers hand a `BlobRef` to the runtime and get bytes out. Where the bytes physically live is the runtime's problem — it caches popular content near the readers that want it, evicts cold content under memory pressure, and migrates hot content toward the nodes that read it most.
+A blob is referenced by its content hash. Producers store bytes and receive a
+`BlobRef`; consumers use the reference to read locally or fetch from a holder.
+Caching and placement policy determine which nodes retain copies.
 
 ## Putting and getting
 
@@ -36,7 +42,12 @@ let bytes = fetch_blob_discovered(&mesh, &blob_ref).await?;
 
 `store_blob_reader` is content-addressed. Storing the same bytes twice yields the same `BlobRef`; the runtime deduplicates automatically and never stores the same content twice on the same node. The hash is BLAKE3, chunked with content-defined chunking — so editing the middle of a file doesn't invalidate the chunks at the start or end, and the unchanged chunks dedupe across versions.
 
-`fetch_blob_discovered` is location-aware. It probes connected peers and pulls the verified bytes from the first holder that serves them; when the holder is already known, `fetch_blob(&mesh, source, &blob_ref)` names it directly and skips discovery. Manifest fetches stream the per-chunk requests concurrently — a thousand-chunk blob completes in roughly the slowest single-chunk round-trip, not the sum of all of them. The first byte returned to your code typically comes from the closest cache; the rest streams in behind it.
+`fetch_blob_discovered` is location-aware. It probes connected peers and pulls the
+verified bytes from the first holder that serves them; when the holder is already
+known, `fetch_blob(&mesh, source, &blob_ref)` names it directly and skips discovery.
+Manifest fetches can request chunks concurrently. Completion time depends on
+holder availability, link capacity, scheduling, disk behavior, and configured
+concurrency rather than simply adding one round trip per chunk.
 
 ## How the transfer actually works
 
@@ -52,7 +63,11 @@ Discovery and transfer ride the substrate's existing primitives — there's no s
 
 Both sides of a transfer stream chunk-at-a-time, so peak memory for a single transfer is roughly one chunk (4 MiB) regardless of total blob size. The receive path writes each verified chunk straight to disk via an atomic-rename writer — it opens an `<out>.partial` file, appends each chunk as it lands, and renames into place once the manifest is fully consumed. The send path reads through `store_blob_reader`, hashing and persisting each chunk as it's pulled from the source (a file, stdin, or any `AsyncRead`). Large leaves inside a directory tree get the same treatment inside `fetch_dir` — anything above one chunk streams to disk rather than buffering.
 
-The only remaining per-chunk cap is `TRANSFER_MAX_CHUNK_BYTES` (16 MiB), which guards against a misbehaving holder claiming an absurd chunk size. Total transfer size is bounded by free disk, not by RAM. A 100 GB blob moves through the same memory footprint as a 100 MB blob.
+The only remaining per-chunk cap is `TRANSFER_MAX_CHUNK_BYTES` (16 MiB), which
+guards against a misbehaving holder claiming an absurd chunk size. Total transfer
+size is primarily bounded by storage and configured limits rather
+than requiring the entire blob in memory. Process and protocol overhead still vary
+with chunk count, concurrency, manifests, and filesystem behavior.
 
 The CLI surfaces this directly: `net-mesh transfer recv-blob` shows a determinate byte-progress bar driven from the per-chunk loop, so an operator watching a long transfer sees byte-count and percentage rather than a generic spinner.
 
@@ -100,7 +115,7 @@ let receipt = publish_with_blob(
 ```
 
 `BlobDurability` picks how hard the store commits before the event goes out —
-`BestEffort` or `DurableOnLocal`. Retrying a failed call must keep the *same*
+`BestEffort` or `DurableOnLocal`. Retrying a failed call must keep the _same_
 durability: dropping from `DurableOnLocal` to `BestEffort` on a retry after a
 partial sync publishes an event whose consumer can race the substrate's flush
 of the remaining chunks.
@@ -127,15 +142,23 @@ publish_event(WorkspaceReady { root: root_ref });
 fetch_dir(&mesh, source, &root_ref, Path::new("./materialized"), 0).await?;
 ```
 
-`fetch_dir` is **atomic**. The runtime writes the entire tree into a sibling temp path on the same filesystem, and only renames into the caller's `dest` once every file, directory, and symlink has materialized successfully. A failure mid-fetch — network loss, disk-full, the process getting killed — removes the partial temp tree and leaves `dest` exactly as it was before the call. There's no rollback machinery to wrap around it at the application layer; the contract is the substrate's.
+`fetch_dir` materializes the tree in a sibling temporary path and renames it into
+place after all entries complete. This gives the destination the filesystem's
+same-filesystem rename semantics. Applications should still account for platform
+differences, cleanup after abrupt process or host failure, and external readers
+that do not follow the same path discipline.
 
-If `dest` already exists, the runtime swaps the new tree in with the old tree preserved as a backup until the swap completes, then removes the backup — so a crash between renames leaves either the new tree or the old tree, never neither and never both. Because the temp path is a sibling of `dest` on the same filesystem, the rename is a true atomic operation rather than a copy-and-delete masquerading as one.
+If `dest` already exists, the runtime preserves the previous tree during the swap
+and removes the backup after completion. Recovery behavior follows the underlying
+filesystem and the point at which an abrupt failure occurred.
 
 ## Caching
 
 Dataforts maintains a greedy-LRU cache on every node. The cache evicts cold content first; heat counters on each blob bias eviction so frequently-read blobs stay cached longer than their LRU position alone would imply. The cache size is configurable per node — the default is a fraction of available memory, with the rest left to the operating system.
 
-When the cache evicts a blob, the bytes go away but the `BlobRef` doesn't — the next `get` will refetch from a peer or, if no peer has it, from a colder tier. There's no chance of a `BlobRef` becoming stale unless the blob is explicitly deleted from every holder, which is a separate operator action.
+When the cache evicts a blob, the `BlobRef` remains valid as a content identity but
+a later fetch still requires an authorized reachable holder or colder tier. If no
+holder retains the bytes, the reference cannot be materialized.
 
 ## Data gravity
 
@@ -176,7 +199,7 @@ fetch_dir(&mesh, source, &root, Path::new("./out"), 0).await?;
 ```ts
 // TypeScript — the ops hang off the Mesh handle
 const bytes = await mesh.fetchBlob(holderId, blobRef);
-const root  = await mesh.storeDir(adapter, "./src");
+const root = await mesh.storeDir(adapter, "./src");
 await mesh.fetchDir(sourceId, root, "./out");
 ```
 
@@ -214,6 +237,9 @@ net-blob gc --max-age 30d
 
 The rule of thumb is around tens of kilobytes. If your payload fits comfortably in an event (small JSON, short messages, encoded structs), put it in the event. If it's larger — and especially if it's content you'll want to deduplicate, cache, or fetch from arbitrary readers — put it in Dataforts and pass a `BlobRef`.
 
-The model is composable. The bus moves the small references at high frequency; Dataforts moves the large payloads on demand. CortEX folds can hold `BlobRef`s in their state; NetDB queries can join against them; nRPC can return them. The blob's identity, like everything else in Net, is content-bound and verifiable — the hash *is* the reference, so a forged `BlobRef` won't decode to the wrong bytes.
+The model is composable. The bus moves the small references at high frequency; Dataforts moves the large payloads on demand. CortEX folds can hold `BlobRef`s in their state; NetDB queries can join against them; nRPC can return them. The blob's identity, like everything else in Net, is content-bound and verifiable — the hash _is_ the reference, so a forged `BlobRef` won't decode to the wrong bytes.
 
-For the workloads Dataforts is built for — model serving, dataset distribution, large-payload event sourcing, content delivery on the mesh, workspace transfer between agents — the alternative is bolting an external object store onto the side of your event bus and writing your own glue. Dataforts is what's there if you don't want to.
+Use Dataforts when content identity, mesh-local discovery, on-demand transfer, and
+Net's artifact workflow belong together. Keep an external object store when it is
+the system of record, its access model already fits, or independent object-store
+operations are more important than mesh-local placement.

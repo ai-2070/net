@@ -1,20 +1,21 @@
 ---
 title: Tutorials
-description: The pages in this section are end-to-end builds.
+description: "End-to-end builds that connect Net's APIs into complete systems."
 ---
+
 # Tutorials
 
-The pages in this section are end-to-end builds. Each one starts from an empty project, walks through the design decisions, and ends with something that works — code you could lift, adapt, and ship.
+These tutorials are worked architecture examples. They connect the main APIs and
+show the expected control flow, but the snippets are illustrative rather than
+complete repositories with deployment manifests.
 
-Tutorials are longer than guides because they cover the whole arc. You'll read about why each piece is shaped the way it is, not just what it is. If you're new to Net, picking one tutorial that's close to what you're building and working through it end-to-end is the fastest way to internalize the patterns.
+- **[Fleet telemetry](/docs/tutorials/fleet-telemetry)** builds hierarchical
+  channels, subnet scopes, capability announcements, and a folded operator view.
+- **[Distributed daemon with failover](/docs/tutorials/distributed-daemon)** runs a
+  stateful daemon with a standby and promotes it after host failure.
+- **[Event-sourced service](/docs/tutorials/event-sourced-service)** stores events
+  in RedEX, materializes a query view with CortEX, and restores from a snapshot.
 
-All three are written in Rust. The patterns port directly — the call shapes match
-across bindings — but the code does not, so if you're building in TypeScript,
-Python, or Go, expect to translate as you read. Your language's
-[SDK spine](/docs/sdk) is the reference for the idioms.
-
-The three tutorials here cover different parts of the surface:
-
-- **[Fleet telemetry](/docs/tutorials/fleet-telemetry)** — edge devices publishing to a hierarchical channel namespace, gateways scoping by subnet, a fold materializing aggregate metrics for an operator dashboard. Hits channels, subnets, capabilities, folds.
-- **[Distributed daemon with failover](/docs/tutorials/distributed-daemon)** — a stateful daemon running across a standby group, surviving a node failure by promoting a passive replica. Hits MeshDaemon, placement, standby groups, continuity.
-- **[Event-sourced service](/docs/tutorials/event-sourced-service)** — building a small service backed by RedEX, with a CortEX fold materializing the queryable view and snapshot/restore handling restarts. Hits the storage stack, queries, and snapshots.
+The tutorials use Rust. TypeScript, Python, Go, and C expose the same major SDK
+surfaces with language-specific call shapes; use the [SDK section](/docs/sdk) while
+translating an example.
