@@ -19,6 +19,16 @@
 # time; `BlobRef::MAX` was real at v0.15 and has since been renamed. A check
 # that forces edits to them corrupts the record rather than fixing anything.
 #
+# ONE NARROW EXCEPTION: verbs that never coexisted with the old binary name. The
+# rename to `net-mesh` landed 2026-05-19 (38647c447); the MCP-bridge verbs
+# arrived with v0.31 on 2026-07-04, seven weeks later. So `net wrap` is not a
+# dated record of anything — it was never runnable at any version — while
+# `net admin` in the v0.18 note IS correct for its date and must stay. The v0.31
+# note carried the unrunnable form in ten places, including its own "New CLI"
+# line and its upgrade steps, and this blanket exclusion is why it survived a
+# full audit cycle. POST_RENAME_VERBS below closes exactly that gap, nothing
+# wider.
+#
 # Run locally:  .github/scripts/check-docs.sh
 # Exit 0 = the docs agree with the tree. Exit 1 = something drifted.
 
@@ -86,9 +96,20 @@ if [ -z "$VERBS" ]; then
 else
   while read -r hit; do
     [ -n "$hit" ] && note "bare 'net' CLI invocation (the binary is net-mesh): $hit"
-  done < <(grep -rnE "(\`|^|\\\$ )net ($VERBS)\b" $(docs_files) 2>/dev/null || true)
+  done < <(grep -rnE "(\`|^|\\$ )net ($VERBS)\b" $(docs_files) 2>/dev/null || true)
 fi
-[ "$fail" -eq "$before" ] && ok "all CLI invocations use net-mesh"
+
+# The check above excludes release notes and keeps excluding them for every verb
+# that predates the rename. These three do not: they shipped with the MCP bridge
+# in v0.31, so no note can legitimately pair them with the old binary name, and
+# no allowlist is needed.
+POST_RENAME_VERBS="wrap|mcp|forwarding"
+while read -r hit; do
+  [ -n "$hit" ] && note "post-rename verb with the old binary name: $hit"
+done < <(grep -rnE "(\`|^|\$ )net ($POST_RENAME_VERBS)\b" \
+           "$DOCS"/releases/*.md net/crates/net/docs/releases/*.md \
+           2>/dev/null || true)
+[ "$fail" -eq "$before" ] && ok "all CLI invocations use net-mesh (post-rename verbs checked in releases too)"
 
 echo
 if [ "$fail" -eq 0 ]; then
