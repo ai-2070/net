@@ -734,7 +734,8 @@ Step-3 lineage, held twice:
 ```text
 fa0b9ddd5  wake/invalidation edge + plan correction   <- HELD (P1 successor race, P2 breadth)
 7348529fb  conditional + scope-exact invalidation     <- HELD (P1b absence ordering)
-<this head> total publication-generation fence + W-W8
+f91cff2ab  total publication-generation fence + W-W8
+           (candidate head = the docs commit immediately after it)
 ```
 
 What step 3 closes, both directions of design §0.1:
