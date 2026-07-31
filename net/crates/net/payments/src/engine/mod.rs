@@ -429,14 +429,36 @@ fn prune_terminal(
         };
         retired += 1;
         // Co-prune the payload guard this record owns — but only if it is
-        // still *this* record's. The payload hash protects claim-time
-        // concurrency before a settlement transaction is known; once the
-        // quote is terminal its enduring guard is the transaction
-        // tombstone, so the payload entry may retire with the record. If
-        // ownership has diverged (corruption, or an unexpected migration
-        // state) the entry belongs to some other quote's replay
-        // protection: leave it. Never erase another quote's guard merely
-        // because the retiring record names that hash.
+        // still *this* record's. If ownership has diverged (corruption, or
+        // an unexpected migration state) the entry belongs to some other
+        // quote's replay protection: leave it. Never erase another quote's
+        // guard merely because the retiring record names that hash.
+        //
+        // What retiring it costs, stated exactly. The payload hash is the
+        // claim-time guard, effective before any settlement transaction is
+        // known. Afterwards two things stand behind it, and only the second
+        // is universal:
+        //
+        //   [a] the transaction tombstone — but that catches a replay only
+        //       when it resolves to the SAME transaction id. It is what
+        //       `a_retired_settlement_transaction_is_still_rejected_later`
+        //       exercises, because the mock facilitator derives its
+        //       transaction id from the payload bytes;
+        //   [b] the scheme's own single-use authorization — the EIP-3009
+        //       nonce, the SVM transaction's recent blockhash + signature,
+        //       the XRPL sequence number. On a real rail this is the guard
+        //       that actually holds: re-presenting one authorization does
+        //       not settle twice, it fails.
+        //
+        // So this leans on a scheme-level property, which the paragraph
+        // above declines to lean on for `consumed_transactions`. The
+        // asymmetry is deliberate and worth naming: "this authorization
+        // cannot be spent twice" is a property every supported scheme
+        // already provides and the engine merely benefits from, whereas
+        // "this settlement identity may now be forgotten" is a claim about
+        // when it is safe to STOP remembering — nothing in the schemes
+        // establishes it, and being wrong there means one payment serves
+        // twice. Relying on the first is not licence to assume the second.
         if s.consumed
             .get(&rec.payload_hash)
             .is_some_and(|owner| owner == quote_id)

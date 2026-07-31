@@ -565,8 +565,15 @@ async fn a_retired_settlement_transaction_is_still_rejected_later() {
 }
 
 /// The payload replay guard retires *with* its record — it protects
-/// claim-time concurrency before a transaction is known, and the enduring
-/// guard is the tombstone.
+/// claim-time concurrency before a transaction is known.
+///
+/// What stands behind it afterwards is the tombstone *when the replay
+/// resolves to the same transaction id* (the case
+/// `a_retired_settlement_transaction_is_still_rejected_later` drives), and
+/// otherwise the scheme's own single-use authorization — the EIP-3009
+/// nonce, the SVM blockhash + signature, the XRPL sequence. See the note
+/// on `prune_terminal` for why leaning on that is not licence to expire
+/// tombstones.
 #[tokio::test]
 async fn the_payload_guard_retires_with_its_record() {
     let f = fixture();
