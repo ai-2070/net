@@ -375,10 +375,12 @@ impl QuoteRecord {
 }
 
 /// Retention sweep: drop terminal quote records past the horizon, plus the
-/// payload replay entry each one owns. Returns whether anything was
-/// removed, so the caller can fold it into its `dirty` flag — a sweep is a
-/// real mutation and must persist even when the surrounding operation was
-/// otherwise read-only (the P5e discipline; see
+/// payload replay entry each one owns. Returns **how many records were
+/// retired**, counted as they are removed rather than derived from a
+/// before/after size difference — the caller folds a non-zero count into
+/// its `dirty` flag, because a sweep is a real mutation and must persist
+/// even when the surrounding operation was otherwise read-only (the P5e
+/// discipline; see
 /// `docs/internal/performance/payments-spend-contention.md`).
 ///
 /// **`consumed_transactions` is never touched.** It is a permanent
@@ -395,10 +397,10 @@ fn prune_terminal(
     now_ns: u64,
     retention_ns: Option<u64>,
     tolerance_ns: u64,
-) -> bool {
+) -> usize {
     // Compaction explicitly disabled: keep every terminal record.
     let Some(retention_ns) = retention_ns else {
-        return false;
+        return 0;
     };
     let retiring: Vec<String> = s
         .quotes
@@ -406,10 +408,14 @@ fn prune_terminal(
         .filter(|(_, rec)| rec.is_prunable_at(now_ns, retention_ns, tolerance_ns))
         .map(|(id, _)| id.clone())
         .collect();
-    if retiring.is_empty() {
-        return false;
-    }
+    let mut retired = 0;
     for quote_id in &retiring {
+        // One lookup: the removal yields the record, so the co-prune below
+        // reads the payload hash it owns without a second `get` or a clone.
+        let Some(rec) = s.quotes.remove(quote_id) else {
+            continue;
+        };
+        retired += 1;
         // Co-prune the payload guard this record owns — but only if it is
         // still *this* record's. The payload hash protects claim-time
         // concurrency before a settlement transaction is known; once the
@@ -419,18 +425,14 @@ fn prune_terminal(
         // state) the entry belongs to some other quote's replay
         // protection: leave it. Never erase another quote's guard merely
         // because the retiring record names that hash.
-        if let Some(rec) = s.quotes.get(quote_id) {
-            let payload_hash = rec.payload_hash.clone();
-            if s.consumed
-                .get(&payload_hash)
-                .is_some_and(|owner| owner == quote_id)
-            {
-                s.consumed.remove(&payload_hash);
-            }
+        if s.consumed
+            .get(&rec.payload_hash)
+            .is_some_and(|owner| owner == quote_id)
+        {
+            s.consumed.remove(&rec.payload_hash);
         }
-        s.quotes.remove(quote_id);
     }
-    true
+    retired
 }
 
 enum Claim {
@@ -671,7 +673,7 @@ impl PaymentEngine {
             // `mutate_json_if_changed` therefore skips the durable write on
             // the read-only outcomes (Frozen / QuoteAlreadyPaid / AlreadyServed
             // / InProgress / AlreadySettled / ReplayOtherQuote). The dirty
-            // flag is `matches!(_, Fresh) || pruned`, each disjunct derived
+            // flag is `matches!(_, Fresh) || retired > 0`, each disjunct derived
             // from the SAME branch that mutated — so it can never diverge from
             // the mutation. The later writes (completion, `release_claim`,
             // billing republish) are separate calls and remain unconditional,
@@ -688,7 +690,7 @@ impl PaymentEngine {
                 // only prunable well past its quote's authoritative expiry,
                 // and an expired quote was already rejected above, before this
                 // transaction. The two guards are independent.
-                let pruned =
+                let retired =
                     prune_terminal(s, now_ns, terminal_record_retention_ns, expiry_tolerance_ns);
                 let claim: Claim = 'claim: {
                     if let Some(rec) = s.quotes.get_mut(&quote_id) {
@@ -770,7 +772,7 @@ impl PaymentEngine {
                     s.quotes.insert(quote_id.clone(), record);
                     Claim::Fresh
                 };
-                let dirty = matches!(claim, Claim::Fresh) || pruned;
+                let dirty = matches!(claim, Claim::Fresh) || retired > 0;
                 (claim, dirty)
             })
             .await?
@@ -1837,9 +1839,8 @@ impl PaymentEngine {
         let retention_ns = self.terminal_record_retention_ns;
         let tolerance_ns = self.expiry_tolerance_ns;
         let removed = mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
-            let before = s.quotes.len();
-            let pruned = prune_terminal(s, now_ns, retention_ns, tolerance_ns);
-            (before - s.quotes.len(), pruned)
+            let retired = prune_terminal(s, now_ns, retention_ns, tolerance_ns);
+            (retired, retired > 0)
         })
         .await?;
         Ok(removed)

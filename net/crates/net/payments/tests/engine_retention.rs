@@ -644,6 +644,38 @@ async fn legacy_records_without_an_expiry_are_never_pruned() {
 // Idempotence + the P5e dirty discipline
 // ============================================================================
 
+/// The reported count is the number of records actually removed, not a
+/// before/after size difference — so a sweep that retires several reports
+/// all of them. Every other count assertion in this suite is 0 or 1, which
+/// a `bool`-shaped sweep would satisfy just as well.
+#[tokio::test]
+async fn a_sweep_reports_every_record_it_retires() {
+    let f = fixture();
+    for (amount, nonce) in [("2500", "n1"), ("2600", "n2"), ("2700", "n3")] {
+        terminal_quote(&f, amount, nonce).await;
+    }
+    assert_eq!(
+        raw_state(&f.path).await["quotes"]
+            .as_object()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    assert_eq!(
+        f.engine
+            .prune_terminal_records(past_horizon())
+            .await
+            .unwrap(),
+        3,
+        "the sweep reports each record it retired"
+    );
+    assert!(raw_state(&f.path).await["quotes"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+}
+
 /// A second identical sweep finds nothing and reports nothing removed.
 #[tokio::test]
 async fn a_second_sweep_is_a_no_op() {
