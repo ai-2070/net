@@ -21,7 +21,7 @@
 #   - Rust-native reference pages                -> sdk_native (nav owner only;
 #     D7 keeps their physical path and canonical URL unchanged)
 #
-# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=13 universal=83, total=131
+# Counts: adaptive=2 adaptive_pending=28 boundary_native=5 sdk_native=13 universal=84, total=132
 #
 # Governed by docs/internal/plans/DOCS_POLYGLOT_LENS_PLAN.md
 
@@ -141,6 +141,9 @@ pages:
   reference/subprotocol-ids: universal
   reference/versioning: universal
   reference/wire-format: universal
+  # The SDK section README is the language chooser — one URL, no language
+  # segment — so it is navigation like every other section README, not a lens.
+  sdk: universal
   # The composed spine. Seven pages, each one universal body plus four
   # fragments, served at the URLs they always had (`/docs/sdk/python/announce`).
   # They stay `sdk_native` because composition is a storage and authoring
