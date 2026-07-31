@@ -1,4 +1,4 @@
-# Windows full-load test flakes (OPEN, undiagnosed)
+# Windows test flakes and unexplained failures (OPEN, undiagnosed)
 
 **Status: OPEN, reproduced, NOT diagnosed.** No owner, no scheduled work. Split
 out of the OLB-2B.3c-pre step-3 corrective record because none of it is related
@@ -57,7 +57,33 @@ Capture a failure. Run the full suite in a loop with per-run output retained
 until it reproduces, then read the actual assertion and any `icacls` stderr. Until
 then there is nothing to fix.
 
+## A third observation: one unidentified wiring-gate failure
+
+**Status: OBSERVED ONCE, NOT REPRODUCED, NOT DIAGNOSED.** Recorded here because
+it previously existed only in a commit message, which is not a place anyone
+looks for open questions (Kyra, review of `010c718ea`).
+
+During OLB-2B.3c-pre step 3, a single routing-plane wiring witness failed inside
+a shell command that ran `cargo fmt` alongside the test run. **The failing test
+name was not captured**, so there is nothing to attribute it to.
+
+| | |
+|---|---|
+| Occurrences | 1 |
+| Reproduction attempts since | 40 wiring-only runs, 6 full-load runs |
+| Reproduced | no |
+| Failing test name | **not captured** |
+
+The leading hypothesis is a rebuild race — `cargo fmt` rewriting sources while
+the test binary was being built — which would make it an artifact of that one
+command rather than a property of any witness. **That is a guess.** Without the
+test name it cannot be confirmed or ruled out, and "did not reproduce in 46
+runs" is weaker evidence than it looks for a race that needs a concurrent
+formatter to trigger.
+
+If it recurs, capture the test name before anything else.
+
 ## Scope
 
-Touches no OLB slice. It appears in OLB records only because that is when it was
-observed.
+None of this touches any OLB slice. It appears in OLB records only because that
+is when it was observed.

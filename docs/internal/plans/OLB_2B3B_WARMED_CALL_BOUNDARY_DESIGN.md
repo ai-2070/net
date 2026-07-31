@@ -633,15 +633,15 @@ is the §19 defect class this process has already caught once.
 |---|---|---|
 | **1–3** — non-aliasing installation identity | **SIGNED** 2026-07-28 | `OLB_2B3C_PRE_STEP1_SIGNED_HEAD = 300e80f6c` |
 | **4–9, 12–14** — scope stamp + Grant source service | **SIGNED** 2026-07-29 | `OLB_2B3C_PRE_STEP2_SIGNED_HEAD = a788232bd` |
-| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | **IMPLEMENTED + WITNESSED — REVIEWED FOUR TIMES, HELD FOUR TIMES, REPAIRED — NOT SIGNED** | see the step-3 lineage below |
+| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | **IMPLEMENTED + WITNESSED — REVIEWED FIVE TIMES, HELD FIVE TIMES, REPAIRED — NOT SIGNED** | see the step-3 lineage below |
 
 **Step 2 signed by Kyra 2026-07-29 at `a788232bd`**, after an independent
 mutation matrix in a detached worktree: every security claim below went RED
 under its own inverse mutation with zero retries, and the source was restored to
 the exact SHA before the final GREEN and adjudication.
 
-The corrective lineage is the useful record, because two of its turns were
-HOLDs:
+The corrective lineage is the useful record. Step 2 was held **once** — the
+FIRST of the six HOLDs across this slice; the other five are step 3's, below:
 
 ```text
 8189676a7  Grant-plane implementation
@@ -729,7 +729,7 @@ slice remain UNAUTHORIZED until this step signs.** The normative plan still says
 "OLB-2B.3 is AUTHORIZED" in the broad sense; that does not authorize any later
 slice, and this line is the operative one.
 
-Step-3 lineage, held FOUR times (five HOLDs across steps 2 and 3):
+Step-3 lineage, held FIVE times (SIX HOLDs overall: one on step 2, five here):
 
 ```text
 fa0b9ddd5  wake/invalidation edge + plan correction   <- HELD (P1 successor race, P2 breadth)
@@ -739,9 +739,11 @@ f91cff2ab  total publication-generation fence + W-W8  <- HELD (exhaustion, equal
 d70810aa4  checked exhaustion + equality witnesses    <- HELD (terminal aliasing,
            reviewed as 46af3d625 (its docs commit)         public API, terminal
                                                            scope exactness)
-b226b2dbf  terminal artifact fence + public API revert
-           (candidate head = the docs commit immediately after it)
-d70810aa4  checked exhaustion + equality + remove-if-current witnesses
+b226b2dbf  terminal artifact fence + public API revert <- HELD (the fourth matrix
+           reviewed as 010c718ea (its docs commit)          cell; W-W13's terminal
+                                                            control rescued by the
+                                                            artifact side)
+ce688d5d1  the fourth cell split out + W-W15, W-W16
            (candidate head = the docs commit immediately after it)
 ```
 
@@ -773,8 +775,10 @@ could not close the install direction at all, because it returns cold for
 | `a_delayed_removal_notification_preserves_its_own_absence_artifact` | W-W10 — the EQUALITY arm, absence-stamped | `<` → `<=` |
 | `a_current_lease_removal_publishes_wakes_and_fences` | W-W11 — the SUCCESSFUL conditional-removal branch | a branch-local omission in remove-if-current |
 | `publication_exhaustion_refuses_an_install_without_publishing` | W-W12 — exhaustion refuses an install fail-closed, publishing nothing | advance the identity unchecked, after the store |
-| `terminal_withdrawal_retires_the_last_live_identity_and_nothing_else` | W-W13 — terminal withdrawal clears the artifact stamped at the LAST LIVE identity, and only its own scope | reuse `Publication(MAX-1)` for `Terminal`; widen the scope predicate for `Terminal` only |
+| `terminal_withdrawal_retires_the_last_live_identity_and_nothing_else` | W-W13 — terminal withdrawal clears BOTH capability slots stamped at the LAST LIVE identity, and only its own exact scope | reuse `Publication(MAX-1)` for `Terminal`; widen the terminal scope predicate to `grant_id` alone; narrow terminal selection to one capability |
 | `a_delayed_terminal_notification_preserves_its_own_absence_artifact` | W-W14 — terminal withdrawal preserves the absence artifact its OWN publication produced | `TerminalAbsence` clears under a `Terminal` movement |
+| `a_final_ordinary_removal_preserves_the_terminal_absence_it_caused` | W-W15 — the FOURTH cell: an ORDINARY movement at the last live identity meeting the terminal absence it caused | `TerminalAbsence` clears under a `Publication(_)` movement |
+| `a_second_installed_grant_still_withdraws_terminally_after_the_first` | W-W16 — terminal withdrawals are sequential; a second installed grant stays `Publication(_)` and can still withdraw terminally afterwards | stamp `TerminalAbsence` on SERVED scopes once the space is spent |
 
 W-W3 is the one that constrains the design rather than confirming it: "invalidate
 everything on any Grant movement" satisfies W-W1 and W-W2 perfectly and makes
@@ -790,8 +794,8 @@ five binding components with what each one catches, the per-slot-stamp-not-a-
 generation rule, install/remove/replacement as source movement with the ordering
 constraints, and the zero-provider deadline), plus the two new reconciler inputs.
 
-**W-W6 and W-W7 exist because Kyra's independent review of `fa0b9ddd5` found two
-defects the first five do not cover.** She confirmed W-W1..W-W5 are real and
+**Second HOLD, on `fa0b9ddd5` — W-W6 and W-W7 exist because Kyra's independent
+review found two defects the first five do not cover.** She confirmed W-W1..W-W5 are real and
 mutation-sensitive — they simply say nothing about reordered notifications for
 successive installations of the same Grant id.
 
@@ -848,12 +852,18 @@ authority actually moved (Kyra, review of `91f1c2e11`).
   delivered — a partial publication, and precisely the non-aliasing failure the
   identity exists to prevent. It is now RESERVED before anything becomes visible
   and committed after, `u64::MAX` is reserved as the terminal marker and never
-  handed out, an install at exhaustion refuses with a typed
-  `PublicationSpaceExhausted`, and a WITHDRAWAL still proceeds under a
-  `Terminal` fence — refusing to revoke because a counter ran out is the one
-  failure direction that is not fail-closed. Unconditional terminal retirement
-  is sound because no installation can follow exhaustion, so absence is terminal
-  and there is no successor to protect (W-W12, W-W13).
+  handed out, an install at exhaustion refuses fail-closed, and a WITHDRAWAL
+  still proceeds under a `Terminal` fence — refusing to revoke because a counter
+  ran out is the one failure direction that is not fail-closed. Retiring the
+  `Publication` artifacts under a terminal movement is sound because no
+  installation can follow exhaustion, so absence is terminal and none of them has
+  a successor to protect (W-W12, W-W13).
+
+  This repair introduced a typed `PublicationSpaceExhausted` variant. **That
+  variant no longer exists** — it was reverted at the next HOLD as an
+  unauthorized public API change, and the refusal now maps to the pre-existing
+  `IdSpaceExhausted`. The sentence above describes the `d70810aa4` state, not
+  the current one.
 - **The equality arm was unwitnessed.** All 62 witnesses survived `<` → `<=`.
   W-W6 and W-W8 cover only `artifact > movement`; neither says anything about
   `==`, which is the ordinary "a demand arriving after publication is safe" case
@@ -873,6 +883,12 @@ have crossed.**
   space is carried in an `error!` log. Precision does not make an unauthorized
   API change disappear. **Item 16 now holds; the earlier claim that it "held by
   construction" was false for as long as that variant existed.**
+
+  The binding-visible TEXT was still wrong after that revert, and was corrected
+  at the sixth HOLD: `IdSpaceExhausted`'s `Display` named the installation
+  counter specifically while the variant covered both spaces, and that string
+  propagates through `OrgSdkError::AudienceInstallRefused` to the SDK. It is now
+  generic, and BOTH refusal arms log which space ran out.
 - **Terminal absence needed its own representation.** A `Terminal` movement that
   cleared unconditionally destroyed the absence artifact its OWN publication
   produced — the terminal counterpart of the `<`/`<=` defect. It could not be
@@ -883,21 +899,59 @@ have crossed.**
   the artifact as `GrantArtifactFence::TerminalAbsence`, and still-installed
   scopes keep an ordinary `Publication`.
 
-The full comparison table:
+The full comparison table — **four cells, each pinned by its own witness**:
 
 ```text
               artifact:  Publication(a)      TerminalAbsence
  movement:
  Publication(p)          clear iff a < p     preserve
+                         W-W6/W-W8/W-W9/     W-W15
+                         W-W10
  Terminal                clear               preserve
+                         W-W13               W-W14
 ```
+
+The four arms are written out separately in `invalidate_grant_scope` even though
+the two `TerminalAbsence` ones agree. Collapsed to `(TerminalAbsence, _)` they
+cannot be mutated apart, and a cell that cannot be mutated alone cannot be
+witnessed alone — see the sixth HOLD below, where exactly that happened.
 
 W-W13 was rebuilt too: it warmed at publication 1 and only then jumped the
 counter, so `1 < MAX-1` cleared even under an identity-reusing terminal fence and
 it stayed green. It now positions the counter at `MAX-2` so the installation
-genuinely commits `MAX-1`, and carries scope controls, because `Terminal` is the
-one fence that clears unconditionally and therefore the easiest to widen by
+genuinely commits `MAX-1`, and carries scope controls, because `Terminal` skips
+the generation comparison entirely and is therefore the easiest fence to widen by
 accident.
+
+**Sixth HOLD, on `010c718ea` — the fourth cell, and a control that rescued the
+mutation it was meant to catch.**
+
+- **`Publication(_) × TerminalAbsence` was documented but not pinned.** It is
+  reachable by an ORDINARY movement: the removal that SPENDS the space reserves
+  and commits the last live identity, so its notification carries
+  `Publication(MAX-1)`, not `Terminal` — while a demand landing after that
+  publication reconstructs the scope absent under a now-spent space, which is
+  `TerminalAbsence`. Kyra flipped that cell to clear and all 68 committed
+  witnesses passed; an independent production-path probe of the schedule went RED
+  under the mutation and GREEN on restore. Closed by **W-W15**.
+- **W-W13's terminal scope control could not fail.** Its same-id/different-handle
+  control was warmed AFTER exhaustion, so it carried `TerminalAbsence` — and a
+  terminal predicate widened to `grant_id` alone would select it, only for the
+  fence to preserve it anyway. Exact Arc, invalidation count and requeue count
+  all unchanged; the witness stayed green against the narrowest and most
+  security-relevant form of the mutation it claimed to die to. The artifact side
+  was silently rescuing the selection side. Closed by warming that control BEFORE
+  the counter is positioned, so it carries an ordinary `Publication`.
+- Two further terminal permutations were closed rather than deferred: **W-W16**
+  (sequential terminal withdrawals — a second installed grant stays
+  `Publication(_)` and must still be able to withdraw terminally afterwards) and
+  two capabilities under one exact scope in W-W13 (W-W7 pins capability-wide
+  selection for ordinary movement only, so a terminal-only narrowing would evade
+  it).
+- W-W13's `quiet[2] >= before[2]` was vacuous — it passes at zero, the retirement
+  failure the witness exists to catch — and is now an exact delta. W-W9, W-W10
+  and W-W14 now assert the parked movement's fence directly instead of inferring
+  it from their own setup.
 
 **The publication generation is deliberately NOT in `SourceToken`.** It is
 ordering metadata, not authority. The capture/commit token remains the exact

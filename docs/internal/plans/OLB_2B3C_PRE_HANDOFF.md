@@ -9,10 +9,14 @@ Written at `8189676a7`. **Step 2 SIGNED by Kyra 2026-07-29 at `a788232bd`**
 Branch **`load-balancing-3`** since the step-2 merge to master.
 
 **This handoff is now nearly spent.** Its remaining job is the step-3 boundary
-and the HOLD lessons in §2b/§2c/§4 — FOUR HOLDs across steps 2 and 3, each
-finding a defect the author's own witnesses did not. Delete it when step 3 signs — steps 1 and 2
-are both recorded in the authoritative design's §16.0, which is where they
-belong.
+and the HOLD lessons in §2b/§2c/§4 — **SIX HOLDs overall: one on step 2, five on
+step 3**, each finding a defect the author's own witnesses did not. Delete it
+when step 3 signs — steps 1 and 2 are both recorded in the authoritative design's
+§16.0, which is where they belong.
+
+The count is kept here deliberately. It has been understated twice, and an
+understated HOLD ledger is the same failure mode as an over-claiming witness:
+the record reads as more settled than it is.
 
 ---
 
@@ -25,7 +29,7 @@ belong.
 | OLB-2B.3 boundary design (rev 5 + addenda) | `1c1b652e6` | SIGNED **as a design only** |
 | 2B.3c-pre **step 1** — installation identity (items 1–3) | `300e80f6c` | SIGNED |
 | 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `a788232bd` | **SIGNED** (`OLB_2B3C_PRE_STEP2_SIGNED_HEAD`) — held once at `df32cbd7d`, repaired, signed 2026-07-29; see §2b |
-| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | repair at `b226b2dbf`; **candidate head = this commit** | **HELD FOUR TIMES, REPAIRED — NOT SIGNED, AWAITING INDEPENDENT REVIEW.** P1/P2 at `fa0b9ddd5`, P1b at `7348529fb`, exhaustion + equality at `91f1c2e11`, terminal aliasing + public API at `46af3d625`; see §2c |
+| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | repair at `ce688d5d1`; **candidate head = this commit** | **HELD FIVE TIMES, REPAIRED — NOT SIGNED, AWAITING INDEPENDENT REVIEW.** P1/P2 at `fa0b9ddd5`, P1b at `7348529fb`, exhaustion + equality at `91f1c2e11`, terminal aliasing + public API at `46af3d625`, the unwitnessed fourth matrix cell at `010c718ea`; see §2c |
 | `SAFE_LIVE_HEAD` | — | **not established**, still reserved for provider-free leader lighting |
 
 Authoritative design: [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md).
@@ -36,15 +40,15 @@ proof, the exclusions, and the closure gate. §2A is the substrate spec.
 
 ## 2. Do this first
 
-**Step 2 is signed. Step 3 was HELD at `fa0b9ddd5` and is repaired; it owes
-Kyra's re-run.**
+**Step 2 is signed. Step 3 has been HELD five times, most recently at
+`010c718ea`, and is repaired; it owes Kyra's re-run.**
 
 Step 3 (items 10, 11, 15, 16 — the consumer-Grant wake/invalidation edge and the
 normative plan correction) was authorized by the user AFTER the step-2 signature;
-that signature did not cover it. Kyra's independent review confirmed the five
-original witnesses are real and mutation-sensitive, and found two defects they do
-not cover — see §2c. The full witness table and the mutation each one dies to is
-in the design's §16.0. Every RED is the author's own.
+that signature did not cover it. Each review has confirmed the existing witnesses
+are real and mutation-sensitive, and then found a permutation, boundary or matrix
+cell they do not reach — see §2c. The full witness table and the mutation each
+one dies to is in the design's §16.0. Every RED is the author's own.
 
 `SAFE_LIVE_HEAD` remains unestablished and still reserved for the provider-free
 leader path.
@@ -87,14 +91,15 @@ Four notes carried forward — each was load-bearing in the independent run:
   actor-arm assertions then pass with the actor arm deleted entirely. That was
   found by running the mutation, not by reading the test.
 
-## 2c. Kyra's independent review of `fa0b9ddd5` — HOLD, and what closed it
+## 2c. The step-3 HOLDs, and what closed each
 
-Three HOLDs on step 3 in total — `fa0b9ddd5`, `7348529fb`, `91f1c2e11` — each
-finding a permutation or boundary the previous witness set did not reach. The
-first review confirmed W-W1..W-W5 RED under all six inverse mutations, so those
-witnesses were real; they simply did not cover reordered notifications for
-successive transitions of the same Grant id, nor the equality arm, nor
-identity exhaustion.
+**Five HOLDs on step 3 in total** — `fa0b9ddd5`, `7348529fb`, `91f1c2e11`,
+`46af3d625`, `010c718ea` — each finding a permutation, boundary or matrix cell
+the previous witness set did not reach. The first review confirmed W-W1..W-W5 RED
+under all six inverse mutations, so those witnesses were real; they simply did
+not cover reordered notifications for successive transitions of the same Grant
+id, nor the equality arm, nor identity exhaustion, nor the terminal row, nor the
+one ordinary-movement-against-terminal-artifact cell.
 
 **P1 — a delayed notification could retire a SUCCESSOR.** The notification
 carried only `grant_id`, and the invalidation cleared unconditionally. Because
@@ -147,10 +152,16 @@ vector is also load-bearing. Witness
   the store, so at the ceiling it panicked or aliased to zero with the snapshot
   ALREADY VISIBLE and no notification delivered. Now reserved before anything is
   visible and committed after; `u64::MAX` reserved as the terminal marker; an
-  install at exhaustion refuses with a typed `PublicationSpaceExhausted`; a
-  WITHDRAWAL still proceeds under a `Terminal` fence, because refusing to revoke
-  for want of a counter is the one direction that is not fail-closed
-  (W-W12, W-W13);
+  install at exhaustion refuses fail-closed; a WITHDRAWAL still proceeds under a
+  `Terminal` fence, because refusing to revoke for want of a counter is the one
+  direction that is not fail-closed (W-W12, W-W13).
+
+  **The refusal type changed after this repair.** `d70810aa4` introduced a new
+  `GrantAudienceInstallError::PublicationSpaceExhausted` variant; that variant
+  **no longer exists**. It was an unauthorized public API change (§2d), and the
+  current mapping is the pre-existing `IdSpaceExhausted`, whose `Display` is now
+  generic across both identity spaces and whose refusal paths each log
+  `space = "installation"` or `space = "publication"`;
 - the EQUALITY arm was unwitnessed — all 62 witnesses survived `<` → `<=`.
   Closed on both authority states (W-W9, W-W10), because the premise that failed
   at `7348529fb` was authority-state-specific.
@@ -182,9 +193,78 @@ stamped `Grant` — the source answers ANY capability under an installed
 grant's movement genuinely affects those slots, and narrowing would leave a
 Grant-stamped artifact behind after removal and a permanently `Unserved` slot
 after install — the two defects this edge exists to close, reintroduced for a
-subset. W-W7 pins the current behaviour with an assertion that fails loudly if
-the source is ever narrowed, forcing the invalidation to be narrowed in the same
-change. **Flagged for Kyra's adjudication rather than decided unilaterally.**
+subset. W-W7 pins the current behaviour for ORDINARY movement with an assertion
+that fails loudly if the source is ever narrowed, forcing the invalidation to be
+narrowed in the same change; W-W13 pins it for TERMINAL movement, with two
+capabilities under one exact scope, because a terminal-only narrowing would
+otherwise evade the ordinary witness entirely.
+
+## 2d. The fourth and fifth HOLDs — the terminal row, and the cell beside it
+
+**Fourth HOLD, on `46af3d625`.** Three findings.
+
+- **An unauthorized public API change.** `d70810aa4` added
+  `GrantAudienceInstallError::PublicationSpaceExhausted`. That enum is reachable
+  through `pub mod behavior` / `pub mod org_grant_registry` and is not
+  `#[non_exhaustive]`, so a new variant is source-breaking — and scope item 16
+  excludes public API changes outright. It was added for precision, which is not
+  a defence: precision does not make an unauthorized change disappear. Reverted.
+  Publication exhaustion now maps to the pre-existing `IdSpaceExhausted`.
+- **A global `u64::MAX` terminal marker would not work.** With a second Grant
+  scope still installed, that scope's reconstruction observes the same marker,
+  and its own later withdrawal can no longer order its pre-terminal `Served`
+  artifact. Terminal absence is therefore a property of ONE scope's
+  reconstruction and lives on the artifact:
+  `GrantArtifactFence::{Publication(u64), TerminalAbsence}`.
+- **W-W13 was mutation-insensitive at the last live identity.** It warmed at
+  publication 1 and only then jumped the counter, so `1 < MAX-1` cleared even
+  under an implementation that reused `Publication(MAX-1)` for the withdrawal.
+  Rebuilt at `MAX-2`, so the installation genuinely commits `MAX-1`.
+
+**Fifth HOLD, on `010c718ea`.** The production fence was found sound under every
+inspected schedule, and the three claimed mutations were independently confirmed
+orthogonal. The blockers were both witness-side, and both are the same failure:
+an arm that cannot be mutated alone cannot be witnessed alone.
+
+- **The fourth matrix cell was unwitnessed.** `Publication(_) × TerminalAbsence`
+  is reachable by an ORDINARY movement — the removal that SPENDS the space
+  reserves and commits the last live identity, so it is not `Terminal`, while the
+  absence it causes reconstructs terminal. Kyra changed that cell from preserve
+  to clear and all 68 committed witnesses passed; a temporary production-path
+  probe of the schedule then went RED under the mutation and GREEN on restore.
+  Closed by **W-W15**, and by splitting the collapsed `(TerminalAbsence, _)` arm
+  into the two cells it was hiding.
+- **W-W13's terminal scope control was rescued by the artifact side.** Its
+  same-id/different-handle control was warmed AFTER exhaustion, so it carried
+  `TerminalAbsence` — a terminal predicate widened to `grant_id` alone would
+  select it and the fence would preserve it anyway, leaving the exact Arc, the
+  invalidation count and the requeue count all unchanged. W-W13's claim to die to
+  "any terminal-only widening" was therefore false for the narrowest and most
+  security-relevant form of it. Closed by warming that control BEFORE the counter
+  is positioned, so it carries an ordinary `Publication` and erroneous selection
+  becomes observable.
+
+Also closed in the same repair, from the same review:
+
+- **W-W16**, sequential terminal withdrawal: a second still-installed Grant must
+  remain `Publication(_)` through the first grant's terminal withdrawal, and must
+  still be able to withdraw terminally itself afterwards. Without it, a
+  regression that globally terminalized every artifact once the space was spent
+  would leave a stale `Served` artifact for a grant that is gone;
+- W-W13 now asserts **exact** reconciliation deltas. `quiet[2] >= before[2]` was
+  vacuous — it passes at zero, which is the retirement failure the witness
+  exists to catch;
+- W-W9, W-W10 and W-W14 now assert the **parked movement's fence directly**
+  rather than inferring it from their own setup;
+- the installation-identity no-effect helper now pins the **publication**
+  allocator too. A delegated audit claimed reservation consumes that identity
+  before the installation allocator can refuse; that claim was WRONG —
+  `reserve_publication` only loads and checks — but the witness gap was real;
+- `IdSpaceExhausted`'s `Display` said "installation identity space", which is
+  false for a publication refusal and propagates through
+  `OrgSdkError::AudienceInstallRefused` to the SDK. Now generic, with the precise
+  counter in the log, and the installation arm logs `space = "installation"` so
+  the enum's own claim about its refusal paths is true.
 
 ---
 
