@@ -98,6 +98,40 @@ identity and routing. Assembling that from a broker plus an object store plus a
 workflow engine plus an IAM system is possible; keeping their identity, authority
 and failure models agreeing with each other is the part that is hard.
 
+## Transport and delivery, concretely
+
+The abstraction argument above is the important one, but two mechanical facts
+decide whether Net can be deployed on your network at all.
+
+**NATS is TCP; Net is UDP, and only UDP.** TLS and WebSocket connections to a NATS
+server are still TCP underneath, which is why NATS drops into ordinary corporate
+networking without an argument. The Net mesh speaks UDP datagrams and has no TCP
+fallback. **A security group that permits only TCP will let a Net process start and
+then silently break the handshake** — the failure looks like a peer that never
+finishes connecting, not like a blocked port. Open the bind port for inbound and
+outbound UDP.
+
+**Delivery semantics are opt-in on both sides, but they divide differently.**
+
+| | NATS | Net |
+|---|---|---|
+| Default | core: at-most-once | fire-and-forget |
+| Stronger | JetStream: at-least-once or exactly-once | opt-in reliability: `None` / `Light` / `Full` per adapter, `FireAndForget` / `Reliable` per stream |
+| Ordering | per-subject within a JetStream stream | **not implied by reliability** |
+
+That last cell is the one to read twice. Choosing `Reliable` in Net buys *gap-free
+eventual delivery* — nothing in flight is unrecoverable — and buys nothing about
+order. Packets, including retransmits, arrive in **arrival order** tagged with a
+monotonic sequence number, and a consumer that needs strict ordering reassembles
+them itself. Reliable means "no loss", not "delivered in order".
+
+Even fire-and-forget carries those sequence numbers, so a consumer can detect gaps
+without paying for retransmission. If you want JetStream's "durable, ordered,
+replayable" as a single setting, that is a NATS strength and not a Net one.
+
+The full four-way table, including MCP and Zenoh, is on
+[How Net compares](/docs/worldview/how-net-compares).
+
 ## An honest caveat about Net's own model
 
 Capability **filters are advisory**. They match against what a node says about

@@ -88,6 +88,70 @@ different thing to be organised around.
 Both systems propagate announcements past direct peers — Zenoh through routers and
 gossip, Net by forwarding capability announcements up to a depth of 16 hops.
 
+## Three differences that hold up
+
+Feature-by-feature the two look adjacent. These three survive scrutiny.
+
+**1. What propagates when a node joins.** Zenoh exchanges *routing state* — which
+key expressions have subscribers, which queryables exist, which liveliness tokens
+are declared. A joining peer learns the shape of the key space. It does not learn
+what any node *is*. Net propagates signed capability announcements: attributed to
+an identity, carrying a TTL and a hop count, verifiable by any receiver. Zenoh's
+liveliness tokens are the closest analogue, and they assert that *a key expression
+is alive* — a subscriber is notified when the token appears or disappears, and gets
+a delete if connectivity to its creator is lost. That is an assertion about a key,
+not a description of a provider.
+
+> **Zenoh discovers endpoints. Net discovers providers.** Both find each other
+> without configuration; the difference is what the mesh knows once they have.
+
+**2. Admission is network-level versus identity-level.** Zenoh's access control is
+configured — ACL rules and mTLS certificates set on nodes and routers — so trust is
+a property of the deployment. In Net the joining node carries its own organisation
+membership as a signed attestation, and visibility follows from that rather than
+from what an operator wrote in a config file. The difference is between *the admin
+allowed this machine onto the network* and *this machine proves which fleet it
+belongs to*. It matters exactly where you would expect: contractors, dealers,
+cross-vendor fleets, anywhere the operator of the network is not the owner of the
+capability.
+
+**3. Mode is a deployment decision versus a property.** Someone configures a Zenoh
+node as peer, client or router, and getting that wrong is a real source of the
+complaints you will find in ROS 2 threads. Net nodes are symmetric by construction
+— a node publishes, subscribes, relays and persists as needed, and relay-capable is
+a tag rather than a role. Modest, but it is a genuine operational simplification
+and the one a field technician actually feels.
+
+## Transport and delivery, concretely
+
+Two mechanical facts decide whether Net fits your network at all.
+
+**Zenoh is a mix; Net is UDP, and only UDP.** Zenoh runs over TCP by default and
+also speaks UDP, QUIC, TLS, serial and shared memory — the breadth is deliberate
+and is part of how it reaches microcontrollers and gets zero-copy on-host. The Net
+mesh speaks UDP datagrams with no TCP fallback. **A security group that permits
+only TCP will let a Net process start and then silently break the handshake.** Open
+the bind port for inbound and outbound UDP; see
+[NAT and traversal](/docs/guides/nat-and-traversal).
+
+**Reliability is opt-in in both, but Net does not fold ordering into it.**
+
+| | Zenoh | Net |
+|---|---|---|
+| Default | best-effort | fire-and-forget |
+| Stronger | reliable, over a TCP or QUIC session | opt-in: `None` / `Light` / `Full` per adapter, `FireAndForget` / `Reliable` per stream |
+| Ordering | reliable delivery arrives ordered | **not implied by reliability** |
+
+Choosing `Reliable` in Net buys *gap-free eventual delivery* and nothing about
+order: packets, including retransmits, are delivered in **arrival order** tagged
+with a monotonic sequence number, and a consumer needing strict ordering
+reassembles them itself. Fire-and-forget carries the same sequence numbers, so
+detecting gaps costs nothing. If you want "reliable and therefore ordered" as one
+switch, Zenoh gives you that and Net does not.
+
+The full four-way table, including MCP and NATS, is on
+[How Net compares](/docs/worldview/how-net-compares).
+
 ## The comparison as a decision
 
 Neither of us should pretend this is a knockout. The honest version:
