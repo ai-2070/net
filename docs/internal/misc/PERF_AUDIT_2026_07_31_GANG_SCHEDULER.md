@@ -669,20 +669,6 @@ host, candidate is **flat**. §5's equivalent witness is the clone counter in
 `apply_moves_the_payload_instead_of_cloning_it` (zero clones across insert / replace /
 reject).
 
-### What remains unmeasured
-
-Stated plainly, because three of the seven findings now have numbers and the rest do not:
-
-- **§3 has no wall-clock evidence.** Its only measurement is the snapshot-count witness
-  (topology reads 2 → 1, verified falsifiable). ICB-1 cannot see it and ICB-5's fixture is
-  three named islands — the ~1000-island sensed scaling row this audit asks for has not
-  been built, so §3's benefit is demonstrated structurally, not empirically.
-- **§5 and §6 have allocation evidence but no wall-clock evidence.** Both are on write /
-  dispatch paths that no bench in the ICB suite times. Their value is argued from the
-  allocation counts plus the frequency of those paths, not measured end-to-end.
-- **§7's hasher is bundled into s2** and is not separated from §1 within that arm.
-- Nothing here is a threshold or a public performance claim — ICB-7 owns those.
-
 ### Reproduce
 
 ```bash
@@ -702,10 +688,80 @@ Caveat for anyone re-running: `cargo clippy` sharing a target directory **evicts
 bench artifacts**, so an arm binary can vanish between building and measuring. The runner
 now checks every arm up front and names the missing one.
 
+---
+
+## What is left undone, and why
+
+Three of the seven findings are implemented and measured. This section is the complete
+list of what is *not* done, so nobody has to reconstruct it from the section headers.
+Nothing below was skipped for convenience — each has a named reason and, where relevant,
+the gate that has to clear first.
+
+### Not implemented
+
+**§2 — the `by_host` island index (slice 4). HELD by review, not attempted.**
+This is the only finding that changes the scaling curve rather than a constant, and the
+only one that can *regress* the system: islands re-announce every heartbeat, and a naive
+index would churn `on_remove`/`on_insert` on every one of them for a mapping that cannot
+change. It needs `index_payload_equivalent(old, new) = old.host == new.host` plus a test
+proving steady heartbeats skip the index, and it needs all four §2 result sets (read
+scaling, heartbeat-write, lifecycle, index memory) reported *separately* — a read win that
+hides a write regression inside one averaged number is exactly what the hold exists to
+prevent. Implementing it before that evidence exists would defeat the gate.
+
+**§4 — the reservation pre-read (slice 5). BLOCKED on a protocol decision, deferred to
+Kyra (2026-08-01).** Not a coding task. On the public node path a losing reserve is
+signed, locally rejected, *and broadcast anyway*, and ICB-4 both asserts
+`rejected_delta == 1` per sample and carries a "Honesty note (W4)" documenting that gossip
+as deliberately witnessed. Suppressing it is a change to what the mesh emits, not a
+CPU-saving refactor, so it needs the decision recorded in "The decision to make" above
+before any of the four claim surfaces is touched. No claim path was modified.
+
+### Implemented but not fully measured
+
+The measurement contract is satisfied for slice 2 and for the allocation claims. It is
+**not** satisfied for the rest:
+
+- **§3 has no wall-clock evidence.** Its only measurement is the snapshot-count witness
+  (topology reads 2 → 1, verified falsifiable). ICB-1 does not call
+  `match_islands_sensed`, and ICB-5's fixture is three named islands — far too small to
+  show the removal of a whole-topology scan. The ~1000-island sensed scaling row this
+  audit asks for **has not been built**, so §3's benefit is demonstrated structurally and
+  by scan count, not empirically. This is the largest outstanding measurement gap.
+- **§5 and §6 have allocation evidence but no wall-clock evidence.** Both sit on write /
+  dispatch paths that no bench in the ICB suite times — confirmed by the s1 arm showing
+  ±0% on every ICB-1 cell, which is the expected result, not a disappointing one. Their
+  value rests on the allocation counts plus how often those paths run, and an end-to-end
+  number would need a bench that does not currently exist.
+- **§7's hasher is not separated from §1.** Both landed in the s2 arm, so the −40% to −75%
+  is their combined effect and the split between them is unknown.
+- **§1's fast path covers `Composite` only.** The other five `CapabilityQuery` shapes are
+  tested for equivalence but still take the clone-heavy route. Deliberate scoping, not an
+  oversight — `Composite` is the shape every `MatchCriteria` in the tree uses — but the
+  finding is not "fixed" for arbitrary callers.
+
+### Known-imperfect, left alone
+
+- **`Fold::with_state` remains unmetered**, and three existing lib paths
+  (`capability_tags_for`, `capability_tags_for_all`, `nodes_with_capability_tag`) read
+  production state through it. §7 added the metered `with_state_query` and used it for the
+  holder reads *because those replaced metered `query` calls*; the pre-existing unmetered
+  readers were left as they are rather than widening this work into a telemetry audit.
+- **`tests/sensing_origin_emitter.rs` does not compile** under `--features net` alone
+  (missing `sensing_consumer_cell_interval_for_test`). Pre-existing — confirmed with all
+  slice changes stashed — and untouched.
+
+### Explicitly not claimed
+
+No threshold and no public performance claim is made anywhere in this document. ICB-7 owns
+those. The numbers here are a before/after on one pinned machine under one stated protocol,
+sufficient to say the mechanisms work and to attribute the improvement, and not sufficient
+for anything stronger.
+
 ## Reproduce
 
-There is no measurement in this document to reproduce. The instruments that should be used
-to validate it are below.
+The measured results above have their own reproduction steps; this section lists the
+broader instrument set for validating the findings.
 
 **Working directory matters.** There is no workspace `Cargo.toml` at the repository root or
 under `net/`; these commands fail from either. Run them from the crate:
@@ -737,6 +793,8 @@ known-held first island followed by a free fallback, and **ICB-5b** (the sensed 
 row inside `island_claim_sensed`) for the sensed equivalent.
 
 ICB-1's population discipline (exact matched-host / candidate-island counts asserted before
-and after every timed batch) will fail loudly if §1–§3 change what the matcher returns
-rather than only how fast it returns it. Take the before/after on the **sparse-1000 row**
-specifically — the row the bench header identifies as dominated by the full topology scan.
+and after every timed batch) fails loudly if §1–§3 change what the matcher returns rather
+than only how fast it returns it. That discipline was exercised: it held on all four arms,
+and the runner additionally cross-checked `viable_returned` across arms before comparing
+any timing. The **sparse-1000 row** — the one the bench header identifies as dominated by
+the full topology scan — is reported in "Measured results" above.
