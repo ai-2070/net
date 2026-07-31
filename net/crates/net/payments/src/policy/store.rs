@@ -310,19 +310,28 @@ mod tests {
         let loaded: Counters = load_json(&path).await.unwrap();
         assert_eq!(loaded.counts["a"], 1, "a pretty store must still parse");
 
-        // Rewriting it emits compact bytes (no newline/indent runs).
+        // Rewriting it emits compact bytes. The assertion is the strongest
+        // one available: compact output contains no raw newline ANYWHERE,
+        // not merely no newline-plus-indent run. That holds even for
+        // newline-bearing data, because serde escapes a newline inside a
+        // string as the two bytes `\n` — which is why the second key here
+        // carries one.
         mutate_json::<Counters, _, _>(&path, |s| {
-            s.counts.insert("b".into(), 2);
+            s.counts.insert("b\nwith a newline in the key".into(), 2);
         })
         .await
         .unwrap();
         let raw = tokio::fs::read(&path).await.unwrap();
         assert!(
-            !raw.windows(2).any(|w| w == b"\n "),
+            !raw.contains(&b'\n'),
             "saves must be compact, not pretty-printed"
         );
         let loaded: Counters = load_json(&path).await.unwrap();
         assert_eq!(loaded.counts.len(), 2, "the mutation still round-trips");
+        assert_eq!(
+            loaded.counts["b\nwith a newline in the key"], 2,
+            "escaping is what makes the no-raw-newline assertion safe"
+        );
     }
 
     /// `mutate_json_if_changed` writes on a dirty pass and skips the write
