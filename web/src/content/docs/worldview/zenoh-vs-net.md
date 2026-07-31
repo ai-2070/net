@@ -152,6 +152,49 @@ switch, Zenoh gives you that and Net does not.
 The full four-way table, including MCP and NATS, is on
 [How Net compares](/docs/worldview/how-net-compares).
 
+## Setup cost, and what it costs you to skip it
+
+Point 2 above said Zenoh's admission is configured. That deserves its own weighing,
+because the previous version of this page was scrupulous about Net's weaknesses and
+quiet about what the alternative actually asks of an operator.
+
+Net uses **Noise**, not TLS — `Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s`. The `NK`
+pattern means the initiator already knows the responder's static public key, and
+`psk0` mixes a pre-shared key in before the first message. So an authenticated,
+encrypted link is configured with four values and nothing else:
+
+```text title="Everything a Net link is configured with"
+bind_addr            where this node listens
+peer_addr            where the peer listens
+psk                  32 bytes, shared out of band
+peer_static_pubkey   32 bytes, the peer's identity
+```
+
+No certificate authority. No issuance, expiry, renewal or chain validation. No ACL
+file. And nothing to deploy: the mesh is a **4.3 MB** library linked into your
+process — measured, `libnet.dylib`, release build, default features — where a
+Zenoh deployment past peer mode also runs `zenohd`.
+
+Mutual TLS is not hard because TLS is bad; it is hard because it is an
+infrastructure commitment. Doing it properly means a CA, a certificate and key per
+node, distribution of all of it to devices that may be in the field, and a renewal
+plan that works before the first certificate expires. Access control is then a
+second, separate artefact: ACL rules maintained in node and router configuration.
+Two things to get right, both of them operator-authored, both of them living
+outside the code that uses them.
+
+**The consequence is not inconvenience, it is posture.** A fleet operator who
+cannot stand up a PKI does not run a slower pilot — they run one with
+authentication switched off, and it stays off. A lower floor means the insecure
+shortcut is less tempting, and that is a security argument rather than an
+ergonomics one.
+
+**The honest cost on our side.** A PSK is symmetric and has to be distributed;
+anyone holding it can attempt a handshake with any node that accepts it. There is
+no certificate expiry quietly forcing rotation, and no CRL at the transport layer —
+revocation lives higher up, in delegation chains. If you already operate a mature
+PKI, that is machinery you have paid for and Net does not use it.
+
 ## The comparison as a decision
 
 Neither of us should pretend this is a knockout. The honest version:

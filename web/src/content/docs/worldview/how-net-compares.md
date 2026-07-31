@@ -38,14 +38,19 @@ large class of work.
 | **Liveness** | process lifetime | no core primitive; server-side slow-consumer detection | liveliness tokens declared on a key expression | announcements carry a TTL and are refreshed by signed diffs |
 | **Delivery** | request/response over the transport | core at-most-once; JetStream at-least-once or exactly-once | best-effort, or reliable over a TCP/QUIC session | fire-and-forget by default; reliability is opt-in |
 | **Ordering** | n/a | per-subject within a stream | reliable delivery is ordered | **not implied by reliability** — see below |
+| **Session crypto** | whatever the transport gives you | TLS | TLS / mTLS | **Noise `NKpsk0`** — X25519, ChaCha20-Poly1305, BLAKE2s |
+| **What a secure link needs** | trust the local process | server config, accounts, NKeys or JWT, a `.creds` file per client | a CA, a cert and key per node, ACL rules in config | the peer's static public key and a shared 32-byte PSK |
+| **What you deploy** | the server process the host spawns | a NATS server (cluster, supercluster, leaf nodes) | peers need nothing; router mode runs `zenohd` | a **4.3 MB** library linked into your process — no broker |
 | **Trust boundary** | host-local: the host decides what is wired in | server-enforced: NKeys, JWT, subject permissions | deployment-configured: ACL rules, mTLS | node-held: signed permission tokens with explicitly trusted roots |
 | **Cross-organisation** | not a primitive | accounts with subject import/export, server-mediated | not a primitive | native — organisation-scoped capabilities |
 | **Maturity** | young; large and fast-moving ecosystem | CNCF project, many client languages, very large production base | Eclipse project, ROS 2 middleware, robotics and industrial deployments | young |
 
-Two rows a previous draft of this table carried have been dropped rather than
-guessed at: process footprint in megabytes, and client-language counts. Neither was
-verified, and a comparison page is exactly the wrong place to round a number in our
-own favour.
+The 4.3 MB is measured, not estimated: `libnet.dylib`, release profile, default
+features, macOS arm64, unstripped — the artifact a C or Go consumer links. The
+equivalent numbers for NATS and Zenoh are deliberately absent because we have not
+measured them under comparable conditions, and a comparison page is the wrong place
+to quote a competitor's figure from memory. Client-language counts are left
+qualitative for the same reason.
 
 ## The rows worth reading twice
 
@@ -87,6 +92,47 @@ exactly-once with per-subject ordering inside a stream; Zenoh offers best-effort
 reliable, where reliable rides a TCP or QUIC session and arrives ordered. Net is
 the only one of the three that separates "no loss" from "in order" and hands the
 second decision to you.
+
+### Setup cost is a security property, not a convenience one
+
+The trust-boundary row understates something, so it is spelled out here: **the
+three systems ask for very different amounts of work before anything is
+encrypted**, and that difference has consequences beyond developer comfort.
+
+Net uses the Noise protocol — `Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s` — not TLS.
+The `NK` pattern means the initiator already knows the responder's static public
+key, and `psk0` mixes in a pre-shared key before the first message. Bringing up an
+authenticated, encrypted link therefore needs four values:
+
+```text title="Everything a Net link is configured with"
+bind_addr            where this node listens
+peer_addr            where the peer listens
+psk                  32 bytes, shared out of band
+peer_static_pubkey   32 bytes, the peer's identity
+```
+
+No certificate authority. No certificate issuance, expiry, renewal, or chain
+validation. No ACL file. Nothing to run.
+
+The comparison is not that TLS is bad — it is that mTLS is an *infrastructure
+commitment*. A Zenoh deployment doing mutual authentication needs a CA, a
+certificate and key per node, distribution of all of it, and a renewal story
+before the first cert expires; access control is then a separate set of ACL rules
+maintained in node and router config. NATS is lighter but still asks for a server,
+an account model, NKeys or JWTs, and a credentials file per client. Both are
+well-trodden and both are real operational surface — the kind that gets deferred in
+a pilot and then never quite gets done.
+
+**Where this genuinely matters:** an operator who cannot stand up a PKI ends up
+running the pilot without mutual authentication. Net's floor is lower, so the
+insecure shortcut is less tempting.
+
+**And the honest cost on our side.** A PSK has to be distributed, and it is
+symmetric — anyone holding it can attempt a handshake with any node that accepts
+it. There is no certificate expiry doing quiet rotation for you, and no CRL at the
+transport layer; revocation lives higher up, in delegation chains. If your
+organisation already runs a mature PKI, that machinery is an asset you have already
+paid for and Net does not use it.
 
 ### Typing is a contract, not a wire format
 

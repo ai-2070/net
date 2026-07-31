@@ -132,6 +132,44 @@ replayable" as a single setting, that is a NATS strength and not a Net one.
 The full four-way table, including MCP and Zenoh, is on
 [How Net compares](/docs/worldview/how-net-compares).
 
+## Setup cost, and what there is to run
+
+The section above weighed Net's transport honestly. This one weighs what each side
+asks of an operator, which an earlier draft of this page skipped.
+
+**There is no Net server.** The mesh is a **4.3 MB** library linked into your
+process — measured, `libnet.dylib`, release build, default features. NATS is a
+server: you deploy it, cluster it, monitor it, upgrade it, and decide where leaf
+nodes sit. That is a mature and well-understood operational story, and it is also a
+piece of infrastructure that has to exist before your first message moves.
+
+**And Net uses Noise, not TLS** — `Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s`. An
+authenticated, encrypted link is configured with four values:
+
+```text title="Everything a Net link is configured with"
+bind_addr            where this node listens
+peer_addr            where the peer listens
+psk                  32 bytes, shared out of band
+peer_static_pubkey   32 bytes, the peer's identity
+```
+
+NATS's equivalent is lighter than a full PKI but is still a model to learn and
+maintain: server configuration, an operator/account/user hierarchy, NKeys or JWTs,
+a `.creds` file per client, and subject permissions per account. Cross-account
+sharing means import/export rules, mediated by the server.
+
+Which is better depends on what you already have. **If you run a platform team, the
+NATS model is an asset**: central policy, one place to audit, revocation by
+reissuing credentials. **If your nodes are field devices, contractor machines or
+another organisation's hardware**, the same centralisation is the problem — every
+participant needs a credential issued by your infrastructure before it can do
+anything.
+
+**The honest cost on our side.** A PSK is symmetric and has to be distributed;
+anyone holding it can attempt a handshake with any node that accepts it. There is
+no credential expiry forcing rotation for you, and no server-side kill switch —
+revocation lives in delegation chains, higher up the stack.
+
 ## An honest caveat about Net's own model
 
 Capability **filters are advisory**. They match against what a node says about
