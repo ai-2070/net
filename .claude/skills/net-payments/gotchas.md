@@ -106,6 +106,18 @@ they go red (`testing.md`).
   transaction, or `check_and_reserve`, keep the dirty flag derived from the
   same branch that mutated — and note the two traps (housekeeping pruning makes
   a nominal denial dirty; a re-requested identical pending approval is clean).
+- **`engine.status()` is not an audit surface.** Terminal quote records are
+  compacted 6h past quote expiry by default, so `status()` returns `None` for a
+  payment that completed and settled fine. The durable evidence is the
+  `BillingLog`. Don't build reconciliation, receipts, or "was this paid?" on
+  the quote record — see `provider.md`.
+- **Retention removes bookkeeping, never replay protection.** Settlement
+  transaction tombstones are permanent at every setting; expiring them means one
+  payment serves twice provided the attacker waits long enough. Nor is anything
+  removed that is unredeemed, frozen (including frozen *after* redemption by a
+  reverted-settlement verdict), or missing an authoritative expiry. If you are
+  adding a condition to the sweep, it belongs on the *keep* side unless you can
+  say what makes the record redundant with the `BillingLog`.
 
 ## Language reality checks (before you promise a flow)
 
