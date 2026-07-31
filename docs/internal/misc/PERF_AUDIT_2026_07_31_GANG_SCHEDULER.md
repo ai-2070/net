@@ -4,16 +4,25 @@ Source: code inspection of the gang-claim scheduler
 (`net/crates/net/src/adapter/net/behavior/gang/`) and the fold surfaces its hot path
 reads and writes — `fold/capability.rs` (step 1), `fold/island.rs` (step 2),
 `fold/reservation.rs` (step 4), plus the shared `fold/mod.rs` apply path and
-`fold/wire.rs` envelope codec — and the existing island-claim bench suite
-(`benches/island_claim_*.rs`) to establish what is already characterized.
+`fold/wire.rs` envelope codec — the node-level claim surface in `adapter/net/mesh.rs`,
+the Cortex claim pipeline in `adapter/net/cortex/workflow/step.rs`, and the existing
+island-claim bench suite (`benches/island_claim_*.rs`).
 
 **Status: findings only. Nothing here is implemented and nothing here is measured.**
 Every cost claim below is derived from reading the code; the one absolute latency figure
 used (Ed25519 sign ≈ 50 µs) is quoted from this repo's own
-`PERF_AUDIT_2026_06_10_FULL_CRATE.md` §"Impact: medium", not re-measured. Treat the
-ranking as a hypothesis ordered by expected leverage, not as a result. The
-`island_claim_match` bench (ICB-1) is the instrument for validating §1–§3; see
-**Reproduce** at the bottom.
+`PERF_AUDIT_2026_06_10_FULL_CRATE.md`, not re-measured. Treat the ranking as a hypothesis
+ordered by expected leverage, not as a result.
+
+> **Review disposition (2026-07-31, Kyra), against `performance-gang-scheduler` @
+> `1c53f800a`.** §5, §6, §1, §3 and the lookup portions of §7 approved subject to the
+> scope and test corrections now folded into each section. **§2 is held behind read *and*
+> write evidence** — it is the only scaling-curve change and the only one that can regress
+> heartbeat writes. **§4 is returned for architectural revision and must not be coded as
+> an optimization** — it is a protocol/observability decision, and §4 below has been
+> rewritten as a decision point rather than a proposal. The benchmark mapping and the
+> `cd` for every command were also corrected; the original revision pointed §4 at two
+> benches that cannot characterize it.
 
 The hot path in question is the read pipeline plus the commit — plan §2 steps 1–4:
 
@@ -24,21 +33,29 @@ The hot path in question is the read pipeline plus the commit — plan §2 steps
 [4] ReservationFold CAS                    (the only commit)
 ```
 
-Steps 1–3 (`match_islands`) run on **every retry round** of `schedule_single`
-(`gang/schedule.rs:136`) — the loop deliberately re-matches because the world moves
-between attempts — so constant-factor waste there is paid per round, not per job.
+Steps 1–3 (`match_islands`) run on **every retry round** of the synchronous
+`schedule_single` loop (`gang/schedule.rs:136`), and once per claim attempt on the node
+and Cortex paths — so constant-factor waste there is paid per round, not per job.
 
 The headline conclusion: **the matcher's cost is dominated by work it throws away.**
 Step 1 deep-clones capability payloads to extract a `u64` from each; step 2 scans the
 entire topology regardless of how few hosts matched; the sensed variant scans it a second
-time and clones all of it. Separately, step 4 pays full Ed25519 signing for claim attempts
-whose rejection is already determined by state the caller could have read.
+time and clones all of it. Those three are ordinary optimizations. The fourth candidate —
+skipping predictably-losing claim attempts — turned out **not** to be an optimization at
+all, and is written up as such.
 
 Recommended order of attack is at the bottom.
 
 ---
 
-## 1. (Highest constant-factor leverage) Step 1 deep-clones every matched capability payload, then discards it
+## 1. (Highest constant-factor leverage) `CapabilityQuery::Composite` matching deep-clones every matched payload, then discards it
+
+**Scope, stated up front:** this finding and its fix cover the **`Composite`** query shape
+only. That is the shape every in-repo `MatchCriteria` uses, but `match_islands` accepts
+any `CapabilityQuery`, and `InClass` / `HasAllTags` / `HasAnyTag` / `InState` / `InRegion`
+(`fold/capability.rs:536-573`) all remain clone-heavy under the sketch below. This section
+does not fix "the scheduler's capability matching"; it fixes the composite path and leaves
+the others on today's route.
 
 **The gap.** `match_islands` (`gang/mod.rs:117-118`) does:
 
@@ -61,8 +78,7 @@ matches.iter().map(|((_class, node), _)| *node).collect()
 
 Every cloned byte is dropped on the next line. On a 100-matching-host mesh with ~30 tags
 per host, `PERF_AUDIT_2026_06_10_FULL_CRATE.md` models a comparable membership clone at
-~1–3 µs and ~100 allocations *each* — so the discarded work is plausibly the largest
-single term in step 1, and it is paid again on every retry round.
+~1–3 µs and ~100 allocations *each*.
 
 **Why it is straightforward.** The clone-free entry point already exists and is already
 `pub(crate)`. `resolve_candidate_keys` (`fold/capability.rs:661`) resolves the same
@@ -85,32 +101,34 @@ let hosts: HashSet<NodeId> = capability_fold.with_state_and_index(|state, index|
                 .map(|(_, node)| *node);
             if f.limit > 0 { it.take(f.limit).collect() } else { it.collect() }
         }
-        // Non-composite shapes keep the existing path.
+        // Every other shape keeps today's clone-heavy path.
         other => candidate_hosts(&CapabilityFold::query(state, index, other.clone())),
     }
 });
 ```
 
-**Two correctness notes for whoever implements this.**
+**Two invariants the implementation must preserve.**
 
-- The `state.entries.contains_key` guard is not optional. `composite_query` uses
-  `filter_map(|k| state.entries.get(&k)…)`, so a key present in the index but absent from
-  the primary store is silently dropped today. Collecting node ids straight off the index
-  would resurrect it.
-- `filter.limit` must stay applied to *keys*, before host dedup, to match today's
-  semantics (`composite_query` takes `limit` matches and `candidate_hosts` dedups after).
-  Iteration order of the candidate `HashSet` is already unspecified, so which `limit`
-  matches survive is already unspecified — this change does not make it worse, but it
-  should not silently change the *count* either.
+- **Index-then-primary-store filtering.** The `state.entries.contains_key` guard is not
+  optional. `composite_query` uses `filter_map(|k| state.entries.get(&k)…)`, so a key
+  present in the index but absent from the primary store is silently dropped today.
+  Collecting node ids straight off the index would resurrect it.
+- **Limit before host dedup.** `filter.limit` must stay applied to *keys*, matching
+  today's order (`composite_query` takes `limit` matches; `candidate_hosts` dedups after).
+  Iteration order of the candidate `HashSet` is already unspecified, so *which* `limit`
+  matches survive is already unspecified — but the resulting host *count* must not change.
+
+**Required tests.** Equivalence against the existing `query` path for **every**
+`CapabilityQuery` shape, not just `Composite` — including the index/primary-store
+divergence case and a `limit`-bounded composite.
 
 **Same line, second win.** `criteria.capability.clone()` (`gang/mod.rs:117`) clones the
 `CapabilityFilter` — its `tags_all`, `tags_any`, `tag_groups_all` String Vecs — on every
-call, only because `Fold::query` takes `K::Query` by value. The sketch above borrows it
-instead. This is per retry round.
+call, only because `Fold::query` takes `K::Query` by value. The sketch borrows it instead.
 
 ---
 
-## 2. (Only structural finding) Step 2 scans the whole topology; the island fold has no index
+## 2. (Held behind write-side evidence) Step 2 scans the whole topology; the island fold has no index
 
 **The gap.** `IslandQuery::HostedByAny` (`fold/island.rs:251-256`) iterates **every entry
 in the topology fold** and hashes each entry's `host` against the candidate set:
@@ -123,8 +141,9 @@ IslandQuery::HostedByAny(hosts) => state.entries.iter()
 ```
 
 `IslandTopologyFold::Index = NoIndex` (`fold/island.rs:176`), so there is nothing to
-narrow with. Matcher cost is therefore proportional to **total mesh island count**, not to
-how many islands the capability match actually implicated.
+narrow with. Matcher cost is proportional to **total mesh island count**, not to how many
+islands the capability match actually implicated. `HostedBy` (`fold/island.rs:245-250`)
+has the identical full-scan shape.
 
 This is not a new observation — the ICB-1 bench header states it as measured architecture
 evidence:
@@ -137,27 +156,42 @@ The bench frames this as "architecture evidence — NOT an optimization task", w
 right call for a measurement doc. It is the optimization task here.
 
 **The shape.** A `by_host: HashMap<NodeId, HashSet<IslandId>>` implementing
-`FoldIndex<IslandTopologyFold>` turns both `HostedBy` and `HostedByAny` into a lookup
-proportional to *matched* islands. `HostedBy` (`fold/island.rs:245-250`) has the identical
-full-scan shape and gets the same win.
+`FoldIndex<IslandTopologyFold>` makes both queries proportional to *matched* islands.
 
-**The constraint that makes or breaks it.** Islands re-announce on **every heartbeat** —
-that is the entire point of keeping `load` / `p50_latency_us` in this fold rather than the
-capability index (module doc, `fold/island.rs:12-19`). Each heartbeat is an
+**The constraint that decides whether it is a win at all.** Islands re-announce on **every
+heartbeat** — the entire reason `load` / `p50_latency_us` live in this fold rather than
+the capability index (`fold/island.rs:12-19`). Each heartbeat is an
 `ApplyOutcome::Replaced`, and the Replace path (`fold/mod.rs:401-441`) does
-remove-then-insert on the index. A naive index would churn on every heartbeat for a
-mapping (`island → host`) that is quasi-static by construction — `record.host` cannot even
-change, since `merge` pins the key to its first publisher (`fold/island.rs:212-229`).
+remove-then-insert on the index. A naive index churns on every heartbeat for a mapping
+that is quasi-static by construction — `record.host` cannot change at all, since `merge`
+pins the key to its first publisher (`fold/island.rs:212-229`).
 
-The hook for this already exists: `index_payload_equivalent` (`fold/mod.rs:419`, added by
-PERF_AUDIT §4.5 for exactly the capability-fold analogue of this problem) skips the index
-churn when the new payload is index-equivalent to the old. An island-fold implementation
-comparing only `host` would make every steady-state heartbeat skip the index entirely.
-Without that, this finding is plausibly a net loss on write-heavy meshes.
+The hook exists: `index_payload_equivalent` (`fold/mod.rs:419`, added by PERF_AUDIT §4.5
+for the capability-fold analogue). The correct implementation is:
 
-**Sizing.** This is the only finding that changes the scaling curve rather than a
-constant. It is also the only one that touches a fold's index invariants, and should get
-its own review and its own ICB-1 sparse-1000 row before and after.
+```rust
+fn index_payload_equivalent(old: &IslandRecord, new: &IslandRecord) -> bool {
+    old.host == new.host
+}
+```
+
+Without it this finding is plausibly a **net loss** on write-heavy meshes.
+
+**Required evidence before approval — read *and* write.** The original revision asked only
+for a sparse-1000 read comparison. That is insufficient. Measure:
+
+| axis | what to capture |
+|---|---|
+| read | ICB-1 sparse-1000 row, before/after |
+| steady-state heartbeat | same-host `Replaced` — must not touch the index at all |
+| host-relevant replacement | if such a transition is constructible under the ownership gate |
+| insert | first announcement of an island |
+| eviction / expiry | `evict_node` and the TTL sweep both drive `on_remove` |
+| snapshot restore | `Fold::restore` repopulates the index from scratch |
+| index size | population and memory at representative cardinality |
+
+**Required test.** A direct witness that a steady-state heartbeat calls neither
+`on_remove` nor `on_insert` — an assertion on the hooks, not an inference from timing.
 
 ---
 
@@ -182,85 +216,126 @@ The `.map` immediately projects each cloned record down to a single `u64` field.
 defends this as deriving the band map from "ONE literal topology snapshot — a single `All`
 scan, not one `Get` per island", because separate fold reads "could interleave with
 concurrent updates and hand the sort a mixed-time view". That reasoning is sound and the
-fix does not weaken it — it strengthens it. `match_islands` *just* queried exactly the
-records needed, in one scan, one moment earlier; `ordered` is by construction a subset of
+fix strengthens rather than weakens it: `match_islands` *just* queried exactly the records
+needed, in one scan, one moment earlier, and `ordered` is by construction a subset of
 those candidates. Threading the filtered records out (an internal `match_islands_records`
 returning `Vec<IslandRecord>`, with the public `match_islands` projecting to ids) gives the
 band map from data already in hand, from a **single** snapshot instead of two taken at
 different times.
 
-Net: one topology scan per sensed match instead of two, and zero whole-topology payload
-clones.
+**Invariant to preserve:** the selected record order out of step 3. The band sort is
+documented as stable so that within a band the selection policy's order survives
+(`gang/mod.rs:211`); an internal records variant must not perturb what
+`select_with_affinity` produced.
 
 **Two smaller ones in the same function.**
 
 - **`sensed_viable_order.iter().position(...)`** (`gang/mod.rs:201-204`) is a linear scan
-  of the provider order **per island**, inside the map that builds `bands` — O(islands ×
-  providers). Building a `HashMap<NodeId, usize>` from `sensed_viable_order` once makes it
-  O(islands + providers). The comment above it correctly notes there are no fold queries
-  inside the sort; this is the same idea applied to the band derivation itself.
+  of the provider order **per island** — O(islands × providers). Build a
+  `HashMap<NodeId, usize>` once.
 - **`down_nodes.clone()`** (`gang/mod.rs:175-179`) copies the entire down-set on the common
-  path where `sensed_non_viable` is empty, only to satisfy the `&HashSet` parameter. A
-  `Cow<'_, HashSet<NodeId>>` avoids the allocation whenever there is no sensed prune —
-  which the function's own contract calls out as the "byte-identical to `match_islands`"
-  case.
+  path where `sensed_non_viable` is empty. `Cow<'_, HashSet<NodeId>>` avoids it in exactly
+  the case the function's contract calls out as "byte-identical to `match_islands`".
+
+**Benchmark gap — this needs a new fixture.** `island_claim_sensed` (ICB-5) does measure
+plain-versus-sensed matcher overhead, but its fixture is a fixed, tiny named-island set
+(`ISLAND_A` / `ISLAND_R` / `ISLAND_X`). It cannot validate the removal of a second
+**whole-topology** scan, because at that cardinality there is no topology to speak of. Add
+a sensed matcher scaling row:
+
+- ~1 000 total islands, ~100 matched
+- explicit viable provider ordering
+- non-viable **and** unsensed hosts present (the trailing-band case)
+- exact before/after result ordering asserted, not just timing
 
 ---
 
-## 4. Contended claims pay full Ed25519 signing for attempts whose rejection is already determined
+## 4. (Not an optimization — a protocol decision) Signing before reading on predictably-losing claim attempts
 
-**The gap.** `claim_first_available` (`gang/contention.rs:38-45`) walks the ordered island
-list calling `single_island_claim` on each. `single_island_claim` (`gang/claim.rs:159-169`)
-signs first, asks second:
+The original revision proposed a reservation pre-read as a transparent local optimization.
+**That framing was wrong and the proposal is withdrawn in that form.** The cost is real;
+the change is not transparent. What follows is the decision that has to be made first.
+
+### The cost is real
+
+`single_island_claim` (`gang/claim.rs:159-169`) signs first and asks second:
 
 ```rust
 let ann = reserve_announcement(keypair, node_id, generation, island, until_unix_us)?;
 Ok(ClaimOutcome::from_apply(reservations.apply(ann)?))
 ```
 
-`reserve_announcement` → `sign_state` → `SignedAnnouncement::sign` (`fold/wire.rs:283`) is
-a postcard serialization plus an Ed25519 signature — **~50 µs** per this repo's own
-`PERF_AUDIT_2026_06_10_FULL_CRATE.md`. `Fold::apply` then takes the write lock and
-`ReservationFold::merge` rejects it in what is effectively a couple of comparisons.
+`SignedAnnouncement::sign` (`fold/wire.rs:283`) is a postcard serialization plus an
+Ed25519 signature — **~50 µs** per this repo's own audit. `ReservationFold::merge`
+(`fold/reservation.rs:222-247`) then rejects it in a couple of comparisons, and the
+rejection was determined by state readable before the signature:
 
-A claimant walking 8 already-held islands before winning the 9th burns on the order of
-400 µs of signing to learn what a read under the same lock would have told it. The whole
-premise of this module is contention — `claim_first_available`'s doc is "reserve the first
-one that's free", and ICB's oversubscribed fixtures are the designed case — so the losing
-attempts are the common path, not the exceptional one.
-
-`try_acquire_gang` (`gang/multi.rs:90-93`) has the same shape and pays it twice over: the
-blocked attempt signs for the blocker, then signs again per already-grabbed island to roll
-it back (`gang/multi.rs:104-108`), and `acquire_gang` retries the whole thing under
-backoff.
-
-**Why a pre-read is sound.** `ReservationFold::merge` (`fold/reservation.rs:222-247`)
-makes foreign rejection deterministic and readable from the state alone:
-
-| existing state | foreign `Reserved` incoming | readable today? |
+| existing state | foreign `Reserved` incoming | predetermined? |
 |---|---|---|
-| `Active { .. }` | always `Reject` (`reservation.rs:243`) | yes — `ReservationQuery::State` |
-| `Reserved { holder ≠ us, not expired }` | `Reject` (`reservation.rs:231-241`) | yes — holder + `until_unix_us` are both in the state |
-| `Reserved { holder ≠ us, expired }` | `Replace` — takeover | must still be attempted |
-| `Free` / absent | `Replace` / `Insert` | must still be attempted |
+| `Active { .. }` | always `Reject` (`reservation.rs:243`) | yes |
+| `Reserved { holder ≠ us, not expired }` | `Reject` (`reservation.rs:231-241`) | yes |
+| `Reserved { holder ≠ us, expired }` | `Replace` — takeover | no, must attempt |
+| `Free` / absent | `Replace` / `Insert` | no, must attempt |
 
-So the filter is "skip islands whose current state is foreign-`Active`, or foreign-
-`Reserved` with a live deadline" — the two rows where the CAS outcome is already fixed.
-The CAS remains the sole arbiter; the pre-read only declines to do work whose result is
-predetermined.
+### Why it is not transparent: there are three claim paths, not one
 
-**The race is not a new one.** If an island frees between the read and the CAS we would
-have made, we skip it this round and take it on the next re-match. That is
-indistinguishable from having lost the race by a microsecond, which the existing design
-already tolerates — `schedule_single` re-matches every round precisely because the world
-moves between attempts.
+| # | path | walk | reach |
+|---|---|---|---|
+| 1 | `claim_first_available` (`gang/contention.rs:38-45`), used by `schedule_single` | shared helper | **no non-test callers** outside the gang module and its proptests |
+| 2 | `GangClaimPipeline::claim` (`cortex/workflow/step.rs:250-267`) | its own loop over `single_island_claim` | Cortex workflow |
+| 3 | `MeshNode::claim_island` / `claim_island_sensed` (`mesh.rs:27234-27318`) | its own loop over `reserve_island` | **the public node API** |
 
-**Shape.** One `with_state` pass over the candidate list (a single read lock, no per-island
-`query` call — see §7) producing the skip set, then the existing walk over what survives.
-Note that a fully-held list must still return `Ok(None)` rather than erroring, and the
-generation counter must keep advancing exactly as documented in
-`claim_first_available`'s contract (`gang/contention.rs:25-29`) — skipped islands should
-simply not consume a generation.
+Only path 1 uses `claim_first_available`. So restricting the change to
+`claim_first_available` + `try_acquire_gang` — the conservative reading — buys almost
+nothing in production today, because `schedule_single`, `schedule_gang` and `acquire_gang`
+have no non-test callers.
+
+And path 3 does not merely sign locally. `reserve_island` →
+`apply_and_broadcast_reservation` (`mesh.rs:27321+`) applies **and broadcasts**, and the
+broadcast happens **regardless of the local CAS outcome** — a losing reserve is signed,
+rejected locally, and gossiped to peers anyway. ICB-4 documents this deliberately:
+
+> **Honesty note (W4):** a LOSING reserve still gossips — `C`'s rejected `Reserved{C}` on
+> `A` is broadcast to `O` regardless of the local CAS outcome, so `O` ends up observing
+> `A` held by `C` while `C` keeps `A` held by `H`. […] It is witnessed, not hidden.
+
+ICB-4 also asserts, per sample, that the reservation fold's **rejected-apply delta is
+exactly one** (`island_claim_fallback.rs:305-306`, and again in W2 at `:400-418`). A
+pre-read on path 3 would drive that delta to zero and fail the bench — correctly. The
+bench is doing its job: it is pinning behavior a pre-read would silently change.
+
+So on the public path this is not "skip equivalent CPU work". It suppresses a signed
+announcement, a rejected-apply metric, an audit transition, and network fan-out. That may
+well be **desirable** — it removes a known divergence source that ICB-4 currently has to
+witness and disclaim — but it is a deliberate protocol and observability change.
+
+### Withdrawn claim
+
+The original text said skipping was "indistinguishable from having lost the race by a
+microsecond". **That is too strong.** Both `acquire_gang` and `schedule_single` are
+deadline-bounded, and the Cortex and node walks are single-pass. Skipping a reservation
+that is moments from expiry can convert a final-round success into backpressure; the next
+round is not guaranteed to exist. Any implementation must handle the expiry boundary
+explicitly rather than assuming a retry will cover it.
+
+### The decision to make
+
+> Decide whether predictably-losing local claim attempts should remain observable,
+> metered, audited, and broadcast protocol events. If they should not, implement **one**
+> shared reservation-viability classifier and adopt it deliberately across all four
+> surfaces — synchronous scheduler, Cortex workflow, ordinary node claim, sensed node
+> claim — rather than optimizing one loop and leaving the others divergent.
+
+Tests any implementation must carry:
+
+- expiry crossing between the pre-read and the apply, in both directions
+- final-round deadline behavior (success-vs-backpressure at the boundary)
+- generation advancement — skipped islands must not consume a generation, per
+  `claim_first_available`'s documented contract (`gang/contention.rs:25-29`)
+- rejected-apply metric deltas (ICB-4's assertion is the reference)
+- audit-event emission for suppressed rejects
+- an explicit statement of whether losing announcements are still expected on the wire,
+  with ICB-4's W4 note updated or removed to match
 
 ---
 
@@ -270,20 +345,21 @@ simply not consume a generation.
 (`fold/mod.rs:350`), then calls `build_entry::<K>(&ann)` (`fold/mod.rs:369`,
 `fold/mod.rs:411`), which does `payload: ann.payload.clone()` (`fold/mod.rs:779`).
 
-Nothing reads `ann` after the match arms. `ann.node_id` and `ann.generation` are `Copy`;
-the Reject arm's `incoming: &ann` is a different arm from the two that build an entry.
-Capturing `node_id` up front and moving `ann` into `build_entry` removes one deep clone
-from **every accepted apply in the crate** — every island heartbeat (`IslandRecord`:
-`UnitSet` Vec + `capabilities` String Vec), every capability announce
-(`CapabilityMembership`: the ~100-allocation clone from §1), every reservation CAS.
+Nothing reads `ann` after the match arms. Capturing the scalar envelope fields up front —
+`node_id`, `generation`, `ttl_secs`, and anything else `build_entry` reads — and moving
+`ann` into `build_entry` removes one deep clone from **every accepted apply in the crate**:
+every island heartbeat (`IslandRecord`: `UnitSet` Vec + `capabilities` String Vec), every
+capability announce (the ~100-allocation clone from §1), every reservation CAS.
 
-This is outside the gang module but squarely on its hot path, in both directions: the
-topology fold is written on every host heartbeat and read on every match round.
+Outside the gang module, but squarely on its hot path in both directions.
 
 Borrow-checker note: `let action = K::merge(existing, &ann)` holds an immutable borrow of
 `state` in `existing`, which the Reject arm still uses; NLL already permits the
 Insert/Replace arms to mutate `state`, and moving `ann` in those arms is the same
 situation.
+
+**Blast radius is every fold** — run the full fold apply / audit / index suite, not just
+the gang tests.
 
 ---
 
@@ -298,94 +374,114 @@ if self.signature == placeholder_signature() {
 `placeholder_signature()` (`fold/wire.rs:64-66`) is `vec![0u8; SIGNATURE_LEN]` — a fresh
 heap allocation on **every verify**, on the inbound dispatch path, purely to compare
 against zero. `self.signature.iter().all(|&b| b == 0)` is the same predicate with no
-allocation.
+allocation, and it sits after the length check (`fold/wire.rs:323-325`), so the predicate
+is preserved exactly.
 
-Small in absolute terms next to the Ed25519 verify that follows it, but it is free to fix
-and it is on the per-envelope inbound path, which every fold shares.
+Keep the malformed-length and all-zero rejection tests.
 
 ---
 
-## 7. Two smaller ones
+## 7. Hasher and holder-lookup cleanups
 
-**`candidate_hosts` returns a SipHash `HashSet<NodeId>`** (`gang/filter.rs:21-23`), and
-`HostedByAny` performs one `hosts.contains(&e.payload.host)` **per topology entry**
-(`fold/island.rs:253`) — so the hash count scales with total islands, not with candidate
-hosts. The repo already established both the precedent and the threat-model reasoning for
-exactly this substitution: `BuildU64TupleHasher` (`fold/capability.rs:314-351`, PERF_AUDIT
-§4.6) notes that these keys are already hashed identity bytes and SipHash's DoS resistance
-"adds zero protection". `NodeId` is a `u64` from the same source. This matters most if §2
-does *not* land; with a `by_host` index the lookup count drops to |hosts|.
+**The `NodeId` set hasher.** `candidate_hosts` returns a SipHash `HashSet<NodeId>`
+(`gang/filter.rs:21-23`), and `HostedByAny` performs one `hosts.contains(&e.payload.host)`
+**per topology entry** (`fold/island.rs:253`) — so the hash count scales with total
+islands, not candidate hosts. The precedent and the threat-model reasoning already exist:
+`U64TupleHasher` (`fold/capability.rs:314-351`, PERF_AUDIT §4.6) notes these keys are
+already hashed identity bytes and SipHash's DoS resistance "adds zero protection".
 
-**`ReservationQuery::State` allocates a `Vec` for a single row**
-(`fold/reservation.rs:274-277`: `.map(|e| vec![(resource_id, …)])`). `release_island`
-(`gang/claim.rs:203-207`) calls it once per release just to read the holder, and
-`try_acquire_gang`'s rollback loop calls `release_island` per grabbed island
-(`gang/multi.rs:104-108`). A non-allocating holder lookup via `Fold::with_state` would
-serve both — and is the same primitive §4's batched pre-read wants.
+Do **not** reach for `BuildU64TupleHasher` directly — it is named for `(u64, u64)` keys and
+is private to the capability module. Define a dedicated single-`u64` hasher (or factor the
+shared mixing step both can use) in a neutral location. This matters most if §2 does not
+land; with a `by_host` index the lookup count drops to |hosts|.
+
+**The allocating holder read.** `ReservationQuery::State` allocates a `Vec` for a single
+row (`fold/reservation.rs:274-277`). Three callers just want the holder:
+
+- `release_island` (`gang/claim.rs:203-207`) — synchronous
+- `try_acquire_gang`'s rollback loop, once per grabbed island (`gang/multi.rs:104-108`)
+- **`MeshNode::release_island` (`mesh.rs:27282-27292`)** — the public async path, same
+  allocating query, and missed by the original revision
+
+One borrowed holder lookup via `Fold::with_state` should serve all three. It is also the
+primitive a §4 implementation would want, if §4 is ever authorized.
 
 ---
 
 ## What came back clean
 
 - **`select_islands` / `select_with_affinity`** (`gang/filter.rs:144-172`) are honest pure
-  functions over an already-narrowed set. The `partition` in the affinity path allocates
-  two Vecs, but it runs over filtered candidates, not the population, and the
-  sort-within-band structure is what makes the affinity ranking well-defined. Not worth
-  touching.
+  functions over an already-narrowed set. The `partition` allocates two Vecs, but runs over
+  filtered candidates, not the population.
 - **`NumericFilter::accepts`** (`gang/filter.rs:57-90`) short-circuits in the right order —
-  cheap scalar comparisons (`units.len()`, `load`, `p50_latency_us`) before the String
-  `contains` scans. `require_all` / `require_any` do linear `Vec<String>::contains`, but
-  over one island's resident capability list; a set would be slower at these cardinalities.
+  cheap scalar comparisons before the String `contains` scans.
 - **`UnitSet::intersects`** (`fold/island.rs:93-103`) is the documented O(n+m) sorted merge,
-  with the sorted+deduped invariant established at construction. Correct as written.
+  with the sorted+deduped invariant established at construction.
 - **`policy_cmp`'s `partial_cmp(...).unwrap_or(Equal)`** (`gang/filter.rs:127-140`) looks
   like a total-order hazard, but `IslandTopologyFold::merge` rejects non-finite `load` at
-  the door (`fold/island.rs:209-211`) specifically to keep it total. Already handled.
-- **`acquire_gang`'s `claim.islands.clone()` + sort + dedup** (`gang/multi.rs:137-139`)
-  happens once per acquire, outside the retry loop, and establishes the global lock order
-  the deadlock-freedom argument depends on. Correctly placed.
+  the door (`fold/island.rs:209-211`) specifically to keep it total.
+- **`acquire_gang`'s `claim.islands.clone()` + sort + dedup** (`gang/multi.rs:137-139`) runs
+  once per acquire, outside the retry loop, and establishes the global lock order the
+  deadlock-freedom argument depends on.
 - **The `Fold::apply` lock discipline** (state → index, both write; `fold/mod.rs:360-361`)
-  is fixed-order and documented. Taking the index write lock on the reservation fold where
-  `Index = NoIndex` is nominally wasted, but it is an uncontended `parking_lot` write on a
-  zero-sized type — not worth special-casing against the deadlock-safety argument that the
-  uniform order buys.
+  is fixed-order and documented. The `NoIndex` write lock on the reservation fold is
+  nominally wasted but is an uncontended `parking_lot` write on a zero-sized type — not
+  worth special-casing against the uniform-ordering safety argument.
 
 ---
 
 ## Recommended order of attack
 
-Nothing is implemented. Suggested sequencing, by risk rather than by size:
+Nothing is implemented. **Do not land these as one aggregate delta** — that destroys
+attribution. Five separately-measured slices:
 
-| # | finding | blast radius | risk |
-|---|---|---|---|
-| §5 | move payload into `build_entry` | every fold apply | low — local, type-checked |
-| §6 | non-allocating placeholder check | every inbound verify | low — pure predicate |
-| §1 | keys-only step 1 via `resolve_candidate_keys` | gang matcher | low-medium — two semantics notes above |
-| §3 | single-snapshot sensed band map | sensed matcher | low-medium — needs an internal records variant |
-| §7 | u64 hasher + non-allocating holder read | matcher + release | low |
-| §4 | pre-read filter before signing | contended claim | medium — behavioral, wants ICB coverage |
-| §2 | `by_host` island index | topology fold | medium-high — index invariants + heartbeat churn |
+| slice | contents | gate |
+|---|---|---|
+| 1. generic fold/wire mechanics | §5 + §6 | full fold apply / audit / index suite |
+| 2. ordinary matcher | §1 + §7 hasher | ICB-1, equivalence tests across all query shapes |
+| 3. sensed matcher | §3 + §7 holder lookup | ICB-5 **plus the new large sparse sensed row** |
+| 4. topology scaling | §2 | read **and** heartbeat-write evidence; index-hook test |
+| 5. claim behavior | §4 | **blocked** on the protocol decision |
 
-§5, §6, §1, §3, §7 are constant-factor and mechanical; land them together and take one
-ICB-1 delta. §4 changes observable claim behavior under contention (islands are skipped
-rather than attempted) and deserves its own review plus a contention-fixture row. §2 is the
-only one that changes the scaling curve and the only one that can regress write-heavy
-meshes if `index_payload_equivalent` is not implemented alongside it.
+Slices 1–3 are constant-factor and mechanical. Slice 4 is the only scaling-curve change and
+the only one that can regress writes. Slice 5 must not begin until the observability
+question in §4 is answered.
 
 ## Reproduce
 
-There is no measurement in this document to reproduce. The instruments that *should* be
-used to validate any of it, all pre-existing:
+There is no measurement in this document to reproduce. The instruments that should be used
+to validate it are below.
 
-```
-cargo bench -p net-mesh --bench island_claim_match      --features net           # ICB-1, matcher scaling — §1 §2 §3 §7
-cargo bench -p net-mesh --bench island_claim_sensed     --features net,redex     # sensed path — §3
-cargo bench -p net-mesh --bench island_claim_harness    --features net           # end-to-end claim — §4 §5
-cargo bench -p net-mesh --bench island_claim_boundaries --features net           # contention boundaries — §4
+**Working directory matters.** There is no workspace `Cargo.toml` at the repository root or
+under `net/`; these commands fail from either. Run them from the crate:
+
+```bash
+cd net/crates/net
+cargo bench --bench island_claim_match      --features net         # ICB-1  — §1 §2 §7
+cargo bench --bench island_claim_sensed     --features net,redex   # ICB-5  — §3 (needs the new scaling row)
+cargo bench --bench island_claim_fallback   --features net         # ICB-4  — §4 reject-walk reference
 ```
 
-ICB-1's population discipline (exact matched-host / candidate-island counts asserted
-before and after every timed batch) means it will fail loudly if any of §1–§3 change what
-the matcher returns rather than only how fast it returns it. That is the property to lean
-on: **take a before/after on the sparse-1000 row specifically**, since that is the row the
-bench header identifies as dominated by the full topology scan.
+Or, equivalently, from anywhere:
+
+```bash
+cargo bench --manifest-path net/crates/net/Cargo.toml --bench island_claim_match --features net
+```
+
+`-p net-mesh` is unnecessary when invoking the crate manifest directly.
+
+**Two benches the original revision mapped to §4 and should not have:**
+
+- `island_claim_harness` (ICB-0) is a harness self-test — its own header says "This is NOT
+  a measurement bench".
+- `island_claim_boundaries` (ICB-2) is "ONE uncontended claimant […] a FRESH island per
+  sample" — there is no reject walk in it to characterize.
+
+The reject-walk reference is **ICB-4** (`island_claim_fallback`), which measures a
+known-held first island followed by a free fallback, and **ICB-5b** (the sensed fallback
+row inside `island_claim_sensed`) for the sensed equivalent.
+
+ICB-1's population discipline (exact matched-host / candidate-island counts asserted before
+and after every timed batch) will fail loudly if §1–§3 change what the matcher returns
+rather than only how fast it returns it. Take the before/after on the **sparse-1000 row**
+specifically — the row the bench header identifies as dominated by the full topology scan.
