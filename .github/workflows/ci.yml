@@ -143,7 +143,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=68
+          MIN=70
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -186,6 +186,8 @@ jobs:
           publication_exhaustion_refuses_an_install_without_publishing
           terminal_withdrawal_retires_the_last_live_identity_and_nothing_else
           a_delayed_terminal_notification_preserves_its_own_absence_artifact
+          a_final_ordinary_removal_preserves_the_terminal_absence_it_caused
+          a_second_installed_grant_still_withdraws_terminally_after_the_first
           a_publication_cannot_occupy_the_gap_between_validation_and_settlement
           poison_cannot_occupy_the_gap_between_validation_and_settlement
           a_recovery_poison_clear_cannot_land_under_a_publication_pin

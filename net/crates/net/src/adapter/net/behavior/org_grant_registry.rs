@@ -153,8 +153,16 @@ pub enum GrantAudienceInstallError {
     ///
     /// Covers BOTH terminal identity spaces — the installation identity, and the
     /// publication identity that orders transitions. They are distinct counters
-    /// and the distinction matters operationally, so the refusal path logs which
-    /// one ran out; the public outcome is deliberately shared.
+    /// and the distinction matters operationally, so each refusal path logs which
+    /// one ran out (`space = "installation"` / `space = "publication"`); the
+    /// public outcome is deliberately shared.
+    ///
+    /// **The `Display` text is therefore GENERIC.** It named the installation
+    /// counter specifically while the variant covered both, so it was simply
+    /// false for a publication refusal — and that string is binding-visible: it
+    /// propagates through `OrgSdkError::AudienceInstallRefused` and the SDK
+    /// re-export, where the operator reading it has nothing else to go on
+    /// (Kyra, review of `010c718ea`).
     ///
     /// A separate variant would be more precise and was briefly added, but
     /// `GrantAudienceInstallError` is reachable through `pub mod behavior` /
@@ -197,8 +205,11 @@ impl std::fmt::Display for GrantAudienceInstallError {
                 "a different grant is already installed under this grant id"
             }
             GrantAudienceInstallError::AtCapacity => "grant-audience registry at capacity",
+            // GENERIC on purpose: this variant covers the installation identity
+            // AND the publication identity, so naming either one is false half
+            // the time. The precise counter is in the refusal log.
             GrantAudienceInstallError::IdSpaceExhausted => {
-                "grant-audience installation identity space exhausted"
+                "consumer grant identity space exhausted"
             }
         };
         f.write_str(s)

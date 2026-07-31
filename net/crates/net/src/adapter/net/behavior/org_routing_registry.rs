@@ -731,11 +731,19 @@ pub(crate) enum GrantMovementFence {
     /// The publication-identity space is EXHAUSTED (OLB-2B.3c-pre step 3).
     ///
     /// Reached only by a withdrawal, because an installation at exhaustion is
-    /// refused before it publishes anything. That is what makes unconditional
-    /// retirement sound rather than merely convenient: with no further
-    /// installation publishable, absence is TERMINAL for this scope, so there is
-    /// no successor left to protect. Ordering would be meaningless anyway — the
-    /// generation that would express it cannot be allocated.
+    /// refused before it publishes anything. With no further installation
+    /// publishable, absence is TERMINAL for this scope, so no `Publication`
+    /// artifact under it has a successor left to protect — and ordering would be
+    /// meaningless anyway, since the generation that would express it cannot be
+    /// allocated.
+    ///
+    /// **This clears every `Publication` artifact in the exact scope; it is NOT
+    /// "clear everything".** A terminal movement still preserves
+    /// [`GrantArtifactFence::TerminalAbsence`]. Nothing can supersede a terminal
+    /// absence — but the artifact THIS withdrawal's own publication produced is
+    /// one, and retiring it is the same self-inflicted churn `<=` would cause on
+    /// the ordinary row. "Unconditional" describes the comparison against
+    /// generations, not the set of artifacts (Kyra, review of `010c718ea`).
     ///
     /// Revocation is never refused for want of an identity. Withdrawing
     /// authority must always be possible; it is the direction that fails closed.
@@ -1173,10 +1181,30 @@ impl NodeOrgRoutingRegistry {
                 // an identity comparison could not distinguish "before the
                 // withdrawal" from "after" — which is exactly the alias this
                 // arm exists to avoid.
+                //
+                // FOUR arms for four cells, and the two `TerminalAbsence` ones
+                // are written out separately even though they agree. Collapsed
+                // to `(TerminalAbsence, _)` they could not be mutated apart, and
+                // that is not hypothetical: the whole gate stayed green with
+                // ordinary movement clearing terminal absence, because the only
+                // witness in that column tested the `Terminal` row (Kyra, review
+                // of `010c718ea`). A cell that cannot be mutated alone cannot be
+                // witnessed alone.
                 let superseded = match cell.load().as_ref() {
                     None => true,
                     Some(facts) => match (facts.grant_fence, movement.fence) {
-                        (GrantArtifactFence::TerminalAbsence, _) => false,
+                        // Terminal absence survives its own ORDINARY publication.
+                        // The removal that SPENDS the space is an ordinary
+                        // transition — it reserves the last live identity — yet
+                        // the absence it causes reconstructs terminal. W-W15.
+                        (
+                            GrantArtifactFence::TerminalAbsence,
+                            GrantMovementFence::Publication(_),
+                        ) => false,
+                        // And survives a terminal one. W-W14.
+                        (GrantArtifactFence::TerminalAbsence, GrantMovementFence::Terminal) => {
+                            false
+                        }
                         (GrantArtifactFence::Publication(_), GrantMovementFence::Terminal) => true,
                         (
                             GrantArtifactFence::Publication(artifact),

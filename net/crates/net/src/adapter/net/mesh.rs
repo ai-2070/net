@@ -11345,12 +11345,24 @@ impl MeshNode {
     /// identity — the same defect wearing a safer-looking operator. Exhaustion
     /// is terminal by construction: the counter only ever increases, so once
     /// `checked_add` fails it fails forever (review-pass-3 §12 discipline).
+    ///
+    /// The refusal is logged with `space = "installation"`. `IdSpaceExhausted`
+    /// covers two distinct counters and its `Display` is generic, so WITHOUT a
+    /// log on this arm the enum's own claim — that the refusal path names the
+    /// space that ran out — held only for the publication half
+    /// (Kyra, review of `010c718ea`).
     fn allocate_consumer_grant_install_seq(
         &self,
     ) -> Result<u64, super::behavior::org_grant_registry::GrantAudienceInstallError> {
         let mut observed = self.consumer_grant_install_seq.load(Ordering::Acquire);
         loop {
             let Some(next) = observed.checked_add(1) else {
+                tracing::error!(
+                    space = "installation",
+                    "consumer grant install refused: the installation identity \
+                     space is exhausted; this is terminal. Withdrawal of \
+                     already-installed grants is still possible."
+                );
                 return Err(
                     super::behavior::org_grant_registry::GrantAudienceInstallError::IdSpaceExhausted,
                 );
@@ -11501,7 +11513,9 @@ impl MeshNode {
                 // out, which is the part an operator needs.
                 tracing::error!(
                     space = "publication",
-                    "consumer grant install refused: the transition-ordering                      identity space is exhausted; this is terminal. Withdrawal                      of already-installed grants is still possible."
+                    "consumer grant install refused: the transition-ordering \
+                     identity space is exhausted; this is terminal. Withdrawal \
+                     of already-installed grants is still possible."
                 );
                 return Err(GrantAudienceInstallError::IdSpaceExhausted);
             };
@@ -11565,9 +11579,13 @@ impl MeshNode {
     /// exhaustion the absence is published anyway and the movement carries
     /// [`GrantMovementFence::Terminal`](super::behavior::org_routing_registry::GrantMovementFence::Terminal):
     /// no installation can follow, so absence is terminal for the scope and
-    /// unconditional retirement cannot destroy a successor. Refusing to revoke
-    /// because a counter ran out would be the one failure direction that is not
-    /// fail-closed.
+    /// retiring its `Publication` artifacts cannot destroy a successor. Refusing
+    /// to revoke because a counter ran out would be the one failure direction
+    /// that is not fail-closed.
+    ///
+    /// It retires those artifacts only. A terminal movement PRESERVES a
+    /// `TerminalAbsence` artifact, including the one its own publication
+    /// produces — see `GrantMovementFence::Terminal`.
     fn withdraw_consumer_grant(
         &self,
         grant_id: &[u8; 32],
@@ -34276,6 +34294,10 @@ mod oa34b2_query_currentness_tests {
         snapshot: Arc<crate::adapter::net::behavior::org_grant_registry::ConsumerGrantSnapshot>,
         publications: u64,
         identity: u64,
+        /// The PUBLICATION-identity allocator, distinct from `publications`
+        /// above: that one counts snapshot publications, this one is the
+        /// terminal counter that orders transitions.
+        publication_identity: u64,
     }
 
     fn grant_registry_state(node: &MeshNode) -> GrantRegistryState {
@@ -34283,6 +34305,7 @@ mod oa34b2_query_currentness_tests {
             snapshot: node.consumer_grant_audiences.load_full(),
             publications: node.consumer_grant_publications_for_test(),
             identity: node.consumer_grant_install_seq_for_test(),
+            publication_identity: node.consumer_grant_publication_for_test(),
         }
     }
 
@@ -34301,6 +34324,16 @@ mod oa34b2_query_currentness_tests {
     /// mutation moving the identity passed a test named
     /// `..._refuses_without_mutating`. A partial helper makes the omission the
     /// default; a total one makes it unrepresentable.
+    ///
+    /// The PUBLICATION identity is the fourth, added after Kyra's review of
+    /// `010c718ea`. A delegated audit read `reserve_publication` as consuming
+    /// the transition identity before the installation-identity allocator can
+    /// refuse; that reading was WRONG — `reserve_publication` only loads and
+    /// checks, and `commit_publication` alone advances the counter — but the
+    /// witness gap it exposed was real. Nothing pinned the publication allocator
+    /// across an installation-identity refusal, so a future edit that made the
+    /// reservation eager would have been a genuine depletion defect with every
+    /// witness still green. Totality is the point of this helper.
     fn assert_no_effect(node: &MeshNode, before: &GrantRegistryState) {
         assert!(
             Arc::ptr_eq(&before.snapshot, &node.consumer_grant_audiences.load_full()),
@@ -34315,6 +34348,14 @@ mod oa34b2_query_currentness_tests {
             node.consumer_grant_install_seq_for_test(),
             before.identity,
             "a non-publishing outcome must not move the installation identity"
+        );
+        assert_eq!(
+            node.consumer_grant_publication_for_test(),
+            before.publication_identity,
+            "nor the PUBLICATION identity. Reservation is a load-and-check \
+             today, so this holds by construction — which is exactly why it \
+             needs pinning: an eager reservation would drain a second terminal \
+             space on a path that publishes nothing"
         );
     }
 
