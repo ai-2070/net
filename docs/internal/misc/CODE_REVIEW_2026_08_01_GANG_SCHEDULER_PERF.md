@@ -64,11 +64,12 @@ and drops it untouched.
 
 That is the path this branch's own doc comment (`gang/mod.rs:213-215`) calls
 "the common path, and the one the contract above calls byte-identical to
-`match_islands`", and `MeshNode::claim_first_sensed` (`mesh.rs:27242`) drives it
-inside the claim retry loop — so, exactly like the costs the audit opened
-against, it is paid per round rather than per job. Removing a two-snapshot read
-and reintroducing a per-round allocation on the more common branch is a poor
-trade even though the snapshot is the larger term.
+`match_islands`". `MeshNode::claim_island_sensed` (`mesh.rs:27242`) pays it once
+per claim attempt, and that surface is itself retried on contention — so, like
+the costs the audit opened against, it is charged per attempt rather than per
+job. Removing a two-snapshot read and reintroducing a per-attempt allocation on
+the more common branch is a poor trade even though the snapshot is the larger
+term.
 
 `select_with_affinity` (`gang/filter.rs:215`) is a 1:1 projection —
 `select_islands` sorts and maps, and the affinity arm partitions and
@@ -260,9 +261,10 @@ Recorded so a later pass does not re-derive them:
   the same order; both then visit it with a primary-store existence check
   (`filter_map(get)` vs `filter(contains_key)`) before `take(limit)`. So
   `take(limit)` selects the same keys. The primary-store check is load-bearing
-  and correctly retained, and `candidate_hosts_for_drops_index_keys_with_no_live_
-  entry` is the right witness for it (eviction is the only constructible
-  divergence between index and primary store).
+  and correctly retained, and
+  `candidate_hosts_for_drops_index_keys_with_no_live_entry` is the right witness
+  for it (eviction is the only constructible divergence between index and
+  primary store).
 - **The non-composite fallback keeps one metered query**, not two, because it
   calls `FoldKind::query` *inside* the already-metered `with_state_and_index`.
   `candidate_hosts_for_matches_the_query_path_on_every_shape` covers all 12
