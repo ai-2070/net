@@ -534,14 +534,7 @@ mod tests {
         let nodes: Vec<NodeId> = kps.iter().map(|k| k.entity_id().node_id()).collect();
         for (i, (kp, node)) in kps.iter().zip(nodes.iter()).enumerate() {
             announce_capability(&caps, kp, *node, vec!["gpu:h100".into()]);
-            announce_island(
-                &topo,
-                kp,
-                *node,
-                0xA0 + i as u64,
-                8,
-                0.1 + 0.1 * i as f32,
-            );
+            announce_island(&topo, kp, *node, 0xA0 + i as u64, 8, 0.1 + 0.1 * i as f32);
         }
         let criteria = MatchCriteria {
             capability: CapabilityQuery::Composite(CapabilityFilter {

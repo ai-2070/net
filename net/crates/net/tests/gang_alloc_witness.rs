@@ -41,15 +41,27 @@ thread_local! {
 
 struct CountingAlloc;
 
+// SAFETY: every allocation call is forwarded verbatim to `System`,
+// which upholds the `GlobalAlloc` contract; this type adds only a
+// counter increment and never inspects, retains, or derives a pointer.
+// The counter is a `Cell` in thread-local storage, so incrementing it
+// cannot allocate (const-initialized — no lazy init on first touch)
+// and cannot re-enter the allocator, which is what would otherwise
+// make a counting `GlobalAlloc` unsound.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if COUNTING.get() {
             ALLOCS.set(ALLOCS.get() + 1);
         }
+        // SAFETY: `layout` is forwarded unchanged from a caller that
+        // already owes `System` the same validity guarantee.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from `Self::alloc`/`Self::realloc`, which
+        // return `System`'s pointers unmodified, so `System` is the
+        // rightful owner and `layout` is the one it was allocated with.
         unsafe { System.dealloc(ptr, layout) }
     }
 
@@ -57,6 +69,8 @@ unsafe impl GlobalAlloc for CountingAlloc {
         if COUNTING.get() {
             ALLOCS.set(ALLOCS.get() + 1);
         }
+        // SAFETY: as `dealloc` — `ptr` and `layout` are `System`'s own,
+        // and `new_size` is forwarded unchanged from the caller.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -99,7 +113,11 @@ fn new_fold<K: FoldKind>() -> Fold<K> {
 fn fixture(
     hosts: usize,
     tags_per_host: usize,
-) -> (Fold<CapabilityFold>, Fold<IslandTopologyFold>, MatchCriteria) {
+) -> (
+    Fold<CapabilityFold>,
+    Fold<IslandTopologyFold>,
+    MatchCriteria,
+) {
     let caps: Fold<CapabilityFold> = new_fold();
     let topo: Fold<IslandTopologyFold> = new_fold();
 
