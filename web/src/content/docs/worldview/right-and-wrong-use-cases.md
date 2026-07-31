@@ -52,4 +52,4 @@ The short rule:
   fixed producer, a fixed consumer, and a broker you're happy operating, Net's
   discovery and presence aren't buying you anything.
 - **You don't need discovery, presence, policy, artifacts, streams, or recovery.**
-  If none of those words describe your problem, you do 't need Net yet.
+  If none of those words describe your problem, you don't need Net yet.
