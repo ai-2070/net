@@ -149,7 +149,19 @@ pub enum GrantAudienceInstallError {
     /// The registry is at capacity and no expired record could be reclaimed —
     /// refused fail-closed rather than evicting an active record.
     AtCapacity,
-    /// The installation-identity space is exhausted (OLB-2B.3c-pre).
+    /// A consumer-Grant identity space is exhausted (OLB-2B.3c-pre).
+    ///
+    /// Covers BOTH terminal identity spaces — the installation identity, and the
+    /// publication identity that orders transitions. They are distinct counters
+    /// and the distinction matters operationally, so the refusal path logs which
+    /// one ran out; the public outcome is deliberately shared.
+    ///
+    /// A separate variant would be more precise and was briefly added, but
+    /// `GrantAudienceInstallError` is reachable through `pub mod behavior` /
+    /// `pub mod org_grant_registry` and is not `#[non_exhaustive]`, so a new
+    /// variant is a source-breaking PUBLIC API change — which scope item 16
+    /// excludes ("public call path unchanged"). Precision does not make an
+    /// unauthorized API change disappear (Kyra, review of `46af3d625`).
     ///
     /// TERMINAL and irreversible. The identity is compared for EQUALITY to
     /// decide whether a stale lease may remove the current installation, and —
@@ -161,20 +173,6 @@ pub enum GrantAudienceInstallError {
     /// rather than aborting the process over a bookkeeping limit
     /// (review-pass-3 §12 discipline, applied to this counter).
     IdSpaceExhausted,
-    /// The consumer-Grant PUBLICATION-identity space is exhausted
-    /// (OLB-2B.3c-pre step 3).
-    ///
-    /// TERMINAL and irreversible, and DISTINCT from [`Self::IdSpaceExhausted`]:
-    /// that one is the installation identity, this one is the identity that
-    /// orders TRANSITIONS so a delayed notification cannot retire a newer
-    /// artifact. Conflating them would tell an operator the wrong counter ran
-    /// out.
-    ///
-    /// Refused fail-closed and BEFORE anything is published, so an exhausted
-    /// space cannot leave a visible snapshot with no notification behind it.
-    /// WITHDRAWAL is deliberately not refused here — revoking authority must
-    /// always be possible, and it is the direction that fails closed.
-    PublicationSpaceExhausted,
 }
 
 impl std::fmt::Display for GrantAudienceInstallError {
@@ -201,9 +199,6 @@ impl std::fmt::Display for GrantAudienceInstallError {
             GrantAudienceInstallError::AtCapacity => "grant-audience registry at capacity",
             GrantAudienceInstallError::IdSpaceExhausted => {
                 "grant-audience installation identity space exhausted"
-            }
-            GrantAudienceInstallError::PublicationSpaceExhausted => {
-                "grant-audience publication identity space exhausted"
             }
         };
         f.write_str(s)

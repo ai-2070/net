@@ -25,7 +25,7 @@ belong.
 | OLB-2B.3 boundary design (rev 5 + addenda) | `1c1b652e6` | SIGNED **as a design only** |
 | 2B.3c-pre **step 1** — installation identity (items 1–3) | `300e80f6c` | SIGNED |
 | 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `a788232bd` | **SIGNED** (`OLB_2B3C_PRE_STEP2_SIGNED_HEAD`) — held once at `df32cbd7d`, repaired, signed 2026-07-29; see §2b |
-| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | repair at `d70810aa4`; **candidate head = this commit** | **HELD THREE TIMES, REPAIRED — NOT SIGNED, AWAITING INDEPENDENT REVIEW.** P1/P2 at `fa0b9ddd5`, P1b at `7348529fb`, exhaustion + equality at `91f1c2e11`; see §2c |
+| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | repair at `d70810aa4`; **candidate head = this commit** | **HELD FOUR TIMES, REPAIRED — NOT SIGNED, AWAITING INDEPENDENT REVIEW.** P1/P2 at `fa0b9ddd5`, P1b at `7348529fb`, exhaustion + equality at `91f1c2e11`, terminal aliasing + public API at `46af3d625`; see §2c |
 | `SAFE_LIVE_HEAD` | — | **not established**, still reserved for provider-free leader lighting |
 
 Authoritative design: [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md).
@@ -108,11 +108,14 @@ A: [resumes]   clear by grant_id  ->  destroys the N+1 artifact
 ```
 
 Fail-closed at the read seam, but an obsolete transition retiring CURRENT work is
-the defect class `invalidate_if_stale` already guards one layer up. The
-notification now carries `superseded_through`, and the decision is made per
-artifact **under the registry lock** — a pre-lock currentness check is
-insufficient, because a publication can land between the check and the clear.
-Witness `a_delayed_grant_notification_cannot_retire_a_successor_installation`.
+the defect class `invalidate_if_stale` already guards one layer up.
+
+The first repair carried `superseded_through` and **is superseded** — the
+current mechanism is `GrantMovementFence::{Publication, Terminal}` compared
+against `GrantArtifactFence::{Publication, TerminalAbsence}`. What survives
+from it is the shape: the decision is made per artifact UNDER the registry
+lock, because a pre-lock currentness check cannot hold when a publication can
+land between the check and the clear.
 
 **P2 — selection was broader than the moved scope.** `grant_id` alone churns the
 same id under a rotated-away audience handle. Now exact on
@@ -156,10 +159,22 @@ Also: the successful `remove_consumer_grant_audience_if_current` branch had no
 witness. Both removal surfaces now share one `withdraw_consumer_grant`, and
 W-W11 covers the successful conditional path regardless.
 
+**The publication generation is deliberately NOT in `SourceToken`** — adjudicated
+at the review of `91f1c2e11` and recorded here because it lived only in review
+history before. It is ordering metadata, not authority. The capture/commit token
+stays the exact selected installation-identity vector, which moves for every
+semantically relevant Grant transition (absent→installed, installed→absent,
+N→N+1); a global generation there would defeat unrelated in-flight commits for
+no gain.
+
 **ONLY step 3 is under corrective review. 2B.3b and every later OLB slice remain
 UNAUTHORIZED until it signs.**
 
-**Capability narrowing was NOT adopted, and that is a decision.** Kyra also asked
+**Capability narrowing was NOT adopted — ADJUDICATED and CLOSED**, not still
+open. Kyra ruled in favour of the current boundary at `7348529fb`: exact
+`(grant_id, audience_handle)`, capability-wide within that scope. An earlier
+version of this file said the question was "flagged for adjudication" AND that
+it was decided; the adjudication happened, and this is the ruling. Kyra also asked
 for narrowing by the grant's capability. Verified directly first: a Grant slot
 for a capability the grant does not cover reconstructs as `Served(0 providers)`,
 stamped `Grant` — the source answers ANY capability under an installed
@@ -275,7 +290,7 @@ net/crates/net/src/adapter/net/
     MeshNode::publish_consumer_grant_snapshot
                                         the ONE consumer publication seam (counted in test)
     oa34b2_query_currentness_tests      W-G9 / W-G10 / W-G10b + assert_no_effect
-  org_routing_wiring_tests.rs           67 witnesses; CI floor MIN=67
+  org_routing_wiring_tests.rs           68 witnesses; CI floor MIN=68
   behavior/org_routing_registry.rs
     ScopedDiscoveryAuthorityStamp       Owner | Grant{id, install_seq, signature, handle}
     ScopedSourceFacts                   facts + the authority that produced them
@@ -336,8 +351,8 @@ cd net/crates/net
 export UNIT_FEATURES="net redex redex-disk cortex netdb meshdb meshos dataforts \
 nat-traversal port-mapping tool batched-ingress cli regex"
 
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,482 expected
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 67, MIN 67
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,484 discovered / 5,483 passed / 1 ignored
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 68, MIN 68
 CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" behavior::org_routing::     # 24, MIN 24
 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo clippy --all-features --all-targets -- -D warnings \
@@ -350,10 +365,12 @@ git diff --check
   workspace once (disk-full → zero-byte rlibs → rustc ICEs).
 - Adding a wiring witness means raising `MIN` in `.github/workflows/ci.yml` in
   the **same commit**, and name-pinning anything carrying a security property.
-- Unrelated Windows flake, moved to its own record:
+- Unrelated Windows full-load flakes, in their own record:
   [`../misc/FLAKE_ORG_AUTHORITY_DENY_ACE.md`](../misc/FLAKE_ORG_AUTHORITY_DENY_ACE.md).
-  Reproduced, not diagnosed; 2 failures in 15 full-load runs, 0 in 10 isolated.
-  Touches no OLB slice.
+  TWO tests now — `org_authority ... a_deny_ace ...` (2 failures in 15 full-load
+  runs, 0 in 10 isolated) and `redex::disk ... append_failure_after_dat_write ...`
+  (1 in 6, found while hunting the first). Both filesystem-adjacent, neither
+  touching any OLB path, neither diagnosed.
 
 ---
 

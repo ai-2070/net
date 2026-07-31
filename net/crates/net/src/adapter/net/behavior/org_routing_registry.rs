@@ -128,9 +128,9 @@ pub(crate) struct SlotBaseFacts {
     pub authority: ScopedDiscoveryAuthorityStamp,
     pub actor_incarnation: u64,
     pub slot_incarnation: u64,
-    /// The consumer-Grant publication generation this artifact was reconstructed
-    /// under (OLB-2B.3c-pre step 3). See [`ScopedSourceFacts::grant_publication`].
-    pub grant_publication: u64,
+    /// Where this artifact sits in the consumer-Grant transition order
+    /// (OLB-2B.3c-pre step 3). See [`ScopedSourceFacts::grant_fence`].
+    pub grant_fence: GrantArtifactFence,
     /// The earliest `expires_at` across the retained providers, or `u64::MAX`
     /// when nothing here can expire.
     ///
@@ -244,17 +244,17 @@ pub(crate) struct ScopedSourceFacts {
     /// exactly `not_after + MAX_TOKEN_CLOCK_SKEW_SECS` — the first instant the
     /// authority is no longer valid, not the last instant it is.
     pub authority_deadline: u64,
-    /// The consumer-Grant PUBLICATION generation this reconstruction observed.
+    /// Where this reconstruction sits in the consumer-Grant transition order.
     ///
     /// Ordering, not authority — `authority` above is the authority. This exists
     /// so a delayed movement notification can tell whether the artifact it is
     /// about to clear predates or postdates the transition it carries.
     ///
-    /// It must be present on EVERY reconstruction, including `Unserved` ones,
-    /// which is the whole point: an absent-Grant reconstruction is stamped
-    /// `Owner` and so carries no installation identity, yet it can be the exact
-    /// successor a later removal produced.
-    pub grant_publication: u64,
+    /// Present on EVERY reconstruction, including `Unserved` ones, which is the
+    /// whole point: an absent-Grant reconstruction is stamped `Owner` and so
+    /// carries no installation identity, yet it can be the exact successor a
+    /// later removal produced.
+    pub grant_fence: GrantArtifactFence,
 }
 
 /// An opaque, comparable summary of EVERY authority input a snapshot was taken
@@ -700,6 +700,29 @@ impl Drop for DemandHandle {
     }
 }
 
+/// Where a reconstruction sits in the consumer-Grant transition order.
+///
+/// The ARTIFACT side of the fence, distinct from the movement side below.
+///
+/// `TerminalAbsence` is not "publication `u64::MAX`". A single global terminal
+/// generation would be wrong the moment a second Grant scope is still installed:
+/// scope A withdraws terminally and sets the global marker, scope B's
+/// reconstruction observes the same marker, and B's own later withdrawal can no
+/// longer order B's pre-terminal `Served` artifact. Terminal absence is a
+/// property of ONE scope's reconstruction, so it lives on the artifact, and
+/// still-installed scopes keep an ordinary `Publication` (Kyra, review of
+/// `46af3d625`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrantArtifactFence {
+    /// Reconstructed while the publication-identity space was still live, under
+    /// the generation it observed.
+    Publication(u64),
+    /// Reconstructed ABSENT for this exact scope, with the publication-identity
+    /// space exhausted. Terminal: no installation can follow, so nothing can
+    /// supersede it.
+    TerminalAbsence,
+}
+
 /// How a consumer-Grant transition orders itself against retained artifacts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrantMovementFence {
@@ -1134,14 +1157,31 @@ impl NodeOrgRoutingRegistry {
                 // "a demand arriving after publication is safe" case of §2A.2,
                 // and `<=` would have the notification destroy its own
                 // publication's current artifact.
+                //             artifact:  Publication(a)      TerminalAbsence
+                //  movement:
+                //  Publication(p)         clear iff a < p     preserve
+                //  Terminal               clear               preserve
+                //
+                // The `Terminal` row is NOT "clear everything". Terminal
+                // withdrawal must still preserve the absence artifact its OWN
+                // publication produced — the same equality property W-W9/W-W10
+                // pin for ordinary publications, and it does not come for free
+                // just because nothing can supersede a terminal state.
+                //
+                // `Publication(_)` under a `Terminal` movement always clears: at
+                // exhaustion the last live identity may equal the artifact's, so
+                // an identity comparison could not distinguish "before the
+                // withdrawal" from "after" — which is exactly the alias this
+                // arm exists to avoid.
                 let superseded = match cell.load().as_ref() {
                     None => true,
-                    Some(facts) => match movement.fence {
-                        GrantMovementFence::Publication(publication) => {
-                            facts.grant_publication < publication
-                        }
-                        // Absence is terminal here; nothing can supersede it.
-                        GrantMovementFence::Terminal => true,
+                    Some(facts) => match (facts.grant_fence, movement.fence) {
+                        (GrantArtifactFence::TerminalAbsence, _) => false,
+                        (GrantArtifactFence::Publication(_), GrantMovementFence::Terminal) => true,
+                        (
+                            GrantArtifactFence::Publication(artifact),
+                            GrantMovementFence::Publication(publication),
+                        ) => artifact < publication,
                     },
                 };
                 if !superseded {
@@ -1647,7 +1687,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     facts,
                     authority,
                     authority_deadline,
-                    grant_publication,
+                    grant_fence,
                 } = facts;
                 let row_expiry = match &facts {
                     SourceFacts::Served(providers) => providers
@@ -1670,7 +1710,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     providers: facts,
                     epoch,
                     authority,
-                    grant_publication,
+                    grant_fence,
                     actor_incarnation: incarnation,
                     slot_incarnation,
                     earliest_expiry,
@@ -1910,7 +1950,7 @@ mod tests {
             ScopedSourceFacts {
                 facts: SourceFacts::Served(Arc::from(Vec::new())),
                 authority: ScopedDiscoveryAuthorityStamp::Owner,
-                grant_publication: 0,
+                grant_fence: GrantArtifactFence::Publication(0),
                 authority_deadline: u64::MAX,
             }
         }

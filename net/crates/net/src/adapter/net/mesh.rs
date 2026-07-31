@@ -5622,6 +5622,10 @@ struct ScopedSourceSnapshot {
     /// see `ConsumerGrantGate::publications` for why that direction is the safe
     /// one.
     grant_publication: u64,
+    /// Whether the publication-identity space was already spent at capture. An
+    /// ABSENT Grant scope reconstructed under a spent space is TERMINAL: no
+    /// installation can follow, so nothing can supersede it.
+    grant_publications_spent: bool,
     /// ONLY the keys this source can actually speak for. A key absent here
     /// reconstructs as `SourceFacts::Unserved`, never as an empty provider set.
     ///
@@ -6082,8 +6086,10 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
         key: &super::behavior::org_routing_registry::SlotKey,
     ) -> super::behavior::org_routing_registry::ScopedSourceFacts {
         use super::behavior::org_routing_registry::{
-            ScopedDiscoveryAuthorityStamp, ScopedSourceFacts, SourceFacts,
+            GrantArtifactFence as ScopedGrantArtifactFence, ScopedDiscoveryAuthorityStamp,
+            ScopedSourceFacts, SourceFacts,
         };
+        use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
         // Reconstruction proper: no lock of any kind, no await. Ordering is
         // imposed HERE rather than at capture, so the deterministic projection is
         // off-lock work.
@@ -6104,7 +6110,18 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
                 // Carried even here — ESPECIALLY here. An absent-Grant
                 // reconstruction is `Owner`-stamped and so names no installation,
                 // yet it is exactly the successor a later removal produces.
-                grant_publication: self.grant_publication,
+                //
+                // TERMINAL when the identity space is spent AND this scope is a
+                // Grant one: no installation can follow, so this absence cannot
+                // be superseded and must survive even the withdrawal that caused
+                // it. Owner scopes are never terminal — they have no consumer
+                // Grant to exhaust.
+                grant_fence: match key.scope.scope() {
+                    CapabilityAudienceScope::Grant { .. } if self.grant_publications_spent => {
+                        ScopedGrantArtifactFence::TerminalAbsence
+                    }
+                    _ => ScopedGrantArtifactFence::Publication(self.grant_publication),
+                },
             };
         };
         let authority = *authority;
@@ -6129,7 +6146,9 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
             facts: SourceFacts::Served(providers.into()),
             authority,
             authority_deadline,
-            grant_publication: self.grant_publication,
+            // A SERVED scope has an installed grant, so it is not terminal
+            // whatever the identity space is doing.
+            grant_fence: ScopedGrantArtifactFence::Publication(self.grant_publication),
         }
     }
 }
@@ -6396,6 +6415,9 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             token,
             rows,
             grant_publication,
+            // Spent when the next reservation would land on the reserved
+            // terminal marker — i.e. no further installation can ever publish.
+            grant_publications_spent: grant_publication == u64::MAX - 1,
         })
     }
 
@@ -11352,9 +11374,19 @@ impl MeshNode {
     /// therefore refuse.
     #[cfg(test)]
     fn exhaust_consumer_grant_publications_for_test(&self) {
+        self.set_consumer_grant_publications_for_test(u64::MAX - 1);
+    }
+
+    /// Test-only: position the publication allocator exactly.
+    ///
+    /// `u64::MAX - 2` is the interesting one: the next reservation is then the
+    /// LAST live identity, so a witness can produce an artifact stamped with the
+    /// exact value a reusing terminal fence would compare against itself.
+    #[cfg(test)]
+    fn set_consumer_grant_publications_for_test(&self, at: u64) {
         self.consumer_grant_gate
             .publications
-            .store(u64::MAX - 1, Ordering::Release);
+            .store(at, Ordering::Release);
     }
 
     /// Test-only: the publication allocator's current position.
@@ -11462,7 +11494,16 @@ impl MeshNode {
             // allocated, too: that one is consumed on success, and a refusal
             // after consuming it would burn a terminal identity for nothing.
             let Some(publication) = self.consumer_grant_gate.reserve_publication() else {
-                return Err(GrantAudienceInstallError::PublicationSpaceExhausted);
+                // Refused BEFORE anything is published. The public outcome is
+                // shared with installation-identity exhaustion because a new
+                // variant on that public enum would be a source-breaking API
+                // change (item 16); the log carries which space actually ran
+                // out, which is the part an operator needs.
+                tracing::error!(
+                    space = "publication",
+                    "consumer grant install refused: the transition-ordering                      identity space is exhausted; this is terminal. Withdrawal                      of already-installed grants is still possible."
+                );
+                return Err(GrantAudienceInstallError::IdSpaceExhausted);
             };
             // Past this point publication is certain, so claiming the identity
             // cannot be wasted.
@@ -11477,9 +11518,11 @@ impl MeshNode {
         // cold forever — the read seam returns cold for `Unserved` WITHOUT
         // invalidating, so no reader can rescue it either (design §0.1).
         //
-        // Supersedes everything BEFORE this installation: an artifact already
-        // stamped `install_seq` is this installation's own and must survive, so
-        // a concurrent rebuild that beat this notification is not undone.
+        // Supersedes everything published BEFORE this transition. The ordering is
+        // by PUBLICATION generation, not by `install_seq` — that was the first,
+        // held repair, and it could not order absences. An artifact already
+        // reconstructed under THIS publication is the transition's own and must
+        // survive, so a demand that beat the notification is not undone.
         self.note_consumer_grant_movement(
             &super::behavior::org_routing_registry::GrantScopeMovement {
                 grant_id,

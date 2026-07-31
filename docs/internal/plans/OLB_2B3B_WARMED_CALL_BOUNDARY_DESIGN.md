@@ -633,7 +633,7 @@ is the §19 defect class this process has already caught once.
 |---|---|---|
 | **1–3** — non-aliasing installation identity | **SIGNED** 2026-07-28 | `OLB_2B3C_PRE_STEP1_SIGNED_HEAD = 300e80f6c` |
 | **4–9, 12–14** — scope stamp + Grant source service | **SIGNED** 2026-07-29 | `OLB_2B3C_PRE_STEP2_SIGNED_HEAD = a788232bd` |
-| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | **IMPLEMENTED + WITNESSED — REVIEWED TWICE, HELD TWICE, REPAIRED — NOT SIGNED** | see the step-3 lineage below |
+| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | **IMPLEMENTED + WITNESSED — REVIEWED FOUR TIMES, HELD FOUR TIMES, REPAIRED — NOT SIGNED** | see the step-3 lineage below |
 
 **Step 2 signed by Kyra 2026-07-29 at `a788232bd`**, after an independent
 mutation matrix in a detached worktree: every security claim below went RED
@@ -729,13 +729,16 @@ slice remain UNAUTHORIZED until this step signs.** The normative plan still says
 "OLB-2B.3 is AUTHORIZED" in the broad sense; that does not authorize any later
 slice, and this line is the operative one.
 
-Step-3 lineage, held twice:
+Step-3 lineage, held FOUR times (five HOLDs across steps 2 and 3):
 
 ```text
 fa0b9ddd5  wake/invalidation edge + plan correction   <- HELD (P1 successor race, P2 breadth)
 7348529fb  conditional + scope-exact invalidation     <- HELD (P1b absence ordering)
-f91cff2ab  total publication-generation fence + W-W8  <- HELD (exhaustion, equality arm)
+f91cff2ab  total publication-generation fence + W-W8  <- HELD (exhaustion, equality)
            reviewed as 91f1c2e11 (its docs commit)
+d70810aa4  checked exhaustion + equality witnesses    <- HELD (terminal aliasing,
+           reviewed as 46af3d625 (its docs commit)         public API, terminal
+                                                           scope exactness)
 d70810aa4  checked exhaustion + equality + remove-if-current witnesses
            (candidate head = the docs commit immediately after it)
 ```
@@ -768,7 +771,8 @@ could not close the install direction at all, because it returns cold for
 | `a_delayed_removal_notification_preserves_its_own_absence_artifact` | W-W10 — the EQUALITY arm, absence-stamped | `<` → `<=` |
 | `a_current_lease_removal_publishes_wakes_and_fences` | W-W11 — the SUCCESSFUL conditional-removal branch | a branch-local omission in remove-if-current |
 | `publication_exhaustion_refuses_an_install_without_publishing` | W-W12 — exhaustion refuses an install fail-closed, publishing nothing | advance the identity unchecked, after the store |
-| `publication_exhaustion_still_withdraws_and_fences_terminally` | W-W13 — exhaustion still withdraws, and fences terminally without spinning | refuse revocation at exhaustion; reuse an identity |
+| `terminal_withdrawal_retires_the_last_live_identity_and_nothing_else` | W-W13 — terminal withdrawal clears the artifact stamped at the LAST LIVE identity, and only its own scope | reuse `Publication(MAX-1)` for `Terminal`; widen the scope predicate for `Terminal` only |
+| `a_delayed_terminal_notification_preserves_its_own_absence_artifact` | W-W14 — terminal withdrawal preserves the absence artifact its OWN publication produced | `TerminalAbsence` clears under a `Terminal` movement |
 
 W-W3 is the one that constrains the design rather than confirming it: "invalidate
 everything on any Grant movement" satisfies W-W1 and W-W2 perfectly and makes
@@ -794,9 +798,10 @@ successive installations of the same Grant id.
   correctly — an obsolete transition can arrive after a newer installation has
   been published, notified and warmed, and destroy it. Fail-closed at the read
   seam, but an obsolete transition retiring CURRENT work is the class
-  `invalidate_if_stale` already guards. The movement now carries
-  `superseded_through`, and the decision is made per artifact **under the
-  registry lock** — a pre-lock currentness check cannot hold, because a
+  `invalidate_if_stale` already guards. That first repair carried
+  `superseded_through` and **is superseded** — see the HOLDs below. What
+  survives from it is the shape: the decision is made per artifact **under the
+  registry lock**, because a pre-lock currentness check cannot hold when a
   publication can land between the check and the clear.
 - **P2.** Selection by `grant_id` churned the same id under a rotated-away
   audience handle. Now exact on `(grant_id, audience_handle)`.
@@ -854,6 +859,49 @@ authority actually moved (Kyra, review of `91f1c2e11`).
   premise that failed at `7348529fb` was authority-state-specific, so closing
   only the `Grant` arm would leave a future branch free to reopen the `Owner`
   gap.
+
+**Fifth HOLD, on `46af3d625` — two findings, one of them a boundary I should not
+have crossed.**
+
+- **The public API.** Adding `GrantAudienceInstallError::PublicationSpaceExhausted`
+  is a source-breaking change to an exhaustive `pub enum` reachable through
+  `pub mod behavior` / `pub mod org_grant_registry`, and scope item 16 excludes
+  public API changes. The variant is REVERTED; the refusal maps to the existing
+  `IdSpaceExhausted`, whose doc now covers both identity spaces, and the precise
+  space is carried in an `error!` log. Precision does not make an unauthorized
+  API change disappear. **Item 16 now holds; the earlier claim that it "held by
+  construction" was false for as long as that variant existed.**
+- **Terminal absence needed its own representation.** A `Terminal` movement that
+  cleared unconditionally destroyed the absence artifact its OWN publication
+  produced — the terminal counterpart of the `<`/`<=` defect. It could not be
+  fixed by stamping a global `u64::MAX` either: with a second Grant scope still
+  installed, that scope's reconstruction would observe the same marker and its
+  own later withdrawal could no longer order its pre-terminal `Served` artifact.
+  Terminal absence is a property of ONE scope's reconstruction, so it lives on
+  the artifact as `GrantArtifactFence::TerminalAbsence`, and still-installed
+  scopes keep an ordinary `Publication`.
+
+The full comparison table:
+
+```text
+              artifact:  Publication(a)      TerminalAbsence
+ movement:
+ Publication(p)          clear iff a < p     preserve
+ Terminal                clear               preserve
+```
+
+W-W13 was rebuilt too: it warmed at publication 1 and only then jumped the
+counter, so `1 < MAX-1` cleared even under an identity-reusing terminal fence and
+it stayed green. It now positions the counter at `MAX-2` so the installation
+genuinely commits `MAX-1`, and carries scope controls, because `Terminal` is the
+one fence that clears unconditionally and therefore the easiest to widen by
+accident.
+
+**The publication generation is deliberately NOT in `SourceToken`.** It is
+ordering metadata, not authority. The capture/commit token remains the exact
+selected installation-identity vector, which moves for every semantically
+relevant Grant transition; a global generation there would defeat unrelated
+in-flight commits for no gain (Kyra's adjudication, review of `91f1c2e11`).
 
 Also folded in: the successful `remove_consumer_grant_audience_if_current`
 branch had no witness of its own (W-W5 drives only its stale branch). Both

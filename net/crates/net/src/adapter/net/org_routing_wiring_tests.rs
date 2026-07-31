@@ -7,8 +7,8 @@
 use super::*;
 use crate::adapter::net::behavior::org_grant::CapabilityAuthorityId;
 use crate::adapter::net::behavior::org_routing_registry::{
-    PrivateAudienceScope, ScopedDiscoveryAuthorityStamp, ScopedSourceFacts, SlotKey, SlotSource,
-    SourceCommitPin, SourceFacts, SourceSnapshot, SourceToken,
+    GrantArtifactFence, PrivateAudienceScope, ScopedDiscoveryAuthorityStamp, ScopedSourceFacts,
+    SlotKey, SlotSource, SourceCommitPin, SourceFacts, SourceSnapshot, SourceToken,
 };
 use crate::adapter::net::behavior::org_scoped_ingest::CapabilityAudienceScope;
 use crate::adapter::net::behavior::org_scoped_store::{
@@ -689,7 +689,7 @@ async fn cached_facts_that_crossed_their_expiry_read_cold() {
     // them: valid at capture, expired by the time they are read.
     let expired = Arc::new(SlotBaseFacts {
         authority: ScopedDiscoveryAuthorityStamp::Owner,
-        grant_publication: 0,
+        grant_fence: GrantArtifactFence::Publication(0),
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: crate::adapter::net::behavior::org_routing_registry::SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -923,7 +923,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
         key.clone(),
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
-            grant_publication: 0,
+            grant_fence: GrantArtifactFence::Publication(0),
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -946,7 +946,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
         key.clone(),
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
-            grant_publication: 0,
+            grant_fence: GrantArtifactFence::Publication(0),
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -1649,7 +1649,7 @@ async fn a_delayed_reader_does_not_delete_a_newer_artifact() {
     let facts = |authority: u64| {
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
-            grant_publication: 0,
+            grant_fence: GrantArtifactFence::Publication(0),
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -1715,7 +1715,7 @@ async fn the_read_seam_fences_a_dead_incarnations_facts() {
     let key = slot(29, "nrpc:incarnation-fence");
     let facts = Arc::new(SlotBaseFacts {
         authority: ScopedDiscoveryAuthorityStamp::Owner,
-        grant_publication: 0,
+        grant_fence: GrantArtifactFence::Publication(0),
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -1793,7 +1793,7 @@ async fn the_read_seams_authority_sample_cannot_straddle_a_store_install() {
     let key = slot(30, "nrpc:coherent-sample");
     let facts = Arc::new(SlotBaseFacts {
         authority: ScopedDiscoveryAuthorityStamp::Owner,
-        grant_publication: 0,
+        grant_fence: GrantArtifactFence::Publication(0),
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -1879,7 +1879,7 @@ async fn poisoning_authority_colds_already_cached_facts() {
         key.clone(),
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
-            grant_publication: 0,
+            grant_fence: GrantArtifactFence::Publication(0),
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -1933,7 +1933,7 @@ async fn authority_only_movement_invalidates_and_requeues_everything() {
         key.clone(),
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
-            grant_publication: 0,
+            grant_fence: GrantArtifactFence::Publication(0),
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: scoped_before,
@@ -2215,7 +2215,7 @@ async fn the_epoch_advances_before_the_store_becomes_visible() {
         key.clone(),
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
-            grant_publication: 0,
+            grant_fence: GrantArtifactFence::Publication(0),
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -2408,7 +2408,7 @@ async fn authority_invalidation_spares_successor_facts() {
     let facts = |authority: u64| {
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
-            grant_publication: 0,
+            grant_fence: GrantArtifactFence::Publication(0),
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -3279,7 +3279,7 @@ async fn a_reader_retires_unserved_facts_once_their_poison_clears() {
     let poisoned_facts = |floor_generation: u64| {
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
-            grant_publication: 0,
+            grant_fence: GrantArtifactFence::Publication(0),
             providers: SourceFacts::Unserved,
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -3462,6 +3462,7 @@ async fn duplicate_provider_rows_collapse_to_the_newest_generation() {
     let snapshot = ScopedSourceSnapshot {
         token: SourceToken::default(),
         grant_publication: 0,
+        grant_publications_spent: false,
         rows: [(
             key.clone(),
             (
@@ -6125,10 +6126,8 @@ async fn publication_exhaustion_refuses_an_install_without_publishing() {
         .expect_err("an exhausted publication space must refuse an install");
     assert_eq!(
         err,
-        GrantAudienceInstallError::PublicationSpaceExhausted,
-        "the refusal must be TYPED, and must name the PUBLICATION space rather \
-         than the installation space — they are different counters, and telling \
-         an operator the wrong one ran out is worse than saying nothing"
+        GrantAudienceInstallError::IdSpaceExhausted,
+        "the refusal must be TYPED. It shares the public variant with installation-identity exhaustion deliberately: a NEW variant on that public enum would be a source-breaking API change, which scope item 16 excludes. The precise space is carried in the log, and the counter assertions below are what distinguish the two behaviourally"
     );
 
     assert!(
@@ -6163,64 +6162,123 @@ async fn publication_exhaustion_refuses_an_install_without_publishing() {
     );
 }
 
-/// W-W13. Publication-identity exhaustion still lets a REMOVAL withdraw, and
-/// fences the affected Grant routing terminally.
+/// W-W13. Terminal withdrawal retires the artifact produced at the LAST LIVE
+/// identity, and touches nothing else.
 ///
-/// The asymmetry with W-W12 is deliberate and is the point of the design:
-/// refusing to revoke because a counter ran out is the one failure direction
-/// that is NOT fail-closed — it would leave live authority an operator has
-/// revoked. Withdrawal must always be possible.
+/// Two properties, and the first one is why this witness was rebuilt.
 ///
-/// Unconditional retirement is sound precisely BECAUSE installation is refused
-/// at exhaustion: with no further installation publishable, absence is terminal
-/// for the scope, so there is no successor left to protect. The generation that
-/// would express an ordering cannot be allocated, and does not need to be.
+/// **Non-aliasing.** The dangerous boundary is the last live identity itself:
+///
+/// ```text
+/// the final installation publishes at MAX-1
+/// -> its Served artifact is stamped MAX-1
+/// -> withdrawal cannot allocate another identity
+/// -> an implementation that REUSED MAX-1 would compare MAX-1 < MAX-1 = false
+/// -> the stale Served artifact survives its own withdrawal
+/// ```
+///
+/// The earlier version of this witness warmed at publication 1 and only then
+/// jumped the counter, so `1 < MAX-1` cleared even under the alias and it stayed
+/// green. Kyra demonstrated that directly. The counter is therefore positioned
+/// at `MAX-2` here so the installation genuinely commits `MAX-1` and the
+/// artifact genuinely carries it.
+///
+/// **Scope exactness.** `Terminal` is the one fence that clears unconditionally,
+/// which makes it the easiest place to be accidentally global. Three controls —
+/// same grant id under another handle, an unrelated grant, and the Owner plane —
+/// must keep their EXACT artifacts.
+///
+/// Dies to reusing `Publication(MAX - 1)` in place of `Terminal`, and to any
+/// terminal-only widening of the scope predicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn publication_exhaustion_still_withdraws_and_fences_terminally() {
-    use crate::adapter::net::behavior::org_routing_registry::SourceFacts;
+async fn terminal_withdrawal_retires_the_last_live_identity_and_nothing_else() {
+    use crate::adapter::net::behavior::org_routing_registry::{GrantArtifactFence, SourceFacts};
 
     let f = grant_fixture("ww13").await;
+
+    // The unrelated control installs FIRST, while the identity space is still
+    // live. After the installation under test there is none left — which is the
+    // whole situation being tested, so the ordering is forced.
+    let (grant_b, secret_b) = f.mint("nrpc:ww13-b", Some([0xaeu8; 32]), None);
+    let (id_b, handle_b) = f.install(grant_b, secret_b);
+    let unrelated = f.key(id_b, handle_b, "nrpc:ww13-b");
+    let owner = slot(46, "nrpc:ww13-owner");
+
+    // One short of spent: the NEXT reservation is the last live identity.
+    f.node
+        .set_consumer_grant_publications_for_test(u64::MAX - 2);
     let (grant, secret) = f.mint("nrpc:ww13", Some([0xadu8; 32]), None);
     let (grant_id, handle) = f.install(grant, secret);
+    assert_eq!(
+        f.node.consumer_grant_publication_for_test(),
+        u64::MAX - 1,
+        "precondition: the installation commits the LAST live identity — the          whole point of this witness is that the artifact carries exactly the          value a broken terminal fence would reuse"
+    );
+
+    let mut other_handle = handle;
+    other_handle[0] ^= 0xff;
+    let same_id_other_handle = f.key(grant_id, other_handle, "nrpc:ww13");
     let key = f.key(grant_id, handle, "nrpc:ww13");
 
     f.node.start();
     assert!(until(|| f.node.org_routing_ready()).await, "healthy");
     let family = f.node.org_routing_family().expect("family");
     let held = family.demand(key.clone()).expect("demand");
+    let held_h = family
+        .demand(same_id_other_handle.clone())
+        .expect("demand h");
+    let held_b = family.demand(unrelated.clone()).expect("demand b");
+    let held_o = family.demand(owner.clone()).expect("demand owner");
     assert!(
-        until(|| f.node.org_routing_base_facts(&key).is_some()).await,
-        "precondition: warm under the installed grant"
+        until(|| {
+            [&key, &same_id_other_handle, &unrelated, &owner]
+                .iter()
+                .all(|k| f.node.routing_registry.base_facts_unvalidated(k).is_some())
+        })
+        .await,
+        "precondition: every slot holds an artifact"
     );
 
-    // Exhausted AFTER installing, which is the only reachable order — an install
-    // at exhaustion is refused (W-W12).
-    f.node.exhaust_consumer_grant_publications_for_test();
-    let movements_before = f.node.consumer_grant_movements_for_test();
+    let warm = f
+        .node
+        .routing_registry
+        .base_facts_unvalidated(&key)
+        .expect("warm");
+    assert_eq!(
+        warm.grant_fence,
+        GrantArtifactFence::Publication(u64::MAX - 1),
+        "precondition: the artifact under test is stamped with the LAST LIVE \
+         identity, which is the value a reusing implementation would compare \
+         against itself"
+    );
+    let before_h = f
+        .node
+        .routing_registry
+        .base_facts_unvalidated(&same_id_other_handle)
+        .expect("h");
+    let before_b = f
+        .node
+        .routing_registry
+        .base_facts_unvalidated(&unrelated)
+        .expect("b");
+    let before_o = f
+        .node
+        .routing_registry
+        .base_facts_unvalidated(&owner)
+        .expect("owner");
+    let counts_before = f.node.org_routing_reconciliation_counts();
 
+    // Withdrawal at exhaustion: no identity can be allocated, so the movement is
+    // TERMINAL.
     assert!(
         f.node.remove_consumer_grant_audience(&grant_id),
         "an exhausted publication space must NOT block revocation"
     );
-    assert!(
-        f.node
-            .consumer_grant_audiences
-            .load()
-            .get(&grant_id)
-            .is_none(),
-        "and absence must actually be published"
-    );
-    assert_eq!(
-        f.node.consumer_grant_movements_for_test(),
-        movements_before + 1,
-        "and it is still routing movement — a terminal fence, not a silent drop"
-    );
     assert_eq!(
         f.node.consumer_grant_publication_for_test(),
         u64::MAX - 1,
-        "the identity must not advance past its last live value: `u64::MAX` stays \
-         RESERVED as the terminal marker rather than becoming an ordinary \
-         publication that a later artifact could compare against"
+        "and must not advance past the last live value — `u64::MAX` stays \
+         reserved as the terminal marker"
     );
 
     assert!(
@@ -6231,24 +6289,148 @@ async fn publication_exhaustion_still_withdraws_and_fences_terminally() {
                 .is_some_and(|facts| matches!(facts.providers, SourceFacts::Unserved))
         })
         .await,
-        "the terminal fence must retire the affected scope and rebuild it as \
-         Unserved, with no reader involved"
-    );
-    assert!(
-        f.node.org_routing_base_facts(&key).is_none(),
-        "and it reads cold"
+        "the withdrawal must retire the Served artifact stamped MAX-1 and \
+         rebuild the scope as Unserved. An implementation that reused \
+         Publication(MAX-1) here would compare it against itself and leave the \
+         stale Served artifact in place"
     );
 
-    // NO SPIN. A terminal fence retires unconditionally, so convergence has to be
-    // shown rather than assumed: it must not re-fire on what it just rebuilt.
+    // --- scope exactness: nothing else moved --------------------------------
+    for (label, key, before) in [
+        (
+            "same grant id, other audience handle",
+            &same_id_other_handle,
+            &before_h,
+        ),
+        ("an unrelated grant", &unrelated, &before_b),
+        ("the Owner plane", &owner, &before_o),
+    ] {
+        assert!(
+            f.node
+                .routing_registry
+                .base_facts_unvalidated(key)
+                .is_some_and(|live| Arc::ptr_eq(&live, before)),
+            "{label}: must keep its EXACT artifact. `Terminal` is the one fence \
+             that clears unconditionally, so it is the easiest one to widen by \
+             accident"
+        );
+    }
+
+    // NO SPIN.
     let settled = f.node.org_routing_reconciliation_counts();
     tokio::time::sleep(Duration::from_millis(300)).await;
+    let quiet = f.node.org_routing_reconciliation_counts();
     assert_eq!(
-        f.node.org_routing_reconciliation_counts()[0],
-        settled[0],
-        "the actor must be QUIESCENT after a terminal fence — one movement, one \
-         retirement, one rebuild"
+        quiet[0], settled[0],
+        "the actor must be QUIESCENT after a terminal fence"
     );
+    assert!(
+        quiet[2] >= counts_before[2],
+        "sanity: the invalidation counter only moves forward"
+    );
+
+    drop(held);
+    drop(held_h);
+    drop(held_b);
+    drop(held_o);
+    let _ = f.node.shutdown().await;
+}
+
+/// W-W14. A terminal withdrawal preserves the ABSENCE artifact its own
+/// publication produced.
+///
+/// The terminal counterpart of W-W9/W-W10. Terminal withdrawal clears
+/// unconditionally by publication — which is right for everything that existed
+/// BEFORE it — but the artifact reconstructed AFTER its publication is its own
+/// successor and must survive:
+///
+/// ```text
+/// terminal withdrawal publishes absence
+/// -> its notification parks
+/// -> a demand arrives and reconstructs the scope as Unserved
+/// -> notification resumes  ->  must preserve that exact artifact
+/// ```
+///
+/// It cannot resurrect authority — nothing can install after exhaustion — but it
+/// would have a notification retire the artifact produced from its own
+/// transition, which breaks same-publication preservation and the "a demand
+/// arriving after publication is safe" rule just as surely as `<=` did.
+///
+/// This is why terminal absence is a distinct artifact fence rather than a
+/// generation: at exhaustion the last live identity may equal the artifact's, so
+/// no numeric comparison could tell "before this withdrawal" from "after" it.
+///
+/// Dies to `TerminalAbsence => true` — i.e. to `Terminal` clearing everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delayed_terminal_notification_preserves_its_own_absence_artifact() {
+    use crate::adapter::net::behavior::org_routing_registry::{GrantArtifactFence, SourceFacts};
+
+    let f = grant_fixture("ww14").await;
+    f.node
+        .set_consumer_grant_publications_for_test(u64::MAX - 2);
+    let (grant, secret) = f.mint("nrpc:ww14", Some([0xafu8; 32]), None);
+    let (grant_id, handle) = f.install(grant, secret);
+    let key = f.key(grant_id, handle, "nrpc:ww14");
+
+    f.node.start();
+    assert!(until(|| f.node.org_routing_ready()).await, "healthy");
+    let family = f.node.org_routing_family().expect("family");
+
+    let (reached, release) = park_first_grant_notification(&f.node);
+    let remover = {
+        let node = f.node.clone();
+        std::thread::spawn(move || node.remove_consumer_grant_audience(&grant_id))
+    };
+    reached
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the terminal withdrawal must park at its notification");
+
+    // Absence is published and the space is spent. First demand enqueues, and the
+    // scope reconstructs TERMINALLY absent.
+    let held = family.demand(key.clone()).expect("demand");
+    assert!(
+        until(|| {
+            f.node
+                .routing_registry
+                .base_facts_unvalidated(&key)
+                .is_some_and(|facts| matches!(facts.providers, SourceFacts::Unserved))
+        })
+        .await,
+        "the demand must reconstruct the scope as Unserved under the published \
+         absence"
+    );
+    let own = f
+        .node
+        .routing_registry
+        .base_facts_unvalidated(&key)
+        .expect("own terminal absence artifact");
+    assert_eq!(
+        own.grant_fence,
+        GrantArtifactFence::TerminalAbsence,
+        "precondition: an absent Grant scope reconstructed under a SPENT identity \
+         space is terminal — and it is a distinct fence, not a number, precisely \
+         because no number could order it against the withdrawal that caused it"
+    );
+    let counts_before = f.node.org_routing_reconciliation_counts();
+
+    let _ = release.send(());
+    assert!(
+        remover.join().expect("remover thread"),
+        "precondition: the withdrawal published"
+    );
+
+    assert!(
+        f.node
+            .routing_registry
+            .base_facts_unvalidated(&key)
+            .is_some_and(|live| Arc::ptr_eq(&live, &own)),
+        "a terminal withdrawal must preserve the absence artifact its OWN \
+         publication produced — clearing everything unconditionally retires \
+         current work that nothing owes"
+    );
+    let counts_after = f.node.org_routing_reconciliation_counts();
+    assert_eq!(counts_after[2], counts_before[2], "and invalidate nothing");
+    assert_eq!(counts_after[0], counts_before[0], "and re-queue nothing");
 
     drop(held);
     let _ = f.node.shutdown().await;

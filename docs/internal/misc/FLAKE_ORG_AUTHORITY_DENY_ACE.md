@@ -1,17 +1,22 @@
-# Flake — `org_authority::tests::a_deny_ace_does_not_make_an_owner_only_dir_invalid`
+# Windows full-load test flakes (OPEN, undiagnosed)
 
 **Status: OPEN, reproduced, NOT diagnosed.** No owner, no scheduled work. Split
-out of the OLB-2B.3c-pre step-3 corrective record because it is unrelated to that
-slice and was distorting its bookkeeping (Kyra, 2026-07-31).
+out of the OLB-2B.3c-pre step-3 corrective record because none of it is related
+to that slice and it was distorting the slice's bookkeeping (Kyra, 2026-07-31).
 
-## What is observed
-
-A Windows-only unit test fails intermittently under full-suite parallel load. It
-shells out to `icacls` against a PID-scoped temporary directory.
+**Two** unit tests have now been observed failing intermittently under full-suite
+parallel load on Windows. Both are filesystem-adjacent; neither touches any OLB
+code path.
 
 ```
 adapter::net::behavior::org_authority::tests::a_deny_ace_does_not_make_an_owner_only_dir_invalid
+adapter::net::redex::disk::tests::append_failure_after_dat_write_rolls_back_dat
 ```
+
+The second was found on 2026-07-31 while hunting the first — 1 failure in 6
+full-load runs. That it surfaced immediately once someone looked suggests the
+population of load-sensitive filesystem tests may be larger than these two, which
+is the more useful thing to know than either individual failure.
 
 ## Evidence, stated as two separate populations
 
