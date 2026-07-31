@@ -35,6 +35,15 @@ ordered by expected leverage, not as a result.
 > before/after". Final disposition: §1 ready for `Composite`; §2 held behind evidence; §3
 > ready under the locked snapshot contract; §4 blocked on the protocol decision; §5 ready
 > as an isolated broad-fold change; §6 ready; §7 ready under query-count parity.
+>
+> **§4 decision recorded (2026-08-01).** The blocked finding split. Its *publication*
+> behavior — a locally rejected reservation being broadcast anyway — was a correctness
+> defect, not an optimization target, and is fixed at `eb4d270b5` under the invariant
+> **only locally accepted reservation-fold transitions are publishable**. Its *pre-read*
+> optimization remains **not adopted**; the local CAS stays the sole decision point, which
+> is what discharges the expiry-boundary, backpressure and generation-consumption
+> requirements by construction. ICB-4's W4 witness now pins the suppression rather than
+> witnessing the divergence. See §4, "The decision taken".
 
 The hot path in question is the read pipeline plus the commit — plan §2 steps 1–4:
 
@@ -338,24 +347,31 @@ Only path 1 uses `claim_first_available`. So restricting the change to
 nothing in production today, because `schedule_single`, `schedule_gang` and `acquire_gang`
 have no non-test callers.
 
-And path 3 does not merely sign locally. `reserve_island` →
-`apply_and_broadcast_reservation` (`mesh.rs:27321+`) applies **and broadcasts**, and the
-broadcast happens **regardless of the local CAS outcome** — a losing reserve is signed,
-rejected locally, and gossiped to peers anyway. ICB-4 documents this deliberately:
+And path 3 did not merely sign locally. `reserve_island` →
+`apply_and_broadcast_reservation` applied **and broadcast**, and the broadcast happened
+**regardless of the local CAS outcome** — a losing reserve was signed, rejected locally,
+and gossiped to peers anyway. ICB-4 documented that deliberately:
 
 > **Honesty note (W4):** a LOSING reserve still gossips — `C`'s rejected `Reserved{C}` on
 > `A` is broadcast to `O` regardless of the local CAS outcome, so `O` ends up observing
 > `A` held by `C` while `C` keeps `A` held by `H`. […] It is witnessed, not hidden.
 
-ICB-4 also asserts, per sample, that the reservation fold's **rejected-apply delta is
-exactly one** (`island_claim_fallback.rs:305-306`, and again in W2 at `:400-418`). A
-pre-read on path 3 would drive that delta to zero and fail the bench — correctly. The
-bench is doing its job: it is pinning behavior a pre-read would silently change.
+> **Superseded.** The broadcast half of this was a defect, and it is fixed — see "The
+> decision taken" below. W4 now witnesses the suppression. The paragraphs above are kept
+> as the reasoning that led there, in past tense; the pre-read half they argue against is
+> still unadopted, so the rest of this section stands as written.
 
-So on the public path this is not "skip equivalent CPU work". It suppresses a signed
-announcement, a rejected-apply metric, an audit transition, and network fan-out. That may
-well be **desirable** — it removes a known divergence source that ICB-4 currently has to
-witness and disclaim — but it is a deliberate protocol and observability change.
+ICB-4 also asserts, per sample, that the reservation fold's **rejected-apply delta is
+exactly one** (and again in W2). A pre-read on path 3 would drive that delta to zero and
+fail the bench — correctly. The bench is doing its job: it is pinning behavior a pre-read
+would silently change. Suppressing only the *broadcast* leaves that assertion untouched,
+which is one reason the two halves separate cleanly.
+
+So on the public path a pre-read is not "skip equivalent CPU work". It would suppress a
+signed announcement, a rejected-apply metric, and network fan-out at once. Removing the
+network fan-out alone turned out to be **desirable and separable** — it removes the
+divergence source ICB-4 had to witness and disclaim — while the metric and the attempt
+itself are worth keeping.
 
 ### Withdrawn claim
 
@@ -373,6 +389,105 @@ explicitly rather than assuming a retry will cover it.
 > shared reservation-viability classifier and adopt it deliberately across all four
 > surfaces — synchronous scheduler, Cortex workflow, ordinary node claim, sensed node
 > claim — rather than optimizing one loop and leaving the others divergent.
+
+### The decision taken (2026-08-01)
+
+**The question splits in two, and the halves get opposite answers.**
+
+> **Observability: keep.** A predictably-losing attempt stays a real local event —
+> signed, applied, metered (`applies_rejected`), and generation-consuming.
+>
+> **Publication: drop.** *Only locally accepted reservation-fold transitions are
+> publishable.* A transition the local CAS rejected must never become replicated state.
+
+Publication was never an optimization question. The pre-existing behavior was
+incoherent on its own terms:
+
+```text
+sign → reject locally → broadcast anyway → remote peer may accept
+```
+
+A node published a reservation state **it did not itself believe**. W4 witnessed the
+consequence — the claimant kept `A` held by `H` while the observer installed the losing
+claimant `C` — and disclaimed it as an "orthogonal ICB-3-style divergence". It is not
+orthogonal. It is a defect, and the disclaimer was covering it.
+
+**Implemented at `eb4d270b5`** in `MeshNode::apply_and_broadcast_reservation`: the
+broadcast moves inside the `Inserted | Replaced` arms. Because release shares the helper,
+a `Free` rejected after a holder-check race is likewise unpublishable.
+
+**The pre-read is still not adopted, and the requirement list above is why.** Keeping the
+CAS as the sole decision point discharges every item on it by construction rather than by
+test:
+
+| required test | status under this shape |
+|---|---|
+| expiry crossing between pre-read and apply | **n/a** — there is no pre-read to cross |
+| final-round success-vs-backpressure at the deadline | **n/a** — no attempt is skipped |
+| skipped islands must not consume a generation | **n/a** — no island is skipped |
+| rejected-apply metric deltas (ICB-4's assertion) | **unchanged** — ICB-4's `rejected_delta == 1` still holds |
+| audit-event emission for suppressed rejects | **unchanged** — see the caveat below |
+| explicit statement on losing announcements, W4 updated | **done** — W4 rewritten to witness suppression |
+
+The signature cost §4 opened against therefore remains **unpaid**. That is deliberate: it
+is a real cost, but it is a separate change needing its own justification, and it is the
+half of this finding that genuinely was an optimization.
+
+**Caveat on "still audited".** The natural way to state the retained-observability half is
+"still metered *and audited*", and the first draft of the regression test asserted exactly
+that. It fails — `ReservationFold` does not implement `FoldKind::audit_event`, so it emits
+nothing to an installed sink. Nor does any other production fold in the crate; only a test
+fold in `fold/tests.rs` does. So an audit assertion here would have been vacuous in both
+directions, and it was removed rather than written to pass for the wrong reason.
+
+Whether the reservation fold *should* emit audit events is a live question and not this
+patch's to answer: it would make it the first production fold to do so, and an `AuditEvent`
+carries an owned `String`, so it is a per-apply allocation on the CAS path this branch
+spent its time removing allocations from. Filed here, not fixed.
+
+### Evidence
+
+ICB-4 was **run** for this change (Windows 11, `--features net`, bench profile) — the only
+ICB run in the review/fix pass, and the one place a bench was the right instrument, since
+W4 is a correctness witness rather than a timing row:
+
+```text
+-- witnesses --
+  [PASS] W1 held island still matches (matcher ignores reservation state)
+  [PASS] W2 reserve(held A)=Lost (+1 rejected), reserve(free B)=Won (+0 rejected)
+  [PASS] W3 claim_island walks A→Lost→B (returns B, rejected-delta=1, A stays H)
+  [PASS] W4 losing reserve is NOT published → O has no entry for A (C:A=H, O:A=none);
+         B converged as the positive control
+
+-- measurement --
+ICB-4 · fallback claim API return (walk A→Lost→B)   p50=55.10us  p95=73.66us  samples=35
+ICB-4 · direct remote visibility (O reads B held by C) p50=105.41us p95=133.12us samples=35
+```
+
+All 35 measured samples still assert `rejected_delta == 1`, so the retained-observability
+half is checked 35 times per run, not just in W2/W3.
+
+**The timing rows are not a claim.** The timed region contains one fewer broadcast than it
+did pre-fix, so these numbers are not comparable to any previously recorded ICB-4 figure —
+and no previous ICB-4 figure is recorded in this document to compare them to. They are
+reported because the run happened, not as a result.
+
+**W4's sensitivity was verified, and it took two attempts.** The obvious fixture — pre-converge
+`Reserved{H}` onto the observer as well, then assert both nodes still see `H` — is
+insensitive: `ReservationFold::merge` already refuses a foreign publisher's steal of a
+fresh reservation, so the observer rejects the losing announcement on its own and the
+assertion passes whether or not anything was sent. That version was written, run against
+the unconditional broadcast, and **passed**. The observer must start with *no entry* for
+`A` — as ICB-4's fixture already did, which is why W4 saw a divergence in the first place
+— so an arriving announcement `Insert`s cleanly and `None` is a true zero-received
+witness. The corrected version fails against the unconditional broadcast.
+
+### Boundary — what this does NOT fix
+
+Two nodes that both observe `Free` and both locally win still both publish, and still
+diverge. That is the genuine AP `Reserved` divergence; the quorum/fencing edge into
+`Active` owns authoritative execution. ICB-4's single-claimant framing stays load-bearing
+for that reason — the reason changed, the framing did not.
 
 Tests any implementation must carry:
 
@@ -558,11 +673,14 @@ separately-measured slices, each under the measurement contract above:
 | 2. ordinary matcher | §1 + §7 hasher | `97e8457d2` | **implemented** + 3 equivalence tests |
 | 3. sensed matcher | §3 + §7 holder lookup | `6b377f0c8` | **implemented** + 5 tests |
 | 4. topology scaling | §2 | — | **held** — needs all four §2 result sets |
-| 5. claim behavior | §4 | — | **blocked** on the protocol decision |
+| 5a. claim publication | §4 (correctness half) | `eb4d270b5` | **implemented** — reject ⇒ no broadcast |
+| 5b. claim pre-read | §4 (optimization half) | — | **not adopted** — cost stands, unjustified |
 
 Slices 1–3 are constant-factor and mechanical. Slice 4 is the only scaling-curve change and
-the only one that can regress writes. Slice 5 must not begin until the observability
-question in §4 is answered.
+the only one that can regress writes. Slice 5 split once the §4 decision was taken: the
+publication half was a correctness defect and shipped; the pre-read half remains an
+unadopted optimization, and declining it is what makes the publication fix cheap to reason
+about (the local CAS stays the sole decision point).
 
 ### Correctness state of slices 1–3 (2026-07-31)
 
@@ -709,13 +827,15 @@ scaling, heartbeat-write, lifecycle, index memory) reported *separately* — a r
 hides a write regression inside one averaged number is exactly what the hold exists to
 prevent. Implementing it before that evidence exists would defeat the gate.
 
-**§4 — the reservation pre-read (slice 5). BLOCKED on a protocol decision, deferred to
-Kyra (2026-08-01).** Not a coding task. On the public node path a losing reserve is
-signed, locally rejected, *and broadcast anyway*, and ICB-4 both asserts
-`rejected_delta == 1` per sample and carries a "Honesty note (W4)" documenting that gossip
-as deliberately witnessed. Suppressing it is a change to what the mesh emits, not a
-CPU-saving refactor, so it needs the decision recorded in "The decision to make" above
-before any of the four claim surfaces is touched. No claim path was modified.
+**§4 — the reservation pre-read (slice 5b). NOT ADOPTED, deliberately.** The decision
+recorded in §4's "The decision taken" split this finding: the *publication* half was a
+correctness defect and shipped at `eb4d270b5`; the *pre-read* half is the optimization and
+was declined. Skipping a predictably-losing attempt would still mean predicting an expiry
+boundary, possibly converting a final-round success into backpressure, and deciding what a
+skipped island does to the generation counter — three questions the shipped fix avoids
+entirely by keeping the local CAS as the sole decision point. The ~50 µs signature on a
+losing attempt therefore still gets paid, on all four claim surfaces. That is a known,
+accepted, unmeasured cost, not an oversight.
 
 ### Implemented but not fully measured
 
@@ -784,6 +904,17 @@ the evidence that the surface is reachable from outside the crate rather than
 boundary:** the set is probed once per *topology entry* during the `HostedByAny` scan.
 Converting at the call boundary would reintroduce a per-call rebuild of the very set
 §7 exists to make cheap to probe.
+
+**Observable behavior change (no signature change, no migration).**
+`MeshNode::reserve_island` and `MeshNode::release_island` no longer emit a fold broadcast
+when the local CAS rejects the transition (§4, "The decision taken"). Return values are
+unchanged — a rejected attempt still returns `ClaimOutcome::Lost` — and so are the local
+fold metrics. What changes is what peers see: a losing claim used to place a
+`Reserved{self}` announcement on the wire that observers could accept, and no longer does.
+Anything downstream that was (deliberately or not) relying on losing attempts as a
+liveness or activity signal on the reservation channel will stop seeing them. This is a
+fix, but it is wire-visible, so it belongs in release notes rather than only in a
+changelog's "internal" section.
 
 **Additive** (no migration; listed so release notes are complete):
 

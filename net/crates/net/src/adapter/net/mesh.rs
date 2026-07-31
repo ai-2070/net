@@ -27258,8 +27258,8 @@ impl MeshNode {
     /// node's view, `Lost` if already held). `until_unix_us` is the
     /// takeover deadline.
     ///
-    /// A `Lost` attempt is still signed, applied, metered and audited,
-    /// and still consumes a generation — but it is not published. See
+    /// A `Lost` attempt is still signed, applied and metered, and
+    /// still consumes a generation — but it is not published. See
     /// [`Self::apply_and_broadcast_reservation`] for why.
     pub async fn reserve_island(
         &self,
@@ -27334,8 +27334,14 @@ impl MeshNode {
     /// The local CAS is the sole decision point, and it runs before
     /// any publication decision — there is no pre-read, so no
     /// expiry-boundary prediction, no skipped generation, and no
-    /// suppressed metric or audit event. What changes on a `Rejected`
-    /// outcome is only that nothing goes on the wire.
+    /// suppressed `applies_rejected` count. What changes on a
+    /// `Rejected` outcome is only that nothing goes on the wire.
+    ///
+    /// (`ReservationFold` implements no
+    /// [`FoldKind::audit_event`](super::behavior::fold::FoldKind::audit_event),
+    /// so there is no audit emission on this path to preserve or
+    /// suppress either way — see PERF_AUDIT_2026_07_31_GANG_SCHEDULER
+    /// §4.)
     async fn apply_and_broadcast_reservation(
         &self,
         island: super::behavior::fold::IslandId,
@@ -27385,8 +27391,7 @@ impl MeshNode {
             // ONLY LOCALLY ACCEPTED TRANSITIONS ARE PUBLISHABLE.
             //
             // A rejected transition stays locally attempted, locally
-            // metered (`applies_rejected`), locally audited
-            // (`AuditKind::Rejected`), generation-consuming, and
+            // metered (`applies_rejected`), generation-consuming, and
             // returned as `Lost` — but it must never become replicated
             // state. Broadcasting it published a reservation this node
             // does not itself believe:

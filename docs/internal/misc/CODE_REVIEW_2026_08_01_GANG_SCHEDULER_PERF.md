@@ -429,6 +429,42 @@ Recorded so a later pass does not re-derive them:
 
 ---
 
+## Follow-on work landed on this branch (not a review finding)
+
+Recorded here because it lands in the same range and touches code this review
+covers, but it did **not** come out of this pass — it is the answer to the
+protocol decision audit §4 was blocked on, and it is a correctness fix rather
+than a review finding.
+
+**`eb4d270b5` — a locally rejected reservation is never broadcast.**
+`MeshNode::apply_and_broadcast_reservation` published every signed transition
+regardless of the local CAS outcome, so a node emitted reservation state it did
+not itself believe and an observer could install a claimant the claimant knew
+had lost. The broadcast now sits inside the `Inserted | Replaced` arms, under
+the invariant *only locally accepted reservation-fold transitions are
+publishable*. Deliberately **not** the pre-read audit §4 sketched: the local CAS
+stays the sole decision point, so the rejected-apply metric, the generation
+consumption and the expiry semantics are all untouched, and only the wire output
+changes. Full reasoning and the declined half in the audit's §4, "The decision
+taken".
+
+Two things from that work are worth carrying back into how this review's
+material reads:
+
+- **ICB-4's W4 witness was inverted.** It asserted the divergence as an
+  "orthogonal ICB-3-style" property and disclaimed it. My original pass read
+  ICB-4 and did not question that framing — a disclaimed defect is still a
+  defect, and "witnessed, not hidden" is not the same as "correct".
+- **`ReservationFold` emits no audit events.** Neither does any other production
+  fold; only a test fold does. Anywhere this branch's comments or the audit say
+  a transition is "audited", that is aspirational — `Fold::audit_event` defaults
+  to `None`. Nothing asserts it, and the one place a fix-pass test tried to,
+  it failed. Filed in audit §4 rather than fixed, because making the reservation
+  fold the first audited production fold puts a per-apply `String` allocation on
+  the CAS path.
+
+---
+
 ## Verification
 
 Run on Windows 11 from `net/crates/net`.
