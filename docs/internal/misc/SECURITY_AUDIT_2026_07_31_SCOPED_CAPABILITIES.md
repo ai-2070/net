@@ -16,13 +16,16 @@ exploit link re-checked against the live code path.
 `origin/master` at that commit). All line references below are against that SHA,
 not against a branch name.
 
-Revised twice following review (Kyra, 2026-07-31). First pass: the remediation
-for the two HIGH findings was rewritten, two findings narrowed for precision, and
-the query-cost finding elevated. Second pass: the multi-hop discovery repair was
-made generation-coherent — re-keying `peer_subnets` to `ann.node_id` is necessary
-but not sufficient, because the write precedes the authoritative fold apply and
-would otherwise admit stale-replay and reordering divergence. The exploit
-analysis and severity of the HIGH findings are unchanged throughout.
+Revised three times following review (Kyra, 2026-07-31). First pass: the
+remediation for the two HIGH findings was rewritten, two findings narrowed for
+precision, and the query-cost finding elevated. Second pass: the multi-hop
+discovery repair was made generation-coherent — re-keying `peer_subnets` to
+`ann.node_id` is necessary but not sufficient, because the write precedes the
+authoritative fold apply. Third pass: that repair was further strengthened to
+full lifecycle coherence — generation ordering alone does not survive fold
+expiry, eviction, snapshot restore, local policy replacement, or a publisher
+restart that resets its version counter. The exploit analysis and severity of the
+HIGH findings are unchanged throughout.
 
 The scope feature itself is well-scoped and honestly documented. The findings
 below cluster in two places: the *adjacent* enforcement gates that inherit
@@ -298,31 +301,73 @@ current capability entry against stale subnet state:
    resumes and overwrites with 10. `Fold::apply` serialises internally, but a
    separate `DashMap` write is outside that lock.
 
-The requirement is therefore: **publish the derived subnet only as part of the
-same accepted-generation transition as the authoritative capability membership.**
-A rejected apply must produce zero `peer_subnets` mutation, and a delayed older
-accepted transition must not overwrite a newer value. Two implementations satisfy
-this:
+Generation ordering is necessary but still not the whole requirement. The derived
+subnet must share the fold entry's **full lifecycle**, not merely its accepted
+generation:
 
-- **Derived field on the membership payload**, computed at
-  `translate_announcement` time and committed under the fold's mutation lock, so
-  it moves with the entry by construction. There is in-tree precedent: `region`
-  is already derived from the `scope:region:` tag this way
-  (`capability_bridge.rs:1066-1068`). *Constraint to verify first:*
-  `policy.assign` is a **receiver-local** computation — different receivers may
-  hold different policies — so this is only sound if the payload is not shared
-  across nodes. `Fold::snapshot` / `restore` exist (`fold/mod.rs:521`, `:554`)
-  and no cross-node use appears in `mesh.rs`, but that must be confirmed before
-  committing to this shape.
-- **Version-stamped conditional sidecar update** under a shared
-  ingest/publication serializer: store `(generation, SubnetId)` and apply the
-  write only when the accepted generation is strictly greater than the stored
-  one, after a successful apply.
+> The derived subnet must be an inseparable local projection of the *currently
+> retained* fold entry. It must move on accepted insert/replace, disappear or
+> become unusable on every fold removal path, and be reconstructed or invalidated
+> on restore and on local policy replacement. Generation comparison applies only
+> within one uninterrupted authoritative-entry lifetime; absence resets that
+> lifetime, so a restarted publisher's lower generation must be admissible.
 
-This composes with the query-cost finding below: canonical scope derivation and
-receiver-local subnet derivation are the same class of problem, and both belong
-as derived state tied to the accepted membership generation rather than written
-independently ahead of acceptance.
+Two naive shapes fail this, and both were proposed in an earlier draft:
+
+**A payload field is not safe as an ordinary `CapabilityMembership` member.**
+`CapabilityMembership` is the fold's *wire payload*
+(`fold/capability.rs:74-76`), derives `Serialize`/`Deserialize`, and rides
+`SUBPROTOCOL_FOLD` as positional postcard. The receiver-derived `owner` field is
+safe only because it is `#[serde(skip)]`, and `fold/capability.rs:145-152`
+records both reasons: a serialized field breaks every mixed-fleet fold frame at
+upgrade, and a wire-carried receiver projection would become a self-declared
+claim. `policy.assign` is receiver-local — different receivers hold different
+policies — so a serialized subnet would make one receiver's policy result another
+receiver's input. Any payload-resident subnet must therefore be a **non-wire
+local projection** (`#[serde(skip)]`), which in turn means decode and snapshot
+restore yield it empty and it must be deliberately rebuilt or invalidated.
+
+**A bare generation high-water sidecar cannot survive authoritative absence.**
+`peer_subnets` is cleaned only for *directly failed* peers (`mesh.rs:8111`,
+paired with `capability_fold.evict_node` at `:8136`); a forwarded-only origin is
+never a failure-detector peer, so neither cleanup fires for it, while fold
+expiry can still remove the authoritative entry. Meanwhile `capability_version`
+starts at `0` on construction (`mesh.rs:8494`). Hence:
+
+```text
+accept generation 500 / subnet A
+→ authoritative fold entry expires or is evicted
+→ sidecar (500, A) remains
+→ publisher restarts and valid generation 1 lands in an empty fold
+→ strict `>` comparison rejects 1 because 1 < 500
+→ fold and derived subnet disagree indefinitely
+```
+
+This is not hypothetical in this codebase: `mesh.rs:13724-13737` documents the
+same wedge already having bitten the scoped-discovery generation high-water — "a
+provider that restarted (its `capability_version` counter resets to 0)
+re-announced at generation 1 against a consumer still holding, say, 500 — every
+announcement `Stale` … that provider undiscoverable at every prior consumer."
+The fix there was bounded retention with a tombstone horizon on a 60 s GC
+cadence. A `peer_subnets` high-water would recreate the identical bug.
+
+Implementation shapes that can satisfy the full requirement:
+
+1. **Non-serialized local projection inside the fold entry** (`#[serde(skip)]`),
+   derived under the same mutation transaction and explicitly rebuilt on restore
+   and on policy replacement.
+2. **Node-owned wrapper around fold + sidecar** that serialises every apply,
+   eviction, expiry, restore, and policy transition — not only inbound apply
+   publication.
+3. **Sidecar keyed by an opaque retained-entry identity/epoch** rather than a
+   bare publisher generation, with reads validating that the token still matches
+   the live fold entry.
+
+This composes with the query-cost finding below, with one distinction that must
+be preserved: canonical `CapabilityScope` is derived purely from signed publisher
+tags and may be persisted like any other tag-derived projection; receiver-local
+`SubnetId` depends on local policy and must never cross the wire as publisher
+data. Both are derived state; only the latter carries the policy dependency.
 
 **Required witnesses** for whichever shape is chosen:
 
@@ -332,6 +377,12 @@ independently ahead of acceptance.
    completes → release v10 → both fold and peer subnet reflect v11.
 3. *Rejected input* — a rejected fold apply produces zero `peer_subnets`
    mutation.
+4. *Expiry / restart* — accept v500/A → expire or evict the authoritative entry
+   and its derived state → accept restarted v1/B → fold and subnet both reflect
+   v1/B.
+5. *Restore or policy replacement* — restore an entry, or replace the local
+   `SubnetPolicy` → no old receiver-derived subnet remains usable → the
+   projection is rebuilt under the current policy or treated as unresolved.
 
 An earlier draft suggested instead admitting unknowns only for peers with a live
 direct session. **That suggestion has been withdrawn** — it does not bound the
@@ -552,12 +603,14 @@ reserved-prefix policy and apply it across all three bindings.
 4. **Make semantically invalid binding filters return errors**, and align the
    Node kind spellings. Independently shippable.
 5. **Resolve forwarded signed subnet discovery under `ann.node_id`**, dropping the
-   `hop_count` gate while retaining `signature_verified` — and publish the derived
-   value only as part of the accepted-generation transition, with the three
-   witnesses listed under that finding. Fixes the discovery leak; does not affect
-   item 2 or 3.
+   `hop_count` gate while retaining `signature_verified` — and bind the derived
+   value to the retained fold entry's full lifecycle (accepted transition, every
+   removal path, restore, policy replacement), with the five witnesses listed
+   under that finding. Fixes the discovery leak; does not affect item 2 or 3.
 6. **Move scope derivation to verified ingest** so the query path stops parsing
-   under the fold locks. Same generation-coherence requirement as item 5; the two
-   are best done together.
+   under the fold locks. Same lifecycle-coherence requirement as item 5 and best
+   done together — but note the split: tag-derived `CapabilityScope` may be
+   persisted like any publisher projection, while receiver-local `SubnetId` must
+   stay non-wire and policy-dependent.
 7. **Correct the docs**: `group.rs`'s value-as-secret claim, the `SubnetLocal`
    contract wording, and the scope boundary on the exported types.
