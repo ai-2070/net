@@ -52,16 +52,4 @@ The short rule:
   fixed producer, a fixed consumer, and a broker you're happy operating, Net's
   discovery and presence aren't buying you anything.
 - **You don't need discovery, presence, policy, artifacts, streams, or recovery.**
-  If none of those words describe your problem, Net is overhead.
-
-## Why the "no" list matters
-
-Every one of those "do not" cases is a place where Net would add moving parts
-without adding leverage. Reaching for a discovery mesh when a single HTTP call
-would do is the same mistake as standing up Kafka to move ten messages a day. The
-value of Net shows up precisely when the world is *distributed, changing, and
-stateful* — and when it isn't, the honest answer is to use the simpler thing.
-
-If you're not sure which side of the line you're on, ask: *does anything need to
-be discovered at runtime, and does the work have state I have to observe or
-recover?* Two nos means you don't need Net yet. One yes is worth reading on.
+  If none of those words describe your problem, you do 't need Net yet.
