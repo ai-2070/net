@@ -242,10 +242,16 @@ reads land at different times:
 | today | snapshot **T1** | snapshot **T2** (the second `All` scan) |
 | proposed | snapshot **T1** | snapshot **T1** |
 
-If an island is replaced (a heartbeat carrying a new `host`-irrelevant payload, or an
-eviction) between T1 and T2, today's banding sees the T2 world and the proposed banding
-sees T1. Those can rank differently. The right answer is T1 — but it has to be chosen, not
-asserted away:
+Banding reads **only** `record.host` (`gang/mod.rs:190-207`), so the difference is narrower
+than "any topology change". If an island is **evicted or expires** between T1 and T2,
+today's banding no longer finds it and `unwrap_or(usize::MAX)` drops it into the trailing
+band; the proposed path retains its T1 host band for the in-progress invocation. If the
+same `IslandId` is subsequently **reinserted under another host** — constructible, because
+`merge`'s first-writer pin only holds while the entry exists — today observes the new host
+while the proposed path retains T1. **Ordinary same-host heartbeat replacement does not
+affect band assignment**, since `host` is unchanged and is the only field banding reads.
+
+The right answer is T1 — but it has to be chosen, not asserted away:
 
 > **Snapshot decision.** Sensed band assignment uses the same topology snapshot that
 > produced the filtered and selected records. Topology replacements or evictions after
@@ -254,8 +260,12 @@ asserted away:
 
 **Required tests.**
 
-- island **replaced** between selection and banding
-- island **evicted** between selection and banding
+- same-host heartbeat **replacement** between selection and banding ⇒ assert **no band
+  change** (the negative control — this is the case that does *not* differ)
+- island **evicted / expired** between selection and banding ⇒ T1 band retained, not the
+  trailing band
+- island evicted **and reinserted under another host** between selection and banding ⇒ T1
+  band retained
 - empty sensed inputs ⇒ plain and sensed output identical (the existing contract at
   `gang/mod.rs:164-166`)
 - stable within-band ordering — the selection policy's order survives inside a band
