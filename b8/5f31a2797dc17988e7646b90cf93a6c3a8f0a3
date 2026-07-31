@@ -1,0 +1,27 @@
+web/src/content/docs/worldview/zenoh-vs-net.md
+  s_4e844c75f3aded::t_d9e0305f7f247e 1-121
+docs/data/tiers.yaml
+  s_4e844c75f3aded::t_bdc1d970df7b81 24,32-33
+web/src/content/docs/worldview/nats-vs-net.md
+  s_4e844c75f3aded::t_c31dc730ff92ad 1-124
+.claude/skills/net-event-bus/capabilities.md
+  s_4e844c75f3aded::t_8bccce6ff5caf6 111,457
+web/src/docs.order.ts
+  s_4e844c75f3aded::t_bdc1d970df7b81 88-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "b85f31a2797dc17988e7646b90cf93a6c3a8f0a3",
+  "prompts": {},
+  "sessions": {
+    "s_4e844c75f3aded": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a15fe99c-1910-4f73-ae09-8a2ba5b4ff55",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
