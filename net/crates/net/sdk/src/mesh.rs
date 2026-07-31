@@ -640,6 +640,32 @@ impl Mesh {
         self.channel_configs.insert(config);
     }
 
+    /// Register a **prefix-matched** channel config. Any channel name
+    /// starting with `prefix` that has no exact-match entry resolves
+    /// to `config`; when several prefixes match, the longest wins.
+    ///
+    /// Use this to install an ACL over a family of dynamically-named
+    /// channels — notably nRPC's per-caller reply channels, where
+    /// `<service>.replies.` covers every
+    /// `<service>.replies.<caller_origin>` without pre-registering
+    /// each one.
+    ///
+    /// Registering a prefix ACL **before** `serve_rpc*` is the
+    /// supported way to override nRPC's permissive defaults: auto-
+    /// registration installs its default only when the prefix is
+    /// otherwise unclaimed, so an entry made here survives.
+    ///
+    /// Note the gate for a prefix entry is evaluated against
+    /// `config.channel_id`, so a token-gated prefix authorizes against
+    /// that sentinel identity rather than the specific requested
+    /// channel — see `with_token_roots` for the per-channel form.
+    ///
+    /// Idempotent: re-registering the same prefix replaces the prior
+    /// config.
+    pub fn register_channel_prefix(&self, prefix: impl Into<String>, config: ChannelConfig) {
+        self.channel_configs.insert_prefix(prefix, config);
+    }
+
     /// Ask `publisher_node_id` to add this node to `channel`'s
     /// subscriber set. Blocks until the publisher's `Ack` arrives or
     /// the mesh's membership-ack timeout elapses.

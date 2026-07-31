@@ -254,8 +254,11 @@ impl Mesh {
     /// no `require_token`) — channel-level ACLs on RPC traffic
     /// are a Phase 3 concern (alongside the per-service token
     /// allowlist). Operators who need RPC ACLs today can call
-    /// `register_channel` / `register_channel_prefix` themselves
-    /// before `serve_rpc` to override.
+    /// [`Mesh::register_channel`](crate::Mesh::register_channel) /
+    /// [`Mesh::register_channel_prefix`](crate::Mesh::register_channel_prefix)
+    /// themselves before `serve_rpc` to override: auto-registration
+    /// installs a default only where the operator expressed no
+    /// opinion, so a pre-installed config is never replaced.
     ///
     /// For typed handlers (auto serde), use
     /// [`Self::serve_rpc_typed`].
@@ -268,18 +271,34 @@ impl Mesh {
         self.node().serve_rpc(service, handler)
     }
 
-    /// Internal helper used by `serve_rpc` / `serve_rpc_typed` to
+    /// Internal helper used by every `serve_rpc*` variant to
     /// auto-register the request channel + reply prefix in the
-    /// SDK's `ChannelConfigRegistry`. Idempotent — repeated calls
-    /// for the same service are no-ops (DashMap insert overwrites
-    /// with the same default permissive config).
+    /// SDK's `ChannelConfigRegistry`.
+    ///
+    /// **Install-if-absent, never replace.** Both entries go in via
+    /// `insert_if_absent` / `insert_prefix_if_absent`, so an ACL the
+    /// operator registered before serving survives untouched. Pre-fix
+    /// these were plain replacing inserts, which meant the documented
+    /// hardening sequence — register a strict config, then
+    /// `serve_rpc` — silently discarded that config and left the
+    /// service wide open, with no error and no log. Every `serve_rpc*`
+    /// entry point calls this helper independently, so the guarantee
+    /// has to live here rather than at any one call site.
+    ///
+    /// Idempotent for the ordinary path too: repeated calls for the
+    /// same service find their own prior default and leave it alone.
     pub(crate) fn auto_register_rpc_channels(&self, service: &str) {
         use crate::ChannelConfig;
         use net::adapter::net::channel::{ChannelId, ChannelName};
         // Exact: `<service>.requests`.
         let req_name = format!("{service}.requests");
         if let Ok(req_channel) = ChannelName::new(&req_name) {
-            self.register_channel(ChannelConfig::new(ChannelId::new(req_channel)));
+            // Return value deliberately ignored: "an entry already
+            // existed" is the operator-configured case and is not a
+            // problem — it's the outcome this method exists to protect.
+            let _ = self
+                .channel_configs_arc()
+                .insert_if_absent(ChannelConfig::new(ChannelId::new(req_channel)));
         }
         // Prefix: `<service>.replies.` — admits every per-caller
         // `<service>.replies.<caller_origin>` subscribe.
@@ -288,8 +307,9 @@ impl Mesh {
         // hash lookups, just carried so the ChannelConfig is
         // structurally well-formed.
         if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
-            self.channel_configs_arc()
-                .insert_prefix(prefix, ChannelConfig::new(ChannelId::new(sentinel_name)));
+            let _ = self
+                .channel_configs_arc()
+                .insert_prefix_if_absent(prefix, ChannelConfig::new(ChannelId::new(sentinel_name)));
         }
     }
 
@@ -1422,6 +1442,110 @@ where
                 code: NRPC_TYPED_HANDLER_ERROR,
                 message,
             })
+    }
+}
+
+#[cfg(test)]
+mod auto_register_covers_every_serve_variant {
+    //! H2 (2026-07-31 channel-auth audit): the "operator ACLs survive
+    //! `serve_rpc*`" guarantee lives in `auto_register_rpc_channels`,
+    //! which every serving entry point calls **independently**. A
+    //! behavioural test of one variant (see
+    //! `sdk/tests/mesh_rpc_acl_preserved.rs`) proves the helper is
+    //! correct; it cannot prove a *new* variant remembered to call it.
+    //!
+    //! This is that second half: a source-level witness that every
+    //! `pub fn serve_rpc*` routes through the helper. Adding a ninth
+    //! variant without the call fails here rather than silently
+    //! shipping a path that clobbers operator configuration. The
+    //! codebase uses the same technique for
+    //! `authorize_subscribe_only_suppresses_cap_for_already_subscribed`.
+
+    /// Every `pub fn serve_rpc…` in this file must call
+    /// `auto_register_rpc_channels` in its body.
+    #[test]
+    fn every_serve_rpc_variant_calls_auto_register() {
+        let full = include_str!("mesh_rpc.rs");
+        // Scan production code only. Two reasons, both learned the hard
+        // way when this test first ran and reported nine variants:
+        //
+        // 1. This module's own search literals appear verbatim in the
+        //    file, so an unanchored scan matches itself.
+        // 2. The final real variant's body window would otherwise run
+        //    to EOF and swallow the `body.contains(...)` assertion
+        //    below — making that variant pass on the strength of this
+        //    test's own source text rather than its implementation.
+        let src = match full.find("\n#[cfg(test)]") {
+            Some(i) => &full[..i],
+            None => full,
+        };
+        let mut checked = 0usize;
+        let mut offset = 0usize;
+
+        // Anchored at a line start so a literal inside a string (which
+        // is preceded by `"`, not a newline) can never match.
+        while let Some(rel) = src[offset..].find("\n    pub fn serve_rpc") {
+            let start = offset + rel + 1; // skip the newline
+                                          // Name runs to the first `<` (generics) or `(` (args).
+            let name_start = start + "    pub fn ".len();
+            let name_end = src[name_start..]
+                .find(['<', '('])
+                .map(|i| name_start + i)
+                .expect("a fn signature must have generics or an arg list");
+            let name = &src[name_start..name_end];
+
+            // Scan to the next top-level `pub fn` so the window is this
+            // variant's body and nothing else.
+            let body_end = src[name_end..]
+                .find("\n    pub fn ")
+                .map(|i| name_end + i)
+                .unwrap_or(src.len());
+            let body = &src[name_end..body_end];
+
+            assert!(
+                body.contains("self.auto_register_rpc_channels(service)"),
+                "regression (H2): `{name}` does not call \
+                 `auto_register_rpc_channels`. Every serving entry point \
+                 must, or it will register nothing (breaking dynamic reply \
+                 subscriptions) or — if reinstated as a replacing insert — \
+                 silently discard an operator's pre-installed channel ACL."
+            );
+            checked += 1;
+            offset = body_end;
+        }
+
+        assert_eq!(
+            checked, 8,
+            "expected 8 `serve_rpc*` variants; found {checked}. If a variant \
+             was added or removed, update this count deliberately — the point \
+             is that the set is enumerated, not discovered."
+        );
+    }
+
+    /// The helper must use the non-clobbering registry operations.
+    /// Pinned separately from the behavioural test so a revert to
+    /// plain `insert` / `insert_prefix` is named precisely.
+    #[test]
+    fn auto_register_uses_install_if_absent() {
+        let src = include_str!("mesh_rpc.rs");
+        let start = src
+            .find("pub(crate) fn auto_register_rpc_channels(")
+            .expect("auto_register_rpc_channels must exist");
+        let end = (start + 3_000).min(src.len());
+        let body = &src[start..end];
+
+        assert!(
+            body.contains(".insert_if_absent(") && body.contains(".insert_prefix_if_absent("),
+            "regression (H2): auto-registration must install its permissive \
+             defaults via `insert_if_absent` / `insert_prefix_if_absent`. A \
+             plain replacing insert silently destroys an ACL the operator \
+             registered before serving — the exact defect this fix closed."
+        );
+        assert!(
+            !body.contains("self.register_channel("),
+            "regression (H2): `register_channel` REPLACES. Auto-registration \
+             must not use it."
+        );
     }
 }
 

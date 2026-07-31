@@ -407,21 +407,111 @@ impl ChannelConfigRegistry {
         self.prefix_configs.insert(prefix.into(), config);
     }
 
+    /// Register a prefix-matched config **only if that prefix has no
+    /// entry yet**. Returns `true` if this call installed the config,
+    /// `false` if an entry already existed (which is left untouched).
+    ///
+    /// The prefix counterpart of [`Self::insert_if_absent`], and the
+    /// operation auto-registration must use so it cannot silently
+    /// discard an operator's ACL. See that method for the rationale.
+    pub fn insert_prefix_if_absent(
+        &self,
+        prefix: impl Into<String>,
+        config: ChannelConfig,
+    ) -> bool {
+        match self.prefix_configs.entry(prefix.into()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                warn_if_fail_closed(&config);
+                slot.insert(config);
+                true
+            }
+        }
+    }
+
     /// Remove a prefix-matched config. Returns the removed config
     /// if it existed.
     pub fn remove_prefix(&self, prefix: &str) -> Option<ChannelConfig> {
         self.prefix_configs.remove(prefix).map(|(_, v)| v)
     }
 
-    /// Register a channel configuration.
+    /// Register a channel configuration, **replacing** any existing
+    /// entry for the same canonical name.
+    ///
+    /// Callers that must not clobber an existing policy — notably
+    /// anything auto-registering a default on behalf of a subsystem —
+    /// want [`Self::insert_if_absent`] instead.
     pub fn insert(&self, config: ChannelConfig) {
         warn_if_fail_closed(&config);
         let name = config.channel_id.name().to_string();
         let hash = config.channel_id.hash();
         let wire_hash = config.channel_id.wire_hash();
         self.configs.insert(name.clone(), config);
-        self.by_hash.entry(hash).or_default().push(name.clone());
-        self.by_wire_hash.entry(wire_hash).or_default().push(name);
+        self.index_name(hash, wire_hash, name);
+    }
+
+    /// Register a channel configuration **only if that canonical name
+    /// has no entry yet**. Returns `true` if this call installed the
+    /// config, `false` if an entry already existed (which is left
+    /// untouched).
+    ///
+    /// This exists because [`Self::insert`] replaces, and a subsystem
+    /// that auto-registers a permissive default for a channel it owns
+    /// (nRPC's `<service>.requests` / `<service>.replies.`) would
+    /// otherwise silently destroy an ACL the operator installed first
+    /// — with no error and no log, leaving a posture identical to the
+    /// default. Auto-registration must be "install a default if the
+    /// operator expressed no opinion," which is exactly this
+    /// operation.
+    ///
+    /// Atomic against concurrent callers: the occupancy test and the
+    /// insert happen under one DashMap entry guard, so exactly one of
+    /// N racing callers observes `true`.
+    pub fn insert_if_absent(&self, config: ChannelConfig) -> bool {
+        let name = config.channel_id.name().to_string();
+        let hash = config.channel_id.hash();
+        let wire_hash = config.channel_id.wire_hash();
+        // Hold the entry guard across the occupancy decision so two
+        // racing callers can't both observe "vacant". The reverse
+        // indices are separate DashMaps, so they're updated after the
+        // guard drops — only the winner gets there, which is what
+        // keeps them consistent.
+        let installed = match self.configs.entry(name.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                warn_if_fail_closed(&config);
+                slot.insert(config);
+                true
+            }
+        };
+        if installed {
+            self.index_name(hash, wire_hash, name);
+        }
+        installed
+    }
+
+    /// Add `name` to the canonical- and wire-hash reverse indices,
+    /// skipping a name already present in either bucket.
+    ///
+    /// The de-dup is load-bearing, not hygiene. [`Self::get`] and
+    /// [`Self::remove`] treat a bucket holding more than one name as a
+    /// hash collision and return `None` to avoid applying the wrong
+    /// channel's policy. Pre-fix, `insert` pushed unconditionally, so
+    /// re-registering the *same* channel (which the SDK documents as
+    /// idempotent, and which `serve_rpc` does on every call) grew the
+    /// bucket to `[name, name]` and made `get(hash)` start returning
+    /// `None` for a channel that plainly exists — a self-inflicted
+    /// collision that disabled canonical-hash lookup for that channel.
+    fn index_name(&self, hash: ChannelHash, wire_hash: u16, name: String) {
+        let mut by_hash = self.by_hash.entry(hash).or_default();
+        if !by_hash.iter().any(|n| n == &name) {
+            by_hash.push(name.clone());
+        }
+        drop(by_hash);
+        let mut by_wire = self.by_wire_hash.entry(wire_hash).or_default();
+        if !by_wire.iter().any(|n| n == &name) {
+            by_wire.push(name);
+        }
     }
 
     /// Look up a channel config by canonical [`ChannelHash`] (`u64`).
@@ -1211,5 +1301,145 @@ mod tests {
         assert_eq!(removed.priority, 7);
         assert_eq!(reg.len(), 0);
         assert!(reg.get(hash).is_none());
+    }
+
+    // ---- H2 (2026-07-31 audit): install-if-absent must not clobber ----
+
+    /// `insert_if_absent` installs into an empty slot and reports it.
+    #[test]
+    fn insert_if_absent_installs_when_vacant() {
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("svc.requests").unwrap();
+        assert!(reg.insert_if_absent(ChannelConfig::new(id.clone()).with_priority(4)));
+        assert_eq!(reg.get_by_name("svc.requests").unwrap().priority, 4);
+        assert_eq!(reg.get(id.hash()).unwrap().priority, 4);
+    }
+
+    /// The H2 regression at the registry level: an operator's strict
+    /// config must survive a later auto-registered permissive default.
+    /// Pre-fix `insert` replaced unconditionally and the ACL vanished.
+    #[test]
+    fn insert_if_absent_preserves_existing_strict_config() {
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("svc.requests").unwrap();
+        let root = EntityKeypair::generate();
+        reg.insert(ChannelConfig::new(id.clone()).with_token_roots(vec![root.entity_id().clone()]));
+
+        // Auto-registration's permissive default arrives second.
+        let installed = reg.insert_if_absent(ChannelConfig::new(id.clone()));
+
+        assert!(!installed, "must report that it did not install");
+        let cfg = reg.get_by_name("svc.requests").unwrap();
+        assert!(
+            cfg.token_required(),
+            "operator's token gate must survive auto-registration"
+        );
+        assert_eq!(cfg.token_roots.len(), 1);
+    }
+
+    /// Same guarantee on the prefix table, which is where nRPC's
+    /// reply-channel ACL would live.
+    #[test]
+    fn insert_prefix_if_absent_preserves_existing_strict_prefix() {
+        let reg = ChannelConfigRegistry::new();
+        let sentinel = ChannelId::parse("svc.replies.prefix").unwrap();
+        let root = EntityKeypair::generate();
+        reg.insert_prefix(
+            "svc.replies.",
+            ChannelConfig::new(sentinel.clone()).with_token_roots(vec![root.entity_id().clone()]),
+        );
+
+        let installed = reg.insert_prefix_if_absent("svc.replies.", ChannelConfig::new(sentinel));
+
+        assert!(!installed);
+        let cfg = reg.get_by_name("svc.replies.abcdef0123456789").unwrap();
+        assert!(
+            cfg.token_required(),
+            "operator's reply-prefix gate must survive auto-registration"
+        );
+    }
+
+    #[test]
+    fn insert_prefix_if_absent_installs_when_vacant() {
+        let reg = ChannelConfigRegistry::new();
+        let sentinel = ChannelId::parse("svc.replies.prefix").unwrap();
+        assert!(reg.insert_prefix_if_absent(
+            "svc.replies.",
+            ChannelConfig::new(sentinel).with_priority(2)
+        ));
+        assert_eq!(reg.get_by_name("svc.replies.deadbeef").unwrap().priority, 2);
+    }
+
+    /// Re-registering the same channel must not corrupt the canonical-
+    /// hash index. Pre-fix `insert` pushed the name unconditionally, so
+    /// the second registration grew the bucket to `[name, name]`,
+    /// `get()` read that as a hash collision, and canonical-hash lookup
+    /// started returning `None` for a channel that plainly exists.
+    #[test]
+    fn repeated_insert_does_not_self_collide_the_hash_index() {
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("svc.requests").unwrap();
+        let hash = id.hash();
+
+        reg.insert(ChannelConfig::new(id.clone()).with_priority(1));
+        reg.insert(ChannelConfig::new(id.clone()).with_priority(2));
+        reg.insert(ChannelConfig::new(id).with_priority(3));
+
+        assert_eq!(reg.len(), 1, "one channel, not three");
+        let cfg = reg
+            .get(hash)
+            .expect("canonical-hash lookup must survive re-registration");
+        assert_eq!(cfg.priority, 3, "latest config wins");
+    }
+
+    /// The mixed path auto-registration actually takes: a replacing
+    /// `insert` followed by install-if-absent attempts.
+    #[test]
+    fn insert_then_if_absent_leaves_hash_index_unambiguous() {
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("svc.requests").unwrap();
+        let hash = id.hash();
+
+        reg.insert(ChannelConfig::new(id.clone()).with_priority(9));
+        assert!(!reg.insert_if_absent(ChannelConfig::new(id.clone())));
+        assert!(!reg.insert_if_absent(ChannelConfig::new(id)));
+
+        assert_eq!(
+            reg.get(hash).expect("must stay resolvable").priority,
+            9,
+            "the operator's config must remain, and the index unambiguous"
+        );
+    }
+
+    /// Exactly one of N concurrent `insert_if_absent` callers may win,
+    /// and the reverse index must not end up ambiguous afterwards.
+    #[test]
+    fn concurrent_insert_if_absent_elects_exactly_one_winner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let reg = StdArc::new(ChannelConfigRegistry::new());
+        let wins = StdArc::new(AtomicUsize::new(0));
+        let id = ChannelId::parse("svc.requests").unwrap();
+
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let reg = reg.clone();
+                let wins = wins.clone();
+                let id = id.clone();
+                s.spawn(move || {
+                    if reg.insert_if_absent(ChannelConfig::new(id).with_priority(i)) {
+                        wins.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(wins.load(Ordering::Relaxed), 1, "exactly one installer");
+        assert_eq!(reg.len(), 1);
+        assert!(
+            reg.get(id.hash()).is_some(),
+            "hash index must stay unambiguous under concurrent installs"
+        );
     }
 }
