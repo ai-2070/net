@@ -8,7 +8,9 @@ reads and writes — `fold/capability.rs` (step 1), `fold/island.rs` (step 2),
 the Cortex claim pipeline in `adapter/net/cortex/workflow/step.rs`, and the existing
 island-claim bench suite (`benches/island_claim_*.rs`).
 
-**Status: findings only. Nothing here is implemented and nothing here is measured.**
+**Status: slices 1–3 implemented (see "Recommended order of attack"); slice 4 held, slice 5
+blocked. Nothing here is measured** — the implemented slices landed on correctness and
+mechanism witnesses, not on benchmark evidence.
 Every cost claim below is derived from reading the code; the one absolute latency figure
 used (Ed25519 sign ≈ 50 µs) is quoted from this repo's own
 `PERF_AUDIT_2026_06_10_FULL_CRATE.md`, not re-measured. Treat the ranking as a hypothesis
@@ -546,20 +548,43 @@ hold exists to prevent.
 
 ## Recommended order of attack
 
-Nothing is implemented. **Do not land these as one aggregate delta** — that destroys
-attribution. Five separately-measured slices, each under the measurement contract above:
+**Do not land these as one aggregate delta** — that destroys attribution. Five
+separately-measured slices, each under the measurement contract above:
 
-| slice | contents | gate |
-|---|---|---|
-| 1. generic fold/wire mechanics | §5 + §6 | full fold apply / audit / index suite; allocation deltas |
-| 2. ordinary matcher | §1 + §7 hasher | ICB-1; equivalence tests across **all** query shapes; allocation deltas |
-| 3. sensed matcher | §3 + §7 holder lookup | ICB-5 **plus the new large sparse sensed row**; the locked T1 snapshot tests; query-count parity |
-| 4. topology scaling | §2 | all four §2 result sets; index-hook test proving steady heartbeats skip the index |
-| 5. claim behavior | §4 | **blocked** on the protocol decision |
+| slice | contents | commit | state |
+|---|---|---|---|
+| 1. generic fold/wire mechanics | §5 + §6 | `a2bd969ed` | **implemented** + 2 witness tests |
+| 2. ordinary matcher | §1 + §7 hasher | `97e8457d2` | **implemented** + 3 equivalence tests |
+| 3. sensed matcher | §3 + §7 holder lookup | `6b377f0c8` | **implemented** + 5 tests |
+| 4. topology scaling | §2 | — | **held** — needs all four §2 result sets |
+| 5. claim behavior | §4 | — | **blocked** on the protocol decision |
 
 Slices 1–3 are constant-factor and mechanical. Slice 4 is the only scaling-curve change and
 the only one that can regress writes. Slice 5 must not begin until the observability
 question in §4 is answered.
+
+### Correctness state of slices 1–3 (2026-07-31)
+
+5 366 lib tests pass; benches compile; clippy clean on every touched file. Two of the new
+tests were verified to **fail against the pre-fix code**, so they witness the mechanism
+rather than merely passing alongside it:
+
+| test | pre-fix result |
+|---|---|
+| `apply_moves_the_payload_instead_of_cloning_it` | fails — `left: 1, right: 0` clones |
+| `sensed_match_takes_exactly_one_topology_snapshot` | fails — `left: 2, right: 1` topology reads |
+
+The §3 snapshot test asserts on the fold's own query counter, so it cannot be satisfied by
+a *faster* second scan — only by not taking one.
+
+**Performance evidence is NOT yet collected.** Slices 1–3 landed on correctness and
+mechanism witnesses alone. The measurement contract above still has to be run against them
+before any performance claim is made about this work; nothing here has been benchmarked,
+and no row of ICB-1 or ICB-5 has been compared before/after.
+
+**Pre-existing, unrelated:** `tests/sensing_origin_emitter.rs` does not compile under
+`--features net` alone (missing `sensing_consumer_cell_interval_for_test`). Confirmed
+present on this branch with all slice changes stashed.
 
 ## Reproduce
 
