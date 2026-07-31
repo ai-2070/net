@@ -476,35 +476,12 @@ impl PaymentEngine {
                 })
             }
         };
-        let idem = IdempotencyScope {
-            caller: quote.caller.clone(),
-            provider: quote.provider.clone(),
-            capability: quote.capability.clone(),
-            quote_id: quote.quote_id.clone(),
-        };
-
         // -- claim: check-and-mark under the lock, then release it before
         // any facilitator I/O.
         let quote_id = quote.quote_id.clone();
         let in_flight_ttl_ns = self.in_flight_ttl_ns;
         let claim = {
             let payload_hash = payload_hash.clone();
-            let record = QuoteRecord {
-                idempotency_key: idem.key(),
-                payload_hash: payload_hash.clone(),
-                capability: quote.capability.clone(),
-                caller_hex: hex::encode(quote.caller.as_bytes()),
-                requirements_b64: BASE64.encode(quote.requirements.bytes()),
-                payload_b64: BASE64.encode(payload.bytes()),
-                in_flight: true,
-                in_flight_since_ns: Some(now_ns),
-                frozen: None,
-                served: false,
-                redeemed: false,
-                chain: Vec::new(),
-                billing: None,
-                billing_published: false,
-            };
             // Only the three `Claim::Fresh` paths mutate state (insert a new
             // record, mark an existing record in_flight, or reclaim a stale
             // in_flight); every other outcome is a read-only inspection.
@@ -562,6 +539,36 @@ impl PaymentEngine {
                             break 'claim Claim::ReplayOtherQuote;
                         }
                     }
+                    // Built here, not before the closure: the two base64
+                    // encodes below cover the *whole* preserved carries
+                    // (requirements + payload, the bulk of a record's bytes)
+                    // and the idempotency key is a blake3 transcript hash.
+                    // Every branch above discards the record, so building it
+                    // eagerly spent all of that on each duplicate/retry —
+                    // and under a duplicate storm all but one attempt takes
+                    // one of those branches.
+                    let record = QuoteRecord {
+                        idempotency_key: IdempotencyScope {
+                            caller: quote.caller.clone(),
+                            provider: quote.provider.clone(),
+                            capability: quote.capability.clone(),
+                            quote_id: quote.quote_id.clone(),
+                        }
+                        .key(),
+                        payload_hash: payload_hash.clone(),
+                        capability: quote.capability.clone(),
+                        caller_hex: hex::encode(quote.caller.as_bytes()),
+                        requirements_b64: BASE64.encode(quote.requirements.bytes()),
+                        payload_b64: BASE64.encode(payload.bytes()),
+                        in_flight: true,
+                        in_flight_since_ns: Some(now_ns),
+                        frozen: None,
+                        served: false,
+                        redeemed: false,
+                        chain: Vec::new(),
+                        billing: None,
+                        billing_published: false,
+                    };
                     s.consumed.insert(payload_hash, quote_id.clone());
                     s.quotes.insert(quote_id.clone(), record);
                     Claim::Fresh
