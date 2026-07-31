@@ -351,6 +351,69 @@ async fn a_record_frozen_after_redemption_is_never_pruned() {
     );
 }
 
+/// **The horizon is the whole gate.** `is_prunable_at` does not consult the
+/// verified tier, so a record served on the facilitator's receipt alone —
+/// `observed`, and the facilitator is not in the trust root — retires on
+/// exactly the same clock as one an independent checker drove to `final`.
+///
+/// This is the tradeoff documented on `DEFAULT_TERMINAL_RECORD_RETENTION_NS`,
+/// not an accident, and it is pinned here so it stays a decision rather than
+/// a discovery. A `final`-tier precondition would make compaction a no-op
+/// for every deployment that never runs a `ChainChecker` — all mock ones —
+/// which is the failure compaction exists to fix. Whoever adds a tier gate
+/// breaks this test, and is meant to go read that paragraph first.
+///
+/// The second half is the cost the operator is accepting: past the horizon,
+/// a checker reporting the settlement reverted has nothing to attribute it
+/// to. A deployment that re-verifies out of band on a slower cadence must
+/// widen the window or pass `None`.
+#[tokio::test]
+async fn an_observed_tier_record_retires_on_the_same_clock_as_a_final_one() {
+    let f = fixture();
+    let (quote, _) = terminal_quote(&f, "2500", "n1").await;
+
+    let status = f
+        .engine
+        .status(&quote.quote_id)
+        .await
+        .unwrap()
+        .expect("record exists");
+    assert_eq!(
+        status.tier,
+        Some(VerificationTier::Observed),
+        "never re-verified: a facilitator receipt caps at observed"
+    );
+
+    assert_eq!(
+        f.engine
+            .prune_terminal_records(past_horizon())
+            .await
+            .unwrap(),
+        1,
+        "no tier precondition — the horizon alone retires it"
+    );
+
+    let after = f
+        .engine
+        .re_verify_with_checker(
+            &quote.quote_id,
+            &RevertingChecker,
+            VerificationTier::Final,
+            past_horizon(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            after,
+            PaymentDecision::Rejected {
+                reason: RejectReason::BadQuote(_)
+            }
+        ),
+        "past the horizon a revert can no longer be attributed: {after:?}"
+    );
+}
+
 // ============================================================================
 // Resurrection
 // ============================================================================

@@ -508,6 +508,33 @@ pub struct PaymentEngine {
 /// re-verification; it only declines to discard a record something might
 /// still want to re-check.
 ///
+/// **The horizon IS the re-verification window, and it is the only gate.**
+/// [`QuoteRecord::is_prunable_at`] does not consult the record's verified
+/// tier, so a record served at `observed` — the facilitator's receipt
+/// alone, and the facilitator is deliberately not in the trust root —
+/// retires on the same clock as one an independent checker drove to
+/// `final`. Once it is gone,
+/// [`re_verify_with_checker`](PaymentEngine::re_verify_with_checker)
+/// answers `BadQuote("unknown quote")` and a revert or reorg can no longer
+/// be attributed to that payment at all.
+///
+/// A `final`-tier precondition was considered and **rejected**: a
+/// facilitator receipt caps at `observed`, so a provider that never runs a
+/// [`ChainChecker`] — the common deployment, and every mock one — would
+/// hold every record at `observed` forever and compaction would silently
+/// become a no-op, which is the exact failure it was introduced to fix. The
+/// assumption is therefore stated rather than enforced, and it is the
+/// operator's:
+///
+/// > A deployment that re-verifies out of band, on a slower rail, or at a
+/// > raised `FINAL_DEPTH_*` must widen this window past its own
+/// > re-verification period — or pass `None` to keep records indefinitely.
+///
+/// Pinned by `engine_retention.rs`'s
+/// `an_observed_tier_record_retires_on_the_same_clock_as_a_final_one`, so
+/// the tradeoff is red-coupled rather than incidental: a future tier gate
+/// breaks that test by design, and its author is meant to read this.
+///
 /// At 1 000 **redeemed** calls/day this retains ~250 records (~0.8 MB)
 /// instead of letting months of fat records ride every whole-file
 /// transaction.
