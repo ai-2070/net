@@ -700,6 +700,43 @@ fn verify_rejects_placeholder_signature_sentinel() {
     }
 }
 
+/// PERF_AUDIT_2026_07_31_GANG_SCHEDULER §6 — the allocation-free
+/// zero-check must be an EXACT replacement for the old
+/// `== placeholder_signature()` comparison, not a loose one. A
+/// signature that is all-zero except a single byte is NOT the
+/// sentinel and must fall through to the real Ed25519 verify
+/// (which then rejects it as invalid).
+#[test]
+fn verify_does_not_mistake_a_near_zero_signature_for_the_placeholder() {
+    let kp = EntityKeypair::generate();
+    let mut ann = sign_cap_ann(&kp, 0x1000, 1, vec!["gpu"]);
+
+    // Zero every byte but the last — length stays correct, so the
+    // sentinel check is the next gate.
+    ann.signature = vec![0u8; wire::SIGNATURE_LEN];
+    ann.signature[wire::SIGNATURE_LEN - 1] = 1;
+    match ann.verify(kp.entity_id()) {
+        Err(WireError::PlaceholderSignature) => {
+            panic!("a single non-zero byte must not read as the all-zero sentinel")
+        }
+        // Falls through to the algorithm, which rejects it.
+        Err(_) => {}
+        Ok(()) => panic!("a forged signature must not verify"),
+    }
+
+    // And the first byte, symmetrically — an `all(|b| b == 0)` that
+    // short-circuits on the wrong end would still pass the check above.
+    ann.signature = vec![0u8; wire::SIGNATURE_LEN];
+    ann.signature[0] = 1;
+    match ann.verify(kp.entity_id()) {
+        Err(WireError::PlaceholderSignature) => {
+            panic!("a single leading non-zero byte must not read as the sentinel")
+        }
+        Err(_) => {}
+        Ok(()) => panic!("a forged signature must not verify"),
+    }
+}
+
 #[test]
 fn verify_rejects_signature_of_wrong_length() {
     let kp = EntityKeypair::generate();
@@ -1773,4 +1810,139 @@ fn ring_audit_sink_plugs_into_fold_and_captures_transitions() {
     for e in &snap {
         assert_eq!(e.kind, super::AuditKind::Created);
     }
+}
+
+// ---------------------------------------------------------------
+// PERF_AUDIT_2026_07_31_GANG_SCHEDULER §5 — payload-move witness.
+// ---------------------------------------------------------------
+
+/// Global clone counter for [`CountingPayload`]. Only the single
+/// `apply_moves_the_payload_instead_of_cloning_it` test constructs
+/// this payload type, so no other test can perturb the count.
+static PAYLOAD_CLONES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Payload whose `Clone` is counted, and whose contents are heap
+/// data so a clone is a real allocation rather than a memcpy —
+/// the shape `CapabilityMembership` / `IslandRecord` have.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CountingPayload {
+    id: u64,
+    blob: Vec<String>,
+}
+
+impl Clone for CountingPayload {
+    fn clone(&self) -> Self {
+        PAYLOAD_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            id: self.id,
+            blob: self.blob.clone(),
+        }
+    }
+}
+
+/// Minimal fold over [`CountingPayload`] — default LWW merge, no
+/// secondary index, no audit. Anything this fold's `apply` does to
+/// the payload beyond moving it shows up in [`PAYLOAD_CLONES`].
+struct CountingFold;
+
+impl FoldKind for CountingFold {
+    const KIND_ID: u16 = 0x0F03;
+    const CHANNEL_PREFIX: &'static str = "test:count:";
+    const DEFAULT_TTL: Duration = Duration::from_secs(60);
+    type Key = u64;
+    type Payload = CountingPayload;
+    type Query = ();
+    type Result = usize;
+    type Index = NoIndex;
+
+    fn key_for(_node_id: NodeId, payload: &CountingPayload) -> u64 {
+        payload.id
+    }
+
+    fn build_index() -> NoIndex {
+        NoIndex
+    }
+
+    fn query(state: &FoldState<Self>, _index: &NoIndex, _q: ()) -> usize {
+        state.entries.len()
+    }
+}
+
+fn counting_ann(node_id: NodeId, id: u64, generation: u64) -> SignedAnnouncement<CountingPayload> {
+    SignedAnnouncement::placeholder(
+        CountingFold::KIND_ID,
+        0,
+        node_id,
+        generation,
+        EnvelopeMeta::default(),
+        CountingPayload {
+            id,
+            blob: vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)],
+        },
+    )
+}
+
+/// §5: `Fold::apply` takes the announcement by value and drops it
+/// immediately, so it must MOVE the payload into the entry rather
+/// than deep-cloning it. Pre-fix, `build_entry(&ann)` cloned on
+/// every accepted apply — once per capability announce, once per
+/// island heartbeat, once per reservation CAS, on every fold.
+///
+/// Asserts zero clones across all three merge outcomes, and that
+/// the moved payload is intact afterwards (a move that lost data
+/// would be worse than the clone it replaced).
+#[test]
+fn apply_moves_the_payload_instead_of_cloning_it() {
+    use std::sync::atomic::Ordering;
+
+    let fold: Fold<CountingFold> = Fold::with_sweep_interval(Duration::ZERO);
+
+    // Insert.
+    let before = PAYLOAD_CLONES.load(Ordering::Relaxed);
+    assert_eq!(
+        fold.apply(counting_ann(0xAA, 0x10, 1)).expect("insert"),
+        ApplyOutcome::Inserted,
+    );
+    assert_eq!(
+        PAYLOAD_CLONES.load(Ordering::Relaxed) - before,
+        0,
+        "an inserting apply must not clone the payload",
+    );
+
+    // Replace (same publisher, strictly-higher generation).
+    let before = PAYLOAD_CLONES.load(Ordering::Relaxed);
+    assert_eq!(
+        fold.apply(counting_ann(0xAA, 0x10, 2)).expect("replace"),
+        ApplyOutcome::Replaced,
+    );
+    assert_eq!(
+        PAYLOAD_CLONES.load(Ordering::Relaxed) - before,
+        0,
+        "a replacing apply must not clone the payload",
+    );
+
+    // Reject (stale generation) — the rejected path never built an
+    // entry, so it never cloned either.
+    let before = PAYLOAD_CLONES.load(Ordering::Relaxed);
+    assert_eq!(
+        fold.apply(counting_ann(0xAA, 0x10, 1)).expect("stale"),
+        ApplyOutcome::Rejected,
+    );
+    assert_eq!(
+        PAYLOAD_CLONES.load(Ordering::Relaxed) - before,
+        0,
+        "a rejected apply must not clone the payload",
+    );
+
+    // The moved payload survived the move intact.
+    fold.with_state(|state| {
+        let entry = state.entries.get(&0x10).expect("entry present");
+        assert_eq!(entry.generation, 2);
+        assert_eq!(entry.payload.id, 0x10);
+        assert_eq!(
+            entry.payload.blob,
+            vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)],
+            "the moved payload must be byte-identical to what was announced",
+        );
+    });
 }
