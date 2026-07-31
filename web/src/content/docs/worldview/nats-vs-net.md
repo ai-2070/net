@@ -187,9 +187,6 @@ mechanism you will build something unsafe — see
 - **Authorized work crossing machines, runtimes, organisations and failure
   boundaries** — where the same identity has to govern discovery, invocation,
   streams, artifacts and recovery — evaluate Net.
-- **You want one narrow thing Net happens to contain** — do not adopt Net for it
-  yet. [Right and wrong use cases](/docs/worldview/right-and-wrong-use-cases) is
-  blunter than most vendor documentation on this.
 
 The two are not mutually exclusive. Net's event bus ships adapters for other
 transports, and a mesh that federates capabilities across boundaries can sit
