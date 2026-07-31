@@ -161,6 +161,20 @@ pub enum GrantAudienceInstallError {
     /// rather than aborting the process over a bookkeeping limit
     /// (review-pass-3 §12 discipline, applied to this counter).
     IdSpaceExhausted,
+    /// The consumer-Grant PUBLICATION-identity space is exhausted
+    /// (OLB-2B.3c-pre step 3).
+    ///
+    /// TERMINAL and irreversible, and DISTINCT from [`Self::IdSpaceExhausted`]:
+    /// that one is the installation identity, this one is the identity that
+    /// orders TRANSITIONS so a delayed notification cannot retire a newer
+    /// artifact. Conflating them would tell an operator the wrong counter ran
+    /// out.
+    ///
+    /// Refused fail-closed and BEFORE anything is published, so an exhausted
+    /// space cannot leave a visible snapshot with no notification behind it.
+    /// WITHDRAWAL is deliberately not refused here — revoking authority must
+    /// always be possible, and it is the direction that fails closed.
+    PublicationSpaceExhausted,
 }
 
 impl std::fmt::Display for GrantAudienceInstallError {
@@ -187,6 +201,9 @@ impl std::fmt::Display for GrantAudienceInstallError {
             GrantAudienceInstallError::AtCapacity => "grant-audience registry at capacity",
             GrantAudienceInstallError::IdSpaceExhausted => {
                 "grant-audience installation identity space exhausted"
+            }
+            GrantAudienceInstallError::PublicationSpaceExhausted => {
+                "grant-audience publication identity space exhausted"
             }
         };
         f.write_str(s)

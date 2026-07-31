@@ -700,6 +700,25 @@ impl Drop for DemandHandle {
     }
 }
 
+/// How a consumer-Grant transition orders itself against retained artifacts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrantMovementFence {
+    /// The ordinary case: this transition's publication generation.
+    Publication(u64),
+    /// The publication-identity space is EXHAUSTED (OLB-2B.3c-pre step 3).
+    ///
+    /// Reached only by a withdrawal, because an installation at exhaustion is
+    /// refused before it publishes anything. That is what makes unconditional
+    /// retirement sound rather than merely convenient: with no further
+    /// installation publishable, absence is TERMINAL for this scope, so there is
+    /// no successor left to protect. Ordering would be meaningless anyway — the
+    /// generation that would express it cannot be allocated.
+    ///
+    /// Revocation is never refused for want of an identity. Withdrawing
+    /// authority must always be possible; it is the direction that fails closed.
+    Terminal,
+}
+
 /// One consumer-Grant transition, carried to routing with enough identity to
 /// invalidate CONDITIONALLY (OLB-2B.3c-pre items 10/11).
 ///
@@ -726,31 +745,32 @@ pub(crate) struct GrantScopeMovement {
     /// live scopes across an audience rotation, and the one that did not move
     /// must not be churned.
     pub audience_handle: [u8; 32],
-    /// The consumer-Grant PUBLICATION generation of this transition.
+    /// How this transition orders itself against retained artifacts.
     ///
-    /// A reconstruction that observed generation `g` is obsolete with respect to
-    /// this movement iff `g < publication`; anything at or beyond it already
-    /// reflects the transition and is a SUCCESSOR.
+    /// Ordinarily a consumer-Grant PUBLICATION generation: a reconstruction that
+    /// observed generation `g` is obsolete with respect to this movement iff
+    /// `g < publication`. **Strictly less than** — an artifact from THIS
+    /// publication already reflects the transition and must survive it, which is
+    /// exactly the "a demand arriving after publication is safe" case design
+    /// §2A.2 names.
     ///
     /// **It must order absences as well as installations.** An earlier shape
     /// carried `superseded_through`, derived from `install_seq`, and treated an
-    /// `Owner`-stamped artifact on a Grant slot as never-a-successor. That is
-    /// false, and Kyra's production-path probe against `7348529fb` demonstrated
-    /// it: a delayed INSTALL notification destroyed the newer `Unserved`
-    /// artifact a later REMOVAL had produced. `install_seq` orders installations
-    /// only, and an absence has no installation identity to order it by.
+    /// `Owner`-stamped artifact on a Grant slot as never-a-successor. That was
+    /// the first repair, HELD at `7348529fb`: it is false, and Kyra's
+    /// production-path probe demonstrated it — a delayed INSTALL notification
+    /// destroyed the newer `Unserved` artifact a later REMOVAL had produced.
+    /// `install_seq` totally orders installations, not transitions, and an
+    /// absence has no installation identity to be ordered by.
     ///
     /// ```text
     /// install N     publish, [stall before notifying]
     /// (warm)        artifact reconstructed under N
     /// remove N      publish absence, notify -> clears it, re-queues
     /// (rebuild)     newer artifact: Unserved, `Owner`-stamped
-    /// install N     [resumes] -> destroys that newer artifact
+    /// install N     [resumes] -> destroyed that newer artifact
     /// ```
-    ///
-    /// A publication generation orders every transition uniformly, which is what
-    /// makes the fence total.
-    pub publication: u64,
+    pub fence: GrantMovementFence,
 }
 
 impl GrantScopeMovement {
@@ -1069,9 +1089,17 @@ impl NodeOrgRoutingRegistry {
     /// A slot that is retained but holds NO artifact is still re-queued — that is
     /// the whole install direction, and it is harmless coalescing besides.
     /// Everything else is judged by the publication generation the artifact was
-    /// reconstructed under, so an `Unserved` reconstruction is preserved exactly
-    /// when it is NEWER than the notifying transition. Treating absence as
-    /// never-a-successor is the defect Kyra's probe found at `7348529fb`.
+    /// reconstructed under.
+    ///
+    /// Three kinds of survivor, and the wording matters because two earlier
+    /// versions of this comment erased one of them each:
+    ///
+    /// - **this publication's own artifact** — equal generation. A demand that
+    ///   arrived after the publication and before its notification produces one,
+    ///   and it already reflects the transition;
+    /// - a LATER installation's artifact;
+    /// - an equal-or-later ABSENCE artifact. Treating absence as
+    ///   never-a-successor is the defect Kyra's probe found at `7348529fb`.
     ///
     /// **Not keyed on `ScopedDiscoveryState::revision`** (item 11, design §2A.2).
     /// A consumer-Grant transition mutates the grant registry, not the scoped
@@ -1100,9 +1128,21 @@ impl NodeOrgRoutingRegistry {
                 // artifact has nothing to preserve and still owes work, so it is
                 // re-queued: harmless coalescing, since `pending` is a set and a
                 // cold slot needs rebuilding regardless.
+                //
+                // STRICTLY less than. An artifact from THIS publication already
+                // reflects the transition and must survive it — that is the
+                // "a demand arriving after publication is safe" case of §2A.2,
+                // and `<=` would have the notification destroy its own
+                // publication's current artifact.
                 let superseded = match cell.load().as_ref() {
                     None => true,
-                    Some(facts) => facts.grant_publication < movement.publication,
+                    Some(facts) => match movement.fence {
+                        GrantMovementFence::Publication(publication) => {
+                            facts.grant_publication < publication
+                        }
+                        // Absence is terminal here; nothing can supersede it.
+                        GrantMovementFence::Terminal => true,
+                    },
                 };
                 if !superseded {
                     // A LATER installation already published here. Leave it

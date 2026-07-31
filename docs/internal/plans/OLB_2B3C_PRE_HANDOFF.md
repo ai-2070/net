@@ -9,7 +9,8 @@ Written at `8189676a7`. **Step 2 SIGNED by Kyra 2026-07-29 at `a788232bd`**
 Branch **`load-balancing-3`** since the step-2 merge to master.
 
 **This handoff is now nearly spent.** Its remaining job is the step-3 boundary
-and the two HOLD lessons in §2b/§4. Delete it when step 3 signs — steps 1 and 2
+and the HOLD lessons in §2b/§2c/§4 — FOUR HOLDs across steps 2 and 3, each
+finding a defect the author's own witnesses did not. Delete it when step 3 signs — steps 1 and 2
 are both recorded in the authoritative design's §16.0, which is where they
 belong.
 
@@ -88,10 +89,12 @@ Four notes carried forward — each was load-bearing in the independent run:
 
 ## 2c. Kyra's independent review of `fa0b9ddd5` — HOLD, and what closed it
 
-Two defects, both in the notification edge. She independently drove all six
-inverse mutations for W-W1..W-W5 and confirmed them RED, so the original
-witnesses are real — they simply did not cover reordered notifications for
-successive installations of the same Grant id.
+Three HOLDs on step 3 in total — `fa0b9ddd5`, `7348529fb`, `91f1c2e11` — each
+finding a permutation or boundary the previous witness set did not reach. The
+first review confirmed W-W1..W-W5 RED under all six inverse mutations, so those
+witnesses were real; they simply did not cover reordered notifications for
+successive transitions of the same Grant id, nor the equality arm, nor
+identity exhaustion.
 
 **P1 — a delayed notification could retire a SUCCESSOR.** The notification
 carried only `grant_id`, and the invalidation cleared unconditionally. Because
@@ -116,9 +119,9 @@ same id under a rotated-away audience handle. Now exact on
 `(grant_id, audience_handle)`. Witness
 `consumer_grant_movement_preserves_same_id_unaffected_scopes`.
 
-**P1b, from the review of `7348529fb` — the SYMMETRIC permutation.** The first
-repair ordered by `install_seq` and treated an `Owner`-stamped artifact as
-never-a-successor. False, and reproduced dynamically: when the later state is
+**P1b, from the review of `7348529fb` — the SYMMETRIC permutation.**
+`superseded_through` (derived from `install_seq`) **was the first repair and is
+superseded**; it treated an `Owner`-stamped artifact as never-a-successor. False, and reproduced dynamically: when the later state is
 ABSENCE, the `Unserved` artifact IS the successor, and installation identity
 cannot order it.
 
@@ -129,9 +132,29 @@ W-W8:  delayed install  N  -> remove  N    -> preserve the Owner-stamped absence
 
 The fence is now a consumer-Grant PUBLICATION generation, which orders every
 transition uniformly, carried on every reconstruction including `Unserved` ones.
-Bumped AFTER the store and read BEFORE the load, so a recorded generation is
-never newer than the content it was built from. Witness
+Committed AFTER the store and read BEFORE the load, so a recorded generation is
+never newer than the content it was built from — though it is NOT the only
+protection against stale settlement; the commit pin's exact installation-identity
+vector is also load-bearing. Witness
 `a_delayed_install_notification_cannot_retire_a_successor_removal_artifact`.
+
+**Fourth HOLD, on `91f1c2e11`.** Two findings, both closed:
+
+- the publication identity advanced with an unchecked `fetch_add(1) + 1` AFTER
+  the store, so at the ceiling it panicked or aliased to zero with the snapshot
+  ALREADY VISIBLE and no notification delivered. Now reserved before anything is
+  visible and committed after; `u64::MAX` reserved as the terminal marker; an
+  install at exhaustion refuses with a typed `PublicationSpaceExhausted`; a
+  WITHDRAWAL still proceeds under a `Terminal` fence, because refusing to revoke
+  for want of a counter is the one direction that is not fail-closed
+  (W-W12, W-W13);
+- the EQUALITY arm was unwitnessed — all 62 witnesses survived `<` → `<=`.
+  Closed on both authority states (W-W9, W-W10), because the premise that failed
+  at `7348529fb` was authority-state-specific.
+
+Also: the successful `remove_consumer_grant_audience_if_current` branch had no
+witness. Both removal surfaces now share one `withdraw_consumer_grant`, and
+W-W11 covers the successful conditional path regardless.
 
 **ONLY step 3 is under corrective review. 2B.3b and every later OLB slice remain
 UNAUTHORIZED until it signs.**
@@ -252,7 +275,7 @@ net/crates/net/src/adapter/net/
     MeshNode::publish_consumer_grant_snapshot
                                         the ONE consumer publication seam (counted in test)
     oa34b2_query_currentness_tests      W-G9 / W-G10 / W-G10b + assert_no_effect
-  org_routing_wiring_tests.rs           62 witnesses; CI floor MIN=62
+  org_routing_wiring_tests.rs           67 witnesses; CI floor MIN=67
   behavior/org_routing_registry.rs
     ScopedDiscoveryAuthorityStamp       Owner | Grant{id, install_seq, signature, handle}
     ScopedSourceFacts                   facts + the authority that produced them
@@ -313,8 +336,8 @@ cd net/crates/net
 export UNIT_FEATURES="net redex redex-disk cortex netdb meshdb meshos dataforts \
 nat-traversal port-mapping tool batched-ingress cli regex"
 
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,477 expected
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 62, MIN 62
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,482 expected
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 67, MIN 67
 CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" behavior::org_routing::     # 24, MIN 24
 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo clippy --all-features --all-targets -- -D warnings \

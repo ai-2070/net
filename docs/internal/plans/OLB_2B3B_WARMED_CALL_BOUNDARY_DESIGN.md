@@ -734,8 +734,9 @@ Step-3 lineage, held twice:
 ```text
 fa0b9ddd5  wake/invalidation edge + plan correction   <- HELD (P1 successor race, P2 breadth)
 7348529fb  conditional + scope-exact invalidation     <- HELD (P1b absence ordering)
-f91cff2ab  total publication-generation fence + W-W8
-           (candidate head = the docs commit immediately after it)
+f91cff2ab  total publication-generation fence + W-W8  <- HELD (exhaustion, equality arm)
+           reviewed as 91f1c2e11 (its docs commit)
+<next>     checked exhaustion + equality + remove-if-current witnesses
 ```
 
 What step 3 closes, both directions of design §0.1:
@@ -762,6 +763,11 @@ could not close the install direction at all, because it returns cold for
 | `a_delayed_grant_notification_cannot_retire_a_successor_installation` | W-W6 — a delayed transition for N cannot retire an artifact stamped N+1 | clear unconditionally |
 | `consumer_grant_movement_preserves_same_id_unaffected_scopes` | W-W7 — the same id under a rotated-away handle is a different scope | select by `grant_id` alone |
 | `a_delayed_install_notification_cannot_retire_a_successor_removal_artifact` | W-W8 — a delayed INSTALL cannot retire the newer ABSENCE a later removal produced | order by `install_seq`; treat `Owner` as never-a-successor |
+| `a_delayed_install_notification_preserves_its_own_publication_artifact` | W-W9 — the EQUALITY arm, Grant-stamped | `<` → `<=` |
+| `a_delayed_removal_notification_preserves_its_own_absence_artifact` | W-W10 — the EQUALITY arm, absence-stamped | `<` → `<=` |
+| `a_current_lease_removal_publishes_wakes_and_fences` | W-W11 — the SUCCESSFUL conditional-removal branch | a branch-local omission in remove-if-current |
+| `publication_exhaustion_refuses_an_install_without_publishing` | W-W12 — exhaustion refuses an install fail-closed, publishing nothing | advance the identity unchecked, after the store |
+| `publication_exhaustion_still_withdraws_and_fences_terminally` | W-W13 — exhaustion still withdraws, and fences terminally without spinning | refuse revocation at exhaustion; reuse an identity |
 
 W-W3 is the one that constrains the design rather than confirming it: "invalidate
 everything on any Grant movement" satisfies W-W1 and W-W2 perfectly and makes
@@ -797,11 +803,11 @@ successive installations of the same Grant id.
 The two are orthogonal: W-W6 dies only to the unconditional clear, W-W7 only to
 the broad selection.
 
-**A third defect, found by Kyra's review of `7348529fb` (W-W8).** The first
-repair ordered transitions by `superseded_through`, derived from `install_seq`,
-and treated an `Owner`-stamped artifact on a Grant slot as never-a-successor. I
-wrote that comment and believed it. It is false, and her production-path probe
-demonstrated it — the SYMMETRIC permutation of W-W6:
+**Third HOLD, on `7348529fb` (W-W8).** `superseded_through` — derived from
+`install_seq` — **was the first repair and is superseded**; it is named here only
+as history. It treated an `Owner`-stamped artifact on a Grant slot as
+never-a-successor. I wrote that comment and believed it. It is false, and her
+production-path probe demonstrated it — the SYMMETRIC permutation of W-W6:
 
 ```text
 W-W6:  delayed removal N   -> install N+1  -> preserve the Grant-stamped N+1
@@ -815,11 +821,44 @@ absence has no installation identity. The fence is now a consumer-Grant
 every reconstruction records the generation it observed — `Unserved` ones
 included, which is the whole point.
 
-The generation is bumped AFTER the snapshot store and read BEFORE the snapshot
-load. That asymmetry is load-bearing: it makes an artifact's recorded generation
-never NEWER than the content it was built from. Under-stating costs a needless
-rebuild; over-stating would preserve a stale artifact against the movement meant
-to clear it, and only one of those is survivable.
+The generation is committed AFTER the snapshot store and read BEFORE the
+snapshot load. That asymmetry is load-bearing: it makes an artifact's recorded
+generation never NEWER than the content it was built from. Under-stating costs a
+needless rebuild; over-stating would preserve a stale artifact against the
+movement meant to clear it, and only one of those is survivable.
+
+It is **not** the only protection against stale settlement, and should not be
+described as such: the commit pin's exact selected installation-identity vector
+is also load-bearing, and it is what rejects a straddling snapshot whose Grant
+authority actually moved (Kyra, review of `91f1c2e11`).
+
+**Fourth HOLD, on `91f1c2e11` — two findings.**
+
+- **Exhaustion.** The generation advanced with an unchecked `fetch_add(1) + 1`
+  AFTER the snapshot store, so at the ceiling it panicked (debug) or aliased to
+  zero (release) with the new snapshot ALREADY VISIBLE and no notification
+  delivered — a partial publication, and precisely the non-aliasing failure the
+  identity exists to prevent. It is now RESERVED before anything becomes visible
+  and committed after, `u64::MAX` is reserved as the terminal marker and never
+  handed out, an install at exhaustion refuses with a typed
+  `PublicationSpaceExhausted`, and a WITHDRAWAL still proceeds under a
+  `Terminal` fence — refusing to revoke because a counter ran out is the one
+  failure direction that is not fail-closed. Unconditional terminal retirement
+  is sound because no installation can follow exhaustion, so absence is terminal
+  and there is no successor to protect (W-W12, W-W13).
+- **The equality arm was unwitnessed.** All 62 witnesses survived `<` → `<=`.
+  W-W6 and W-W8 cover only `artifact > movement`; neither says anything about
+  `==`, which is the ordinary "a demand arriving after publication is safe" case
+  of §2A.2. Closed on BOTH authority states (W-W9, W-W10) deliberately: the
+  premise that failed at `7348529fb` was authority-state-specific, so closing
+  only the `Grant` arm would leave a future branch free to reopen the `Owner`
+  gap.
+
+Also folded in: the successful `remove_consumer_grant_audience_if_current`
+branch had no witness of its own (W-W5 drives only its stale branch). Both
+removal surfaces now share one `withdraw_consumer_grant`, and W-W11 covers the
+successful conditional path anyway — "they share a helper today" is not a
+property a future edit preserves.
 
 **Capability narrowing was asked for and NOT adopted.** Verified first: a Grant
 slot for a capability the grant does not cover reconstructs as

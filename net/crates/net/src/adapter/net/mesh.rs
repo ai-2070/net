@@ -5520,13 +5520,27 @@ struct ConsumerGrantGate {
     /// publishes) and the routing source (which reads) share, and every
     /// publication happens under the mutex above.
     ///
-    /// **Bumped AFTER the snapshot store, and read BEFORE the snapshot load.**
-    /// Together those give the invariant the movement fence depends on: an
-    /// artifact's recorded generation is never NEWER than the content it was
-    /// built from. Reversing either would let a reconstruction be stamped with a
-    /// generation whose publication it had not actually observed, and the fence
-    /// would then preserve a stale artifact against the very movement meant to
-    /// clear it.
+    /// **Reserved BEFORE the content is made visible, committed AFTER it.**
+    /// Two separate requirements, and both are load-bearing:
+    ///
+    /// - reserving first means a refused transition publishes NOTHING. The
+    ///   earlier shape advanced this counter after the snapshot store with an
+    ///   unchecked `fetch_add(1) + 1`, so at the ceiling it panicked (debug) or
+    ///   aliased to zero (release) with the new snapshot ALREADY VISIBLE and no
+    ///   notification delivered — a partial publication, and exactly the
+    ///   non-aliasing failure this identity exists to prevent (Kyra, review of
+    ///   `91f1c2e11`);
+    /// - committing after the store keeps an artifact's recorded generation from
+    ///   ever being NEWER than the content it was built from. A reconstruction
+    ///   that straddles a publication understates its generation and costs a
+    ///   rebuild; overstating would preserve a stale artifact against the very
+    ///   movement meant to clear it.
+    ///
+    /// Reserve-then-commit is safe as a non-atomic pair because every publication
+    /// holds `mu` above, so this counter only ever advances under that gate.
+    ///
+    /// `u64::MAX` is RESERVED as the terminal marker and never handed out, so a
+    /// live generation can never alias it.
     publications: std::sync::atomic::AtomicU64,
     /// Test-only: fired ONLY when a `try_lock` has actually FAILED, immediately
     /// before blocking on `lock()`.
@@ -5549,6 +5563,28 @@ impl ConsumerGrantGate {
             #[cfg(test)]
             contended_hook: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Reserve the next publication generation WITHOUT advancing the counter, or
+    /// `None` if the space is exhausted.
+    ///
+    /// Checked, never wrapping, never saturating — the same discipline the
+    /// installation identity carries, applied to the counter that orders
+    /// transitions. The caller must hold `mu`; the reservation is only atomic
+    /// with respect to other publishers because they all do.
+    fn reserve_publication(&self) -> Option<u64> {
+        let next = self
+            .publications
+            .load(std::sync::atomic::Ordering::Acquire)
+            .checked_add(1)?;
+        // `u64::MAX` is the terminal marker, never a live identity.
+        (next != u64::MAX).then_some(next)
+    }
+
+    /// Commit a reservation. Called AFTER the content is visible.
+    fn commit_publication(&self, publication: u64) {
+        self.publications
+            .store(publication, std::sync::atomic::Ordering::Release);
     }
 
     /// Take the gate, acknowledging PROVEN contention on the way.
@@ -11188,7 +11224,8 @@ impl MeshNode {
     fn publish_consumer_grant_snapshot(
         &self,
         next: Arc<super::behavior::org_grant_registry::ConsumerGrantSnapshot>,
-    ) -> u64 {
+        reserved: Option<u64>,
+    ) -> super::behavior::org_routing_registry::GrantMovementFence {
         // `AcqRel`, not `Relaxed`: the counter exists precisely so a transient
         // publication is observable, which invites a witness that samples it from
         // ANOTHER thread while one is in flight. Paired with the `Acquire` load
@@ -11200,13 +11237,17 @@ impl MeshNode {
         self.consumer_grant_publications
             .fetch_add(1, Ordering::AcqRel);
         self.consumer_grant_audiences.store(next);
-        // AFTER the store — see `ConsumerGrantGate::publications`. `fetch_add`
-        // returns the PREVIOUS value, so the generation this publication owns is
-        // one beyond it.
-        self.consumer_grant_gate
-            .publications
-            .fetch_add(1, Ordering::AcqRel)
-            + 1
+        // Committed AFTER the store — see `ConsumerGrantGate::publications`.
+        match reserved {
+            Some(publication) => {
+                self.consumer_grant_gate.commit_publication(publication);
+                super::behavior::org_routing_registry::GrantMovementFence::Publication(publication)
+            }
+            // Exhausted, and reachable only by a withdrawal: an installation is
+            // refused before it publishes. Nothing to commit, and nothing left
+            // that could supersede the absence this just published.
+            None => super::behavior::org_routing_registry::GrantMovementFence::Terminal,
+        }
     }
 
     /// Test-only: how many consumer-Grant snapshot publications have occurred.
@@ -11304,6 +11345,26 @@ impl MeshNode {
         }
     }
 
+    /// Test-only: drive the PUBLICATION-identity allocator to its ceiling.
+    ///
+    /// Set to `u64::MAX - 1`, the last value that is itself a live identity: the
+    /// next reservation would land on the reserved terminal marker and must
+    /// therefore refuse.
+    #[cfg(test)]
+    fn exhaust_consumer_grant_publications_for_test(&self) {
+        self.consumer_grant_gate
+            .publications
+            .store(u64::MAX - 1, Ordering::Release);
+    }
+
+    /// Test-only: the publication allocator's current position.
+    #[cfg(test)]
+    fn consumer_grant_publication_for_test(&self) -> u64 {
+        self.consumer_grant_gate
+            .publications
+            .load(Ordering::Acquire)
+    }
+
     /// Test-only: drive the installation-identity allocator to its ceiling, so
     /// exhaustion is reachable without 2^64 installs.
     #[cfg(test)]
@@ -11377,7 +11438,7 @@ impl MeshNode {
         // Scoped so the gate is RELEASED before routing is notified (item 10).
         // Every `return` inside this block is a non-publishing outcome, so each
         // one deliberately leaves without waking anything.
-        let (install_seq, publication) = {
+        let (install_seq, fence) = {
             let _guard = self.consumer_grant_gate.lock();
             let current = self.consumer_grant_audiences.load_full();
             // Settle EVERY ordinary refusal before allocation — idempotence,
@@ -11395,12 +11456,20 @@ impl MeshNode {
                 }
                 PreparedInstall::Ready(slot) => *slot,
             };
+            // The transition identity is reserved BEFORE anything is published,
+            // so an exhausted space refuses without leaving a partial
+            // publication. Reserved before the INSTALLATION identity is
+            // allocated, too: that one is consumed on success, and a refusal
+            // after consuming it would burn a terminal identity for nothing.
+            let Some(publication) = self.consumer_grant_gate.reserve_publication() else {
+                return Err(GrantAudienceInstallError::PublicationSpaceExhausted);
+            };
             // Past this point publication is certain, so claiming the identity
             // cannot be wasted.
             let install_seq = self.allocate_consumer_grant_install_seq()?;
             let next = ConsumerGrantSnapshot::finish_install(prepared, install_seq);
-            let publication = self.publish_consumer_grant_snapshot(Arc::new(next));
-            (install_seq, publication)
+            let fence = self.publish_consumer_grant_snapshot(Arc::new(next), Some(publication));
+            (install_seq, fence)
         };
         // An INSTALL is routing movement in the availability direction: a
         // Grant-scoped slot reconstructed `Unserved` because this grant was not
@@ -11415,7 +11484,7 @@ impl MeshNode {
             &super::behavior::org_routing_registry::GrantScopeMovement {
                 grant_id,
                 audience_handle,
-                publication,
+                fence,
             },
         );
         Ok(ConsumerAudienceInstall::Installed(
@@ -11434,30 +11503,58 @@ impl MeshNode {
     ///
     /// [`remove_consumer_grant_audience_if_current`]: Self::remove_consumer_grant_audience_if_current
     pub fn remove_consumer_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
+        self.withdraw_consumer_grant(grant_id, |_| true)
+    }
+
+    /// The ONE place a consumer Grant is withdrawn (OLB-2B.3c-pre step 3).
+    ///
+    /// Both removal surfaces route through here — unconditional, and
+    /// lease-conditional via `accept`. Centralized because the two previously
+    /// built and published their own movement, so a branch-local omission in
+    /// either would have escaped every witness that drove the other. Kyra's
+    /// review of `91f1c2e11` named exactly that exposure for the successful
+    /// remove-if-current path.
+    ///
+    /// Returns `true` iff absence was published — which is also the only case
+    /// that is routing movement.
+    ///
+    /// **Withdrawal is never refused for want of a transition identity.** At
+    /// exhaustion the absence is published anyway and the movement carries
+    /// [`GrantMovementFence::Terminal`](super::behavior::org_routing_registry::GrantMovementFence::Terminal):
+    /// no installation can follow, so absence is terminal for the scope and
+    /// unconditional retirement cannot destroy a successor. Refusing to revoke
+    /// because a counter ran out would be the one failure direction that is not
+    /// fail-closed.
+    fn withdraw_consumer_grant(
+        &self,
+        grant_id: &[u8; 32],
+        accept: impl Fn(&super::behavior::org_grant_registry::GrantAudienceRecord) -> bool,
+    ) -> bool {
         // Scoped so the gate is RELEASED before routing is notified (item 10).
-        // The transition's exact identity is read from the record being removed,
-        // under the gate, so it names precisely the installation this removal
-        // supersedes — and nothing later.
         let movement = {
             let _guard = self.consumer_grant_gate.lock();
             let current = self.consumer_grant_audiences.load_full();
             let handle = current
                 .get(grant_id)
+                .filter(|record| accept(record))
                 .map(|record| *record.audience_handle());
             match (handle, current.without(grant_id)) {
                 (Some(audience_handle), Some(next)) => {
-                    let publication = self.publish_consumer_grant_snapshot(Arc::new(next));
+                    // Reserved under the gate; `None` means exhausted, and the
+                    // withdrawal proceeds terminally rather than being refused.
+                    let reserved = self.consumer_grant_gate.reserve_publication();
+                    let fence = self.publish_consumer_grant_snapshot(Arc::new(next), reserved);
                     Some(super::behavior::org_routing_registry::GrantScopeMovement {
                         grant_id: *grant_id,
                         audience_handle,
-                        publication,
+                        fence,
                     })
                 }
                 _ => None,
             }
         };
-        // Only a real publication is routing movement. A no-op removal changed
-        // nothing, so it must wake nothing.
+        // Only a real publication is routing movement. A refused or absent
+        // withdrawal changed nothing, so it must wake nothing.
         if let Some(movement) = movement {
             self.note_consumer_grant_movement(&movement);
             return true;
@@ -11479,39 +11576,12 @@ impl MeshNode {
         &self,
         lease: &super::behavior::org_grant_registry::ConsumerAudienceLease,
     ) -> bool {
-        // Scoped so the gate is RELEASED before routing is notified (item 10).
-        let movement = {
-            let _guard = self.consumer_grant_gate.lock();
-            let current = self.consumer_grant_audiences.load_full();
-            match current.get(lease.grant_id()) {
-                // Same grant id, different installation — the lease is stale and
-                // owns nothing here.
-                Some(record) if record.install_seq() != lease.install_seq() => None,
-                Some(record) => {
-                    let audience_handle = *record.audience_handle();
-                    match current.without(lease.grant_id()) {
-                        Some(next) => {
-                            let publication = self.publish_consumer_grant_snapshot(Arc::new(next));
-                            Some(super::behavior::org_routing_registry::GrantScopeMovement {
-                                grant_id: *lease.grant_id(),
-                                audience_handle,
-                                publication,
-                            })
-                        }
-                        None => None,
-                    }
-                }
-                None => None,
-            }
-        };
-        // A STALE lease publishes nothing and must therefore wake nothing —
-        // otherwise a caller holding a superseded lease could churn the exact
-        // slots the current installation is serving.
-        if let Some(movement) = movement {
-            self.note_consumer_grant_movement(&movement);
-            return true;
-        }
-        false
+        // Same withdrawal, with the lease as the acceptance test: same grant id
+        // but a different installation means the lease is STALE and owns nothing
+        // here, so nothing publishes and nothing wakes.
+        self.withdraw_consumer_grant(lease.grant_id(), |record| {
+            record.install_seq() == lease.install_seq()
+        })
     }
 
     /// Whether the caller explicitly supplied this node's identity (OSDK-L N).
