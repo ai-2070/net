@@ -171,8 +171,9 @@ opaque authority-epoch comparison:
 9. per-request sorting of Ready candidates is prohibited; the fallback
    vector is sorted once at rebuild (§9);
 10. exact-provider fan-out is hard-bounded (32 sensed providers per
-    capability, 64 warmed capabilities per client state) with
-    deterministic truncation and `org_sensing_truncated_total` (§7);
+    capability, 64 retained authority-scoped route demands per client
+    state) with deterministic truncation and
+    `org_sensing_truncated_total` (§7);
 11. `OrgClient`'s internals are pinned to four operations — maintain
     candidates, maintain leases, project route sets, select — never a
     mini scheduler (§2, §7);
@@ -833,9 +834,12 @@ project immutable route set
 select one provider
 ```
 
-**Bound the cache.** Service names are caller-controlled: at most **64 distinct
-warmed capabilities per clone family** and **256 retained warmed route slots
-node-wide** (implementation defaults, not public options). At either bound:
+**Bound the cache.** Service names are caller-controlled: at most **64 retained
+authority-scoped route demands per clone family** and **256 retained warmed route
+slots node-wide** (implementation defaults, not public options). A capability
+costs one demand per authority-scoped contributor it needs, so the number of
+warmed capabilities that fit is 64 only in the grantless case — see the §7/§13
+divergence note below. At either bound:
 
 ```text
 organization call still proceeds
@@ -1029,7 +1033,7 @@ sensing/route join.
 Hard bounds:
 
 ```text
-max warmed capabilities per OrgRoutingState clone family: 64
+max retained authority-scoped route demands per OrgRoutingState clone family: 64
 max retained warmed route slots node-wide across all families: 256
 max sensed providers per capability: 32
 ```
@@ -1039,6 +1043,62 @@ current-authority deterministic unsensed cold path and allocates no watcher,
 actor, timer, or cache slot. This is bounded degradation, not call failure.
 Dropping owners in arbitrary order removes only their weak consumer reference;
 the last reference retires the shared slot/lease state.
+
+> ### §7/§13 divergence — the family bound counts DEMANDS (CORRECTED)
+>
+> **Corrected by OLB-2B.3b.** Authoritative design:
+> [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md)
+> §4 and §13.
+>
+> **What this plan got wrong.** It said "max warmed capabilities per
+> `OrgRoutingState` clone family: 64" in four places, and "64 warmed capabilities
+> per client state" in a fifth. No layer has ever enforced a bound on
+> capabilities. The registry bounds **demand handles**, and a warmed capability
+> costs one handle per AUTHORITY-SCOPED contributor it needs:
+>
+> ```text
+> Owner
+> + each Grant audience THIS FAMILY ACTUALLY LEASED FOR DISCOVER
+> ```
+>
+> So a grantless family warms 64 capabilities and a family with two leased
+> DISCOVER grants per capability warms 21. The capability count is a
+> **consequence** of the demand budget, never an input to it. Stating the bound
+> in capabilities described a limit nothing implements, and the gap always
+> favoured over-retention — the direction that is silently wrong.
+>
+> **A capability entry is `<= 64` structurally**, not by a second counter. Every
+> entry retains at least the Owner demand, so the entry count cannot exceed the
+> demand budget however cheap the entries are. A separately enforced entry cap
+> would be a second bound free to disagree with the first.
+>
+> **The demand set is what the family actually LEASED, and it is acquired
+> all-or-none.** Two exclusions are load-bearing:
+>
+> - a DISCOVER grant with no installed audience secret is **not** a demand. It
+>   yields no consumer audience, so the source can only ever answer `Unserved` —
+>   demanding it retains a contributor that can never contribute while consuming
+>   family and node budget permanently;
+> - an INVOKE-only grant is **not** a source demand. It stays in the family's
+>   credential set for INVOKE matching. `DISCOVER ≠ INVOKE ≠ SENSE`.
+>
+> Acquisition is one registry transaction: family capacity for the whole set,
+> node capacity for every new distinct slot, every incarnation reserved without
+> wrap or alias, then all references retained. **On any refusal, zero handles are
+> retained, zero partial entries published, and zero work enqueued.** A kept
+> prefix would warm a capability whose Owner plane is retained and whose Grant
+> plane is not, which reads downstream as a route that legitimately found no
+> granted provider — a silent authority narrowing presenting as a routing
+> preference.
+>
+> **The three refusals are three different policies**, and collapsing them breaks
+> in a different direction each time:
+>
+> | Refusal | Policy | Why not the others |
+> |---|---|---|
+> | family at capacity | **sticky** for the family's lifetime | entries are never evicted, so a spent budget stays spent; retrying re-derives and re-locks forever |
+> | node at capacity | **retryable**, gated on a node capacity generation that advances only on slot RETIREMENT | the bound is node-wide, so an ungated retry has every family hammering one lock; gating on retained-slot COUNT misses a retire-then-demand pair |
+> | identity exhausted | **terminal — never retry** | exhaustion is irreversible by construction, so no later signal can make an attempt worth taking |
 
 One long-lived node-owned routing actor consumes all families' dirty work. It
 owns a bounded dirty-capability set plus `RebuildAll`, one single-flight build,
@@ -1139,7 +1199,7 @@ options):
 
 ```text
 max sensed providers per capability: 32
-max warmed capabilities per OrgRoutingState clone family: 64
+max retained authority-scoped route demands per OrgRoutingState clone family: 64
 max retained warmed route slots node-wide: 256
 ```
 
@@ -1699,9 +1759,9 @@ Exit witnesses:
   scan, no sort, and no registration emission** (instrumented
   witness);
 - 1,024 indexed rows + one affected capability: rebuild visits only that bucket
-  and performs ZERO descriptor decodes after ingest; 64 warmed capabilities and
-  many independent clients do not multiply store scans or shared base-fact
-  builds;
+  and performs ZERO descriptor decodes after ingest; a family's full 64 retained
+  route demands and many independent clients do not multiply store scans or
+  shared base-fact builds;
 - many independent clients for the same node/capability observe one shared
   discovery/sensing/route base projection, one source rebuild, and one underlying
   exact-interest registration; last consumer alone retires it;

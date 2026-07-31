@@ -39,9 +39,17 @@ use super::org_scoped_ingest::CapabilityAudienceScope;
 use super::org_scoped_store::{DirtyCapabilities, PrivateCapabilityProvider};
 
 /// Max demand handles ONE clone family may hold.
-const MAX_HANDLES_PER_FAMILY: usize = 64;
+///
+/// Handles, not capabilities. One warmed capability costs one handle per
+/// AUTHORITY-SCOPED contributor it needs — Owner plus every DISCOVER audience
+/// the family actually leased for it — so a family holding two leased DISCOVER
+/// grants per capability warms ~21 capabilities, not 64. The plan's older
+/// "64 warmed capabilities per clone family" wording described a bound this
+/// registry has never enforced; OLB-2B.3b corrects it there to
+/// "64 retained authority-scoped route demands".
+pub(crate) const MAX_HANDLES_PER_FAMILY: usize = 64;
 /// Max distinct retained node slots.
-const MAX_NODE_SLOTS: usize = 256;
+pub(crate) const MAX_NODE_SLOTS: usize = 256;
 /// Max slots rebuilt in ONE synchronous application. Work beyond this stays
 /// authoritative in `pending` and re-marks, so a 256-slot rebuild becomes several
 /// yielding quanta rather than one unbroken burst.
@@ -618,6 +626,28 @@ pub(crate) struct NodeOrgRoutingRegistry {
     source: Arc<dyn SlotSource>,
     work: Arc<RegistryWork>,
     metrics: Arc<RegistryMetrics>,
+    /// Advances every time a retained slot is RETIRED, and only then
+    /// (OLB-2B.3b §9).
+    ///
+    /// `NodeAtCapacity` is the one retryable refusal, and this is what a
+    /// refused family gates its retry on: node capacity can only have become
+    /// available by a slot going away. Without it a family that missed at the
+    /// node bound would re-derive its demand set, re-sort it and re-take the
+    /// registry lock on EVERY subsequent cold call for that capability — the
+    /// bound is node-wide, so a node at 256 slots would have every family
+    /// hammering the one lock the warmed path exists to avoid.
+    ///
+    /// Deliberately NOT `slots.len()`: a retire-then-demand pair leaves the
+    /// length equal while capacity genuinely moved, and a family comparing
+    /// lengths would conclude nothing had changed and never retry. It is also
+    /// NOT advanced on demand — growth cannot free capacity, so advancing there
+    /// would only manufacture pointless retries.
+    ///
+    /// Read lock-free, mutated under the registry lock. Publishing it AFTER the
+    /// retirement is committed (the `Release` half of the `AcqRel`) is what
+    /// makes an observer that sees the new generation able to see the freed
+    /// slot too.
+    node_capacity_generation: AtomicU64,
 }
 
 /// A clone family: one private identity and one shared 64-handle budget.
@@ -634,6 +664,12 @@ pub(crate) struct NodeOrgRoutingRegistry {
 // handles is the warmed-call consumer, which is deliberately outside the OLB-2B
 // entry boundary (Kyra). The registry's REAL consumer — the supervised actor
 // driving `DirtyApply` — is fully live and node-wired in E3c.
+//
+// OLB-2B.3b moved the boundary one layer, and no further: `org_routing_state`
+// now owns this surface, so `demand_set` and `RoutingFamily` have an in-crate
+// consumer. That consumer is itself dark, because what reaches it is
+// `MeshNode::call` in OLB-2B.3d. The allows below therefore stay, and they stay
+// for a reason that is now one hop away rather than two.
 //
 // These allows are therefore permanent-until-warmed-calls and item-scoped. They
 // are NOT the E1/E2/E3a/E3b module-wide allowances, which are gone.
@@ -652,9 +688,22 @@ impl RoutingFamily {
         self.registry.demand(self.id, key)
     }
 
+    /// Acquire a COMPLETE demand set atomically, or nothing (OLB-2B.3b §4.1).
+    pub(crate) fn demand_set(
+        &self,
+        keys: Vec<SlotKey>,
+    ) -> Result<Vec<DemandHandle>, DemandRefused> {
+        self.registry.demand_set(self.id, keys)
+    }
+
     /// Handles this family currently holds.
     pub(crate) fn handles(&self) -> usize {
         self.registry.inner.lock().family_handles(self.id)
+    }
+
+    /// The node capacity generation this family's refusals gate retries on.
+    pub(crate) fn node_capacity_generation(&self) -> u64 {
+        self.registry.node_capacity_generation()
     }
 }
 
@@ -685,9 +734,13 @@ impl DemandHandle {
     /// accessor that looks authoritative and is not is a trap, and adding a
     /// lock-free twin would re-lay it under a friendlier name.
     ///
-    /// The allow is scoped to this ONE method and names its consumer: the warmed
-    /// call path (OLB-2B.3b), which is the next slice. Per the E3c discipline, a
-    /// leftover allow here after 2B.3b lands means that consumer never arrived.
+    /// The allow is scoped to this ONE method and names its consumer: the
+    /// FAMILY PROJECTION, which reads the contributing artifacts and narrows
+    /// them into one route set. That is OLB-2B.3d, not 2B.3b — 2B.3b's
+    /// `CapabilityRouteHandle` OWNS the demand set without reading a single
+    /// artifact through it, which is exactly why the allow survived that slice.
+    /// Per the E3c discipline, a leftover allow here after 2B.3d lands means
+    /// that consumer never arrived.
     #[allow(dead_code)]
     pub(crate) fn base_facts_unvalidated(&self) -> Option<Arc<SlotBaseFacts>> {
         self.facts.load_full()
@@ -841,7 +894,13 @@ impl NodeOrgRoutingRegistry {
             source,
             work,
             metrics,
+            node_capacity_generation: AtomicU64::new(0),
         })
+    }
+
+    /// The node capacity generation (OLB-2B.3b §9). See the field.
+    pub(crate) fn node_capacity_generation(&self) -> u64 {
+        self.node_capacity_generation.load(Ordering::Acquire)
     }
 
     /// Mint a new clone family with its own private identity and handle budget.
@@ -967,6 +1026,149 @@ impl NodeOrgRoutingRegistry {
         })
     }
 
+    /// Acquire a family's COMPLETE demand set for one capability entry, or
+    /// nothing at all (OLB-2B.3b §4.1).
+    ///
+    /// The all-or-none property is the whole point, and it is a CORRECTNESS
+    /// property rather than a tidiness one. A capability's demand set is
+    /// `Owner + every DISCOVER audience the family actually leased`, and each
+    /// member contributes discovery provenance the final route is built from. A
+    /// kept prefix would warm a capability whose Owner plane is retained and
+    /// whose Grant plane is not — which does not read as a failure anywhere
+    /// downstream. It reads as a route that legitimately found no granted
+    /// provider, i.e. a silent authority narrowing presenting as a routing
+    /// preference (§4.1).
+    ///
+    /// So every refusal is decided BEFORE anything is mutated, and after the
+    /// last refusal the loop cannot fail:
+    ///
+    /// ```text
+    /// sort + deduplicate
+    /// → ONE registry acquisition
+    ///     → family capacity for the WHOLE set
+    ///     → node capacity for every NEW distinct slot
+    ///     → reserve every required incarnation, contiguously, no wrap
+    ///     → retain all references
+    /// → mark work once
+    /// ```
+    ///
+    /// Deduplicating first is not cosmetic either: a repeated key would reserve
+    /// two handles against the family bound and count two new slots against the
+    /// node bound, so a set that fits could be refused for capacity it never
+    /// needed.
+    ///
+    /// This is NOT `demand` in a loop. That version consumes an identity per
+    /// new slot before it discovers the refusal, retires those slots when the
+    /// caller drops the prefix, and leaves the node's monotone id space
+    /// permanently advanced by a call that retained nothing.
+    #[allow(dead_code)] // consumer: `OrgRoutingState` (OLB-2B.3b), still dark.
+    fn demand_set(
+        self: &Arc<Self>,
+        family: FamilyId,
+        keys: Vec<SlotKey>,
+    ) -> Result<Vec<DemandHandle>, DemandRefused> {
+        let mut keys = keys;
+        keys.sort();
+        keys.dedup();
+
+        let mut queued = false;
+        let cells = {
+            let mut inner = self.inner.lock();
+
+            // Family capacity, for the whole set at once.
+            if inner.family_handles(family) + keys.len() > MAX_HANDLES_PER_FAMILY {
+                self.metrics
+                    .refused_family_at_capacity
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(DemandRefused::FamilyAtCapacity);
+            }
+
+            // Node capacity, counting only slots this set would CREATE. Keys
+            // already retained by some family cost no node capacity, exactly as
+            // in the single-key path — a live slot is never evicted.
+            let new_slots = keys
+                .iter()
+                .filter(|key| !inner.slots.contains_key(key))
+                .count();
+            if inner.slots.len() + new_slots > MAX_NODE_SLOTS {
+                self.metrics
+                    .refused_node_at_capacity
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(DemandRefused::NodeAtCapacity);
+            }
+
+            // Reserve every incarnation this set needs as ONE contiguous block,
+            // checked, before the first mutation. `allocate_id` per slot inside
+            // the loop would be equivalent only if the loop could not fail —
+            // and the reason it cannot fail is precisely this reservation.
+            let Some(reserved_through) = inner.next_id.checked_add(new_slots as u64) else {
+                self.metrics
+                    .refused_id_space_exhausted
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(DemandRefused::IdSpaceExhausted);
+            };
+            let mut next_incarnation = inner.next_id;
+            inner.next_id = reserved_through;
+
+            // Every refusal is above this line. Nothing below can fail, so
+            // nothing below needs an unwind path.
+            let mut cells = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let cell = match inner.slots.get_mut(key) {
+                    Some(slot) => {
+                        slot.refs += 1;
+                        slot.facts.clone()
+                    }
+                    None => {
+                        next_incarnation += 1;
+                        let cell = Arc::new(ArcSwapOption::empty());
+                        inner.slots.insert(
+                            key.clone(),
+                            Slot {
+                                incarnation: next_incarnation,
+                                refs: 1,
+                                facts: cell.clone(),
+                            },
+                        );
+                        inner
+                            .slots_by_capability
+                            .entry(key.capability)
+                            .or_default()
+                            .insert(key.clone());
+                        inner.pending.insert(key.clone());
+                        queued = true;
+                        cell
+                    }
+                };
+                *inner
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .entry(key.clone())
+                    .or_insert(0) += 1;
+                cells.push(cell);
+            }
+            debug_assert_eq!(next_incarnation, reserved_through, "reservation is exact");
+            cells
+        };
+
+        if queued {
+            // ONE wake for the whole set: the actor's queue is the authoritative
+            // `pending`, and it already holds every new identity.
+            self.work.mark();
+        }
+        Ok(keys
+            .into_iter()
+            .zip(cells)
+            .map(|(key, facts)| DemandHandle {
+                registry: self.clone(),
+                family,
+                key,
+                facts,
+            })
+            .collect())
+    }
+
     /// Release one handle. The LAST reference retires the slot; a re-demand then
     /// allocates a FRESH incarnation, so work in flight cannot resurrect it.
     #[allow(dead_code)]
@@ -1000,6 +1202,10 @@ impl NodeOrgRoutingRegistry {
                 }
             }
             self.metrics.slots_retired.fetch_add(1, Ordering::AcqRel);
+            // Node capacity genuinely moved. Published while the registry lock
+            // still covers the removal, so an observer that reads the new
+            // generation cannot then find the slot still there.
+            self.node_capacity_generation.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -1356,6 +1562,26 @@ impl NodeOrgRoutingRegistry {
 
     pub(crate) fn pending_slots(&self) -> usize {
         self.inner.lock().pending.len()
+    }
+
+    /// Test-only: the high-water mark of the monotone identity allocator.
+    ///
+    /// The no-effect assertion for a refused demand set has to be TOTAL —
+    /// {slots, pending, handles, identities} — and the identity component is
+    /// the one a naive `demand`-in-a-loop implementation silently fails while
+    /// every other component looks clean, because the prefix it retained is
+    /// released again on the error path (OLB-2B.3b, W-A5; the same lesson as
+    /// step 1's `300e80f6c`).
+    #[cfg(test)]
+    pub(crate) fn allocated_ids_for_test(&self) -> u64 {
+        self.inner.lock().next_id
+    }
+
+    /// Test-only: drive the identity allocator to exhaustion, so a witness can
+    /// reach the TERMINAL refusal without minting 2^64 slots.
+    #[cfg(test)]
+    pub(crate) fn exhaust_ids_for_test(&self) {
+        self.inner.lock().next_id = u64::MAX;
     }
 }
 
@@ -2334,6 +2560,313 @@ mod tests {
             family.demand(key(1, "nrpc:a")).is_ok(),
             "sharing a retained slot allocates nothing"
         );
+    }
+
+    // ------------------------------- OLB-2B.3b: atomic demand-set acquisition
+
+    /// The TOTAL state a refused acquisition must leave untouched.
+    ///
+    /// Total on purpose (step 1's `300e80f6c` lesson): a witness that asserts a
+    /// SUBSET of {slots, pending, handles, identities, retirements} passes
+    /// against the naive `demand`-in-a-loop implementation, whose prefix IS
+    /// released on the error path — so slots and handles come back to their
+    /// starting values and only the identity space and the retirement counter
+    /// still show what happened.
+    #[derive(Debug, PartialEq, Eq)]
+    struct NoEffect {
+        slots: usize,
+        pending: usize,
+        handles: usize,
+        ids: u64,
+        retired: u64,
+    }
+
+    fn no_effect(f: &Fixture, family: &RoutingFamily) -> NoEffect {
+        NoEffect {
+            slots: f.registry.retained_slots(),
+            pending: f.registry.pending_slots(),
+            handles: family.handles(),
+            ids: f.registry.allocated_ids_for_test(),
+            retired: f.metrics.slots_retired(),
+        }
+    }
+
+    fn set(seeds: &[u8], tag: &str) -> Vec<SlotKey> {
+        seeds.iter().map(|s| key(*s, tag)).collect()
+    }
+
+    /// W-A1 — the family bound is checked for the WHOLE set, and a refusal
+    /// retains nothing.
+    ///
+    /// The set is deliberately larger than the remaining budget by ONE, with
+    /// several NEW keys ahead of the one that does not fit. That is the schedule
+    /// a per-key loop gets wrong: it admits the prefix, mints an incarnation for
+    /// each, and only then discovers the bound.
+    #[test]
+    fn a_demand_set_past_the_family_bound_retains_nothing() {
+        let f = fixture();
+        let family = f.family();
+        let mut held = Vec::new();
+        for i in 0..62u32 {
+            held.push(
+                family
+                    .demand(key(1, &format!("nrpc:fill-{i}")))
+                    .expect("fill"),
+            );
+        }
+        assert_eq!(family.handles(), 62);
+        let before = no_effect(&f, &family);
+
+        assert_eq!(
+            family.demand_set(set(&[10, 11, 12], "nrpc:wide")).err(),
+            Some(DemandRefused::FamilyAtCapacity),
+            "62 + 3 exceeds the 64-handle family budget"
+        );
+        assert_eq!(
+            no_effect(&f, &family),
+            before,
+            "a refused set retains no slot, queues no work, spends no handle, \
+             consumes no identity and retires nothing"
+        );
+        assert_eq!(f.metrics.refused_family_at_capacity(), 1);
+
+        // The bound is exact, not conservative: a set that FITS still goes
+        // through, so the refusal above was the budget and not the batching.
+        let fits = family
+            .demand_set(set(&[10, 11], "nrpc:wide"))
+            .expect("62 + 2 fits exactly");
+        assert_eq!(fits.len(), 2);
+        assert_eq!(family.handles(), 64);
+    }
+
+    /// W-A2 — the node bound is checked for every NEW distinct slot, and a
+    /// refusal retains nothing.
+    #[test]
+    fn a_demand_set_past_the_node_bound_retains_nothing() {
+        let f = fixture();
+        // Fill the node to 255 with four families, none of which may exceed 64.
+        let mut fillers = Vec::new();
+        let mut held = Vec::new();
+        for chunk in 0..4u32 {
+            let filler = f.family();
+            for i in 0..64u32 {
+                let n = chunk * 64 + i;
+                if n == 255 {
+                    break;
+                }
+                held.push(
+                    filler
+                        .demand(key(2, &format!("nrpc:node-{n}")))
+                        .expect("fill"),
+                );
+            }
+            fillers.push(filler);
+        }
+        assert_eq!(f.registry.retained_slots(), 255);
+
+        let family = f.family();
+        let before = no_effect(&f, &family);
+        assert_eq!(
+            family.demand_set(set(&[20, 21], "nrpc:pair")).err(),
+            Some(DemandRefused::NodeAtCapacity),
+            "255 + 2 new slots exceeds the 256-slot node bound"
+        );
+        assert_eq!(
+            no_effect(&f, &family),
+            before,
+            "the FIRST of the two must not be retained"
+        );
+        assert_eq!(f.metrics.refused_node_at_capacity(), 1);
+
+        // One new slot still fits — so the refusal counted the set, not the call.
+        let one = family
+            .demand_set(set(&[20], "nrpc:pair"))
+            .expect("255 + 1 fits");
+        assert_eq!(one.len(), 1);
+        assert_eq!(f.registry.retained_slots(), 256);
+    }
+
+    /// W-A2b — an ALREADY-RETAINED key costs no node capacity, so a set that
+    /// shares slots with another family is admitted at the bound.
+    ///
+    /// The control for W-A2: without it, "count every key" and "count every NEW
+    /// key" both refuse the case above, and the witness would not distinguish
+    /// the implementation from a strictly-worse one that never shares.
+    #[test]
+    fn a_demand_set_over_retained_slots_costs_no_node_capacity() {
+        let f = fixture();
+        let mut fillers = Vec::new();
+        let mut held = Vec::new();
+        for chunk in 0..4u32 {
+            let filler = f.family();
+            for i in 0..64u32 {
+                held.push(
+                    filler
+                        .demand(key(2, &format!("nrpc:node-{}", chunk * 64 + i)))
+                        .expect("fill"),
+                );
+            }
+            fillers.push(filler);
+        }
+        assert_eq!(f.registry.retained_slots(), 256, "the node is FULL");
+
+        let family = f.family();
+        let shared = family
+            .demand_set(vec![key(2, "nrpc:node-0"), key(2, "nrpc:node-1")])
+            .expect("sharing retained slots needs no node capacity");
+        assert_eq!(shared.len(), 2);
+        assert_eq!(f.registry.retained_slots(), 256, "and created nothing");
+        assert_eq!(f.metrics.refused_node_at_capacity(), 0);
+    }
+
+    /// W-A3 — exhaustion refuses the whole set and consumes no identity.
+    #[test]
+    fn an_exhausted_identity_space_refuses_a_whole_demand_set() {
+        let f = fixture();
+        let family = f.family();
+        let _live = family.demand(key(1, "nrpc:a")).expect("a");
+        f.registry.exhaust_ids_for_test();
+        let before = no_effect(&f, &family);
+
+        assert_eq!(
+            family.demand_set(set(&[30, 31], "nrpc:fresh")).err(),
+            Some(DemandRefused::IdSpaceExhausted),
+            "two new slots need two incarnations and there are none"
+        );
+        assert_eq!(no_effect(&f, &family), before, "and nothing moved");
+        assert_eq!(f.metrics.refused_id_space_exhausted(), 1);
+
+        // A set over ONLY retained slots needs no incarnation, so exhaustion
+        // does not refuse it. The control that stops "refuse everything once
+        // exhausted" from passing this witness.
+        let shared = family
+            .demand_set(vec![key(1, "nrpc:a")])
+            .expect("a retained slot needs no fresh identity");
+        assert_eq!(shared.len(), 1);
+    }
+
+    /// W-A4 — duplicate keys collapse to one slot and one handle each.
+    ///
+    /// The single-key `demand` deliberately counts a repeat as a second handle
+    /// (re-demanding must not bypass the bound). A demand SET is a set: the same
+    /// scope named twice is one contributor, and charging it twice would refuse
+    /// families for capacity they never needed.
+    #[test]
+    fn duplicate_keys_in_a_demand_set_collapse() {
+        let f = fixture();
+        let family = f.family();
+        let handles = family
+            .demand_set(vec![
+                key(1, "nrpc:dup"),
+                key(1, "nrpc:dup"),
+                key(2, "nrpc:dup"),
+                key(1, "nrpc:dup"),
+            ])
+            .expect("acquired");
+
+        assert_eq!(handles.len(), 2, "four keys, two distinct scopes");
+        assert_eq!(family.handles(), 2, "and two handles against the budget");
+        assert_eq!(f.registry.retained_slots(), 2);
+        assert_eq!(
+            f.registry.allocated_ids_for_test(),
+            3,
+            "one identity for the family and one per distinct slot — not per key"
+        );
+    }
+
+    /// W-A5 — a refusal reached AFTER the identity space was consulted still
+    /// consumes no identity, and the set is ordered so a per-key loop provably
+    /// would.
+    ///
+    /// The family holds 63 of 64 handles and asks for three NEW keys. A loop
+    /// admits the first (63 < 64), minting an incarnation, and refuses the
+    /// second. The prefix handle is then dropped, the slot retires, and every
+    /// count returns to its starting value EXCEPT the identity high-water mark
+    /// and the retirement counter — which is exactly why the assertion is total.
+    #[test]
+    fn a_refusal_after_identities_are_considered_consumes_none() {
+        let f = fixture();
+        let family = f.family();
+        let mut held = Vec::new();
+        for i in 0..63u32 {
+            held.push(
+                family
+                    .demand(key(1, &format!("nrpc:fill-{i}")))
+                    .expect("fill"),
+            );
+        }
+        let before = no_effect(&f, &family);
+        assert_eq!(before.handles, 63);
+
+        assert_eq!(
+            family.demand_set(set(&[40, 41, 42], "nrpc:late")).err(),
+            Some(DemandRefused::FamilyAtCapacity)
+        );
+        let after = no_effect(&f, &family);
+        assert_eq!(
+            after.ids, before.ids,
+            "the identity space is untouched — the component a loop leaks"
+        );
+        assert_eq!(
+            after.retired, before.retired,
+            "and nothing was created only to be retired again"
+        );
+        assert_eq!(after, before, "totally, not just in those two components");
+    }
+
+    /// W-A6 — a successful acquisition marks the actor ONCE and queues every new
+    /// identity, so the set is warmed by one pass rather than one pass per key.
+    #[test]
+    fn a_successful_demand_set_queues_every_key_and_marks_once() {
+        let f = fixture();
+        let family = f.family();
+        let handles = family
+            .demand_set(set(&[50, 51, 52], "nrpc:batch"))
+            .expect("acquired");
+        assert_eq!(handles.len(), 3);
+        assert_eq!(f.registry.pending_slots(), 3, "every key owes work");
+
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(
+            matches!(outcome, ApplyOutcome::Current { .. }),
+            "{outcome:?}"
+        );
+        for seed in [50u8, 51, 52] {
+            assert!(
+                f.registry
+                    .base_facts_unvalidated(&key(seed, "nrpc:batch"))
+                    .is_some(),
+                "the whole set is warmed by ONE pass"
+            );
+        }
+    }
+
+    /// The demand set arrives in deterministic key order, Owner scopes first.
+    ///
+    /// §3.1 projects Owner pool first and then Grant pools; a handle vector in
+    /// call order would make that ordering the caller's problem.
+    #[test]
+    fn a_demand_set_is_ordered_owner_scopes_first() {
+        let f = fixture();
+        let family = f.family();
+        let grant = PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
+            grant_id: [9u8; 32],
+            audience_handle: [9u8; 32],
+        })
+        .expect("grant scopes are private");
+        let cap = CapabilityAuthorityId::for_tag("nrpc:order");
+        let handles = family
+            .demand_set(vec![
+                SlotKey {
+                    scope: grant.clone(),
+                    capability: cap,
+                },
+                key(1, "nrpc:order"),
+            ])
+            .expect("acquired");
+
+        assert_eq!(handles[0].key, key(1, "nrpc:order"), "Owner first");
+        assert_eq!(handles[1].key.scope, grant, "Grant after");
     }
 
     // -------------------------------------------------------------- lifecycle
