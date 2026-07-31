@@ -28,6 +28,19 @@ Line numbers reflect `master` at audit time and may drift.
 > `AuthGuard`-namespace finding to Info (I1); narrowed the registry-less finding
 > to direct `MeshNode` embedders (L1). ID map from rev 1: `H2 → H3`,
 > `M1 → M1`, `M2 → M2`, `L1 → I1`, `L2 → L1`, `I1 → I2`.
+>
+> **Revision (rev 3).** Four corrections after a second review, no IDs changed.
+> H2: removed the claim that overwriting `<service>.requests` costs an
+> invocation gate — that gate is already inert under H1 — and rescoped the
+> finding to reply-side ACLs and config integrity. M4: the failing publish drops
+> the *delivery*, not the subscriber, which composes into a permanent
+> queue-group DoS that no sweep can clear. M3: moved the fix from
+> `verify_inner` to `check_time_bounds`, the seam that actually covers every
+> receiver path the finding claims. H3: stated the roster-fallback trigger
+> exactly (a bridge-cache miss alone does not suffice; the global reverse index
+> can still resolve). Plus three precision edits — nRPC's independent frame
+> checks in H1, origin-vs-node in H3's fix, and the sweep's cache dependency in
+> the "found sound" list.
 
 ## Summary
 
@@ -63,7 +76,7 @@ They are gaps **around** it. Three themes:
 | M1 | Medium | Channel auth | Prefix configs gate and retain on the sentinel hash — accept-then-fail-closed, a persistent queue-group DoS, and unusable `set_publish_chain` |
 | M2 | Medium | Channel auth / availability | Queue-group membership is unauthenticated — a subscriber can steal another group member's work |
 | M3 | Medium | Identity | `MAX_TOKEN_TTL_SECS` is issuance-only; receivers accept arbitrarily long remote TTLs |
-| M4 | Medium | Channel auth | Registry without `TokenCache`: subscribe accepts, first publish always denies; the docs say it always rejects |
+| M4 | Medium | Channel auth | Registry without `TokenCache`: subscribe accepts but every publish denies, stranding a rostered peer permanently; the docs say it always rejects |
 | L1 | Low | Defaults | A registry-less `MeshNode` accepts every `Subscribe` and publishes every channel as open |
 | I1 | Info | Channel auth / storage | The `AuthGuard` exact ACL is one namespace shared by four readers under unconstrained `u64` keys |
 | I2 | Info | Docs | The "presented tokens are installed into `TokenCache`" contract is stale in several places |
@@ -116,7 +129,14 @@ self-attested; it is absent on both ends.
   stream id and sends it to a subscriber. No token, no capability, no roster
   entry.
 - **Impact**: events forged by an unauthorized peer are delivered to the
-  subscriber's consumer indistinguishably from the authorized publisher's.
+  subscriber's consumer indistinguishably from the authorized publisher's. That
+  is unqualified for **generic** channel events, which reach the shard queue
+  with no sender or channel attribution at all. nRPC traffic is harder to forge
+  end-to-end — the dispatcher matches the in-payload `RpcRouteV1` canonical
+  hash, and the client fold checks `call_id` and the expected session peer
+  (`cortex/rpc.rs:4045-4070`) — so an injected frame there must additionally
+  satisfy those. Neither is a channel ACL, and neither applies to the generic
+  event plane; the channel-auth bypass is real in both cases.
   `token_roots` + `TokenScope::PUBLISH` and `publish_caps` protect a channel's
   integrity only against nodes running unmodified code — the check lives on the
   machine with the incentive to skip it. Subscribe-side auth (who may *read*) is
@@ -205,8 +225,22 @@ operator installs strict request/reply ACL
 ```
 
 This hits the **request** channel (`<service>.requests`) as well as the reply
-family, so it is broader than H3 — an operator who token-gated who may *invoke*
-a service loses that gate the moment they serve it.
+family, so it is broader than H3 in surface — but the two halves differ in live
+impact, and the request half must not be overstated. **Overwriting the request
+config does not newly remove an invocation gate, because that gate is already
+inert under H1**: `publish_initial_request` sends via `publish_to_peer`
+(`mesh_rpc.rs:1961-1979`), which never consults a `ChannelConfig`, and no
+receive-side channel gate exists. A strict `<service>.requests` ACL does not
+control who may invoke the service today, preserved or not. (nRPC invocation is
+gated separately, by the capability fold's `may_execute` — a different
+mechanism, out of this finding's scope.)
+
+So the live impact concentrates on the reply side and on config integrity:
+reply-prefix subscription ACLs, capability-only or token-gated reply
+configurations, and any present or future roster-based consumer of either
+config. Preserving the request config is necessary configuration hygiene and
+prerequisite work — it becomes load-bearing the moment H1 adds receive-side
+publish authority — but on its own it enforces nothing.
 
 **2. `register_channel_prefix` does not exist.** It appears exactly once in the
 tree — in that doc comment. There is no such method on `Mesh`. The lower-level
@@ -290,10 +324,21 @@ and a malicious peer reads them via the raw shard API or a custom inbound
 dispatcher — neither of which consults the pending-call binding. So the accurate
 statement is: *a public-mode RPC service can disclose full response bodies to
 any mesh peer willing to read its own event plane directly, whenever the
-server's direct route to the caller misses.* Both triggers are ordinary
-operation, not attack preconditions — route-cache eviction under concurrency,
-and `NoSession` when the caller reconnects under a new NodeId (the case the
-fallback exists to serve).
+server's direct route to the caller misses.*
+
+The trigger condition must be stated exactly, since it drives exploit
+frequency. Resolution is `target_hint.or_else(|| mesh.get_node_by_origin_hash(caller_origin))`
+(`mesh_rpc.rs:2871-2873`), so a bridge-cache miss **alone is not sufficient** —
+the global reverse index can still recover a live direct target. The fallback
+fires only when:
+
+1. the bridge-cache hint is absent or evicted **and** the global reverse index
+   yields no usable route; or
+2. a resolved target returns `PeerPublishOutcome::NoSession` at send time.
+
+Both are ordinary operation rather than attack preconditions — (1) under
+route-cache pressure with concurrency, (2) when the caller reconnected under a
+new NodeId, which is the case the fallback was added to serve.
 
 - **Fix**: (a) scope the prefix — admit a `<service>.replies.<X>` subscribe only
   when `X` equals the subscribing peer's **pinned** `origin_hash`, the value
@@ -301,7 +346,11 @@ fallback exists to serve).
   (b) make public RESPONSE `DirectOnly` too, accepting the reconnect-window drop
   AV-5 traded away. (a) is better — it fixes the channel rather than one
   consumer, and a reply channel named for an origin has exactly one legitimate
-  subscriber.
+  **origin identity**. Note that is not the same as one node: the channel is
+  named by `origin_hash`, and one entity may be represented by several NodeIDs
+  (concurrently, or successively across the reconnects that trigger the leak in
+  the first place). The binding must therefore be origin-to-suffix, not
+  node-to-suffix.
 - **(a) needs an ordering rule.** Today a reply subscribe succeeds *before* any
   peer-identity lookup. Binding the suffix to the pinned origin makes
   subscribe-before-announcement fail, which is reachable on a first call and on
@@ -443,12 +492,37 @@ So a compromised root, a rolled-back build, or any alternate implementation can
 sign a token with a century-long lifetime and every receiver accepts it. The
 one-year ceiling constrains only tokens this process mints for itself.
 
-- **Fix**: enforce `not_after - not_before <= MAX_TOKEN_TTL_SECS` (saturating)
-  during `verify_inner`, per link — consistent with the constant's stated
-  purpose, and the only version of the check that binds a remote issuer. If that
-  is judged too strict for existing deployments, the audit wording must instead
-  say "locally-minted TTL is bounded" and the constant's rustdoc must stop
-  claiming it caps leaked-credential lifetime.
+- **Fix**: enforce the bound in `check_time_bounds` (`token.rs:346`), not in
+  `TokenChain::verify_inner`. `verify_inner` would close only channel-auth chain
+  verification, leaving every other receiver path — `is_valid`,
+  `is_valid_with_skew`, `TokenCache::check`, `get_for_action`, the FFI/UI
+  validity surfaces, and any future bare-token consumer — still accepting an
+  overlong remote token. `check_time_bounds` is the common seam: `is_valid` →
+  `is_valid_with_skew` → `check_time_bounds` (`:325-338`), and
+  `verify_inner`'s presigned path calls it directly (`:804`). One check there
+  covers all of them, which is what the constant's receiver-wide
+  "leaked credential lifetime" rationale actually requires:
+
+  ```rust
+  let ttl = self
+      .not_after
+      .checked_sub(self.not_before)
+      .ok_or(TokenError::InvalidFormat)?;   // not_after < not_before
+  if ttl == 0 || ttl > MAX_TOKEN_TTL_SECS {
+      return Err(TokenError::TtlTooLong);   // or a distinct variant
+  }
+  ```
+
+  Two notes for the implementer. `is_expired` (`:377`) is deliberately outside
+  this seam — it is a documented pure wall-clock check and should stay one. And
+  the `ttl == 0` arm is a real behaviour change: a zero-TTL token is already
+  rejected at issuance, but on receipt one can currently pass inside the skew
+  window (`now < not_after + skew`), so rejecting it here closes a small gap
+  rather than preserving status quo. If that arm is dropped, say so explicitly.
+  If the receiver-wide check is judged too disruptive for existing deployments,
+  this finding must be narrowed to "channel-auth receivers accept overlong
+  remote token chains" and the constant's rustdoc must stop claiming it caps
+  leaked-credential lifetime.
 
 ### M4 — Registry without `TokenCache`: subscribe accepts, first publish always denies
 
@@ -464,9 +538,21 @@ points disagree about what a token-gated channel means:
    presented chain normally — a valid chain passes and the peer gets an
    accepting `Ack` (`:23563-23589`).
 2. **The sweep is a no-op.** It returns early without a cache (`:2737-2739`).
-3. **The first publish denies.** The token-gated branch requires
-   `Some(cache)`; the `_ => false` arm treats its absence as unauthorized,
-   revokes the `AuthGuard` entry, and drops the subscriber (`:23990-24024`).
+3. **Every publish denies.** The token-gated branch requires `Some(cache)`; the
+   `_ => false` arm treats its absence as unauthorized, revokes the `AuthGuard`
+   entry, and drops **that delivery** — while leaving the peer rostered
+   (`:23990-24024`). As in M1, `revoke_channel` does not call `roster.remove`
+   and does not delete the retained chain.
+
+Composed, those three produce a **permanent** version of M1's queue-group
+denial primitive, and this time nothing clears it. The Subscribe succeeds;
+publish revalidation fails on every attempt because the cache will never
+appear; the peer stays in the roster; and the sweep — the mechanism that would
+normally evict it — is itself a no-op for exactly the same missing-cache
+reason. If that peer subscribed under a queue group, it consumes selections
+(`roster.rs:205-235`, selection precedes the auth filter) and that group's
+share of events is dropped for the lifetime of the process. Unlike M1, no
+periodic sweep and no configuration change recovers it.
 
 The public documentation states the opposite of (1) — `set_token_cache`
 (`mesh.rs:19038-19041`):
@@ -484,7 +570,11 @@ does not match either observed behaviour.
   cache-less verification consistently, in which case the publish path's
   `_ => false` must accept the transient-registry construction the subscribe
   path already builds, and the sweep must stop being a no-op. The first is
-  simpler and fails closed earlier.
+  simpler, fails closed earlier, and is the only one that resolves the DoS by
+  itself — a peer rejected at `Subscribe` never enters the roster, so it never
+  consumes a queue-group selection. The second option additionally requires the
+  M1 fix (evict from the roster, not just the `AuthGuard`, on publish-time auth
+  failure), or the stranded-peer primitive survives.
 
 ---
 
@@ -614,9 +704,11 @@ Recorded so a future pass does not re-derive it:
 - **Org-protected RPC response routing** (`mesh_rpc.rs:5882-5893`):
   `Protected` / `OwnerScoped` / `Granted` are `DirectOnly`, with the permissive
   reply prefix named as the reason.
-- **Revocation reaches the data plane**: the publish path re-verifies the
-  retained chain per fan-out and revokes inline; the sweep re-verifies with full
-  signature checks rather than trusting the publish path's cached flag.
+- **Revocation reaches the data plane — when a `TokenCache` is installed**: the
+  publish path re-verifies the retained chain per fan-out and revokes inline;
+  the sweep re-verifies with full signature checks rather than trusting the
+  publish path's cached flag. Without a cache the sweep is a no-op and the
+  publish path denies unconditionally — see M4.
 - **Auth-failure throttling** is per-peer and excludes resource-limit
   rejections, so it cannot be used to lock out a third party.
 
@@ -639,13 +731,18 @@ They cover the intended paths only. No existing test covers:
   the queue-group selection stall (M1);
 - peer-to-specific-queue-group authority (M2);
 - an overlong remote token TTL accepted on receipt (M3);
-- registry-present / cache-absent subscribe-then-publish behaviour (M4).
+- registry-present / cache-absent subscribe-then-publish behaviour, including
+  the stranded rostered peer and its queue-group effect (M4);
+- a denied subscriber remaining roster-selectable after a publish-time auth
+  failure (M1, M4) — the shared `revoke_channel`-without-`roster.remove` gap.
 
 ## Suggested order
 
-1. **H2** — smallest fix, largest blast radius. Every operator ACL on RPC
-   channels is currently discarded silently; entry-if-absent plus eight
-   regression witnesses. Also unblocks the documented mitigation for H3.
+1. **H2** — smallest fix, and the one that makes every other RPC-side
+   mitigation stick. Entry-if-absent plus eight regression witnesses. Its own
+   direct security yield is narrower than the surface suggests (the request-side
+   config enforces nothing until H1 lands), but it unblocks the documented
+   mitigation for H3 and stops silently discarding operator intent.
 2. **H3** — scope the reply prefix to the pinned caller origin, with the
    identity-publication ordering rule worked out first.
 3. **M1** — mechanical once the requested channel is threaded through; fixes
