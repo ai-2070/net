@@ -60,7 +60,7 @@ pub use routing::{RouteAnnouncement, RouteRow, RoutingFold, RoutingQuery};
 pub use snapshot::{FoldSnapshot, FoldSnapshotEntry};
 pub use state::{
     ApplyOutcome, BuildU64Hasher, EntryTransition, FoldEntry, FoldError, FoldIndex, FoldState,
-    MergeAction, NoIndex, NodeId, NodeIdSet, U64Hasher,
+    FxU64Hasher, MergeAction, NoIndex, NodeId, NodeIdSet,
 };
 pub use wire::{EnvelopeMeta, SignedAnnouncement, WireError};
 

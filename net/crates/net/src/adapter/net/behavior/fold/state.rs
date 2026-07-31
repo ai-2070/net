@@ -30,27 +30,30 @@ use super::FoldKind;
 /// cryptographic identity.
 pub type NodeId = u64;
 
-/// Fast multiplicative mixer for hash keys that are already a
-/// single well-distributed `u64` — [`NodeId`] and
-/// [`IslandId`](super::IslandId) being the ones the scheduler
-/// probes in bulk.
+/// Fast multiplicative mixer for hash keys built entirely out of
+/// `u64`s that are already well-distributed — fold ids
+/// ([`NodeId`], [`IslandId`](super::IslandId)) and the capability
+/// index's `(u64, u64)` keys.
 ///
-/// Same rationale as `capability::U64TupleHasher` (PERF_AUDIT §4.6),
-/// which mixes `(u64, u64)` index keys: these ids are derived from
-/// already-hashed identity bytes, so collision resistance exists at
-/// construction and SipHash's DoS resistance adds nothing — it just
-/// charges ~15-25 ns of mixing per probe. That cost is paid once per
-/// *topology entry* on the gang matcher's `HostedByAny` scan, not
-/// once per candidate host, which is what makes it worth removing
-/// (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+/// Those ids are derived from already-hashed identity bytes, so
+/// collision resistance exists at construction and SipHash's DoS
+/// resistance adds nothing — it just charges ~15-25 ns of mixing per
+/// probe (PERF_AUDIT §4.6, PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+/// What makes that worth removing is the probe *count*: the gang
+/// matcher's `HostedByAny` scan probes once per topology entry, not
+/// once per candidate host.
 ///
-/// Deliberately distinct from the tuple hasher rather than reusing
-/// it: that one is named and shaped for `(u64, u64)` keys and is
-/// private to the capability module.
+/// **One implementation, two aliases.** [`BuildU64Hasher`] here and
+/// `capability::BuildU64TupleHasher` both build this type; the
+/// arity lives in the alias names, not in the mixer, which only ever
+/// sees a sequence of `write_u64` calls. They were briefly two
+/// byte-identical copies — same constant, same fallback — which meant
+/// a correction to one would silently miss the other. Per-site
+/// rationale belongs on the aliases.
 #[derive(Default, Clone)]
-pub struct U64Hasher(u64);
+pub struct FxU64Hasher(u64);
 
-impl std::hash::Hasher for U64Hasher {
+impl std::hash::Hasher for FxU64Hasher {
     #[inline]
     fn finish(&self) -> u64 {
         self.0
@@ -77,12 +80,13 @@ impl std::hash::Hasher for U64Hasher {
     }
 }
 
-/// [`BuildHasher`](std::hash::BuildHasher) for [`U64Hasher`].
-pub type BuildU64Hasher = std::hash::BuildHasherDefault<U64Hasher>;
+/// [`BuildHasher`](std::hash::BuildHasher) for [`FxU64Hasher`] over
+/// single-`u64` fold ids.
+pub type BuildU64Hasher = std::hash::BuildHasherDefault<FxU64Hasher>;
 
-/// A set of [`NodeId`]s hashed with [`U64Hasher`] — the candidate-host
-/// set the gang matcher builds and then probes once per topology
-/// entry.
+/// A set of [`NodeId`]s hashed with [`FxU64Hasher`] — the
+/// candidate-host set the gang matcher builds and then probes once per
+/// topology entry.
 pub type NodeIdSet = HashSet<NodeId, BuildU64Hasher>;
 
 /// One entry in a fold: the payload most recently accepted for
