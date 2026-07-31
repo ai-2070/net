@@ -85,6 +85,8 @@ export const DOCS_ORDER: DocsOrderConfig = {
       "agentic-mesh",
       "right-and-wrong-use-cases",
       "mcp-vs-net",
+      "nats-vs-net",
+      "zenoh-vs-net",
       "rest-vs-net",
     ],
     payments: [

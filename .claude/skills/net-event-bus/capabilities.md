@@ -108,7 +108,7 @@ These come from the tag codec itself (`src/adapter/net/behavior/tag_codec.rs`), 
 
 ## Announcing
 
-`announce_capabilities(caps)` pushes the set to every directly-connected peer over subprotocol `0x0C00` (`net/crates/net/src/adapter/net/behavior/broadcast.rs:12`). The announcer self-indexes too, so single-node tests round-trip. Multi-hop propagation is deferred — peers more than one hop away will not see the announcement today.
+`announce_capabilities(caps)` pushes the set to every directly-connected peer over subprotocol `0x0C00` (`net/crates/net/src/adapter/net/behavior/broadcast.rs:12`). The announcer self-indexes too, so single-node tests round-trip. **Multi-hop propagation ships**: a receiving peer re-broadcasts, `hop_count` increments, and forwarding stops at `MAX_CAPABILITY_HOPS = 16` (`net/crates/net/src/adapter/net/behavior/capability.rs:2247`). Proven by `net/crates/net/tests/capability_multihop.rs::three_node_chain_propagates` — A ↔ B ↔ C with no direct A–C link, and C sees A's announcement — which `ci.yml` runs.
 
 Re-announce to update. Subsequent calls go through the `CapabilityDiff` machinery in `net/crates/net/src/adapter/net/behavior/diff.rs` — incremental, signed — so steady-state changes (a model gets loaded, a tag toggles) cost ~50 bytes on the wire instead of a full re-broadcast. You don't drive this directly; the mesh figures it out from your last announced set.
 
@@ -454,7 +454,7 @@ Capability routing is for **placement** (pick a node), not **delivery** (the bus
   - publish on a channel that node has subscribed to (`apis.md` § Named channels), or
   - open a per-peer reliable stream (`Reliability::Reliable`) and send directly.
 - The capability index is **per-node, eventually consistent**. Two nodes querying at the same instant may see different candidate sets if an announcement is in flight. Don't treat results as global truth.
-- Multi-hop propagation is deferred today. If your mesh has a relay-only node between announcer and querier, the querier won't see the announcement until the announcer connects directly. Plan capacity around direct-peer topology.
+- Multi-hop propagation is bounded, not unlimited: forwarding stops at 16 hops (`MAX_CAPABILITY_HOPS`, mirroring the pingwave contract). A querier more than 16 hops from the announcer will not see it. Duplicate arrivals at a converge point are dropped (`capability_multihop.rs::dedup_drops_duplicate_at_converge_point`), and a multi-hop receipt installs a route with a worse metric than a direct one, so direct peers still win.
 
 ---
 
