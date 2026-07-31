@@ -2253,8 +2253,15 @@ pub struct CapabilityAnnouncement {
     /// vec = permissive default (anyone may invoke, subject to
     /// the other two lists). See `CAPABILITY_AUTH_PLAN.md`.
     ///
+    /// This is the ONLY allow-list axis that carries security weight:
+    /// `ann.node_id` is a blake2s derivation over the announcing key
+    /// and is checked against `entity_id` at dispatch, so it cannot be
+    /// claimed by another peer. [`Self::allowed_subnets`] and
+    /// [`Self::allowed_groups`] are advisory — see their docs.
+    ///
     /// Capped at [`MAX_ALLOW_LIST_LEN`] (64) per axis — past that,
-    /// operators use a [`super::group::GroupId`] instead.
+    /// operators use a [`super::group::GroupId`] instead (with the
+    /// caveat on that type: groups do not gate).
     ///
     /// `skip_serializing_if` preserves byte-identity with pre-v0.4
     /// announcements: an unrestricted (empty) list serializes to
@@ -2266,8 +2273,16 @@ pub struct CapabilityAnnouncement {
     /// v0.4 capability-auth allow-list — [`super::subnet::SubnetId`]s
     /// whose members may invoke. Empty = permissive default.
     /// Receivers determine a caller's subnet via the `subnet:<hex>`
-    /// tag on the caller's own announcement (self-declared, signed,
-    /// TOFU-bound). Same wire-compat treatment as `allowed_nodes`.
+    /// tag on the caller's own announcement. Same wire-compat
+    /// treatment as `allowed_nodes`.
+    ///
+    /// ⚠ **Advisory — does not keep anyone out.** The caller's subnet
+    /// is self-declared, and this list is published in a broadcast
+    /// announcement that forwards up to `MAX_CAPABILITY_HOPS`, so every
+    /// node in the mesh learns the admitted values. A `SubnetId` is
+    /// also only 32 bits and typically holds small level values, so it
+    /// is enumerable even unobserved. Use [`Self::allowed_nodes`] for
+    /// anything load-bearing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_subnets: Vec<super::subnet::SubnetId>,
     /// v0.4 capability-auth allow-list — [`super::group::GroupId`]s
@@ -2275,6 +2290,15 @@ pub struct CapabilityAnnouncement {
     /// Group membership is self-declared via `group:<hex>` tags on
     /// the caller's own announcement. Same wire-compat treatment
     /// as `allowed_nodes`.
+    ///
+    /// ⚠ **Advisory — does not keep anyone out.** Populating this field
+    /// publishes the very ids it restricts to: the announcement carries
+    /// them in cleartext to every peer and relay within
+    /// `MAX_CAPABILITY_HOPS`, and `group:` is not a reserved prefix, so
+    /// any recipient can claim the membership with a one-line
+    /// `add_tag`. See [`super::group`] for the full reasoning and what
+    /// a real fix requires. Use [`Self::allowed_nodes`] for anything
+    /// load-bearing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_groups: Vec<super::group::GroupId>,
     /// OA-1 organization ownership — the announcer's

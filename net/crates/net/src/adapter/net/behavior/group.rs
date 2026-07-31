@@ -2,26 +2,66 @@
 //!
 //! A `GroupId` is a 32-byte opaque identifier for an operator-
 //! defined named collection of peers. Mirrors [`super::subnet::SubnetId`]
-//! one-for-one but at 32 bytes (the wider value-as-secret space
-//! lets operators use a random `GroupId` that's effectively
-//! unguessable, matching the substrate's channel-auth-token
-//! pattern).
+//! one-for-one but at 32 bytes.
+//!
+//! # ⚠ Advisory only — NOT an access-control boundary
+//!
+//! This module previously documented a value-as-secret model: pick a
+//! random 32-byte `GroupId` and its unguessability prevents
+//! unauthorised membership claims. **That model does not hold on the
+//! deployed transport, and `allowed_groups` must not be relied on to
+//! keep anyone out.** Two independent reasons:
+//!
+//! 1. **The id is broadcast.** A provider restricting a capability
+//!    publishes `allowed_groups` in its own
+//!    [`CapabilityAnnouncement`](super::capability::CapabilityAnnouncement),
+//!    which fans out to every directly-connected peer and forwards up
+//!    to `MAX_CAPABILITY_HOPS` (16). Every node that receives it — and
+//!    every node that relays it — learns the full set of authorised
+//!    ids. The "secret" is published by the very announcement it is
+//!    supposed to protect. Session AEAD is hop-by-hop, so it does not
+//!    help.
+//! 2. **The claim is unverified.** `group:` is not a reserved tag
+//!    prefix, so `CapabilitySet::add_tag("group:<hex>")` is accepted by
+//!    the public API in every binding. A signature proves only that the
+//!    announcer holds its own key — never that any authority granted it
+//!    that membership.
+//!
+//! Together those make the `allowed_groups` axis of
+//! [`may_execute`](super::fold::capability_bridge::may_execute) bypassable
+//! by any peer that has observed one provider announcement. The same
+//! reasoning applies to `allowed_subnets`, whose values are both
+//! published and only 32 bits wide.
+//!
+//! `allowed_nodes` is unaffected: `ann.node_id` is a blake2s derivation
+//! over the announcing key and is checked against `entity_id` at
+//! dispatch, so it cannot be claimed.
+//!
+//! Closing this needs an entitlement primitive the substrate does not
+//! have yet: an issuer-signed assertion binding
+//! `(subject, axis, value, validity)`, verified at ingest against the
+//! issuer's key with revocation semantics fit for an execution gate —
+//! i.e. the ORG vouches for the membership rather than the subject
+//! asserting it. Note that
+//! [`VerifiedOwner`](super::fold::capability::VerifiedOwner) is NOT that
+//! primitive: it proves org belonging only and is authority-dark by
+//! explicit invariant (OA-1), carrying no group, subnet, or invocation
+//! entitlement.
+//!
+//! Until then, treat groups as advisory routing / grouping metadata.
+//! See `docs/internal/misc/SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md`.
 //!
 //! # Membership
 //!
 //! Peers self-declare group membership via `group:<hex64>` tags on
-//! their own [`CapabilityAnnouncement`](super::capability::CapabilityAnnouncement).
-//! A peer may emit multiple group tags to claim membership in
-//! multiple groups. The capability index parses every group tag
-//! and stores the `NodeId → Vec<GroupId>` mapping on the peer view.
+//! their own `CapabilityAnnouncement`. A peer may emit multiple group
+//! tags to claim membership in multiple groups. The capability index
+//! parses every group tag and stores the `NodeId → Vec<GroupId>`
+//! mapping on the peer view.
 //!
-//! Self-declaration is safe in the same sense as
-//! [`super::subnet::SubnetId`]: the announcement is signed +
-//! TOFU-bound to the entity's ed25519 key, so a peer can only
-//! claim membership for itself. Group ids that act as secrets
-//! (random 32 bytes) prevent unauthorised claims; group ids that
-//! are public (e.g. blake2s-of-name) accept any claimant and are
-//! suitable for advisory routing rather than strict gating.
+//! The signature + TOFU pin do guarantee one narrow thing: a peer can
+//! only make claims *about itself*, never about another node. That is
+//! integrity of attribution, not authorisation.
 //!
 //! This is a separate concept from the compute-layer
 //! `replica_group` / `standby_group` — those are about replica
@@ -37,8 +77,11 @@ use subtle::ConstantTimeEq;
 pub const GROUP_TAG_PREFIX: &str = "group:";
 
 /// 32-byte stable group identifier. Opaque to the substrate.
-/// Operators choose the value; values that double as secrets
-/// (random 32 bytes) prevent unauthorised membership claims.
+///
+/// ⚠ A random value does NOT prevent unauthorised membership claims —
+/// providers publish their `allowed_groups` in a broadcast
+/// announcement, so the value reaches every node in the mesh. See the
+/// module docs; treat group membership as advisory.
 ///
 /// The inner array is `pub(crate)` rather than `pub` — external
 /// callers go through [`Self::from_bytes`] / [`Self::as_bytes`]

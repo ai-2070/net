@@ -763,6 +763,21 @@ impl std::fmt::Debug for CapabilitySetCache {
 ///   axis (node / subnet / group) matches. Caller's subnet and
 ///   groups are read from the caller's own fold entries via
 ///   reserved `subnet:` / `group:` membership tags.
+///
+/// # Strength of each axis
+///
+/// Only `allowed_nodes` is load-bearing. `ann.node_id` is blake2s-bound
+/// to `entity_id` at dispatch, so a peer cannot present another node's
+/// identity.
+///
+/// `allowed_subnets` and `allowed_groups` are ADVISORY. Both read
+/// self-declared tags off the caller's own announcement, and the target
+/// publishes both lists in a broadcast announcement that forwards up to
+/// `MAX_CAPABILITY_HOPS` — so any peer that has seen one provider
+/// announcement learns the admitted values and can claim them with a
+/// single `add_tag`. Treat a match on those axes as a routing hint, not
+/// as authorisation, until the substrate grows an issuer-signed
+/// entitlement (see [`super::super::group`]).
 pub fn may_execute(
     fold: &Fold<CapabilityFold>,
     target_node: NodeId,

@@ -104,10 +104,14 @@ pub struct AnnounceArgs {
     pub allow_nodes: Vec<String>,
 
     /// Allow-listed subnet ids — `<hex32>` or `subnet:<hex32>`.
+    /// ADVISORY ONLY: subnet membership is self-declared and this list
+    /// is broadcast mesh-wide. Use --allow-node for access control.
     #[arg(long = "allow-subnet", num_args = 0.., value_name = "SUBNET")]
     pub allow_subnets: Vec<String>,
 
     /// Allow-listed group ids — `<hex64>` or `group:<hex64>`.
+    /// ADVISORY ONLY: group membership is self-declared and this list
+    /// is broadcast mesh-wide. Use --allow-node for access control.
     #[arg(long = "allow-group", num_args = 0.., value_name = "GROUP")]
     pub allow_groups: Vec<String>,
 
@@ -251,6 +255,28 @@ async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     let allowed_nodes = parse_node_ids(&args.allow_nodes)?;
     let allowed_subnets = parse_subnets(&args.allow_subnets)?;
     let allowed_groups = parse_groups(&args.allow_groups)?;
+
+    // The subnet / group axes read tags the CALLER declares about
+    // itself, and this announcement publishes the admitted values to
+    // every peer and relay within MAX_CAPABILITY_HOPS. Anyone who
+    // receives it can claim a listed group or subnet with a one-line
+    // `add_tag`. An operator reaching for these flags is almost
+    // certainly trying to restrict access, so say plainly that they do
+    // not. `--allow-nodes` is the axis that holds.
+    if !allowed_subnets.is_empty() || !allowed_groups.is_empty() {
+        eprintln!(
+            "warning: --allow-subnets / --allow-groups are ADVISORY and do not \
+             restrict access.\n\
+             \x20        This announcement publishes the admitted values to every \
+             peer and relay in\n\
+             \x20        the mesh, and membership in a subnet or group is \
+             self-declared by the caller,\n\
+             \x20        so any recipient can claim one. Use --allow-nodes for \
+             access control.\n\
+             \x20        See docs/internal/misc/\
+             SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md"
+        );
+    }
 
     // 3. Resolve target node_id. The keypair's derived `node_id`
     //    is the only value that round-trips through the receiver's
