@@ -9,11 +9,19 @@ they belong rather than appended: the scope-stamp / batch-token separation in
 §2A.1, the 2B.3c-pre plan divergence in §15, and W-G13 (installed Grant expiry,
 including the empty-provider case) in §12.
 
-**`2B.3c-pre` is AUTHORIZED**; every other slice is not. Its exact scope, its
-slice-local witnesses, and the boundary of what it may NOT touch are in §16.
+**`2B.3c-pre` is SIGNED IN FULL** —
+`OLB_2B3C_PRE_SIGNED_HEAD = 2aa6431edf952e1fdba117db7a92cc8cd08c3e81`, all three
+steps and all 16 scope items. Its record is §16.
+
+**`2B.3b` is AUTHORIZED**; `2B.3c`, `2B.3d-pre`, `2B.3d` and every later OLB
+slice are not. 2B.3b's exact content is the §13 row, its accounting is §4/§4.1,
+its lookup shape is §8, its refusal policy is §9, and its plan-reconciliation
+debt is the §15 row assigned to it.
 
 **Substrate:** `OLB_2B3A_SIGNED_HEAD = fd05a89ba` — the per-slot
-`Arc<ArcSwapOption<SlotBaseFacts>>` publication cell, and nothing more.
+`Arc<ArcSwapOption<SlotBaseFacts>>` publication cell — plus
+`OLB_2B3C_PRE_SIGNED_HEAD`'s Grant-plane currentness substrate and source
+service. Nothing more.
 
 ---
 
@@ -625,15 +633,20 @@ Sign-off on each slice is conditional on its plan edits landing **in the same
 commit as the code**, not tracked as follow-up. The plan and the code disagreeing
 is the §19 defect class this process has already caught once.
 
-## 16. 2B.3c-pre — the authorized slice
+## 16. 2B.3c-pre — the SIGNED slice
 
 ### 16.0 Progress
+
+**The whole slice is SIGNED at
+`OLB_2B3C_PRE_SIGNED_HEAD = 2aa6431edf952e1fdba117db7a92cc8cd08c3e81`** — all
+three steps, all 16 scope items. The per-step heads below are kept because the
+corrective lineage is the useful record, not because any of them is still open.
 
 | Items | Status | Head |
 |---|---|---|
 | **1–3** — non-aliasing installation identity | **SIGNED** 2026-07-28 | `OLB_2B3C_PRE_STEP1_SIGNED_HEAD = 300e80f6c` |
 | **4–9, 12–14** — scope stamp + Grant source service | **SIGNED** 2026-07-29 | `OLB_2B3C_PRE_STEP2_SIGNED_HEAD = a788232bd` |
-| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | **IMPLEMENTED + WITNESSED — REVIEWED SIX TIMES, HELD SIX TIMES, REPAIRED — NOT SIGNED.** The most recent HOLD (`bc45d3c6f`, seventh overall) was documentation-only: production and witnesses passed independent review at `ce688d5d1`, with all six inverse mutations independently reproduced | see the step-3 lineage below |
+| **10, 11, 15, 16** — wake/invalidation edge + plan reconciliation | **SIGNED** 2026-07-31, after seven HOLDs and their repairs. Production and witnesses passed independent review at `ce688d5d1`, with all six inverse mutations independently reproduced; the seventh HOLD (`bc45d3c6f`) was documentation-only and its closure-record corrections landed at `2aa6431ed` | `OLB_2B3C_PRE_SIGNED_HEAD = 2aa6431ed` |
 
 **Step 2 signed by Kyra 2026-07-29 at `a788232bd`**, after an independent
 mutation matrix in a detached worktree: every security claim below went RED
@@ -721,13 +734,14 @@ deadline; and the production actor arms that deadline, retires the artifact,
 rebuilds `Unserved`, and converges without spinning.
 
 **Step 3 — items 10, 11, 15, 16 — was authorized by the user after the step-2
-signature and is implemented and witnessed, NOT signed.** The step-2 signature
-of `a788232bd` did not cover it; nothing here retroactively extends that.
+signature, and is now SIGNED in its own right at `2aa6431ed`.** The step-2
+signature of `a788232bd` never covered it; the slice signature does, and it is
+the only thing that does.
 
-**ONLY 2B.3c-pre step 3 is under corrective review. 2B.3b and every later OLB
-slice remain UNAUTHORIZED until this step signs.** The normative plan still says
-"OLB-2B.3 is AUTHORIZED" in the broad sense; that does not authorize any later
-slice, and this line is the operative one.
+**2B.3c-pre is closed. 2B.3b is AUTHORIZED; 2B.3c, 2B.3d-pre, 2B.3d and every
+later OLB slice remain UNAUTHORIZED.** The normative plan still says "OLB-2B.3
+is AUTHORIZED" in the broad sense; that does not authorize any later slice, and
+this line is the operative one.
 
 Step-3 lineage, held SIX times (SEVEN HOLDs overall: one on step 2, six here):
 
@@ -756,6 +770,8 @@ ce688d5d1  the fourth cell split out + W-W15, W-W16
                                                         reproduced.
            closure-record corrections only, no production or witness change
            (candidate head = THIS commit; it carries no repair to name)
+2aa6431ed  the two contradictory closure records closed  <- SIGNED here
+           (documentation only, as the HOLD that produced it was)
 ```
 
 What step 3 closes, both directions of design §0.1:
@@ -983,6 +999,11 @@ themselves in two places:
 Nothing about the mechanism changed. The lesson is narrower and duller than the
 earlier ones: **a record that is authoritative is part of the candidate**, and
 duplicated prose drifts one copy at a time.
+
+`OLB_2B3C_PRE_HANDOFF.md` — the ephemeral session handoff that held the second
+copy of both drifted claims — **is deleted at this signature**, as it required of
+itself. This document is now the only record of the slice, which is the whole
+point of deleting it.
 
 **The publication generation is deliberately NOT in `SourceToken`.** It is
 ordering metadata, not authority. The capture/commit token remains the exact
