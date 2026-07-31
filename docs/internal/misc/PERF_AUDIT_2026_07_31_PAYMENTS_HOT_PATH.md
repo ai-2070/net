@@ -13,8 +13,8 @@ marked otherwise. The byte figures in §2 are **modeled** — measured on a synt
 `EngineState` built to the real field shapes, not on a captured production store; the
 *ratio* is the claim, not the absolute size.
 
-> **Status: findings only (2026-07-31). §1 decided 2026-07-31 (Kyra); not yet
-> implemented.** This is a survey answering "what payments hot-path headroom is available
+> **Status: §1 decided (Kyra) and implemented 2026-07-31; §2/§3/§5 implemented; §4
+> withdrawn.** This is a survey answering "what payments hot-path headroom is available
 > *without* the storage replacement" — because the dominant bottleneck is already
 > characterized and explicitly gated. **§1 removes unbounded growth of fat lifecycle
 > records and sharply reduces the growth slope; settlement-uniqueness tombstones remain
@@ -213,6 +213,32 @@ transaction tombstone, the payload entry can leave with the full record.
 
 The read-only-writes audit (`tests/read_only_writes_audit.rs`) must stay green throughout.
 
+### Implementation notes (landed 2026-07-31, `94469d244`)
+
+All six constraints and all six regressions landed, plus the flagged seventh
+(owner-checked co-prune). Tests are in `payments/tests/engine_retention.rs`; 172 crate
+tests pass, clippy clean on lib + tests. Three things worth recording:
+
+- **Sweep sites.** Retention runs in `accept_payment`'s claim transaction — the operation
+  that *mints* records also retires them, mirroring the spend engine's counter prune in
+  `check_and_reserve` — folded into that transaction's `dirty` flag per constraint 5.
+  `PaymentEngine::prune_terminal_records(now_ns)` exposes it for a provider that stops
+  accepting but keeps redeeming. **The redeem gate was deliberately not chosen** as a
+  sweep site: `redeem_for_invocation` takes no `now_ns` and there is no global clock
+  (expiry uses signer timestamps), so sweeping there would have meant an API break.
+- **The tombstone regression is driven end to end**, not asserted on state. The mock
+  derives its transaction id from the payload bytes, and a payload binds the requirements
+  but not the quote id — so an identical payload against a different quote genuinely
+  re-settles the same transaction, and with the payload guard pruned the tombstone is
+  demonstrably the last line of defense. It required a *second engine over the same store
+  with a fresh mock*: the mock keeps its own settled-payload index and refuses the replay
+  before the engine sees it, which would have silently made the test prove nothing. A
+  forgetful facilitator is also the more faithful threat model, since the facilitator is
+  deliberately not in the trust root.
+- **The dirty/clean inode witness is unix-gated**, matching `read_only_writes_audit.rs`
+  and `redeem_denial_no_write.rs`. Those two suites — and this one's P5e assertion — do
+  **not execute on Windows**; they need a Linux/macOS run to be exercised.
+
 **Relationship to the storage disposition.** This is not a store replacement and does not
 pre-empt one. Partitioning attacks the *locking* term; retention attacks the *size* term.
 They are orthogonal, and a partitioned store still wants retention. Nothing in the
@@ -365,17 +391,25 @@ is free to remove — move the construction into the branch that inserts it.
 
 ## Recommended order of attack
 
-1. **§1 engine retention.** Decided 2026-07-31: 6-hour terminal-record horizon, payload
-   guards co-pruned, permanent settlement tombstones. The only finding that moves the
-   growth *slope* rather than shaving a constant, and it reuses a pruning pattern the
-   codebase already accepts. Unblocked — carries the six implementation constraints and
-   six regressions in §1.
-2. **§2 compact store writes** and **§3 lazy `quote_b64`.** Both near-zero-risk, both
-   independent of §1, could land in one pass.
-3. **§5 lazy `QuoteRecord`.** Genuinely marginal; do it when next in that function.
+All landed 2026-07-31 on `performance-x402`, one commit each:
 
-**§4 is withdrawn** — see the correction in that section. It was not implementable as
-described, and the two parses it flagged are structurally necessary.
+| finding | commit | state |
+|---|---|---|
+| §1 engine retention | `94469d244` | implemented + 10 regressions |
+| §2 compact store writes | `a0f21e849` | implemented + 1 regression |
+| §5 lazy `QuoteRecord` | `0c0d773be` | implemented |
+| §3 lazy `quote_b64` | `327c68b63` | implemented |
+| §4 folded spend read | `4f5ddedb8` | **withdrawn** — not implementable as described |
+
+172 crate tests pass; clippy clean on lib + tests. Two caveats on the verification, both
+environmental rather than about the changes:
+
+- The **unix-gated suites do not run on Windows** — `read_only_writes_audit.rs`,
+  `redeem_denial_no_write.rs`, and this work's P5e inode witness all need a Linux/macOS
+  run. The dirty-flag discipline is asserted but unexercised here.
+- `benches/spend_contention.rs` **does not compile on Windows** (uses `std::os::unix`
+  unconditionally). Pre-existing, unrelated to this work, and the reason
+  `cargo clippy --all-targets` fails on this platform.
 
 None of these move the c128 tail — that is the lock, and it is the storage disposition's
 problem. What they move is the per-operation constant and, in §1's case, how fast that
