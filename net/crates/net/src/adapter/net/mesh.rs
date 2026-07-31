@@ -23533,6 +23533,37 @@ impl MeshNode {
             }
         }
 
+        // Token-gated channel with no `TokenCache` installed (M4).
+        //
+        // Reject here rather than admitting and failing later. Pre-fix
+        // the three enforcement points disagreed about what this
+        // configuration means: subscribe ACCEPTED (falling back to a
+        // transient empty revocation registry and verifying the chain
+        // normally), every publish DENIED (the token-gated branch
+        // requires `Some(cache)` and treats its absence as
+        // unauthorized), and the sweep was a no-op (it returns early
+        // without a cache). The peer therefore got an accepting Ack for
+        // a subscription that could never deliver an event, and — since
+        // the publish-time denial revokes the AuthGuard entry but does
+        // not remove the roster entry, and the sweep that would
+        // normally evict it can never run — it stayed rostered
+        // permanently, consuming a queue-group selection slot for the
+        // lifetime of the process.
+        //
+        // `set_token_cache`'s documented contract already said
+        // "when unset, `require_token` channels always reject". This
+        // makes that true, and makes the Ack honest.
+        if cfg.token_required() && ctx.token_cache.is_none() {
+            tracing::debug!(
+                from_node = format!("{:#x}", from_node),
+                channel = channel.as_str(),
+                "auth: token-gated channel but no TokenCache installed; \
+                 rejecting subscribe (publish would deny it anyway and the \
+                 expiry sweep cannot run)"
+            );
+            return (false, Some(AckReason::Unauthorized));
+        }
+
         // Parse the presented credential as a delegation chain. A
         // single directly-issued token is a one-link chain. Full
         // verification — root anchor, per-link signature/time/
@@ -23568,6 +23599,14 @@ impl MeshNode {
         // transient empty registry (nothing revoked) with strict skew.
         // The `transient_revocation` binding is declared here so it
         // outlives the borrow taken in the `None` arm.
+        //
+        // Post-M4 the `None` arm is only reachable for channels that do
+        // NOT require a token — a token-gated channel without a cache
+        // already returned `Unauthorized` above. Those channels never
+        // consult `revocation` or `skew_secs` (`token_gate` short-
+        // circuits on `!token_required()`), so the transient registry
+        // is now purely a borrow-checker placeholder rather than a
+        // silently-different verification policy.
         let transient_revocation;
         let (revocation, skew_secs): (&RevocationRegistry, u64) = match ctx.token_cache.as_ref() {
             Some(cache) => (cache.revocation().as_ref(), cache.clock_skew_secs()),

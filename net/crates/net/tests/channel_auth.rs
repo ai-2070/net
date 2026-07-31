@@ -376,6 +376,81 @@ async fn unauth_channel_accepts_everyone() {
     assert_eq!(report.delivered, 1);
 }
 
+/// M4 (2026-07-31 audit): a token-gated channel on a publisher with no
+/// `TokenCache` must reject the subscribe outright.
+///
+/// Pre-fix the three enforcement points disagreed. Subscribe ACCEPTED
+/// (it fell back to a transient empty revocation registry and verified
+/// the chain normally), every publish DENIED (the token-gated branch
+/// requires `Some(cache)`), and the sweep was a no-op (it returns early
+/// without a cache). So the peer received an accepting Ack for a
+/// subscription that could never deliver an event — and because the
+/// publish-time denial revokes the AuthGuard entry WITHOUT removing the
+/// roster entry, and the sweep that would evict it can never run, the
+/// peer stayed rostered permanently. On a queue-group channel that is a
+/// standing denial of service: selection happens before the auth
+/// filter, so the stranded peer keeps consuming that group's events and
+/// they are dropped rather than delivered to a working member.
+///
+/// `set_token_cache` already documented "when unset, `require_token`
+/// channels always reject". This makes that true.
+#[tokio::test]
+async fn token_gated_subscribe_rejected_when_no_token_cache() {
+    // Publisher A deliberately has a channel registry but NO token
+    // cache — the exact configuration that used to accept-then-strand.
+    let a = {
+        let keypair = EntityKeypair::generate();
+        let mut node = MeshNode::new(keypair.clone(), test_config())
+            .await
+            .expect("MeshNode::new");
+        let registry = Arc::new(ChannelConfigRegistry::new());
+        node.set_channel_configs(registry.clone());
+        Node {
+            mesh: Arc::new(node),
+            keypair,
+            registry,
+        }
+    };
+    let b = build_node().await;
+    handshake_no_start(&a.mesh, &b.mesh).await;
+    a.mesh.start();
+    b.mesh.start();
+
+    let name = ChannelName::new("lab/nocache").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
+
+    // A perfectly good token — the rejection must come from the missing
+    // cache, not from anything wrong with the credential.
+    let token = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        name.hash(),
+        300,
+        0,
+    );
+    let result = b
+        .mesh
+        .subscribe_channel_with_token(a.mesh.node_id(), name.clone(), token)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a token-gated channel with no TokenCache must reject the subscribe \
+         rather than accept one that can never deliver"
+    );
+    assert!(
+        !a.mesh
+            .roster()
+            .is_subscribed(b.mesh.node_id(), &ChannelId::new(name)),
+        "the rejected peer must not be left in the roster — that is the \
+         stranded-subscriber state this fix exists to prevent"
+    );
+}
+
 #[tokio::test]
 async fn tampered_announcement_signature_rejected() {
     use net::adapter::net::behavior::capability::CapabilityAnnouncement;
