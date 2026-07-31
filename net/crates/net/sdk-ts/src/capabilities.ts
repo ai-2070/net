@@ -387,6 +387,21 @@ export function capabilityFilterToNapi(f: CapabilityFilter): NapiCapabilityFilte
  * under most filters by design (matches the v1-permissive
  * default). Peers tagged `scope:subnet-local` only show up under
  * `sameSubnet`.
+ *
+ * ## This is a discovery filter, not an access-control boundary
+ *
+ * Announcements propagate to every peer and forward up to 16 hops
+ * regardless of their `scope:*` tags, and the tags are self-asserted by
+ * the announcer. So:
+ *
+ * - **`Global` is permissive.** A peer with no `scope:*` tag matches
+ *   EVERY `tenant` and `region` query. A tenant filter narrows away
+ *   only *cooperating* peers that scoped themselves elsewhere — an
+ *   adversary simply omits the tag and stays visible.
+ * - **Nothing is withheld on the wire.** An unscoped query (`any`, or
+ *   plain `findNodes`) returns what a scoped one filters out. Scope
+ *   keeps unrelated tenants out of your own placement decisions; it
+ *   does not keep your providers secret.
  */
 export type ScopeFilter =
   | { kind: 'any' }

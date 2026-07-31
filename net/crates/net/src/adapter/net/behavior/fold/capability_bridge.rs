@@ -1303,7 +1303,7 @@ pub fn filter_by_predicate(
 ///
 /// `same_subnet_lookup` is invoked ONLY for candidates whose verdict
 /// actually depends on subnet membership — a [`ScopeFilter::SameSubnet`]
-/// query, or a [`CapabilityScope::SubnetLocal`] candidate under any
+/// query, or a `CapabilityScope::SubnetLocal` candidate under any
 /// filter. Every other candidate short-circuits without calling it. The
 /// closure is potentially expensive (the `MeshNode` implementation may
 /// take its own fold read to derive a forwarded peer's subnet), and it

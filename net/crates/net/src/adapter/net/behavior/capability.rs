@@ -670,11 +670,17 @@ pub(crate) enum CapabilityScope {
     /// query that doesn't explicitly opt out (`GlobalOnly` /
     /// `SameSubnet`).
     Global,
-    /// `scope:subnet-local` present — visible only under
-    /// [`ScopeFilter::SameSubnet`]. Excluded from
-    /// [`ScopeFilter::Any`] and every other filter, because the
-    /// announcer has explicitly opted out of cross-subnet
-    /// discovery.
+    /// `scope:subnet-local` present — returned only under
+    /// [`ScopeFilter::SameSubnet`], and then only to a caller whose
+    /// subnet matches. Excluded from [`ScopeFilter::Any`] and every
+    /// other filter, because the announcer has explicitly opted out of
+    /// cross-subnet discovery.
+    ///
+    /// "Same subnet" is resolved from the announcer's own tags (via the
+    /// receiver's `SubnetPolicy`), so this narrows discovery among
+    /// cooperating peers — it does not withhold anything from a peer
+    /// that chooses to tag itself differently, and the announcement
+    /// itself still propagates mesh-wide. Not an isolation boundary.
     SubnetLocal,
     /// One or more `scope:tenant:*` tags, no regions, no
     /// subnet-local.
@@ -759,6 +765,28 @@ pub(crate) fn parse_membership_tags(
 /// excludes peers that explicitly tagged themselves
 /// `scope:subnet-local` — that tag is an opt-out from cross-subnet
 /// discovery.
+///
+/// # This is a discovery filter, not an access-control boundary
+///
+/// Scope is evaluated entirely at query time. Announcements still
+/// propagate permissively to every peer and forward up to
+/// `MAX_CAPABILITY_HOPS` regardless of their `scope:*` tags, and the
+/// tags are self-asserted by the announcer. Two consequences worth
+/// knowing before relying on this:
+///
+/// - **`Global` is permissive.** A peer with no `scope:*` tag matches
+///   EVERY tenant and region query ([`Self::Tenant`], [`Self::Region`],
+///   and their list forms). A tenant filter therefore narrows away only
+///   *cooperating* peers that scoped themselves elsewhere — an
+///   adversary simply omits the tag and stays visible.
+/// - **Nothing is withheld on the wire.** An unscoped query
+///   ([`Self::Any`], or plain `find_nodes_by_filter`) returns what a
+///   scoped one filters out. Scope keeps unrelated tenants out of your
+///   own placement decisions; it does not keep your providers secret.
+///
+/// Wire-level scope with forwarder enforcement is deferred — see
+/// `docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md` and
+/// `docs/internal/misc/SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md`.
 #[derive(Debug, Clone)]
 pub enum ScopeFilter<'a> {
     /// Match every peer regardless of scope, except those tagged
@@ -1080,7 +1108,7 @@ impl CapabilitySet {
     /// `parse_user` returns `Err` for them. The drop is now logged at
     /// `warn`: `add_tag("scope:tenant:acme")` looks like it scopes the
     /// announcement but does not, and the resulting set resolves to
-    /// [`CapabilityScope::Global`] — visible to every tenant and region
+    /// `CapabilityScope::Global` — visible to every tenant and region
     /// query. Silently widening a set the caller believed was narrowed
     /// is the failure mode worth hearing about
     /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
@@ -1168,7 +1196,7 @@ impl CapabilitySet {
     /// — repeated calls with the same id do not duplicate. Empty
     /// `tenant_id` is dropped with a `warn` (matches the scope
     /// resolver, which rejects empty ids) — the resulting set is NOT
-    /// tenant-scoped and resolves to [`CapabilityScope::Global`].
+    /// tenant-scoped and resolves to `CapabilityScope::Global`.
     pub fn with_tenant_scope(mut self, tenant_id: impl Into<String>) -> Self {
         let id = tenant_id.into();
         if id.is_empty() {
@@ -1190,7 +1218,7 @@ impl CapabilitySet {
     /// announcement as advertised under the given region.
     /// Idempotent. Empty `region` is dropped with a `warn` — the
     /// resulting set is NOT region-scoped and resolves to
-    /// [`CapabilityScope::Global`].
+    /// `CapabilityScope::Global`.
     pub fn with_region_scope(mut self, region: impl Into<String>) -> Self {
         let name = region.into();
         if name.is_empty() {
