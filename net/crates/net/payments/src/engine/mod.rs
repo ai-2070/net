@@ -355,6 +355,17 @@ impl QuoteRecord {
     /// stand in for the record here. (`accept_payment` also rejects an
     /// expired quote before the claim transaction, so this is the second
     /// of two independent guards, not the only one.)
+    ///
+    /// **A frozen record is never terminal**, whatever else is set on it.
+    /// Freezing is not confined to the pre-redemption lifecycle: a
+    /// `re_verify_with_checker` pass that finds the settlement REVERTED
+    /// freezes a record that is already billed, published, and redeemed —
+    /// so without this the record would satisfy every other condition and
+    /// retire on the ordinary horizon. What it takes with it is the one
+    /// thing worth keeping: the evidence that this provider served against
+    /// a settlement the chain later said never landed. "Fully completed"
+    /// and "completed, then found invalid" are not the same lifecycle, and
+    /// only the first is redundant with the `BillingLog`.
     fn is_prunable_at(&self, now_ns: u64, retention_ns: u64, tolerance_ns: u64) -> bool {
         // A record with no authoritative expiry (written by a build
         // before the field existed) has no floor to measure from and is
@@ -363,7 +374,8 @@ impl QuoteRecord {
         let Some(expiry) = self.expires_at_ns else {
             return false;
         };
-        self.billing.is_some()
+        self.frozen.is_none()
+            && self.billing.is_some()
             && self.billing_published
             && self.redeemed
             && !self.in_flight
@@ -502,14 +514,15 @@ pub struct PaymentEngine {
 ///
 /// **What this does NOT bound.** That figure is the redeemed steady state,
 /// and compaction is not a bound on store size in general — two classes of
-/// record are permanent by construction, because
-/// [`QuoteRecord::is_prunable_at`] requires `redeemed`:
+/// record are permanent by construction (see
+/// [`QuoteRecord::is_prunable_at`]):
 ///
 /// - **settled, billed, published, never redeemed** — a normal outcome, not
 ///   an error: the caller pays and then crashes, times out, or simply never
 ///   invokes. These are full-fat records (both preserved base64 carries);
-/// - **frozen** — every invalidation path (network mismatch, transaction
-///   replay, amount mismatch) leaves `redeemed` false.
+/// - **frozen** — every invalidation, whether it lands before redemption
+///   (network mismatch, transaction replay, amount mismatch) or after one
+///   (a checker finding the settlement reverted).
 ///
 /// Neither is an oversight. `redeem_for_invocation` applies no expiry, so a
 /// paid entitlement never lapses, and retiring its record would destroy

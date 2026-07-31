@@ -271,6 +271,86 @@ async fn an_unredeemed_record_is_never_pruned() {
     assert!(f.engine.status(&quote.quote_id).await.unwrap().is_some());
 }
 
+/// A checker that always reports the settlement **reverted** — the one
+/// verdict that freezes a record which has already completed.
+struct RevertingChecker;
+
+#[async_trait::async_trait]
+impl net_payments::checker::ChainChecker for RevertingChecker {
+    fn reference(&self) -> net_payments::core::verification::VerifierRef {
+        net_payments::core::verification::VerifierRef {
+            identity: None,
+            endpoint: "independent-chain-check:reverting".into(),
+        }
+    }
+
+    async fn check(
+        &self,
+        _network: &str,
+        _transaction: &str,
+        _query: Option<&net_payments::checker::TransferQuery>,
+    ) -> Result<net_payments::checker::ChainVerdict, net_payments::checker::CheckerError> {
+        Ok(net_payments::checker::ChainVerdict::Reverted)
+    }
+}
+
+/// **Freezing is not confined to the pre-redemption lifecycle.** A record
+/// can be billed, published, and redeemed — every other terminal condition
+/// satisfied — and *then* be frozen by a checker finding the settlement
+/// reverted. Retention must not treat that as a completed payment: what it
+/// would discard is the evidence that this provider served against money
+/// that never landed.
+///
+/// The pre-redemption freezes (network mismatch, transaction replay, amount
+/// mismatch) are already excluded by the `redeemed` condition — this is the
+/// one freeze that reaches every other condition first.
+#[tokio::test]
+async fn a_record_frozen_after_redemption_is_never_pruned() {
+    let f = fixture();
+    let (quote, _) = terminal_quote(&f, "2500", "n1").await;
+
+    // Fully terminal, then the chain says the settlement reverted.
+    let decision = f
+        .engine
+        .re_verify_with_checker(
+            &quote.quote_id,
+            &RevertingChecker,
+            VerificationTier::Final,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            decision,
+            PaymentDecision::Invalidated {
+                reason: InvalidationReason::Reorg | InvalidationReason::Rejected
+            }
+        ),
+        "a reverted settlement invalidates: {decision:?}"
+    );
+    let status = f
+        .engine
+        .status(&quote.quote_id)
+        .await
+        .unwrap()
+        .expect("record exists");
+    assert!(status.frozen.is_some(), "a reverted settlement freezes");
+
+    assert_eq!(
+        f.engine
+            .prune_terminal_records(past_horizon())
+            .await
+            .unwrap(),
+        0,
+        "a frozen record is not a completed lifecycle, however old"
+    );
+    assert!(
+        f.engine.status(&quote.quote_id).await.unwrap().is_some(),
+        "the evidence of a served-then-reverted payment survives retention"
+    );
+}
+
 // ============================================================================
 // Resurrection
 // ============================================================================
