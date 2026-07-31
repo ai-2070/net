@@ -41,6 +41,9 @@ typedef enum {
     NET_ERR_MISMATCHED_HANDLES = -10,
     /* CString::new interior NUL — see include/net.h for rationale. */
     NET_ERR_INTERIOR_NUL = -11,
+    /* Parsed but semantically unusable input (e.g. a scope filter with an
+     * unknown kind or an empty required selector) — see include/net.h. */
+    NET_ERR_INVALID_ARGUMENT = -12,
     NET_ERR_UNKNOWN = -99,
     /* CortEX / RedEX surface (compiled when the Rust cdylib has
      * `netdb` + `redex-disk` features on). Codes below -99 so they

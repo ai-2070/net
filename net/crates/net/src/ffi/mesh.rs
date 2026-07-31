@@ -3474,49 +3474,55 @@ enum ScopeFilterOwned {
     Regions(Vec<String>),
 }
 
-fn scope_filter_from_json(f: ScopeFilterJson) -> ScopeFilterOwned {
-    match f.kind.as_str() {
+/// Convert the deserialized scope-filter object into the owned form.
+///
+/// Returns `Err(NetError::InvalidArgument)` for an object that parsed as
+/// JSON but carries no usable selector: an unrecognized `kind`, a
+/// missing/empty required selector, or a list that is empty once empty
+/// entries are removed.
+///
+/// These three shapes all used to collapse to [`ScopeFilterOwned::Any`],
+/// on the reasoning that an empty tenant id could never match a real
+/// tenant tag. But `Any` is the BROADEST filter — every non-`SubnetLocal`
+/// peer in the mesh — so a caller whose tenant id came through empty
+/// silently queried everything and selected a provider from it. A
+/// narrowing filter that cannot narrow must fail, not widen.
+///
+/// `GlobalOnly` is deliberately not used as the fallback either: it
+/// would still return (and let the caller select from) every unscoped
+/// provider. The caller asked to narrow by an identity it did not
+/// supply; the honest answers are an error or no matches.
+fn scope_filter_from_json(f: ScopeFilterJson) -> Result<ScopeFilterOwned, NetError> {
+    // Drop empty entries, then require at least one survivor —
+    // `scope_from_membership_tags` never produces an empty tenant/region,
+    // so an all-empty list can only be caller error.
+    fn clean(v: Vec<String>) -> Option<Vec<String>> {
+        let cleaned: Vec<String> = v.into_iter().filter(|s| !s.is_empty()).collect();
+        (!cleaned.is_empty()).then_some(cleaned)
+    }
+    let filter = match f.kind.as_str() {
         "any" => ScopeFilterOwned::Any,
         "global_only" | "globalOnly" => ScopeFilterOwned::GlobalOnly,
         "same_subnet" | "sameSubnet" => ScopeFilterOwned::SameSubnet,
         "tenant" => match f.tenant {
             Some(t) if !t.is_empty() => ScopeFilterOwned::Tenant(t),
-            _ => ScopeFilterOwned::Any,
+            _ => return Err(NetError::InvalidArgument),
         },
-        "tenants" => match f.tenants {
-            // Drop empty tenant ids — `scope_from_membership_tags`
-            // rejects empty announcements, so a query containing
-            // `[""]` would never match a real tenant and would only
-            // pin to Global candidates. Fall back to Any when cleaned
-            // list is empty.
-            Some(ts) => {
-                let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
-                if cleaned.is_empty() {
-                    ScopeFilterOwned::Any
-                } else {
-                    ScopeFilterOwned::Tenants(cleaned)
-                }
-            }
-            None => ScopeFilterOwned::Any,
+        "tenants" => match f.tenants.and_then(clean) {
+            Some(ts) => ScopeFilterOwned::Tenants(ts),
+            None => return Err(NetError::InvalidArgument),
         },
         "region" => match f.region {
             Some(r) if !r.is_empty() => ScopeFilterOwned::Region(r),
-            _ => ScopeFilterOwned::Any,
+            _ => return Err(NetError::InvalidArgument),
         },
-        "regions" => match f.regions {
-            // Same reasoning as `tenants` above.
-            Some(rs) => {
-                let cleaned: Vec<String> = rs.into_iter().filter(|r| !r.is_empty()).collect();
-                if cleaned.is_empty() {
-                    ScopeFilterOwned::Any
-                } else {
-                    ScopeFilterOwned::Regions(cleaned)
-                }
-            }
-            None => ScopeFilterOwned::Any,
+        "regions" => match f.regions.and_then(clean) {
+            Some(rs) => ScopeFilterOwned::Regions(rs),
+            None => return Err(NetError::InvalidArgument),
         },
-        _ => ScopeFilterOwned::Any,
-    }
+        _ => return Err(NetError::InvalidArgument),
+    };
+    Ok(filter)
 }
 
 /// Run `f` with a borrowed scope filter projected from `owned`.
@@ -3603,7 +3609,10 @@ pub unsafe extern "C" fn net_mesh_find_nodes_scoped(
         Err(_) => return NetError::InvalidJson.into(),
     };
     let filter = capability_filter_from_json(parsed_filter);
-    let owned = scope_filter_from_json(parsed_scope);
+    let owned = match scope_filter_from_json(parsed_scope) {
+        Ok(v) => v,
+        Err(e) => return e.into(),
+    };
     let ids = with_scope_filter(&owned, |sf| {
         h.inner.find_nodes_by_filter_scoped(&filter, sf)
     });
@@ -3741,7 +3750,10 @@ pub unsafe extern "C" fn net_mesh_find_best_node_scoped(
         Err(_) => return NetError::InvalidJson.into(),
     };
     let req = capability_requirement_from_json(parsed_req);
-    let owned = scope_filter_from_json(parsed_scope);
+    let owned = match scope_filter_from_json(parsed_scope) {
+        Ok(v) => v,
+        Err(e) => return e.into(),
+    };
     let result = with_scope_filter(&owned, |sf| h.inner.find_best_node_scoped(&req, sf));
     match result {
         Some(node_id) => unsafe {
@@ -4072,6 +4084,98 @@ fn claim_outcome_code(o: crate::adapter::net::behavior::gang::ClaimOutcome) -> c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scope filters that deserialize cleanly but carry no usable
+    /// selector must return `InvalidArgument`, not resolve to the
+    /// broadest filter.
+    ///
+    /// Pre-fix these all produced `ScopeFilterOwned::Any` — every
+    /// non-`SubnetLocal` peer in the mesh — so a caller whose tenant id
+    /// arrived empty silently queried everything and selected a
+    /// provider from it
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    mod scope_filter_rejects_unusable {
+        use super::super::{scope_filter_from_json, ScopeFilterJson, ScopeFilterOwned};
+        use crate::ffi::NetError;
+
+        fn kind(kind: &str) -> ScopeFilterJson {
+            ScopeFilterJson {
+                kind: kind.into(),
+                tenant: None,
+                tenants: None,
+                region: None,
+                regions: None,
+            }
+        }
+
+        #[test]
+        fn unknown_kind_is_invalid_argument() {
+            assert!(matches!(
+                scope_filter_from_json(kind("tenat")),
+                Err(NetError::InvalidArgument)
+            ));
+        }
+
+        #[test]
+        fn missing_or_empty_selectors_are_invalid_argument() {
+            let cases = vec![
+                kind("tenant"),
+                ScopeFilterJson {
+                    tenant: Some(String::new()),
+                    ..kind("tenant")
+                },
+                kind("tenants"),
+                ScopeFilterJson {
+                    tenants: Some(vec![String::new()]),
+                    ..kind("tenants")
+                },
+                kind("region"),
+                ScopeFilterJson {
+                    region: Some(String::new()),
+                    ..kind("region")
+                },
+                kind("regions"),
+                ScopeFilterJson {
+                    regions: Some(vec![String::new(), String::new()]),
+                    ..kind("regions")
+                },
+            ];
+            for case in cases {
+                let label = case.kind.clone();
+                assert!(
+                    matches!(
+                        scope_filter_from_json(case),
+                        Err(NetError::InvalidArgument)
+                    ),
+                    "kind {label:?} with an unusable selector must be \
+                     InvalidArgument, not a silent widen to Any"
+                );
+            }
+        }
+
+        /// Both spellings resolve, and the selector-bearing kinds still
+        /// work with empty entries stripped.
+        #[test]
+        fn usable_filters_still_convert() {
+            assert!(matches!(
+                scope_filter_from_json(kind("any")),
+                Ok(ScopeFilterOwned::Any)
+            ));
+            for k in ["global_only", "globalOnly"] {
+                assert!(matches!(
+                    scope_filter_from_json(kind(k)),
+                    Ok(ScopeFilterOwned::GlobalOnly)
+                ));
+            }
+            assert!(matches!(
+                scope_filter_from_json(ScopeFilterJson {
+                    tenants: Some(vec![String::new(), "oem-123".into()]),
+                    ..kind("tenants")
+                }),
+                Ok(ScopeFilterOwned::Tenants(ts)) if ts == vec!["oem-123".to_string()]
+            ));
+        }
+    }
 
     /// ABI parity between the Rust `#[repr(C)] NetTraversalStatsV2` and
     /// the hand-maintained C header `include/net.go.h`. The Go guard

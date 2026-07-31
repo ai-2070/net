@@ -449,6 +449,18 @@ pub enum NetError {
     /// reading the typed error and seeing "invalid UTF-8" would
     /// chase the wrong cause.
     InteriorNul = -11,
+    /// Input deserialized cleanly but is semantically unusable — e.g. a
+    /// scope filter whose `kind` is unrecognized, or whose required
+    /// selector is missing / empty / an all-empty list.
+    ///
+    /// Distinct from [`Self::InvalidJson`], which means the bytes were
+    /// not valid JSON at all. Reporting these as `InvalidJson` would send
+    /// a caller looking for a syntax error that isn't there — the same
+    /// reasoning that made [`Self::InteriorNul`] its own code.
+    ///
+    /// Returning an error rather than silently widening is the point:
+    /// a narrowing filter that cannot narrow must fail closed.
+    InvalidArgument = -12,
     /// Unknown error.
     Unknown = -99,
 }
