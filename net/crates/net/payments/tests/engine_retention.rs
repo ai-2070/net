@@ -28,7 +28,7 @@ use net_payments::core::registry::default_mock_registry;
 use net_payments::core::verification::{InvalidationReason, VerificationTier};
 use net_payments::engine::{
     AdmitAll, PaymentDecision, PaymentEngine, RedeemDecision, RejectReason,
-    DEFAULT_TERMINAL_RECORD_RETENTION_NS,
+    DEFAULT_TERMINAL_RECORD_RETENTION_NS, ENGINE_STORE_SIZE_WARN_RECORDS,
 };
 use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::x402::payload::PaymentPayload;
@@ -769,5 +769,131 @@ async fn accepting_a_payment_sweeps_eligible_records() {
             .len(),
         2,
         "tombstones accumulate across retention — both settlements stay claimed"
+    );
+}
+
+// ============================================================================
+// What compaction does NOT bound
+// ============================================================================
+
+/// A `tracing::Layer` recording every event's fields as (name, value)
+/// pairs — the `native_tool_gate.rs` idiom, precise enough to assert the
+/// emit site's *structured* fields by key + value rather than by substring.
+struct FieldCapture {
+    fields: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Collector<'a>(&'a mut Vec<(String, String)>);
+        impl tracing::field::Visit for Collector<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.push((field.name().to_string(), value.to_string()));
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .push((field.name().to_string(), format!("{value:?}")));
+            }
+        }
+        let mut buf = self.fields.lock().expect("capture mutex");
+        event.record(&mut Collector(&mut buf));
+    }
+}
+
+/// Compaction bounds the *redeemed* population and nothing else: a record
+/// that is frozen, or paid but never redeemed, is retained indefinitely by
+/// design. Growth in those classes has no symptom but every payment getting
+/// slower, so the store warns as it crosses
+/// `ENGINE_STORE_SIZE_WARN_RECORDS`.
+///
+/// **Once, on the way up.** The emit uses `==`, not `>=`, so a store parked
+/// above the threshold does not warn on every payment — pinned by the
+/// second payment below, which a `>=` would have warned on again.
+///
+/// Sync + current-thread runtime so the emit fires on the same thread the
+/// capturing subscriber is default for, matching `native_tool_gate.rs`.
+#[test]
+fn crossing_the_store_size_threshold_warns_exactly_once() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let fields = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(FieldCapture {
+        fields: fields.clone(),
+    });
+
+    tracing::subscriber::with_default(subscriber, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let f = fixture();
+            let (quote, _) = terminal_quote(&f, "2500", "n1").await;
+
+            // Seed to one record below the threshold by cloning the real
+            // record under synthetic ids. The clones are ballast — nothing
+            // reads them — so the fat fields are blanked to keep the
+            // fixture store small; they still deserialize as `QuoteRecord`,
+            // which is the only property that matters here. They are not
+            // prunable at `NOW`: they carry the real record's expiry.
+            let mut state = raw_state(&f.path).await;
+            let mut ballast = state["quotes"][&quote.quote_id].clone();
+            for field in ["requirements_b64", "payload_b64"] {
+                ballast[field] = serde_json::json!("");
+            }
+            ballast["chain"] = serde_json::json!([]);
+            ballast["billing"] = serde_json::Value::Null;
+            let quotes = state["quotes"].as_object_mut().unwrap();
+            for i in 0..ENGINE_STORE_SIZE_WARN_RECORDS - 2 {
+                quotes.insert(format!("ballast-{i}"), ballast.clone());
+            }
+            assert_eq!(quotes.len(), ENGINE_STORE_SIZE_WARN_RECORDS - 1);
+            tokio::fs::write(&f.path, serde_json::to_vec(&state).unwrap())
+                .await
+                .unwrap();
+
+            // Two more payments: the first insert takes the store across the
+            // threshold, the second leaves it above.
+            for (amount, nonce) in [("2600", "n2"), ("2700", "n3")] {
+                let next = f
+                    .engine
+                    .issue_quote(
+                        f.caller.entity_id().clone(),
+                        CAP,
+                        mock_reqs(amount),
+                        NOW,
+                        TTL,
+                    )
+                    .unwrap();
+                let decision = f
+                    .engine
+                    .accept_payment(
+                        &next,
+                        &payload(&next, nonce),
+                        VerificationTier::Observed,
+                        NOW,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(decision, PaymentDecision::Served { .. }));
+            }
+        });
+    });
+
+    let captured = fields.lock().expect("capture mutex");
+    let crossings = captured
+        .iter()
+        .filter(|(name, value)| {
+            name == "records" && value == &ENGINE_STORE_SIZE_WARN_RECORDS.to_string()
+        })
+        .count();
+    assert_eq!(
+        crossings, 1,
+        "the store warns once as it crosses the threshold, not on every \
+         payment thereafter: {captured:?}"
     );
 }

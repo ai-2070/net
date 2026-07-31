@@ -496,8 +496,29 @@ pub struct PaymentEngine {
 /// re-verification; it only declines to discard a record something might
 /// still want to re-check.
 ///
-/// At 1 000 paid calls/day this retains ~250 records (~0.8 MB) instead of
-/// letting months of fat records ride every whole-file transaction.
+/// At 1 000 **redeemed** calls/day this retains ~250 records (~0.8 MB)
+/// instead of letting months of fat records ride every whole-file
+/// transaction.
+///
+/// **What this does NOT bound.** That figure is the redeemed steady state,
+/// and compaction is not a bound on store size in general — two classes of
+/// record are permanent by construction, because
+/// [`QuoteRecord::is_prunable_at`] requires `redeemed`:
+///
+/// - **settled, billed, published, never redeemed** — a normal outcome, not
+///   an error: the caller pays and then crashes, times out, or simply never
+///   invokes. These are full-fat records (both preserved base64 carries);
+/// - **frozen** — every invalidation path (network mismatch, transaction
+///   replay, amount mismatch) leaves `redeemed` false.
+///
+/// Neither is an oversight. `redeem_for_invocation` applies no expiry, so a
+/// paid entitlement never lapses, and retiring its record would destroy
+/// something the caller paid for; a frozen record is evidence. But it means
+/// a deployment whose callers pay and abandon accumulates fat records
+/// forever, at the linear per-transaction cost compaction exists to
+/// contain. Making that class prunable needs a *redemption deadline* — a
+/// payment-semantics decision, not a retention one. Until then the growth is
+/// at least visible: see [`ENGINE_STORE_SIZE_WARN_RECORDS`].
 ///
 /// **Default-on, explicit opt-out.** Making compaction opt-in would leave
 /// most deployments silently accumulating multi-kilobyte terminal records
@@ -505,6 +526,22 @@ pub struct PaymentEngine {
 /// publication, and redemption, the full record is redundant lifecycle
 /// material — not active authority state.
 pub const DEFAULT_TERMINAL_RECORD_RETENTION_NS: u64 = 6 * 3_600 * 1_000_000_000;
+
+/// Record count at which the engine store warns once, on the way up.
+///
+/// Every engine operation parses and (when dirty) re-serializes the whole
+/// file, so store size is a latency term on every payment. Compaction keeps
+/// the redeemed population flat, but the classes it cannot retire — see
+/// [`DEFAULT_TERMINAL_RECORD_RETENTION_NS`] — grow without bound, and their
+/// only symptom is payments getting gradually slower. That is exactly the
+/// failure an operator cannot diagnose from the outside, so it gets a log
+/// line rather than nothing.
+///
+/// Emitted from the one site that grows the map, on the single transition
+/// `len() == ENGINE_STORE_SIZE_WARN_RECORDS`, so a store sitting above the
+/// threshold does not warn on every payment. A store oscillating across it
+/// re-warns, which is informative rather than noisy.
+pub const ENGINE_STORE_SIZE_WARN_RECORDS: usize = 10_000;
 
 impl PaymentEngine {
     pub fn new(
@@ -770,6 +807,24 @@ impl PaymentEngine {
                     };
                     s.consumed.insert(payload_hash, quote_id.clone());
                     s.quotes.insert(quote_id.clone(), record);
+                    // The one site that grows the map, so the one site that
+                    // can observe the store crossing the warn threshold.
+                    // `==` rather than `>=`: this fires once per upward
+                    // crossing, not on every payment thereafter. What it
+                    // catches is the population compaction cannot retire
+                    // (paid-but-never-redeemed, frozen), whose only other
+                    // symptom is every payment getting slower.
+                    if s.quotes.len() == ENGINE_STORE_SIZE_WARN_RECORDS {
+                        tracing::warn!(
+                            records = s.quotes.len(),
+                            "payment engine store crossed \
+                             ENGINE_STORE_SIZE_WARN_RECORDS — every operation parses and \
+                             rewrites the whole file, so this is a latency term on every \
+                             payment. Terminal records are compacted; records that are \
+                             frozen, or paid but never redeemed, are retained \
+                             indefinitely by design and are the likely cause"
+                        );
+                    }
                     Claim::Fresh
                 };
                 let dirty = matches!(claim, Claim::Fresh) || retired > 0;
