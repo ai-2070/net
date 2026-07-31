@@ -34,6 +34,32 @@ invalid filters instead of rejecting them.
 
 ---
 
+## Remediation status (2026-08-01)
+
+| # | Finding | Status |
+| - | ------- | ------ |
+| HIGH #1 | `allowed_groups` publishes its own secret | **Documented as advisory.** Behaviour unchanged by decision — disabling would break deployments relying on the axes today, including legitimate members. Corrected at every operator-facing surface: module docs, both announcement fields, `may_execute`, CLI flag help, and a runtime warning on `net cap announce`. Real fix deferred to the entitlement design. |
+| HIGH #2 | `ParentVisible` admits unresolved peers | **Fixed.** `subnet_visible` takes `Option<SubnetId>`; unknown no longer coerces to `GLOBAL`. Flat-mesh behaviour preserved via `source.is_global()`. |
+| HIGH #2 (issue 1) | Subnet membership self-asserted | **Open** — same root cause as HIGH #1; needs the entitlement primitive. |
+| MEDIUM | Multi-hop `SameSubnet` / `scope:subnet-local` leak | **Fixed.** Forwarded peers resolve from the origin's own tags on the indexed announcement. No sidecar, so no lifecycle divergence. |
+| MEDIUM | Converters widen invalid filters to `Any` | **Fixed.** All three native converters now error. |
+| MEDIUM | Node kind-spelling drift | **Fixed.** |
+| MEDIUM | Scope derivation under fold locks | **Fixed.** `tags_match_scope` evaluates off borrowed tags with no allocation. |
+| LOW | `Global` is permissive | **Documented** on the exported Rust and TS types. |
+| LOW | Silent builder widening | **Fixed.** All three drop paths now `warn`; test pins the consequence. |
+| LOW | Query cost | Folded into the fold-lock fix above. |
+
+The entitlement primitive (issuer-signed `(subject, axis, value, validity)`) is
+the one item deliberately not attempted: it is a design pass with a wire format,
+issuer/delegation model, execution-grade revocation, and cross-language surface.
+Both open items depend on it.
+
+Verification: 5365 lib tests, 8 `capability_scope`, 17 `capability_broadcast`,
+7 `subnet_enforcement`, 11 `channel_auth`, 7 `channel_auth_hardening` — all
+passing. `cargo doc` clean.
+
+---
+
 ## Design baseline (documented, not a defect)
 
 `docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md:31-88` is explicit that scope is
