@@ -128,6 +128,9 @@ pub(crate) struct SlotBaseFacts {
     pub authority: ScopedDiscoveryAuthorityStamp,
     pub actor_incarnation: u64,
     pub slot_incarnation: u64,
+    /// The consumer-Grant publication generation this artifact was reconstructed
+    /// under (OLB-2B.3c-pre step 3). See [`ScopedSourceFacts::grant_publication`].
+    pub grant_publication: u64,
     /// The earliest `expires_at` across the retained providers, or `u64::MAX`
     /// when nothing here can expire.
     ///
@@ -241,6 +244,17 @@ pub(crate) struct ScopedSourceFacts {
     /// exactly `not_after + MAX_TOKEN_CLOCK_SKEW_SECS` — the first instant the
     /// authority is no longer valid, not the last instant it is.
     pub authority_deadline: u64,
+    /// The consumer-Grant PUBLICATION generation this reconstruction observed.
+    ///
+    /// Ordering, not authority — `authority` above is the authority. This exists
+    /// so a delayed movement notification can tell whether the artifact it is
+    /// about to clear predates or postdates the transition it carries.
+    ///
+    /// It must be present on EVERY reconstruction, including `Unserved` ones,
+    /// which is the whole point: an absent-Grant reconstruction is stamped
+    /// `Owner` and so carries no installation identity, yet it can be the exact
+    /// successor a later removal produced.
+    pub grant_publication: u64,
 }
 
 /// An opaque, comparable summary of EVERY authority input a snapshot was taken
@@ -712,18 +726,31 @@ pub(crate) struct GrantScopeMovement {
     /// live scopes across an audience rotation, and the one that did not move
     /// must not be churned.
     pub audience_handle: [u8; 32],
-    /// Every artifact built under an installation identity `<=` this is obsolete;
-    /// anything stamped higher is a SUCCESSOR and must survive.
+    /// The consumer-Grant PUBLICATION generation of this transition.
     ///
-    /// One number rather than an identity plus a kind, because the two transition
-    /// kinds differ only in where the boundary sits:
+    /// A reconstruction that observed generation `g` is obsolete with respect to
+    /// this movement iff `g < publication`; anything at or beyond it already
+    /// reflects the transition and is a SUCCESSOR.
     ///
-    /// - install of `k` supersedes everything BEFORE it — `k - 1`;
-    /// - removal of `k` supersedes `k` itself as well — `k`.
+    /// **It must order absences as well as installations.** An earlier shape
+    /// carried `superseded_through`, derived from `install_seq`, and treated an
+    /// `Owner`-stamped artifact on a Grant slot as never-a-successor. That is
+    /// false, and Kyra's production-path probe against `7348529fb` demonstrated
+    /// it: a delayed INSTALL notification destroyed the newer `Unserved`
+    /// artifact a later REMOVAL had produced. `install_seq` orders installations
+    /// only, and an absence has no installation identity to order it by.
     ///
-    /// `install_seq` is the checked, terminal, strictly monotone identity signed
-    /// at `300e80f6c`, so this comparison cannot alias.
-    pub superseded_through: u64,
+    /// ```text
+    /// install N     publish, [stall before notifying]
+    /// (warm)        artifact reconstructed under N
+    /// remove N      publish absence, notify -> clears it, re-queues
+    /// (rebuild)     newer artifact: Unserved, `Owner`-stamped
+    /// install N     [resumes] -> destroys that newer artifact
+    /// ```
+    ///
+    /// A publication generation orders every transition uniformly, which is what
+    /// makes the fence total.
+    pub publication: u64,
 }
 
 impl GrantScopeMovement {
@@ -1040,10 +1067,11 @@ impl NodeOrgRoutingRegistry {
     /// successor has to still be true when the clear happens.
     ///
     /// A slot that is retained but holds NO artifact is still re-queued — that is
-    /// the whole install direction. A Grant-scoped slot reconstructed `Unserved`
-    /// holds an `Owner`-stamped artifact, which names no installation at all and
-    /// therefore cannot be a successor; it is retired and rebuilt. Only a
-    /// `Grant`-stamped artifact from a LATER installation is preserved.
+    /// the whole install direction, and it is harmless coalescing besides.
+    /// Everything else is judged by the publication generation the artifact was
+    /// reconstructed under, so an `Unserved` reconstruction is preserved exactly
+    /// when it is NEWER than the notifying transition. Treating absence as
+    /// never-a-successor is the defect Kyra's probe found at `7348529fb`.
     ///
     /// **Not keyed on `ScopedDiscoveryState::revision`** (item 11, design §2A.2).
     /// A consumer-Grant transition mutates the grant registry, not the scoped
@@ -1066,17 +1094,15 @@ impl NodeOrgRoutingRegistry {
                 let Some(cell) = inner.slots.get(&key).map(|slot| slot.facts.clone()) else {
                     continue;
                 };
+                // Ordered by the PUBLICATION generation the reconstruction
+                // observed, not by the authority it stamped — that is what makes
+                // the fence total over installations AND absences. A slot with no
+                // artifact has nothing to preserve and still owes work, so it is
+                // re-queued: harmless coalescing, since `pending` is a set and a
+                // cold slot needs rebuilding regardless.
                 let superseded = match cell.load().as_ref() {
-                    // Nothing to preserve, and the slot still owes work.
                     None => true,
-                    Some(facts) => match facts.authority {
-                        ScopedDiscoveryAuthorityStamp::Grant { install_seq, .. } => {
-                            install_seq <= movement.superseded_through
-                        }
-                        // An `Unserved` reconstruction names NO installation, so
-                        // it cannot be the successor this transition must spare.
-                        ScopedDiscoveryAuthorityStamp::Owner => true,
-                    },
+                    Some(facts) => facts.grant_publication < movement.publication,
                 };
                 if !superseded {
                     // A LATER installation already published here. Leave it
@@ -1581,6 +1607,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     facts,
                     authority,
                     authority_deadline,
+                    grant_publication,
                 } = facts;
                 let row_expiry = match &facts {
                     SourceFacts::Served(providers) => providers
@@ -1603,6 +1630,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     providers: facts,
                     epoch,
                     authority,
+                    grant_publication,
                     actor_incarnation: incarnation,
                     slot_incarnation,
                     earliest_expiry,
@@ -1842,6 +1870,7 @@ mod tests {
             ScopedSourceFacts {
                 facts: SourceFacts::Served(Arc::from(Vec::new())),
                 authority: ScopedDiscoveryAuthorityStamp::Owner,
+                grant_publication: 0,
                 authority_deadline: u64::MAX,
             }
         }

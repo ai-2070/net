@@ -24,7 +24,7 @@ belong.
 | OLB-2B.3 boundary design (rev 5 + addenda) | `1c1b652e6` | SIGNED **as a design only** |
 | 2B.3c-pre **step 1** — installation identity (items 1–3) | `300e80f6c` | SIGNED |
 | 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `a788232bd` | **SIGNED** (`OLB_2B3C_PRE_STEP2_SIGNED_HEAD`) — held once at `df32cbd7d`, repaired, signed 2026-07-29; see §2b |
-| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | `fa0b9ddd5` → repaired | **HELD at `fa0b9ddd5`, REPAIRED — NOT SIGNED.** Kyra's P1 (delayed notification retiring a successor) and P2 (invalidation broader than the exact scope); see §2c |
+| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | `fa0b9ddd5` → `7348529fb` → this repair | **HELD TWICE, REPAIRED — NOT SIGNED.** P1/P2 at `fa0b9ddd5`, P1b (absence ordering) at `7348529fb`; exact head recorded in the follow-up commit; see §2c |
 | `SAFE_LIVE_HEAD` | — | **not established**, still reserved for provider-free leader lighting |
 
 Authoritative design: [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md).
@@ -115,6 +115,26 @@ Witness `a_delayed_grant_notification_cannot_retire_a_successor_installation`.
 same id under a rotated-away audience handle. Now exact on
 `(grant_id, audience_handle)`. Witness
 `consumer_grant_movement_preserves_same_id_unaffected_scopes`.
+
+**P1b, from the review of `7348529fb` — the SYMMETRIC permutation.** The first
+repair ordered by `install_seq` and treated an `Owner`-stamped artifact as
+never-a-successor. False, and reproduced dynamically: when the later state is
+ABSENCE, the `Unserved` artifact IS the successor, and installation identity
+cannot order it.
+
+```text
+W-W6:  delayed removal N   -> install N+1  -> preserve the Grant-stamped N+1
+W-W8:  delayed install  N  -> remove  N    -> preserve the Owner-stamped absence
+```
+
+The fence is now a consumer-Grant PUBLICATION generation, which orders every
+transition uniformly, carried on every reconstruction including `Unserved` ones.
+Bumped AFTER the store and read BEFORE the load, so a recorded generation is
+never newer than the content it was built from. Witness
+`a_delayed_install_notification_cannot_retire_a_successor_removal_artifact`.
+
+**ONLY step 3 is under corrective review. 2B.3b and every later OLB slice remain
+UNAUTHORIZED until it signs.**
 
 **Capability narrowing was NOT adopted, and that is a decision.** Kyra also asked
 for narrowing by the grant's capability. Verified directly first: a Grant slot
@@ -232,7 +252,7 @@ net/crates/net/src/adapter/net/
     MeshNode::publish_consumer_grant_snapshot
                                         the ONE consumer publication seam (counted in test)
     oa34b2_query_currentness_tests      W-G9 / W-G10 / W-G10b + assert_no_effect
-  org_routing_wiring_tests.rs           61 witnesses; CI floor MIN=61
+  org_routing_wiring_tests.rs           62 witnesses; CI floor MIN=62
   behavior/org_routing_registry.rs
     ScopedDiscoveryAuthorityStamp       Owner | Grant{id, install_seq, signature, handle}
     ScopedSourceFacts                   facts + the authority that produced them
@@ -293,8 +313,8 @@ cd net/crates/net
 export UNIT_FEATURES="net redex redex-disk cortex netdb meshdb meshos dataforts \
 nat-traversal port-mapping tool batched-ingress cli regex"
 
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,476 expected
-CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 61, MIN 61
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES"          # 5,477 expected
+CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" org_routing_wiring_tests   # 62, MIN 62
 CARGO_INCREMENTAL=0 cargo test --lib --features "$UNIT_FEATURES" behavior::org_routing::     # 24, MIN 24
 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo clippy --all-features --all-targets -- -D warnings \
@@ -307,27 +327,10 @@ git diff --check
   workspace once (disk-full → zero-byte rlibs → rustc ICEs).
 - Adding a wiring witness means raising `MIN` in `.github/workflows/ci.yml` in
   the **same commit**, and name-pinning anything carrying a security property.
-- `org_authority::tests::a_deny_ace_does_not_make_an_owner_only_dir_invalid`
-  **HAS now reproduced, and therefore meets Kyra's threshold for action.**
-  Tally so far, all under full-suite parallel load and all on Windows:
-
-  ```text
-  2026-07-29  failed once, then 10 isolated + 5 full-suite repeats all clean
-  2026-07-30  failed once more, then 8 further full-suite repeats all clean
-  ```
-
-  So roughly 2 in ~25 full-load runs, and 0 in 10 isolated runs. The earlier
-  "did not reproduce" note was accurate about those 15 runs and is now
-  superseded: the correct statement is that it is a genuine low-frequency flake
-  under parallel load, not a one-off.
-
-  It shells out to `icacls` against a PID-scoped temp dir, so the likely shape is
-  contention on the external process or on the directory rather than anything in
-  the ACL logic — but that is a HYPOTHESIS, not a diagnosis, and no failure
-  message has been captured yet (both observed failures were in runs whose output
-  was not retained). It touches nothing in any OLB slice. **Not diagnosed, not
-  fixed, and deliberately not chased inside this slice** — raised for Kyra to
-  schedule, since it now clears the bar she set.
+- Unrelated Windows flake, moved to its own record:
+  [`../misc/FLAKE_ORG_AUTHORITY_DENY_ACE.md`](../misc/FLAKE_ORG_AUTHORITY_DENY_ACE.md).
+  Reproduced, not diagnosed; 2 failures in 15 full-load runs, 0 in 10 isolated.
+  Touches no OLB slice.
 
 ---
 

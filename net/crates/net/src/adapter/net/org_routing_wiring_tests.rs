@@ -689,6 +689,7 @@ async fn cached_facts_that_crossed_their_expiry_read_cold() {
     // them: valid at capture, expired by the time they are read.
     let expired = Arc::new(SlotBaseFacts {
         authority: ScopedDiscoveryAuthorityStamp::Owner,
+        grant_publication: 0,
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: crate::adapter::net::behavior::org_routing_registry::SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -922,6 +923,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
         key.clone(),
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
+            grant_publication: 0,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -944,6 +946,7 @@ async fn facts_built_against_superseded_floors_read_cold() {
         key.clone(),
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
+            grant_publication: 0,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -1646,6 +1649,7 @@ async fn a_delayed_reader_does_not_delete_a_newer_artifact() {
     let facts = |authority: u64| {
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
+            grant_publication: 0,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -1711,6 +1715,7 @@ async fn the_read_seam_fences_a_dead_incarnations_facts() {
     let key = slot(29, "nrpc:incarnation-fence");
     let facts = Arc::new(SlotBaseFacts {
         authority: ScopedDiscoveryAuthorityStamp::Owner,
+        grant_publication: 0,
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -1788,6 +1793,7 @@ async fn the_read_seams_authority_sample_cannot_straddle_a_store_install() {
     let key = slot(30, "nrpc:coherent-sample");
     let facts = Arc::new(SlotBaseFacts {
         authority: ScopedDiscoveryAuthorityStamp::Owner,
+        grant_publication: 0,
         providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
         epoch: SourceEpoch {
             generation: node.scoped_discovery.lock().revision(),
@@ -1873,6 +1879,7 @@ async fn poisoning_authority_colds_already_cached_facts() {
         key.clone(),
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
+            grant_publication: 0,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -1926,6 +1933,7 @@ async fn authority_only_movement_invalidates_and_requeues_everything() {
         key.clone(),
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
+            grant_publication: 0,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: scoped_before,
@@ -2207,6 +2215,7 @@ async fn the_epoch_advances_before_the_store_becomes_visible() {
         key.clone(),
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
+            grant_publication: 0,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -2399,6 +2408,7 @@ async fn authority_invalidation_spares_successor_facts() {
     let facts = |authority: u64| {
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
+            grant_publication: 0,
             providers: SourceFacts::Served(Arc::from([] as [PrivateCapabilityProvider; 0])),
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -3269,6 +3279,7 @@ async fn a_reader_retires_unserved_facts_once_their_poison_clears() {
     let poisoned_facts = |floor_generation: u64| {
         Arc::new(SlotBaseFacts {
             authority: ScopedDiscoveryAuthorityStamp::Owner,
+            grant_publication: 0,
             providers: SourceFacts::Unserved,
             epoch: SourceEpoch {
                 generation: node.scoped_discovery.lock().revision(),
@@ -3450,6 +3461,7 @@ async fn duplicate_provider_rows_collapse_to_the_newest_generation() {
     // because the input happened to be sorted the right way.
     let snapshot = ScopedSourceSnapshot {
         token: SourceToken::default(),
+        grant_publication: 0,
         rows: [(
             key.clone(),
             (
@@ -5682,4 +5694,137 @@ async fn consumer_grant_movement_preserves_same_id_unaffected_scopes() {
          THIS assertion is the one that must fail and force the invalidation to \
          be narrowed with it"
     );
+}
+
+/// W-W8. A delayed INSTALL notification cannot retire the newer ABSENCE artifact
+/// a later removal produced.
+///
+/// The mirror of W-W6, and the permutation W-W6 does not reach:
+///
+/// ```text
+/// W-W6:  delayed removal N   -> install N+1  -> preserve the Grant-stamped N+1
+/// W-W8:  delayed install  N  -> remove  N    -> preserve the Owner-stamped absence
+/// ```
+///
+/// It was missed because of a comment I wrote and believed: "an `Unserved`
+/// reconstruction names NO installation, so it cannot be the successor". That is
+/// false. When the later state is ABSENCE, the `Unserved` artifact IS the exact
+/// successor — and an ordering derived from `install_seq` cannot see it, because
+/// an absence has no installation identity to be ordered by. Kyra's
+/// production-path probe against `7348529fb` failed on precisely the pointer
+/// identity asserted below.
+///
+/// The fence is therefore a consumer-Grant PUBLICATION generation, which orders
+/// installs and removals alike, and every reconstruction carries the generation
+/// it observed — including `Unserved` ones, which is the whole point.
+///
+/// Dies to ordering by `install_seq`, and to treating an `Owner`-stamped artifact
+/// as never-a-successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delayed_install_notification_cannot_retire_a_successor_removal_artifact() {
+    use crate::adapter::net::behavior::org_routing_registry::SourceFacts;
+
+    let f = grant_fixture("ww8").await;
+    let (grant, secret) = f.mint("nrpc:ww8", Some([0xa8u8; 32]), None);
+    let grant_id = grant.grant_id;
+    let handle = secret.audience_handle;
+    let key = f.key(grant_id, handle, "nrpc:ww8");
+
+    f.node.start();
+    assert!(until(|| f.node.org_routing_ready()).await, "healthy");
+    let family = f.node.org_routing_family().expect("family");
+
+    // Park the FIRST notification — the install's. A one-shot latch rather than a
+    // predicate on the movement, for the same reason as W-W6: the transitions are
+    // not reliably distinguishable by value, and the install's notification is
+    // guaranteed first because nothing removes until `reached` is observed.
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
+    {
+        let release_rx = release_rx.clone();
+        let parked = Arc::new(AtomicBool::new(false));
+        f.node.arm_grant_movement_hook(Arc::new(move |_movement| {
+            if parked.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let _ = reached_tx.try_send(());
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the witness must release the parked notification");
+        }));
+    }
+
+    let installer = {
+        let node = f.node.clone();
+        std::thread::spawn(move || {
+            node.install_consumer_grant_audience(grant, secret)
+                .expect("install")
+        })
+    };
+    reached_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the install must reach its notification and park there");
+
+    // The install has PUBLISHED but has not yet notified. Demand the slot NOW:
+    // first demand enqueues it and marks work on its own, which is the only
+    // reason this slot can warm while the install's own wake is parked — and it
+    // is also precisely the "a demand arriving after publication is safe" case
+    // design §2A.2 calls out.
+    let held = family.demand(key.clone()).expect("demand");
+    assert!(
+        until(|| f.node.org_routing_base_facts(&key).is_some()).await,
+        "the slot must warm under the installed grant before it is removed"
+    );
+
+    // Now remove it. Its notification passes through the latch freely, clears the
+    // artifact above, and the actor rebuilds the slot as a NEWER absence.
+    assert!(
+        f.node.remove_consumer_grant_audience(&grant_id),
+        "precondition: the removal published"
+    );
+    assert!(
+        until(|| {
+            f.node
+                .routing_registry
+                .base_facts_unvalidated(&key)
+                .is_some_and(|facts| matches!(facts.providers, SourceFacts::Unserved))
+        })
+        .await,
+        "the removal must leave a newer UNSERVED artifact — retained, and read \
+         cold"
+    );
+    let successor = f
+        .node
+        .routing_registry
+        .base_facts_unvalidated(&key)
+        .expect("successor absence artifact");
+    let counts_before = f.node.org_routing_reconciliation_counts();
+
+    // Release the obsolete INSTALL notification.
+    let _ = release_tx.send(());
+    installer.join().expect("installer thread");
+
+    assert!(
+        f.node
+            .routing_registry
+            .base_facts_unvalidated(&key)
+            .is_some_and(|live| Arc::ptr_eq(&live, &successor)),
+        "the obsolete INSTALL notification must preserve the exact newer \
+         Unserved artifact produced by the later removal — an absence IS a \
+         successor, and ordering by installation identity cannot see it"
+    );
+    let counts_after = f.node.org_routing_reconciliation_counts();
+    assert_eq!(
+        counts_after[2], counts_before[2],
+        "and must invalidate nothing"
+    );
+    assert_eq!(
+        counts_after[0], counts_before[0],
+        "and must not have re-queued it either"
+    );
+
+    drop(held);
+    let _ = f.node.shutdown().await;
 }

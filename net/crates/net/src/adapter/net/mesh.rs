@@ -5513,6 +5513,21 @@ struct GrantAuthority {
 /// creating an inversion.
 struct ConsumerGrantGate {
     mu: parking_lot::Mutex<()>,
+    /// A monotone identity for every consumer-Grant PUBLICATION — install,
+    /// removal and remove-if-current alike (OLB-2B.3c-pre step 3).
+    ///
+    /// Lives here because this is already the one thing both the node (which
+    /// publishes) and the routing source (which reads) share, and every
+    /// publication happens under the mutex above.
+    ///
+    /// **Bumped AFTER the snapshot store, and read BEFORE the snapshot load.**
+    /// Together those give the invariant the movement fence depends on: an
+    /// artifact's recorded generation is never NEWER than the content it was
+    /// built from. Reversing either would let a reconstruction be stamped with a
+    /// generation whose publication it had not actually observed, and the fence
+    /// would then preserve a stale artifact against the very movement meant to
+    /// clear it.
+    publications: std::sync::atomic::AtomicU64,
     /// Test-only: fired ONLY when a `try_lock` has actually FAILED, immediately
     /// before blocking on `lock()`.
     ///
@@ -5530,6 +5545,7 @@ impl ConsumerGrantGate {
     fn new() -> Self {
         Self {
             mu: parking_lot::Mutex::new(()),
+            publications: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             contended_hook: parking_lot::Mutex::new(None),
         }
@@ -5565,6 +5581,11 @@ impl ConsumerGrantGate {
 /// registry selected, captured at `generation`.
 struct ScopedSourceSnapshot {
     token: super::behavior::org_routing_registry::SourceToken,
+    /// The consumer-Grant publication generation this capture observed. Read
+    /// BEFORE the snapshot load, so it can only UNDER-state what was observed —
+    /// see `ConsumerGrantGate::publications` for why that direction is the safe
+    /// one.
+    grant_publication: u64,
     /// ONLY the keys this source can actually speak for. A key absent here
     /// reconstructs as `SourceFacts::Unserved`, never as an empty provider set.
     ///
@@ -5958,6 +5979,7 @@ impl ScopedSlotSource {
         use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
         let installed = slot.load_full();
         let mut stamps = std::collections::BTreeMap::new();
+        // (the publication generation is read by the caller, BEFORE this load)
         for key in keys {
             let CapabilityAudienceScope::Grant {
                 grant_id,
@@ -6043,6 +6065,10 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
                 facts: SourceFacts::Unserved,
                 authority: ScopedDiscoveryAuthorityStamp::Owner,
                 authority_deadline: u64::MAX,
+                // Carried even here — ESPECIALLY here. An absent-Grant
+                // reconstruction is `Owner`-stamped and so names no installation,
+                // yet it is exactly the successor a later removal produces.
+                grant_publication: self.grant_publication,
             };
         };
         let authority = *authority;
@@ -6067,6 +6093,7 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
             facts: SourceFacts::Served(providers.into()),
             authority,
             authority_deadline,
+            grant_publication: self.grant_publication,
         }
     }
 }
@@ -6196,6 +6223,19 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         // protects it from unrelated Grant movement; the deterministic VECTOR of
         // selected identities goes into the token and protects this
         // capture/commit transaction.
+        //
+        // The publication generation is read BEFORE the snapshot load inside
+        // `grant_installations_for`, so it can only under-state what that load
+        // observed. Under-stating means an artifact looks OLDER than it is and
+        // gets cleared by a movement that need not have cleared it: churn.
+        // Over-stating would mean an artifact looks NEWER than it is and SURVIVES
+        // a movement that had to clear it: staleness. Only one of those is
+        // survivable, which is why the order is fixed here and documented on
+        // `ConsumerGrantGate::publications`.
+        let grant_publication = self
+            .consumer_grant_gate
+            .publications
+            .load(std::sync::atomic::Ordering::Acquire);
         let (grant_installations, grant_identity_vector) =
             Self::grant_installations_for(&self.consumer_grants, keys, now_secs);
 
@@ -6316,7 +6356,11 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             exhausted || generations_exhausted,
             &grant_identity_vector,
         );
-        Box::new(ScopedSourceSnapshot { token, rows })
+        Box::new(ScopedSourceSnapshot {
+            token,
+            rows,
+            grant_publication,
+        })
     }
 
     fn pin_if_current(
@@ -11144,7 +11188,7 @@ impl MeshNode {
     fn publish_consumer_grant_snapshot(
         &self,
         next: Arc<super::behavior::org_grant_registry::ConsumerGrantSnapshot>,
-    ) {
+    ) -> u64 {
         // `AcqRel`, not `Relaxed`: the counter exists precisely so a transient
         // publication is observable, which invites a witness that samples it from
         // ANOTHER thread while one is in flight. Paired with the `Acquire` load
@@ -11156,6 +11200,13 @@ impl MeshNode {
         self.consumer_grant_publications
             .fetch_add(1, Ordering::AcqRel);
         self.consumer_grant_audiences.store(next);
+        // AFTER the store — see `ConsumerGrantGate::publications`. `fetch_add`
+        // returns the PREVIOUS value, so the generation this publication owns is
+        // one beyond it.
+        self.consumer_grant_gate
+            .publications
+            .fetch_add(1, Ordering::AcqRel)
+            + 1
     }
 
     /// Test-only: how many consumer-Grant snapshot publications have occurred.
@@ -11326,7 +11377,7 @@ impl MeshNode {
         // Scoped so the gate is RELEASED before routing is notified (item 10).
         // Every `return` inside this block is a non-publishing outcome, so each
         // one deliberately leaves without waking anything.
-        let install_seq = {
+        let (install_seq, publication) = {
             let _guard = self.consumer_grant_gate.lock();
             let current = self.consumer_grant_audiences.load_full();
             // Settle EVERY ordinary refusal before allocation — idempotence,
@@ -11348,8 +11399,8 @@ impl MeshNode {
             // cannot be wasted.
             let install_seq = self.allocate_consumer_grant_install_seq()?;
             let next = ConsumerGrantSnapshot::finish_install(prepared, install_seq);
-            self.publish_consumer_grant_snapshot(Arc::new(next));
-            install_seq
+            let publication = self.publish_consumer_grant_snapshot(Arc::new(next));
+            (install_seq, publication)
         };
         // An INSTALL is routing movement in the availability direction: a
         // Grant-scoped slot reconstructed `Unserved` because this grant was not
@@ -11364,7 +11415,7 @@ impl MeshNode {
             &super::behavior::org_routing_registry::GrantScopeMovement {
                 grant_id,
                 audience_handle,
-                superseded_through: install_seq.saturating_sub(1),
+                publication,
             },
         );
         Ok(ConsumerAudienceInstall::Installed(
@@ -11390,20 +11441,19 @@ impl MeshNode {
         let movement = {
             let _guard = self.consumer_grant_gate.lock();
             let current = self.consumer_grant_audiences.load_full();
-            let removing = current.get(grant_id).map(|record| {
-                super::behavior::org_routing_registry::GrantScopeMovement {
-                    grant_id: *grant_id,
-                    audience_handle: *record.audience_handle(),
-                    // A removal supersedes its OWN installation as well.
-                    superseded_through: record.install_seq(),
+            let handle = current
+                .get(grant_id)
+                .map(|record| *record.audience_handle());
+            match (handle, current.without(grant_id)) {
+                (Some(audience_handle), Some(next)) => {
+                    let publication = self.publish_consumer_grant_snapshot(Arc::new(next));
+                    Some(super::behavior::org_routing_registry::GrantScopeMovement {
+                        grant_id: *grant_id,
+                        audience_handle,
+                        publication,
+                    })
                 }
-            });
-            match current.without(grant_id) {
-                Some(next) => {
-                    self.publish_consumer_grant_snapshot(Arc::new(next));
-                    removing
-                }
-                None => None,
+                _ => None,
             }
         };
         // Only a real publication is routing movement. A no-op removal changed
@@ -11438,17 +11488,15 @@ impl MeshNode {
                 // owns nothing here.
                 Some(record) if record.install_seq() != lease.install_seq() => None,
                 Some(record) => {
-                    let removing = super::behavior::org_routing_registry::GrantScopeMovement {
-                        grant_id: *lease.grant_id(),
-                        audience_handle: *record.audience_handle(),
-                        // The lease matched this record, so its identity IS the
-                        // installation being superseded.
-                        superseded_through: record.install_seq(),
-                    };
+                    let audience_handle = *record.audience_handle();
                     match current.without(lease.grant_id()) {
                         Some(next) => {
-                            self.publish_consumer_grant_snapshot(Arc::new(next));
-                            Some(removing)
+                            let publication = self.publish_consumer_grant_snapshot(Arc::new(next));
+                            Some(super::behavior::org_routing_registry::GrantScopeMovement {
+                                grant_id: *lease.grant_id(),
+                                audience_handle,
+                                publication,
+                            })
                         }
                         None => None,
                     }
