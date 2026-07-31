@@ -393,9 +393,13 @@ impl QuoteRecord {
 fn prune_terminal(
     s: &mut EngineState,
     now_ns: u64,
-    retention_ns: u64,
+    retention_ns: Option<u64>,
     tolerance_ns: u64,
 ) -> bool {
+    // Compaction explicitly disabled: keep every terminal record.
+    let Some(retention_ns) = retention_ns else {
+        return false;
+    };
     let retiring: Vec<String> = s
         .quotes
         .iter()
@@ -469,9 +473,10 @@ pub struct PaymentEngine {
     /// itself, while a crashed one eventually frees up.
     in_flight_ttl_ns: u64,
     /// How long a terminal quote record is kept past its authoritative
-    /// expiry before retention may remove it. Default 6 hours — see
-    /// [`DEFAULT_TERMINAL_RETENTION_NS`].
-    terminal_retention_ns: u64,
+    /// expiry before compaction may remove it, or `None` to keep terminal
+    /// records indefinitely. Default `Some(6 hours)` — see
+    /// [`DEFAULT_TERMINAL_RECORD_RETENTION_NS`].
+    terminal_record_retention_ns: Option<u64>,
     /// Optional billing stream: every freshly-emitted billing event is
     /// appended (durable JSONL + in-process subscribers). Idempotent
     /// retries republish nothing — one event per idempotency key.
@@ -485,13 +490,19 @@ pub struct PaymentEngine {
 /// every reorg was observed — it is deliberately comfortably above the
 /// Base pack's ~1h final-depth posture (`FINAL_DEPTH_BASE` = 1800 L2 blocks
 /// ≈ 1h at 2s/block), while Solana and XRPL reach deterministic finality
-/// faster and configure no depth at all. Retention does not perform
+/// faster and configure no depth at all. Compaction does not perform
 /// re-verification; it only declines to discard a record something might
 /// still want to re-check.
 ///
 /// At 1 000 paid calls/day this retains ~250 records (~0.8 MB) instead of
 /// letting months of fat records ride every whole-file transaction.
-pub const DEFAULT_TERMINAL_RETENTION_NS: u64 = 6 * 3_600 * 1_000_000_000;
+///
+/// **Default-on, explicit opt-out.** Making compaction opt-in would leave
+/// most deployments silently accumulating multi-kilobyte terminal records
+/// forever and degrading continuously. Past expiry, durable billing
+/// publication, and redemption, the full record is redundant lifecycle
+/// material — not active authority state.
+pub const DEFAULT_TERMINAL_RECORD_RETENTION_NS: u64 = 6 * 3_600 * 1_000_000_000;
 
 impl PaymentEngine {
     pub fn new(
@@ -511,19 +522,53 @@ impl PaymentEngine {
             state_path: state_path.into(),
             expiry_tolerance_ns: 0,
             in_flight_ttl_ns: 300_000_000_000,
-            terminal_retention_ns: DEFAULT_TERMINAL_RETENTION_NS,
+            terminal_record_retention_ns: Some(DEFAULT_TERMINAL_RECORD_RETENTION_NS),
             billing_log: None,
         })
     }
 
     /// Set how long terminal quote records are retained past authoritative
-    /// quote expiry (default [`DEFAULT_TERMINAL_RETENTION_NS`], 6 hours).
+    /// quote expiry (default `Some(`[`DEFAULT_TERMINAL_RECORD_RETENTION_NS`]`)`,
+    /// 6 hours).
     ///
-    /// Only affects records that are already billed, published, redeemed,
-    /// and not in flight; nothing shortens the expiry floor itself, and
-    /// settlement tombstones are never removed at any setting.
-    pub fn with_terminal_retention_ns(mut self, retention_ns: u64) -> Self {
-        self.terminal_retention_ns = retention_ns;
+    /// This is a **narrow lifecycle-compaction policy**, not general
+    /// retention configuration:
+    ///
+    /// - `Some(6h)` — the default;
+    /// - `Some(longer)` — a deployment wanting a larger local
+    ///   re-verification / forensic window;
+    /// - `None` — explicitly keep full terminal records indefinitely;
+    /// - `Some(0)` — **refused**, and normalized to the default (see below).
+    ///
+    /// The safety conditions are **not** configurable at any setting:
+    /// nothing prunes before authoritative expiry plus tolerance; only
+    /// billed, durably published, redeemed, non-in-flight records are ever
+    /// eligible; the payload guard retires atomically and owner-safely with
+    /// its record; legacy records lacking an authoritative expiry are never
+    /// pruned; and **settlement-transaction tombstones are never removed.**
+    /// There is deliberately no knob for tombstone expiry — exposing
+    /// "retain transaction ids for N days" would turn a security invariant
+    /// into a deployment preference.
+    ///
+    /// `Some(0)` is refused rather than honored because zero conventionally
+    /// reads as "off", while here it would mean the *most* aggressive
+    /// setting — compaction the instant a quote expires. An operator
+    /// reaching for "disable this" would get the opposite of what they
+    /// meant, so the value is rejected, normalized to the default, and
+    /// logged. `None` is the way to turn compaction off.
+    pub fn with_terminal_record_retention_ns(mut self, retention_ns: Option<u64>) -> Self {
+        self.terminal_record_retention_ns = match retention_ns {
+            Some(0) => {
+                tracing::warn!(
+                    default_ns = DEFAULT_TERMINAL_RECORD_RETENTION_NS,
+                    "terminal-record retention of 0 is refused (0 reads as \"off\" but would \
+                     mean immediate compaction at quote expiry) — normalized to the default; \
+                     pass `None` to keep terminal records indefinitely"
+                );
+                Some(DEFAULT_TERMINAL_RECORD_RETENTION_NS)
+            }
+            other => other,
+        };
         self
     }
 
@@ -616,7 +661,7 @@ impl PaymentEngine {
         // any facilitator I/O.
         let quote_id = quote.quote_id.clone();
         let in_flight_ttl_ns = self.in_flight_ttl_ns;
-        let terminal_retention_ns = self.terminal_retention_ns;
+        let terminal_record_retention_ns = self.terminal_record_retention_ns;
         let expiry_tolerance_ns = self.expiry_tolerance_ns;
         let claim = {
             let payload_hash = payload_hash.clone();
@@ -646,7 +691,7 @@ impl PaymentEngine {
                 let pruned = prune_terminal(
                     s,
                     now_ns,
-                    terminal_retention_ns,
+                    terminal_record_retention_ns,
                     expiry_tolerance_ns,
                 );
                 let claim: Claim = 'claim: {
@@ -1793,7 +1838,7 @@ impl PaymentEngine {
     /// Only terminal records past the horizon are affected, and settlement
     /// tombstones are never removed — see [`prune_terminal`].
     pub async fn prune_terminal_records(&self, now_ns: u64) -> Result<usize, EngineError> {
-        let retention_ns = self.terminal_retention_ns;
+        let retention_ns = self.terminal_record_retention_ns;
         let tolerance_ns = self.expiry_tolerance_ns;
         let removed = mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
             let before = s.quotes.len();

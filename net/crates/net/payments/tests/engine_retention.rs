@@ -28,7 +28,7 @@ use net_payments::core::registry::default_mock_registry;
 use net_payments::core::verification::{InvalidationReason, VerificationTier};
 use net_payments::engine::{
     AdmitAll, PaymentDecision, PaymentEngine, RedeemDecision, RejectReason,
-    DEFAULT_TERMINAL_RETENTION_NS,
+    DEFAULT_TERMINAL_RECORD_RETENTION_NS,
 };
 use net_payments::facilitator::mock::{MockFacilitator, MOCK_NETWORK, MOCK_SCHEME};
 use net_payments::x402::payload::PaymentPayload;
@@ -42,7 +42,7 @@ const TOOL: &str = "fixture-tool";
 
 /// A moment safely past the retention horizon for a quote issued at `NOW`.
 fn past_horizon() -> u64 {
-    NOW + TTL + DEFAULT_TERMINAL_RETENTION_NS + 1
+    NOW + TTL + DEFAULT_TERMINAL_RECORD_RETENTION_NS + 1
 }
 
 fn mock_reqs(amount: &str) -> X402Carry<PaymentRequirements> {
@@ -98,6 +98,27 @@ impl Fixture {
             self.path.clone(),
         )
         .unwrap()
+    }
+}
+
+/// A fixture whose engine carries an explicit compaction setting.
+fn fixture_with_retention(retention_ns: Option<u64>) -> Fixture {
+    let f = fixture();
+    let engine = PaymentEngine::new(
+        f.provider.clone(),
+        Arc::new(MockFacilitator::new()),
+        Arc::new(AdmitAll),
+        default_mock_registry(f.provider.entity_id().clone()),
+        f.path.clone(),
+    )
+    .unwrap()
+    .with_billing_log(Arc::new(BillingLog::new(
+        f.path.with_file_name("billing2.jsonl"),
+    )))
+    .with_terminal_record_retention_ns(retention_ns);
+    Fixture {
+        engine: Arc::new(engine),
+        ..f
     }
 }
 
@@ -199,7 +220,7 @@ async fn a_terminal_record_survives_until_the_horizon() {
     assert!(f.engine.status(&quote.quote_id).await.unwrap().is_some());
 
     // One nanosecond before the horizon: still retained.
-    let horizon = quote.expires_at_ns + DEFAULT_TERMINAL_RETENTION_NS;
+    let horizon = quote.expires_at_ns + DEFAULT_TERMINAL_RECORD_RETENTION_NS;
     assert_eq!(f.engine.prune_terminal_records(horizon - 1).await.unwrap(), 0);
     assert!(
         f.engine.status(&quote.quote_id).await.unwrap().is_some(),
@@ -446,6 +467,107 @@ async fn a_payload_guard_owned_by_another_quote_survives_the_prune() {
         after["consumed"][&hash], "some-other-quote",
         "another quote's replay guard must survive an unrelated prune"
     );
+}
+
+// ============================================================================
+// Configuration — a narrow lifecycle-compaction policy
+// ============================================================================
+
+/// Compaction is **default-on at 6 hours**. An opt-in default would leave
+/// most deployments silently accumulating terminal records forever.
+#[tokio::test]
+async fn compaction_is_on_by_default_at_six_hours() {
+    assert_eq!(
+        DEFAULT_TERMINAL_RECORD_RETENTION_NS,
+        6 * 60 * 60 * 1_000_000_000
+    );
+    let f = fixture(); // constructed without touching retention
+    let (quote, _) = terminal_quote(&f, "2500", "n1").await;
+    assert_eq!(
+        f.engine.prune_terminal_records(past_horizon()).await.unwrap(),
+        1,
+        "an engine nobody configured must still compact"
+    );
+    assert!(f.engine.status(&quote.quote_id).await.unwrap().is_none());
+}
+
+/// `None` is the explicit opt-out: terminal records are kept indefinitely.
+#[tokio::test]
+async fn none_disables_compaction_entirely() {
+    let f = fixture_with_retention(None);
+    let (quote, _) = terminal_quote(&f, "2500", "n1").await;
+    assert_eq!(
+        f.engine.prune_terminal_records(u64::MAX).await.unwrap(),
+        0,
+        "None must keep terminal records forever"
+    );
+    assert!(f.engine.status(&quote.quote_id).await.unwrap().is_some());
+}
+
+/// A longer window is honored — a deployment wanting a bigger local
+/// re-verification / forensic window gets exactly that.
+#[tokio::test]
+async fn a_longer_window_is_honored() {
+    let week = 7 * 24 * 60 * 60 * 1_000_000_000u64;
+    let f = fixture_with_retention(Some(week));
+    let (quote, _) = terminal_quote(&f, "2500", "n1").await;
+
+    // Past the default horizon, but well inside the configured one.
+    assert_eq!(f.engine.prune_terminal_records(past_horizon()).await.unwrap(), 0);
+    assert!(f.engine.status(&quote.quote_id).await.unwrap().is_some());
+
+    assert_eq!(
+        f.engine
+            .prune_terminal_records(quote.expires_at_ns + week)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+/// `Some(0)` is refused and normalized to the default, never honored as
+/// "compact immediately at expiry" — zero reads as "off" to an operator,
+/// so honoring it would do the opposite of what they meant. `None` is the
+/// opt-out.
+#[tokio::test]
+async fn zero_is_refused_and_normalized_to_the_default() {
+    let f = fixture_with_retention(Some(0));
+    let (quote, _) = terminal_quote(&f, "2500", "n1").await;
+
+    // If 0 had been honored, this would already be prunable.
+    let just_past_expiry = quote.expires_at_ns + 1;
+    assert_eq!(
+        f.engine
+            .prune_terminal_records(just_past_expiry)
+            .await
+            .unwrap(),
+        0,
+        "Some(0) must not become immediate compaction"
+    );
+    assert!(f.engine.status(&quote.quote_id).await.unwrap().is_some());
+
+    // It behaves exactly as the default does.
+    assert_eq!(f.engine.prune_terminal_records(past_horizon()).await.unwrap(), 1);
+}
+
+/// Settlement tombstones are permanent at **every** setting — including a
+/// deliberately tiny window. There is no configuration path to expiring
+/// them, by construction: no such knob exists.
+#[tokio::test]
+async fn tombstones_are_permanent_under_every_retention_setting() {
+    for retention in [None, Some(1u64), Some(DEFAULT_TERMINAL_RECORD_RETENTION_NS)] {
+        let f = fixture_with_retention(retention);
+        terminal_quote(&f, "2500", "n1").await;
+        f.engine.prune_terminal_records(u64::MAX).await.unwrap();
+        assert_eq!(
+            raw_state(&f.path).await["consumed_transactions"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1,
+            "the settlement tombstone must survive retention = {retention:?}"
+        );
+    }
 }
 
 // ============================================================================
