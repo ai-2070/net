@@ -26,7 +26,9 @@ use net::adapter::net::behavior::fold::{
     CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, EnvelopeMeta, Fold,
     FoldKind, IslandRecord, IslandTopologyFold, NodeState, SignedAnnouncement, UnitSet,
 };
-use net::adapter::net::behavior::gang::{match_islands, MatchCriteria, NumericFilter, SelectionPolicy};
+use net::adapter::net::behavior::gang::{
+    match_islands, match_islands_sensed, MatchCriteria, NumericFilter, SelectionPolicy,
+};
 use net::adapter::net::identity::EntityKeypair;
 
 thread_local! {
@@ -211,6 +213,60 @@ fn matcher_allocations_do_not_scale_with_capability_payload_size() {
         "§1 matcher allocations over {HOSTS} hosts: {lean_allocs} (1 tag) vs \
          {fat_allocs} (40 tags)",
     );
+}
+
+/// §3: with no sensed evidence, the sensed matcher must cost EXACTLY
+/// what `match_islands` costs — not one allocation more.
+///
+/// The audit's §3 contract calls the empty-delta path "byte-identical
+/// to `match_islands`: absence of evidence never prunes and never
+/// reorders". That is a statement about the *result*, and it held
+/// before this test existed; the cost was a separate matter. The
+/// single-snapshot rewrite briefly built the island → host band map
+/// before the early return, so this path allocated one throwaway
+/// `HashMap` sized to the whole candidate set — the same
+/// build-it-then-discard-it shape §3 was opened against, reintroduced
+/// on the more common branch while removing the second topology scan
+/// from the rarer one.
+///
+/// Equality, not a ratio: with `sensed_non_viable` empty the prune set
+/// is `Cow::Borrowed`, so on this path the sensed matcher does
+/// literally the same work through the same calls. Any delta at all is
+/// a discarded allocation, which is exactly what is being pinned.
+#[test]
+fn sensed_match_with_no_evidence_allocates_exactly_what_the_plain_matcher_does() {
+    const HOSTS: usize = 50;
+    let down: HashSet<u64> = HashSet::new();
+    let non_viable: HashSet<u64> = HashSet::new();
+
+    let (caps, topo, crit) = fixture(HOSTS, 4);
+
+    // Warm any lazily-initialized state so it lands outside the count.
+    let _ = match_islands(&caps, &topo, &crit, &down);
+    let _ = match_islands_sensed(&caps, &topo, &crit, &down, &non_viable, &[]);
+
+    let (plain_allocs, plain_out) = count_allocs(|| match_islands(&caps, &topo, &crit, &down));
+    let (sensed_allocs, sensed_out) =
+        count_allocs(|| match_islands_sensed(&caps, &topo, &crit, &down, &non_viable, &[]));
+
+    // The result equality the §3 contract already promises — asserted
+    // here too so a regression cannot satisfy the cost check by
+    // returning less.
+    assert_eq!(sensed_out, plain_out, "empty sensed delta must not reorder");
+    assert_eq!(
+        sensed_out.len(),
+        HOSTS,
+        "the fixture must not be degenerate",
+    );
+
+    assert_eq!(
+        sensed_allocs, plain_allocs,
+        "the no-evidence sensed path allocated {sensed_allocs} vs the plain \
+         matcher's {plain_allocs} over {HOSTS} hosts — it is building something \
+         it never reads",
+    );
+
+    println!("§3 no-evidence sensed match: {sensed_allocs} allocs vs plain {plain_allocs}");
 }
 
 /// §6: rejecting the all-zero placeholder signature must allocate

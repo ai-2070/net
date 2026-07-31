@@ -221,6 +221,21 @@ pub fn match_islands_sensed(
     // ONE topology read (T1). `candidates` carries the host field
     // banding needs, so no second scan is taken to recover it.
     let candidates = match_island_records(capability_fold, topology_fold, criteria, &pruned);
+    // Bail out BEFORE building the band map, not after: on the
+    // no-sensing path that map is never read, and building it there
+    // would charge this path an allocation `match_islands` does not
+    // pay — the same discarded-work shape §3 was opened against.
+    // `select_with_affinity` is a 1:1 projection (`select_islands`
+    // sorts and maps; the affinity arm partitions and concatenates —
+    // neither drops a record), so `candidates.len()` is the
+    // `ordered.len()` this guard used to read.
+    if sensed_viable_order.is_empty() || candidates.len() < 2 {
+        return select_with_affinity(
+            candidates,
+            criteria.selection,
+            criteria.prefer_capability.clone(),
+        );
+    }
     let hosts: std::collections::HashMap<IslandId, NodeId> =
         candidates.iter().map(|r| (r.id, r.host)).collect();
     let mut ordered = select_with_affinity(
@@ -228,9 +243,6 @@ pub fn match_islands_sensed(
         criteria.selection,
         criteria.prefer_capability.clone(),
     );
-    if sensed_viable_order.is_empty() || ordered.len() < 2 {
-        return ordered;
-    }
     // Provider → rank, resolved once. The linear `position()` this
     // replaces ran per island, making band derivation
     // O(islands × providers). `or_insert` keeps first-occurrence
