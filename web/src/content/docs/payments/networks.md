@@ -1,19 +1,20 @@
 ---
 title: Networks
-description: "Adding a chain to Net Payments is configuration, not code: a facilitator config pack, entries in the signed asset registry, and a conformance run."
+description: "How payment networks, assets, facilitator configuration, scheme modules, and conformance tests enter Net Payments."
 ---
+
 # Networks
 
-Adding a chain to Net Payments is **configuration, not code**: a facilitator
-config pack, entries in the signed asset registry, and a conformance run. There
-are no new envelope types and no per-network branches outside the x402 scheme
-modules. That constraint is what keeps the money path honest as chains are added.
+All networks use the same Net payment envelopes. Enabling another network may
+require asset-registry entries, facilitator configuration, conformance fixtures,
+and implementation in the relevant x402 scheme module. Net core does not add a
+new envelope type for each chain.
 
 ## CAIP identifiers and the asset registry
 
 Networks and assets are named with **CAIP-2** (chain, e.g. `eip155:8453`) and
 **CAIP-19** (asset) identifiers. IDs compare **exactly and case-sensitively** —
-`eip155:8453/erc20:0xABC` and `…0xabc` are *distinct* ids; equivalence is
+`eip155:8453/erc20:0xABC` and `…0xabc` are _distinct_ ids; equivalence is
 registry policy, never string normalization.
 
 The **asset registry** is a signed document (`net.payment.asset_registry@1`)
@@ -28,12 +29,12 @@ guess.
 Enablement is deliberate and per-rung. **Do not read the ladder as "all
 shipped."** As of this writing:
 
-| Rung | State |
-|---|---|
-| **Mock** (`mock:net`) | **Active.** The conformance backbone; no real value. |
-| **Base Sepolia** (`eip155:84532`) | Suite shipped; the **live testnet run is env-gated**, not on by default. |
-| **Base mainnet / Solana** | Scheme seams **and** independent chain checkers landed (`SvmChecker` for Solana); the packs serve `confirmed(1)`, not receipt-trust. Still **enablement-gated** per deployment — needs `allowed_networks`, a signer, facilitator credentials, and a live conformance run. |
-| **XRPL** (`xrpl:0`) | **Built (XRP-only), enablement-gated** — on par with the other real rungs now, not a "not-shipped-active" outlier. A `t54_xrpl_mainnet` pack serving `confirmed(1)`, an independent `XrplChecker`, an XRP registry entry (`xrpl:0/slip44:144`, Mode A; RLUSD deferred), and fixture conformance all exist. Enable it like any rung (`allowed_networks` + signer + pack + live run). The `xrpl:0` CAIP-2 id is a pinned-doc convention, unratified upstream. |
+| Rung                              | State                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Mock** (`mock:net`)             | **Active.** The conformance backbone; no real value.                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **Base Sepolia** (`eip155:84532`) | Suite shipped; the **live testnet run is env-gated**, not on by default.                                                                                                                                                                                                                                                                                                                                                                                    |
+| **Base mainnet / Solana**         | Scheme seams **and** independent chain checkers landed (`SvmChecker` for Solana); the packs serve `confirmed(1)`, not receipt-trust. Still **enablement-gated** per deployment — needs `allowed_networks`, a signer, facilitator credentials, and a live conformance run.                                                                                                                                                                                   |
+| **XRPL** (`xrpl:0`)               | **Built (XRP-only), enablement-gated** — on par with the other real rungs now, not a "not-shipped-active" outlier. A `t54_xrpl_mainnet` pack serving `confirmed(1)`, an independent `XrplChecker`, an XRP registry entry (`xrpl:0/slip44:144`, Mode A; RLUSD deferred), and fixture conformance all exist. Enable it like any rung (`allowed_networks` + signer + pack + live run). The `xrpl:0` CAIP-2 id is a pinned-doc convention, unratified upstream. |
 
 Enabling a real network for a deployment means: list it in the spend policy's
 `allowed_networks`, wire a facilitator config pack, provide an
@@ -77,7 +78,7 @@ a demo can't quietly train the policy path wrong. Under
 
 ## Why config-not-code matters
 
-A new payment *scheme* (EVM `exact`, SVM `exact`, XRPL `exact`) is real
+A new payment _scheme_ (EVM `exact`, SVM `exact`, XRPL `exact`) is real
 code — but it lives **quarantined** in the x402 scheme modules, the one place
 chain-specific reality is allowed. Net core never grows a per-network branch. So
 "support chain X" is a pack + registry entries + a conformance run, and the

@@ -1,94 +1,100 @@
 ---
 title: The Agentic Mesh
-description: AI agents need work done. The work lives somewhere else — in tools, APIs, other agents, files, GPUs, browsers, enterprise systems, and humans.
+description: "How applications discover and use capabilities across machines while providers retain their credentials and local authority."
 ---
+
 # The Agentic Mesh
 
-AI agents need work done. The work lives somewhere else — in tools, APIs, other
-agents, files, GPUs, browsers, enterprise systems, and humans. Those capabilities
-are distributed across machines and organizations, they come and go, and no
-single agent owns them. So an agent needs four things it mostly doesn't have
-today: to **discover** capabilities live, **invoke** them safely, **observe** what
-actually happened, and **recover** when work fails.
+An agent rarely owns everything it needs. The useful tools may live on another
+machine, behind another runtime, inside an organization, or next to a device that
+cannot hand its credentials to the caller.
 
-That is the gap Net fills.
+Net gives applications a common way to use that distributed supply. Providers
+announce typed capabilities from the machines that own them. Callers discover the
+providers currently visible to them, invoke one under explicit authority, and
+follow the resulting streams, state, and artifacts.
 
-> **Net is a discovery mesh for agentic capability.**
+We call this an **agentic mesh**.
 
-## Why request/response and hand-wired tools run out
-
-The dominant way to give an agent a tool is to wire it in by hand: a fixed list
-of endpoints, hard-coded in a config, each reached by an HTTP or MCP call. That
-works right up until the moment the world stops being fixed:
-
-- The tool you need is on a **different machine** — a colleague's workstation, a
-  GPU box, a service in another org — and it wasn't in your config.
-- The provider's **availability changes**: the GPU is busy, the model isn't
-  loaded, the service moved.
-- The work has **live state** — it streams, it fails partway, it needs a retry, it
-  produces an artifact — and a single `200 OK` can't express any of that (see
-  [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
-- **Credentials** for the tool shouldn't leave the machine that owns them.
-
-A hand-wired call surface has no answer to "what can I use *right now*, and did the
-work actually happen?" It only knows the endpoints someone typed in, and it only
-learns of failure if the callee bothers to report it.
-
-## What a capability is
-
-On Net, a **capability** is a typed, discoverable unit of work a node can do —
-a tool, an API, a model, a GPU, an agent, a service. A node **announces** its
-capabilities (name, input/output schema, policy, availability); every peer folds
-that announcement into a local index; and any node can **query** the index by
-what it needs rather than by who has it:
-
-```
-net-mesh cap query --tag gpu --tag vram:24     # who can do this, right now?
-net-mesh cap nodes                             # everything the local index knows
+```text title="The application loop"
+request a capability
+→ discover visible providers
+→ evaluate availability and authority
+→ invoke one provider
+→ observe typed execution state
+→ collect streams, state, and artifacts
+→ verify the required outcome when the application has suitable evidence
 ```
 
-Announcements propagate across the mesh, not just to direct neighbors — a node
-several hops away learns the same capability fingerprint (bounded by a hop count,
-so reach is finite and predictable, not a broadcast storm). Discovery is by
-**capability**, and location is incidental: the answer might be a laptop, a rack
-server, or a Jetson on a factory floor, and your code doesn't care which.
+## Capabilities instead of configured endpoints
 
-## Discover → invoke → observe → recover
+A capability is a typed operation a participant offers: run a tool, query a
+service, process an artifact, operate a device, provide compute, or perform work
+for another application.
 
-The agent loop Net is built for:
+The provider announces the capability with its schema and relevant properties.
+Other nodes fold those announcements into a local index and query by what they
+need rather than by a hostname someone configured earlier.
 
-1. **Discover** — ask the mesh who can do the work (`net-mesh cap query …`, or the SDK
-   `find_nodes`). You get back nodes you can talk to directly.
-2. **Describe** — read a capability's schema, risk, and provider before you commit
-   to it. Display never implies permission to invoke.
-3. **Invoke** — make a typed call and get a typed result. On Net this is nRPC
-   (`call_typed` in the SDK); through an MCP host it's the `net_invoke_capability`
-   meta-tool. Deadlines, retries, and cancellation are built in.
-4. **Observe** — subscribe to the events the work emits; replay them later from a
-   durable log if you need to.
-5. **Recover** — when a call fails, retry, hedge to another provider, or trip a
-   circuit breaker — because failure is a first-class, typed outcome, not silence.
+```sh
+net-mesh cap query --tag hardware.gpu --tag hardware.gpu.vram_gb=24
+net-mesh cap nodes
+```
 
-Each step is a real primitive, not a diagram. The
-[claims audit](/docs/worldview/right-and-wrong-use-cases) behind these pages maps
-every one of them to shipped code.
+Discovery can span several hops. The result may be a laptop, a rack server, or an
+edge device; the application receives provider identities and capability details,
+not a promise that every match is admissible or healthy forever.
 
-## Credentials stay local; policy is local authority
+## Discovery, invocation, and outcome are separate
 
-Discovery is not authorization. A capability can be **visible** to the mesh while
-being **invocable** only by its owner — the default for anything credentialed.
-The node that holds a secret runs the work; the caller never sees the credential.
-Widening who may invoke is an explicit, local decision, and consent for anything
-sensitive is granted out-of-band by a human, not inferred by a model. This is what
-makes it safe to expose a capability to agents you don't fully trust.
+Finding a provider does not authorize a call. A capability may be visible but
+owner-only, restricted to an organization, or granted to a specific audience.
+The provider enforces invocation policy where the work and its consequences live.
+
+An invocation result is also not automatically proof that the requested real-world
+outcome holds. Net distinguishes transport acceptance, provider execution, and
+verified outcome. The capability contract can specify the evidence the application
+requires; without that evidence, the caller keeps the narrower typed result.
+
+This separation matters for retries. A caller can select another provider after a
+known pre-execution refusal or clearly unexecuted request. An ambiguous external
+effect needs reconciliation or an idempotency contract before another attempt.
+
+## Credentials stay with the provider
+
+The node that owns a credential performs the operation. The caller receives the
+result and any permitted artifacts, not the provider's API key, device secret, or
+local account.
+
+That lets a personal agent use a capability on another trusted device, or an
+application invoke a partner-operated service, without turning the caller into a
+central vault for every credential in the system.
+
+## Applications remain applications
+
+Net does not replace workspaces, dashboards, fleet products, or agent runtimes.
+Those systems keep their own conversations, workflows, approvals, and interfaces.
+They use Net when work must cross a machine or authority boundary.
+
+A workspace might resolve a capability through Net, invoke a qualified provider,
+track the resulting task, attach returned artifacts to its own record, and show the
+outcome in its existing interface. Net supplies the distributed capability model;
+the application supplies the product experience.
 
 ## The substrate underneath
 
-The agentic mesh is the flagship use case, not the whole system. Underneath,
-Net is a latency-first encrypted mesh — the same substrate that runs vehicular
-sensor fusion, factory-floor robotics, and edge inference. Capability discovery,
-typed RPC (nRPC), durable logs (RedEX), folded state (CortEX), and content-
-addressed artifacts (Dataforts) are all layers on one encrypted, brokerless
-transport. That's why the agentic story holds up: it's not a thin coordination
-API over someone else's cloud — it's discovery, presence, policy, events, and
-artifacts on infrastructure you own.
+The same identity and routing model supports typed RPC, streams, durable logs,
+folded state, content-addressed artifacts, and long-running work. These are
+separate layers over one encrypted mesh rather than requirements every application
+must adopt at once.
+
+Start with the smallest useful loop: announce one capability, discover it from
+another node, and invoke it under an explicit authority rule. Add streams,
+artifacts, durable state, or scheduling when the work requires them.
+
+Next:
+
+- [Discover and invoke](/docs/guides/discover-and-invoke)
+- [Tool federation](/docs/concepts/tool-federation)
+- [Private capabilities](/docs/guides/private-capabilities)
+- [Submitted is not completed](/docs/guides/submitted-is-not-completed)

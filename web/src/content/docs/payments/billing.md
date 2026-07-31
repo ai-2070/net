@@ -2,6 +2,7 @@
 title: Billing
 description: Billing in Net is a record of commercial facts, not an invoicing system.
 ---
+
 # Billing
 
 Billing in Net is a **record of commercial facts**, not an invoicing system. Each
@@ -80,7 +81,7 @@ let event = net_payments::BillingEvent::from_json_bytes(signed.as_bytes())?;
 ## What billing is NOT
 
 - **Not an invoice.** No line items, tax, currency conversion, or customer
-  balance. A `net.billing.event@1` is a *usage fact*; turning facts into an
+  balance. A `net.billing.event@1` is a _usage fact_; turning facts into an
   invoice is the provider's (or a partner's) job.
 - **Not a ledger of custody.** Net didn't hold the money; the event references a
   settled on-chain transaction, it doesn't represent a balance Net keeps.
@@ -88,6 +89,6 @@ let event = net_payments::BillingEvent::from_json_bytes(signed.as_bytes())?;
   needed, is an opaque reference resolved in provider systems — never a customer
   profile embedded in the event.
 
-The lifecycle hooks doctrine: billing is the *last* step of a served invocation,
-emitted from the same engine that verified and redeemed it — so a billing event
-exists only for work that was actually paid for and served.
+For the integrated paid-invocation path, billing is emitted after the engine has
+verified payment, redeemed the quote, and served the invocation. A billing event
+records that path; it is not independent proof of an external business outcome.

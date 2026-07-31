@@ -2,6 +2,7 @@
 title: Channels
 description: A channel is a named endpoint that carries events through the mesh.
 ---
+
 # Channels
 
 A channel is a named endpoint that carries events through the mesh. Channels are the primary thing you program against: you publish to a channel, you subscribe to a channel, and everything else Net does — durable logs, materialized views, RPC, distributed daemons — is expressed in terms of one channel or another.
@@ -12,7 +13,7 @@ A channel name looks like a path: `sensors/lidar/front`, `chat/lobby`, `metrics/
 
 Channel names are slash-separated paths, up to 255 bytes, drawn from `a-z`, `A-Z`, `0-9`, and the characters `-`, `_`, `.`, `/`. They can't start or end with a slash, can't contain a double slash, and are matched case-sensitively.
 
-Every channel name is reduced to *two* hashes, and the distinction matters.
+Every channel name is reduced to _two_ hashes, and the distinction matters.
 
 The **canonical `ChannelHash`** is a 64-bit xxh3 of the name. It's the substrate-wide key for authorization, channel config, storage, and metrics — the full keyspace, so a targeted second-preimage costs about 2^64 work even though xxh3 isn't a cryptographic hash.
 
@@ -26,12 +27,12 @@ Names are hierarchical, and prefix matching is a first-class operation. A subscr
 
 Channels carry a visibility scope that controls how far their packets propagate through the subnet hierarchy:
 
-| Scope            | Behavior                                                          |
-|------------------|-------------------------------------------------------------------|
-| `SubnetLocal`    | Never crosses a subnet boundary. Stays where it was published.    |
-| `ParentVisible`  | Visible to ancestor subnets; not to siblings.                     |
-| `Exported`       | Forwarded only to subnets named in the channel's export table.   |
-| `Global`         | No subnet restriction. The default.                               |
+| Scope           | Behavior                                                       |
+| --------------- | -------------------------------------------------------------- |
+| `SubnetLocal`   | Never crosses a subnet boundary. Stays where it was published. |
+| `ParentVisible` | Visible to ancestor subnets; not to siblings.                  |
+| `Exported`      | Forwarded only to subnets named in the channel's export table. |
+| `Global`        | No subnet restriction. The default.                            |
 
 Subnet gateways enforce these scopes at the boundary by reading the packet header alone — there's no payload inspection, no decryption, no escape hatch. A `SubnetLocal` channel cannot leak across a gateway, by construction.
 
@@ -42,18 +43,18 @@ A channel can optionally require capability matching and a permission token befo
 A channel's configuration carries eight settings. Two of them look like access
 control and are not; one of them is:
 
-| Setting | What it does | Is it a boundary? |
-|---|---|---|
-| visibility | Subnet scope — one of the four above | Yes, enforced at the gateway |
-| publish capabilities | Predicate a publisher's *self-advertised* capabilities must match | **No — advisory routing** |
-| subscribe capabilities | Same, for subscribers | **No — advisory routing** |
-| require token | Demand a signed permission token | **Yes — this is the access boundary** |
-| token roots | Which entities may issue this channel's tokens | Yes, it is what makes the token mean anything |
-| priority | Scheduling weight against other channels | No |
-| reliable | Retransmit on loss rather than drop | No |
-| rate limit | Ceiling on accepted publishes | No, but it shapes load |
+| Setting                | What it does                                                      | Is it a boundary?                             |
+| ---------------------- | ----------------------------------------------------------------- | --------------------------------------------- |
+| visibility             | Subnet scope — one of the four above                              | Yes, enforced at the gateway                  |
+| publish capabilities   | Predicate a publisher's _self-advertised_ capabilities must match | **No — advisory routing**                     |
+| subscribe capabilities | Same, for subscribers                                             | **No — advisory routing**                     |
+| require token          | Demand a signed permission token                                  | **Yes — this is the access boundary**         |
+| token roots            | Which entities may issue this channel's tokens                    | Yes, it is what makes the token mean anything |
+| priority               | Scheduling weight against other channels                          | No                                            |
+| reliable               | Retransmit on loss rather than drop                               | No                                            |
+| rate limit             | Ceiling on accepted publishes                                     | No, but it shapes load                        |
 
-The two capability predicates are matched against what a node *says* about itself.
+The two capability predicates are matched against what a node _says_ about itself.
 A node that lies matches. That is why they are routing hints and not a security
 boundary, and why `require token` plus `token roots` is the pair that actually
 decides who may publish or subscribe.
@@ -66,23 +67,29 @@ The flow at subscription time is straightforward. The node's announced capabilit
 
 `publish_caps` and `subscribe_caps` match against a node's **self-advertised** capability set. A peer declares its own capabilities, in its own signed announcement — so any peer that wants to satisfy a capability filter can simply advertise the tag it requires. Self-asserting `role:admin` is not a hard thing to do.
 
-The signature on an announcement proves *who said it*. It proves nothing about whether the claim is true. So:
+The signature on an announcement proves _who said it_. It proves nothing about whether the claim is true. So:
 
 > Capability filters are matchmaking and intent-routing. They are **not** an access-control boundary, and a capability filter alone restricts nothing.
 
 The actual boundary is `require_token` plus `token_roots`. A presented `TokenChain` is honored only if it roots at one of the entities the channel explicitly trusts, and every link in the chain is signature-verified up to that root — which is what makes it unforgeable, and what a self-advertised tag can never be. **Any channel that must restrict who publishes or subscribes needs token enforcement.** Reach for a capability filter to route work to the right kind of node; reach for a token to decide who is allowed at all.
 
-After that, the per-packet check is constant-time and lock-free. The auth guard is a bloom filter sized to fit in L1 cache plus a verified-positive cache for confirmed pairs. A header carrying an authorized `(origin_hash, channel_hash)` clears the guard in single-digit nanoseconds; a header carrying anything else is dropped.
+After full verification, the packet path consults an `AuthGuard` containing a
+bloom filter and a verified-positive cache for confirmed pairs. A header carrying
+an authorized `(origin_hash, channel_hash)` can use the cached decision; anything
+else is denied or escalated according to the guard result.
 
 ## Fan-out
 
 Publishing on a channel sends one packet to every subscriber. There's no multicast primitive on the wire — Net deliberately doesn't have one. Each subscriber gets a unicast, encrypted with the per-peer session key, with the same payload. This keeps the trust model simple (every packet is end-to-end authenticated to a single recipient) and keeps the wire format unchanged whether there are two subscribers or two thousand.
 
-For the small-to-medium fan-out case (up to a few hundred subscribers per publish), Net ships a `ChannelPublisher` helper that handles per-peer concurrency, failure policy, and reporting. For the millions-of-subscribers case, you compose: publish to a smaller intermediary set that fan-out themselves, or move the workload into the durable-log layer where consumers pull on their own schedule.
+`ChannelPublisher` handles per-peer concurrency, failure policy, and reporting.
+The practical fan-out limit depends on payload size, publish rate, link capacity,
+peer count, and failure policy. Larger audiences generally need intermediary
+fan-out or a durable log that consumers read on their own schedule.
 
 ## Membership
 
-The subscriber list for a channel — the *roster* — is maintained by a small membership subprotocol. Subscribes and unsubscribes flow on a dedicated control channel; acks confirm them; the failure detector reaps subscribers that drop off without unsubscribing.
+The subscriber list for a channel — the _roster_ — is maintained by a small membership subprotocol. Subscribes and unsubscribes flow on a dedicated control channel; acks confirm them; the failure detector reaps subscribers that drop off without unsubscribing.
 
 The roster is what `ChannelPublisher` consults when it fans out. It's also what the export table consults when deciding whether a `Exported` channel should be forwarded across a gateway. Membership is eventually consistent across the mesh — the cost of subscribing is one round trip, and the cost of unsubscribing is one round trip or a failure-detector timeout.
 

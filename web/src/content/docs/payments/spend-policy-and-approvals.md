@@ -2,6 +2,7 @@
 title: "Spend Policy & Approvals"
 description: The model requests an invocation; it does not decide whether to spend.
 ---
+
 # Spend policy & approvals
 
 The model requests an invocation; it does not decide whether to spend. That
@@ -66,7 +67,7 @@ let approved: bool = policy.approve(&quote_id).await?;
 ```
 
 Re-running the flow after approval redeems the exact quote the human saw.
-Approving quote *X* never authorizes a later quote *Y*, so a caller cannot get
+Approving quote _X_ never authorizes a later quote _Y_, so a caller cannot get
 an approval for a cheap quote and spend it on an expensive one.
 
 The per-day counter is a **lock-held read-modify-write** on the shared store:
@@ -80,7 +81,7 @@ decision, and conditional save all stay under the same advisory lock, so the
 check-and-set is still atomic and at-most-once behavior is unchanged — only the
 serialize-fsync-rename is skipped.
 
-This is a security property, not a micro-optimization. Every redemption *denial*
+This is a security property, not a micro-optimization. Every redemption _denial_
 used to pay a full durable write, which meant a caller spraying quote ids could
 force one global-lock acquisition plus one fsync per attempt and collapse
 throughput. Denials are cheap now, and if you extend the engine, keep them that
@@ -96,10 +97,10 @@ billing republish are separate calls and remain unconditional.
 
 Contention benchmarks put the atomic accounting unit at the
 `(day, network, asset)` counter row — distinct capabilities sharing one counter
-genuinely contend, different assets share nothing, and approvals are a separate
+contend, different assets share nothing, and approvals are a separate
 quote-keyed state machine.
 
-But logically independent traffic currently benchmarks *identically* to maximum
+But logically independent traffic currently benchmarks _identically_ to maximum
 same-counter contention. The coupling is the global file lock, not accounting
 authority. Sharding by asset or capability buys nothing today, so don't design
 around per-capability parallelism until the store backend changes.
@@ -116,16 +117,8 @@ around per-capability parallelism until the store backend changes.
 ## The approval surface (operator, not model)
 
 Approval mirrors the consent split. The engine (model-reachable) writes only a
-**pending** record when it returns *requires payment approval*. Moving a record
+**pending** record when it returns _requires payment approval_. Moving a record
 to **approved** is an **operator-only** verb — the model must not approve its own
 future spending. The gateway exposes the operator verbs `approve` / `reject` /
-`pending` / `spent_today`; approval of quote *X* authorizes *X*, never a later
-quote *Y* (the pending record carries the quote's canonical bytes).
-
-## Roadmap: delegation-chain budgets
-
-Per-delegation-chain budgets — where a child agent's budget is bounded by its
-parent's remaining allowance (*child ≤ parent's remaining, always*) — are a
-**forward-looking doctrine, not shipped behavior** (P5 territory). Today the
-engine enforces per-`(network, asset)` limits + the approval split above; treat
-chain inheritance as roadmap, not a current guarantee.
+`pending` / `spent_today`; approval of quote _X_ authorizes _X_, never a later
+quote _Y_ (the pending record carries the quote's canonical bytes).

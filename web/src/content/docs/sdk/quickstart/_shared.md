@@ -5,6 +5,7 @@ capability: Event bus — ingest + poll
 boundary: /docs/sdk/c/quickstart
 boundaryLabel: C — Quickstart
 ---
+
 # Quickstart
 
 Build a node, put something on it, and prove the node accepted it. That is the
@@ -54,8 +55,8 @@ received it, or the work is done. That distinction has a page of its own —
 [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed) — and it is
 the model, not an implementation detail to be optimized away later.
 
-So the honest verification for a first program is a counter read, not a round
-trip. Every fragment below ends by asserting the node's own ingested count,
+The first program therefore verifies a local counter rather than claiming a
+round trip. Every fragment below ends by asserting the node's own ingested count,
 because that is the strongest claim the smallest program can actually make.
 
 ## Why your first program appears to hang
@@ -77,5 +78,5 @@ what it emits → [move artifacts](/docs/sdk/artifacts) too large for the bus �
 handle [the ways it fails](/docs/sdk/errors).
 
 Those links are language-neutral: each one states the objective and hands you the
-four lenses. Once you are inside a language the *Next* control keeps you there —
+four lenses. Once you are inside a language the _Next_ control keeps you there —
 it will not walk a Python reader into Go.

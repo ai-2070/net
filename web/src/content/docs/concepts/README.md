@@ -1,13 +1,26 @@
 ---
 title: Concepts
-description: "The pages in this section describe how Net is put together — the mental model you need to write code against it, and the reasoning behind the pieces you'll find in the API."
+description: "The capability, identity, state, and authority model behind Net's APIs."
 ---
+
 # Concepts
 
-The pages in this section describe how Net is put together — the mental model you need to write code against it, and the reasoning behind the pieces you'll find in the API.
+These pages explain the model behind Net's APIs.
 
-Read [Architecture](/docs/concepts/architecture) first. It frames the three-layer model that the rest of the section builds on. From there, every other page goes deep on one of the layers or one of the abstractions that sits across them.
+Start with [Architecture](/docs/concepts/architecture), then read the concepts that
+match the system you are building:
 
-If you're evaluating Net for somewhere that matters, read [Security Model](/docs/concepts/security-model) too — it states the limits as plainly as the guarantees.
+- [Capabilities](/docs/concepts/capabilities) for provider discovery and selection.
+- [Identity](/docs/concepts/identity) and [Organizations](/docs/concepts/organizations)
+  for ownership and authority.
+- [Channels](/docs/concepts/channels) and [Events and causality](/docs/concepts/events-and-causality)
+  for the event substrate.
+- [Storage stack](/docs/concepts/storage-stack) for RedEX, CortEX, NetDB, and
+  Dataforts.
+- [Tool federation](/docs/concepts/tool-federation) for capabilities shared across
+  agent runtimes and machines.
+- [Security model](/docs/concepts/security-model) for the guarantees, trust
+  assumptions, and limits.
 
-You don't need to read this section to get something working — the [Quickstart](/docs/start/quickstart) will get you running in minutes. You'll want to read it before you make any non-trivial design decisions, because the abstractions in Net are unusual enough that intuition from other systems will mislead you in places.
+You can complete the [Quickstart](/docs/start/quickstart) without reading this
+section. Return here before making authority, durability, or topology decisions.

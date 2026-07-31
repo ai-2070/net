@@ -2,6 +2,7 @@
 title: Continuity and Migration
 description: Daemons that survive node failures are the whole point of the runtime, and continuity is the layer that makes survival meaningful.
 ---
+
 # Continuity and Migration
 
 Daemons that survive node failures are the whole point of the runtime, and continuity is the layer that makes survival meaningful. A daemon migrating from one node to another isn't just "the same code running somewhere else" — its identity, its causal chain, its observed history, and the events in flight at the moment of cutover all have to travel with it. Continuity is the protocol that gets that right.
@@ -33,9 +34,9 @@ Once started, the orchestrator drives every step. The source node snapshots the 
 
 The SDK hands back handles rather than making you poll the registry:
 
-| Handle | What it gives you |
-|---|---|
-| `DaemonHandle` | `stats()` for the live counters, `snapshot()` for the current `StateSnapshot` (or `None` if the daemon doesn't snapshot) |
+| Handle            | What it gives you                                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `DaemonHandle`    | `stats()` for the live counters, `snapshot()` for the current `StateSnapshot` (or `None` if the daemon doesn't snapshot)             |
 | `MigrationHandle` | `phase()` for the current `MigrationPhase`, `wait()` to block until the move completes, `wait_with_timeout(d)` for a bounded version |
 
 `wait()` consumes the handle — it's the end of that migration's story, so
@@ -94,7 +95,10 @@ How it works: the active daemon processes events normally. Periodically (`sync_s
 
 The trade-off is straightforward. Standbys cost you memory (N − 1 copies of the daemon's state) but no compute (they don't process events). Promotion latency is bounded by the size of the buffered-event replay, which is bounded by the time since the last sync.
 
-For workloads where seconds matter — operations control planes, real-time decision making — standbys give you sub-second recovery from a node failure. For workloads where minutes are fine — most analytics, batch processing — migration on a healthy node plus replay-from-snapshot is simpler and cheaper.
+Standbys can reduce recovery time when heartbeat, snapshot, buffer, and routing
+settings support the target. Measure the complete failure-detection and promotion
+path in the deployment. For workloads with a looser recovery objective, migration
+on a healthy node plus replay from a snapshot may require fewer reserved resources.
 
 ## Replica groups: scaling stateless daemons
 
@@ -117,7 +121,7 @@ let group = ReplicaGroup::spawn(&runtime, "worker", ReplicaGroupConfig {
 
 Recovery is automatic and coordination-free. When a node fails, the affected replica is re-spawned on a different node using the same `group_seed + index`, which produces the same keypair — so the replica's origin hash is unchanged, peers routing to it don't notice the move, and the load balancer's view repairs on the next health check.
 
-The model only works for daemons that are *actually* stateless. If your daemon's behavior depends on its own accumulated state, it isn't stateless, and a replica group will give you the wrong answers under failure. Use standby groups for that case, or — if the state is naturally partitioned by some key — use consistent-hash routing across replicas, where each replica owns a slice of the keyspace and re-derives its slice on recovery.
+The model only works for daemons that are _actually_ stateless. If your daemon's behavior depends on its own accumulated state, it isn't stateless, and a replica group will give you the wrong answers under failure. Use standby groups for that case, or — if the state is naturally partitioned by some key — use consistent-hash routing across replicas, where each replica owns a slice of the keyspace and re-derives its slice on recovery.
 
 ## Fork groups: deliberate divergence
 
@@ -168,9 +172,9 @@ The companion type is `ContinuityStatus`, which an observer can use to describe 
 
 The four states are the vocabulary the continuity layer uses to talk about an entity's chain. Most application code doesn't reach for them directly — the runtime exposes them in failure logs, in the operator surface, and in tooling that needs to reason about chain health.
 
-## Honest discontinuity
+## Explicit discontinuity
 
-When a chain genuinely breaks — node crash without a recent snapshot, data corruption, conflicting events arriving on different paths — the runtime doesn't silently paper over it. It creates a `ForkRecord`, marks the original chain as discontinued, and starts a new entity with documented lineage:
+When a chain breaks because of a node crash without a recent snapshot, data corruption, or conflicting events on different paths, the runtime creates a `ForkRecord`, marks the original chain as discontinued, and starts a new entity with documented lineage:
 
 ```rust
 pub enum DiscontinuityReason {
@@ -183,7 +187,7 @@ pub enum DiscontinuityReason {
 
 The fork record is signed by the entity that detected the discontinuity and broadcast on a dedicated subprotocol. Downstream observers see the new entity, see its lineage, and can decide for themselves whether to treat it as a continuation or as a fresh entity. There's no implicit recovery — the discontinuity is visible.
 
-This is the "honest discontinuity" principle. A chain that broke shouldn't pretend it didn't; observers shouldn't be lied to. If you have a workload that genuinely can't tolerate discontinuity, the answer is to make discontinuity less likely (snapshot more often, run with a standby group, replicate the underlying log) rather than to pretend it doesn't happen.
+The discontinuity remains visible to observers. Workloads that cannot tolerate it should reduce its probability by taking snapshots more often, running a standby group, or replicating the underlying log.
 
 ## Superposition
 

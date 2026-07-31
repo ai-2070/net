@@ -2,8 +2,7 @@
 
 ### Cross-peer blob transfer is not in the Go binding
 
-This is the honest state of the surface rather than a phrasing choice. Rust,
-TypeScript and Python each expose `serve_blob_transfer`, `fetch_blob`,
+Rust, TypeScript and Python each expose `serve_blob_transfer`, `fetch_blob`,
 `fetch_blob_discovered` and `fetch_dir`. **Go exposes none of them.** There is no
 `net_transport.h` binding in the Go module, and no transfer stream helpers.
 

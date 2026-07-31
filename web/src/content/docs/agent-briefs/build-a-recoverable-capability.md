@@ -2,18 +2,19 @@
 title: Build a Recoverable Capability
 description: "Stand up a capability behind a standby group, kill the primary mid-run, and prove the call fails over."
 ---
+
 # Brief: Build a Recoverable Capability
 
 **Goal.** Serve a native capability from two providers, invoke it by service name,
-kill the primary mid-run, and prove the call fails over to the standby — the
-"recover" half of the agent loop
-([Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
+remove the first provider between calls, and verify that a later call selects the
+standby. See [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)
+for the distinction between a returned call and a verified workflow outcome.
 
 ## Prerequisites
 
 - Rust toolchain; `cargo add net-mesh-sdk tokio serde`.
 - No external mesh needed — this brief stands up its own two (or three) in-process
-  `Mesh` nodes, the pattern proven by `adapters/mcp/tests/serve_end_to_end.rs`
+  `Mesh` nodes, following `adapters/mcp/tests/serve_end_to_end.rs`
   (`invoke_fails_over_when_the_primary_provider_goes_down`).
 
 ## Steps
@@ -21,12 +22,14 @@ kill the primary mid-run, and prove the call fails over to the standby — the
 1. **Serve the capability from two providers.** Build two `Mesh` nodes, register the
    same typed handler on each under one service name, and make the capability
    **substitutable** so the mesh treats them as interchangeable:
+
    ```rust
    let _h1 = primary.serve_rpc_typed("summarize", handler.clone())?;
    let _h2 = standby.serve_rpc_typed("summarize", handler.clone())?;
    ```
 
 2. **Invoke by service name, not node id** — this is what makes failover possible:
+
    ```rust
    let resp: SummarizeResp = caller.call_service_typed("summarize", &req, opts).await?;
    ```
@@ -49,8 +52,8 @@ kill the primary mid-run, and prove the call fails over to the standby — the
 - [ ] The pre-kill call and the post-kill call both return a valid `SummarizeResp`.
 - [ ] The post-kill result demonstrably came from the standby (tag the two handlers'
       output so you can tell them apart).
-- [ ] Calling by a **pinned node id** instead of the service name does *not* fail
-      over — proving the failover is a property of service-name discovery, not magic.
+- [ ] Calling by a **pinned node id** instead of the service name does _not_ select
+      another provider. Provider reselection applies to service-name discovery.
 
 ## Pitfalls
 
