@@ -9,8 +9,9 @@ Written at `8189676a7`. **Step 2 SIGNED by Kyra 2026-07-29 at `a788232bd`**
 Branch **`load-balancing-3`** since the step-2 merge to master.
 
 **This handoff is now nearly spent.** Its remaining job is the step-3 boundary
-and the HOLD lessons in §2b/§2c/§4 — **SIX HOLDs overall: one on step 2, five on
-step 3**, each finding a defect the author's own witnesses did not. Delete it
+and the HOLD lessons in §2b/§2c/§2d/§4 — **SEVEN HOLDs overall: one on step 2,
+six on step 3.** The first six each found a defect the author's own witnesses did
+not; the seventh found the closure records contradicting themselves. Delete it
 when step 3 signs — steps 1 and 2 are both recorded in the authoritative design's
 §16.0, which is where they belong.
 
@@ -29,7 +30,7 @@ the record reads as more settled than it is.
 | OLB-2B.3 boundary design (rev 5 + addenda) | `1c1b652e6` | SIGNED **as a design only** |
 | 2B.3c-pre **step 1** — installation identity (items 1–3) | `300e80f6c` | SIGNED |
 | 2B.3c-pre **step 2** — Grant source service (items 4–9, 12–14) | `a788232bd` | **SIGNED** (`OLB_2B3C_PRE_STEP2_SIGNED_HEAD`) — held once at `df32cbd7d`, repaired, signed 2026-07-29; see §2b |
-| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | repair at `ce688d5d1`; **candidate head = this commit** | **HELD FIVE TIMES, REPAIRED — NOT SIGNED, AWAITING INDEPENDENT REVIEW.** P1/P2 at `fa0b9ddd5`, P1b at `7348529fb`, exhaustion + equality at `91f1c2e11`, terminal aliasing + public API at `46af3d625`, the unwitnessed fourth matrix cell at `010c718ea`; see §2c |
+| 2B.3c-pre **step 3** — wake edge + plan reconciliation (items 10, 11, 15, 16) | production + witnesses at `ce688d5d1` (independently reviewed and PASSED); **candidate head = this commit**, closure records only | **HELD SIX TIMES, REPAIRED — NOT SIGNED.** P1/P2 at `fa0b9ddd5`, P1b at `7348529fb`, exhaustion + equality at `91f1c2e11`, terminal aliasing + public API at `46af3d625`, the unwitnessed fourth matrix cell at `010c718ea`, contradictory closure records at `bc45d3c6f`; see §2c/§2d |
 | `SAFE_LIVE_HEAD` | — | **not established**, still reserved for provider-free leader lighting |
 
 Authoritative design: [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md).
@@ -40,15 +41,23 @@ proof, the exclusions, and the closure gate. §2A is the substrate spec.
 
 ## 2. Do this first
 
-**Step 2 is signed. Step 3 has been HELD five times, most recently at
-`010c718ea`, and is repaired; it owes Kyra's re-run.**
+**Step 2 is signed. Step 3 has been HELD six times, most recently at
+`bc45d3c6f`, and is repaired; it owes Kyra's re-run.**
+
+**The sixth HOLD was documentation-only.** The production repair at `ce688d5d1`
+and its witnesses PASSED independent review with no code or witness blocker
+found. What was held is this file and the design — an authoritative record is
+part of the candidate, and a claim that lives in two documents drifts one copy at
+a time.
 
 Step 3 (items 10, 11, 15, 16 — the consumer-Grant wake/invalidation edge and the
 normative plan correction) was authorized by the user AFTER the step-2 signature;
-that signature did not cover it. Each review has confirmed the existing witnesses
-are real and mutation-sensitive, and then found a permutation, boundary or matrix
-cell they do not reach — see §2c. The full witness table and the mutation each
-one dies to is in the design's §16.0. Every RED is the author's own.
+that signature did not cover it. The first five reviews each confirmed the
+existing witnesses are real and mutation-sensitive, and then found a permutation,
+boundary or matrix cell they do not reach — see §2c/§2d. The full witness table
+and the mutation each one dies to is in the design's §16.0. Every RED was the
+author's own through `46af3d625`; at `bc45d3c6f` Kyra independently reproduced
+all six inverse mutations.
 
 `SAFE_LIVE_HEAD` remains unestablished and still reserved for the provider-free
 leader path.
@@ -93,9 +102,11 @@ Four notes carried forward — each was load-bearing in the independent run:
 
 ## 2c. The step-3 HOLDs, and what closed each
 
-**Five HOLDs on step 3 in total** — `fa0b9ddd5`, `7348529fb`, `91f1c2e11`,
-`46af3d625`, `010c718ea` — each finding a permutation, boundary or matrix cell
-the previous witness set did not reach. The first review confirmed W-W1..W-W5 RED
+**Six HOLDs on step 3 in total** — `fa0b9ddd5`, `7348529fb`, `91f1c2e11`,
+`46af3d625`, `010c718ea`, `bc45d3c6f`. The first five each found a permutation,
+boundary or matrix cell the previous witness set did not reach; the sixth found
+no code or witness defect and held the closure records alone (§2d). The first
+review confirmed W-W1..W-W5 RED
 under all six inverse mutations, so those witnesses were real; they simply did
 not cover reordered notifications for successive transitions of the same Grant
 id, nor the equality arm, nor identity exhaustion, nor the terminal row, nor the
@@ -146,7 +157,8 @@ protection against stale settlement; the commit pin's exact installation-identit
 vector is also load-bearing. Witness
 `a_delayed_install_notification_cannot_retire_a_successor_removal_artifact`.
 
-**Fourth HOLD, on `91f1c2e11`.** Two findings, both closed:
+**Fourth HOLD overall — step 3's third — on `91f1c2e11`.** Two findings, both
+closed:
 
 - the publication identity advanced with an unchecked `fetch_add(1) + 1` AFTER
   the store, so at the ceiling it panicked or aliased to zero with the snapshot
@@ -199,9 +211,16 @@ narrowed in the same change; W-W13 pins it for TERMINAL movement, with two
 capabilities under one exact scope, because a terminal-only narrowing would
 otherwise evade the ordinary witness entirely.
 
-## 2d. The fourth and fifth HOLDs — the terminal row, and the cell beside it
+## 2d. The fifth, sixth and seventh HOLDs
 
-**Fourth HOLD, on `46af3d625`.** Three findings.
+**Ordinals in both documents are OVERALL**, counting the step-2 HOLD as the
+first: `df32cbd7d`, `fa0b9ddd5`, `7348529fb`, `91f1c2e11`, `46af3d625`,
+`010c718ea`, `bc45d3c6f`. This section previously numbered its entries by step-3
+position while §2c above numbered by overall position, which put two different
+HOLDs under "Fourth" in one document. One scheme only, with the step-3 position
+given alongside.
+
+**Fifth HOLD overall — step 3's fourth — on `46af3d625`.** Three findings.
 
 - **An unauthorized public API change.** `d70810aa4` added
   `GrantAudienceInstallError::PublicationSpaceExhausted`. That enum is reachable
@@ -221,7 +240,8 @@ otherwise evade the ordinary witness entirely.
   under an implementation that reused `Publication(MAX-1)` for the withdrawal.
   Rebuilt at `MAX-2`, so the installation genuinely commits `MAX-1`.
 
-**Fifth HOLD, on `010c718ea`.** The production fence was found sound under every
+**Sixth HOLD overall — step 3's fifth — on `010c718ea`.** The production fence
+was found sound under every
 inspected schedule, and the three claimed mutations were independently confirmed
 orthogonal. The blockers were both witness-side, and both are the same failure:
 an arm that cannot be mutated alone cannot be witnessed alone.
@@ -265,6 +285,28 @@ Also closed in the same repair, from the same review:
   `OrgSdkError::AudienceInstallRefused` to the SDK. Now generic, with the precise
   counter in the log, and the installation arm logs `space = "installation"` so
   the enum's own claim about its refusal paths is true.
+
+**Seventh HOLD overall — step 3's sixth — on `bc45d3c6f`. Documentation only.**
+
+The production repair and its witnesses PASSED. Kyra reproduced all six inverse
+mutations from a clean detached worktree, each restored before the next, with the
+exact-head gates re-run after restoration, and found no code or witness blocker.
+Two contradictions in the closure records held it:
+
+- the design carried **two copies** of the capability-width passage and only one
+  was corrected at the previous HOLD, so the surviving copy still ended "Flagged
+  for adjudication, not decided" — contradicting its own preceding paragraph and
+  this file. Both now state the ruling: movement stays capability-wide within the
+  exact `(grant_id, audience_handle)` scope until the source structurally refuses
+  uncovered capabilities;
+- this file numbered `91f1c2e11` by OVERALL position and `46af3d625` by STEP-3
+  position, so two different HOLDs appeared as "Fourth" in one document. Fixed by
+  the note at the head of this section.
+
+The lesson is duller than the earlier ones and worth keeping anyway: **an
+authoritative record is part of the candidate**, and a claim duplicated across
+two documents drifts one copy at a time. Correcting the copy you happen to be
+reading is not correcting the claim — grep for the other one.
 
 ---
 

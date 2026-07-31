@@ -633,7 +633,7 @@ is the §19 defect class this process has already caught once.
 |---|---|---|
 | **1–3** — non-aliasing installation identity | **SIGNED** 2026-07-28 | `OLB_2B3C_PRE_STEP1_SIGNED_HEAD = 300e80f6c` |
 | **4–9, 12–14** — scope stamp + Grant source service | **SIGNED** 2026-07-29 | `OLB_2B3C_PRE_STEP2_SIGNED_HEAD = a788232bd` |
-| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | **IMPLEMENTED + WITNESSED — REVIEWED FIVE TIMES, HELD FIVE TIMES, REPAIRED — NOT SIGNED** | see the step-3 lineage below |
+| 10, 11, 15, 16 — wake/invalidation edge + plan reconciliation | **IMPLEMENTED + WITNESSED — REVIEWED SIX TIMES, HELD SIX TIMES, REPAIRED — NOT SIGNED.** The most recent HOLD (`bc45d3c6f`, seventh overall) was documentation-only: production and witnesses passed independent review at `ce688d5d1`, with all six inverse mutations independently reproduced | see the step-3 lineage below |
 
 **Step 2 signed by Kyra 2026-07-29 at `a788232bd`**, after an independent
 mutation matrix in a detached worktree: every security claim below went RED
@@ -641,7 +641,7 @@ under its own inverse mutation with zero retries, and the source was restored to
 the exact SHA before the final GREEN and adjudication.
 
 The corrective lineage is the useful record. Step 2 was held **once** — the
-FIRST of the six HOLDs across this slice; the other five are step 3's, below:
+FIRST of the seven HOLDs across this slice; the other six are step 3's, below:
 
 ```text
 8189676a7  Grant-plane implementation
@@ -729,7 +729,7 @@ slice remain UNAUTHORIZED until this step signs.** The normative plan still says
 "OLB-2B.3 is AUTHORIZED" in the broad sense; that does not authorize any later
 slice, and this line is the operative one.
 
-Step-3 lineage, held FIVE times (SIX HOLDs overall: one on step 2, five here):
+Step-3 lineage, held SIX times (SEVEN HOLDs overall: one on step 2, six here):
 
 ```text
 fa0b9ddd5  wake/invalidation edge + plan correction   <- HELD (P1 successor race, P2 breadth)
@@ -744,7 +744,18 @@ b226b2dbf  terminal artifact fence + public API revert <- HELD (the fourth matri
                                                             control rescued by the
                                                             artifact side)
 ce688d5d1  the fourth cell split out + W-W15, W-W16
-           (candidate head = the docs commit immediately after it)
+           reviewed as bc45d3c6f (its docs commit)   <- HELD, documentation only:
+                                                        the capability-width
+                                                        ruling and the HOLD
+                                                        ordinals contradicted
+                                                        themselves. Production
+                                                        and witnesses PASSED
+                                                        independent review;
+                                                        all six inverse
+                                                        mutations independently
+                                                        reproduced.
+           closure-record corrections only, no production or witness change
+           (candidate head = THIS commit; it carries no repair to name)
 ```
 
 What step 3 closes, both directions of design §0.1:
@@ -953,6 +964,26 @@ mutation it was meant to catch.**
   and W-W14 now assert the parked movement's fence directly instead of inferring
   it from their own setup.
 
+**Seventh HOLD, on `bc45d3c6f` — documentation only.** The production repair and
+its witnesses PASSED independent review: all six inverse mutations were
+reproduced from a clean detached worktree, each restored before the next, with
+the exact-head gates re-run after restoration, and no code or witness blocker was
+found. The candidate was held because the closure records still contradicted
+themselves in two places:
+
+- the capability-width passage above stated the ruling correctly and then ended
+  "Flagged for adjudication, not decided" — contradicting its own preceding
+  paragraph and the handoff. **There were two copies of that passage and only one
+  was corrected at the previous HOLD**, which is the whole hazard of a claim
+  living in two documents;
+- the handoff numbered `91f1c2e11` by OVERALL position and `46af3d625` by STEP-3
+  position, putting two different HOLDs under "Fourth" in one document. Ordinals
+  are overall everywhere now, with the step-3 position given alongside.
+
+Nothing about the mechanism changed. The lesson is narrower and duller than the
+earlier ones: **a record that is authoritative is part of the candidate**, and
+duplicated prose drifts one copy at a time.
+
 **The publication generation is deliberately NOT in `SourceToken`.** It is
 ordering metadata, not authority. The capture/commit token remains the exact
 selected installation-identity vector, which moves for every semantically
@@ -971,11 +1002,22 @@ slot for a capability the grant does not cover reconstructs as
 an installed `(grant_id, audience_handle)`. So that grant's movement genuinely
 affects those slots, and narrowing would leave a Grant-stamped artifact after
 removal and a permanently `Unserved` slot after install. W-W7 pins the current
-behaviour with an assertion designed to fail if the source is ever narrowed,
-forcing both to change together. Flagged for adjudication, not decided.
+behaviour for ORDINARY movement with an assertion designed to fail if the source
+is ever narrowed, forcing both to change together; W-W13 pins it for TERMINAL
+movement, with two capabilities under one exact scope.
 
-**Every RED for step 3 is the author's own.** It owes an independent mutation
-run before any signature.
+**Adjudicated and closed** (Kyra, at `7348529fb`): movement remains
+capability-wide within the exact `(grant_id, audience_handle)` scope until the
+source structurally refuses uncovered capabilities. Narrowing becomes correct
+only then, and that is not in this slice.
+
+**Step 3's REDs are no longer only the author's own.** They were, through
+`46af3d625`, and the sentence here said so. At `bc45d3c6f` Kyra independently
+reproduced all six inverse mutations from a clean detached worktree, each
+restored before the next, with the exact-head gates re-run after restoration —
+so the independent mutation run this slice owed has been obtained at that head.
+It is owed again at any later head: a mutation run proves the tree it ran
+against, not the branch.
 
 Step 1's corrective lineage, kept because each turn found a distinct defect class
 and the sequence is the useful record:
