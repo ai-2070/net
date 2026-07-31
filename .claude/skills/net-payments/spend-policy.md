@@ -158,6 +158,40 @@ Writes that remain unconditional: completion, `release_claim`, and billing
 republish are separate calls, so a `verify_rejected` still persists **both**
 its claim and its release — both are semantically real.
 
+### The quote is canonicalized lazily, inside the transaction
+
+`require` holds the quote's canonical bytes beside a **new** pending approval so
+a post-approval retry redeems that exact provider-signed quote. That work — a
+full `to_value`, a recursive canonical write, and a base64 over the whole
+envelope — happens only on the branch that needs it. The `Allowed` path and the
+already-pending observation (the common case under a duplicate storm) do none of
+it.
+
+Two things follow that are easy to get wrong if you touch this:
+
+- **`check_and_reserve` can return `SpendError::Malformed`.** The store closure
+  has no error channel (`FnOnce(&mut T) -> (R, bool)`), so a canonicalization
+  failure parks in an `Option<String>` and is re-raised *after* the transaction.
+  No approval is recorded on that path — an approval holding no quote bytes is
+  one a retry cannot redeem — and nothing is reserved. Don't "simplify" this
+  into a `Denied` decision: a denial is a policy verdict, and this is not one.
+- **It runs under the cross-process lock**, where it previously ran ahead of the
+  transaction. Accepted deliberately: approvals are operator-gated and rare, and
+  the hot paths now do none of the work. Don't move it back out behind a
+  speculative check of `s.approvals` — that costs a second read on every call to
+  save a rare one.
+
+### The store file is compact JSON
+
+`save_json` writes `to_vec`, not `to_vec_pretty`: the store is machine-shared
+state, and pretty-printing cost ~11% more bytes to serialize, write, and fsync
+on *every* dirty mutation, on a path whose cost is already linear in file size.
+Both formats parse identically, so a rolling upgrade never sees a corrupt store.
+If you are eyeballing `payment-policy.json` or `payment-engine.json`, pipe it
+through `jq`. **This is not the canonical envelope encoding** — that is
+`core::canonical`, a different encoder pinned by the cross-language golden
+vectors, and it is untouched by this.
+
 ### What the contention benchmarks actually found
 
 Measured, not designed: the atomic accounting unit is the

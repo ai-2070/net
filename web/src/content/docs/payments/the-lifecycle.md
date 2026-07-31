@@ -159,3 +159,31 @@ provider.
 The same `PaymentEngine` serves the quote/pay wire and gates priced tools in the
 integrated path. Settlement, verification, billing, and redemption use one store
 under its lock, which is the boundary for the engine's at-most-once bookkeeping.
+
+## What the engine store keeps, and for how long
+
+The engine store is bookkeeping, not the audit trail. Every operation parses the
+whole file and rewrites it when something changed, so the engine **compacts
+terminal quote records 6 hours past quote expiry** by default — a payment that
+settled, billed, published, and was redeemed has nothing left in its record that
+the billing event does not already carry durably.
+
+Two things follow for anything you build on top:
+
+- **`status()` returns `None` for a completed quote past that horizon.** It is a
+  live-lifecycle view, not a receipt store. Reconciliation, receipts, and
+  "was this paid?" belong on the [billing stream](/docs/payments/billing), which
+  compaction never touches.
+- **Replay protection is never compacted.** Settlement-transaction tombstones
+  are permanent — one on-chain settlement serves exactly one quote, however long
+  an attacker waits. Records that are unredeemed or frozen are kept too.
+
+A provider that re-verifies settlements out of band — on a slower rail, or at a
+deeper finality requirement — should widen the window past its own
+re-verification period, or turn compaction off entirely, because compaction does
+not consult how far a record's verification got:
+
+```rust
+let engine = PaymentEngine::new(provider, facilitator, admission, registry, state_path)?
+    .with_terminal_record_retention_ns(None);  // keep terminal records indefinitely
+```

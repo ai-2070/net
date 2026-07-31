@@ -148,7 +148,15 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
                 .map_err(|e| StoreError::io(path, e))?;
         }
     }
-    let bytes = serde_json::to_vec_pretty(value).map_err(|e| StoreError::io(path, e))?;
+    // Compact, not pretty: the store is machine-shared state, never
+    // hand-authored config, and pretty-printing costs ~11% more bytes to
+    // serialize, write, and fsync on *every* dirty mutation — a tax paid
+    // on a path whose cost is already linear in file size. Both formats
+    // parse identically, so this is forward- and backward-compatible with
+    // stores written by an older build. (The canonical envelope encoding
+    // pinned by the cross-language golden vectors is
+    // `core::canonical` — a different encoder entirely, untouched here.)
+    let bytes = serde_json::to_vec(value).map_err(|e| StoreError::io(path, e))?;
 
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let result: Result<(), StoreError> = async {
@@ -283,6 +291,47 @@ mod tests {
             let name = name.to_string_lossy();
             name == "state.json" || name == "state.json.lock"
         }));
+    }
+
+    /// Saves are compact, and a store written by an older (pretty-printing)
+    /// build still loads — the format change is a pure byte reduction, not a
+    /// schema change, so a rolling upgrade never sees a corrupt store.
+    #[tokio::test]
+    async fn saves_are_compact_and_pretty_stores_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        // A store left behind by an older build: pretty-printed.
+        let mut legacy = Counters::default();
+        legacy.counts.insert("a".into(), 1);
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap())
+            .await
+            .unwrap();
+        let loaded: Counters = load_json(&path).await.unwrap();
+        assert_eq!(loaded.counts["a"], 1, "a pretty store must still parse");
+
+        // Rewriting it emits compact bytes. The assertion is the strongest
+        // one available: compact output contains no raw newline ANYWHERE,
+        // not merely no newline-plus-indent run. That holds even for
+        // newline-bearing data, because serde escapes a newline inside a
+        // string as the two bytes `\n` — which is why the second key here
+        // carries one.
+        mutate_json::<Counters, _, _>(&path, |s| {
+            s.counts.insert("b\nwith a newline in the key".into(), 2);
+        })
+        .await
+        .unwrap();
+        let raw = tokio::fs::read(&path).await.unwrap();
+        assert!(
+            !raw.contains(&b'\n'),
+            "saves must be compact, not pretty-printed"
+        );
+        let loaded: Counters = load_json(&path).await.unwrap();
+        assert_eq!(loaded.counts.len(), 2, "the mutation still round-trips");
+        assert_eq!(
+            loaded.counts["b\nwith a newline in the key"], 2,
+            "escaping is what makes the no-raw-newline assertion safe"
+        );
     }
 
     /// `mutate_json_if_changed` writes on a dirty pass and skips the write

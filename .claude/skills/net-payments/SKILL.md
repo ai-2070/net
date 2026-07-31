@@ -34,10 +34,10 @@ Load reference files on demand — do not read them all up front.
 | `bindings/coverage.md` | **Before promising payments works in a given language.** Payments is a three-binding subsystem: Rust, Node and Python only, and Node/Python reach it solely through the low-level package. Go and C have no payments API at all. |
 | `object-model.md` | When touching the five Net envelopes — exact fields, the canonical signing regime, versioning, idempotency, amounts. |
 | `x402.md` | When touching x402 structures — `X402Carry` byte-preservation, `PaymentRequirements`/`PaymentPayload`/settlement views, CAIP ids, the `exact` EVM scheme. |
-| `provider.md` | When the user **charges for a capability** — `PaymentEngine` lifecycle (quote → verify → settle → serve → bill), provider admission policy, pricing at publish, `serve_payments` over the mesh. |
+| `provider.md` | When the user **charges for a capability** — `PaymentEngine` lifecycle (quote → verify → settle → serve → bill), provider admission policy, pricing at publish, `serve_payments` over the mesh, and terminal-record compaction (default-on at 6h; why `status()` is not an audit surface). |
 | `caller.md` | When the user **pays to invoke** — `CallerPaymentFlow`, `ProviderChannel` (`InProcessProvider` / `MeshPaymentChannel`), spend check, the approval loop, the MCP gateway path. |
 | `facilitator.md` | When wiring the `verify`/`settle` boundary — the `Facilitator` trait, the mock + its injectable modes, the real `HttpFacilitator`, `GET /supported` validation, auth, config packs. |
-| `verification.md` | When the question is about **confidence** — the `observed / confirmed(n) / final` tiers, the independent `ChainChecker`, reorg freeze, the immutable chain, idempotency/replay. |
+| `verification.md` | When the question is about **confidence** — the `observed / confirmed(n) / final` tiers, the independent `ChainChecker`, reorg freeze, the immutable chain, idempotency/replay, and the deadline on re-verification (the retention horizon). |
 | `signer.md` | When touching settlement signing — the `SchemeSigner` seam, `ExternalSigner` (production) vs `DevLocalSigner` (testnet), EIP-3009 authoring, the no-raw-signing invariant. |
 | `spend-policy.md` | When the user wants **limits, budgets, or approvals** — `SpendPolicyEngine`, `SpendLimits`, the fail-closed default posture, the operator approval surface, delegation inheritance. |
 | `networks.md` | When **enabling a network** — CAIP-2/CAIP-19, the signed asset registry, the Base Sepolia → Base → Solana → xrpl ladder, "config, not code," the live testnet runbook. |
@@ -74,6 +74,13 @@ If you remember nothing else from `concepts.md`, remember these:
 6. **Enabling a network is config, not code.** Facilitator pack + registry
    entries + a conformance run — no new envelope types, no core changes, no
    per-network branches outside `src/x402/`.
+7. **The engine store is bookkeeping; the billing log is the record.** Terminal
+   quote records are compacted 6h past quote expiry by default, so
+   `engine.status()` returns `None` for a payment that completed fine — build
+   reconciliation on the billing stream. Replay protection is never compacted:
+   settlement-transaction tombstones are permanent at every setting, and nothing
+   unredeemed or frozen is retired. The horizon is also your re-verification
+   window; if you re-verify out of band, widen it or pass `None`.
 
 The category line, verbatim: **Net standardizes the commercial facts around
 capability invocation; it does not intermediate the money.**
