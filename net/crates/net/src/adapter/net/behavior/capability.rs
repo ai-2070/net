@@ -971,12 +971,33 @@ impl CapabilitySet {
     /// scope helpers for those). Untyped strings parse as
     /// `Tag::Legacy`; axis-prefixed strings (`hardware.gpu`,
     /// `software.os=linux`) parse as `AxisPresent` / `AxisValue`.
-    /// Empty tags and reserved-prefix tags are silently dropped
-    /// (the parser returns `Err` and we ignore it).
+    ///
+    /// Empty tags and reserved-prefix tags are dropped, because
+    /// `parse_user` returns `Err` for them. The drop is now logged at
+    /// `warn`: `add_tag("scope:tenant:acme")` looks like it scopes the
+    /// announcement but does not, and the resulting set resolves to
+    /// [`CapabilityScope::Global`] — visible to every tenant and region
+    /// query. Silently widening a set the caller believed was narrowed
+    /// is the failure mode worth hearing about
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
     pub fn add_tag(mut self, tag: impl Into<String>) -> Self {
         let s: String = tag.into();
-        if let Ok(t) = Tag::parse_user(&s) {
-            self.tags.insert(t);
+        match Tag::parse_user(&s) {
+            Ok(t) => {
+                self.tags.insert(t);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tag = %s,
+                    error = %e,
+                    "add_tag: tag dropped — it is NOT on the announcement. \
+                     Reserved-prefix tags (scope:, causal:, heat:, fork-of:, \
+                     dataforts:) need their dedicated builder; for scope use \
+                     with_tenant_scope / with_region_scope / \
+                     with_subnet_local_scope. A dropped scope tag leaves the \
+                     set globally visible."
+                );
+            }
         }
         self
     }
@@ -1041,11 +1062,17 @@ impl CapabilitySet {
     /// Add a `scope:tenant:<id>` reserved tag, marking this
     /// announcement as advertised under the given tenant. Idempotent
     /// — repeated calls with the same id do not duplicate. Empty
-    /// `tenant_id` is silently dropped (matches the scope resolver,
-    /// which rejects empty ids).
+    /// `tenant_id` is dropped with a `warn` (matches the scope
+    /// resolver, which rejects empty ids) — the resulting set is NOT
+    /// tenant-scoped and resolves to [`CapabilityScope::Global`].
     pub fn with_tenant_scope(mut self, tenant_id: impl Into<String>) -> Self {
         let id = tenant_id.into();
         if id.is_empty() {
+            tracing::warn!(
+                "with_tenant_scope(\"\"): empty tenant id ignored — this set is \
+                 NOT tenant-scoped and resolves to Global, visible to every \
+                 tenant and region query"
+            );
             return self;
         }
         let tag = format!("{TAG_SCOPE_TENANT_PREFIX}{id}");
@@ -1057,10 +1084,17 @@ impl CapabilitySet {
 
     /// Add a `scope:region:<name>` reserved tag, marking this
     /// announcement as advertised under the given region.
-    /// Idempotent. Empty `region` is silently dropped.
+    /// Idempotent. Empty `region` is dropped with a `warn` — the
+    /// resulting set is NOT region-scoped and resolves to
+    /// [`CapabilityScope::Global`].
     pub fn with_region_scope(mut self, region: impl Into<String>) -> Self {
         let name = region.into();
         if name.is_empty() {
+            tracing::warn!(
+                "with_region_scope(\"\"): empty region ignored — this set is \
+                 NOT region-scoped and resolves to Global, visible to every \
+                 tenant and region query"
+            );
             return self;
         }
         let tag = format!("{TAG_SCOPE_REGION_PREFIX}{name}");
@@ -3928,12 +3962,52 @@ mod tests {
             CapabilityScope::Tenants(vec!["oem-123".to_string()]),
         );
     }
+    /// The consequence of every silent-drop path in the scope
+    /// builders: the set stays `Global`, which matches EVERY tenant
+    /// and region query. Pinning it here makes the cost of the drop
+    /// explicit — it is not "no scope applied", it is "visible to
+    /// everyone" (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    #[test]
+    fn dropped_scope_input_leaves_the_set_globally_visible() {
+        // `add_tag` cannot set a reserved `scope:` tag — parse_user
+        // rejects it — so this reads as scoping but does not scope.
+        let via_add_tag = CapabilitySet::new().add_tag("scope:tenant:oem-123");
+        let tags: Vec<String> = via_add_tag.tags.iter().map(|t| t.to_string()).collect();
+        assert!(
+            !tags.iter().any(|t| t.starts_with("scope:")),
+            "add_tag must not be able to set a reserved scope tag; got {tags:?}"
+        );
+
+        // Both drop paths land on the same resolved scope, and that
+        // scope is permissive against an arbitrary tenant query.
+        for caps in [
+            via_add_tag,
+            CapabilitySet::new().with_tenant_scope(""),
+            CapabilitySet::new().with_region_scope(""),
+        ] {
+            let rendered: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+            let resolved = super::super::fold::capability_bridge::scope_from_membership_tags(
+                &rendered,
+            );
+            assert_eq!(
+                resolved,
+                CapabilityScope::Global,
+                "a dropped scope input must resolve to Global"
+            );
+            assert!(
+                matches_scope(&resolved, &ScopeFilter::Tenant("someone-else"), false),
+                "Global matches every tenant query — the dropped scope input \
+                 left this set visible to an unrelated tenant"
+            );
+        }
+    }
+
     #[test]
     fn with_tenant_scope_is_idempotent_and_drops_empty() {
         let caps = CapabilitySet::new()
             .with_tenant_scope("oem-123")
             .with_tenant_scope("oem-123") // duplicate
-            .with_tenant_scope(""); // empty — silently dropped
+            .with_tenant_scope(""); // empty — dropped (now with a warn)
                                     // Phase A.5.N.2: tags are typed; render to wire form
                                     // for prefix-string filtering.
         let tenant_tags: Vec<String> = caps
