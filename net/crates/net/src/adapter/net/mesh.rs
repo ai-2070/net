@@ -23468,14 +23468,17 @@ impl MeshNode {
             // No registry → no ACL (test / permissive deployments).
             return (true, None);
         };
-        let Some(cfg_ref) = configs.get_by_name(channel.as_str()) else {
+        // `resolve_by_name` (not `get_by_name`) so we also learn WHICH
+        // prefix matched — `subscriber_origin_binding` needs it to
+        // locate the dynamic suffix inside the requested name. Returns
+        // owned values, which is what we wanted anyway: the config is
+        // cloned here so the registry guard is dropped before any
+        // signature work below.
+        let Some(resolved) = configs.resolve_by_name(channel.as_str()) else {
             return (false, Some(AckReason::UnknownChannel));
         };
-        // Clone the cfg so we can drop the DashMap guard before
-        // any further work — the cfg fields are all cheap to clone
-        // and doing so releases the registry's read lock early.
-        let cfg = cfg_ref.clone();
-        drop(cfg_ref);
+        let cfg = resolved.config;
+        let matched_prefix = resolved.matched_prefix;
 
         let peer_subnet = ctx
             .peer_subnets
@@ -23492,6 +23495,42 @@ impl MeshNode {
         }
         if !visible {
             return (false, Some(AckReason::Unauthorized));
+        }
+
+        // Origin binding (H3). For a channel family whose name encodes
+        // the subscriber's identity — nRPC's
+        // `<service>.replies.<caller_origin>` — a peer may subscribe
+        // ONLY to the name carrying its own origin. Runs BEFORE the
+        // `has_auth_gates` short-circuit below, because the family this
+        // protects is otherwise fully permissive: caps and tokens are
+        // both `None`, so that short-circuit would return `(true, None)`
+        // and never reach a gate at all.
+        //
+        // Evaluated against the TOFU-pinned entity, never a wire-claimed
+        // origin. An unpinned peer is REJECTED rather than admitted:
+        // falling back to "allow when we don't know who you are" would
+        // hand an attacker the bypass of simply never announcing, which
+        // is not a fix. The cost is an ordering requirement — a
+        // subscriber must have announced (so the publisher pinned it)
+        // before its first subscribe to a bound family. `Unauthorized`
+        // is a retryable answer; the nRPC client re-announces and
+        // retries on it, so first-call and post-reconnect races
+        // self-heal rather than failing permanently.
+        if let Some(binding) = cfg.subscriber_origin_binding {
+            let pinned_origin = ctx
+                .peer_entity_ids
+                .get(&from_node)
+                .map(|e| e.value().origin_hash());
+            if !binding.authorizes(channel.as_str(), matched_prefix.as_deref(), pinned_origin) {
+                tracing::debug!(
+                    from_node = format!("{:#x}", from_node),
+                    channel = channel.as_str(),
+                    pinned = pinned_origin.is_some(),
+                    "auth: origin-bound channel subscribe rejected (peer is \
+                     unpinned, or the name encodes a different peer's origin)"
+                );
+                return (false, Some(AckReason::Unauthorized));
+            }
         }
 
         // Parse the presented credential as a delegation chain. A
@@ -24729,6 +24768,39 @@ impl MeshNode {
     pub(crate) async fn reannounce_current_capabilities(&self) -> Result<(), AdapterError> {
         self.announce_from_baseline(None, Duration::from_secs(300), true)
             .await
+    }
+
+    /// Republish the current baseline **bypassing the announce rate
+    /// limit**, for a caller that is blocked on a peer having pinned our
+    /// identity rather than merely wanting eventual visibility.
+    ///
+    /// [`Self::reannounce_current_capabilities`] goes through the
+    /// `Routine` path, which coalesces inside `min_announce_interval`
+    /// and returns `Ok` without sending. That is right for visibility
+    /// refreshes and wrong here: the H3 origin binding on a reply
+    /// channel is evaluated against the TOFU pin a peer installs from
+    /// our signature-verified DIRECT announcement, so a caller whose
+    /// subscribe was just rejected needs an announcement to actually go
+    /// out *now* — coalescing it away means the retry waits out the
+    /// full window and fails for the same reason.
+    ///
+    /// Reuses the `SecurityCorrective` mode rather than adding a third:
+    /// the semantics wanted are identical (bypass coalescing, rebuild
+    /// from the current baseline), and this genuinely is an
+    /// authorization-corrective pass — a peer cannot authorize us until
+    /// it has our identity.
+    ///
+    /// Still a pure republish: the baseline is read inside the announce
+    /// lock, so this can never lose a concurrently-announced capability.
+    pub(crate) async fn reannounce_for_authorization(&self) -> Result<(), AdapterError> {
+        self.announce_loop(
+            None,
+            Duration::from_secs(300),
+            true,
+            AnnounceMode::SecurityCorrective,
+            None,
+        )
+        .await
     }
 
     /// Core announce path shared by explicit announces and the
@@ -27450,6 +27522,17 @@ impl MeshNode {
     /// `peer_addr`. Called from the end of `connect` / `accept` so
     /// late joiners don't have to wait for a re-announce. No-op
     /// when we haven't yet announced anything.
+    ///
+    /// Deliberately still a no-op in that case. Synthesizing an
+    /// announcement here would make a node that has never announced
+    /// visible to peers with an EMPTY capability set, and "absent from
+    /// the fold" is not equivalent to "present with no tags" — the
+    /// callee-side nRPC capability gate reads the difference, so
+    /// materializing one flips `may_execute` outcomes for callers that
+    /// never announced. Identity propagation must not ride on a
+    /// side effect of the capability plane; see
+    /// `ensure_reply_subscription` for how the H3 origin binding gets
+    /// the pin it needs instead.
     async fn push_local_announcement(&self, peer_addr: SocketAddr) {
         // Serialized through the epoch-checked path (review-9
         // addendum): a late joiner must receive what this node's

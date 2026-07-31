@@ -289,7 +289,7 @@ impl Mesh {
     /// same service find their own prior default and leave it alone.
     pub(crate) fn auto_register_rpc_channels(&self, service: &str) {
         use crate::ChannelConfig;
-        use net::adapter::net::channel::{ChannelId, ChannelName};
+        use net::adapter::net::channel::{ChannelId, ChannelName, OriginBinding};
         // Exact: `<service>.requests`.
         let req_name = format!("{service}.requests");
         if let Ok(req_channel) = ChannelName::new(&req_name) {
@@ -301,15 +301,27 @@ impl Mesh {
                 .insert_if_absent(ChannelConfig::new(ChannelId::new(req_channel)));
         }
         // Prefix: `<service>.replies.` — admits every per-caller
-        // `<service>.replies.<caller_origin>` subscribe.
+        // `<service>.replies.<caller_origin>` subscribe, bound to that
+        // caller's own identity.
         let prefix = format!("{service}.replies.");
         // Sentinel ChannelId for the prefix entry; not used for
         // hash lookups, just carried so the ChannelConfig is
         // structurally well-formed.
         if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
+            // H3: the prefix admits a *family* of names, so without a
+            // binding any mesh peer could hold a live subscription to
+            // another caller's `<service>.replies.<X>` and receive that
+            // caller's response bodies whenever the server's direct
+            // route missed and the response fell back to roster
+            // fan-out. The bound suffix is exactly the 16-hex origin
+            // the reply-channel name is built from, so the legitimate
+            // caller satisfies it by construction and an impostor
+            // cannot.
+            let cfg = ChannelConfig::new(ChannelId::new(sentinel_name))
+                .with_subscriber_origin_binding(OriginBinding::OriginHashHex16);
             let _ = self
                 .channel_configs_arc()
-                .insert_prefix_if_absent(prefix, ChannelConfig::new(ChannelId::new(sentinel_name)));
+                .insert_prefix_if_absent(prefix, cfg);
         }
     }
 

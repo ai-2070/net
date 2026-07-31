@@ -9,6 +9,91 @@ use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet}
 use crate::adapter::net::identity::{EntityId, RevocationRegistry, TokenChain, TokenScope};
 use dashmap::DashMap;
 
+/// How a channel binds its dynamic name suffix to the subscribing
+/// peer's authenticated identity.
+///
+/// Set on a **prefix**-registered [`ChannelConfig`], this turns a
+/// family of dynamically-named channels from "anyone may subscribe to
+/// any name under the prefix" into "a peer may subscribe only to the
+/// one name that encodes its own identity".
+///
+/// The motivating case is nRPC's per-caller reply channels
+/// (`<service>.replies.<caller_origin>`). Those resolve through a
+/// permissive prefix entry, so pre-fix any mesh peer could hold a live
+/// subscription to *another* caller's reply channel and receive that
+/// caller's response bodies whenever the server's direct route missed
+/// and the response fell back to roster fan-out.
+///
+/// Evaluated against the **pinned** peer identity (the TOFU binding
+/// installed from a signature-verified direct capability announcement),
+/// never a wire-claimed value. A peer whose identity is not yet pinned
+/// is rejected: admitting it would hand an attacker the bypass of
+/// simply never announcing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginBinding {
+    /// The requested name's suffix — everything after the matched
+    /// prefix — must equal the subscriber's
+    /// [`EntityId::origin_hash`](crate::adapter::net::identity::EntityId::origin_hash)
+    /// rendered as exactly 16 lowercase hex digits, which is the
+    /// format nRPC uses to build the channel name.
+    OriginHashHex16,
+}
+
+impl OriginBinding {
+    /// The complete subscribe decision for a bound channel family.
+    ///
+    /// `pinned_origin` is the subscriber's TOFU-pinned
+    /// `EntityId::origin_hash()`, or `None` when the publisher has not
+    /// pinned that peer yet (no signature-verified direct capability
+    /// announcement has arrived from it).
+    ///
+    /// **`None` rejects.** This is the rule the whole finding turns on:
+    /// admitting a peer whose identity we do not know would let an
+    /// attacker bypass the binding entirely by simply never announcing,
+    /// which is not a fix. It is stated here, as one branch of a pure
+    /// function, rather than left implicit at the call site — that
+    /// makes it directly testable and hard to "simplify" away.
+    ///
+    /// The cost is an ordering requirement: a peer must be pinned
+    /// before its first subscribe to a bound family. In practice a node
+    /// announces as part of coming up, and the publisher pushes/learns
+    /// identities at session establishment, so this is satisfied well
+    /// before any application traffic; the nRPC client additionally
+    /// re-announces and retries on rejection.
+    pub fn authorizes(
+        self,
+        name: &str,
+        matched_prefix: Option<&str>,
+        pinned_origin: Option<u64>,
+    ) -> bool {
+        let Some(origin_hash) = pinned_origin else {
+            return false;
+        };
+        self.matches(name, matched_prefix, origin_hash)
+    }
+
+    /// Does `name` bind to `origin_hash` under `matched_prefix`?
+    ///
+    /// `matched_prefix` is `None` when the config was resolved by exact
+    /// name rather than through the prefix table. That combination has
+    /// no coherent meaning — there is no dynamic suffix to check — so
+    /// it fails closed rather than silently admitting.
+    pub fn matches(self, name: &str, matched_prefix: Option<&str>, origin_hash: u64) -> bool {
+        let Some(prefix) = matched_prefix else {
+            return false;
+        };
+        let Some(suffix) = name.strip_prefix(prefix) else {
+            // Defensive: the registry only hands us a prefix it
+            // matched, so this is unreachable — but a mismatch must
+            // never read as "bound".
+            return false;
+        };
+        match self {
+            Self::OriginHashHex16 => suffix == format!("{origin_hash:016x}"),
+        }
+    }
+}
+
 /// Channel visibility scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Visibility {
@@ -74,6 +159,15 @@ pub struct ChannelConfig {
     /// closed** — there is no authority a chain could anchor to, so
     /// nothing is authorized.
     pub token_roots: Vec<EntityId>,
+    /// Bind the dynamic name suffix to the subscriber's own pinned
+    /// identity. `None` (default) = any peer that clears the other
+    /// gates may subscribe to any name this config covers.
+    ///
+    /// Only meaningful on a prefix-registered config; see
+    /// [`OriginBinding`]. Unlike `publish_caps` / `subscribe_caps`,
+    /// this **is** an access boundary — it is evaluated against the
+    /// TOFU-pinned peer identity, which a peer cannot self-assert.
+    pub subscriber_origin_binding: Option<OriginBinding>,
     /// Default priority level for this channel's packets (0 = lowest).
     pub priority: u8,
     /// Default reliability mode for streams on this channel.
@@ -92,6 +186,7 @@ impl ChannelConfig {
             subscribe_caps: None,
             require_token: false,
             token_roots: Vec::new(),
+            subscriber_origin_binding: None,
             priority: 0,
             reliable: false,
             max_rate_pps: None,
@@ -157,6 +252,19 @@ impl ChannelConfig {
     /// consult this rather than `require_token` directly.
     pub fn token_required(&self) -> bool {
         self.require_token || !self.token_roots.is_empty()
+    }
+
+    /// Bind this (prefix-registered) channel family's dynamic suffix to
+    /// the subscribing peer's own pinned identity — see
+    /// [`OriginBinding`].
+    ///
+    /// Callers subscribing to a bound family must have had their
+    /// identity pinned on the publisher first, which happens when their
+    /// signature-verified direct capability announcement arrives. A peer
+    /// that has not announced is rejected (fail closed).
+    pub fn with_subscriber_origin_binding(mut self, binding: OriginBinding) -> Self {
+        self.subscriber_origin_binding = Some(binding);
+        self
     }
 
     /// Set default priority.
@@ -317,6 +425,18 @@ impl ChannelConfig {
             )
             .is_ok()
     }
+}
+
+/// A channel config plus how it was resolved, from
+/// [`ChannelConfigRegistry::resolve_by_name`].
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    /// The resolved configuration.
+    pub config: ChannelConfig,
+    /// `Some(prefix)` when resolution fell through to the prefix table,
+    /// `None` for an exact-name match. [`OriginBinding`] uses this to
+    /// split the requested name into prefix + dynamic suffix.
+    pub matched_prefix: Option<String>,
 }
 
 /// Registry of channel configurations.
@@ -591,6 +711,41 @@ impl ChannelConfigRegistry {
             }
         }
         self.prefix_configs.get(&best_key?)
+    }
+
+    /// Resolve `name` the same way [`Self::get_by_name`] does, but also
+    /// report **which prefix matched** when resolution came from the
+    /// prefix table.
+    ///
+    /// [`OriginBinding`] needs that prefix to locate the dynamic suffix
+    /// inside the requested name; `get_by_name` alone discards it, and
+    /// re-deriving it at the call site would duplicate the
+    /// longest-match rule (and drift from it). Returns owned values
+    /// because every caller on the authorization path clones the config
+    /// immediately anyway, to drop the registry guard before doing
+    /// signature work.
+    pub fn resolve_by_name(&self, name: &str) -> Option<ResolvedConfig> {
+        if let Some(exact) = self.configs.get(name) {
+            return Some(ResolvedConfig {
+                config: exact.clone(),
+                matched_prefix: None,
+            });
+        }
+        let mut best_len = 0usize;
+        let mut best_key: Option<String> = None;
+        for entry in self.prefix_configs.iter() {
+            let prefix = entry.key();
+            if name.starts_with(prefix) && prefix.len() >= best_len {
+                best_len = prefix.len();
+                best_key = Some(prefix.clone());
+            }
+        }
+        let key = best_key?;
+        let config = self.prefix_configs.get(&key)?.clone();
+        Some(ResolvedConfig {
+            config,
+            matched_prefix: Some(key),
+        })
     }
 
     /// Remove a channel config by canonical [`ChannelHash`].
@@ -1301,6 +1456,107 @@ mod tests {
         assert_eq!(removed.priority, 7);
         assert_eq!(reg.len(), 0);
         assert!(reg.get(hash).is_none());
+    }
+
+    // ---- H3 (2026-07-31 audit): origin-bound channel families ----
+
+    const OB: OriginBinding = OriginBinding::OriginHashHex16;
+    const OB_PREFIX: &str = "svc.replies.";
+
+    /// The rule the whole finding turns on: a peer whose identity is
+    /// not pinned is REJECTED. Admitting it would let an attacker
+    /// bypass the binding by simply never announcing.
+    #[test]
+    fn origin_binding_rejects_unpinned_peer() {
+        let name = format!("{OB_PREFIX}{:016x}", 0xABCD_1234_5678_9ABCu64);
+        assert!(
+            !OB.authorizes(&name, Some(OB_PREFIX), None),
+            "an unpinned peer must never be authorized, even for a \
+             well-formed name"
+        );
+    }
+
+    #[test]
+    fn origin_binding_admits_matching_origin() {
+        let origin = 0xABCD_1234_5678_9ABCu64;
+        let name = format!("{OB_PREFIX}{origin:016x}");
+        assert!(OB.authorizes(&name, Some(OB_PREFIX), Some(origin)));
+    }
+
+    /// The attack: a pinned peer asking for a name that encodes some
+    /// OTHER peer's origin.
+    #[test]
+    fn origin_binding_rejects_other_peers_origin() {
+        let victim = 0xABCD_1234_5678_9ABCu64;
+        let attacker = 0x0011_2233_4455_6677u64;
+        let name = format!("{OB_PREFIX}{victim:016x}");
+        assert!(
+            !OB.authorizes(&name, Some(OB_PREFIX), Some(attacker)),
+            "a peer must not claim a channel naming another peer's origin"
+        );
+    }
+
+    /// A binding on an exact-match config has no dynamic suffix to
+    /// check, so it fails closed rather than admitting.
+    #[test]
+    fn origin_binding_without_a_matched_prefix_fails_closed() {
+        let origin = 0xABCD_1234_5678_9ABCu64;
+        let name = format!("{OB_PREFIX}{origin:016x}");
+        assert!(!OB.authorizes(&name, None, Some(origin)));
+    }
+
+    /// Formatting is exact: no truncation, no case folding, no
+    /// suffix-prefix matching.
+    #[test]
+    fn origin_binding_requires_exact_16_hex_suffix() {
+        let origin = 0x0000_0000_0000_00ABu64;
+        for bad in [
+            "ab",                // unpadded
+            "AB",                // uppercase (also unpadded)
+            "00000000000000ab0", // trailing garbage
+            "00000000000000a",   // short
+            "00000000000000AB",  // uppercase, padded
+        ] {
+            let name = format!("{OB_PREFIX}{bad}");
+            assert!(
+                !OB.authorizes(&name, Some(OB_PREFIX), Some(origin)),
+                "suffix {bad:?} must not authorize origin {origin:#x}"
+            );
+        }
+        // The canonical rendering does authorize.
+        let good = format!("{OB_PREFIX}{origin:016x}");
+        assert!(OB.authorizes(&good, Some(OB_PREFIX), Some(origin)));
+    }
+
+    /// A config carrying no binding is unaffected — the gate is opt-in.
+    #[test]
+    fn config_without_binding_is_unconstrained() {
+        let cfg = ChannelConfig::new(ChannelId::parse("svc.replies.prefix").unwrap());
+        assert!(cfg.subscriber_origin_binding.is_none());
+    }
+
+    /// `resolve_by_name` must report the prefix it matched, or the
+    /// binding has no way to locate the dynamic suffix.
+    #[test]
+    fn resolve_by_name_reports_the_matched_prefix() {
+        let reg = ChannelConfigRegistry::new();
+        let sentinel = ChannelId::parse("svc.replies.prefix").unwrap();
+        reg.insert_prefix(
+            OB_PREFIX,
+            ChannelConfig::new(sentinel).with_subscriber_origin_binding(OB),
+        );
+
+        let resolved = reg
+            .resolve_by_name("svc.replies.00112233445566aa")
+            .expect("prefix must resolve");
+        assert_eq!(resolved.matched_prefix.as_deref(), Some(OB_PREFIX));
+        assert_eq!(resolved.config.subscriber_origin_binding, Some(OB));
+
+        // An exact-match resolution reports no prefix.
+        let exact = ChannelId::parse("plain.channel").unwrap();
+        reg.insert(ChannelConfig::new(exact));
+        let resolved = reg.resolve_by_name("plain.channel").expect("exact");
+        assert!(resolved.matched_prefix.is_none());
     }
 
     // ---- H2 (2026-07-31 audit): install-if-absent must not clobber ----

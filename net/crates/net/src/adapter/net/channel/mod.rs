@@ -11,7 +11,7 @@ mod name;
 mod publisher;
 mod roster;
 
-pub use config::{ChannelConfig, ChannelConfigRegistry, Visibility};
+pub use config::{ChannelConfig, ChannelConfigRegistry, OriginBinding, ResolvedConfig, Visibility};
 pub use guard::{AuthGuard, AuthVerdict};
 pub use membership::{
     AckReason, MembershipCodecError, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP,

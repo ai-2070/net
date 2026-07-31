@@ -5475,12 +5475,66 @@ impl MeshNode {
         // Subscribe to our own reply channel from the target so the
         // target's roster has us as a subscriber when the server's
         // emit closure publishes the RESPONSE.
-        self.subscribe_channel(target_node_id, reply_channel.clone())
-            .await
-            .map_err(|e| RpcError::NoRoute {
+        //
+        // H3 ordering rule: the reply prefix is origin-BOUND on the
+        // server, and that binding is evaluated against the TOFU pin
+        // the server installs from our signature-verified direct
+        // capability announcement. If we have never announced to this
+        // target — or the pin was dropped when a previous session
+        // failed — the subscribe is rejected as `Unauthorized`, which
+        // is a *retryable* answer rather than a permanent one.
+        //
+        // So: on failure, republish our current capability baseline
+        // (`reannounce_current_capabilities` is the clobber-safe
+        // republish — it re-reads the baseline under the announce lock
+        // rather than snapshotting it outside, so it cannot lose a
+        // concurrent explicit announce), give the announcement a moment
+        // to land and be verified, and retry. The happy path is
+        // unchanged: one attempt, no announce, no sleep.
+        let mut last_err = None;
+        for attempt in 0..REPLY_SUBSCRIBE_ATTEMPTS {
+            match self
+                .subscribe_channel(target_node_id, reply_channel.clone())
+                .await
+            {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 == REPLY_SUBSCRIBE_ATTEMPTS {
+                        break;
+                    }
+                    // Re-announce so the target can pin us, then back
+                    // off before retrying. Announce failures are not
+                    // fatal here — the retry may still succeed if the
+                    // pin arrives by another route.
+                    //
+                    // `reannounce_for_authorization`, NOT the routine
+                    // republish: the routine path coalesces inside
+                    // `min_announce_interval` (10 s by default) and
+                    // returns Ok without sending, so the retry would
+                    // wait out the backoff and fail for exactly the
+                    // same missing-pin reason. Bypassing coalescing is
+                    // the whole point here.
+                    let _ = self.reannounce_for_authorization().await;
+                    tokio::time::sleep(REPLY_SUBSCRIBE_BACKOFF * (attempt as u32 + 1)).await;
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(RpcError::NoRoute {
                 target: target_node_id,
-                reason: e.to_string(),
-            })?;
+                reason: format!(
+                    "reply-channel subscribe rejected by {target_node_id:#x} ({e}). \
+                     The reply channel is bound to this node's announced identity; \
+                     if this persists, the target has not pinned our EntityId \
+                     (no signature-verified direct capability announcement has \
+                     been received from us)."
+                ),
+            });
+        }
 
         // Register the inbound dispatcher only if the slot is
         // unoccupied. The reply-channel name embeds *self_origin*,
@@ -5555,6 +5609,33 @@ fn reply_subscription_covers(
 /// generous for any realistic deployment — a caller that needs
 /// more should reuse existing reply paths.
 pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
+
+/// How many times `ensure_reply_subscription` attempts the reply-channel
+/// subscribe before giving up.
+///
+/// The reply prefix is origin-bound on the server (H3), and that binding
+/// resolves against the TOFU pin installed from our signature-verified
+/// direct capability announcement. A caller making its first call — or
+/// one whose pin was dropped with a failed session — can legitimately
+/// race ahead of its own announcement, so a single rejection is not
+/// evidence of a permanent authorization failure. Three attempts covers
+/// the announce + verify + pin round trip without turning a genuine
+/// denial into a long stall.
+const REPLY_SUBSCRIBE_ATTEMPTS: usize = 3;
+
+/// Base backoff between reply-subscribe attempts; multiplied by the
+/// attempt number, so waits are ~8 ms then ~16 ms.
+///
+/// Deliberately small. The corrective announce and the retry travel the
+/// same session as the subscribe, so the wait only has to cover the
+/// peer's receive-and-verify of an announcement it already has in hand —
+/// not a fresh round trip. Sizing it generously would be actively
+/// harmful: this cost lands on a caller's FIRST call to a target, and a
+/// first call is frequently the one under a latency policy. At 75 ms the
+/// hedge suite's 50 ms hedge window elapsed before the primary leg's
+/// request was even sent, so the primary never ran and the policy
+/// silently degraded to "always use the backup".
+const REPLY_SUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(8);
 
 /// Mint a random 64-bit call_id. Used as the correlation token
 /// for REQUEST/RESPONSE pairing. The fold keys pending oneshots on
