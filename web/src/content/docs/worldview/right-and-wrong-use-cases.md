@@ -15,7 +15,7 @@ The short rule:
 
 ## Use Net when
 
-- **Agents need to discover capabilities dynamically** — the set of available
+- **Machines & agents need to discover and rebalance capabilities dynamically** — the set of available
   tools, models, or services changes at runtime and isn't a fixed config.
 - **Tools live across multiple machines or organizations** — the work you need
   isn't on the box you're running on.
