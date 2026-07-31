@@ -184,6 +184,9 @@ let status: Option<QuoteStatus> = engine.status(quote_id).await?;
 //               billing_event_id: Option<String>, chain: Vec<VerificationEvent> }
 ```
 
+The `None` is **live lifecycle, not "never paid"** — a compacted quote reads the
+same as an unknown one. Don't branch on it for reconciliation.
+
 Billing: `BillingLog::subscribe()` (a `tokio::sync::broadcast::Receiver<BillingEvent>`),
 `read_all()`, `export_jsonl(dest)`. See `billing.md`.
 

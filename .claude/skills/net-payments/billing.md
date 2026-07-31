@@ -45,6 +45,15 @@ Node**; other languages are verifier-level only (`bindings.md`).
 
 ## Immutability
 
+**The billing log is the durable record of a payment; the engine store is not.**
+Terminal quote records are compacted 6h past quote expiry by default, so
+`engine.status()` returns `None` for a payment that completed perfectly well.
+Retention cannot touch the `BillingLog` — and a record is only ever eligible for
+compaction *because* its billing event is already durable there
+(`billing_published`), which is what makes the record redundant. Build
+reconciliation, receipts, invoicing, and "was this paid?" on this stream. See
+`provider.md` for the compaction settings.
+
 Billing events are never rewritten. A reorg, adjustment, refund, or dispute
 emits a *new* event that **references** the original `billing_event_id`.
 Event-sourced all the way down — the audit trail is the append-only log, and

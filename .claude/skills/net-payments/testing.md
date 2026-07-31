@@ -107,6 +107,18 @@ The design's acceptance test: **the mock and the HTTP client pass the
   never overspend** (the loop test).
 - `billing_stream.rs` — subscribe/read/export; idempotent retries republish
   nothing.
+- `engine_retention.rs` — terminal-record compaction. The expiry floor (nothing
+  retires before quote expiry + tolerance + horizon), the resurrection guard (a
+  pruned quote cannot recreate lifecycle state), the permanence of settlement
+  tombstones against a *forgetful facilitator* replaying an old settlement onto
+  a fresh quote, the owner-checked payload co-prune, the keep-side conditions
+  (unredeemed, frozen-after-redemption, no authoritative expiry), the
+  configuration matrix (default 6h / `None` / longer / `Some(0)` refused), and
+  the store-size warning crossing. **Note the trap the tombstone test
+  documents:** it needs a *second engine over the same store with a fresh mock*,
+  because the mock keeps its own settled-payload index and would otherwise
+  refuse the replay before the engine's guard was ever consulted — the test
+  would have proved nothing.
 - `checker_verification.rs`, `eip155_checker.rs` — the independent-check tier
   upgrade (`observed` → `confirmed(n)` → `final`) and delivered-amount
   cross-check.
@@ -196,6 +208,28 @@ Never enable `unsafe-dev-signer` on mainnet.
   the real-asset registry.
 - Use `tempfile` for the engine/policy/billing store paths so tests don't
   collide on the per-user default paths.
+- To assert a `tracing` emit site's **structured fields** by key + value rather
+  than by substring, copy the `FieldCapture` layer in `native_tool_gate.rs` /
+  `engine_retention.rs`: a sync `#[test]` with a current-thread runtime inside
+  `tracing::subscriber::with_default`, so the emit fires on the thread the
+  capturing subscriber is default for. Use `parking_lot::Mutex` — the workspace
+  `clippy.toml` disallows `std::sync::Mutex::lock`.
+
+## The Windows blind spot (read this before trusting a green run)
+
+**"Did the write happen?" is asserted with an inode witness, and that is
+`#[cfg(unix)]`.** A save renames a fresh temp over the store, so a new inode
+proves a durable write and an unchanged one proves the write was skipped.
+Windows has no equivalent here, so those tests are gated out and the suite
+reports `running 0 tests` — a *pass*, not a skip you would notice.
+
+Affected: `read_only_writes_audit.rs` and `redeem_denial_no_write.rs` entirely,
+plus `engine_retention.rs`'s
+`a_sweep_persists_on_an_otherwise_clean_pass_then_settles`. Those three are the
+whole evidence base for the conditional-write discipline (`gotchas.md`: a
+durable write on a read-only branch is a DoS regression). **If you change a
+dirty-flag determination, a green Windows run tells you nothing about it — get
+a Linux/macOS run.**
 
 ## Further reading
 
