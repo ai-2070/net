@@ -930,7 +930,7 @@ async fn accepting_a_payment_sweeps_eligible_records() {
 /// pairs — the `native_tool_gate.rs` idiom, precise enough to assert the
 /// emit site's *structured* fields by key + value rather than by substring.
 struct FieldCapture {
-    fields: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    fields: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
@@ -949,7 +949,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
                     .push((field.name().to_string(), format!("{value:?}")));
             }
         }
-        let mut buf = self.fields.lock().expect("capture mutex");
+        let mut buf = self.fields.lock();
         event.record(&mut Collector(&mut buf));
     }
 }
@@ -970,7 +970,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
 fn crossing_the_store_size_threshold_warns_exactly_once() {
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let fields = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fields = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(FieldCapture {
         fields: fields.clone(),
     });
@@ -1034,7 +1034,7 @@ fn crossing_the_store_size_threshold_warns_exactly_once() {
         });
     });
 
-    let captured = fields.lock().expect("capture mutex");
+    let captured = fields.lock();
     let crossings = captured
         .iter()
         .filter(|(name, value)| {
