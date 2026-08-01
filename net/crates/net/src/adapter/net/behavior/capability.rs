@@ -1205,14 +1205,18 @@ impl CapabilitySet {
             }
             Err(e) => {
                 // `error` names the prefix that tripped, so the message
-                // does not re-list them.
+                // does not re-list them. It does keep the consequence:
+                // a dropped `scope:` tag is the caller believing they
+                // narrowed a set that is in fact still global, which is
+                // the whole reason this logs at all.
                 tracing::warn!(
                     tag = %s,
                     error = %e,
                     "add_tag: tag dropped, not on the announcement — reserved \
                      prefixes need their dedicated builder (for scope: \
                      with_tenant_scope / with_region_scope / \
-                     with_subnet_local_scope)"
+                     with_subnet_local_scope). A dropped scope tag leaves the \
+                     set globally visible."
                 );
             }
         }
