@@ -122,4 +122,30 @@ pub trait Facilitator: Send + Sync {
         payload: &X402Carry<PaymentPayload>,
         requirements: &X402Carry<PaymentRequirements>,
     ) -> Result<SettleOutcome, FacilitatorError>;
+
+    /// The `(scheme, network)` pairs this backend will actually settle,
+    /// at this crate's x402 version — when it can say.
+    ///
+    /// A provider announces its prices at discovery, and nothing checked
+    /// those announcements against the backend that has to honour them.
+    /// The asset registry says the *asset* is one the provider knows;
+    /// this says the *settlement route* is one its facilitator serves.
+    /// Without it a provider can publish terms, sign a quote under them,
+    /// and discover at verify/settle time that its facilitator never
+    /// handled that pair — after the caller has signed an authorization.
+    ///
+    /// `None` means **"cannot say"**, never "supports nothing". The mock
+    /// has no discovery surface, and neither does an arbitrary
+    /// implementation of this trait, so a caller that reads `None` must
+    /// carry on rather than refuse — a check that turns every
+    /// implementation without an answer into a failure is worse than the
+    /// gap it closes. The default is `None` for exactly that reason:
+    /// existing implementations keep working and say nothing.
+    ///
+    /// Live: implementations are expected to query their backend, so
+    /// treat this as network I/O and call it at configuration or
+    /// publication time, not per payment.
+    async fn supported_pairs(&self) -> Result<Option<Vec<(String, String)>>, FacilitatorError> {
+        Ok(None)
+    }
 }

@@ -367,6 +367,24 @@ impl Facilitator for HttpFacilitator {
         // reports no finality; the chain checker owns everything above).
         Ok(SettleOutcome { response })
     }
+
+    /// From `GET /supported`, filtered to this build's x402 version.
+    ///
+    /// The version filter is the point of doing it here rather than
+    /// letting a caller read `kinds` directly: a facilitator offering
+    /// `(exact, eip155:8453)` at some other x402 version does not offer
+    /// it to us, and a pair we cannot speak is a pair we cannot settle.
+    async fn supported_pairs(&self) -> Result<Option<Vec<(String, String)>>, FacilitatorError> {
+        let supported = self.supported().await?;
+        Ok(Some(
+            supported
+                .kinds
+                .into_iter()
+                .filter(|k| k.x402_version == X402_VERSION)
+                .map(|k| (k.scheme, k.network))
+                .collect(),
+        ))
+    }
 }
 
 #[cfg(test)]

@@ -18,15 +18,19 @@ use net_payments::core::terms::PricingTerms;
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::X402Carry;
 
-/// Author the canonical `net.pricing.terms@1` JSON for a capability from a
-/// provider entity id + a JSON array of x402 `PaymentRequirements`. Pure —
-/// the pyfunction below is a thin wrapper.
-fn author_pricing_terms(
-    provider_entity_id: [u8; 32],
-    capability: &str,
+/// Decode the caller's JSON array into byte-preserved carries.
+///
+/// Shared so the authoring path and the settlement-route check read the
+/// same requirements from the same string — two parses of one input can
+/// disagree, and the whole point of the check is that what gets
+/// announced is what got validated.
+///
+/// Locally-originated x402: `author` is the sanctioned serialization
+/// point (the templates originate here, so these bytes become the
+/// preserved originals — no byte-preservation violation).
+fn parse_requirements(
     requirements_json: &str,
-    production_registry: bool,
-) -> Result<String, String> {
+) -> Result<Vec<X402Carry<PaymentRequirements>>, String> {
     let reqs: Vec<PaymentRequirements> = serde_json::from_str(requirements_json).map_err(|e| {
         format!("requirements_json must be a JSON array of x402 PaymentRequirements objects: {e}")
     })?;
@@ -36,14 +40,22 @@ fn author_pricing_terms(
                 .to_string(),
         );
     }
-    // Locally-originated x402: `author` is the sanctioned serialization point
-    // (the templates originate here, so these bytes become the preserved
-    // originals — no byte-preservation violation).
-    let accepts = reqs
-        .iter()
+    reqs.iter()
         .map(X402Carry::author)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("author payment requirement: {e}"))?;
+        .map_err(|e| format!("author payment requirement: {e}"))
+}
+
+/// Author the canonical `net.pricing.terms@1` JSON for a capability from a
+/// provider entity id + a JSON array of x402 `PaymentRequirements`. Pure —
+/// the pyfunction below is a thin wrapper.
+fn author_pricing_terms(
+    provider_entity_id: [u8; 32],
+    capability: &str,
+    requirements_json: &str,
+    production_registry: bool,
+) -> Result<String, String> {
+    let accepts = parse_requirements(requirements_json)?;
     let provider = EntityId::from_bytes(provider_entity_id);
     // The registry revision these terms are announced under. It must match
     // the one the provider's engine issues quotes under, or discovery
@@ -461,22 +473,43 @@ mod provider {
         ///
         /// ``requirements_json`` is the same JSON array of x402
         /// ``PaymentRequirements`` objects (camelCase wire names). Every
-        /// entry is checked against the registry before the terms are
-        /// returned, so this raises rather than announcing something
-        /// unquotable.
+        /// entry is checked twice before the terms are returned, so this
+        /// raises rather than announcing something unquotable:
+        ///
+        /// - against the **registry**, which answers "is this an asset
+        ///   this provider knows";
+        /// - against the **settlement backend's** ``GET /supported``,
+        ///   which answers "is this a route its facilitator will
+        ///   actually settle".
+        ///
+        /// The second is the one the free function cannot do: it has no
+        /// facilitator to ask. A provider that passes the registry check
+        /// can still announce a ``(scheme, network)`` its facilitator has
+        /// never handled, and the caller finds out after signing an
+        /// authorization. Behind the mock — which has no discovery
+        /// surface — only the registry check applies.
+        ///
+        /// Reaches the facilitator over the network, so call it when
+        /// publishing, not per request.
         fn pricing_terms(&self, capability: &str, requirements_json: &str) -> PyResult<String> {
             let id: [u8; 32] = self
                 .provider_entity_id
                 .as_slice()
                 .try_into()
                 .map_err(|_| PyValueError::new_err("provider entity id is not 32 bytes"))?;
-            crate::payment_provider::author_pricing_terms(
+            let terms = crate::payment_provider::author_pricing_terms(
                 id,
                 capability,
                 requirements_json,
                 self.registry_version == PRODUCTION_REGISTRY_VERSION,
             )
-            .map_err(PyValueError::new_err)
+            .map_err(PyValueError::new_err)?;
+            let accepts = crate::payment_provider::parse_requirements(requirements_json)
+                .map_err(PyValueError::new_err)?;
+            self.runtime
+                .block_on(self.engine.check_settlement_routes(&accepts))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok(terms)
         }
 
         /// The asset registry revision this provider issues quotes under —

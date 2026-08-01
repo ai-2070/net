@@ -298,7 +298,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider settlement backend', () => {
             maxTimeoutSeconds: 60,
           },
         ])
-        const terms = JSON.parse(provider.pricingTerms('prov/echo', reqs))
+        const terms = JSON.parse(await provider.pricingTerms('prov/echo', reqs))
         expect(terms.object).toBe('net.pricing.terms@1')
         expect(terms.capability).toBe('prov/echo')
 
@@ -325,7 +325,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider settlement backend', () => {
             maxTimeoutSeconds: 60,
           },
         ])
-        expect(() => provider.pricingTerms('prov/echo', absent)).toThrow()
+        await expect(provider.pricingTerms('prov/echo', absent)).rejects.toThrow()
       } finally {
         provider.close()
       }

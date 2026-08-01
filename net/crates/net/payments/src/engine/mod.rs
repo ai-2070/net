@@ -2170,6 +2170,57 @@ impl PaymentEngine {
         self.provider.entity_id()
     }
 
+    /// Check that this engine's settlement backend will actually settle
+    /// every `(scheme, network)` in `requirements`, before they are
+    /// announced.
+    ///
+    /// The registry check answers a different question — is this an
+    /// asset the provider knows — and a provider that passes it can
+    /// still publish a route its facilitator has never handled. The
+    /// caller then picks that entry, signs an authorization, and the
+    /// discovery happens at settle time with their signature already
+    /// given away.
+    ///
+    /// A backend that cannot say what it supports (the mock, or any
+    /// other [`Facilitator`] that does not answer) passes. Refusing on
+    /// silence would turn every implementation without a discovery
+    /// surface into a failure, which is a worse trade than the gap.
+    ///
+    /// Network I/O: call at publication or configuration time, never per
+    /// payment.
+    pub async fn check_settlement_routes(
+        &self,
+        requirements: &[X402Carry<PaymentRequirements>],
+    ) -> Result<(), EngineError> {
+        let Some(pairs) = self
+            .facilitator
+            .supported_pairs()
+            .await
+            .map_err(|e| EngineError::State(format!("facilitator /supported: {e}")))?
+        else {
+            return Ok(());
+        };
+        for requirement in requirements {
+            let view = requirement.view();
+            let offered = pairs
+                .iter()
+                .any(|(scheme, network)| *scheme == view.scheme && *network == view.network);
+            if !offered {
+                let offers = pairs
+                    .iter()
+                    .map(|(s, n)| format!("({s}, {n})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(EngineError::State(format!(
+                    "the settlement backend does not settle ({}, {}) — refusing to announce a \
+                     price it cannot honour. It offers: [{offers}]",
+                    view.scheme, view.network
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Read-only lifecycle snapshot for gates and tests.
     pub async fn status(&self, quote_id: &str) -> Result<Option<QuoteStatus>, EngineError> {
         let state: EngineState = load_json(&self.state_path).await?;

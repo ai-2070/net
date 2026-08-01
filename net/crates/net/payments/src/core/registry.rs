@@ -502,7 +502,10 @@ mod tests {
                     continue;
                 }
                 assert_eq!(
-                    (entry.eip712_name.as_deref(), entry.eip712_version.as_deref()),
+                    (
+                        entry.eip712_name.as_deref(),
+                        entry.eip712_version.as_deref()
+                    ),
                     (Some("USDC"), Some("2")),
                     "{} must pin its EIP-712 domain in {}",
                     entry.id.as_str(),
