@@ -172,10 +172,21 @@ impl Redex {
         Self::with_auth_principal(guard, AclPrincipal::Origin(origin_hash))
     }
 
-    /// Escape hatch for callers that genuinely hold a non-origin
-    /// principal — today only tests. Kept `pub(crate)` so the public
-    /// storage surface cannot be handed a `Node` principal.
-    pub(crate) fn with_auth_principal(guard: Arc<AuthGuard>, principal: AclPrincipal) -> Self {
+    /// The unconstrained constructor `with_auth` wraps.
+    ///
+    /// **Private, and it must stay private.** `pub(crate)` was still too
+    /// wide: any module in this crate could build the storage gate with
+    /// an `AclPrincipal::Node`, and since the subscribe path is the
+    /// ACL's only production writer and grants exactly `Node(node_id)`,
+    /// such a `Redex` would authorize `open_file` on every channel a
+    /// peer had merely subscribed to. That is the
+    /// subscription-to-storage escalation the principal type exists to
+    /// make unrepresentable — a boundary is not enforced if the crate
+    /// can step around it.
+    ///
+    /// Only this module and its nested tests need it, which is exactly
+    /// what private reaches.
+    fn with_auth_principal(guard: Arc<AuthGuard>, principal: AclPrincipal) -> Self {
         Self {
             files: DashMap::new(),
             auth: Some(guard),
