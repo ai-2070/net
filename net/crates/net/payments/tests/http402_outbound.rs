@@ -642,3 +642,60 @@ async fn public_only_refuses_loopback_too() {
         "the default policy must still admit loopback"
     );
 }
+
+/// Two paid fetches under a **stopped clock** are two payments and must
+/// consume two reservations.
+///
+/// The local pseudo-quote's id derives from provider + caller + terms
+/// hash + issued-at, and on this door the provider and caller are the
+/// same identity while the terms are whatever the server demanded. Under
+/// a fixed or coarse `Clock` two fetches of the same URL therefore derive
+/// the SAME quote id — and the spend engine treats a repeat reservation
+/// for one quote id as a retry. Money would leave twice while only the
+/// first fetch consumed budget, which is `max_per_day` failing exactly
+/// where it is the loss bound.
+///
+/// This door has no provider-side idempotency by design (one `fetch_paid`
+/// = one attempt), so each attempt gets its own reservation identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_paid_fetches_each_consume_budget_under_a_stopped_clock() {
+    let server = PaidServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = dir.path().join("spend.json");
+
+    let caller = Arc::new(EntityKeypair::generate());
+    let registry = default_mock_registry(caller.entity_id().clone());
+    // `TestClock` returns a constant — exactly the case that used to
+    // collapse two payments into one reservation.
+    let f = X402HttpFlow::new(
+        caller,
+        SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest),
+        registry,
+        Arc::new(TestClock),
+    )
+    .expect("flow");
+
+    for n in 1..=3 {
+        let outcome = f.fetch_paid(&server.url).await;
+        assert!(
+            matches!(outcome, X402HttpOutcome::Paid { .. }),
+            "fetch {n} should pay, got {outcome:?}"
+        );
+    }
+
+    // Three payments actually left the machine...
+    assert_eq!(
+        server.received_payloads.lock().len(),
+        3,
+        "three fetches means three payments"
+    );
+
+    // ...so three must be counted. Anything less is budget the caller
+    // spent without it being charged against the cap.
+    let checker = SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest);
+    assert_eq!(
+        checker.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(7500),
+        "every attempt must consume its own reservation"
+    );
+}

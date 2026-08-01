@@ -99,6 +99,21 @@ pub struct X402HttpFlow {
     clock: Arc<dyn Clock>,
     http: reqwest::Client,
     destinations: crate::http_policy::DestinationPolicy,
+    /// Counter making every fetch's local pseudo-quote a distinct one.
+    ///
+    /// The pseudo-quote's id derives from provider + caller + terms hash +
+    /// issued-at. On this door the provider and caller are both this
+    /// identity and the terms are whatever the server demanded, so under
+    /// a fixed or coarse [`Clock`] two fetches of the same URL derive the
+    /// SAME id — and the spend engine, which now treats a repeat
+    /// reservation for one quote id as a retry, would count only the
+    /// first. Money would leave twice against one budget entry.
+    ///
+    /// That collapse is wrong here specifically because this door has no
+    /// provider-side idempotency: it is documented that one `fetch_paid`
+    /// is one attempt. Two attempts are two payments and must be two
+    /// reservations.
+    attempt: std::sync::atomic::AtomicU64,
 }
 
 impl X402HttpFlow {
@@ -164,6 +179,7 @@ impl X402HttpFlow {
             clock,
             http,
             destinations,
+            attempt: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -234,7 +250,13 @@ impl X402HttpFlow {
                 // reaches here as a connect error, so name the policy —
                 // otherwise "error sending request" is all an operator
                 // sees when their own configuration refused the address.
-                let message = if e.is_connect() {
+                // A destination-policy refusal happens inside the
+                // resolver, so it arrives as a connect error — but it is
+                // not transient: the policy will refuse the same address
+                // forever, and reporting it retryable invites a caller to
+                // spin on a denial.
+                let refused = crate::http_policy::is_policy_refusal(&e);
+                let message = if refused {
                     format!(
                         "{e} (destination policy admits {} — a refused address surfaces here)",
                         self.destinations.describe()
@@ -244,7 +266,7 @@ impl X402HttpFlow {
                 };
                 return X402HttpOutcome::Failed {
                     message,
-                    retryable: e.is_timeout() || e.is_connect(),
+                    retryable: !refused && (e.is_timeout() || e.is_connect()),
                 };
             }
         };
@@ -364,11 +386,19 @@ impl X402HttpFlow {
             .max_timeout_seconds
             .max(1)
             .saturating_mul(1_000_000_000);
+        // The attempt counter rides `input_hash`, which feeds `terms_hash`
+        // and therefore the quote id — so each fetch is its own quote and
+        // its own reservation. (`input_hash` is the field for "what this
+        // quote is bound to beyond the terms", and on this door the thing
+        // it is bound to is this specific attempt.)
+        let attempt = self
+            .attempt
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let quote = PaymentQuote::new(
             self.caller.entity_id().clone(),
             self.caller.entity_id().clone(),
             format!("x402-http/{intended_host}"),
-            None,
+            Some(format!("x402-http-attempt:{attempt}")),
             requirements,
             match self.registry.reference() {
                 Ok(r) => r,
