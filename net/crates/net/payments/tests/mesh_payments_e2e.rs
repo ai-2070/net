@@ -60,6 +60,16 @@ async fn handshake(server: &Mesh, caller: &Mesh) {
 struct World {
     caller_mesh: Arc<Mesh>,
     caller_keys: Arc<EntityKeypair>,
+    /// Held, not dropped. `start()` used to let the provider's `Mesh`
+    /// wrapper fall out of scope and keep only its node id, so whether
+    /// the provider survived long enough to answer a `request_quote`
+    /// rested on `MeshNode` self-owning its background loop. It does —
+    /// these tests pass — but that is a fact about another type, and if
+    /// it ever stopped being true every H1 refusal here would still pass,
+    /// against a dead provider, for the wrong reason.
+    ///
+    /// The lifetime is the fixture's to state, so it states it.
+    _provider_mesh: Mesh,
     provider_node: u64,
     provider_id: net::adapter::net::identity::EntityId,
     provider_log: Arc<BillingLog>,
@@ -135,6 +145,7 @@ impl World {
 
         Self {
             provider_node: provider_mesh.inner().node_id(),
+            _provider_mesh: provider_mesh,
             provider_id: provider_keys.entity_id().clone(),
             provider_log,
             registry,
