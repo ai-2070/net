@@ -1499,3 +1499,114 @@ async fn a_second_payload_for_a_satisfied_quote_is_rejected() {
         "got {dup:?}"
     );
 }
+
+
+// ---------------------------------------------------------------------
+// M1: requiring the invocation binding
+// ---------------------------------------------------------------------
+
+/// A provider that requires the binding refuses bearer redemption.
+///
+/// Without the requirement, possession of the quote id is enough to
+/// consume the paid invocation — and the quote id is not a secret: it
+/// rides a request header on every paid invoke, appears in the caller's
+/// payment proof, and is carried on the billing event. Requiring the
+/// binding means only the identity that paid can redeem.
+#[tokio::test]
+async fn requiring_the_binding_refuses_bearer_redemption() {
+    let provider = Arc::new(EntityKeypair::generate());
+    let facilitator = Arc::new(MockFacilitator::new());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caller = EntityKeypair::generate();
+    let engine = PaymentEngine::new(
+        provider.clone(),
+        facilitator,
+        Arc::new(AdmitAll),
+        default_mock_registry(provider.entity_id().clone()),
+        dir.path().join("engine.json"),
+    )
+    .expect("engine")
+    .with_require_invocation_binding(true);
+
+    let quote = engine
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
+        .expect("quote");
+    let payload = payload_for(&quote, "payer-1");
+    let served = engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .expect("engine");
+    assert!(matches!(served, PaymentDecision::Served { .. }));
+
+    let tool = CAPABILITY.split_once('/').expect("capability").1;
+
+    // Bearer: the quote id alone no longer redeems.
+    let bearer = engine
+        .redeem_for_invocation(tool, &quote.quote_id, None)
+        .await
+        .expect("engine");
+    assert_eq!(
+        bearer,
+        RedeemDecision::Denied {
+            reason: RedeemDenialReason::BindingRequired
+        },
+        "a required binding must refuse a bearer redemption"
+    );
+
+    // A binding from the WRONG identity is still a security rejection,
+    // not merely "missing" — the two denials stay distinct.
+    let impostor = EntityKeypair::generate();
+    let bad = impostor
+        .try_sign(&invocation_binding_transcript(&quote.quote_id, tool))
+        .expect("sign");
+    let rejected = engine
+        .redeem_for_invocation(tool, &quote.quote_id, Some(&bad.to_bytes()))
+        .await
+        .expect("engine");
+    assert_eq!(
+        rejected,
+        RedeemDecision::Denied {
+            reason: RedeemDenialReason::BindingRejected
+        }
+    );
+
+    // The paying identity's binding admits.
+    let good = caller
+        .try_sign(&invocation_binding_transcript(&quote.quote_id, tool))
+        .expect("sign");
+    let admitted = engine
+        .redeem_for_invocation(tool, &quote.quote_id, Some(&good.to_bytes()))
+        .await
+        .expect("engine");
+    assert_eq!(admitted, RedeemDecision::Admitted);
+}
+
+/// The default stays bearer-compatible: a provider that has not opted in
+/// still admits a binding-free redemption, so callers written before the
+/// binding existed keep working.
+#[tokio::test]
+async fn the_binding_requirement_is_opt_in() {
+    let h = harness();
+    let quote = h.quote("2500");
+    let payload = payload_for(&quote, "payer-1");
+    h.engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .expect("engine");
+
+    let tool = CAPABILITY.split_once('/').expect("capability").1;
+    assert_eq!(
+        h.engine
+            .redeem_for_invocation(tool, &quote.quote_id, None)
+            .await
+            .expect("engine"),
+        RedeemDecision::Admitted,
+        "the default must stay bearer-compatible"
+    );
+}

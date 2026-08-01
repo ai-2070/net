@@ -211,6 +211,14 @@ pub enum RedeemDenialReason {
     WrongToolBinding { capability: String, tool_id: String },
     #[error("quote already redeemed — one payment, one serve")]
     AlreadyRedeemed,
+    /// The provider requires the invocation binding and none was
+    /// presented. Distinct from [`BindingMalformed`](Self::BindingMalformed)
+    /// (a binding arrived but was not 64 bytes) and from
+    /// [`BindingRejected`](Self::BindingRejected) (it verified against the
+    /// wrong identity): this caller sent no proof of possession at all,
+    /// which is a client-configuration gap, not an attack signal.
+    #[error("this provider requires the invocation binding — no possession proof was presented")]
+    BindingRequired,
 }
 
 impl RedeemDenialReason {
@@ -227,6 +235,7 @@ impl RedeemDenialReason {
             Self::SettlementPending => "settlement_pending",
             Self::WrongToolBinding { .. } => "wrong_tool_binding",
             Self::AlreadyRedeemed => "already_redeemed",
+            Self::BindingRequired => "binding_required",
         }
     }
 
@@ -541,6 +550,10 @@ pub struct PaymentEngine {
     /// appended (durable JSONL + in-process subscribers). Idempotent
     /// retries republish nothing — one event per idempotency key.
     billing_log: Option<Arc<BillingLog>>,
+    /// Whether [`redeem_for_invocation`](Self::redeem_for_invocation)
+    /// refuses a redemption that presents no invocation binding.
+    /// See [`with_require_invocation_binding`](Self::with_require_invocation_binding).
+    require_invocation_binding: bool,
 }
 
 /// Default retention for terminal quote records: 6 hours past authoritative
@@ -648,6 +661,7 @@ impl PaymentEngine {
             in_flight_ttl_ns: 300_000_000_000,
             terminal_record_retention_ns: Some(DEFAULT_TERMINAL_RECORD_RETENTION_NS),
             billing_log: None,
+            require_invocation_binding: false,
         })
     }
 
@@ -713,6 +727,38 @@ impl PaymentEngine {
     /// Attach the billing stream/export surface.
     pub fn with_billing_log(mut self, log: Arc<BillingLog>) -> Self {
         self.billing_log = Some(log);
+        self
+    }
+
+    /// Require the invocation binding: refuse to redeem a quote unless the
+    /// invoker presents the paying identity's signature over
+    /// [`invocation_binding_transcript`].
+    ///
+    /// **What this closes.** Without it, possession of the quote id is
+    /// sufficient to consume the paid invocation, and the quote id is not
+    /// a secret in practice: it rides a request header on every paid
+    /// invoke, appears in the caller's payment proof, and is carried on
+    /// the billing event. Anything that learns one — a log sink, a
+    /// support bundle, an audit export — can spend it, and redemption is
+    /// at-most-once, so the legitimate payer then gets
+    /// `already_redeemed`. Requiring the binding means only the identity
+    /// that paid can redeem.
+    ///
+    /// **What this does not close.** The binding transcript covers the
+    /// quote and the tool, and the signature travels beside the quote id
+    /// on the invocation itself. An intermediary that observes the *paid
+    /// invocation* can copy both headers and front-run it. Closing that
+    /// needs channel binding or an authenticated transport identity, not
+    /// a bigger transcript — a visible, transferable signature cannot fix
+    /// it. Do not document this flag as protection against an on-path
+    /// observer.
+    ///
+    /// Defaults to `false` for compatibility with callers written before
+    /// the binding existed. New deployments should turn it on; a caller
+    /// built on [`crate::flow::CallerPaymentFlow`] always signs one when
+    /// its identity can sign.
+    pub fn with_require_invocation_binding(mut self, require: bool) -> Self {
+        self.require_invocation_binding = require;
         self
     }
 
@@ -1860,6 +1906,14 @@ impl PaymentEngine {
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<RedeemDecision, EngineError> {
+        if self.require_invocation_binding && binding.is_none() {
+            // Refused before the store is touched: nothing to look up, and
+            // a missing binding is a client-configuration fact that does
+            // not depend on whether the quote exists.
+            return Ok(RedeemDecision::Denied {
+                reason: RedeemDenialReason::BindingRequired,
+            });
+        }
         let binding = binding.map(<[u8]>::to_vec);
         let tool_id = tool_id.to_string();
         let quote_id = quote_id.to_string();

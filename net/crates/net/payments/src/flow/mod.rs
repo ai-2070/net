@@ -92,6 +92,22 @@ fn denial_for(
             v::PRIOR_UNKNOWN,
             Some("fix_payment_client"),
         ),
+        // Not a security row: the caller sent no possession proof, which
+        // for a provider that requires one is a client-configuration gap
+        // and not evidence of anyone attacking anything. It is safe to
+        // retry once the client signs the binding, but a fresh quote will
+        // not help — the quote is fine, the client is not — so
+        // `safe_to_requote` stays false and the action names the fix.
+        R::BindingRequired => (
+            v::CLASS_CALLER_CONFIGURATION_ERROR,
+            v::ACTOR_CALLER_OPERATOR,
+            false,
+            false,
+            false,
+            v::FUNDS_UNKNOWN,
+            v::PRIOR_UNKNOWN,
+            Some("fix_payment_client"),
+        ),
         // Security rows advise nothing: do not retry, do not just buy
         // another quote — report the mismatch.
         //
