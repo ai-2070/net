@@ -254,8 +254,7 @@ warning: --allow-subnet / --allow-group are ADVISORY and do not restrict access.
          This announcement publishes the admitted values to every peer and relay in
          the mesh, and membership in a subnet or group is self-declared by the
          caller, so any recipient can claim one. Use --allow-node for access
-         control.
-         See docs/internal/misc/SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md";
+         control.";
 
 /// Rejection message for a `--tag` value the parser refused.
 ///
