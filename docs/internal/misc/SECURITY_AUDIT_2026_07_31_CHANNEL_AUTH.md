@@ -29,6 +29,17 @@ Line numbers reflect `master` at audit time and may drift.
 > to direct `MeshNode` embedders (L1). ID map from rev 1: `H2 → H3`,
 > `M1 → M1`, `M2 → M2`, `L1 → I1`, `L2 → L1`, `I1 → I2`.
 >
+> **Revision (rev 4).** Three factual wording corrections after a third
+> review; no IDs, severities, or conclusions changed. H2: `may_execute`
+> gates *public* nRPC invocation only — protected, owner-scoped, and
+> granted modes bypass it for their org-admission gates. H2 impact:
+> distinguishes the exact request ACL (installable via
+> `register_channel`, then discarded) from the reply-prefix ACL, whose
+> documented SDK path does not exist at all. M4: the stranded-subscriber
+> state has no *periodic* recovery, but peer disconnect or a successful
+> re-subscribe after a cache is installed does clear it — "permanent for
+> the process lifetime" was too strong.
+>
 > **Revision (rev 3).** Four corrections after a second review, no IDs changed.
 > H2: removed the claim that overwriting `<service>.requests` costs an
 > invocation gate — that gate is already inert under H1 — and rescoped the
@@ -106,7 +117,7 @@ Two things found while fixing, not in the original audit:
 | M1 | Medium | Channel auth | Prefix configs gate and retain on the sentinel hash — accept-then-fail-closed, a persistent queue-group DoS, and unusable `set_publish_chain` |
 | M2 | Medium | Channel auth / availability | Queue-group membership is unauthenticated — a subscriber can steal another group member's work |
 | M3 | Medium | Identity | `MAX_TOKEN_TTL_SECS` is issuance-only; receivers accept arbitrarily long remote TTLs |
-| M4 | Medium | Channel auth | Registry without `TokenCache`: subscribe accepts but every publish denies, stranding a rostered peer permanently; the docs say it always rejects |
+| M4 | Medium | Channel auth | Registry without `TokenCache`: subscribe accepts but every publish denies, stranding a rostered peer with no periodic recovery; the docs say it always rejects |
 | L1 | Low | Defaults | A registry-less `MeshNode` accepts every `Subscribe` and publishes every channel as open |
 | I1 | Info | Channel auth / storage | The `AuthGuard` exact ACL is one namespace shared by four readers under unconstrained `u64` keys |
 | I2 | Info | Docs | The "presented tokens are installed into `TokenCache`" contract is stale in several places |
@@ -261,9 +272,14 @@ config does not newly remove an invocation gate, because that gate is already
 inert under H1**: `publish_initial_request` sends via `publish_to_peer`
 (`mesh_rpc.rs:1961-1979`), which never consults a `ChannelConfig`, and no
 receive-side channel gate exists. A strict `<service>.requests` ACL does not
-control who may invoke the service today, preserved or not. (nRPC invocation is
-gated separately, by the capability fold's `may_execute` — a different
-mechanism, out of this finding's scope.)
+control who may invoke the service today, preserved or not.
+
+(nRPC invocation is gated separately, and by more than one mechanism: **public**
+admission runs the capability fold's `may_execute`, while protected,
+owner-scoped, and granted modes deliberately bypass that and run their
+org-admission gates instead — `mesh_rpc.rs:687` and `:3247` state the split
+explicitly. Neither mechanism is the request channel's `ChannelConfig`, which is
+the point here.)
 
 So the live impact concentrates on the reply side and on config integrity:
 reply-prefix subscription ACLs, capability-only or token-gated reply
@@ -278,10 +294,13 @@ tree — in that doc comment. There is no such method on `Mesh`. The lower-level
 but the advertised SDK surface is fictitious, so an operator following the
 documentation cannot pre-register a reply-prefix ACL at all.
 
-- **Impact**: every RPC ACL an operator installs through the documented path is
-  discarded at `serve_rpc` time, with no error and no log. The failure is
-  silent and the resulting posture (fully open request + reply channels) looks
-  identical to the default.
+- **Impact**: every exact request ACL installed through `register_channel`, and
+  every reply-prefix ACL installed through lower-level registry access, is
+  discarded at `serve_rpc*` time — with no error and no log. The documented SDK
+  path for installing the latter cannot be performed at all, per (2) above; an
+  operator who follows the documentation reaches neither a working ACL nor an
+  error. The failure is silent either way, and the resulting posture (fully open
+  request + reply channels) is indistinguishable from the default.
 - **Fix**: `auto_register_rpc_channels` must preserve existing entries —
   an atomic entry-if-absent on both the exact and prefix tables (the registry
   currently exposes no such operation; `DashMap::entry(..).or_insert(..)` is the
@@ -574,15 +593,24 @@ points disagree about what a token-gated channel means:
    (`:23990-24024`). As in M1, `revoke_channel` does not call `roster.remove`
    and does not delete the retained chain.
 
-Composed, those three produce a **permanent** version of M1's queue-group
-denial primitive, and this time nothing clears it. The Subscribe succeeds;
-publish revalidation fails on every attempt because the cache will never
-appear; the peer stays in the roster; and the sweep — the mechanism that would
-normally evict it — is itself a no-op for exactly the same missing-cache
-reason. If that peer subscribed under a queue group, it consumes selections
-(`roster.rs:205-235`, selection precedes the auth filter) and that group's
-share of events is dropped for the lifetime of the process. Unlike M1, no
-periodic sweep and no configuration change recovers it.
+Composed, those three produce a version of M1's queue-group denial primitive
+with **no periodic recovery**. The Subscribe succeeds; publish revalidation
+fails on every attempt because the cache will never appear; the peer stays in
+the roster; and the sweep — the mechanism that would normally evict it — is
+itself a no-op for exactly the same missing-cache reason. If that peer
+subscribed under a queue group, it consumes selections (`roster.rs:205-235`,
+selection precedes the auth filter) and that group's share of events is dropped.
+
+Unlike M1, no sweep clears it, and installing a cache alone does not fix it
+either: the first failed publish already revoked the `AuthGuard` entry, so
+subsequent publishes stop at `check_fast == Denied`, and the sweep — now able to
+run — sees the retained chain as valid and does nothing, because it never calls
+`allow_channel`. It is not, however, unrecoverable for the process lifetime:
+peer failure or disconnect removes the peer wholesale (`mesh.rs:8168`,
+`roster.remove_peer`), and a successful re-subscribe after a cache is installed
+restores the guard entry. So the accurate statement is that recovery requires
+peer cleanup or an explicit re-subscribe — nothing the running system does on
+its own will repair it.
 
 The public documentation states the opposite of (1) — `set_token_cache`
 (`mesh.rs:19038-19041`):

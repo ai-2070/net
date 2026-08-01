@@ -464,10 +464,13 @@ async fn token_gated_prefix_channel_subscribes_and_delivers() {
 /// subscription that could never deliver an event — and because the
 /// publish-time denial revokes the AuthGuard entry WITHOUT removing the
 /// roster entry, and the sweep that would evict it can never run, the
-/// peer stayed rostered permanently. On a queue-group channel that is a
-/// standing denial of service: selection happens before the auth
-/// filter, so the stranded peer keeps consuming that group's events and
-/// they are dropped rather than delivered to a working member.
+/// peer stayed rostered with no periodic recovery. On a queue-group
+/// channel that is a standing denial of service: selection happens
+/// before the auth filter, so the stranded peer keeps consuming that
+/// group's events and they are dropped rather than delivered to a
+/// working member. Installing a cache later did not repair it — the
+/// guard entry was already revoked and the sweep never re-grants — so
+/// only peer disconnect or an explicit re-subscribe cleared it.
 ///
 /// `set_token_cache` already documented "when unset, `require_token`
 /// channels always reject". This makes that true.

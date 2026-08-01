@@ -23667,9 +23667,14 @@ impl MeshNode {
         // a subscription that could never deliver an event, and — since
         // the publish-time denial revokes the AuthGuard entry but does
         // not remove the roster entry, and the sweep that would
-        // normally evict it can never run — it stayed rostered
-        // permanently, consuming a queue-group selection slot for the
-        // lifetime of the process.
+        // normally evict it can never run — it stayed rostered with no
+        // periodic recovery, consuming a queue-group selection slot.
+        // Installing a cache later did not repair it either: the first
+        // failed publish already revoked the guard entry, so subsequent
+        // publishes stop at `check_fast == Denied`, and the sweep — now
+        // able to run — sees the retained chain as valid and does
+        // nothing, because it never calls `allow_channel`. Only peer
+        // disconnect or an explicit re-subscribe cleared it.
         //
         // `set_token_cache`'s documented contract already said
         // "when unset, `require_token` channels always reject". This
