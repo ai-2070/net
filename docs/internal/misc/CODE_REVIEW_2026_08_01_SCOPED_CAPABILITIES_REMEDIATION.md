@@ -474,11 +474,29 @@ is what makes a warning worth emitting rather than swallowing. The two scope
 builders kept theirs through the same edit; only `add_tag` lost it, which is the
 signature of an over-trim rather than a principle misapplied.
 
-### Verification at `baf466fcb`
+### Sixth pass — item 23
+
+| # | Item | Resolution | Commit |
+| - | ---- | ---------- | ------ |
+| 23 | `can_assign_non_global` counted a rule whose `tag_prefix` and value are both empty. That matches exactly the empty tag, which no announcement can carry (`Tag::parse` rejects `""`, no `Tag` renders to it), so `assign` can never make it fire | Excluded, scoped to the both-empty case only — an empty value under a real prefix matches the prefix as a whole tag (`region:` parses as legacy and renders back unchanged), so rejecting empty values outright would have broken a reachable mapping. Verified by neutralising the exclusion and watching the test fail | `9ae19d4ed` |
+
+This is the second correction to the same predicate (item 20 was the first), and
+both have one root: it was written as a property of the *rules* — "does any rule
+hold a non-zero value" — rather than as a question about what `assign` can
+actually do with them. Each fix narrowed the gap between the two by one case.
+The doc on it now states which exclusions make the predicate and `assign` agree,
+so the next reader is deciding against the right question.
+
+Worth stating as the general lesson, since three separate items in this review
+reduce to it: a diagnostic that fires at configurations which cannot misbehave
+is not a conservative diagnostic. It is a diagnostic being trained out of the
+reader.
+
+### Verification at `9ae19d4ed`
 
 | Check | Result |
 | ----- | ------ |
-| `cargo test --lib` (full) | 5377 passed, 0 failed, 1 ignored |
+| `cargo test --lib` (full) | 5378 passed, 0 failed, 1 ignored |
 | `cargo test --test capability_scope` | 8 passed, 0 failed |
 | `cargo test --bin net-mesh commands::cap` | 7 passed, 0 failed |
 | `cargo clippy --lib --all-features` | clean |
