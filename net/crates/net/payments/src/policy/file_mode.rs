@@ -65,9 +65,7 @@ mod sys {
         GetSecurityDescriptorDacl, TokenUser, ACL, DACL_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
     };
-    pub(super) use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, OpenProcessToken,
-    };
+    pub(super) use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 }
 
 /// An owning handle to a `LocalAlloc`'d security descriptor.
@@ -161,9 +159,8 @@ fn current_user_sid_string() -> std::io::Result<String> {
     let mut token: sys::HANDLE = std::ptr::null_mut();
     // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no
     // close; `token` is a live local the callee fills in.
-    let ok = unsafe {
-        sys::OpenProcessToken(sys::GetCurrentProcess(), sys::TOKEN_QUERY, &mut token)
-    };
+    let ok =
+        unsafe { sys::OpenProcessToken(sys::GetCurrentProcess(), sys::TOKEN_QUERY, &mut token) };
     if ok == 0 {
         return Err(std::io::Error::last_os_error());
     }

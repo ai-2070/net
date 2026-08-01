@@ -1500,7 +1500,6 @@ async fn a_second_payload_for_a_satisfied_quote_is_rejected() {
     );
 }
 
-
 // ---------------------------------------------------------------------
 // M1: requiring the invocation binding
 // ---------------------------------------------------------------------

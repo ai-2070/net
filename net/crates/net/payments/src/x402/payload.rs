@@ -183,8 +183,8 @@ impl X402Carry<PaymentPayload> {
                 // rather than raw, so the identity is still independent of
                 // encoding — and taken from `payload` only, never the
                 // wrapper, which is the point of this function.
-                let bytes = crate::core::canonical::canonical_bytes(&view.payload)
-                    .map_err(|e| {
+                let bytes =
+                    crate::core::canonical::canonical_bytes(&view.payload).map_err(|e| {
                         X402Error::Invalid(format!("mock payload not canonicalizable: {e}"))
                     })?;
                 vec![bytes]
@@ -334,7 +334,10 @@ mod tests {
             X402Carry::from_bytes(other_asset.into_bytes()).unwrap();
 
         // Same authorization, different chain.
-        let other_chain = FIXTURE.replace("\"network\": \"eip155:84532\"", "\"network\": \"eip155:8453\"");
+        let other_chain = FIXTURE.replace(
+            "\"network\": \"eip155:84532\"",
+            "\"network\": \"eip155:8453\"",
+        );
         let other_chain: X402Carry<PaymentPayload> =
             X402Carry::from_bytes(other_chain.into_bytes()).unwrap();
 
@@ -358,8 +361,7 @@ mod tests {
         let unknown = FIXTURE
             .replace("\"scheme\": \"exact\"", "\"scheme\": \"future-scheme\"")
             .replace("\"network\": \"eip155:84532\"", "\"network\": \"future:1\"");
-        let carry: X402Carry<PaymentPayload> =
-            X402Carry::from_bytes(unknown.into_bytes()).unwrap();
+        let carry: X402Carry<PaymentPayload> = X402Carry::from_bytes(unknown.into_bytes()).unwrap();
         let err = carry.replay_key().unwrap_err();
         assert!(
             format!("{err}").contains("no replay identity"),

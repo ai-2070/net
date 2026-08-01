@@ -37,8 +37,11 @@ fn cleartext_remote_rpc_endpoints_are_refused() {
     );
 
     assert!(
-        SvmChecker::new("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", "http://rpc.example.com")
-            .is_err(),
+        SvmChecker::new(
+            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            "http://rpc.example.com"
+        )
+        .is_err(),
         "an svm checker must refuse a cleartext remote RPC endpoint"
     );
     assert!(

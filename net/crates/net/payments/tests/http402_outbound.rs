@@ -573,7 +573,9 @@ async fn the_destination_policy_refuses_internal_addresses_on_the_probe() {
     // address must never be dialled at all. An IP literal is never
     // resolved, so this is the check that catches it — the resolver
     // cannot.
-    let outcome = f.fetch_paid("http://169.254.169.254/latest/meta-data/").await;
+    let outcome = f
+        .fetch_paid("http://169.254.169.254/latest/meta-data/")
+        .await;
     match outcome {
         X402HttpOutcome::Denied { policy_reason } => assert!(
             policy_reason.contains("destination policy"),
@@ -591,7 +593,9 @@ async fn the_destination_policy_refuses_internal_addresses_on_the_probe() {
     );
 
     // IPv4-mapped IPv6 must not be a way around the v4 rules.
-    let outcome = f.fetch_paid("http://[::ffff:169.254.169.254]/latest/").await;
+    let outcome = f
+        .fetch_paid("http://[::ffff:169.254.169.254]/latest/")
+        .await;
     assert!(
         matches!(outcome, X402HttpOutcome::Denied { .. }),
         "an IPv4-mapped metadata address must be refused, got {outcome:?}"
@@ -631,7 +635,10 @@ async fn public_only_refuses_loopback_too() {
     let dir2 = tempfile::tempdir().expect("tempdir");
     let default = flow(SpendProfile::DevTest, &dir2);
     assert!(
-        matches!(default.fetch_paid(&server.url).await, X402HttpOutcome::Paid { .. }),
+        matches!(
+            default.fetch_paid(&server.url).await,
+            X402HttpOutcome::Paid { .. }
+        ),
         "the default policy must still admit loopback"
     );
 }

@@ -245,7 +245,10 @@ async fn an_overflowing_delivered_sum_is_terminal_not_clamped() {
         "error should name the overflow, got: {}",
         err.message
     );
-    assert!(!err.retryable, "an overflowing sum is terminal, not transient");
+    assert!(
+        !err.retryable,
+        "an overflowing sum is terminal, not transient"
+    );
 }
 
 /// H3 regression: when the query carries the authorized payer, a

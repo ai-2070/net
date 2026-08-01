@@ -342,9 +342,7 @@ impl Facilitator for HttpFacilitator {
             .await?;
         let response: X402Carry<VerifyResponse> = X402Carry::from_bytes(body)
             .map_err(|e| FacilitatorError::protocol(format!("/verify response: {e}")))?;
-        Ok(VerifyOutcome {
-            response,
-        })
+        Ok(VerifyOutcome { response })
     }
 
     async fn settle(
@@ -359,9 +357,7 @@ impl Facilitator for HttpFacilitator {
             .map_err(|e| FacilitatorError::protocol(format!("/settle response: {e}")))?;
         // A receipt is a receipt: `observed`, never more (the spec
         // reports no finality; the chain checker owns everything above).
-        Ok(SettleOutcome {
-            response,
-        })
+        Ok(SettleOutcome { response })
     }
 }
 

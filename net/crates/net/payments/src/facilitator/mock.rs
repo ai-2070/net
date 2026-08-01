@@ -244,17 +244,17 @@ impl Facilitator for MockFacilitator {
                 amount: Some(short_by_one(amount)),
                 extensions: None,
             },
-            MockMode::Success
-            | MockMode::ReorgInvalidate
-            | MockMode::VerificationTimeout => SettlementResponse {
-                success: true,
-                error_reason: None,
-                payer: None,
-                transaction: Self::tx_for(payload),
-                network: MOCK_NETWORK.to_string(),
-                amount: Some(amount.clone()),
-                extensions: None,
-            },
+            MockMode::Success | MockMode::ReorgInvalidate | MockMode::VerificationTimeout => {
+                SettlementResponse {
+                    success: true,
+                    error_reason: None,
+                    payer: None,
+                    transaction: Self::tx_for(payload),
+                    network: MOCK_NETWORK.to_string(),
+                    amount: Some(amount.clone()),
+                    extensions: None,
+                }
+            }
         };
         Ok(SettleOutcome {
             response: Self::author_settle(&response)?,

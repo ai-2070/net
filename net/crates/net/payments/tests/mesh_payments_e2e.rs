@@ -116,7 +116,11 @@ async fn the_paid_lifecycle_crosses_the_wire() {
         caller_keys.clone(),
         SpendPolicyEngine::new(&spend_path, SpendProfile::DevTest),
         registry,
-        Arc::new(MeshPaymentChannel::new(Arc::new(caller_mesh), caller_keys, clock.clone())),
+        Arc::new(MeshPaymentChannel::new(
+            Arc::new(caller_mesh),
+            caller_keys,
+            clock.clone(),
+        )),
         clock,
     );
 
@@ -180,7 +184,6 @@ async fn the_paid_lifecycle_crosses_the_wire() {
         "exactly one new charge"
     );
 }
-
 
 // ---------------------------------------------------------------------
 // H1: the caller identity on a quote request is proven, not claimed

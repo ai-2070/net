@@ -263,8 +263,7 @@ impl ProviderChannel for MeshPaymentChannel {
         }
         let node = Self::provider_node(capability)?;
         let now_ns = self.clock.now_ns();
-        let nonce =
-            QuoteRequest::derive_nonce(caller, capability, template.bytes(), now_ns);
+        let nonce = QuoteRequest::derive_nonce(caller, capability, template.bytes(), now_ns);
         let mut request = QuoteRequest::new(
             provider.clone(),
             caller.clone(),

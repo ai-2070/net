@@ -197,7 +197,7 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || (a == 100 && (64..128).contains(&b))  // 100.64/10 carrier NAT
         || (a == 192 && b == 0)      // 192.0.0/24 IETF protocol assignments
         || (a == 198 && (18..20).contains(&b))   // 198.18/15 benchmarking
-        || a >= 240)                 // 240/4 reserved (incl. 255.255.255.255)
+        || a >= 240) // 240/4 reserved (incl. 255.255.255.255)
 }
 
 fn is_public_v6(ip: Ipv6Addr) -> bool {
@@ -215,7 +215,7 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         || (first & 0xfe00) == 0xfc00   // fc00::/7  unique local
         || (first & 0xffc0) == 0xfe80   // fe80::/10 link local
         || (first == 0x2001 && (s[1] & 0xff00) == 0x0d00) // 2001:db8::/32 doc
-        || first == 0x0100)             // 100::/64  discard-only
+        || first == 0x0100) // 100::/64  discard-only
 }
 
 /// Apply the destination policy to a URL whose host is an **IP literal**.
@@ -229,7 +229,10 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 /// A domain host returns `Ok` here and is enforced by the resolver
 /// instead. The two halves together cover every host form; neither alone
 /// does.
-pub fn check_url_destination(url: &reqwest::Url, policy: DestinationPolicy) -> Result<(), PolicyError> {
+pub fn check_url_destination(
+    url: &reqwest::Url,
+    policy: DestinationPolicy,
+) -> Result<(), PolicyError> {
     let Some(host) = url.host_str() else {
         return Ok(());
     };
@@ -281,9 +284,10 @@ impl reqwest::dns::Resolve for GuardedResolver {
             {
                 Ok(addrs) => addrs.collect(),
                 Err(e) => {
-                    return Err(Box::new(PolicyError::new(format!(
-                        "resolving `{host}`: {e}"
-                    ))) as Box<dyn std::error::Error + Send + Sync>)
+                    return Err(
+                        Box::new(PolicyError::new(format!("resolving `{host}`: {e}")))
+                            as Box<dyn std::error::Error + Send + Sync>,
+                    )
                 }
             };
 
@@ -299,7 +303,8 @@ impl reqwest::dns::Resolve for GuardedResolver {
                     "destination policy ({}) refuses every address `{host}` resolves to: {:?}",
                     policy.describe(),
                     seen
-                ))) as Box<dyn std::error::Error + Send + Sync>);
+                )))
+                    as Box<dyn std::error::Error + Send + Sync>);
             }
             Ok(Box::new(admitted.into_iter()) as reqwest::dns::Addrs)
         })
@@ -458,18 +463,18 @@ mod tests {
             "172.16.0.1",
             "192.168.1.1",
             "169.254.169.254",
-            "100.64.0.1",   // carrier NAT
-            "192.0.0.1",    // IETF protocol assignments
-            "198.18.0.1",   // benchmarking
-            "224.0.0.1",    // multicast
-            "240.0.0.1",    // reserved
+            "100.64.0.1", // carrier NAT
+            "192.0.0.1",  // IETF protocol assignments
+            "198.18.0.1", // benchmarking
+            "224.0.0.1",  // multicast
+            "240.0.0.1",  // reserved
             "255.255.255.255",
             "::",
             "::1",
-            "fc00::1",      // unique local
-            "fe80::1",      // link local
-            "ff02::1",      // multicast
-            "2001:db8::1",  // documentation
+            "fc00::1",     // unique local
+            "fe80::1",     // link local
+            "ff02::1",     // multicast
+            "2001:db8::1", // documentation
         ];
         for r in refused {
             let ip: IpAddr = r.parse().expect(r);

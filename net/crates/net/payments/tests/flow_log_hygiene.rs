@@ -84,7 +84,9 @@ impl ProviderChannel for ForgedBillingProvider {
         capability: &str,
         template: &X402Carry<PaymentRequirements>,
     ) -> Result<Vec<u8>, net_payments::flow::ChannelError> {
-        self.inner.quote(caller, provider, capability, template).await
+        self.inner
+            .quote(caller, provider, capability, template)
+            .await
     }
 
     async fn pay(
@@ -156,10 +158,9 @@ fn flow_warnings_carry_a_short_quote_ref_never_the_quote_id() {
             .expect("runtime");
         rt.block_on(async {
             let dir = tempfile::tempdir().expect("tempdir");
-            let clock: Arc<dyn Clock> =
-                Arc::new(TestClock(std::sync::atomic::AtomicU64::new(
-                    1_000_000_000_000_000,
-                )));
+            let clock: Arc<dyn Clock> = Arc::new(TestClock(std::sync::atomic::AtomicU64::new(
+                1_000_000_000_000_000,
+            )));
             let provider_keys = Arc::new(EntityKeypair::generate());
             let registry = default_mock_registry(provider_keys.entity_id().clone());
             let engine = Arc::new(
@@ -224,7 +225,11 @@ fn flow_warnings_carry_a_short_quote_ref_never_the_quote_id() {
         "the dropped-billing-event warning must emit a quote_ref: {captured:?}"
     );
     for (_, value) in &refs {
-        assert_eq!(value.len(), 16, "quote_ref is 8 bytes of hex, got `{value}`");
+        assert_eq!(
+            value.len(),
+            16,
+            "quote_ref is 8 bytes of hex, got `{value}`"
+        );
         assert!(
             value.chars().all(|c| c.is_ascii_hexdigit()),
             "quote_ref must be hex, got `{value}`"

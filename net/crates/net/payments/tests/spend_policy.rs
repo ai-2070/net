@@ -607,7 +607,6 @@ async fn approve_grants_a_held_quote_and_refuses_to_invent_one() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // L2: reservations are owner-tracked and release is idempotent
 // ---------------------------------------------------------------------------
@@ -629,11 +628,17 @@ async fn releasing_twice_does_not_refund_twice() {
     let second = s.quote(mock_requirements("1000"), NOW + 1);
 
     assert_eq!(
-        s.engine.check_and_reserve(&first, &s.registry, NOW).await.unwrap(),
+        s.engine
+            .check_and_reserve(&first, &s.registry, NOW)
+            .await
+            .unwrap(),
         SpendDecision::Allowed
     );
     assert_eq!(
-        s.engine.check_and_reserve(&second, &s.registry, NOW).await.unwrap(),
+        s.engine
+            .check_and_reserve(&second, &s.registry, NOW)
+            .await
+            .unwrap(),
         SpendDecision::Allowed
     );
     assert_eq!(
@@ -661,8 +666,18 @@ async fn releasing_twice_does_not_refund_twice() {
 
     // And the surviving reservation is still on file, so it can still be
     // released exactly once.
-    assert!(s.engine.reservation(&second.quote_id).await.unwrap().is_some());
-    assert!(s.engine.reservation(&first.quote_id).await.unwrap().is_none());
+    assert!(s
+        .engine
+        .reservation(&second.quote_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(s
+        .engine
+        .reservation(&first.quote_id)
+        .await
+        .unwrap()
+        .is_none());
     s.engine.release_reservation(&second, NOW).await.unwrap();
     assert_eq!(
         s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
@@ -702,7 +717,10 @@ async fn release_uses_the_reservations_own_day_not_the_callers_clock() {
     );
 
     // Release the first quote with a clock that has rolled over.
-    s.engine.release_reservation(&quote, tomorrow).await.unwrap();
+    s.engine
+        .release_reservation(&quote, tomorrow)
+        .await
+        .unwrap();
 
     assert_eq!(
         s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),

@@ -273,7 +273,12 @@ impl SeenNonces {
     ///
     /// Sweeps expired entries as it goes — the operation that grows the
     /// map is the one that prunes it, mirroring the engine's retention.
-    pub fn admit(&mut self, nonce: &str, expires_at_ns: u64, now_ns: u64) -> Result<(), QuoteRequestError> {
+    pub fn admit(
+        &mut self,
+        nonce: &str,
+        expires_at_ns: u64,
+        now_ns: u64,
+    ) -> Result<(), QuoteRequestError> {
         self.seen
             .retain(|_, expiry| now_ns < expiry.saturating_add(MAX_REQUEST_LIFETIME_NS));
         if self.seen.contains_key(nonce) {
@@ -304,8 +309,7 @@ mod tests {
     const CAPABILITY: &str = "prov/tool";
 
     fn signed(caller: &EntityKeypair, provider: &EntityId) -> Vec<u8> {
-        let nonce =
-            QuoteRequest::derive_nonce(caller.entity_id(), CAPABILITY, TEMPLATE, NOW);
+        let nonce = QuoteRequest::derive_nonce(caller.entity_id(), CAPABILITY, TEMPLATE, NOW);
         let mut req = QuoteRequest::new(
             provider.clone(),
             caller.entity_id().clone(),
@@ -325,8 +329,8 @@ mod tests {
         let provider = EntityKeypair::generate().entity_id().clone();
         let bytes = signed(&caller, &provider);
 
-        let ok =
-            QuoteRequest::verify(&bytes, &provider, CAPABILITY, TEMPLATE, NOW + 1, 0).expect("verify");
+        let ok = QuoteRequest::verify(&bytes, &provider, CAPABILITY, TEMPLATE, NOW + 1, 0)
+            .expect("verify");
         assert_eq!(ok.caller, *caller.entity_id());
     }
 
@@ -485,7 +489,10 @@ mod tests {
     fn the_derived_nonce_is_stable_for_one_request_and_distinct_across_requests() {
         let caller = EntityKeypair::generate().entity_id().clone();
         let a = QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW);
-        assert_eq!(a, QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW));
+        assert_eq!(
+            a,
+            QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW)
+        );
         assert_ne!(
             a,
             QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW + 1)
