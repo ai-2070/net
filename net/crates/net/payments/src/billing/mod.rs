@@ -112,38 +112,18 @@ impl BillingLog {
             // `mode` is inherent on tokio's OpenOptions (no trait import).
             opts.mode(0o600);
         }
-        // Create the log through a restricted temp rather than opening it
-        // in place. On Windows the file would otherwise exist at its final
-        // path with the parent's inherited ACL until the DACL call landed,
-        // so a reader could see the first signed usage records through
-        // that window. Creating empty, restricting, then renaming means it
-        // only ever appears at its final name already owner-only.
+        // Create the log with its permissions already in place, rather
+        // than opening it and tightening afterwards. On Windows a reader
+        // that opens the file before a later DACL change keeps the access
+        // it was granted for the life of its handle, so there must be no
+        // window in which the log exists unrestricted — not even an empty
+        // one, because the handle outlives the emptiness.
         //
-        // Only for creation: once the log exists it is already restricted,
-        // and an append must not disturb it.
-        if !tokio::fs::try_exists(&self.path).await.unwrap_or(false) {
-            let tmp = self
-                .path
-                .with_extension(format!("tmp.{}", std::process::id()));
-            let mut create = tokio::fs::OpenOptions::new();
-            create.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                create.mode(0o600);
-            }
-            match create.open(&tmp).await {
-                Ok(_) => {
-                    crate::policy::file_mode::restrict_to_owner(&tmp)
-                        .map_err(|e| BillingError::io(&tmp, e))?;
-                    // Another process may have created the log meanwhile;
-                    // the rename is harmless either way because both files
-                    // are empty and restricted.
-                    let _ = tokio::fs::rename(&tmp, &self.path).await;
-                }
-                // A concurrent creator won — its file is restricted too.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(BillingError::io(&tmp, e)),
-            }
+        // `AlreadyExists` is the ordinary case after the first append.
+        match crate::policy::file_mode::create_owner_only(&self.path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(BillingError::io(&self.path, e)),
         }
         let mut file = opts
             .open(&self.path)
