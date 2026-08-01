@@ -162,6 +162,106 @@ fn auto_register_rpc_channels(mesh: &Mesh, service: &str) {
     mesh.register_rpc_service_channels(service);
 }
 
+#[cfg(test)]
+mod aggregator_channel_registration_tests {
+    //! The aggregator's own entry points, checked on the aggregator's own
+    //! service names.
+    //!
+    //! The shared helper is pinned by tests next to it, and the
+    //! delegation chain by a scan in `mesh_rpc.rs`. Neither reaches
+    //! *these* three functions with *these* two service names, and this
+    //! is the module whose hand-rolled copy stayed unbound through both
+    //! H3 and the aggregator-specific follow-up. Assert the property
+    //! where the drift actually happened.
+
+    use super::*;
+    use ::net::adapter::net::channel::{ChannelConfigRegistry, OriginBinding};
+    use crate::mesh::MeshBuilder;
+
+    async fn mesh() -> Mesh {
+        MeshBuilder::new("127.0.0.1:0", &[0xA6u8; 32])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// `Mesh::channel_configs` is private to its module, so reach the
+    /// same registry through the public node accessor.
+    fn registry(mesh: &Mesh) -> Arc<ChannelConfigRegistry> {
+        mesh.node_arc()
+            .channel_configs()
+            .expect("an SDK-built mesh always installs a registry")
+            .clone()
+    }
+
+    /// Both aggregator services must end up with an origin-bound reply
+    /// prefix. Unbound, any peer sharing a session with the server can
+    /// subscribe to a victim's `<service>.replies.<victim_origin>` and
+    /// receive that victim's response bodies whenever direct delivery
+    /// misses and the reply falls back to roster fan-out.
+    #[tokio::test]
+    async fn both_aggregator_services_bind_their_reply_prefix() {
+        let mesh = mesh().await;
+
+        for service in [REGISTRY_SERVICE, FOLD_QUERY_SERVICE] {
+            auto_register_rpc_channels(&mesh, service);
+
+            let caller = format!("{service}.replies.00112233445566aa");
+            let reg = registry(&mesh);
+            let resolved = reg
+                .resolve_by_name(&caller)
+                .unwrap_or_else(|| {
+                    panic!("{service}: the reply prefix must resolve for {caller}")
+                });
+            assert_eq!(
+                resolved.matched_prefix.as_deref(),
+                Some(format!("{service}.replies.").as_str()),
+                "{service}: resolved through the wrong entry"
+            );
+            assert_eq!(
+                resolved.config.subscriber_origin_binding,
+                Some(OriginBinding::OriginHashHex16),
+                "{service}: reply channels are world-subscribable (H3)"
+            );
+            assert!(
+                reg.get_by_name(&format!("{service}.requests")).is_some(),
+                "{service}: the request channel must still be installed — \
+                 'fix the clobbering by registering nothing' would break RPC \
+                 with UnknownChannel instead"
+            );
+        }
+    }
+
+    /// An operator ACL registered before the aggregator is installed
+    /// must survive it (H2).
+    #[tokio::test]
+    async fn installing_an_aggregator_service_preserves_an_operator_acl() {
+        use ::net::adapter::net::identity::EntityKeypair;
+        use ::net::adapter::net::{ChannelConfig, ChannelId, ChannelName};
+
+        let mesh = mesh().await;
+        let root = EntityKeypair::generate();
+        let requests = format!("{REGISTRY_SERVICE}.requests");
+        mesh.register_channel(
+            ChannelConfig::new(ChannelId::new(ChannelName::new(&requests).unwrap()))
+                .with_token_roots(vec![root.entity_id().clone()]),
+        );
+
+        auto_register_rpc_channels(&mesh, REGISTRY_SERVICE);
+
+        let cfg = registry(&mesh)
+            .get_by_name(&requests)
+            .expect("request channel must exist")
+            .clone();
+        assert!(
+            cfg.token_required(),
+            "installing the aggregator discarded the operator's ACL (H2)"
+        );
+        assert_eq!(cfg.token_roots[0], *root.entity_id());
+    }
+}
+
 /// Ergonomic wrapper that binds a [`RegistryClient`] to a
 /// specific `target_node_id` once at construction. Removes the
 /// repetition of passing the same `u64` to every call.

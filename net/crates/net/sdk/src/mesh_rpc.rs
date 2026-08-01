@@ -1546,6 +1546,19 @@ mod auto_register_covers_every_serve_variant {
              the registry, not carry its own copy of the H2/H3 policy."
         );
 
+        let agg_src = include_str!("aggregator.rs");
+        let agg_start = agg_src
+            .find("fn auto_register_rpc_channels(mesh: &Mesh")
+            .expect("the aggregator's registration hop must exist");
+        let agg = &agg_src[agg_start..(agg_start + 400).min(agg_src.len())];
+        assert!(
+            agg.contains("mesh.register_rpc_service_channels(service)"),
+            "regression (H2+H3): the aggregator must delegate to the shared \
+             registration. Its hand-rolled copy kept replacing inserts and \
+             never gained the reply-prefix origin binding, long after both \
+             were fixed for `serve_rpc`."
+        );
+
         let org_src = include_str!("org/serve.rs");
         let org_start = org_src
             .find("fn auto_register_org_channels(")
