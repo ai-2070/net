@@ -269,6 +269,36 @@ fn tag_rejected_message(tag: &str, err: &impl std::fmt::Display) -> String {
     )
 }
 
+/// Build the announcement's [`CapabilitySet`] from `--tag` values,
+/// rejecting any the parser refuses.
+///
+/// Validates via `Tag::parse_user` and returns `Err` on the first
+/// rejection, rather than handing the tag to `CapabilitySet::add_tag` —
+/// which warns and DROPS, producing a signed announcement quietly
+/// missing the tag the operator asked for. This path has the option of
+/// refusing to sign, and takes it.
+///
+/// The parser result is used directly rather than a length delta on
+/// `caps.tags.len()`: the pre-fix heuristic could not distinguish
+/// "parser rejected the tag" from "tag was a duplicate already in the
+/// set", so a legal `--tag nrpc:echo --tag nrpc:echo` errored out with
+/// the reserved-prefix message. Duplicates dedupe silently through the
+/// underlying `HashSet<Tag>`.
+///
+/// Extracted from `run_announce` so the contract is testable without a
+/// keypair file and a daemon profile — the guard that matters is over
+/// this behaviour, not over `Tag::parse_user` itself.
+fn capability_set_from_tags(tags: &[String]) -> Result<CapabilitySet, CliError> {
+    let mut caps = CapabilitySet::new();
+    for tag in tags {
+        if let Err(e) = Tag::parse_user(tag) {
+            return Err(invalid_args(tag_rejected_message(tag, &e)));
+        }
+        caps = caps.add_tag(tag.clone());
+    }
+    Ok(caps)
+}
+
 async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     // 1. Identity. Reuses the same TOML loader the live
     //    `CliContext::build` path uses so an operator can point
@@ -332,21 +362,7 @@ async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     };
 
     // 4. Build the CapabilitySet with the user-supplied tags.
-    //    Validate each tag via `Tag::parse_user` directly — the
-    //    pre-fix length-delta heuristic on `caps.tags.len()`
-    //    couldn't distinguish "parser rejected the tag" from
-    //    "tag was a duplicate already in the set", so a perfectly
-    //    legal `--tag nrpc:echo --tag nrpc:echo` invocation errored
-    //    out with the reserved-prefix message. Using the parser
-    //    result directly: invalid tags fail, duplicates dedupe
-    //    silently via the underlying `HashSet<Tag>`.
-    let mut caps = CapabilitySet::new();
-    for tag in &args.tags {
-        if let Err(e) = Tag::parse_user(tag) {
-            return Err(invalid_args(tag_rejected_message(tag, &e)));
-        }
-        caps = caps.add_tag(tag.clone());
-    }
+    let caps = capability_set_from_tags(&args.tags)?;
 
     // 5. Build + sign.
     let mut ann =
@@ -535,17 +551,60 @@ mod tests {
     }
 
     /// Finding 8: the `--tag` doc promised warn-and-drop; the code
-    /// refuses to sign. Pin the behaviour the doc now claims, so the
-    /// two cannot drift apart again.
+    /// refuses to sign. Pinned against the announce path's own
+    /// tag-building step, not against `Tag::parse_user` — testing the
+    /// parser would only restate a library guarantee, and would stay
+    /// green if this command went back to `add_tag`-and-drop, which is
+    /// the exact regression it is here to prevent.
     #[test]
     fn reserved_prefix_tags_are_rejected_not_dropped() {
         for prefix in RESERVED_PREFIXES {
             let tag = format!("{prefix}whatever");
+            let err = capability_set_from_tags(&[tag.clone()])
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("`{tag}` must fail the announce build, not be dropped from it")
+                });
+            let msg = err.to_string();
             assert!(
-                Tag::parse_user(&tag).is_err(),
-                "`{tag}` must be rejected by the parser, not silently dropped"
+                msg.contains(&tag),
+                "the rejection must name the offending tag; got {msg}"
             );
         }
+    }
+
+    /// The drop this guards against is silent, so absence-of-tag is the
+    /// thing to assert: a rejected tag must not produce a set at all.
+    #[test]
+    fn a_reserved_tag_never_reaches_the_announcement() {
+        let tags = vec![
+            "nrpc:echo".to_string(),
+            "scope:tenant:acme".to_string(),
+            "gpu".to_string(),
+        ];
+        assert!(
+            capability_set_from_tags(&tags).is_err(),
+            "one reserved tag must fail the whole announcement rather than \
+             signing the other two without it"
+        );
+    }
+
+    /// The legal cases still work — including the duplicate that the
+    /// pre-fix length-delta heuristic mistook for a rejection.
+    #[test]
+    fn ordinary_and_duplicate_tags_still_build() {
+        let caps = capability_set_from_tags(&[
+            "nrpc:echo".to_string(),
+            "nrpc:echo".to_string(),
+            "gpu".to_string(),
+        ])
+        .expect("legal tags must build");
+        let rendered: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+        assert_eq!(
+            rendered.len(),
+            2,
+            "duplicates dedupe through HashSet<Tag> rather than erroring; got {rendered:?}"
+        );
     }
 
     /// The rejection message is built from `RESERVED_PREFIXES`, so it
