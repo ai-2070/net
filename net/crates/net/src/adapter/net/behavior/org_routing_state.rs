@@ -489,7 +489,7 @@ pub(crate) enum ColdReason {
 ///
 /// ```text
 /// FamilyAtCapacity   sticky FROM THE REFUSED WIDTH UP
-/// NodeAtCapacity     retryable, gated on the node capacity generation
+/// NodeAtCapacity     retryable, on node capacity OR authority movement
 /// IdSpaceExhausted   terminal — never retry
 /// ```
 #[derive(Debug, Default)]
@@ -550,13 +550,40 @@ pub(crate) struct RefusalState {
     /// SHARING a slot without retiring it — no retirement, no capacity movement,
     /// and yet the projection genuinely changed.
     replace_refused: Option<(u64, DemandRefused)>,
-    /// The node capacity generation observed at the last `NodeAtCapacity`
-    /// refusal, or `None` if there has not been one.
+    /// The node capacity generation AND the lease revision observed at the last
+    /// `NodeAtCapacity` refusal, or `None` if there has not been one.
     ///
-    /// A later miss retries only if the generation has MOVED. Equality means no
-    /// slot has retired since the refusal, so the node is provably still full
-    /// and the attempt would take the registry lock only to be refused again.
-    node_at_capacity_at: Option<u64>,
+    /// TWO wake conditions, because the refusal is a statement about
+    /// `retained slots + the NEW slots this set needs` and both halves move
+    /// independently:
+    ///
+    /// ```text
+    /// a slot retired                 → the node capacity generation moves
+    /// the family's authority moved   → the lease revision moves
+    /// ```
+    ///
+    /// The generation ALONE is not enough, and the gap is self-sustaining rather
+    /// than merely slow. A family refused for `Owner + Grant` whose Grant lease
+    /// is then removed derives `Owner` alone on its next miss — a key another
+    /// family may already retain, so it needs no new slot and no node capacity
+    /// whatsoever — but nothing retired, so the generation stands still and the
+    /// attempt is suppressed. Nothing this family can do moves the signal it is
+    /// waiting on, so it stays cold for a demand it no longer has: the refusal
+    /// cache preserving exactly the authority §4.2 exists to correct.
+    ///
+    /// The revision is EXACT for what it adds. A demand set is a pure function
+    /// of (credentials, capability, leased), and credentials are fixed for the
+    /// family's lifetime, so while the revision stands still no set this family
+    /// derives for a given capability can have changed — an attempt would ask
+    /// the registry the identical question.
+    ///
+    /// It is deliberately CONSERVATIVE across capabilities, exactly as the bare
+    /// generation gate already was: one registry attempt per (generation,
+    /// revision) pair, whichever capability spends it. That is the property that
+    /// keeps this a cache rather than a licence to hammer the lock — the retry
+    /// rate is the rate of real movement in either domain, never the rate of
+    /// calls — and it is the same discipline [`Self::replace_refused`] follows.
+    node_at_capacity_at: Option<(u64, u64)>,
 }
 
 impl RefusalState {
@@ -567,17 +594,20 @@ impl RefusalState {
     }
 
     /// Whether a FRESH acquisition may be attempted for a set of exactly
-    /// `width`, given the CURRENT node capacity generation.
+    /// `width` derived under `revision`, given the CURRENT node capacity
+    /// generation.
     ///
-    /// Unchanged from the signed fresh-path semantics: sticky from the refused
-    /// width up, retryable on the node capacity generation, terminal on
-    /// exhaustion.
-    fn may_attempt(&self, node_capacity_generation: u64, width: usize) -> bool {
+    /// Sticky from the refused width up, terminal on exhaustion, and retryable
+    /// on EITHER node capacity movement or authority movement — see
+    /// [`Self::node_at_capacity_at`] for why the generation alone strands a
+    /// family whose demand has since narrowed.
+    fn may_attempt(&self, node_capacity_generation: u64, revision: u64, width: usize) -> bool {
         if self.id_space_exhausted || self.family_spent_at(width) {
             return false;
         }
-        self.node_at_capacity_at
-            .is_none_or(|at| at != node_capacity_generation)
+        self.node_at_capacity_at.is_none_or(|(at, at_revision)| {
+            at != node_capacity_generation || at_revision != revision
+        })
     }
 
     /// Whether a REPLACEMENT may be attempted, given the current
@@ -596,7 +626,13 @@ impl RefusalState {
         self.replace_refused = Some((ref_release_generation, refusal));
     }
 
-    fn record(&mut self, refusal: DemandRefused, node_capacity_generation: u64, width: usize) {
+    fn record(
+        &mut self,
+        refusal: DemandRefused,
+        node_capacity_generation: u64,
+        revision: u64,
+        width: usize,
+    ) {
         match refusal {
             DemandRefused::FamilyAtCapacity => {
                 // Keep the NARROWEST. A later, wider refusal says nothing the
@@ -609,7 +645,10 @@ impl RefusalState {
             }
             DemandRefused::IdSpaceExhausted => self.id_space_exhausted = true,
             DemandRefused::NodeAtCapacity => {
-                self.node_at_capacity_at = Some(node_capacity_generation);
+                // BOTH coordinates, recorded together. Either moving is a
+                // genuine reason to ask again, and recording only the
+                // generation is what let a narrowed demand stay suppressed.
+                self.node_at_capacity_at = Some((node_capacity_generation, revision));
             }
         }
     }
@@ -961,7 +1000,7 @@ impl OrgRoutingState {
             }
         } else {
             let generation = self.family.node_capacity_generation();
-            if !refusals.may_attempt(generation, charge) {
+            if !refusals.may_attempt(generation, revision, charge) {
                 return RouteLookup::Cold(self.settled_reason(refusals, charge));
             }
         }
@@ -1024,7 +1063,7 @@ impl OrgRoutingState {
                     // acquisitions that are still perfectly serviceable.
                     refusals.record_replacement_refusal(refusal, release_generation);
                 } else {
-                    refusals.record(refusal, generation, charge);
+                    refusals.record(refusal, generation, revision, charge);
                 }
                 RouteLookup::Cold(ColdReason::Refused(refusal))
             }
