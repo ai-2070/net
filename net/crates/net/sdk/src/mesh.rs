@@ -1481,11 +1481,7 @@ fn parse_ack_reason(s: &str) -> Option<AckReason> {
 // does not exist, and the policy it installs is unreachable from `Mesh`
 // — `ChannelConfigRegistry::install_rpc_service_defaults` has its own
 // tests in the `net` crate, so the property stays covered there.
-#[cfg(all(
-    test,
-    feature = "net",
-    any(feature = "cortex", feature = "aggregator")
-))]
+#[cfg(all(test, feature = "net", any(feature = "cortex", feature = "aggregator")))]
 mod rpc_service_channel_registration_tests {
     //! The aggregator module registers RPC channels through its own
     //! entry points, and used to carry a hand-copied version of the
