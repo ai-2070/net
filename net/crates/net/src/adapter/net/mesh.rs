@@ -2873,11 +2873,21 @@ mod membership_failure_tests {
             replies.insert((target, svc), Arc::from("svc"));
         }
 
+        #[cfg(feature = "cortex")]
+        let announced: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        #[cfg(feature = "cortex")]
+        {
+            announced.insert(FAILED);
+            announced.insert(HEALTHY);
+        }
+
         evict_failed_peer_channel_state(
             FAILED,
             &chains,
             #[cfg(feature = "cortex")]
             &replies,
+            #[cfg(feature = "cortex")]
+            &announced,
         );
 
         assert!(
@@ -2904,7 +2914,53 @@ mod membership_failure_tests {
                 replies.get(&(HEALTHY, 10)).is_some(),
                 "a healthy target's reply subscription must survive"
             );
+            assert!(
+                !announced.contains(&FAILED),
+                "the corrective-announce latch must clear on failure, so a \
+                 genuine reconnect can re-announce"
+            );
+            assert!(
+                announced.contains(&HEALTHY),
+                "…but only for the failed peer — a peer that merely keeps \
+                 rejecting us stays latched"
+            );
         }
+    }
+
+    /// The corrective re-announce is bounded to ONE per target.
+    ///
+    /// `Unauthorized` is not specific to the origin pin — the publisher
+    /// also returns it for cap-filter, token, visibility, queue-group
+    /// and missing-TokenCache rejections — and the membership wire
+    /// cannot carry a finer reason without a versioned cutover (an
+    /// unknown reason byte is a hard decode error on existing peers).
+    /// So the amplification is bounded structurally instead: a target
+    /// that keeps refusing us for an unrelated reason costs at most one
+    /// rate-limit-bypassing broadcast, not one per RPC.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn corrective_announce_is_claimed_at_most_once_per_target() {
+        let latch: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        const A: u64 = 1;
+        const B: u64 = 2;
+
+        assert!(latch.insert(A), "first claim for a target succeeds");
+        assert!(
+            !latch.insert(A),
+            "a second claim for the same target must not"
+        );
+        assert!(latch.insert(B), "a different target is independent");
+
+        // Failure clears only that target's latch.
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
+        evict_failed_peer_channel_state(A, &chains, &replies, &latch);
+
+        assert!(
+            latch.insert(A),
+            "after failure the target may be claimed again"
+        );
+        assert!(!latch.insert(B), "an unaffected target stays latched");
     }
 
     /// Collapsing back to `AdapterError` must preserve the historical
@@ -2951,14 +3007,21 @@ mod membership_failure_tests {
 ///   skips both the re-subscribe AND the corrective re-announce retry —
 ///   and its replies are dropped by a publisher that no longer has us
 ///   rostered, silently, because the caller believes it is subscribed.
+/// - `rpc_corrective_announced` — the once-per-target latch that bounds
+///   corrective re-announces. Clearing it on failure is what makes a
+///   genuine reconnect able to re-announce again, while a peer that
+///   merely keeps rejecting us stays latched.
 fn evict_failed_peer_channel_state(
     node_id: u64,
     subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
     #[cfg(feature = "cortex")] rpc_reply_subscriptions: &dashmap::DashMap<(u64, u64), Arc<str>>,
+    #[cfg(feature = "cortex")] rpc_corrective_announced: &dashmap::DashSet<u64>,
 ) {
     subscriber_chains.retain(|(nid, _), _| *nid != node_id);
     #[cfg(feature = "cortex")]
     rpc_reply_subscriptions.retain(|(target, _), _| *target != node_id);
+    #[cfg(feature = "cortex")]
+    rpc_corrective_announced.remove(&node_id);
 }
 
 /// Rolling-window auth-failure tracker, one entry per peer.
@@ -6882,6 +6945,12 @@ pub struct MeshNode {
     /// re-subscribe instead of a correctness bug.
     #[cfg(feature = "cortex")]
     rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), Arc<str>>>,
+    /// Targets we have already fired one corrective re-announce at.
+    /// Bounds the amplification described on
+    /// `MembershipFailure::warrants_reannounce`; cleared on peer failure
+    /// so a genuine reconnect can announce again.
+    #[cfg(feature = "cortex")]
+    rpc_corrective_announced: Arc<dashmap::DashSet<u64>>,
     /// nRPC services the local node currently handles (registered
     /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
     /// drops). `announce_capabilities` merges these as
@@ -8135,6 +8204,13 @@ impl MeshNode {
             Arc::new(dashmap::DashMap::new());
         #[cfg(feature = "cortex")]
         let rpc_reply_subscriptions_failure = rpc_reply_subscriptions.clone();
+        // Once-per-target latch bounding corrective re-announces; see
+        // `MembershipFailure::warrants_reannounce`.
+        #[cfg(feature = "cortex")]
+        let rpc_corrective_announced: Arc<dashmap::DashSet<u64>> =
+            Arc::new(dashmap::DashSet::new());
+        #[cfg(feature = "cortex")]
+        let rpc_corrective_announced_failure = rpc_corrective_announced.clone();
         // RT-4: event-pingwave gate + the clones the `on_recovery`
         // closure captures (it runs before `Self` exists, so it
         // can't call `emit_event_pingwave`).
@@ -8419,6 +8495,8 @@ impl MeshNode {
                 &subscriber_chains_failure,
                 #[cfg(feature = "cortex")]
                 &rpc_reply_subscriptions_failure,
+                #[cfg(feature = "cortex")]
+                &rpc_corrective_announced_failure,
             );
             // RT-5: tell the mesh this peer is unreachable via us —
             // receivers drop their `(node_id, via=us)` routes within
@@ -8585,6 +8663,8 @@ impl MeshNode {
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
             rpc_reply_subscriptions,
+            #[cfg(feature = "cortex")]
+            rpc_corrective_announced,
             #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(LocalServiceRegistry::new(local_caps_changed.clone())),
             #[cfg(feature = "tool")]
@@ -19446,6 +19526,17 @@ impl MeshNode {
             Some(queue_group),
         )
         .await
+    }
+
+    /// Claim the one corrective re-announce allowed for `target`.
+    ///
+    /// Returns `true` exactly once per target (until that peer fails,
+    /// which clears the latch). See
+    /// [`MembershipFailure::warrants_reannounce`] for why the `Unauthorized`
+    /// filter alone is not sufficient.
+    #[cfg(feature = "cortex")]
+    pub(super) fn claim_corrective_announce(&self, target: u64) -> bool {
+        self.rpc_corrective_announced.insert(target)
     }
 
     /// Bare subscribe that reports the publisher's rejection reason as

@@ -5510,7 +5510,22 @@ impl MeshNode {
                     // announce bypasses the rate limit, retrying
                     // regardless would let one bad target turn every
                     // RPC into two extra capability broadcasts.
-                    let retryable = failure.warrants_reannounce();
+                    //
+                    // `Unauthorized` alone is not a precise signal: the
+                    // publisher returns it for cap-filter, token,
+                    // visibility, queue-group and missing-TokenCache
+                    // rejections as well as the origin pin, and the
+                    // membership wire cannot currently carry a more
+                    // specific reason (an unknown reason byte is a hard
+                    // decode error on existing peers, so a new
+                    // `AckReason` needs the versioned cutover the H1
+                    // constraint set describes). So the amplification is
+                    // bounded structurally instead: at most ONE
+                    // corrective announce per target, ever — cleared
+                    // only when that peer's session fails, which is
+                    // exactly when a fresh pin is genuinely needed.
+                    let retryable = failure.warrants_reannounce()
+                        && self.claim_corrective_announce(target_node_id);
                     last_err = Some(failure.into_adapter_error());
                     if !retryable || attempt + 1 == REPLY_SUBSCRIBE_ATTEMPTS {
                         break;
