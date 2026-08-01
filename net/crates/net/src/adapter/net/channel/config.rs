@@ -641,6 +641,30 @@ pub struct ChannelConfigRegistry {
     /// practice (one prefix per nRPC service). The exact-match
     /// hot path is unaffected.
     prefix_configs: DashMap<String, ChannelConfig>,
+    /// Serializes every mutation of `configs` + the two reverse
+    /// indices, so the three maps are only ever observed in a
+    /// consistent state.
+    ///
+    /// `configs` and the indices are separate DashMaps, so no per-entry
+    /// guard can span them. Under concurrent insert/remove that showed
+    /// up as index corruption in both directions: a re-registration
+    /// racing a removal could have its fresh index entry deleted (the
+    /// channel present in `configs` but invisible to `get(hash)`), and
+    /// the repair for THAT could re-add a name a second removal had
+    /// just taken out (a phantom name in a bucket, which `get` and
+    /// `remove` read as a hash collision and answer `None` to — taking
+    /// out the *real* channel's lookup as collateral).
+    ///
+    /// Writes only. Readers stay lock-free on the DashMaps: they are
+    /// the hot path, and a reader that observes a mid-write state
+    /// resolves through `configs` and simply misses, which is the
+    /// pre-existing behaviour for an unregistered channel. Mutations
+    /// are control-plane — registration, `net channel rm` — so
+    /// serializing them costs nothing measurable.
+    ///
+    /// NOT reentrant (`parking_lot::Mutex`). Methods that hold it call
+    /// the `_locked` inner helpers, never each other.
+    write_lock: parking_lot::Mutex<()>,
 }
 
 impl ChannelConfigRegistry {
@@ -651,6 +675,7 @@ impl ChannelConfigRegistry {
             by_hash: DashMap::new(),
             by_wire_hash: DashMap::new(),
             prefix_configs: DashMap::new(),
+            write_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -719,6 +744,7 @@ impl ChannelConfigRegistry {
         let name = config.channel_id.name().to_string();
         let hash = config.channel_id.hash();
         let wire_hash = config.channel_id.wire_hash();
+        let _w = self.write_lock.lock();
         self.configs.insert(name.clone(), config);
         self.index_name(hash, wire_hash, name);
     }
@@ -737,18 +763,14 @@ impl ChannelConfigRegistry {
     /// operator expressed no opinion," which is exactly this
     /// operation.
     ///
-    /// Atomic against concurrent callers: the occupancy test and the
-    /// insert happen under one DashMap entry guard, so exactly one of
-    /// N racing callers observes `true`.
+    /// Atomic against concurrent callers: exactly one of N racing
+    /// callers observes `true`, and its index update is not visible
+    /// before its `configs` entry.
     pub fn insert_if_absent(&self, config: ChannelConfig) -> bool {
         let name = config.channel_id.name().to_string();
         let hash = config.channel_id.hash();
         let wire_hash = config.channel_id.wire_hash();
-        // Hold the entry guard across the occupancy decision so two
-        // racing callers can't both observe "vacant". The reverse
-        // indices are separate DashMaps, so they're updated after the
-        // guard drops — only the winner gets there, which is what
-        // keeps them consistent.
+        let _w = self.write_lock.lock();
         let installed = match self.configs.entry(name.clone()) {
             dashmap::mapref::entry::Entry::Occupied(_) => false,
             dashmap::mapref::entry::Entry::Vacant(slot) => {
@@ -914,6 +936,10 @@ impl ChannelConfigRegistry {
     /// Callers that need to remove a specific channel should use
     /// [`remove_by_name`](Self::remove_by_name).
     pub fn remove(&self, channel_hash: ChannelHash) -> Option<ChannelConfig> {
+        // One critical section covering the index read AND the removal
+        // it selects, so the name cannot be replaced by a different
+        // channel in between and get removed in its place.
+        let _w = self.write_lock.lock();
         let name = {
             let names = self.by_hash.get(&channel_hash)?;
             if names.len() != 1 {
@@ -921,13 +947,40 @@ impl ChannelConfigRegistry {
             }
             names.first()?.clone()
         };
-        self.remove_by_name(&name)
+        self.remove_by_name_locked(&name)
     }
 
     /// Remove a channel config by exact name (collision-safe).
     ///
     /// Returns the removed config if it existed.
     pub fn remove_by_name(&self, name: &str) -> Option<ChannelConfig> {
+        let _w = self.write_lock.lock();
+        self.remove_by_name_locked(name)
+    }
+
+    /// [`Self::remove_by_name`] for callers already holding
+    /// `write_lock`. Split out because `parking_lot::Mutex` is not
+    /// reentrant and [`Self::remove`] must hold the lock across its
+    /// index lookup.
+    ///
+    /// Under the lock, `configs.remove` and the index cleanup are one
+    /// step, which is what makes the pair sound. Previously they were
+    /// not, and the repair each defect needed reintroduced the other:
+    ///
+    /// - Without a repair pass, a re-registration landing between the
+    ///   `configs.remove` and the `retain` had its fresh index entry
+    ///   deleted — the channel present in `configs`, invisible to
+    ///   `get(hash)`.
+    /// - With one (`if configs.contains_key(name) { index_name(..) }`),
+    ///   a second removal completing between that test and the re-index
+    ///   put a name back into the bucket with nothing behind it. `get`
+    ///   and `remove` treat a bucket holding more than one name as a
+    ///   hash collision and answer `None`, so a phantom entry disables
+    ///   lookup for whatever real channel shares the bucket.
+    ///
+    /// Serializing removes the interleaving both were patching around,
+    /// so neither the repair nor its own failure mode remains.
+    fn remove_by_name_locked(&self, name: &str) -> Option<ChannelConfig> {
         let (_, removed) = self.configs.remove(name)?;
         let hash = removed.channel_id.hash();
         let wire_hash = removed.channel_id.wire_hash();
@@ -936,22 +989,6 @@ impl ChannelConfigRegistry {
         }
         if let Some(mut wire_names) = self.by_wire_hash.get_mut(&wire_hash) {
             wire_names.retain(|n| n != name);
-        }
-        // Repair pass. `configs.remove` and the index cleanup above are
-        // not one atomic step, so a concurrent re-registration can land
-        // in between: it inserts into `configs` AND re-indexes the name,
-        // and then our `retain` deletes the index entry it just made.
-        // That strands the new channel — present in `configs`, but
-        // invisible to `get(hash)` and `get_by_wire_hash`, which resolve
-        // through the reverse indices.
-        //
-        // Re-checking `configs` and re-indexing converges under either
-        // interleaving: whichever operation finishes last leaves the
-        // index agreeing with `configs`. The name maps to a fixed
-        // `(hash, wire_hash)` — same name, same hashes — so re-adding is
-        // always the right repair, and `index_name` de-dups.
-        if self.configs.contains_key(name) {
-            self.index_name(hash, wire_hash, name.to_string());
         }
         Some(removed)
     }
@@ -1784,10 +1821,13 @@ mod tests {
     /// the reverse indices that `get(hash)` / `get_by_wire_hash`
     /// resolve through.
     ///
-    /// Sequenced deterministically rather than raced: re-register while
-    /// the remove is "in flight" by doing the insert between the
-    /// `configs.remove` and the index cleanup. The repair pass makes
-    /// either ordering converge.
+    /// Sequenced deterministically rather than raced, so it pins the
+    /// outcome rather than an interleaving: remove-then-reregister and
+    /// reregister-then-remove must both leave the index agreeing with
+    /// `configs`. (The interleaving itself can no longer occur —
+    /// `remove_by_name_locked` holds the registry write lock across both
+    /// steps — but the property is what callers depend on, and it should
+    /// keep being asserted independently of how it is achieved.)
     #[test]
     fn remove_racing_reregistration_leaves_the_index_consistent() {
         let reg = ChannelConfigRegistry::new();
@@ -2430,5 +2470,82 @@ mod tests {
             reg.get(id.hash()).is_some(),
             "hash index must stay unambiguous under concurrent installs"
         );
+    }
+
+    /// The reverse indices must agree with `configs` after arbitrary
+    /// concurrent registration and removal — no name indexed that
+    /// `configs` does not hold, and none held that is not indexed.
+    ///
+    /// Both directions matter and they used to fail in turn:
+    ///
+    /// - Un-indexed-but-present: a re-registration landing between
+    ///   `remove`'s `configs.remove` and its `retain` had its fresh
+    ///   index entry deleted. The channel is registered and `get_by_name`
+    ///   finds it, but `get(hash)` — the path publish and subscribe
+    ///   authorization take — answers `None`, so its ACL stops being
+    ///   enforced.
+    /// - Indexed-but-absent: the repair pass for the above re-added a
+    ///   name a second concurrent removal had just taken out. `get` and
+    ///   `remove` read a bucket of more than one name as a hash
+    ///   collision and refuse it, so a phantom name disables lookup for
+    ///   whatever real channel shares the bucket.
+    ///
+    /// Interleaving-dependent, so a green run is evidence rather than
+    /// proof. It fails reliably against the unsynchronized version
+    /// (typically within a few hundred iterations), which is what makes
+    /// it worth keeping: the assertion states the invariant exactly, and
+    /// a future change that drops the serialization has a real chance of
+    /// being caught here.
+    #[test]
+    fn concurrent_registration_and_removal_keep_the_indices_consistent() {
+        use std::sync::Arc as StdArc;
+
+        // Distinct names, so threads contend on the registry rather
+        // than on one key — the churn that produced both defects.
+        let names: Vec<String> = (0..4).map(|i| format!("svc.chan{i}")).collect();
+
+        for _round in 0..200 {
+            let reg = StdArc::new(ChannelConfigRegistry::new());
+            std::thread::scope(|s| {
+                for name in &names {
+                    for _ in 0..2 {
+                        let reg = reg.clone();
+                        let id = ChannelId::parse(name).unwrap();
+                        s.spawn(move || {
+                            reg.insert(ChannelConfig::new(id.clone()));
+                            reg.remove_by_name(id.name().as_str());
+                            reg.insert(ChannelConfig::new(id));
+                        });
+                    }
+                }
+                for name in &names {
+                    let reg = reg.clone();
+                    let name = name.clone();
+                    s.spawn(move || {
+                        reg.remove_by_name(&name);
+                    });
+                }
+            });
+
+            for name in &names {
+                let present = reg.get_by_name(name).is_some();
+                // Straight at `by_hash`: the invariant is about the
+                // index itself, and the collision-safe public accessors
+                // hide exactly the corruption being asserted on.
+                let hash = ChannelId::parse(name).unwrap().hash();
+                let indexed = reg
+                    .by_hash
+                    .get(&hash)
+                    .is_some_and(|names| names.iter().any(|n| n == name));
+                assert_eq!(
+                    present, indexed,
+                    "index and `configs` disagree about {name:?}: present={present}, \
+                     indexed={indexed}. Registered-but-unindexed silently stops \
+                     enforcing that channel's ACL on the `get(hash)` path; \
+                     indexed-but-absent poisons the bucket for every channel \
+                     sharing it."
+                );
+            }
+        }
     }
 }
