@@ -521,17 +521,31 @@ impl SpendPolicyEngine {
     /// Operator-only verb: approve a specific quote. Resolves through the
     /// SDK consent API (Hermes/OpenClaw render the prompt); the shared
     /// store holds the decision. Returns whether state changed.
+    ///
+    /// **Approves an existing held quote only.** An unknown `quote_id` is
+    /// a no-op returning `false`, never a new record: the engine writes
+    /// the pending record (with the exact provider-signed quote bytes
+    /// attached) when it decides an approval is needed, so an id with no
+    /// record is one nothing ever asked about.
+    ///
+    /// Minting one here would create a record with an empty `capability`
+    /// and empty `quote_b64` that [`Self::check_and_reserve`] still reads
+    /// as approved — bypassing `max_per_call`, `max_per_day`, and
+    /// `allowed_assets` for whatever quote later carried that id, while
+    /// [`Self::approved_quote`] skipped it (no bytes to redeem). Reaching
+    /// that state requires a BLAKE3 preimage over the whole quote
+    /// transcript, so this is API integrity rather than a live attack
+    /// path — but "approve" should not be able to invent the thing it
+    /// approves.
     pub async fn approve(&self, quote_id: &str) -> Result<bool, SpendError> {
         let quote_id = quote_id.to_string();
-        let changed = mutate_json::<SpendPolicyFile, _, _>(&self.path, move |s| {
-            let record = s.approvals.entry(quote_id).or_insert(ApprovalRecord {
-                state: ApprovalState::Pending,
-                capability: String::new(),
-                quote_b64: String::new(),
-            });
+        let changed = mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, move |s| {
+            let Some(record) = s.approvals.get_mut(&quote_id) else {
+                return (false, false);
+            };
             let changed = record.state != ApprovalState::Approved;
             record.state = ApprovalState::Approved;
-            changed
+            (changed, changed)
         })
         .await?;
         Ok(changed)

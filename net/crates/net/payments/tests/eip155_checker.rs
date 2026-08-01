@@ -208,6 +208,46 @@ async fn delivered_amount_comes_from_the_right_transfer_logs_only() {
     assert_eq!(delivered.as_deref(), Some("0"));
 }
 
+/// L5 regression: a delivered-amount sum that overflows `u128` is a
+/// terminal error, never a clamped total.
+///
+/// Saturating here would report exactly `u128::MAX`, and `AtomicAmount`
+/// admits a requirement of exactly `u128::MAX` — so a clamped overpayment
+/// would compare `Ordering::Equal` in `re_verify_with_checker` and be
+/// billed as an exact settlement instead of routing to the `Overpayment`
+/// exception. Contrived to reach, but this is the independent
+/// verification path: it does not get to assume a bound on what a token's
+/// logs can sum to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overflowing_delivered_sum_is_terminal_not_clamped() {
+    let rpc = RpcFixture::start().await;
+    let checker = Eip155Checker::new("eip155:84532", &rpc.endpoint).expect("checker");
+    rpc.set_head(100);
+
+    // Two qualifying transfers that individually fit in u128 but sum past
+    // it: u128::MAX, then 1.
+    let max_hex = format!("0x{:x}", u128::MAX);
+    rpc.set_receipt(json!({
+        "status": "0x1",
+        "blockNumber": "0x5f",
+        "logs": [
+            transfer_log(TOKEN, RECIPIENT, &max_hex),
+            transfer_log(TOKEN, RECIPIENT, "0x1"),
+        ],
+    }));
+
+    let err = checker
+        .check("eip155:84532", TX, Some(&query()))
+        .await
+        .expect_err("an overflowing sum must not be reported as a total");
+    assert!(
+        err.message.contains("overflow"),
+        "error should name the overflow, got: {}",
+        err.message
+    );
+    assert!(!err.retryable, "an overflowing sum is terminal, not transient");
+}
+
 /// H3 regression: when the query carries the authorized payer, a
 /// qualifying transfer to the same merchant from a *different* payer does
 /// not count. This is the leg that stops a facilitator satisfying a quote

@@ -539,3 +539,64 @@ async fn concurrent_processes_hammering_max_per_day_never_overspend() {
         "the counter never overshoots the cap"
     );
 }
+
+/// L6 regression: `approve` grants an existing held quote and refuses to
+/// invent one.
+///
+/// The engine writes the pending record — with the exact provider-signed
+/// quote bytes attached — when it decides an approval is needed, so an id
+/// with no record is one nothing ever asked about. Minting a record here
+/// would leave an approval carrying no quote bytes that
+/// `check_and_reserve` still reads as approved (bypassing `max_per_call`,
+/// `max_per_day`, and `allowed_assets`) while `approved_quote` skips it.
+#[tokio::test]
+async fn approve_grants_a_held_quote_and_refuses_to_invent_one() {
+    let s = setup(SpendProfile::Production);
+    let quote = s.quote(mock_requirements("2500"), NOW);
+
+    // An id nobody has asked about: no-op, no record, and crucially the
+    // policy gate does not treat it as approved afterwards.
+    assert!(
+        !s.engine.approve("not-a-quote-id").await.unwrap(),
+        "approving an unknown id must be a no-op"
+    );
+    assert!(
+        s.engine.pending().await.unwrap().is_empty(),
+        "approve must not mint an approval record"
+    );
+
+    // The production profile holds a mock spend for approval, which is
+    // what writes the pending record in the first place.
+    let held = s
+        .engine
+        .check_and_reserve(&quote, &s.registry, NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        held,
+        SpendDecision::RequiresPaymentApproval { .. }
+    ));
+
+    // Now the id resolves: first approval changes state, second is idempotent.
+    assert!(s.engine.approve(&quote.quote_id).await.unwrap());
+    assert!(
+        !s.engine.approve(&quote.quote_id).await.unwrap(),
+        "re-approving an already-approved quote changes nothing"
+    );
+
+    // And the approval carries the exact quote bytes a retry redeems —
+    // the human's approval applies to the quote they saw, not to some
+    // later one with the same id.
+    let (held_id, bytes) = s
+        .engine
+        .approved_quote(CAPABILITY)
+        .await
+        .unwrap()
+        .expect("an approved hold carries its quote");
+    assert_eq!(held_id, quote.quote_id);
+    assert_eq!(
+        bytes,
+        net_payments::core::canonical::canonical_bytes(&quote).unwrap(),
+        "the held bytes must be the exact quote that was approved"
+    );
+}

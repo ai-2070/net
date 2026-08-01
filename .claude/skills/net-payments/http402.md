@@ -27,6 +27,26 @@ pub const HDR_PAYMENT_SIGNATURE: &str = "payment-signature";  // client → serv
 pub const HDR_PAYMENT_RESPONSE:  &str = "payment-response";   // server → client settlement on success
 ```
 
+### You pay the server's advertised ceiling, exactly
+
+The pinned v2 spec names the price `amount`. Widely-deployed x402 servers
+name it **`maxAmountRequired`**, and in that vocabulary it is a *maximum* —
+the most the server will accept, not necessarily what it wants.
+
+`PaymentRequirements` accepts both spellings (`#[serde(alias)]`), and Net
+then treats the value as an **exact** amount everywhere: the caller authors
+an authorization for the full figure, and the provider-side engine's
+verification demands exact equality (under-delivery invalidates,
+over-delivery routes to a manual `Overpayment` exception).
+
+So paying a server that advertises `maxAmountRequired` means **paying its
+ceiling**, not negotiating below it. There is no partial-payment path and
+no counter-offer object — that absence is the rule. It is not a
+correctness or safety problem (spend policy still caps every outbound
+payment, and the byte-preserved requirements are what got signed), but
+budget for the advertised maximum when you set `max_per_call` for an
+external host.
+
 ## `X402HttpFlow`
 
 ```rust
