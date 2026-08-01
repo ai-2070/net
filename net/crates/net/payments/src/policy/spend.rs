@@ -362,10 +362,9 @@ impl SpendPolicyEngine {
             // `retain` only ever removes, so a shrink means we pruned.
             let counters_before = s.counters.len();
             s.counters
-                .retain(|k, _| counter_day(k).is_some_and(|d| d + COUNTER_RETAIN_DAYS >= day));
+                .retain(|k, _| counter_day(k).is_some_and(|d| within_retention(d, day)));
             let reservations_before = s.reservations.len();
-            s.reservations
-                .retain(|_, r| r.day + COUNTER_RETAIN_DAYS >= day);
+            s.reservations.retain(|_, r| within_retention(r.day, day));
             let mut dirty =
                 s.counters.len() != counters_before || s.reservations.len() != reservations_before;
 
@@ -629,8 +628,7 @@ impl SpendPolicyEngine {
             // Housekeeping: a reservation whose counter has aged past the
             // retention horizon can never be released meaningfully again.
             let before = s.reservations.len();
-            s.reservations
-                .retain(|_, r| r.day + COUNTER_RETAIN_DAYS >= today);
+            s.reservations.retain(|_, r| within_retention(r.day, today));
             let mut dirty = s.reservations.len() != before;
 
             // One holder drops. Only when the last one does is the amount
@@ -787,6 +785,26 @@ fn counter_day(key: &str) -> Option<u64> {
     key.split('|').next()?.parse().ok()
 }
 
+/// Is a record stamped `day` still inside the retention horizon that
+/// ends at `today`?
+///
+/// Subtraction on `today`, never addition on `day`. `day` comes off
+/// disk — a counter key, or a persisted reservation — so a corrupt or
+/// hostile policy file can put `u64::MAX` there, and `day +
+/// COUNTER_RETAIN_DAYS` then panics in debug and wraps in release. The
+/// wrap is the worse half: it lands on a small number, the record reads
+/// as ancient, and the pruning pass drops live counters along with it.
+///
+/// A day this can't interpret is retained rather than dropped.
+/// Housekeeping's job is to remove what is provably past the horizon;
+/// anything else is the audit trail's problem, not the sweeper's.
+///
+/// One function for all three call sites so the comparison cannot drift
+/// between the two pruning passes and the release path.
+fn within_retention(day: u64, today: u64) -> bool {
+    day >= today.saturating_sub(COUNTER_RETAIN_DAYS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +820,31 @@ mod tests {
     fn counter_keys_parse_their_day() {
         assert_eq!(counter_day("11574|mock:net|musd"), Some(11_574));
         assert_eq!(counter_day("garbage"), None);
+    }
+
+    /// The retention horizon is a subtraction on today, so a day read
+    /// off disk can be anything at all without arithmetic deciding the
+    /// outcome.
+    #[test]
+    fn retention_holds_at_the_edges_of_the_day_range() {
+        let today = 11_574;
+        // The horizon itself is inclusive; one day past it is not.
+        assert!(within_retention(today, today));
+        assert!(within_retention(today - COUNTER_RETAIN_DAYS, today));
+        assert!(!within_retention(today - COUNTER_RETAIN_DAYS - 1, today));
+
+        // A corrupt or hostile policy file. `day + COUNTER_RETAIN_DAYS`
+        // panicked in debug and wrapped in release here — and the wrap
+        // was the dangerous half, because it read as ancient and took
+        // every live counter with it. Retained instead: housekeeping
+        // removes what is provably past the horizon and nothing else.
+        assert!(within_retention(u64::MAX, today));
+        assert!(within_retention(today + 1, today));
+
+        // Early epoch, where the horizon would underflow.
+        assert!(within_retention(0, 0));
+        assert!(within_retention(0, COUNTER_RETAIN_DAYS));
+        assert!(!within_retention(0, COUNTER_RETAIN_DAYS + 1));
     }
 
     #[test]
