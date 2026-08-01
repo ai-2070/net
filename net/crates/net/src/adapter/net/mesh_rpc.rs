@@ -5502,15 +5502,35 @@ impl MeshNode {
                     break;
                 }
                 Err(failure) => {
-                    // Only an origin-binding `Unauthorized` is worth a
-                    // corrective re-announce. Anything else — the peer
-                    // is gone, throttling us, or does not know the
-                    // channel — returns immediately: re-announcing
-                    // cannot fix it, and because the corrective
-                    // announce bypasses the rate limit, retrying
-                    // regardless would let one bad target turn every
-                    // RPC into two extra capability broadcasts.
+                    // Two INDEPENDENT decisions, deliberately not fused:
                     //
+                    // 1. Is this rejection worth retrying at all? Only an
+                    //    `Unauthorized` is. Anything else — the peer is
+                    //    gone, throttling us, or does not know the
+                    //    channel — returns immediately, because waiting
+                    //    and asking again cannot change the answer.
+                    //
+                    // 2. Should THIS attempt also emit a corrective
+                    //    capability announce? Only the first one per
+                    //    target, ever.
+                    //
+                    // Fusing them (the original `retryable = warrants &&
+                    // claim`) made the latch silently eat retry budget:
+                    // attempt 0 claimed the latch and announced, then
+                    // attempt 1's rejection found the latch already
+                    // claimed, read that as "not retryable" and broke —
+                    // abandoning the announcement it had just sent while
+                    // it was still in flight. The retry loop exists
+                    // precisely to cover that flight time, so the two
+                    // must stay separate.
+                    //
+                    // The bound on amplification is unaffected: it lives
+                    // on the announce, not on the retry.
+                    let retryable = failure.warrants_reannounce();
+                    last_err = Some(failure.into_adapter_error());
+                    if !retryable || attempt + 1 == REPLY_SUBSCRIBE_ATTEMPTS {
+                        break;
+                    }
                     // `Unauthorized` alone is not a precise signal: the
                     // publisher returns it for cap-filter, token,
                     // visibility, queue-group and missing-TokenCache
@@ -5519,21 +5539,15 @@ impl MeshNode {
                     // specific reason (an unknown reason byte is a hard
                     // decode error on existing peers, so a new
                     // `AckReason` needs the versioned cutover the H1
-                    // constraint set describes). So the amplification is
-                    // bounded structurally instead: at most ONE
-                    // corrective announce per target, ever — cleared
-                    // only when that peer's session fails, which is
-                    // exactly when a fresh pin is genuinely needed.
-                    let retryable = failure.warrants_reannounce()
-                        && self.claim_corrective_announce(target_node_id);
-                    last_err = Some(failure.into_adapter_error());
-                    if !retryable || attempt + 1 == REPLY_SUBSCRIBE_ATTEMPTS {
-                        break;
-                    }
-                    // Re-announce so the target can pin us, then back
-                    // off before retrying. Announce failures are not
-                    // fatal here — the retry may still succeed if the
-                    // pin arrives by another route.
+                    // constraint set describes). Since we cannot tell a
+                    // missing pin from a policy denial, the corrective
+                    // announce is bounded structurally instead: at most
+                    // ONE per target, ever — cleared only when that
+                    // peer's session fails, which is exactly when a
+                    // fresh pin is genuinely needed. Without that bound,
+                    // one persistently-denying target would turn every
+                    // RPC into extra capability broadcasts, because the
+                    // corrective path bypasses the rate limit.
                     //
                     // `reannounce_for_authorization`, NOT the routine
                     // republish: the routine path coalesces inside
@@ -5542,7 +5556,16 @@ impl MeshNode {
                     // wait out the backoff and fail for exactly the
                     // same missing-pin reason. Bypassing coalescing is
                     // the whole point here.
-                    let _ = self.reannounce_for_authorization().await;
+                    //
+                    // Announce failures are not fatal — the retry may
+                    // still succeed if the pin arrives by another route.
+                    if self.claim_corrective_announce(target_node_id) {
+                        let _ = self.reannounce_for_authorization().await;
+                    }
+                    // Back off whether or not we announced. On the
+                    // attempts after the latch is spent we are waiting
+                    // out the flight time of the announce attempt 0
+                    // sent.
                     tokio::time::sleep(REPLY_SUBSCRIBE_BACKOFF * (attempt as u32 + 1)).await;
                 }
             }
@@ -6120,6 +6143,72 @@ fn _ensure_send_sync() {
     assert_send_sync::<RpcStatus>();
     assert_send_sync::<RpcReply>();
     assert_send_sync::<CallOptions>();
+}
+
+#[cfg(test)]
+mod reply_subscribe_retry_tests {
+    /// The retry condition and the corrective-announce latch are two
+    /// separate decisions, and re-fusing them is a silent regression:
+    /// the loop still compiles, still retries once, and only misbehaves
+    /// on a caller's very first call to a target — precisely the case
+    /// the retry exists for.
+    ///
+    /// The failure it reintroduces: attempt 0 rejected, claims the
+    /// latch, announces. Attempt 1 rejected (the announce is still in
+    /// flight), finds the latch spent, reads `false` as "not retryable"
+    /// and breaks — throwing away the remaining attempt and returning
+    /// `NoRoute` for a target that would have accepted a moment later.
+    ///
+    /// Structural rather than behavioural: exercising the loop needs two
+    /// live sessions and a server that rejects exactly twice. So pin the
+    /// shape instead — the latch may appear only as a statement guarding
+    /// the announce, never inside the expression bound to `retryable`.
+    ///
+    /// Scans the production function only. `ensure_reply_subscription`
+    /// is above every `#[cfg(test)]` module in this file, so truncating
+    /// at the first one keeps this test from matching its own prose.
+    #[test]
+    fn the_announce_latch_does_not_gate_the_retry() {
+        let src = include_str!("mesh_rpc.rs");
+        let start = src
+            .find("    async fn ensure_reply_subscription(")
+            .expect("ensure_reply_subscription must exist");
+        let end = src
+            .find("\n#[cfg(test)]")
+            .expect("this file has test modules");
+        assert!(
+            start < end,
+            "ensure_reply_subscription moved below the test modules; this scan \
+             would read its own source"
+        );
+        let body = &src[start..end];
+
+        let retryable = body
+            .find("let retryable = ")
+            .expect("the retry decision must still be a named binding");
+        let stmt_end = body[retryable..]
+            .find(';')
+            .expect("the retryable binding must terminate");
+        let binding = &body[retryable..retryable + stmt_end];
+        assert!(
+            !binding.contains("claim_corrective_announce"),
+            "regression: the once-per-target announce latch is back inside the \
+             retry condition ({binding:?}). Attempt 1 would then read a spent \
+             latch as a permanent denial and abandon the announcement attempt \
+             0 had just sent. The latch bounds ANNOUNCES, not attempts."
+        );
+        assert!(
+            binding.contains("warrants_reannounce"),
+            "the retry condition must remain the `Unauthorized` test — \
+             retrying anything else cannot change the answer"
+        );
+        assert!(
+            body.contains("if self.claim_corrective_announce(target_node_id) {"),
+            "regression: the corrective announce must stay behind the \
+             once-per-target latch, or one persistently-denying target turns \
+             every RPC into extra rate-limit-bypassing capability broadcasts"
+        );
+    }
 }
 
 #[cfg(test)]
