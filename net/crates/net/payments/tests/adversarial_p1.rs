@@ -139,6 +139,189 @@ impl World {
     }
 }
 
+/// A facilitator that parks in `verify` until it is told to answer, so a
+/// test can hold one attempt open across the claim boundary and see what
+/// a second attempt is told meanwhile.
+struct BlockingVerifier {
+    release: Arc<tokio::sync::Notify>,
+    /// Only the *first* verify blocks. The point is to hold one attempt
+    /// open across the claim boundary, not to wedge the fixture: the
+    /// retry that follows the race has to be able to complete, and a
+    /// facilitator that parked on every call would hang the test rather
+    /// than fail it.
+    held_one: std::sync::atomic::AtomicBool,
+}
+
+/// The forged attempt is the one the facilitator will reject; anything
+/// else is the real payer. Keyed on the payload rather than on call
+/// order, so the fixture does not depend on who wins the race.
+const FORGED: &str = "forged-authorization";
+
+#[async_trait]
+impl Facilitator for BlockingVerifier {
+    fn reference(&self) -> VerifierRef {
+        VerifierRef {
+            identity: None,
+            endpoint: "blocking-fixture".into(),
+        }
+    }
+
+    async fn verify(
+        &self,
+        payload: &X402Carry<PaymentPayload>,
+        _requirements: &X402Carry<PaymentRequirements>,
+    ) -> Result<VerifyOutcome, FacilitatorError> {
+        if !self
+            .held_one
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.release.notified().await;
+        }
+        let forged = payload.view().payload["mock_authorization"] == FORGED;
+        Ok(VerifyOutcome {
+            response: X402Carry::author(&VerifyResponse {
+                is_valid: !forged,
+                invalid_reason: forged.then(|| "forged".to_string()),
+                payer: None,
+                extra: None,
+            })
+            .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
+        })
+    }
+
+    async fn settle(
+        &self,
+        _payload: &X402Carry<PaymentPayload>,
+        requirements: &X402Carry<PaymentRequirements>,
+    ) -> Result<SettleOutcome, FacilitatorError> {
+        Ok(SettleOutcome {
+            response: X402Carry::author(&SettlementResponse {
+                success: true,
+                error_reason: None,
+                payer: None,
+                transaction: "mock:settled".into(),
+                network: MOCK_NETWORK.into(),
+                amount: Some(requirements.view().amount.clone()),
+                extensions: None,
+            })
+            .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
+        })
+    }
+}
+
+/// An unverified attempt holds a quote, but it does not get to say the
+/// quote was paid.
+///
+/// The claim is taken before the facilitator verifies — verification is
+/// network I/O and does not hold the store lock — and the semantic replay
+/// key is derived from the authorization's `(from, nonce)` and scope,
+/// every part of which an observer of a real authorization knows. So the
+/// attempt sitting on the record need not be the payer: a forged payload
+/// claims the same quote just as well.
+///
+/// That race cannot be closed by ordering alone without moving signature
+/// verification into the engine, which is the facilitator's job. What it
+/// must not do is *lie*: the real payer arriving mid-race used to be told
+/// `QuoteAlreadyPaid`, a terminal rejection, when nothing had been paid
+/// and the quote would be free again a round trip later. `InProgress` is
+/// retryable and true.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unverified_attempt_holds_a_quote_without_claiming_it_was_paid() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let w = world(Arc::new(BlockingVerifier {
+        release: release.clone(),
+        held_one: std::sync::atomic::AtomicBool::new(false),
+    }));
+
+    let quote = w
+        .engine
+        .issue_quote(
+            w.caller.entity_id().clone(),
+            CAPABILITY,
+            requirements(),
+            NOW,
+            60_000_000_000,
+        )
+        .expect("quote");
+
+    let payload = |auth: &str| {
+        X402Carry::author(&PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: quote.requirements.view().clone(),
+            payload: serde_json::json!({ "mock_authorization": auth }),
+            extensions: None,
+        })
+        .expect("payload")
+    };
+
+    // The forgery claims first and parks inside `verify`.
+    let forged = payload(FORGED);
+    let engine = &w.engine;
+    let quote_ref = &quote;
+    let racing = async {
+        engine
+            .accept_payment(quote_ref, &forged, VerificationTier::Observed, NOW + 1)
+            .await
+            .expect("accept")
+    };
+
+    let observed = async {
+        // Let the forgery reach `verify` and block there. Polling the
+        // record beats sleeping on a hope: once it exists and is
+        // unsettled, the claim is taken and the lock is released.
+        loop {
+            if engine
+                .status(&quote_ref.quote_id)
+                .await
+                .expect("status")
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // The real payer arrives mid-race.
+        let honest = payload("the-real-authorization");
+        let blocked = engine
+            .accept_payment(quote_ref, &honest, VerificationTier::Observed, NOW + 2)
+            .await
+            .expect("accept");
+        // `notify_one`, not `notify_waiters`: the record existing proves
+        // the claim is committed, not that `verify` has registered its
+        // waiter yet. `notify_waiters` would drop a signal sent in that
+        // gap and hang the test; `notify_one` stores a permit.
+        release.notify_one();
+        blocked
+    };
+
+    let (forged_decision, blocked) = tokio::join!(racing, observed);
+
+    assert!(
+        matches!(forged_decision, PaymentDecision::Rejected { .. }),
+        "the facilitator rejected the forgery: {forged_decision:?}"
+    );
+    assert!(
+        matches!(blocked, PaymentDecision::InProgress),
+        "an unverified attempt in flight is InProgress — retryable and true — \
+         not a terminal `quote already has a different payment attached`: {blocked:?}"
+    );
+
+    // And the retry `InProgress` invites actually works: the forgery
+    // released its claim on rejection, so the quote is free again.
+    let honest = payload("the-real-authorization");
+    let paid = w
+        .engine
+        .accept_payment(&quote, &honest, VerificationTier::Observed, NOW + 3)
+        .await
+        .expect("accept");
+    assert!(
+        matches!(paid, PaymentDecision::Served { .. }),
+        "the real payer gets the quote once the forgery fails verification: {paid:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_replayed_settlement_transaction_never_serves_a_second_quote() {
     // The facilitator echoes ONE transaction hash for every settle: the

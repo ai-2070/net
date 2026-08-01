@@ -884,29 +884,81 @@ impl PaymentEngine {
                 // transaction. The two guards are independent.
                 let retired =
                     prune_terminal(s, now_ns, terminal_record_retention_ns, expiry_tolerance_ns);
+                // Read before the `&mut` borrow below, which would
+                // otherwise rule out touching `consumed` while holding it.
+                let payload_consumed_elsewhere = s
+                    .consumed
+                    .get(&payload_hash)
+                    .is_some_and(|owner| *owner != quote_id);
+                // Set when a stale in-flight record is taken over by a
+                // different payload: the replay index still names the dead
+                // attempt's hash and has to move with the record. Applied
+                // once the borrow ends.
+                let mut rebind_consumed_from: Option<String> = None;
                 let claim: Claim = 'claim: {
                     if let Some(rec) = s.quotes.get_mut(&quote_id) {
                         if let Some(reason) = &rec.frozen {
                             break 'claim Claim::Frozen(reason.clone());
                         }
-                        if rec.payload_hash != payload_hash {
-                            break 'claim Claim::QuoteAlreadyPaid;
-                        }
+                        let same_payload = rec.payload_hash == payload_hash;
+
+                        // Commitment first, and only then the payload
+                        // comparison.
+                        //
+                        // This used to be the other way round: any
+                        // differing payload was `QuoteAlreadyPaid`, a
+                        // terminal rejection, whether or not the record had
+                        // actually paid anything. But the claim is taken
+                        // *before* the facilitator verifies (verification is
+                        // network I/O and does not hold the lock), so an
+                        // unverified attempt held the quote against everyone
+                        // else with a decision that reads "someone already
+                        // paid this".
+                        //
+                        // The semantic replay key is derived from the
+                        // authorization's `(from, nonce)` and scope — all of
+                        // which an observer of a real authorization knows.
+                        // So the attempt occupying the record need not be
+                        // the payer: a forged payload with a garbage
+                        // signature claims the same quote just as well, and
+                        // the real payer was told their quote was spent.
+                        //
+                        // A record that has billed or settled *is* bound to
+                        // the payload it holds, and a different one there is
+                        // genuinely a second payment for one quote. Below
+                        // that line, nothing is decided yet.
                         if let Some(billing) = &rec.billing {
+                            if !same_payload {
+                                break 'claim Claim::QuoteAlreadyPaid;
+                            }
                             break 'claim Claim::AlreadyServed(
                                 Box::new(billing.clone()),
                                 best_verified_tier(&rec.chain),
                                 rec.billing_published,
                             );
                         }
+                        // Completion is atomic (chain push + in_flight=false
+                        // in one commit), so a non-empty chain and
+                        // `in_flight` are mutually exclusive and this order
+                        // is free to put settlement first.
+                        if !rec.chain.is_empty() {
+                            if !same_payload {
+                                break 'claim Claim::QuoteAlreadyPaid;
+                            }
+                            break 'claim Claim::AlreadySettled;
+                        }
                         if rec.in_flight {
-                            // Completion is atomic (chain push + in_flight=false
-                            // in one commit), so an in_flight record has an
-                            // empty chain: a prior attempt claimed it and then
-                            // crashed (or is still running) before completing.
-                            // Reclaim only after the TTL, refreshing the clock
-                            // so a concurrent retry still sees InProgress and
-                            // only one attempt re-runs verify/settle.
+                            // An attempt claimed this and has not finished:
+                            // still running, or the process died before it
+                            // could release. Reclaim only after the TTL,
+                            // refreshing the clock so a concurrent retry
+                            // still sees InProgress and only one attempt
+                            // re-runs verify/settle.
+                            //
+                            // `InProgress` is retryable, which is the whole
+                            // point — a caller told this comes back and
+                            // finds the quote free once the attempt ahead of
+                            // it fails verification and releases.
                             let stale = rec
                                 .in_flight_since_ns
                                 .map(|since| now_ns.saturating_sub(since) >= in_flight_ttl_ns)
@@ -914,20 +966,36 @@ impl PaymentEngine {
                             if !stale {
                                 break 'claim Claim::InProgress;
                             }
+                            // Stale, so the attempt holding it is gone.
+                            // Taking the record over with a different
+                            // payload rebinds it, and the replay index has
+                            // to follow — otherwise the dead attempt's hash
+                            // stays claimed forever and the live one is
+                            // never registered.
+                            if !same_payload {
+                                if payload_consumed_elsewhere {
+                                    break 'claim Claim::ReplayOtherQuote;
+                                }
+                                rebind_consumed_from = Some(std::mem::replace(
+                                    &mut rec.payload_hash,
+                                    payload_hash.clone(),
+                                ));
+                                rec.payload_b64 = BASE64.encode(payload.bytes());
+                            }
                             rec.in_flight_since_ns = Some(now_ns);
                             break 'claim Claim::Fresh;
                         }
-                        if !rec.chain.is_empty() {
-                            break 'claim Claim::AlreadySettled;
-                        }
+                        // Not in flight, nothing settled, nothing billed.
+                        // `release_claim` removes an unsettled record
+                        // outright, so this is unreachable in practice; take
+                        // it as a fresh claim rather than invent a state for
+                        // it.
                         rec.in_flight = true;
                         rec.in_flight_since_ns = Some(now_ns);
                         break 'claim Claim::Fresh;
                     }
-                    if let Some(other) = s.consumed.get(&payload_hash) {
-                        if *other != quote_id {
-                            break 'claim Claim::ReplayOtherQuote;
-                        }
+                    if payload_consumed_elsewhere {
+                        break 'claim Claim::ReplayOtherQuote;
                     }
                     // Built here, not before the closure: the two base64
                     // encodes below cover the *whole* preserved carries
@@ -960,7 +1028,7 @@ impl PaymentEngine {
                         billing: None,
                         billing_published: false,
                     };
-                    s.consumed.insert(payload_hash, quote_id.clone());
+                    s.consumed.insert(payload_hash.clone(), quote_id.clone());
                     s.quotes.insert(quote_id.clone(), record);
                     // The one site that grows the map, so the one site that
                     // can observe the store crossing the warn threshold.
@@ -982,6 +1050,11 @@ impl PaymentEngine {
                     }
                     Claim::Fresh
                 };
+                // The stale-takeover rebind, now that `rec` is released.
+                if let Some(dead) = rebind_consumed_from {
+                    s.consumed.remove(&dead);
+                    s.consumed.insert(payload_hash.clone(), quote_id.clone());
+                }
                 let dirty = matches!(claim, Claim::Fresh) || retired > 0;
                 (claim, dirty)
             })
