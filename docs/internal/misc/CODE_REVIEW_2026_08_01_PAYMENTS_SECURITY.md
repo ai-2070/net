@@ -1,18 +1,27 @@
 # CODE REVIEW 2026-08-01 — Payments security branch (`security-payments`)
 
-> **STATUS: OPEN, not signed off.** One blocker (§B1, clippy fails on
-> production code — six of the ten errors are platform-independent and will
-> fail the `Run clippy — net-payments (production code, strict)` CI step on
-> ubuntu). Two security findings, one verified correctness defect, three
-> lower-severity items, three nits.
+> **STATUS: ADDRESSED at `df54a696f`, NOT signed off.** Every finding below
+> has a landed fix — see [Closure](#closure) for the commit against each.
+> All three hygiene gates now pass and the suite is green (308 passed across
+> 30 binaries).
 >
-> **This review did not exercise the branch's unix-specific file-permission
-> claims.** `file_mode`'s symlink / FIFO / migration tests, the billing log's
-> symlink test, and both `read_only_writes_audit.rs` and
+> One disposition differs from what this document originally recommended,
+> and is argued in place: §1's fix is not the bare `.no_proxy()` suggested
+> here but a rule making a system proxy and a destination policy mutually
+> exclusive, with `DestinationPolicy::Unrestricted` as the operator's
+> explicit way to accept the trade. Fixing §B1 also turned up a defect no
+> pass had noticed — `tracing_capture`'s constructor tripped
+> `clippy::type_complexity` on the relaxed all-targets run, which is a gate
+> CI runs and this document did not.
+>
+> **This review still has not exercised the branch's unix-specific
+> file-permission claims.** `file_mode`'s symlink / FIFO / migration tests,
+> the billing log's symlink test, and both `read_only_writes_audit.rs` and
 > `redeem_denial_no_write.rs` are `#[cfg(unix)]` and ran **0 tests** on the
-> Windows host this pass ran on — and those are exactly the guarantees the
-> `file_mode` module was written to establish. A Linux/macOS run is required
-> before merge. See [Verification](#verification).
+> Windows host both this pass and the fix pass ran on — and those are
+> exactly the guarantees the `file_mode` module was written to establish. A
+> Linux/macOS run is required before merge, and it is not dischargeable by
+> the author of the fixes. See [Verification](#verification).
 
 **Scope:** the full branch diff `master..b629783ca` (merge base `7cd2d6584`)
 — 47 commits, 74 files, +8208/−716.
@@ -106,6 +115,24 @@ the `unsafe` surface with the least coverage is the one nothing checks.
 
 **Fix:** address all ten, and consider adding a Windows clippy leg.
 
+**Disposition: FIXED (`e61641a5a`).** Both `expect`s are gone rather than
+annotated — `BillingLog::append` takes the `&mut` back from
+`Option::insert`, and `release_reservation` removes the record up front and
+puts it back when a holder remains, so neither has a "look it up, then
+assert it is still there" step. The doc lint was one cause and one reword.
+On the Windows side `CreateFileW` no longer takes `&mut`, the SDDL cast is
+gone, and the two multi-operation `unsafe` blocks are split so each
+operation carries its own justification.
+
+Fixing this turned up an eleventh error the review missed:
+`tracing_capture::FieldCapture::new`'s return type tripped
+`clippy::type_complexity` on the relaxed all-targets run — also a CI gate,
+also branch-added. Fixed with a `CapturedFields` alias in the same commit.
+
+**The Windows clippy leg is NOT done** and is deliberately left open: it is
+a CI change, not a code change, and the four lints above are only the ones
+that exist today. Filed as a follow-up rather than folded in here.
+
 ---
 
 ## P1 findings
@@ -151,6 +178,26 @@ apply", rather than the current state where the guard silently does not apply
 and nobody is told. Whichever way it goes, the module header's claim needs to
 be qualified to match.
 
+**Disposition: FIXED (`d02d6ad08`), by a different route than recommended.**
+Not a bare `.no_proxy()` and not a new flag: the two are made **mutually
+exclusive**. A policy that restricts anything gets `no_proxy()`; an operator
+who needs an egress proxy asks for `DestinationPolicy::Unrestricted`, which
+already meant "the operator's choice is the policy" and now also means "and
+this client's destinations are the proxy's business, not ours". That puts
+the trade at the call site rather than in the environment, and needs no API
+surface that did not already exist. The rule is a named predicate
+(`honours_system_proxy`) so it is testable and so the omission stays
+visible, which is the module's stated standard.
+
+Tested at both levels: a predicate test for the rule, and
+`tests/http_policy_proxy.rs` for the behaviour end to end. That file gets
+its own process because `set_var` is global and cargo runs a binary's tests
+on parallel threads — a proxy variable set in a unit test would leak into
+every test beside it. Confirmed to fail without the fix: the request goes
+to the configured proxy and the refusal names `proxy.invalid` rather than
+the target host. The module header now says where the resolver argument
+stops holding.
+
 ### §2 — `is_payment_safe_url` still grants the cleartext exception to the *name* `localhost`, which the shared policy deliberately removed
 
 `src/flow/http402.rs:770-784`; test pinning the weaker behaviour at
@@ -194,6 +241,12 @@ the failure mode the refactor was for.
 the same decision), and flip the `http://localhost/x` assertion at
 `flow/http402.rs:803` — mirroring what
 `facilitator/client.rs`'s test did at line 230.
+
+**Disposition: FIXED (`1402981fa`).** Delegated; the function is now one
+line over the shared rule. The test that pinned the weaker behaviour is
+replaced by one that pins the rule, plus the v4-in-v6 loopback spelling
+(`http://[::ffff:127.0.0.1]/x`) which the old hand-rolled check refused —
+correctly, but for the wrong reason, since it never normalized.
 
 ---
 
@@ -254,6 +307,12 @@ and a regression test in `quote_request.rs`'s module — the invariant worth
 pinning is `per_caller[c] == seen.keys().filter(|(k, _)| k == c).count()`
 after any sequence of `admit`/`release`.
 
+**Disposition: FIXED (`a31597700`).** Exactly that. The test pins the
+invariant rather than the symptom: four live nonces fit a share of four
+after one replacement, the fifth is refused for the real reason
+(`CallerReplayQuotaExhausted`, not a phantom), and one `release` frees
+exactly one slot rather than the two the entry had been charged.
+
 ---
 
 ## P3 findings
@@ -268,6 +327,9 @@ at all.
 
 **Fix:** move the const above the orphaned line, or move that line back onto
 the struct.
+
+**Disposition: FIXED (`f49bdc256`).** Constant moved above; the line is back
+on the struct.
 
 ### §5 — `is_public_v6` covers every v4-in-v6 embedding family except Teredo, and the header's "fails closed" claim does not match the implementation
 
@@ -300,6 +362,14 @@ safety property.
 `/24`, extend the embedding test with a Teredo spelling, and correct the
 header sentence to describe a blocklist.
 
+**Disposition: FIXED (`6b8e97cc7`).** Both ranges refused, the embedding
+test gained two Teredo spellings, and the header now says the enumeration
+*is* the guarantee — including why an allowlist is not writable here
+("globally routable" being the complement of a registry rather than a set
+with a syntactic mark). The test also gained the two ranges' immediate
+neighbours (`192.88.100.1`, `2001:4860:4860::8888`) in the *admitted*
+direction, so neither new rule can quietly widen to the surrounding /16.
+
 ### §6 — the Windows reopen-and-fsync path on the billing log is never exercised by a test
 
 `src/policy/file_mode.rs:389,402-411`.
@@ -325,6 +395,11 @@ that breaks quietly under a later edit.
 **Fix:** a cross-platform test that drops the first `BillingLog` and appends
 through a second one. It costs four lines and covers the branch on both
 platforms.
+
+**Disposition: FIXED (`eda6eba18`).** Two appends through the reopened log,
+so the open and the held handle are covered separately, asserting the
+earlier record is extended rather than truncated. Green on Windows, which
+is the platform the access mask is for.
 
 ---
 
@@ -358,6 +433,12 @@ argues the enumeration is deliberate, which is right — but the failure
 direction it describes ("forgetting one leaves it listed") is precisely the one
 that bites when a real network is added later, and these are free to add now.
 
+**Disposition: all three FIXED (`df54a696f`).** N1 and N2 are comments at
+the sites that depend on the facts, not at the sites that state them. N3
+added all three chain ids, deliberately wider than the shipped asset list —
+the moment they cost something is the moment someone adds an asset on one
+and does not think to come back.
+
 ---
 
 ## Verification
@@ -365,13 +446,25 @@ that bites when a real network is added later, and these are free to add now.
 Ran on **Windows 11 Pro 10.0.26100**, rustc/cargo 1.97.1
 (`x86_64-pc-windows-msvc`), from `net/crates/net/payments`.
 
-| gate | result |
-|---|---|
-| `cargo check --all-features --tests` | clean |
-| `cargo test --all-features` | **all green** — 138 lib + 29 integration binaries, 0 failed |
-| `cargo fmt -p net-payments -- --check` | clean |
-| `cargo clippy --all-features --lib --bins -- -D warnings` | **FAILS — 10 errors** (§B1) |
-| `cargo clippy --all-features --all-targets -- -D warnings -A unwrap_used -A expect_used -A undocumented_unsafe_blocks -A multiple_unsafe_ops_per_block` | **FAILS — 6 errors** (§B1) |
+| gate | at review (`b629783ca`) | after fixes (`df54a696f`) |
+|---|---|---|
+| `cargo check --all-features --tests` | clean | clean |
+| `cargo test --all-features` | green — 30 binaries, 0 failed | green — **308 passed**, 5 ignored, 0 failed |
+| `cargo fmt -p net-payments -- --check` | clean | clean |
+| `cargo clippy --all-features --lib --bins -- -D warnings` | **FAILS — 10 errors** | clean |
+| `cargo clippy --all-features --all-targets -- -D warnings -A unwrap_used -A expect_used -A undocumented_unsafe_blocks -A multiple_unsafe_ops_per_block` | **FAILS — 7 errors** | clean |
+
+> The all-targets count is 7, not the 6 this document originally recorded:
+> `tracing_capture`'s `type_complexity` was present at review time and was
+> missed here. It is fixed in `e61641a5a` with the rest.
+
+**Build-environment note, so the next reader does not mistake it for a code
+problem.** Several runs on this host produced `E0786 found invalid metadata
+files for crate net` and a cascade of `internal compiler error` lines. The
+root cause is in the message: `failed to mmap … The paging file is too small
+for this operation to complete. (os error 1455)` — the machine ran out of
+commit charge linking many test binaries at once. `cargo test -j 3`
+reproduces green every time. Nothing to do with this branch.
 
 **What did not run, and must before merge.** The Windows host skipped every
 unix-gated test on the branch, and those are the tests for the branch's
@@ -390,26 +483,46 @@ file-permission guarantees:
 `tests/live_testnet_conformance.rs` reported 0 passed / 4 ignored, which is
 expected (it needs live testnet credentials).
 
+The fix pass ran on the same host, so this gap is unchanged — and the two
+findings whose fixes most want a unix run are §B1 (the `expect` removals
+touch `BillingLog::append` and `release_reservation`, both on paths those
+suites exercise) and §6 (whose new test is cross-platform but whose
+motivation is the Windows mask).
+
 Also not exercised anywhere: the clippy job runs `ubuntu-latest`, so the four
 Windows-only `unsafe` FFI lints in §B1 — and the `windows_impl` module
 generally, which is this crate's entire raw-Win32 surface — have no CI
-coverage at all.
+coverage at all. **Still true after the fixes**: they are corrected in the
+source but nothing in CI would catch the next one. See the follow-up below.
 
 ---
 
 ## Closure
 
-_Empty — no fixes landed against this document yet._
+Every finding has a landed fix. Gates green as of `df54a696f`; the unix run
+in [Verification](#verification) is still outstanding and is what blocks
+sign-off.
 
 | finding | disposition | commit |
 |---|---|---|
-| B1 | open | — |
-| §1 | open | — |
-| §2 | open | — |
-| §3 | open | — |
-| §4 | open | — |
-| §5 | open | — |
-| §6 | open | — |
-| N1 | open | — |
-| N2 | open | — |
-| N3 | open | — |
+| B1 — clippy fails on production code | FIXED (+1 the review missed) | `e61641a5a` |
+| §1 — env-proxy bypasses the destination policy | FIXED, different route | `d02d6ad08` |
+| §2 — `is_payment_safe_url` admits the name `localhost` | FIXED | `1402981fa` |
+| §3 — `SeenNonces` per-caller quota double-count | FIXED | `a31597700` |
+| §4 — orphaned `X402HttpFlow` doc comment | FIXED | `f49bdc256` |
+| §5 — Teredo / 6to4 relay; fail-closed claim | FIXED | `6b8e97cc7` |
+| §6 — reopen-and-fsync untested | FIXED | `eda6eba18` |
+| N1 — tautological `served_capability` | FIXED | `df54a696f` |
+| N2 — Windows migration latent dependency | FIXED | `df54a696f` |
+| N3 — testnet list | FIXED | `df54a696f` |
+
+### Follow-ups, deliberately not folded in
+
+1. **A Windows clippy leg.** This branch adds the crate's first
+   `#[cfg(windows)]` `unsafe` FFI, and `runs-on: ubuntu-latest` means no job
+   lints it. The four lints §B1 found are the ones that exist today; the
+   point is that nothing would find the next four. This is a CI change and
+   belongs in its own commit against `.github/workflows/ci.yml`.
+2. **A unix CI run of the `#[cfg(unix)]` payment-store suites**, per
+   [Verification](#verification). Not dischargeable by whoever wrote the
+   fixes.
