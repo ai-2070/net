@@ -125,7 +125,13 @@ pub struct X402HttpFlow {
     /// programs run against the same store both start at zero and mint
     /// the same identity, and the second attempt reads as a retry of the
     /// first — the same collapse, one scope further out again. The
-    /// counter is therefore qualified by [`process_token`].
+    /// counter is therefore qualified by [`process_token`] and the live
+    /// pid.
+    ///
+    /// It is only consulted when there is no approved hold to redeem. A
+    /// held quote's identity comes from the spend store, so an approval
+    /// stays redeemable no matter how far this counter has moved in the
+    /// meantime.
     attempt: &'static std::sync::atomic::AtomicU64,
 }
 
@@ -147,6 +153,12 @@ static ATTEMPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// defended against here — a stopped or coarse test clock is exactly what
 /// makes two attempts collide. Nothing monetary is decided from this
 /// value; it is a local bookkeeping label.
+///
+/// The live pid is mixed in **at the use site** rather than baked in
+/// here, because this is cached in a `OnceLock` and a `fork` carries the
+/// cached value — and the attempt counter — into the child. Parent and
+/// child would then mint the same identity for two different payments.
+/// Reading the pid per attempt costs nothing and cannot be inherited.
 fn process_token() -> &'static str {
     static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TOKEN.get_or_init(|| {
@@ -158,6 +170,25 @@ fn process_token() -> &'static str {
         let digest = blake3::hash(format!("{pid}:{started_ns}").as_bytes());
         hex::encode(&digest.as_bytes()[..6])
     })
+}
+
+/// Read back a pseudo-quote this door minted and the spend store held.
+///
+/// Plain deserialization, deliberately: [`PaymentQuote::from_json_bytes`]
+/// requires a signature, and there is no signer for these. On this door
+/// the provider and the caller are the same identity and there is no
+/// provider-issued quote at all — the external server's 402 is the
+/// commercial fact, and the pseudo-quote exists only to give the local
+/// spend engine something to judge and an operator something to approve.
+/// A signature over one's own assertion would prove nothing.
+///
+/// What carries the weight instead is where the bytes come from: the
+/// owner-only spend policy file, keyed by the id the operator approved.
+/// The caller re-checks that the decoded quote's own id matches that key,
+/// so a store edited underneath us cannot substitute a different quote
+/// into an existing approval.
+fn decode_local_quote(bytes: &[u8]) -> Option<PaymentQuote> {
+    serde_json::from_slice::<PaymentQuote>(bytes).ok()
 }
 
 impl X402HttpFlow {
@@ -344,8 +375,12 @@ impl X402HttpFlow {
                 Err(e) => {
                     return X402HttpOutcome::Failed {
                         message: format!("reading the response body: {e}"),
-                        retryable: false,
-                    }
+                        // A truncated or reset read is worth another go;
+                        // only an over-cap body is terminal, because a
+                        // peer that sent more than the cap will not send
+                        // less next time.
+                        retryable: matches!(e, crate::http_policy::ReadError::Transport(_)),
+                    };
                 }
             };
             return X402HttpOutcome::Ok { status, body };
@@ -435,39 +470,108 @@ impl X402HttpFlow {
             .max_timeout_seconds
             .max(1)
             .saturating_mul(1_000_000_000);
-        // The attempt counter rides `input_hash`, which feeds `terms_hash`
-        // and therefore the quote id — so each fetch is its own quote and
-        // its own reservation. (`input_hash` is the field for "what this
-        // quote is bound to beyond the terms", and on this door the thing
-        // it is bound to is this specific attempt.)
-        let attempt = self
-            .attempt
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let quote = PaymentQuote::new(
-            self.caller.entity_id().clone(),
-            self.caller.entity_id().clone(),
-            format!("x402-http/{intended_host}"),
-            Some(format!("x402-http-attempt:{}:{attempt}", process_token())),
-            requirements,
-            match self.registry.reference() {
-                Ok(r) => r,
-                Err(e) => {
-                    return X402HttpOutcome::Failed {
-                        message: e.to_string(),
-                        retryable: false,
-                    }
+        let capability = format!("x402-http/{intended_host}");
+
+        // Redeem an approval before minting anything new.
+        //
+        // An approval names a *quote id*. A fetch that came back
+        // `RequiresPaymentApproval` handed the operator an id, and the
+        // retry has to present that same quote — otherwise every retry
+        // mints a fresh unapproved id, holds again, and the approval can
+        // never be redeemed however many times the operator grants it.
+        //
+        // The store is the memo, not a process-local one: the approval
+        // lives in the shared spend policy file, so an operator can
+        // approve from a different process than the one that will pay.
+        // (This mirrors what `CallerPaymentFlow` does on the mesh door.)
+        //
+        // The held quote is only reusable while it still describes what
+        // the server is asking for. Byte-comparing the preserved
+        // requirements is exact: a server that changed its price, asset,
+        // or payee is making a *different* demand, and an approval for
+        // the old one does not carry over to it.
+        let mut redeeming_approval: Option<String> = None;
+        let held = match self.spend.approved_quote(&capability).await {
+            Ok(Some((held_id, held_bytes))) => match decode_local_quote(&held_bytes) {
+                Some(held)
+                    if held.quote_id == held_id
+                        && !held.is_expired_at(now_ns)
+                        && held.requirements.bytes() == requirements.bytes() =>
+                {
+                    redeeming_approval = Some(held_id);
+                    Some(held)
+                }
+                // Expired, unreadable, mis-keyed, or for a demand that has
+                // since changed: drop it and fall through to a fresh
+                // quote, which will hold again if policy still objects. A
+                // new approval for a new quote, never a silent carry-over.
+                _ => {
+                    let _ = self.spend.clear_approval(&held_id).await;
+                    None
                 }
             },
-            now_ns,
-            now_ns.saturating_add(ttl_ns),
-        );
+            _ => None,
+        };
+
+        let quote = match held {
+            Some(quote) => quote,
+            None => {
+                // The attempt counter rides `input_hash`, which feeds
+                // `terms_hash` and therefore the quote id — so each
+                // payment is its own quote and its own reservation.
+                // (`input_hash` is the field for "what this quote is bound
+                // to beyond the terms", and on this door the thing it is
+                // bound to is this specific attempt.)
+                //
+                // The live pid rides alongside the cached process token:
+                // the token is memoized in a `OnceLock`, so a `fork`
+                // carries it — and this counter — into the child, and the
+                // two processes would mint one identity for two payments.
+                let attempt = self
+                    .attempt
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                PaymentQuote::new(
+                    self.caller.entity_id().clone(),
+                    self.caller.entity_id().clone(),
+                    capability.clone(),
+                    Some(format!(
+                        "x402-http-attempt:{}:{}:{attempt}",
+                        process_token(),
+                        std::process::id()
+                    )),
+                    requirements,
+                    match self.registry.reference() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return X402HttpOutcome::Failed {
+                                message: e.to_string(),
+                                retryable: false,
+                            }
+                        }
+                    },
+                    now_ns,
+                    now_ns.saturating_add(ttl_ns),
+                )
+            }
+        };
 
         match self
             .spend
             .check_and_reserve(&quote, &self.registry, now_ns)
             .await
         {
-            Ok(SpendDecision::Allowed) => {}
+            Ok(SpendDecision::Allowed) => {
+                // The approval authorized one payment and this is it.
+                // Clearing here rather than after the HTTP round trip is
+                // deliberate: a reservation now exists for this quote, so
+                // every later attempt on the same id reads as a retry of
+                // this payment rather than a new one. Leaving the record
+                // behind would make the approval a standing licence to
+                // pay this host, which is not what anyone granted.
+                if let Some(held_id) = redeeming_approval.take() {
+                    let _ = self.spend.clear_approval(&held_id).await;
+                }
+            }
             Ok(SpendDecision::RequiresPaymentApproval {
                 quote_id,
                 policy_reason,

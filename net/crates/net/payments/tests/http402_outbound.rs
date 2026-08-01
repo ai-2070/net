@@ -282,6 +282,55 @@ async fn policy_holds_before_anything_is_signed_or_sent() {
     );
 }
 
+/// Approving the held quote id and refetching pays — the approval is
+/// redeemable.
+///
+/// This is the whole point of returning a `quote_id` with the hold. The
+/// pseudo-quote's id carries a per-attempt component, and if that
+/// component advanced on every `fetch_paid` the retry would derive a
+/// *different* id, find no approval against it, and hold again: an
+/// operator could approve forever and the fetch would never go through.
+/// The counter therefore advances only once a reservation is actually
+/// taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_approved_hold_is_redeemable_on_the_next_fetch() {
+    let server = PaidServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = flow(SpendProfile::Production, &dir);
+
+    let X402HttpOutcome::RequiresPaymentApproval { quote_id, .. } = f.fetch_paid(&server.url).await
+    else {
+        panic!("expected the approval hold");
+    };
+
+    // The operator approves the id they were handed, through the shared
+    // policy file — the same store the flow reads.
+    let spend = SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::Production);
+    assert!(
+        spend.approve(&quote_id).await.expect("approve"),
+        "the held quote must be on file to approve"
+    );
+
+    let outcome = f.fetch_paid(&server.url).await;
+    assert!(
+        matches!(outcome, X402HttpOutcome::Paid { .. }),
+        "the approved quote must pay on retry, got {outcome:?}"
+    );
+    assert_eq!(
+        server.received_payloads.lock().len(),
+        1,
+        "exactly one payment, on the approved attempt"
+    );
+
+    // And the next fetch is a new payment, not a free ride on the
+    // approval: a fresh id, so a fresh hold.
+    let after = f.fetch_paid(&server.url).await;
+    assert!(
+        matches!(after, X402HttpOutcome::RequiresPaymentApproval { .. }),
+        "an approval authorizes one payment, not the host forever; got {after:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejected_payment_releases_the_reservation() {
     let server = PaidServer::start().await;

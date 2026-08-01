@@ -104,6 +104,15 @@ tracing = "0.1"
 # record. On unix they are created 0600; Windows has no mode, so the
 # equivalent is an explicit owner-only DACL, which needs these APIs.
 # Already in the workspace lock transitively — no new supply chain.
+
+# `O_NOFOLLOW` + `O_NONBLOCK` for the billing log's open. std exposes
+# `custom_flags` but not the flag values, and the alternative — checking
+# `symlink_metadata` and then opening — is a check the open does not share,
+# so a link can be swapped in between the two. Already in the workspace
+# lock via `net`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

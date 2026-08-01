@@ -37,9 +37,26 @@
 //! established. A handle refers to the object, not to the path, so
 //! nothing can be substituted underneath it.
 //!
-//! The same reasoning is why the repair path
-//! ([`open_append_owner_only`]) refuses a symlink outright and applies
-//! its permission change to the handle rather than to the pathname.
+//! The same reasoning is why [`open_append_owner_only`] refuses a
+//! symlink — and anything else that is not a regular file — atomically
+//! with the open, and applies its permission change to the handle rather
+//! than to the pathname.
+//!
+//! ## Why a permissive predecessor is replaced, not repaired
+//!
+//! It follows from the same fact. A file another user could already open
+//! may already *be* open by them, and no amount of tightening takes that
+//! handle away. Chmod'ing it to `0600` and then appending signed usage
+//! records would be writing into a file with a reader attached, while
+//! reporting the file as owner-only.
+//!
+//! So on unix, a pre-existing log whose mode grants anyone but its owner
+//! is copied into a fresh owner-only file which is renamed over the name.
+//! The old inode keeps its readers and stops receiving anything; the name
+//! now refers to a file that never existed unprotected. Windows has no
+//! equally cheap way to ask "is this already owner-only?", so it
+//! re-asserts the descriptor on the handle instead — see `is_owner_only`
+//! for what that leaves on the table.
 //!
 //! Failure is loud. A file whose permissions could not be established is
 //! not one to write bearer material into, so the caller surfaces the
@@ -69,7 +86,9 @@ pub(crate) fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
     }
     #[cfg(windows)]
     {
-        windows_impl::create_owner_only(path)
+        // Exclusive: the store's temp is written once and renamed away, so
+        // nothing else has any business holding it open.
+        windows_impl::create_owner_only(path, windows_impl::SHARE_NONE)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -83,28 +102,34 @@ pub(crate) fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
 /// Open `path` for **appending**, owner-only, creating it if absent —
 /// and hand back the handle to append through.
 ///
-/// The handle is the point. An append log is reopened on every write, so
-/// this is the one path where "secure the name, then open the name" is
-/// most obviously wrong: a writer to a shared parent directory only has
-/// to win the gap once to have every later record appended to a file it
-/// controls.
+/// The handle is the point. Securing a name and then opening the name are
+/// two operations, and a writer to a shared parent directory only has to
+/// win the gap once to have records appended to a file it controls. Every
+/// check below is therefore made against the **open handle**, never
+/// against the path a second time, and callers are expected to keep the
+/// handle rather than reopen.
 ///
-/// Two cases, and the second is strictly weaker:
+/// Three cases:
 ///
 /// - **Absent** — [`create_owner_only`] creates it with the permissions
 ///   already attached, and that handle is returned. No window exists.
-/// - **Present** — the ordinary case after the first append, and also
-///   the case where an older build or an operator left a file with
-///   whatever permissions it happened to get. A symlink here is refused
-///   rather than followed: a link planted at a shared `state_path` would
-///   otherwise have this chmod, and then append signed usage records to,
-///   a file the caller never named. The surviving file is opened, the
-///   restriction applied **to the handle**, and the same handle
-///   returned.
+/// - **Present and already owner-only** — the ordinary case after the
+///   first append. Opened without following links, checked to be a
+///   regular file, restriction re-asserted on the handle.
+/// - **Present and permissive** — an older build, or an operator, left a
+///   file others can read. This is **migrated, not repaired**: tightening
+///   the permissions cannot revoke access already granted to a handle
+///   someone else holds, so records would keep flowing to a reader that
+///   got in first. A fresh owner-only file is created, the existing
+///   contents copied into it, and it is renamed over the name — so the
+///   old inode, and every handle onto it, stops receiving anything.
 ///
-/// Repair cannot revoke access already granted to a handle someone else
-/// holds (see the module note), which is why it is confined to the
-/// pre-existing case and never used for creation.
+/// A symlink is refused rather than followed, atomically with the open
+/// (`O_NOFOLLOW`, `FILE_FLAG_OPEN_REPARSE_POINT`) so no separate check
+/// can be raced. Anything that is not a regular file is refused too: the
+/// symlink test alone still admits a FIFO, and a FIFO planted at a shared
+/// `state_path` turns every appended record into a message delivered to
+/// whoever holds the read end.
 pub(crate) fn open_append_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
     match create_append_owner_only(path) {
         Ok(file) => return Ok(file),
@@ -112,19 +137,67 @@ pub(crate) fn open_append_owner_only(path: &Path) -> std::io::Result<std::fs::Fi
         Err(e) => return Err(e),
     }
 
-    // `symlink_metadata` does not follow the link, so this sees the link
-    // itself rather than its target. A reparse point on Windows reports
-    // as a symlink here too.
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "{} is a symbolic link; refusing to append bearer-adjacent records through it",
-                path.display()
-            ),
-        ));
+    let file = open_existing_no_follow(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(not_a_regular_file(path));
     }
-    open_and_restrict_handle(path)
+    if is_owner_only(&metadata) {
+        restrict_handle(&file)?;
+        return Ok(file);
+    }
+    migrate_to_a_fresh_owner_only_file(path, file)
+}
+
+fn not_a_regular_file(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{} is not a regular file; refusing to append bearer-adjacent records through it",
+            path.display()
+        ),
+    )
+}
+
+/// Copy an existing permissive log into a fresh owner-only file and put
+/// that file at `path`, returning the handle to append through.
+///
+/// The rename is what makes this a migration rather than a repair: a
+/// reader holding a handle on the old inode keeps that handle, and the old
+/// inode stops being what `path` names — so it receives nothing further.
+/// Tightening permissions in place could not achieve that, because access
+/// is granted at open time on every platform this runs on.
+///
+/// The handle returned is the one created here, already renamed into
+/// place, so the rename cannot be raced either.
+fn migrate_to_a_fresh_owner_only_file(
+    path: &Path,
+    mut existing: std::fs::File,
+) -> std::io::Result<std::fs::File> {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    // Per-pid temp beside the log, so two processes migrating at once do
+    // not clobber each other and the rename stays same-filesystem.
+    let temp = path.with_extension(format!("owner-only-migrate.{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let mut fresh = create_append_owner_only(&temp)?;
+
+    let mut carried = Vec::new();
+    existing.rewind()?;
+    existing.read_to_end(&mut carried)?;
+    drop(existing);
+    fresh.write_all(&carried)?;
+    fresh.sync_all()?;
+
+    // Rename over the name. The handle keeps referring to the object it
+    // was opened on, which is now the object `path` names.
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(fresh),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(e)
+        }
+    }
 }
 
 /// [`create_owner_only`], but the handle is positioned for appending.
@@ -134,6 +207,7 @@ fn create_append_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .append(true)
+            .read(true)
             .create_new(true)
             .mode(0o600)
             .open(path)
@@ -143,40 +217,97 @@ fn create_append_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
         // No append flag needed: `CREATE_NEW` guarantees the file did not
         // exist, so the handle starts at offset zero of an empty file and
         // the first write *is* the append.
-        windows_impl::create_owner_only(path)
+        //
+        // Shared, unlike the store's temp: the log is read back by
+        // `read_all` while the appending handle is held for the life of
+        // the process, and an exclusive handle would make the log
+        // unreadable to its own owner.
+        windows_impl::create_owner_only(path, windows_impl::SHARE_ALL)
     }
     #[cfg(not(any(unix, windows)))]
     {
         std::fs::OpenOptions::new()
             .append(true)
+            .read(true)
             .create_new(true)
             .open(path)
     }
 }
 
-/// Open an existing file for appending and apply the owner-only
-/// restriction to the resulting handle.
+/// Open an existing file for appending **without following a link**, and
+/// without blocking if it turns out to be a pipe.
 #[cfg(unix)]
-fn open_and_restrict_handle(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let file = std::fs::OpenOptions::new().append(true).open(path)?;
-    // `File::set_permissions` is `fchmod` — it names the open file, not
-    // the path, so a rename or replacement racing this call cannot
-    // redirect it.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    Ok(file)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_and_restrict_handle(path: &Path) -> std::io::Result<std::fs::File> {
-    // No permission model to apply, but the open still has to succeed —
-    // the contract is "checked" rather than silently skipped.
-    std::fs::OpenOptions::new().append(true).open(path)
+fn open_existing_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .read(true)
+        // `O_NOFOLLOW` makes the refusal atomic with the open, so a link
+        // cannot be swapped in after a separate `symlink_metadata` check.
+        // `O_NONBLOCK` is for the FIFO case: opening a pipe for writing
+        // otherwise blocks until a reader appears, turning a planted FIFO
+        // into a hang rather than an error. It has no effect on a regular
+        // file, which is the only thing that gets past the check above.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
 }
 
 #[cfg(windows)]
-fn open_and_restrict_handle(path: &Path) -> std::io::Result<std::fs::File> {
-    windows_impl::open_append_and_set_dacl(path)
+fn open_existing_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    windows_impl::open_append_no_follow(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_existing_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .read(true)
+        .open(path)
+}
+
+/// Is this file already readable and writable by its owner alone?
+#[cfg(unix)]
+fn is_owner_only(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    metadata.permissions().mode() & 0o077 == 0
+}
+
+/// Windows has no mode bits, and reading a DACL back to compare it
+/// against the one this module writes is a great deal of FFI for a
+/// question with a cheaper answer: re-assert the descriptor on the
+/// handle, every time.
+///
+/// So the migration path is not taken there. The residual risk is the one
+/// the module note describes — a handle opened before the descriptor
+/// landed keeps its access — bounded by the fact that the default state
+/// path lives under `%LOCALAPPDATA%`, which is already user-scoped. An
+/// operator who puts the log in a shared directory and lets another user
+/// create it first is outside what this can repair.
+#[cfg(not(unix))]
+fn is_owner_only(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// Apply the owner-only restriction to an already-open handle.
+#[cfg(unix)]
+fn restrict_handle(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    // `File::set_permissions` is `fchmod` — it names the open file, not
+    // the path, so a rename or replacement racing this call cannot
+    // redirect it.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(windows)]
+fn restrict_handle(file: &std::fs::File) -> std::io::Result<()> {
+    windows_impl::set_dacl_on_handle(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restrict_handle(_file: &std::fs::File) -> std::io::Result<()> {
+    // No permission model to apply. The open already succeeded, so the
+    // contract is "checked" rather than silently skipped.
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -186,7 +317,7 @@ mod windows_impl {
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::{
-        LocalFree, ERROR_SUCCESS, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+        LocalFree, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -200,9 +331,18 @@ mod windows_impl {
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+    /// No sharing: nobody opens the file alongside us. Right for the
+    /// store's temp, which is written once and renamed away.
+    pub(super) const SHARE_NONE: u32 = 0;
+    /// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`. Right for
+    /// the billing log, whose appending handle is held for the life of the
+    /// process while `read_all` reads the same file back — an exclusive
+    /// handle would make the log unreadable to its own owner.
+    pub(super) const SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+
     /// `CreateFileW` with an owner-only descriptor attached, so the
     /// permissions are in place before the name exists.
-    pub(super) fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    pub(super) fn create_owner_only(path: &Path, share: u32) -> std::io::Result<std::fs::File> {
         let descriptor = owner_only_descriptor()?;
         let wide = wide(path);
         let mut attrs = SECURITY_ATTRIBUTES {
@@ -217,8 +357,8 @@ mod windows_impl {
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                GENERIC_WRITE,
-                0, // no sharing: nobody opens it alongside us either
+                GENERIC_WRITE | GENERIC_READ,
+                share,
                 &mut attrs,
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL,
@@ -248,21 +388,35 @@ mod windows_impl {
     /// makes the handle usable as an ordinary blocking `File`.
     const APPEND_AND_WRITE_DAC: u32 = 0x0004 | 0x0002_0000 | 0x0004_0000 | 0x0010_0000;
 
-    /// Open an existing file for appending and replace the DACL **on the
-    /// returned handle**.
+    /// `FILE_FLAG_OPEN_REPARSE_POINT` — open the reparse point itself
+    /// rather than what it points at, so a symlink or junction planted at
+    /// the log name is refused by the regular-file check that follows
+    /// instead of silently redirecting the append. Atomic with the open,
+    /// unlike a separate `symlink_metadata` call.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    /// Open an existing file for appending, without following a link.
+    ///
+    /// The caller checks the returned handle is a regular file and then
+    /// restricts it; nothing here re-resolves the pathname.
+    pub(super) fn open_append_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .read(true)
+            .access_mode(APPEND_AND_WRITE_DAC)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+
+    /// Replace the DACL **on an open handle**.
     ///
     /// [`SetSecurityInfo`] takes a handle where `SetNamedSecurityInfoW`
-    /// takes a pathname. That difference is the whole point: the
-    /// pathname form re-resolves the name, so it can be pointed at a
-    /// different object than the one about to be written to.
-    pub(super) fn open_append_and_set_dacl(path: &Path) -> std::io::Result<std::fs::File> {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        let file = std::fs::OpenOptions::new()
-            .append(true)
-            .access_mode(APPEND_AND_WRITE_DAC)
-            .open(path)?;
-
+    /// takes a pathname. That difference is the whole point: the pathname
+    /// form re-resolves the name, so it can be pointed at a different
+    /// object than the one about to be written to.
+    pub(super) fn set_dacl_on_handle(file: &std::fs::File) -> std::io::Result<()> {
         let descriptor = owner_only_descriptor()?;
         // SAFETY: `file` owns a live handle for the duration of the call;
         // `dacl` borrows from `descriptor`, also alive; owner/group/sacl
@@ -281,7 +435,7 @@ mod windows_impl {
         if status != ERROR_SUCCESS {
             return Err(std::io::Error::from_raw_os_error(status as i32));
         }
-        Ok(file)
+        Ok(())
     }
 
     fn wide(path: &Path) -> Vec<u16> {
@@ -446,6 +600,8 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::io::Read as _;
     use std::io::Write as _;
 
     /// A file created this way is writable by us and refuses to clobber
@@ -541,12 +697,111 @@ mod tests {
         let link = dir.path().join("billing.jsonl");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
-        let err = open_append_owner_only(&link).expect_err("must refuse a link");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // The refusal comes from `O_NOFOLLOW` inside the open itself, so
+        // the error is the platform's (ELOOP and friends) rather than one
+        // this module builds. What matters is that it failed and the
+        // target was not touched — atomicity is the point, not the kind.
+        open_append_owner_only(&link).expect_err("must refuse a link");
         assert_eq!(
             std::fs::read(&target).expect("read target"),
             b"not ours\n",
             "the target must be untouched"
+        );
+    }
+
+    /// A FIFO at the log path is refused.
+    ///
+    /// The symlink check alone does not cover this: a named pipe is not a
+    /// link, so it passes, and every appended record then becomes a
+    /// message delivered to whoever holds the read end. The check is on
+    /// the *handle's* type, which is why it catches this at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_log_path_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("billing.jsonl");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("cstring");
+        // SAFETY: a NUL-terminated path in a directory this test owns.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+
+        // Must not hang, either — the open is `O_NONBLOCK`, so a pipe
+        // with no reader returns rather than parking forever. Whether the
+        // refusal comes from the open (some platforms reject a FIFO
+        // outright) or from the regular-file check afterwards is a
+        // platform detail; that it refuses is not.
+        open_append_owner_only(&path).expect_err("must refuse a pipe");
+    }
+
+    /// A pre-existing world-readable log is **migrated**, not chmod'ed.
+    ///
+    /// Tightening it in place would leave any handle another user already
+    /// holds intact — access is granted at open time — so the records
+    /// would keep flowing to a reader that got in first. Migration puts a
+    /// fresh file at the name, and the old inode stops being what the
+    /// name refers to.
+    #[cfg(unix)]
+    #[test]
+    fn a_permissive_predecessor_is_migrated_to_a_fresh_file() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.jsonl");
+        std::fs::write(&path, b"carried\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+        let old_inode = std::fs::metadata(&path).expect("stat").ino();
+
+        // Stand in for the reader that got in before the repair.
+        let mut squatter = std::fs::File::open(&path).expect("pre-existing handle");
+
+        let mut file = open_append_owner_only(&path).expect("migrate");
+        file.write_all(b"appended\n").expect("append");
+        drop(file);
+
+        let migrated = std::fs::metadata(&path).expect("stat");
+        assert_ne!(
+            migrated.ino(),
+            old_inode,
+            "the name must refer to a new file, or the old handle still sees the appends"
+        );
+        assert_eq!(migrated.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            b"carried\nappended\n",
+            "existing records are carried across, not dropped"
+        );
+
+        // The squatter's handle is intact but stale: it sees what was
+        // there when it opened, and nothing since.
+        let mut seen = Vec::new();
+        squatter.read_to_end(&mut seen).expect("read old inode");
+        assert_eq!(
+            seen, b"carried\n",
+            "the pre-existing handle must not receive anything appended after the migration"
+        );
+    }
+
+    /// An already-owner-only log is opened in place rather than migrated
+    /// — the ordinary case, and it must not rewrite the file on every
+    /// process start.
+    #[cfg(unix)]
+    #[test]
+    fn an_already_restricted_log_is_not_migrated() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("billing.jsonl");
+        let mut first = open_append_owner_only(&path).expect("create");
+        first.write_all(b"one\n").expect("write");
+        drop(first);
+        let inode = std::fs::metadata(&path).expect("stat").ino();
+
+        let second = open_append_owner_only(&path).expect("reopen");
+        drop(second);
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").ino(),
+            inode,
+            "a log that is already owner-only is opened, not copied"
         );
     }
 }

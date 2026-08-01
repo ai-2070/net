@@ -102,6 +102,12 @@ pub fn serve_payments(
     // caller's settlement authorization), so this does not earn a place in
     // the locked store on the path of every quote. The guard that must be
     // durable is the one on payment, and that one is.
+    //
+    // Shared, but not first-come-first-served: `SeenNonces` bounds each
+    // caller's share as well as the whole map (see its `admit`), so one
+    // admitted identity minting unique signed requests cannot fill the
+    // guard and take quote issuance away from every other caller for the
+    // rest of the window.
     let seen: Arc<parking_lot::Mutex<SeenNonces>> =
         Arc::new(parking_lot::Mutex::new(SeenNonces::new()));
     let quote =

@@ -262,7 +262,7 @@ fn require_secure_endpoint(endpoint: &str) -> Result<(), FacilitatorError> {
 
 /// Build the client: pinned TLS roots plus the shared destination policy.
 ///
-/// [`DestinationPolicy::AllowPrivate`] — a facilitator endpoint is
+/// [`crate::http_policy::DestinationPolicy::AllowPrivate`] — a facilitator endpoint is
 /// operator configuration, and a self-hosted facilitator on loopback or a
 /// LAN is an ordinary deployment. What stays refused is the set nobody
 /// configures deliberately (link-local including cloud metadata,

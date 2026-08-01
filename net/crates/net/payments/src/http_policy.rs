@@ -248,6 +248,11 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         // the private ranges the v4 rules refuse. Left admitted, they are
         // a way round every guard above.
         || (first == 0x0064 && s[1] == 0xff9b)
+        // 2002::/16 — 6to4. The next 32 bits are the v4 tunnel endpoint,
+        // so `2002:0a00:0005::` is a route to 10.0.0.5 on any host with
+        // 6to4 configured. Same shape as the NAT64 and translated forms:
+        // a v4 destination wearing a v6 address.
+        || first == 0x2002
         || first == 0x0100) // 100::/64  discard-only
 }
 
@@ -546,6 +551,8 @@ mod tests {
             "::10.0.0.5",               // IPv4-compatible, ::/96 (deprecated)
             "64:ff9b::10.0.0.5",        // well-known NAT64
             "64:ff9b:1::10.0.0.5",      // local-use NAT64
+            "2002:0a00:0005::1",        // 6to4, tunnel endpoint 10.0.0.5
+            "2002:a9fe:a9fe::1",        // 6to4, tunnel endpoint 169.254.169.254
             "::ffff:0:169.254.169.254", // the metadata address, translated
         ] {
             let ip: IpAddr = embedding.parse().expect(embedding);

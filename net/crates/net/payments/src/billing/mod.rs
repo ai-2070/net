@@ -57,6 +57,27 @@ impl BillingError {
 pub struct BillingLog {
     path: PathBuf,
     tx: broadcast::Sender<BillingEvent>,
+    /// The appending handle, opened securely on first append and then
+    /// kept.
+    ///
+    /// **Held, not reopened.** Reopening by name on every append means
+    /// re-deciding "is this file safe to write to?" every time, and every
+    /// one of those decisions is a fresh race with anyone who can write
+    /// the parent directory: win it once and the records land in a file
+    /// they control. Opening once and keeping the handle removes the
+    /// question — a handle names the object, and no rename or replacement
+    /// of the *name* can redirect it.
+    ///
+    /// It also means the permission work ([`crate::policy::file_mode`]:
+    /// descriptor at creation, migration of a permissive predecessor,
+    /// symlink and regular-file checks) is paid once per process instead
+    /// of once per charge.
+    ///
+    /// The trade is that a log deleted or rotated out from under a
+    /// running process keeps receiving appends on the old inode. That is
+    /// the right way round for an append-only record: the alternative is
+    /// silently following whatever now holds the name.
+    file: tokio::sync::Mutex<Option<tokio::fs::File>>,
 }
 
 impl BillingLog {
@@ -69,6 +90,7 @@ impl BillingLog {
         Self {
             path: path.into(),
             tx,
+            file: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -113,35 +135,37 @@ impl BillingLog {
         // one, because the handle outlives the emptiness. Existing but
         // permissive is the same problem: "it exists" is not "it is
         // protected", and a log written by an older build or pre-created
-        // by an operator carries whatever it was made with.
+        // by an operator carries whatever it was made with — which is why
+        // `file_mode` migrates that case onto a fresh file rather than
+        // chmod'ing one whose readers already have handles.
         //
-        // The record is then written through the returned handle. Not by
-        // reopening the path: securing a name and reopening it are two
-        // operations, and a writer to a shared parent can replace the
-        // name in between — with a permissive file, or a symlink — so the
-        // append lands outside the guarantee that was just established. A
-        // handle names the object, so nothing can be substituted under
-        // it. `file_mode` refuses a symlink outright for the same reason.
+        // Done once. `self.file` then holds the handle for the life of
+        // this log; see its doc for why reopening by name on every append
+        // is the wrong shape.
         //
         // Off the reactor: this is several blocking syscalls, and on
         // Windows a token read and an SDDL conversion besides. A custom
         // path on a network or FUSE filesystem makes them slow, and every
         // charge passes through here.
-        let path = self.path.clone();
-        let file = tokio::task::spawn_blocking(move || {
-            crate::policy::file_mode::open_append_owner_only(&path)
-        })
-        .await
-        .map_err(|e| BillingError::io(&self.path, e))?
-        .map_err(|e| BillingError::io(&self.path, e))?;
-        let mut file = tokio::fs::File::from_std(file);
+        let mut handle = self.file.lock().await;
+        if handle.is_none() {
+            let path = self.path.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                crate::policy::file_mode::open_append_owner_only(&path)
+            })
+            .await
+            .map_err(|e| BillingError::io(&self.path, e))?
+            .map_err(|e| BillingError::io(&self.path, e))?;
+            *handle = Some(tokio::fs::File::from_std(opened));
+        }
+        let file = handle.as_mut().expect("just opened");
         file.write_all(&line)
             .await
             .map_err(|e| BillingError::io(&self.path, e))?;
         file.sync_all()
             .await
             .map_err(|e| BillingError::io(&self.path, e))?;
-        drop(file);
+        drop(handle);
 
         // Publish after the durable write; a send error only means no
         // subscribers right now, which is fine — the log is the record.

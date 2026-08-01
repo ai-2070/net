@@ -126,6 +126,11 @@ pub enum QuoteRequestError {
          than forgetting a nonce that is still presentable"
     )]
     ReplayGuardSaturated { capacity: usize },
+    #[error(
+        "this caller already holds its share ({capacity}) of the provider's quote-request replay \
+         guard — refusing rather than letting one identity take issuance away from every other"
+    )]
+    CallerReplayQuotaExhausted { capacity: usize },
 }
 
 impl QuoteRequest {
@@ -308,9 +313,24 @@ pub struct SeenNonces {
     /// accepted (its expiry plus the verifier's skew tolerance). Past
     /// that the nonce is unreplayable and the entry is dead weight.
     seen: std::collections::HashMap<(EntityId, String), u64>,
+    /// How many entries each caller currently holds. Kept alongside
+    /// `seen` so the per-caller quota is O(1) to check rather than a scan.
+    per_caller: std::collections::HashMap<EntityId, usize>,
     capacity: usize,
+    /// The most nonces any one caller may hold. See [`Self::admit`].
+    per_caller_capacity: usize,
     /// Map size at which the next expiry sweep runs. See [`Self::admit`].
     sweep_at: usize,
+    /// The earliest acceptance deadline in `seen`, or `u64::MAX` when
+    /// empty.
+    ///
+    /// The point of tracking it is to know when a sweep *cannot* free
+    /// anything. Without it, a caller that fills the guard makes every
+    /// subsequent request pay two full-map scans under the shared mutex
+    /// before being refused — the refusal path becomes the expensive one,
+    /// which is exactly backwards for a guard whose job is to survive
+    /// abuse.
+    earliest_deadline: u64,
 }
 
 /// Nonces are identifiers, not payloads. Anything longer is a caller
@@ -324,6 +344,19 @@ pub const MAX_NONCE_BYTES: usize = 128;
 /// minute from legitimate callers is far past where other limits bite.
 pub const DEFAULT_REPLAY_GUARD_CAPACITY: usize = 100_000;
 
+/// One caller's share of the guard: a sixteenth of the whole, floored at
+/// one.
+///
+/// The guard is shared across every caller a provider serves, so without
+/// a per-caller bound the *global* one is reachable by a single admitted
+/// identity — and reaching it refuses issuance to everybody for the rest
+/// of the window. A sixteenth still allows ~6k in-flight requests a
+/// minute from one caller at the default capacity, which is far past any
+/// honest rate, while keeping at least sixteen callers' worth of room.
+fn default_per_caller_capacity(capacity: usize) -> usize {
+    (capacity / 16).max(1)
+}
+
 impl Default for SeenNonces {
     fn default() -> Self {
         Self::new()
@@ -336,10 +369,20 @@ impl SeenNonces {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacities(capacity, default_per_caller_capacity(capacity))
+    }
+
+    /// Both bounds explicitly. `per_caller_capacity` is clamped to
+    /// `capacity` — a per-caller share larger than the whole guard is not
+    /// a share.
+    pub fn with_capacities(capacity: usize, per_caller_capacity: usize) -> Self {
         Self {
             seen: std::collections::HashMap::new(),
+            per_caller: std::collections::HashMap::new(),
             capacity,
+            per_caller_capacity: per_caller_capacity.clamp(1, capacity.max(1)),
             sweep_at: (capacity / 8).max(1),
+            earliest_deadline: u64::MAX,
         }
     }
 
@@ -368,7 +411,7 @@ impl SeenNonces {
                 max: MAX_NONCE_BYTES,
             });
         }
-        if self.seen.len() >= self.sweep_at {
+        if self.seen.len() >= self.sweep_at && self.sweep_could_free(now_ns) {
             self.sweep(now_ns);
         }
         let key = (caller.clone(), nonce.to_string());
@@ -385,18 +428,47 @@ impl SeenNonces {
         // Measured after any sweep, so capacity reflects what is actually
         // still presentable rather than historical volume.
         if self.seen.len() >= self.capacity {
-            // One more sweep before refusing: better to pay the scan than
-            // to reject a legitimate caller over entries that have all
-            // expired since the last one.
-            self.sweep(now_ns);
+            // One more sweep before refusing — but only if it could free
+            // something. Once the guard is full and nothing has expired,
+            // this is the hot path for an abusive caller, and re-scanning
+            // the map on every refused request is the denial of service
+            // rather than the defence against it.
+            if self.sweep_could_free(now_ns) {
+                self.sweep(now_ns);
+            }
             if self.seen.len() >= self.capacity {
                 return Err(QuoteRequestError::ReplayGuardSaturated {
                     capacity: self.capacity,
                 });
             }
         }
+
+        // The per-caller share. The guard is shared across every caller a
+        // provider serves, so a global bound alone means one admitted
+        // identity minting unique signed requests takes issuance away
+        // from everyone else for a whole window — a denial of service
+        // costing the attacker nothing but bandwidth. Bounding each
+        // caller's share keeps saturation local to whoever caused it.
+        let held = self.per_caller.get(caller).copied().unwrap_or(0);
+        if held >= self.per_caller_capacity {
+            return Err(QuoteRequestError::CallerReplayQuotaExhausted {
+                capacity: self.per_caller_capacity,
+            });
+        }
+
         self.seen.insert(key, accept_until_ns);
+        *self.per_caller.entry(caller.clone()).or_insert(0) += 1;
+        self.earliest_deadline = self.earliest_deadline.min(accept_until_ns);
         Ok(())
+    }
+
+    /// Could a sweep at `now_ns` remove anything at all?
+    ///
+    /// `earliest_deadline` is the minimum over `seen`, so if it is still
+    /// in the future then every entry is, and a scan would visit the
+    /// whole map to delete nothing.
+    fn sweep_could_free(&self, now_ns: u64) -> bool {
+        now_ns >= self.earliest_deadline
     }
 
     /// Drop entries that can no longer be presented, and schedule the
@@ -413,6 +485,17 @@ impl SeenNonces {
         // refusing new callers over entries that could not be replayed
         // anyway.
         self.seen.retain(|_, deadline| now_ns < *deadline);
+        // Rebuild the derived bookkeeping from what survived. Both are
+        // exact rather than approximate: a drifting per-caller count would
+        // either leak quota to a caller or refuse one that holds nothing,
+        // and a stale `earliest_deadline` would either skip a sweep that
+        // could free space or run one that cannot.
+        self.per_caller.clear();
+        self.earliest_deadline = u64::MAX;
+        for ((caller, _), deadline) in &self.seen {
+            *self.per_caller.entry(caller.clone()).or_insert(0) += 1;
+            self.earliest_deadline = self.earliest_deadline.min(*deadline);
+        }
         // Next sweep once the map has grown by ~1/8 of capacity, floored
         // so a tiny capacity still sweeps sometimes.
         let step = (self.capacity / 8).max(1);
@@ -429,7 +512,26 @@ impl SeenNonces {
     /// legitimate retry once the denial is fixed. Only the caller that
     /// took the nonce can give it back.
     pub fn release(&mut self, caller: &EntityId, nonce: &str) {
-        self.seen.remove(&(caller.clone(), nonce.to_string()));
+        if self
+            .seen
+            .remove(&(caller.clone(), nonce.to_string()))
+            .is_none()
+        {
+            return;
+        }
+        // Give the quota back too, or a caller whose requests are being
+        // denied for some unrelated reason would exhaust its own share on
+        // work that never happened.
+        if let Some(held) = self.per_caller.get_mut(caller) {
+            *held -= 1;
+            if *held == 0 {
+                self.per_caller.remove(caller);
+            }
+        }
+        // `earliest_deadline` is left alone: it is a lower bound, and a
+        // stale-low one only costs a sweep that finds nothing, which the
+        // sweep then corrects. Recomputing it here would be a scan on a
+        // path taken once per denial.
     }
 
     /// How many nonces are currently remembered (diagnostics/tests).
@@ -672,6 +774,71 @@ mod tests {
         );
     }
 
+    /// One caller cannot take the whole guard.
+    ///
+    /// The map is shared across every caller a provider serves, so a
+    /// global bound alone is reachable by one admitted identity minting
+    /// unique signed requests — and reaching it refuses issuance to
+    /// *everybody* until the window rolls. That is a denial of service on
+    /// the whole provider for the price of some bandwidth. The per-caller
+    /// share keeps the saturation where it was caused.
+    #[test]
+    fn a_caller_cannot_take_more_than_its_share() {
+        let hog = EntityKeypair::generate().entity_id().clone();
+        let bystander = EntityKeypair::generate().entity_id().clone();
+        // Room for eight, two apiece.
+        let mut seen = SeenNonces::with_capacities(8, 2);
+
+        assert!(seen.admit(&hog, "n1", NOW + 1_000, NOW).is_ok());
+        assert!(seen.admit(&hog, "n2", NOW + 1_000, NOW).is_ok());
+        assert_eq!(
+            seen.admit(&hog, "n3", NOW + 1_000, NOW),
+            Err(QuoteRequestError::CallerReplayQuotaExhausted { capacity: 2 }),
+            "a caller at its share is refused even though the guard has room"
+        );
+
+        // The room is still there, for someone else.
+        assert!(
+            seen.admit(&bystander, "n1", NOW + 1_000, NOW).is_ok(),
+            "one caller's excess must not cost another caller its quotes"
+        );
+
+        // Releasing hands the share back — a denial that produced nothing
+        // must not spend the caller's budget.
+        seen.release(&hog, "n1");
+        assert!(seen.admit(&hog, "n3", NOW + 1_000, NOW).is_ok());
+    }
+
+    /// A full guard does not re-scan itself on every refusal.
+    ///
+    /// Once saturated, the refusal path is the hot path for whoever
+    /// saturated it. Sweeping the whole map twice per refused request
+    /// would make the guard the denial of service rather than the defence
+    /// against it, so a sweep runs only when something can actually have
+    /// expired.
+    #[test]
+    fn a_full_guard_does_not_sweep_when_nothing_can_have_expired() {
+        let caller = EntityKeypair::generate().entity_id().clone();
+        let mut seen = SeenNonces::with_capacities(2, 2);
+        assert!(seen.admit(&caller, "n1", NOW + 1_000, NOW).is_ok());
+        assert!(seen.admit(&caller, "n2", NOW + 2_000, NOW).is_ok());
+
+        // Full, and the earliest deadline is still ahead: refusing must
+        // not disturb the map.
+        for _ in 0..3 {
+            assert_eq!(
+                seen.admit(&caller, "n3", NOW + 1_000, NOW),
+                Err(QuoteRequestError::ReplayGuardSaturated { capacity: 2 })
+            );
+            assert_eq!(seen.len(), 2, "a refusal must not evict anything");
+        }
+
+        // Past the earliest deadline a sweep is worth running, and it
+        // frees exactly the entry that expired.
+        assert!(seen.admit(&caller, "n3", NOW + 3_000, NOW + 1_000).is_ok());
+        assert_eq!(seen.len(), 2, "n1 expired, n3 took its place");
+    }
+
     /// At capacity the guard refuses rather than evicting.
     ///
     /// Time-based expiry alone bounds nothing against an attacker minting
@@ -682,7 +849,12 @@ mod tests {
     #[test]
     fn a_saturated_guard_refuses_rather_than_forgetting() {
         let caller = EntityKeypair::generate().entity_id().clone();
-        let mut seen = SeenNonces::with_capacity(2);
+        // Per-caller share set to the whole guard: this test is about
+        // the GLOBAL bound, and the default share of a 2-entry guard is
+        // 1, which would refuse at the quota before saturation was ever
+        // reached. `a_caller_cannot_take_more_than_its_share` covers the
+        // other bound.
+        let mut seen = SeenNonces::with_capacities(2, 2);
 
         assert!(seen.admit(&caller, "n1", NOW + 1_000, NOW).is_ok());
         assert!(seen.admit(&caller, "n2", NOW + 1_000, NOW).is_ok());
@@ -757,7 +929,9 @@ mod tests {
     #[test]
     fn nonces_replay_once_and_expired_entries_do_not_accumulate() {
         let caller = EntityKeypair::generate().entity_id().clone();
-        let mut seen = SeenNonces::with_capacity(8);
+        // Per-caller share set to the whole guard — this test is about
+        // expiry, not the quota.
+        let mut seen = SeenNonces::with_capacities(8, 8);
 
         assert!(seen.admit(&caller, "a", NOW + 1_000, NOW).is_ok());
         assert_eq!(
