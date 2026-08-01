@@ -16,9 +16,12 @@
 //!   header for wire-speed filtering by forwarding nodes. 65 K buckets;
 //!   routine collisions at scale. Mirrors the
 //!   `origin_hash: u64 canonical → u32 wire` precedent in the protocol
-//!   layer: per-packet width is fixed by the 64-byte header budget, and
-//!   wire-side collisions are benign (only affect filter precision, not
-//!   ACL or storage decisions, since those key on the canonical hash).
+//!   layer: per-packet width is constrained by the fixed wire header
+//!   ([`protocol::HEADER_SIZE`](super::super::protocol::HEADER_SIZE) —
+//!   68 bytes; an earlier version of this comment said 64, which has
+//!   been wrong since the header last grew), and wire-side collisions
+//!   are benign (they affect filter precision only, not ACL or storage
+//!   decisions, since those key on the canonical hash).
 
 use std::sync::Arc;
 
