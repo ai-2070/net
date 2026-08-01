@@ -26603,6 +26603,20 @@ impl MeshNode {
     /// subnet `GLOBAL`, which would otherwise match a `GLOBAL` local
     /// subnet.
     ///
+    /// Deriving from the SELECTED entry rather than the publisher's
+    /// node-wide tag union is safe only because a publisher owns exactly
+    /// one fold entry on this path: `translate_announcement` pins
+    /// `class_hash` to the 0 cutover sentinel, so successive
+    /// announcements replace rather than accumulate. Were per-class
+    /// sharding to reach the announcement path, a class that omitted the
+    /// policy's tags could resolve a co-resident peer to `GLOBAL` and
+    /// exclude it, making `SameSubnet`'s verdict depend on which
+    /// capability was searched for — subnet is a node property, scope is
+    /// a per-announcement one. `tags_union_for` is the fix if that day
+    /// comes;
+    /// `a_publisher_owns_exactly_one_fold_entry_on_the_announcement_path`
+    /// fails first.
+    ///
     /// Forwarded announcements are safe to resolve this way even though
     /// `peer_subnets` deliberately skips them: `from_node` is the relay,
     /// but `ann.node_id` is blake2s-bound to `ann.entity_id` at
@@ -36223,6 +36237,83 @@ mod scoped_discovery_ignores_peer_subnets_tests {
             !same.contains(&peer_id),
             "the fold rejected the v1 announcement, so the retained v500 \
              (region:eu → [4]) must still decide; got {same:?}"
+        );
+    }
+
+    /// The invariant scoped discovery's subnet derivation rests on: on
+    /// the announcement path a publisher owns exactly ONE fold entry.
+    ///
+    /// The fold keys entries `(class_hash, NodeId)` and its payload doc
+    /// says "a publisher in multiple classes emits one announcement per
+    /// class", which invites the conclusion that
+    /// `find_nodes_by_filter_scoped` — deriving a candidate's subnet
+    /// from the tags of the entry the capability filter selected — could
+    /// read a class that omits the policy's tags while a sibling class
+    /// carries them, resolving a co-resident peer to `GLOBAL` and
+    /// excluding it. Subnet is a node property; scope is a per-
+    /// announcement one, so that would be a real defect.
+    ///
+    /// It is unreachable here because `translate_announcement` pins
+    /// `class_hash: 0` for every `CapabilityAnnouncement` — the cutover
+    /// sentinel documented on that function — so successive
+    /// announcements from one publisher REPLACE a single entry rather
+    /// than accumulating siblings. Every non-zero `class_hash` writer in
+    /// the crate is `#[cfg(test)]`.
+    ///
+    /// This test exists so that stops being an accident. If per-class
+    /// sharding ever lands on the announcement path, this fails, and
+    /// the subnet derivation must move to the node-wide tag union
+    /// (`tags_union_for`) within the same snapshot before it can.
+    #[tokio::test]
+    async fn a_publisher_owns_exactly_one_fold_entry_on_the_announcement_path() {
+        let node = observer().await;
+        let peer = EntityKeypair::generate();
+        let peer_id = peer.node_id();
+
+        // Two announcements from one publisher, different tags and
+        // different capability classes in the informal sense — a GPU
+        // advert and a relay advert.
+        let mut first = {
+            let caps = CapabilitySet::new()
+                .add_tag("region:us")
+                .add_tag("gpu")
+                .add_tag("multiclass-canary");
+            CapabilityAnnouncement::new(peer_id, peer.entity_id().clone(), 1, caps).with_ttl(300)
+        };
+        first.sign(&peer);
+        node.test_inject_capability_announcement(first);
+
+        // The second omits `region:us` entirely. If it landed as a
+        // SIBLING entry rather than a replacement, a query selecting it
+        // would derive GLOBAL and drop a peer that is really in [3].
+        let mut second = {
+            let caps = CapabilitySet::new()
+                .add_tag("relay-capable")
+                .add_tag("multiclass-canary");
+            CapabilityAnnouncement::new(peer_id, peer.entity_id().clone(), 2, caps).with_ttl(300)
+        };
+        second.sign(&peer);
+        node.test_inject_capability_announcement(second);
+
+        let (entry_count, classes) = node.capability_fold.with_state(|state| {
+            let keys = state.by_node.get(&peer_id).cloned().unwrap_or_default();
+            let classes: Vec<u64> = keys.iter().map(|(class, _)| *class).collect();
+            (keys.len(), classes)
+        });
+
+        assert_eq!(
+            entry_count, 1,
+            "a publisher must own exactly one fold entry on the announcement \
+             path; got {entry_count} (classes {classes:?}). If per-class \
+             sharding now reaches this path, find_nodes_by_filter_scoped must \
+             derive the subnet from the node-wide tag union instead of the \
+             selected entry's tags — otherwise SameSubnet's verdict depends on \
+             which capability was searched for."
+        );
+        assert_eq!(
+            classes,
+            vec![0],
+            "translate_announcement pins class_hash to the 0 cutover sentinel"
         );
     }
 
