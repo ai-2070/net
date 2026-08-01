@@ -263,11 +263,11 @@ pub struct MeshPaymentChannel {
     /// a replay. A counter cannot repeat within a process.
     ///
     /// A quote request is **single-use**, and this counter is why every
-    /// `request_quote` is a new one. Re-sending a request already
-    /// admitted gets `ReplayedNonce`, not the original quote — the
-    /// provider keeps no copy of what it replied. See
-    /// [`QuoteRequest::derive_nonce`] for why that trade is the right
-    /// one.
+    /// [`quote`](super::ProviderChannel::quote) call mints a new one.
+    /// Re-sending a request already admitted gets `ReplayedNonce`, not
+    /// the original quote — the provider keeps no copy of what it
+    /// replied. See [`QuoteRequest::derive_nonce`] for why that trade is
+    /// the right one.
     ///
     /// **Process-global, not per-channel.** Two channels for the same
     /// caller would each start at zero, so under a stopped clock their

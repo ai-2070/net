@@ -183,10 +183,10 @@ impl QuoteRequest {
     /// as long as `verify` would still accept the request carrying it,
     /// and the provider keeps no copy of what it replied. So a lost
     /// quote response is not recoverable by retransmission — the caller
-    /// derives a new request, which is what [`request_quote`] does on
-    /// every call.
+    /// derives a new request, which is what [`ProviderChannel::quote`]
+    /// does on every call.
     ///
-    /// [`request_quote`]: crate::flow::mesh::MeshPaymentChannel::request_quote
+    /// [`ProviderChannel::quote`]: crate::flow::ProviderChannel::quote
     ///
     /// That is a deliberate trade, not an oversight. Returning the first
     /// response for a repeated nonce would mean the provider retaining
