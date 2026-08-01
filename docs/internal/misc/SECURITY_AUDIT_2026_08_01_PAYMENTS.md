@@ -5,7 +5,40 @@ Scope: full-surface security pass over the `net-payments` crate (`net/crates/net
 
 Findings are organised by severity. File paths are relative to repo root; line numbers reflect the audited tree and may drift.
 
-**Status: HOLD.** The crate's core lifecycle is unusually hardened — byte-preservation is structural rather than conventional, and the fail-closed direction is chosen consistently even where it costs. Three defects are disqualifying for a real-money deployment: the shipped provider bindings have no real settlement backend at all (H2), the independent verification path can be pointed at cleartext HTTP (H3), and quote issuance authenticates nobody — with **no authenticated end-to-end caller available on the public RPC surface to fix it with** (H1). The findings cluster in one theme: **the money path's trust roots are asserted in doctrine and documentation but not enforced at the boundaries that matter**, and in two places the documentation actively misdescribes what the code guarantees.
+**Status: RESOLVED** (see the resolution table below; this paragraph is the original verdict).
+
+**Status at audit time: HOLD.** The crate's core lifecycle is unusually hardened — byte-preservation is structural rather than conventional, and the fail-closed direction is chosen consistently even where it costs. Three defects are disqualifying for a real-money deployment: the shipped provider bindings have no real settlement backend at all (H2), the independent verification path can be pointed at cleartext HTTP (H3), and quote issuance authenticates nobody — with **no authenticated end-to-end caller available on the public RPC surface to fix it with** (H1). The findings cluster in one theme: **the money path's trust roots are asserted in doctrine and documentation but not enforced at the boundaries that matter**, and in two places the documentation actively misdescribes what the code guarantees.
+
+## Resolution (2026-08-01, branch `security-payments`)
+
+All findings remediated. Each fix carries a regression test where one was meaningful; several are red-coupled (verified to fail against the old behaviour).
+
+| ID | Status | Commit |
+|----|--------|--------|
+| H1 | Fixed — `net.payment.quote_request@1`, a caller-signed envelope binding tag, destination provider, caller, capability, template hash, bounded freshness, and nonce; `SeenNonces` replay guard | `feat(payments): prove the caller identity on a quote request` |
+| H2 | Fixed — provider constructors require an explicit settlement backend (`facilitator_url` or `unsafe_dev_mock_facilitator`); neither is an error, both is an error, a real URL is never silently downgraded; `production_registry_v1` added | `fix(bindings): require an explicit settlement backend on PaymentProvider` |
+| H3 | Fixed — checker transport goes through the shared `http_policy`: scheme enforcement, destination policy, bounded reads | `fix(payments): one HTTP boundary policy for all three money-path clients` |
+| M1 | Fixed — `with_require_invocation_binding`, new `binding_required` denial reason mapped as a caller-configuration error; scope limits documented (closes off-path leakage, not an on-path observer) | `feat(payments): let a provider require the invocation binding` |
+| M2 | Fixed — `tier` removed from `VerifyOutcome`/`SettleOutcome`; the engine mints `Observed`; `MockMode::LateFinality` deleted and its test rewritten against a `ChainChecker` | `fix(payments): remove tier from facilitator outcomes…` |
+| M3 | Fixed — all four sites emit a domain-separated 8-byte `quote_ref` | `fix(payments): log a non-authorizing quote_ref, never the quote id` |
+| M4 | Fixed — bounded reads on both outbound bodies; destination policy enforced before the unpaid probe, via reqwest's resolver (rebinding-safe) plus a literal check (literals never resolve) | (with H3 commit) |
+| M5 | Fixed — replay identity from the scheme's signed material, namespaced `scheme + network + asset + authorization`; unknown schemes fail closed | `fix(payments): key replay on the scheme's signed material, fully namespaced` |
+| M6 | Fixed — doctrine deleted; admission is issuance-only and the quote TTL is the revocation window, pinned by a test that revokes mid-flight | `docs(payments): state that admission is issuance-only…` |
+| L1 | Fixed — capability key from `Url::host_str()`; unparseable URL is a denial | `fix(payments): derive the per-host spend key from the URL parser…` |
+| L2 | Fixed — `Reservation` records keyed by quote id; release is idempotent and owner-checked, independent of the caller's clock | `fix(payments): give spend reservations an owner…` |
+| L3 | Fixed — explicit protected owner-only DACL on Windows, applied pre-rename; `create_new` closes the stale-temp permission reuse | `fix(payments): owner-only payment stores on Windows too` |
+| L4 | Fixed — optional `eip712_name`/`eip712_version` on `AssetEntry`, enforced when pinned; module header corrected to state what is actually pinned | `fix(payments): make the EIP-712 domain pinnable…` |
+| L5 | Fixed — `checked_add` with a terminal error on overflow | `fix(payments): checked delivered-amount sum, approve() integrity…` |
+| L6 | Fixed — `approve()` no longer mints records for unknown ids; `maxAmountRequired` ceiling-vs-exact documented | (with L5 commit) |
+| H1 sub | Fixed — `RpcContext::caller_origin`'s doc corrected to match its source field | `docs(rpc): correct RpcContext::caller_origin authentication claim` |
+
+**Two behaviour changes worth knowing about beyond the finding they fix.** An eip155 payload carrying no usable EIP-3009 authorization is now refused at *accept* rather than settling and failing at re-verification (M5) — something the engine cannot identify is something it must not accept. And `ProviderChannel::quote` takes the intended provider, so any custom channel implementation needs the new parameter (H1).
+
+**Not addressed, and not a finding — recorded so it is not mistaken for one.** M1 closes off-path quote-id leakage. An intermediary that observes the *paid invocation* can still copy the quote header and the binding signature together and front-run it. That needs channel binding or an authenticated transport identity; a visible, transferable signature cannot fix it however much the transcript covers. See M1's scope note.
+
+Verification at time of resolution: 281 payments tests passing across 29 suites, no warnings; `net-mesh` and `net-mesh-sdk` build clean with 231 SDK tests passing; both bindings compile under `payments` and `payments-http`.
+
+The remaining content below is the original audit, retained as the point-in-time record.
 
 ## Revision history
 
