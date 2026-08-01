@@ -1,50 +1,56 @@
 # Security audit — `net-payments` (2026-08-01)
 
-Branch: `master`.
+Branch: `security-payments`.
 Scope: full-surface security pass over the `net-payments` crate (`net/crates/net/payments/`, ~5k lines of non-test source across `x402/`, `core/`, `facilitator/`, `engine/`, `flow/`, `policy/`, `checker/`, `billing/`), the SDK seams it composes against (`sdk/src/tool_payment.rs`, `sdk/src/tool.rs`, `sdk/src/mesh_rpc.rs`), the substrate identity/RPC surface it relies on, and the Node/Python provider bindings that expose it. Attack surfaces audited: the provider lifecycle engine (replay, idempotency, expiry, redemption), the caller flow and spend policy, canonical encoding and envelope signing, x402 parsing and byte-preservation, the facilitator and chain-checker HTTP boundaries, the settlement signer seam, the mesh payment wire, and the outbound HTTP-402 door.
 
-Findings are organised by severity. File paths are relative to repo root; line numbers reflect `master` at audit time and may drift.
+Findings are organised by severity. File paths are relative to repo root; line numbers reflect the audited tree and may drift.
 
-**Status: HOLD.** The crate's core lifecycle is unusually hardened — byte-preservation is structural rather than conventional, replay identity is canonical rather than byte-keyed, and the fail-closed direction is chosen consistently even where it costs. But three defects are disqualifying for a real-money deployment: the shipped provider bindings have no real settlement backend at all (H2), the independent verification path can be pointed at cleartext HTTP (H3), and quote issuance authenticates nobody (H1). The findings cluster in one theme — **the money path's trust roots are asserted in doctrine and documentation but not enforced at the boundaries that matter.**
+**Status: HOLD.** The crate's core lifecycle is unusually hardened — byte-preservation is structural rather than conventional, and the fail-closed direction is chosen consistently even where it costs. Three defects are disqualifying for a real-money deployment: the shipped provider bindings have no real settlement backend at all (H2), the independent verification path can be pointed at cleartext HTTP (H3), and quote issuance authenticates nobody — with **no authenticated end-to-end caller available on the public RPC surface to fix it with** (H1). The findings cluster in one theme: **the money path's trust roots are asserted in doctrine and documentation but not enforced at the boundaries that matter**, and in two places the documentation actively misdescribes what the code guarantees.
 
 ## Revision history
 
-**Rev 2 (2026-08-01)** — incorporates a parallel review. Changes from rev 1, including retractions:
+**Rev 3 (2026-08-01)** — second parallel review. Every claim below was verified against source before adoption; all were confirmed.
 
 | Change | Detail |
 |---|---|
-| **Retracted** | Rev 1's L2 (midnight-straddling reservation release) was **not a live defect** — all four release call sites pass the reservation-time `now_ns`. Replaced with the real defect at that site: reservations have no durable ownership and release is not idempotent. |
-| **Retracted** | Rev 1's M1 claimed there was "no way" for provider policy to require the invocation binding. Wrong — `ToolPaymentGate` is public and `serve_tool_paid` accepts any gate, so a wrapper can already reject `None`. Corrected to "the supplied engine-backed gates expose no first-class option." |
-| **Retracted** | Rev 1's "logging carries no payloads or secrets" was inconsistent with the engine's own definition of an unbound quote id as a bearer credential. Now M3. |
-| **Corrected** | "https is required except to loopback on both doors" — there is a *third* HTTP client (the checker transport) with no scheme check. Now H3. |
-| **Corrected** | "checked arithmetic throughout" overstated: two deliberate saturating sites exist. |
-| **Promoted** | L4 (mock facilitator) → H2 on evidence the bindings hard-code it. L6 (destination policy) → M4 on agent-reachability. |
-| **Added** | M1 extended: a *required* binding is still replayable by an observer of the paid invocation. |
+| **Retracted** | Rev 2's H1 remediation (compare `caller_hex.origin_hash()` against `ctx.caller_origin`) is **invalid** — `caller_origin` is a wire-carried claim, not authenticated identity. See H1. The "confirm before building on it" caveat treated as open a question the source already answers. |
+| **Retracted** | Rev 2's "all three HTTP clients bound their response bodies" is **false** — `X402HttpFlow` reads both bodies unbounded (`http402.rs:178`, `:358`). Folded into M4. |
+| **Retracted** | Rev 2's replay-identity claim was narrowed only on the retention axis. The deeper gap — the replay key covers unsigned wrapper fields — is now **M5**, not a footnote. |
+| **Retracted** | Rev 2's M2 remediation `settle.tier.min(...)` does not compile: `VerificationTier` has `PartialOrd` but no `Ord` (`core/verification.rs:25`, `:51`). |
+| **Corrected** | M1's per-request binding does **not** stop an on-path observer; the two threat classes are now separated. |
+| **Corrected** | L3 no longer offers documentation as an alternative to remediation. L4's optional registry fields do not pin anything; now required-or-retract. L5's pre-approval path is a preimage problem, not timestamp prediction. |
+| **Added** | M6 — the provider-admission re-check the doctrine promises does not exist (`admit` has exactly one call site). |
+| **Added** | L5 — the eip155 delivered-amount sum saturates; rev 2 called this "defensible" without establishing a bound. |
+
+**Rev 2 (2026-08-01)** — first parallel review. Retracted rev 1's L2 (midnight reservation release — not reachable; all callers pass reservation-time `now_ns`), rev 1's M1 overclaim ("no way" to require the binding — `ToolPaymentGate` is public), and rev 1's "no secrets in logs" (→ M3). Promoted the mock facilitator to H2 on binding evidence and added H3 (cleartext checker RPC).
 
 | ID | Severity | Area | One-line |
 |----|----------|------|----------|
-| H1 | High | Mesh wire | Quote issuance binds the caller identity from the request body; the verified peer is discarded |
+| H1 | High | Mesh wire | Quote issuance binds a self-asserted caller, and no authenticated end-to-end caller exists on the public RPC surface |
 | H2 | High | Bindings | Node and Python provider constructors hard-code `MockFacilitator` — no real settlement path exists |
 | H3 | High | Checker | The independent chain checker accepts cleartext remote RPC endpoints |
-| M1 | Medium | Redemption | Bearer redemption by default, and the binding is replayable even when supplied |
+| M1 | Medium | Redemption | Bearer redemption by default; a visible signature cannot fix on-path front-running |
 | M2 | Medium | Verification | The engine bills at whatever tier a `Facilitator` impl reports |
 | M3 | Medium | Logging | Quote ids are logged while the engine treats them as bearer credentials |
-| M4 | Medium | HTTP door | No destination-address policy on the outbound fetch |
+| M4 | Medium | HTTP door | Outbound fetch has no destination policy and reads both response bodies unbounded |
+| M5 | Medium | Replay | The replay key covers unsigned wrapper fields, so one authorization yields many replay identities |
+| M6 | Medium | Admission | The post-verification provider-admission re-check the doctrine promises does not exist |
 | L1 | Low | Spend policy | `host_of` string-splits a URL, so a port or non-lowercase host bypasses per-host overrides |
 | L2 | Low | Spend policy | Reservations have no durable ownership; release is non-idempotent and saturates a budget to zero |
-| L3 | Low | Storage | 0600 file modes are `#[cfg(unix)]` |
+| L3 | Low | Storage | 0600 file modes are `#[cfg(unix)]`; stored bearer authorizations are unprotected on Windows |
 | L4 | Low | Signing | The EIP-712 domain cross-check the `exact_evm` header promises does not exist |
-| L5 | Low | Misc | `maxAmountRequired` aliased to an exact amount; `approve()` can pre-approve a nonexistent quote id |
+| L5 | Low | Checker | The delivered-amount sum saturates, which can mask an overpayment as exact |
+| L6 | Low | Misc | `maxAmountRequired` aliased to an exact amount; `approve()` can mint a malformed approval record |
 
 ---
 
 ## HIGH
 
-### H1 — Quote issuance trusts a self-asserted caller identity
+### H1 — Quote issuance binds a self-asserted caller, and the public RPC surface exposes no authenticated end-to-end caller
 
-`net/crates/net/payments/src/flow/mesh.rs:72` (handler registration), `:75` (the decode).
+`payments/src/flow/mesh.rs:72` (handler registration), `:75` (the decode).
 
-The mesh quote handler takes the caller identity straight from the request body and never checks it against the peer:
+The mesh quote handler takes the caller identity from the request body and checks it against nothing:
 
 ```rust
 let quote = mesh.serve_rpc_typed(QUOTE_SERVICE, Codec::Json, move |req: QuoteWireRequest| {
@@ -55,21 +61,37 @@ let quote = mesh.serve_rpc_typed(QUOTE_SERVICE, Codec::Json, move |req: QuoteWir
         let quote_bytes = provider.quote(&caller, &req.capability, &template).await
 ```
 
-`Mesh::serve_rpc_typed` (`sdk/src/mesh_rpc.rs:347`) hands the handler only the deserialized `Req`, discarding the `RpcContext`. `serve_rpc` (`:262`) carries it, and it holds `caller_origin` (`net/src/adapter/net/cortex/rpc.rs:1482`), documented as:
+**Impact.** `EntityId` is an ed25519 *public* key; asserting someone else's requires no secret.
+
+1. **Provider admission bypass.** `ProviderAdmissionPolicy::admit(&caller, capability)` (`engine/mod.rs:707`) is the crate's stated "never quote a caller you'd deny" gate. Evaluated against an attacker-chosen identity, caller allowlists, attestation, and exposure caps are defeated by naming an admitted entity. (M6 compounds this: the re-check that would catch it later does not exist.)
+2. **Billing misattribution.** The quote's `caller` becomes `QuoteRecord.caller_hex` (`engine/mod.rs:856`) and then `BillingEvent.payer` (`engine/mod.rs:2110`) — the provider-signed record `concepts.md` routes reconciliation through.
+3. **The binding defense inherits the forgery.** `redeem_for_invocation` verifies the binding against that same `rec.caller_hex` (`engine/mod.rs:1863`).
+
+Combined with bearer redemption (M1), the path completes: mint a quote naming a victim, pay it yourself, redeem without a binding, and the signed billing record says the victim paid.
+
+#### There is no cheap fix, and rev 2's proposed one was wrong
+
+Rev 2 recommended recomputing `origin_hash` from `caller_hex` and comparing it to `ctx.caller_origin`. **That compares two attacker-controlled values and must not be implemented.** `RpcContext::caller_origin` is copied verbatim from `RpcInboundEvent::origin_hash` (`net/src/adapter/net/cortex/rpc.rs:1850`), which is documented at its definition (`rpc.rs:1153`) as:
+
+> Caller's `origin_hash` **from the packet header** … The dispatcher should treat this as **routing metadata, not identity authentication** (the AEAD-verified `session_node` field below carries that).
+
+And `session_node` is not the end-to-end caller either — it is the **wire-session peer that delivered the packet** (`rpc.rs:1165`), i.e. the last authenticated hop, whose stated purpose is rejecting spoofed RESPONSE frames.
+
+So the public nRPC surface carries no authenticated end-to-end caller identity at all. Moving from `serve_rpc_typed` to raw `serve_rpc` gains nothing.
+
+**Sub-finding — the SDK doc comment that caused this error.** `RpcContext::caller_origin` (`rpc.rs:1482`) claims the opposite of its own source field:
 
 > AEAD-verified caller `origin_hash`. The bus sets this from the verified peer; not self-claimable from the request body.
 
-**Impact.** `EntityId` is an ed25519 *public* key; asserting someone else's requires no secret.
+That comment is on the field application code actually reads, and it is how rev 2 arrived at an invalid remediation. It should be corrected to match `RpcInboundEvent::origin_hash`'s honest description regardless of what happens to the rest of this audit — it is an active trap for any handler author reaching for caller identity.
 
-1. **Provider admission bypass.** `ProviderAdmissionPolicy::admit(&caller, capability)` (`engine/mod.rs:706`) is the crate's stated "never quote a caller you'd deny" gate. Evaluated against an attacker-chosen identity, caller allowlists, attestation, and exposure caps are all defeated by naming an admitted entity.
-2. **Billing misattribution.** The quote's `caller` becomes `QuoteRecord.caller_hex` (`engine/mod.rs:856`) and then `BillingEvent.payer` (`engine/mod.rs:2110`) — the provider-signed record that `concepts.md` routes reconciliation through, since `engine.status()` is compacted.
-3. **The binding defense inherits the forgery.** `redeem_for_invocation` verifies the binding against that same `rec.caller_hex` (`engine/mod.rs:1863`).
+**The implementation decision** (an architectural choice, not a patch):
 
-The pay service (`flow/mesh.rs:91`) has no caller check either. Alone that is benign — paying someone else's quote is generosity — but combined with bearer redemption (M1) it completes the path: mint a quote naming a victim, pay it yourself, redeem without a binding, and the signed billing record says the victim paid.
+- **an application-level caller signature** over the quote request — payments-local, no substrate change, and the only option that is end-to-end by construction;
+- **protected RPC's verified caller attribution** — `RpcContext::org_admission` carries a four-party verified identity (`rpc.rs:1500-1509`) but only for calls through the PROTECTED-service admission gate, which means moving the payment services behind it;
+- **a new authenticated-caller context** on the substrate with explicitly direct-only (non-relayed) semantics.
 
-**Recommended fix.** `origin_hash` derives deterministically from the public key (`blake2s(pubkey, "net-origin-v1")[0..8]`, `net/src/adapter/net/identity/entity.rs:47`), so the handler can recompute it from `caller_hex` and compare against `ctx.caller_origin`. Requires moving to raw `serve_rpc` or adding a context-carrying typed variant.
-
-**Implementation caveat — confirm before building on it.** `caller_origin` is populated from `meta.origin_hash` on the delivered message (`rpc.rs:1850`). Whoever implements this must first establish whether that field authenticates the **originator end-to-end** or the **last authenticated hop**. If nRPC traffic can be relayed, binding to it authenticates the relay rather than the payer, and H1's fix would need an application-level caller signature over the quote request instead. The premise of the finding is unaffected either way — a self-asserted body field is unauthenticated under any reading — but the shape of the correct fix depends on this answer.
+Option one is the smallest change and composes with M1(b), which needs a per-request payer signature anyway.
 
 ### H2 — The Node and Python provider bindings hard-code the mock facilitator
 
@@ -89,13 +111,13 @@ let mut engine = PaymentEngine::new(
 )
 ```
 
-`HttpFacilitator` appears **nowhere** in `bindings/` — there is no facilitator argument, no configuration hook, and no real-provider construction path. Both also use `default_registry_v1`, which includes the mock asset alongside Base and Solana USDC (`payments/src/core/registry.rs:170`).
+`HttpFacilitator` appears **nowhere** in `bindings/` — no facilitator argument, no configuration hook, no real-provider construction path. Both also use `default_registry_v1`, which includes the mock asset alongside Base and Solana USDC (`payments/src/core/registry.rs:170`).
 
-**Impact.** This is the finding that changes the verdict. Rev 1 filed it as "a test constructor is reachable in release builds — optional posture." That was wrong: the shipped Node and Python provider APIs can publish paid tools, sign quotes with the node's real mesh identity, emit signed billing events, and serve — while settlement moves no value whatsoever. `MockFacilitator`'s `Success` mode is its `Default` (`facilitator/mock.rs:33`), so the happy path is "verify passes, settle succeeds, tier `observed`" against nothing. A provider integrating through the documented binding surface has no way to reach a real facilitator and no signal that it hasn't.
+**Impact.** The shipped Node and Python provider APIs can publish paid tools, sign quotes with the node's real mesh identity, emit signed billing events, and serve — while settlement moves no value whatsoever. `MockFacilitator`'s `Success` mode is its `Default` (`facilitator/mock.rs:33`), so the happy path is "verify passes, settle succeeds, tier `observed`" against nothing. A provider integrating through the documented binding surface has no way to reach a real facilitator and no signal that it hasn't.
 
-`AdmitAll` beside it (with the comment "anyone may quote; PAYMENT is the real gate on the serve") compounds this: the payment gate is the stated control, and the payment gate is a simulator.
+`AdmitAll` beside it — with the comment "anyone may quote; PAYMENT is the real gate on the serve" — compounds this: the payment gate is the stated control, and the payment gate is a simulator.
 
-**Required fix.** The release-facing provider constructors must take a configured facilitator, or fail closed when no real backend is supplied. Mock settlement belongs behind an explicitly-named unsafe development constructor or Cargo feature — mirroring `unsafe-dev-signer`, which is correctly gated and documented as "never in default features, never in release binding builds." Splitting the mock asset out of `default_registry_v1` into a separate constructor would close the matching registry half.
+**Required fix.** Release-facing provider constructors must take a configured facilitator, or fail closed when no real backend is supplied. Mock settlement belongs behind an explicitly-named unsafe development constructor or Cargo feature, mirroring `unsafe-dev-signer` — which is correctly gated and documented as "never in default features, never in release binding builds." Split the mock asset out of `default_registry_v1` to close the matching registry half.
 
 ### H3 — The independent chain checker accepts cleartext remote RPC endpoints
 
@@ -114,42 +136,42 @@ pub(super) fn new(endpoint: impl Into<String>) -> Result<Self, CheckerError> {
 }
 ```
 
-A remote `http://` endpoint is accepted and used verbatim. This is the transport behind all three checkers (`eip155`, `svm`, `xrpl`), reached via `Eip155Checker::from_config` from `FacilitatorConfig.rpc_endpoints` (`checker/eip155.rs:70`).
+A remote `http://` endpoint is accepted and used verbatim. This is the transport behind all three checkers (`eip155`, `svm`, `xrpl`), reached from `FacilitatorConfig.rpc_endpoints` via `Eip155Checker::from_config` (`checker/eip155.rs:70`).
 
-**Impact.** This is the path that mints `Confirmed(n)` and `Final` — the tiers that exist specifically so the facilitator need not be trusted (`checker/mod.rs:5-7`). Over cleartext, an on-path attacker fabricates `eth_getTransactionReceipt`, `eth_blockNumber`, and `eth_chainId` at will, producing `Final` for a transaction that never landed. The `ensure_chain_id` guard (`eip155.rs:103`) compares a value from the same unauthenticated channel, so it detects a *misconfigured* endpoint but authenticates nothing.
+**Impact.** This is the path that mints `Confirmed(n)` and `Final` — the tiers that exist so the facilitator need not be trusted (`checker/mod.rs:5`). Over cleartext, an on-path attacker fabricates `eth_getTransactionReceipt`, `eth_blockNumber`, and `eth_chainId` at will, producing `Final` for a transaction that never landed. The `ensure_chain_id` guard (`eip155.rs:103`) compares a value from the same unauthenticated channel, so it catches a *misconfigured* endpoint and authenticates nothing.
 
-The inconsistency is the tell: `HttpFacilitator::new` enforces exactly this policy (`facilitator/client.rs:112`, `require_secure_endpoint` at `:257`), and `X402HttpFlow` enforces it for the paid retry (`http402.rs:455`). The checker — the component with the strictest trust requirement of the three — is the one that skips it. Rev 1's "https is required except to loopback on both doors" was accurate about the two doors it named and missed this third client.
+The inconsistency is the tell: `HttpFacilitator::new` enforces exactly this policy (`facilitator/client.rs:112`, `require_secure_endpoint` at `:257`), and `X402HttpFlow` enforces it for the paid retry (`http402.rs:455`). The checker — the component with the strictest trust requirement of the three — is the one that skips it.
 
-**Required fix.** Call the same `require_secure_endpoint` policy from `RpcTransport::new`, hoisted to a shared module so the three HTTP clients cannot drift again. Pair it with the destination-address policy in M4 — a TLS-valid hostname can still resolve to an unintended private destination, and the checker takes its endpoints from config that may be templated.
+**Required fix.** Call the same `require_secure_endpoint` policy from `RpcTransport::new`, hoisted to a shared module so the three clients cannot drift again, and pair it with M4's destination policy in that module.
 
 ---
 
 ## MEDIUM
 
-### M1 — Bearer redemption by default, and the binding is replayable even when supplied
+### M1 — Bearer redemption by default; a visible signature cannot fix on-path front-running
 
 `engine/mod.rs:1854` (the optional binding block), `engine/mod.rs:243` (the transcript), `sdk/src/tool.rs:1466` (the header read), `adapters/mcp/src/serve/mesh_gateway.rs:598` (the send).
 
-Two distinct problems, one of which survives fixing the other.
+`redeem_for_invocation` skips verification entirely when the binding is absent, so possession of the quote id suffices. The quote id rides the `net-payment-quote` request header on every paid invoke, is returned in the caller's `proof` JSON (`flow/mod.rs:784`), and appears in `PayResponse::Served` and the billing event.
 
-**(a) Bearer is the default and the built-in gates cannot refuse it.** `redeem_for_invocation` skips verification entirely when the binding is absent, so possession of the quote id is sufficient. The quote id rides the `net-payment-quote` request header on every paid invoke, is returned in the caller's `proof` JSON (`flow/mod.rs:784`), and appears in `PayResponse::Served` and the billing event.
+`ToolPaymentGate` is public, receives `binding: Option<&[u8]>`, and `Mesh::serve_tool_paid` accepts any gate (`sdk/src/tool.rs:419`), so a provider *can* wrap the engine gate and reject `None` today. The accurate statement is narrower than rev 1's: **the supplied engine-backed gates (`EngineToolPaymentGate`, `EnginePaymentAdmission`) expose no first-class required-binding option**, so `sdk/src/tool_payment.rs:53`'s "providers may require it by policy" holds only for providers who write their own wrapper, and nothing tells them to.
 
-Rev 1 claimed no provider policy could require the binding. That was wrong: `ToolPaymentGate` is public, receives `binding: Option<&[u8]>`, and `Mesh::serve_tool_paid` accepts any gate (`sdk/src/tool.rs:419`); the MCP side has the same public `PaymentAdmission` seam. A provider can wrap the engine gate and reject `None` today. The accurate statement is narrower: **the supplied engine-backed gates (`EngineToolPaymentGate`, `EnginePaymentAdmission`) expose no first-class required-binding option**, so `sdk/src/tool_payment.rs:53`'s "providers may require it by policy" is true only for providers who write their own wrapper — and nothing in the docs tells them to.
+#### Two threat classes, and only one is fixable with a signature
 
-**(b) A required binding is still replayable.** The transcript covers only the quote and tool:
+Rev 2 recommended extending the transcript with a request digest, `call_id`, or provider challenge to stop front-running. **That does not work**, and the distinction matters for what gets built:
+
+**(a) Off-path quote-id leakage** — from logs (M3), billing events, proof records, or support bundles. The observer has the id but never saw the invocation. *A mandatory payer signature fixes this completely*, and the current transcript (`quote_id + tool_id`) is sufficient for it.
+
+**(b) On-path invocation observation** — a relay, proxy, or anything else that sees the actual paid request. Today the transcript covers only:
 
 ```rust
-pub fn invocation_binding_transcript(quote_id: &str, tool_id: &str) -> Vec<u8> {
-    const DOMAIN: &[u8] = b"net.payments.invocation_binding@1";
-    // ... length-prefixed quote_id, tool_id
-}
+const DOMAIN: &[u8] = b"net.payments.invocation_binding@1";
+// ... length-prefixed quote_id, tool_id
 ```
 
-No request digest, no nonce, no challenge, no expiry. The gateway sends that signature beside the quote id on the invocation (`mesh_gateway.rs:598-602`), so both headers travel together on the wire. Anyone who observes the actual paid invocation can copy both and front-run the legitimate request; redemption then consumes the quote at most once and the payer gets `already_redeemed`.
+Adding a request digest, nonce, expiry, or challenge restricts *mutation* and *delayed* replay — real gains — but the observer sees the complete signed request and can copy it wholesale and front-run. A challenge only helps if bound to something the observer cannot reuse. **A visible, transferable signature cannot solve class (b) at all.** That needs channel binding to an authenticated session, direct authenticated delivery, or end-to-end confidentiality — the same architectural question as H1, and it should be decided once for both.
 
-So requiring the binding closes leakage from billing/proof records and log exposure (M3), but **not** an intermediary observing the invocation itself. The domain separation and length-prefixing here are done correctly — the gap is the transcript's *contents*.
-
-**Recommended fix.** Add `require_invocation_binding` to the engine-backed gates (default on for new deployments). Separately, extend the transcript to cover the request digest plus a freshness element — a provider-issued challenge, or the `call_id` with a bounded validity window — so the signature authorizes *one* invocation rather than any invocation of that tool. This interacts with H1's caveat: if `caller_origin` turns out to be hop-authenticated, an application-level per-request signature is the only end-to-end binding available.
+**Recommended fix.** Add `require_invocation_binding` to the engine-backed gates (default on for new deployments) and treat it as closing class (a). Extend the transcript with a request digest and freshness to narrow mutation and delayed replay. Do **not** document either as protection against an on-path observer; scope class (b) to the H1 architectural decision.
 
 ### M2 — The `observed` cap on facilitator receipts is not enforced at the engine boundary
 
@@ -161,41 +183,98 @@ The engine takes the facilitator's self-reported tier verbatim and bills on it:
 let tier = settle.tier;                     // engine/mod.rs:998
 // ...
 if tier.satisfies(&required_tier) {         // engine/mod.rs:1170
-    let billing = self.build_billing(rec, &quote_id, &transaction, delivered.clone(), now_ns)?;
 ```
 
-Only `HttpFacilitator` clamps itself to `Observed`. `Facilitator` is a public trait (`facilitator/traits.rs:96`), so any other implementation can report `Final` and satisfy a `required_tier: Final` policy with no `ChainChecker` consulted — the exact property `concepts.md` and `engine/mod.rs:1466` say is impossible. The shape is already used in-tree: `MockFacilitator::LateFinality` returns `Confirmed(1)` (`facilitator/mock.rs:202`). Combined with H2, the shipped bindings run a facilitator that is free to claim any tier.
+Only `HttpFacilitator` clamps itself to `Observed`. `Facilitator` is a public trait (`facilitator/traits.rs:96`), so any other implementation can report `Final` and satisfy a `required_tier: Final` policy with no `ChainChecker` consulted — the exact property `concepts.md` and `engine/mod.rs:1466` say is impossible. `MockFacilitator::LateFinality` already returns `Confirmed(1)` (`facilitator/mock.rs:202`); combined with H2, the shipped bindings run a facilitator free to claim any tier.
 
 Doc contradiction to fix in the same change: `core/verification.rs:9` says *"Facilitator receipt → `observed`/`confirmed(n)`"*; `concepts.md` and `facilitator/client.rs:17` say `observed`, full stop.
 
-**Recommended fix.** Clamp in the engine: `settle.tier.min(VerificationTier::Observed)` at both sites, or drop the tier from `SettleOutcome`/`VerifyOutcome` and have the engine mint `Observed` unconditionally, leaving `re_verify_with_checker` the only producer of anything higher.
+**Recommended fix.** Rev 2's `settle.tier.min(VerificationTier::Observed)` **does not compile** — `VerificationTier` derives `PartialEq, Eq` and implements `PartialOrd` manually but has no `Ord` (`core/verification.rs:25`, `:51`), so `Ord::min` is unavailable. Instead: **remove `tier` from `SettleOutcome` / `VerifyOutcome` entirely** and have the engine mint `VerificationTier::Observed` unconditionally at every facilitator-consumption boundary, leaving `re_verify_with_checker` as the only producer of anything higher. The `LateFinality` simulation moves to a mock `ChainChecker`, which is where tier progression belongs anyway.
 
 ### M3 — Quote ids are logged while the engine treats them as bearer credentials
 
 `flow/mod.rs:929`, `flow/mod.rs:754`, `flow/http402.rs:446`.
 
-The engine defines an unbound quote id as a bearer credential (`engine/mod.rs:1825`: "absent falls back to bearer semantics (the quote id is content-derived and unguessable)"). It is nevertheless logged in full at three sites:
+The engine defines an unbound quote id as a bearer credential (`engine/mod.rs:1825`). It is logged in full at three sites:
 
 ```rust
 tracing::warn!(quote = %quote.quote_id, error = %e, "spend reservation release failed");
-tracing::warn!(quote = %quote.quote_id, "provider billing event does not bind this quote/caller/provider — dropped from proof");
 ```
 
-Rev 1's "logging carries no payloads or secrets" was inconsistent with that definition and is retracted.
+All three are **caller-side** — the payer logging its own id — so the exposure is to readers of the payer's logs (aggregation, shared hosts, support bundles), not to a remote attacker. Narrower than a leak to the counterparty, but still a credential in a log line, and these fire on the failure paths where a quote is most likely to be unredeemed.
 
-**Scope, stated precisely.** All three sites are **caller-side** — the payer logging its own quote id. So the exposure is to readers of the payer's logs (log aggregation, shared hosts, support bundles), not to a remote attacker. That is narrower than a credential leak to the counterparty, but it is still a credential in a log line: anyone with log access can redeem the payer's unredeemed paid invocation while bearer mode is on, and these fire precisely on the failure paths where a quote is most likely to still be unredeemed.
+**Recommended fix.** Log a non-authorizing short hash (`blake3(quote_id)[..8]`) — the operator need here is correlation, not reconstruction. Closes on its own if M1(a) makes the binding mandatory.
 
-**Recommended fix.** Log a non-authorizing short hash (`blake3(quote_id)[..8]`) for correlation instead of the full id — the operator's need here is to correlate, not to reconstruct. Alternatively this closes on its own once M1(a) makes the binding mandatory, since the id alone would no longer authorize.
+### M4 — Outbound HTTP door: no destination policy, and both response bodies are unbounded
 
-### M4 — No destination-address policy on the outbound HTTP door
+`flow/http402.rs:146` (`fetch_paid`), `:178` and `:358` (the reads), `:455` (`is_payment_safe_url`).
 
-`flow/http402.rs:146` (`fetch_paid`), `:455` (`is_payment_safe_url`).
+Two problems at one door.
 
-The unpaid probe at `:148` fetches any URL supplied, including RFC1918, link-local, and cloud metadata addresses; the paid retry permits cleartext http to loopback.
+**(a) Unbounded response bodies.** Rev 2's "all three HTTP clients bound their response bodies" was **false**. `X402HttpFlow` reads both the unpaid and the paid response with plain `.bytes()`:
 
-The surrounding work is good and should be kept: redirects are disabled with a stated rationale (`:107`), a 3xx is a hard failure rather than a chase (`:163`), and the 402 demand origin is re-checked against the intended host (`:194`). The gap is that no allowlist or private-range check exists. Where the URL is agent-supplied — the documented use case for the Python/Node `PaymentHttpClient` surface — this is an SSRF primitive with the host's network position, on a crate whose threat model reasons explicitly elsewhere about prompt-injected agents (doctrine 8). Promoted from Low on that reachability.
+```rust
+let body = response.bytes().await.map(|b| b.to_vec()).unwrap_or_default();   // :178, :358
+```
 
-**Recommended fix.** A host/CIDR allowlist or deny-private-ranges option on `X402HttpFlow`, defaulting to denying non-public destinations for non-loopback traffic, with explicit opt-in for self-hosted deployments. Implement it once, in the shared module H3 calls for, and apply it to all three HTTP clients — scheme policy and destination policy are the same concern and currently live in zero, one, or two of the three depending on which client you look at.
+The facilitator client (`client.rs:291`) and checker transport (`transport.rs:79`) both use bounded streaming readers with explicit caps; this one has neither, so a hostile or compromised endpoint can stream until memory is exhausted within the 30s timeout.
+
+**(b) No destination-address policy.** The unpaid probe at `:148` fetches any URL supplied — RFC1918, link-local, cloud metadata — and the paid retry permits cleartext http to loopback. Where the URL is agent-supplied (the documented `PaymentHttpClient` use case), this is an SSRF primitive with the host's network position, on a crate whose threat model reasons explicitly about prompt-injected agents (doctrine 8).
+
+The surrounding work is good and should be kept: redirects are disabled with a stated rationale (`:107`), a 3xx is a hard failure rather than a chase (`:163`), and the 402 demand origin is re-checked (`:194`).
+
+**Required fix**, all four parts:
+
+1. bounded streaming reads on **both** the unpaid and paid responses, matching `read_bounded` in `client.rs:291`;
+2. destination policy applied **before the first unpaid probe**, not only before the paid retry — the probe is the SSRF;
+3. validation of the **actual connected address**, not the hostname text: a host/CIDR allowlist over hostnames alone is bypassable by DNS rebinding;
+4. resolution pinning or per-connection revalidation, so the address checked is the address connected to.
+
+Implement in the shared module H3 calls for and apply across all three clients — scheme policy, destination policy, and body bounds are one concern currently present in zero, one, or two of the three depending on which client you read.
+
+### M5 — The replay key covers unsigned wrapper fields, so one authorization yields many replay identities
+
+`x402/payload.rs:78` (`replay_key`), `:29-44` (the wrapper shape), `engine/mod.rs:752` and `:833` (the guard).
+
+`replay_key` hashes the canonical bytes of the **entire parsed `PaymentPayload` wrapper**:
+
+```rust
+pub fn replay_key(&self) -> Result<String, X402Error> {
+    let bytes = crate::core::canonical::canonical_bytes(self.view())...;
+    Ok(hex::encode(blake3::hash(&bytes).as_bytes()))
+}
+```
+
+That wrapper includes `resource` and `extensions` — arbitrary JSON, unconstrained beyond shape (`payload.rs:33`, `:42`) — and `payload`, validated only as "must be an object" (`:57`). None of those are covered by the scheme's own signature, which signs the EIP-3009 authorization tuple inside `payload` and nothing else.
+
+So the *same signed authorization* re-wrapped with a different `resource`, a different `extensions`, or an additional tolerated field yields a **different replay key** and misses the engine's `s.consumed` guard (`engine/mod.rs:833`) — the "one payload satisfies exactly one quote" invariant stated at `engine/mod.rs:7`.
+
+Rev 2 narrowed this claim only on the retention-horizon axis. That correction was orthogonal and does not close this.
+
+**What still backstops it** (why this is Medium, not High): for the *same* quote, a differing payload hash trips `Claim::QuoteAlreadyPaid` (`engine/mod.rs:798`). Across quotes, `consumed_transactions` catches a repeated settlement id (`engine/mod.rs:1052`), and every real scheme's authorization is single-use on-chain (EIP-3009 nonce, SPL blockhash, XRPL sequence). So a live double-serve requires defeating those too. But the engine's own first-line replay guard is bypassable by mutating fields nobody signed, and canonicalization — which correctly defeats whitespace and key-ordering variation — does not address semantically irrelevant wrapper variation.
+
+**Required fix.** Derive the replay key from **scheme-semantic identity** — the signed nonce / transaction / signature material the authorization is actually unique by — rather than the whole extensible wrapper. That is a per-scheme extraction (`exact_evm`: `authorization.nonce` + `from`; `exact_svm`: the transaction signature; `exact_xrpl`: account + sequence), failing closed for a scheme with no defined identity rather than falling back to whole-wrapper hashing.
+
+### M6 — The post-verification provider-admission re-check does not exist
+
+`engine/mod.rs:140` (the trait), `:707` (the sole call site), `core/quote.rs:10-13` and `engine/mod.rs:20-22` (the doctrine).
+
+`ProviderAdmissionPolicy::admit` has exactly one call site in the crate — inside `issue_quote`. The doctrine says otherwise. `core/quote.rs:12`:
+
+> **Provider policy runs at quote issuance — never quote a caller you'd deny.** … (The post-verification provider check is a re-check.)
+
+and `engine/mod.rs:21`:
+
+> Provider policy runs at quote issuance …; the WS4 `payment_gate` re-checks before the handler.
+
+`accept_payment` never re-runs admission, and `redeem_for_invocation` checks frozen / billed / tool-binding / already-redeemed — not admission. An unexpired quote therefore survives later allowlist removal, attestation failure, or exposure-policy revocation: revoking a caller's access does not stop them redeeming quotes already issued, for the whole TTL. This is also what makes H1's admission bypass durable rather than momentary.
+
+**Required decision** — the audit forces the choice rather than assuming one:
+
+- **outstanding signed quotes are irrevocable until expiry** — defensible (they are signed commitments, and refusing after taking payment creates the refund obligation P0 explicitly avoids), in which case delete the two doctrine claims above and document quote TTL as the revocation window; or
+- **admission is dynamic** — in which case re-run `admit` in `accept_payment` *before* settlement can move value, and decide separately whether `redeem_for_invocation` re-checks (refusing there means refusing after payment, which needs a refund story).
+
+Either is acceptable. Shipping the doctrine without the code is not.
 
 ---
 
@@ -211,84 +290,96 @@ fn host_of(url: &str) -> String {
 }
 ```
 
-String surgery, with a parsed `reqwest::Url` already in scope twenty lines earlier (`:190`). A URL with an explicit port (`https://api.example.com:443/x`) or a non-lowercase host produces a capability key that misses a configured `x402-http/api.example.com` override, so `check_and_reserve` falls back to `s.defaults` (`policy/spend.rs:302`). Where the operator wrote a *tighter* per-host limit than the default, the tighter limit is silently skipped.
+String surgery, with a parsed `reqwest::Url` already in scope twenty lines earlier (`:190`). An explicit port (`https://api.example.com:443/x`) or a non-lowercase host produces a capability key that misses a configured `x402-http/api.example.com` override, so `check_and_reserve` falls back to `s.defaults` (`policy/spend.rs:302`) — skipping a *tighter* per-host limit where the operator wrote one.
 
-**Fix.** Use `Url::host_str()` from the already-parsed URL; treat an unparseable URL as a hard denial rather than `"unknown-host"`.
+**Fix.** Use `Url::host_str()`; treat an unparseable URL as a hard denial rather than `"unknown-host"`.
 
 ### L2 — Reservations have no durable ownership; release is non-idempotent
 
 `policy/spend.rs:194` (counter shape), `:269` (reserve key), `:492`–`:518` (release).
 
-**Rev 1 retraction first:** rev 1 claimed a reservation taken before UTC midnight and released after would decrement the wrong day. That is **not reachable** — all four release call sites pass the `now_ns` captured before `check_and_reserve` (`flow/mod.rs:676` → `:720`, `:809`, `:828`; `flow/http402.rs:268` → `:325`, `:378`). The claim is withdrawn.
+Rev 1's midnight-straddle claim was withdrawn in rev 2 and stays withdrawn: all four release sites pass the reservation-time `now_ns` (`flow/mod.rs:676` → `:720`, `:809`, `:828`; `flow/http402.rs:268` → `:325`, `:378`).
 
-The real defect at that site is the missing ownership model. The counter is aggregate:
-
-```rust
-counters: BTreeMap<String, String>,          // "{day}|{network}|{asset}" → atomic total
-```
-
-Nothing records that a *particular quote* reserved a particular amount. Release subtracts by the aggregate key and saturates on underflow:
+The real defect is the missing ownership model. The counter is aggregate — `"{day}|{network}|{asset}" → total` — and nothing records that a *particular quote* reserved a particular amount. Release subtracts by that aggregate key and saturates on underflow:
 
 ```rust
 let reduced = current.checked_sub(&amount).unwrap_or_else(|_| AtomicAmount::from_u128(0));
 ```
 
-Three consequences, none currently triggered by in-tree callers but all live on a `pub` API over a cross-process shared store:
+Three consequences, none triggered by in-tree callers but all live on a `pub` API over a cross-process shared store: release is **not idempotent** (two releases for one quote subtract twice); an **over-large release zeroes the day**, erasing every *other* reservation for that `(network, asset)` and reopening `max_per_day` as a loss bound; and the **same-`now_ns` contract is undocumented and unenforced**.
 
-- **Not idempotent.** Two releases for one quote subtract twice. A host retry wrapper or a re-entrant error path silently refunds budget that was spent.
-- **An over-large release zeroes the day.** The saturation sets the counter to zero rather than clamping the decrement, so one bad release erases every *other* reservation that day for that `(network, asset)` — reopening `max_per_day` as a loss bound for unrelated spending.
-- **The same-`now_ns` contract is undocumented and unenforced.** Correctness depends on the caller passing the reservation's timestamp; nothing in the signature or docs says so. This is what rev 1 mistook for a live bug — it is a latent API hazard, and the fix below removes it.
-
-**Fix.** Store a durable reservation record keyed by quote id carrying `{day, network, asset, amount}`. Release looks up that exact record, decrements once, and removes it — making release idempotent, ownership-checked, and independent of the caller's clock. Threading the original day alone fixes neither idempotency nor ownership.
+**Fix.** Store a durable reservation record keyed by quote id carrying `{day, network, asset, amount}`. Release looks up that exact record, decrements once, and removes it — idempotent, ownership-checked, and independent of the caller's clock. Threading the original day fixes neither idempotency nor ownership.
 
 ### L3 — 0600 file modes are unix-only
 
 `policy/store.rs:165`, `billing/mod.rs:110`.
 
-Both `save_json` and `BillingLog::append` set `opts.mode(0o600)` under `#[cfg(unix)]`. The engine store holds base64 of preserved x402 payloads — signed EIP-3009 authorizations, i.e. bearer instruments (`engine/mod.rs:857`) — and the billing log holds the signed usage record. On Windows both inherit directory ACLs from `dirs::data_local_dir()/net-mesh/` (`policy/store.rs:65`), user-scoped by default but not owner-only by construction. `policy/store.rs:22` states "owner-only (0600) from creation" with no platform caveat.
+Both `save_json` and `BillingLog::append` set `opts.mode(0o600)` under `#[cfg(unix)]`. The engine store holds base64 of preserved x402 payloads — signed EIP-3009 authorizations, i.e. bearer instruments (`engine/mod.rs:857`) — and the billing log holds the signed usage record. On Windows both inherit directory ACLs from `dirs::data_local_dir()/net-mesh/` (`policy/store.rs:65`).
 
-**Fix.** Set a restrictive DACL on Windows at creation, or narrow the doc comment so operators know to secure the directory. Secondary nit at the same site: `save_json` opens the temp with `.create(true).truncate(true)`, so a leftover temp from a crashed same-pid process is reused with its existing permissions rather than fresh 0600 — `create_new(true)` plus a retry closes that.
+**Required fix.** Rev 2 offered "set a DACL **or** narrow the doc comment." Documentation is not remediation for an unprotected bearer instrument at rest, so: enforce a restrictive Windows ACL at creation, **or** refuse to operate unless the operator explicitly supplies a path they have secured. Correcting `policy/store.rs:22` ("owner-only (0600) from creation", stated without platform caveat) is necessary but is not the fix.
+
+Secondary nit at the same site: `save_json` opens the temp with `.create(true).truncate(true)`, so a leftover temp from a crashed same-pid process is reused with its existing permissions rather than fresh 0600 — `create_new(true)` plus a retry closes that.
 
 ### L4 — The EIP-712 domain cross-check the header promises does not exist
 
 `x402/schemes/exact_evm.rs:17`, against `core/registry.rs:45` and `:129`.
 
-The module header claims *"the registry cross-check (WS4 packs) catches mismatches before signing"* for the domain's `name` / `version`. `AssetEntry` has no such fields and `check_requirements` validates only `decimals`.
+The module header claims *"the registry cross-check (WS4 packs) catches mismatches before signing"* for the domain's `name` / `version`. `AssetEntry` has no such fields; `check_requirements` validates only `decimals`.
 
-**Impact is bounded, and worth stating precisely:** `verifyingContract` comes from `requirements.asset`, which *is* registry-pinned via `check_and_reserve` → `registry.check_requirements` (`policy/spend.rs:254`), and `chainId` from the CAIP-2 network. A counterparty supplying wrong `name`/`version` produces a signature whose domain separator matches no deployed contract — a wasted signature and a failed payment, not an authorization usable elsewhere. The issue is that the comment asserts a guarantee the code does not provide.
+Impact is bounded: `verifyingContract` comes from `requirements.asset`, registry-pinned via `check_and_reserve` → `registry.check_requirements` (`policy/spend.rs:254`), and `chainId` from the CAIP-2 network. Wrong `name`/`version` produces a signature whose domain separator matches no deployed contract — a wasted signature, not an authorization usable elsewhere.
 
-**Fix.** Add optional `eip712_name` / `eip712_version` to `AssetEntry` and check them alongside `decimals`, or correct the comment to say the domain is provider-asserted and the pinning comes from `verifyingContract`/`chainId` alone.
+**Required fix.** Rev 2 proposed *optional* `eip712_name` / `eip712_version` on `AssetEntry`. Optional fields pin nothing — absent, the counterparty-controlled values stand. So either make them **required for EVM assets** (or fail closed when an EVM requirement carries no pinned metadata), which makes the module's guarantee true; or **retract the guarantee** in the header and state that the domain is provider-asserted and only `verifyingContract`/`chainId` are pinned. Not both halves of the current wording.
 
-### L5 — Smaller notes
+### L5 — The delivered-amount sum saturates, which can mask an overpayment as exact
 
-**`maxAmountRequired` is aliased to an exact amount.** `x402/requirements.rs:46`. Deliberate (the M9 comment and test at `:128`) and safe against theft — exact-equality and spend caps both still apply. But in the deployed x402 vocabulary that key means a *ceiling*, and on the outbound HTTP path the caller pays it as an exact amount. Worth a line in `http402.md`.
+`checker/eip155.rs:332`.
 
-**`approve()` can pre-approve a nonexistent quote id.** `policy/spend.rs:527` uses `.entry(quote_id).or_insert(...)` then sets `Approved`, so approving an unknown id creates a record `check_and_reserve` later reads as `approved == true` (`:299`), bypassing `max_per_call` / `max_per_day` / `allowed_assets`. Effectively unreachable — operator-only verb, and quote ids are `blake3(provider ‖ caller ‖ terms_hash ‖ issued_at_ns)` (`core/quote.rs:144`), so hitting one requires predicting the issuance nanosecond. Make `approve` return `false` for an unknown id rather than minting a record.
+```rust
+total = total.saturating_add(value);
+```
+
+If matching `Transfer` logs sum past `u128::MAX`, saturation clamps `total` to exactly `u128::MAX`. A quote whose `required_amount` is `u128::MAX` — permitted by `AtomicAmount`'s grammar (`core/units.rs:44`) — then compares `Ordering::Equal` in `re_verify_with_checker` (`engine/mod.rs:1700`) and is billed as an exact settlement instead of routing to the `Overpayment` exception.
+
+Contrived, and rev 2 called it "defensible" — but that assessment asserted a bound nobody has established, on the independent-verification path, where the whole point is not trusting the amounts anyone else reports.
+
+**Fix.** Use `checked_add` and return `CheckerError::terminal` on overflow, matching how the same file already treats an unparseable `log.data` (`:331`). Cheap, and removes the need to reason about the bound at all.
+
+### L6 — Smaller notes
+
+**`maxAmountRequired` is aliased to an exact amount.** `x402/requirements.rs:46`. Deliberate (the M9 comment and test at `:128`) and safe against theft — exact-equality and spend caps both apply. But in the deployed x402 vocabulary that key means a *ceiling*, and on the outbound HTTP path the caller pays it as an exact amount. Worth a line in `http402.md`.
+
+**`approve()` can mint a malformed approval record.** `policy/spend.rs:527` uses `.entry(quote_id).or_insert(...)` then sets `Approved`, creating a record for an id with no quote — empty `capability`, empty `quote_b64` — that `check_and_reserve` later reads as `approved == true` (`:299`), bypassing `max_per_call` / `max_per_day` / `allowed_assets`.
+
+Rev 2 described reaching this as "predicting the issuance nanosecond." That understates the difficulty and mislabels the mechanism: for an already-approved 256-bit id, producing a quote that matches it is a BLAKE3 preimage problem over the full quote transcript (`core/quote.rs:144`), not a timing race. This is therefore **malformed operator/API state, not an attack path** — the recommendation stands on API-integrity grounds alone. Make `approve` return `false` (or error) for an unknown quote id rather than minting a record.
 
 ---
 
 ## What holds up
 
-Recorded because it is genuinely most of the crate, and because several of these are load-bearing enough that a future change should know it is undoing deliberate work. **Two rev-1 claims in this section were overstated and are corrected inline.**
+Recorded because it is genuinely most of the crate, and because several of these are load-bearing enough that a future change should know it is undoing deliberate work. Claims corrected across revisions are marked.
 
 - **Byte-preservation is structural, not conventional.** There is no `to_bytes(&view)` on `X402Carry`, and the carry serializes as base64 of the originals (`x402/mod.rs:127`), so no binding's JSON encoder can reach the signed bytes. Authoring is the single sanctioned serialization point and round-trips through `from_bytes` to satisfy the same invariants (`x402/mod.rs:88`).
-- **Replay identity is canonical, not byte-keyed.** `replay_key` (`x402/payload.rs:78`) hashes the canonical payload rather than the preserved bytes, so a re-encoded resubmission of one authorization cannot claim a second quote — the trap byte-preservation would otherwise have opened. *Correction to rev 1's phrasing:* this holds within the retention horizon. `prune_terminal` co-prunes the `consumed` entry when a terminal record retires (`engine/mod.rs:462`), after which the guarantee rests on the scheme's own single-use authorization rather than the engine's index. The engine documents that tradeoff explicitly at `:436-461`; the claim is about *encoding* and remains correct on that axis.
+- **Canonical encoding is disciplined**: all keys sorted bytewise including unknown ones, compact separators, and floats rejected at the writer (`core/canonical.rs:120`) rather than coerced. Signatures cover the envelope with the `signature` key absent (`:88`), and unknown fields are covered rather than decorative — pinned by test (`core/quote.rs:341`).
+  *Note:* canonicalization defeats whitespace and key-ordering variation. It does **not** establish replay identity — see M5, which replaces rev 1's and rev 2's positive claim on that point.
 - **Settlement tombstones are permanent with no expiry knob**, and `prune_terminal`'s doc (`engine/mod.rs:398`) states exactly why the asymmetry with payload-hash pruning is deliberate. Refusing to expose "retain transaction ids for N days" so a security invariant cannot become a deployment preference is the right call.
 - **The claim/complete state machine** holds no lock across facilitator I/O, uses an in-flight TTL for crash recovery, and derives every `dirty` flag from the same branch that performed the mutation (`engine/mod.rs:891`).
-- **`AtomicAmount` rejects every ambiguous spelling** — leading zeros, signs, exponents, non-ASCII digits (`core/units.rs:33`) — and floats are rejected at the canonical writer (`core/canonical.rs:120`) rather than coerced. *Correction to rev 1:* "checked arithmetic throughout" was too strong. The primitives are checked, but two call sites deliberately discard the check — `release_reservation` turns a `checked_sub` underflow into zero (`policy/spend.rs:511`, see L2) and the eip155 checker sums delivery with `saturating_add` (`checker/eip155.rs:332`). The second is defensible; the first is L2's failure mode.
-- **TLS is pinned and hermetic** where it is applied — bundled Mozilla roots, ring provider supplied explicitly rather than installed process-globally, with reasoning about not leaking into other rustls users in the host process (`tls_roots.rs`). All three HTTP clients bound their response bodies against a hostile endpoint (`facilitator/client.rs:291`, `checker/transport.rs:79`). *Correction to rev 1:* scheme enforcement is **not** uniform — see H3.
-- **The eip155 checker binds delivery to the authorization**, not merely to `(token, recipient)`: the `AuthorizationUsed` nonce bind is mandatory and fail-closed at the engine (`engine/mod.rs:1566`), and event topics are computed from their signatures rather than memorized as constants (`checker/eip155.rs:152`). `ensure_chain_id` refuses a mismatched endpoint — though over cleartext it authenticates nothing (H3).
+- **`AtomicAmount` rejects every ambiguous spelling** — leading zeros, signs, exponents, non-ASCII digits (`core/units.rs:33`). *Corrected from rev 1's "checked arithmetic throughout":* the primitives are checked, but two call sites discard the check — `release_reservation` turns a `checked_sub` underflow into zero (L2) and the eip155 checker sums with `saturating_add` (L5). Both are findings, not features.
+- **TLS is pinned and hermetic where applied** — bundled Mozilla roots, ring provider supplied explicitly rather than installed process-globally, with reasoning about not leaking into other rustls users in the host process (`tls_roots.rs`). *Corrected across revisions:* scheme enforcement is **not** uniform (H3), and body bounds are **not** uniform (M4) — only the facilitator client and checker transport have both.
+- **The eip155 checker binds delivery to the authorization**, not merely to `(token, recipient)`: the `AuthorizationUsed` nonce bind is mandatory and fail-closed at the engine (`engine/mod.rs:1566`), and event topics are computed from their signatures rather than memorized as constants (`checker/eip155.rs:152`).
 - **Fail-closed accounting on ambiguity.** `reject_releases_reservation` (`flow/mod.rs:943`) keeps the caller's reservation whenever the counterparty holds a self-contained bearer authorization, on the correct reasoning that a claimed non-settlement is not proof. Easy to get backwards, and getting it backwards would defeat `max_per_day`.
 - **The signer seam has no raw-bytes method**, and the two non-EVM signers return structured refusals for the EVM method by construction rather than by discipline (`flow/signer.rs:169`, `:218`). `unsafe-dev-signer` is correctly feature-gated — the model H2 should follow.
-- **Facilitator config carries secret *refs* only** (`facilitator/config.rs:6`), `BearerAuth` is deliberately not `Debug`, and the failure schematic keeps free-form freeze text off the structured header while leaving it on the human body (`engine/mod.rs:220`). *Correction to rev 1:* the blanket "no secrets in logs" claim is retracted — see M3.
+- **Facilitator config carries secret *refs* only** (`facilitator/config.rs:6`), `BearerAuth` is deliberately not `Debug`, and the failure schematic keeps free-form freeze text off the structured header while leaving it on the human body (`engine/mod.rs:220`). *Corrected from rev 1:* the blanket "no secrets in logs" claim is retracted — see M3.
 
 ---
 
 ## Suggested order of work
 
-1. **H2 first** — it is the one finding that makes the shipped product not do the thing it says. Until the binding constructors can reach a real facilitator, the rest is defence in depth around a simulator.
-2. **H3** — a one-function fix (`require_secure_endpoint`, already written) hoisted to a shared module, applied to all three HTTP clients. Land M4's destination policy in the same module while it is open.
-3. **H1 + M1 together** — same root cause: neither the quote boundary nor the redeem boundary authenticates anybody. Resolve H1's implementation caveat (originator vs. hop) first, because the answer determines whether M1(b)'s per-request binding is a hardening measure or the only available end-to-end identity.
-4. **M2** — a two-line clamp plus a doc correction; closes a trust-root gap that widens the moment a second `Facilitator` implementation exists.
-5. **M3** — subsumed by M1(a) if the binding becomes mandatory; otherwise a one-line change to a short hash.
-6. **L1–L5** — small, self-contained, each with a regression test that writes itself. L2 needs a schema addition to the policy store, so it is the largest of them.
+1. **H2** — the one finding that makes the shipped product not do what it says. Until the binding constructors can reach a real facilitator, everything else is defence in depth around a simulator.
+2. **H3 + M4 together** — one shared HTTP-policy module: scheme enforcement, destination policy with connected-address validation and rebinding defence, and bounded body reads. Three clients, one implementation, applied uniformly.
+3. **H1 — architectural decision required before any code.** Choose among application-level caller signature, protected-RPC attribution, or a new authenticated-caller context. **Do not implement rev 2's `caller_origin` comparison.** Correct the misleading `RpcContext::caller_origin` doc comment (`rpc.rs:1482`) immediately and independently — it is an active trap for any handler author, and it is what produced the invalid rev-2 recommendation.
+4. **M1 with H1** — same decision. Ship `require_invocation_binding` now to close off-path leakage (class a); scope on-path front-running (class b) to whatever H1 resolves, and do not describe the binding as solving it.
+5. **M6** — a decision, not a patch: either delete the doctrine or add the re-check. Cheap either way, and it determines whether H1's bypass is momentary or lasts a full quote TTL.
+6. **M2** — remove `tier` from the facilitator outcome types; mint `Observed` at the boundary. Move `LateFinality` to a mock `ChainChecker`.
+7. **M5** — per-scheme replay identity extraction, failing closed for schemes with none.
+8. **M3** — subsumed by M1(a) if the binding becomes mandatory; otherwise a one-line change to a short hash.
+9. **L1–L6** — small and self-contained. L2 needs a schema addition to the policy store and is the largest; L5 is a one-line `checked_add`.
