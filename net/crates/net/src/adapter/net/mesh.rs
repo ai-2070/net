@@ -8259,6 +8259,16 @@ impl MeshNode {
         // without going back through `config`.
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
+        if Self::subnet_policy_without_local_subnet(local_subnet, local_subnet_policy.is_some()) {
+            tracing::warn!(
+                "subnet policy installed but this node's own subnet is GLOBAL — \
+                 MeshNodeConfig::with_subnet_policy assigns PEERS' subnets, it does \
+                 not set your own. Add with_subnet(..). Until you do, \
+                 Visibility::ParentVisible channels reject peers whose subnet the \
+                 policy resolved and admit peers it could not, because a global \
+                 local subnet has no ancestor to compare against."
+            );
+        }
         // Pre-apply the reflex override so the node starts in
         // `Open` + `reflex_addr = Some(override)` state before
         // the first capability announcement leaves the box. Skips
@@ -23736,6 +23746,46 @@ impl MeshNode {
         }
     }
 
+    /// True for a node that installed a [`SubnetPolicy`] but left its
+    /// own subnet at [`SubnetId::GLOBAL`] — a configuration that
+    /// resolves peers into subnets while holding no subnet identity to
+    /// compare them against.
+    ///
+    /// The consequence is confined to [`Visibility::ParentVisible`] and
+    /// it is an inversion: `dest.is_ancestor_of(GLOBAL)` is false for
+    /// every concrete `dest`, so a peer whose subnet the policy DID
+    /// resolve is rejected, while a peer it could not resolve takes the
+    /// unknown arm — `source.is_global()`, which is true here — and is
+    /// admitted. Being unresolvable becomes strictly more privileged
+    /// than being resolved, on the path that otherwise answers
+    /// [`AckReason::Unauthorized`].
+    ///
+    /// The unknown arm is deliberately left permissive for a genuinely
+    /// flat mesh: a node with no subnet of its own cannot express "same
+    /// subnet as me" or "ancestor of me" as a constraint, and failing
+    /// closed there would silently partition every deployment that
+    /// never configured subnets. See [`Self::subnet_visible`]. This
+    /// predicate separates the flat case (no policy — nothing is ever
+    /// resolvable, permissive is the only workable answer) from the
+    /// misconfigured one (a policy, so resolution is expected, but no
+    /// local subnet to judge against).
+    ///
+    /// The condition is the CONJUNCTION. A policy with a scoped local
+    /// subnet is the intended subnet-aware setup; a global local subnet
+    /// with no policy is the intended flat setup. Only the pair is
+    /// suspect.
+    ///
+    /// Recorded in
+    /// CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md
+    /// finding 2, where warning rather than failing closed was an
+    /// explicit decision: failing closed would flip every direct
+    /// subscriber that never published a capability announcement from
+    /// admitted to `Unauthorized`, since such a peer is absent from
+    /// `peer_subnets` permanently rather than transiently.
+    fn subnet_policy_without_local_subnet(subnet: SubnetId, policy_installed: bool) -> bool {
+        policy_installed && subnet.is_global()
+    }
+
     /// `dest` is `None` when the peer's subnet has not been derived —
     /// `peer_subnets` only populates when a `local_subnet_policy` is
     /// installed and the peer has sent a signature-verified direct
@@ -36269,6 +36319,61 @@ mod subnet_visible_unknown_tests {
                  unresolved peers under {visibility:?} (flat-mesh compat)"
             );
         }
+    }
+
+    /// The permissive arm above is correct for a genuinely flat mesh
+    /// and wrong for a node that installed a `SubnetPolicy` and then
+    /// left its own subnet global: there, resolution is expected, so
+    /// "unresolved" means something went wrong rather than "subnets are
+    /// not in use". That pairing is warned about at construction rather
+    /// than failed closed — see
+    /// `MeshNode::subnet_policy_without_local_subnet` for the decision.
+    ///
+    /// The condition must be the CONJUNCTION. Firing on either half
+    /// alone would warn every correctly-configured deployment: a policy
+    /// with a scoped subnet is the intended subnet-aware setup, and a
+    /// global subnet with no policy is the intended flat one.
+    #[test]
+    fn misconfiguration_warning_fires_only_on_policy_plus_global_subnet() {
+        let scoped = SubnetId::new(&[3, 7]);
+        let cases = [
+            // (subnet, policy_installed, should_warn)
+            (SubnetId::GLOBAL, true, true), // the misconfiguration
+            (SubnetId::GLOBAL, false, false), // flat mesh, intended
+            (scoped, true, false),          // subnet-aware, intended
+            (scoped, false, false),         // scoped but no peer resolution
+        ];
+        for (subnet, policy_installed, should_warn) in cases {
+            assert_eq!(
+                MeshNode::subnet_policy_without_local_subnet(subnet, policy_installed),
+                should_warn,
+                "subnet={subnet:?} policy_installed={policy_installed}"
+            );
+        }
+    }
+
+    /// The inversion the warning describes, pinned against
+    /// `subnet_visible` itself so the message cannot drift from the
+    /// behaviour. On a global-subnet node under `ParentVisible`, a
+    /// resolved peer is rejected while an unresolved one is admitted.
+    #[test]
+    fn global_local_subnet_privileges_unresolved_peers_over_resolved_ones() {
+        let resolved = Some(SubnetId::new(&[3]));
+        assert!(
+            !MeshNode::subnet_visible(SubnetId::GLOBAL, resolved, Visibility::ParentVisible),
+            "a peer whose subnet resolved to [3] is not an ancestor of GLOBAL, \
+             so it is rejected"
+        );
+        assert!(
+            MeshNode::subnet_visible(SubnetId::GLOBAL, None, Visibility::ParentVisible),
+            "yet an unresolved peer takes the permissive unknown arm and is \
+             admitted — being unresolvable is more privileged than being \
+             resolved, which is what the construction warning exists to flag"
+        );
+        assert!(
+            MeshNode::subnet_policy_without_local_subnet(SubnetId::GLOBAL, true),
+            "and this is exactly the configuration the warning fires on"
+        );
     }
 
     /// Every known-subnet verdict is byte-for-byte what it was before
