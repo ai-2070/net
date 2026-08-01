@@ -26571,6 +26571,31 @@ impl MeshNode {
     /// Subnet membership remains SELF-ASSERTED — a peer picks its own
     /// tags, so this is a discovery filter, not an access-control
     /// boundary. See the audit's HIGH finding on self-asserted subnets.
+    ///
+    /// # Cost under the fold locks
+    ///
+    /// Resolving inside the selecting snapshot is what the single-
+    /// snapshot argument above requires, so the derivation necessarily
+    /// runs while the fold's state and index read locks are held. Under
+    /// `SameSubnet` that is, per candidate:
+    ///
+    /// - no allocation — [`SubnetPolicy::assign_from_rendered_tags`]
+    ///   borrows the tags the snapshot already holds; and
+    /// - `O(operator_rules × announcement_tags)` prefix strips and map
+    ///   lookups.
+    ///
+    /// Announcement tags are announcer-chosen and capped only by the
+    /// wire payload; rules are configured locally and small. The other
+    /// scope filters do not reach the closure at all — their verdict
+    /// comes entirely from the tags — so this cost is confined to
+    /// `SameSubnet` queries.
+    ///
+    /// Stated because it replaced a `peer_subnets` lookup that ran
+    /// AFTER the locks dropped, and moving announcer-shaped work under
+    /// them is the kind of thing
+    /// SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md flags. It is
+    /// accepted here on correctness grounds, not on a claim of being
+    /// cheaper than what it replaced — no such measurement was taken.
     pub fn find_nodes_by_filter_scoped(
         &self,
         filter: &CapabilityFilter,
