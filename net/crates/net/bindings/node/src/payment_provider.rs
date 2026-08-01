@@ -106,9 +106,18 @@ fn author_pricing_terms(
 ///
 /// `productionRegistry` must match the provider that will quote these terms: a
 /// `PaymentProvider` built with a real `facilitatorUrl` issues quotes under the
-/// production registry revision (no mock asset), so its announced terms should
-/// be authored with `true`. Announcing one revision while quoting under another
-/// leaves discovery metadata naming a registry the backend does not use.
+/// production registry revision (which drops the mock asset and the testnets),
+/// so its announced terms must be authored with `true`. Announcing one revision
+/// while quoting under another leaves discovery metadata naming a registry the
+/// backend does not use, and a caller that picks an entry from it gets refused
+/// with nothing to fall back to.
+///
+/// **Prefer [`PaymentProvider.pricingTerms`](provider::PaymentProvider::pricing_terms)
+/// when you have a provider.** It takes the registry from the engine that will
+/// actually issue the quotes, so the two cannot disagree. This free function
+/// exists for authoring terms without standing a provider up — a discovery
+/// tool, a fixture — and its default of `false` is a real footgun for anyone
+/// who has a real facilitator and does not pass the flag.
 #[napi]
 pub fn build_pricing_terms(
     provider_entity_id: Buffer,
@@ -138,8 +147,14 @@ pub fn build_pricing_terms(
 // tool-publish building blocks) alongside `payments`.
 // ---------------------------------------------------------------------------
 
+/// The registry revision a real settlement backend puts the engine on.
+/// Named once so the provider's authoring path and its `registryVersion`
+/// getter cannot drift apart.
+const PRODUCTION_REGISTRY_VERSION: &str = "net-production-1";
+
 #[cfg(feature = "publish")]
 mod provider {
+    use super::PRODUCTION_REGISTRY_VERSION;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -422,6 +437,41 @@ mod provider {
         #[napi(getter)]
         pub fn provider_entity_id(&self) -> Buffer {
             Buffer::from(self.provider_entity_id.clone())
+        }
+
+        /// Author this provider's `net.pricing.terms@1` for `capability`,
+        /// against **the registry its own engine quotes under**.
+        ///
+        /// The same authoring as the free `buildPricingTerms`, minus the two
+        /// ways to get it wrong. That function takes the provider id and a
+        /// `productionRegistry` flag as separate arguments, either of which can
+        /// disagree with the provider that will serve the quotes: announce the
+        /// dev revision while quoting under the production one and a caller
+        /// picks an asset the backend will never quote, then gets refused with
+        /// no other entry to fall back to. Here both come from the engine.
+        ///
+        /// `requirementsJson` is the same JSON array of x402
+        /// `PaymentRequirements` objects (camelCase wire names). Every entry is
+        /// checked against the registry before the terms are returned, so this
+        /// throws rather than announcing something unquotable.
+        #[napi]
+        pub fn pricing_terms(
+            &self,
+            capability: String,
+            requirements_json: String,
+        ) -> Result<String> {
+            let id: [u8; 32] = self
+                .provider_entity_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::from_reason("provider entity id is not 32 bytes"))?;
+            crate::payment_provider::author_pricing_terms(
+                id,
+                &capability,
+                &requirements_json,
+                self.registry_version == PRODUCTION_REGISTRY_VERSION,
+            )
+            .map_err(Error::from_reason)
         }
 
         /// The asset registry revision this provider issues quotes under —

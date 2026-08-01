@@ -3484,6 +3484,24 @@ class PaymentProvider:
         price + quote under. Pass it to :func:`build_pricing_terms`."""
         ...
 
+    def pricing_terms(self, capability: str, requirements_json: str) -> str:
+        """Author this provider's ``net.pricing.terms@1`` for ``capability``,
+        against **the registry its own engine quotes under**.
+
+        The same authoring as :func:`build_pricing_terms`, minus the two ways
+        to get it wrong: that function takes the provider id and a
+        ``production_registry`` flag as separate arguments, and either can
+        disagree with the provider that will serve the quotes. Announce the dev
+        revision while quoting under the production one and a caller picks an
+        asset the backend will never quote, then gets refused with nothing to
+        fall back to. Here both come from the engine.
+
+        ``requirements_json`` is the same JSON array of x402
+        ``PaymentRequirements`` objects. Every entry is checked against the
+        registry first, so this raises ``ValueError`` rather than announcing
+        something unquotable."""
+        ...
+
     @property
     def registry_version(self) -> str:
         """The asset registry revision this provider issues quotes under —

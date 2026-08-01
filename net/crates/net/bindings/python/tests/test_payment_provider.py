@@ -249,6 +249,65 @@ def test_a_real_facilitator_url_is_never_silently_downgraded(mesh, tmp_path):
     assert provider.registry_version == "net-production-1"
 
 
+def test_provider_authored_terms_follow_the_provider_registry(mesh, tmp_path):
+    """The provider-bound authoring cannot announce a revision it will not
+    quote under.
+
+    The free ``build_pricing_terms`` takes the provider id and the registry
+    choice as separate arguments, so both can disagree with the provider
+    that actually serves the quotes. ``provider.pricing_terms`` takes both
+    from the engine, which is why it is the one to reach for.
+    """
+    provider = PaymentProvider(
+        mesh,
+        str(tmp_path / "engine.json"),
+        unsafe_dev_mock_facilitator=True,
+    )
+    reqs = json.dumps(
+        [
+            {
+                "scheme": "mock",
+                "network": "mock:net",
+                "amount": "2500",
+                "asset": "musd",
+                "payTo": "mock-provider-settle-addr",
+                "maxTimeoutSeconds": 60,
+            }
+        ]
+    )
+    terms = json.loads(provider.pricing_terms("prov/echo", reqs))
+    assert terms["object"] == "net.pricing.terms@1"
+    assert terms["capability"] == "prov/echo"
+
+    # Byte-identical to the free function told the truth about this
+    # provider — which is the point: the method is the version that cannot
+    # be told a lie.
+    free = _net.build_pricing_terms(
+        bytes(provider.provider_entity_id),
+        "prov/echo",
+        reqs,
+        provider.registry_version == "net-production-1",
+    )
+    assert json.loads(free) == terms
+
+    # And an asset this provider's registry does not carry is refused at
+    # authoring rather than announced and refused later at quote time.
+    absent = json.dumps(
+        [
+            {
+                "scheme": "exact",
+                "network": "eip155:1",
+                "amount": "2500",
+                "asset": "0x0000000000000000000000000000000000000001",
+                "payTo": "0x0000000000000000000000000000000000000002",
+                "maxTimeoutSeconds": 60,
+            }
+        ]
+    )
+    with pytest.raises(ValueError):
+        provider.pricing_terms("prov/echo", absent)
+
+
 def test_the_mock_backend_says_so_in_the_registry_revision(mesh, tmp_path):
     """The other side of the same guarantee.
 

@@ -273,6 +273,65 @@ describe.skipIf(!PaymentProvider)('PaymentProvider settlement backend', () => {
     })
   }, 20000)
 
+  it('provider-authored terms follow the provider registry', async () => {
+    await withProvider(async (mesh) => {
+      // The free buildPricingTerms takes the provider id and the registry
+      // choice as separate arguments, so both can disagree with the provider
+      // that actually serves the quotes. `pricingTerms` takes both from the
+      // engine, which is why it is the one to reach for.
+      const provider = new PaymentProvider(
+        mesh,
+        tmp('terms.state'),
+        undefined,
+        undefined,
+        undefined,
+        true,
+      )
+      try {
+        const reqs = JSON.stringify([
+          {
+            scheme: 'mock',
+            network: 'mock:net',
+            amount: '2500',
+            asset: 'musd',
+            payTo: 'mock-provider-settle-addr',
+            maxTimeoutSeconds: 60,
+          },
+        ])
+        const terms = JSON.parse(provider.pricingTerms('prov/echo', reqs))
+        expect(terms.object).toBe('net.pricing.terms@1')
+        expect(terms.capability).toBe('prov/echo')
+
+        // Identical to the free function told the truth about this provider —
+        // which is the point: the method is the version that cannot be told a
+        // lie.
+        const free = buildPricingTerms(
+          provider.providerEntityId,
+          'prov/echo',
+          reqs,
+          provider.registryVersion === 'net-production-1',
+        )
+        expect(JSON.parse(free)).toEqual(terms)
+
+        // An asset this provider's registry does not carry is refused at
+        // authoring rather than announced and refused later at quote time.
+        const absent = JSON.stringify([
+          {
+            scheme: 'exact',
+            network: 'eip155:1',
+            amount: '2500',
+            asset: '0x0000000000000000000000000000000000000001',
+            payTo: '0x0000000000000000000000000000000000000002',
+            maxTimeoutSeconds: 60,
+          },
+        ])
+        expect(() => provider.pricingTerms('prov/echo', absent)).toThrow()
+      } finally {
+        provider.close()
+      }
+    })
+  }, 20000)
+
   it('the mock backend says so in the registry revision', async () => {
     await withProvider(async (mesh) => {
       // The other side of the same guarantee: asking for the mock gets the
