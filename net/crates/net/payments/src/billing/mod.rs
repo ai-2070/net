@@ -105,48 +105,36 @@ impl BillingLog {
                     .map_err(|e| BillingError::io(&self.path, e))?;
             }
         }
-        let mut opts = tokio::fs::OpenOptions::new();
-        opts.append(true).create(true);
-        #[cfg(unix)]
-        {
-            // `mode` is inherent on tokio's OpenOptions (no trait import).
-            opts.mode(0o600);
-        }
-        // Create the log with its permissions already in place, rather
-        // than opening it and tightening afterwards. On Windows a reader
-        // that opens the file before a later DACL change keeps the access
-        // it was granted for the life of its handle, so there must be no
+        // Open the log with its permissions already in place, rather than
+        // opening it and tightening afterwards. On Windows a reader that
+        // opens the file before a later DACL change keeps the access it
+        // was granted for the life of its handle, so there must be no
         // window in which the log exists unrestricted — not even an empty
-        // one, because the handle outlives the emptiness.
+        // one, because the handle outlives the emptiness. Existing but
+        // permissive is the same problem: "it exists" is not "it is
+        // protected", and a log written by an older build or pre-created
+        // by an operator carries whatever it was made with.
         //
-        // `AlreadyExists` is the ordinary case after the first append —
-        // but "it exists" is not "it is protected". A log written by an
-        // older build, or pre-created by an operator in a shared
-        // directory, carries whatever permissions it was made with, and
-        // appending signed usage records to it would inherit them. Repair
-        // rather than assume.
+        // The record is then written through the returned handle. Not by
+        // reopening the path: securing a name and reopening it are two
+        // operations, and a writer to a shared parent can replace the
+        // name in between — with a permissive file, or a symlink — so the
+        // append lands outside the guarantee that was just established. A
+        // handle names the object, so nothing can be substituted under
+        // it. `file_mode` refuses a symlink outright for the same reason.
         //
-        // `restrict_existing` is the weaker operation (it cannot revoke a
-        // handle already open — see `file_mode`), which is exactly why it
-        // is confined to this pre-existing case and never used for
-        // creation.
+        // Off the reactor: this is several blocking syscalls, and on
+        // Windows a token read and an SDDL conversion besides. A custom
+        // path on a network or FUSE filesystem makes them slow, and every
+        // charge passes through here.
         let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            match crate::policy::file_mode::create_owner_only(&path) {
-                Ok(_) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    crate::policy::file_mode::restrict_existing(&path)
-                }
-                Err(e) => Err(e),
-            }
+        let file = tokio::task::spawn_blocking(move || {
+            crate::policy::file_mode::open_append_owner_only(&path)
         })
         .await
         .map_err(|e| BillingError::io(&self.path, e))?
         .map_err(|e| BillingError::io(&self.path, e))?;
-        let mut file = opts
-            .open(&self.path)
-            .await
-            .map_err(|e| BillingError::io(&self.path, e))?;
+        let mut file = tokio::fs::File::from_std(file);
         file.write_all(&line)
             .await
             .map_err(|e| BillingError::io(&self.path, e))?;
@@ -269,5 +257,51 @@ mod tests {
         let events = log.read_all().await.unwrap();
         assert_eq!(events.len(), 1, "one charge per billing_event_id");
         assert_eq!(events[0].billing_event_id, ev.billing_event_id);
+    }
+
+    /// The append writes through the handle `file_mode` secured, so a
+    /// symlink standing where the log should be is refused rather than
+    /// followed.
+    ///
+    /// A writer to a shared parent directory is the threat: replace the
+    /// log name with a link and every later signed usage record lands in
+    /// a file that writer can read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn appending_through_a_symlinked_log_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("attacker-readable.jsonl");
+        std::fs::write(&elsewhere, b"").unwrap();
+        let log_path = dir.path().join("billing.jsonl");
+        std::os::unix::fs::symlink(&elsewhere, &log_path).unwrap();
+
+        let log = BillingLog::new(&log_path);
+        let kp = EntityKeypair::generate();
+        let err = log
+            .append(&signed_event(&kp, "q1"))
+            .await
+            .expect_err("a symlinked log path must not be appended through");
+        assert!(
+            matches!(err, BillingError::Io { .. }),
+            "expected an I/O refusal, got {err:?}"
+        );
+        assert!(
+            std::fs::read(&elsewhere).unwrap().is_empty(),
+            "nothing may be written to the link's target"
+        );
+    }
+
+    /// Two appends land as two lines: the second open extends the log
+    /// rather than truncating it.
+    #[tokio::test]
+    async fn a_second_append_extends_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = BillingLog::new(dir.path().join("b.jsonl"));
+        let kp = EntityKeypair::generate();
+
+        log.append(&signed_event(&kp, "q1")).await.unwrap();
+        log.append(&signed_event(&kp, "q2")).await.unwrap();
+
+        assert_eq!(log.read_all().await.unwrap().len(), 2);
     }
 }

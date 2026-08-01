@@ -27,6 +27,20 @@
 //! The descriptor therefore has to be present at `CreateFileW` time,
 //! which is what [`create_owner_only`] does. There is no window to race.
 //!
+//! ## Why the caller gets a handle, never a repaired pathname
+//!
+//! Everything here returns an open [`std::fs::File`], and the caller
+//! writes through *that*. Securing a name and then reopening it is not
+//! the same operation: between the two calls the name can be replaced —
+//! with a permissive file, or with a symlink pointing somewhere else
+//! entirely — and the write lands outside the guarantee that was just
+//! established. A handle refers to the object, not to the path, so
+//! nothing can be substituted underneath it.
+//!
+//! The same reasoning is why the repair path
+//! ([`open_append_owner_only`]) refuses a symlink outright and applies
+//! its permission change to the handle rather than to the pathname.
+//!
 //! Failure is loud. A file whose permissions could not be established is
 //! not one to write bearer material into, so the caller surfaces the
 //! error rather than continuing.
@@ -66,39 +80,109 @@ pub(crate) fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
-/// Tighten an **existing** file to owner-only.
+/// Open `path` for **appending**, owner-only, creating it if absent —
+/// and hand back the handle to append through.
 ///
-/// Weaker than [`create_owner_only`] by construction — see the module
-/// note: it cannot revoke access already granted to an open handle. Use
-/// it only to repair a file that predates this code, never as the
-/// primary guard for one being created now.
+/// The handle is the point. An append log is reopened on every write, so
+/// this is the one path where "secure the name, then open the name" is
+/// most obviously wrong: a writer to a shared parent directory only has
+/// to win the gap once to have every later record appended to a file it
+/// controls.
+///
+/// Two cases, and the second is strictly weaker:
+///
+/// - **Absent** — [`create_owner_only`] creates it with the permissions
+///   already attached, and that handle is returned. No window exists.
+/// - **Present** — the ordinary case after the first append, and also
+///   the case where an older build or an operator left a file with
+///   whatever permissions it happened to get. A symlink here is refused
+///   rather than followed: a link planted at a shared `state_path` would
+///   otherwise have this chmod, and then append signed usage records to,
+///   a file the caller never named. The surviving file is opened, the
+///   restriction applied **to the handle**, and the same handle
+///   returned.
+///
+/// Repair cannot revoke access already granted to a handle someone else
+/// holds (see the module note), which is why it is confined to the
+/// pre-existing case and never used for creation.
+pub(crate) fn open_append_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    match create_append_owner_only(path) {
+        Ok(file) => return Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+
+    // `symlink_metadata` does not follow the link, so this sees the link
+    // itself rather than its target. A reparse point on Windows reports
+    // as a symlink here too.
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symbolic link; refusing to append bearer-adjacent records through it",
+                path.display()
+            ),
+        ));
+    }
+    open_and_restrict_handle(path)
+}
+
+/// [`create_owner_only`], but the handle is positioned for appending.
+fn create_append_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        // No append flag needed: `CREATE_NEW` guarantees the file did not
+        // exist, so the handle starts at offset zero of an empty file and
+        // the first write *is* the append.
+        windows_impl::create_owner_only(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(path)
+    }
+}
+
+/// Open an existing file for appending and apply the owner-only
+/// restriction to the resulting handle.
 #[cfg(unix)]
-pub(crate) fn restrict_existing(path: &Path) -> std::io::Result<()> {
+fn open_and_restrict_handle(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::PermissionsExt as _;
-    // Not a no-op: a caller relying on the owner-only contract must get
-    // it on every platform, and a file created by an older build (or by
-    // an operator) can carry any mode. `set_permissions` errors on a
-    // missing path, which is the right answer — the caller is about to
-    // write bearer material there.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    let file = std::fs::OpenOptions::new().append(true).open(path)?;
+    // `File::set_permissions` is `fchmod` — it names the open file, not
+    // the path, so a rename or replacement racing this call cannot
+    // redirect it.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn restrict_existing(path: &Path) -> std::io::Result<()> {
-    // No permission model to apply. Still verify the file exists, so the
-    // contract is "checked" rather than silently skipped.
-    std::fs::metadata(path).map(|_| ())
+fn open_and_restrict_handle(path: &Path) -> std::io::Result<std::fs::File> {
+    // No permission model to apply, but the open still has to succeed —
+    // the contract is "checked" rather than silently skipped.
+    std::fs::OpenOptions::new().append(true).open(path)
 }
 
 #[cfg(windows)]
-pub(crate) fn restrict_existing(path: &Path) -> std::io::Result<()> {
-    windows_impl::set_dacl_by_path(path)
+fn open_and_restrict_handle(path: &Path) -> std::io::Result<std::fs::File> {
+    windows_impl::open_append_and_set_dacl(path)
 }
 
 #[cfg(windows)]
 mod windows_impl {
     use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::io::FromRawHandle as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::{
@@ -106,7 +190,7 @@ mod windows_impl {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
         GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION,
@@ -150,16 +234,42 @@ mod windows_impl {
         Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
     }
 
-    /// Replace an existing file's DACL by pathname.
-    pub(super) fn set_dacl_by_path(path: &Path) -> std::io::Result<()> {
+    /// `FILE_APPEND_DATA | READ_CONTROL | WRITE_DAC | SYNCHRONIZE`.
+    ///
+    /// Spelled out rather than imported: they live in different
+    /// `windows-sys` modules, so naming them here keeps the crate's
+    /// feature list from growing for four integers.
+    ///
+    /// `WRITE_DAC` is what lets [`SetSecurityInfo`] modify the handle's
+    /// DACL, and `READ_CONTROL` is what lets it read the one already
+    /// there — replacing a DACL with a protected one needs both, and
+    /// omitting `READ_CONTROL` fails with `ERROR_ACCESS_DENIED` rather
+    /// than with anything that names the missing right. `SYNCHRONIZE`
+    /// makes the handle usable as an ordinary blocking `File`.
+    const APPEND_AND_WRITE_DAC: u32 = 0x0004 | 0x0002_0000 | 0x0004_0000 | 0x0010_0000;
+
+    /// Open an existing file for appending and replace the DACL **on the
+    /// returned handle**.
+    ///
+    /// [`SetSecurityInfo`] takes a handle where `SetNamedSecurityInfoW`
+    /// takes a pathname. That difference is the whole point: the
+    /// pathname form re-resolves the name, so it can be pointed at a
+    /// different object than the one about to be written to.
+    pub(super) fn open_append_and_set_dacl(path: &Path) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .access_mode(APPEND_AND_WRITE_DAC)
+            .open(path)?;
+
         let descriptor = owner_only_descriptor()?;
-        let wide = wide(path);
-        // SAFETY: `wide` is NUL-terminated and alive across the call;
+        // SAFETY: `file` owns a live handle for the duration of the call;
         // `dacl` borrows from `descriptor`, also alive; owner/group/sacl
         // are null because only `DACL_SECURITY_INFORMATION` is requested.
         let status = unsafe {
-            SetNamedSecurityInfoW(
-                wide.as_ptr(),
+            SetSecurityInfo(
+                file.as_raw_handle() as HANDLE,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
@@ -171,7 +281,7 @@ mod windows_impl {
         if status != ERROR_SUCCESS {
             return Err(std::io::Error::from_raw_os_error(status as i32));
         }
-        Ok(())
+        Ok(file)
     }
 
     fn wide(path: &Path) -> Vec<u16> {
@@ -362,21 +472,51 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
-    /// The repair path tightens a file that already exists — including
-    /// one an older build left world-readable.
+    /// The append path creates a missing file and appends to an existing
+    /// one through the handle it returns — never truncating.
     #[test]
-    fn restricting_an_existing_file_tightens_it() {
+    fn appending_creates_then_extends_through_the_handle() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("legacy.json");
-        std::fs::write(&path, b"{}").expect("write");
+        let path = dir.path().join("billing.jsonl");
+
+        let mut first = open_append_owner_only(&path).expect("create");
+        first.write_all(b"one\n").expect("write");
+        drop(first);
+
+        let mut second = open_append_owner_only(&path).expect("reopen");
+        second.write_all(b"two\n").expect("append");
+        drop(second);
+
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            b"one\ntwo\n",
+            "the second open must append, not truncate"
+        );
+    }
+
+    /// The repair path tightens a file that already exists — including
+    /// one an older build left world-readable — and does it on the
+    /// handle it hands back.
+    #[test]
+    fn appending_to_a_permissive_file_tightens_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.jsonl");
+        std::fs::write(&path, b"{}\n").expect("write");
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            // Start deliberately permissive, as a legacy store might be.
+            // Start deliberately permissive, as a legacy log might be.
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
                 .expect("loosen");
-            restrict_existing(&path).expect("restrict");
+        }
+
+        let file = open_append_owner_only(&path).expect("open existing");
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
             let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
             assert_eq!(
                 mode & 0o777,
@@ -384,17 +524,29 @@ mod tests {
                 "repair must actually change the mode, not just return Ok"
             );
         }
-        #[cfg(not(unix))]
-        restrict_existing(&path).expect("restrict");
 
-        assert_eq!(std::fs::read(&path).expect("read back"), b"{}");
+        assert_eq!(std::fs::read(&path).expect("read back"), b"{}\n");
     }
 
-    /// A missing file is an error rather than a silent pass: the caller
-    /// is about to write bearer material.
+    /// A symlink at the log path is refused rather than followed. A
+    /// writer to a shared directory could otherwise redirect signed
+    /// usage records — and this function's own chmod — onto a file the
+    /// caller never named.
+    #[cfg(unix)]
     #[test]
-    fn restricting_a_missing_file_is_an_error() {
+    fn a_symlinked_path_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(restrict_existing(&dir.path().join("nope.json")).is_err());
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"not ours\n").expect("write target");
+        let link = dir.path().join("billing.jsonl");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let err = open_append_owner_only(&link).expect_err("must refuse a link");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"not ours\n",
+            "the target must be untouched"
+        );
     }
 }

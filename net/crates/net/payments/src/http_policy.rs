@@ -219,10 +219,18 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     // map `::1` to `0.0.0.1` and lose its loopback meaning, so the block
     // is simply never public.
     let ipv4_compatible_block = s[..6].iter().all(|seg| *seg == 0);
+    // `::ffff:0:0:0/96` — IPv4-**translated** (RFC 2765), one group along
+    // from the IPv4-*mapped* form `normalize` unwraps. `to_ipv4_mapped`
+    // does not match it, so without this rule `::ffff:0:10.0.0.5` reaches
+    // here as an opaque v6 address, passes every rule below, and on a
+    // host running a translator for this standardized prefix arrives at
+    // the private v4 address embedded in it.
+    let ipv4_translated_block = s[..4].iter().all(|seg| *seg == 0) && s[4] == 0xffff && s[5] == 0;
     !(ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
         || ipv4_compatible_block
+        || ipv4_translated_block
         || (first & 0xfe00) == 0xfc00   // fc00::/7  unique local
         || (first & 0xffc0) == 0xfe80   // fe80::/10 link local
         || (first & 0xffc0) == 0xfec0   // fec0::/10 site local (deprecated,
@@ -512,6 +520,33 @@ mod tests {
             assert!(
                 !DestinationPolicy::PublicOnly.admits(ip),
                 "{compat} must not be public"
+            );
+        }
+    }
+
+    /// Every standardized way to carry an IPv4 destination inside a v6
+    /// address, refused together.
+    ///
+    /// The mapped form (`::ffff:a.b.c.d`) is unwrapped by `normalize` and
+    /// judged as the v4 address it reaches. The other three are opaque to
+    /// `to_ipv4_mapped` and would otherwise sail past every rule as
+    /// unrecognised v6 unicast — on a host with a translator for the
+    /// prefix, each is a route to the embedded address, including into
+    /// the private ranges the v4 rules refuse.
+    #[test]
+    fn v4_in_v6_embeddings_are_refused_whatever_the_prefix() {
+        for embedding in [
+            "::ffff:10.0.0.5",          // IPv4-mapped, ::ffff:0:0/96
+            "::ffff:0:10.0.0.5",        // IPv4-translated, ::ffff:0:0:0/96
+            "::10.0.0.5",               // IPv4-compatible, ::/96 (deprecated)
+            "64:ff9b::10.0.0.5",        // well-known NAT64
+            "64:ff9b:1::10.0.0.5",      // local-use NAT64
+            "::ffff:0:169.254.169.254", // the metadata address, translated
+        ] {
+            let ip: IpAddr = embedding.parse().expect(embedding);
+            assert!(
+                !DestinationPolicy::PublicOnly.admits(ip),
+                "{embedding} carries an embedded v4 destination and must not be public"
             );
         }
     }
