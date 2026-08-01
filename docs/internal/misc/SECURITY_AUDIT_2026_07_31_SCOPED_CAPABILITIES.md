@@ -54,9 +54,27 @@ the one item deliberately not attempted: it is a design pass with a wire format,
 issuer/delegation model, execution-grade revocation, and cross-language surface.
 Both open items depend on it.
 
-Verification: 5365 lib tests, 8 `capability_scope`, 17 `capability_broadcast`,
-7 `subnet_enforcement`, 11 `channel_auth`, 7 `channel_auth_hardening` — all
-passing. `cargo doc` clean.
+### Follow-up review addendum
+
+A second review pass found six further items, all since addressed:
+
+| Item | Status |
+| ---- | ------ |
+| Candidate match and subnet derived from two different fold snapshots | **Fixed.** The subnet closure now takes `(NodeId, &[String])` and runs inside the selecting snapshot on the selected entry's borrowed tags. New `SubnetPolicy::assign_from_rendered_tags` avoids rebuilding a `CapabilitySet`; `assign` delegates to it so they cannot drift. Removes the second fold read per candidate as a side effect. |
+| Exported TS scope builders still widened silently | **Fixed.** `withTenantScope` / `withRegionScope` throw on an empty selector. The earlier "fixed" claim was true only for the Rust builders — these build raw arrays and never reach them. |
+| Go remediation incomplete | **Fixed.** `include/net.go.h` was missing `-12`, which broke `go/header_parity_test.go` (that guard compares `go/net.h` against `net.go.h`, not `net.h`) — a regression introduced by the converter commit. Plus typed `ErrInvalidArgument`, contract docs, and rejection tests replacing the two that required the fail-open. |
+| Stale contract docs | **Fixed** in NAPI, C ABI, CLI, and the bridge (the last was drift I introduced in the perf commit). |
+| Selector lists rescanned after a hit | **Fixed.** |
+| Equivalence test read as a performance oracle | **Documented.** It pins verdicts only; allocation, lock cost, and callback count are explicitly out of scope. |
+
+Verification: 5368 lib tests, 8 `capability_scope`, 17 `capability_broadcast`,
+7 `subnet_enforcement`, 11 `channel_auth`, 7 `channel_auth_hardening`, 21 TS
+tests (against the built NAPI module), 4 Node binding unit tests — all passing.
+`cargo doc` clean; C header constant parity verified by direct comparison.
+
+Not executed: the Go test suite needs a built cdylib this environment lacks
+(`gofmt` parses every touched file, and header parity is checked directly, but
+the assertions have not been run).
 
 ---
 

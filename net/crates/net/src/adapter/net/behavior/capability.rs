@@ -941,7 +941,7 @@ pub(crate) fn tags_match_scope(
             if !tenant_hit {
                 tenant_hit = match filter {
                     F::Tenant(t) => id == *t,
-                    F::Tenants(wanted) => wanted.iter().any(|w| id == *w),
+                    F::Tenants(wanted) => wanted.contains(&id),
                     _ => false,
                 };
             }
@@ -953,7 +953,7 @@ pub(crate) fn tags_match_scope(
             if !region_hit {
                 region_hit = match filter {
                     F::Region(r) => name == *r,
-                    F::Regions(wanted) => wanted.iter().any(|w| name == *w),
+                    F::Regions(wanted) => wanted.contains(&name),
                     _ => false,
                 };
             }
