@@ -130,6 +130,26 @@ pub fn serve_payments(
                     X402Carry::from_bytes(template_bytes.clone()).map_err(|e| e.to_string())?;
 
                 let now_ns = provider.now_ns();
+                // `served_capability` is `claimed.capability`, so
+                // `verify`'s capability check compares the request against
+                // itself and decides nothing **here**. That is not an
+                // oversight, and it is not a hole either — but a reader
+                // should not count it as a check:
+                //
+                // - one nRPC service serves every capability this provider
+                //   offers, so there is no out-of-band "the capability
+                //   being served" to compare against. The request names it;
+                //   that IS the routing;
+                // - the field is inside the signed transcript regardless,
+                //   so an intermediary cannot rewrite it, and the quote
+                //   below is issued for `verified.capability` — the value
+                //   the signature covers, never `claimed`'s.
+                //
+                // The argument the field's doc makes ("a request for a
+                // cheap tool cannot be replayed against an expensive one")
+                // is discharged by that binding, not by this comparison. A
+                // caller with a fixed capability per endpoint — an HTTP
+                // route, say — would pass its own and get the check too.
                 let verified = QuoteRequest::verify(
                     &request_bytes,
                     provider.provider_id(),

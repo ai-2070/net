@@ -170,6 +170,15 @@ fn not_a_regular_file(path: &Path) -> std::io::Error {
 ///
 /// The handle returned is the one created here, already renamed into
 /// place, so the rename cannot be raced either.
+///
+/// **Unix only in practice, and it depends on that.** The copy below
+/// reads `existing`, and on Windows [`open_existing_no_follow`] opens
+/// with `APPEND_AND_WRITE_DAC` — which deliberately omits
+/// `FILE_READ_DATA`, so the read would fail. Nothing routes here today
+/// because [`is_owner_only`] is hardcoded `true` off unix, i.e. Windows
+/// never reports a predecessor as permissive. Giving Windows a real
+/// `is_owner_only` therefore means widening that access mask in the same
+/// change, or this path breaks the moment it first runs.
 fn migrate_to_a_fresh_owner_only_file(
     path: &Path,
     mut existing: std::fs::File,

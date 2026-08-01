@@ -345,12 +345,26 @@ pub fn production_registry_v1(signer: EntityId) -> AssetRegistry {
 fn is_valueless_chain(chain: &ChainId) -> bool {
     match chain.namespace() {
         "mock" => true,
-        // Base Sepolia. Enumerated rather than pattern-matched because
-        // there is no syntactic mark for "testnet" in CAIP-2 — a new
-        // testnet has to be added here deliberately, which is the right
-        // failure direction: forgetting one leaves it listed and visible
-        // rather than silently dropping a real chain.
-        "eip155" => matches!(chain.reference(), "84532" | "11155111" | "5" | "17000"),
+        // Enumerated rather than pattern-matched because there is no
+        // syntactic mark for "testnet" in CAIP-2 — a new testnet has to
+        // be added here deliberately, which is the right failure
+        // direction: forgetting one leaves it listed and visible rather
+        // than silently dropping a real chain.
+        //
+        // Wider than the shipped asset list on purpose. Only Base Sepolia
+        // is in `default_registry_v1` today, so the rest cost nothing
+        // now — and the moment they cost something is the moment someone
+        // adds an asset on one and does not think to come back here.
+        "eip155" => matches!(
+            chain.reference(),
+            "84532"       // Base Sepolia
+                | "11155111"  // Sepolia
+                | "5"         // Goerli
+                | "17000"     // Holesky
+                | "11155420"  // OP Sepolia
+                | "421614"    // Arbitrum Sepolia
+                | "80002" // Polygon Amoy
+        ),
         _ => false,
     }
 }
