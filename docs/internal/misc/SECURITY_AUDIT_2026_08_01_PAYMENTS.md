@@ -9,6 +9,14 @@ Findings are organised by severity. File paths are relative to repo root; line n
 
 ## Revision history
 
+**Rev 4 (2026-08-01)** — third parallel review. No new findings; three corrections to *remediation guidance*, one of which would have introduced a defect.
+
+| Change | Detail |
+|---|---|
+| **Corrected** | M5's proposed per-scheme replay identities were **too narrow** and would have caused false replay rejections — EIP-3009 nonces are scoped per token contract, XRPL sequences per account *per network* and not used by ticket-based transactions. Now specifies full `scheme + network + asset/contract + authorization identity` namespacing, and names both failure directions explicitly. |
+| **Corrected** | M6 was wrongly described as compounding H1 and as making its bypass "durable." A re-check re-reads the same stored `caller_hex` and re-admits the named identity — it cannot detect a forged caller. The coupling is removed from both sites; M6 is now scoped purely to revocation semantics. |
+| **Added** | H1's application-signature option now pins the transcript contents and a bounded freshness policy, so the fix cannot itself produce a transferable or replayable proof. |
+
 **Rev 3 (2026-08-01)** — second parallel review. Every claim below was verified against source before adoption; all were confirmed.
 
 | Change | Detail |
@@ -63,7 +71,7 @@ let quote = mesh.serve_rpc_typed(QUOTE_SERVICE, Codec::Json, move |req: QuoteWir
 
 **Impact.** `EntityId` is an ed25519 *public* key; asserting someone else's requires no secret.
 
-1. **Provider admission bypass.** `ProviderAdmissionPolicy::admit(&caller, capability)` (`engine/mod.rs:707`) is the crate's stated "never quote a caller you'd deny" gate. Evaluated against an attacker-chosen identity, caller allowlists, attestation, and exposure caps are defeated by naming an admitted entity. (M6 compounds this: the re-check that would catch it later does not exist.)
+1. **Provider admission bypass.** `ProviderAdmissionPolicy::admit(&caller, capability)` (`engine/mod.rs:707`) is the crate's stated "never quote a caller you'd deny" gate. Evaluated against an attacker-chosen identity, caller allowlists, attestation, and exposure caps are defeated by naming an admitted entity. Note that **M6's missing re-check is not a mitigation for this and adding it would not detect it** — a re-check reads the same stored `caller_hex` and would admit the named victim again. The two findings are independent.
 2. **Billing misattribution.** The quote's `caller` becomes `QuoteRecord.caller_hex` (`engine/mod.rs:856`) and then `BillingEvent.payer` (`engine/mod.rs:2110`) — the provider-signed record `concepts.md` routes reconciliation through.
 3. **The binding defense inherits the forgery.** `redeem_for_invocation` verifies the binding against that same `rec.caller_hex` (`engine/mod.rs:1863`).
 
@@ -87,7 +95,7 @@ That comment is on the field application code actually reads, and it is how rev 
 
 **The implementation decision** (an architectural choice, not a patch):
 
-- **an application-level caller signature** over the quote request — payments-local, no substrate change, and the only option that is end-to-end by construction;
+- **an application-level caller signature** over the quote request — payments-local, no substrate change, and the only option that is end-to-end by construction. **The transcript must be pinned, or this reintroduces a transferable proof.** It must be domain-separated and length-prefixed (reuse the pattern already correct at `engine/mod.rs:243`) and cover: a protocol/version identifier, the **destination provider identity**, the caller identity, the capability, the exact requested template bytes, and a freshness element (nonce, or issued-at plus expiry). Anything that can affect the resulting quote must be inside it. The provider must reject stale or already-seen requests under an explicit bounded policy — otherwise an intercepted *valid* request can be replayed to mint fresh quotes and burn caller-scoped issuance or exposure limits, even though it can no longer impersonate a different identity. Binding the provider identity is what stops the same signed request being replayed to a *different* provider;
 - **protected RPC's verified caller attribution** — `RpcContext::org_admission` carries a four-party verified identity (`rpc.rs:1500-1509`) but only for calls through the PROTECTED-service admission gate, which means moving the payment services behind it;
 - **a new authenticated-caller context** on the substrate with explicitly direct-only (non-relayed) semantics.
 
@@ -253,7 +261,26 @@ Rev 2 narrowed this claim only on the retention-horizon axis. That correction wa
 
 **What still backstops it** (why this is Medium, not High): for the *same* quote, a differing payload hash trips `Claim::QuoteAlreadyPaid` (`engine/mod.rs:798`). Across quotes, `consumed_transactions` catches a repeated settlement id (`engine/mod.rs:1052`), and every real scheme's authorization is single-use on-chain (EIP-3009 nonce, SPL blockhash, XRPL sequence). So a live double-serve requires defeating those too. But the engine's own first-line replay guard is bypassable by mutating fields nobody signed, and canonicalization — which correctly defeats whitespace and key-ordering variation — does not address semantically irrelevant wrapper variation.
 
-**Required fix.** Derive the replay key from **scheme-semantic identity** — the signed nonce / transaction / signature material the authorization is actually unique by — rather than the whole extensible wrapper. That is a per-scheme extraction (`exact_evm`: `authorization.nonce` + `from`; `exact_svm`: the transaction signature; `exact_xrpl`: account + sequence), failing closed for a scheme with no defined identity rather than falling back to whole-wrapper hashing.
+**Required fix.** Derive the replay key from **scheme-semantic identity** — the signed material the authorization is actually unique by — rather than the whole extensible wrapper, failing closed for a scheme with no defined identity rather than falling back to whole-wrapper hashing.
+
+**The key must be fully namespaced, and getting this wrong in the other direction is also a bug.** The two failure modes are opposite and both real:
+
+- **too broad** (today) — one authorization yields many keys, so a genuine replay is missed. A security failure.
+- **too narrow** (the naive fix) — two unrelated legitimate authorizations collide on one key, so the second is rejected as a replay. A liveness failure, and in a payments path a spurious rejection is a real harm.
+
+An earlier draft of this fix proposed `(from, nonce)` for EVM and `(account, sequence)` for XRPL. **Both are too narrow.** EIP-3009 nonce uniqueness is scoped to the token contract's own `authorizationState[authorizer][nonce]` mapping, so the same wallet may legitimately reuse a nonce on a different token, a different chain, or a different EIP-712 domain — keying on `(from, nonce)` alone would let a USDC payment block an unrelated legitimate payment on another asset. XRPL sequence is scoped per account **per network**, and ticket-based transactions do not consume `Sequence` in the ordinary way, so `(account, sequence)` does not identify every transaction form.
+
+The identity must therefore be at minimum:
+
+```text
+scheme + network + asset/contract + scheme-specific authorization identity
+```
+
+with the per-scheme component being:
+
+- **EVM** — normalized network, verifying contract, authorizer (`from`), EIP-3009 nonce;
+- **SVM** — normalized network plus a hash of the *decoded* partially-signed transaction bytes, or the stable payer signature / message identity; not a wrapper-level string lifted from the payload JSON;
+- **XRPL** — normalized network plus the canonical signed-transaction hash or blob identity; do not assume `(account, sequence)` generalizes.
 
 ### M6 — The post-verification provider-admission re-check does not exist
 
@@ -267,7 +294,9 @@ and `engine/mod.rs:21`:
 
 > Provider policy runs at quote issuance …; the WS4 `payment_gate` re-checks before the handler.
 
-`accept_payment` never re-runs admission, and `redeem_for_invocation` checks frozen / billed / tool-binding / already-redeemed — not admission. An unexpired quote therefore survives later allowlist removal, attestation failure, or exposure-policy revocation: revoking a caller's access does not stop them redeeming quotes already issued, for the whole TTL. This is also what makes H1's admission bypass durable rather than momentary.
+`accept_payment` never re-runs admission, and `redeem_for_invocation` checks frozen / billed / tool-binding / already-redeemed — not admission. An unexpired quote therefore survives later allowlist removal, attestation failure, or exposure-policy revocation: revoking a caller's access does not stop them redeeming quotes already issued, for the whole TTL.
+
+**This is independent of H1 and is not a mitigation for it.** A re-check would re-read the same stored `rec.caller_hex` and re-admit the identity named at issuance; it authenticates nobody and cannot discover a forged caller. M6 is purely about **revocation semantics during quote validity** — what happens when policy changes between issuance and settlement.
 
 **Required decision** — the audit forces the choice rather than assuming one:
 
@@ -378,7 +407,7 @@ Recorded because it is genuinely most of the crate, and because several of these
 2. **H3 + M4 together** — one shared HTTP-policy module: scheme enforcement, destination policy with connected-address validation and rebinding defence, and bounded body reads. Three clients, one implementation, applied uniformly.
 3. **H1 — architectural decision required before any code.** Choose among application-level caller signature, protected-RPC attribution, or a new authenticated-caller context. **Do not implement rev 2's `caller_origin` comparison.** Correct the misleading `RpcContext::caller_origin` doc comment (`rpc.rs:1482`) immediately and independently — it is an active trap for any handler author, and it is what produced the invalid rev-2 recommendation.
 4. **M1 with H1** — same decision. Ship `require_invocation_binding` now to close off-path leakage (class a); scope on-path front-running (class b) to whatever H1 resolves, and do not describe the binding as solving it.
-5. **M6** — a decision, not a patch: either delete the doctrine or add the re-check. Cheap either way, and it determines whether H1's bypass is momentary or lasts a full quote TTL.
+5. **M6** — a decision, not a patch: either delete the doctrine or add the re-check. Independent of H1; it governs whether a signed quote survives a policy change during its TTL.
 6. **M2** — remove `tier` from the facilitator outcome types; mint `Observed` at the boundary. Move `LateFinality` to a mock `ChainChecker`.
 7. **M5** — per-scheme replay identity extraction, failing closed for schemes with none.
 8. **M3** — subsumed by M1(a) if the binding becomes mandatory; otherwise a one-line change to a short hash.
