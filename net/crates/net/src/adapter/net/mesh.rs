@@ -7438,8 +7438,30 @@ pub struct MeshNode {
     local_subnet_policy: Option<Arc<SubnetPolicy>>,
     /// Per-peer subnet map. Keys are `node_id`; values are the
     /// subnet derived from each peer's most recent announcement via
-    /// `local_subnet_policy`. Unknown peers default to
-    /// [`SubnetId::GLOBAL`] at read time.
+    /// `local_subnet_policy`.
+    ///
+    /// **Absence means "not derived", and must stay that way.** Readers
+    /// preserve it as `Option<SubnetId>` and hand `None` to
+    /// [`MeshNode::subnet_visible`], which decides per visibility mode.
+    /// This doc used to say unknown peers "default to
+    /// [`SubnetId::GLOBAL`] at read time" — that WAS the behaviour, and
+    /// it was the HIGH #2 vulnerability: `GLOBAL` is a universal
+    /// ancestor, so every peer whose subnet had not been derived was
+    /// admitted to every `ParentVisible` channel, on the path that
+    /// otherwise answers `AckReason::Unauthorized`
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    ///
+    /// Absence is routine, not transient. The write in
+    /// `handle_capability_announcement` is gated on
+    /// `signature_verified && ann.hop_count == 0` with a policy
+    /// installed, so a peer learned only through a relay is never in
+    /// here, and no peer is with no policy configured.
+    ///
+    /// Read by the channel publish / subscribe paths, which want the
+    /// last thing a session peer said about itself. NOT read by scoped
+    /// discovery — see [`MeshNode::find_nodes_by_filter_scoped`] for why
+    /// a pre-apply sidecar is the wrong input for a query against fold
+    /// state.
     peer_subnets: Arc<DashMap<u64, SubnetId>>,
     /// Optional `SubnetGateway` instance for this node — installed
     /// alongside `channel_configs` in [`Self::set_channel_configs`]
