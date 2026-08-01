@@ -148,17 +148,22 @@ impl BillingLog {
         // path on a network or FUSE filesystem makes them slow, and every
         // charge passes through here.
         let mut handle = self.file.lock().await;
-        if handle.is_none() {
-            let path = self.path.clone();
-            let opened = tokio::task::spawn_blocking(move || {
-                crate::policy::file_mode::open_append_owner_only(&path)
-            })
-            .await
-            .map_err(|e| BillingError::io(&self.path, e))?
-            .map_err(|e| BillingError::io(&self.path, e))?;
-            *handle = Some(tokio::fs::File::from_std(opened));
-        }
-        let file = handle.as_mut().expect("just opened");
+        // `Option::insert` hands back the `&mut` it just stored, so the
+        // opened handle reaches the writes below without a second lookup
+        // that would have to assert it is there.
+        let file = match handle.as_mut() {
+            Some(file) => file,
+            None => {
+                let path = self.path.clone();
+                let opened = tokio::task::spawn_blocking(move || {
+                    crate::policy::file_mode::open_append_owner_only(&path)
+                })
+                .await
+                .map_err(|e| BillingError::io(&self.path, e))?
+                .map_err(|e| BillingError::io(&self.path, e))?;
+                handle.insert(tokio::fs::File::from_std(opened))
+            }
+        };
         file.write_all(&line)
             .await
             .map_err(|e| BillingError::io(&self.path, e))?;

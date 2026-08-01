@@ -345,7 +345,9 @@ mod windows_impl {
     pub(super) fn create_owner_only(path: &Path, share: u32) -> std::io::Result<std::fs::File> {
         let descriptor = owner_only_descriptor()?;
         let wide = wide(path);
-        let mut attrs = SECURITY_ATTRIBUTES {
+        // Shared, not `&mut`: `CreateFileW` reads the attributes and does
+        // not write through the pointer, so the binding stays immutable.
+        let attrs = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.0,
             bInheritHandle: 0,
@@ -359,7 +361,7 @@ mod windows_impl {
                 wide.as_ptr(),
                 GENERIC_WRITE | GENERIC_READ,
                 share,
-                &mut attrs,
+                &attrs,
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL,
                 std::ptr::null_mut(),
@@ -496,7 +498,7 @@ mod windows_impl {
         let ok = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 wide.as_ptr(),
-                SDDL_REVISION_1 as u32,
+                SDDL_REVISION_1,
                 &mut descriptor,
                 std::ptr::null_mut(),
             )
@@ -538,9 +540,12 @@ mod windows_impl {
     /// The current process user's SID, as an SDDL string.
     fn current_user_sid_string() -> std::io::Result<String> {
         let mut token: HANDLE = std::ptr::null_mut();
-        // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no
-        // close; `token` is a live local the callee fills in.
-        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        // SAFETY: returns a pseudo-handle for the current process, which
+        // needs no close and is always valid.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: `process` is that pseudo-handle; `token` is a live local
+        // the callee fills in.
+        let ok = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
         if ok == 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -582,14 +587,21 @@ mod windows_impl {
             return Err(std::io::Error::last_os_error());
         }
         let _sid_guard = LocalString(raw);
-        // SAFETY: `raw` is a NUL-terminated UTF-16 string from above.
-        let len = unsafe {
-            let mut n = 0usize;
-            while *raw.add(n) != 0 {
-                n += 1;
+        // Walk to the NUL. One unsafe operation per block, which is the
+        // house rule: the offset and the read are separate facts and each
+        // gets its own justification.
+        let mut len = 0usize;
+        loop {
+            // SAFETY: `raw` is NUL-terminated, so every offset up to and
+            // including the terminator is inside the same allocation.
+            let cell = unsafe { raw.add(len) };
+            // SAFETY: `cell` is that in-bounds pointer, aligned for `u16`
+            // because `ConvertSidToStringSidW` allocated it as one.
+            if unsafe { *cell } == 0 {
+                break;
             }
-            n
-        };
+            len += 1;
+        }
         // SAFETY: `raw` is valid for `len` u16s, established just above.
         let slice = unsafe { std::slice::from_raw_parts(raw, len) };
         String::from_utf16(slice)

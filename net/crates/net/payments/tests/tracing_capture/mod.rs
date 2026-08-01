@@ -13,14 +13,18 @@
 
 use std::sync::Arc;
 
+/// The buffer the layer fills: every event's `(field name, value)` pairs,
+/// in emit order, shared with the test that installed the layer.
+pub type CapturedFields = Arc<parking_lot::Mutex<Vec<(String, String)>>>;
+
 /// Records every event's fields into a shared buffer.
 pub struct FieldCapture {
-    pub fields: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
+    pub fields: CapturedFields,
 }
 
 impl FieldCapture {
     /// The layer plus the buffer it fills.
-    pub fn new() -> (Self, Arc<parking_lot::Mutex<Vec<(String, String)>>>) {
+    pub fn new() -> (Self, CapturedFields) {
         let fields = Arc::new(parking_lot::Mutex::new(Vec::new()));
         (
             Self {

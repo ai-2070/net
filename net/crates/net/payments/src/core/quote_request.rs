@@ -165,8 +165,8 @@ impl QuoteRequest {
     /// are: the money path carries no rng.
     ///
     /// `sequence` is a per-channel counter and is what makes two requests
-    /// distinct. Without it the inputs are caller + capability + template
-    /// + timestamp, and [`crate::flow::Clock`] is a public seam with no
+    /// distinct. Without it the inputs are caller, capability, template and
+    /// timestamp, and [`crate::flow::Clock`] is a public seam with no
     /// monotonicity requirement — a fixed or coarse clock makes two
     /// legitimate back-to-back requests derive the same nonce, and the
     /// second is then refused as a replay. A counter cannot repeat within

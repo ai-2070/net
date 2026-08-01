@@ -638,11 +638,17 @@ impl SpendPolicyEngine {
             // another attempt still holds the claim, this quote's budget
             // stays committed and the record stays, so that attempt keeps
             // reading as a retry rather than a fresh spend.
-            if let Some(reservation) = s.reservations.get_mut(&quote_id) {
+            //
+            // Taken out and put back rather than borrowed and then
+            // removed: the removal is what lets the counter decrement
+            // read the record by value, and doing it up front means
+            // there is no "it must still be there" step in between.
+            if let Some(mut reservation) = s.reservations.remove(&quote_id) {
                 dirty = true;
                 reservation.holders = reservation.holders.saturating_sub(1);
-                if reservation.holders == 0 {
-                    let reservation = s.reservations.remove(&quote_id).expect("just borrowed");
+                if reservation.holders > 0 {
+                    s.reservations.insert(quote_id.clone(), reservation);
+                } else {
                     let key = reservation.counter_key();
                     if let Some(raw) = s.counters.get(&key) {
                         if let Ok(current) = AtomicAmount::parse(raw) {
