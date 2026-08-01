@@ -494,7 +494,9 @@ use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{
-    DropReason, SubnetAuthorityConfig, SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy,
+    DropReason, SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig,
+    SubnetChallengeStore, SubnetContextStore, SubnetCredentialSet, SubnetFloorRegistry,
+    SubnetGateway, SubnetId, SubnetPolicy, SubnetRevocationFloor, VerifiedSubnetContext,
 };
 use super::subprotocol::stream_window::{
     StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_WINDOW_SIZE,
@@ -7888,6 +7890,17 @@ pub struct MeshNode {
     /// for subnet credentials. Session admission (S3) verifies
     /// against this registry and pins the epoch it saw.
     subnet_floors: Arc<SubnetFloorRegistry>,
+    /// Outstanding one-use admission challenges this node has issued
+    /// as verifier (SUBNET_AUTH_PLAN.md D5).
+    subnet_challenges: Arc<SubnetChallengeStore>,
+    /// Compiled per-session subnet contexts. Reads validate the
+    /// stored session id against the live one, so a replaced
+    /// incarnation cannot inherit authority.
+    subnet_contexts: Arc<SubnetContextStore>,
+    /// Topology epoch this node evaluates against. Reparenting or
+    /// reinterpreting the hierarchy bumps it, invalidating every
+    /// context minted under the old meaning.
+    subnet_topology_epoch: Arc<std::sync::atomic::AtomicU32>,
     /// Per-peer subnet map — **routing state, not authenticated
     /// membership** (SUBNET_AUTH_PLAN.md). Keys are `node_id`; values
     /// are the subnet derived from each peer's most recent
@@ -8339,6 +8352,13 @@ impl MeshNode {
         let rp_recovery = reroute_policy.clone();
         let roster_failure = roster.clone();
         let peer_subnets_failure = peer_subnets.clone();
+        // Admission stores are created here (not in the struct
+        // literal) so the failure closure can hold its own handles,
+        // matching how the roster/peer maps above are threaded.
+        let subnet_challenges = Arc::new(SubnetChallengeStore::new());
+        let subnet_contexts = Arc::new(SubnetContextStore::new());
+        let subnet_challenges_failure = subnet_challenges.clone();
+        let subnet_contexts_failure = subnet_contexts.clone();
         let peer_entity_ids_failure = peer_entity_ids.clone();
         let origin_hash_to_node_failure = origin_hash_to_node.clone();
         let capability_fold_failure = capability_fold.clone();
@@ -8630,6 +8650,13 @@ impl MeshNode {
                 );
             }
             peer_subnets_failure.remove(&node_id);
+            // Admission state dies with the peer. Note this is the
+            // SUSPICION boundary, not incarnation death — the context
+            // store is the real defence (it validates the stored
+            // session id on every read), so dropping here is defence
+            // in depth plus prompt reclamation, not the invariant.
+            subnet_challenges_failure.forget_peer(node_id);
+            subnet_contexts_failure.forget_peer(node_id);
             // Pull `entity_id` BEFORE removing it so we know which
             // origin_hash slot to demote / drop. A node disappearing
             // releases its claim on the wire hash.
@@ -9038,6 +9065,9 @@ impl MeshNode {
             local_subnet_policy,
             subnet_authorities,
             subnet_floors: Arc::new(SubnetFloorRegistry::new()),
+            subnet_challenges,
+            subnet_contexts,
+            subnet_topology_epoch: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             peer_subnets,
             // Gateway is installed lazily by `set_channel_configs`;
             // a node without an installed registry has no gateway
@@ -10774,6 +10804,178 @@ impl MeshNode {
     /// one registry.
     pub fn subnet_floor_registry(&self) -> &Arc<SubnetFloorRegistry> {
         &self.subnet_floors
+    }
+
+    /// Session id of the live incarnation for `node_id`, or `None`
+    /// when no session exists. A subnet presentation binds to this
+    /// value, so a replaced incarnation invalidates outstanding
+    /// proofs by construction.
+    pub fn peer_session_id(&self, node_id: u64) -> Option<u64> {
+        self.peers.get(&node_id).map(|p| p.session.session_id())
+    }
+
+    /// Topology epoch this node evaluates subnet authority against.
+    pub fn subnet_topology_epoch(&self) -> u32 {
+        self.subnet_topology_epoch.load(Ordering::Acquire)
+    }
+
+    /// Advance the topology epoch — reparenting, reusing a path for a
+    /// different security meaning, or otherwise reinterpreting the
+    /// hierarchy. Every context minted under the old epoch is dropped
+    /// immediately: old ancestry authority must not survive a change
+    /// in what a path means. Adding a previously unused descendant
+    /// under a stable parent is NOT such a change (parent grants
+    /// deliberately cover future children) and needs no bump.
+    pub fn advance_subnet_topology_epoch(&self) -> u32 {
+        let next = self.subnet_topology_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let dropped = self.subnet_contexts.invalidate_stale_topology(next);
+        if dropped > 0 {
+            tracing::info!(
+                topology_epoch = next,
+                dropped,
+                "subnet: topology epoch advanced; invalidated contexts from the prior epoch"
+            );
+        }
+        next
+    }
+
+    /// Issue a one-use admission challenge for `node_id` on its
+    /// current session incarnation. `None` when the peer has no live
+    /// session or the node-wide challenge ceiling is reached.
+    pub fn issue_subnet_challenge(&self, node_id: u64) -> Option<[u8; 32]> {
+        let session_id = self.peers.get(&node_id)?.session.session_id();
+        self.subnet_challenges
+            .issue(node_id, session_id, Instant::now())
+    }
+
+    /// Verify a presented credential set + session proof and, on
+    /// success, compile and install the session's
+    /// [`VerifiedSubnetContext`] (SUBNET_AUTH_PLAN.md D5).
+    ///
+    /// The challenge is consumed whether verification succeeds or
+    /// fails — a captured presentation cannot retry the same nonce.
+    /// The `NodeId → EntityId` pin is compared and installed
+    /// atomically only after every other check passes: a conflicting
+    /// pin is refused and never overwritten, so a deliberate 64-bit
+    /// routing collision is an availability event, never credential
+    /// aliasing.
+    pub fn admit_subnet_session(
+        &self,
+        from_node: u64,
+        presentation: &SubnetAuthPresentation,
+        set: &SubnetCredentialSet,
+    ) -> Result<VerifiedSubnetContext, SubnetAuthError> {
+        let Some(peer) = self.peers.get(&from_node) else {
+            return Err(SubnetAuthError::WrongSession);
+        };
+        let session_id = peer.session.session_id();
+        drop(peer);
+
+        // Consume first: the nonce is spent by the attempt itself.
+        let expected = self
+            .subnet_challenges
+            .consume(
+                from_node,
+                session_id,
+                &presentation.verifier_nonce,
+                self.entity_id(),
+                Instant::now(),
+            )
+            .ok_or(SubnetAuthError::WrongChallenge)?;
+
+        let config = self
+            .subnet_authority_config(&presentation.target.authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+
+        let ctx = crate::adapter::net::subnet::auth::verify_admission(
+            presentation,
+            set,
+            &expected,
+            config,
+            self.subnet_topology_epoch.load(Ordering::Acquire),
+            &self.subnet_floors,
+            crate::adapter::net::subnet::admission::unix_now_secs(),
+            crate::adapter::net::identity::TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
+        )?;
+
+        // Step 8: atomic compare/install of the routing-id pin. The
+        // capability-announcement TOFU path does get-then-insert,
+        // which two concurrent first-announcements can race; this one
+        // must not, because it decides whether a proven identity may
+        // take over a routing key.
+        if ctx.subject_node != from_node {
+            return Err(SubnetAuthError::WrongSubject);
+        }
+        match self.peer_entity_ids.entry(from_node) {
+            dashmap::mapref::entry::Entry::Occupied(slot) => {
+                if slot.get() != &ctx.subject {
+                    tracing::warn!(
+                        from_node = format!("{from_node:#x}"),
+                        "subnet: admission refused — a different entity is already pinned to this routing id"
+                    );
+                    return Err(SubnetAuthError::IdentityPinConflict);
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(ctx.subject.clone());
+            }
+        }
+
+        self.subnet_contexts.install(from_node, ctx.clone());
+        Ok(ctx)
+    }
+
+    /// The compiled context for `from_node`, iff it was compiled on
+    /// that peer's CURRENT session incarnation and is still current
+    /// with respect to expiry and both epochs. This is the read the
+    /// forwarding path performs: pure integer comparisons over
+    /// immutable state, no crypto.
+    pub fn subnet_context_for(&self, from_node: u64) -> Option<VerifiedSubnetContext> {
+        let session_id = self.peers.get(&from_node)?.session.session_id();
+        let ctx = self
+            .subnet_contexts
+            .get_for_session(from_node, session_id)?;
+        let epoch_ok = ctx.topology_epoch == self.subnet_topology_epoch.load(Ordering::Acquire)
+            && ctx.subnet_auth_epoch == self.subnet_floors.auth_epoch(&ctx.authority);
+        let live = crate::adapter::net::subnet::admission::unix_now_secs() < ctx.expires_at;
+        (epoch_ok && live).then_some(ctx)
+    }
+
+    /// Apply a signed revocation floor and drop every context the
+    /// resulting auth-epoch move invalidates. Off the packet path by
+    /// construction: forwarding only ever compares the pinned epoch
+    /// integer.
+    pub fn apply_subnet_floor(
+        &self,
+        floor: &SubnetRevocationFloor,
+    ) -> Result<bool, SubnetAuthError> {
+        let config = self
+            .subnet_authority_config(&floor.scope.authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        let changed = self.subnet_floors.apply(floor, config)?;
+        if changed {
+            let epoch = self.subnet_floors.auth_epoch(&floor.scope.authority);
+            let dropped = self
+                .subnet_contexts
+                .invalidate_stale_epoch(&floor.scope.authority, epoch);
+            tracing::info!(
+                subnet_auth_epoch = epoch,
+                dropped,
+                "subnet: revocation floor accepted; invalidated stale session contexts"
+            );
+        }
+        Ok(changed)
+    }
+
+    /// Explicitly withdraw a peer's subnet admission — outstanding
+    /// challenges and any compiled context. One of the invalidation
+    /// triggers in SUBNET_AUTH_PLAN.md D5; the peer must re-present
+    /// against a fresh challenge to regain authority. The
+    /// failure-detector and permanent-eviction paths perform the same
+    /// cleanup through their own handles.
+    pub fn withdraw_subnet_admission(&self, node_id: u64) {
+        self.subnet_challenges.forget_peer(node_id);
+        self.subnet_contexts.forget_peer(node_id);
     }
 
     /// Read-only handle to the `SubnetPolicy` this node applies to
@@ -17840,6 +18042,8 @@ impl MeshNode {
         let peer_addrs = self.peer_addrs.clone();
         let session_id_to_node = self.session_id_to_node.clone();
         let ack_ranges_peer_cache = self.ack_ranges_peer_cache.clone();
+        let subnet_challenges_evict = self.subnet_challenges.clone();
+        let subnet_contexts_evict = self.subnet_contexts.clone();
         let route_withdraw_gate = self.route_withdraw_gate.clone();
         let failure_detector = self.failure_detector.clone();
         // SI-2a: sensing soft-state expiry rides this loop's tick —
@@ -18496,6 +18700,14 @@ impl MeshNode {
                                 // node_id re-resolves through the fold
                                 // on its first gate check.
                                 ack_ranges_peer_cache.remove(&node_id);
+                                // Admission state, same lockstep. The
+                                // context store already refuses to
+                                // serve a context whose session id no
+                                // longer matches, so this is prompt
+                                // reclamation rather than the
+                                // security boundary.
+                                subnet_challenges_evict.forget_peer(node_id);
+                                subnet_contexts_evict.forget_peer(node_id);
                                 tracing::info!(
                                     node_id = format!("{:#x}", node_id),
                                     "evicted permanently-dead peer from peer map",

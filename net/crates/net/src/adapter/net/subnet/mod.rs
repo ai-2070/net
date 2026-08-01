@@ -12,16 +12,19 @@
 //! effects, and (per SUBNET_AUTH_PLAN.md) authority-qualified
 //! `SubnetGrant`s for protected transport rights.
 
+pub mod admission;
 mod assignment;
 pub mod auth;
 mod error;
 mod gateway;
 mod id;
 
+pub use admission::{SubnetChallengeStore, SubnetContextStore};
 pub use assignment::{SubnetPolicy, SubnetRule};
 pub use auth::{
-    SubnetAuthError, SubnetAuthorityConfig, SubnetCredentialSet, SubnetFloorRegistry, SubnetGrant,
-    SubnetIssuerGrant, SubnetRef, SubnetRevocationFloor, SubnetRights, VerifiedSubnetAuthority,
+    ExpectedBinding, SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig,
+    SubnetCredentialSet, SubnetFloorRegistry, SubnetGrant, SubnetIssuerGrant, SubnetRef,
+    SubnetRevocationFloor, SubnetRights, VerifiedSubnetAuthority, VerifiedSubnetContext,
 };
 pub use error::SubnetError;
 pub use gateway::{DropReason, ForwardDecision, SubnetGateway};

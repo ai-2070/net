@@ -176,6 +176,19 @@ pub enum SubnetAuthError {
     /// Leaf rights exceed the issuer grant's `maximum_rights`, or
     /// the leaf window escapes the issuer window.
     IssuerAttenuationBroadened,
+    /// Requested rights exceed the granted rights.
+    RightNotGranted,
+    /// Presentation bound to a different session incarnation.
+    WrongSession,
+    /// Presentation bound to a different verifier.
+    WrongVerifier,
+    /// Presentation carries an unknown, stale, or already-consumed
+    /// challenge, or a credential-set hash that does not match the
+    /// presented artifacts.
+    WrongChallenge,
+    /// A different full `EntityId` is already pinned to this routing
+    /// `NodeId` — refused, never overwritten.
+    IdentityPinConflict,
     /// ed25519 verification failed.
     InvalidSignature,
     /// Structural decode failure: wrong length, unknown version,
@@ -202,6 +215,11 @@ impl std::fmt::Display for SubnetAuthError {
             Self::Revoked => "revoked",
             Self::IssuerNotAuthorized => "issuer_not_authorized",
             Self::IssuerAttenuationBroadened => "issuer_attenuation_broadened",
+            Self::RightNotGranted => "right_not_granted",
+            Self::WrongSession => "wrong_session",
+            Self::WrongVerifier => "wrong_verifier",
+            Self::WrongChallenge => "wrong_challenge",
+            Self::IdentityPinConflict => "identity_pin_conflict",
             Self::InvalidSignature => "invalid_signature",
             Self::InvalidFormat => "invalid_format",
             Self::InvalidValidityWindow => "invalid_validity_window",
@@ -1128,6 +1146,355 @@ pub fn verify_credential_set(
         expires_at: leaf.not_after,
         subnet_auth_epoch: floors.auth_epoch(&config.authority),
         credential_set_hash: set.credential_set_hash(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Session proof (S3)
+// ---------------------------------------------------------------------------
+
+/// Domain prefix for the session-proof transcript.
+pub const SUBNET_PRESENTATION_SIG_DOMAIN: &[u8] = b"net.subnet.presentation.v1";
+
+/// Proof of possession of the leaf grant's subject key, bound to one
+/// admission attempt (SUBNET_AUTH_PLAN.md D5).
+///
+/// The AEAD session alone does not prove the leaf `EntityId`: Noise
+/// `NKpsk0` authenticates the responder's X25519 static while the
+/// initiator is anonymous, and the `peer_entity_ids` TOFU pin can
+/// corroborate identity but cannot substitute for proof-of-possession
+/// on a protected credential. The subject therefore signs a fresh
+/// verifier challenge with its Ed25519 key.
+///
+/// Binding the credential-set hash, session id, verifier identity,
+/// nonce, target, and requested rights makes the signature
+/// non-transferable to another credential set, session, verifier,
+/// scope, or operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubnetAuthPresentation {
+    /// Wire version; only `1` decodes.
+    pub version: u8,
+    /// The signing entity — must equal the leaf grant's subject.
+    pub subject: EntityId,
+    /// Hash of the exact credential set being presented.
+    pub credential_set_hash: [u8; 32],
+    /// Session incarnation this proof is valid on.
+    pub session_id: u64,
+    /// The verifier that issued the challenge.
+    pub verifier: EntityId,
+    /// One-use 32-byte challenge from that verifier.
+    pub verifier_nonce: [u8; 32],
+    /// Subnet the subject is asking to operate in.
+    pub target: SubnetRef,
+    /// Rights being requested for this session.
+    pub requested_rights: SubnetRights,
+    /// ed25519 over [`SUBNET_PRESENTATION_SIG_DOMAIN`] ‖ payload.
+    pub signature: [u8; 64],
+}
+
+impl SubnetAuthPresentation {
+    /// Field widths in order: version 1, subject 32,
+    /// credential_set_hash 32, session_id 8, verifier 32,
+    /// verifier_nonce 32, target authority 32, target path 4,
+    /// requested_rights 1.
+    pub const SIGNED_PAYLOAD_SIZE: usize = 174;
+    /// Payload + 64-byte signature.
+    pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64;
+    const SIGNING_INPUT_SIZE: usize =
+        SUBNET_PRESENTATION_SIG_DOMAIN.len() + Self::SIGNED_PAYLOAD_SIZE;
+
+    /// Sign a presentation with the subject's keypair.
+    pub fn try_issue(
+        subject_keypair: &EntityKeypair,
+        credential_set_hash: [u8; 32],
+        session_id: u64,
+        verifier: EntityId,
+        verifier_nonce: [u8; 32],
+        target: SubnetRef,
+        requested_rights: SubnetRights,
+    ) -> Result<Self, SubnetAuthError> {
+        let mut p = Self {
+            version: 1,
+            subject: subject_keypair.entity_id().clone(),
+            credential_set_hash,
+            session_id,
+            verifier,
+            verifier_nonce,
+            target,
+            requested_rights,
+            signature: [0u8; 64],
+        };
+        let sig = subject_keypair
+            .try_sign(&p.signing_input())
+            .map_err(|_| SubnetAuthError::InvalidSignature)?;
+        p.signature = sig.to_bytes();
+        Ok(p)
+    }
+
+    pub(crate) fn signed_payload(&self) -> [u8; Self::SIGNED_PAYLOAD_SIZE] {
+        let mut buf = [0u8; Self::SIGNED_PAYLOAD_SIZE];
+        let mut off = 0;
+        buf[off] = self.version;
+        off += 1;
+        buf[off..off + 32].copy_from_slice(self.subject.as_bytes());
+        off += 32;
+        buf[off..off + 32].copy_from_slice(&self.credential_set_hash);
+        off += 32;
+        buf[off..off + 8].copy_from_slice(&self.session_id.to_le_bytes());
+        off += 8;
+        buf[off..off + 32].copy_from_slice(self.verifier.as_bytes());
+        off += 32;
+        buf[off..off + 32].copy_from_slice(&self.verifier_nonce);
+        off += 32;
+        buf[off..off + 32].copy_from_slice(self.target.authority.as_bytes());
+        off += 32;
+        buf[off..off + 4].copy_from_slice(&self.target.path.raw().to_le_bytes());
+        off += 4;
+        buf[off] = self.requested_rights.bits();
+        buf
+    }
+
+    fn signing_input(&self) -> [u8; Self::SIGNING_INPUT_SIZE] {
+        let mut buf = [0u8; Self::SIGNING_INPUT_SIZE];
+        buf[..SUBNET_PRESENTATION_SIG_DOMAIN.len()].copy_from_slice(SUBNET_PRESENTATION_SIG_DOMAIN);
+        buf[SUBNET_PRESENTATION_SIG_DOMAIN.len()..].copy_from_slice(&self.signed_payload());
+        buf
+    }
+
+    /// Wire form: payload ‖ signature.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_SIZE);
+        out.extend_from_slice(&self.signed_payload());
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    /// Strict decode; signature NOT verified here.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, SubnetAuthError> {
+        if bytes.len() != Self::WIRE_SIZE {
+            return Err(SubnetAuthError::InvalidFormat);
+        }
+        let mut off = 0;
+        let version = bytes[off];
+        off += 1;
+        if version != 1 {
+            return Err(SubnetAuthError::InvalidFormat);
+        }
+        let subject = EntityId::from_bytes(read_32(bytes, &mut off));
+        let credential_set_hash = read_32(bytes, &mut off);
+        let session_id = read_u64(bytes, &mut off);
+        let verifier = EntityId::from_bytes(read_32(bytes, &mut off));
+        let verifier_nonce = read_32(bytes, &mut off);
+        let target_authority = EntityId::from_bytes(read_32(bytes, &mut off));
+        let target_path = TopologySubnetId::from_raw(read_u32(bytes, &mut off));
+        let requested_rights = SubnetRights::try_from_bits(bytes[off])?;
+        off += 1;
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&bytes[off..off + 64]);
+        Ok(Self {
+            version,
+            subject,
+            credential_set_hash,
+            session_id,
+            verifier,
+            verifier_nonce,
+            target: SubnetRef {
+                authority: target_authority,
+                path: target_path,
+            },
+            requested_rights,
+            signature,
+        })
+    }
+
+    /// Verify the signature against `self.subject`.
+    pub fn verify(&self) -> Result<(), SubnetAuthError> {
+        let sig = Signature::from_bytes(&self.signature);
+        self.subject
+            .verify(&self.signing_input(), &sig)
+            .map_err(|_| SubnetAuthError::InvalidSignature)
+    }
+}
+
+/// What the verifier expects a presentation to be bound to. Every
+/// field is verifier-owned state, never taken from the wire.
+#[derive(Debug, Clone)]
+pub struct ExpectedBinding {
+    /// Session incarnation the challenge was issued on.
+    pub session_id: u64,
+    /// This node's identity.
+    pub verifier: EntityId,
+    /// The one-use challenge this node minted and has not yet
+    /// consumed.
+    pub verifier_nonce: [u8; 32],
+}
+
+/// Immutable per-session authority compiled once at admission and
+/// read by the packet path (SUBNET_AUTH_PLAN.md D5/D6).
+///
+/// Forwarding consumes only this: authority equality, one fixed-width
+/// prefix comparison, two epoch comparisons, an expiry check, and a
+/// rights-bit test. No signature verification, chain walk, string
+/// parse, allocation, or online lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSubnetContext {
+    /// Authority the credentials verified under.
+    pub authority: EntityId,
+    /// Granted subtree root.
+    pub scope: TopologySubnetId,
+    /// Topology epoch verified against.
+    pub topology_epoch: u32,
+    /// Full subject entity, proven by signature this session.
+    pub subject: EntityId,
+    /// Routing derivative of `subject`, derived once after
+    /// verification (never used to establish identity).
+    pub subject_node: u64,
+    /// Session incarnation this context belongs to.
+    pub session_id: u64,
+    /// Rights granted for this session.
+    pub rights: SubnetRights,
+    /// Leaf generation at verification time.
+    pub generation: u32,
+    /// Authority auth epoch at verification time.
+    pub subnet_auth_epoch: u64,
+    /// Leaf expiry (unix seconds, exclusive).
+    pub expires_at: u64,
+    /// Hash binding the exact credentials that produced this context.
+    pub credential_set_hash: [u8; 32],
+}
+
+impl VerifiedSubnetContext {
+    /// The D6 hot-path check: is `right` authorized for `target`
+    /// right now? Pure integer work over immutable state.
+    #[inline]
+    pub fn allows(
+        &self,
+        current_topology_epoch: u32,
+        current_subnet_auth_epoch: u64,
+        now_secs: u64,
+        target: TopologySubnetId,
+        right: SubnetRights,
+    ) -> bool {
+        self.topology_epoch == current_topology_epoch
+            && self.subnet_auth_epoch == current_subnet_auth_epoch
+            && now_secs < self.expires_at
+            && self.scope.is_ancestor_or_self_of(target)
+            && self.rights.contains(right)
+    }
+
+    /// Forwarding boundary rule (D6): traffic with both endpoints
+    /// inside the scope needs `ROUTE`; traffic crossing the boundary
+    /// needs `EXPORT`; traffic wholly outside is not this context's
+    /// business. Returns the required right, or `None` when the
+    /// context is irrelevant to the transition.
+    #[inline]
+    pub fn required_forwarding_right(
+        &self,
+        source: TopologySubnetId,
+        target: TopologySubnetId,
+    ) -> Option<SubnetRights> {
+        let inside_source = self.scope.is_ancestor_or_self_of(source);
+        let inside_target = self.scope.is_ancestor_or_self_of(target);
+        match (inside_source, inside_target) {
+            (true, true) => Some(SubnetRights::ROUTE),
+            (true, false) | (false, true) => Some(SubnetRights::EXPORT),
+            (false, false) => None,
+        }
+    }
+}
+
+/// Verify a presentation + credential set and compile the session
+/// context (SUBNET_AUTH_PLAN.md D5 steps 2–7, 9, 10).
+///
+/// The caller owns the surrounding steps that need node state: minting
+/// and consuming the one-use challenge (step 1/4), and the atomic
+/// `NodeId → EntityId` pin compare/install (step 8), which must happen
+/// only after every check here succeeds.
+///
+/// Order matters: the presentation is checked against verifier-owned
+/// expectations BEFORE any credential work, so a replayed or
+/// misdirected proof cannot spend credential verification effort.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every parameter is a distinct verifier-owned input; bundling them into a struct \
+              would hide which ones the caller must supply from trusted state"
+)]
+pub fn verify_admission(
+    presentation: &SubnetAuthPresentation,
+    set: &SubnetCredentialSet,
+    expected: &ExpectedBinding,
+    config: &SubnetAuthorityConfig,
+    current_topology_epoch: u32,
+    floors: &SubnetFloorRegistry,
+    now_secs: u64,
+    skew_secs: u64,
+) -> Result<VerifiedSubnetContext, SubnetAuthError> {
+    // Verifier-owned bindings first — cheap, and they reject a proof
+    // aimed at another session, node, or challenge before any
+    // signature work on the credential chain.
+    if presentation.session_id != expected.session_id {
+        return Err(SubnetAuthError::WrongSession);
+    }
+    if presentation.verifier != expected.verifier {
+        return Err(SubnetAuthError::WrongVerifier);
+    }
+    // Constant-time nonce comparison: the challenge is a one-use
+    // secret until consumed.
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(
+        &presentation.verifier_nonce[..],
+        &expected.verifier_nonce[..],
+    )) {
+        return Err(SubnetAuthError::WrongChallenge);
+    }
+    if presentation.credential_set_hash != set.credential_set_hash() {
+        return Err(SubnetAuthError::WrongChallenge);
+    }
+    if presentation.target.authority != config.authority {
+        return Err(SubnetAuthError::WrongAuthority);
+    }
+
+    // The leaf subject is the identity the proof must come from.
+    let leaf_subject = set.leaf().subject.clone();
+    if presentation.subject != leaf_subject {
+        return Err(SubnetAuthError::WrongSubject);
+    }
+    presentation.verify()?;
+
+    let verified = verify_credential_set(
+        set,
+        &leaf_subject,
+        config,
+        current_topology_epoch,
+        floors,
+        now_secs,
+        skew_secs,
+    )?;
+
+    // The requested target must lie inside the granted scope, and the
+    // requested rights inside the granted rights: a session is
+    // admitted for what it asked for, never more.
+    if !verified
+        .scope
+        .is_ancestor_or_self_of(presentation.target.path)
+    {
+        return Err(SubnetAuthError::ScopeNotAncestor);
+    }
+    if !verified.rights.contains(presentation.requested_rights) {
+        return Err(SubnetAuthError::RightNotGranted);
+    }
+
+    Ok(VerifiedSubnetContext {
+        authority: verified.authority,
+        scope: verified.scope,
+        topology_epoch: verified.topology_epoch,
+        subject_node: verified.subject.node_id(),
+        subject: verified.subject,
+        session_id: expected.session_id,
+        rights: presentation.requested_rights,
+        generation: verified.generation,
+        subnet_auth_epoch: verified.subnet_auth_epoch,
+        expires_at: verified.expires_at,
+        credential_set_hash: verified.credential_set_hash,
     })
 }
 
