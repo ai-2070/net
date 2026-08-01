@@ -80,7 +80,6 @@ pub enum X402HttpOutcome {
     Failed { message: String, retryable: bool },
 }
 
-/// The outbound paid-HTTP client.
 /// Response bodies from an external x402 server. Capped so a hostile or
 /// compromised endpoint cannot stream until the 30s timeout and exhaust
 /// memory — the same discipline the facilitator client and chain checker
@@ -91,6 +90,7 @@ pub enum X402HttpOutcome {
 /// returning a few megabytes of JSON is ordinary. It is still a bound.
 const MAX_RESOURCE_BODY: usize = 32 * 1024 * 1024;
 
+/// The outbound paid-HTTP client.
 pub struct X402HttpFlow {
     caller: Arc<EntityKeypair>,
     spend: SpendPolicyEngine,
