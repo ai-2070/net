@@ -54,7 +54,7 @@ use super::behavior::org::{OrgId, OrgMembershipCert};
 use super::behavior::org_admission::OrgAdmission;
 use super::behavior::org_call::{OrgCallProof, MAX_ORG_PROOF_TTL_SECS, ORG_ADMISSION_HEADER};
 use super::behavior::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant, OrgDispatcherGrant};
-use super::mesh::{MeshNode, PeerPublishOutcome};
+use super::mesh::{MeshNode, PeerPublishOutcome, ReplySubscription};
 use super::org_admission_gate::{
     org_request_digest, CapabilityVisibility, OrgProviderPolicy, RegisteredRpcService,
 };
@@ -5664,7 +5664,29 @@ impl MeshNode {
                             // past MAX_REPLY_SUBSCRIPTIONS during a concurrent insert
                             // race is bounded by the number of concurrent callers,
                             // which operators tune separately.
-        registry.insert((target_node_id, service_hash), Arc::from(service));
+        // A missing snapshot means no attempt reported success, which the
+        // `last_err` return above already covers — so this is
+        // unreachable. Checked BEFORE the insert so the unreachable case
+        // cannot cache anything: the one thing this block must never do
+        // is leave a cache entry standing that nothing verified.
+        let Some(gen_before) = gen_before else {
+            return Err(RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!(
+                    "reply-channel subscribe to {target_node_id:#x} completed with \
+                     no recorded outcome; refusing to cache an unverified \
+                     subscription. Retry — the next call re-subscribes."
+                ),
+            });
+        };
+
+        registry.insert(
+            (target_node_id, service_hash),
+            ReplySubscription {
+                service: Arc::from(service),
+                written_at_generation: gen_before,
+            },
+        );
 
         // Fence. If the target's session failed since the snapshot taken
         // before the SUCCEEDING subscribe attempt, the eviction that ran
@@ -5683,30 +5705,20 @@ impl MeshNode {
         // our insert then the bump did too and we observe it here; if it
         // runs after, it takes the entry itself.
         //
-        // `remove` unconditionally rather than
-        // `remove_if(value == service)`: a concurrent caller for a
-        // colliding service hash may have overwritten the slot, but that
-        // caller's own fence covers its entry, and dropping a live slot
-        // costs at most one idempotent re-subscribe.
-        //
-        // A missing snapshot means no attempt reported success, which
-        // the `last_err` return above already covers — so this is
-        // unreachable. It still tears the entry down rather than
-        // skipping the fence: the one thing this block must never do is
-        // leave a cache entry standing that nothing verified.
-        let Some(gen_before) = gen_before else {
-            registry.remove(&(target_node_id, service_hash));
-            return Err(RpcError::NoRoute {
-                target: target_node_id,
-                reason: format!(
-                    "reply-channel subscribe to {target_node_id:#x} completed with \
-                     no recorded outcome; refusing to cache an unverified \
-                     subscription. Retry — the next call re-subscribes."
-                ),
-            });
-        };
+        // Rolls back OUR entry, not whatever is in the slot. Removing by
+        // key alone let a fenced older call delete an entry a NEWER
+        // post-recovery call had just established, after which that
+        // newer caller believed it was cached and re-subscribed
+        // needlessly on its next RPC. Matching the stamp fixes it: any
+        // call that ran after the failure we just detected wrote a
+        // different generation, so its entry survives. An entry stamped
+        // with the same generation is either ours or a concurrent call
+        // that started where we did — and that call reaches this same
+        // fence and rolls back too, so removing it is right either way.
         if self.peer_failure_generation(target_node_id) != gen_before {
-            registry.remove(&(target_node_id, service_hash));
+            registry.remove_if(&(target_node_id, service_hash), |_, entry| {
+                entry.written_at_generation == gen_before
+            });
             return Err(RpcError::NoRoute {
                 target: target_node_id,
                 reason: format!(
@@ -5732,14 +5744,14 @@ impl MeshNode {
 /// collision into a per-call re-subscribe (idempotent, harmless)
 /// instead of a correctness bug.
 fn reply_subscription_covers(
-    registry: &dashmap::DashMap<(u64, u64), Arc<str>>,
+    registry: &dashmap::DashMap<(u64, u64), ReplySubscription>,
     target_node_id: u64,
     service_hash: u64,
     service: &str,
 ) -> bool {
     registry
         .get(&(target_node_id, service_hash))
-        .is_some_and(|entry| entry.value().as_ref() == service)
+        .is_some_and(|entry| entry.value().service.as_ref() == service)
 }
 
 /// Hard cap on the number of distinct (target_node_id, service)
@@ -6466,12 +6478,18 @@ mod origin_cache_tests {
     #[test]
     fn reply_subscriptions_keyed_by_target_and_service_hash() {
         use dashmap::DashMap;
-        let registry: DashMap<(u64, u64), Arc<str>> = DashMap::new();
+        let registry: DashMap<(u64, u64), ReplySubscription> = DashMap::new();
         let h_a = xxhash_rust::xxh3::xxh3_64(b"svc-a");
         let h_b = xxhash_rust::xxh3::xxh3_64(b"svc-b");
         // Same target, different services → distinct entries.
-        registry.insert((0xAA, h_a), Arc::from("svc-a"));
-        registry.insert((0xAA, h_b), Arc::from("svc-b"));
+        registry.insert(
+            (0xAA, h_a),
+            ReplySubscription { service: Arc::from("svc-a"), written_at_generation: 0 },
+        );
+        registry.insert(
+            (0xAA, h_b),
+            ReplySubscription { service: Arc::from("svc-b"), written_at_generation: 0 },
+        );
         assert!(super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-a"
         ));
@@ -6482,13 +6500,19 @@ mod origin_cache_tests {
         assert!(!super::reply_subscription_covers(
             &registry, 0xBB, h_a, "svc-a"
         ));
-        registry.insert((0xBB, h_a), Arc::from("svc-a"));
+        registry.insert(
+            (0xBB, h_a),
+            ReplySubscription { service: Arc::from("svc-a"), written_at_generation: 0 },
+        );
         assert!(super::reply_subscription_covers(
             &registry, 0xBB, h_a, "svc-a"
         ));
         // Idempotent — repeat insert overwrites with the identical
         // value; the fast path keeps answering true.
-        registry.insert((0xAA, h_a), Arc::from("svc-a"));
+        registry.insert(
+            (0xAA, h_a),
+            ReplySubscription { service: Arc::from("svc-a"), written_at_generation: 0 },
+        );
         assert!(super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-a"
         ));
@@ -6507,13 +6531,72 @@ mod origin_cache_tests {
         // overwritten), the original service degrades to
         // re-subscribe — covered must flip to false for it, never
         // silently true for both.
-        registry.insert((0xAA, h_a), Arc::from("svc-evil"));
+        registry.insert(
+            (0xAA, h_a),
+            ReplySubscription { service: Arc::from("svc-evil"), written_at_generation: 0 },
+        );
         assert!(super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-evil"
         ));
         assert!(!super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-a"
         ));
+    }
+
+    /// The fence rollback must remove the entry ITS OWN call wrote, and
+    /// leave a newer one alone.
+    ///
+    /// The losing sequence, which removing by key alone produced: call A
+    /// snapshots generation 0 and inserts; the peer fails and recovers;
+    /// call B snapshots generation 1, subscribes successfully on the new
+    /// session and inserts; call A finally reaches its fence, sees the
+    /// generation moved, and deletes B's entry. B's caller believes it
+    /// is subscribed — it is, and correctly so — but the cache no longer
+    /// says so, and its next RPC re-subscribes for nothing.
+    ///
+    /// Not a correctness hole (the redundant subscribe is idempotent),
+    /// which is why the stamp is cheap insurance rather than a fix for
+    /// data loss. Modelled rather than raced: two RPC calls interleaving
+    /// around a session failure is not something the harness schedules
+    /// deterministically.
+    #[test]
+    fn the_fence_rollback_spares_a_newer_calls_entry() {
+        use dashmap::DashMap;
+        let registry: DashMap<(u64, u64), ReplySubscription> = DashMap::new();
+        let key = (0xAAu64, xxhash_rust::xxh3::xxh3_64(b"svc"));
+
+        // Call A, at generation 0.
+        registry.insert(
+            key,
+            ReplySubscription {
+                service: Arc::from("svc"),
+                written_at_generation: 0,
+            },
+        );
+        // Peer fails and recovers; call B re-subscribes at generation 1.
+        registry.insert(
+            key,
+            ReplySubscription {
+                service: Arc::from("svc"),
+                written_at_generation: 1,
+            },
+        );
+
+        // Call A's fence fires late. Its rollback must be a no-op.
+        registry.remove_if(&key, |_, entry| entry.written_at_generation == 0);
+        assert!(
+            super::reply_subscription_covers(&registry, key.0, key.1, "svc"),
+            "the late rollback deleted a newer call's entry; that caller is \
+             genuinely subscribed and will now re-subscribe for nothing"
+        );
+
+        // …and when the entry IS the one that call wrote, it goes.
+        registry.remove_if(&key, |_, entry| entry.written_at_generation == 1);
+        assert!(
+            !super::reply_subscription_covers(&registry, key.0, key.1, "svc"),
+            "a call must still be able to roll back its own entry — leaving it \
+             is the stale-cache bug the fence exists to prevent"
+        );
     }
 
     /// PERF_AUDIT §3.3 — grant-stall backstop check for the

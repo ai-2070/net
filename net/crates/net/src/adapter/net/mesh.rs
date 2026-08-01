@@ -2879,7 +2879,7 @@ impl MembershipFailure {
 fn evict_failed_peer_channel_state(
     node_id: u64,
     subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
-    #[cfg(feature = "cortex")] rpc_reply_subscriptions: &dashmap::DashMap<(u64, u64), Arc<str>>,
+    #[cfg(feature = "cortex")] rpc_reply_subscriptions: &dashmap::DashMap<(u64, u64), ReplySubscription>,
     #[cfg(feature = "cortex")] rpc_corrective_announced: &dashmap::DashSet<u64>,
     #[cfg(feature = "cortex")] rpc_peer_failure_gen: &PeerFailureGenerations,
 ) {
@@ -2890,6 +2890,26 @@ fn evict_failed_peer_channel_state(
     rpc_reply_subscriptions.retain(|(target, _), _| *target != node_id);
     #[cfg(feature = "cortex")]
     rpc_corrective_announced.remove(&node_id);
+}
+
+/// One caller-side reply subscription, plus the peer-failure generation
+/// it was written under.
+///
+/// The generation is not part of the cache decision — `reply_subscription_covers`
+/// ignores it. It exists so the R6 fence can roll back exactly the entry
+/// its own call wrote. Rolling back by key alone let a fenced OLDER call
+/// delete an entry a newer post-recovery call had just established, after
+/// which the newer caller believed it was cached and re-subscribed
+/// needlessly on its next RPC.
+#[cfg(feature = "cortex")]
+#[derive(Debug, Clone)]
+pub(super) struct ReplySubscription {
+    /// Full service name. xxh3 is not collision-free and the key holds
+    /// only the hash, so the hot path verifies this.
+    pub(super) service: Arc<str>,
+    /// `peer_failure_generation(target)` as read immediately before the
+    /// subscribe attempt that produced this entry.
+    pub(super) written_at_generation: u64,
 }
 
 /// Node-wide rate cap on corrective capability announces.
@@ -6979,7 +6999,7 @@ pub struct MeshNode {
     /// hash hit; a collision therefore degrades to an idempotent
     /// re-subscribe instead of a correctness bug.
     #[cfg(feature = "cortex")]
-    rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), Arc<str>>>,
+    rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), ReplySubscription>>,
     /// Targets we have already fired one corrective re-announce at.
     /// Bounds the amplification described on
     /// `MembershipFailure::warrants_reannounce`; cleared on peer failure
@@ -8248,7 +8268,7 @@ impl MeshNode {
         // closure — which runs before `Self` exists — can hold a clone
         // and evict a failed peer's entries.
         #[cfg(feature = "cortex")]
-        let rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), Arc<str>>> =
+        let rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), ReplySubscription>> =
             Arc::new(dashmap::DashMap::new());
         #[cfg(feature = "cortex")]
         let rpc_reply_subscriptions_failure = rpc_reply_subscriptions.clone();
@@ -18713,7 +18733,7 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub(super) fn rpc_reply_subscriptions_arc(
         &self,
-    ) -> Arc<dashmap::DashMap<(u64, u64), Arc<str>>> {
+    ) -> Arc<dashmap::DashMap<(u64, u64), ReplySubscription>> {
         self.rpc_reply_subscriptions.clone()
     }
 
@@ -36865,7 +36885,7 @@ mod membership_failure_tests {
 
         let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
         #[cfg(feature = "cortex")]
-        let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
+        let replies: dashmap::DashMap<(u64, u64), ReplySubscription> = dashmap::DashMap::new();
 
         // Two channels for the failed peer, one for a healthy peer.
         for (node, ch) in [(FAILED, 1u64), (FAILED, 2u64), (HEALTHY, 1u64)] {
@@ -36876,7 +36896,13 @@ mod membership_failure_tests {
         }
         #[cfg(feature = "cortex")]
         for (target, svc) in [(FAILED, 10u64), (FAILED, 11u64), (HEALTHY, 10u64)] {
-            replies.insert((target, svc), Arc::from("svc"));
+            replies.insert(
+                (target, svc),
+                ReplySubscription {
+                    service: Arc::from("svc"),
+                    written_at_generation: 0,
+                },
+            );
         }
 
         #[cfg(feature = "cortex")]
@@ -36970,7 +36996,7 @@ mod membership_failure_tests {
     fn a_subscribe_spanning_a_failure_observes_a_generation_change() {
         const TARGET: u64 = 0xC0FFEE;
         let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
-        let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
+        let replies: dashmap::DashMap<(u64, u64), ReplySubscription> = dashmap::DashMap::new();
         let latch: dashmap::DashSet<u64> = dashmap::DashSet::new();
         let gens = PeerFailureGenerations::new();
 
@@ -36987,7 +37013,13 @@ mod membership_failure_tests {
         );
 
         // 3. The subscribe completes and records itself.
-        replies.insert((TARGET, 7), Arc::from("svc"));
+        replies.insert(
+            (TARGET, 7),
+            ReplySubscription {
+                service: Arc::from("svc"),
+                written_at_generation: 0,
+            },
+        );
 
         // 4. The fence must fire. It only does because the eviction
         //    bumps BEFORE its retain: with the bump last, step 2's
@@ -37008,7 +37040,13 @@ mod membership_failure_tests {
         // fence must not cost the happy path its cache.
         const QUIET: u64 = 0xD00D;
         let quiet_before = gens.get(QUIET);
-        replies.insert((QUIET, 7), Arc::from("svc"));
+        replies.insert(
+            (QUIET, 7),
+            ReplySubscription {
+                service: Arc::from("svc"),
+                written_at_generation: 0,
+            },
+        );
         assert_eq!(gens.get(QUIET), quiet_before);
     }
 
@@ -37164,7 +37202,7 @@ mod membership_failure_tests {
 
         // Failure clears only that target's latch.
         let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
-        let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
+        let replies: dashmap::DashMap<(u64, u64), ReplySubscription> = dashmap::DashMap::new();
         let gens = PeerFailureGenerations::new();
         evict_failed_peer_channel_state(A, &chains, &replies, &latch, &gens);
 
