@@ -94,10 +94,10 @@ mod linux;
 
 pub use batch::AdaptiveBatcher;
 pub use channel::{
-    AckReason, AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError,
-    ChannelHash, ChannelId, ChannelName, ChannelPublisher, ChannelRegistry, MembershipMsg,
-    OnFailure, PublishConfig, PublishReport, SubscriberRoster, Visibility,
-    SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+    queue_group_hash, AckReason, AclPrincipal, AuthGuard, AuthVerdict, ChannelConfig,
+    ChannelConfigRegistry, ChannelError, ChannelHash, ChannelId, ChannelName, ChannelPublisher,
+    ChannelRegistry, MembershipMsg, OnFailure, OriginBinding, PublishConfig, PublishReport,
+    QueueGroupPolicy, ResolvedConfig, SubscriberRoster, Visibility, SUBPROTOCOL_CHANNEL_MEMBERSHIP,
 };
 pub use compute::{
     DaemonError, DaemonFactoryRegistry, DaemonHost, DaemonHostConfig, DaemonRegistry, DaemonStats,
@@ -136,7 +136,7 @@ pub use identity::{
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
     ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingReadinessOverlay,
-    SensingRegistrationError, ACK_RANGES_CAPABILITY_TAG,
+    SensingRegistrationError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
 };
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};

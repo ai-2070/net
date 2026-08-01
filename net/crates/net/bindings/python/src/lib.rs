@@ -1378,21 +1378,27 @@ mod mesh_bindings {
             if !permissive_channels.unwrap_or(false) {
                 node.set_channel_configs(channel_configs.clone());
             }
-            // Install a fresh TokenCache — channel auth needs
-            // somewhere to stash tokens presented on subscribe.
+            // Install a fresh TokenCache — channel auth needs one to
+            // supply the RevocationRegistry and clock-skew tolerance,
+            // and `require_token` channels reject outright without it.
+            //
+            // It is NOT where subscriber-presented tokens land: those
+            // ride the wire, are verified inline against the channel's
+            // `token_roots`, and are retained as chains.
             //
             // **Known limitation.** Each `NetMesh` gets its own
-            // `TokenCache`. A caller's `Identity.install_token(...)`
-            // against the same seed binds to a different
-            // `Arc<TokenCache>` than the mesh's cache, so
-            // subscribe-with-token from a separately-built
-            // `Identity` silently fails verification until the
-            // token is explicitly re-installed via
-            // `NetMesh.subscribe_channel(..., token=bytes)`.
-            // Sharing across meshes is tracked separately — it
-            // needs a per-seed registry on the Python side so a
-            // second `NetMesh.__new__` with the same seed picks
-            // up the existing cache.
+            // `TokenCache`, and a caller's `Identity.install_token(...)`
+            // against the same seed binds a DIFFERENT `Arc<TokenCache>`.
+            // Post-`TokenChain` that no longer affects
+            // subscribe-with-token (the credential is passed as bytes
+            // and verified inline), but it does affect the local node's
+            // own credentials: the publish path resolves its PUBLISH
+            // token from the MESH's cache via `get_for_action`, so a
+            // token installed on a separately-built `Identity` is
+            // invisible to it. Sharing across meshes is tracked
+            // separately — it needs a per-seed registry on the Python
+            // side so a second `NetMesh.__new__` with the same seed
+            // picks up the existing cache.
             node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
             Ok(Self {

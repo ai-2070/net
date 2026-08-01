@@ -376,6 +376,496 @@ async fn unauth_channel_accepts_everyone() {
     assert_eq!(report.delivered, 1);
 }
 
+/// M1 (2026-07-31 audit): a token-gated **prefix** channel must work
+/// end to end — subscribe accepted AND the first publish delivered.
+///
+/// Pre-fix the gate and the chain retention both keyed on
+/// `cfg.channel_id.hash()`, which for a prefix config is a sentinel
+/// standing for the whole family. Two things went wrong at once:
+/// a token minted for the sentinel authorized every channel under the
+/// prefix, and the chain was retained under the sentinel key while the
+/// publish path looked it up by the real channel — so a legitimate
+/// subscriber was accepted with a successful Ack and then revoked
+/// before a single event reached it. Accept-then-fail-closed, reported
+/// to the peer as success.
+#[tokio::test]
+async fn token_gated_prefix_channel_subscribes_and_delivers() {
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
+
+    // Registered as a PREFIX, with a sentinel channel_id — the shape
+    // nRPC uses for its per-caller reply channels.
+    let sentinel = ChannelName::new("lab/pfx/sentinel").unwrap();
+    a.registry.insert_prefix(
+        "lab/pfx/",
+        ChannelConfig::new(ChannelId::new(sentinel))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
+
+    // The real, dynamically-named channel the peer asks for.
+    let name = ChannelName::new("lab/pfx/instance-one").unwrap();
+    let token = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        name.hash(), // scoped to the REAL channel, not the sentinel
+        300,
+        0,
+    );
+    b.mesh
+        .subscribe_channel_with_token(a.mesh.node_id(), name.clone(), token)
+        .await
+        .expect("token-gated prefix subscribe must be accepted");
+
+    // The part that used to fail: the publish path must find the
+    // retained chain and actually deliver.
+    let publisher = ChannelPublisher::new(
+        name.clone(),
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    );
+    // The publisher is the channel's own root, so it needs a PUBLISH
+    // grant to itself to clear its own gate.
+    let self_token = PermissionToken::issue(
+        &a.keypair,
+        a.keypair.entity_id().clone(),
+        TokenScope::PUBLISH,
+        name.hash(),
+        300,
+        0,
+    );
+    a.mesh.set_publish_chain(
+        &name,
+        net::adapter::net::identity::TokenChain::single(self_token),
+    );
+
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"payload"))
+        .await
+        .expect("publish must be authorized");
+    assert_eq!(
+        report.delivered, 1,
+        "a legitimately token-gated prefix subscriber must actually receive \
+         events, not be revoked before the first delivery"
+    );
+}
+
+/// M4 (2026-07-31 audit): a token-gated channel on a publisher with no
+/// `TokenCache` must reject the subscribe outright.
+///
+/// Pre-fix the three enforcement points disagreed. Subscribe ACCEPTED
+/// (it fell back to a transient empty revocation registry and verified
+/// the chain normally), every publish DENIED (the token-gated branch
+/// requires `Some(cache)`), and the sweep was a no-op (it returns early
+/// without a cache). So the peer received an accepting Ack for a
+/// subscription that could never deliver an event — and because the
+/// publish-time denial revokes the AuthGuard entry WITHOUT removing the
+/// roster entry, and the sweep that would evict it can never run, the
+/// peer stayed rostered with no periodic recovery. On a queue-group
+/// channel that is a standing denial of service: selection happens
+/// before the auth filter, so the stranded peer keeps consuming that
+/// group's events and they are dropped rather than delivered to a
+/// working member. Installing a cache later did not repair it — the
+/// guard entry was already revoked and the sweep never re-grants — so
+/// clearing it took the peer going away or sending something that drops
+/// its per-peer state (an explicit re-subscribe, or an `Unsubscribe`,
+/// which revokes the guard entry, removes the retained chain and drops
+/// the roster entry). Every one of those is peer-driven: the publisher
+/// had no way to repair itself.
+///
+/// `set_token_cache` already documented "when unset, `require_token`
+/// channels always reject". This makes that true.
+#[tokio::test]
+async fn token_gated_subscribe_rejected_when_no_token_cache() {
+    // Publisher A deliberately has a channel registry but NO token
+    // cache — the exact configuration that used to accept-then-strand.
+    let a = {
+        let keypair = EntityKeypair::generate();
+        let mut node = MeshNode::new(keypair.clone(), test_config())
+            .await
+            .expect("MeshNode::new");
+        let registry = Arc::new(ChannelConfigRegistry::new());
+        node.set_channel_configs(registry.clone());
+        Node {
+            mesh: Arc::new(node),
+            keypair,
+            registry,
+        }
+    };
+    let b = build_node().await;
+    handshake_no_start(&a.mesh, &b.mesh).await;
+    a.mesh.start();
+    b.mesh.start();
+
+    let name = ChannelName::new("lab/nocache").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()]),
+    );
+
+    // A perfectly good token — the rejection must come from the missing
+    // cache, not from anything wrong with the credential.
+    let token = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        name.hash(),
+        300,
+        0,
+    );
+    let result = b
+        .mesh
+        .subscribe_channel_with_token(a.mesh.node_id(), name.clone(), token)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a token-gated channel with no TokenCache must reject the subscribe \
+         rather than accept one that can never deliver"
+    );
+    assert!(
+        !a.mesh
+            .roster()
+            .is_subscribed(b.mesh.node_id(), &ChannelId::new(name)),
+        "the rejected peer must not be left in the roster — that is the \
+         stranded-subscriber state this fix exists to prevent"
+    );
+}
+
+/// L1 (2026-07-31 audit): a registry-less node's permissiveness must be
+/// a recorded decision, not a consequence of an unset field.
+///
+/// `Deny` fails closed; the default still admits (so no existing
+/// embedder breaks) but now says so in the log exactly once.
+#[tokio::test]
+async fn unregistered_channel_policy_governs_registry_less_nodes() {
+    use net::adapter::net::UnregisteredChannelPolicy;
+
+    async fn subscribe_under(policy: UnregisteredChannelPolicy) -> bool {
+        // A deliberately registry-less publisher.
+        let keypair = EntityKeypair::generate();
+        let cfg = test_config().with_unregistered_channel_policy(policy);
+        let a = Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"));
+        let b = build_node().await;
+        handshake_no_start(&a, &b.mesh).await;
+        a.start();
+        b.mesh.start();
+
+        let name = ChannelName::new("lab/unregistered").unwrap();
+        b.mesh.subscribe_channel(a.node_id(), name).await.is_ok()
+    }
+
+    assert!(
+        !subscribe_under(UnregisteredChannelPolicy::Deny).await,
+        "Deny must fail closed on a node with no channel registry"
+    );
+    assert!(
+        subscribe_under(UnregisteredChannelPolicy::Allow).await,
+        "Allow is an intentionally open mesh"
+    );
+    assert!(
+        subscribe_under(UnregisteredChannelPolicy::AllowWithWarning).await,
+        "the default must preserve historical behaviour — permissive, but \
+         it now warns once so a forgotten registry is observable"
+    );
+}
+
+/// M2 (2026-07-31 audit): under `QueueGroupPolicy::TokenBound` a peer
+/// may join only the group its grant names.
+///
+/// Queue-group membership is a claim on other members' work: every
+/// event goes to exactly ONE member, so an attacker who joins a
+/// production group takes a share of its events and, by not processing
+/// them, destroys that share. Pre-fix the group name was an
+/// unauthenticated string taken straight off the wire, with no config
+/// axis restricting who could join what.
+#[tokio::test]
+async fn queue_group_join_requires_a_grant_for_that_group() {
+    use net::adapter::net::{queue_group_hash, QueueGroupPolicy};
+
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
+
+    let name = ChannelName::new("work/queue").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound),
+    );
+
+    // A grant for the "batch" group specifically.
+    let grant = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        queue_group_hash(name.as_str(), "batch"),
+        300,
+        0,
+    );
+
+    // Joining the granted group works.
+    b.mesh
+        .subscribe_channel_in_queue_group_with_token(
+            a.mesh.node_id(),
+            name.clone(),
+            "batch".to_string(),
+            grant.clone(),
+        )
+        .await
+        .expect("the granted queue group must be joinable");
+
+    // Joining a DIFFERENT group with the same grant must not.
+    let result = b
+        .mesh
+        .subscribe_channel_in_queue_group_with_token(
+            a.mesh.node_id(),
+            name.clone(),
+            "realtime".to_string(),
+            grant,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a grant for one queue group must not admit the holder to another — \
+         that is the work-stealing this policy exists to stop"
+    );
+
+    // And a plain channel-scoped SUBSCRIBE token — what an ordinary
+    // read-only subscriber holds — is not a worker grant.
+    let reader_token = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        name.hash(),
+        300,
+        0,
+    );
+    let result = b
+        .mesh
+        .subscribe_channel_in_queue_group_with_token(
+            a.mesh.node_id(),
+            name,
+            "batch".to_string(),
+            reader_token,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a channel-scoped subscribe token must not double as a queue-group \
+         worker grant, or the policy would be a no-op"
+    );
+}
+
+/// A `TokenBound` queue-group worker must work end to end — join
+/// accepted AND events actually delivered.
+///
+/// `TokenBound` cannot be configured without `token_roots`, and roots
+/// make `token_required()` true, which makes the publish path re-verify
+/// every admitted subscriber's retained chain on every packet. That
+/// re-check asked the chain about the CHANNEL hash, but a group grant
+/// authorizes `queue_group_hash(channel, group)` — a deliberately
+/// different hash, so that a reader's channel token cannot double as a
+/// worker grant. The question therefore had no answer, the worker was
+/// revoked and de-rostered before its first event, and the feature was
+/// unusable: accepted with a successful Ack, then silently starved.
+///
+/// The subscribe-side test above passed throughout — it never published.
+#[tokio::test]
+async fn token_bound_queue_group_worker_receives_events() {
+    use net::adapter::net::{queue_group_hash, QueueGroupPolicy};
+
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
+
+    let name = ChannelName::new("work/delivery").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound),
+    );
+
+    let grant = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        queue_group_hash(name.as_str(), "batch"),
+        300,
+        0,
+    );
+    b.mesh
+        .subscribe_channel_in_queue_group_with_token(
+            a.mesh.node_id(),
+            name.clone(),
+            "batch".to_string(),
+            grant,
+        )
+        .await
+        .expect("the granted queue group must be joinable");
+
+    // The publisher is the channel's own root, so it needs a PUBLISH
+    // grant to itself to clear its own gate.
+    let self_token = PermissionToken::issue(
+        &a.keypair,
+        a.keypair.entity_id().clone(),
+        TokenScope::PUBLISH,
+        name.hash(),
+        300,
+        0,
+    );
+    a.mesh.set_publish_chain(
+        &name,
+        net::adapter::net::identity::TokenChain::single(self_token),
+    );
+
+    let publisher = ChannelPublisher::new(
+        name.clone(),
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    );
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"work-item"))
+        .await
+        .expect("publish must be authorized");
+    assert_eq!(
+        report.delivered, 1,
+        "a worker admitted by a group grant must actually receive the group's \
+         events, not be revoked by a publish-time re-check asking its grant \
+         about the channel instead of the group"
+    );
+
+    // Publish-time denial de-rosters as well as revoking, so a surviving
+    // roster entry is the sharpest evidence the re-check agreed.
+    assert!(
+        a.mesh
+            .roster()
+            .is_subscribed(b.mesh.node_id(), &ChannelId::new(name.clone())),
+        "the worker must still be rostered after a publish — a failed \
+         re-check evicts it, which on a queue group means that group's \
+         events are dropped rather than delivered"
+    );
+
+    // Second publish: the first one flips `signatures_verified`, so this
+    // takes the presigned re-check path. Both paths must agree about
+    // which hash the grant answers for.
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"work-item-2"))
+        .await
+        .expect("publish must be authorized");
+    assert_eq!(
+        report.delivered, 1,
+        "the presigned re-check path must use the same grant hash as the \
+         full one — it skips signatures, not scope"
+    );
+}
+
+/// `QueueGroupPolicy::Deny` must hold on a channel that has NO other
+/// gate — which is the shape it is most likely to be reached for.
+///
+/// `authorize_subscribe` short-circuits open channels before evaluating
+/// policy, and that test used to read only the cap filters and
+/// `require_token`. `Deny` needs neither: it is meaningful on a plainly
+/// open channel, and it is exactly there that the short-circuit returned
+/// "accepted" before the policy was consulted, making the setting a
+/// silent no-op.
+///
+/// Driven through the real subscribe path rather than
+/// `can_join_queue_group` directly — the unit test on that function
+/// passed throughout, because it never reached the short-circuit.
+#[tokio::test]
+async fn queue_group_deny_holds_on_a_channel_with_no_other_gates() {
+    use net::adapter::net::QueueGroupPolicy;
+
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
+
+    // No cap filters, no token roots, no `require_token`. The policy is
+    // the only thing standing between B and the group.
+    let name = ChannelName::new("work/broadcast-only").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_queue_group_policy(QueueGroupPolicy::Deny),
+    );
+
+    let result = b
+        .mesh
+        .subscribe_channel_in_queue_group(a.mesh.node_id(), name.clone(), "workers".to_string())
+        .await;
+    assert!(
+        result.is_err(),
+        "QueueGroupPolicy::Deny must refuse a queue-group subscribe even when \
+         the channel has no cap filter and no token gate — otherwise the \
+         open-channel short-circuit answers before the policy is read"
+    );
+    assert!(
+        !a.mesh
+            .roster()
+            .is_subscribed(b.mesh.node_id(), &ChannelId::new(name.clone())),
+        "a refused queue-group join must not be left in the roster, or it \
+         keeps consuming that group's selections"
+    );
+
+    // The policy restricts group membership, not the channel: a
+    // broadcast subscriber is unaffected and keeps the cheap path.
+    b.mesh
+        .subscribe_channel(a.mesh.node_id(), name)
+        .await
+        .expect("Deny governs queue groups only — broadcast must still work");
+}
+
+/// The same bypass, reached the other way: a peer whose entity the
+/// publisher has not pinned.
+///
+/// Widening the open-channel short-circuit is not enough on its own. On
+/// a channel with no `require_token`, an unpinned peer takes a separate
+/// early return that runs the capability match against a dummy identity
+/// — a path that answers "do your caps fit?" and never asks the
+/// queue-group question at all. `Deny` admits nobody and `TokenBound`
+/// needs a chain bound to a real AEAD-verified entity, so an unpinned
+/// peer must be refused on both.
+#[tokio::test]
+async fn queue_group_deny_holds_for_an_unpinned_peer() {
+    use net::adapter::net::QueueGroupPolicy;
+
+    // Deliberately NOT `setup_pair`: no announcement, so A never pins
+    // B's entity.
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake_no_start(&a.mesh, &b.mesh).await;
+    a.mesh.start();
+    b.mesh.start();
+
+    let name = ChannelName::new("work/unpinned").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_queue_group_policy(QueueGroupPolicy::Deny),
+    );
+    assert!(
+        a.mesh.peer_entity_id(b.mesh.node_id()).is_none(),
+        "harness precondition: B must be unpinned on A"
+    );
+
+    let result = b
+        .mesh
+        .subscribe_channel_in_queue_group(a.mesh.node_id(), name.clone(), "workers".to_string())
+        .await;
+    assert!(
+        result.is_err(),
+        "an unpinned peer must not slip past a restricted queue-group policy \
+         via the cap-only early return"
+    );
+    assert!(
+        !a.mesh
+            .roster()
+            .is_subscribed(b.mesh.node_id(), &ChannelId::new(name)),
+        "a refused queue-group join must not be left in the roster"
+    );
+}
+
 #[tokio::test]
 async fn tampered_announcement_signature_rejected() {
     use net::adapter::net::behavior::capability::CapabilityAnnouncement;

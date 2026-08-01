@@ -76,8 +76,9 @@ use super::behavior::sensing;
 use super::behavior::tag::Tag;
 use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
 use super::channel::{
-    AckReason, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelHash, ChannelId, ChannelName,
-    ChannelPublisher, OnFailure, PublishConfig, PublishReport, SubscriberRoster,
+    queue_group_hash, AckReason, AclPrincipal, AuthGuard, AuthVerdict, ChannelConfigRegistry,
+    ChannelHash, ChannelId, ChannelName, ChannelPublisher, OnFailure, PublishConfig, PublishReport,
+    QueueGroupPolicy, SubscriberRoster,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
@@ -1072,13 +1073,35 @@ fn routed_rotation_outcome(
 /// check.
 struct RetainedChain {
     chain: TokenChain,
+    /// The `ChannelHash` this chain was ADMITTED on — the question the
+    /// subscribe gate actually asked of it, which the publish-time
+    /// re-check and the sweep must keep asking.
+    ///
+    /// Usually the requested channel's own hash. It is NOT that for a
+    /// [`QueueGroupPolicy::TokenBound`] worker: under that policy the
+    /// group grant *is* the subscribe authority, and it authorizes
+    /// [`queue_group_hash(channel, group)`](queue_group_hash) — a
+    /// deliberately different hash, so a reader's channel token cannot
+    /// double as a worker grant.
+    ///
+    /// Recording it is what keeps the two re-check paths honest.
+    /// `TokenBound` requires `token_roots`, which makes
+    /// `token_required()` true, which makes the publish path re-verify
+    /// every admitted subscriber's chain on every packet. Re-verifying
+    /// against the CHANNEL hash asked a question the worker's grant was
+    /// never meant to answer, so it failed, and the worker was revoked
+    /// and de-rostered before its first delivery — accepted with a
+    /// successful Ack and then silently starved. Same shape as the
+    /// prefix-channel defect (M1), one hash further along.
+    grant_hash: ChannelHash,
     signatures_verified: AtomicBool,
 }
 
 impl RetainedChain {
-    fn new(chain: TokenChain) -> Self {
+    fn new(chain: TokenChain, grant_hash: ChannelHash) -> Self {
         Self {
             chain,
+            grant_hash,
             signatures_verified: AtomicBool::new(false),
         }
     }
@@ -1469,6 +1492,11 @@ struct DispatchCtx {
     traversal_config: super::traversal::TraversalConfig,
     /// Max distinct channels a single peer may subscribe to.
     max_channels_per_peer: usize,
+    /// What to do with a `Subscribe` when `channel_configs` is `None`.
+    unregistered_channels: UnregisteredChannelPolicy,
+    /// Latches once the registry-less warning has been emitted, so a
+    /// subscribe storm doesn't turn an operator hint into a log flood.
+    unregistered_warned: Arc<AtomicBool>,
     /// Capability fold shared with `MeshNode`. Inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets land here via the
     /// bridge's `translate_announcement`.
@@ -1547,10 +1575,18 @@ struct DispatchCtx {
     /// task, so an O(peers) scan per routed data packet serialized
     /// ingress on relay-heavy topologies (PERF_AUDIT §2.4).
     session_id_to_node: Arc<DashMap<u64, u64>>,
-    /// Shared token cache, populated by subscriber-presented tokens
-    /// plus caller-side pre-installs. `None` disables the
-    /// `require_token` path — unset is equivalent to "no token is
-    /// ever valid."
+    /// Shared token cache, populated by caller-side pre-installs (the
+    /// local node's own credentials, e.g. the publish token
+    /// `publish_many` looks up via `get_for_action`).
+    ///
+    /// It is NOT populated by subscriber-presented tokens: since the
+    /// `TokenChain` migration a peer's credential is verified inline
+    /// against the channel's roots and retained in `subscriber_chains`,
+    /// never inserted here. On the subscribe path this cache supplies
+    /// only the `RevocationRegistry` and the clock-skew tolerance.
+    ///
+    /// `None` disables the `require_token` path — unset is equivalent
+    /// to "no token is ever valid" (enforced at subscribe since M4).
     token_cache: Option<Arc<TokenCache>>,
     /// Verified subscribe token chains, keyed by `(node_id,
     /// channel_hash)`. `authorize_subscribe` stores the chain a peer
@@ -1727,6 +1763,9 @@ pub struct MeshNodeConfig {
     /// a channel with an explicit registry entry always uses
     /// its configured visibility.
     pub default_visibility: Visibility,
+    /// What to do with a `Subscribe` when no [`ChannelConfigRegistry`]
+    /// is installed at all. See [`UnregisteredChannelPolicy`].
+    pub unregistered_channels: UnregisteredChannelPolicy,
     /// Minimum time between successive
     /// [`MeshNode::announce_capabilities`] broadcasts from this
     /// origin. Calls within the window coalesce: the local index
@@ -2047,6 +2086,7 @@ impl MeshNodeConfig {
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
             default_visibility: Visibility::Global,
+            unregistered_channels: UnregisteredChannelPolicy::default(),
             min_announce_interval: Duration::from_secs(10),
             configured_identity: false,
             announce_debounce: Duration::from_millis(100),
@@ -2381,6 +2421,19 @@ impl MeshNodeConfig {
         self.default_visibility = visibility;
         self
     }
+
+    /// Decide what a registry-less node does with an inbound
+    /// `Subscribe` — see [`UnregisteredChannelPolicy`].
+    ///
+    /// Setting this at all is the point: it turns "this mesh has no
+    /// ACL" from an accident of construction into a recorded decision.
+    /// Use [`UnregisteredChannelPolicy::Deny`] to fail closed, or
+    /// [`UnregisteredChannelPolicy::Allow`] to silence the warning on a
+    /// mesh that is open on purpose.
+    pub fn with_unregistered_channel_policy(mut self, policy: UnregisteredChannelPolicy) -> Self {
+        self.unregistered_channels = policy;
+        self
+    }
 }
 
 /// Peer connection info.
@@ -2434,19 +2487,29 @@ fn routing_id(node_id: u64) -> u64 {
     (node_id as u32) as u64
 }
 
-/// 64-bit origin-hash projection used as the `AuthGuard` key.
+/// The `AuthGuard` principal for a subscriber: its **node id**, tagged
+/// as [`AclPrincipal::Node`].
 ///
-/// A prior version truncated to `u32` so the key matched the
-/// routing-plane's 32-bit `src_id`, but truncating to 32 bits
-/// birthday-collides at ~65 k peers — inside the practical reach of
-/// a medium mesh — and lets one subscriber's grant admit a different
+/// Named `subscriber_origin_hash` until I1, and documented as a
+/// "64-bit origin-hash projection" — both wrong in the same way. It
+/// never produced an `EntityId::origin_hash`; it returned the node id
+/// unchanged. That mattered because the storage and blob readers of
+/// this same ACL authorize an actual origin hash, a different blake2s
+/// derivation, and the shared vocabulary is what made
+/// "subscribed to a channel" look interchangeable with "may mutate that
+/// channel's blobs". The derivation now rides in the key, so the two
+/// cannot alias even on an identical scalar.
+///
+/// The full 64 bits are used deliberately. A prior version truncated to
+/// `u32` so the key matched the routing plane's `src_id`, but that
+/// birthday-collides at ~65 k peers — inside the practical reach of a
+/// medium mesh — and would let one subscriber's grant admit a different
 /// subscriber's packets. The fan-out fast path keys on the full
-/// 64-bit `node_id` (the value it already has in hand), which pushes
-/// the collision floor out of reach. The `src_id` field on wire
-/// packets is not consulted for authorization.
+/// `node_id` it already holds; the wire `src_id` field is not consulted
+/// for authorization at all.
 #[inline]
-fn subscriber_origin_hash(node_id: u64) -> u64 {
-    node_id
+fn subscriber_principal(node_id: u64) -> AclPrincipal {
+    AclPrincipal::Node(node_id)
 }
 
 /// Soft cap on the number of distinct services kept in
@@ -2717,6 +2780,325 @@ fn keepalive_send_offsets(fire_at_ms: u64, now_ms: u64, deadline: Duration) -> [
     ]
 }
 
+/// What a node does with a `Subscribe` for a channel when it has no
+/// [`ChannelConfigRegistry`] installed at all.
+///
+/// Without a registry there is no ACL to consult, so every subscribe
+/// from any session peer is admitted and every channel publishes as
+/// open. That is a reasonable posture for a single-tenant or test mesh
+/// and a bad surprise otherwise — and pre-fix the two were
+/// indistinguishable, because permissiveness was a *consequence of an
+/// unset field* rather than a decision anyone recorded.
+///
+/// Every shipped construction path (Rust SDK, C FFI, Node, Python)
+/// installs a registry, so this only governs embedders driving
+/// `MeshNode` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnregisteredChannelPolicy {
+    /// Admit, and warn once that the mesh is running without an ACL.
+    ///
+    /// The default: it preserves historical behaviour exactly, while
+    /// making "I forgot to install a registry" observable instead of
+    /// silent. Distinguishing that from a deliberate open mesh is the
+    /// whole point of this knob.
+    #[default]
+    AllowWithWarning,
+    /// Admit silently — an intentionally open mesh.
+    Allow,
+    /// Reject with `Unauthorized`. Fail closed: a registry-less node
+    /// accepts no subscriptions at all.
+    Deny,
+}
+
+/// Why a membership request (Subscribe / Unsubscribe) did not succeed.
+///
+/// Exists so `ensure_reply_subscription` can tell "the publisher
+/// answered and refused for a reason that a corrective re-announce
+/// might fix" from "the peer is gone / timed out / refused for a reason
+/// re-announcing cannot help". The corrective re-announce deliberately
+/// bypasses the announce rate limit, so firing it on every failure
+/// would let one unreachable or throttling target turn each RPC attempt
+/// into two rate-limit-bypassing capability broadcasts.
+#[derive(Debug)]
+pub(super) enum MembershipFailure {
+    /// The publisher replied with `accepted = false`. The reason is the
+    /// publisher's own, and `None` means it sent no reason code.
+    Rejected(Option<AckReason>),
+    /// No usable answer: no session, send failure, dropped waiter, or
+    /// ack timeout.
+    Transport(AdapterError),
+}
+
+impl MembershipFailure {
+    /// Collapse back into the historical `AdapterError`, preserving the
+    /// exact message text callers already see.
+    pub(super) fn into_adapter_error(self) -> AdapterError {
+        match self {
+            Self::Transport(e) => e,
+            Self::Rejected(reason) => {
+                AdapterError::Connection(format!("membership request rejected: {:?}", reason))
+            }
+        }
+    }
+
+    /// Is a corrective capability re-announce plausibly the fix?
+    ///
+    /// Only for `Unauthorized`, which is what the H3 origin binding
+    /// returns when the publisher has not pinned our `EntityId` yet.
+    /// Explicitly NOT `RateLimited` (the peer is already asking us to
+    /// slow down — re-announcing adds load and cannot help),
+    /// `UnknownChannel`, `TooManyChannels`, or any transport failure.
+    pub(super) fn warrants_reannounce(&self) -> bool {
+        matches!(self, Self::Rejected(Some(AckReason::Unauthorized)))
+    }
+}
+
+/// Drop every piece of per-peer channel state a failed peer leaves
+/// behind, in one place so it can be tested without failing a real
+/// session.
+///
+/// Both maps are keyed by node id in their first tuple position and
+/// both are invisible to the sweeps that would otherwise reclaim them:
+///
+/// - `subscriber_chains` — retained subscribe credentials. The expiry
+///   sweep iterates `peer_entity_ids`, which the failure path clears
+///   just before this, and a failed peer never sends the unsubscribe
+///   that would remove them. Left behind they leak for the node's
+///   lifetime, and a reused `node_id` could re-validate a stale chain.
+/// - `rpc_reply_subscriptions` — the CALLER-side record of "we already
+///   subscribed to our reply channel on this target", which
+///   short-circuits `ensure_reply_subscription` entirely. The target
+///   meanwhile evicts our roster entry on failure
+///   (`roster.remove_peer`, the mirror image on the publisher side), so
+///   leaving this populated means every later call to a recovered peer
+///   skips both the re-subscribe AND the corrective re-announce retry —
+///   and its replies are dropped by a publisher that no longer has us
+///   rostered, silently, because the caller believes it is subscribed.
+/// - `rpc_corrective_announced` — the once-per-target latch that bounds
+///   corrective re-announces. Clearing it on failure is what makes a
+///   genuine reconnect able to re-announce again, while a peer that
+///   merely keeps rejecting us stays latched.
+///
+/// Eviction alone is not sufficient for `rpc_reply_subscriptions`,
+/// because a `ensure_reply_subscription` already past its subscribe
+/// `await` will insert AFTER this runs and restore precisely the stale
+/// "we are subscribed" state we just cleared. So this also bumps
+/// `rpc_peer_failure_gen`, the fence that lets such an insert detect it
+/// spanned a failure and roll itself back.
+///
+/// **The bump must come FIRST, before the retain.** Two things can
+/// remove a resurrected entry — this retain, or the subscribe's own
+/// rollback — and one of them has to be guaranteed to fire. With the
+/// bump last there is a window where neither does: the retain completes
+/// (finding nothing), and the subscribe then inserts AND re-reads a
+/// generation the bump has not reached yet, sees no change, and keeps
+/// the entry. Bumping first collapses that window. If the retain runs
+/// before the insert then the bump did too, so the subscribe's
+/// post-insert read observes it and rolls back; if the retain runs after
+/// the insert it removes the entry itself.
+///
+/// The two orders are NOT symmetric, which is what the first version of
+/// this comment got backwards.
+fn evict_failed_peer_channel_state(
+    node_id: u64,
+    subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
+    #[cfg(feature = "cortex")] rpc_reply_subscriptions: &dashmap::DashMap<
+        (u64, u64),
+        ReplySubscription,
+    >,
+    #[cfg(feature = "cortex")] rpc_corrective_announced: &dashmap::DashSet<u64>,
+    #[cfg(feature = "cortex")] rpc_peer_failure_gen: &PeerFailureGenerations,
+) {
+    #[cfg(feature = "cortex")]
+    rpc_peer_failure_gen.bump(node_id);
+    subscriber_chains.retain(|(nid, _), _| *nid != node_id);
+    #[cfg(feature = "cortex")]
+    rpc_reply_subscriptions.retain(|(target, _), _| *target != node_id);
+    #[cfg(feature = "cortex")]
+    rpc_corrective_announced.remove(&node_id);
+}
+
+/// One caller-side reply subscription, plus the peer-failure generation
+/// it was written under.
+///
+/// The generation is not part of the cache decision — `reply_subscription_covers`
+/// ignores it. It exists so the R6 fence can roll back exactly the entry
+/// its own call wrote. Rolling back by key alone let a fenced OLDER call
+/// delete an entry a newer post-recovery call had just established, after
+/// which the newer caller believed it was cached and re-subscribed
+/// needlessly on its next RPC.
+#[cfg(feature = "cortex")]
+#[derive(Debug, Clone)]
+pub(super) struct ReplySubscription {
+    /// Full service name. xxh3 is not collision-free and the key holds
+    /// only the hash, so the hot path verifies this.
+    pub(super) service: Arc<str>,
+    /// `peer_failure_generation(target)` as read immediately before the
+    /// subscribe attempt that produced this entry.
+    pub(super) written_at_generation: u64,
+}
+
+/// Node-wide rate cap on corrective capability announces.
+///
+/// The per-target latch answers "has THIS peer already had its one
+/// corrective announce". It says nothing about the aggregate, and the
+/// aggregate is what hurts: a corrective announce bypasses the routine
+/// rate limit deliberately (that is the whole point — the routine path
+/// coalesces inside `min_announce_interval` and would return Ok without
+/// sending), and it goes to every connected peer. So each distinct
+/// rejecting target bought one mesh-wide broadcast, and a population of
+/// peers refusing our reply subscribe for any ordinary ACL reason could
+/// keep that running indefinitely.
+///
+/// A plain window counter rather than a token bucket: this is a safety
+/// valve on a path that should fire a handful of times after a
+/// reconnect, not a shaper for sustained traffic. Refundable, because
+/// claims are taken before the send and a send that failed broadcast
+/// nothing.
+#[cfg(feature = "cortex")]
+#[derive(Debug)]
+pub(super) struct CorrectiveAnnounceBudget {
+    /// `(window start, announces charged in this window)`.
+    state: parking_lot::Mutex<(Instant, u32)>,
+}
+
+#[cfg(feature = "cortex")]
+impl CorrectiveAnnounceBudget {
+    /// Corrective announces allowed per [`Self::WINDOW`], node-wide.
+    ///
+    /// Sized for the case this exists to serve — a node reconnecting
+    /// and re-pinning with a handful of RPC targets — while keeping the
+    /// pathological case bounded. A target refused by the budget is not
+    /// denied permanently: it keeps its claim and retries on a later
+    /// call.
+    const MAX_PER_WINDOW: u32 = 8;
+    const WINDOW: Duration = Duration::from_secs(10);
+
+    fn new(now: Instant) -> Self {
+        Self {
+            state: parking_lot::Mutex::new((now, 0)),
+        }
+    }
+
+    /// Charge one announce, or refuse if this window is exhausted.
+    fn try_spend(&self, now: Instant) -> bool {
+        let mut st = self.state.lock();
+        if now.duration_since(st.0) >= Self::WINDOW {
+            *st = (now, 0);
+        }
+        if st.1 >= Self::MAX_PER_WINDOW {
+            return false;
+        }
+        st.1 += 1;
+        true
+    }
+
+    /// Un-charge an announce that was never broadcast.
+    ///
+    /// Saturating: if the window rolled over between the spend and the
+    /// refund there is nothing to give back, and going negative would
+    /// hand out free capacity in the NEXT window.
+    fn refund(&self) {
+        let mut st = self.state.lock();
+        st.1 = st.1.saturating_sub(1);
+    }
+}
+
+/// Per-peer failure counters, and the reclamation floor that lets them
+/// be forgotten without breaking the fence they serve.
+///
+/// A subscribe reads a peer's generation before its `await` and again
+/// after recording itself; any change means the peer failed in between
+/// and the record must be rolled back. See
+/// [`MeshNode::peer_failure_generation`] for what goes wrong otherwise.
+///
+/// The reason this is a type rather than a bare `DashMap`: the naive
+/// version grows one entry per peer that has ever failed, forever, and
+/// the obvious fix breaks it. Simply removing an entry makes that peer
+/// read back as "generation 0" — the same value a peer that never
+/// failed reads — so a subscribe that snapshotted 0, spanned a failure,
+/// and had the counter reclaimed underneath it would compare 0 to 0 and
+/// keep exactly the stale entry the fence exists to remove. Absence has
+/// to mean something a reclamation cannot reproduce.
+///
+/// So absence resolves to a monotonic FLOOR instead of to zero. Both the
+/// per-peer counters and the floor are drawn from one counter, and
+/// reclamation raises the floor above every value it discards before
+/// discarding it. A reclaimed peer therefore reads back HIGHER than any
+/// snapshot taken before the reclamation, never equal to one — the
+/// comparison still detects the failure it was watching for. Reclaiming
+/// with no failure involved is likewise safe: it also raises the floor,
+/// so in-flight subscribes roll back and re-subscribe, which is
+/// idempotent.
+///
+/// Generations are only ever compared WITHIN one `ensure_reply_subscription`
+/// call — nothing durable stores one — so reclamation costs at most a
+/// retry for calls in flight at that moment, and clearing wholesale is
+/// as safe as clearing selectively.
+#[cfg(feature = "cortex")]
+#[derive(Debug)]
+pub(super) struct PeerFailureGenerations {
+    /// Peers with at least one recorded failure since the last
+    /// reclamation. Absent peers resolve to `floor`.
+    per_peer: dashmap::DashMap<u64, u64>,
+    /// Source of every generation value, per-peer and floor alike, so
+    /// the floor is always above the counters it replaces.
+    next: std::sync::atomic::AtomicU64,
+    /// What an absent peer reads as.
+    floor: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "cortex")]
+impl PeerFailureGenerations {
+    /// Beyond this many tracked peers, the whole table is reclaimed.
+    /// Sized so a normal mesh never reaches it — this is a backstop
+    /// against unbounded churn over a long-lived process, not a working
+    /// limit.
+    const MAX_TRACKED: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            per_peer: dashmap::DashMap::new(),
+            next: std::sync::atomic::AtomicU64::new(1),
+            floor: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn take_next(&self) -> u64 {
+        self.next.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Current generation for `peer`. Never `Option` — absence is a
+    /// value (the floor), which is the whole point.
+    pub(super) fn get(&self, peer: u64) -> u64 {
+        self.per_peer
+            .get(&peer)
+            .map(|e| *e.value())
+            .unwrap_or_else(|| self.floor.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Record a failure for `peer`, reclaiming the table first if it has
+    /// grown past [`Self::MAX_TRACKED`].
+    fn bump(&self, peer: u64) {
+        if self.per_peer.len() >= Self::MAX_TRACKED {
+            self.reclaim();
+        }
+        self.per_peer.insert(peer, self.take_next());
+    }
+
+    /// Forget every counter, raising the floor above all of them first.
+    ///
+    /// Order is load-bearing: the floor must be published BEFORE the
+    /// entries disappear. Removing first would leave a window in which
+    /// a reader sees absence resolving to the OLD floor, which is
+    /// exactly the reproducible value that makes reclamation unsafe.
+    fn reclaim(&self) {
+        self.floor
+            .store(self.take_next(), std::sync::atomic::Ordering::Release);
+        self.per_peer.clear();
+    }
+}
+
 /// Rolling-window auth-failure tracker, one entry per peer.
 /// Lives behind a per-key `Mutex` so updates from concurrent
 /// subscribes don't race each other on the same peer's counter.
@@ -2787,11 +3169,19 @@ fn sweep_expired_subscribers(
             // The periodic sweep is the cold authoritative re-check; it
             // always re-verifies signatures (full `reverify_subscribe`)
             // rather than trusting the publish path's cached flag.
+            //
+            // Against `r.grant_hash`, the hash the subscribe gate
+            // admitted this chain on — see `RetainedChain::grant_hash`.
+            // A `TokenBound` queue-group worker's grant names the group,
+            // not the channel, so re-asking about the channel here would
+            // evict every worker on the first sweep.
             let authorized = subscriber_chains
                 .get(&(node_id, name.hash()))
-                .is_some_and(|r| cfg.reverify_subscribe(&r.chain, &entity_id, revocation, skew));
+                .is_some_and(|r| {
+                    cfg.reverify_subscribe(&r.chain, &entity_id, r.grant_hash, revocation, skew)
+                });
             if !authorized {
-                guard.revoke_channel(subscriber_origin_hash(node_id), name);
+                guard.revoke_channel(subscriber_principal(node_id), name);
                 roster.remove(&channel_id, node_id);
                 subscriber_chains.remove(&(node_id, name.hash()));
                 tracing::debug!(
@@ -6635,7 +7025,26 @@ pub struct MeshNode {
     /// hash hit; a collision therefore degrades to an idempotent
     /// re-subscribe instead of a correctness bug.
     #[cfg(feature = "cortex")]
-    rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), Arc<str>>>,
+    rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), ReplySubscription>>,
+    /// Targets we have already fired one corrective re-announce at.
+    /// Bounds the amplification described on
+    /// `MembershipFailure::warrants_reannounce`; cleared on peer failure
+    /// so a genuine reconnect can announce again.
+    #[cfg(feature = "cortex")]
+    rpc_corrective_announced: Arc<dashmap::DashSet<u64>>,
+    /// Node-wide cap on how many corrective announces the latch above
+    /// may authorize per window. See [`CorrectiveAnnounceBudget`] — the
+    /// latch bounds one target, this bounds the mesh-wide total.
+    #[cfg(feature = "cortex")]
+    rpc_corrective_budget: Arc<CorrectiveAnnounceBudget>,
+    /// Per-peer failure counters, bumped every time that peer's session
+    /// fails. The fence that stops an in-flight reply-subscribe from
+    /// resurrecting `rpc_reply_subscriptions` state the failure path
+    /// just evicted — see [`MeshNode::peer_failure_generation`] for the
+    /// hazard and [`PeerFailureGenerations`] for why it is bounded the
+    /// way it is.
+    #[cfg(feature = "cortex")]
+    rpc_peer_failure_gen: Arc<PeerFailureGenerations>,
     /// nRPC services the local node currently handles (registered
     /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
     /// drops). `announce_capabilities` merges these as
@@ -7546,6 +7955,9 @@ pub struct MeshNode {
     /// signature verification. See
     /// [`docs/internal/plans/CHANNEL_AUTH_GUARD_PLAN.md`](../../../../../../docs/internal/plans/CHANNEL_AUTH_GUARD_PLAN.md).
     auth_guard: Arc<AuthGuard>,
+    /// Latches the one-shot "no channel registry installed" warning
+    /// (see `UnregisteredChannelPolicy::AllowWithWarning`).
+    unregistered_warned: Arc<AtomicBool>,
     /// Per-peer auth-failure tracker. Counts failed
     /// `authorize_subscribe` attempts per `auth_failure_window` and
     /// throttles bursts — peers that exceed
@@ -7900,6 +8312,31 @@ impl MeshNode {
         let subscriber_chains: Arc<DashMap<(u64, ChannelHash), RetainedChain>> =
             Arc::new(DashMap::new());
         let subscriber_chains_failure = subscriber_chains.clone();
+        // Hoisted out of the `Self { .. }` literal so the failure
+        // closure — which runs before `Self` exists — can hold a clone
+        // and evict a failed peer's entries.
+        #[cfg(feature = "cortex")]
+        let rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), ReplySubscription>> =
+            Arc::new(dashmap::DashMap::new());
+        #[cfg(feature = "cortex")]
+        let rpc_reply_subscriptions_failure = rpc_reply_subscriptions.clone();
+        // Once-per-target latch bounding corrective re-announces; see
+        // `MembershipFailure::warrants_reannounce`.
+        #[cfg(feature = "cortex")]
+        let rpc_corrective_announced: Arc<dashmap::DashSet<u64>> =
+            Arc::new(dashmap::DashSet::new());
+        #[cfg(feature = "cortex")]
+        let rpc_corrective_announced_failure = rpc_corrective_announced.clone();
+        #[cfg(feature = "cortex")]
+        let rpc_corrective_budget: Arc<CorrectiveAnnounceBudget> =
+            Arc::new(CorrectiveAnnounceBudget::new(Instant::now()));
+        // Per-peer failure counter fencing in-flight reply-subscribes;
+        // see `MeshNode::peer_failure_generation`.
+        #[cfg(feature = "cortex")]
+        let rpc_peer_failure_gen: Arc<PeerFailureGenerations> =
+            Arc::new(PeerFailureGenerations::new());
+        #[cfg(feature = "cortex")]
+        let rpc_peer_failure_gen_failure = rpc_peer_failure_gen.clone();
         // RT-4: event-pingwave gate + the clones the `on_recovery`
         // closure captures (it runs before `Self` exists, so it
         // can't call `emit_event_pingwave`).
@@ -8179,13 +8616,16 @@ impl MeshNode {
             // failure; the capability fold is now consistent
             // with them.
             capability_fold_failure.evict_node(node_id, "failure-detector");
-            // Drop any retained subscribe token chains for this peer.
-            // The sweep can no longer reach them (it iterates
-            // `peer_entity_ids`, just cleared above), and a failed peer
-            // never sends the unsubscribe that would otherwise remove
-            // them — so without this they leak for the node's lifetime,
-            // and a reused `node_id` could re-validate a stale chain.
-            subscriber_chains_failure.retain(|(nid, _), _| *nid != node_id);
+            evict_failed_peer_channel_state(
+                node_id,
+                &subscriber_chains_failure,
+                #[cfg(feature = "cortex")]
+                &rpc_reply_subscriptions_failure,
+                #[cfg(feature = "cortex")]
+                &rpc_corrective_announced_failure,
+                #[cfg(feature = "cortex")]
+                &rpc_peer_failure_gen_failure,
+            );
             // RT-5: tell the mesh this peer is unreachable via us —
             // receivers drop their `(node_id, via=us)` routes within
             // one flood instead of waiting for the 3× session_timeout
@@ -8361,7 +8801,13 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
-            rpc_reply_subscriptions: Arc::new(dashmap::DashMap::new()),
+            rpc_reply_subscriptions,
+            #[cfg(feature = "cortex")]
+            rpc_corrective_announced,
+            #[cfg(feature = "cortex")]
+            rpc_corrective_budget,
+            #[cfg(feature = "cortex")]
+            rpc_peer_failure_gen,
             #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(LocalServiceRegistry::new(local_caps_changed.clone())),
             #[cfg(feature = "tool")]
@@ -8569,6 +9015,7 @@ impl MeshNode {
             subscriber_chains,
             published_chains: Arc::new(DashMap::new()),
             auth_guard: Arc::new(AuthGuard::new()),
+            unregistered_warned: Arc::new(AtomicBool::new(false)),
             auth_failures: Arc::new(DashMap::new()),
             tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -14540,6 +14987,8 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
+            unregistered_channels: self.config.unregistered_channels,
+            unregistered_warned: self.unregistered_warned.clone(),
             capability_fold: self.capability_fold.clone(),
             ack_ranges_peer_cache: self.ack_ranges_peer_cache.clone(),
             #[cfg(feature = "dataforts")]
@@ -18375,7 +18824,7 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub(super) fn rpc_reply_subscriptions_arc(
         &self,
-    ) -> Arc<dashmap::DashMap<(u64, u64), Arc<str>>> {
+    ) -> Arc<dashmap::DashMap<(u64, u64), ReplySubscription>> {
         self.rpc_reply_subscriptions.clone()
     }
 
@@ -19121,13 +19570,19 @@ impl MeshNode {
     /// Install a shared `TokenCache` used by the channel-auth path.
     /// When set, `authorize_subscribe` and `publish_many` consult
     /// it via `ChannelConfig::can_subscribe` / `can_publish`.
-    /// Subscribers that present a token on the wire have their
-    /// token installed into this cache (after signature
-    /// verification) before the ACL check runs.
     ///
-    /// When unset, `require_token` channels always reject —
-    /// without a cache there's no way to validate presented tokens
-    /// or find pre-cached ones.
+    /// A subscriber-presented credential is **not** installed here.
+    /// Since the `TokenChain` migration it is verified inline against
+    /// the channel's `token_roots` and retained in `subscriber_chains`;
+    /// on that path this cache supplies only the `RevocationRegistry`
+    /// and the clock-skew tolerance. What it does hold is the local
+    /// node's own pre-installed credentials — notably the PUBLISH token
+    /// `publish_many` looks up via `get_for_action`.
+    ///
+    /// When unset, `require_token` channels always reject. That is now
+    /// enforced where it is observable: `authorize_subscribe` refuses
+    /// the subscribe outright (M4) rather than accepting one that every
+    /// later publish would deny while the peer sat rostered forever.
     pub fn set_token_cache(&mut self, cache: Arc<TokenCache>) {
         self.token_cache = Some(cache);
     }
@@ -19248,6 +19703,106 @@ impl MeshNode {
         .await
     }
 
+    /// Claim the one corrective re-announce allowed for `target`.
+    ///
+    /// Returns `true` exactly once per target (until that peer fails,
+    /// which clears the latch). See
+    /// [`MembershipFailure::warrants_reannounce`] for why the `Unauthorized`
+    /// filter alone is not sufficient.
+    /// Two bounds, checked in this order:
+    ///
+    /// 1. A node-wide window budget. The per-target latch alone bounds
+    ///    only ONE target: N distinct peers each rejecting our reply
+    ///    subscribe still bought N rate-limit-bypassing broadcasts, and
+    ///    a corrective announce goes to EVERY connected peer, not just
+    ///    the one that rejected us. So the aggregate was
+    ///    O(rejecting targets x peers) with nothing capping it — a set
+    ///    of peers that refuse for an ordinary ACL reason could drive
+    ///    sustained mesh-wide announce traffic.
+    /// 2. The per-target latch, so one peer cannot spend the budget
+    ///    repeatedly.
+    ///
+    /// Budget FIRST, and the latch is only consumed once the budget has
+    /// admitted. A target refused by the budget has not spent its one
+    /// claim and will get it on a later call — otherwise a burst would
+    /// permanently deny a corrective announce to whichever targets
+    /// happened to arrive during it, which is the opposite of what the
+    /// latch is for.
+    #[cfg(feature = "cortex")]
+    pub(super) fn claim_corrective_announce(&self, target: u64) -> bool {
+        if self.rpc_corrective_announced.contains(&target) {
+            return false;
+        }
+        if !self.rpc_corrective_budget.try_spend(Instant::now()) {
+            return false;
+        }
+        // Racing callers: `insert` returns false for the loser, which
+        // then refunds so the budget is not charged twice for one target.
+        if self.rpc_corrective_announced.insert(target) {
+            true
+        } else {
+            self.rpc_corrective_budget.refund();
+            false
+        }
+    }
+
+    /// Give back a claim whose announcement never went out.
+    ///
+    /// `claim_corrective_announce` has to be taken BEFORE the send,
+    /// because two callers racing on the same target must not both
+    /// announce. But the send is best-effort and its error was
+    /// discarded, so a dropped datagram used up the target's single
+    /// claim and left its reply subscriptions rejected until an
+    /// unrelated peer failure cleared the latch or a routine
+    /// re-announce happened to land. Refunding on a failed send keeps
+    /// the bound (nothing was broadcast, so there is nothing to bound)
+    /// while letting a later RPC retry the repair.
+    #[cfg(feature = "cortex")]
+    pub(super) fn release_corrective_announce(&self, target: u64) {
+        if self.rpc_corrective_announced.remove(&target).is_some() {
+            self.rpc_corrective_budget.refund();
+        }
+    }
+
+    /// `peer`'s current failure generation. The fence for operations
+    /// that span an `await` and then write per-peer state the failure
+    /// path evicts: snapshot it before the `await`, compare after the
+    /// write, undo the write if it moved.
+    ///
+    /// The problem it solves: `ensure_reply_subscription` reads the
+    /// cache, subscribes (an `await`, so the peer can fail underneath
+    /// it), then records "subscribed". The failure path's eviction runs
+    /// during that gap and finds nothing to evict; the insert lands
+    /// afterwards. The caller is now cached as subscribed to a target
+    /// that dropped it from the roster on failure — so every later call
+    /// short-circuits the re-subscribe, and the target publishes replies
+    /// to a channel we are no longer rostered on. They are dropped
+    /// silently: no error, no timeout on the subscribe, just replies
+    /// that never arrive until the process restarts.
+    ///
+    /// A peer with no recorded failure resolves to the reclamation
+    /// floor rather than to a fixed zero, which is what lets the
+    /// counters be forgotten without opening a hole in the fence. See
+    /// [`PeerFailureGenerations`].
+    #[cfg(feature = "cortex")]
+    pub(super) fn peer_failure_generation(&self, peer: u64) -> u64 {
+        self.rpc_peer_failure_gen.get(peer)
+    }
+
+    /// Bare subscribe that reports the publisher's rejection reason as
+    /// a value. Used by `ensure_reply_subscription`, which must
+    /// distinguish the one retryable rejection (origin-binding
+    /// `Unauthorized`) from everything else before firing a
+    /// rate-limit-bypassing corrective re-announce.
+    pub(super) async fn subscribe_channel_reporting_reason(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+    ) -> Result<(), MembershipFailure> {
+        self.send_membership_request_typed(publisher_node_id, channel, true, None, None)
+            .await
+    }
+
     /// Ask `publisher_node_id` to remove this node from `channel`'s
     /// subscriber set. Mirror of `subscribe_channel`. Mode-agnostic
     /// — unsubscribe finds the peer in whichever mode they're in.
@@ -19260,6 +19815,9 @@ impl MeshNode {
             .await
     }
 
+    /// Stringifying wrapper over [`Self::send_membership_request_typed`],
+    /// preserving the exact `AdapterError` text every existing caller
+    /// already matches on.
     async fn send_membership_request(
         &self,
         publisher_node_id: u64,
@@ -19268,12 +19826,40 @@ impl MeshNode {
         token: Option<Vec<u8>>,
         queue_group: Option<String>,
     ) -> Result<(), AdapterError> {
+        self.send_membership_request_typed(
+            publisher_node_id,
+            channel,
+            subscribe,
+            token,
+            queue_group,
+        )
+        .await
+        .map_err(MembershipFailure::into_adapter_error)
+    }
+
+    /// Same request, but reporting **why** it failed as a value rather
+    /// than as prose.
+    ///
+    /// `ensure_reply_subscription` needs the distinction: only an
+    /// origin-binding `Unauthorized` is worth a corrective re-announce,
+    /// and that re-announce deliberately bypasses the announce rate
+    /// limit. Re-announcing on *every* failure would let a target that
+    /// is simply down, throttling us, or refusing the channel turn each
+    /// RPC attempt into two rate-limit-bypassing capability broadcasts.
+    async fn send_membership_request_typed(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        subscribe: bool,
+        token: Option<Vec<u8>>,
+        queue_group: Option<String>,
+    ) -> Result<(), MembershipFailure> {
         let peer_addr = {
             let peer = self.peers.get(&publisher_node_id).ok_or_else(|| {
-                AdapterError::Connection(format!(
+                MembershipFailure::Transport(AdapterError::Connection(format!(
                     "no session to publisher {:#x}",
                     publisher_node_id
-                ))
+                )))
             })?;
             peer.addr
         };
@@ -19287,8 +19873,8 @@ impl MeshNode {
         // unguessable from another session.
         let mut nonce_bytes = [0u8; 8];
         if let Err(e) = getrandom::fill(&mut nonce_bytes) {
-            return Err(AdapterError::Connection(format!(
-                "membership nonce generation failed: {e}"
+            return Err(MembershipFailure::Transport(AdapterError::Connection(
+                format!("membership nonce generation failed: {e}"),
             )));
         }
         let nonce = u64::from_le_bytes(nonce_bytes);
@@ -19320,31 +19906,32 @@ impl MeshNode {
             .await
         {
             self.pending_membership_acks.remove(&nonce);
-            return Err(e);
+            return Err(MembershipFailure::Transport(e));
         }
 
         let ack = match tokio::time::timeout(self.config.membership_ack_timeout, rx).await {
             Ok(Ok(ack)) => ack,
             Ok(Err(_)) => {
                 self.pending_membership_acks.remove(&nonce);
-                return Err(AdapterError::Connection(
+                return Err(MembershipFailure::Transport(AdapterError::Connection(
                     "membership ack channel closed".into(),
-                ));
+                )));
             }
             Err(_) => {
                 self.pending_membership_acks.remove(&nonce);
-                return Err(AdapterError::Connection(format!(
-                    "membership ack timeout ({:?}) for channel {}",
-                    self.config.membership_ack_timeout, channel
+                return Err(MembershipFailure::Transport(AdapterError::Connection(
+                    format!(
+                        "membership ack timeout ({:?}) for channel {}",
+                        self.config.membership_ack_timeout, channel
+                    ),
                 )));
             }
         };
 
         if !ack.accepted {
-            return Err(AdapterError::Connection(format!(
-                "membership request rejected: {:?}",
-                ack.reason
-            )));
+            // The publisher answered and said no. Carry the reason as a
+            // value — this is the arm callers need to discriminate.
+            return Err(MembershipFailure::Rejected(ack.reason));
         }
         Ok(())
     }
@@ -19367,8 +19954,13 @@ impl MeshNode {
                 token,
                 queue_group,
             } => {
-                let (accepted, reason) =
-                    Self::authorize_subscribe(&channel, from_node, token.as_deref(), ctx);
+                let (accepted, reason) = Self::authorize_subscribe(
+                    &channel,
+                    from_node,
+                    token.as_deref(),
+                    queue_group.as_deref(),
+                    ctx,
+                );
                 if accepted {
                     // Populate the AuthGuard fast path so publish
                     // fan-out can admit this subscriber in <10 ns
@@ -19380,7 +19972,7 @@ impl MeshNode {
                     // change which capability tokens authorize the
                     // channel.
                     ctx.auth_guard
-                        .allow_channel(subscriber_origin_hash(from_node), &channel);
+                        .allow_channel(subscriber_principal(from_node), &channel);
                     let id = ChannelId::new(channel);
                     let mode = match queue_group {
                         None => crate::adapter::net::channel::SubscriptionMode::Broadcast,
@@ -19409,7 +20001,7 @@ impl MeshNode {
                 // publish stops admitting this subscriber even
                 // before the roster update is visible.
                 ctx.auth_guard
-                    .revoke_channel(subscriber_origin_hash(from_node), &channel);
+                    .revoke_channel(subscriber_principal(from_node), &channel);
                 let id = ChannelId::new(channel);
                 // Drop the retained subscribe chain so it can't be
                 // re-validated by the sweep and doesn't leak memory.
@@ -23501,15 +24093,31 @@ impl MeshNode {
     ///    it, reject with `UnknownChannel`.
     /// 3. Channel [`Visibility`] must permit the subscriber's subnet
     ///    — reject cross-subnet subscribes with `Unauthorized`.
-    /// 4. Channel auth — `publish_caps` / `subscribe_caps` /
+    /// 4. Origin binding — a channel family whose name encodes the
+    ///    subscriber's identity (`subscriber_origin_binding`) admits
+    ///    only the peer that identity belongs to, evaluated against the
+    ///    TOFU pin. Runs ahead of the cap/token gates because the
+    ///    families it protects are otherwise permissive.
+    /// 5. Token-gated channel with no `TokenCache` → `Unauthorized`.
+    /// 6. Channel auth — `publish_caps` / `subscribe_caps` /
     ///    `require_token` on `ChannelConfig` are honored via
-    ///    `ChannelConfig::can_subscribe`. A presented token is
-    ///    installed into the local `TokenCache` (after signature
-    ///    verification) before the check runs.
+    ///    `ChannelConfig::can_subscribe`.
+    ///
+    /// The presented credential is parsed here and verified **inline**
+    /// by `can_subscribe` → `TokenChain::verify_authorizes`, against
+    /// the channel's `token_roots`. It is NOT inserted into the
+    /// `TokenCache` — that stopped being true at the `TokenChain`
+    /// migration, and the stale claim pointed readers at the wrong
+    /// place for where peer-supplied credentials are validated, which
+    /// is the most important question on this path. A chain that
+    /// verifies is retained in `subscriber_chains` so the publish-time
+    /// re-check and the periodic sweep can re-evaluate expiry and
+    /// revocation without the peer re-presenting.
     fn authorize_subscribe(
         channel: &ChannelName,
         from_node: u64,
         token_bytes: Option<&[u8]>,
+        queue_group: Option<&str>,
         ctx: &DispatchCtx,
     ) -> (bool, Option<AckReason>) {
         // Rate-limit check runs first — a throttled peer short-
@@ -23553,17 +24161,46 @@ impl MeshNode {
             return (false, Some(AckReason::TooManyChannels));
         }
         let Some(ref configs) = ctx.channel_configs else {
-            // No registry → no ACL (test / permissive deployments).
-            return (true, None);
+            // No registry → no ACL at all. Which of the two situations
+            // that is — "open mesh on purpose" or "forgot to install a
+            // registry" — used to be indistinguishable, because
+            // permissiveness fell out of an unset field rather than a
+            // recorded decision. The policy makes it a decision (L1).
+            return match ctx.unregistered_channels {
+                UnregisteredChannelPolicy::Deny => (false, Some(AckReason::Unauthorized)),
+                UnregisteredChannelPolicy::Allow => (true, None),
+                UnregisteredChannelPolicy::AllowWithWarning => {
+                    // Latched so a subscribe storm can't turn an
+                    // operator hint into a log flood.
+                    if !ctx.unregistered_warned.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "channel auth: no ChannelConfigRegistry installed — every \
+                             Subscribe from any session peer is admitted and every \
+                             channel publishes as open. Install a registry via \
+                             `set_channel_configs`, or record the intent with \
+                             `MeshNodeConfig::with_unregistered_channel_policy(...)`."
+                        );
+                    }
+                    (true, None)
+                }
+            };
         };
-        let Some(cfg_ref) = configs.get_by_name(channel.as_str()) else {
+        // `resolve_by_name` (not `get_by_name`) so we also learn WHICH
+        // prefix matched — `subscriber_origin_binding` needs it to
+        // locate the dynamic suffix inside the requested name. Returns
+        // owned values, which is what we wanted anyway: the config is
+        // cloned here so the registry guard is dropped before any
+        // signature work below.
+        let Some(resolved) = configs.resolve_by_name(channel.as_str()) else {
             return (false, Some(AckReason::UnknownChannel));
         };
-        // Clone the cfg so we can drop the DashMap guard before
-        // any further work — the cfg fields are all cheap to clone
-        // and doing so releases the registry's read lock early.
-        let cfg = cfg_ref.clone();
-        drop(cfg_ref);
+        let cfg = resolved.config;
+        let matched_prefix = resolved.matched_prefix;
+        // The hash of the channel the peer actually asked for. Every
+        // token gate and every retention key below uses THIS, never
+        // `cfg.channel_id.hash()` — for a prefix-matched config the
+        // latter is a sentinel that stands for the whole family (M1).
+        let requested_hash = channel.hash();
 
         // `None` when this peer's subnet has not been derived — passed
         // through as unknown rather than coerced to GLOBAL, which used
@@ -23581,6 +24218,83 @@ impl MeshNode {
             return (false, Some(AckReason::Unauthorized));
         }
 
+        // Origin binding (H3). For a channel family whose name encodes
+        // the subscriber's identity — nRPC's
+        // `<service>.replies.<caller_origin>` — a peer may subscribe
+        // ONLY to the name carrying its own origin. Runs BEFORE the
+        // `has_auth_gates` short-circuit below, because the family this
+        // protects is otherwise fully permissive: caps and tokens are
+        // both `None`, so that short-circuit would return `(true, None)`
+        // and never reach a gate at all.
+        //
+        // Evaluated against the TOFU-pinned entity, never a wire-claimed
+        // origin. An unpinned peer is REJECTED rather than admitted:
+        // falling back to "allow when we don't know who you are" would
+        // hand an attacker the bypass of simply never announcing, which
+        // is not a fix. The cost is an ordering requirement — a
+        // subscriber must have announced (so the publisher pinned it)
+        // before its first subscribe to a bound family. `Unauthorized`
+        // is a retryable answer; the nRPC client re-announces and
+        // retries on it, so first-call and post-reconnect races
+        // self-heal rather than failing permanently.
+        if let Some(binding) = cfg.subscriber_origin_binding {
+            let pinned_origin = ctx
+                .peer_entity_ids
+                .get(&from_node)
+                .map(|e| e.value().origin_hash());
+            if !binding.authorizes(channel.as_str(), matched_prefix.as_deref(), pinned_origin) {
+                tracing::debug!(
+                    from_node = format!("{:#x}", from_node),
+                    channel = channel.as_str(),
+                    pinned = pinned_origin.is_some(),
+                    "auth: origin-bound channel subscribe rejected (peer is \
+                     unpinned, or the name encodes a different peer's origin)"
+                );
+                return (false, Some(AckReason::Unauthorized));
+            }
+        }
+
+        // Token-gated channel with no `TokenCache` installed (M4).
+        //
+        // Reject here rather than admitting and failing later. Pre-fix
+        // the three enforcement points disagreed about what this
+        // configuration means: subscribe ACCEPTED (falling back to a
+        // transient empty revocation registry and verifying the chain
+        // normally), every publish DENIED (the token-gated branch
+        // requires `Some(cache)` and treats its absence as
+        // unauthorized), and the sweep was a no-op (it returns early
+        // without a cache). The peer therefore got an accepting Ack for
+        // a subscription that could never deliver an event, and — since
+        // the publish-time denial revokes the AuthGuard entry but does
+        // not remove the roster entry, and the sweep that would
+        // normally evict it can never run — it stayed rostered with no
+        // periodic recovery, consuming a queue-group selection slot.
+        // Installing a cache later did not repair it either: the first
+        // failed publish already revoked the guard entry, so subsequent
+        // publishes stop at `check_fast == Denied`, and the sweep — now
+        // able to run — sees the retained chain as valid and does
+        // nothing, because it never calls `allow_channel`. Nothing
+        // periodic cleared it: recovery needed the peer to go away, or
+        // to say something that drops its per-peer state — an explicit
+        // re-subscribe, or an `Unsubscribe` (which revokes the guard
+        // entry, removes the retained chain and drops the roster entry).
+        // All of those are peer-driven; the publisher could not repair
+        // itself.
+        //
+        // `set_token_cache`'s documented contract already said
+        // "when unset, `require_token` channels always reject". This
+        // makes that true, and makes the Ack honest.
+        if cfg.token_required() && ctx.token_cache.is_none() {
+            tracing::debug!(
+                from_node = format!("{:#x}", from_node),
+                channel = channel.as_str(),
+                "auth: token-gated channel but no TokenCache installed; \
+                 rejecting subscribe (publish would deny it anyway and the \
+                 expiry sweep cannot run)"
+            );
+            return (false, Some(AckReason::Unauthorized));
+        }
+
         // Parse the presented credential as a delegation chain. A
         // single directly-issued token is a one-link chain. Full
         // verification — root anchor, per-link signature/time/
@@ -23590,11 +24304,29 @@ impl MeshNode {
         // treated as "no credential presented" (rejected by the gate).
         let presented_chain = token_bytes.and_then(|bytes| TokenChain::from_bytes(bytes).ok());
 
-        // Whether any cap / token gate is in play. A fully open
-        // channel (no filters, no require_token) short-circuits
-        // without needing a peer entity_id at all.
-        let has_auth_gates =
-            cfg.publish_caps.is_some() || cfg.subscribe_caps.is_some() || cfg.token_required();
+        // Does this request need a gate evaluated at all? A fully open
+        // channel short-circuits without needing a peer entity_id.
+        //
+        // `queue_group_policy` is part of that test, not just the cap
+        // and token filters. A restricted policy is frequently the ONLY
+        // gate on an otherwise-open channel — `Deny` needs no roots, no
+        // caps and no `require_token` to be meaningful — so without it
+        // here the short-circuit returned `(true, None)` before the
+        // policy below was ever consulted, and `Deny` was a silent
+        // no-op. It is the same hazard the origin binding is hoisted
+        // above this point to escape; this one is answered by widening
+        // the test instead, because `TokenBound` needs the peer
+        // identity that is only resolved further down.
+        //
+        // Conditioned on the peer actually ASKING for a group. A
+        // broadcast subscriber on a queue-group-restricted channel is
+        // unaffected by the policy and keeps the cheap path.
+        let queue_group_gated =
+            queue_group.is_some() && cfg.queue_group_policy != QueueGroupPolicy::Unrestricted;
+        let has_auth_gates = cfg.publish_caps.is_some()
+            || cfg.subscribe_caps.is_some()
+            || cfg.token_required()
+            || queue_group_gated;
         if !has_auth_gates {
             return (true, None);
         }
@@ -23616,6 +24348,14 @@ impl MeshNode {
         // transient empty registry (nothing revoked) with strict skew.
         // The `transient_revocation` binding is declared here so it
         // outlives the borrow taken in the `None` arm.
+        //
+        // Post-M4 the `None` arm is only reachable for channels that do
+        // NOT require a token — a token-gated channel without a cache
+        // already returned `Unauthorized` above. Those channels never
+        // consult `revocation` or `skew_secs` (`token_gate` short-
+        // circuits on `!token_required()`), so the transient registry
+        // is now purely a borrow-checker placeholder rather than a
+        // silently-different verification policy.
         let transient_revocation;
         let (revocation, skew_secs): (&RevocationRegistry, u64) = match ctx.token_cache.as_ref() {
             Some(cache) => (cache.revocation().as_ref(), cache.clock_skew_secs()),
@@ -23636,24 +24376,92 @@ impl MeshNode {
             if cfg.token_required() {
                 return (false, Some(AckReason::Unauthorized));
             }
+            // A restricted queue-group policy cannot be satisfied by a
+            // peer we have not pinned, whichever policy it is: `Deny`
+            // admits nobody, and `TokenBound` needs a chain whose leaf
+            // binds to an AEAD-verified entity, which is precisely what
+            // is missing here. Falling through to the cap-only path
+            // below would answer a different question with a dummy id
+            // and admit the join — the second way `Deny` could be
+            // bypassed on a channel with no other gates.
+            if queue_group_gated {
+                return (false, Some(AckReason::Unauthorized));
+            }
             // Cap-filter-only mode without a known entity — run the
             // cap match with a dummy id. The token gate is skipped
             // because the channel requires no token.
             let dummy = EntityId::from_bytes([0u8; 32]);
-            return if cfg.can_subscribe(&peer_caps, &dummy, None, revocation, skew_secs) {
+            return if cfg.can_subscribe(
+                &peer_caps,
+                &dummy,
+                requested_hash,
+                None,
+                revocation,
+                skew_secs,
+            ) {
                 (true, None)
             } else {
                 (false, Some(AckReason::Unauthorized))
             };
         };
 
-        if !cfg.can_subscribe(
-            &peer_caps,
-            &peer_entity,
-            presented_chain.as_ref(),
-            revocation,
-            skew_secs,
-        ) {
+        // Queue-group membership (M2). Joining a group is an authority
+        // question, not a routing preference: every event goes to
+        // exactly ONE member, so a peer that joins a production group
+        // takes a share of its events and — by not processing them —
+        // destroys that share. Pre-fix the group name was an
+        // unauthenticated string straight off the wire with no config
+        // axis restricting who could join what.
+        //
+        // Not a confidentiality boundary: a peer that can subscribe at
+        // all can already take every event in Broadcast mode. This
+        // guards integrity and availability.
+        //
+        // Under `TokenBound` the group grant IS this request's
+        // subscribe authority — see `QueueGroupPolicy::TokenBound` for
+        // why it cannot be an additional credential (one chain per
+        // Subscribe on the wire). Capability filters still apply.
+        //
+        // Yields the hash the group grant was verified against, which
+        // is NOT the channel's — see `RetainedChain::grant_hash` for why
+        // that distinction has to survive past this function.
+        let group_grant_hash = match (queue_group, cfg.queue_group_policy) {
+            (Some(_), QueueGroupPolicy::Deny) => {
+                return (false, Some(AckReason::Unauthorized));
+            }
+            (Some(group), QueueGroupPolicy::TokenBound) => {
+                if !cfg.can_join_queue_group(
+                    &peer_entity,
+                    channel.as_str(),
+                    group,
+                    presented_chain.as_ref(),
+                    revocation,
+                    skew_secs,
+                ) || !cfg.caps_allow_subscribe(&peer_caps)
+                {
+                    tracing::debug!(
+                        from_node = format!("{:#x}", from_node),
+                        channel = channel.as_str(),
+                        group,
+                        "auth: queue-group join rejected — no grant naming this group"
+                    );
+                    return (false, Some(AckReason::Unauthorized));
+                }
+                Some(queue_group_hash(channel.as_str(), group))
+            }
+            _ => None,
+        };
+
+        if group_grant_hash.is_none()
+            && !cfg.can_subscribe(
+                &peer_caps,
+                &peer_entity,
+                requested_hash,
+                presented_chain.as_ref(),
+                revocation,
+                skew_secs,
+            )
+        {
             return (false, Some(AckReason::Unauthorized));
         }
 
@@ -23668,9 +24476,25 @@ impl MeshNode {
             // re-check re-establishes it without trusting cross-path
             // state. (Marking it verified here would only save the one
             // first-publish verification.)
+            //
+            // Keyed on the REQUESTED channel's hash, not the config's.
+            // For a prefix-registered config those differ (the config
+            // carries a sentinel), and storing under the sentinel put
+            // the chain somewhere the publish path — which looks it up
+            // by the real channel — could never find, so every such
+            // subscriber was accepted and then revoked before its first
+            // delivery. `Unsubscribe` also removes by the real hash, so
+            // the sentinel-keyed entry leaked until peer failure.
+            //
+            // The KEY is the requested channel — that is how the publish
+            // path and `Unsubscribe` find this entry. What the chain was
+            // verified AGAINST is carried separately, because for a
+            // `TokenBound` worker the two are deliberately different
+            // hashes and the re-check has to keep asking the admitting
+            // question. See `RetainedChain::grant_hash`.
             ctx.subscriber_chains.insert(
-                (from_node, cfg.channel_id.hash()),
-                RetainedChain::new(chain),
+                (from_node, requested_hash),
+                RetainedChain::new(chain, group_grant_hash.unwrap_or(requested_hash)),
             );
         }
         (true, None)
@@ -23971,20 +24795,26 @@ impl MeshNode {
                 // when the node has no token cache configured — a held
                 // chain still publishes in that mode (nothing revoked,
                 // strict skew).
+                //
+                // All three lookups key on the channel being published
+                // to, NOT `cfg.channel_id.hash()`. For a prefix-matched
+                // config the latter is a sentinel, and using it meant
+                // `set_publish_chain(real_channel, chain)` — which
+                // stores under the real hash — could never satisfy a
+                // token-gated prefix publish, so the delegated-publish
+                // escape hatch was unreachable for that whole class of
+                // channel (M1).
+                let publish_hash = publisher.channel().hash();
                 let held = self
                     .published_chains
-                    .get(&cfg.channel_id.hash())
+                    .get(&publish_hash)
                     .map(|c| c.value().clone());
                 let transient_revocation;
                 let (revocation, skew, chain) = match self.token_cache.as_ref() {
                     Some(cache) => {
                         let chain = held.or_else(|| {
                             cache
-                                .get_for_action(
-                                    &self_entity,
-                                    TokenScope::PUBLISH,
-                                    cfg.channel_id.hash(),
-                                )
+                                .get_for_action(&self_entity, TokenScope::PUBLISH, publish_hash)
                                 .map(TokenChain::single)
                         });
                         (cache.revocation().as_ref(), cache.clock_skew_secs(), chain)
@@ -23994,7 +24824,14 @@ impl MeshNode {
                         (&transient_revocation, 0u64, held)
                     }
                 };
-                if !cfg.can_publish(&self_caps, &self_entity, chain.as_ref(), revocation, skew) {
+                if !cfg.can_publish(
+                    &self_caps,
+                    &self_entity,
+                    publish_hash,
+                    chain.as_ref(),
+                    revocation,
+                    skew,
+                ) {
                     return Err(AdapterError::Connection(
                         "channel: publish denied by channel ACL".into(),
                     ));
@@ -24114,7 +24951,7 @@ impl MeshNode {
                 return false;
             }
             // (2) Auth guard (bloom + verified cache).
-            let origin = subscriber_origin_hash(*peer_id);
+            let origin = subscriber_principal(*peer_id);
             let admitted = match auth_guard.check_fast(origin, channel_hash) {
                 AuthVerdict::Allowed => auth_guard.is_authorized_full(origin, &channel_name),
                 AuthVerdict::Denied => false,
@@ -24157,9 +24994,30 @@ impl MeshNode {
                         // re-checked every packet. Avoids N × up-to-8
                         // signature verifies per publish on a high-fanout
                         // channel.
+                        //
+                        // Re-verified against `r.grant_hash`, the hash
+                        // the subscribe gate admitted this chain on —
+                        // not `channel_hash`. They coincide for an
+                        // ordinary subscriber; for a `TokenBound`
+                        // queue-group worker the grant names the GROUP,
+                        // and asking it about the channel instead
+                        // revoked every such worker on its first
+                        // packet. See `RetainedChain::grant_hash`.
                         if r.signatures_verified.load(Ordering::Relaxed) {
-                            cfg.reverify_subscribe_presigned(&r.chain, &entity, revocation, skew)
-                        } else if cfg.reverify_subscribe(&r.chain, &entity, revocation, skew) {
+                            cfg.reverify_subscribe_presigned(
+                                &r.chain,
+                                &entity,
+                                r.grant_hash,
+                                revocation,
+                                skew,
+                            )
+                        } else if cfg.reverify_subscribe(
+                            &r.chain,
+                            &entity,
+                            r.grant_hash,
+                            revocation,
+                            skew,
+                        ) {
                             r.signatures_verified.store(true, Ordering::Relaxed);
                             true
                         } else {
@@ -24177,6 +25035,23 @@ impl MeshNode {
             };
             if !chain_ok {
                 auth_guard.revoke_channel(origin, &channel_name);
+                // Evict from the roster too, not just the AuthGuard.
+                //
+                // Revoking only the guard left the peer rostered, and
+                // queue-group selection (`dispatch_recipients`) runs
+                // BEFORE this auth filter with no alternate-member
+                // retry — so a denied peer kept being selected as its
+                // group's recipient and that group's copy of each event
+                // was dropped rather than delivered to a working
+                // member. The periodic sweep eventually cleared it, but
+                // only if a sweep runs at all: it is a no-op without a
+                // TokenCache, and `token_sweep_interval = Duration::MAX`
+                // disables it outright. Dropping the roster entry here
+                // makes the denial self-clearing on the path that
+                // observed it.
+                self.roster
+                    .remove(&ChannelId::new(channel_name.clone()), *peer_id);
+                self.subscriber_chains.remove(&(*peer_id, channel_hash));
                 return false;
             }
             true
@@ -24886,6 +25761,39 @@ impl MeshNode {
     pub(crate) async fn reannounce_current_capabilities(&self) -> Result<(), AdapterError> {
         self.announce_from_baseline(None, Duration::from_secs(300), true)
             .await
+    }
+
+    /// Republish the current baseline **bypassing the announce rate
+    /// limit**, for a caller that is blocked on a peer having pinned our
+    /// identity rather than merely wanting eventual visibility.
+    ///
+    /// [`Self::reannounce_current_capabilities`] goes through the
+    /// `Routine` path, which coalesces inside `min_announce_interval`
+    /// and returns `Ok` without sending. That is right for visibility
+    /// refreshes and wrong here: the H3 origin binding on a reply
+    /// channel is evaluated against the TOFU pin a peer installs from
+    /// our signature-verified DIRECT announcement, so a caller whose
+    /// subscribe was just rejected needs an announcement to actually go
+    /// out *now* — coalescing it away means the retry waits out the
+    /// full window and fails for the same reason.
+    ///
+    /// Reuses the `SecurityCorrective` mode rather than adding a third:
+    /// the semantics wanted are identical (bypass coalescing, rebuild
+    /// from the current baseline), and this genuinely is an
+    /// authorization-corrective pass — a peer cannot authorize us until
+    /// it has our identity.
+    ///
+    /// Still a pure republish: the baseline is read inside the announce
+    /// lock, so this can never lose a concurrently-announced capability.
+    pub(crate) async fn reannounce_for_authorization(&self) -> Result<(), AdapterError> {
+        self.announce_loop(
+            None,
+            Duration::from_secs(300),
+            true,
+            AnnounceMode::SecurityCorrective,
+            None,
+        )
+        .await
     }
 
     /// Core announce path shared by explicit announces and the
@@ -27753,6 +28661,17 @@ impl MeshNode {
     /// `peer_addr`. Called from the end of `connect` / `accept` so
     /// late joiners don't have to wait for a re-announce. No-op
     /// when we haven't yet announced anything.
+    ///
+    /// Deliberately still a no-op in that case. Synthesizing an
+    /// announcement here would make a node that has never announced
+    /// visible to peers with an EMPTY capability set, and "absent from
+    /// the fold" is not equivalent to "present with no tags" — the
+    /// callee-side nRPC capability gate reads the difference, so
+    /// materializing one flips `may_execute` outcomes for callers that
+    /// never announced. Identity propagation must not ride on a
+    /// side effect of the capability plane; see
+    /// `ensure_reply_subscription` for how the H3 origin binding gets
+    /// the pin it needs instead.
     async fn push_local_announcement(&self, peer_addr: SocketAddr) {
         // Serialized through the epoch-checked path (review-9
         // addendum): a late joiner must receive what this node's
@@ -31234,10 +32153,14 @@ mod fold_publisher_helpers_tests {
             3600,
             0,
         ));
-        node.subscriber_chains
-            .insert((dead, channel_hash), RetainedChain::new(chain.clone()));
-        node.subscriber_chains
-            .insert((live, channel_hash), RetainedChain::new(chain));
+        node.subscriber_chains.insert(
+            (dead, channel_hash),
+            RetainedChain::new(chain.clone(), channel_hash),
+        );
+        node.subscriber_chains.insert(
+            (live, channel_hash),
+            RetainedChain::new(chain, channel_hash),
+        );
         assert_eq!(node.subscriber_chains.len(), 2);
 
         node.failure_detector.heartbeat(dead, addr);
@@ -36628,5 +37551,418 @@ mod subnet_visible_unknown_tests {
             Some(parent),
             Visibility::Exported
         ));
+    }
+}
+// NOTE: this test module lives at the END of the file ON PURPOSE, for
+// the same reason spelled out above `committed_flush_stall_tests`: the
+// heartbeat drift check in session.rs treats the FIRST column-0
+// `#[cfg(test)] mod` as the production/test boundary. This module was
+// originally added next to `MembershipFailure` a few hundred lines in,
+// which hid the real `session.build_heartbeat()` caller behind that
+// boundary and left `mesh_rs_production_callers_match_allowlist` red.
+#[cfg(test)]
+mod membership_failure_tests {
+    use super::*;
+
+    /// Only the origin-binding `Unauthorized` warrants a corrective
+    /// re-announce.
+    ///
+    /// That re-announce deliberately bypasses the announce rate limit,
+    /// so this predicate is what stops one unreachable or throttling
+    /// target from turning every RPC attempt into two extra
+    /// rate-limit-bypassing capability broadcasts.
+    #[test]
+    fn only_unauthorized_warrants_a_corrective_reannounce() {
+        assert!(
+            MembershipFailure::Rejected(Some(AckReason::Unauthorized)).warrants_reannounce(),
+            "Unauthorized is the retryable origin-binding rejection"
+        );
+
+        // RateLimited especially must NOT: the peer is already asking
+        // us to slow down, so re-announcing adds load and cannot help.
+        for reason in [
+            AckReason::RateLimited,
+            AckReason::UnknownChannel,
+            AckReason::TooManyChannels,
+        ] {
+            assert!(
+                !MembershipFailure::Rejected(Some(reason)).warrants_reannounce(),
+                "{reason:?} must not trigger a rate-limit-bypassing re-announce"
+            );
+        }
+
+        assert!(!MembershipFailure::Rejected(None).warrants_reannounce());
+        assert!(
+            !MembershipFailure::Transport(AdapterError::Connection("peer gone".into()))
+                .warrants_reannounce(),
+            "a peer that is simply gone must not drive re-announces"
+        );
+    }
+
+    /// The peer-failure cleanup must evict BOTH per-peer maps, and only
+    /// for the failed peer.
+    ///
+    /// Exercises `evict_failed_peer_channel_state` directly rather than
+    /// failing a live session. The previous version of this test was a
+    /// source scan, and it was worse than useless: `str::find` returned
+    /// the search literal inside the test itself — which sits earlier in
+    /// the file than the production call — so the window it asserted
+    /// over was its own source, and deleting the real eviction still
+    /// passed.
+    #[test]
+    fn peer_failure_cleanup_evicts_only_the_failed_peers_state() {
+        const FAILED: u64 = 0xF0;
+        const HEALTHY: u64 = 0xB0;
+
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        #[cfg(feature = "cortex")]
+        let replies: dashmap::DashMap<(u64, u64), ReplySubscription> = dashmap::DashMap::new();
+
+        // Two channels for the failed peer, one for a healthy peer.
+        for (node, ch) in [(FAILED, 1u64), (FAILED, 2u64), (HEALTHY, 1u64)] {
+            chains.insert(
+                (node, ch),
+                RetainedChain::new(TokenChain { tokens: Vec::new() }, ch),
+            );
+        }
+        #[cfg(feature = "cortex")]
+        for (target, svc) in [(FAILED, 10u64), (FAILED, 11u64), (HEALTHY, 10u64)] {
+            replies.insert(
+                (target, svc),
+                ReplySubscription {
+                    service: Arc::from("svc"),
+                    written_at_generation: 0,
+                },
+            );
+        }
+
+        #[cfg(feature = "cortex")]
+        let announced: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        #[cfg(feature = "cortex")]
+        {
+            announced.insert(FAILED);
+            announced.insert(HEALTHY);
+        }
+        #[cfg(feature = "cortex")]
+        let gens = PeerFailureGenerations::new();
+        #[cfg(feature = "cortex")]
+        let failed_gen_before = gens.get(FAILED);
+        #[cfg(feature = "cortex")]
+        let healthy_gen_before = gens.get(HEALTHY);
+
+        evict_failed_peer_channel_state(
+            FAILED,
+            &chains,
+            #[cfg(feature = "cortex")]
+            &replies,
+            #[cfg(feature = "cortex")]
+            &announced,
+            #[cfg(feature = "cortex")]
+            &gens,
+        );
+
+        assert!(
+            chains.get(&(FAILED, 1)).is_none() && chains.get(&(FAILED, 2)).is_none(),
+            "the failed peer's retained subscribe chains must be dropped — \
+             otherwise they leak for the node's lifetime and a reused \
+             node_id could re-validate a stale chain"
+        );
+        assert!(
+            chains.get(&(HEALTHY, 1)).is_some(),
+            "a healthy peer's state must survive another peer's failure"
+        );
+
+        #[cfg(feature = "cortex")]
+        {
+            assert!(
+                replies.get(&(FAILED, 10)).is_none() && replies.get(&(FAILED, 11)).is_none(),
+                "the failed peer's reply-subscription cache must be dropped — \
+                 the publisher already evicted our roster entry, so leaving \
+                 this makes later calls skip the re-subscribe and silently \
+                 lose every reply"
+            );
+            assert!(
+                replies.get(&(HEALTHY, 10)).is_some(),
+                "a healthy target's reply subscription must survive"
+            );
+            assert!(
+                !announced.contains(&FAILED),
+                "the corrective-announce latch must clear on failure, so a \
+                 genuine reconnect can re-announce"
+            );
+            assert!(
+                announced.contains(&HEALTHY),
+                "…but only for the failed peer — a peer that merely keeps \
+                 rejecting us stays latched"
+            );
+            assert_ne!(
+                gens.get(FAILED),
+                failed_gen_before,
+                "the failure generation must advance, or a reply-subscribe \
+                 already past its await cannot tell it spanned this failure \
+                 and will restore the cache entry we just evicted"
+            );
+            assert_eq!(
+                gens.get(HEALTHY),
+                healthy_gen_before,
+                "…and only for the failed peer — advancing an unaffected \
+                 peer's generation would roll back its in-flight subscribes \
+                 for nothing"
+            );
+        }
+    }
+
+    /// The eviction alone cannot close the reply-subscription hole,
+    /// because the racing insert has not happened yet when it runs. This
+    /// pins the generation half: the sequence a subscribe spanning a
+    /// failure actually observes.
+    ///
+    /// Models the interleaving rather than driving it — forcing a real
+    /// session failure to land inside `ensure_reply_subscription`'s
+    /// `await` is not something the test harness can schedule
+    /// deterministically. The step order below is the one that used to
+    /// defeat the fence, so it is worth walking explicitly.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn a_subscribe_spanning_a_failure_observes_a_generation_change() {
+        const TARGET: u64 = 0xC0FFEE;
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        let replies: dashmap::DashMap<(u64, u64), ReplySubscription> = dashmap::DashMap::new();
+        let latch: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        let gens = PeerFailureGenerations::new();
+
+        // 1. The subscribe snapshots, before its `await`.
+        let gen_before = gens.get(TARGET);
+
+        // 2. The peer fails mid-`await`. The eviction finds nothing to
+        //    evict — the entry does not exist yet. This is the whole
+        //    defect: cleanup ran, and it was a no-op.
+        evict_failed_peer_channel_state(TARGET, &chains, &replies, &latch, &gens);
+        assert!(
+            replies.is_empty(),
+            "precondition: the eviction had nothing to remove"
+        );
+
+        // 3. The subscribe completes and records itself.
+        replies.insert(
+            (TARGET, 7),
+            ReplySubscription {
+                service: Arc::from("svc"),
+                written_at_generation: 0,
+            },
+        );
+
+        // 4. The fence must fire. It only does because the eviction
+        //    bumps BEFORE its retain: with the bump last, step 2's
+        //    retain would have completed while this read still returned
+        //    the step-1 value, and the stale entry would survive.
+        assert_ne!(
+            gens.get(TARGET),
+            gen_before,
+            "the post-insert read must differ from the pre-await snapshot"
+        );
+
+        // A peer that flaps stays distinguishable.
+        let gen_before = gens.get(TARGET);
+        evict_failed_peer_channel_state(TARGET, &chains, &replies, &latch, &gens);
+        assert_ne!(gens.get(TARGET), gen_before);
+
+        // A subscribe that spans no failure must keep its entry — the
+        // fence must not cost the happy path its cache.
+        const QUIET: u64 = 0xD00D;
+        let quiet_before = gens.get(QUIET);
+        replies.insert(
+            (QUIET, 7),
+            ReplySubscription {
+                service: Arc::from("svc"),
+                written_at_generation: 0,
+            },
+        );
+        assert_eq!(gens.get(QUIET), quiet_before);
+    }
+
+    /// Reclaiming the generation table must not resurrect the state the
+    /// fence exists to remove.
+    ///
+    /// This is the subtlety that makes the table a type instead of a
+    /// `DashMap`. The obvious bound — drop entries past a cap — breaks
+    /// the fence, because a dropped counter reads back as the SAME
+    /// default a never-failed peer reads. A subscribe that snapshotted
+    /// that default, spanned a failure, and had the counter reclaimed
+    /// underneath it would compare default to default and keep the stale
+    /// entry.
+    ///
+    /// Absence resolving to a rising floor is what fixes it: a reclaimed
+    /// peer reads back strictly above any earlier snapshot.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn reclaiming_generations_cannot_reproduce_an_earlier_reading() {
+        const TARGET: u64 = 0xC0FFEE;
+        let gens = PeerFailureGenerations::new();
+
+        // The losing sequence: snapshot, fail, reclaim, compare.
+        let gen_before = gens.get(TARGET);
+        gens.bump(TARGET);
+        gens.reclaim();
+        assert_ne!(
+            gens.get(TARGET),
+            gen_before,
+            "a reclaimed counter read back as its pre-failure value — the \
+             in-flight subscribe would keep an entry for a peer that dropped \
+             it from the roster"
+        );
+
+        // Reclaiming with no failure involved is also safe, in the
+        // fail-safe direction: in-flight subscribes roll back and
+        // re-subscribe, which is idempotent.
+        const QUIET: u64 = 0xD00D;
+        let quiet_before = gens.get(QUIET);
+        gens.reclaim();
+        assert_ne!(gens.get(QUIET), quiet_before);
+
+        // The floor only ever rises, so no reading is ever reproduced
+        // across any number of reclamations.
+        let mut seen = vec![gens.get(TARGET)];
+        for _ in 0..8 {
+            gens.bump(TARGET);
+            gens.reclaim();
+            let now = gens.get(TARGET);
+            assert!(
+                seen.iter().all(|prev| *prev != now),
+                "generation {now} repeats an earlier reading {seen:?}"
+            );
+            seen.push(now);
+        }
+    }
+
+    /// The per-target latch bounds ONE target; the budget bounds the
+    /// mesh-wide total. Without it, N distinct rejecting peers bought N
+    /// rate-limit-bypassing broadcasts, each fanned out to every
+    /// connected peer.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn corrective_announces_are_capped_node_wide_across_distinct_targets() {
+        let t0 = Instant::now();
+        let budget = CorrectiveAnnounceBudget::new(t0);
+
+        let allowed = (0..1_000u64).filter(|_| budget.try_spend(t0)).count();
+        assert_eq!(
+            allowed as u32,
+            CorrectiveAnnounceBudget::MAX_PER_WINDOW,
+            "a thousand distinct rejecting targets must not buy a thousand \
+             mesh-wide broadcasts"
+        );
+
+        // The window rolls, and capacity comes back — this is a rate
+        // cap, not a lifetime quota. A node that reconnects hours later
+        // must still be able to re-pin.
+        assert!(budget.try_spend(t0 + CorrectiveAnnounceBudget::WINDOW));
+    }
+
+    /// A refund returns capacity, and cannot manufacture it.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn a_refunded_corrective_announce_does_not_create_capacity() {
+        let t0 = Instant::now();
+        let budget = CorrectiveAnnounceBudget::new(t0);
+        for _ in 0..CorrectiveAnnounceBudget::MAX_PER_WINDOW {
+            assert!(budget.try_spend(t0));
+        }
+        assert!(!budget.try_spend(t0), "precondition: window exhausted");
+
+        // A send that failed broadcast nothing, so its charge comes back.
+        budget.refund();
+        assert!(budget.try_spend(t0), "the refunded slot must be reusable");
+        assert!(!budget.try_spend(t0), "…and only that one slot");
+
+        // Refunds beyond what was spent must not go negative — that
+        // would hand out free capacity in the NEXT window.
+        for _ in 0..100 {
+            budget.refund();
+        }
+        let after = (0..1_000u64).filter(|_| budget.try_spend(t0)).count();
+        assert!(
+            after as u32 <= CorrectiveAnnounceBudget::MAX_PER_WINDOW,
+            "over-refunding created {after} slots in a window capped at {}",
+            CorrectiveAnnounceBudget::MAX_PER_WINDOW
+        );
+    }
+
+    /// The table is actually bounded — the cap fires on its own rather
+    /// than needing a caller to notice.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn generation_tracking_stays_bounded_under_peer_churn() {
+        let gens = PeerFailureGenerations::new();
+        for peer in 0..(PeerFailureGenerations::MAX_TRACKED as u64 * 3) {
+            gens.bump(peer);
+        }
+        assert!(
+            gens.per_peer.len() <= PeerFailureGenerations::MAX_TRACKED,
+            "generation table grew to {} past the {} cap; a long-lived node \
+             facing peer churn would accumulate an entry per identity that \
+             ever failed",
+            gens.per_peer.len(),
+            PeerFailureGenerations::MAX_TRACKED
+        );
+    }
+
+    /// The corrective re-announce is bounded to ONE per target.
+    ///
+    /// `Unauthorized` is not specific to the origin pin — the publisher
+    /// also returns it for cap-filter, token, visibility, queue-group
+    /// and missing-TokenCache rejections — and the membership wire
+    /// cannot carry a finer reason without a versioned cutover (an
+    /// unknown reason byte is a hard decode error on existing peers).
+    /// So the amplification is bounded structurally instead: a target
+    /// that keeps refusing us for an unrelated reason costs at most one
+    /// rate-limit-bypassing broadcast, not one per RPC.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn corrective_announce_is_claimed_at_most_once_per_target() {
+        let latch: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        const A: u64 = 1;
+        const B: u64 = 2;
+
+        assert!(latch.insert(A), "first claim for a target succeeds");
+        assert!(
+            !latch.insert(A),
+            "a second claim for the same target must not"
+        );
+        assert!(latch.insert(B), "a different target is independent");
+
+        // Failure clears only that target's latch.
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        let replies: dashmap::DashMap<(u64, u64), ReplySubscription> = dashmap::DashMap::new();
+        let gens = PeerFailureGenerations::new();
+        evict_failed_peer_channel_state(A, &chains, &replies, &latch, &gens);
+
+        assert!(
+            latch.insert(A),
+            "after failure the target may be claimed again"
+        );
+        assert!(!latch.insert(B), "an unaffected target stays latched");
+    }
+
+    /// Collapsing back to `AdapterError` must preserve the historical
+    /// rejection text, since callers surface it to users.
+    #[test]
+    fn rejection_stringifies_to_the_historical_message() {
+        let msg = MembershipFailure::Rejected(Some(AckReason::Unauthorized))
+            .into_adapter_error()
+            .to_string();
+        assert!(
+            msg.contains("membership request rejected") && msg.contains("Unauthorized"),
+            "unexpected rejection message: {msg}"
+        );
+
+        // Transport failures pass through untouched.
+        let msg = MembershipFailure::Transport(AdapterError::Connection("no session".into()))
+            .into_adapter_error()
+            .to_string();
+        assert!(
+            msg.contains("no session"),
+            "unexpected transport message: {msg}"
+        );
     }
 }

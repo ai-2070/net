@@ -615,9 +615,12 @@ pub unsafe extern "C" fn net_mesh_new(
         Ok(mut node) => {
             let channel_configs = Arc::new(ChannelConfigRegistry::new());
             node.set_channel_configs(channel_configs.clone());
-            // Install a fresh TokenCache — channel auth needs
-            // somewhere to stash tokens presented on subscribe.
-            // Matches the PyO3 / NAPI behaviour.
+            // Install a fresh TokenCache — channel auth needs one to
+            // supply the RevocationRegistry and clock-skew tolerance,
+            // and `require_token` channels reject outright without it.
+            // Subscriber-presented tokens do NOT land here; they are
+            // verified inline against the channel's `token_roots` and
+            // retained as chains. Matches the PyO3 / NAPI behaviour.
             node.set_token_cache(Arc::new(TokenCache::new()));
             let handle = Box::new(MeshNodeHandle {
                 inner: ManuallyDrop::new(Arc::new(node)),

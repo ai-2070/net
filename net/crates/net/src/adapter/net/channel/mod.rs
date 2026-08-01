@@ -11,14 +11,17 @@ mod name;
 mod publisher;
 mod roster;
 
-pub use config::{ChannelConfig, ChannelConfigRegistry, Visibility};
-pub use guard::{AuthGuard, AuthVerdict};
+pub use config::{
+    ChannelConfig, ChannelConfigRegistry, OriginBinding, QueueGroupPolicy, ResolvedConfig,
+    Visibility,
+};
+pub use guard::{AclPrincipal, AuthGuard, AuthVerdict};
 pub use membership::{
     AckReason, MembershipCodecError, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP,
 };
 pub use name::{
-    channel_hash, wire_channel_hash, ChannelError, ChannelHash, ChannelId, ChannelName,
-    ChannelRegistry,
+    channel_hash, queue_group_hash, wire_channel_hash, ChannelError, ChannelHash, ChannelId,
+    ChannelName, ChannelRegistry,
 };
 pub use publisher::{ChannelPublisher, OnFailure, PublishConfig, PublishReport};
 pub use roster::{QueueGroupName, SubscriberRoster, SubscriptionMode};
