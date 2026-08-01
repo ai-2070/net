@@ -885,27 +885,14 @@ pub(crate) fn matches_scope(
     }
 }
 
-/// Allocation-free equivalent of
-/// `matches_scope(&scope_from_membership_tags(tags), filter, same_subnet)`,
-/// evaluated directly against a membership's borrowed tag strings.
-///
-/// The materializing form allocates a `String` per `scope:tenant:` /
-/// `scope:region:` tag and a `Vec` to hold them, per candidate, per
-/// query — and the query path runs it while the fold's state and index
-/// read locks are held, so the allocation extends lock hold time under
-/// input an announcer chooses. This streams the same decision in one
-/// pass with no allocation
-/// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
-///
-/// `scope_from_membership_tags` is retained as the readable reference
-/// definition; `tags_match_scope_agrees_with_materialized_scope` pins
-/// the two to the same verdict across the matrix.
 /// Convenience wrapper that prepares and evaluates in one call.
 ///
 /// NOT for the query path — it rebuilds the selector sets per call, and
 /// the query path must hoist them out of the locked region via
 /// [`PreparedScope::new`]. Kept for tests and single-shot callers, where
 /// the preparation cost is paid once anyway.
+///
+/// See [`PreparedScope::matches`] for the decision this evaluates.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tags_match_scope(
     tags: &[String],
@@ -955,6 +942,23 @@ impl<'a> PreparedScope<'a> {
 
     /// Evaluate one candidate's borrowed tags. Allocation-free, and
     /// every selector test is O(1).
+    ///
+    /// Equivalent to
+    /// `matches_scope(&scope_from_membership_tags(tags), filter, same_subnet)`,
+    /// evaluated directly against the membership's borrowed tag strings.
+    ///
+    /// The materializing form allocates a `String` per `scope:tenant:` /
+    /// `scope:region:` tag and a `Vec` to hold them, per candidate, per
+    /// query — and the query path runs it while the fold's state and
+    /// index read locks are held, so the allocation extends lock hold
+    /// time under input an announcer chooses. This streams the same
+    /// decision in one pass with no allocation
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    ///
+    /// [`scope_from_membership_tags`](super::fold::capability_bridge::scope_from_membership_tags)
+    /// is retained as the readable reference definition;
+    /// `tags_match_scope_agrees_with_materialized_scope` pins the two to
+    /// the same verdict across the matrix.
     pub(crate) fn matches(&self, tags: &[String], same_subnet: bool) -> bool {
         tags_match_prepared(tags, self, same_subnet)
     }
