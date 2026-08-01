@@ -262,8 +262,15 @@ pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
             symbol: "USDC".to_string(),
             display_name: Some("USDC (Base Sepolia testnet)".to_string()),
             equivalence_class: None,
-            eip712_name: None,
-            eip712_version: None,
+            // Circle's FiatTokenV2_2, whose EIP-712 domain is `USDC` / `2`
+            // on every deployment. Pinned because this is a *known*
+            // contract: leaving it open let a counterparty declare any
+            // name/version, which authored typed data under a domain
+            // separator matching nothing deployed — a wasted signature and
+            // a failed payment discovered at settle time rather than a
+            // refusal at check time.
+            eip712_name: Some("USDC".to_string()),
+            eip712_version: Some("2".to_string()),
         },
         AssetEntry {
             id: AssetId::parse(
@@ -275,8 +282,11 @@ pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
             symbol: "USDC".to_string(),
             display_name: Some("USDC (Base)".to_string()),
             equivalence_class: None,
-            eip712_name: None,
-            eip712_version: None,
+            // Same contract family as the Sepolia entry above, and the
+            // one that moves real money — so if only one of the two were
+            // pinned it would have to be this one.
+            eip712_name: Some("USDC".to_string()),
+            eip712_version: Some("2".to_string()),
         },
         AssetEntry {
             id: AssetId::parse(
@@ -288,6 +298,8 @@ pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
             symbol: "USDC".to_string(),
             display_name: Some("USDC (Solana SPL)".to_string()),
             equivalence_class: None,
+            // Not EVM: there is no EIP-712 domain to pin. `None` here
+            // means "does not apply", not "not yet pinned".
             eip712_name: None,
             eip712_version: None,
         },
@@ -304,6 +316,7 @@ pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
             symbol: "XRP".to_string(),
             display_name: Some("XRP (XRP Ledger)".to_string()),
             equivalence_class: None,
+            // Not EVM — see the Solana entry.
             eip712_name: None,
             eip712_version: None,
         },
@@ -477,6 +490,26 @@ mod tests {
             dev.assets.len() - 2,
             "exactly the mock and testnet entries are removed"
         );
+
+        // Every EVM entry the shipped registries carry names a contract
+        // this crate knows, so none of them leaves its EIP-712 domain for
+        // a counterparty to assert. A new EVM entry that forgets to pin
+        // is the regression this catches; non-EVM entries have no domain
+        // and are exempt.
+        for registry in [&dev, &prod] {
+            for entry in &registry.assets {
+                if !entry.id.chain().as_str().starts_with("eip155:") {
+                    continue;
+                }
+                assert_eq!(
+                    (entry.eip712_name.as_deref(), entry.eip712_version.as_deref()),
+                    (Some("USDC"), Some("2")),
+                    "{} must pin its EIP-712 domain in {}",
+                    entry.id.as_str(),
+                    registry.version
+                );
+            }
+        }
 
         // Every real-money network survives.
         for chain in ["eip155:8453", "xrpl:0"] {

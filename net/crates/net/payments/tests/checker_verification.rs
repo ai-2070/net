@@ -662,7 +662,12 @@ async fn accept_eip155_inner(
         asset: TESTNET_USDC.into(),
         pay_to: MERCHANT_ADDR.into(),
         max_timeout_seconds: 60,
-        extra: None,
+        // The registry pins this deployment's EIP-712 domain, so
+        // requirements that decline to name it are refused at
+        // `issue_quote`. They always were unusable — `typed_data` needs
+        // both fields to sign — but the refusal now lands at quote time
+        // instead of at the wallet.
+        extra: Some(serde_json::json!({ "name": "USDC", "version": "2" })),
     })
     .expect("author");
     let quote = engine
