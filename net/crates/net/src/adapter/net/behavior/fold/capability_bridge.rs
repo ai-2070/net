@@ -1223,10 +1223,14 @@ pub fn target_matches_filter(
 /// through [`find_nodes_matching_scoped`].
 ///
 /// No longer on the query path — that now runs
-/// [`tags_match_scope`](super::super::capability::tags_match_scope),
+/// [`PreparedScope::matches`](super::super::capability::PreparedScope::matches),
 /// which reaches the same verdict without allocating a `String` per
-/// scope tag while the fold's read locks are held. Retained as the
-/// readable reference definition and as the oracle for
+/// scope tag while the fold's read locks are held. (The
+/// `tags_match_scope` wrapper is NOT the query path: it rebuilds the
+/// prepared selector sets per call, so it allocates for the `Tenants` /
+/// `Regions` forms and is for tests and single-shot callers.)
+///
+/// Retained as the readable reference definition and as the oracle for
 /// `tags_match_scope_agrees_with_materialized_scope`, which pins the
 /// two to identical verdicts across the scope matrix.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1298,7 +1302,7 @@ pub fn filter_by_predicate(
 /// Scoped variant of [`find_nodes_matching`]. Filters
 /// candidates through `scope` (resolved from each
 /// publisher's `scope:*` tags) on top of the capability
-/// filter. `same_subnet_lookup(node_id) -> bool` is supplied
+/// filter. `same_subnet_lookup(node_id, tags) -> bool` is supplied
 /// by the caller; the bridge has no native subnet state.
 ///
 /// `same_subnet_lookup(node_id, tags)` is invoked ONLY under a
@@ -1337,11 +1341,14 @@ pub fn find_nodes_matching_scoped(
     // against borrowed payloads without cloning.
     //
     // The scope decision runs here too, but through
-    // [`tags_match_scope`], which streams the borrowed tag strings
+    // `PreparedScope::matches`, which streams the borrowed tag strings
     // without materializing a `CapabilityScope`. The materializing
     // form allocated a `String` per scope tag plus a `Vec` per
     // candidate, per query, while these read locks were held — cost an
     // announcer controls, paid by every peer on every scoped query.
+    // Note this is `matches` on the ALREADY-prepared filter, not the
+    // `tags_match_scope` wrapper — that one rebuilds the selector sets
+    // per call and would reintroduce an allocation inside the locks.
     //
     // `same_subnet_lookup` runs INSIDE the same snapshot, against the
     // borrowed tags of the entry that was just selected — see the
