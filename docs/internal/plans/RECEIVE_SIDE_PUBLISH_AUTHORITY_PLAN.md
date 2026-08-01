@@ -1,238 +1,326 @@
-# Receive-side publish authority — design (H1)
+# Receive-side publish authority (H1) — constraint set
 
-Status: **problem statement + constraint set. NOT an approved
-implementation plan.** Rev 2 after review; the reviewer's position on
-rev 1 was "do not implement Option 2 from this revision", and that
-stands until the six items in [Open decisions](#open-decisions-that-must-be-settled-before-coding)
-are settled. Written to close H1 of
+Status: **STOP NOTICE + constraint set. Not an implementation plan, and
+not implementation authorization.** Neither option below may be built
+from this document. Rev 3 after three review rounds; each round found
+blockers the previous one had missed, which is itself the argument for
+not coding yet.
+
+Closes nothing. Records what H1 is, why the obvious fixes fail, and the
+nine defects (D1–D9) any real plan must answer. Companion to
 [`SECURITY_AUDIT_2026_07_31_CHANNEL_AUTH.md`](../misc/SECURITY_AUDIT_2026_07_31_CHANNEL_AUTH.md).
 
-Every other finding from that audit has landed. This one changes either
-the wire format or the session state machine, and rev 1's sketch was
-shown to have five concrete defects — recorded below so they are not
-rediscovered.
+Every other finding from that audit has landed, **except** the residual
+I1 hardening — the `AuthGuard` key newtype — which the audit's status
+table records as still open alongside this.
 
 ## The defect
 
-Publish authority is checked on the machine that has the incentive to
-skip it, and one whole class of sender skips even that.
+Publish authority is checked on the machine with the incentive to skip
+it, and one class of sender skips even that.
 
-**Emitter-side only.** `ChannelConfig::can_publish` is invoked exactly
-once in the runtime — inside `publish_many`, on the publishing node,
-against its own config, before its own fan-out. Nothing on the receiving
-side re-establishes the property. Ingress resolves the stream, does
-credit accounting, optionally diverts to a blob transfer or an nRPC
-dispatcher, and otherwise pushes onto the per-shard queue. `StoredEvent`
-carries `(event_id, data, seq, shard_id)` — not the channel, not the
-sender. `AuthGuard` is consulted only on the **egress** path.
+`ChannelConfig::can_publish` is invoked exactly once in the runtime:
+inside `publish_many`, on the publishing node, against its own config,
+before its own fan-out. Ingress resolves the stream, does credit
+accounting, optionally diverts to blob transfer or an nRPC dispatcher,
+and otherwise pushes onto the per-shard queue. `StoredEvent` carries
+`(event_id, data, seq, shard_id)` — not the channel, not the sender.
+`AuthGuard` is consulted only on egress.
 
-**And nRPC bypasses the emitter gate too.** `try_publish_to_peer` takes
-a `channel_hash` and `stream_id` and sends: session lookup, partition
-filter, `open_stream_with`, credit acquire, build, `send_to`. No config
-lookup, no `can_publish`, no `AuthGuard`. Every nRPC direct send routes
-through it — requests, grants, responses.
+`try_publish_to_peer` — which every nRPC direct send uses — does no
+config lookup, no `can_publish`, no `AuthGuard` at all.
 
 **Impact.** Any handshake-completed peer can build a packet on a
 channel's stream id and have its events delivered to a subscriber's
 consumer, indistinguishable from the authorized publisher's.
-`token_roots` + `TokenScope::PUBLISH` and `publish_caps` protect a
-channel's integrity only against nodes running unmodified code.
+`require_token` and `publish_caps` protect integrity only against nodes
+running unmodified code.
 
-Generic channel events are fully forgeable. nRPC frames are harder to
-forge end-to-end — the dispatcher matches the in-payload `RpcRouteV1`
-canonical hash, and the client fold checks `call_id` and the expected
-session peer — but neither is a channel ACL, and neither applies to the
-generic event plane.
-
-**Until this ships, `require_token` is a READ ACL.** That is the current
-documented position.
+**Until this ships, `require_token` is a READ ACL.**
 
 ## Why the naive fix does not work
 
-Rev 1 of the audit proposed reverse-mapping an inbound packet to its
-channel from the header hint plus the stream id. Not derivable:
+The receiver cannot name the channel a packet belongs to:
 
-- `NetHeader.channel_hash` is a **`u16`**. The sender deliberately
-  narrows the canonical `u64` when stamping it.
-- The stream id is `0x0001_0000_0000_0000 | channel.hash()`. That is a
-  bitwise **OR**, so it destroys bit 48 of the hash — the stream id is
-  not a reversible encoding, and two distinct channels whose hashes
-  differ only in bit 48 share a stream id.
-- nRPC works around this with an in-payload `RpcRouteV1` discriminator.
-  Generic channel events have no equivalent.
-- Prefix-configured channels appear in neither `by_hash` nor
-  `by_wire_hash`; they live only in `prefix_configs`, reachable by full
-  name, which the wire never carries.
+- `NetHeader.channel_hash` is a **`u16`**; the sender narrows the
+  canonical `u64` when stamping it.
+- `publish_stream_id` is `0x0001_0000_0000_0000 | channel.hash()` — a
+  bitwise OR, so bit 48 is destroyed and two channels differing only
+  there share a stream id.
+- nRPC compensates with an in-payload `RpcRouteV1`; generic channel
+  events have no equivalent.
+- Prefix-configured channels are in neither `by_hash` nor
+  `by_wire_hash` — only in `prefix_configs`, reachable by full name,
+  which the wire never carries.
 
 ## The two options
 
-### Option 1 — authenticated canonical discriminator on the wire
+**Option 1 — authenticated canonical discriminator on the wire.**
+Stateless receiver; every packet self-describing. Costs a wire-format
+change affecting every publisher, version negotiation, and a
+mixed-version window during which the gate cannot fail closed. The wire
+header is `protocol::HEADER_SIZE` = **68 bytes**; widening
+`channel_hash` `u16 → u64` costs 6 bytes per packet, and carrying the
+full *name* — the only variant that resolves prefix channels — costs far
+more.
 
-Carry canonical channel identity on every event-plane publish,
-generalizing `RpcRouteV1`.
+**Option 2 — receiver-owned `(session, stream_id) → ChannelName`,**
+established by a `PublishIntent` control exchange. No data-plane wire
+change, and the full name is available. D1–D9 are all objections to
+this option; D6 in particular may be disqualifying.
 
-- **Pro:** stateless on the receiver; every packet self-describing; no
-  session state to build, migrate, or expire.
-- **Con:** wire-format change affecting every publisher; needs
-  negotiation and a mixed-version window during which the gate cannot
-  fail closed. The wire header is `protocol::HEADER_SIZE` = **68
-  bytes** (rev 1 of this doc said 64, copying a stale comment in
-  `name.rs` that has now been corrected); widening `channel_hash`
-  `u16 → u64` costs 6 bytes per packet. Carrying the full *name* — the
-  only variant that handles prefix channels — costs far more per packet.
-
-### Option 2 — receiver-owned `(session, stream_id) → ChannelName`
-
-A `PublishIntent` control message; the receiver verifies as
-`authorize_subscribe` does, records the mapping plus retained chain, and
-ingress consults it.
-
-- **Pro:** no data-plane wire change; full channel *name* available, so
-  prefix channels and `OriginBinding` work with machinery already built;
-  re-verification reuses `reverify_subscribe`'s shape.
-- **Con:** the five defects below, all of which are load-bearing.
-
-## Defects found in rev 1's Option 2 sketch
-
-These are the reason this document is not yet a plan.
+## Defects any plan must answer
 
 ### D1 — mapping the stream does not bind the dispatcher hint
 
-`stream_id` and `header.channel_hash` are supplied **independently**:
-authority would be keyed on `(session_id, stream_id)`, but registered /
-nRPC dispatcher selection uses `parsed.header.channel_hash`, and
-`try_publish_to_peer` takes the two as separate arguments. A hostile
-publisher could establish authority for channel A's stream, then keep
-A's stream id while stamping channel B's `u16` hint.
+`stream_id` and `header.channel_hash` are supplied independently
+(separate arguments to `try_publish_to_peer`; dispatcher selection uses
+the header hint). A publisher could establish authority for channel A's
+stream, keep A's stream id, and stamp B's `u16` hint.
 
-The gate must therefore require **both**:
+The gate must bind **both**:
 
 ```text
 stream_id           == publish_stream_id(mapped_channel)
 header.channel_hash == mapped_channel.wire_hash()
 ```
 
-and authority-sensitive dispatch should derive its channel identity from
-the receiver-owned mapping rather than trusting the packet hint at all.
-
-This still does not resolve the bit-48 stream alias: two distinct full
-names can derive the same stream id. Conflicting names for one stream
-must **poison/reject** that stream, never silently replace the mapping.
+and authority-sensitive dispatch should take its channel identity from
+the receiver-owned mapping, not the packet. Bit-48 aliasing remains:
+conflicting full names deriving one stream id must **poison** that
+stream, never replace the mapping.
 
 ### D2 — the existing membership transport is unsafe for routed peers
 
-`send_membership_request` ultimately uses address-scoped
-`send_subprotocol`, and the membership ACK path sends a bare packet to
-`peer_entry.addr` without building a routing envelope. Routed logical
-peers can share a relay address, so address resolution may select the
-**relay's** session rather than the intended end-to-end peer.
-
-Option 2 needs a NodeID/session-targeted, routing-aware control send for
-both intent and ACK. Reusing the current membership helper yields
-something that works only for direct peers — and fails in a way that
-looks like an authorization bug.
+`send_membership_request` uses address-scoped `send_subprotocol`, and
+the ACK path sends a bare packet to `peer_entry.addr` with no routing
+envelope. Routed logical peers can share a relay address, so resolution
+may select the relay's session. Intent and ACK need a
+NodeID/session-targeted, routing-aware control send, or the feature
+works only for direct peers and fails looking like an authorization bug.
 
 ### D3 — "evict on peer failure" is the wrong lifecycle boundary
 
-The failure callback fires on failure *suspicion*; it clears the roster,
-`peer_entity_ids`, and `subscriber_chains`, but the session itself is
-retained for recovery. Dropping publish authority there desynchronizes:
+The failure callback is failure *suspicion*: it clears roster,
+`peer_entity_ids`, and `subscriber_chains`, but the session is retained
+for recovery. Dropping authority there desynchronizes — receiver deletes
+the mapping, the same session recovers, the sender still believes intent
+is established, and every subsequent packet silently drops.
 
-```text
-receiver deletes mapping
-  → same session recovers
-    → sender still believes intent is established
-      → every subsequent data packet silently drops
-```
-
-Authority lifetime must follow exact **session-incarnation**
-destruction/replacement, not failure suspicion — or recovery must
-explicitly invalidate both sides and repeat the handshake. Cleanup must
-cover: direct session replacement, routed handshake replacement, failed
-installation rollback, permanent peer eviction, and shutdown.
+Lifetime must follow exact **session-incarnation**
+destruction/replacement, covering direct replacement, routed handshake
+replacement, failed-install rollback, permanent eviction, and shutdown.
 Failure-callback cleanup alone leaks displaced-session entries.
 
 ### D4 — the low-level send APIs cannot construct or recover an intent
 
 `try_publish_to_peer` receives `(peer_node_id, channel_hash, stream_id,
-reliable, events)`. It never receives the canonical `ChannelName` or a
-credential source, and several nRPC paths retain only hash + stream id —
-including grant, streaming, and chunk paths.
+reliable, events)` — never the canonical `ChannelName` or a credential
+source. Several nRPC paths keep only hash + stream id, including grant,
+streaming, and chunk paths.
 
-So the API family must change: every channel-derived send retains the
-canonical name; intent establishment and data emission must use the
-**same `Arc<NetSession>` incarnation**; session replacement between ACK
-and send forces re-establishment. A separate `ensure_intent()` followed
-by today's `try_publish_to_peer()` has a check/use race on the session.
-Migration covers request chunks, cancellation, request-window grants,
-streaming responses, and ordinary requests/responses.
+Every channel-derived send must retain the canonical name; intent
+establishment and data emission must use the **same `Arc<NetSession>`
+incarnation**; session replacement between ACK and send forces
+re-establishment. `ensure_intent()` followed by today's
+`try_publish_to_peer()` has a check/use race. Migration covers request
+chunks, cancellation, request-window grants, streaming responses, and
+ordinary requests/responses.
 
-### D5 — a blanket gate breaks blob transfer and other traffic classes
+### D5 — traffic-class isolation, not "ungated"
 
-Blob transfer is ordinary subprotocol-0 event traffic, recognized only
-*after* stream parsing and credit accounting (`is_transfer_stream_id`).
-"Absent mapping → drop" would break it, along with raw batches and
-arbitrary Stream API traffic.
+Rev 2 said raw batches, Stream API traffic, and blob transfer "must
+remain ungated". That was wrong in a way that preserves the original
+injection path: they must remain **functional**, but they cannot remain
+unlabelled in the *same delivery path* as protected channel events.
 
-Before any gate is written, the traffic-class inventory must be explicit
-and each class must have a stated verdict:
+Generic `StoredEvent` discards channel, sender, stream, and
+traffic-class provenance. So if unrestricted raw traffic keeps entering
+the same shard queue, a hostile peer simply uses a different stream that
+reaches the same consumer: the mapping protects one stream and then
+throws the established identity away before delivery.
 
-| class | reaches ingress as | gate verdict |
+A "channel stream id" is not a positive traffic classifier either — raw
+callers choose their own stream ids and the consumer discards them.
+
+| class | reaches ingress as | verdict |
 |---|---|---|
-| channel publisher traffic | channel stream id | **gated** — the target |
-| blob transfer | subprotocol-0 events on a transfer stream id | must remain ungated |
-| raw `send_to_peer` | arbitrary stream id | must remain ungated |
-| arbitrary Stream API | caller-chosen stream id | must remain ungated |
-| nRPC dispatchers | channel-derived + `RpcRouteV1` | gated, but see D1/D4 |
+| channel publisher traffic | channel stream id | gated — the target |
+| blob transfer | subprotocol-0 events on a transfer stream id | functional, isolated from protected channel delivery |
+| raw `send_to_peer` | arbitrary stream id | functional, isolated |
+| arbitrary Stream API | caller-chosen stream id | functional, isolated |
+| nRPC dispatchers | channel-derived + `RpcRouteV1` | gated; see D1, D4, D6 |
 | generic observers | fan-out of the above | inherits its source's verdict |
 
-The gate must be able to *identify* the gated class positively, rather
-than dropping whatever it does not recognize.
+A plan must pick one of:
 
-## Open decisions that must be settled before coding
+- separate channel vs. raw delivery queues;
+- authenticated channel + sender provenance carried in `StoredEvent`
+  and enforced by consumers;
+- authority required for **every** stream sharing a consumer;
+- removal or isolation of unrestricted peer ingress.
 
-1. **Traffic-class isolation through delivery** — how the gated class is
-   positively identified end to end (D5).
-2. **Receiver-owned authoritative policy** — dispatch identity from the
-   mapping, not the packet hint (D1).
-3. **Routed intent/ACK protocol** — a session-targeted, routing-aware
-   control send (D2).
-4. **Exact session-incarnation lifecycle** — establishment, replacement,
-   rollback, eviction, shutdown (D3).
-5. **Canonical-name propagation through every sender** — the API family
-   change and its nRPC migration (D4).
-6. **Stream/header collision and mismatch behaviour** — including
-   bit-48 aliasing and the poison rule (D1).
+### D6 — the receiver may not hold the policy it is being asked to enforce
 
-## Requirements that hold for whichever option is chosen
+**This is the one that may disqualify Option 2**, and it was missing
+from rev 1 and rev 2.
+
+A receive-side gate must evaluate *some* `ChannelConfig`, token roots,
+and revocation state. The receiver is not guaranteed to have any of
+them:
+
+- SDK meshes start with independent, empty registries;
+  `subscribe_channel_with` does not copy the publisher's configuration
+  to the subscriber.
+- `auto_register_rpc_channels` is called **only** from the eight
+  `serve_rpc*` entry points — i.e. on the *server*.
+- So an ordinary nRPC **caller** installs no config for
+  `<service>.replies.<its own origin>`, the very channel on which it
+  receives every reply.
+- A registry that is installed but has no matching name rejects with
+  `UnknownChannel`.
+
+Composed: a receiver-side gate that resolves policy from the receiver's
+own registry **fails closed on every nRPC reply**. Not an edge case —
+the primary flow.
+
+And the obvious escape is not available: policy supplied by the
+publisher being authorized must never be trusted, since that is the
+party the gate exists to restrain.
+
+A plan must settle: receiver-local mirrored configuration; automatic
+role-specific registration; independently signed receiver-trusted
+policy; no-registry and unknown-name semantics; the token-root and
+revocation source on the receiving side; prefix replacement;
+publisher/receiver policy disagreement; and live policy mutation.
+
+### D7 — `PublishIntent` is a state machine and a wire-version change
+
+Rev 2 described it as one message. It is not:
+
+```text
+Idle
+  → IntentPending(exact session, channel, nonce)
+    → Ready(exact session, stream, exact name, credential)
+      → Expired / Revoked / Renewing
+```
+
+Required properties: nonce-correlated ACK/reject; sender waits for
+receiver commit; ACK bound to the exact expected session;
+current-session recheck immediately before data emission; concurrent
+first publishes single-flighted; timeout and rejection surfaced into
+`PublishReport` / nRPC error handling; reconnect never inherits
+readiness; credential replacement and renewal.
+
+It also changes the membership wire protocol: old receivers reject
+unknown tags, and old senders never establish mappings on new receivers.
+Needs version negotiation, an explicit old/new behaviour matrix, a typed
+unsupported-peer failure, and a cutover rule.
+
+### D8 — the gate must precede all stream side effects
+
+It must run after AEAD/session authentication but **before**
+`EventFrame` parsing, receive-stream creation, reliability/sequence
+mutation, credit accounting and grant emission, blob/nRPC dispatch, and
+queue insertion.
+
+Otherwise a rejected packet still allocates state, perturbs sequencing,
+or earns the sender credit — a denial-of-service and accounting channel
+that survives the authorization decision.
+
+### D9 — currentness, renewal, and resource bounds
+
+**Currentness** is broader than expiry and revocation. A re-check must
+also reflect: the currently pinned peer/entity; `publish_caps` changes;
+exact and prefix configuration replacement; a newly inserted
+*more-specific* prefix; token-root changes; token enforcement being
+switched on; and `UnregisteredChannelPolicy` changes. The plan must
+state whether every packet re-resolves current policy, or entries carry
+a configuration/capability generation that is validated cheaply.
+
+**Renewal** — fail-closed expiry is not recovery. Needs
+replacement-chain presentation; sender-ready invalidation when
+`set_publish_chain` changes; the accepted expiry returned in the ACK;
+atomic replacement only after successful verification; and defined
+behaviour on early revocation.
+
+**Bounds** — cap mapping entries per session and per node; pending
+intent verifications; canonical-name and chain byte lengths; chain
+depth; successful churn and failed attempts; and cryptographic work per
+peer.
+
+## Open decisions
+
+1. Traffic-class isolation **through delivery** (D5).
+2. Receiver policy authority — where the receiving node's
+   `ChannelConfig` / roots / revocation come from (D6).
+3. Receiver-owned dispatch identity and stream/hint binding (D1).
+4. Routed intent/ACK control transport (D2).
+5. Intent/ACK state machine and membership wire versioning (D7).
+6. Exact session-incarnation lifecycle (D3).
+7. Canonical-name propagation through every sender (D4).
+8. Gate placement ahead of stream side effects (D8).
+9. Currentness model, renewal, and resource bounds (D9).
+
+## Requirements for whichever option is chosen
 
 - **Fail closed** on ambiguity, absent mapping, and unresolved prefix
-  names — but only *within the gated traffic class* (D5).
+  names — but only *within the gated traffic class* (D5), and only once
+  D6 guarantees the receiver actually has policy to apply.
 - **Cover both gates**: `publish_caps` as well as `TokenScope::PUBLISH`.
-- **Evaluate against the AEAD-authenticated peer**, never a wire-claimed
-  origin — the rule H3's `OriginBinding` follows.
-- **Close the nRPC bypass** at ingress, so it covers every send API.
-- **Re-check on use**, not only at admission, so expiry and revocation
-  reject a previously-authorized publisher.
+- **Bind to the AEAD-authenticated peer.** The PUBLISH chain's leaf
+  subject must be the `EntityId` pinned to the authenticated session —
+  never a wire-claimed origin.
+- **Do not reuse subscriber origin binding.** The existing field is
+  `subscriber_origin_binding` and it is subscribe-only. Applying it to
+  publication would reject ordinary nRPC responses, because the reply
+  channel's suffix names the *caller* while the publisher is the
+  *server*. A publisher-side binding policy, if wanted, is a separate
+  design.
+- **Add a publish re-verify path.** `reverify_subscribe` /
+  `reverify_subscribe_presigned` hard-code `TokenScope::SUBSCRIBE`; an
+  analogous `reverify_publish_presigned` is needed rather than reuse.
+- **Close the nRPC bypass** at ingress, covering every send API.
+- **Re-check on use**, per D9's full currentness list.
 
 ## Test obligations
 
 No existing test covers hostile ingress publishing. At minimum:
 
-- an unauthorized peer publishing on a token-gated channel's stream id
-  reaches no consumer;
-- the same for a `publish_caps`-gated channel;
-- an expired / revoked publish grant stops delivery without a reconnect;
-- a prefix-configured channel authorizes on the requested name, not a
+**Authorization**
+- unauthorized peer publishing on a token-gated channel's stream id
+  reaches no consumer; same for a `publish_caps`-gated channel;
+- prefix-configured channel authorizes on the requested name, not a
   sentinel (M1's failure mode, publish direction);
-- **stream/hint mismatch**: authority for A + A's stream id + B's wire
-  hint is rejected (D1);
-- **stream aliasing**: two names deriving one stream id poison it rather
-  than one replacing the other (D1);
-- **routed peers**: intent and ACK reach the end-to-end peer, not a
-  shared relay (D2);
-- **session recovery**: a suspected-then-recovered peer still publishes,
-  and a genuinely replaced session must re-establish (D3);
-- **non-gated classes keep working**: blob transfer, raw `send_to_peer`,
-  arbitrary Stream API traffic, and every nRPC path — requests, chunks,
-  cancellation, grants, streaming responses (D4, D5).
+- expired / revoked grant stops delivery without a reconnect.
+
+**Identity and aliasing (D1)**
+- authority for A + A's stream id + B's wire hint is rejected;
+- two names deriving one stream id poison it rather than one replacing
+  the other.
+
+**Transport and lifecycle (D2, D3, D7)**
+- intent and ACK reach the end-to-end peer, not a shared relay;
+- suspected-then-recovered peer still publishes; genuinely replaced
+  session must re-establish;
+- intent/data reordering and ACK loss; duplicate and concurrent
+  intents; ACK from the wrong session;
+- old/new version compatibility matrix.
+
+**Receiver policy (D6)**
+- an nRPC caller receiving replies, with no local config for its own
+  reply channel, still receives them;
+- live policy tightening and capability tightening take effect.
+
+**Isolation and side effects (D5, D8)**
+- blob transfer, raw `send_to_peer`, arbitrary Stream API traffic, and
+  every nRPC path (requests, chunks, cancellation, grants, streaming
+  responses) all keep working;
+- unrestricted traffic cannot enter protected channel delivery;
+- a rejected packet causes zero stream, sequence, credit, dispatch, or
+  queue mutation.
+
+**Renewal and bounds (D9)**
+- credential renewal and `set_publish_chain` replacement;
+- resource caps and per-peer cryptographic throttling hold under a
+  hostile intent flood.
