@@ -50,21 +50,42 @@ fn cleartext_remote_rpc_endpoints_are_refused() {
     );
 }
 
-/// https anywhere, and cleartext to loopback for local nodes — the
-/// documented self-hosted path stays open.
+/// https anywhere, and cleartext to a loopback **literal** for local
+/// nodes — the documented self-hosted path stays open.
 #[test]
-fn https_and_loopback_endpoints_are_accepted() {
+fn https_and_loopback_literal_endpoints_are_accepted() {
     for ok in [
         "https://mainnet.base.org",
+        "https://localhost:8545",
         "http://127.0.0.1:8545",
         "http://[::1]:8545",
-        "http://localhost:8545",
     ] {
         assert!(
             Eip155Checker::new("eip155:8453", ok).is_ok(),
             "should accept {ok}"
         );
     }
+}
+
+/// The cleartext exception does not extend to the *name* `localhost`.
+///
+/// A name resolves to whatever DNS says, so `http://localhost` can be a
+/// cleartext request to a public address — and on the checker that is
+/// the worst place for it, since this is the path that mints
+/// `confirmed(n)` and `final`. Only a literal loopback address is
+/// self-evidently local.
+#[test]
+fn cleartext_to_the_name_localhost_is_refused() {
+    let err = Eip155Checker::new("eip155:8453", "http://localhost:8545")
+        .err()
+        .map(|e| e.message)
+        .unwrap_or_default();
+    assert!(
+        err.contains("cleartext") || err.contains("https"),
+        "the name `localhost` must not get the cleartext exception: {err}"
+    );
+    // Over https it is fine — the guard is about cleartext, not the name.
+    assert!(Eip155Checker::new("eip155:8453", "https://localhost:8545").is_ok());
 }
 
 /// A non-web scheme is refused rather than passed to the HTTP client.

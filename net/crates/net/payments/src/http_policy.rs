@@ -74,12 +74,17 @@ pub fn require_secure_endpoint(endpoint: &str) -> Result<(), PolicyError> {
     }
 }
 
-/// Is this host literal a loopback name or address? `host_str` keeps
-/// IPv6 brackets (`[::1]`), so strip them before parsing.
+/// Is this host a loopback **address literal**?
+///
+/// Deliberately literals only. `localhost` is a name, and a name is
+/// whatever DNS says it is — a host file or a resolver can point it at a
+/// public address, and then "http to localhost" is a cleartext request to
+/// a remote host, which is exactly what the scheme rule exists to
+/// prevent. The exception has to be address-level to mean anything.
+///
+/// `host_str` keeps IPv6 brackets (`[::1]`), so strip them before
+/// parsing.
 fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     bare.parse::<IpAddr>()
         .map(|ip| normalize(ip).is_loopback())
@@ -166,8 +171,14 @@ fn normalize(ip: IpAddr) -> IpAddr {
 fn is_private_use(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_private(),
-        // Unique local addresses, fc00::/7.
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            // fc00::/7 unique local, plus deprecated fec0::/10 site local
+            // — both are "an operator's own network", which is what
+            // `AllowPrivate` is for. The stricter policies refuse them via
+            // `is_public`.
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfec0
+        }
     }
 }
 
@@ -214,6 +225,8 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         || ipv4_compatible_block
         || (first & 0xfe00) == 0xfc00   // fc00::/7  unique local
         || (first & 0xffc0) == 0xfe80   // fe80::/10 link local
+        || (first & 0xffc0) == 0xfec0   // fec0::/10 site local (deprecated,
+                                        // still routable on many stacks)
         || (first == 0x2001 && (s[1] & 0xff00) == 0x0d00) // 2001:db8::/32 doc
         || first == 0x0100) // 100::/64  discard-only
 }
@@ -386,13 +399,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn https_is_required_except_for_loopback() {
+    fn https_is_required_except_for_loopback_literals() {
         for ok in [
             "https://facilitator.example.com",
+            "https://localhost:8080",
             "http://127.0.0.1:8080",
             "http://[::1]:8080",
-            "http://localhost:8080/base",
-            "http://LOCALHOST:8080",
+            "http://[::ffff:127.0.0.1]:8080",
         ] {
             assert!(require_secure_endpoint(ok).is_ok(), "should accept {ok}");
         }
@@ -404,6 +417,32 @@ mod tests {
         ] {
             assert!(require_secure_endpoint(bad).is_err(), "should reject {bad}");
         }
+    }
+
+    /// The cleartext exception is address-level, so the *name* `localhost`
+    /// does not get it.
+    ///
+    /// A name is whatever DNS says it is: a hosts file or a resolver can
+    /// point `localhost` at a public address, and then "http to localhost"
+    /// is a cleartext request to a remote host — precisely what the scheme
+    /// rule exists to prevent. Only a literal loopback address is
+    /// self-evidently local.
+    #[test]
+    fn cleartext_to_the_name_localhost_is_refused() {
+        for name in [
+            "http://localhost:8080",
+            "http://localhost:8080/base",
+            "http://LOCALHOST:8080",
+            "http://localhost.localdomain:8080",
+        ] {
+            assert!(
+                require_secure_endpoint(name).is_err(),
+                "`{name}` is a name, not a loopback literal — it must not get the cleartext \
+                 exception"
+            );
+        }
+        // https to the same name is fine: the guard is about cleartext.
+        assert!(require_secure_endpoint("https://localhost:8080").is_ok());
     }
 
     /// The v4 rules must not be bypassable by spelling the address in
@@ -473,6 +512,7 @@ mod tests {
             "::1",
             "fc00::1",     // unique local
             "fe80::1",     // link local
+            "fec0::1",     // site local (deprecated but still routed)
             "ff02::1",     // multicast
             "2001:db8::1", // documentation
         ];
@@ -507,6 +547,14 @@ mod tests {
 
         assert!(!DestinationPolicy::PublicOrLoopback.admits(private));
         assert!(DestinationPolicy::AllowPrivate.admits(private));
+
+        // Deprecated IPv6 site-local is an operator's own network: never
+        // public, but reachable under `AllowPrivate` so a self-hosted node
+        // there is not collateral damage.
+        let site_local: IpAddr = "fec0::1".parse().unwrap();
+        assert!(!DestinationPolicy::PublicOnly.admits(site_local));
+        assert!(!DestinationPolicy::PublicOrLoopback.admits(site_local));
+        assert!(DestinationPolicy::AllowPrivate.admits(site_local));
 
         for p in [
             DestinationPolicy::PublicOnly,

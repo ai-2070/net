@@ -365,16 +365,21 @@ impl Facilitator for HttpFacilitator {
 mod tests {
     use super::*;
 
+    /// The facilitator's view of the shared scheme policy. The rule
+    /// itself is owned and exhaustively tested by `crate::http_policy`;
+    /// this pins that the client actually applies it.
     #[test]
-    fn https_is_required_except_for_loopback() {
-        // Secure or loopback: accepted.
+    fn https_is_required_except_for_loopback_literals() {
+        // Secure anywhere, or cleartext to a loopback *literal*.
         assert!(require_secure_endpoint("https://facilitator.example.com").is_ok());
         assert!(require_secure_endpoint("http://127.0.0.1:8080").is_ok());
         assert!(require_secure_endpoint("http://[::1]:8080").is_ok());
-        assert!(require_secure_endpoint("http://localhost:8080/base").is_ok());
         // Cleartext to a remote host, or an unsupported scheme: refused.
         assert!(require_secure_endpoint("http://facilitator.example.com").is_err());
         assert!(require_secure_endpoint("ftp://facilitator.example.com").is_err());
+        // And the NAME `localhost` no longer buys the exception: DNS
+        // decides what it resolves to, so it is not self-evidently local.
+        assert!(require_secure_endpoint("http://localhost:8080/base").is_err());
     }
 
     #[test]
