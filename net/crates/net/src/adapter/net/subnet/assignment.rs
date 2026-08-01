@@ -32,9 +32,17 @@ use crate::adapter::net::behavior::capability::CapabilitySet;
 ///    resolve as *later-rule-wins*: the earlier rule may write
 ///    the level byte first, but a subsequent match at the same
 ///    level overwrites it.
-/// 2. **First tag wins per rule.** Inside one rule, the first
-///    capability tag whose stripped suffix is present in `values`
-///    wins — subsequent tags matching the same rule are ignored.
+/// 2. **Smallest matching tag wins per rule.** Inside one rule, the
+///    lexicographically smallest capability tag whose stripped suffix
+///    is present in `values` wins; other tags matching the same rule
+///    are ignored. The tie-break has to be order-independent, not
+///    positional: tags arrive from a `HashSet` (via
+///    [`SubnetPolicy::assign`]) or as fold-stored strings in
+///    unspecified order, so "the first one" is not a defined thing.
+///    Two receivers holding the same announcement must assign it the
+///    same subnet. See
+///    [`SubnetPolicy::assign_from_rendered_tags`], which is the sole
+///    definition.
 /// 3. **No partial-prefix match on values.** `tag_prefix` is
 ///    stripped by [`str::strip_prefix`]; the remaining value is
 ///    then looked up by *exact* string equality against `values`.
@@ -508,19 +516,24 @@ mod tests {
         );
     }
 
-    /// First matching tag wins *within* a single rule — a second
-    /// tag for the same rule is ignored (the `break` in `assign`).
-    /// Phase A.5.N.2: tags are now `HashSet<Tag>` (unordered);
-    /// `assign()` sorts tag strings lexicographically before the
-    /// first-match scan, so the result is deterministic regardless
-    /// of insertion order.
+    /// One tag wins *within* a single rule, and which one cannot
+    /// depend on order — tags are a `HashSet<Tag>`, so there is no
+    /// "first". The rule resolves to the lexicographically smallest
+    /// matching tag, which is what makes two receivers holding the
+    /// same announcement agree.
+    ///
+    /// (Formerly `first_tag_wins_within_a_single_rule`, describing a
+    /// sort-then-`break` that `assign` no longer performs — it
+    /// delegates to `assign_from_rendered_tags`, which selects the
+    /// minimum directly. The assertions are unchanged; only the name
+    /// and rationale were wrong.)
     #[test]
-    fn first_tag_wins_within_a_single_rule() {
+    fn smallest_matching_tag_wins_within_a_single_rule() {
         let policy =
             SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 1).map("eu", 2));
 
         // Both insertions converge on the same answer — the
-        // lexicographically-first matching tag wins. `region:eu`
+        // lexicographically smallest matching tag wins. `region:eu`
         // sorts before `region:us`, so 2 (eu's level value) wins
         // regardless of which tag was inserted first.
         let caps = caps_with_tags(&["region:us", "region:eu"]);

@@ -2330,9 +2330,11 @@ impl MeshNodeConfig {
 
     /// Pin this node to a specific subnet.
     ///
-    /// This is the ONLY way to set the local subnet.
-    /// [`Self::with_subnet_policy`] does not do it — that policy applies
-    /// to peers. A subnet-scoped deployment wants both.
+    /// This is the builder method for the local subnet; the
+    /// [`subnet`](Self::subnet) field is public and can be assigned
+    /// directly. What does NOT set it is
+    /// [`Self::with_subnet_policy`] — that policy applies to peers. A
+    /// subnet-scoped deployment wants both.
     pub fn with_subnet(mut self, subnet: SubnetId) -> Self {
         self.subnet = subnet;
         self
