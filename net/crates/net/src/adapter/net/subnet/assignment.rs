@@ -117,6 +117,13 @@ impl SubnetPolicy {
     /// policy that can only ever answer GLOBAL puts every peer in the
     /// same subnet as a GLOBAL local node, so nothing is inconsistent
     /// and there is nothing to warn about.
+    ///
+    /// Exact, not approximate: a non-zero mapping here always CAN be
+    /// assigned, because [`Self::assign_from_rendered_tags`] ignores
+    /// zero-valued mappings rather than writing them, so no later rule
+    /// can zero out an earlier one. Were zeros written, a policy could
+    /// hold non-zero values and still only ever answer GLOBAL, and this
+    /// would return `true` for it.
     pub fn can_assign_non_global(&self) -> bool {
         self.rules
             .iter()
@@ -168,6 +175,15 @@ impl SubnetPolicy {
     /// `assign_from_rendered_tags_is_order_independent` pins the
     /// property; `assign_from_rendered_tags_agrees_with_assign` pins
     /// that the two entry points cannot drift.
+    ///
+    /// A mapped value of `0` is ignored, not written. `0` is reserved
+    /// for "unmatched / no restriction" and both [`SubnetRule::map`] and
+    /// [`SubnetRule::try_map`] refuse it, so one can only arrive through
+    /// the public `values` field. Honouring the reservation keeps a
+    /// later same-level rule from erasing an earlier rule's real
+    /// assignment — see contract point 1 on [`SubnetPolicy`], where
+    /// same-level rules are later-rule-wins — and is what makes
+    /// [`Self::can_assign_non_global`] exact rather than approximate.
     pub fn assign_from_rendered_tags(&self, tags: &[String]) -> SubnetId {
         let mut levels = [0u8; 4];
 
@@ -183,6 +199,16 @@ impl SubnetPolicy {
                 let Some(&level_value) = rule.values.get(value) else {
                     continue;
                 };
+                // 0 is reserved for "unmatched / no restriction" —
+                // `map` / `try_map` refuse it, so a 0 here arrived
+                // through `SubnetRule`'s public `values` field. Treat it
+                // as the absence of a mapping, which is what the
+                // reservation means, rather than as an instruction to
+                // write 0. Writing it would let a later same-level rule
+                // erase an earlier rule's real assignment.
+                if level_value == 0 {
+                    continue;
+                }
                 let better = match winner {
                     Some((current, _)) => tag < current,
                     None => true,
@@ -332,6 +358,58 @@ mod tests {
             policy.assign_from_rendered_tags(&reversed),
             "tag order must not change the assigned subnet"
         );
+    }
+
+    /// A rule value of `0` means "no mapping", not "assign global".
+    ///
+    /// `0` is reserved for unmatched / no restriction and `map` /
+    /// `try_map` reject it, so one only arrives through the public
+    /// `values` field. If it were written rather than skipped, a later
+    /// same-level rule — which contract point 1 makes later-rule-wins —
+    /// could erase an earlier rule's real assignment, leaving a policy
+    /// that holds non-zero mappings and yet can only ever answer GLOBAL.
+    /// `can_assign_non_global` would then be wrong about it, and the
+    /// startup diagnostic would fire at a policy that cannot scope.
+    #[test]
+    fn a_zero_mapping_cannot_erase_a_real_assignment() {
+        let mut zeroing = SubnetRule::new("region:", 0);
+        zeroing.values.insert("us".to_string(), 0);
+
+        // Same level, later rule: without the skip this overwrites 3.
+        let policy = SubnetPolicy::new()
+            .add_rule(SubnetRule::new("region:", 0).map("us", 3))
+            .add_rule(zeroing);
+
+        let tags = vec!["region:us".to_string()];
+        assert_eq!(
+            policy.assign_from_rendered_tags(&tags),
+            SubnetId::new(&[3]),
+            "a later rule mapping to the reserved 0 must not zero out an \
+             earlier rule's assignment"
+        );
+        assert!(
+            policy.can_assign_non_global(),
+            "and the predicate must agree — this policy really can scope"
+        );
+    }
+
+    /// The other direction: a rule whose ONLY values are `0` maps
+    /// nothing, so it neither assigns nor reports as able to.
+    #[test]
+    fn a_rule_with_only_zero_values_maps_nothing() {
+        let mut zero_only = SubnetRule::new("region:", 0);
+        zero_only.values.insert("us".to_string(), 0);
+        zero_only.values.insert("eu".to_string(), 0);
+        let policy = SubnetPolicy::new().add_rule(zero_only);
+
+        for tag in ["region:us", "region:eu"] {
+            assert_eq!(
+                policy.assign_from_rendered_tags(&[tag.to_string()]),
+                SubnetId::GLOBAL,
+                "{tag} maps only to the reserved 0, so nothing is assigned"
+            );
+        }
+        assert!(!policy.can_assign_non_global());
     }
 
     #[test]
