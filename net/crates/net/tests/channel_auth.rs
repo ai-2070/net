@@ -654,6 +654,108 @@ async fn queue_group_join_requires_a_grant_for_that_group() {
     );
 }
 
+/// `QueueGroupPolicy::Deny` must hold on a channel that has NO other
+/// gate — which is the shape it is most likely to be reached for.
+///
+/// `authorize_subscribe` short-circuits open channels before evaluating
+/// policy, and that test used to read only the cap filters and
+/// `require_token`. `Deny` needs neither: it is meaningful on a plainly
+/// open channel, and it is exactly there that the short-circuit returned
+/// "accepted" before the policy was consulted, making the setting a
+/// silent no-op.
+///
+/// Driven through the real subscribe path rather than
+/// `can_join_queue_group` directly — the unit test on that function
+/// passed throughout, because it never reached the short-circuit.
+#[tokio::test]
+async fn queue_group_deny_holds_on_a_channel_with_no_other_gates() {
+    use net::adapter::net::QueueGroupPolicy;
+
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
+
+    // No cap filters, no token roots, no `require_token`. The policy is
+    // the only thing standing between B and the group.
+    let name = ChannelName::new("work/broadcast-only").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_queue_group_policy(QueueGroupPolicy::Deny),
+    );
+
+    let result = b
+        .mesh
+        .subscribe_channel_in_queue_group(a.mesh.node_id(), name.clone(), "workers".to_string())
+        .await;
+    assert!(
+        result.is_err(),
+        "QueueGroupPolicy::Deny must refuse a queue-group subscribe even when \
+         the channel has no cap filter and no token gate — otherwise the \
+         open-channel short-circuit answers before the policy is read"
+    );
+    assert!(
+        !a.mesh
+            .roster()
+            .is_subscribed(b.mesh.node_id(), &ChannelId::new(name.clone())),
+        "a refused queue-group join must not be left in the roster, or it \
+         keeps consuming that group's selections"
+    );
+
+    // The policy restricts group membership, not the channel: a
+    // broadcast subscriber is unaffected and keeps the cheap path.
+    b.mesh
+        .subscribe_channel(a.mesh.node_id(), name)
+        .await
+        .expect("Deny governs queue groups only — broadcast must still work");
+}
+
+/// The same bypass, reached the other way: a peer whose entity the
+/// publisher has not pinned.
+///
+/// Widening the open-channel short-circuit is not enough on its own. On
+/// a channel with no `require_token`, an unpinned peer takes a separate
+/// early return that runs the capability match against a dummy identity
+/// — a path that answers "do your caps fit?" and never asks the
+/// queue-group question at all. `Deny` admits nobody and `TokenBound`
+/// needs a chain bound to a real AEAD-verified entity, so an unpinned
+/// peer must be refused on both.
+#[tokio::test]
+async fn queue_group_deny_holds_for_an_unpinned_peer() {
+    use net::adapter::net::QueueGroupPolicy;
+
+    // Deliberately NOT `setup_pair`: no announcement, so A never pins
+    // B's entity.
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake_no_start(&a.mesh, &b.mesh).await;
+    a.mesh.start();
+    b.mesh.start();
+
+    let name = ChannelName::new("work/unpinned").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_queue_group_policy(QueueGroupPolicy::Deny),
+    );
+    assert!(
+        a.mesh.peer_entity_id(b.mesh.node_id()).is_none(),
+        "harness precondition: B must be unpinned on A"
+    );
+
+    let result = b
+        .mesh
+        .subscribe_channel_in_queue_group(a.mesh.node_id(), name.clone(), "workers".to_string())
+        .await;
+    assert!(
+        result.is_err(),
+        "an unpinned peer must not slip past a restricted queue-group policy \
+         via the cap-only early return"
+    );
+    assert!(
+        !a.mesh
+            .roster()
+            .is_subscribed(b.mesh.node_id(), &ChannelId::new(name)),
+        "a refused queue-group join must not be left in the roster"
+    );
+}
+
 #[tokio::test]
 async fn tampered_announcement_signature_rejected() {
     use net::adapter::net::behavior::capability::CapabilityAnnouncement;

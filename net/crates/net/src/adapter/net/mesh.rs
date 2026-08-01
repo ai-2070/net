@@ -24035,11 +24035,29 @@ impl MeshNode {
         // treated as "no credential presented" (rejected by the gate).
         let presented_chain = token_bytes.and_then(|bytes| TokenChain::from_bytes(bytes).ok());
 
-        // Whether any cap / token gate is in play. A fully open
-        // channel (no filters, no require_token) short-circuits
-        // without needing a peer entity_id at all.
-        let has_auth_gates =
-            cfg.publish_caps.is_some() || cfg.subscribe_caps.is_some() || cfg.token_required();
+        // Does this request need a gate evaluated at all? A fully open
+        // channel short-circuits without needing a peer entity_id.
+        //
+        // `queue_group_policy` is part of that test, not just the cap
+        // and token filters. A restricted policy is frequently the ONLY
+        // gate on an otherwise-open channel — `Deny` needs no roots, no
+        // caps and no `require_token` to be meaningful — so without it
+        // here the short-circuit returned `(true, None)` before the
+        // policy below was ever consulted, and `Deny` was a silent
+        // no-op. It is the same hazard the origin binding is hoisted
+        // above this point to escape; this one is answered by widening
+        // the test instead, because `TokenBound` needs the peer
+        // identity that is only resolved further down.
+        //
+        // Conditioned on the peer actually ASKING for a group. A
+        // broadcast subscriber on a queue-group-restricted channel is
+        // unaffected by the policy and keeps the cheap path.
+        let queue_group_gated =
+            queue_group.is_some() && cfg.queue_group_policy != QueueGroupPolicy::Unrestricted;
+        let has_auth_gates = cfg.publish_caps.is_some()
+            || cfg.subscribe_caps.is_some()
+            || cfg.token_required()
+            || queue_group_gated;
         if !has_auth_gates {
             return (true, None);
         }
@@ -24087,6 +24105,17 @@ impl MeshNode {
             .map(|e| e.value().clone())
         else {
             if cfg.token_required() {
+                return (false, Some(AckReason::Unauthorized));
+            }
+            // A restricted queue-group policy cannot be satisfied by a
+            // peer we have not pinned, whichever policy it is: `Deny`
+            // admits nobody, and `TokenBound` needs a chain whose leaf
+            // binds to an AEAD-verified entity, which is precisely what
+            // is missing here. Falling through to the cap-only path
+            // below would answer a different question with a dummy id
+            // and admit the join — the second way `Deny` could be
+            // bypassed on a channel with no other gates.
+            if queue_group_gated {
                 return (false, Some(AckReason::Unauthorized));
             }
             // Cap-filter-only mode without a known entity — run the
