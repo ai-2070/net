@@ -4141,13 +4141,13 @@ mod tests {
         use super::super::fold::capability_bridge::scope_from_membership_tags;
 
         let tag_sets: Vec<Vec<String>> = vec![
-            vec![],                                          // Global
-            vec!["scope:global".into()],                     // Global (explicit)
-            vec!["gpu".into(), "hardware.gpu".into()],       // Global + noise
-            vec!["scope:subnet-local".into()],               // SubnetLocal
+            vec![],                                    // Global
+            vec!["scope:global".into()],               // Global (explicit)
+            vec!["gpu".into(), "hardware.gpu".into()], // Global + noise
+            vec!["scope:subnet-local".into()],         // SubnetLocal
             vec![
                 "scope:subnet-local".into(),
-                "scope:tenant:oem-123".into(),               // strictest wins
+                "scope:tenant:oem-123".into(), // strictest wins
             ],
             vec!["scope:tenant:oem-123".into()],
             vec![
@@ -4155,15 +4155,12 @@ mod tests {
                 "scope:tenant:corp-acme".into(),
             ],
             vec!["scope:region:eu-west".into()],
-            vec![
-                "scope:region:eu-west".into(),
-                "scope:region:us-east".into(),
-            ],
+            vec!["scope:region:eu-west".into(), "scope:region:us-east".into()],
             vec![
                 "scope:tenant:oem-123".into(),
-                "scope:region:eu-west".into(),               // TenantsAndRegions
+                "scope:region:eu-west".into(), // TenantsAndRegions
             ],
-            vec!["scope:tenant:".into()],                    // empty id → not a scope
+            vec!["scope:tenant:".into()], // empty id → not a scope
             vec!["scope:region:".into()],
         ];
         let tenants_multi = ["oem-123", "other"];
@@ -4301,9 +4298,8 @@ mod tests {
             CapabilitySet::new().with_region_scope(""),
         ] {
             let rendered: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
-            let resolved = super::super::fold::capability_bridge::scope_from_membership_tags(
-                &rendered,
-            );
+            let resolved =
+                super::super::fold::capability_bridge::scope_from_membership_tags(&rendered);
             assert_eq!(
                 resolved,
                 CapabilityScope::Global,

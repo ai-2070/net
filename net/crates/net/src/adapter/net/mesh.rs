@@ -36440,10 +36440,10 @@ mod subnet_visible_unknown_tests {
         let scoped = SubnetId::new(&[3, 7]);
         let cases = [
             // (subnet, policy_can_scope, should_warn)
-            (SubnetId::GLOBAL, true, true), // the misconfiguration
+            (SubnetId::GLOBAL, true, true),   // the misconfiguration
             (SubnetId::GLOBAL, false, false), // flat mesh, intended
-            (scoped, true, false),          // subnet-aware, intended
-            (scoped, false, false),         // scoped but no peer resolution
+            (scoped, true, false),            // subnet-aware, intended
+            (scoped, false, false),           // scoped but no peer resolution
         ];
         for (subnet, policy_can_scope, should_warn) in cases {
             assert_eq!(
@@ -36560,11 +36560,7 @@ mod subnet_visible_unknown_tests {
             Visibility::ParentVisible
         ));
         // Global ignores subnets entirely, including unknown ones.
-        assert!(MeshNode::subnet_visible(
-            child,
-            None,
-            Visibility::Global
-        ));
+        assert!(MeshNode::subnet_visible(child, None, Visibility::Global));
         // Exported is unconditionally closed here.
         assert!(!MeshNode::subnet_visible(
             child,

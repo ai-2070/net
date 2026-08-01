@@ -4145,10 +4145,7 @@ mod tests {
             for case in cases {
                 let label = case.kind.clone();
                 assert!(
-                    matches!(
-                        scope_filter_from_json(case),
-                        Err(NetError::InvalidArgument)
-                    ),
+                    matches!(scope_filter_from_json(case), Err(NetError::InvalidArgument)),
                     "kind {label:?} with an unusable selector must be \
                      InvalidArgument, not a silent widen to Any"
                 );

@@ -2051,17 +2051,13 @@ mod tests {
         legacy.require_tags.push("gpu".into());
 
         let seen = std::cell::RefCell::new(Vec::new());
-        let nodes = find_nodes_matching_scoped(
-            &fold,
-            &legacy,
-            &ScopeFilter::SameSubnet,
-            |nid, tags| {
+        let nodes =
+            find_nodes_matching_scoped(&fold, &legacy, &ScopeFilter::SameSubnet, |nid, tags| {
                 seen.borrow_mut().push((nid, tags.to_vec()));
                 // Admit on a tag the closure could only know by having
                 // been handed the selected entry's payload.
                 tags.iter().any(|t| t == "region:eu")
-            },
-        );
+            });
 
         assert_eq!(nodes, vec![0xCC]);
         let seen = seen.into_inner();
