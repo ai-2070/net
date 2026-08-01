@@ -413,7 +413,13 @@ fn handle_is_valid(handle: *const NetHandle) -> bool {
 }
 
 /// Error codes returned by FFI functions.
+///
+/// `Copy` because it is a fieldless `#[repr(C)]` enum that is passed by
+/// value everywhere already; having it lets the header-parity guard read
+/// each variant's discriminant from a slice without rebuilding the
+/// variant by hand.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub enum NetError {
     /// Success (no error).
     Success = 0,
@@ -2327,12 +2333,66 @@ mod tests {
         let primary = include_str!("../../include/net.h");
         let go_copy = include_str!("../../include/net.go.h");
 
-        // The Rust enum's full set of values (mirrors `pub enum
-        // NetError` above). When a new variant is added in the
-        // Rust source, this list — AND both headers — must be
-        // updated together. The asserts that follow then catch a
-        // missing header update at the next CI run.
-        let rust_values: &[i32] = &[0, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -99];
+        // The Rust enum's full set of values, derived from the variants
+        // rather than transcribed.
+        //
+        // This used to be a hand-written `&[i32]`, and it drifted
+        // exactly as you would expect: `InvalidArgument = -12` was added
+        // to the enum and to both headers, but not here — so the guard
+        // silently stopped covering the newest code. A header could have
+        // dropped `NET_ERR_INVALID_ARGUMENT` and CI would have passed.
+        //
+        // `variant_value` below is an exhaustive match with no wildcard
+        // arm, so adding a variant to `NetError` now fails to compile
+        // until it is handled — and the compile error lands two lines
+        // from the `ALL` array that also needs it, instead of nowhere at
+        // all.
+        fn variant_value(e: &NetError) -> i32 {
+            match e {
+                NetError::Success => 0,
+                NetError::NullPointer => -1,
+                NetError::InvalidUtf8 => -2,
+                NetError::InvalidJson => -3,
+                NetError::InitFailed => -4,
+                NetError::IngestionFailed => -5,
+                NetError::PollFailed => -6,
+                NetError::BufferTooSmall => -7,
+                NetError::ShuttingDown => -8,
+                NetError::IntOverflow => -9,
+                NetError::MismatchedHandles => -10,
+                NetError::InteriorNul => -11,
+                NetError::InvalidArgument => -12,
+                NetError::Unknown => -99,
+            }
+        }
+        const ALL: &[NetError] = &[
+            NetError::Success,
+            NetError::NullPointer,
+            NetError::InvalidUtf8,
+            NetError::InvalidJson,
+            NetError::InitFailed,
+            NetError::IngestionFailed,
+            NetError::PollFailed,
+            NetError::BufferTooSmall,
+            NetError::ShuttingDown,
+            NetError::IntOverflow,
+            NetError::MismatchedHandles,
+            NetError::InteriorNul,
+            NetError::InvalidArgument,
+            NetError::Unknown,
+        ];
+        // The `#[repr(C)]` discriminant is what the headers mirror, so
+        // that is the contract — read it rather than trusting the match
+        // arms above to have been transcribed correctly.
+        for &e in ALL {
+            assert_eq!(
+                variant_value(&e),
+                c_int::from(e),
+                "variant_value disagrees with the #[repr(C)] discriminant"
+            );
+        }
+        let rust_values: Vec<i32> = ALL.iter().map(variant_value).collect();
+        let rust_values: &[i32] = &rust_values;
 
         // Pull every numeric literal that looks like an enum-value
         // assignment (`= <number>` followed by `,` or whitespace).
