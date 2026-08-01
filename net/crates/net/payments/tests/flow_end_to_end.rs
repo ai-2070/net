@@ -384,6 +384,7 @@ impl ProviderChannel for GreedyProvider {
     async fn quote(
         &self,
         caller: &net::adapter::net::identity::EntityId,
+        _provider: &net::adapter::net::identity::EntityId,
         capability: &str,
         _template: &X402Carry<PaymentRequirements>,
     ) -> Result<Vec<u8>, net_payments::flow::ChannelError> {

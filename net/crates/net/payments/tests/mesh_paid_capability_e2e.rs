@@ -278,10 +278,10 @@ async fn a_paid_capability_serves_once_and_only_once_across_the_mesh() {
     let caller_keys = Arc::new(EntityKeypair::generate());
     let spend_path = dir.path().join("spend-policy.json");
     let flow = CallerPaymentFlow::new(
-        caller_keys,
+        caller_keys.clone(),
         SpendPolicyEngine::new(&spend_path, SpendProfile::DevTest),
         registry,
-        Arc::new(MeshPaymentChannel::new(caller_mesh.clone())),
+        Arc::new(MeshPaymentChannel::new(caller_mesh.clone(), caller_keys, clock.clone())),
         clock,
     );
 

@@ -423,9 +423,16 @@ impl PayResponse {
 /// byte-preservation discipline holds across the channel).
 #[async_trait::async_trait]
 pub trait ProviderChannel: Send + Sync {
+    /// Request a quote.
+    ///
+    /// `provider` is the identity the caller *intends* to pay, taken from
+    /// the announced pricing terms. It is not decoration: the mesh
+    /// channel binds it into the signed quote request, which is what
+    /// stops a captured request being replayed to a different provider.
     async fn quote(
         &self,
         caller: &EntityId,
+        provider: &EntityId,
         capability: &str,
         template: &X402Carry<PaymentRequirements>,
     ) -> Result<Vec<u8>, ChannelError>;
@@ -468,6 +475,18 @@ impl InProcessProvider {
         self.required_tier = tier;
         self
     }
+
+    /// The provider identity quotes are signed with — the destination a
+    /// `net.payment.quote_request@1` must be addressed to.
+    pub fn provider_id(&self) -> &EntityId {
+        self.engine.provider_id()
+    }
+
+    /// The flow's clock, so a wire handler stamps freshness from the same
+    /// source the lifecycle does.
+    pub fn now_ns(&self) -> u64 {
+        self.clock.now_ns()
+    }
 }
 
 #[async_trait::async_trait]
@@ -475,9 +494,22 @@ impl ProviderChannel for InProcessProvider {
     async fn quote(
         &self,
         caller: &EntityId,
+        provider: &EntityId,
         capability: &str,
         template: &X402Carry<PaymentRequirements>,
     ) -> Result<Vec<u8>, ChannelError> {
+        // In-process there is no wire, so no signed request and nothing to
+        // forge — the caller identity is passed by the same process that
+        // owns it, and this channel cannot misrepresent its own engine.
+        //
+        // Deliberately NOT re-checked against `self.engine.provider_id()`
+        // here: the flow already compares the *signed quote's* provider
+        // against the announced terms, which is the security-relevant
+        // check (it catches a provider that signs a quote naming someone
+        // else, which an engine-identity comparison cannot). Duplicating
+        // it here only short-circuits that path and reclassifies a policy
+        // `Denied` as a transport `Failed`.
+        let _ = provider;
         // Provider policy runs inside issue_quote — never quote a caller
         // you'd deny.
         let quote = self
@@ -644,7 +676,12 @@ impl CallerPaymentFlow {
                         let _ = self.spend.clear_approval(&held_id).await;
                         match self
                             .provider
-                            .quote(self.caller.entity_id(), capability, template)
+                            .quote(
+                                self.caller.entity_id(),
+                                &terms.provider,
+                                capability,
+                                template,
+                            )
                             .await
                         {
                             Ok(b) => b,
@@ -661,7 +698,12 @@ impl CallerPaymentFlow {
             Ok(None) => {
                 match self
                     .provider
-                    .quote(self.caller.entity_id(), capability, template)
+                    .quote(
+                        self.caller.entity_id(),
+                        &terms.provider,
+                        capability,
+                        template,
+                    )
                     .await
                 {
                     Ok(b) => b,

@@ -20,15 +20,28 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use net::adapter::net::identity::EntityId;
+use net::adapter::net::identity::{EntityId, EntityKeypair};
 use net_sdk::mesh::Mesh;
 use net_sdk::mesh_rpc::{Codec, RpcError, ServeError, ServeHandle};
 use serde::{Deserialize, Serialize};
 
-use super::{ChannelError, InProcessProvider, PayResponse, ProviderChannel};
+use super::{ChannelError, Clock, InProcessProvider, PayResponse, ProviderChannel};
+use crate::core::canonical::SignedEnvelope as _;
+use crate::core::quote_request::{QuoteRequest, SeenNonces};
 use crate::x402::payload::PaymentPayload;
 use crate::x402::requirements::PaymentRequirements;
 use crate::x402::X402Carry;
+
+/// How long a signed quote request stays valid. Short: it is a bearer
+/// credential inside its window, and a quote round trip does not need
+/// more. Clamped by `MAX_REQUEST_LIFETIME_NS` regardless.
+const QUOTE_REQUEST_TTL_NS: u64 = 30_000_000_000;
+
+/// Clock-skew tolerance the provider allows on a request's freshness
+/// window. There is no global clock, so some tolerance is required; it is
+/// deliberately much smaller than the TTL so it widens the replay window
+/// only marginally.
+const QUOTE_REQUEST_SKEW_NS: u64 = 5_000_000_000;
 
 /// Quote-issuance service name (nRPC; channel-safe, so `.v1` not `@1`).
 pub const QUOTE_SERVICE: &str = "net.payments.quote.v1";
@@ -37,8 +50,23 @@ pub const PAY_SERVICE: &str = "net.payments.pay.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QuoteWireRequest {
-    caller_hex: String,
-    capability: String,
+    /// Canonical bytes of the caller-signed `net.payment.quote_request@1`,
+    /// base64.
+    ///
+    /// This replaced a bare `caller_hex` field. An `EntityId` is a public
+    /// key, so a self-asserted one proves nothing: naming an admitted
+    /// caller cleared provider admission, and naming a victim put their
+    /// identity on the provider's signed billing event. The envelope
+    /// carries the same identity plus a signature over it, bound to this
+    /// provider, capability, template and a freshness window.
+    request_b64: String,
+    /// The announced template's preserved bytes, base64.
+    ///
+    /// Carried beside the envelope rather than inside it because the
+    /// envelope binds them by hash: `verify` recomputes it, so substituted
+    /// bytes are refused. Keeping them out of the signed transcript means
+    /// the signature stays small and the preserved bytes stay preserved —
+    /// they never round-trip through a second encoder.
     template_b64: String,
 }
 
@@ -68,18 +96,55 @@ pub fn serve_payments(
     provider: Arc<InProcessProvider>,
 ) -> Result<PaymentServeHandle, ServeError> {
     let quote_provider = provider.clone();
+    // Replay guard for quote-request nonces, shared across the service.
+    // In-process by design: a replayed request costs a duplicate quote and
+    // nothing else (quotes are free, and paying one still needs the
+    // caller's settlement authorization), so this does not earn a place in
+    // the locked store on the path of every quote. The guard that must be
+    // durable is the one on payment, and that one is.
+    let seen: Arc<parking_lot::Mutex<SeenNonces>> =
+        Arc::new(parking_lot::Mutex::new(SeenNonces::new()));
     let quote =
         mesh.serve_rpc_typed(QUOTE_SERVICE, Codec::Json, move |req: QuoteWireRequest| {
             let provider = quote_provider.clone();
+            let seen = seen.clone();
             async move {
-                let caller = decode_entity(&req.caller_hex)?;
+                let request_bytes = BASE64
+                    .decode(&req.request_b64)
+                    .map_err(|e| format!("quote request is not base64: {e}"))?;
+                // Decode only to learn which template and capability the
+                // request claims; NOTHING is trusted until `verify` below
+                // checks the signature over exactly these fields.
+                let claimed: QuoteRequest = serde_json::from_slice(&request_bytes)
+                    .map_err(|e| format!("quote request is not a valid envelope: {e}"))?;
                 let template_bytes = BASE64
                     .decode(&req.template_b64)
                     .map_err(|e| format!("template is not base64: {e}"))?;
                 let template: X402Carry<PaymentRequirements> =
-                    X402Carry::from_bytes(template_bytes).map_err(|e| e.to_string())?;
+                    X402Carry::from_bytes(template_bytes.clone()).map_err(|e| e.to_string())?;
+
+                let now_ns = provider.now_ns();
+                let verified = QuoteRequest::verify(
+                    &request_bytes,
+                    provider.provider_id(),
+                    &claimed.capability,
+                    &template_bytes,
+                    now_ns,
+                    QUOTE_REQUEST_SKEW_NS,
+                )
+                .map_err(|e| e.to_string())?;
+                seen.lock()
+                    .admit(&verified.nonce, verified.expires_at_ns, now_ns)
+                    .map_err(|e| e.to_string())?;
+
+                // From here the caller identity is proven, not claimed.
                 let quote_bytes = provider
-                    .quote(&caller, &req.capability, &template)
+                    .quote(
+                        &verified.caller,
+                        provider.provider_id(),
+                        &verified.capability,
+                        &template,
+                    )
                     .await
                     .map_err(|e| e.message)?;
                 Ok(QuoteWireResponse {
@@ -113,14 +178,6 @@ pub fn serve_payments(
     })
 }
 
-fn decode_entity(hex_str: &str) -> Result<EntityId, String> {
-    let bytes: [u8; 32] = hex::decode(hex_str)
-        .map_err(|e| format!("caller id is not hex: {e}"))?
-        .try_into()
-        .map_err(|_| "caller id must be 32 bytes".to_string())?;
-    Ok(EntityId::from_bytes(bytes))
-}
-
 /// The caller side of the payment wire: a [`ProviderChannel`] that
 /// resolves the provider node from the capability id's provider segment
 /// (`<node_id>/<capability>`, decimal or `0x`-hex — the same spellings
@@ -131,11 +188,32 @@ fn decode_entity(hex_str: &str) -> Result<EntityId, String> {
 /// binding (correctly, but pointlessly).
 pub struct MeshPaymentChannel {
     mesh: Arc<Mesh>,
+    /// The caller identity, needed to **sign** each quote request.
+    ///
+    /// The channel holds the keypair rather than taking an `EntityId`
+    /// because a quote request is a signed envelope now: the identity a
+    /// request names is only worth something if the requester proves it
+    /// holds the key. A public-only keypair therefore cannot request
+    /// quotes over the mesh at all, and fails loudly at `quote` rather
+    /// than sending an unsigned request that the provider would refuse.
+    caller: Arc<EntityKeypair>,
+    /// Timestamps the request's freshness window.
+    ///
+    /// There is no global clock in this crate, and a quote request is
+    /// checked against the *provider's* clock — so the caller must stamp
+    /// from the same source the rest of the flow does, or every request
+    /// looks like it was issued in the future. Tests inject a fixed
+    /// instant on both sides; production uses `SystemClock` on both.
+    clock: Arc<dyn Clock>,
 }
 
 impl MeshPaymentChannel {
-    pub fn new(mesh: Arc<Mesh>) -> Self {
-        Self { mesh }
+    pub fn new(mesh: Arc<Mesh>, caller: Arc<EntityKeypair>, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            mesh,
+            caller,
+            clock,
+        }
     }
 
     fn provider_node(capability: &str) -> Result<u64, ChannelError> {
@@ -168,18 +246,51 @@ impl ProviderChannel for MeshPaymentChannel {
     async fn quote(
         &self,
         caller: &EntityId,
+        provider: &EntityId,
         capability: &str,
         template: &X402Carry<PaymentRequirements>,
     ) -> Result<Vec<u8>, ChannelError> {
+        // The flow's caller and this channel's signing identity must be
+        // the same, or the request would name one identity and be signed
+        // by another — which the provider refuses. Catch it here, where
+        // the message can say what is actually wrong.
+        if caller != self.caller.entity_id() {
+            return Err(ChannelError {
+                message: "the flow's caller identity does not match this channel's signing                           identity — a quote request must be signed by the identity it names"
+                    .to_string(),
+                retryable: false,
+            });
+        }
         let node = Self::provider_node(capability)?;
+        let now_ns = self.clock.now_ns();
+        let nonce =
+            QuoteRequest::derive_nonce(caller, capability, template.bytes(), now_ns);
+        let mut request = QuoteRequest::new(
+            provider.clone(),
+            caller.clone(),
+            capability,
+            template.bytes(),
+            now_ns,
+            QUOTE_REQUEST_TTL_NS,
+            nonce,
+        );
+        request.sign_with(&self.caller).map_err(|e| ChannelError {
+            message: format!("signing the quote request: {e}"),
+            retryable: false,
+        })?;
+        let request_bytes =
+            crate::core::canonical::canonical_bytes(&request).map_err(|e| ChannelError {
+                message: e.to_string(),
+                retryable: false,
+            })?;
+
         let response: QuoteWireResponse = self
             .mesh
             .call_typed(
                 node,
                 QUOTE_SERVICE,
                 &QuoteWireRequest {
-                    caller_hex: hex::encode(caller.as_bytes()),
-                    capability: capability.to_string(),
+                    request_b64: BASE64.encode(request_bytes),
                     template_b64: BASE64.encode(template.bytes()),
                 },
                 Default::default(),

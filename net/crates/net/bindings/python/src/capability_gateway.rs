@@ -671,12 +671,16 @@ fn build_payment_flow(
     let registry = net_payments::core::registry::default_registry_v1(caller.entity_id().clone());
     let spend = SpendPolicyEngine::new(&config.policy_path, profile)
         .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
+    // One clock for both halves: the channel stamps each signed quote
+    // request's freshness window and the provider checks it, so a
+    // divergent clock would make every request look future-dated.
+    let clock: Arc<dyn net_payments::flow::Clock> = Arc::new(SystemClock);
     let mut flow = CallerPaymentFlow::new(
-        caller,
+        caller.clone(),
         spend,
         registry,
-        Arc::new(MeshPaymentChannel::new(mesh)),
-        Arc::new(SystemClock),
+        Arc::new(MeshPaymentChannel::new(mesh, caller, clock.clone())),
+        clock,
     );
     if let Some((address, callable)) = config.signer {
         flow = flow.with_signer("eip155", python_external_signer(address, callable));

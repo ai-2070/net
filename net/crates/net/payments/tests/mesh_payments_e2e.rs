@@ -113,10 +113,10 @@ async fn the_paid_lifecycle_crosses_the_wire() {
     let caller_keys = Arc::new(EntityKeypair::generate());
     let spend_path = dir.path().join("spend-policy.json");
     let flow = CallerPaymentFlow::new(
-        caller_keys,
+        caller_keys.clone(),
         SpendPolicyEngine::new(&spend_path, SpendProfile::DevTest),
         registry,
-        Arc::new(MeshPaymentChannel::new(Arc::new(caller_mesh))),
+        Arc::new(MeshPaymentChannel::new(Arc::new(caller_mesh), caller_keys, clock.clone())),
         clock,
     );
 
@@ -178,5 +178,233 @@ async fn the_paid_lifecycle_crosses_the_wire() {
         provider_log.read_all().await.unwrap().len(),
         2,
         "exactly one new charge"
+    );
+}
+
+
+// ---------------------------------------------------------------------
+// H1: the caller identity on a quote request is proven, not claimed
+// ---------------------------------------------------------------------
+
+/// The wire shape of a quote request, mirrored here on purpose.
+///
+/// `QuoteWireRequest` is private to the flow, so these tests re-declare
+/// it — which makes them a check on the *wire contract* rather than on an
+/// internal type, and lets them send requests the real channel would
+/// never build.
+#[derive(serde::Serialize)]
+struct QuoteWire {
+    request_b64: String,
+    template_b64: String,
+}
+
+#[derive(serde::Deserialize)]
+struct QuoteWireReply {
+    #[allow(dead_code)]
+    quote_b64: String,
+}
+
+/// A provider serving the payment wire, plus everything needed to hand-
+/// build a quote request at it.
+struct World {
+    caller_mesh: Arc<Mesh>,
+    provider_node: u64,
+    provider_id: net::adapter::net::identity::EntityId,
+    capability: String,
+    template: X402Carry<PaymentRequirements>,
+    clock: Arc<dyn Clock>,
+    _serving: net_payments::flow::mesh::PaymentServeHandle,
+    _dir: tempfile::TempDir,
+}
+
+impl World {
+    async fn start() -> Self {
+        let psk = [0x42u8; 32];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock: Arc<dyn Clock> = Arc::new(TestClock(std::sync::atomic::AtomicU64::new(
+            1_000_000_000_000_000,
+        )));
+        let provider_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
+            .expect("builder")
+            .build()
+            .await
+            .expect("provider mesh");
+        let caller_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
+            .expect("builder")
+            .build()
+            .await
+            .expect("caller mesh");
+        handshake(&provider_mesh, &caller_mesh).await;
+
+        let provider_keys = Arc::new(EntityKeypair::generate());
+        let registry = default_mock_registry(provider_keys.entity_id().clone());
+        let engine = Arc::new(
+            PaymentEngine::new(
+                provider_keys.clone(),
+                Arc::new(MockFacilitator::new()),
+                Arc::new(AdmitAll),
+                registry,
+                dir.path().join("engine.json"),
+            )
+            .expect("engine"),
+        );
+        let in_process = Arc::new(InProcessProvider::new(engine, clock.clone()));
+        let serving = serve_payments(&provider_mesh, in_process).expect("serve payments");
+        let capability = format!("{}/fixture-tool", provider_mesh.inner().node_id());
+        let template = X402Carry::author(&PaymentRequirements {
+            scheme: MOCK_SCHEME.into(),
+            network: MOCK_NETWORK.into(),
+            amount: "2500".into(),
+            asset: "musd".into(),
+            pay_to: "mock-provider-settle-addr".into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .expect("author");
+
+        Self {
+            provider_node: provider_mesh.inner().node_id(),
+            provider_id: provider_keys.entity_id().clone(),
+            caller_mesh: Arc::new(caller_mesh),
+            capability,
+            template,
+            clock,
+            _serving: serving,
+            _dir: dir,
+        }
+    }
+
+    /// Send a hand-built quote request over the real wire.
+    async fn request_quote(
+        &self,
+        request: &net_payments::core::quote_request::QuoteRequest,
+    ) -> Result<(), String> {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        let bytes = canonical_bytes(request).expect("canonical");
+        let reply: Result<QuoteWireReply, _> = self
+            .caller_mesh
+            .call_typed(
+                self.provider_node,
+                "net.payments.quote.v1",
+                &QuoteWire {
+                    request_b64: BASE64.encode(bytes),
+                    template_b64: BASE64.encode(self.template.bytes()),
+                },
+                Default::default(),
+            )
+            .await;
+        reply.map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+/// A forged quote request — naming a victim the attacker holds no key
+/// for — is refused over the real wire.
+///
+/// This is the finding the signed request exists for. The service used to
+/// take the caller identity from a body field, and `EntityId` is a public
+/// key, so naming an admitted caller cleared provider admission and
+/// naming a victim put their identity on the provider's signed billing
+/// event. `RpcContext::caller_origin` could not fix it: it is routing
+/// metadata carried on the packet header, so comparing it against a body
+/// field compares two claims from the same untrusted source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_caller_identity_is_refused_over_the_wire() {
+    use net_payments::core::quote_request::QuoteRequest;
+
+    let w = World::start().await;
+
+    let victim = EntityKeypair::generate();
+    let attacker = EntityKeypair::generate();
+    let now_ns = w.clock.now_ns();
+
+    // The attacker builds a request naming the victim and signs it with
+    // its own key — the exact impersonation the old wire permitted.
+    let mut forged = QuoteRequest::new(
+        w.provider_id.clone(),
+        victim.entity_id().clone(),
+        &w.capability,
+        w.template.bytes(),
+        now_ns,
+        30_000_000_000,
+        "forged-nonce",
+    );
+    let payload = net_payments::core::canonical::signed_payload_bytes(&forged).expect("payload");
+    let sig = attacker.try_sign(&payload).expect("sign");
+    forged.signature = Some(net_payments::core::canonical::SignatureHex(sig.to_bytes()));
+
+    let refusal = w.request_quote(&forged).await;
+    assert!(
+        refusal.is_err(),
+        "a request signed by anyone but the identity it names must be refused"
+    );
+
+    // And the honest path still works, so the refusal is the signature
+    // check rather than the wire being broken.
+    let mut honest = QuoteRequest::new(
+        w.provider_id.clone(),
+        victim.entity_id().clone(),
+        &w.capability,
+        w.template.bytes(),
+        w.clock.now_ns(),
+        30_000_000_000,
+        "honest-nonce",
+    );
+    honest.sign_with(&victim).expect("sign");
+    assert!(
+        w.request_quote(&honest).await.is_ok(),
+        "the identity that holds the key still gets a quote"
+    );
+}
+
+/// A verified request cannot be replayed: the nonce is remembered for as
+/// long as the request remains presentable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_quote_request_is_refused() {
+    use net_payments::core::quote_request::QuoteRequest;
+
+    let w = World::start().await;
+    let caller = EntityKeypair::generate();
+    let mut request = QuoteRequest::new(
+        w.provider_id.clone(),
+        caller.entity_id().clone(),
+        &w.capability,
+        w.template.bytes(),
+        w.clock.now_ns(),
+        30_000_000_000,
+        "replay-me",
+    );
+    request.sign_with(&caller).expect("sign");
+
+    assert!(w.request_quote(&request).await.is_ok(), "first use");
+    assert!(
+        w.request_quote(&request).await.is_err(),
+        "the same signed request must not be presentable twice"
+    );
+}
+
+/// A request signed for one provider cannot be relayed to another, even
+/// though it is perfectly well signed — the destination bind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_for_another_provider_is_refused() {
+    use net_payments::core::quote_request::QuoteRequest;
+
+    let w = World::start().await;
+    let caller = EntityKeypair::generate();
+    let elsewhere = EntityKeypair::generate().entity_id().clone();
+
+    let mut request = QuoteRequest::new(
+        elsewhere,
+        caller.entity_id().clone(),
+        &w.capability,
+        w.template.bytes(),
+        w.clock.now_ns(),
+        30_000_000_000,
+        "wrong-destination",
+    );
+    request.sign_with(&caller).expect("sign");
+    assert!(
+        w.request_quote(&request).await.is_err(),
+        "a request addressed to another provider must be refused"
     );
 }

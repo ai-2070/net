@@ -16,6 +16,12 @@ pub const TAG_PRICING_TERMS: &str = "net.pricing.terms@1";
 /// `net.payment.quote@1` — provider-identity-signed envelope over
 /// instantiated x402 PaymentRequirements + capability binding.
 pub const TAG_PAYMENT_QUOTE: &str = "net.payment.quote@1";
+/// `net.payment.quote_request@1` — the **caller**-signed request for a
+/// quote. The demand-side counterpart of the quote: it proves the
+/// requester holds the identity it names, which is what makes provider
+/// admission and billing attribution mean anything. See
+/// [`crate::core::quote_request`].
+pub const TAG_QUOTE_REQUEST: &str = "net.payment.quote_request@1";
 /// `net.settlement.ref@1` — wraps the x402 settlement response + tx hash.
 pub const TAG_SETTLEMENT_REF: &str = "net.settlement.ref@1";
 /// `net.payment.verification@1` — tiered, chained, immutable.

@@ -80,10 +80,11 @@ impl ProviderChannel for ForgedBillingProvider {
     async fn quote(
         &self,
         caller: &net::adapter::net::identity::EntityId,
+        provider: &net::adapter::net::identity::EntityId,
         capability: &str,
         template: &X402Carry<PaymentRequirements>,
     ) -> Result<Vec<u8>, net_payments::flow::ChannelError> {
-        self.inner.quote(caller, capability, template).await
+        self.inner.quote(caller, provider, capability, template).await
     }
 
     async fn pay(

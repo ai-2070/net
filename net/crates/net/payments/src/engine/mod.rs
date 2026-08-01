@@ -2046,6 +2046,12 @@ impl PaymentEngine {
         Ok(removed)
     }
 
+    /// The provider identity this engine signs with — the destination a
+    /// `net.payment.quote_request@1` must be addressed to.
+    pub fn provider_id(&self) -> &EntityId {
+        self.provider.entity_id()
+    }
+
     /// Read-only lifecycle snapshot for gates and tests.
     pub async fn status(&self, quote_id: &str) -> Result<Option<QuoteStatus>, EngineError> {
         let state: EngineState = load_json(&self.state_path).await?;
