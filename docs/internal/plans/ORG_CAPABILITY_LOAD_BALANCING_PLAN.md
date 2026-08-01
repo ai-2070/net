@@ -799,16 +799,40 @@ owner with client lifetime:
 
 ```rust
 struct OrgRoutingState {
-    slots: Mutex<BoundedMap<CapabilityKey, NodeOrgRouteHandle>>,
-    selector: SensedSelectorState,
+    // OLB-2B.3b, IMPLEMENTED. The capability index is an IMMUTABLE snapshot
+    // behind an ArcSwap, rebuilt copy-on-write. The read path is one atomic
+    // load, one map lookup and one Arc clone, and takes NO lock.
+    index: ArcSwap<CapabilityIndex>,
+    // Taken on miss, insert and drop ONLY — never by a warmed read. It guards
+    // the refusal bookkeeping, which is read and written on exactly the miss
+    // path it already delimits.
+    mutate: Mutex<RefusalState>,
     // ownership handle only; no task/timer/reconciler
+
+    // NOT YET IMPLEMENTED — OLB-2B.3c/2B.3d.
+    // selector: SensedSelectorState,
 }
 
 pub struct OrgClient {
     // existing fields
-    routing: Arc<OrgRoutingState>,
+    routing: Arc<OrgRoutingState>,   // OLB-2B.3d
 }
 ```
+
+**Staged ownership.** 2B.3b implements the index, the entries it points at, and
+the refusal bookkeeping — nothing else. A `CapabilityRouteHandle` owns a demand
+set and no route: there is no `OrgRouteSet`, no route-set cell, no scoped pool,
+no candidate, no provider list, no selection and no projection in it, and the
+module deliberately cannot express them. The selector state above is commented
+out for that reason, and `OrgClient` does not hold an `OrgRoutingState` yet —
+what reaches it is `MeshNode::call` in 2B.3d.
+
+An earlier revision of this block sketched
+`slots: Mutex<BoundedMap<CapabilityKey, NodeOrgRouteHandle>>`. That is not what
+was authorized or built: a map behind a lock puts the lock on the READ path,
+which is precisely what the warmed boundary exists to remove. It is corrected
+here rather than annotated, because a normative plan that describes a different
+concurrency architecture from the one in the tree is a defect in the plan.
 
 Semantics:
 
@@ -825,7 +849,8 @@ last node-slot consumer drops   → retire shared slot; node actor remains bound
 
 The actual registration refcount and routing scheduler remain node-global.
 `OrgRoutingState` owns only RAII/route-slot handles and selector nonce state. The
-internal machinery is exactly four operations and stays that way:
+internal machinery is exactly four operations and stays that way (2B.3b
+implements the first; the other three are 2B.3c/2B.3d):
 
 ```text
 maintain candidate set

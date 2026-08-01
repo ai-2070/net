@@ -261,6 +261,101 @@ jobs:
           done
           echo "routing supervisor witnesses: $n passed (min $MIN); all named security witnesses present"
 
+      # OLB-2B.3b: the clone-family routing-state witnesses — the atomic
+      # demand-set acquisition in `behavior::org_routing_registry::tests` and the
+      # capability index / demand lifecycle / refusal policy in
+      # `behavior::org_routing_state::tests`.
+      #
+      # Same reasoning as the two gates above, and the same failure it forecloses:
+      # the broad `--lib` step already runs these, but a filtered run that matches
+      # nothing exits 0, so "the module was renamed, feature-gated or deleted"
+      # would be indistinguishable from "it passed". `org_routing_state` is a NEW
+      # module whose entire consumer is still dark (OLB-2B.3d), which makes it
+      # exactly the kind of file a future cleanup pass deletes as unreachable.
+      #
+      # Both filters are asserted SEPARATELY. A combined floor would let the 36
+      # registry witnesses cover the disappearance of the whole state module.
+      #
+      # NOTE: `#[cfg(test)]`, NOT `feature = "fixtures"` — `$UNIT_FEATURES`
+      # deliberately excludes `fixtures`, so a fixtures gate would compile these
+      # to a silent 0-test no-op in this job.
+      - name: Gate OLB-2B.3b routing-state witnesses
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          REG_MIN=36
+          STATE_MIN=25
+          reg=$(cargo test --lib --features "$UNIT_FEATURES" \
+                  behavior::org_routing_registry:: 2>&1 | tee /dev/stderr)
+          state=$(cargo test --lib --features "$UNIT_FEATURES" \
+                  behavior::org_routing_state:: 2>&1 | tee /dev/stderr)
+          count() {
+            printf '%s\n' "$1" | grep -oE 'test result: ok\. [0-9]+ passed' \
+              | grep -oE '[0-9]+' | head -1
+          }
+          rn=$(count "$reg")
+          sn=$(count "$state")
+          if [ -z "$rn" ] || [ "$rn" -lt "$REG_MIN" ]; then
+            echo "::error::expected >= $REG_MIN org_routing_registry witnesses, ran ${rn:-0}."
+            echo "The module is the #[cfg(test)] mod tests in"
+            echo "src/adapter/net/behavior/org_routing_registry.rs."
+            exit 1
+          fi
+          if [ -z "$sn" ] || [ "$sn" -lt "$STATE_MIN" ]; then
+            echo "::error::expected >= $STATE_MIN org_routing_state witnesses, ran ${sn:-0}."
+            echo "The module is src/adapter/net/behavior/org_routing_state_tests.rs,"
+            echo "included from org_routing_state.rs. If witnesses were intentionally"
+            echo "removed, lower STATE_MIN in this step in the SAME commit — do not"
+            echo "let the gate pass vacuously."
+            exit 1
+          fi
+          # Cardinality cannot say WHICH witness vanished. Pin the ones carrying a
+          # capacity, lifecycle, concurrency or lock-freedom property outright.
+          REQUIRED="a_demand_set_past_the_family_bound_retains_nothing
+          a_demand_set_past_the_node_bound_retains_nothing
+          a_demand_set_over_retained_slots_costs_no_node_capacity
+          an_exhausted_identity_space_refuses_a_whole_demand_set
+          a_refusal_after_identities_are_considered_consumes_none
+          duplicate_keys_in_a_demand_set_collapse
+          the_sixty_fifth_family_handle_is_refused_without_corrupting_the_first_64
+          the_two_hundred_fifty_seventh_slot_is_deterministically_unretained"
+          for required in $REQUIRED; do
+            if ! printf "%s" "$reg" | grep -q "$required"; then
+              echo "::error::required org_routing_registry witness missing: $required"
+              exit 1
+            fi
+          done
+          REQUIRED_STATE="a_discover_grant_with_no_installed_audience_is_not_a_demand
+          an_invoke_only_grant_is_not_a_source_demand
+          a_rotated_audience_handle_is_not_leased_under_its_own_id
+          a_warmed_lookup_takes_no_lock
+          a_warmed_lookup_completes_while_the_mutation_lock_is_held
+          concurrent_misses_acquire_one_demand_set
+          concurrent_rederivations_spend_one_demand_set
+          family_capacity_refusal_is_sticky_for_the_family
+          a_wide_refusal_does_not_poison_residual_capacity
+          a_refusal_settles_every_wider_set_without_the_registry
+          capacity_freed_by_a_supersession_is_spendable_again
+          node_capacity_refusal_retries_only_when_the_generation_moves
+          identity_exhaustion_is_terminal_and_outranks_a_moving_generation
+          the_family_bound_counts_demands_not_capabilities
+          a_refused_entry_retains_no_partial_demand
+          a_newly_leased_audience_joins_a_warmed_entry
+          a_removed_audience_leaves_a_warmed_entry
+          a_rotated_audience_replaces_the_scope_it_supersedes
+          a_rotated_away_scope_is_not_retained_under_its_own_id
+          a_refused_rederivation_leaves_the_entry_exactly_as_it_was
+          a_current_warmed_entry_with_a_leased_audience_takes_no_lock
+          the_capability_index_derives_exactly_what_the_full_scan_derives
+          dropping_the_state_releases_every_demand"
+          for required in $REQUIRED_STATE; do
+            if ! printf "%s" "$state" | grep -q "$required"; then
+              echo "::error::required org_routing_state witness missing: $required"
+              exit 1
+            fi
+          done
+          echo "OLB-2B.3b: $rn registry (min $REG_MIN) + $sn state (min $STATE_MIN) passed; all named witnesses present"
+
       # Doctests live in `///` comment blocks across `src/` and `sdk/src/`.
       # `cargo test --lib` does not execute them — they need a separate
       # `cargo test --doc` invocation. Same broad feature set so doc

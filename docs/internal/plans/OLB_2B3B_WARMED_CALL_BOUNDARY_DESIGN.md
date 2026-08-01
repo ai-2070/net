@@ -365,9 +365,18 @@ that can never be satisfied, consuming budget forever.
 family projection for matching providers discovered through Owner or another
 DISCOVER grant.
 
-**Plan-text correction, same code slice.** Both normative occurrences (§7, §13)
-of `max warmed capabilities per OrgRoutingState clone family: 64` become
-`max retained authority-scoped route demands per OrgRoutingState clone family: 64`.
+**Plan-text correction, same code slice.** All FIVE normative occurrences of
+`max warmed capabilities per OrgRoutingState clone family: 64` become
+`max retained authority-scoped route demands per OrgRoutingState clone family: 64`:
+the two literal bound blocks (§7, §13), pin 10, §7's "Bound the cache" prose, and
+§13's OLB-2 exit criterion. The plan also gains a §7/§13 divergence note beside
+the bounds.
+
+An earlier revision of this line said "both normative occurrences (§7, §13)"
+while §15's reconciliation row in this same document said five. Two of the three
+extra sites — pin 10 and the exit criterion — are the ones a reader checking only
+§7 and §13 would have left stale, which is exactly how a corrected bound drifts
+back. The count is five.
 
 ### 4.1 Atomic complete demand-set acquisition
 
@@ -385,6 +394,73 @@ derive the exact required source scopes (leased DISCOVER audiences only)
 On any refusal: **zero handles retained, zero partial capability entries, zero
 partial work enqueued.** A kept prefix would silently warm an incomplete
 Owner/Grant view — a correctness failure presenting as a routing preference.
+
+### 4.2 The demand set is CURRENT, not first-seen
+
+`route_handle` takes a `ConsumerGrantSnapshot` **that changes under it**. An
+audience secret can be installed, removed or rotated long after a capability
+warmed, so "actually leased" means **leased now** — never "leased on whichever
+miss happened to warm this entry".
+
+A first-seen demand set fails in both directions, and neither failure is loud:
+
+```text
+lease INSTALLED after warming   → the entry omits an authority the family HAS
+lease REMOVED  after warming    → the entry demands an authority it has LOST
+lease ROTATED  after warming    → both at once, under one grant id
+```
+
+The first reads downstream as a route that legitimately found no granted
+provider — the same silent authority narrowing §4.1 refuses to let a kept prefix
+produce. The second holds a required contributor the source can only ever answer
+`Unserved`, consuming family and node budget for authority that is gone.
+
+**The currency check is on the warmed read and takes no lock.**
+
+```text
+warm hit
+→ compare the scopes the entry RETAINS
+       with the scopes this capability's grants are leased for NOW
+→ equal   → return, no lock, no registry, no re-derivation
+→ unequal → take the mutation lock and re-derive
+```
+
+Three properties make that comparison sound:
+
+- **Both directions.** Retained-but-not-leased is OBSOLETE; leased-but-not-retained
+  is MISSING. A check that ran one direction would silently accept half the
+  lifecycle.
+- **Whole-scope comparison.** `(grant_id, audience_handle)`, never the id alone —
+  a rotation leaves the id installed under a different handle, so an id-keyed
+  check calls the rotated-away scope current. This is the aliasing the source
+  seam closed at `cbbd448b3`, arriving on the lifecycle side.
+- **Bounded by ONE capability.** The family's credentials are indexed by
+  capability once at construction, so the check walks that capability's grants
+  and nothing else — never the whole credential set, never the provider set. The
+  index is a pure filter of the credential set and both derivations share one
+  body, so the warmed check and the miss path cannot disagree about what "leased"
+  means.
+
+**Re-derivation acquires before it releases.** The replacement set is acquired
+whole (§4.1) while the superseded entry is still retained, so a refusal leaves
+the family holding exactly what it held. The cost is a transient peak of
+`old + new` against the family bound; the alternative — releasing first — would
+tear down retained authority for an acquisition that may not succeed.
+
+A refused re-derivation reports the **refusal**, not the stale entry. Answering
+`Warm` from a Grant plane known to be incomplete is the failure this section
+exists to prevent, so the caller takes the current-authority cold path instead:
+bounded degradation, correct authority. The stale entry stays retained and the
+capability keeps reporting cold until the lease moves again or capacity frees.
+
+**What re-derivation costs when it is refused.** The registry is asked once (§9
+settles every later attempt locally), but the family-local mutation lock IS taken
+on each subsequent call for that capability, because the entry is stale and the
+check that says so is cheap while the decision that acts on it is not. That is
+bounded and deliberate: the call is taking the cold path anyway, which dominates
+a single uncontended lock acquisition by orders of magnitude. The lock this
+slice's boundary exists to keep off the hot path is the NODE-WIDE registry lock,
+and no refused re-derivation ever reaches it.
 
 ## 5. Ambiguity refuses publication; the cold plan produces the error
 
@@ -1232,7 +1308,7 @@ free to disagree with the first.
 
 | Refusal | Policy | What the gate is |
 |---|---|---|
-| `FamilyAtCapacity` | sticky for the family's lifetime | a flag. Entries are never evicted, so a spent budget stays spent — sticky is exact here, not merely conservative |
+| `FamilyAtCapacity` | sticky **from the refused WIDTH up** | the narrowest width ever refused. Demand sets have variable width and the registry refuses on `held + width > 64`, so a refusal is a statement about a width, not about the family |
 | `NodeAtCapacity` | retryable | a node capacity generation that advances **only on slot retirement**. Not `slots.len()`, which a retire-then-demand pair leaves equal while capacity genuinely moved; not advanced on demand, since growth cannot free capacity |
 | `IdSpaceExhausted` | terminal | a flag that outranks the retryable class. Exhaustion is irreversible by construction, so a generation that moves afterwards says nothing about it |
 
@@ -1240,6 +1316,47 @@ The generation is read once, before the attempt, and a refusal records that same
 value. Reading it after the refusal would record a generation that may already
 have moved because of the very retirement that would have made the attempt
 succeed, and the family would then never retry.
+
+**`FamilyAtCapacity` is a width, not a flag.** A single Boolean is INVALID here,
+and the repair that replaced it is not a refinement of a conservative
+approximation — the flag suppressed demand the family could afford:
+
+```text
+family holds 62 of 64
+capability `wide`   Owner + two leased DISCOVER audiences = 3   → refused
+capability `narrow` Owner                                  = 1   → MUST warm
+```
+
+Under one `family_at_capacity: bool`, `wide`'s refusal answers `narrow` — and
+every later capability, for the family's LIFETIME, without ever asking the
+registry. Two spendable handles become permanently unreachable, and the family
+reports `FamilyAtCapacity` while not being at capacity.
+
+What the refusal actually established is `held + refused_width > 64`. The handle
+count never falls except across a supersession (§4.2), so the implication holds
+upward and only upward:
+
+```text
+width >= refused_width   → provably refused, settle locally, do not ask
+width <  refused_width   → unknown, ask the registry
+```
+
+The record keeps the **narrowest** width refused. A wider later refusal adds
+nothing the narrower one did not already say, and taking the wider value would
+re-open sets already proven not to fit.
+
+It converges, so it is not a licence to hammer the node-wide lock: an attempt
+reaches the registry only when its width is strictly below the record, and being
+refused there lowers the record. Widths are bounded by 64 and every demand set
+contains at least the Owner scope, so a family can be refused at most 64 times
+before the record reaches 1 — the old flag's exact behaviour, arrived at only
+once it is actually true.
+
+**A supersession clears it.** Re-derivation is the one path on which the family's
+handle count falls, which is the exact premise the upward implication rests on.
+Terminal exhaustion and the node generation are NOT cleared: neither is a
+statement about this family's budget, and clearing them would manufacture
+retries against a node that is still full or an id space that can never recover.
 
 ### 17.6 Witnesses
 
@@ -1262,11 +1379,22 @@ Every one selects exactly one test and dies to its own inverse mutation.
 | §8 | `a_warmed_lookup_takes_no_lock` | the counter form | take the mutation lock on the read path |
 | §8 | `a_warmed_lookup_completes_while_the_mutation_lock_is_held` | the real contention form | make the read path depend on that lock |
 | §8 | `concurrent_misses_acquire_one_demand_set` | one entry, one budget spend, no poisoned sticky refusal | drop the under-lock re-check |
-| §9 | `family_capacity_refusal_is_sticky_for_the_family` | sticky | drop the sticky arm |
+| §9 | `family_capacity_refusal_is_sticky_for_the_family` | sticky at a uniform width; the registry is asked ONCE | drop the width gate (always attempt) |
+| W-R1 | `a_wide_refusal_does_not_poison_residual_capacity` | a wide refusal leaves narrow residual capacity spendable | record a family-global flag instead of the width |
+| W-R2 | `a_refusal_settles_every_wider_set_without_the_registry` | every set at or above the refused width settles locally | keep the WIDEST refused width instead of the narrowest |
+| W-L1 | `a_newly_leased_audience_joins_a_warmed_entry` | an audience leased after warming joins the demand set | return the warmed entry without checking lease currency; drop the MISSING direction |
+| W-L2 | `a_removed_audience_leaves_a_warmed_entry` | a removed audience leaves it | drop the OBSOLETE direction |
+| W-L3 | `a_rotated_audience_replaces_the_scope_it_supersedes` | rotation swaps the scope under one grant id | — (composite control for W-L2/W-L4) |
+| W-L4 | `a_rotated_away_scope_is_not_retained_under_its_own_id` | no aliasing through `grant_id` on the lifecycle path | compare `leased.get(id).is_some()` |
+| W-L5 | `a_refused_rederivation_leaves_the_entry_exactly_as_it_was` | total no-effect, and the refusal is REPORTED | answer `Warm` from the stale entry |
+| W-L6 | `capacity_freed_by_a_supersession_is_spendable_again` | the width record is forgotten when handles are released | keep the record across a supersession |
+| W-L7 | `a_current_warmed_entry_with_a_leased_audience_takes_no_lock` | the currency check is lock-free with a real Grant plane | perform it under the mutation lock |
+| W-L8 | `the_capability_index_derives_exactly_what_the_full_scan_derives` | the index is a filter, never a second admission rule | index only the first grant per capability |
+| W-L9 | `concurrent_rederivations_spend_one_demand_set` | one lease movement spends one demand set | drop the under-`mutate` re-check in `rederive` |
 | §9 | `node_capacity_refusal_retries_only_when_the_generation_moves` | retryable, gated | always retry; never retry; gate on a count |
 | §9 | `identity_exhaustion_is_terminal_and_outranks_a_moving_generation` | terminal | drop the terminal arm |
 | §4 | `the_family_bound_counts_demands_not_capabilities` | Option-A accounting | bound by index entries instead (two sites) |
-| §4.1 | `a_refused_entry_retains_no_partial_demand` | no partial entry survives a refusal, at the STATE layer | the same two mutations as W-A1 and W-A5; it is not the test either selects, and it asserts the index and entry count they do not |
+| §4.1 | `a_refused_entry_retains_no_partial_demand` | no partial entry survives a refusal, at the STATE layer | W-A1's mutation (shared, M-A1s); it is not the test W-A1 selects, and it asserts the index and entry count W-A1 does not. NOT W-A5's — see §17.6a |
 | §17.4 | `dropping_the_state_releases_every_demand` | ownership is the whole lifecycle | leak the demand set |
 
 Three carry controls that exist because their assertions would otherwise be
@@ -1287,7 +1415,7 @@ satisfiable by a weaker implementation:
 both directions in one test: always-retry reds its "not asked again" assertion,
 never-retry reds its post-retirement success.
 
-### 17.6a Two witnesses the mutation run found asserting more than they exercised
+### 17.6a Three witnesses the mutation run found asserting more than they exercised
 
 Both passed on their first writing. Both were repaired only because the inverse
 mutation was actually run, and in both cases reading the test would not have
@@ -1331,9 +1459,15 @@ distinct problems:
   either way. What does not clean up is the refusal a transient over-spend
   produces, and `FamilyAtCapacity` is sticky for the family's LIFETIME (§9) — one
   redundant acquisition can poison a family permanently. The witness now runs the
-  family at 62 of 64 handles so a duplicate provably runs out, and asserts that
-  no rival was refused, that no sticky refusal was recorded, and that the family
-  still warms its 64th demand afterwards.
+  family at 60 of 64 handles against a THREE-demand contested capability, so the
+  first acquisition fits at 63 and a duplicate provably does not, and asserts
+  that no rival was refused, that no capacity refusal was recorded, and that the
+  family still warms its 64th demand afterwards.
+
+  (An earlier revision of this paragraph said "62 of 64". The witness has always
+  filled 60; 62 would not have fitted the first acquisition either. Corrected
+  here rather than left, because a design that misstates the schedule its own
+  witness runs is how a later reader "fixes" the test to match the prose.)
 
 A third mutation was rejected rather than its witness: "bound the family by
 `family_handles + 1`" is not the entry bound it claimed to be, because
@@ -1341,15 +1475,47 @@ A third mutation was rejected rather than its witness: "bound the family by
 The entry bound is a two-site mutation (lift the registry's demand bound, add an
 index-length bound in the state), and the witness reds on that.
 
+**The third was found by the HOLD-1 rerun, in a row this document had already
+written down.** §17.6's entry for `a_refused_entry_retains_no_partial_demand`
+claimed it dies to "the same two mutations as W-A1 and W-A5". W-A1's mutation
+does kill it (M-A1s, RED). **W-A5's does not** (M-A5s, GREEN), and the reason is
+structural rather than accidental: W-A5's mutation replaces the atomic
+acquisition with `demand` in a loop, whose refusal drops the acquired prefix on
+the `?` — so the family handle count, the retained slot count and the index are
+all back where they started by the time the state-level test looks at them. What
+the loop mutation actually spends, and never gets back, is an INCARNATION per new
+slot, and the id space is precisely what the state-level test does not assert.
+That is W-A5's own witness's job
+(`a_refusal_after_identities_are_considered_consumes_none`, M-A5, RED), and it is
+the only test that sees it.
+
+The row is corrected above rather than deleted: the witness is sound and its
+W-A1 coupling is real. What was wrong was the claim of a second coupling it never
+had — the same over-claim shape as the two below, surviving because the earlier
+matrix counted mutations rather than recording one row per run.
+
+**A fourth, also from the HOLD-1 repair, is recorded the same way.** `settled_reason`'s
+family arm asks `family_spent_at(width)` rather than "has this family ever been
+refused". Replacing it with the weaker predicate is NOT independently observable:
+the arm is only reached once `may_attempt` has already returned false, and the
+only way it returns false without `family_spent_at(width)` being true is the node
+or terminal gate — both of which `settled_reason` checks first or reports
+identically. No reachable input separates the two, so no witness claims the
+distinction, and the width predicate stays as defence in depth rather than being
+asserted by a test that would pass either way. This is the same discipline the
+two repairs above came out of: a witness constructed to imply otherwise would be
+the over-claim this process exists to catch.
+
 ### 17.6b Gates, and one unreproduced failure
 
 `CARGO_INCREMENTAL=0`, `cargo nextest -j 1 --no-tests=fail --retries 0`
 throughout. No security or race witness is retried.
 
 ```text
-slice witnesses          50 selected, 50 passed   (36 registry + 14 state)
+slice witnesses          61 selected, 61 passed   (36 registry + 25 state)
 routing/grant/scoped    291 selected, 291 passed
-inverse mutations        19 run, 19 RED, restored and re-verified after each
+inverse mutations        33 run, 32 RED, 1 GREEN (recorded, §17.6a)
+                         every row: exactly 1 test selected, restored + hash-verified
 fmt                     clean
 clippy --all-features --lib --bins                    clean
 clippy --all-features --all-targets (test allows)     clean
@@ -1357,10 +1523,91 @@ doc_link_guard          2 selected, 2 passed
 git diff --check        clean
 ```
 
-The mutation matrix was re-run in full against the FINAL tree after the two
-witness repairs in §17.6a, because a mutation run proves the tree it ran against
-and not the branch — the lesson step 3 recorded at `bc45d3c6f`. Every RED here is
-the author's own; this slice owes an independent run.
+The mutation matrix was re-run in full against the FINAL tree after the HOLD-1
+repair, because a mutation run proves the tree it ran against and not the branch
+— the lesson step 3 recorded at `bc45d3c6f`. Every RED here is the author's own;
+this slice owes an independent run.
+
+**The harness verifies that the selected test RAN.** An earlier revision of the
+HOLD-1 harness passed its filter through `Start-Process -ArgumentList`, which
+mangled the quoting; nextest matched **zero** tests, `--no-tests=fail` exited
+non-zero, and the harness recorded RED. Four rows were reported killed by
+mutations that had never been executed against them. The ledger below therefore
+carries a `selected` column, and any row that is not exactly `1` is `INVALID`
+rather than RED — a filtered run that matches nothing is the same vacuous-gate
+failure the CI gates in this repository already exist to forbid, and a mutation
+harness is no more entitled to it than a CI step is.
+
+### 17.6c The mutation ledger
+
+One row per mutation RUN, against the final tree. `Selected` is the number of
+tests the filter actually ran; the source file is restored from a pristine copy
+and SHA256-verified after every row (33/33 verified).
+
+Positive controls are **excluded** from the mutation count, because they have no
+inverse mutation by construction: `a_successful_demand_set_queues_every_key_and_marks_once`
+(W-A6) and `demands_are_exact_on_capability_and_grantee`. `a_rotated_audience_replaces_the_scope_it_supersedes`
+(W-L3) is likewise a composite control — it exercises the same two directions
+M-L2 and M-L4 already kill separately, and claims no mutation of its own.
+
+Rows marked **shared** run a mutation another row already ran, against a
+DIFFERENT selected test. They are counted as distinct runs, because a run against
+a different witness is different evidence — but they are not evidence of a
+distinct defect, and are labelled so that the count cannot be read as
+one-mutation-per-witness.
+
+| # | ID | Production change | Selected test | Sel | Outcome | RED site |
+|---|---|---|---|---|---|---|
+| 1 | M-R1 | `record`: `family_at_capacity_from = Some(1)` — the family-global flag | `a_wide_refusal_does_not_poison_residual_capacity` | 1 | RED | `org_routing_state_tests.rs:935` |
+| 2 | M-R2 | `record`: keep `max(width)` instead of `min(width)` | `a_refusal_settles_every_wider_set_without_the_registry` | 1 | RED | `org_routing_state_tests.rs:1004` |
+| 3 | M-R3 | `may_attempt`: drop the `family_spent_at(width)` gate | `family_capacity_refusal_is_sticky_for_the_family` | 1 | RED | `org_routing_state_tests.rs:652` |
+| 4 | M-L1 | `route_handle`: return the warmed entry without the currency check | `a_newly_leased_audience_joins_a_warmed_entry` | 1 | RED | `org_routing_state_tests.rs:1069` |
+| 5 | M-L2 | `leases_current`: drop the OBSOLETE direction | `a_removed_audience_leaves_a_warmed_entry` | 1 | RED | `org_routing_state_tests.rs:1120` |
+| 6 | M-L3 | `leases_current`: drop the MISSING direction | `a_newly_leased_audience_joins_a_warmed_entry` (shared test with #4) | 1 | RED | `org_routing_state_tests.rs:1069` |
+| 7 | M-L4 | `leases_current`: compare `leased.get(id).is_some()` — id-only | `a_rotated_away_scope_is_not_retained_under_its_own_id` | 1 | RED | `org_routing_state_tests.rs:1257` |
+| 8 | M-L5 | refused re-derivation answers `Warm` from the stale entry | `a_refused_rederivation_leaves_the_entry_exactly_as_it_was` | 1 | RED | `org_routing_state_tests.rs:1385` |
+| 9 | M-L6 | `new`: index only the FIRST grant per capability | `the_capability_index_derives_exactly_what_the_full_scan_derives` | 1 | RED | `org_routing_state_tests.rs:1549` |
+| 10 | M-L7 | take `mutate` on the warmed currency check | `a_current_warmed_entry_with_a_leased_audience_takes_no_lock` | 1 | RED | `org_routing_state_tests.rs:1503` |
+| 11 | M-L8 | `rederive`: drop the under-`mutate` re-check | `concurrent_rederivations_spend_one_demand_set` | 1 | RED | `org_routing_state_tests.rs:1324` |
+| 12 | M-L9 | drop `refusals.on_supersession()` | `capacity_freed_by_a_supersession_is_spendable_again` | 1 | RED | `org_routing_state_tests.rs:1469` |
+| 13 | M-A1 | registry family bound: per-key `>=` instead of whole-set `+ len` | `a_demand_set_past_the_family_bound_retains_nothing` | 1 | RED | `org_routing_registry.rs:2620` |
+| 14 | M-A1s | **shared** with #13 | `a_refused_entry_retains_no_partial_demand` | 1 | RED | `org_routing_state_tests.rs:856` |
+| 15 | M-A2 | registry node bound: per-key `>=` | `a_demand_set_past_the_node_bound_retains_nothing` | 1 | RED | `org_routing_registry.rs:2669` |
+| 16 | M-A2b | count every key as a NEW slot | `a_demand_set_over_retained_slots_costs_no_node_capacity` | 1 | RED | `org_routing_registry.rs:2713` |
+| 17 | M-A3 | wrap the incarnation reservation instead of `checked_add` | `an_exhausted_identity_space_refuses_a_whole_demand_set` | 1 | RED | `org_routing_registry.rs:1123` (production `debug_assert`) |
+| 18 | M-A4 | drop `keys.dedup()` | `duplicate_keys_in_a_demand_set_collapse` | 1 | RED | `org_routing_registry.rs:1150` (production `debug_assert`) |
+| 19 | M-A5 | acquire per key in a loop, releasing the prefix | `a_refusal_after_identities_are_considered_consumes_none` | 1 | RED | `org_routing_registry.rs:2813` |
+| 20 | M-A5s | **shared** with #19 | `a_refused_entry_retains_no_partial_demand` | 1 | **GREEN — not killed** (§17.6a) | — |
+| 21 | M-A7 | drop `keys.sort()` | `a_demand_set_is_ordered_owner_scopes_first` | 1 | RED | `org_routing_registry.rs:2867` |
+| 22 | M-N1 | `classify`: drop the installed-lease requirement | `a_discover_grant_with_no_installed_audience_is_not_a_demand` | 1 | RED | `org_routing_state_tests.rs:257` |
+| 23 | M-N2 | `classify`: synthesize an audience for a right-less grant | `an_invoke_only_grant_is_not_a_source_demand` | 1 | RED | `org_routing_state_tests.rs:323` |
+| 24 | M-N3 | `classify`: compare `grant_id` alone | `a_rotated_audience_handle_is_not_leased_under_its_own_id` | 1 | RED | `org_routing_state_tests.rs:450` |
+| 25 | M-S1 | `warm`: take `mutate` and count it | `a_warmed_lookup_takes_no_lock` | 1 | RED | `org_routing_state_tests.rs:469` |
+| 26 | M-S2 | `warm`: hold `mutate` across the read | `a_warmed_lookup_completes_while_the_mutation_lock_is_held` | 1 | **RED (deadlock)**, terminated at the 300 s bound | hang, no assertion reached |
+| 27 | M-S3 | `acquire`: drop the under-`mutate` re-check | `concurrent_misses_acquire_one_demand_set` | 1 | RED | `org_routing_state_tests.rs:594` |
+| 28 | M-P1 | node gate: always retry | `node_capacity_refusal_retries_only_when_the_generation_moves` | 1 | RED | `org_routing_state_tests.rs:753` |
+| 29 | M-P2 | node gate: never retry | `node_capacity_refusal_retries_only_when_the_generation_moves` (shared test with #28) | 1 | RED | `org_routing_state_tests.rs:768` |
+| 30 | M-P3 | node gate: gate on `handles()` instead of the generation | `node_capacity_refusal_retries_only_when_the_generation_moves` (shared test with #28) | 1 | RED | `org_routing_state_tests.rs:768` |
+| 31 | M-P4 | drop the terminal `id_space_exhausted` arm | `identity_exhaustion_is_terminal_and_outranks_a_moving_generation` | 1 | RED | `org_routing_state_tests.rs:823` |
+| 32 | M-P5 | **two-site**: lift the registry demand bound + add an index-length bound | `the_family_bound_counts_demands_not_capabilities` | 1 | RED | `org_routing_state_tests.rs:695` |
+| 33 | M-P6 | leak an `Arc` on publication so the demand set never releases | `dropping_the_state_releases_every_demand` | 1 | RED | `org_routing_state_tests.rs:1575` |
+
+```text
+33 runs   32 RED (31 assertion, 1 deadlock)   1 GREEN-NOT-KILLED
+          33/33 selected exactly one test
+          33/33 restored and SHA256-verified
+```
+
+**The total is 33, not 19.** The earlier figure was prose, not a ledger: it
+counted the mutations the author believed had been run, with no row-by-row record
+to check it against, and it silently folded the shared runs and the three-way
+node-gate mutation into single entries. Twelve of the thirty-three are new with
+the HOLD-1 repair (M-R1..M-R3, M-L1..M-L9); the remaining twenty-one are the
+pre-existing set, re-run here because a mutation run proves the tree it ran
+against. Reconstructing it row by row is what surfaced #20.
+
+Evidence: the run is reproducible from `run.ps1` and `ledger.tsv` under the
+out-of-repo scratch directory used for the matrix; nothing from it is committed.
 
 **One unreproduced failure, recorded rather than dropped.** During the first
 serial run of the 291-test group,
@@ -1375,6 +1622,13 @@ that witness's path: it calls the unchanged single-key `demand`, never
 is the capacity-generation increment inside `release`'s existing retirement
 branch, which runs after every assertion in it. That is the evidence; it is not
 a proof that the two are unrelated, and it is left stated rather than resolved.
+
+The HOLD-1 repair does not change this record and does not narrow it. It adds no
+production statement to any shared path: every line it touches is inside
+`org_routing_state`, whose only consumers are its own witnesses. The record
+therefore stands exactly as written above — still unreproduced, still unexplained,
+still owed. It is NOT reclassified as flaky, and the 2B.3c-pre semantics it runs
+against were not altered to silence it.
 
 ### 17.7 Not in this slice
 
