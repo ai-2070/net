@@ -171,17 +171,28 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
         //
         // `create_new` also means a leftover temp from a crashed same-pid
         // process cannot be silently reused with its old permissions.
-        let file = match super::file_mode::create_owner_only(&tmp) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Stale temp from a dead same-pid process. Remove and
-                // retry once, so recovery needs no manual cleanup while a
-                // live conflict still surfaces.
-                let _ = tokio::fs::remove_file(&tmp).await;
-                super::file_mode::create_owner_only(&tmp).map_err(|e| StoreError::io(&tmp, e))?
+        // Off the reactor: `create_owner_only` is synchronous, and on
+        // Windows it is several blocking syscalls (token read, SDDL
+        // conversion, `CreateFileW`). A custom store path on a network or
+        // FUSE filesystem can make those slow, and every payment passes
+        // through here — a stalled worker would stall concurrent
+        // payments, not merely this one.
+        let tmp_for_create = tmp.clone();
+        let file = tokio::task::spawn_blocking(move || {
+            match super::file_mode::create_owner_only(&tmp_for_create) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Stale temp from a dead same-pid process. Remove and
+                    // retry once, so recovery needs no manual cleanup
+                    // while a live conflict still surfaces.
+                    let _ = std::fs::remove_file(&tmp_for_create);
+                    super::file_mode::create_owner_only(&tmp_for_create)
+                }
+                other => other,
             }
-            Err(e) => return Err(StoreError::io(&tmp, e)),
-        };
+        })
+        .await
+        .map_err(|e| StoreError::io(&tmp, e))?
+        .map_err(|e| StoreError::io(&tmp, e))?;
         let mut file = tokio::fs::File::from_std(file);
         use tokio::io::AsyncWriteExt as _;
         file.write_all(&bytes)

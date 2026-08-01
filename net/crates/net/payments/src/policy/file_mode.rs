@@ -72,9 +72,22 @@ pub(crate) fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
 /// note: it cannot revoke access already granted to an open handle. Use
 /// it only to repair a file that predates this code, never as the
 /// primary guard for one being created now.
-#[cfg(not(windows))]
-pub(crate) fn restrict_existing(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+#[cfg(unix)]
+pub(crate) fn restrict_existing(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    // Not a no-op: a caller relying on the owner-only contract must get
+    // it on every platform, and a file created by an older build (or by
+    // an operator) can carry any mode. `set_permissions` errors on a
+    // missing path, which is the right answer — the caller is about to
+    // write bearer material there.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn restrict_existing(path: &Path) -> std::io::Result<()> {
+    // No permission model to apply. Still verify the file exists, so the
+    // contract is "checked" rather than silently skipped.
+    std::fs::metadata(path).map(|_| ())
 }
 
 #[cfg(windows)]
@@ -349,19 +362,36 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
-    /// The repair path works on a file that already exists.
+    /// The repair path tightens a file that already exists — including
+    /// one an older build left world-readable.
     #[test]
-    fn restricting_an_existing_file_succeeds() {
+    fn restricting_an_existing_file_tightens_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("legacy.json");
         std::fs::write(&path, b"{}").expect("write");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Start deliberately permissive, as a legacy store might be.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("loosen");
+            restrict_existing(&path).expect("restrict");
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "repair must actually change the mode, not just return Ok"
+            );
+        }
+        #[cfg(not(unix))]
         restrict_existing(&path).expect("restrict");
+
         assert_eq!(std::fs::read(&path).expect("read back"), b"{}");
     }
 
     /// A missing file is an error rather than a silent pass: the caller
     /// is about to write bearer material.
-    #[cfg(windows)]
     #[test]
     fn restricting_a_missing_file_is_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");

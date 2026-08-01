@@ -119,12 +119,30 @@ impl BillingLog {
         // window in which the log exists unrestricted — not even an empty
         // one, because the handle outlives the emptiness.
         //
-        // `AlreadyExists` is the ordinary case after the first append.
-        match crate::policy::file_mode::create_owner_only(&self.path) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(BillingError::io(&self.path, e)),
-        }
+        // `AlreadyExists` is the ordinary case after the first append —
+        // but "it exists" is not "it is protected". A log written by an
+        // older build, or pre-created by an operator in a shared
+        // directory, carries whatever permissions it was made with, and
+        // appending signed usage records to it would inherit them. Repair
+        // rather than assume.
+        //
+        // `restrict_existing` is the weaker operation (it cannot revoke a
+        // handle already open — see `file_mode`), which is exactly why it
+        // is confined to this pre-existing case and never used for
+        // creation.
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            match crate::policy::file_mode::create_owner_only(&path) {
+                Ok(_) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    crate::policy::file_mode::restrict_existing(&path)
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|e| BillingError::io(&self.path, e))?
+        .map_err(|e| BillingError::io(&self.path, e))?;
         let mut file = opts
             .open(&self.path)
             .await
