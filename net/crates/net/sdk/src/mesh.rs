@@ -657,6 +657,19 @@ impl Mesh {
     /// `Arc<MeshNode>` for the language bindings. Each copy that existed
     /// per receiver drifted from the others; the registry is the one
     /// object all of them already hold.
+    ///
+    /// Gated to match its callers exactly. `Mesh` itself is `net`-only,
+    /// but both hops into here are narrower — `mesh_rpc` needs `cortex`,
+    /// `aggregator` needs `aggregator` — so a `--features net` build has
+    /// no caller and this is genuinely dead there. The org path is NOT a
+    /// caller: it holds a `MeshNode`, so it reaches
+    /// `install_rpc_service_defaults` on the registry directly and needs
+    /// no `Mesh`-shaped hop.
+    ///
+    /// `cfg` rather than `#[allow(dead_code)]` on purpose: the allow
+    /// would also silence the day this genuinely loses its last caller,
+    /// which for a security-policy hop is worth being told about.
+    #[cfg(any(feature = "cortex", feature = "aggregator"))]
     pub(crate) fn register_rpc_service_channels(&self, service: &str) {
         self.channel_configs.install_rpc_service_defaults(service);
     }
@@ -1463,7 +1476,16 @@ fn parse_ack_reason(s: &str) -> Option<AckReason> {
     }
 }
 
-#[cfg(all(test, feature = "net"))]
+// Gated to match `register_rpc_service_channels`, which these exercise
+// through its `Mesh`-shaped hop. Under `--features net` alone the method
+// does not exist, and the policy it installs is unreachable from `Mesh`
+// — `ChannelConfigRegistry::install_rpc_service_defaults` has its own
+// tests in the `net` crate, so the property stays covered there.
+#[cfg(all(
+    test,
+    feature = "net",
+    any(feature = "cortex", feature = "aggregator")
+))]
 mod rpc_service_channel_registration_tests {
     //! The aggregator module registers RPC channels through its own
     //! entry points, and used to carry a hand-copied version of the
