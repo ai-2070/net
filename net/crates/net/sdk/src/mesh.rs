@@ -646,31 +646,19 @@ impl Mesh {
     /// **Install-if-absent, never replace** — an ACL the operator
     /// registered before serving survives untouched (H2).
     ///
-    /// Lives here, gated only on `net`, because more than one subsystem
-    /// needs it: `mesh_rpc`'s `serve_rpc*` (gated on `cortex`) and the
-    /// `aggregator` module (gated on `aggregator`). They previously
-    /// carried separate copies, and the copy drifted — the aggregator's
-    /// kept replacing inserts and never gained the origin binding, so
-    /// aggregator reply channels were still world-subscribable after
-    /// H2 and H3 were fixed for `serve_rpc`. One implementation, so the
-    /// next fix cannot land on only one of them.
+    /// The `Mesh`-shaped hop to
+    /// [`ChannelConfigRegistry::install_rpc_service_defaults`], which
+    /// holds the implementation.
+    ///
+    /// It lives on the registry rather than here because the serve paths
+    /// do not share a receiver — `serve_rpc*` (gated on `cortex`) and
+    /// the `aggregator` module (gated on `aggregator`) go through
+    /// `Mesh`, while the org facade's `serve_org_bytes_node` holds an
+    /// `Arc<MeshNode>` for the language bindings. Each copy that existed
+    /// per receiver drifted from the others; the registry is the one
+    /// object all of them already hold.
     pub(crate) fn register_rpc_service_channels(&self, service: &str) {
-        use net::adapter::net::channel::{ChannelId, ChannelName, OriginBinding};
-
-        if let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) {
-            // Return value ignored: "already registered" is the
-            // operator-configured case, which is what this protects.
-            let _ = self
-                .channel_configs
-                .insert_if_absent(ChannelConfig::new(ChannelId::new(req_channel)));
-        }
-        if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
-            let cfg = ChannelConfig::new(ChannelId::new(sentinel_name))
-                .with_subscriber_origin_binding(OriginBinding::OriginHashHex16);
-            let _ = self
-                .channel_configs
-                .insert_prefix_if_absent(format!("{service}.replies."), cfg);
-        }
+        self.channel_configs.install_rpc_service_defaults(service);
     }
 
     /// Register a **prefix-matched** channel config. Any channel name

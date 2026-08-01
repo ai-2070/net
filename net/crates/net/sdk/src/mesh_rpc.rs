@@ -1504,19 +1504,26 @@ mod auto_register_covers_every_serve_variant {
         );
     }
 
-    /// The registration path must use the non-clobbering registry
-    /// operations. Pinned separately from the behavioural tests so a
-    /// revert to plain `insert` / `insert_prefix` is named precisely.
+    /// Every serve path must reach the ONE registration implementation.
     ///
-    /// Scans `mesh.rs`, not this file: the implementation now lives in
-    /// `Mesh::register_rpc_service_channels`, shared with the
-    /// `aggregator` module, which is gated on a different feature and
-    /// used to carry a copy that drifted. `auto_register_rpc_channels`
-    /// is a delegation, so the first half of this test pins that the
-    /// chain is intact and the second half pins the implementation.
+    /// Only the delegation chain is scanned here. The implementation
+    /// moved out of this crate entirely, onto
+    /// `ChannelConfigRegistry::install_rpc_service_defaults`, and its
+    /// H2/H3 content is pinned by
+    /// `rpc_service_defaults_are_install_if_absent_and_origin_bound` next
+    /// to it in `net`'s `channel/config.rs`. Reaching across the crate
+    /// boundary with `include_str!("../../src/...")` would pin it from
+    /// here too, at the cost of a path that breaks on any layout change.
+    ///
+    /// Why the policy is on the registry at all: the serve paths do not
+    /// share a receiver. `serve_rpc*` and the aggregator go through
+    /// `Mesh`; the org facade's `serve_org_bytes_node` holds an
+    /// `Arc<MeshNode>` for the language bindings. Every copy written per
+    /// receiver has drifted — the aggregator's, then the org path's,
+    /// each missing H2 and H3 after they were fixed for `serve_rpc`. The
+    /// registry is the object all of them already hold.
     #[test]
-    fn auto_register_uses_install_if_absent() {
-        // The delegation itself.
+    fn every_serve_path_delegates_to_the_shared_registration() {
         let rpc_src = include_str!("mesh_rpc.rs");
         let hop_start = rpc_src
             .find("pub(crate) fn auto_register_rpc_channels(")
@@ -1525,34 +1532,36 @@ mod auto_register_covers_every_serve_variant {
         assert!(
             hop.contains("self.register_rpc_service_channels(service)"),
             "regression: `auto_register_rpc_channels` must delegate to the \
-             shared `register_rpc_service_channels`, or `serve_rpc*` and the \
-             aggregator can drift apart again."
+             shared `register_rpc_service_channels`."
         );
 
-        // The shared implementation.
-        let src = include_str!("mesh.rs");
-        let start = src
+        let mesh_src = include_str!("mesh.rs");
+        let shared_start = mesh_src
             .find("pub(crate) fn register_rpc_service_channels(")
             .expect("register_rpc_service_channels must exist");
-        let end = (start + 3_000).min(src.len());
-        let body = &src[start..end];
+        let shared = &mesh_src[shared_start..(shared_start + 600).min(mesh_src.len())];
+        assert!(
+            shared.contains("install_rpc_service_defaults(service)"),
+            "regression: `Mesh::register_rpc_service_channels` must delegate to \
+             the registry, not carry its own copy of the H2/H3 policy."
+        );
 
+        let org_src = include_str!("org/serve.rs");
+        let org_start = org_src
+            .find("fn auto_register_org_channels(")
+            .expect("auto_register_org_channels must exist");
+        let org = &org_src[org_start..(org_start + 600).min(org_src.len())];
         assert!(
-            body.contains(".insert_if_absent(") && body.contains(".insert_prefix_if_absent("),
-            "regression (H2): auto-registration must install its permissive \
-             defaults via `insert_if_absent` / `insert_prefix_if_absent`. A \
-             plain replacing insert silently destroys an ACL the operator \
-             registered before serving — the exact defect this fix closed."
+            org.contains("install_rpc_service_defaults(service)"),
+            "regression (H2+H3): the org serve path must delegate to the shared \
+             registration. It carried its own copy until R9 — with a REPLACING \
+             insert that destroyed operator ACLs, and an unbound reply prefix \
+             that let any peer subscribe to another caller's reply channel."
         );
         assert!(
-            body.contains("with_subscriber_origin_binding("),
-            "regression (H3): the reply prefix must be origin-bound, or any \
-             peer can subscribe to another caller's reply channel."
-        );
-        assert!(
-            !body.contains("self.register_channel("),
-            "regression (H2): `register_channel` REPLACES. Auto-registration \
-             must not use it."
+            !org.contains("registry.insert(") && !org.contains("registry.insert_prefix("),
+            "regression: the org path is registering channels directly again \
+             instead of through the shared policy."
         );
     }
 }

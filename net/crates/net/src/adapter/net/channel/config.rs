@@ -4,7 +4,7 @@
 //! for access rules, combined with L1 permission tokens. This avoids
 //! building a separate rule engine.
 
-use super::name::{ChannelHash, ChannelId};
+use super::name::{ChannelHash, ChannelId, ChannelName};
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use crate::adapter::net::identity::{EntityId, RevocationRegistry, TokenChain, TokenScope};
 use dashmap::DashMap;
@@ -731,6 +731,55 @@ impl ChannelConfigRegistry {
     /// if it existed.
     pub fn remove_prefix(&self, prefix: &str) -> Option<ChannelConfig> {
         self.prefix_configs.remove(prefix).map(|(_, v)| v)
+    }
+
+    /// Install the standard channel policy for an RPC-style service:
+    /// the exact `<service>.requests` channel, and the
+    /// `<service>.replies.` prefix bound to each caller's own origin.
+    ///
+    /// **Install-if-absent, never replace** (H2) — an ACL the operator
+    /// registered before serving survives untouched. **Origin-bound
+    /// reply prefix** (H3) — a peer may subscribe only to the one reply
+    /// channel that encodes its own pinned identity, not to another
+    /// caller's.
+    ///
+    /// Lives on the registry, not on an SDK type, because there are
+    /// several serve paths and they do not share a receiver: the SDK's
+    /// `Mesh::serve_rpc*`, the `aggregator` module, and the org facade's
+    /// `serve_org_bytes_node` (which holds an `Arc<MeshNode>` for the
+    /// language bindings). What they DO share is this registry.
+    ///
+    /// That sharing is the whole point. This policy has now drifted
+    /// twice, both times the same way — a serve path carrying its own
+    /// copy of the registration and not receiving a later fix. The
+    /// aggregator kept a replacing insert and never gained the origin
+    /// binding, so aggregator reply channels stayed world-subscribable
+    /// after H2 and H3 were fixed for `serve_rpc`; the org path did the
+    /// same and was still doing it after the aggregator was folded in.
+    /// A copy per receiver type is not a shared implementation. One
+    /// implementation on the object all of them already hold is.
+    ///
+    /// A caller with no registry (possible via the bare `MeshNode::new`
+    /// path) simply has no channel ACLs in play and does not call this.
+    ///
+    /// Silently tolerates an unrepresentable `service` name: nothing is
+    /// installed, and the channel is then governed by the registry's
+    /// unregistered-channel policy rather than by a half-installed one.
+    pub fn install_rpc_service_defaults(&self, service: &str) {
+        // Return values ignored on purpose: "already registered" is the
+        // operator-configured case, which is exactly what this protects.
+        if let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) {
+            let _ = self.insert_if_absent(ChannelConfig::new(ChannelId::new(req_channel)));
+        }
+        // The sentinel name is never routed — it exists so the prefix
+        // entry has a `ChannelId` to carry. Token gates on a prefix
+        // entry evaluate against the requested CONCRETE channel (M1),
+        // not this.
+        if let Ok(sentinel) = ChannelName::new(&format!("{service}.replies.prefix")) {
+            let cfg = ChannelConfig::new(ChannelId::new(sentinel))
+                .with_subscriber_origin_binding(OriginBinding::OriginHashHex16);
+            let _ = self.insert_prefix_if_absent(format!("{service}.replies."), cfg);
+        }
     }
 
     /// Register a channel configuration, **replacing** any existing
@@ -2330,6 +2379,88 @@ mod tests {
         reg.insert(ChannelConfig::new(exact));
         let resolved = reg.resolve_by_name("plain.channel").expect("exact");
         assert!(resolved.matched_prefix.is_none());
+    }
+
+    // ---- R9: the one shared RPC service-channel registration ----
+
+    /// The H2 + H3 content of `install_rpc_service_defaults`, asserted
+    /// behaviourally rather than by scanning for method names.
+    ///
+    /// This is the policy every serve path now shares — `serve_rpc*`,
+    /// the aggregator, and the org facade. It has drifted twice, each
+    /// time because a serve path carried its own copy and a later fix
+    /// landed on only one of them, so it is worth pinning what the
+    /// policy DOES and not just where it lives.
+    #[test]
+    fn rpc_service_defaults_are_install_if_absent_and_origin_bound() {
+        let reg = ChannelConfigRegistry::new();
+        let root = EntityKeypair::generate();
+
+        // H2: an operator's strict ACL, registered before serving.
+        reg.insert(
+            ChannelConfig::new(ChannelId::parse("svc.requests").unwrap())
+                .with_token_roots(vec![root.entity_id().clone()]),
+        );
+        reg.insert_prefix(
+            "svc.replies.",
+            ChannelConfig::new(ChannelId::parse("svc.replies.prefix").unwrap())
+                .with_token_roots(vec![root.entity_id().clone()]),
+        );
+
+        reg.install_rpc_service_defaults("svc");
+
+        assert!(
+            reg.get_by_name("svc.requests").unwrap().token_required(),
+            "H2: serving must not replace an ACL the operator registered \
+             first — a replacing insert destroys it silently, leaving a \
+             posture identical to the default"
+        );
+        assert!(
+            reg.get_by_name("svc.replies.abcdef0123456789")
+                .unwrap()
+                .token_required(),
+            "H2 applies to the reply PREFIX too"
+        );
+
+        // …and on a clean registry it installs both, with the binding.
+        let fresh = ChannelConfigRegistry::new();
+        fresh.install_rpc_service_defaults("svc");
+
+        assert!(
+            fresh.get_by_name("svc.requests").is_some(),
+            "the request channel must be installed when unclaimed"
+        );
+        let replies = fresh
+            .get_by_name("svc.replies.abcdef0123456789")
+            .expect("the reply prefix must admit a per-caller channel");
+        assert_eq!(
+            replies.subscriber_origin_binding,
+            Some(OriginBinding::OriginHashHex16),
+            "H3: the reply prefix must be origin-bound. Unbound, any mesh peer \
+             can hold a live subscription to another caller's reply channel and \
+             receive that caller's response bodies whenever the server's direct \
+             route misses and the response falls back to roster fan-out."
+        );
+    }
+
+    /// A service name that cannot form a valid channel name installs
+    /// NOTHING — not a half-configured pair where the requests channel
+    /// exists and the reply prefix does not (or vice versa).
+    #[test]
+    fn rpc_service_defaults_install_nothing_for_an_unrepresentable_name() {
+        let reg = ChannelConfigRegistry::new();
+        reg.install_rpc_service_defaults("bad name#with/invalid chars");
+        assert_eq!(
+            reg.len(),
+            0,
+            "no exact entry may be installed for an unrepresentable service"
+        );
+        assert_eq!(
+            reg.snapshot_prefixes().len(),
+            0,
+            "and no prefix entry either — a half-installed pair is worse than \
+             none, since one half would look deliberately configured"
+        );
     }
 
     // ---- H2 (2026-07-31 audit): install-if-absent must not clobber ----

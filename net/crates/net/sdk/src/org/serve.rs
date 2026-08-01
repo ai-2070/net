@@ -266,29 +266,27 @@ where
 /// Register the request/reply channels a served nRPC service needs, through the
 /// NODE's registry so the SDK and binding paths register identically.
 ///
+/// Delegates to [`ChannelConfigRegistry::install_rpc_service_defaults`], the
+/// single implementation shared with `Mesh::serve_rpc*` and the aggregator.
+///
+/// It did not, until R9. This function was a third copy of the registration and
+/// it had received neither H2 nor H3: it used the REPLACING `insert`, so serving
+/// an org service silently destroyed an ACL the operator had registered for
+/// `<service>.requests` beforehand; and its `<service>.replies.` prefix carried
+/// no origin binding, so any mesh peer could hold a live subscription to another
+/// caller's reply channel and receive that caller's response bodies whenever the
+/// server's direct route missed and the response fell back to roster fan-out.
+/// Both were fixed for `serve_rpc` and both were still open here.
+///
 /// A node built without a channel registry (possible via the bare
 /// `MeshNode::new` path) simply skips this — the same tolerance the SDK's
 /// `auto_register_rpc_channels` has, since a missing registry means channel ACLs
 /// are not in play for that node.
 fn auto_register_org_channels(node: &MeshNode, service: &str) {
-    use net::adapter::net::channel::{ChannelId, ChannelName};
-    use net::adapter::net::ChannelConfig;
-
     let Some(registry) = node.channel_configs() else {
         return;
     };
-    // Exact: `<service>.requests`.
-    if let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) {
-        registry.insert(ChannelConfig::new(ChannelId::new(req_channel)));
-    }
-    // Prefix: `<service>.replies.` — admits every per-caller
-    // `<service>.replies.<caller_origin>` subscribe.
-    if let Ok(sentinel) = ChannelName::new(&format!("{service}.replies.prefix")) {
-        registry.insert_prefix(
-            format!("{service}.replies."),
-            ChannelConfig::new(ChannelId::new(sentinel)),
-        );
-    }
+    registry.install_rpc_service_defaults(service);
 }
 
 /// Bridges the facade's `Fn(OrgCaller, Bytes) -> Future` closure to the raw
