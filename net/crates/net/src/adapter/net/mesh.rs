@@ -493,7 +493,9 @@ use super::route::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
-use super::subnet::{DropReason, SubnetGateway, SubnetId, SubnetPolicy};
+use super::subnet::{
+    DropReason, SubnetAuthorityConfig, SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy,
+};
 use super::subprotocol::stream_window::{
     StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_WINDOW_SIZE,
     SUBPROTOCOL_STREAM_ACK, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
@@ -1746,6 +1748,15 @@ pub struct MeshNodeConfig {
     /// practice means `Visibility::SubnetLocal` channels ship only
     /// when both sides are `GLOBAL`.
     pub subnet_policy: Option<Arc<SubnetPolicy>>,
+    /// Trust anchors for protected subnet authorities
+    /// (SUBNET_AUTH_PLAN.md S2). Each entry names an authority, the
+    /// roots whose signatures anchor its `SubnetGrant` /
+    /// `SubnetIssuerGrant` / `SubnetRevocationFloor` artifacts, and
+    /// the authority-local grant-lifetime ceiling. Empty (the
+    /// default) means no protected subnet assertions verify —
+    /// fail-closed for authority claims, no effect on plain
+    /// topology/visibility operation.
+    pub subnet_authorities: Vec<SubnetAuthorityConfig>,
     /// Visibility applied on publish when a channel has **no**
     /// registered config in the local
     /// [`ChannelConfigRegistry`]. Defaults to
@@ -2085,6 +2096,7 @@ impl MeshNodeConfig {
             enable_stream_ack_ranges: true,
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
+            subnet_authorities: Vec::new(),
             default_visibility: Visibility::Global,
             unregistered_channels: UnregisteredChannelPolicy::default(),
             min_announce_interval: Duration::from_secs(10),
@@ -2403,6 +2415,18 @@ impl MeshNodeConfig {
     /// oblige you to add a local subnet.
     pub fn with_subnet_policy(mut self, policy: Arc<SubnetPolicy>) -> Self {
         self.subnet_policy = Some(policy);
+        self
+    }
+
+    /// Anchor a protected subnet authority (SUBNET_AUTH_PLAN.md S2):
+    /// grants, issuer grants, and revocation floors naming
+    /// `config.authority` verify only against `config.roots`.
+    /// Repeatable — one entry per authority this node trusts. A
+    /// root configured for one authority can never verify another
+    /// authority's credentials, and an authority with an empty root
+    /// set fails closed.
+    pub fn with_subnet_authority(mut self, config: SubnetAuthorityConfig) -> Self {
+        self.subnet_authorities.push(config);
         self
     }
 
@@ -7855,6 +7879,15 @@ pub struct MeshNode {
     /// Subnet policy applied to inbound `CapabilityAnnouncement`s.
     /// `None` disables per-peer subnet tracking.
     local_subnet_policy: Option<Arc<SubnetPolicy>>,
+    /// Per-authority trust anchors for protected subnet credentials
+    /// (SUBNET_AUTH_PLAN.md S2). Copied from
+    /// `MeshNodeConfig::subnet_authorities`; empty means every
+    /// protected subnet assertion fails closed.
+    subnet_authorities: Vec<SubnetAuthorityConfig>,
+    /// Applied revocation-floor state + per-authority auth epochs
+    /// for subnet credentials. Session admission (S3) verifies
+    /// against this registry and pins the epoch it saw.
+    subnet_floors: Arc<SubnetFloorRegistry>,
     /// Per-peer subnet map — **routing state, not authenticated
     /// membership** (SUBNET_AUTH_PLAN.md). Keys are `node_id`; values
     /// are the subnet derived from each peer's most recent
@@ -8715,6 +8748,7 @@ impl MeshNode {
         // without going back through `config`.
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
+        let subnet_authorities = config.subnet_authorities.clone();
         let policy_can_scope = local_subnet_policy
             .as_ref()
             .is_some_and(|p| p.can_assign_non_global());
@@ -9002,6 +9036,8 @@ impl MeshNode {
             capability_version: Arc::new(AtomicU64::new(0)),
             local_subnet,
             local_subnet_policy,
+            subnet_authorities,
+            subnet_floors: Arc::new(SubnetFloorRegistry::new()),
             peer_subnets,
             // Gateway is installed lazily by `set_channel_configs`;
             // a node without an installed registry has no gateway
@@ -10720,6 +10756,24 @@ impl MeshNode {
     /// configured — see [`Self::local_subnet_policy`].
     pub fn local_subnet(&self) -> SubnetId {
         self.local_subnet
+    }
+
+    /// Trust config for `authority`'s protected subnet credentials,
+    /// or `None` when this node anchors no such authority — in which
+    /// case every protected assertion under it fails closed
+    /// (SUBNET_AUTH_PLAN.md S2).
+    pub fn subnet_authority_config(&self, authority: &EntityId) -> Option<&SubnetAuthorityConfig> {
+        self.subnet_authorities
+            .iter()
+            .find(|c| &c.authority == authority)
+    }
+
+    /// Applied subnet revocation-floor state + per-authority auth
+    /// epochs. Shared handle: floor application (S5 distribution,
+    /// or operator provisioning) and session verification (S3) see
+    /// one registry.
+    pub fn subnet_floor_registry(&self) -> &Arc<SubnetFloorRegistry> {
+        &self.subnet_floors
     }
 
     /// Read-only handle to the `SubnetPolicy` this node applies to

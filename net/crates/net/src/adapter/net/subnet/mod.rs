@@ -13,11 +13,16 @@
 //! `SubnetGrant`s for protected transport rights.
 
 mod assignment;
+pub mod auth;
 mod error;
 mod gateway;
 mod id;
 
 pub use assignment::{SubnetPolicy, SubnetRule};
+pub use auth::{
+    SubnetAuthError, SubnetAuthorityConfig, SubnetCredentialSet, SubnetFloorRegistry, SubnetGrant,
+    SubnetIssuerGrant, SubnetRef, SubnetRevocationFloor, SubnetRights, VerifiedSubnetAuthority,
+};
 pub use error::SubnetError;
 pub use gateway::{DropReason, ForwardDecision, SubnetGateway};
 pub use id::{SubnetId, TopologySubnetId};
