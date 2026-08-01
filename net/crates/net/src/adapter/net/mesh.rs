@@ -2931,8 +2931,7 @@ impl PeerFailureGenerations {
     }
 
     fn take_next(&self) -> u64 {
-        self.next
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        self.next.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Current generation for `peer`. Never `Option` — absence is a
