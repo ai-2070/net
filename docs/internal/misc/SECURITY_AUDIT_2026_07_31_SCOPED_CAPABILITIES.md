@@ -61,6 +61,8 @@ A second review pass found six further items, all since addressed:
 | Item | Status |
 | ---- | ------ |
 | Candidate match and subnet derived from two different fold snapshots | **Fixed.** The subnet closure now takes `(NodeId, &[String])` and runs inside the selecting snapshot on the selected entry's borrowed tags. New `SubnetPolicy::assign_from_rendered_tags` avoids rebuilding a `CapabilitySet`; `assign` delegates to it so they cannot drift. Removes the second fold read per candidate as a side effect. |
+| Direct peers still preferred the `peer_subnets` sidecar | **Fixed.** The first pass moved only forwarded peers onto snapshot tags, leaving the direct branch reading a pre-apply sidecar the fold's rejected applies never reconcile — so a restarted peer's rejected `v1` could still decide the subnet for a retained `v500`. Scoped discovery no longer reads `peer_subnets` at all; every non-self candidate resolves from the selected entry's tags. Three witnesses, each confirmed to fail with the sidecar branch reinstated. |
+| Selector-list amplification on a MISS | **Fixed.** `PreparedScope` hoists list-form selectors into hash sets once per query, before the locks. `assign_from_rendered_tags` is now allocation-free (smallest matching tag per rule, no sort). |
 | Exported TS scope builders still widened silently | **Fixed.** `withTenantScope` / `withRegionScope` throw on an empty selector. The earlier "fixed" claim was true only for the Rust builders — these build raw arrays and never reach them. |
 | Go remediation incomplete | **Fixed.** `include/net.go.h` was missing `-12`, which broke `go/header_parity_test.go` (that guard compares `go/net.h` against `net.go.h`, not `net.h`) — a regression introduced by the converter commit. Plus typed `ErrInvalidArgument`, contract docs, and rejection tests replacing the two that required the fail-open. |
 | Stale contract docs | **Fixed** in NAPI, C ABI, CLI, and the bridge (the last was drift I introduced in the perf commit). |
@@ -82,6 +84,13 @@ Not executed: the Go test suite, which needs a built cdylib this environment
 lacks. `gofmt` parses every touched file and header parity is checked directly,
 but the Go assertions themselves have not been run — they are the one
 remaining gap.
+
+Pre-existing and unrelated: the full Python suite aborts at
+`test_async_interop.py::test_streaming_mid_iter_cancel_terminates_stream` (a
+native crash, reproducible standalone). Confirmed to reproduce identically on
+`master` with a separately built extension, so it predates this work.
+`test_capabilities.py` — the file covering everything changed here — runs
+clean.
 
 ---
 
