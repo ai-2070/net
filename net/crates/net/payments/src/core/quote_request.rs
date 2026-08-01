@@ -304,7 +304,9 @@ impl SignedEnvelope for QuoteRequest {
 /// guard that has to be durable is the one on *payment*, and that one is.
 #[derive(Debug)]
 pub struct SeenNonces {
-    /// `(caller, nonce)` → the instant it stops being presentable.
+    /// `(caller, nonce)` → the last instant the request could still be
+    /// accepted (its expiry plus the verifier's skew tolerance). Past
+    /// that the nonce is unreplayable and the entry is dead weight.
     seen: std::collections::HashMap<(EntityId, String), u64>,
     capacity: usize,
     /// Map size at which the next expiry sweep runs. See [`Self::admit`].
@@ -350,11 +352,15 @@ impl SeenNonces {
     /// everyone. Sweeping only when the map has grown by a fraction of
     /// its capacity (or when it is actually full) keeps the amortized
     /// cost constant while bounding how much dead weight can accumulate.
+    /// `accept_until_ns` is the last instant the request could still be
+    /// accepted — its expiry plus whatever skew the verifier allows. The
+    /// caller passes it rather than the raw expiry so the guard sweeps
+    /// against the same boundary `verify` enforces.
     pub fn admit(
         &mut self,
         caller: &EntityId,
         nonce: &str,
-        expires_at_ns: u64,
+        accept_until_ns: u64,
         now_ns: u64,
     ) -> Result<(), QuoteRequestError> {
         if nonce.len() > MAX_NONCE_BYTES {
@@ -382,15 +388,24 @@ impl SeenNonces {
                 });
             }
         }
-        self.seen.insert(key, expires_at_ns);
+        self.seen.insert(key, accept_until_ns);
         Ok(())
     }
 
     /// Drop entries that can no longer be presented, and schedule the
     /// next sweep a growth step away.
     fn sweep(&mut self, now_ns: u64) {
-        self.seen
-            .retain(|_, expiry| now_ns < expiry.saturating_add(MAX_REQUEST_LIFETIME_NS));
+        // Against the stored deadline, which is the request's own expiry
+        // plus the provider's skew tolerance — i.e. the last instant
+        // `verify` would still accept it.
+        //
+        // This used to add `MAX_REQUEST_LIFETIME_NS` on top, holding every
+        // nonce for a further full minute after it stopped being
+        // presentable. That is dead weight counted against the capacity,
+        // so under sustained traffic the guard could saturate and start
+        // refusing new callers over entries that could not be replayed
+        // anyway.
+        self.seen.retain(|_, deadline| now_ns < *deadline);
         // Next sweep once the map has grown by ~1/8 of capacity, floored
         // so a tiny capacity still sweeps sometimes.
         let step = (self.capacity / 8).max(1);

@@ -58,6 +58,15 @@ fn author_pricing_terms(
     } else {
         default_registry_v1(provider.clone())
     };
+    // Every announced requirement must be one this registry actually
+    // carries. Without the check, a production provider can advertise an
+    // asset it will never quote — the caller picks that entry, asks for a
+    // quote, and gets refused with no other entry to fall back to.
+    for requirement in &accepts {
+        registry
+            .check_requirements(requirement.view())
+            .map_err(|e| format!("payment requirement is not in the selected registry: {e}"))?;
+    }
     let reference = registry
         .reference()
         .map_err(|e| format!("registry reference: {e}"))?;
@@ -235,7 +244,9 @@ mod provider {
             }
             #[cfg(feature = "payments-http")]
             (Some(url), false) => {
-                use net_payments::facilitator::client::{AuthProvider, BearerAuth, HttpFacilitator, NoAuth};
+                use net_payments::facilitator::client::{
+                    AuthProvider, BearerAuth, HttpFacilitator, NoAuth,
+                };
                 let auth: Arc<dyn AuthProvider> = match facilitator_auth_token {
                     Some(token) => Arc::new(BearerAuth::new(token)),
                     None => Arc::new(NoAuth),

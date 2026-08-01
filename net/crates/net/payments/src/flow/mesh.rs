@@ -139,7 +139,11 @@ pub fn serve_payments(
                     .admit(
                         &verified.caller,
                         &verified.nonce,
-                        verified.expires_at_ns,
+                        // The last instant `verify` would still accept
+                        // this request — expiry plus the same skew it
+                        // allowed. Remembering it exactly that long is
+                        // both necessary and sufficient.
+                        verified.expires_at_ns.saturating_add(QUOTE_REQUEST_SKEW_NS),
                         now_ns,
                     )
                     .map_err(|e| e.to_string())?;
