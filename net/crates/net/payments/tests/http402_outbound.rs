@@ -554,3 +554,84 @@ async fn an_unparseable_url_is_denied_not_fetched() {
         );
     }
 }
+
+/// M4 regression: the destination policy applies to the **unpaid
+/// probe**, not just the paid retry.
+///
+/// The probe is the SSRF. It is the request an agent-supplied URL can
+/// aim at a link-local or internal address, and it fires before any
+/// policy the caller could otherwise interpose. The default policy
+/// (public unicast plus loopback) refuses the cloud metadata address,
+/// private/LAN ranges, and carrier-NAT space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_destination_policy_refuses_internal_addresses_on_the_probe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = flow(SpendProfile::DevTest, &dir);
+
+    // The cloud metadata address, the canonical SSRF target.
+    // Refused as a Denied policy outcome, NOT as a connect failure: the
+    // address must never be dialled at all. An IP literal is never
+    // resolved, so this is the check that catches it — the resolver
+    // cannot.
+    let outcome = f.fetch_paid("http://169.254.169.254/latest/meta-data/").await;
+    match outcome {
+        X402HttpOutcome::Denied { policy_reason } => assert!(
+            policy_reason.contains("destination policy"),
+            "the refusal should name the policy: {policy_reason}"
+        ),
+        other => panic!("the metadata address must not be fetched, got {other:?}"),
+    }
+
+    // A private LAN address, likewise — and over https, so the scheme
+    // guard is not what refuses it.
+    let outcome = f.fetch_paid("https://10.0.0.5/resource").await;
+    assert!(
+        matches!(outcome, X402HttpOutcome::Denied { .. }),
+        "a private address must not be fetched, got {outcome:?}"
+    );
+
+    // IPv4-mapped IPv6 must not be a way around the v4 rules.
+    let outcome = f.fetch_paid("http://[::ffff:169.254.169.254]/latest/").await;
+    assert!(
+        matches!(outcome, X402HttpOutcome::Denied { .. }),
+        "an IPv4-mapped metadata address must be refused, got {outcome:?}"
+    );
+}
+
+/// The `PublicOnly` policy — what a host passing agent-supplied URLs
+/// should choose — additionally refuses loopback, so a local admin
+/// surface is not reachable either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_only_refuses_loopback_too() {
+    let server = PaidServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caller = Arc::new(EntityKeypair::generate());
+    let registry = default_mock_registry(caller.entity_id().clone());
+    let strict = X402HttpFlow::with_destination_policy(
+        caller,
+        SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::DevTest),
+        registry,
+        Arc::new(TestClock),
+        net_payments::http_policy::DestinationPolicy::PublicOnly,
+    )
+    .expect("flow");
+
+    let outcome = strict.fetch_paid(&server.url).await;
+    assert!(
+        matches!(outcome, X402HttpOutcome::Denied { .. }),
+        "PublicOnly must refuse loopback, got {outcome:?}"
+    );
+    assert!(
+        server.received_payloads.lock().is_empty(),
+        "nothing may be signed or sent to a refused destination"
+    );
+
+    // The default policy still reaches the same loopback server, so the
+    // documented local-testing path is not collateral damage.
+    let dir2 = tempfile::tempdir().expect("tempdir");
+    let default = flow(SpendProfile::DevTest, &dir2);
+    assert!(
+        matches!(default.fetch_paid(&server.url).await, X402HttpOutcome::Paid { .. }),
+        "the default policy must still admit loopback"
+    );
+}

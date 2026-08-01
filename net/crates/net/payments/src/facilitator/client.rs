@@ -109,15 +109,21 @@ impl HttpFacilitator {
         let endpoint = endpoint.trim_end_matches('/').to_string();
         // The bearer secret (CDP key) must never ride cleartext http to a
         // remote host. Enforce https except to loopback (local/self-hosted).
+        // Shared with the chain checker and the outbound HTTP-402 door —
+        // see `crate::http_policy` for why all three go through one
+        // implementation.
         require_secure_endpoint(&endpoint)?;
-        let tls = crate::tls_roots::tls_config()
-            .map_err(|e| FacilitatorError::protocol(format!("http tls config: {e}")))?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .use_preconfigured_tls(tls)
-            .build()
-            .map_err(|e| FacilitatorError::protocol(format!("http client build: {e}")))?;
+        // An IP-literal endpoint is dialled without a DNS lookup, so the
+        // client's resolver never sees it — check literals here, names at
+        // resolve time. Together they cover every host form.
+        if let Ok(url) = reqwest::Url::parse(&endpoint) {
+            crate::http_policy::check_url_destination(
+                &url,
+                crate::http_policy::DestinationPolicy::AllowPrivate,
+            )
+            .map_err(|e| FacilitatorError::protocol(format!("facilitator endpoint: {e}")))?;
+        }
+        let http = build_client(Duration::from_secs(30), Duration::from_secs(10))?;
         Ok(Self {
             endpoint,
             http,
@@ -127,14 +133,7 @@ impl HttpFacilitator {
 
     /// Override request timeouts (per call).
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, FacilitatorError> {
-        let tls = crate::tls_roots::tls_config()
-            .map_err(|e| FacilitatorError::protocol(format!("http tls config: {e}")))?;
-        self.http = reqwest::Client::builder()
-            .timeout(timeout)
-            .connect_timeout(timeout.min(Duration::from_secs(10)))
-            .use_preconfigured_tls(tls)
-            .build()
-            .map_err(|e| FacilitatorError::protocol(format!("http client build: {e}")))?;
+        self.http = build_client(timeout, timeout.min(Duration::from_secs(10)))?;
         Ok(self)
     }
 
@@ -252,64 +251,50 @@ impl HttpFacilitator {
 const MAX_FACILITATOR_BODY: usize = 4 * 1024 * 1024;
 
 /// Reject a config-supplied endpoint that would send credentials in
-/// cleartext: https is required, except to a loopback host for local and
-/// self-hosted testing.
+/// cleartext. Delegates to the shared money-path policy so this client,
+/// the chain checker, and the outbound HTTP-402 door enforce one rule.
 fn require_secure_endpoint(endpoint: &str) -> Result<(), FacilitatorError> {
-    let url = reqwest::Url::parse(endpoint).map_err(|e| {
-        FacilitatorError::protocol(format!("facilitator endpoint `{endpoint}`: {e}"))
-    })?;
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" => {
-            let host = url.host_str().unwrap_or_default();
-            // `host_str` keeps IPv6 brackets (`[::1]`); strip them to parse.
-            let bare = host.trim_start_matches('[').trim_end_matches(']');
-            let is_loopback = host == "localhost"
-                || bare
-                    .parse::<std::net::IpAddr>()
-                    .map(|ip| ip.is_loopback())
-                    .unwrap_or(false);
-            if is_loopback {
-                Ok(())
-            } else {
-                Err(FacilitatorError::protocol(format!(
-                    "facilitator endpoint `{endpoint}` is plaintext http to a non-loopback host \
-                     — refusing to send credentials in cleartext; use https"
-                )))
-            }
-        }
-        other => Err(FacilitatorError::protocol(format!(
-            "facilitator endpoint `{endpoint}` uses unsupported scheme `{other}` (want https)"
-        ))),
-    }
+    crate::http_policy::require_secure_endpoint(endpoint)
+        .map_err(|e| FacilitatorError::protocol(format!("facilitator {e}")))
 }
 
-/// Read a response body, capped at `max` bytes. A declared over-cap
-/// `content-length` is rejected up front; a body that streams past the
-/// cap (no/underdeclared length) is rejected mid-stream. Bounds memory
-/// against a hostile endpoint.
+/// Build the client: pinned TLS roots plus the shared destination policy.
+///
+/// [`DestinationPolicy::AllowPrivate`] — a facilitator endpoint is
+/// operator configuration, and a self-hosted facilitator on loopback or a
+/// LAN is an ordinary deployment. What stays refused is the set nobody
+/// configures deliberately (link-local including cloud metadata,
+/// carrier-NAT, reserved), so a templated or half-substituted endpoint
+/// fails closed rather than reaching instance metadata with a bearer
+/// token attached.
+fn build_client(
+    timeout: Duration,
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, FacilitatorError> {
+    crate::http_policy::client(
+        crate::http_policy::DestinationPolicy::AllowPrivate,
+        timeout,
+        connect_timeout,
+        reqwest::redirect::Policy::none(),
+    )
+    .map_err(|e| FacilitatorError::protocol(e.to_string()))
+}
+
+/// Read a response body, capped at `max` bytes — the shared bounded
+/// reader. An over-cap body is a protocol fault (terminal): a peer
+/// sending more than the cap will not send less on retry.
 async fn read_bounded(
     response: reqwest::Response,
     max: usize,
 ) -> Result<Vec<u8>, FacilitatorError> {
-    if let Some(len) = response.content_length() {
-        if len as usize > max {
-            return Err(FacilitatorError::protocol(format!(
-                "facilitator response declared {len} bytes, over the {max}-byte cap"
-            )));
-        }
-    }
-    let mut response = response;
-    let mut out = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(map_send_error)? {
-        if out.len().saturating_add(chunk.len()) > max {
-            return Err(FacilitatorError::protocol(format!(
-                "facilitator response exceeded the {max}-byte cap"
-            )));
-        }
-        out.extend_from_slice(&chunk);
-    }
-    Ok(out)
+    crate::http_policy::read_bounded(response, max)
+        .await
+        .map_err(|e| match e {
+            crate::http_policy::ReadError::TooLarge { .. } => {
+                FacilitatorError::protocol(format!("facilitator {e}"))
+            }
+            crate::http_policy::ReadError::Transport(inner) => map_send_error(inner),
+        })
 }
 
 /// Transport-level error mapping. Timeouts and connect failures are the

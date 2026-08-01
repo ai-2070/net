@@ -67,6 +67,8 @@ pub mod core;
 pub mod engine;
 pub mod facilitator;
 pub mod flow;
+#[cfg(feature = "http-facilitator")]
+pub mod http_policy;
 pub mod policy;
 #[cfg(feature = "http-facilitator")]
 pub(crate) mod tls_roots;

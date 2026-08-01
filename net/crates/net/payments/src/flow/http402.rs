@@ -81,6 +81,16 @@ pub enum X402HttpOutcome {
 }
 
 /// The outbound paid-HTTP client.
+/// Response bodies from an external x402 server. Capped so a hostile or
+/// compromised endpoint cannot stream until the 30s timeout and exhaust
+/// memory — the same discipline the facilitator client and chain checker
+/// apply, which this door was missing.
+///
+/// Larger than the facilitator's 4 MiB cap because this body is the
+/// *resource the caller paid for*, not a protocol envelope: a paid API
+/// returning a few megabytes of JSON is ordinary. It is still a bound.
+const MAX_RESOURCE_BODY: usize = 32 * 1024 * 1024;
+
 pub struct X402HttpFlow {
     caller: Arc<EntityKeypair>,
     spend: SpendPolicyEngine,
@@ -88,6 +98,7 @@ pub struct X402HttpFlow {
     signers: std::collections::BTreeMap<String, Arc<dyn SchemeSigner>>,
     clock: Arc<dyn Clock>,
     http: reqwest::Client,
+    destinations: crate::http_policy::DestinationPolicy,
 }
 
 impl X402HttpFlow {
@@ -97,20 +108,54 @@ impl X402HttpFlow {
         registry: AssetRegistry,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, String> {
-        let tls = crate::tls_roots::tls_config().map_err(|e| format!("http tls config: {e}"))?;
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            // Never follow redirects: both the unpaid probe and the paid
-            // retry carry (or are about to carry) a signed EIP-3009
-            // authorization — a bearer instrument. Following a 3xx would
-            // hand it to an origin we never scoped spend policy against.
-            .redirect(reqwest::redirect::Policy::none())
-            // Ring provider + bundled Mozilla roots, no OS store and no
-            // process-global provider (see `crate::tls_roots`): the money
-            // path must not trust a store that could carry a MITM root.
-            .use_preconfigured_tls(tls)
-            .build()
-            .map_err(|e| format!("http client: {e}"))?;
+        Self::with_destination_policy(
+            caller,
+            spend,
+            registry,
+            clock,
+            // Default: public unicast plus loopback. This is the one
+            // money-path client whose URL may be chosen by a model rather
+            // than an operator, so the SSRF-shaped ranges — link-local
+            // (including the cloud metadata address), private/LAN,
+            // carrier-NAT, reserved — are refused by default. Loopback
+            // stays admitted because the local-testing path is documented
+            // and `is_payment_safe_url` already allows http to it.
+            //
+            // A host that passes agent-supplied URLs straight through
+            // should tighten this to `PublicOnly`.
+            crate::http_policy::DestinationPolicy::PublicOrLoopback,
+        )
+    }
+
+    /// Build with an explicit destination policy — tighten to
+    /// [`PublicOnly`](crate::http_policy::DestinationPolicy::PublicOnly)
+    /// when fetch URLs come from a model, or widen to
+    /// [`AllowPrivate`](crate::http_policy::DestinationPolicy::AllowPrivate)
+    /// for a self-hosted x402 server on an internal network.
+    pub fn with_destination_policy(
+        caller: Arc<EntityKeypair>,
+        spend: SpendPolicyEngine,
+        registry: AssetRegistry,
+        clock: Arc<dyn Clock>,
+        destinations: crate::http_policy::DestinationPolicy,
+    ) -> Result<Self, String> {
+        // Never follow redirects: both the unpaid probe and the paid
+        // retry carry (or are about to carry) a signed EIP-3009
+        // authorization — a bearer instrument. Following a 3xx would
+        // hand it to an origin we never scoped spend policy against.
+        //
+        // Pinned TLS roots and the destination policy come from the
+        // shared money-path builder (`crate::http_policy`), so the
+        // resolver enforcing the policy IS the resolver reqwest dials —
+        // no window for DNS to answer differently between check and
+        // connect.
+        let http = crate::http_policy::client(
+            destinations,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
+            reqwest::redirect::Policy::none(),
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Self {
             caller,
             spend,
@@ -118,6 +163,7 @@ impl X402HttpFlow {
             signers: std::collections::BTreeMap::new(),
             clock,
             http,
+            destinations,
         })
     }
 
@@ -163,15 +209,43 @@ impl X402HttpFlow {
                 policy_reason: format!("refusing to fetch a URL with no host: `{url}`"),
             };
         };
+        // Destination policy for an IP-literal host, applied BEFORE the
+        // unpaid probe. `GuardedResolver` covers names, but a literal is
+        // dialled without a DNS lookup and so never reaches it — and a
+        // literal is exactly how `http://169.254.169.254/` is spelled.
+        // The probe is the SSRF, so this must gate the probe, not merely
+        // the paid retry.
+        if let Err(e) = crate::http_policy::check_url_destination(&parsed, self.destinations) {
+            return X402HttpOutcome::Denied {
+                policy_reason: format!("refusing to fetch `{url}`: {e}"),
+            };
+        }
 
-        // -- [1] the unpaid attempt.
+        // -- [1] the unpaid attempt. The destination policy is enforced
+        //    inside the client's resolver, so it applies to THIS probe —
+        //    not merely to the paid retry. The probe is the SSRF: it is
+        //    the request an agent-supplied URL can aim at a link-local or
+        //    internal address, and it fires before any policy the caller
+        //    could otherwise interpose.
         let response = match self.http.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
+                // A destination refusal happens inside the resolver and
+                // reaches here as a connect error, so name the policy —
+                // otherwise "error sending request" is all an operator
+                // sees when their own configuration refused the address.
+                let message = if e.is_connect() {
+                    format!(
+                        "{e} (destination policy admits {} — a refused address surfaces here)",
+                        self.destinations.describe()
+                    )
+                } else {
+                    e.to_string()
+                };
                 return X402HttpOutcome::Failed {
-                    message: e.to_string(),
+                    message,
                     retryable: e.is_timeout() || e.is_connect(),
-                }
+                };
             }
         };
         let status = response.status().as_u16();
@@ -194,11 +268,15 @@ impl X402HttpFlow {
             };
         }
         if status != 402 {
-            let body = response
-                .bytes()
-                .await
-                .map(|b| b.to_vec())
-                .unwrap_or_default();
+            let body = match crate::http_policy::read_bounded(response, MAX_RESOURCE_BODY).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return X402HttpOutcome::Failed {
+                        message: format!("reading the response body: {e}"),
+                        retryable: false,
+                    }
+                }
+            };
             return X402HttpOutcome::Ok { status, body };
         }
 
@@ -370,11 +448,19 @@ impl X402HttpFlow {
             .and_then(|v| v.to_str().ok())
             .and_then(|b64| BASE64.decode(b64.as_bytes()).ok())
             .and_then(|bytes| X402Carry::<SettlementResponse>::from_bytes(bytes).ok());
-        let body = paid_response
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
+        // Bounded, like the unpaid probe. The payment has already left at
+        // this point, so a body that overruns the cap does not cost the
+        // caller their money — but it must not cost them their memory
+        // either, and reporting the overrun beats silently truncating.
+        let body = match crate::http_policy::read_bounded(paid_response, MAX_RESOURCE_BODY).await {
+            Ok(b) => b,
+            Err(e) => {
+                return X402HttpOutcome::Failed {
+                    message: format!("reading the paid response body: {e}"),
+                    retryable: false,
+                }
+            }
+        };
 
         if (200..300).contains(&status) {
             X402HttpOutcome::Paid {
