@@ -134,6 +134,36 @@ is fixed for nodes that also set `with_subnet`.
 certainly a misconfiguration; and qualify the HIGH #2 row to say the fail-closed
 behaviour requires a non-global `local_subnet`.
 
+### Decision (2026-08-01)
+
+Two fixes were put to the operator and the **warning-only** one was chosen.
+
+The alternative considered and **rejected** was a behavioural fix: thread
+"a `SubnetPolicy` is installed" into `subnet_visible` and fail closed on an
+unknown peer subnet whenever it is, staying permissive only when no policy
+exists (in which case `peer_subnets` is structurally always empty and every peer
+is unknown forever, so permissiveness is the only workable default). That would
+have closed the gap rather than annotating it.
+
+It was rejected because of its blast radius on the channel paths. `peer_subnets`
+is written only for `signature_verified && hop_count == 0`, so a direct session
+peer that subscribes without ever publishing a capability announcement is
+unknown *permanently*, not transiently. Under the behavioural fix every such
+subscriber would flip from admitted to `AckReason::Unauthorized` on
+`ParentVisible` channels the moment a policy was installed — a silent,
+deployment-wide subscription outage in exchange for closing a gap that only
+opens under a configuration (`with_subnet_policy` without `with_subnet`) that is
+itself a mistake. The branch's own `subnet_visible` fix was deliberately
+minimal, reproducing the previous verdict for every input except the vulnerable
+one; extending it this far is a separate decision that deserves its own change,
+not a rider on a review pass.
+
+**Therefore:** `subnet_visible` is unchanged. The pairing is surfaced as a
+`warn` at node construction, and the audit's HIGH #2 row is qualified to state
+that fail-closed behaviour requires a non-global `local_subnet`. The residual
+gap stays open, by decision, and is recorded here so it is not rediscovered as
+an oversight.
+
 ---
 
 ## 3. Test comments contradict the invariant the branch establishes
