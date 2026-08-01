@@ -96,7 +96,16 @@ impl RpcTransport {
             .send()
             .await
             .map_err(|e| {
-                if e.is_timeout() || e.is_connect() {
+                // A destination-policy refusal happens inside the
+                // resolver, so it arrives here as a connect error. It is
+                // a configuration fact, not a transient one — the policy
+                // will refuse the same address forever — so it must not
+                // be reported as retryable. This matches how the same
+                // refusal is classified for an IP literal, which is
+                // caught up front at construction.
+                if http_policy::is_policy_refusal(&e) {
+                    CheckerError::terminal(format!("rpc endpoint refused by policy: {e}"))
+                } else if e.is_timeout() || e.is_connect() {
                     CheckerError::retryable(e.to_string())
                 } else {
                     CheckerError::terminal(e.to_string())

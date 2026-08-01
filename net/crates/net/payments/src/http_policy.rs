@@ -324,6 +324,30 @@ impl reqwest::dns::Resolve for GuardedResolver {
     }
 }
 
+/// Did this request failure come from *our* destination policy rather
+/// than from the network?
+///
+/// A policy refusal happens inside the resolver, so reqwest reports it as
+/// a connect failure — which every caller classifies as retryable. It is
+/// not: the policy will refuse the same address again, forever. Callers
+/// use this to map it to a terminal error instead, matching how the same
+/// refusal is reported for an IP literal (which never reaches the
+/// resolver and is refused up front).
+///
+/// Walks the source chain and downcasts, rather than matching on the
+/// message: the boxed error is preserved through hyper's layers, so the
+/// type is available and is not a formatting detail that can drift.
+pub fn is_policy_refusal(error: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(err) = source {
+        if err.downcast_ref::<PolicyError>().is_some() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
 /// Build a money-path [`reqwest::Client`]: pinned TLS roots, the
 /// destination policy wired in as the resolver, and the supplied
 /// timeouts. Every money-path client is constructed through here.

@@ -45,7 +45,7 @@
 //! make the transport confidential, and it is not a session: an
 //! intermediary that observes a valid request can replay it **within the
 //! freshness window** unless the provider also rejects repeated nonces,
-//! which [`SeenNonces`] is for. Replay costs the attacker nothing and
+//! which [`SeenNonces`] is for (keyed per caller, and capped). Replay costs the attacker nothing and
 //! gains them nothing except a duplicate quote — quotes are free, and
 //! paying one still requires the caller's settlement authorization — but
 //! it can burn caller-scoped issuance or exposure limits, so the guard
@@ -118,6 +118,13 @@ pub enum QuoteRequestError {
     NotYetValid,
     #[error("quote request nonce was already used")]
     ReplayedNonce,
+    #[error("quote request nonce is longer than the {max}-byte limit")]
+    NonceTooLong { max: usize },
+    #[error(
+        "the provider's quote-request replay guard is at capacity ({capacity}) — refusing rather \
+         than forgetting a nonce that is still presentable"
+    )]
+    ReplayGuardSaturated { capacity: usize },
 }
 
 impl QuoteRequest {
@@ -146,19 +153,29 @@ impl QuoteRequest {
         }
     }
 
-    /// Derive a nonce for this request deterministically, so a retry of
-    /// the *same* request re-presents the same nonce (and is therefore
-    /// idempotent at the provider's replay guard) while distinct requests
-    /// never collide.
+    /// Derive a nonce for this request.
     ///
-    /// Deterministic rather than random for the same reason quote ids are:
-    /// the money path carries no rng, and a retry that minted a fresh
-    /// nonce would look like a replay attempt rather than a retry.
+    /// Deterministic rather than random, for the same reason quote ids
+    /// are: the money path carries no rng.
+    ///
+    /// `sequence` is a per-channel counter and is what makes two requests
+    /// distinct. Without it the inputs are caller + capability + template
+    /// + timestamp, and [`crate::flow::Clock`] is a public seam with no
+    /// monotonicity requirement — a fixed or coarse clock makes two
+    /// legitimate back-to-back requests derive the same nonce, and the
+    /// second is then refused as a replay. A counter cannot repeat within
+    /// a process.
+    ///
+    /// This does not weaken retry idempotency, because a retry does not
+    /// re-derive: the caller re-sends the *serialized request* it already
+    /// built, nonce included. Deriving again is a new request, and a new
+    /// request should have a new nonce.
     pub fn derive_nonce(
         caller: &EntityId,
         capability: &str,
         template_bytes: &[u8],
         issued_at_ns: u64,
+        sequence: u64,
     ) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"net.payments.quote_request.nonce@1");
@@ -167,6 +184,7 @@ impl QuoteRequest {
             capability.as_bytes(),
             template_bytes,
             &issued_at_ns.to_le_bytes(),
+            &sequence.to_le_bytes(),
         ] {
             hasher.update(&(part.len() as u64).to_le_bytes());
             hasher.update(part);
@@ -250,42 +268,109 @@ impl SignedEnvelope for QuoteRequest {
 /// A verified request is still replayable inside its freshness window by
 /// anything that saw it, so the provider remembers nonces until they can
 /// no longer be presented. Entries are dropped once
-/// `now > expiry + MAX_REQUEST_LIFETIME_NS`, which bounds the set by the
-/// request rate over one window rather than by total traffic.
+/// `now > expiry + MAX_REQUEST_LIFETIME_NS`.
+///
+/// ## Keyed per caller, and capped
+///
+/// The key is `(caller, nonce)`, not the nonce alone. A global nonce
+/// space would let one caller suppress another's quote by picking a
+/// colliding nonce — a cross-identity denial of service costing the
+/// attacker one signed request. Scoping to the caller means a collision
+/// can only affect the identity that produced it.
+///
+/// The map is also hard-capped. Time-based expiry alone bounds nothing
+/// useful against an attacker who can mint unique signed requests as
+/// fast as it can send them: every one is a distinct nonce, and they all
+/// live for a full window. At capacity the guard **refuses** rather than
+/// evicting — forgetting a nonce that is still presentable would turn a
+/// memory bound into a replay window, which is the thing it exists to
+/// prevent. A saturated guard is a loud, retryable refusal.
 ///
 /// **In-process, deliberately.** A quote is free and idempotent to
 /// re-issue, so a replay that slips past a restart or a second node costs
 /// a duplicate quote and nothing else — not worth the write amplification
 /// of putting this in the locked store on the path of every quote. The
 /// guard that has to be durable is the one on *payment*, and that one is.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SeenNonces {
-    /// nonce → the instant it stops being presentable.
-    seen: std::collections::HashMap<String, u64>,
+    /// `(caller, nonce)` → the instant it stops being presentable.
+    seen: std::collections::HashMap<(EntityId, String), u64>,
+    capacity: usize,
+}
+
+/// Nonces are identifiers, not payloads. Anything longer is a caller
+/// trying to spend the provider's memory rather than identify a request.
+pub const MAX_NONCE_BYTES: usize = 128;
+
+/// How many in-window nonces one provider remembers before refusing.
+///
+/// Sized so the guard costs a few MiB at worst while comfortably
+/// exceeding any honest request rate over a 60s window: 100k requests a
+/// minute from legitimate callers is far past where other limits bite.
+pub const DEFAULT_REPLAY_GUARD_CAPACITY: usize = 100_000;
+
+impl Default for SeenNonces {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SeenNonces {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_capacity(DEFAULT_REPLAY_GUARD_CAPACITY)
     }
 
-    /// Record `nonce` as used, or refuse it as a replay.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            seen: std::collections::HashMap::new(),
+            capacity,
+        }
+    }
+
+    /// Record this caller's `nonce` as used, or refuse it.
     ///
     /// Sweeps expired entries as it goes — the operation that grows the
     /// map is the one that prunes it, mirroring the engine's retention.
     pub fn admit(
         &mut self,
+        caller: &EntityId,
         nonce: &str,
         expires_at_ns: u64,
         now_ns: u64,
     ) -> Result<(), QuoteRequestError> {
+        if nonce.len() > MAX_NONCE_BYTES {
+            return Err(QuoteRequestError::NonceTooLong {
+                max: MAX_NONCE_BYTES,
+            });
+        }
         self.seen
             .retain(|_, expiry| now_ns < expiry.saturating_add(MAX_REQUEST_LIFETIME_NS));
-        if self.seen.contains_key(nonce) {
+        let key = (caller.clone(), nonce.to_string());
+        if self.seen.contains_key(&key) {
             return Err(QuoteRequestError::ReplayedNonce);
         }
-        self.seen.insert(nonce.to_string(), expires_at_ns);
+        // Checked after the sweep, so capacity is measured against what is
+        // actually still presentable rather than historical volume.
+        if self.seen.len() >= self.capacity {
+            return Err(QuoteRequestError::ReplayGuardSaturated {
+                capacity: self.capacity,
+            });
+        }
+        self.seen.insert(key, expires_at_ns);
         Ok(())
+    }
+
+    /// Give a nonce back, because the request it belonged to was refused
+    /// before it produced anything.
+    ///
+    /// [`Self::admit`] is a check-and-set so concurrent duplicates cannot
+    /// both pass — but a request that is then denied (provider admission,
+    /// a policy refusal) produced no quote, so holding its nonce would
+    /// both retain state for work never done and block the caller's
+    /// legitimate retry once the denial is fixed. Only the caller that
+    /// took the nonce can give it back.
+    pub fn release(&mut self, caller: &EntityId, nonce: &str) {
+        self.seen.remove(&(caller.clone(), nonce.to_string()));
     }
 
     /// How many nonces are currently remembered (diagnostics/tests).
@@ -309,7 +394,7 @@ mod tests {
     const CAPABILITY: &str = "prov/tool";
 
     fn signed(caller: &EntityKeypair, provider: &EntityId) -> Vec<u8> {
-        let nonce = QuoteRequest::derive_nonce(caller.entity_id(), CAPABILITY, TEMPLATE, NOW);
+        let nonce = QuoteRequest::derive_nonce(caller.entity_id(), CAPABILITY, TEMPLATE, NOW, 0);
         let mut req = QuoteRequest::new(
             provider.clone(),
             caller.entity_id().clone(),
@@ -463,47 +548,164 @@ mod tests {
         assert_eq!(req.expires_at_ns, NOW + MAX_REQUEST_LIFETIME_NS);
     }
 
+    /// The guard is keyed per caller, so one caller cannot suppress
+    /// another's quote by colliding a nonce.
+    ///
+    /// A global nonce space would make that a cross-identity denial of
+    /// service costing the attacker one signed request.
+    #[test]
+    fn one_callers_nonce_does_not_block_another_callers() {
+        let a = EntityKeypair::generate().entity_id().clone();
+        let b = EntityKeypair::generate().entity_id().clone();
+        let mut seen = SeenNonces::new();
+
+        assert!(seen.admit(&a, "shared", NOW + 1_000, NOW).is_ok());
+        // Same nonce string, different caller: unaffected.
+        assert!(
+            seen.admit(&b, "shared", NOW + 1_000, NOW).is_ok(),
+            "a nonce collision must not cross identities"
+        );
+        // And each is still replay-protected within its own scope.
+        assert_eq!(
+            seen.admit(&a, "shared", NOW + 1_000, NOW),
+            Err(QuoteRequestError::ReplayedNonce)
+        );
+        assert_eq!(
+            seen.admit(&b, "shared", NOW + 1_000, NOW),
+            Err(QuoteRequestError::ReplayedNonce)
+        );
+    }
+
+    /// At capacity the guard refuses rather than evicting.
+    ///
+    /// Time-based expiry alone bounds nothing against an attacker minting
+    /// unique signed requests as fast as it can send them — every one is
+    /// a distinct nonce living a full window. Evicting to make room would
+    /// turn the memory bound into a replay window, which is the thing the
+    /// guard exists to prevent, so saturation is a loud refusal.
+    #[test]
+    fn a_saturated_guard_refuses_rather_than_forgetting() {
+        let caller = EntityKeypair::generate().entity_id().clone();
+        let mut seen = SeenNonces::with_capacity(2);
+
+        assert!(seen.admit(&caller, "n1", NOW + 1_000, NOW).is_ok());
+        assert!(seen.admit(&caller, "n2", NOW + 1_000, NOW).is_ok());
+        assert_eq!(
+            seen.admit(&caller, "n3", NOW + 1_000, NOW),
+            Err(QuoteRequestError::ReplayGuardSaturated { capacity: 2 })
+        );
+        // The nonces already held are still held — nothing was evicted to
+        // make room, so nothing became replayable.
+        assert_eq!(
+            seen.admit(&caller, "n1", NOW + 1_000, NOW),
+            Err(QuoteRequestError::ReplayedNonce)
+        );
+
+        // Once the window passes, the sweep frees the space again.
+        let later = NOW + 1_000 + MAX_REQUEST_LIFETIME_NS + 1;
+        assert!(seen.admit(&caller, "n3", later + 1_000, later).is_ok());
+    }
+
+    /// A nonce is an identifier, not a payload: an over-long one is a
+    /// caller spending the provider's memory rather than identifying a
+    /// request.
+    #[test]
+    fn an_over_long_nonce_is_refused() {
+        let caller = EntityKeypair::generate().entity_id().clone();
+        let mut seen = SeenNonces::new();
+        let huge = "n".repeat(MAX_NONCE_BYTES + 1);
+        assert_eq!(
+            seen.admit(&caller, &huge, NOW + 1_000, NOW),
+            Err(QuoteRequestError::NonceTooLong {
+                max: MAX_NONCE_BYTES
+            })
+        );
+        assert!(seen.is_empty(), "a refused nonce must not be recorded");
+        // Exactly at the limit is fine.
+        let ok = "n".repeat(MAX_NONCE_BYTES);
+        assert!(seen.admit(&caller, &ok, NOW + 1_000, NOW).is_ok());
+    }
+
+    /// A released nonce is free again — a request that produced nothing
+    /// must not retain state or block the caller's retry.
+    #[test]
+    fn a_released_nonce_can_be_used_again() {
+        let caller = EntityKeypair::generate().entity_id().clone();
+        let mut seen = SeenNonces::new();
+        assert!(seen.admit(&caller, "n", NOW + 1_000, NOW).is_ok());
+        assert_eq!(seen.len(), 1);
+
+        seen.release(&caller, "n");
+        assert!(seen.is_empty());
+        assert!(
+            seen.admit(&caller, "n", NOW + 1_000, NOW).is_ok(),
+            "a denied request's nonce must be reusable once the denial is fixed"
+        );
+
+        // Release is scoped to the caller that took it.
+        let other = EntityKeypair::generate().entity_id().clone();
+        seen.release(&other, "n");
+        assert_eq!(
+            seen.admit(&caller, "n", NOW + 1_000, NOW),
+            Err(QuoteRequestError::ReplayedNonce),
+            "another identity's release must not free this nonce"
+        );
+    }
+
     #[test]
     fn nonces_replay_once_and_the_window_bounds_the_set() {
+        let caller = EntityKeypair::generate().entity_id().clone();
         let mut seen = SeenNonces::new();
-        assert!(seen.admit("a", NOW + 1_000, NOW).is_ok());
+        assert!(seen.admit(&caller, "a", NOW + 1_000, NOW).is_ok());
         assert_eq!(
-            seen.admit("a", NOW + 1_000, NOW),
+            seen.admit(&caller, "a", NOW + 1_000, NOW),
             Err(QuoteRequestError::ReplayedNonce)
         );
         // A different nonce is fine.
-        assert!(seen.admit("b", NOW + 1_000, NOW).is_ok());
+        assert!(seen.admit(&caller, "b", NOW + 1_000, NOW).is_ok());
         assert_eq!(seen.len(), 2);
 
         // Well past the window, entries are swept and the nonce is free
         // again — by then the request it belonged to is long expired, so
         // re-admitting it grants nothing.
         let later = NOW + 1_000 + MAX_REQUEST_LIFETIME_NS + 1;
-        assert!(seen.admit("c", later + 1_000, later).is_ok());
+        assert!(seen.admit(&caller, "c", later + 1_000, later).is_ok());
         assert_eq!(seen.len(), 1, "expired entries are swept as the map grows");
     }
 
-    /// A retry of the same request re-presents the same nonce, so the
-    /// replay guard treats a retry as a retry rather than an attack.
+    /// Nonce derivation is a pure function of its inputs, and the
+    /// sequence is what separates two requests that share everything
+    /// else.
+    ///
+    /// The clock cannot carry that weight: `Clock` is a public seam with
+    /// no monotonicity requirement, so a fixed or coarse implementation
+    /// would make two legitimate back-to-back requests collide and the
+    /// second would be refused as a replay.
     #[test]
-    fn the_derived_nonce_is_stable_for_one_request_and_distinct_across_requests() {
+    fn the_sequence_separates_requests_that_share_every_other_input() {
         let caller = EntityKeypair::generate().entity_id().clone();
-        let a = QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW);
+        let a = QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW, 0);
+
+        // Same inputs, same nonce — the function is pure.
         assert_eq!(
             a,
-            QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW)
+            QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW, 0)
         );
+
+        // A stopped clock must not make two requests collide.
         assert_ne!(
             a,
-            QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW + 1)
+            QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW, 1),
+            "the sequence must separate requests a fixed clock cannot"
         );
-        assert_ne!(
-            a,
-            QuoteRequest::derive_nonce(&caller, "prov/other", TEMPLATE, NOW)
-        );
-        assert_ne!(
-            a,
-            QuoteRequest::derive_nonce(&caller, CAPABILITY, b"other", NOW)
-        );
+
+        // Every other input still separates too.
+        for other in [
+            QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW + 1, 0),
+            QuoteRequest::derive_nonce(&caller, "prov/other", TEMPLATE, NOW, 0),
+            QuoteRequest::derive_nonce(&caller, CAPABILITY, b"other", NOW, 0),
+        ] {
+            assert_ne!(a, other);
+        }
     }
 }

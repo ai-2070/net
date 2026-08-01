@@ -301,6 +301,12 @@ async fn read_bounded(
 /// facilitator being unreachable (retryable, policy decides); anything
 /// else at this layer is a protocol fault (fail-closed).
 fn map_send_error(e: reqwest::Error) -> FacilitatorError {
+    // A destination-policy refusal surfaces as a connect error because it
+    // happens inside the resolver. It is terminal: the policy will refuse
+    // the same address again.
+    if crate::http_policy::is_policy_refusal(&e) {
+        return FacilitatorError::protocol(format!("endpoint refused by policy: {e}"));
+    }
     if e.is_timeout() {
         FacilitatorError::timeout(e.to_string())
     } else if e.is_connect() || e.is_request() {

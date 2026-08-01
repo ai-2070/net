@@ -133,20 +133,39 @@ pub fn serve_payments(
                     QUOTE_REQUEST_SKEW_NS,
                 )
                 .map_err(|e| e.to_string())?;
+                // Check-and-set before issuance, so two concurrent copies
+                // of one request cannot both mint a quote.
                 seen.lock()
-                    .admit(&verified.nonce, verified.expires_at_ns, now_ns)
+                    .admit(
+                        &verified.caller,
+                        &verified.nonce,
+                        verified.expires_at_ns,
+                        now_ns,
+                    )
                     .map_err(|e| e.to_string())?;
 
                 // From here the caller identity is proven, not claimed.
-                let quote_bytes = provider
+                let issued = provider
                     .quote(
                         &verified.caller,
                         provider.provider_id(),
                         &verified.capability,
                         &template,
                     )
-                    .await
-                    .map_err(|e| e.message)?;
+                    .await;
+                let quote_bytes = match issued {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        // Nothing was issued, so nothing needs replay
+                        // protection. Holding the nonce would retain state
+                        // for work never done — the shape an attacker uses
+                        // to fill the guard with denied requests — and
+                        // would block this caller's legitimate retry once
+                        // the denial is fixed (an allowlist edit, say).
+                        seen.lock().release(&verified.caller, &verified.nonce);
+                        return Err(e.message);
+                    }
+                };
                 Ok(QuoteWireResponse {
                     quote_b64: BASE64.encode(quote_bytes),
                 })
@@ -205,6 +224,16 @@ pub struct MeshPaymentChannel {
     /// looks like it was issued in the future. Tests inject a fixed
     /// instant on both sides; production uses `SystemClock` on both.
     clock: Arc<dyn Clock>,
+    /// Per-request counter feeding the quote-request nonce.
+    ///
+    /// The clock alone cannot separate two requests: `Clock` is a public
+    /// seam with no monotonicity requirement, so a fixed or coarse
+    /// implementation would derive one nonce for two legitimate
+    /// back-to-back requests and the provider would refuse the second as
+    /// a replay. A counter cannot repeat within a process, and a
+    /// transport-level retransmit re-sends the already-serialized request
+    /// rather than re-deriving, so retry idempotency is unaffected.
+    request_seq: std::sync::atomic::AtomicU64,
 }
 
 impl MeshPaymentChannel {
@@ -213,6 +242,7 @@ impl MeshPaymentChannel {
             mesh,
             caller,
             clock,
+            request_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -263,7 +293,11 @@ impl ProviderChannel for MeshPaymentChannel {
         }
         let node = Self::provider_node(capability)?;
         let now_ns = self.clock.now_ns();
-        let nonce = QuoteRequest::derive_nonce(caller, capability, template.bytes(), now_ns);
+        let sequence = self
+            .request_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nonce =
+            QuoteRequest::derive_nonce(caller, capability, template.bytes(), now_ns, sequence);
         let mut request = QuoteRequest::new(
             provider.clone(),
             caller.clone(),

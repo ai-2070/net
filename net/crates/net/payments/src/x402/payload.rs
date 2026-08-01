@@ -418,8 +418,7 @@ mod tests {
 
         // Same chain, zero-padded reference.
         let padded = FIXTURE.replace("eip155:84532", "eip155:084532");
-        let padded: X402Carry<PaymentPayload> =
-            X402Carry::from_bytes(padded.into_bytes()).unwrap();
+        let padded: X402Carry<PaymentPayload> = X402Carry::from_bytes(padded.into_bytes()).unwrap();
 
         let key = base.replay_key().unwrap();
         assert_eq!(
