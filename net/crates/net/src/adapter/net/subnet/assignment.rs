@@ -126,8 +126,13 @@ impl SubnetPolicy {
     ///   out an earlier one. Were zeros written, a policy could hold
     ///   non-zero values and still only ever answer GLOBAL.
     /// - A mapping whose prefix and value are BOTH empty is skipped. It
-    ///   would match only the empty tag, and no announcement can carry
-    ///   one, so it can never fire.
+    ///   would match only the empty tag, which
+    ///   [`Self::assign_from_rendered_tags`] discards — so it can never
+    ///   fire. Note the justification is that skip, NOT that empty tags
+    ///   are unrepresentable: `CapabilityMembership::tags` is a
+    ///   deserialized `Vec<String>` with no non-empty invariant, so
+    ///   without the skip the assignment helper would scope on an empty
+    ///   tag while this predicate said it could not.
     ///
     /// Both exclusions exist so this agrees with `assign` about the same
     /// policy. A diagnostic that flags configurations which cannot
@@ -136,13 +141,19 @@ impl SubnetPolicy {
         self.rules.iter().any(|rule| {
             rule.values.iter().any(|(value, &level_value)| {
                 // A mapping matches exactly the tag `tag_prefix + value`.
-                // With both halves empty that is the empty tag, which no
-                // announcement can carry: `Tag::parse` rejects `""` and
-                // no `Tag` renders to it. Counting it would report a
-                // policy as able to scope when `assign` can never make
-                // it do so.
+                // With both halves empty that is the empty tag, which
+                // `assign_from_rendered_tags` discards — so counting it
+                // would report a policy as able to scope when the
+                // assignment can never make it do so.
                 //
-                // Only BOTH being empty is impossible. An empty `value`
+                // The justification is that skip, not that empty tags
+                // cannot exist. `CapabilityMembership::tags` is a
+                // deserialized `Vec<String>`, so one is representable
+                // off the wire even though nothing that went through
+                // `Tag` produces it; the two must agree on the same
+                // domain, and the skip is what makes them.
+                //
+                // Only BOTH being empty is discounted. An empty `value`
                 // under a real prefix matches that prefix as a whole
                 // tag — `region:` parses (as `Tag::Legacy`) and renders
                 // back unchanged, so `region:` + `""` is reachable.
@@ -215,6 +226,21 @@ impl SubnetPolicy {
             let mut winner: Option<(&str, u8)> = None;
             for tag in tags {
                 let tag = tag.as_str();
+                // An empty tag is not a tag. `Tag::parse` rejects `""`
+                // and no `Tag` renders to it, but this function takes
+                // raw strings from `CapabilityMembership::tags`, which
+                // is a deserialized wire payload with no non-empty
+                // invariant — so an empty string is representable here
+                // even though nothing that went through `Tag` produces
+                // one. Skipping it is what lets
+                // [`Self::can_assign_non_global`] discount the
+                // empty-prefix/empty-value mapping: otherwise the two
+                // would disagree about the same policy, the predicate
+                // reasoning over `Tag`-validated input and this over
+                // whatever the wire carried.
+                if tag.is_empty() {
+                    continue;
+                }
                 let Some(value) = tag.strip_prefix(&rule.tag_prefix) else {
                     continue;
                 };
@@ -438,6 +464,21 @@ mod tests {
         assert!(
             !impossible.can_assign_non_global(),
             "a mapping that can never fire must not be reported as scoping"
+        );
+
+        // The domain the predicate reasons about must be the domain the
+        // helper operates on. `assign_from_rendered_tags` takes raw
+        // strings off `CapabilityMembership::tags` — a deserialized wire
+        // payload with no non-empty invariant — so an empty tag is
+        // representable even though nothing that went through `Tag`
+        // produces one. Without the skip in the helper, this would
+        // assign [5] while `can_assign_non_global` reported false, and
+        // the startup diagnostic would stay quiet on a real inversion.
+        assert_eq!(
+            impossible.assign_from_rendered_tags(&[String::new()]),
+            SubnetId::GLOBAL,
+            "an empty tag off the wire must not scope, or the predicate and \
+             the helper disagree about the same policy"
         );
 
         // The near miss that IS reachable: an empty value under a real
