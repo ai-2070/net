@@ -68,6 +68,36 @@ They are gaps **around** it. Three themes:
    (M1), producing inconsistent accept-then-deny behaviour and a persistent
    queue-group denial of service.
 
+## Remediation status (2026-08-01)
+
+All findings addressed except H1, which is a design decision rather than
+a patch and is costed in
+[`RECEIVE_SIDE_PUBLISH_AUTHORITY_PLAN.md`](../plans/RECEIVE_SIDE_PUBLISH_AUTHORITY_PLAN.md).
+
+| ID | Status |
+|----|--------|
+| H1 | **Open** — design written, implementation pending a decision on wire-format vs. session-state. Until it ships, `require_token` is a READ ACL. |
+| H2 | Fixed — `insert_if_absent` / `insert_prefix_if_absent`; `Mesh::register_channel_prefix` now exists; 8 per-variant witnesses. Also fixed a self-inflicted hash-index collision on re-registration. |
+| H3 | Fixed — `OriginBinding` on the reply prefix, evaluated against the pinned identity; unpinned rejects; nRPC client re-announces and retries. |
+| M1 | Fixed — requested channel threaded through every gate and retention key; publish-time denial now evicts from the roster. |
+| M2 | Fixed — `QueueGroupPolicy::TokenBound` binds a peer to a named group via `queue_group_hash`. |
+| M3 | Fixed — TTL width enforced in `check_time_bounds`, the common receiver seam. |
+| M4 | Fixed — token-gated subscribe rejected outright when no `TokenCache` is installed. |
+| L1 | Fixed — `UnregisteredChannelPolicy` makes registry-less permissiveness a recorded decision. |
+| I1 | Partially fixed — hazard documented at the guard; the key newtype spans ~50 call sites in dataforts/redex and remains open. |
+| I2 | Fixed — stale `TokenCache` install contract corrected across all five sites. |
+
+Two things found while fixing, not in the original audit:
+
+- `ChannelConfigRegistry::insert` pushed the channel name into the
+  canonical- and wire-hash reverse indices unconditionally, so
+  re-registering the same channel (documented as idempotent) grew the
+  bucket to `[name, name]`; `get()` read that as a hash collision and
+  canonical-hash lookup silently died for that channel. Fixed with H2.
+- `set_publish_chain` was unreachable for token-gated prefix channels —
+  it stores under the real channel hash while the publish gate asked
+  about the sentinel. Fixed with M1.
+
 | ID | Severity | Area | One-line |
 |----|----------|------|----------|
 | H1 | High | Channel auth / integrity | Publish authority is emitter-side only, and nRPC direct sends bypass even that |
