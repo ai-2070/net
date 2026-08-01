@@ -345,6 +345,13 @@ pub enum OverflowReject {
 /// channel name is intentionally NOT included — names can carry
 /// tenant / project identifiers and we don't want them flowing
 /// to client bindings via error strings.
+///
+/// The wrong-principal rejection names no identity at all, for the same
+/// reason. The origin hash in the not-authorized case is the caller's
+/// own and is what makes the error actionable; a rejected `Node(id)` is
+/// a mesh peer's identity, which the operator asking about a blob has no
+/// business learning from an error string. The principal TYPE is the
+/// whole diagnostic — the value adds nothing a caller can act on.
 /// `operator` must be an [`AclPrincipal::Origin`] — blob operations
 /// authorize an `EntityId::origin_hash`.
 ///
@@ -367,10 +374,11 @@ pub fn auth_allows_blob_op(
     channel: &ChannelName,
 ) -> Result<(), BlobError> {
     if !matches!(operator, AclPrincipal::Origin(_)) {
-        return Err(BlobError::Unauthorized(format!(
-            "blob operations authorize an entity origin hash; refusing a \
-             {operator:?} principal"
-        )));
+        return Err(BlobError::Unauthorized(
+            "blob operations authorize an entity origin hash; the supplied \
+             principal is not one"
+                .to_owned(),
+        ));
     }
     if guard.is_authorized_full(operator, channel) {
         Ok(())
@@ -688,9 +696,26 @@ mod tests {
 
         let err = auth_allows_blob_op(&guard, AclPrincipal::Node(node_id), &channel)
             .expect_err("a node principal must never authorize a blob mutation");
+        let BlobError::Unauthorized(msg) = &err else {
+            panic!("expected Unauthorized, got {err:?}");
+        };
+
+        // The rejection must not carry the node id. `BlobError` strings
+        // reach client bindings, and a rejected `Node(id)` is a mesh
+        // PEER's identity — nothing the operator asking about a blob
+        // should learn from an error, and nothing they could act on.
+        // (Contrast the not-authorized case, which does name the origin
+        // hash: that one is the caller's own, and it is what makes the
+        // error actionable.)
         assert!(
-            matches!(err, BlobError::Unauthorized(_)),
-            "expected Unauthorized, got {err:?}"
+            !msg.contains(&format!("{node_id:#x}"))
+                && !msg.contains(&node_id.to_string())
+                && !msg.contains(&format!("{node_id:x}")),
+            "the wrong-principal rejection leaked the peer's node id: {msg:?}"
+        );
+        assert!(
+            msg.contains("origin hash"),
+            "…but it must still say WHY it was refused: {msg:?}"
         );
     }
 
