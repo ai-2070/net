@@ -451,25 +451,51 @@ export const SCOPE_SUBNET_LOCAL = 'scope:subnet-local';
 
 /**
  * Append a `scope:tenant:<id>` tag to a tag list. Idempotent —
- * safe to call repeatedly with the same id. Empty `tenantId` is a
- * no-op.
+ * safe to call repeatedly with the same id.
+ *
+ * Throws on an empty `tenantId`. It used to return the tag list
+ * unchanged, which reads as "scope applied" but leaves the
+ * announcement resolving to `Global` — visible to EVERY tenant and
+ * region query. These helpers build raw arrays, so nothing downstream
+ * catches it: the Rust builders never see the call.
+ *
+ * @throws {Error} if `tenantId` is empty.
  */
 export function withTenantScope(
   tags: string[] | undefined,
   tenantId: string,
 ): string[] {
-  if (!tenantId) return tags ?? [];
+  if (!tenantId) {
+    throw new Error(
+      'withTenantScope: tenantId is empty — refusing to return an unscoped ' +
+        'tag list, which would leave this announcement visible to every ' +
+        'tenant and region query',
+    );
+  }
   const tag = `${SCOPE_TENANT_PREFIX}${tenantId}`;
   const list = tags ?? [];
   return list.includes(tag) ? list : [...list, tag];
 }
 
-/** Append a `scope:region:<name>` tag to a tag list. Idempotent. */
+/**
+ * Append a `scope:region:<name>` tag to a tag list. Idempotent.
+ *
+ * Throws on an empty `region`, for the same reason as
+ * {@link withTenantScope}.
+ *
+ * @throws {Error} if `region` is empty.
+ */
 export function withRegionScope(
   tags: string[] | undefined,
   region: string,
 ): string[] {
-  if (!region) return tags ?? [];
+  if (!region) {
+    throw new Error(
+      'withRegionScope: region is empty — refusing to return an unscoped ' +
+        'tag list, which would leave this announcement visible to every ' +
+        'tenant and region query',
+    );
+  }
   const tag = `${SCOPE_REGION_PREFIX}${region}`;
   const list = tags ?? [];
   return list.includes(tag) ? list : [...list, tag];
