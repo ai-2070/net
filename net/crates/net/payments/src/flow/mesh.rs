@@ -260,9 +260,14 @@ pub struct MeshPaymentChannel {
     /// seam with no monotonicity requirement, so a fixed or coarse
     /// implementation would derive one nonce for two legitimate
     /// back-to-back requests and the provider would refuse the second as
-    /// a replay. A counter cannot repeat within a process, and a
-    /// transport-level retransmit re-sends the already-serialized request
-    /// rather than re-deriving, so retry idempotency is unaffected.
+    /// a replay. A counter cannot repeat within a process.
+    ///
+    /// A quote request is **single-use**, and this counter is why every
+    /// `request_quote` is a new one. Re-sending a request already
+    /// admitted gets `ReplayedNonce`, not the original quote — the
+    /// provider keeps no copy of what it replied. See
+    /// [`QuoteRequest::derive_nonce`] for why that trade is the right
+    /// one.
     ///
     /// **Process-global, not per-channel.** Two channels for the same
     /// caller would each start at zero, so under a stopped clock their

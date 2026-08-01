@@ -117,7 +117,10 @@ pub enum QuoteRequestError {
     Expired,
     #[error("quote request is not yet valid (issued in the future beyond tolerance)")]
     NotYetValid,
-    #[error("quote request nonce was already used")]
+    #[error(
+        "quote request nonce was already used — a signed quote request is single-use; derive a \
+         new one rather than re-sending this one"
+    )]
     ReplayedNonce,
     #[error("quote request nonce is longer than the {max}-byte limit")]
     NonceTooLong { max: usize },
@@ -172,10 +175,30 @@ impl QuoteRequest {
     /// second is then refused as a replay. A counter cannot repeat within
     /// a process.
     ///
-    /// This does not weaken retry idempotency, because a retry does not
-    /// re-derive: the caller re-sends the *serialized request* it already
-    /// built, nonce included. Deriving again is a new request, and a new
-    /// request should have a new nonce.
+    /// ## A signed quote request is single-use
+    ///
+    /// Worth stating plainly, because the counter invites the opposite
+    /// reading. Re-sending the serialized bytes does **not** get the
+    /// original answer back: [`SeenNonces::admit`] refuses the nonce for
+    /// as long as `verify` would still accept the request carrying it,
+    /// and the provider keeps no copy of what it replied. So a lost
+    /// quote response is not recoverable by retransmission — the caller
+    /// derives a new request, which is what [`request_quote`] does on
+    /// every call.
+    ///
+    /// [`request_quote`]: crate::flow::mesh::MeshPaymentChannel::request_quote
+    ///
+    /// That is a deliberate trade, not an oversight. Returning the first
+    /// response for a repeated nonce would mean the provider retaining
+    /// every issued quote for the guard's whole window — the same
+    /// unbounded retention the guard exists to prevent, for a benefit
+    /// worth one quote. Quotes are free, cost the provider a signature,
+    /// and paying one still requires the caller's settlement
+    /// authorization, so re-deriving loses nothing but the round trip.
+    ///
+    /// What it does cost: an nRPC-level retransmit whose original reply
+    /// was lost surfaces `ReplayedNonce` rather than the quote. The error
+    /// says so and names the recovery.
     pub fn derive_nonce(
         caller: &EntityId,
         capability: &str,

@@ -375,8 +375,15 @@ async fn a_forged_caller_identity_is_refused_over_the_wire() {
 
 /// A verified request cannot be replayed: the nonce is remembered for as
 /// long as the request remains presentable.
+///
+/// Which makes a signed quote request **single-use**, and this pins that
+/// as the contract rather than an accident. Re-sending does not get the
+/// original quote back — the provider keeps no copy of what it replied —
+/// so a caller whose response was lost derives a new request. The
+/// refusal has to say so, because the alternative reading (retransmit
+/// and you'll get your answer) is the one a retrying transport assumes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_replayed_quote_request_is_refused() {
+async fn a_replayed_quote_request_is_refused_and_names_its_recovery() {
     let w = World::start().await;
     let caller = EntityKeypair::generate();
     let request = w.quote_request(&caller, "replay-me");
@@ -389,6 +396,19 @@ async fn a_replayed_quote_request_is_refused() {
     assert!(
         refusal.contains("nonce was already used"),
         "the refusal must be the replay guard: {refusal}"
+    );
+    assert!(
+        refusal.contains("single-use") && refusal.contains("derive a new one"),
+        "the refusal must name the recovery, or a caller reads it as a transient \
+         failure and retransmits forever: {refusal}"
+    );
+
+    // The recovery it names actually works: a freshly derived request for
+    // the same capability is quoted.
+    let derived_again = w.quote_request(&caller, "replay-me-derived-again");
+    assert!(
+        w.request_quote(&derived_again).await.is_ok(),
+        "deriving a new request is the documented way out and must be open"
     );
 }
 
