@@ -600,7 +600,7 @@ fn test_redex_auth_enforcement() {
     // in-process manager.
     let guard = Arc::new(AuthGuard::new());
     let name = cn("locked");
-    let r = Redex::with_auth(guard.clone(), AclPrincipal::Origin(0xDEAD_BEEF));
+    let r = Redex::with_auth(guard.clone(), 0xDEAD_BEEF);
     assert!(matches!(
         r.open_file(&name, RedexFileConfig::default()),
         Err(RedexError::Unauthorized)
@@ -655,7 +655,7 @@ fn test_regression_auth_does_not_grant_access_via_u16_collision() {
     // (different `u32` canonical hash with overwhelming probability).
     guard.allow_channel(AclPrincipal::Origin(0xDEAD_BEEF), &allowed);
 
-    let r = Redex::with_auth(guard.clone(), AclPrincipal::Origin(0xDEAD_BEEF));
+    let r = Redex::with_auth(guard.clone(), 0xDEAD_BEEF);
 
     // Allowed name opens cleanly.
     assert!(r.open_file(&allowed, RedexFileConfig::default()).is_ok());

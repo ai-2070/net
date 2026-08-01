@@ -345,19 +345,33 @@ pub enum OverflowReject {
 /// channel name is intentionally NOT included — names can carry
 /// tenant / project identifiers and we don't want them flowing
 /// to client bindings via error strings.
-/// `operator` must be an [`AclPrincipal`], so the caller states which
-/// derivation of a peer identity it is authorizing. Blob operations
-/// authorize an `EntityId::origin_hash`, i.e.
-/// [`AclPrincipal::Origin`] — a `node_id` is a different derivation and
-/// will not match a grant made under it, which is the point: the
-/// subscribe path (the ACL's only production writer) grants
-/// [`AclPrincipal::Node`], and "this peer subscribed to a channel" must
-/// never read as "this peer may mutate that channel's blobs".
+/// `operator` must be an [`AclPrincipal::Origin`] — blob operations
+/// authorize an `EntityId::origin_hash`.
+///
+/// A [`AclPrincipal::Node`] is **rejected outright**, not merely looked
+/// up and missed. Carrying the derivation in the key means a node-id
+/// grant cannot match an origin-keyed entry, but this function accepts
+/// whatever principal its caller builds — so a future call site that
+/// resolves its caller by node id would hand us `Node(x)`, and the
+/// subscribe path (the ACL's only production writer) populates exactly
+/// that. It would then find a real entry and authorize the mutation:
+/// "this peer subscribed to a channel" silently becoming "this peer may
+/// pin, unpin, delete, and repair that channel's blobs" — the
+/// escalation this whole boundary exists to prevent, re-entered through
+/// the front door.
+///
+/// Rejecting here makes the boundary enforced rather than documented.
 pub fn auth_allows_blob_op(
     guard: &AuthGuard,
     operator: AclPrincipal,
     channel: &ChannelName,
 ) -> Result<(), BlobError> {
+    if !matches!(operator, AclPrincipal::Origin(_)) {
+        return Err(BlobError::Unauthorized(format!(
+            "blob operations authorize an entity origin hash; refusing a \
+             {operator:?} principal"
+        )));
+    }
     if guard.is_authorized_full(operator, channel) {
         Ok(())
     } else {
@@ -647,6 +661,38 @@ mod tests {
     }
 
     // --- auth_allows_blob_op ---
+
+    /// A `Node` principal is refused outright, even when the ACL holds a
+    /// real grant for it.
+    ///
+    /// This is the escalation the derivation boundary exists to stop,
+    /// re-entered through the front door: the subscribe handler is the
+    /// ACL's only production writer and grants exactly `Node(node_id)`,
+    /// so a future blob call site that resolved its caller by node id
+    /// would hand us a principal that *does* have an entry. Keying on
+    /// the derivation stops a node grant from matching an origin lookup,
+    /// but it cannot stop a caller from asking the wrong question — so
+    /// the question itself is rejected.
+    #[test]
+    fn auth_refuses_a_node_principal_even_with_a_matching_grant() {
+        let guard = AuthGuard::new();
+        let node_id = 0xDEAD_BEEF_u64;
+        let channel = ChannelName::new("dataforts/test/escalation").unwrap();
+
+        // Exactly what an accepted Subscribe writes.
+        guard.allow_channel(AclPrincipal::Node(node_id), &channel);
+        assert!(
+            guard.is_authorized_full(AclPrincipal::Node(node_id), &channel),
+            "precondition: the subscribe grant really is present"
+        );
+
+        let err = auth_allows_blob_op(&guard, AclPrincipal::Node(node_id), &channel)
+            .expect_err("a node principal must never authorize a blob mutation");
+        assert!(
+            matches!(err, BlobError::Unauthorized(_)),
+            "expected Unauthorized, got {err:?}"
+        );
+    }
 
     #[test]
     fn auth_admits_when_origin_authorized_for_channel() {
