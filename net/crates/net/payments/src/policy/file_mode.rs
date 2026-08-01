@@ -585,9 +585,26 @@ mod windows_impl {
             return Err(std::io::Error::last_os_error());
         }
 
-        // SAFETY: on success the buffer holds a `TOKEN_USER` whose
-        // `User.Sid` points inside the same allocation, still alive here.
-        let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+        // `read_unaligned`, not a typed dereference.
+        //
+        // The buffer is a `Vec<u8>`, so the allocator guarantees alignment
+        // 1 and nothing more. `TOKEN_USER` contains a pointer, so it wants
+        // pointer alignment; forming `*const TOKEN_USER` from that
+        // allocation and dereferencing it is undefined behaviour whenever
+        // the allocation happens not to be suitably aligned. It reads
+        // correctly on x86 in practice, which is exactly what makes it
+        // worth writing down — the bug is in the contract, not in the
+        // observed behaviour.
+        //
+        // `read_unaligned` copies the struct out byte-wise instead. The
+        // `Sid` pointer it yields still points *into* `buffer`, which
+        // outlives every use below.
+        //
+        // SAFETY: on success the buffer holds a `TOKEN_USER` of exactly
+        // the size the probe asked for, and `read_unaligned` imposes no
+        // alignment requirement on the source.
+        let token_user = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>()) };
+        let sid = token_user.User.Sid;
         let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
         // SAFETY: `sid` is a valid SID borrowed from `buffer`; `raw` is a
         // live local the callee fills with a `LocalAlloc`'d string.
