@@ -764,23 +764,27 @@ impl X402HttpFlow {
 }
 
 /// Whether a signed payment may be sent to `url`: https anywhere, or http
-/// only to a loopback host (local/self-hosted testing). Anything else
-/// would put the PAYMENT-SIGNATURE bearer instrument on the wire in the
-/// clear.
+/// only to a loopback **address literal** (local/self-hosted testing).
+/// Anything else would put the PAYMENT-SIGNATURE bearer instrument on the
+/// wire in the clear.
+///
+/// **Delegates to [`crate::http_policy::require_secure_endpoint`]**, which
+/// is the same rule the facilitator client and the chain checker apply.
+/// It used to be a private copy, and the copy did not get the fix that
+/// made the cleartext exception address-level: it granted the exception to
+/// the *name* `localhost`, which is whatever DNS says it is. A hosts file
+/// or a split-horizon resolver pointing that name at a LAN address turned
+/// "http to localhost" into an unencrypted EIP-3009 authorization sent to
+/// a remote host — the precise thing this check exists to prevent, on the
+/// one door whose URL may be model-chosen.
+///
+/// Under the default `PublicOnly` the resolver refused that address
+/// anyway, so the gap opened only for a caller that had opted into
+/// `PublicOrLoopback` or `AllowPrivate`. Narrow — and beside the point.
+/// `http_policy` exists because these rules drifted when they were
+/// per-client, and one surviving copy is how they drift again.
 fn is_payment_safe_url(url: &str) -> bool {
-    match reqwest::Url::parse(url) {
-        Ok(u) if u.scheme() == "https" => true,
-        Ok(u) if u.scheme() == "http" => {
-            let host = u.host_str().unwrap_or_default();
-            let bare = host.trim_start_matches('[').trim_end_matches(']');
-            host == "localhost"
-                || bare
-                    .parse::<std::net::IpAddr>()
-                    .map(|ip| ip.is_loopback())
-                    .unwrap_or(false)
-        }
-        _ => false,
-    }
+    crate::http_policy::require_secure_endpoint(url).is_ok()
 }
 
 // The per-host capability key comes from `Url::host_str()` on the single
@@ -796,13 +800,40 @@ mod tests {
     use super::is_payment_safe_url;
 
     #[test]
-    fn payment_requires_https_except_loopback() {
+    fn payment_requires_https_except_loopback_literals() {
         assert!(is_payment_safe_url("https://api.example.com/x"));
         assert!(is_payment_safe_url("http://127.0.0.1:8080/x"));
         assert!(is_payment_safe_url("http://[::1]/x"));
-        assert!(is_payment_safe_url("http://localhost/x"));
+        // The v4 rules are not bypassable by spelling the address in v6.
+        assert!(is_payment_safe_url("http://[::ffff:127.0.0.1]/x"));
         // Cleartext to a remote host, or a non-web scheme: refused.
         assert!(!is_payment_safe_url("http://api.example.com/x"));
         assert!(!is_payment_safe_url("ftp://api.example.com/x"));
+        assert!(!is_payment_safe_url("not-a-url"));
+    }
+
+    /// The cleartext exception is address-level, so the NAME `localhost`
+    /// does not get it — this door applies the same rule as the
+    /// facilitator client and the chain checker.
+    ///
+    /// A name is whatever DNS says it is. A hosts file or a split-horizon
+    /// resolver can point `localhost` at a LAN address, and then this
+    /// check would be waving a signed EIP-3009 authorization onto the
+    /// wire in the clear, bound for a host that is not this one.
+    #[test]
+    fn a_signed_payment_is_not_sent_cleartext_to_the_name_localhost() {
+        for name in [
+            "http://localhost/x",
+            "http://LOCALHOST:8080/x",
+            "http://localhost.localdomain/x",
+        ] {
+            assert!(
+                !is_payment_safe_url(name),
+                "`{name}` is a name, not a loopback literal — it must not get the cleartext \
+                 exception"
+            );
+        }
+        // https to the same name is fine: the guard is about cleartext.
+        assert!(is_payment_safe_url("https://localhost:8080/x"));
     }
 }
