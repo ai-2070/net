@@ -55,6 +55,16 @@ var (
 	ErrPollFailed      = errors.New("poll failed")
 	ErrBufferTooSmall  = errors.New("buffer too small")
 	ErrShuttingDown    = errors.New("shutting down")
+	// ErrInvalidArgument (NET_ERR_INVALID_ARGUMENT, -12) reports input
+	// that deserialized cleanly but is semantically unusable — e.g. a
+	// ScopeFilter whose Kind is unrecognized, or whose required
+	// selector is missing, empty, or an all-empty list.
+	//
+	// Distinct from ErrInvalidJSON, which means the bytes were not
+	// valid JSON at all. These shapes previously resolved to the
+	// broadest scope filter, so a query that could not narrow silently
+	// widened instead of failing.
+	ErrInvalidArgument = errors.New("invalid argument")
 	ErrUnknown         = errors.New("unknown error")
 )
 

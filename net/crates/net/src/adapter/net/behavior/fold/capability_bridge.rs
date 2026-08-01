@@ -25,8 +25,8 @@
 //!   replacement for the legacy `find_nodes_scoped`.
 
 use super::super::capability::{
-    matches_scope, CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope,
-    GpuVendor, ScopeFilter,
+    CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope, GpuVendor,
+    PreparedScope, ScopeFilter,
 };
 use super::super::org::OrgId;
 use super::super::org_revocation::OrgRevocationState;
@@ -763,6 +763,21 @@ impl std::fmt::Debug for CapabilitySetCache {
 ///   axis (node / subnet / group) matches. Caller's subnet and
 ///   groups are read from the caller's own fold entries via
 ///   reserved `subnet:` / `group:` membership tags.
+///
+/// # Strength of each axis
+///
+/// Only `allowed_nodes` is load-bearing. `ann.node_id` is blake2s-bound
+/// to `entity_id` at dispatch, so a peer cannot present another node's
+/// identity.
+///
+/// `allowed_subnets` and `allowed_groups` are ADVISORY. Both read
+/// self-declared tags off the caller's own announcement, and the target
+/// publishes both lists in a broadcast announcement that forwards up to
+/// `MAX_CAPABILITY_HOPS` — so any peer that has seen one provider
+/// announcement learns the admitted values and can claim them with a
+/// single `add_tag`. Treat a match on those axes as a routing hint, not
+/// as authorisation, until the substrate grows an issuer-signed
+/// entitlement (see [`super::super::group`]).
 pub fn may_execute(
     fold: &Fold<CapabilityFold>,
     target_node: NodeId,
@@ -1206,6 +1221,19 @@ pub fn target_matches_filter(
 /// `pub(crate)` because [`CapabilityScope`] is itself
 /// `pub(crate)`; downstream callers reach scope filtering
 /// through [`find_nodes_matching_scoped`].
+///
+/// No longer on the query path — that now runs
+/// [`PreparedScope::matches`](super::super::capability::PreparedScope::matches),
+/// which reaches the same verdict without allocating a `String` per
+/// scope tag while the fold's read locks are held. (The
+/// `tags_match_scope` wrapper is NOT the query path: it rebuilds the
+/// prepared selector sets per call, so it allocates for the `Tenants` /
+/// `Regions` forms and is for tests and single-shot callers.)
+///
+/// Retained as the readable reference definition and as the oracle for
+/// `tags_match_scope_agrees_with_materialized_scope`, which pins the
+/// two to identical verdicts across the scope matrix.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn scope_from_membership_tags(tags: &[String]) -> CapabilityScope {
     let mut tenants: Vec<String> = Vec::new();
     let mut regions: Vec<String> = Vec::new();
@@ -1274,35 +1302,74 @@ pub fn filter_by_predicate(
 /// Scoped variant of [`find_nodes_matching`]. Filters
 /// candidates through `scope` (resolved from each
 /// publisher's `scope:*` tags) on top of the capability
-/// filter. `same_subnet_lookup(node_id) -> bool` is supplied
+/// filter. `same_subnet_lookup(node_id, tags) -> bool` is supplied
 /// by the caller; the bridge has no native subnet state.
 ///
-/// **Warm-up semantics** match the legacy path: when the
-/// caller's subnet membership is unknown for a candidate, the
-/// caller's closure decides whether to admit (typically
-/// `true` once a subnet policy is installed, `false`
-/// otherwise).
+/// `same_subnet_lookup(node_id, tags)` is invoked ONLY under a
+/// [`ScopeFilter::SameSubnet`] query, where every arm of the scope
+/// decision reduces to `same_subnet` and the candidate's own tags cannot
+/// change the verdict. Under every other filter the verdict is fully
+/// determined from the tags — including for a `scope:subnet-local`
+/// candidate, which those filters reject outright — so the closure is
+/// never reached. It used to run eagerly for every candidate of every
+/// scoped query even though the result was then discarded.
+///
+/// # Single snapshot
+///
+/// The closure receives the candidate's tags BORROWED FROM THE SAME
+/// fold snapshot that selected it, and runs while that snapshot's locks
+/// are held. That is deliberate: the previous shape passed only a
+/// `NodeId`, so a `MeshNode` resolving a forwarded peer had to reacquire
+/// the fold after the selection locks dropped — two observations, which
+/// a concurrent replacement between them could combine into a result
+/// that never existed in any single fold state (matched on the old
+/// entry's capabilities, judged on the new entry's subnet).
+///
+/// The closure must therefore be PURE with respect to the fold: it may
+/// read caller-side state, but must not query the fold, or it will
+/// deadlock or re-enter. Deriving a subnet from the borrowed tags needs
+/// no fold access, so this costs nothing.
 pub fn find_nodes_matching_scoped(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
     scope: &ScopeFilter<'_>,
-    same_subnet_lookup: impl Fn(NodeId) -> bool,
+    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
 ) -> Vec<NodeId> {
     let fold_filter = translate_filter(legacy);
     // Borrow-and-filter, same as `find_nodes_matching`: resolve
     // candidate keys via the index and run the range post-filter
-    // against borrowed payloads without cloning. We derive each
-    // survivor's scope here too (cheap, just parses the borrowed
-    // tags), but we do NOT call `same_subnet_lookup` under the
-    // lock — it's a caller-supplied closure opaque to the bridge,
-    // so running it while we hold the fold read locks risks lock
-    // contention or re-entrancy (a closure that itself queries the
-    // fold). Collect `(node, scope)` and apply the subnet/scope
-    // gate after the locks drop.
-    let scoped: Vec<(NodeId, CapabilityScope)> = fold.with_state_and_index(|state, index| {
+    // against borrowed payloads without cloning.
+    //
+    // The scope decision runs here too, but through
+    // `PreparedScope::matches`, which streams the borrowed tag strings
+    // without materializing a `CapabilityScope`. The materializing
+    // form allocated a `String` per scope tag plus a `Vec` per
+    // candidate, per query, while these read locks were held — cost an
+    // announcer controls, paid by every peer on every scoped query.
+    // Note this is `matches` on the ALREADY-prepared filter, not the
+    // `tags_match_scope` wrapper — that one rebuilds the selector sets
+    // per call and would reintroduce an allocation inside the locks.
+    //
+    // `same_subnet_lookup` runs INSIDE the same snapshot, against the
+    // borrowed tags of the entry that was just selected — see the
+    // "Single snapshot" note above for why the two observations must
+    // not be split. It is fold-pure by contract, so there is no
+    // re-entrancy hazard.
+    //
+    // Under `ScopeFilter::SameSubnet` every arm of the scope decision
+    // reduces to `same_subnet`, so the tags are not consulted for scope
+    // at all and the subnet closure alone decides. Under every other
+    // filter the verdict comes entirely from the tags and the closure
+    // is never called.
+    let subnet_decides = matches!(scope, ScopeFilter::SameSubnet);
+    // Hoist the filter's selector lists into hash sets BEFORE taking the
+    // locks. Inside, each selector test is then O(1) rather than a scan
+    // of the caller's list per matching scope tag per candidate.
+    let prepared = PreparedScope::new(scope);
+    let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
         let candidates = candidates.as_set();
-        let mut acc: Vec<(NodeId, CapabilityScope)> = Vec::with_capacity(candidates.len());
+        let mut acc: Vec<NodeId> = Vec::with_capacity(candidates.len());
         for &key in candidates {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
@@ -1313,19 +1380,19 @@ pub fn find_nodes_matching_scoped(
             if !membership_passes_range_filter(membership, legacy) {
                 continue;
             }
-            acc.push((key.1, scope_from_membership_tags(&membership.tags)));
+            let admitted = if subnet_decides {
+                same_subnet_lookup(key.1, &membership.tags)
+            } else {
+                // `same_subnet` is unread on every arm reachable here,
+                // so the placeholder never affects the verdict.
+                prepared.matches(&membership.tags, false)
+            };
+            if admitted {
+                acc.push(key.1);
+            }
         }
         acc
     });
-    // Locks released: apply the scope gate, invoking the caller's
-    // subnet closure outside any fold lock.
-    let mut out: Vec<NodeId> = scoped
-        .into_iter()
-        .filter(|(node_id, candidate_scope)| {
-            matches_scope(candidate_scope, scope, same_subnet_lookup(*node_id))
-        })
-        .map(|(node_id, _)| node_id)
-        .collect();
     // Sort + dedup: deterministic order and one entry per publisher
     // (a publisher may match under multiple classes).
     out.sort_unstable();
@@ -1950,12 +2017,57 @@ mod tests {
         let mut legacy = LegacyFilter::default();
         legacy.require_tags.push("gpu".into());
 
-        // SameSubnet lookup says BB is co-resident, AA isn't.
-        let lookup = |nid: NodeId| nid == 0xBB;
+        // SameSubnet lookup says BB is co-resident, AA isn't. The
+        // closure now also receives the candidate's tags, borrowed from
+        // the same snapshot that selected it.
+        let lookup = |nid: NodeId, _tags: &[String]| nid == 0xBB;
         let mut nodes =
             find_nodes_matching_scoped(&fold, &legacy, &ScopeFilter::SameSubnet, lookup);
         nodes.sort();
         assert_eq!(nodes, vec![0xBB]);
+    }
+
+    /// The closure sees the tags of the entry that was selected in the
+    /// SAME snapshot. Pre-fix it received only a `NodeId` and the
+    /// `MeshNode` implementation reacquired the fold to look the tags
+    /// up, so a concurrent replacement between the two reads could
+    /// produce a result that matched one announcement's capabilities
+    /// while being judged against its replacement's subnet
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    #[test]
+    fn scoped_subnet_lookup_sees_the_selected_entry_tags() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(
+            &kp,
+            0xCC,
+            0x100,
+            vec!["gpu", "region:eu"],
+            None,
+        ))
+        .expect("apply CC");
+
+        let mut legacy = LegacyFilter::default();
+        legacy.require_tags.push("gpu".into());
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let nodes =
+            find_nodes_matching_scoped(&fold, &legacy, &ScopeFilter::SameSubnet, |nid, tags| {
+                seen.borrow_mut().push((nid, tags.to_vec()));
+                // Admit on a tag the closure could only know by having
+                // been handed the selected entry's payload.
+                tags.iter().any(|t| t == "region:eu")
+            });
+
+        assert_eq!(nodes, vec![0xCC]);
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), 1, "closure must run once per candidate");
+        assert_eq!(seen[0].0, 0xCC);
+        assert!(
+            seen[0].1.iter().any(|t| t == "region:eu"),
+            "closure must receive the selected entry's tags; got {:?}",
+            seen[0].1
+        );
     }
 
     /// PERF_AUDIT §4.1 — cache hits return the SAME `Arc` instance

@@ -72,6 +72,21 @@ typedef enum {
      * cause now.
      */
     NET_ERR_INTERIOR_NUL     = -11,
+    /*
+     * Input deserialized cleanly but is semantically unusable — e.g. a
+     * scope filter whose `kind` is unrecognized, or whose required
+     * selector is missing, empty, or an all-empty list.
+     *
+     * Distinct from NET_ERR_INVALID_JSON, which means the bytes were not
+     * valid JSON at all; reporting these as INVALID_JSON would send a
+     * caller hunting a syntax error that isn't there. Same reasoning that
+     * gave NET_ERR_INTERIOR_NUL its own code.
+     *
+     * These shapes previously resolved to the broadest scope filter
+     * (match every peer), so a query that could not narrow silently
+     * widened instead of failing.
+     */
+    NET_ERR_INVALID_ARGUMENT = -12,
     NET_ERR_UNKNOWN          = -99
 } net_error_t;
 

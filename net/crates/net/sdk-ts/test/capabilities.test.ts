@@ -292,29 +292,26 @@ describe('MeshNode capabilities', () => {
   // matches no real tenant and silently narrows results to
   // Global candidates. Fix: drop empties; if list is empty
   // after cleaning, fall back to Any.
-  it('findNodesScoped: tenants list with only empty strings falls back to Any', async () => {
+  it('findNodesScoped: tenants list with only empty strings throws', async () => {
     const a = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: PSK });
     nodes.push(a);
 
-    // Tenant-tagged provider — without sanitization, a
-    // `tenants: [""]` query would *not* return this node
-    // (empty string never matches "oem-123") and would NOT
-    // return Global nodes either (none exist here).
     await a.announceCapabilities({
       tags: ['gpu', 'scope:tenant:oem-123'],
     });
 
-    // After sanitization: `tenants: [""]` collapses to Any,
-    // which matches every non-SubnetLocal candidate including
-    // tenant-tagged ones.
-    expect(
+    // A `tenants` filter that cleans down to nothing carries no tenant
+    // identity to narrow by. It used to collapse to `Any` — the
+    // BROADEST filter — so a caller whose tenant id arrived empty
+    // silently queried the whole mesh and selected a provider from it.
+    // A narrowing filter that cannot narrow now throws.
+    expect(() =>
       a.findNodesScoped({ requireTags: ['gpu'] }, { kind: 'tenants', tenants: [''] }),
-    ).toContain(a.nodeId());
+    ).toThrow();
 
-    // `tenants: []` (empty list) also falls back to Any.
-    expect(
+    expect(() =>
       a.findNodesScoped({ requireTags: ['gpu'] }, { kind: 'tenants', tenants: [] }),
-    ).toContain(a.nodeId());
+    ).toThrow();
   });
 
   it('findNodesScoped: tenants list with mixed empty and real ids drops empties', async () => {
@@ -344,7 +341,7 @@ describe('MeshNode capabilities', () => {
     ).not.toContain(a.nodeId());
   });
 
-  it('findNodesScoped: regions list with only empty strings falls back to Any', async () => {
+  it('findNodesScoped: regions list with only empty strings throws', async () => {
     // Same shape as the tenants regression but for regions.
     const a = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: PSK });
     nodes.push(a);
@@ -353,18 +350,18 @@ describe('MeshNode capabilities', () => {
       tags: ['relay-capable', 'scope:region:eu-west'],
     });
 
-    expect(
+    expect(() =>
       a.findNodesScoped(
         { requireTags: ['relay-capable'] },
         { kind: 'regions', regions: [''] },
       ),
-    ).toContain(a.nodeId());
+    ).toThrow();
 
-    expect(
+    expect(() =>
       a.findNodesScoped(
         { requireTags: ['relay-capable'] },
         { kind: 'regions', regions: [] },
       ),
-    ).toContain(a.nodeId());
+    ).toThrow();
   });
 });

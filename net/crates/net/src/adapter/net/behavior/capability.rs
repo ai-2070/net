@@ -659,17 +659,28 @@ pub const RELAY_CAPABLE_TAG: &str = "relay-capable";
 /// Precedence: `SubnetLocal` > tenants/regions > `Global`. A node
 /// that tags itself with both `scope:subnet-local` and
 /// `scope:tenant:foo` resolves to `SubnetLocal` (strictest wins).
+///
+/// Constructed only by `scope_from_membership_tags`, which is now the
+/// reference definition behind [`tags_match_scope`] rather than a query
+/// path — see those two for why the materialized form is retained.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CapabilityScope {
     /// No `scope:*` tag, or `scope:global` only — visible to every
     /// query that doesn't explicitly opt out (`GlobalOnly` /
     /// `SameSubnet`).
     Global,
-    /// `scope:subnet-local` present — visible only under
-    /// [`ScopeFilter::SameSubnet`]. Excluded from
-    /// [`ScopeFilter::Any`] and every other filter, because the
-    /// announcer has explicitly opted out of cross-subnet
-    /// discovery.
+    /// `scope:subnet-local` present — returned only under
+    /// [`ScopeFilter::SameSubnet`], and then only to a caller whose
+    /// subnet matches. Excluded from [`ScopeFilter::Any`] and every
+    /// other filter, because the announcer has explicitly opted out of
+    /// cross-subnet discovery.
+    ///
+    /// "Same subnet" is resolved from the announcer's own tags (via the
+    /// receiver's `SubnetPolicy`), so this narrows discovery among
+    /// cooperating peers — it does not withhold anything from a peer
+    /// that chooses to tag itself differently, and the announcement
+    /// itself still propagates mesh-wide. Not an isolation boundary.
     SubnetLocal,
     /// One or more `scope:tenant:*` tags, no regions, no
     /// subnet-local.
@@ -754,6 +765,35 @@ pub(crate) fn parse_membership_tags(
 /// excludes peers that explicitly tagged themselves
 /// `scope:subnet-local` — that tag is an opt-out from cross-subnet
 /// discovery.
+///
+/// # This is a discovery filter, not an access-control boundary
+///
+/// Scope is evaluated entirely at query time. Announcements still
+/// propagate permissively to every peer and forward up to
+/// `MAX_CAPABILITY_HOPS` regardless of their `scope:*` tags, and the
+/// tags are self-asserted by the announcer. Two consequences worth
+/// knowing before relying on this:
+///
+/// - **`Global` is permissive.** A peer with no `scope:*` tag matches
+///   EVERY tenant and region query ([`Self::Tenant`], [`Self::Region`],
+///   and their list forms). A tenant filter therefore narrows away only
+///   *cooperating* peers that scoped themselves elsewhere — an
+///   adversary simply omits the tag and stays visible.
+/// - **Nothing is withheld on the wire.** Plain `find_nodes_by_filter`
+///   — no scope filter at all — returns everything a tenant or region
+///   query filters out, because the filtering happens locally at query
+///   time and the announcements arrived either way. Scope keeps
+///   unrelated tenants out of your own placement decisions; it does not
+///   keep your providers secret.
+///
+///   [`Self::Any`] is NOT that unfiltered query: it still excludes
+///   candidates tagged `scope:subnet-local`, which only
+///   [`Self::SameSubnet`] returns. `Any` means "every candidate that did
+///   not opt out of cross-subnet discovery", not "every candidate".
+///
+/// Wire-level scope with forwarder enforcement is deferred — see
+/// `docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md` and
+/// `docs/internal/misc/SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md`.
 #[derive(Debug, Clone)]
 pub enum ScopeFilter<'a> {
     /// Match every peer regardless of scope, except those tagged
@@ -789,6 +829,13 @@ pub enum ScopeFilter<'a> {
 /// same-subnet membership). For the warm-up case where one
 /// side's subnet isn't known yet, callers default `same_subnet`
 /// to `true` (permissive).
+///
+/// No longer on the query path — [`tags_match_scope`] evaluates the same
+/// decision straight off the borrowed tags without allocating. This is
+/// kept as the readable reference definition and as the oracle the
+/// equivalence test checks the fast path against, so the scope matrix
+/// stays legible in one place.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn matches_scope(
     candidate_scope: &CapabilityScope,
     filter: &ScopeFilter<'_>,
@@ -842,6 +889,176 @@ pub(crate) fn matches_scope(
             rs.iter().any(|x| wanted.iter().any(|w| w == x))
         }
         (F::Regions(_), S::Tenants(_)) => false,
+    }
+}
+
+/// Convenience wrapper that prepares and evaluates in one call.
+///
+/// NOT for the query path — it rebuilds the selector sets per call, and
+/// the query path must hoist them out of the locked region via
+/// [`PreparedScope::new`]. Kept for tests and single-shot callers, where
+/// the preparation cost is paid once anyway.
+///
+/// See [`PreparedScope::matches`] for the decision this evaluates.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn tags_match_scope(
+    tags: &[String],
+    filter: &ScopeFilter<'_>,
+    same_subnet: bool,
+) -> bool {
+    PreparedScope::new(filter).matches(tags, same_subnet)
+}
+
+/// A [`ScopeFilter`] with its selector lists hoisted into hash sets.
+///
+/// Built ONCE per query, before the capability fold's read locks are
+/// taken. The list forms (`Tenants` / `Regions`) otherwise cost
+/// `candidates × matching scope tags × selectors` inside the locked
+/// region, and both the candidate's tag count and the caller's selector
+/// count are unbounded — an announcer choosing many `scope:tenant:*`
+/// tags and a caller passing a long list multiply. Short-circuiting on a
+/// hit does not bound the MISS case, which is the one an adversary
+/// controls (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+///
+/// Single-selector forms need no set: the comparison is already O(1).
+pub(crate) struct PreparedScope<'a> {
+    filter: &'a ScopeFilter<'a>,
+    /// Populated only for [`ScopeFilter::Tenants`].
+    tenants: Option<HashSet<&'a str>>,
+    /// Populated only for [`ScopeFilter::Regions`].
+    regions: Option<HashSet<&'a str>>,
+}
+
+impl<'a> PreparedScope<'a> {
+    /// Hoist the selector lists. Call outside any fold lock.
+    pub(crate) fn new(filter: &'a ScopeFilter<'a>) -> Self {
+        let tenants = match filter {
+            ScopeFilter::Tenants(wanted) => Some(wanted.iter().copied().collect()),
+            _ => None,
+        };
+        let regions = match filter {
+            ScopeFilter::Regions(wanted) => Some(wanted.iter().copied().collect()),
+            _ => None,
+        };
+        Self {
+            filter,
+            tenants,
+            regions,
+        }
+    }
+
+    /// Evaluate one candidate's borrowed tags. Allocation-free, and
+    /// every selector test is O(1).
+    ///
+    /// Equivalent to
+    /// `matches_scope(&scope_from_membership_tags(tags), filter, same_subnet)`,
+    /// evaluated directly against the membership's borrowed tag strings.
+    ///
+    /// The materializing form allocates a `String` per `scope:tenant:` /
+    /// `scope:region:` tag and a `Vec` to hold them, per candidate, per
+    /// query — and the query path runs it while the fold's state and
+    /// index read locks are held, so the allocation extends lock hold
+    /// time under input an announcer chooses. This streams the same
+    /// decision in one pass with no allocation
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    ///
+    /// [`scope_from_membership_tags`](super::fold::capability_bridge::scope_from_membership_tags)
+    /// is retained as the readable reference definition;
+    /// `tags_match_scope_agrees_with_materialized_scope` pins the two to
+    /// the same verdict across the matrix.
+    pub(crate) fn matches(&self, tags: &[String], same_subnet: bool) -> bool {
+        tags_match_prepared(tags, self, same_subnet)
+    }
+}
+
+fn tags_match_prepared(tags: &[String], prepared: &PreparedScope<'_>, same_subnet: bool) -> bool {
+    use ScopeFilter as F;
+    let filter = prepared.filter;
+
+    // Under `SameSubnet` every arm of `matches_scope` reduces to
+    // `same_subnet` — including the `SubnetLocal` candidate arm — so the
+    // tags cannot change the verdict and we skip the scan entirely.
+    if matches!(filter, F::SameSubnet) {
+        return same_subnet;
+    }
+
+    // One pass: classify the candidate and test the filter's selectors
+    // against the borrowed bodies as we go.
+    let (mut has_tenant, mut has_region) = (false, false);
+    let (mut tenant_hit, mut region_hit) = (false, false);
+    for tag in tags {
+        let Some(body) = tag.strip_prefix("scope:") else {
+            continue;
+        };
+        if body == "subnet-local" {
+            // Strictest scope wins, and every non-`SameSubnet` filter
+            // rejects it — the announcer opted out of cross-subnet
+            // discovery.
+            return false;
+        }
+        if let Some(id) = body.strip_prefix("tenant:") {
+            if id.is_empty() {
+                continue; // matches the resolver: empty ids are not scopes
+            }
+            has_tenant = true;
+            // Once a hit is recorded the selector list cannot change
+            // the outcome, so stop rescanning it. Matters for the
+            // `Tenants` / `Regions` list forms, where the inner scan is
+            // O(selectors) per tag and both sides are caller- or
+            // announcer-sized.
+            if !tenant_hit {
+                tenant_hit = match filter {
+                    F::Tenant(t) => id == *t,
+                    // O(1) against the hoisted set instead of a scan of
+                    // the caller's list per matching tag.
+                    F::Tenants(_) => prepared
+                        .tenants
+                        .as_ref()
+                        .is_some_and(|set| set.contains(id)),
+                    _ => false,
+                };
+            }
+        } else if let Some(name) = body.strip_prefix("region:") {
+            if name.is_empty() {
+                continue;
+            }
+            has_region = true;
+            if !region_hit {
+                region_hit = match filter {
+                    F::Region(r) => name == *r,
+                    F::Regions(_) => prepared
+                        .regions
+                        .as_ref()
+                        .is_some_and(|set| set.contains(name)),
+                    _ => false,
+                };
+            }
+        }
+        // `scope:global` is the default; presence is a no-op.
+    }
+
+    match filter {
+        F::SameSubnet => unreachable!("handled above"),
+        F::Any => true,
+        // Global == carries no tenant or region scope.
+        F::GlobalOnly => !has_tenant && !has_region,
+        // A tenant query matches a tenant-tagged candidate on a hit, an
+        // untagged (Global) candidate permissively, and a region-only
+        // candidate never — the axes are independent.
+        F::Tenant(_) | F::Tenants(_) => {
+            if has_tenant {
+                tenant_hit
+            } else {
+                !has_region
+            }
+        }
+        F::Region(_) | F::Regions(_) => {
+            if has_region {
+                region_hit
+            } else {
+                !has_tenant
+            }
+        }
     }
 }
 
@@ -971,12 +1188,37 @@ impl CapabilitySet {
     /// scope helpers for those). Untyped strings parse as
     /// `Tag::Legacy`; axis-prefixed strings (`hardware.gpu`,
     /// `software.os=linux`) parse as `AxisPresent` / `AxisValue`.
-    /// Empty tags and reserved-prefix tags are silently dropped
-    /// (the parser returns `Err` and we ignore it).
+    ///
+    /// Empty tags and reserved-prefix tags are dropped, because
+    /// `parse_user` returns `Err` for them. The drop is now logged at
+    /// `warn`: `add_tag("scope:tenant:acme")` looks like it scopes the
+    /// announcement but does not, and the resulting set resolves to
+    /// `CapabilityScope::Global` — visible to every tenant and region
+    /// query. Silently widening a set the caller believed was narrowed
+    /// is the failure mode worth hearing about
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
     pub fn add_tag(mut self, tag: impl Into<String>) -> Self {
         let s: String = tag.into();
-        if let Ok(t) = Tag::parse_user(&s) {
-            self.tags.insert(t);
+        match Tag::parse_user(&s) {
+            Ok(t) => {
+                self.tags.insert(t);
+            }
+            Err(e) => {
+                // `error` names the prefix that tripped, so the message
+                // does not re-list them. It does keep the consequence:
+                // a dropped `scope:` tag is the caller believing they
+                // narrowed a set that is in fact still global, which is
+                // the whole reason this logs at all.
+                tracing::warn!(
+                    tag = %s,
+                    error = %e,
+                    "add_tag: tag dropped, not on the announcement — reserved \
+                     prefixes need their dedicated builder (for scope: \
+                     with_tenant_scope / with_region_scope / \
+                     with_subnet_local_scope). A dropped scope tag leaves the \
+                     set globally visible."
+                );
+            }
         }
         self
     }
@@ -1041,11 +1283,16 @@ impl CapabilitySet {
     /// Add a `scope:tenant:<id>` reserved tag, marking this
     /// announcement as advertised under the given tenant. Idempotent
     /// — repeated calls with the same id do not duplicate. Empty
-    /// `tenant_id` is silently dropped (matches the scope resolver,
-    /// which rejects empty ids).
+    /// `tenant_id` is dropped with a `warn` (matches the scope
+    /// resolver, which rejects empty ids) — the resulting set is NOT
+    /// tenant-scoped and resolves to `CapabilityScope::Global`.
     pub fn with_tenant_scope(mut self, tenant_id: impl Into<String>) -> Self {
         let id = tenant_id.into();
         if id.is_empty() {
+            tracing::warn!(
+                "with_tenant_scope(\"\"): empty tenant id ignored — set is NOT \
+                 tenant-scoped and stays globally visible"
+            );
             return self;
         }
         let tag = format!("{TAG_SCOPE_TENANT_PREFIX}{id}");
@@ -1057,10 +1304,16 @@ impl CapabilitySet {
 
     /// Add a `scope:region:<name>` reserved tag, marking this
     /// announcement as advertised under the given region.
-    /// Idempotent. Empty `region` is silently dropped.
+    /// Idempotent. Empty `region` is dropped with a `warn` — the
+    /// resulting set is NOT region-scoped and resolves to
+    /// `CapabilityScope::Global`.
     pub fn with_region_scope(mut self, region: impl Into<String>) -> Self {
         let name = region.into();
         if name.is_empty() {
+            tracing::warn!(
+                "with_region_scope(\"\"): empty region ignored — set is NOT \
+                 region-scoped and stays globally visible"
+            );
             return self;
         }
         let tag = format!("{TAG_SCOPE_REGION_PREFIX}{name}");
@@ -2115,8 +2368,15 @@ pub struct CapabilityAnnouncement {
     /// vec = permissive default (anyone may invoke, subject to
     /// the other two lists). See `CAPABILITY_AUTH_PLAN.md`.
     ///
+    /// This is the ONLY allow-list axis that carries security weight:
+    /// `ann.node_id` is a blake2s derivation over the announcing key
+    /// and is checked against `entity_id` at dispatch, so it cannot be
+    /// claimed by another peer. [`Self::allowed_subnets`] and
+    /// [`Self::allowed_groups`] are advisory — see their docs.
+    ///
     /// Capped at [`MAX_ALLOW_LIST_LEN`] (64) per axis — past that,
-    /// operators use a [`super::group::GroupId`] instead.
+    /// operators use a [`super::group::GroupId`] instead (with the
+    /// caveat on that type: groups do not gate).
     ///
     /// `skip_serializing_if` preserves byte-identity with pre-v0.4
     /// announcements: an unrestricted (empty) list serializes to
@@ -2128,8 +2388,16 @@ pub struct CapabilityAnnouncement {
     /// v0.4 capability-auth allow-list — [`super::subnet::SubnetId`]s
     /// whose members may invoke. Empty = permissive default.
     /// Receivers determine a caller's subnet via the `subnet:<hex>`
-    /// tag on the caller's own announcement (self-declared, signed,
-    /// TOFU-bound). Same wire-compat treatment as `allowed_nodes`.
+    /// tag on the caller's own announcement. Same wire-compat
+    /// treatment as `allowed_nodes`.
+    ///
+    /// ⚠ **Advisory — does not keep anyone out.** The caller's subnet
+    /// is self-declared, and this list is published in a broadcast
+    /// announcement that forwards up to `MAX_CAPABILITY_HOPS`, so every
+    /// node in the mesh learns the admitted values. A `SubnetId` is
+    /// also only 32 bits and typically holds small level values, so it
+    /// is enumerable even unobserved. Use [`Self::allowed_nodes`] for
+    /// anything load-bearing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_subnets: Vec<super::subnet::SubnetId>,
     /// v0.4 capability-auth allow-list — [`super::group::GroupId`]s
@@ -2137,6 +2405,15 @@ pub struct CapabilityAnnouncement {
     /// Group membership is self-declared via `group:<hex>` tags on
     /// the caller's own announcement. Same wire-compat treatment
     /// as `allowed_nodes`.
+    ///
+    /// ⚠ **Advisory — does not keep anyone out.** Populating this field
+    /// publishes the very ids it restricts to: the announcement carries
+    /// them in cleartext to every peer and relay within
+    /// `MAX_CAPABILITY_HOPS`, and `group:` is not a reserved prefix, so
+    /// any recipient can claim the membership with a one-line
+    /// `add_tag`. See [`super::group`] for the full reasoning and what
+    /// a real fix requires. Use [`Self::allowed_nodes`] for anything
+    /// load-bearing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_groups: Vec<super::group::GroupId>,
     /// OA-1 organization ownership — the announcer's
@@ -3847,6 +4124,75 @@ mod tests {
     // `scope_from_membership_tags`.
     // ========================================================================
 
+    /// `tags_match_scope` (allocation-free, used on the query path) must
+    /// agree with `matches_scope(&scope_from_membership_tags(..))` (the
+    /// readable reference) on every combination that matters. If these
+    /// ever diverge, the fast path silently changes who is discoverable.
+    ///
+    /// SEMANTIC oracle only — it pins the verdict, nothing else. It does
+    /// NOT cover, and must not be read as covering: allocation counts or
+    /// selector-list cost under the fold locks; how many times the
+    /// subnet callback fires, or in what order; repeated evaluation for
+    /// a publisher present in several classes; or duplicate-tag
+    /// amplification. Those are performance properties and need their
+    /// own measurements.
+    #[test]
+    fn tags_match_scope_agrees_with_materialized_scope() {
+        use super::super::fold::capability_bridge::scope_from_membership_tags;
+
+        let tag_sets: Vec<Vec<String>> = vec![
+            vec![],                                    // Global
+            vec!["scope:global".into()],               // Global (explicit)
+            vec!["gpu".into(), "hardware.gpu".into()], // Global + noise
+            vec!["scope:subnet-local".into()],         // SubnetLocal
+            vec![
+                "scope:subnet-local".into(),
+                "scope:tenant:oem-123".into(), // strictest wins
+            ],
+            vec!["scope:tenant:oem-123".into()],
+            vec![
+                "scope:tenant:oem-123".into(),
+                "scope:tenant:corp-acme".into(),
+            ],
+            vec!["scope:region:eu-west".into()],
+            vec!["scope:region:eu-west".into(), "scope:region:us-east".into()],
+            vec![
+                "scope:tenant:oem-123".into(),
+                "scope:region:eu-west".into(), // TenantsAndRegions
+            ],
+            vec!["scope:tenant:".into()], // empty id → not a scope
+            vec!["scope:region:".into()],
+        ];
+        let tenants_multi = ["oem-123", "other"];
+        let regions_multi = ["eu-west", "ap-south"];
+        let filters = vec![
+            ScopeFilter::Any,
+            ScopeFilter::GlobalOnly,
+            ScopeFilter::SameSubnet,
+            ScopeFilter::Tenant("oem-123"),
+            ScopeFilter::Tenant("nobody"),
+            ScopeFilter::Tenants(&tenants_multi),
+            ScopeFilter::Region("eu-west"),
+            ScopeFilter::Region("nowhere"),
+            ScopeFilter::Regions(&regions_multi),
+        ];
+
+        for tags in &tag_sets {
+            let materialized = scope_from_membership_tags(tags);
+            for filter in &filters {
+                for same_subnet in [false, true] {
+                    let reference = matches_scope(&materialized, filter, same_subnet);
+                    let fast = tags_match_scope(tags, filter, same_subnet);
+                    assert_eq!(
+                        fast, reference,
+                        "divergence for tags={tags:?} filter={filter:?} \
+                         same_subnet={same_subnet}: fast={fast} reference={reference}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn matches_scope_global_visible_to_tenant_filter() {
         // A peer that doesn't tag itself stays discoverable under
@@ -3928,12 +4274,51 @@ mod tests {
             CapabilityScope::Tenants(vec!["oem-123".to_string()]),
         );
     }
+    /// The consequence of every silent-drop path in the scope
+    /// builders: the set stays `Global`, which matches EVERY tenant
+    /// and region query. Pinning it here makes the cost of the drop
+    /// explicit — it is not "no scope applied", it is "visible to
+    /// everyone" (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    #[test]
+    fn dropped_scope_input_leaves_the_set_globally_visible() {
+        // `add_tag` cannot set a reserved `scope:` tag — parse_user
+        // rejects it — so this reads as scoping but does not scope.
+        let via_add_tag = CapabilitySet::new().add_tag("scope:tenant:oem-123");
+        let tags: Vec<String> = via_add_tag.tags.iter().map(|t| t.to_string()).collect();
+        assert!(
+            !tags.iter().any(|t| t.starts_with("scope:")),
+            "add_tag must not be able to set a reserved scope tag; got {tags:?}"
+        );
+
+        // Both drop paths land on the same resolved scope, and that
+        // scope is permissive against an arbitrary tenant query.
+        for caps in [
+            via_add_tag,
+            CapabilitySet::new().with_tenant_scope(""),
+            CapabilitySet::new().with_region_scope(""),
+        ] {
+            let rendered: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+            let resolved =
+                super::super::fold::capability_bridge::scope_from_membership_tags(&rendered);
+            assert_eq!(
+                resolved,
+                CapabilityScope::Global,
+                "a dropped scope input must resolve to Global"
+            );
+            assert!(
+                matches_scope(&resolved, &ScopeFilter::Tenant("someone-else"), false),
+                "Global matches every tenant query — the dropped scope input \
+                 left this set visible to an unrelated tenant"
+            );
+        }
+    }
+
     #[test]
     fn with_tenant_scope_is_idempotent_and_drops_empty() {
         let caps = CapabilitySet::new()
             .with_tenant_scope("oem-123")
             .with_tenant_scope("oem-123") // duplicate
-            .with_tenant_scope(""); // empty — silently dropped
+            .with_tenant_scope(""); // empty — dropped (now with a warn)
                                     // Phase A.5.N.2: tags are typed; render to wire form
                                     // for prefix-string filtering.
         let tenant_tags: Vec<String> = caps

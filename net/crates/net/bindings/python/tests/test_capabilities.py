@@ -288,27 +288,42 @@ def test_find_nodes_scoped_camelcase_kinds_accepted() -> None:
 # fall back to Any when the cleaned list is empty.
 
 
-def test_find_nodes_scoped_tenants_with_only_empty_strings_falls_back_to_any() -> None:
+def test_find_nodes_scoped_tenants_with_only_empty_strings_raises() -> None:
+    # A `tenants` filter that cleans down to nothing carries no tenant
+    # identity to narrow by. It used to collapse to `Any` — the BROADEST
+    # filter — so a caller whose tenant id arrived empty silently
+    # queried the whole mesh and picked a provider from it. Narrowing
+    # filters that cannot narrow now raise.
     m = NetMesh(_port(13), PSK)
     try:
-        # Tenant-tagged provider — without sanitization, a
-        # `tenants: [""]` query would not return this node and
-        # would not return any Global node either.
         m.announce_capabilities({"tags": ["gpu", "scope:tenant:oem-123"]})
 
-        # After sanitization, `tenants: [""]` collapses to Any.
-        peers = m.find_nodes_scoped(
-            {"require_tags": ["gpu"]},
-            {"kind": "tenants", "tenants": [""]},
-        )
-        assert m.node_id in peers
+        for tenants in ([""], [], ["", ""]):
+            with pytest.raises(ValueError):
+                m.find_nodes_scoped(
+                    {"require_tags": ["gpu"]},
+                    {"kind": "tenants", "tenants": tenants},
+                )
+    finally:
+        m.shutdown()
 
-        # Empty list also falls back to Any.
-        peers = m.find_nodes_scoped(
-            {"require_tags": ["gpu"]},
-            {"kind": "tenants", "tenants": []},
-        )
-        assert m.node_id in peers
+
+def test_find_nodes_scoped_empty_tenant_and_unknown_kind_raise() -> None:
+    # Same rule on the single-selector kinds, and on a kind typo — the
+    # unknown-`kind` fallthrough was previously documented as
+    # "defensive" but resolved to `Any`.
+    m = NetMesh(_port(16), PSK)
+    try:
+        m.announce_capabilities({"tags": ["gpu", "scope:tenant:oem-123"]})
+
+        for scope in (
+            {"kind": "tenant", "tenant": ""},
+            {"kind": "tenant"},
+            {"kind": "region", "region": ""},
+            {"kind": "tenat", "tenant": "oem-123"},
+        ):
+            with pytest.raises(ValueError):
+                m.find_nodes_scoped({"require_tags": ["gpu"]}, scope)
     finally:
         m.shutdown()
 
@@ -337,23 +352,20 @@ def test_find_nodes_scoped_tenants_partial_clean_drops_empties() -> None:
         m.shutdown()
 
 
-def test_find_nodes_scoped_regions_with_only_empty_strings_falls_back_to_any() -> None:
+def test_find_nodes_scoped_regions_with_only_empty_strings_raises() -> None:
+    # Regions mirror tenants: an all-empty list cannot narrow, so it
+    # raises rather than widening to Any.
     m = NetMesh(_port(15), PSK)
     try:
         m.announce_capabilities(
             {"tags": ["relay-capable", "scope:region:eu-west"]}
         )
 
-        peers = m.find_nodes_scoped(
-            {"require_tags": ["relay-capable"]},
-            {"kind": "regions", "regions": [""]},
-        )
-        assert m.node_id in peers
-
-        peers = m.find_nodes_scoped(
-            {"require_tags": ["relay-capable"]},
-            {"kind": "regions", "regions": []},
-        )
-        assert m.node_id in peers
+        for regions in ([""], []):
+            with pytest.raises(ValueError):
+                m.find_nodes_scoped(
+                    {"require_tags": ["relay-capable"]},
+                    {"kind": "regions", "regions": regions},
+                )
     finally:
         m.shutdown()

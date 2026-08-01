@@ -2069,7 +2069,7 @@ mod mesh_bindings {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let core = crate::capabilities::capability_filter_from_js(filter);
-            let owned = crate::capabilities::scope_filter_from_js(scope);
+            let owned = crate::capabilities::scope_filter_from_js(scope)?;
             let ids = crate::capabilities::with_scope_filter(&owned, |f| {
                 node.find_nodes_by_filter_scoped(&core, f)
             });

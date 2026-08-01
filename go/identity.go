@@ -59,6 +59,8 @@ func identityErrorFromCode(code C.int) error {
 		return ErrInvalidUTF8
 	case -3:
 		return ErrInvalidJSON
+	case -12:
+		return ErrInvalidArgument
 	case -120:
 		return ErrIdentity
 	case -121:

@@ -2329,15 +2329,38 @@ impl MeshNodeConfig {
     }
 
     /// Pin this node to a specific subnet.
+    ///
+    /// This is the builder method for the local subnet; the
+    /// [`subnet`](Self::subnet) field is public and can be assigned
+    /// directly. What does NOT set it is
+    /// [`Self::with_subnet_policy`] — that policy applies to peers. A
+    /// subnet-scoped deployment wants both.
     pub fn with_subnet(mut self, subnet: SubnetId) -> Self {
         self.subnet = subnet;
         self
     }
 
-    /// Derive each peer's subnet locally by applying this policy to
+    /// Derive each PEER's subnet locally by applying this policy to
     /// their inbound [`CapabilityAnnouncement`]s. Mesh-wide policy
     /// consistency is assumed; mismatched policies lead to
     /// asymmetric views of peer subnets.
+    ///
+    /// Does not assign this node's own subnet — use
+    /// [`Self::with_subnet`] for that, and prefer setting both.
+    ///
+    /// A policy that CAN assign a non-global subnet
+    /// ([`SubnetPolicy::can_assign_non_global`]) while the local subnet
+    /// is left at [`SubnetId::GLOBAL`] resolves peers but has no subnet
+    /// identity to compare them against, which leaves
+    /// `Visibility::ParentVisible` admitting the peers it could NOT
+    /// resolve while rejecting the ones it could
+    /// (CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md,
+    /// finding 2). `MeshNode::new` warns on exactly that pairing.
+    ///
+    /// A rule-less or all-zero policy is exempt: it assigns `GLOBAL` to
+    /// everyone, so every peer lands in the same subnet as a `GLOBAL`
+    /// local node and nothing is inconsistent. Installing one does not
+    /// oblige you to add a local subnet.
     pub fn with_subnet_policy(mut self, policy: Arc<SubnetPolicy>) -> Self {
         self.subnet_policy = Some(policy);
         self
@@ -7425,8 +7448,30 @@ pub struct MeshNode {
     local_subnet_policy: Option<Arc<SubnetPolicy>>,
     /// Per-peer subnet map. Keys are `node_id`; values are the
     /// subnet derived from each peer's most recent announcement via
-    /// `local_subnet_policy`. Unknown peers default to
-    /// [`SubnetId::GLOBAL`] at read time.
+    /// `local_subnet_policy`.
+    ///
+    /// **Absence means "not derived", and must stay that way.** Readers
+    /// preserve it as `Option<SubnetId>` and hand `None` to
+    /// [`MeshNode::subnet_visible`], which decides per visibility mode.
+    /// This doc used to say unknown peers "default to
+    /// [`SubnetId::GLOBAL`] at read time" — that WAS the behaviour, and
+    /// it was the HIGH #2 vulnerability: `GLOBAL` is a universal
+    /// ancestor, so every peer whose subnet had not been derived was
+    /// admitted to every `ParentVisible` channel, on the path that
+    /// otherwise answers `AckReason::Unauthorized`
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    ///
+    /// Absence is routine, not transient. The write in
+    /// `handle_capability_announcement` is gated on
+    /// `signature_verified && ann.hop_count == 0` with a policy
+    /// installed, so a peer learned only through a relay is never in
+    /// here, and no peer is with no policy configured.
+    ///
+    /// Read by the channel publish / subscribe paths, which want the
+    /// last thing a session peer said about itself. NOT read by scoped
+    /// discovery — see [`MeshNode::find_nodes_by_filter_scoped`] for why
+    /// a pre-apply sidecar is the wrong input for a query against fold
+    /// state.
     peer_subnets: Arc<DashMap<u64, SubnetId>>,
     /// Optional `SubnetGateway` instance for this node — installed
     /// alongside `channel_configs` in [`Self::set_channel_configs`]
@@ -8224,6 +8269,17 @@ impl MeshNode {
         // without going back through `config`.
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
+        let policy_can_scope = local_subnet_policy
+            .as_ref()
+            .is_some_and(|p| p.can_assign_non_global());
+        if Self::subnet_policy_without_local_subnet(local_subnet, policy_can_scope) {
+            tracing::warn!(
+                "subnet policy installed but local subnet is GLOBAL — \
+                 with_subnet_policy assigns peers' subnets, not this node's; \
+                 add with_subnet(..). ParentVisible currently admits peers \
+                 whose subnet could not be resolved and rejects those it could."
+            );
+        }
         // Pre-apply the reflex override so the node starts in
         // `Open` + `reflex_addr = Some(override)` state before
         // the first capability announcement leaves the box. Skips
@@ -10206,15 +10262,47 @@ impl MeshNode {
     /// `MeshNodeConfig::subnet` (or `SubnetId::GLOBAL` when none was
     /// configured). Stable for the node's lifetime; the substrate
     /// doesn't reassign the local subnet at runtime.
+    ///
+    /// A [`SubnetPolicy`] never contributes to this value, however it is
+    /// configured — see [`Self::local_subnet_policy`].
     pub fn local_subnet(&self) -> SubnetId {
         self.local_subnet
     }
 
-    /// Read-only handle to the `SubnetPolicy` that derived this
-    /// node's `local_subnet`, when one was supplied. `None` when
-    /// the local subnet came from `MeshNodeConfig::subnet`
-    /// directly without going through a policy. Operator tools
-    /// surface this to explain "why is this node in subnet X."
+    /// Read-only handle to the `SubnetPolicy` this node applies to
+    /// OTHER peers, or `None` when per-peer subnet resolution is
+    /// disabled.
+    ///
+    /// **This policy does not assign this node's own subnet.** That
+    /// comes from `MeshNodeConfig::subnet` — set through
+    /// [`MeshNodeConfig::with_subnet`] or assigned directly, the field
+    /// being public — see [`Self::local_subnet`]. The two settings are
+    /// independent, and `Some`/`None` here says nothing about where
+    /// `local_subnet` came from; it says only whether inbound
+    /// announcements get resolved to a subnet.
+    ///
+    /// This doc previously claimed the opposite — that the policy
+    /// "derived this node's `local_subnet`", with `None` meaning the
+    /// subnet came from config instead. No such distinction exists, and
+    /// the claim pointed operators at installing a policy as the way to
+    /// subnet a node. That configuration (`with_subnet_policy` without
+    /// `with_subnet`) leaves `local_subnet` at [`SubnetId::GLOBAL`] —
+    /// and when the policy can actually assign a non-global subnet
+    /// ([`SubnetPolicy::can_assign_non_global`]), that is precisely the
+    /// case where an unresolved peer stays visible under
+    /// `ParentVisible` while a resolved one is rejected
+    /// (CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md,
+    /// finding 2). Set both. A policy that can only ever answer
+    /// `GLOBAL` is exempt — it puts every peer in the same subnet as a
+    /// `GLOBAL` local node.
+    ///
+    /// What the policy IS used for: deriving each peer's subnet, both
+    /// for the `peer_subnets` sidecar the channel paths read and — run
+    /// live against the selected fold entry's tags — for
+    /// [`Self::find_nodes_by_filter_scoped`] under
+    /// `ScopeFilter::SameSubnet`. Operator tooling can surface it to
+    /// explain "why did this node place *that peer* in subnet X"; it
+    /// cannot explain this node's own.
     pub fn local_subnet_policy(&self) -> Option<&Arc<SubnetPolicy>> {
         self.local_subnet_policy.as_ref()
     }
@@ -23477,11 +23565,10 @@ impl MeshNode {
         let cfg = cfg_ref.clone();
         drop(cfg_ref);
 
-        let peer_subnet = ctx
-            .peer_subnets
-            .get(&from_node)
-            .map(|e| *e.value())
-            .unwrap_or(SubnetId::GLOBAL);
+        // `None` when this peer's subnet has not been derived — passed
+        // through as unknown rather than coerced to GLOBAL, which used
+        // to open every `ParentVisible` channel to unresolved peers.
+        let peer_subnet = ctx.peer_subnets.get(&from_node).map(|e| *e.value());
         let visible = Self::subnet_visible(ctx.local_subnet, peer_subnet, cfg.visibility);
         if let Some(gw) = ctx.subnet_gateway.as_ref() {
             if visible {
@@ -23675,10 +23762,80 @@ impl MeshNode {
         }
     }
 
-    fn subnet_visible(source: SubnetId, dest: SubnetId, visibility: Visibility) -> bool {
+    /// True for a node whose [`SubnetPolicy`] can assign a non-global
+    /// subnet while its own subnet is left at [`SubnetId::GLOBAL`] — a
+    /// configuration that resolves peers into subnets while holding no
+    /// subnet identity to compare them against.
+    ///
+    /// The consequence is confined to [`Visibility::ParentVisible`] and
+    /// it is an inversion: `dest.is_ancestor_of(GLOBAL)` is false for
+    /// every concrete `dest`, so a peer whose subnet the policy DID
+    /// resolve is rejected, while a peer it could not resolve takes the
+    /// unknown arm — `source.is_global()`, which is true here — and is
+    /// admitted. Being unresolvable becomes strictly more privileged
+    /// than being resolved, on the path that otherwise answers
+    /// [`AckReason::Unauthorized`].
+    ///
+    /// The unknown arm is deliberately left permissive for a genuinely
+    /// flat mesh: a node with no subnet of its own cannot express "same
+    /// subnet as me" or "ancestor of me" as a constraint, and failing
+    /// closed there would silently partition every deployment that
+    /// never configured subnets. See [`Self::subnet_visible`]. This
+    /// predicate separates the flat case (no policy — nothing is ever
+    /// resolvable, permissive is the only workable answer) from the
+    /// misconfigured one (a policy, so resolution is expected, but no
+    /// local subnet to judge against).
+    ///
+    /// The condition is the CONJUNCTION. A policy with a scoped local
+    /// subnet is the intended subnet-aware setup; a global local subnet
+    /// with no policy is the intended flat setup. Only the pair is
+    /// suspect.
+    ///
+    /// `policy_can_scope` is [`SubnetPolicy::can_assign_non_global`],
+    /// not `policy.is_some()`. A rule-less policy assigns `GLOBAL` to
+    /// every peer, so with a `GLOBAL` local subnet everything resolves
+    /// to the same subnet, `is_ancestor_of` holds both ways, and no
+    /// inversion exists — warning there would flag a valid flat
+    /// deployment for installing a no-op policy.
+    ///
+    /// Recorded in
+    /// CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md
+    /// finding 2, where warning rather than failing closed was an
+    /// explicit decision: failing closed would flip every direct
+    /// subscriber that never published a capability announcement from
+    /// admitted to `Unauthorized`, since such a peer is absent from
+    /// `peer_subnets` permanently rather than transiently.
+    fn subnet_policy_without_local_subnet(subnet: SubnetId, policy_can_scope: bool) -> bool {
+        policy_can_scope && subnet.is_global()
+    }
+
+    /// `dest` is `None` when the peer's subnet has not been derived —
+    /// `peer_subnets` only populates when a `local_subnet_policy` is
+    /// installed and the peer has sent a signature-verified direct
+    /// announcement, so "unknown" is a real and common state.
+    ///
+    /// Unknown MUST NOT be coerced to a concrete `SubnetId`. It
+    /// previously resolved to [`SubnetId::GLOBAL`] at both call sites,
+    /// and `is_ancestor_of` short-circuits to `true` for a global
+    /// receiver — so every peer whose subnet had not been derived was
+    /// admitted to every `ParentVisible` channel, on an authorization
+    /// path that otherwise answers `AckReason::Unauthorized`
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md, HIGH #2).
+    ///
+    /// The unknown arms fall back to `source.is_global()`: a node that
+    /// holds no subnet identity of its own cannot express "same subnet
+    /// as me" or "ancestor of me" as a constraint, so a flat mesh keeps
+    /// its existing permissive behaviour. Once this node IS
+    /// subnet-scoped, an underivable peer fails closed. That pair of
+    /// arms reproduces the previous verdict for every input except the
+    /// vulnerable one.
+    fn subnet_visible(source: SubnetId, dest: Option<SubnetId>, visibility: Visibility) -> bool {
         match visibility {
             Visibility::Global => true,
-            Visibility::SubnetLocal => source.is_same_subnet(dest),
+            Visibility::SubnetLocal => match dest {
+                Some(dest) => source.is_same_subnet(dest),
+                None => source.is_global(),
+            },
             Visibility::ParentVisible => {
                 // "Visible to the parent subnet but not siblings" —
                 // strictly upward. A child's broadcast reaches its
@@ -23686,7 +23843,10 @@ impl MeshNode {
                 // subnet is its own ancestor) and any ancestor; a
                 // parent broadcasting down to descendants would leak
                 // region-scoped traffic and is rejected.
-                dest.is_ancestor_of(source)
+                match dest {
+                    Some(dest) => dest.is_ancestor_of(source),
+                    None => source.is_global(),
+                }
             }
             Visibility::Exported => false,
         }
@@ -23940,11 +24100,8 @@ impl MeshNode {
             // (1) Subnet visibility. Cheap check first — a peer in
             // the wrong subnet should short-circuit before any
             // auth-cache probing.
-            let peer_subnet = self
-                .peer_subnets
-                .get(peer_id)
-                .map(|e| *e.value())
-                .unwrap_or(SubnetId::GLOBAL);
+            // `None` = subnet not derived; see `subnet_visible`.
+            let peer_subnet = self.peer_subnets.get(peer_id).map(|e| *e.value());
             let visible = Self::subnet_visible(self.local_subnet, peer_subnet, visibility);
             if let Some(gw) = self.subnet_gateway.as_ref() {
                 if visible {
@@ -26419,42 +26576,139 @@ impl MeshNode {
     /// Scoped variant of [`Self::find_nodes_by_filter`]. Filters
     /// candidates through `scope` (derived from each peer's
     /// `scope:*` reserved tags) on top of the capability filter.
-    /// `SubnetLocal` peers and the [`ScopeFilter::SameSubnet`]
-    /// filter resolve same-subnet membership against
-    /// `peer_subnets`.
     ///
-    /// **Warm-up rule.** When a peer's subnet is unknown:
-    /// - **With** a `local_subnet_policy`, the candidate is
-    ///   admitted (a fresh peer's announcement may not have
-    ///   landed yet — the policy will resolve it on receipt).
-    /// - **Without** a `local_subnet_policy`, `peer_subnets`
-    ///   stays permanently empty (the dispatch handler only
-    ///   writes it when a policy is installed), so "unknown"
-    ///   means "will never resolve" — admitting unknowns there
-    ///   leaks every peer through `SameSubnet`. The candidate
-    ///   is excluded.
+    /// **Subnet resolution.** Every candidate except this node resolves
+    /// the same way: run the local `SubnetPolicy` over the tags of the
+    /// fold entry the query just selected. With no policy installed
+    /// there is nothing to resolve tags with, so the candidate is
+    /// unresolvable and excluded.
+    ///
+    /// **`peer_subnets` is deliberately NOT consulted here.** That map
+    /// is a pre-apply sidecar: `handle_capability_announcement` writes
+    /// it before the announcement reaches the fold, and the fold's apply
+    /// outcome is never fed back. A stale announcement the fold REJECTS
+    /// still updates the sidecar, so the two can disagree:
+    ///
+    /// ```text
+    /// fold and peer_subnets hold v500 / subnet A
+    /// → the peer restarts and sends a valid signed v1 / subnet B
+    /// → peer_subnets becomes B
+    /// → the fold rejects v1 (generation 1 < 500) and keeps v500 / A
+    /// → a scoped query would select on v500's capabilities while
+    ///   judging its subnet by B
+    /// ```
+    ///
+    /// Reading the sidecar for direct peers and the fold for forwarded
+    /// ones also made resolution depend on HOW an announcement arrived,
+    /// which a single authoritative source removes. `peer_subnets`
+    /// remains correct for the direct-session and channel paths that
+    /// intentionally want the last thing a session peer said; it is
+    /// simply not the right input for a query against fold state.
+    ///
+    /// This also replaces a warm-up rule that admitted every unresolved
+    /// candidate whenever a policy was installed. That window never
+    /// closed for forwarded-only peers — the normal way peers are
+    /// learned beyond a direct session — so `SameSubnet` returned peers
+    /// from arbitrary subnets and `scope:subnet-local` providers were
+    /// visible mesh-wide
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    ///
+    /// Deriving at query time rather than caching is what makes the
+    /// lifecycle trivial: the fold entry is the authoritative record and
+    /// the policy is read live, so nothing survives an expiry, eviction,
+    /// snapshot restore, policy replacement, or a publisher restart to
+    /// disagree with the fold later.
+    ///
+    /// The derivation runs on tags borrowed from the SAME fold snapshot
+    /// that selected the candidate, so a query can never mix a match
+    /// against one announcement with a subnet computed from its
+    /// replacement. A candidate with no fold entry never reaches the
+    /// closure at all — the snapshot only yields entries that exist —
+    /// so an unknown peer is excluded rather than being treated as
+    /// subnet `GLOBAL`, which would otherwise match a `GLOBAL` local
+    /// subnet.
+    ///
+    /// Deriving from the SELECTED entry rather than the publisher's
+    /// node-wide tag union is safe only because a publisher owns exactly
+    /// one fold entry on this path: `translate_announcement` pins
+    /// `class_hash` to the 0 cutover sentinel, so successive
+    /// announcements replace rather than accumulate. Were per-class
+    /// sharding to reach the announcement path, a class that omitted the
+    /// policy's tags could resolve a co-resident peer to `GLOBAL` and
+    /// exclude it, making `SameSubnet`'s verdict depend on which
+    /// capability was searched for — subnet is a node property, scope is
+    /// a per-announcement one. `tags_union_for` is the fix if that day
+    /// comes;
+    /// `a_publisher_owns_exactly_one_fold_entry_on_the_announcement_path`
+    /// fails first.
+    ///
+    /// Forwarded announcements are safe to resolve this way even though
+    /// `peer_subnets` deliberately skips them: `from_node` is the relay,
+    /// but `ann.node_id` is blake2s-bound to `ann.entity_id` at
+    /// dispatch, so the fold entry is attributable to the ORIGIN and its
+    /// tags are the origin's own.
+    ///
+    /// In signed mode (`require_signed_capabilities`, the secure
+    /// default) every fold entry came from a verified announcement, so
+    /// the derived subnet rests on the same signature the direct path
+    /// requires. A deployment that opts into unsigned discovery gets
+    /// unsigned tags here exactly as it does for every other axis of the
+    /// same query.
+    ///
+    /// Subnet membership remains SELF-ASSERTED — a peer picks its own
+    /// tags, so this is a discovery filter, not an access-control
+    /// boundary. See the audit's HIGH finding on self-asserted subnets.
+    ///
+    /// # Cost under the fold locks
+    ///
+    /// Resolving inside the selecting snapshot is what the single-
+    /// snapshot argument above requires, so the derivation necessarily
+    /// runs while the fold's state and index read locks are held. Under
+    /// `SameSubnet` that is, per candidate:
+    ///
+    /// - no allocation — [`SubnetPolicy::assign_from_rendered_tags`]
+    ///   borrows the tags the snapshot already holds; and
+    /// - `O(operator_rules × announcement_tags)` prefix strips and map
+    ///   lookups.
+    ///
+    /// Announcement tags are announcer-chosen and capped only by the
+    /// wire payload; rules are configured locally and small. The other
+    /// scope filters do not reach the closure at all — their verdict
+    /// comes entirely from the tags — so this cost is confined to
+    /// `SameSubnet` queries.
+    ///
+    /// Stated because it replaced a `peer_subnets` lookup that ran
+    /// AFTER the locks dropped, and moving announcer-shaped work under
+    /// them is the kind of thing
+    /// SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md flags. It is
+    /// accepted here on correctness grounds, not on a claim of being
+    /// cheaper than what it replaced — no such measurement was taken.
     pub fn find_nodes_by_filter_scoped(
         &self,
         filter: &CapabilityFilter,
         scope: &ScopeFilter<'_>,
     ) -> Vec<u64> {
         let my_subnet = self.local_subnet;
-        let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
-        // See doc-comment: without a policy, an unresolvable
-        // "unknown" cannot be admitted as same-subnet.
-        let policy_installed = self.local_subnet_policy.is_some();
+        let policy = self.local_subnet_policy.clone();
         super::behavior::fold::capability_bridge::find_nodes_matching_scoped(
             &self.capability_fold,
             filter,
             scope,
-            |nid| {
+            // Fold-pure, as the bridge requires: reads only the policy
+            // and the borrowed tags it is handed, never the fold and
+            // never `peer_subnets`.
+            |nid, tags| {
                 if nid == local_node_id {
                     return true;
                 }
-                match peer_subnets.get(&nid).map(|e| *e.value()) {
-                    Some(s) => s == my_subnet,
-                    None => policy_installed,
+                // Every other candidate resolves from the tags of the
+                // entry the snapshot just selected. Without a policy
+                // there is nothing to resolve them with, so the
+                // candidate stays unknown and is excluded.
+                match policy.as_ref() {
+                    Some(policy) => policy.assign_from_rendered_tags(tags) == my_subnet,
+                    None => false,
                 }
             },
         )
@@ -35950,3 +36204,429 @@ mod exact_expiry_timer_tests {
 #[cfg(test)]
 #[path = "org_routing_wiring_tests.rs"]
 mod org_routing_wiring_tests;
+
+#[cfg(test)]
+mod scoped_discovery_ignores_peer_subnets_tests {
+    //! `find_nodes_by_filter_scoped` must resolve a candidate's subnet
+    //! from the fold entry it selected, never from the `peer_subnets`
+    //! sidecar (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    //!
+    //! The sidecar is written by `handle_capability_announcement` BEFORE
+    //! the announcement reaches the fold, and the fold's apply outcome is
+    //! never fed back — so an announcement the fold REJECTS as stale
+    //! still updates it. Preferring it for direct peers meant a query
+    //! could select on one announcement's capabilities while judging its
+    //! subnet by another's.
+    //!
+    //! All three tests fail if the sidecar branch is reinstated.
+    use super::*;
+    use crate::adapter::net::behavior::capability::{
+        CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter,
+    };
+    use crate::adapter::net::SubnetRule;
+
+    /// Observer in subnet `[3]`, with a policy mapping `region:eu` to
+    /// `[4]` and `region:us` to `[3]`.
+    async fn observer() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let policy = Arc::new(
+            SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 3).map("eu", 4)),
+        );
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32])
+            .with_subnet(SubnetId::new(&[3]))
+            .with_subnet_policy(policy);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    fn signed_ann(kp: &EntityKeypair, version: u64, region: &str) -> CapabilityAnnouncement {
+        let caps = CapabilitySet::new()
+            .add_tag(format!("region:{region}"))
+            .add_tag("sidecar-canary");
+        let mut ann =
+            CapabilityAnnouncement::new(kp.node_id(), kp.entity_id().clone(), version, caps)
+                .with_ttl(300);
+        ann.sign(kp);
+        ann
+    }
+
+    /// The load-bearing witness. The sidecar claims the peer shares our
+    /// subnet; the peer's own announced tags say otherwise. The fold
+    /// entry is authoritative, so the peer must be excluded.
+    ///
+    /// Pre-fix the direct branch returned `peer_subnets` before ever
+    /// looking at the tags, so this returned the peer.
+    #[tokio::test]
+    async fn sidecar_cannot_admit_a_peer_the_fold_says_is_elsewhere() {
+        let node = observer().await;
+        let peer = EntityKeypair::generate();
+        let peer_id = peer.node_id();
+
+        // Fold: the peer is really in `[4]` (region:eu).
+        node.test_inject_capability_announcement(signed_ann(&peer, 500, "eu"));
+
+        // Sidecar disagrees — it says the peer is in OUR subnet. This is
+        // the shape a stale or out-of-order pre-apply write leaves behind.
+        node.peer_subnets.insert(peer_id, SubnetId::new(&[3]));
+
+        let filter = CapabilityFilter::new().require_tag("sidecar-canary");
+        assert!(
+            node.find_nodes_by_filter(&filter).contains(&peer_id),
+            "precondition: the peer must be indexed"
+        );
+
+        let same = node.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+        assert!(
+            !same.contains(&peer_id),
+            "SameSubnet must follow the fold entry's tags (region:eu → [4]), \
+             not the peer_subnets sidecar claiming [3]; got {same:?}"
+        );
+    }
+
+    /// The restart case the sidecar cannot represent: a valid signed
+    /// announcement whose generation the fold REJECTS must not move the
+    /// query's verdict, even though the sidecar would have taken it.
+    #[tokio::test]
+    async fn a_fold_rejected_stale_announcement_does_not_move_the_verdict() {
+        let node = observer().await;
+        let peer = EntityKeypair::generate();
+        let peer_id = peer.node_id();
+
+        // Accepted: v500 in `[4]`.
+        node.test_inject_capability_announcement(signed_ann(&peer, 500, "eu"));
+
+        // The peer restarts and its version counter resets. This
+        // announcement is perfectly valid and signed, but the fold
+        // rejects it (generation 1 < 500) and keeps v500 / eu. A
+        // sidecar write would have taken `us` and flipped the verdict.
+        node.test_inject_capability_announcement(signed_ann(&peer, 1, "us"));
+        node.peer_subnets.insert(peer_id, SubnetId::new(&[3]));
+
+        let filter = CapabilityFilter::new().require_tag("sidecar-canary");
+        let same = node.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+        assert!(
+            !same.contains(&peer_id),
+            "the fold rejected the v1 announcement, so the retained v500 \
+             (region:eu → [4]) must still decide; got {same:?}"
+        );
+    }
+
+    /// The invariant scoped discovery's subnet derivation rests on: on
+    /// the announcement path a publisher owns exactly ONE fold entry.
+    ///
+    /// The fold keys entries `(class_hash, NodeId)` and its payload doc
+    /// says "a publisher in multiple classes emits one announcement per
+    /// class", which invites the conclusion that
+    /// `find_nodes_by_filter_scoped` — deriving a candidate's subnet
+    /// from the tags of the entry the capability filter selected — could
+    /// read a class that omits the policy's tags while a sibling class
+    /// carries them, resolving a co-resident peer to `GLOBAL` and
+    /// excluding it. Subnet is a node property; scope is a per-
+    /// announcement one, so that would be a real defect.
+    ///
+    /// It is unreachable here because `translate_announcement` pins
+    /// `class_hash: 0` for every `CapabilityAnnouncement` — the cutover
+    /// sentinel documented on that function — so successive
+    /// announcements from one publisher REPLACE a single entry rather
+    /// than accumulating siblings. Every non-zero `class_hash` writer in
+    /// the crate is `#[cfg(test)]`.
+    ///
+    /// This test exists so that stops being an accident. If per-class
+    /// sharding ever lands on the announcement path, this fails, and
+    /// the subnet derivation must move to the node-wide tag union
+    /// (`tags_union_for`) within the same snapshot before it can.
+    #[tokio::test]
+    async fn a_publisher_owns_exactly_one_fold_entry_on_the_announcement_path() {
+        let node = observer().await;
+        let peer = EntityKeypair::generate();
+        let peer_id = peer.node_id();
+
+        // Two announcements from one publisher, different tags and
+        // different capability classes in the informal sense — a GPU
+        // advert and a relay advert.
+        let mut first = {
+            let caps = CapabilitySet::new()
+                .add_tag("region:us")
+                .add_tag("gpu")
+                .add_tag("multiclass-canary");
+            CapabilityAnnouncement::new(peer_id, peer.entity_id().clone(), 1, caps).with_ttl(300)
+        };
+        first.sign(&peer);
+        node.test_inject_capability_announcement(first);
+
+        // The second omits `region:us` entirely. If it landed as a
+        // SIBLING entry rather than a replacement, a query selecting it
+        // would derive GLOBAL and drop a peer that is really in [3].
+        let mut second = {
+            let caps = CapabilitySet::new()
+                .add_tag("relay-capable")
+                .add_tag("multiclass-canary");
+            CapabilityAnnouncement::new(peer_id, peer.entity_id().clone(), 2, caps).with_ttl(300)
+        };
+        second.sign(&peer);
+        node.test_inject_capability_announcement(second);
+
+        let (entry_count, classes) = node.capability_fold.with_state(|state| {
+            let keys = state.by_node.get(&peer_id).cloned().unwrap_or_default();
+            let classes: Vec<u64> = keys.iter().map(|(class, _)| *class).collect();
+            (keys.len(), classes)
+        });
+
+        assert_eq!(
+            entry_count, 1,
+            "a publisher must own exactly one fold entry on the announcement \
+             path; got {entry_count} (classes {classes:?}). If per-class \
+             sharding now reaches this path, find_nodes_by_filter_scoped must \
+             derive the subnet from the node-wide tag union instead of the \
+             selected entry's tags — otherwise SameSubnet's verdict depends on \
+             which capability was searched for."
+        );
+        assert_eq!(
+            classes,
+            vec![0],
+            "translate_announcement pins class_hash to the 0 cutover sentinel"
+        );
+    }
+
+    /// Same resolution regardless of how the announcement arrived: the
+    /// verdict comes from the retained entry either way. Pins the
+    /// direct-versus-forwarded equivalence.
+    #[tokio::test]
+    async fn resolution_does_not_depend_on_whether_a_sidecar_entry_exists() {
+        let filter = CapabilityFilter::new().require_tag("sidecar-canary");
+
+        // With a sidecar entry present (as a direct peer would have).
+        let with = observer().await;
+        let peer_a = EntityKeypair::generate();
+        with.test_inject_capability_announcement(signed_ann(&peer_a, 7, "us"));
+        with.peer_subnets
+            .insert(peer_a.node_id(), SubnetId::new(&[4]));
+        let with_result = with
+            .find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet)
+            .contains(&peer_a.node_id());
+
+        // Without one (as a forwarded-only peer would be).
+        let without = observer().await;
+        let peer_b = EntityKeypair::generate();
+        without.test_inject_capability_announcement(signed_ann(&peer_b, 7, "us"));
+        let without_result = without
+            .find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet)
+            .contains(&peer_b.node_id());
+
+        assert_eq!(
+            with_result, without_result,
+            "a peer announcing region:us (→ [3], our subnet) must resolve \
+             identically whether or not a sidecar entry exists"
+        );
+        assert!(
+            with_result,
+            "region:us maps to [3], the observer's own subnet, so both must \
+             be admitted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod subnet_visible_unknown_tests {
+    //! Witnesses for the `ParentVisible` unknown-subnet fail-open
+    //! (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md, HIGH #2).
+    //!
+    //! `peer_subnets` only populates when a `local_subnet_policy` is
+    //! installed AND the peer sent a signature-verified direct
+    //! announcement, so an unresolved peer is routine. Coercing that
+    //! unknown to `SubnetId::GLOBAL` made it a universal ancestor,
+    //! admitting it to every `ParentVisible` channel — on the path that
+    //! otherwise answers `AckReason::Unauthorized`.
+    //!
+    //! In-crate because `subnet_visible` is private.
+    use super::*;
+
+    const SCOPED: fn() -> SubnetId = || SubnetId::new(&[3, 7]);
+
+    /// The vulnerability, pinned. A subnet-scoped node must not admit a
+    /// peer whose subnet it could not derive.
+    #[test]
+    fn parent_visible_rejects_unknown_peer_subnet_when_scoped() {
+        assert!(
+            !MeshNode::subnet_visible(SCOPED(), None, Visibility::ParentVisible),
+            "unknown peer subnet must fail closed under ParentVisible on a \
+             subnet-scoped node; coercing it to GLOBAL made every unresolved \
+             peer a universal ancestor"
+        );
+    }
+
+    /// The same coercion on the strict arm was already fail-closed;
+    /// pin it so a future refactor doesn't loosen it.
+    #[test]
+    fn subnet_local_rejects_unknown_peer_subnet_when_scoped() {
+        assert!(
+            !MeshNode::subnet_visible(SCOPED(), None, Visibility::SubnetLocal),
+            "unknown peer subnet must fail closed under SubnetLocal"
+        );
+    }
+
+    /// Flat mesh: a node with no subnet identity of its own cannot
+    /// express "same subnet as me" / "ancestor of me", so unknown peers
+    /// stay visible. This is the pre-fix behaviour and must be
+    /// preserved — breaking it would silently partition every
+    /// deployment that never configured subnets.
+    #[test]
+    fn unscoped_node_still_admits_unknown_peer_subnet() {
+        for visibility in [Visibility::SubnetLocal, Visibility::ParentVisible] {
+            assert!(
+                MeshNode::subnet_visible(SubnetId::GLOBAL, None, visibility),
+                "a node with no subnet of its own must keep admitting \
+                 unresolved peers under {visibility:?} (flat-mesh compat)"
+            );
+        }
+    }
+
+    /// The permissive arm above is correct for a genuinely flat mesh
+    /// and wrong for a node that installed a `SubnetPolicy` and then
+    /// left its own subnet global: there, resolution is expected, so
+    /// "unresolved" means something went wrong rather than "subnets are
+    /// not in use". That pairing is warned about at construction rather
+    /// than failed closed — see
+    /// `MeshNode::subnet_policy_without_local_subnet` for the decision.
+    ///
+    /// The condition must be the CONJUNCTION. Firing on either half
+    /// alone would warn every correctly-configured deployment: a policy
+    /// with a scoped subnet is the intended subnet-aware setup, and a
+    /// global subnet with no policy is the intended flat one.
+    #[test]
+    fn misconfiguration_warning_fires_only_on_policy_plus_global_subnet() {
+        let scoped = SubnetId::new(&[3, 7]);
+        let cases = [
+            // (subnet, policy_can_scope, should_warn)
+            (SubnetId::GLOBAL, true, true),   // the misconfiguration
+            (SubnetId::GLOBAL, false, false), // flat mesh, intended
+            (scoped, true, false),            // subnet-aware, intended
+            (scoped, false, false),           // scoped but no peer resolution
+        ];
+        for (subnet, policy_can_scope, should_warn) in cases {
+            assert_eq!(
+                MeshNode::subnet_policy_without_local_subnet(subnet, policy_can_scope),
+                should_warn,
+                "subnet={subnet:?} policy_can_scope={policy_can_scope}"
+            );
+        }
+    }
+
+    /// The second input is "can this policy produce a non-global
+    /// subnet", not "is a policy installed". A rule-less policy assigns
+    /// GLOBAL to everyone, so on a GLOBAL local node every peer resolves
+    /// to the same subnet and there is no inversion — warning there
+    /// would flag a valid flat deployment for installing a no-op policy.
+    #[test]
+    fn a_policy_that_cannot_scope_does_not_trigger_the_warning() {
+        use crate::adapter::net::SubnetRule;
+
+        let no_rules = SubnetPolicy::new();
+        assert!(
+            !no_rules.can_assign_non_global(),
+            "SubnetPolicy::new() is documented as assigning GLOBAL to all nodes"
+        );
+
+        // A rule with values but every one of them 0, which assigns
+        // GLOBAL just as surely while looking configured. `map` /
+        // `try_map` reject 0 as reserved, so this is only reachable
+        // through `SubnetRule`'s public `values` field — which is
+        // exactly why `can_assign_non_global` inspects the values
+        // rather than counting rules.
+        let mut zero_rule = SubnetRule::new("region:", 0);
+        zero_rule.values.insert("us".to_string(), 0);
+        zero_rule.values.insert("eu".to_string(), 0);
+        let all_zero = SubnetPolicy::new().add_rule(zero_rule);
+        assert!(!all_zero.can_assign_non_global());
+
+        // A rule with no values at all can never match.
+        let empty_rule = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0));
+        assert!(!empty_rule.can_assign_non_global());
+
+        let real = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 3));
+        assert!(real.can_assign_non_global());
+
+        for policy in [&no_rules, &all_zero, &empty_rule] {
+            assert!(
+                !MeshNode::subnet_policy_without_local_subnet(
+                    SubnetId::GLOBAL,
+                    policy.can_assign_non_global()
+                ),
+                "a policy that can only ever answer GLOBAL must not be warned about"
+            );
+        }
+        assert!(
+            MeshNode::subnet_policy_without_local_subnet(
+                SubnetId::GLOBAL,
+                real.can_assign_non_global()
+            ),
+            "a policy that CAN scope, with a global local subnet, is the case worth flagging"
+        );
+    }
+
+    /// The inversion the warning describes, pinned against
+    /// `subnet_visible` itself so the message cannot drift from the
+    /// behaviour. On a global-subnet node under `ParentVisible`, a
+    /// resolved peer is rejected while an unresolved one is admitted.
+    #[test]
+    fn global_local_subnet_privileges_unresolved_peers_over_resolved_ones() {
+        let resolved = Some(SubnetId::new(&[3]));
+        assert!(
+            !MeshNode::subnet_visible(SubnetId::GLOBAL, resolved, Visibility::ParentVisible),
+            "a peer whose subnet resolved to [3] is not an ancestor of GLOBAL, \
+             so it is rejected"
+        );
+        assert!(
+            MeshNode::subnet_visible(SubnetId::GLOBAL, None, Visibility::ParentVisible),
+            "yet an unresolved peer takes the permissive unknown arm and is \
+             admitted — being unresolvable is more privileged than being \
+             resolved, which is what the construction warning exists to flag"
+        );
+        assert!(
+            MeshNode::subnet_policy_without_local_subnet(SubnetId::GLOBAL, true),
+            "and this is exactly the configuration the warning fires on"
+        );
+    }
+
+    /// Every known-subnet verdict is byte-for-byte what it was before
+    /// the `Option` change: only the unknown arms moved.
+    #[test]
+    fn known_subnet_verdicts_are_unchanged() {
+        let child = SubnetId::new(&[3, 7, 2]);
+        let parent = SubnetId::new(&[3, 7]);
+        let sibling = SubnetId::new(&[3, 8]);
+
+        assert!(MeshNode::subnet_visible(
+            child,
+            Some(child),
+            Visibility::SubnetLocal
+        ));
+        assert!(!MeshNode::subnet_visible(
+            child,
+            Some(sibling),
+            Visibility::SubnetLocal
+        ));
+        // ParentVisible is strictly upward: ancestor yes, sibling no.
+        assert!(MeshNode::subnet_visible(
+            child,
+            Some(parent),
+            Visibility::ParentVisible
+        ));
+        assert!(!MeshNode::subnet_visible(
+            child,
+            Some(sibling),
+            Visibility::ParentVisible
+        ));
+        // Global ignores subnets entirely, including unknown ones.
+        assert!(MeshNode::subnet_visible(child, None, Visibility::Global));
+        // Exported is unconditionally closed here.
+        assert!(!MeshNode::subnet_visible(
+            child,
+            Some(parent),
+            Visibility::Exported
+        ));
+    }
+}

@@ -8,6 +8,7 @@
 package net
 
 import (
+	"errors"
 	"slices"
 	"testing"
 )
@@ -334,19 +335,20 @@ func TestFindBestNode_NoMatchReturnsFalseNotError(t *testing.T) {
 	}
 }
 
-// Regression: P2 (Cubic) — empty-string sanitization on
-// `Tenants` / `Regions` lists. Unsanitized input like `[""]` used
-// to flow through to a `Tenants([""])` filter, which matches no
-// real tenant and silently narrows results to Global candidates.
-// Fix: drop empties; fall back to Any when cleaned list is empty.
+// Regression: empty-string handling on `Tenants` / `Regions` lists.
+//
+// P2 (Cubic) first made unsanitized input like `[""]` drop its empties
+// and fall back to Any, so it would not silently narrow to Global
+// candidates. The security audit found that fallback was itself the
+// defect: Any is the BROADEST filter, so a caller whose tenant id
+// arrived empty queried the whole mesh. A filter that cannot narrow is
+// now rejected with ErrInvalidArgument. Partial cleaning is unchanged --
+// a list keeping one real entry still works with the empties stripped.
 
-func TestFindNodesScoped_TenantsEmptyListFallsBackToAny(t *testing.T) {
+func TestFindNodesScoped_TenantsEmptyListIsRejected(t *testing.T) {
 	m := newMeshForCaps(t)
 	defer m.Shutdown()
 
-	// Tenant-tagged provider — without sanitization, a
-	// `tenants: [""]` query would NOT return this node, and
-	// would NOT return any Global node either.
 	if err := m.AnnounceCapabilities(CapabilitySet{
 		Tags: []string{"gpu", "scope:tenant:oem-123"},
 	}); err != nil {
@@ -354,22 +356,41 @@ func TestFindNodesScoped_TenantsEmptyListFallsBackToAny(t *testing.T) {
 	}
 	filter := CapabilityFilter{RequireTags: []string{"gpu"}}
 
-	// `[""]` sanitizes to Any → matches own node.
-	peers, err := m.FindNodesScoped(filter, ScopeFilter{Kind: "tenants", Tenants: []string{""}})
-	if err != nil {
-		t.Fatalf("find_nodes_scoped tenants=[\"\"]: %v", err)
+	// A `tenants` list that cleans down to nothing carries no tenant
+	// identity to narrow by. It used to collapse to Any — the BROADEST
+	// filter — so a caller whose tenant id arrived empty silently
+	// queried the whole mesh and picked a provider from it.
+	for _, tenants := range [][]string{{""}, {}, {"", ""}} {
+		_, err := m.FindNodesScoped(filter, ScopeFilter{Kind: "tenants", Tenants: tenants})
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("tenants=%q must be rejected with ErrInvalidArgument, got %v", tenants, err)
+		}
 	}
-	if !slices.Contains(peers, m.NodeID()) {
-		t.Fatalf("tenants=[\"\"] must fall back to Any (P2 regression); got %v", peers)
-	}
+}
 
-	// `nil` / empty list also falls back to Any.
-	peers, err = m.FindNodesScoped(filter, ScopeFilter{Kind: "tenants", Tenants: []string{}})
-	if err != nil {
-		t.Fatalf("find_nodes_scoped tenants=[]: %v", err)
+func TestFindNodesScoped_UnknownKindAndEmptySelectorsAreRejected(t *testing.T) {
+	m := newMeshForCaps(t)
+	defer m.Shutdown()
+
+	if err := m.AnnounceCapabilities(CapabilitySet{
+		Tags: []string{"gpu", "scope:tenant:oem-123"},
+	}); err != nil {
+		t.Fatalf("announce: %v", err)
 	}
-	if !slices.Contains(peers, m.NodeID()) {
-		t.Fatalf("tenants=[] must fall back to Any; got %v", peers)
+	filter := CapabilityFilter{RequireTags: []string{"gpu"}}
+
+	// The unknown-Kind fallthrough was documented as "defensive" but
+	// resolved to Any, so a typo became a whole-mesh query.
+	for _, scope := range []ScopeFilter{
+		{Kind: "tenat", Tenant: "oem-123"},
+		{Kind: "tenant"},
+		{Kind: "tenant", Tenant: ""},
+		{Kind: "region", Region: ""},
+	} {
+		_, err := m.FindNodesScoped(filter, scope)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("scope %+v must be rejected with ErrInvalidArgument, got %v", scope, err)
+		}
 	}
 }
 
@@ -409,7 +430,7 @@ func TestFindNodesScoped_TenantsPartialCleanDropsEmpties(t *testing.T) {
 	}
 }
 
-func TestFindNodesScoped_RegionsEmptyListFallsBackToAny(t *testing.T) {
+func TestFindNodesScoped_RegionsEmptyListIsRejected(t *testing.T) {
 	m := newMeshForCaps(t)
 	defer m.Shutdown()
 
@@ -420,20 +441,13 @@ func TestFindNodesScoped_RegionsEmptyListFallsBackToAny(t *testing.T) {
 	}
 	filter := CapabilityFilter{RequireTags: []string{"relay-capable"}}
 
-	peers, err := m.FindNodesScoped(filter, ScopeFilter{Kind: "regions", Regions: []string{""}})
-	if err != nil {
-		t.Fatalf("find_nodes_scoped regions=[\"\"]: %v", err)
-	}
-	if !slices.Contains(peers, m.NodeID()) {
-		t.Fatalf("regions=[\"\"] must fall back to Any (P2 regression); got %v", peers)
-	}
-
-	peers, err = m.FindNodesScoped(filter, ScopeFilter{Kind: "regions", Regions: []string{}})
-	if err != nil {
-		t.Fatalf("find_nodes_scoped regions=[]: %v", err)
-	}
-	if !slices.Contains(peers, m.NodeID()) {
-		t.Fatalf("regions=[] must fall back to Any; got %v", peers)
+	// Regions mirror tenants: an all-empty list cannot narrow, so it is
+	// rejected rather than widening to Any.
+	for _, regions := range [][]string{{""}, {}} {
+		_, err := m.FindNodesScoped(filter, ScopeFilter{Kind: "regions", Regions: regions})
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("regions=%q must be rejected with ErrInvalidArgument, got %v", regions, err)
+		}
 	}
 }
 
