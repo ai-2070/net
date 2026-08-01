@@ -23,7 +23,7 @@ use crate::adapter::net::behavior::org_grant_registry::{
 };
 use crate::adapter::net::behavior::org_routing::RegistryWork;
 use crate::adapter::net::behavior::org_routing_registry::{
-    DemandHandle, GrantArtifactFence, NodeOrgRoutingRegistry, RegistryMetrics,
+    DemandHandle, GrantArtifactFence, GrantMovementFence, NodeOrgRoutingRegistry, RegistryMetrics,
     ScopedDiscoveryAuthorityStamp, ScopedSourceFacts, SlotSource, SourceCommitPin, SourceFacts,
     SourceSnapshot, SourceToken, MAX_NODE_SLOTS,
 };
@@ -199,9 +199,25 @@ fn lease(
         .prepare_install(record, now)
         .expect("room reserved")
     {
-        PreparedInstall::Ready(slot) => ConsumerGrantSnapshot::finish_install(*slot, install_seq),
+        PreparedInstall::Ready(slot) => ConsumerGrantSnapshot::finish_install(*slot, install_seq)
+            // Synthetic snapshots stamp their transition explicitly: the
+            // publication seam is not in play here, and an unstamped snapshot
+            // would order against every other one by accident.
+            .stamped(GrantMovementFence::Publication(install_seq)),
         PreparedInstall::Noop => panic!("the witness installs a fresh grant"),
     }
+}
+
+/// Remove `grant_id`, stamping the removal as publication `revision`.
+fn remove(
+    snapshot: &ConsumerGrantSnapshot,
+    grant_id: &[u8; 32],
+    revision: u64,
+) -> ConsumerGrantSnapshot {
+    snapshot
+        .without(grant_id)
+        .expect("the record was there")
+        .stamped(GrantMovementFence::Publication(revision))
 }
 
 // ------------------------------------------- §4: the exact demand set (W-N)
@@ -850,6 +866,7 @@ fn a_refused_entry_retains_no_partial_demand() {
     }
     assert_eq!(state.handles(), 63);
     let slots = f.registry.retained_slots();
+    let identities = f.registry.allocated_ids_for_test();
 
     // `nrpc:wide` needs three demands (Owner + two leased audiences) and only
     // one handle remains.
@@ -867,6 +884,18 @@ fn a_refused_entry_retains_no_partial_demand() {
     assert!(
         state.warm(&cap("nrpc:wide")).is_none(),
         "a refused capability is not warm"
+    );
+    // And NO IDENTITY was consumed. This is the half a handle/slot/entry check
+    // cannot see: acquiring per key in a loop allocates an incarnation for each
+    // new slot BEFORE a later key discovers the refusal, and the prefix it then
+    // drops gives the handles and the slots back — but never the identity. The
+    // monotone id space is finite and terminal, so a refusal that burns one is a
+    // permanent cost paid for retaining nothing, and repeated refusals against a
+    // full family would drain it (W-A5's property, at the STATE layer).
+    assert_eq!(
+        f.registry.allocated_ids_for_test(),
+        identities,
+        "a refused entry consumes no identity either"
     );
 }
 
@@ -1125,9 +1154,7 @@ fn a_removed_audience_leaves_a_warmed_entry() {
     );
 
     // The lease is removed.
-    let removed = leased
-        .without(&grant.grant_id)
-        .expect("the record was there");
+    let removed = remove(&leased, &grant.grant_id, 100);
     assert_eq!(state.route_handle(&capability, &removed), RouteLookup::Warm);
 
     assert_eq!(
@@ -1188,9 +1215,7 @@ fn a_rotated_audience_replaces_the_scope_it_supersedes() {
 
     // Rotate: the id is removed and re-installed under the successor's handle.
     let rotated_lease = lease(
-        &leased
-            .without(&original.grant_id)
-            .expect("the record was there"),
+        &remove(&leased, &original.grant_id, 100),
         &rotated,
         successor_secret.expect("secret"),
         2,
@@ -1254,9 +1279,7 @@ fn a_rotated_away_scope_is_not_retained_under_its_own_id() {
         original_handle
     );
     let rotated = lease(
-        &leased
-            .without(&original.grant_id)
-            .expect("the record was there"),
+        &remove(&leased, &original.grant_id, 100),
         &successor,
         successor_secret,
         2,
@@ -1327,7 +1350,7 @@ fn concurrent_rederivations_spend_one_demand_set() {
             let leased = leased.clone();
             std::thread::spawn(move || {
                 start.wait();
-                state.rederive(&capability, &leased)
+                state.acquire(&capability, &leased)
             })
         })
         .collect();
@@ -1489,11 +1512,8 @@ fn capacity_freed_by_a_supersession_is_spendable_again() {
     );
 
     // Shed BOTH of `wide`'s audiences. Projected: 64 - 3 + 1 = 62.
-    let removed = leased
-        .without(&grant.grant_id)
-        .expect("the record was there")
-        .without(&second.grant_id)
-        .expect("the record was there");
+    let removed = remove(&leased, &grant.grant_id, 100);
+    let removed = remove(&removed, &second.grant_id, 101);
     assert_eq!(state.route_handle(&wide, &removed), RouteLookup::Warm);
     assert_eq!(
         state.handles(),
@@ -1576,9 +1596,7 @@ fn a_narrowing_replacement_at_the_family_bound_is_charged_net() {
     assert_eq!(state.handles(), 64, "the family is EXACTLY at its bound");
 
     // The audience goes away. Projected: 64 - 2 + 1 = 63.
-    let removed = leased
-        .without(&grant.grant_id)
-        .expect("the record was there");
+    let removed = remove(&leased, &grant.grant_id, 100);
     assert_eq!(
         state.route_handle(&changing, &removed),
         RouteLookup::Warm,
@@ -1621,7 +1639,7 @@ fn a_same_width_rotation_at_the_family_bound_is_charged_net() {
 
     // Rotate the audience: the old lease is removed and the successor installed.
     let rotated = lease(
-        &leased.without(&old_grant.grant_id).expect("was there"),
+        &remove(&leased, &old_grant.grant_id, 100),
         &new_grant,
         new_secret.expect("secret"),
         2,
@@ -1681,7 +1699,7 @@ fn a_rotation_at_the_node_bound_retires_the_slot_it_transfers() {
     assert_eq!(f.registry.retained_slots(), MAX_NODE_SLOTS);
 
     let rotated = lease(
-        &leased.without(&old_grant.grant_id).expect("was there"),
+        &remove(&leased, &old_grant.grant_id, 100),
         &new_grant,
         new_secret.expect("secret"),
         2,
@@ -1735,7 +1753,7 @@ fn a_rotation_at_the_node_bound_refuses_when_the_old_slot_is_shared() {
     let entries_before = state.entries();
 
     let rotated = lease(
-        &leased.without(&old_grant.grant_id).expect("was there"),
+        &remove(&leased, &old_grant.grant_id, 100),
         &new_grant,
         new_secret.expect("secret"),
         2,
@@ -1778,7 +1796,7 @@ fn identity_exhaustion_during_a_replacement_refuses_with_no_effect() {
     f.registry.exhaust_ids_for_test();
 
     let rotated = lease(
-        &leased.without(&old_grant.grant_id).expect("was there"),
+        &remove(&leased, &old_grant.grant_id, 100),
         &new_grant,
         new_secret.expect("secret"),
         2,
@@ -1821,7 +1839,7 @@ fn a_narrowing_replacement_needs_no_identity_after_exhaustion() {
 
     f.registry.exhaust_ids_for_test();
 
-    let removed = leased.without(&grant.grant_id).expect("was there");
+    let removed = remove(&leased, &grant.grant_id, 100);
     assert_eq!(
         state.route_handle(&changing, &removed),
         RouteLookup::Warm,
@@ -1833,6 +1851,569 @@ fn a_narrowing_replacement_needs_no_identity_after_exhaustion() {
         &[owner_key(&changing)]
     );
     assert_eq!(f.metrics.refused_id_space_exhausted(), 0);
+}
+
+// ------------- §4.4/4.5/4.6: stale readers, ownership, ordering, races
+
+/// A cached TERMINAL fresh refusal must not block a replacement that needs no
+/// identity at all (§4.5).
+///
+/// Dies to: gating replacement on the fresh-acquisition caches. The family's
+/// terminal flag is about taking MORE; shedding a scope creates no slot and
+/// needs no identity, and suppressing it strands the obsolete scope forever —
+/// the wake condition can never arrive, because exhaustion is irreversible.
+#[test]
+fn a_cached_terminal_refusal_does_not_block_a_zero_identity_replacement() {
+    let f = fixture();
+    let capability = cap("nrpc:changing");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![grant.clone()]));
+    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
+    assert_eq!(state.handles(), 2);
+
+    // An UNRELATED fresh capability records the terminal refusal in THIS
+    // family's cache.
+    f.registry.exhaust_ids_for_test();
+    assert_eq!(
+        state.route_handle(&cap("nrpc:unrelated"), &leased),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::IdSpaceExhausted)),
+    );
+
+    // The audience disappears. The replacement creates nothing.
+    let removed = remove(&leased, &grant.grant_id, 100);
+    assert_eq!(
+        state.route_handle(&capability, &removed),
+        RouteLookup::Warm,
+        "a cached terminal refusal is not a statement about shedding a scope"
+    );
+    assert_eq!(state.handles(), 1);
+    assert_eq!(
+        state.warm(&capability).expect("warm").demanded(),
+        &[owner_key(&capability)]
+    );
+}
+
+/// A cached `NodeAtCapacity(G)` fresh refusal must not block a self-crediting
+/// replacement at unchanged G (§4.5).
+///
+/// Dies to: gating replacement on the node capacity generation. The generation
+/// cannot move until this very replacement retires the slot, so the gate waits
+/// on the transaction it is suppressing.
+#[test]
+fn a_cached_node_refusal_does_not_block_a_self_crediting_replacement() {
+    let f = fixture();
+    let capability = cap("nrpc:changing");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![grant.clone()]));
+    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
+
+    let _fillers = fill_node_to(&f, MAX_NODE_SLOTS);
+    let generation = f.registry.node_capacity_generation();
+
+    // An UNRELATED fresh capability records NodeAtCapacity(G).
+    assert_eq!(
+        state.route_handle(&cap("nrpc:unrelated"), &leased),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
+    );
+    assert_eq!(f.registry.node_capacity_generation(), generation);
+
+    // Shedding the audience frees a slot. G has not moved yet — it moves
+    // BECAUSE of this replacement.
+    let removed = remove(&leased, &grant.grant_id, 100);
+    assert_eq!(
+        state.route_handle(&capability, &removed),
+        RouteLookup::Warm,
+        "the gate must not wait on the generation this transaction itself moves"
+    );
+    assert_eq!(state.handles(), 1);
+    assert_ne!(
+        f.registry.node_capacity_generation(),
+        generation,
+        "and it did move it"
+    );
+}
+
+/// A replacement refused at a full node retries once ANOTHER family stops
+/// sharing the old slot — even though nothing retired and the node capacity
+/// generation never moved.
+///
+/// Dies to: gating replacement on the node capacity generation instead of the
+/// reference-release generation. A shared reference going away frees no slot and
+/// moves no capacity, yet it is exactly what makes the projection succeed.
+#[test]
+fn a_shared_old_replacement_retries_when_the_sharer_releases() {
+    let f = fixture();
+    let capability = cap("nrpc:changing");
+    let (old_grant, old_secret) = issue(capability, GrantRights::DISCOVER);
+    let (new_grant, new_secret) = issue(capability, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &old_grant,
+        old_secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![old_grant.clone(), new_grant.clone()]));
+    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
+
+    // Another family SHARES the exact slot the rotation would give up.
+    let sharer = f.registry.new_family().expect("family");
+    let shared = sharer.demand(grant_key(&old_grant)).expect("shares");
+    let _fillers = fill_node_to(&f, MAX_NODE_SLOTS);
+    let generation = f.registry.node_capacity_generation();
+
+    let rotated = lease(
+        &remove(&leased, &old_grant.grant_id, 100),
+        &new_grant,
+        new_secret.expect("secret"),
+        101,
+    );
+    assert_eq!(
+        state.route_handle(&capability, &rotated),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
+        "the shared old slot frees nothing, so the new one is a 257th"
+    );
+
+    // The sharer lets go. NOTHING retires — the slot is still ours — and the
+    // node capacity generation stands still.
+    drop(shared);
+    assert_eq!(
+        f.registry.node_capacity_generation(),
+        generation,
+        "no retirement, so no capacity movement"
+    );
+    assert_eq!(
+        state.route_handle(&capability, &rotated),
+        RouteLookup::Warm,
+        "but the projection changed, and the replacement must be retried"
+    );
+}
+
+/// A replacement refusal must not poison the FRESH path (§4.5).
+#[test]
+fn a_replacement_refusal_leaves_the_fresh_path_untouched() {
+    let f = fixture();
+    let capability = cap("nrpc:changing");
+    let (old_grant, old_secret) = issue(capability, GrantRights::DISCOVER);
+    let (new_grant, new_secret) = issue(capability, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &old_grant,
+        old_secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![old_grant.clone(), new_grant.clone()]));
+    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
+
+    let sharer = f.registry.new_family().expect("family");
+    let _shared = sharer.demand(grant_key(&old_grant)).expect("shares");
+
+    // A slot this family will later demand FRESH, pre-retained by someone else.
+    // A fresh set over an already-retained key costs no node capacity, so it is
+    // serviceable at a full node — unless the fresh gate has been poisoned.
+    let preheld = cap("nrpc:preheld");
+    let holder = f.registry.new_family().expect("family");
+    let _preheld = holder.demand(owner_key(&preheld)).expect("pre-retains");
+
+    let _fillers = fill_node_to(&f, MAX_NODE_SLOTS);
+
+    let rotated = lease(
+        &remove(&leased, &old_grant.grant_id, 100),
+        &new_grant,
+        new_secret.expect("secret"),
+        101,
+    );
+    assert_eq!(
+        state.route_handle(&capability, &rotated),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
+        "the shared old slot frees nothing, so the rotation is a 257th"
+    );
+
+    // THE ASSERTION: the fresh path is untouched. This capability's whole demand
+    // set is one already-retained slot, so it costs no node capacity and must
+    // warm — which it cannot do if the replacement's refusal was written into
+    // the fresh node cache.
+    assert_eq!(
+        state.route_handle(&preheld, &rotated),
+        RouteLookup::Warm,
+        "a replacement refusal must not settle the FRESH acquisition path"
+    );
+    assert_eq!(
+        f.registry.retained_slots(),
+        MAX_NODE_SLOTS,
+        "and it created no slot, because the key was already retained"
+    );
+}
+
+/// A genuinely impossible replacement asks the registry ONCE and then settles
+/// locally until the release generation moves (§4.5).
+///
+/// The bounded-retry half of the replacement gate. Giving a replacement its own
+/// cache is what stops the fresh caches deadlocking it; this is what stops that
+/// exemption becoming a licence to take the node-wide lock on every call for a
+/// stale entry that cannot be repaired.
+///
+/// Dies to: dropping the replacement cache (attempt every time), which is the
+/// mutation W-C1 also selects — the two halves of one decision.
+#[test]
+fn a_repeatedly_impossible_replacement_asks_the_registry_once() {
+    let f = fixture();
+    let capability = cap("nrpc:changing");
+    let (old_grant, old_secret) = issue(capability, GrantRights::DISCOVER);
+    let (new_grant, new_secret) = issue(capability, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &old_grant,
+        old_secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![old_grant.clone(), new_grant.clone()]));
+    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
+
+    // A sharer keeps the old slot alive, so the rotation genuinely needs a 257th.
+    let sharer = f.registry.new_family().expect("family");
+    let _shared = sharer.demand(grant_key(&old_grant)).expect("shares");
+    let _fillers = fill_node_to(&f, MAX_NODE_SLOTS);
+
+    let rotated = lease(
+        &remove(&leased, &old_grant.grant_id, 100),
+        &new_grant,
+        new_secret.expect("secret"),
+        101,
+    );
+    assert_eq!(
+        state.route_handle(&capability, &rotated),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
+    );
+    let asked = f.metrics.refused_node_at_capacity();
+    assert_eq!(asked, 1, "the registry is asked once");
+
+    for _ in 0..32 {
+        assert_eq!(
+            state.route_handle(&capability, &rotated),
+            RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
+        );
+    }
+    assert_eq!(
+        f.metrics.refused_node_at_capacity(),
+        asked,
+        "and not again while nothing has been released"
+    );
+}
+
+/// An under-lock miss RACE between an older and a newer snapshot leaves the
+/// NEWEST exact set retained (§4.4 + §4.6 together).
+///
+/// Dies to: the existence-only recheck (shared with W-M1). The older caller
+/// enters the mutation path after the newer one published, and must neither
+/// adopt nor overwrite it.
+#[test]
+fn the_under_lock_miss_race_retains_the_newest_snapshot() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let state = f.state(credentials(vec![grant.clone()]));
+
+    let older = ConsumerGrantSnapshot::empty().stamped(GrantMovementFence::Publication(3));
+    let newer = lease(&older, &grant, secret.expect("secret"), 8);
+
+    // The NEWER caller wins the race and publishes.
+    assert_eq!(state.acquire(&capability, &newer), RouteLookup::Warm);
+    assert_eq!(
+        state.warm(&capability).expect("warm").demanded(),
+        &[owner_key(&capability), grant_key(&grant)]
+    );
+
+    // The OLDER caller arrives at the mutation path afterwards.
+    assert_eq!(
+        state.acquire(&capability, &older),
+        RouteLookup::Cold(ColdReason::SnapshotSuperseded),
+        "the loser must not act on a view the family has moved past"
+    );
+    assert_eq!(
+        state.warm(&capability).expect("warm").demanded(),
+        &[owner_key(&capability), grant_key(&grant)],
+        "and the newest exact set is what stays retained"
+    );
+    assert_eq!(state.handles(), 2);
+}
+
+/// The under-lock miss recheck must validate currency for THIS caller's
+/// snapshot, not merely that some entry exists (§4.6).
+///
+/// Dies to: rechecking `index.get(capability).is_some()` and returning `Warm`.
+/// The loser of a miss race then adopts the winner's entry without ever asking
+/// whether it is current for its own snapshot, and reports `Warm` for a set
+/// missing a newly installed audience.
+#[test]
+fn the_under_lock_miss_recheck_validates_the_callers_snapshot() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let state = f.state(credentials(vec![grant.clone()]));
+
+    // T1's snapshot: the audience is NOT installed.
+    let older = ConsumerGrantSnapshot::empty();
+    assert_eq!(state.route_handle(&capability, &older), RouteLookup::Warm);
+    assert_eq!(state.warm(&capability).expect("warm").demands().len(), 1);
+
+    // T2's snapshot is NEWER and has the audience. Entering the mutation path
+    // directly is what puts it past the lock-free check, exactly as the
+    // concurrency witnesses do.
+    let newer = lease(&older, &grant, secret.expect("secret"), 5);
+    assert_eq!(state.acquire(&capability, &newer), RouteLookup::Warm);
+    assert_eq!(
+        state.warm(&capability).expect("warm").demanded(),
+        &[owner_key(&capability), grant_key(&grant)],
+        "the loser of the race must not adopt an entry stale for ITS snapshot"
+    );
+}
+
+/// The same, for a REMOVAL the racing caller can see and the published entry
+/// cannot.
+#[test]
+fn the_under_lock_miss_recheck_sees_a_removal() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![grant.clone()]));
+    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
+    assert_eq!(state.handles(), 2);
+
+    let removed = remove(&leased, &grant.grant_id, 100);
+    assert_eq!(state.acquire(&capability, &removed), RouteLookup::Warm);
+    assert_eq!(
+        state.warm(&capability).expect("warm").demanded(),
+        &[owner_key(&capability)]
+    );
+}
+
+/// And for a ROTATION.
+#[test]
+fn the_under_lock_miss_recheck_sees_a_rotation() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let (old_grant, old_secret) = issue(capability, GrantRights::DISCOVER);
+    let (new_grant, new_secret) = issue(capability, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &old_grant,
+        old_secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![old_grant.clone(), new_grant.clone()]));
+    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
+
+    let rotated = lease(
+        &remove(&leased, &old_grant.grant_id, 100),
+        &new_grant,
+        new_secret.expect("secret"),
+        101,
+    );
+    assert_eq!(state.acquire(&capability, &rotated), RouteLookup::Warm);
+    assert_eq!(
+        state.warm(&capability).expect("warm").demanded(),
+        &[owner_key(&capability), grant_key(&new_grant)]
+    );
+}
+
+/// A STALLED OLDER snapshot cannot overwrite a newer retained demand set
+/// (§4.4).
+///
+/// Dies to: ordering snapshots by lock acquisition instead of by their published
+/// transition. The older caller observes the newer entry as "stale for me" and
+/// would otherwise reinstate the very authority the later transition withdrew.
+#[test]
+fn a_stalled_older_install_cannot_overwrite_a_newer_removal() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let state = f.state(credentials(vec![grant.clone()]));
+
+    // The OLDER view still has the audience installed.
+    let older = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("secret"),
+        5,
+    );
+    // The NEWER view removed it.
+    let newer = remove(&older, &grant.grant_id, 9);
+
+    assert_eq!(state.route_handle(&capability, &newer), RouteLookup::Warm);
+    assert_eq!(
+        state.warm(&capability).expect("warm").demanded(),
+        &[owner_key(&capability)]
+    );
+
+    assert_eq!(
+        state.route_handle(&capability, &older),
+        RouteLookup::Cold(ColdReason::SnapshotSuperseded),
+        "a stalled older snapshot must neither be served nor act"
+    );
+    assert_eq!(
+        state.warm(&capability).expect("warm").demanded(),
+        &[owner_key(&capability)],
+        "and the newer retained set is untouched"
+    );
+    assert_eq!(state.handles(), 1);
+}
+
+/// The mirror: a stalled older REMOVAL cannot overwrite a newer install.
+#[test]
+fn a_stalled_older_removal_cannot_overwrite_a_newer_install() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let state = f.state(credentials(vec![grant.clone()]));
+
+    let installed = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("secret"),
+        9,
+    );
+    // An OLDER transition in which the audience was absent.
+    let older_absent = ConsumerGrantSnapshot::empty().stamped(GrantMovementFence::Publication(5));
+
+    assert_eq!(
+        state.route_handle(&capability, &installed),
+        RouteLookup::Warm
+    );
+    assert_eq!(state.handles(), 2);
+
+    assert_eq!(
+        state.route_handle(&capability, &older_absent),
+        RouteLookup::Cold(ColdReason::SnapshotSuperseded),
+    );
+    assert_eq!(state.handles(), 2, "the newer install survives");
+    assert_eq!(
+        state.warm(&capability).expect("warm").demanded(),
+        &[owner_key(&capability), grant_key(&grant)]
+    );
+}
+
+/// A TERMINAL snapshot outranks every ordinary publication.
+#[test]
+fn a_terminal_snapshot_cannot_be_overwritten_by_an_ordinary_one() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let state = f.state(credentials(vec![grant.clone()]));
+
+    let installed = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("secret"),
+        5,
+    );
+    // The terminal withdrawal: the publication-identity space is spent.
+    let terminal = installed
+        .without(&grant.grant_id)
+        .expect("the record was there")
+        .stamped(GrantMovementFence::Terminal);
+
+    assert_eq!(
+        state.route_handle(&capability, &terminal),
+        RouteLookup::Warm
+    );
+    assert_eq!(
+        state.warm(&capability).expect("warm").demanded(),
+        &[owner_key(&capability)]
+    );
+
+    assert_eq!(
+        state.route_handle(&capability, &installed),
+        RouteLookup::Cold(ColdReason::SnapshotSuperseded),
+        "no ordinary publication can follow a terminal one"
+    );
+    assert_eq!(state.handles(), 1);
+}
+
+/// TWO DIFFERENT snapshots claiming ONE transition identity is an invariant
+/// breach, and is refused rather than acted on.
+#[test]
+fn two_snapshots_at_one_revision_are_refused_as_an_invariant_breach() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let state = f.state(credentials(vec![grant.clone()]));
+
+    let absent = ConsumerGrantSnapshot::empty().stamped(GrantMovementFence::Publication(7));
+    assert_eq!(state.route_handle(&capability, &absent), RouteLookup::Warm);
+    assert_eq!(state.handles(), 1);
+
+    // A DIFFERENT snapshot claiming the SAME transition. The publication seam
+    // allocates each identity once, so this cannot happen — and if it does, the
+    // two disagree about what that transition published.
+    let forged = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("secret"),
+        1,
+    )
+    .stamped(GrantMovementFence::Publication(7));
+    assert_eq!(
+        state.route_handle(&capability, &forged),
+        RouteLookup::Cold(ColdReason::SnapshotSuperseded),
+        "one transition identity, two contents — fail closed"
+    );
+    assert_eq!(state.handles(), 1, "and nothing moved");
+}
+
+/// An UNRELATED newer movement advances freshness without churning demand, and
+/// the older relevant snapshot still cannot regress afterwards.
+#[test]
+fn unrelated_newer_movement_advances_freshness_without_churn() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let (unrelated, unrelated_secret) = issue(cap("nrpc:other"), GrantRights::DISCOVER);
+    let state = f.state(credentials(vec![grant.clone(), unrelated.clone()]));
+
+    let older = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("secret"),
+        5,
+    );
+    assert_eq!(state.route_handle(&capability, &older), RouteLookup::Warm);
+    let acquisitions = state.mutate_acquisitions();
+    let handles = state.handles();
+
+    // A newer publication that changes nothing about THIS capability.
+    let newer = lease(&older, &unrelated, unrelated_secret.expect("secret"), 9);
+    assert_eq!(state.route_handle(&capability, &newer), RouteLookup::Warm);
+    assert_eq!(
+        state.mutate_acquisitions(),
+        acquisitions,
+        "an irrelevant movement re-derives nothing and takes no lock"
+    );
+    assert_eq!(state.handles(), handles);
+
+    // Freshness advanced anyway, so the older snapshot can no longer act.
+    assert_eq!(
+        state.route_handle(&capability, &older),
+        RouteLookup::Cold(ColdReason::SnapshotSuperseded),
+        "freshness must advance even when demand does not"
+    );
 }
 
 /// The currency check is on the LOCK-FREE path: a warmed entry that is still

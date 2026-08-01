@@ -107,7 +107,9 @@
 //!
 //! So re-derivation goes through ONE registry transaction that compares the two
 //! key sets and charges the projected final footprint —
-//! `RoutingFamily::replace_demand_set`. The intersection is never released and
+//! `DemandSet::replace` — rooted in the superseded set's OWN registry and family
+//! identity, so no caller can offer another family's set as the basis. The
+//! intersection is never released and
 //! re-taken, the state asks its own refusal gate only for the MARGINAL cost
 //! (see `marginal_charge`), and a refusal leaves the superseded set owning
 //! everything it owned. A refused re-derivation reports the refusal rather than
@@ -124,7 +126,8 @@ use super::org::OrgId;
 use super::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant};
 use super::org_grant_registry::ConsumerGrantSnapshot;
 use super::org_routing_registry::{
-    DemandRefused, DemandSet, PrivateAudienceScope, RoutingFamily, SlotKey, MAX_HANDLES_PER_FAMILY,
+    DemandRefused, DemandSet, GrantMovementFence, PrivateAudienceScope, ReplaceRefused,
+    RoutingFamily, SlotKey, MAX_HANDLES_PER_FAMILY,
 };
 use super::org_scoped_ingest::CapabilityAudienceScope;
 
@@ -343,6 +346,12 @@ fn marginal_charge(old: &[SlotKey], new: &[SlotKey]) -> usize {
 #[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
 pub(crate) struct CapabilityRouteHandle {
     capability: CapabilityAuthorityId,
+    /// The publication transition this entry was derived under (§4.4).
+    ///
+    /// Two different snapshots claiming ONE transition identity is an invariant
+    /// breach — the publication seam allocates each identity exactly once — and
+    /// this is what makes it detectable rather than silently acted on.
+    derived_at: u64,
     /// The EXACT keys `demands` was acquired for, in the same order.
     ///
     /// Retained rather than re-derived because the currency check (§4.2) needs
@@ -430,12 +439,44 @@ pub(crate) enum RouteLookup {
     Cold(ColdReason),
 }
 
+/// Where one lease snapshot sits against what this family has already acted on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotOrder {
+    /// Strictly older than the family's high-water. Must neither be served nor
+    /// allowed to mutate.
+    Older,
+    /// The same transition the family last acted on.
+    Current,
+    /// A later transition; the high-water has been advanced to it.
+    Newer,
+}
+
+/// Total order over publication transitions, as one comparable integer.
+///
+/// `Terminal` is the last word the publication-identity space can produce, so it
+/// sorts above every ordinary generation. `u64::MAX` is unreachable as an
+/// ordinary generation for the same reason it is terminal: the allocator refuses
+/// before it could ever be handed out.
+fn encode_revision(revision: GrantMovementFence) -> u64 {
+    match revision {
+        GrantMovementFence::Publication(generation) => generation,
+        GrantMovementFence::Terminal => u64::MAX,
+    }
+}
+
 /// Why a lookup is cold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // consumer: `MeshNode::call` (OLB-2B.3d).
 pub(crate) enum ColdReason {
     /// The family has no representable Owner discovery scope.
     NoOwnerScope,
+    /// The caller's lease snapshot is OLDER than one this family has already
+    /// acted on, or claims a transition identity that a different snapshot
+    /// already used (§4.4).
+    ///
+    /// Never served and never acted on. The caller takes the current-authority
+    /// cold path, which is what it would have done had it not raced at all.
+    SnapshotSuperseded,
     /// Demand was refused, with the class deciding whether a later miss retries
     /// (§9).
     Refused(DemandRefused),
@@ -486,6 +527,29 @@ pub(crate) struct RefusalState {
     /// it. A family that retried on that signal would attempt acquisition
     /// forever on a node that can never satisfy it.
     id_space_exhausted: bool,
+    /// The reference-release generation observed at the last REPLACEMENT
+    /// refusal, with the class it was refused as.
+    ///
+    /// A REPLACEMENT gets its own cache, and must not inherit the fresh path's
+    /// (§4.5). The fresh caches answer "can this family take MORE", and a
+    /// replacement often asks the opposite question:
+    ///
+    /// ```text
+    /// terminal id space  + a replacement creating NO slot   → needs no identity
+    /// node full at G     + a net-negative replacement       → frees capacity
+    /// node full at G     + a self-crediting rotation        → moves capacity
+    /// ```
+    ///
+    /// Each of those is suppressed by a fresh-path cache that is not about it,
+    /// and the suppression is self-sustaining: the very transaction that would
+    /// free or move the capacity is the one being refused, so the wake condition
+    /// can never arrive. The entry then keeps an obsolete scope forever.
+    ///
+    /// The gate is the REFERENCE-RELEASE generation, not the node capacity one,
+    /// because a replacement also becomes satisfiable when another family stops
+    /// SHARING a slot without retiring it — no retirement, no capacity movement,
+    /// and yet the projection genuinely changed.
+    replace_refused: Option<(u64, DemandRefused)>,
     /// The node capacity generation observed at the last `NodeAtCapacity`
     /// refusal, or `None` if there has not been one.
     ///
@@ -502,14 +566,34 @@ impl RefusalState {
             .is_some_and(|refused| width >= refused)
     }
 
-    /// Whether acquisition may be attempted for a set of exactly `width`, given
-    /// the CURRENT node capacity generation.
+    /// Whether a FRESH acquisition may be attempted for a set of exactly
+    /// `width`, given the CURRENT node capacity generation.
+    ///
+    /// Unchanged from the signed fresh-path semantics: sticky from the refused
+    /// width up, retryable on the node capacity generation, terminal on
+    /// exhaustion.
     fn may_attempt(&self, node_capacity_generation: u64, width: usize) -> bool {
         if self.id_space_exhausted || self.family_spent_at(width) {
             return false;
         }
         self.node_at_capacity_at
             .is_none_or(|at| at != node_capacity_generation)
+    }
+
+    /// Whether a REPLACEMENT may be attempted, given the current
+    /// reference-release generation.
+    ///
+    /// Deliberately consults NONE of the fresh-path caches — see
+    /// [`Self::replace_refused`]. Its own cache is exact for what it gates: a
+    /// replacement refused with nothing released since is refused for the same
+    /// reason, and any release at all may have changed the projection.
+    fn may_attempt_replacement(&self, ref_release_generation: u64) -> bool {
+        self.replace_refused
+            .is_none_or(|(at, _)| at != ref_release_generation)
+    }
+
+    fn record_replacement_refusal(&mut self, refusal: DemandRefused, ref_release_generation: u64) {
+        self.replace_refused = Some((ref_release_generation, refusal));
     }
 
     fn record(&mut self, refusal: DemandRefused, node_capacity_generation: u64, width: usize) {
@@ -563,6 +647,15 @@ pub(crate) struct OrgRoutingState {
     index: ArcSwap<CapabilityIndex>,
     /// Miss / insert / drop ONLY. Never taken by a hit.
     mutate: parking_lot::Mutex<RefusalState>,
+    /// The newest publication transition this family has acted on (§4.4),
+    /// encoded by `encode_revision`.
+    ///
+    /// Node-family-wide rather than per-entry, because an older snapshot must be
+    /// refused even for a capability it has never touched: authority it still
+    /// believes in may already have been withdrawn. Per-entry freshness is
+    /// carried separately by `CapabilityRouteHandle::derived_at`, which is what
+    /// detects two DIFFERENT snapshots claiming one transition identity.
+    snapshot_high_water: AtomicU64,
     /// Every acquisition of `mutate`, so a witness can assert that a warmed
     /// lookup takes it ZERO times rather than inferring it from timing.
     ///
@@ -594,6 +687,7 @@ impl OrgRoutingState {
             credentials,
             grants_by_capability,
             index: ArcSwap::from_pointee(CapabilityIndex::default()),
+            snapshot_high_water: AtomicU64::new(0),
             mutate: parking_lot::Mutex::new(RefusalState::default()),
             mutate_acquisitions: AtomicU64::new(0),
         }
@@ -716,16 +810,54 @@ impl OrgRoutingState {
         capability: &CapabilityAuthorityId,
         leased: &ConsumerGrantSnapshot,
     ) -> RouteLookup {
+        // SNAPSHOT ORDERING FIRST (§4.4). A caller whose view is older than one
+        // this family has already acted on is answered `SnapshotSuperseded` and
+        // nothing else: it must not be served from a newer entry, because a
+        // downstream projection would then read the newer retained authority as
+        // if it were this older snapshot's; and it must not re-derive, because
+        // that would reinstate authority a later transition already withdrew.
+        match self.note_snapshot(leased) {
+            SnapshotOrder::Older => return RouteLookup::Cold(ColdReason::SnapshotSuperseded),
+            SnapshotOrder::Current | SnapshotOrder::Newer => {}
+        }
         if let Some(entry) = self.warm(capability) {
             if self.leases_current(&entry, capability, leased) {
                 return RouteLookup::Warm;
             }
-            return self.rederive(capability, leased);
         }
         self.acquire(capability, leased)
     }
 
-    /// The MISS path. Never reached by a current hit.
+    /// Where `leased` sits against everything this family has already acted on,
+    /// advancing the high-water when it is newer.
+    ///
+    /// Lock-free, and free in the steady state: a repeat call under the same
+    /// snapshot is one `Acquire` load and no write. Freshness advances even when
+    /// the movement is IRRELEVANT to this capability and no re-derivation
+    /// follows — otherwise an unrelated newer publication would leave the
+    /// high-water behind and let a stalled older snapshot overwrite it later.
+    fn note_snapshot(&self, leased: &ConsumerGrantSnapshot) -> SnapshotOrder {
+        let revision = encode_revision(leased.revision());
+        let high_water = self.snapshot_high_water.load(Ordering::Acquire);
+        if revision < high_water {
+            return SnapshotOrder::Older;
+        }
+        if revision > high_water {
+            self.snapshot_high_water
+                .fetch_max(revision, Ordering::AcqRel);
+            return SnapshotOrder::Newer;
+        }
+        SnapshotOrder::Current
+    }
+
+    /// The MUTATION path: a miss, or a warmed entry that is stale for THIS
+    /// caller's snapshot.
+    ///
+    /// One path, not two. An earlier shape had the miss path re-check only
+    /// `is_some()` under the lock and return `Warm` — so a thread that lost the
+    /// race adopted the winner's entry without ever asking whether that entry
+    /// was current for ITS OWN snapshot, and reported `Warm` for a set missing a
+    /// newly installed audience or still holding a removed one (§4.6).
     fn acquire(
         &self,
         capability: &CapabilityAuthorityId,
@@ -734,34 +866,20 @@ impl OrgRoutingState {
         let mut refusals = self.mutate.lock();
         self.mutate_acquisitions.fetch_add(1, Ordering::AcqRel);
 
-        // Re-check under the mutation lock. A concurrent miss may have inserted
-        // the entry between the lock-free load and here.
-        if self.index.load().get(capability).is_some() {
-            return RouteLookup::Warm;
+        // Re-check the SNAPSHOT ORDER under the lock (§4.4). `route_handle`
+        // checked it too, but the high-water can advance in the window between
+        // that check and this lock: a newer caller can publish while this one is
+        // still on its way in. Ordering it only outside the lock would make the
+        // gate exactly as weak as the serialization it exists to correct.
+        if encode_revision(leased.revision()) < self.snapshot_high_water.load(Ordering::Acquire) {
+            return RouteLookup::Cold(ColdReason::SnapshotSuperseded);
         }
 
-        self.acquire_under_mutate(&mut refusals, capability, leased, None)
-    }
-
-    /// The LIFECYCLE path: a warmed entry whose retained scopes no longer match
-    /// what the family has leased (§4.2).
-    ///
-    /// Takes `mutate` exactly like a miss, because it publishes.
-    fn rederive(
-        &self,
-        capability: &CapabilityAuthorityId,
-        leased: &ConsumerGrantSnapshot,
-    ) -> RouteLookup {
-        let mut refusals = self.mutate.lock();
-        self.mutate_acquisitions.fetch_add(1, Ordering::AcqRel);
-
-        // Re-check under the lock, and supersede the entry the index holds NOW —
-        // never the one the caller loaded before taking it. A concurrent caller
-        // may have already re-derived this capability against the same lease
-        // movement, in which case there is nothing to do and its budget must not
-        // be spent twice; and if it has, the pre-lock entry is a set that has
-        // already given its references away, so replacing THAT would charge the
-        // successor's footprint gross.
+        // Re-check under the mutation lock, against the entry the index holds
+        // NOW — never one loaded before taking it, which may already have
+        // transferred its references away. A concurrent caller may have inserted
+        // or re-derived this capability, and if what it published is current for
+        // this caller too, there is nothing to do and no budget to spend twice.
         let current = self.index.load().get(capability).cloned();
         match current {
             Some(current) => {
@@ -770,8 +888,6 @@ impl OrgRoutingState {
                 }
                 self.acquire_under_mutate(&mut refusals, capability, leased, Some(&current))
             }
-            // Unreachable in 2B.3b — nothing removes an entry — but treating it
-            // as a plain miss is the answer that retains nothing incorrectly.
             None => self.acquire_under_mutate(&mut refusals, capability, leased, None),
         }
     }
@@ -817,21 +933,64 @@ impl OrgRoutingState {
         // would record a generation that may already have moved because of the
         // very retirement that would have made the attempt succeed, and the
         // family would then never retry.
-        let generation = self.family.node_capacity_generation();
-        if !refusals.may_attempt(generation, charge) {
-            return RouteLookup::Cold(self.settled_reason(refusals, charge));
+        let revision = encode_revision(leased.revision());
+
+        // Two DIFFERENT snapshots claiming ONE transition identity is an
+        // invariant breach, not a race: the publication seam allocates each
+        // identity exactly once, under the consumer-Grant gate. If this entry
+        // was derived under the very transition the caller names and the derived
+        // set has nevertheless changed, the two disagree about what that
+        // transition published. Fail closed rather than pick one.
+        if superseded.is_some_and(|stale| stale.derived_at == revision) {
+            return RouteLookup::Cold(ColdReason::SnapshotSuperseded);
         }
 
+        // A REPLACEMENT is gated on the reference-release generation, a FRESH
+        // acquisition on the node capacity generation and the fresh caches
+        // (§4.5). Applying the fresh caches to a replacement deadlocks it
+        // against its own wake condition: the transaction being suppressed is
+        // the one that would free or move the very capacity the cache is
+        // waiting on.
+        let release_generation = self.family.ref_release_generation();
+        if superseded.is_some() {
+            if !refusals.may_attempt_replacement(release_generation) {
+                let refusal = refusals
+                    .replace_refused
+                    .map_or(DemandRefused::NodeAtCapacity, |(_, refusal)| refusal);
+                return RouteLookup::Cold(ColdReason::Refused(refusal));
+            }
+        } else {
+            let generation = self.family.node_capacity_generation();
+            if !refusals.may_attempt(generation, charge) {
+                return RouteLookup::Cold(self.settled_reason(refusals, charge));
+            }
+        }
+        let generation = self.family.node_capacity_generation();
+
+        // A replacement is driven through the SUPERSEDED SET ITSELF, which
+        // carries its own registry and family identity. No argument exists
+        // through which one family could offer another's set as the basis, so
+        // the private ownership boundary is structural here, not checked.
         let acquired = match superseded {
-            Some(stale) => self
-                .family
-                .replace_demand_set(stale.demands(), keys.clone()),
+            Some(stale) => stale
+                .demands()
+                .replace(keys.clone())
+                .map_err(|refusal| match refusal {
+                    ReplaceRefused::Demand(refusal) => refusal,
+                    // The set gave its references away between the index read
+                    // and here. Unreachable while `mutate` serializes every
+                    // replacement, and answered as the most conservative
+                    // capacity refusal rather than a panic: it retains nothing,
+                    // and the caller's next attempt re-reads the index.
+                    ReplaceRefused::Superseded => DemandRefused::NodeAtCapacity,
+                }),
             None => self.family.demand_set(keys.clone()),
         };
         match acquired {
             Ok(demands) => {
                 let handle = Arc::new(CapabilityRouteHandle {
                     capability: *capability,
+                    derived_at: revision,
                     demanded: keys,
                     demands,
                 });
@@ -840,6 +999,12 @@ impl OrgRoutingState {
                 // is no window in which the index is half-built, because the
                 // index a reader can reach was never mutated in place.
                 self.index.store(Arc::new(self.index.load().with(handle)));
+                // The family has now ACTED on this transition. Advanced here as
+                // well as on the read path, because acting is what the ordering
+                // invariant is about: a later caller carrying an older view must
+                // be refused even if no read ever observed the newer one.
+                self.snapshot_high_water
+                    .fetch_max(revision, Ordering::AcqRel);
                 if superseded.is_some() {
                     // The superseded set gave up its references INSIDE the
                     // replacement transaction, so the family's footprint may
@@ -850,7 +1015,17 @@ impl OrgRoutingState {
                 RouteLookup::Warm
             }
             Err(refusal) => {
-                refusals.record(refusal, generation, charge);
+                if superseded.is_some() {
+                    // A replacement refusal records against the release
+                    // generation and NEVER against the fresh caches: a
+                    // replacement that could not fit says nothing about whether
+                    // this family may take more, and writing it into the sticky
+                    // width or the terminal flag would suppress fresh
+                    // acquisitions that are still perfectly serviceable.
+                    refusals.record_replacement_refusal(refusal, release_generation);
+                } else {
+                    refusals.record(refusal, generation, charge);
+                }
                 RouteLookup::Cold(ColdReason::Refused(refusal))
             }
         }

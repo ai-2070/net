@@ -11243,11 +11243,30 @@ impl MeshNode {
     /// transient publish-and-restore, and lock-free readers can observe that
     /// transient snapshot — so the counter, not the pointer, is what makes the
     /// negative claim provable (Kyra, 2B.3c-pre step-1 re-review).
+    /// Publish the next consumer-Grant snapshot and return the transition's
+    /// fence.
+    ///
+    /// **Also stamps the snapshot with that same fence** (OLB-2B.3b §4.4). The
+    /// identity is the one this transition already reserved, so the stamp adds
+    /// no allocation, no ordering, no notification and no fence of its own — it
+    /// records on the artifact what the transition had already decided, which is
+    /// what lets a consumer order two snapshots without inventing a second
+    /// clock. Stamped BEFORE the store, so no observer can reach a published
+    /// snapshot that is not stamped.
     fn publish_consumer_grant_snapshot(
         &self,
-        next: Arc<super::behavior::org_grant_registry::ConsumerGrantSnapshot>,
+        next: super::behavior::org_grant_registry::ConsumerGrantSnapshot,
         reserved: Option<u64>,
     ) -> super::behavior::org_routing_registry::GrantMovementFence {
+        let fence = match reserved {
+            Some(publication) => {
+                super::behavior::org_routing_registry::GrantMovementFence::Publication(publication)
+            }
+            // Exhausted, and reachable only by a withdrawal: an installation is
+            // refused before it publishes. Nothing to commit, and nothing left
+            // that could supersede the absence this just published.
+            None => super::behavior::org_routing_registry::GrantMovementFence::Terminal,
+        };
         // `AcqRel`, not `Relaxed`: the counter exists precisely so a transient
         // publication is observable, which invites a witness that samples it from
         // ANOTHER thread while one is in flight. Paired with the `Acquire` load
@@ -11258,18 +11277,13 @@ impl MeshNode {
         #[cfg(test)]
         self.consumer_grant_publications
             .fetch_add(1, Ordering::AcqRel);
-        self.consumer_grant_audiences.store(next);
+        self.consumer_grant_audiences
+            .store(Arc::new(next.stamped(fence)));
         // Committed AFTER the store — see `ConsumerGrantGate::publications`.
-        match reserved {
-            Some(publication) => {
-                self.consumer_grant_gate.commit_publication(publication);
-                super::behavior::org_routing_registry::GrantMovementFence::Publication(publication)
-            }
-            // Exhausted, and reachable only by a withdrawal: an installation is
-            // refused before it publishes. Nothing to commit, and nothing left
-            // that could supersede the absence this just published.
-            None => super::behavior::org_routing_registry::GrantMovementFence::Terminal,
+        if let Some(publication) = reserved {
+            self.consumer_grant_gate.commit_publication(publication);
         }
+        fence
     }
 
     /// Test-only: how many consumer-Grant snapshot publications have occurred.
@@ -11523,7 +11537,7 @@ impl MeshNode {
             // cannot be wasted.
             let install_seq = self.allocate_consumer_grant_install_seq()?;
             let next = ConsumerGrantSnapshot::finish_install(prepared, install_seq);
-            let fence = self.publish_consumer_grant_snapshot(Arc::new(next), Some(publication));
+            let fence = self.publish_consumer_grant_snapshot(next, Some(publication));
             (install_seq, fence)
         };
         // An INSTALL is routing movement in the availability direction: a
@@ -11604,7 +11618,7 @@ impl MeshNode {
                     // Reserved under the gate; `None` means exhausted, and the
                     // withdrawal proceeds terminally rather than being refused.
                     let reserved = self.consumer_grant_gate.reserve_publication();
-                    let fence = self.publish_consumer_grant_snapshot(Arc::new(next), reserved);
+                    let fence = self.publish_consumer_grant_snapshot(next, reserved);
                     Some(super::behavior::org_routing_registry::GrantScopeMovement {
                         grant_id: *grant_id,
                         audience_handle,

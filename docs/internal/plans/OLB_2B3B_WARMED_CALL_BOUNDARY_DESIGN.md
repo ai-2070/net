@@ -514,6 +514,23 @@ family's footprint grow. The registry recomputes the projection authoritatively
 inside the transaction and is what actually refuses; the state's figure only
 stops a provably-doomed attempt from taking the node-wide lock.
 
+**Retirement clears the cell it abandons.** A slot's publication cell is an
+`Arc` that outstanding readers still hold — a superseded `DemandSet`, or any
+holder of an `Arc<CapabilityRouteHandle>` the index no longer names. Removing the
+slot from the registry map does not reach them, so a retirement that leaves the
+artifact in place lets a reader that owns NO reference go on reading a dead
+incarnation's facts indefinitely. That is retention without ownership, which is
+the one thing this section exists to make impossible, and it is why
+`retire_committed` stores `None` into the cell BEFORE dropping the slot.
+
+Clearing on RETIREMENT must not become clearing on TRANSFER: a `common` key's
+cell is shared with the successor, the scope is still genuinely retained, and it
+must still read. Both directions are witnessed. A re-demand of a retired key
+mints a FRESH cell and incarnation, so the cleared one is unreachable from the
+registry and no reconstruction can republish into it — the apply path refuses
+twice over anyway, skipping a removed slot and fencing a re-demanded one on
+`slot.incarnation`.
+
 **Ownership: the set, not the handle.** The unit is `DemandSet` — one object, one
 `Drop`, one release transaction. A `Vec<DemandHandle>` cannot express an atomic
 replacement: each handle releases itself, so transferring one means defusing its
@@ -523,6 +540,97 @@ RESPONSIBILITY as the keys it still owes, and a replacement MOVES them. No flag
 decides anything: a set releases exactly the keys it currently holds, so at every
 instant exactly one set owes each reference — including while the superseded
 entry is still shared behind an `Arc` that a reader may hold.
+
+### 4.4 Snapshot ordering: an older view can never overwrite a newer one
+
+Serialization is not ordering. `mutate` decides who mutates FIRST, not whose view
+is NEWER, so a caller that captured a snapshot and then stalled can take the lock
+after a later transition has already been applied:
+
+```text
+entry holds audience A
+T-old captures snapshot B, sees A as stale, stalls
+T-new captures the REMOVAL, replaces A with Owner-only
+T-old resumes, takes mutate, sees Owner-only as "stale for B"
+T-old reinstates B — authority a later transition already withdrew
+```
+
+The fix reuses the identity the consumer-Grant machinery ALREADY allocates for
+every publication — `GrantMovementFence`, `Publication(n)` or `Terminal` — rather
+than inventing a second clock that could disagree with the fence the same
+transition published to routing. `publish_consumer_grant_snapshot` stamps the
+snapshot with the fence it was about to return, before the store, so no observer
+can reach an unstamped published snapshot. Nothing about the seam's ordering,
+fences, notifications or public behaviour changes; the stamp records what the
+transition had already decided.
+
+`OrgRoutingState` keeps a high-water of the newest transition it has acted on:
+
+```text
+revision <  high-water   → SnapshotSuperseded; neither served nor acted on
+revision == high-water   → the transition already in force
+revision >  high-water   → advance, then proceed
+```
+
+Three consequences worth stating plainly:
+
+- **`Terminal` outranks every ordinary publication**, because no installation can
+  follow it. Encoded as `u64::MAX`, which is unreachable as an ordinary
+  generation for exactly the same reason.
+- **Freshness advances even when demand does not.** An unrelated newer
+  publication re-derives nothing and takes no lock, but it still moves the
+  high-water — otherwise it would leave a window in which a stalled older
+  relevant snapshot could still act.
+- **Two snapshots at ONE revision is an invariant breach, not a race.** The seam
+  allocates each identity once, under the consumer-Grant gate. If an entry was
+  derived under the very transition a caller names and the derived set has
+  nevertheless changed, the two disagree about what that transition published.
+  Fail closed rather than pick one; `CapabilityRouteHandle::derived_at` is what
+  makes it detectable.
+
+**The 2B.3d consumer contract.** A caller whose snapshot is older than the
+family's high-water gets `Cold(SnapshotSuperseded)` and nothing else. It is NOT
+served the newer entry: a downstream projection would then read newer retained
+authority as though it were this older snapshot's, which is the same
+authority-confusion in the opposite direction. It takes the current-authority
+cold path — what it would have done had it not raced at all.
+
+### 4.5 A replacement does not inherit the fresh path's refusal caches
+
+The fresh caches answer "can this family take MORE". A replacement frequently
+asks the opposite, and each fresh cache suppresses a replacement that is not
+about it:
+
+```text
+terminal id space  + a replacement creating NO slot  → needs no identity
+node full at G     + a net-negative replacement      → frees capacity
+node full at G     + a self-crediting rotation       → moves capacity
+```
+
+Every one of those is self-sustaining: the transaction being suppressed is the
+one that would free or move the capacity the cache is waiting on, so the wake
+condition can never arrive and the entry keeps its obsolete scope forever.
+
+A replacement therefore has its OWN cache, gated on the **reference-release
+generation** rather than the node capacity generation. The distinction is load
+bearing: a replacement also becomes satisfiable when another family stops SHARING
+a slot this replacement wants to give up — nothing retires, node capacity never
+moves, and the projection has still genuinely changed. That is a bounded, exact
+wake condition, not a per-call retry, so the node-wide lock is not hammered.
+
+Refusals do not cross between the two paths in either direction: a replacement
+refusal never writes the sticky width or the terminal flag, and the fresh path's
+signed sticky/retryable/terminal semantics are exactly as before.
+
+### 4.6 The under-lock recheck validates the CALLER's snapshot
+
+The miss path re-checks the index under `mutate` because two threads can miss
+concurrently. Checking only that SOME entry now exists is not enough: the loser
+adopts the winner's entry without ever asking whether it is current for its own
+snapshot, and reports `Warm` for a set missing a newly installed audience or
+still holding a removed one. The recheck runs the same `leases_current` the
+lock-free path runs, and a stale entry goes through atomic replacement — so the
+miss path and the lifecycle path are ONE path, not two that can disagree.
 
 ## 5. Ambiguity refuses publication; the cold plan produces the error
 
@@ -1456,6 +1564,24 @@ Every one selects exactly one test and dies to its own inverse mutation.
 | W-P4 | `a_rotation_at_the_node_bound_refuses_when_the_old_slot_is_shared` | a shared old slot frees nothing, so 257 refuses with no effect | credit every old-only slot unconditionally |
 | W-P5 | `identity_exhaustion_during_a_replacement_refuses_with_no_effect` | exhaustion refuses a slot-creating replacement, old entry intact | reserve identities after mutating |
 | W-P6 | `a_narrowing_replacement_needs_no_identity_after_exhaustion` | a shedding replacement needs no identity | — (control for W-P5) |
+| W-S1 | `a_superseded_reader_cannot_read_a_retired_incarnations_facts` | retirement clears the cell it abandons | drop the `facts.store(None)` |
+| W-S2 | `a_common_key_reader_follows_the_successors_ownership` | clearing on retirement is not clearing on transfer | clear every cell at retirement |
+| W-S3 | `a_fresh_demand_after_retirement_gets_a_fresh_cell` | a re-demand cannot repopulate a stale cell | **shared** with W-S1 |
+| W-S4 | `a_stale_incarnation_apply_cannot_republish_a_cleared_cell` | a real quantum reaches only the live incarnation | — (control for W-S1) |
+| W-O1 | `release_one_cannot_decrement_a_reference_a_family_does_not_hold` | the family reference authorizes the global decrement | drop the `NotHeld` guard |
+| W-O2 | `an_already_transferred_set_cannot_be_replaced_again` | single-use transfer | drop the `held != keys` guard |
+| W-C1 | `a_cached_terminal_refusal_does_not_block_a_zero_identity_replacement` | a replacement does not inherit the terminal cache | gate replacement on the fresh caches |
+| W-C2 | `a_cached_node_refusal_does_not_block_a_self_crediting_replacement` | nor the node cache at unchanged G | **shared** with W-C1 |
+| W-C3 | `a_shared_old_replacement_retries_when_the_sharer_releases` | the wake condition is the REFERENCE-RELEASE generation | gate on the node capacity generation |
+| W-C4 | `a_replacement_refusal_leaves_the_fresh_path_untouched` | refusals do not cross between the paths | record a replacement refusal into the fresh caches |
+| W-M1 | `the_under_lock_miss_recheck_validates_the_callers_snapshot` | the recheck is a currency check, not an existence check | re-check `is_some()` and return `Warm` |
+| W-M2 | `the_under_lock_miss_recheck_sees_a_removal` | same, for a removal | **shared** with W-M1 |
+| W-M3 | `the_under_lock_miss_recheck_sees_a_rotation` | same, for a rotation | — (control for W-M1/W-M2) |
+| W-V1 | `a_stalled_older_install_cannot_overwrite_a_newer_removal` | an older snapshot cannot regress a newer set | drop the ordering gate |
+| W-V2 | `a_stalled_older_removal_cannot_overwrite_a_newer_install` | the mirror direction | **shared** with W-V1 |
+| W-V3 | `a_terminal_snapshot_cannot_be_overwritten_by_an_ordinary_one` | terminal outranks every publication | encode `Terminal` as `0` |
+| W-V4 | `two_snapshots_at_one_revision_are_refused_as_an_invariant_breach` | one identity, one content — fail closed | drop the `derived_at` equality refusal |
+| W-V5 | `unrelated_newer_movement_advances_freshness_without_churn` | freshness advances even when demand does not | advance the high-water only when re-deriving |
 | W-L7 | `a_current_warmed_entry_with_a_leased_audience_takes_no_lock` | the currency check is lock-free with a real Grant plane | perform it under the mutation lock |
 | W-L8 | `the_capability_index_derives_exactly_what_the_full_scan_derives` | the index is a filter, never a second admission rule | index only the first grant per capability |
 | W-L9 | `concurrent_rederivations_spend_one_demand_set` | one lease movement spends one demand set | drop the under-`mutate` re-check in `rederive` |
@@ -1580,9 +1706,11 @@ the over-claim this process exists to catch.
 throughout. No security or race witness is retried.
 
 ```text
-slice witnesses          67 selected, 67 passed   (36 registry + 31 state)
-routing/grant/scoped    291 selected, 291 passed
-inverse mutations        39 run, 38 RED, 1 GREEN (recorded, §17.6a)
+slice witnesses          87 selected, 87 passed   (42 registry + 45 state)
+routing/grant/scoped    326 selected, 326 passed  (incl. 70 signed 2B.3c-pre wiring)
+inverse mutations        54 FINAL rows, 54 RED, 0 survivors
+                         every row: exactly 1 test selected, restored + hash-verified
+                         27 superseded attempts + 6 anchor misses kept as archaeology
                          every row: exactly 1 test selected, restored + hash-verified
 fmt                     clean
 clippy --all-features --lib --bins                    clean
@@ -1605,6 +1733,27 @@ carries a `selected` column, and any row that is not exactly `1` is `INVALID`
 rather than RED — a filtered run that matches nothing is the same vacuous-gate
 failure the CI gates in this repository already exist to forbid, and a mutation
 harness is no more entitled to it than a CI step is.
+
+### 17.6c-0 Evidence hygiene: FINAL matrix vs archaeology
+
+The raw execution log accumulates every mutation ATTEMPT, including ones that
+were re-anchored or corrected and re-run. Historical transparency is worth
+keeping, but the authoritative matrix has to be unambiguous and mechanically
+derivable rather than read off by eye. So the log is split, by script, on three
+rules:
+
+```text
+FINAL matrix    one row per mutation ID — the LAST execution of it
+ARCHAEOLOGY     every earlier execution of that ID; kept, never counted
+NOT A RUN       ANCHOR-NOT-FOUND: nothing was applied and nothing executed,
+                so it is excluded from BOTH counts
+```
+
+Every row in the final matrix must carry `selected == 1` and a verified restore
+hash; a row that cannot show both is not evidence. Total ATTEMPTED executions are
+reported separately from final matrix rows, so the two can never be confused —
+an earlier revision of this document reported "39 final rows" against a log that
+held 43, because four IDs had been re-run and both attempts were still counted.
 
 ### 17.6c The mutation ledger
 
@@ -1665,11 +1814,28 @@ one-mutation-per-witness.
 | 37 | M-X4 | credit EVERY old-only slot (`credited = old_only.len()`) | `a_rotation_at_the_node_bound_refuses_when_the_old_slot_is_shared` | 1 | RED | `org_routing_state_tests.rs:1743` |
 | 38 | M-X5 | wrap the replacement's incarnation reservation | `identity_exhaustion_during_a_replacement_refuses_with_no_effect` | 1 | RED | `org_routing_registry.rs:1444` (production `debug_assert`) |
 | 39 | M-X6 | refuse EVERY replacement once the id space is spent | `a_narrowing_replacement_needs_no_identity_after_exhaustion` | 1 | RED | `org_routing_state_tests.rs:1825` |
+| 40 | M-Y1 | drop `facts.store(None)` from `retire_committed` | `a_superseded_reader_cannot_read_a_retired_incarnations_facts` | 1 | RED | registry tests |
+| 41 | M-Y2 | clear EVERY slot's cell at retirement, not the retiring one | `a_common_key_reader_follows_the_successors_ownership` | 1 | RED | registry tests |
+| 42 | M-Y3 | **shared** with #40 | `a_fresh_demand_after_retirement_gets_a_fresh_cell` | 1 | RED | registry tests |
+| 43 | M-Y4 | drop the `NotHeld` guard from `release_one` | `release_one_cannot_decrement_a_reference_a_family_does_not_hold` | 1 | RED | registry tests |
+| 44 | M-Y5 | drop the `held != keys` single-use transfer guard | `an_already_transferred_set_cannot_be_replaced_again` | 1 | RED | registry tests |
+| 45 | M-Y6 | gate a replacement on the FRESH refusal caches | `a_cached_terminal_refusal_does_not_block_a_zero_identity_replacement` | 1 | RED | state tests |
+| 46 | M-Y7 | **shared** with #45 | `a_cached_node_refusal_does_not_block_a_self_crediting_replacement` | 1 | RED | state tests |
+| 47 | M-Y8 | gate replacement on the NODE CAPACITY generation | `a_shared_old_replacement_retries_when_the_sharer_releases` | 1 | RED | state tests |
+| 48 | M-Y9 | record a replacement refusal into the fresh caches | `a_replacement_refusal_leaves_the_fresh_path_untouched` | 1 | RED | state tests |
+| 49 | M-Y10 | under-lock recheck returns `Warm` on mere existence | `the_under_lock_miss_recheck_validates_the_callers_snapshot` | 1 | RED | state tests |
+| 50 | M-Y11 | **shared** with #49 | `the_under_lock_miss_recheck_sees_a_removal` | 1 | RED | state tests |
+| 51 | M-Y12 | drop the snapshot-ordering gate in `route_handle` | `a_stalled_older_install_cannot_overwrite_a_newer_removal` | 1 | RED | state tests |
+| 52 | M-Y13 | encode `Terminal` as `0` instead of `u64::MAX` | `a_terminal_snapshot_cannot_be_overwritten_by_an_ordinary_one` | 1 | RED | state tests |
+| 53 | M-Y14 | drop the `derived_at == revision` breach refusal | `two_snapshots_at_one_revision_are_refused_as_an_invariant_breach` | 1 | RED | state tests |
+| 54 | M-Y15 | advance the high-water only when re-deriving | `unrelated_newer_movement_advances_freshness_without_churn` | 1 | RED | state tests |
 
 ```text
-39 runs   38 RED (37 assertion, 1 deadlock)   1 GREEN-NOT-KILLED
-          39/39 selected exactly one test
-          39/39 restored and SHA256-verified
+54 FINAL rows   54 RED (53 assertion, 1 deadlock)   0 survivors
+                54/54 selected exactly one test
+                54/54 restored and SHA256-verified
+27 superseded attempts, 6 anchor misses — archaeology, never counted
+81 total executions
 ```
 
 **The total is 39, not 19.** The earlier figure was prose, not a ledger: it
@@ -1679,6 +1845,29 @@ node-gate mutation into single entries. Eighteen of the thirty-nine are new with
 the HOLD repairs (M-R1..M-R3, M-L1..M-L9, M-X1..M-X6); the remaining twenty-one
 are the pre-existing set, re-run here because a mutation run proves the tree it
 ran against. Reconstructing it row by row is what surfaced #20.
+
+**The HOLD-3 rerun produced two survivors, and both were real findings about
+this document's own claims.** Neither was resolved by re-aiming a mutation until
+it went red; each was traced to what the survivor actually proved.
+
+- **M-A5s survived because its WITNESS was weak, not because the mutation was
+  mis-aimed.** W-A5's loop mutation acquires per key and drops the prefix on the
+  `?`, so handles, retained slots and the index are all back at baseline by the
+  time the state-level witness looks — but the incarnation each new slot consumed
+  is never given back. `a_refused_entry_retains_no_partial_demand` asserted
+  handles, slots, entries and warmth, and never the identity space, so "retains
+  NOTHING" was not what it checked. The witness now asserts
+  `allocated_ids_for_test()` is unmoved, which is the property W-A5 names, at the
+  state layer. The §17.6 row that claimed this witness dies to W-A5's mutation is
+  therefore true again — and it is true because the witness was strengthened, not
+  because the claim was quietly dropped.
+- **M-Y12 survived because the implementation is stronger than the mutation
+  assumed.** Removing the snapshot-ordering gate from `route_handle` alone does
+  not regress anything, because the SAME order is re-checked under `mutate` —
+  which is itself a repair this slice made after a witness caught the window
+  between the two. The single-site mutation was therefore not the inverse of the
+  ordering property; the two-site mutation that removes both gates is, and the
+  witness reds on it.
 
 **Two rows changed meaning during the HOLD-2 rerun, and both are recorded rather
 than quietly re-anchored.**
