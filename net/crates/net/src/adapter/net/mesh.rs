@@ -2841,27 +2841,128 @@ impl MembershipFailure {
 /// `rpc_peer_failure_gen`, the fence that lets such an insert detect it
 /// spanned a failure and roll itself back.
 ///
-/// The bump is LAST, after the retain. Ordering it that way means an
-/// observed generation change implies the retain has already run, so
-/// the two never race into a window where the fence fires but the
-/// eviction has not happened yet. (The reverse order would also be
-/// safe — the retain would remove the entry instead — but this way the
-/// rollback is the only mechanism that has to be right.)
+/// **The bump must come FIRST, before the retain.** Two things can
+/// remove a resurrected entry — this retain, or the subscribe's own
+/// rollback — and one of them has to be guaranteed to fire. With the
+/// bump last there is a window where neither does: the retain completes
+/// (finding nothing), and the subscribe then inserts AND re-reads a
+/// generation the bump has not reached yet, sees no change, and keeps
+/// the entry. Bumping first collapses that window. If the retain runs
+/// before the insert then the bump did too, so the subscribe's
+/// post-insert read observes it and rolls back; if the retain runs after
+/// the insert it removes the entry itself.
+///
+/// The two orders are NOT symmetric, which is what the first version of
+/// this comment got backwards.
 fn evict_failed_peer_channel_state(
     node_id: u64,
     subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
     #[cfg(feature = "cortex")] rpc_reply_subscriptions: &dashmap::DashMap<(u64, u64), Arc<str>>,
     #[cfg(feature = "cortex")] rpc_corrective_announced: &dashmap::DashSet<u64>,
-    #[cfg(feature = "cortex")] rpc_peer_failure_gen: &dashmap::DashMap<u64, u64>,
+    #[cfg(feature = "cortex")] rpc_peer_failure_gen: &PeerFailureGenerations,
 ) {
+    #[cfg(feature = "cortex")]
+    rpc_peer_failure_gen.bump(node_id);
     subscriber_chains.retain(|(nid, _), _| *nid != node_id);
     #[cfg(feature = "cortex")]
     rpc_reply_subscriptions.retain(|(target, _), _| *target != node_id);
     #[cfg(feature = "cortex")]
     rpc_corrective_announced.remove(&node_id);
-    #[cfg(feature = "cortex")]
-    {
-        *rpc_peer_failure_gen.entry(node_id).or_insert(0) += 1;
+}
+
+/// Per-peer failure counters, and the reclamation floor that lets them
+/// be forgotten without breaking the fence they serve.
+///
+/// A subscribe reads a peer's generation before its `await` and again
+/// after recording itself; any change means the peer failed in between
+/// and the record must be rolled back. See
+/// [`MeshNode::peer_failure_generation`] for what goes wrong otherwise.
+///
+/// The reason this is a type rather than a bare `DashMap`: the naive
+/// version grows one entry per peer that has ever failed, forever, and
+/// the obvious fix breaks it. Simply removing an entry makes that peer
+/// read back as "generation 0" — the same value a peer that never
+/// failed reads — so a subscribe that snapshotted 0, spanned a failure,
+/// and had the counter reclaimed underneath it would compare 0 to 0 and
+/// keep exactly the stale entry the fence exists to remove. Absence has
+/// to mean something a reclamation cannot reproduce.
+///
+/// So absence resolves to a monotonic FLOOR instead of to zero. Both the
+/// per-peer counters and the floor are drawn from one counter, and
+/// reclamation raises the floor above every value it discards before
+/// discarding it. A reclaimed peer therefore reads back HIGHER than any
+/// snapshot taken before the reclamation, never equal to one — the
+/// comparison still detects the failure it was watching for. Reclaiming
+/// with no failure involved is likewise safe: it also raises the floor,
+/// so in-flight subscribes roll back and re-subscribe, which is
+/// idempotent.
+///
+/// Generations are only ever compared WITHIN one `ensure_reply_subscription`
+/// call — nothing durable stores one — so reclamation costs at most a
+/// retry for calls in flight at that moment, and clearing wholesale is
+/// as safe as clearing selectively.
+#[cfg(feature = "cortex")]
+#[derive(Debug)]
+pub(super) struct PeerFailureGenerations {
+    /// Peers with at least one recorded failure since the last
+    /// reclamation. Absent peers resolve to `floor`.
+    per_peer: dashmap::DashMap<u64, u64>,
+    /// Source of every generation value, per-peer and floor alike, so
+    /// the floor is always above the counters it replaces.
+    next: std::sync::atomic::AtomicU64,
+    /// What an absent peer reads as.
+    floor: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "cortex")]
+impl PeerFailureGenerations {
+    /// Beyond this many tracked peers, the whole table is reclaimed.
+    /// Sized so a normal mesh never reaches it — this is a backstop
+    /// against unbounded churn over a long-lived process, not a working
+    /// limit.
+    const MAX_TRACKED: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            per_peer: dashmap::DashMap::new(),
+            next: std::sync::atomic::AtomicU64::new(1),
+            floor: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn take_next(&self) -> u64 {
+        self.next
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Current generation for `peer`. Never `Option` — absence is a
+    /// value (the floor), which is the whole point.
+    pub(super) fn get(&self, peer: u64) -> u64 {
+        self.per_peer
+            .get(&peer)
+            .map(|e| *e.value())
+            .unwrap_or_else(|| self.floor.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Record a failure for `peer`, reclaiming the table first if it has
+    /// grown past [`Self::MAX_TRACKED`].
+    fn bump(&self, peer: u64) {
+        if self.per_peer.len() >= Self::MAX_TRACKED {
+            self.reclaim();
+        }
+        self.per_peer.insert(peer, self.take_next());
+    }
+
+    /// Forget every counter, raising the floor above all of them first.
+    ///
+    /// Order is load-bearing: the floor must be published BEFORE the
+    /// entries disappear. Removing first would leave a window in which
+    /// a reader sees absence resolving to the OLD floor, which is
+    /// exactly the reproducible value that makes reclamation unsafe.
+    fn reclaim(&self) {
+        self.floor
+            .store(self.take_next(), std::sync::atomic::Ordering::Release);
+        self.per_peer.clear();
     }
 }
 
@@ -6792,26 +6893,14 @@ pub struct MeshNode {
     /// so a genuine reconnect can announce again.
     #[cfg(feature = "cortex")]
     rpc_corrective_announced: Arc<dashmap::DashSet<u64>>,
-    /// Per-peer failure counter, bumped every time that peer's session
+    /// Per-peer failure counters, bumped every time that peer's session
     /// fails. The fence that stops an in-flight reply-subscribe from
     /// resurrecting `rpc_reply_subscriptions` state the failure path
-    /// just evicted — see `MeshNode::peer_failure_generation`.
-    ///
-    /// Absent means "never failed"; the fence compares `Option<u64>`,
-    /// not a value defaulted to zero, so a first-ever subscribe (absent
-    /// → absent) is distinguishable from one that spanned a failure
-    /// (absent → `Some(1)`).
-    ///
-    /// **Not capped, deliberately.** Entries accumulate one per distinct
-    /// peer that has failed at least once — the same order as the peer
-    /// set, at 16 bytes each, and node ids only enter after an
-    /// authenticated session. Evicting under a cap would be a
-    /// correctness hole rather than a memory win: a cleared counter
-    /// re-reads as absent, so a subscribe that snapshotted absent before
-    /// the peer failed would compare absent-to-absent and keep the stale
-    /// entry — exactly the state this fence exists to prevent.
+    /// just evicted — see [`MeshNode::peer_failure_generation`] for the
+    /// hazard and [`PeerFailureGenerations`] for why it is bounded the
+    /// way it is.
     #[cfg(feature = "cortex")]
-    rpc_peer_failure_gen: Arc<dashmap::DashMap<u64, u64>>,
+    rpc_peer_failure_gen: Arc<PeerFailureGenerations>,
     /// nRPC services the local node currently handles (registered
     /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
     /// drops). `announce_capabilities` merges these as
@@ -8075,7 +8164,8 @@ impl MeshNode {
         // Per-peer failure counter fencing in-flight reply-subscribes;
         // see `MeshNode::peer_failure_generation`.
         #[cfg(feature = "cortex")]
-        let rpc_peer_failure_gen: Arc<dashmap::DashMap<u64, u64>> = Arc::new(dashmap::DashMap::new());
+        let rpc_peer_failure_gen: Arc<PeerFailureGenerations> =
+            Arc::new(PeerFailureGenerations::new());
         #[cfg(feature = "cortex")]
         let rpc_peer_failure_gen_failure = rpc_peer_failure_gen.clone();
         // RT-4: event-pingwave gate + the clones the `on_recovery`
@@ -19410,9 +19500,10 @@ impl MeshNode {
         self.rpc_corrective_announced.insert(target)
     }
 
-    /// How many times `peer`'s session has failed, or `None` if it never
-    /// has. The fence for operations that span an `await` and then write
-    /// per-peer state the failure path evicts.
+    /// `peer`'s current failure generation. The fence for operations
+    /// that span an `await` and then write per-peer state the failure
+    /// path evicts: snapshot it before the `await`, compare after the
+    /// write, undo the write if it moved.
     ///
     /// The problem it solves: `ensure_reply_subscription` reads the
     /// cache, subscribes (an `await`, so the peer can fail underneath
@@ -19425,18 +19516,13 @@ impl MeshNode {
     /// silently: no error, no timeout on the subscribe, just replies
     /// that never arrive until the process restarts.
     ///
-    /// Usage: snapshot before the `await`, compare after the write, and
-    /// undo the write if it moved.
-    ///
-    /// Returns `Option` rather than defaulting to `0` on purpose. A
-    /// first-ever subscribe sees `None` both times and correctly keeps
-    /// its entry; if absence collapsed to `0`, it would be
-    /// indistinguishable from a counter reset and the fence would have
-    /// a silent hole. (This is also why the map is never pruned — see
-    /// the field's docs.)
+    /// A peer with no recorded failure resolves to the reclamation
+    /// floor rather than to a fixed zero, which is what lets the
+    /// counters be forgotten without opening a hole in the fence. See
+    /// [`PeerFailureGenerations`].
     #[cfg(feature = "cortex")]
-    pub(super) fn peer_failure_generation(&self, peer: u64) -> Option<u64> {
-        self.rpc_peer_failure_gen.get(&peer).map(|e| *e.value())
+    pub(super) fn peer_failure_generation(&self, peer: u64) -> u64 {
+        self.rpc_peer_failure_gen.get(peer)
     }
 
     /// Bare subscribe that reports the publisher's rejection reason as
@@ -36588,7 +36674,11 @@ mod membership_failure_tests {
             announced.insert(HEALTHY);
         }
         #[cfg(feature = "cortex")]
-        let gens: dashmap::DashMap<u64, u64> = dashmap::DashMap::new();
+        let gens = PeerFailureGenerations::new();
+        #[cfg(feature = "cortex")]
+        let failed_gen_before = gens.get(FAILED);
+        #[cfg(feature = "cortex")]
+        let healthy_gen_before = gens.get(HEALTHY);
 
         evict_failed_peer_channel_state(
             FAILED,
@@ -36635,17 +36725,19 @@ mod membership_failure_tests {
                 "…but only for the failed peer — a peer that merely keeps \
                  rejecting us stays latched"
             );
-            assert_eq!(
-                gens.get(&FAILED).map(|e| *e.value()),
-                Some(1),
+            assert_ne!(
+                gens.get(FAILED),
+                failed_gen_before,
                 "the failure generation must advance, or a reply-subscribe \
                  already past its await cannot tell it spanned this failure \
                  and will restore the cache entry we just evicted"
             );
-            assert!(
-                gens.get(&HEALTHY).is_none(),
-                "a healthy peer's generation must stay ABSENT, not zero — the \
-                 fence distinguishes the two"
+            assert_eq!(
+                gens.get(HEALTHY),
+                healthy_gen_before,
+                "…and only for the failed peer — advancing an unaffected \
+                 peer's generation would roll back its in-flight subscribes \
+                 for nothing"
             );
         }
     }
@@ -36658,10 +36750,8 @@ mod membership_failure_tests {
     /// Models the interleaving rather than driving it — forcing a real
     /// session failure to land inside `ensure_reply_subscription`'s
     /// `await` is not something the test harness can schedule
-    /// deterministically. What is pinned here is the property the fence
-    /// depends on: the generation an insert reads afterwards differs
-    /// from the one it snapshotted before, INCLUDING the first-failure
-    /// case where the snapshot was absent.
+    /// deterministically. The step order below is the one that used to
+    /// defeat the fence, so it is worth walking explicitly.
     #[cfg(feature = "cortex")]
     #[test]
     fn a_subscribe_spanning_a_failure_observes_a_generation_change() {
@@ -36669,11 +36759,10 @@ mod membership_failure_tests {
         let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
         let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
         let latch: dashmap::DashSet<u64> = dashmap::DashSet::new();
-        let gens: dashmap::DashMap<u64, u64> = dashmap::DashMap::new();
+        let gens = PeerFailureGenerations::new();
 
-        // 1. The subscribe snapshots. Never failed → absent.
-        let gen_before = gens.get(&TARGET).map(|e| *e.value());
-        assert_eq!(gen_before, None);
+        // 1. The subscribe snapshots, before its `await`.
+        let gen_before = gens.get(TARGET);
 
         // 2. The peer fails mid-`await`. The eviction finds nothing to
         //    evict — the entry does not exist yet. This is the whole
@@ -36687,30 +36776,99 @@ mod membership_failure_tests {
         // 3. The subscribe completes and records itself.
         replies.insert((TARGET, 7), Arc::from("svc"));
 
-        // 4. The fence fires: absent → Some(1).
-        let gen_after = gens.get(&TARGET).map(|e| *e.value());
+        // 4. The fence must fire. It only does because the eviction
+        //    bumps BEFORE its retain: with the bump last, step 2's
+        //    retain would have completed while this read still returned
+        //    the step-1 value, and the stale entry would survive.
         assert_ne!(
-            gen_after, gen_before,
-            "absent-before vs present-after must compare unequal; if absence \
-             defaulted to 0 this would read 0 == 0 and the stale entry would \
-             survive the very first failure"
+            gens.get(TARGET),
+            gen_before,
+            "the post-insert read must differ from the pre-await snapshot"
         );
 
-        // 5. …and a second failure is likewise distinguishable, so the
-        //    fence keeps working for a peer that flaps.
-        let gen_before = gen_after;
+        // A peer that flaps stays distinguishable.
+        let gen_before = gens.get(TARGET);
         evict_failed_peer_channel_state(TARGET, &chains, &replies, &latch, &gens);
-        assert_ne!(gens.get(&TARGET).map(|e| *e.value()), gen_before);
+        assert_ne!(gens.get(TARGET), gen_before);
 
-        // A subscribe that did NOT span a failure must be left alone.
+        // A subscribe that spans no failure must keep its entry — the
+        // fence must not cost the happy path its cache.
         const QUIET: u64 = 0xD00D;
-        let quiet_before = gens.get(&QUIET).map(|e| *e.value());
+        let quiet_before = gens.get(QUIET);
         replies.insert((QUIET, 7), Arc::from("svc"));
-        assert_eq!(
-            gens.get(&QUIET).map(|e| *e.value()),
-            quiet_before,
-            "no failure, no rollback — the fence must not cost the happy path \
-             its cache entry"
+        assert_eq!(gens.get(QUIET), quiet_before);
+    }
+
+    /// Reclaiming the generation table must not resurrect the state the
+    /// fence exists to remove.
+    ///
+    /// This is the subtlety that makes the table a type instead of a
+    /// `DashMap`. The obvious bound — drop entries past a cap — breaks
+    /// the fence, because a dropped counter reads back as the SAME
+    /// default a never-failed peer reads. A subscribe that snapshotted
+    /// that default, spanned a failure, and had the counter reclaimed
+    /// underneath it would compare default to default and keep the stale
+    /// entry.
+    ///
+    /// Absence resolving to a rising floor is what fixes it: a reclaimed
+    /// peer reads back strictly above any earlier snapshot.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn reclaiming_generations_cannot_reproduce_an_earlier_reading() {
+        const TARGET: u64 = 0xC0FFEE;
+        let gens = PeerFailureGenerations::new();
+
+        // The losing sequence: snapshot, fail, reclaim, compare.
+        let gen_before = gens.get(TARGET);
+        gens.bump(TARGET);
+        gens.reclaim();
+        assert_ne!(
+            gens.get(TARGET),
+            gen_before,
+            "a reclaimed counter read back as its pre-failure value — the \
+             in-flight subscribe would keep an entry for a peer that dropped \
+             it from the roster"
+        );
+
+        // Reclaiming with no failure involved is also safe, in the
+        // fail-safe direction: in-flight subscribes roll back and
+        // re-subscribe, which is idempotent.
+        const QUIET: u64 = 0xD00D;
+        let quiet_before = gens.get(QUIET);
+        gens.reclaim();
+        assert_ne!(gens.get(QUIET), quiet_before);
+
+        // The floor only ever rises, so no reading is ever reproduced
+        // across any number of reclamations.
+        let mut seen = vec![gens.get(TARGET)];
+        for _ in 0..8 {
+            gens.bump(TARGET);
+            gens.reclaim();
+            let now = gens.get(TARGET);
+            assert!(
+                seen.iter().all(|prev| *prev != now),
+                "generation {now} repeats an earlier reading {seen:?}"
+            );
+            seen.push(now);
+        }
+    }
+
+    /// The table is actually bounded — the cap fires on its own rather
+    /// than needing a caller to notice.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn generation_tracking_stays_bounded_under_peer_churn() {
+        let gens = PeerFailureGenerations::new();
+        for peer in 0..(PeerFailureGenerations::MAX_TRACKED as u64 * 3) {
+            gens.bump(peer);
+        }
+        assert!(
+            gens.per_peer.len() <= PeerFailureGenerations::MAX_TRACKED,
+            "generation table grew to {} past the {} cap; a long-lived node \
+             facing peer churn would accumulate an entry per identity that \
+             ever failed",
+            gens.per_peer.len(),
+            PeerFailureGenerations::MAX_TRACKED
         );
     }
 
@@ -36741,7 +36899,7 @@ mod membership_failure_tests {
         // Failure clears only that target's latch.
         let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
         let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
-        let gens: dashmap::DashMap<u64, u64> = dashmap::DashMap::new();
+        let gens = PeerFailureGenerations::new();
         evict_failed_peer_channel_state(A, &chains, &replies, &latch, &gens);
 
         assert!(

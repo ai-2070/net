@@ -762,24 +762,39 @@ impl ChannelConfigRegistry {
     /// A caller with no registry (possible via the bare `MeshNode::new`
     /// path) simply has no channel ACLs in play and does not call this.
     ///
-    /// Silently tolerates an unrepresentable `service` name: nothing is
-    /// installed, and the channel is then governed by the registry's
-    /// unregistered-channel policy rather than by a half-installed one.
+    /// **All or nothing.** Both names are constructed and validated
+    /// before either config is installed. They are not the same length —
+    /// `.replies.prefix` is 7 bytes longer than `.requests` — so a
+    /// service name near [`MAX_NAME_LEN`] can yield a valid request
+    /// channel and an invalid reply sentinel. Installing the half that
+    /// fits would be the worst outcome available: the request channel
+    /// looks deliberately configured while replies silently fall through
+    /// to the registry's unregistered-channel policy, unbound, which is
+    /// exactly the H3 posture this function exists to close.
+    ///
+    /// So an unrepresentable `service` installs nothing, and both
+    /// channels are then governed by that policy together — visibly, and
+    /// consistently with each other.
+    ///
+    /// [`MAX_NAME_LEN`]: super::name::MAX_NAME_LEN
     pub fn install_rpc_service_defaults(&self, service: &str) {
-        // Return values ignored on purpose: "already registered" is the
-        // operator-configured case, which is exactly what this protects.
-        if let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) {
-            let _ = self.insert_if_absent(ChannelConfig::new(ChannelId::new(req_channel)));
-        }
+        let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) else {
+            return;
+        };
         // The sentinel name is never routed — it exists so the prefix
         // entry has a `ChannelId` to carry. Token gates on a prefix
         // entry evaluate against the requested CONCRETE channel (M1),
         // not this.
-        if let Ok(sentinel) = ChannelName::new(&format!("{service}.replies.prefix")) {
-            let cfg = ChannelConfig::new(ChannelId::new(sentinel))
-                .with_subscriber_origin_binding(OriginBinding::OriginHashHex16);
-            let _ = self.insert_prefix_if_absent(format!("{service}.replies."), cfg);
-        }
+        let Ok(sentinel) = ChannelName::new(&format!("{service}.replies.prefix")) else {
+            return;
+        };
+
+        // Return values ignored on purpose: "already registered" is the
+        // operator-configured case, which is exactly what this protects.
+        let _ = self.insert_if_absent(ChannelConfig::new(ChannelId::new(req_channel)));
+        let cfg = ChannelConfig::new(ChannelId::new(sentinel))
+            .with_subscriber_origin_binding(OriginBinding::OriginHashHex16);
+        let _ = self.insert_prefix_if_absent(format!("{service}.replies."), cfg);
     }
 
     /// Register a channel configuration, **replacing** any existing
@@ -2445,22 +2460,53 @@ mod tests {
 
     /// A service name that cannot form a valid channel name installs
     /// NOTHING — not a half-configured pair where the requests channel
-    /// exists and the reply prefix does not (or vice versa).
+    /// exists and the reply prefix does not.
+    ///
+    /// The LENGTH case is the one that matters and the one an
+    /// invalid-character name does not reach: the two suffixes differ in
+    /// size (`.replies.prefix` is 7 bytes longer than `.requests`), so
+    /// there is a band of service-name lengths where the request channel
+    /// validates and the reply sentinel does not. A character-invalid
+    /// name fails both and would pass this test against a
+    /// half-installing implementation.
+    ///
+    /// Installing only the request half is the worst available outcome:
+    /// it looks deliberately configured while replies fall through to
+    /// the unregistered-channel policy with no origin binding — the H3
+    /// posture, reached by accident.
     #[test]
     fn rpc_service_defaults_install_nothing_for_an_unrepresentable_name() {
-        let reg = ChannelConfigRegistry::new();
-        reg.install_rpc_service_defaults("bad name#with/invalid chars");
-        assert_eq!(
-            reg.len(),
-            0,
-            "no exact entry may be installed for an unrepresentable service"
+        use super::super::name::MAX_NAME_LEN;
+
+        // Sits in the band: `<service>.requests` fits, and
+        // `<service>.replies.prefix` is 7 bytes past the limit.
+        let near_limit = "s".repeat(MAX_NAME_LEN - ".requests".len());
+        assert!(
+            ChannelName::new(&format!("{near_limit}.requests")).is_ok(),
+            "precondition: the request channel is representable…"
         );
-        assert_eq!(
-            reg.snapshot_prefixes().len(),
-            0,
-            "and no prefix entry either — a half-installed pair is worse than \
-             none, since one half would look deliberately configured"
+        assert!(
+            ChannelName::new(&format!("{near_limit}.replies.prefix")).is_err(),
+            "…and the reply sentinel is not — otherwise this test proves nothing"
         );
+
+        for service in [near_limit.as_str(), "bad name#with/invalid chars"] {
+            let reg = ChannelConfigRegistry::new();
+            reg.install_rpc_service_defaults(service);
+            assert_eq!(
+                reg.len(),
+                0,
+                "installed a request channel with no reply prefix to match it \
+                 (service len {})",
+                service.len()
+            );
+            assert_eq!(
+                reg.snapshot_prefixes().len(),
+                0,
+                "installed a reply prefix with no request channel (service len {})",
+                service.len()
+            );
+        }
     }
 
     // ---- H2 (2026-07-31 audit): install-if-absent must not clobber ----

@@ -5639,9 +5639,11 @@ impl MeshNode {
         // publish replies into a channel we are not rostered on.
         //
         // Order matters: insert THEN check. Checking first would leave
-        // the same gap one step earlier. Because the eviction bumps the
-        // generation after its retain, observing a change here means the
-        // retain has already happened and cannot take our entry later.
+        // the same gap one step earlier. The eviction bumps the
+        // generation BEFORE its retain, which is what makes exactly one
+        // of the two removals certain to fire — if the retain ran before
+        // our insert then the bump did too and we observe it here; if it
+        // runs after, it takes the entry itself.
         //
         // `remove` unconditionally rather than
         // `remove_if(value == service)`: a concurrent caller for a
