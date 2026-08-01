@@ -5494,16 +5494,25 @@ impl MeshNode {
         let mut last_err = None;
         for attempt in 0..REPLY_SUBSCRIBE_ATTEMPTS {
             match self
-                .subscribe_channel(target_node_id, reply_channel.clone())
+                .subscribe_channel_reporting_reason(target_node_id, reply_channel.clone())
                 .await
             {
                 Ok(()) => {
                     last_err = None;
                     break;
                 }
-                Err(e) => {
-                    last_err = Some(e);
-                    if attempt + 1 == REPLY_SUBSCRIBE_ATTEMPTS {
+                Err(failure) => {
+                    // Only an origin-binding `Unauthorized` is worth a
+                    // corrective re-announce. Anything else — the peer
+                    // is gone, throttling us, or does not know the
+                    // channel — returns immediately: re-announcing
+                    // cannot fix it, and because the corrective
+                    // announce bypasses the rate limit, retrying
+                    // regardless would let one bad target turn every
+                    // RPC into two extra capability broadcasts.
+                    let retryable = failure.warrants_reannounce();
+                    last_err = Some(failure.into_adapter_error());
+                    if !retryable || attempt + 1 == REPLY_SUBSCRIBE_ATTEMPTS {
                         break;
                     }
                     // Re-announce so the target can pin us, then back

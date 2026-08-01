@@ -647,6 +647,41 @@ impl Mesh {
         self.channel_configs.insert(config);
     }
 
+    /// Install the standard channel policy for an RPC-style service:
+    /// the exact `<service>.requests` channel and the
+    /// `<service>.replies.` prefix, the latter bound to each caller's
+    /// own origin.
+    ///
+    /// **Install-if-absent, never replace** — an ACL the operator
+    /// registered before serving survives untouched (H2).
+    ///
+    /// Lives here, gated only on `net`, because more than one subsystem
+    /// needs it: `mesh_rpc`'s `serve_rpc*` (gated on `cortex`) and the
+    /// `aggregator` module (gated on `aggregator`). They previously
+    /// carried separate copies, and the copy drifted — the aggregator's
+    /// kept replacing inserts and never gained the origin binding, so
+    /// aggregator reply channels were still world-subscribable after
+    /// H2 and H3 were fixed for `serve_rpc`. One implementation, so the
+    /// next fix cannot land on only one of them.
+    pub(crate) fn register_rpc_service_channels(&self, service: &str) {
+        use net::adapter::net::channel::{ChannelId, ChannelName, OriginBinding};
+
+        if let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) {
+            // Return value ignored: "already registered" is the
+            // operator-configured case, which is what this protects.
+            let _ = self
+                .channel_configs
+                .insert_if_absent(ChannelConfig::new(ChannelId::new(req_channel)));
+        }
+        if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
+            let cfg = ChannelConfig::new(ChannelId::new(sentinel_name))
+                .with_subscriber_origin_binding(OriginBinding::OriginHashHex16);
+            let _ = self
+                .channel_configs
+                .insert_prefix_if_absent(format!("{service}.replies."), cfg);
+        }
+    }
+
     /// Register a **prefix-matched** channel config. Any channel name
     /// starting with `prefix` that has no exact-match entry resolves
     /// to `config`; when several prefixes match, the longest wins.
@@ -662,10 +697,13 @@ impl Mesh {
     /// registration installs its default only when the prefix is
     /// otherwise unclaimed, so an entry made here survives.
     ///
-    /// Note the gate for a prefix entry is evaluated against
-    /// `config.channel_id`, so a token-gated prefix authorizes against
-    /// that sentinel identity rather than the specific requested
-    /// channel — see `with_token_roots` for the per-channel form.
+    /// Token gates on a prefix entry are evaluated against the
+    /// **requested concrete channel**, not the sentinel
+    /// `config.channel_id`. So a grant stays bound per channel: a token
+    /// minted for `<prefix><a>` does not authorize `<prefix><b>`, and a
+    /// token minted for the sentinel authorizes nothing real. Mint
+    /// per-channel tokens; a sentinel-scoped one is not a broader key,
+    /// it is a useless one.
     ///
     /// Idempotent: re-registering the same prefix replaces the prior
     /// config.
@@ -1443,5 +1481,97 @@ fn parse_ack_reason(s: &str) -> Option<AckReason> {
         "RateLimited" => Some(AckReason::RateLimited),
         "TooManyChannels" => Some(AckReason::TooManyChannels),
         _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "net"))]
+mod rpc_service_channel_registration_tests {
+    //! The aggregator module registers RPC channels through its own
+    //! entry points, and used to carry a hand-copied version of the
+    //! auto-registration helper. The copy drifted: it kept replacing
+    //! inserts (so it discarded operator ACLs, H2) and never gained the
+    //! reply-channel origin binding (so aggregator reply channels stayed
+    //! world-subscribable, H3) — both long after those were fixed for
+    //! `serve_rpc`.
+    //!
+    //! Both callers now route through `register_rpc_service_channels`.
+    //! These pin the two properties ON THE SHARED HELPER, so a future
+    //! divergence fails here rather than in only one subsystem's tests.
+
+    use super::*;
+    use net::adapter::net::identity::EntityKeypair;
+    use net::adapter::net::{ChannelId, ChannelName};
+
+    async fn mesh() -> Mesh {
+        MeshBuilder::new("127.0.0.1:0", &[0x5Au8; 32])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// An operator ACL registered first must survive auto-registration.
+    #[tokio::test]
+    async fn shared_registration_preserves_an_operator_acl() {
+        let mesh = mesh().await;
+        let root = EntityKeypair::generate();
+        let channel = ChannelName::new("agg.svc.requests").unwrap();
+        mesh.register_channel(
+            ChannelConfig::new(ChannelId::new(channel))
+                .with_token_roots(vec![root.entity_id().clone()]),
+        );
+
+        mesh.register_rpc_service_channels("agg.svc");
+
+        let cfg = mesh
+            .channel_configs
+            .get_by_name("agg.svc.requests")
+            .expect("request channel must exist")
+            .clone();
+        assert!(
+            cfg.token_required(),
+            "shared registration must not clobber an operator ACL (H2)"
+        );
+        assert_eq!(cfg.token_roots[0], *root.entity_id());
+    }
+
+    /// The reply prefix it installs must be origin-bound, or any peer
+    /// can subscribe to another caller's reply channel.
+    #[tokio::test]
+    async fn shared_registration_binds_the_reply_prefix_to_the_caller_origin() {
+        let mesh = mesh().await;
+        mesh.register_rpc_service_channels("agg.svc2");
+
+        let resolved = mesh
+            .channel_configs
+            .resolve_by_name("agg.svc2.replies.00112233445566aa")
+            .expect("reply prefix must resolve for a per-caller channel");
+        assert!(
+            resolved.config.subscriber_origin_binding.is_some(),
+            "the shared registration must bind reply channels to the \
+             subscriber's own origin (H3)"
+        );
+        assert_eq!(
+            resolved.matched_prefix.as_deref(),
+            Some("agg.svc2.replies.")
+        );
+    }
+
+    /// Defaults still land when the operator configured nothing —
+    /// guards against "fix the clobbering by registering nothing", which
+    /// would break nRPC's dynamic per-caller reply subscriptions.
+    #[tokio::test]
+    async fn shared_registration_still_installs_defaults() {
+        let mesh = mesh().await;
+        mesh.register_rpc_service_channels("agg.svc3");
+
+        assert!(mesh
+            .channel_configs
+            .get_by_name("agg.svc3.requests")
+            .is_some());
+        assert!(mesh
+            .channel_configs
+            .get_by_name("agg.svc3.replies.00112233445566aa")
+            .is_some());
     }
 }

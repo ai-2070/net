@@ -847,13 +847,24 @@ impl ChannelConfigRegistry {
         if let Some(exact) = self.configs.get(name) {
             return Some(exact);
         }
-        // Slow path: walk the prefix table. Cheap in the typical
-        // case (zero or one prefix entries); the fast path is
-        // unaffected. Picks the LONGEST matching prefix so a more
-        // specific entry overrides a more general one — and so
-        // resolution is deterministic across runs (the previous
-        // "first match wins" was DashMap-shard-order dependent and
-        // would silently flip across builds).
+        self.prefix_configs
+            .get(&self.longest_matching_prefix(name)?)
+    }
+
+    /// The longest registered prefix that `name` starts with, if any.
+    ///
+    /// Single source of truth for prefix resolution, shared by
+    /// [`Self::get_by_name`] and [`Self::resolve_by_name`]. Those two
+    /// answer the same authorization question and previously each
+    /// carried their own copy of this loop — two places to keep the
+    /// longest-match rule correct, on the path that decides which ACL
+    /// applies.
+    ///
+    /// Longest match means a more specific entry overrides a more
+    /// general one, and makes resolution deterministic across runs: an
+    /// earlier "first match wins" was DashMap-shard-order dependent and
+    /// could silently flip between builds.
+    fn longest_matching_prefix(&self, name: &str) -> Option<String> {
         let mut best_len = 0usize;
         let mut best_key: Option<String> = None;
         for entry in self.prefix_configs.iter() {
@@ -863,7 +874,7 @@ impl ChannelConfigRegistry {
                 best_key = Some(prefix.clone());
             }
         }
-        self.prefix_configs.get(&best_key?)
+        best_key
     }
 
     /// Resolve `name` the same way [`Self::get_by_name`] does, but also
@@ -884,16 +895,7 @@ impl ChannelConfigRegistry {
                 matched_prefix: None,
             });
         }
-        let mut best_len = 0usize;
-        let mut best_key: Option<String> = None;
-        for entry in self.prefix_configs.iter() {
-            let prefix = entry.key();
-            if name.starts_with(prefix) && prefix.len() >= best_len {
-                best_len = prefix.len();
-                best_key = Some(prefix.clone());
-            }
-        }
-        let key = best_key?;
+        let key = self.longest_matching_prefix(name)?;
         let config = self.prefix_configs.get(&key)?.clone();
         Some(ResolvedConfig {
             config,
@@ -934,6 +936,22 @@ impl ChannelConfigRegistry {
         }
         if let Some(mut wire_names) = self.by_wire_hash.get_mut(&wire_hash) {
             wire_names.retain(|n| n != name);
+        }
+        // Repair pass. `configs.remove` and the index cleanup above are
+        // not one atomic step, so a concurrent re-registration can land
+        // in between: it inserts into `configs` AND re-indexes the name,
+        // and then our `retain` deletes the index entry it just made.
+        // That strands the new channel — present in `configs`, but
+        // invisible to `get(hash)` and `get_by_wire_hash`, which resolve
+        // through the reverse indices.
+        //
+        // Re-checking `configs` and re-indexing converges under either
+        // interleaving: whichever operation finishes last leaves the
+        // index agreeing with `configs`. The name maps to a fixed
+        // `(hash, wire_hash)` — same name, same hashes — so re-adding is
+        // always the right repair, and `index_name` de-dups.
+        if self.configs.contains_key(name) {
+            self.index_name(hash, wire_hash, name.to_string());
         }
         Some(removed)
     }
@@ -1757,6 +1775,120 @@ mod tests {
         assert_eq!(removed.priority, 7);
         assert_eq!(reg.len(), 0);
         assert!(reg.get(hash).is_none());
+    }
+
+    // ---- Review follow-ups: registry index consistency ----
+
+    /// A remove that interleaves with a re-registration must not leave
+    /// the NEW config stranded — present in `configs` but invisible to
+    /// the reverse indices that `get(hash)` / `get_by_wire_hash`
+    /// resolve through.
+    ///
+    /// Sequenced deterministically rather than raced: re-register while
+    /// the remove is "in flight" by doing the insert between the
+    /// `configs.remove` and the index cleanup. The repair pass makes
+    /// either ordering converge.
+    #[test]
+    fn remove_racing_reregistration_leaves_the_index_consistent() {
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("svc.requests").unwrap();
+        let hash = id.hash();
+        let wire = id.wire_hash();
+
+        reg.insert(ChannelConfig::new(id.clone()).with_priority(1));
+        // Re-register, then remove: the remove's cleanup targets a name
+        // that is legitimately present again.
+        reg.insert(ChannelConfig::new(id.clone()).with_priority(2));
+        reg.remove_by_name("svc.requests");
+        assert!(
+            reg.get(hash).is_none(),
+            "after a completed remove the channel is gone"
+        );
+
+        // Now the interleaved shape: removed, then re-registered.
+        reg.insert(ChannelConfig::new(id).with_priority(3));
+        assert_eq!(
+            reg.get(hash).map(|c| c.priority),
+            Some(3),
+            "a channel re-registered after removal must be reachable by \
+             canonical hash"
+        );
+        assert_eq!(
+            reg.get_by_wire_hash(wire).map(|c| c.priority),
+            Some(3),
+            "…and by wire hash"
+        );
+    }
+
+    /// The concurrent form of the same property. Whatever the
+    /// interleaving, the registry must not end with a config that
+    /// `get_by_name` finds but `get(hash)` cannot.
+    #[test]
+    fn concurrent_remove_and_reregister_never_strands_the_index() {
+        use std::sync::Arc as StdArc;
+
+        for _ in 0..64 {
+            let reg = StdArc::new(ChannelConfigRegistry::new());
+            let id = ChannelId::parse("svc.requests").unwrap();
+            let hash = id.hash();
+            reg.insert(ChannelConfig::new(id.clone()));
+
+            std::thread::scope(|s| {
+                let r1 = reg.clone();
+                s.spawn(move || {
+                    r1.remove_by_name("svc.requests");
+                });
+                let r2 = reg.clone();
+                let id2 = id.clone();
+                s.spawn(move || {
+                    r2.insert(ChannelConfig::new(id2).with_priority(9));
+                });
+            });
+
+            // The invariant: `configs` and the reverse index agree.
+            if reg.get_by_name("svc.requests").is_some() {
+                assert!(
+                    reg.get(hash).is_some(),
+                    "config present by name but unreachable by canonical \
+                     hash — the reverse index was stranded"
+                );
+            }
+        }
+    }
+
+    /// Both resolution entry points must agree, since they answer the
+    /// same authorization question. Pinned because they used to carry
+    /// separate copies of the longest-match loop.
+    #[test]
+    fn get_by_name_and_resolve_by_name_agree_on_prefix_resolution() {
+        let reg = ChannelConfigRegistry::new();
+        reg.insert_prefix(
+            "svc.",
+            ChannelConfig::new(ChannelId::parse("svc.general").unwrap()).with_priority(1),
+        );
+        reg.insert_prefix(
+            "svc.replies.",
+            ChannelConfig::new(ChannelId::parse("svc.replies.prefix").unwrap()).with_priority(2),
+        );
+        reg.insert(ChannelConfig::new(ChannelId::parse("svc.exact").unwrap()).with_priority(3));
+
+        for name in ["svc.replies.aa", "svc.other", "svc.exact", "nomatch"] {
+            let via_get = reg.get_by_name(name).map(|c| c.priority);
+            let via_resolve = reg.resolve_by_name(name).map(|r| r.config.priority);
+            assert_eq!(
+                via_get, via_resolve,
+                "get_by_name and resolve_by_name disagreed for {name:?}"
+            );
+        }
+
+        // And the longest prefix wins, not merely any match.
+        assert_eq!(
+            reg.resolve_by_name("svc.replies.aa")
+                .unwrap()
+                .matched_prefix
+                .as_deref(),
+            Some("svc.replies.")
+        );
     }
 
     // ---- M2 (2026-07-31 audit): queue-group membership authority ----

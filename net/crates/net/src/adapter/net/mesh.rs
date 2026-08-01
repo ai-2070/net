@@ -2760,6 +2760,147 @@ pub enum UnregisteredChannelPolicy {
     Deny,
 }
 
+/// Why a membership request (Subscribe / Unsubscribe) did not succeed.
+///
+/// Exists so `ensure_reply_subscription` can tell "the publisher
+/// answered and refused for a reason that a corrective re-announce
+/// might fix" from "the peer is gone / timed out / refused for a reason
+/// re-announcing cannot help". The corrective re-announce deliberately
+/// bypasses the announce rate limit, so firing it on every failure
+/// would let one unreachable or throttling target turn each RPC attempt
+/// into two rate-limit-bypassing capability broadcasts.
+#[derive(Debug)]
+pub(super) enum MembershipFailure {
+    /// The publisher replied with `accepted = false`. The reason is the
+    /// publisher's own, and `None` means it sent no reason code.
+    Rejected(Option<AckReason>),
+    /// No usable answer: no session, send failure, dropped waiter, or
+    /// ack timeout.
+    Transport(AdapterError),
+}
+
+impl MembershipFailure {
+    /// Collapse back into the historical `AdapterError`, preserving the
+    /// exact message text callers already see.
+    pub(super) fn into_adapter_error(self) -> AdapterError {
+        match self {
+            Self::Transport(e) => e,
+            Self::Rejected(reason) => {
+                AdapterError::Connection(format!("membership request rejected: {:?}", reason))
+            }
+        }
+    }
+
+    /// Is a corrective capability re-announce plausibly the fix?
+    ///
+    /// Only for `Unauthorized`, which is what the H3 origin binding
+    /// returns when the publisher has not pinned our `EntityId` yet.
+    /// Explicitly NOT `RateLimited` (the peer is already asking us to
+    /// slow down — re-announcing adds load and cannot help),
+    /// `UnknownChannel`, `TooManyChannels`, or any transport failure.
+    pub(super) fn warrants_reannounce(&self) -> bool {
+        matches!(self, Self::Rejected(Some(AckReason::Unauthorized)))
+    }
+}
+
+#[cfg(test)]
+mod membership_failure_tests {
+    use super::*;
+
+    /// Only the origin-binding `Unauthorized` warrants a corrective
+    /// re-announce.
+    ///
+    /// That re-announce deliberately bypasses the announce rate limit,
+    /// so this predicate is what stops one unreachable or throttling
+    /// target from turning every RPC attempt into two extra
+    /// rate-limit-bypassing capability broadcasts.
+    #[test]
+    fn only_unauthorized_warrants_a_corrective_reannounce() {
+        assert!(
+            MembershipFailure::Rejected(Some(AckReason::Unauthorized)).warrants_reannounce(),
+            "Unauthorized is the retryable origin-binding rejection"
+        );
+
+        // RateLimited especially must NOT: the peer is already asking
+        // us to slow down, so re-announcing adds load and cannot help.
+        for reason in [
+            AckReason::RateLimited,
+            AckReason::UnknownChannel,
+            AckReason::TooManyChannels,
+        ] {
+            assert!(
+                !MembershipFailure::Rejected(Some(reason)).warrants_reannounce(),
+                "{reason:?} must not trigger a rate-limit-bypassing re-announce"
+            );
+        }
+
+        assert!(!MembershipFailure::Rejected(None).warrants_reannounce());
+        assert!(
+            !MembershipFailure::Transport(AdapterError::Connection("peer gone".into()))
+                .warrants_reannounce(),
+            "a peer that is simply gone must not drive re-announces"
+        );
+    }
+
+    /// The peer-failure cleanup must evict the caller-side
+    /// reply-subscription cache alongside the retained subscribe chains.
+    ///
+    /// A source-scan witness, deliberately: the behavioural version
+    /// needs a real session to fail and then recover, which is both slow
+    /// and timing-dependent — and it would fail *silently* in the
+    /// direction that hides the bug (replies simply stop arriving). The
+    /// property that actually matters is structural, so it is pinned
+    /// structurally, next to the sibling cleanup it must stay beside.
+    ///
+    /// The bug: on failure the publisher drops our roster entry
+    /// (`roster.remove_peer`), but this cache is the CALLER's record of
+    /// "already subscribed" and short-circuits `ensure_reply_subscription`
+    /// entirely. Left populated, every later call to the recovered peer
+    /// skips both the re-subscribe and the corrective re-announce retry,
+    /// and its replies are dropped by a publisher that no longer has us
+    /// rostered.
+    #[test]
+    fn peer_failure_cleanup_evicts_the_reply_subscription_cache() {
+        let src = include_str!("mesh.rs");
+        let anchor = src
+            .find("subscriber_chains_failure.retain(")
+            .expect("the retained-chain cleanup must exist");
+        // Scan the cleanup block that follows the sibling eviction.
+        let window = &src[anchor..(anchor + 1_500).min(src.len())];
+
+        assert!(
+            window.contains("rpc_reply_subscriptions_failure.retain("),
+            "regression: the peer-failure cleanup no longer evicts \
+             `rpc_reply_subscriptions`. Without it a failed-then-recovered \
+             peer keeps a cache entry saying we are subscribed, so later \
+             calls skip the re-subscribe and their replies are silently \
+             dropped by a publisher that already evicted our roster entry."
+        );
+    }
+
+    /// Collapsing back to `AdapterError` must preserve the historical
+    /// rejection text, since callers surface it to users.
+    #[test]
+    fn rejection_stringifies_to_the_historical_message() {
+        let msg = MembershipFailure::Rejected(Some(AckReason::Unauthorized))
+            .into_adapter_error()
+            .to_string();
+        assert!(
+            msg.contains("membership request rejected") && msg.contains("Unauthorized"),
+            "unexpected rejection message: {msg}"
+        );
+
+        // Transport failures pass through untouched.
+        let msg = MembershipFailure::Transport(AdapterError::Connection("no session".into()))
+            .into_adapter_error()
+            .to_string();
+        assert!(
+            msg.contains("no session"),
+            "unexpected transport message: {msg}"
+        );
+    }
+}
+
 /// Rolling-window auth-failure tracker, one entry per peer.
 /// Lives behind a per-key `Mutex` so updates from concurrent
 /// subscribes don't race each other on the same peer's counter.
@@ -7926,6 +8067,14 @@ impl MeshNode {
         let subscriber_chains: Arc<DashMap<(u64, ChannelHash), RetainedChain>> =
             Arc::new(DashMap::new());
         let subscriber_chains_failure = subscriber_chains.clone();
+        // Hoisted out of the `Self { .. }` literal so the failure
+        // closure — which runs before `Self` exists — can hold a clone
+        // and evict a failed peer's entries.
+        #[cfg(feature = "cortex")]
+        let rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), Arc<str>>> =
+            Arc::new(dashmap::DashMap::new());
+        #[cfg(feature = "cortex")]
+        let rpc_reply_subscriptions_failure = rpc_reply_subscriptions.clone();
         // RT-4: event-pingwave gate + the clones the `on_recovery`
         // closure captures (it runs before `Self` exists, so it
         // can't call `emit_event_pingwave`).
@@ -8212,6 +8361,21 @@ impl MeshNode {
             // them — so without this they leak for the node's lifetime,
             // and a reused `node_id` could re-validate a stale chain.
             subscriber_chains_failure.retain(|(nid, _), _| *nid != node_id);
+            // Drop this peer's reply-subscription cache entries.
+            //
+            // That cache is the CALLER-side record of "we already
+            // subscribed to our reply channel on this target", and it
+            // short-circuits `ensure_reply_subscription` entirely. The
+            // target, meanwhile, evicts our roster entry when the
+            // session fails (`roster.remove_peer`, just above, is the
+            // mirror image on the publisher side). Leaving the cache
+            // populated across that means every later call to the
+            // recovered peer skips both the re-subscribe AND the
+            // corrective re-announce retry, and its replies are
+            // dropped by a publisher that no longer has us rostered —
+            // silently, since the caller believes it is subscribed.
+            #[cfg(feature = "cortex")]
+            rpc_reply_subscriptions_failure.retain(|(target, _), _| *target != node_id);
             // RT-5: tell the mesh this peer is unreachable via us —
             // receivers drop their `(node_id, via=us)` routes within
             // one flood instead of waiting for the 3× session_timeout
@@ -8376,7 +8540,7 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
-            rpc_reply_subscriptions: Arc::new(dashmap::DashMap::new()),
+            rpc_reply_subscriptions,
             #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(LocalServiceRegistry::new(local_caps_changed.clone())),
             #[cfg(feature = "tool")]
@@ -19240,6 +19404,20 @@ impl MeshNode {
         .await
     }
 
+    /// Bare subscribe that reports the publisher's rejection reason as
+    /// a value. Used by `ensure_reply_subscription`, which must
+    /// distinguish the one retryable rejection (origin-binding
+    /// `Unauthorized`) from everything else before firing a
+    /// rate-limit-bypassing corrective re-announce.
+    pub(super) async fn subscribe_channel_reporting_reason(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+    ) -> Result<(), MembershipFailure> {
+        self.send_membership_request_typed(publisher_node_id, channel, true, None, None)
+            .await
+    }
+
     /// Ask `publisher_node_id` to remove this node from `channel`'s
     /// subscriber set. Mirror of `subscribe_channel`. Mode-agnostic
     /// — unsubscribe finds the peer in whichever mode they're in.
@@ -19252,6 +19430,9 @@ impl MeshNode {
             .await
     }
 
+    /// Stringifying wrapper over [`Self::send_membership_request_typed`],
+    /// preserving the exact `AdapterError` text every existing caller
+    /// already matches on.
     async fn send_membership_request(
         &self,
         publisher_node_id: u64,
@@ -19260,12 +19441,40 @@ impl MeshNode {
         token: Option<Vec<u8>>,
         queue_group: Option<String>,
     ) -> Result<(), AdapterError> {
+        self.send_membership_request_typed(
+            publisher_node_id,
+            channel,
+            subscribe,
+            token,
+            queue_group,
+        )
+        .await
+        .map_err(MembershipFailure::into_adapter_error)
+    }
+
+    /// Same request, but reporting **why** it failed as a value rather
+    /// than as prose.
+    ///
+    /// `ensure_reply_subscription` needs the distinction: only an
+    /// origin-binding `Unauthorized` is worth a corrective re-announce,
+    /// and that re-announce deliberately bypasses the announce rate
+    /// limit. Re-announcing on *every* failure would let a target that
+    /// is simply down, throttling us, or refusing the channel turn each
+    /// RPC attempt into two rate-limit-bypassing capability broadcasts.
+    async fn send_membership_request_typed(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        subscribe: bool,
+        token: Option<Vec<u8>>,
+        queue_group: Option<String>,
+    ) -> Result<(), MembershipFailure> {
         let peer_addr = {
             let peer = self.peers.get(&publisher_node_id).ok_or_else(|| {
-                AdapterError::Connection(format!(
+                MembershipFailure::Transport(AdapterError::Connection(format!(
                     "no session to publisher {:#x}",
                     publisher_node_id
-                ))
+                )))
             })?;
             peer.addr
         };
@@ -19279,8 +19488,8 @@ impl MeshNode {
         // unguessable from another session.
         let mut nonce_bytes = [0u8; 8];
         if let Err(e) = getrandom::fill(&mut nonce_bytes) {
-            return Err(AdapterError::Connection(format!(
-                "membership nonce generation failed: {e}"
+            return Err(MembershipFailure::Transport(AdapterError::Connection(
+                format!("membership nonce generation failed: {e}"),
             )));
         }
         let nonce = u64::from_le_bytes(nonce_bytes);
@@ -19312,31 +19521,32 @@ impl MeshNode {
             .await
         {
             self.pending_membership_acks.remove(&nonce);
-            return Err(e);
+            return Err(MembershipFailure::Transport(e));
         }
 
         let ack = match tokio::time::timeout(self.config.membership_ack_timeout, rx).await {
             Ok(Ok(ack)) => ack,
             Ok(Err(_)) => {
                 self.pending_membership_acks.remove(&nonce);
-                return Err(AdapterError::Connection(
+                return Err(MembershipFailure::Transport(AdapterError::Connection(
                     "membership ack channel closed".into(),
-                ));
+                )));
             }
             Err(_) => {
                 self.pending_membership_acks.remove(&nonce);
-                return Err(AdapterError::Connection(format!(
-                    "membership ack timeout ({:?}) for channel {}",
-                    self.config.membership_ack_timeout, channel
+                return Err(MembershipFailure::Transport(AdapterError::Connection(
+                    format!(
+                        "membership ack timeout ({:?}) for channel {}",
+                        self.config.membership_ack_timeout, channel
+                    ),
                 )));
             }
         };
 
         if !ack.accepted {
-            return Err(AdapterError::Connection(format!(
-                "membership request rejected: {:?}",
-                ack.reason
-            )));
+            // The publisher answered and said no. Carry the reason as a
+            // value — this is the arm callers need to discriminate.
+            return Err(MembershipFailure::Rejected(ack.reason));
         }
         Ok(())
     }

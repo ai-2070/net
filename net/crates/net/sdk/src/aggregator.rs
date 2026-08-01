@@ -95,9 +95,8 @@ pub use net::adapter::net::behavior::lifecycle::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use ::net::adapter::net::channel::{ChannelId, ChannelName};
 use ::net::adapter::net::mesh_rpc::{ServeError, ServeHandle};
-use ::net::adapter::net::ChannelConfig;
+
 use ::net::adapter::net::MeshNode;
 
 use crate::mesh::Mesh;
@@ -148,27 +147,19 @@ pub fn install_fold_query_service(
     aggregator.install_query_service(&mesh.node_arc())
 }
 
-/// Internal: mirror the SDK's `mesh_rpc::Mesh::serve_rpc`
-/// auto-register pattern — register the `<service>.requests`
-/// channel exactly + the `<service>.replies.` prefix entry
-/// permissively. Idempotent.
+/// Internal: install the standard RPC channel policy for `service`.
 ///
-/// Routes the prefix insertion through `MeshNode::channel_configs()`
-/// (publicly accessible whenever `net` is on) rather than the
-/// SDK's `pub(crate)` accessor (which the SDK gates on
-/// `cortex`).
+/// Delegates to [`Mesh::register_rpc_service_channels`] rather than
+/// carrying its own copy. It previously did carry one — mirroring
+/// `serve_rpc`'s pattern by hand because the SDK's registry accessor is
+/// `cortex`-gated while this module is not — and the copy drifted: it
+/// kept using replacing inserts (so it discarded operator ACLs, H2) and
+/// never gained the reply-channel origin binding (so aggregator reply
+/// channels stayed world-subscribable, H3), both long after those were
+/// fixed for `serve_rpc`. The shared helper is gated only on `net`, so
+/// there is no longer a reason to duplicate it.
 fn auto_register_rpc_channels(mesh: &Mesh, service: &str) {
-    if let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) {
-        mesh.register_channel(ChannelConfig::new(ChannelId::new(req_channel)));
-    }
-    if let Some(configs) = mesh.inner().channel_configs() {
-        if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
-            configs.insert_prefix(
-                format!("{service}.replies."),
-                ChannelConfig::new(ChannelId::new(sentinel_name)),
-            );
-        }
-    }
+    mesh.register_rpc_service_channels(service);
 }
 
 /// Ergonomic wrapper that binds a [`RegistryClient`] to a

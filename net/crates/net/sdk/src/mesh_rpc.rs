@@ -288,41 +288,11 @@ impl Mesh {
     /// Idempotent for the ordinary path too: repeated calls for the
     /// same service find their own prior default and leave it alone.
     pub(crate) fn auto_register_rpc_channels(&self, service: &str) {
-        use crate::ChannelConfig;
-        use net::adapter::net::channel::{ChannelId, ChannelName, OriginBinding};
-        // Exact: `<service>.requests`.
-        let req_name = format!("{service}.requests");
-        if let Ok(req_channel) = ChannelName::new(&req_name) {
-            // Return value deliberately ignored: "an entry already
-            // existed" is the operator-configured case and is not a
-            // problem — it's the outcome this method exists to protect.
-            let _ = self
-                .channel_configs_arc()
-                .insert_if_absent(ChannelConfig::new(ChannelId::new(req_channel)));
-        }
-        // Prefix: `<service>.replies.` — admits every per-caller
-        // `<service>.replies.<caller_origin>` subscribe, bound to that
-        // caller's own identity.
-        let prefix = format!("{service}.replies.");
-        // Sentinel ChannelId for the prefix entry; not used for
-        // hash lookups, just carried so the ChannelConfig is
-        // structurally well-formed.
-        if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
-            // H3: the prefix admits a *family* of names, so without a
-            // binding any mesh peer could hold a live subscription to
-            // another caller's `<service>.replies.<X>` and receive that
-            // caller's response bodies whenever the server's direct
-            // route missed and the response fell back to roster
-            // fan-out. The bound suffix is exactly the 16-hex origin
-            // the reply-channel name is built from, so the legitimate
-            // caller satisfies it by construction and an impostor
-            // cannot.
-            let cfg = ChannelConfig::new(ChannelId::new(sentinel_name))
-                .with_subscriber_origin_binding(OriginBinding::OriginHashHex16);
-            let _ = self
-                .channel_configs_arc()
-                .insert_prefix_if_absent(prefix, cfg);
-        }
+        // One implementation, shared with the `aggregator` module —
+        // which is gated on a different feature and therefore used to
+        // carry its own copy that drifted out of sync with the H2 and
+        // H3 fixes. See `Mesh::register_rpc_service_channels`.
+        self.register_rpc_service_channels(service);
     }
 
     /// Direct-addressed call. Caller specifies `target_node_id`;
