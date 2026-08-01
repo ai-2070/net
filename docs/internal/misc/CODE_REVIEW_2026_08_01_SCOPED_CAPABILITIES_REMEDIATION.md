@@ -458,13 +458,29 @@ run. Neither would have failed on the regression it was named for. Every guard
 added or repaired in this pass was therefore checked by reintroducing the defect
 and confirming the failure, rather than by observing it green.
 
-### Verification at `20d978efc`
+### Fifth-pass items
+
+Three more, two of them again on fixes from the passes above.
+
+| # | Item | Resolution | Commit |
+| - | ---- | ---------- | ------ |
+| 20 | `can_assign_non_global` (item 16's fix) asked "does any rule hold a non-zero value", which is not "can this policy assign a non-global subnet". Same-level rules are later-rule-wins, so a later rule mapping a value to `0` erased an earlier real assignment — a policy could hold non-zero mappings, only ever answer `GLOBAL`, and still be warned about | Fixed at the root rather than by complicating the predicate: `0` is reserved for "unmatched / no restriction" and both constructors refuse it, so `assign_from_rendered_tags` now skips zero mappings instead of writing them. Zeros can no longer suppress anything, which makes the predicate exact and assignment consistent with its own contract. Non-breaking — later-rule-wins between real values is untouched | `5e4d914bb` |
+| 21 | Shortening the `add_tag` warning removed "A dropped scope tag leaves the set globally visible" — the actionable half, and the exact failure the warning exists for | Restored as one clause. The prefix list stays out, since `error` already names the prefix that tripped: that part of the trim removed redundancy, this part removed the point | `6ff237158` |
+| 22 | `--tag ""` was diagnosed with the reserved-prefix list and a pointer at the SDK scope builders, neither of which applies to an empty string | Matched on `CapabilityTagError`, exhaustively rather than with a catch-all, so a future parser error cannot inherit reserved-prefix wording — which is how this arose | `baf466fcb` |
+
+Item 21 is worth noting against item 5's reasoning. Moving detail out of log
+lines and into doc comments was right, but "the consequence" is not detail: it
+is what makes a warning worth emitting rather than swallowing. The two scope
+builders kept theirs through the same edit; only `add_tag` lost it, which is the
+signature of an over-trim rather than a principle misapplied.
+
+### Verification at `baf466fcb`
 
 | Check | Result |
 | ----- | ------ |
-| `cargo test --lib` (full) | 5375 passed, 0 failed, 1 ignored |
+| `cargo test --lib` (full) | 5377 passed, 0 failed, 1 ignored |
 | `cargo test --test capability_scope` | 8 passed, 0 failed |
-| `cargo test --bin net-mesh commands::cap` | 6 passed, 0 failed |
+| `cargo test --bin net-mesh commands::cap` | 7 passed, 0 failed |
 | `cargo clippy --lib --all-features` | clean |
 | `cargo doc --no-deps --lib` | clean |
 | `tsc --noEmit` (sdk-ts) | clean |
