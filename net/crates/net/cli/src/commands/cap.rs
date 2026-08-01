@@ -251,10 +251,8 @@ async fn run_nodes(
 /// parse error. `advisory_warning_names_only_real_flags` pins it.
 const ADVISORY_ALLOW_LIST_WARNING: &str = "\
 warning: --allow-subnet / --allow-group are ADVISORY and do not restrict access.
-         This announcement publishes the admitted values to every peer and relay in
-         the mesh, and membership in a subnet or group is self-declared by the
-         caller, so any recipient can claim one. Use --allow-node for access
-         control.";
+         Membership is self-declared and this announcement publishes the
+         admitted values mesh-wide. Use --allow-node for access control.";
 
 /// Rejection message for a `--tag` value the parser refused.
 ///
@@ -265,11 +263,9 @@ warning: --allow-subnet / --allow-group are ADVISORY and do not restrict access.
 fn tag_rejected_message(tag: &str, err: &impl std::fmt::Display) -> String {
     let reserved = RESERVED_PREFIXES.join("` / `");
     format!(
-        "tag {tag:?} rejected: {err}. Reserved-prefix tags (`{reserved}`) are \
-         not admissible via this subcommand — the announcement is refused \
-         rather than signed without them. Scope must be set through the SDK's \
-         dedicated builders (with_tenant_scope / with_region_scope / \
-         with_subnet_local_scope)."
+        "tag {tag:?} rejected: {err}. Reserved prefixes (`{reserved}`) cannot \
+         be set here; scope needs the SDK builders (with_tenant_scope / \
+         with_region_scope / with_subnet_local_scope)."
     )
 }
 

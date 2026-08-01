@@ -1204,15 +1204,15 @@ impl CapabilitySet {
                 self.tags.insert(t);
             }
             Err(e) => {
+                // `error` names the prefix that tripped, so the message
+                // does not re-list them.
                 tracing::warn!(
                     tag = %s,
                     error = %e,
-                    "add_tag: tag dropped — it is NOT on the announcement. \
-                     Reserved-prefix tags (scope:, causal:, heat:, fork-of:, \
-                     dataforts:) need their dedicated builder; for scope use \
+                    "add_tag: tag dropped, not on the announcement — reserved \
+                     prefixes need their dedicated builder (for scope: \
                      with_tenant_scope / with_region_scope / \
-                     with_subnet_local_scope. A dropped scope tag leaves the \
-                     set globally visible."
+                     with_subnet_local_scope)"
                 );
             }
         }
@@ -1286,9 +1286,8 @@ impl CapabilitySet {
         let id = tenant_id.into();
         if id.is_empty() {
             tracing::warn!(
-                "with_tenant_scope(\"\"): empty tenant id ignored — this set is \
-                 NOT tenant-scoped and resolves to Global, visible to every \
-                 tenant and region query"
+                "with_tenant_scope(\"\"): empty tenant id ignored — set is NOT \
+                 tenant-scoped and stays globally visible"
             );
             return self;
         }
@@ -1308,9 +1307,8 @@ impl CapabilitySet {
         let name = region.into();
         if name.is_empty() {
             tracing::warn!(
-                "with_region_scope(\"\"): empty region ignored — this set is \
-                 NOT region-scoped and resolves to Global, visible to every \
-                 tenant and region query"
+                "with_region_scope(\"\"): empty region ignored — set is NOT \
+                 region-scoped and stays globally visible"
             );
             return self;
         }

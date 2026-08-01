@@ -8261,12 +8261,10 @@ impl MeshNode {
         let local_subnet_policy = config.subnet_policy.clone();
         if Self::subnet_policy_without_local_subnet(local_subnet, local_subnet_policy.is_some()) {
             tracing::warn!(
-                "subnet policy installed but this node's own subnet is GLOBAL — \
-                 MeshNodeConfig::with_subnet_policy assigns PEERS' subnets, it does \
-                 not set your own. Add with_subnet(..). Until you do, \
-                 Visibility::ParentVisible channels reject peers whose subnet the \
-                 policy resolved and admit peers it could not, because a global \
-                 local subnet has no ancestor to compare against."
+                "subnet policy installed but local subnet is GLOBAL — \
+                 with_subnet_policy assigns peers' subnets, not this node's; \
+                 add with_subnet(..). ParentVisible currently admits peers \
+                 whose subnet could not be resolved and rejects those it could."
             );
         }
         // Pre-apply the reflex override so the node starts in
