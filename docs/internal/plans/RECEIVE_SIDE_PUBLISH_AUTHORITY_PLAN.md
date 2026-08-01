@@ -10,9 +10,9 @@ Closes nothing. Records what H1 is, why the obvious fixes fail, and the
 nine defects (D1–D9) any real plan must answer. Companion to
 [`SECURITY_AUDIT_2026_07_31_CHANNEL_AUTH.md`](../misc/SECURITY_AUDIT_2026_07_31_CHANNEL_AUTH.md).
 
-Every other finding from that audit has landed, **except** the residual
-I1 hardening — the `AuthGuard` key newtype — which the audit's status
-table records as still open alongside this.
+Every other finding from that audit has landed, including the residual
+I1 hardening (`AclPrincipal` now carries the derivation in the ACL key).
+H1 is the only one left.
 
 ## The defect
 

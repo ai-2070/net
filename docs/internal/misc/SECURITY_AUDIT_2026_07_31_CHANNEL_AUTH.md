@@ -81,7 +81,7 @@ They are gaps **around** it. Three themes:
 
 ## Remediation status (2026-08-01)
 
-All findings addressed except H1, which is a design decision rather than
+All findings **fixed** except H1, which is a design decision rather than
 a patch and is costed in
 [`RECEIVE_SIDE_PUBLISH_AUTHORITY_PLAN.md`](../plans/RECEIVE_SIDE_PUBLISH_AUTHORITY_PLAN.md).
 
@@ -95,7 +95,7 @@ a patch and is costed in
 | M3 | Fixed — TTL width enforced in `check_time_bounds`, the common receiver seam. |
 | M4 | Fixed — token-gated subscribe rejected outright when no `TokenCache` is installed. |
 | L1 | Fixed — `UnregisteredChannelPolicy` makes registry-less permissiveness a recorded decision. |
-| I1 | Partially fixed — hazard documented at the guard; the key newtype spans ~50 call sites in dataforts/redex and remains open. |
+| I1 | **Fixed** — `AclPrincipal` puts the derivation in the ACL key, so `Node(x)` and `Origin(x)` are disjoint principals even for identical `x`. Migrated across guard/mesh/redex/dataforts; regression test asserts the escalation using an identical scalar for both derivations. |
 | I2 | Fixed — stale `TokenCache` install contract corrected across all five sites. |
 
 Two things found while fixing, not in the original audit:
