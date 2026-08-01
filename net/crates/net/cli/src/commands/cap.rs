@@ -91,8 +91,10 @@ pub struct AnnounceArgs {
     /// One or more capability tags to carry on the announcement
     /// (e.g. `nrpc:my-service`, `dataforts.blob.overflow`).
     /// Reserved-prefix tags (`causal:` / `fork-of:` / `heat:` /
-    /// `scope:`) are silently dropped by the parser — use the
-    /// dedicated builders for those.
+    /// `dataforts:` / `scope:`) are dropped by the parser and a
+    /// warning is logged — they will NOT be on the announcement. A
+    /// dropped `scope:` tag in particular leaves the announcement
+    /// globally visible; use the dedicated scope builders.
     #[arg(long = "tag", required = true, num_args = 1.., value_name = "TAG")]
     pub tags: Vec<String>,
 

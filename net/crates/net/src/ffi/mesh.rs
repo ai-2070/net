@@ -3443,9 +3443,11 @@ pub unsafe extern "C" fn net_mesh_find_nodes(
 /// {"kind": "regions", "regions": ["<name>", ...]}
 /// ```
 ///
-/// Unrecognized `kind` values fall through to `Any` defensively;
-/// empty strings or empty lists also collapse to `Any` (matches
-/// the PyO3 / NAPI converters).
+/// An unrecognized `kind`, a missing/empty required selector, or a list
+/// that is empty once empty entries are removed is REJECTED with
+/// [`NetError::InvalidArgument`] — see [`scope_filter_from_json`] for
+/// why widening to `Any` was the wrong default. Matches the PyO3 / NAPI
+/// converters.
 #[derive(serde::Deserialize)]
 struct ScopeFilterJson {
     kind: String,

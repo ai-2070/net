@@ -460,9 +460,11 @@ pub fn capability_filter_from_js(f: CapabilityFilterJs) -> CapabilityFilter {
 /// - `{ kind: 'regions', regions: ['<name>', ...] }` — any of the
 ///   listed regions + Global.
 ///
-/// Unknown `kind` values are treated as `'any'` defensively
-/// (warns in `tracing`); real validation lives at the type-script
-/// layer.
+/// An unrecognized `kind`, or a missing/empty required selector, is
+/// REJECTED with a `napi::Error` — see [`scope_filter_from_js`] for why
+/// widening to `'any'` was the wrong default. The TypeScript layer's
+/// tagged union catches the same mistakes at compile time; this is the
+/// runtime boundary for raw-JS and native callers.
 #[napi(object)]
 pub struct ScopeFilterJs {
     pub kind: String,

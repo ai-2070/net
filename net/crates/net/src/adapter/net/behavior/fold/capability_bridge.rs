@@ -1301,14 +1301,14 @@ pub fn filter_by_predicate(
 /// filter. `same_subnet_lookup(node_id) -> bool` is supplied
 /// by the caller; the bridge has no native subnet state.
 ///
-/// `same_subnet_lookup` is invoked ONLY for candidates whose verdict
-/// actually depends on subnet membership — a [`ScopeFilter::SameSubnet`]
-/// query, or a `CapabilityScope::SubnetLocal` candidate under any
-/// filter. Every other candidate short-circuits without calling it. The
-/// closure is potentially expensive (the `MeshNode` implementation may
-/// take its own fold read to derive a forwarded peer's subnet), and it
-/// used to run eagerly for every candidate of every scoped query even
-/// though `matches_scope` would discard the result.
+/// `same_subnet_lookup` is invoked ONLY under a
+/// [`ScopeFilter::SameSubnet`] query, where every arm of the scope
+/// decision reduces to `same_subnet` and the candidate's own tags cannot
+/// change the verdict. Under every other filter the verdict is fully
+/// determined from the tags — including for a `scope:subnet-local`
+/// candidate, which those filters reject outright — so the closure is
+/// never reached. It used to run eagerly for every candidate of every
+/// scoped query even though the result was then discarded.
 pub fn find_nodes_matching_scoped(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
