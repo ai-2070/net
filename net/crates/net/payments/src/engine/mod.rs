@@ -512,12 +512,32 @@ enum Claim {
     QuoteAlreadyPaid,
 }
 
-fn last_verified_tier(chain: &[VerificationEvent]) -> Option<VerificationTier> {
-    chain
-        .iter()
-        .rev()
-        .find(|e| matches!(e.status, VerificationStatus::Verified))
-        .map(|e| e.tier)
+/// The best confidence this record has actually reached.
+///
+/// A high-water mark, not the last event — because the chain's tiers are
+/// not monotonic. `re_verify` mints `Observed` and nothing higher (a
+/// facilitator receipt justifies no depth claim), so a facilitator
+/// re-check run after `re_verify_with_checker` had established
+/// `Confirmed(n)` or `Final` appends a *lower* tier than the record had
+/// already earned. Reading the last event reported that as a downgrade —
+/// through `QuoteStatus::tier`, whose own doc promises the highest tier
+/// reached, and through every idempotent `accept_payment` retry.
+///
+/// An `Invalidated` event resets the mark. Withdrawing the verifications
+/// before it is what invalidation *means*, so a reorged record must not
+/// keep advertising confidence its settlement no longer has.
+///
+/// `Exception` events neither raise nor reset it: an overpayment is an
+/// outcome for provider policy, not a statement about chain depth.
+fn best_verified_tier(chain: &[VerificationEvent]) -> Option<VerificationTier> {
+    chain.iter().fold(None, |best, e| match e.status {
+        VerificationStatus::Verified => Some(match best {
+            Some(b) if b.satisfies(&e.tier) => b,
+            _ => e.tier,
+        }),
+        VerificationStatus::Invalidated { .. } => None,
+        VerificationStatus::Exception { .. } => best,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -875,7 +895,7 @@ impl PaymentEngine {
                         if let Some(billing) = &rec.billing {
                             break 'claim Claim::AlreadyServed(
                                 Box::new(billing.clone()),
-                                last_verified_tier(&rec.chain),
+                                best_verified_tier(&rec.chain),
                                 rec.billing_published,
                             );
                         }
@@ -1745,7 +1765,7 @@ impl PaymentEngine {
                         // and the chain stays an append-only record of
                         // *facts*.
                         let reached =
-                            last_verified_tier(&rec.chain).unwrap_or(VerificationTier::Observed);
+                            best_verified_tier(&rec.chain).unwrap_or(VerificationTier::Observed);
                         Ok((
                             PaymentDecision::PendingTier {
                                 reached,
@@ -2083,7 +2103,7 @@ impl PaymentEngine {
         Ok(state.quotes.get(quote_id).map(|rec| QuoteStatus {
             frozen: rec.frozen.clone(),
             served: rec.served,
-            tier: last_verified_tier(&rec.chain),
+            tier: best_verified_tier(&rec.chain),
             billing_event_id: rec.billing.as_ref().map(|b| b.billing_event_id.clone()),
             chain: rec.chain.clone(),
         }))

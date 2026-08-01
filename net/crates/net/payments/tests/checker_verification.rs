@@ -169,6 +169,85 @@ async fn final_is_reachable_only_through_the_checker() {
     assert_eq!(status.tier, Some(VerificationTier::Final));
 }
 
+/// A facilitator re-check cannot lower confidence the chain has already
+/// earned.
+///
+/// The two re-verify paths mint different tiers on purpose: the checker
+/// reads the chain and can reach `confirmed(n)`/`final`, while
+/// `re_verify` takes a facilitator receipt and is capped at `observed`.
+/// So the events are not monotonic, and reading the *last* one reported
+/// a downgrade that never happened — a quote independently confirmed
+/// final went back to advertising `observed` the moment anything asked
+/// the facilitator again.
+///
+/// `QuoteStatus::tier` documents itself as the highest tier reached, and
+/// this is what makes that true.
+#[tokio::test]
+async fn a_facilitator_recheck_does_not_lower_a_tier_the_checker_reached() {
+    let (w, _) = settled_world(VerificationTier::Observed).await;
+
+    let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
+        tier: VerificationTier::Final,
+        delivered: Some("2500".into()),
+    }]);
+    w.engine
+        .re_verify_with_checker(&w.quote_id, &checker, VerificationTier::Final, NOW + 2)
+        .await
+        .expect("engine");
+    let raised = w.engine.status(&w.quote_id).await.unwrap().unwrap();
+    assert_eq!(raised.tier, Some(VerificationTier::Final));
+
+    // The facilitator answers valid, which is worth `observed` and is
+    // appended as such. The record's confidence must not follow it down.
+    w.engine
+        .re_verify(&w.quote_id, VerificationTier::Observed, NOW + 3)
+        .await
+        .expect("engine");
+    let after = w.engine.status(&w.quote_id).await.unwrap().unwrap();
+    assert!(
+        after.chain.len() > raised.chain.len(),
+        "the re-verify must actually have appended its observed event"
+    );
+    assert_eq!(
+        after.tier,
+        Some(VerificationTier::Final),
+        "a facilitator receipt cannot take back a checker's finality"
+    );
+}
+
+/// The high-water mark is not a ratchet: invalidation withdraws the
+/// verifications before it, so a reorged record stops advertising the
+/// confidence its settlement no longer has.
+#[tokio::test]
+async fn an_invalidation_resets_the_tier_it_withdraws() {
+    let (w, _) = settled_world(VerificationTier::Observed).await;
+
+    let up = ScriptedChecker::new(vec![ChainVerdict::Included {
+        tier: VerificationTier::Final,
+        delivered: Some("2500".into()),
+    }]);
+    w.engine
+        .re_verify_with_checker(&w.quote_id, &up, VerificationTier::Final, NOW + 2)
+        .await
+        .expect("engine");
+    assert_eq!(
+        w.engine.status(&w.quote_id).await.unwrap().unwrap().tier,
+        Some(VerificationTier::Final)
+    );
+
+    let reverted = ScriptedChecker::new(vec![ChainVerdict::Reverted]);
+    w.engine
+        .re_verify_with_checker(&w.quote_id, &reverted, VerificationTier::Final, NOW + 3)
+        .await
+        .expect("engine");
+    let after = w.engine.status(&w.quote_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.tier, None,
+        "a reverted settlement leaves no verified tier standing"
+    );
+    assert!(after.frozen.is_some(), "and the record freezes");
+}
+
 #[tokio::test]
 async fn pending_claims_nothing_and_appends_nothing() {
     let (w, _) = settled_world(VerificationTier::Confirmed(1)).await;
