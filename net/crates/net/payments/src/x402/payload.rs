@@ -64,6 +64,35 @@ impl X402View for PaymentPayload {
     }
 }
 
+/// Canonicalize the `(network, asset)` scope a replay identity is keyed
+/// under, so two spellings of one on-chain scope collapse to one key.
+///
+/// Only `eip155` is normalized, and only in the two ways where a
+/// difference in spelling provably is not a difference in meaning:
+///
+/// - the CAIP-2 reference is a decimal chain id, so `eip155:08453`
+///   re-renders as `eip155:8453`;
+/// - the asset is a hex contract address whose EIP-55 checksum casing
+///   carries no on-chain meaning, so it lowercases.
+///
+/// Everything else passes through untouched. Solana mints are base58,
+/// where case *is* significant and lowercasing would merge distinct
+/// mints; XRPL's asset is a currency code. Normalizing those would trade
+/// a missed replay for a false one, which on a payment path is the worse
+/// failure.
+fn canonical_eip_scope(network: &str, asset: &str) -> (String, String) {
+    let Some(reference) = network.strip_prefix("eip155:") else {
+        return (network.to_string(), asset.to_string());
+    };
+    // A non-numeric reference is not an eip155 chain id this build
+    // understands; leave it alone rather than guess at a canonical form.
+    let network = match reference.parse::<u64>() {
+        Ok(chain_id) => format!("eip155:{chain_id}"),
+        Err(_) => network.to_string(),
+    };
+    (network, asset.to_ascii_lowercase())
+}
+
 impl X402Carry<PaymentPayload> {
     /// The **scheme-semantic** replay identity of this payment.
     ///
@@ -199,14 +228,27 @@ impl X402Carry<PaymentPayload> {
             }
         };
 
+        // The namespace, canonicalized. Two spellings of the *same* scope
+        // must not produce two identities, or one authorization satisfies
+        // one quote per spelling.
+        //
+        // This is normalization toward a single on-chain meaning, not a
+        // relaxation of CAIP's exact-comparison rule: `eip155:08453` and
+        // `eip155:8453` are the same chain, and two EIP-55 casings of one
+        // address are the same contract. The registry treats CAIP ids as
+        // case-sensitive and that stays true — equivalence between
+        // genuinely different assets is still registry policy. What is
+        // handled here is only the spelling of one asset.
+        let (scope_network, scope_asset) = canonical_eip_scope(&accepted.network, &accepted.asset);
+
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"net.payments.replay_identity@2");
         // Namespace first: scheme, network, asset. Length-prefixed so no
         // concatenation of parts can be confused for another.
         let mut parts: Vec<&[u8]> = vec![
             scheme.as_bytes(),
-            accepted.network.as_bytes(),
-            accepted.asset.as_bytes(),
+            scope_network.as_bytes(),
+            scope_asset.as_bytes(),
         ];
         for part in &identity {
             parts.push(part);
@@ -352,6 +394,71 @@ mod tests {
             other_chain.replay_key().unwrap(),
             "the same nonce on another chain is a different payment"
         );
+    }
+
+    /// Two spellings of the same on-chain scope must be one replay
+    /// identity, or one authorization satisfies one quote per spelling.
+    ///
+    /// EIP-55 checksum casing carries no on-chain meaning, and a CAIP-2
+    /// reference is a decimal chain id, so `eip155:08453` and
+    /// `eip155:8453` are the same chain. Neither difference is a
+    /// difference in what is being paid.
+    #[test]
+    fn one_scope_spelled_two_ways_is_one_replay_identity() {
+        let base: X402Carry<PaymentPayload> =
+            X402Carry::from_bytes(FIXTURE.as_bytes().to_vec()).unwrap();
+
+        // Same contract, different EIP-55 casing.
+        let recased = FIXTURE.replace(
+            "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+            "0x036cbd53842c5426634e7929541ec2318f3dcf7e",
+        );
+        let recased: X402Carry<PaymentPayload> =
+            X402Carry::from_bytes(recased.into_bytes()).unwrap();
+
+        // Same chain, zero-padded reference.
+        let padded = FIXTURE.replace("eip155:84532", "eip155:084532");
+        let padded: X402Carry<PaymentPayload> =
+            X402Carry::from_bytes(padded.into_bytes()).unwrap();
+
+        let key = base.replay_key().unwrap();
+        assert_eq!(
+            key,
+            recased.replay_key().unwrap(),
+            "EIP-55 casing must not mint a second identity for one contract"
+        );
+        assert_eq!(
+            key,
+            padded.replay_key().unwrap(),
+            "a zero-padded chain id must not mint a second identity"
+        );
+    }
+
+    /// The normalization is scoped to eip155 and must not merge scopes
+    /// that only *look* similar. Solana mints are base58, where case is
+    /// significant — lowercasing them would turn a missed replay into a
+    /// false one.
+    #[test]
+    fn non_eip155_scopes_are_not_case_folded() {
+        let (net, asset) = canonical_eip_scope(
+            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        );
+        assert_eq!(net, "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");
+        assert_eq!(
+            asset, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "a base58 mint must survive untouched"
+        );
+
+        // eip155 with a non-numeric reference is left alone rather than
+        // guessed at.
+        let (net, _) = canonical_eip_scope("eip155:not-a-number", "0xAbC");
+        assert_eq!(net, "eip155:not-a-number");
+
+        // And the eip155 case really does normalize.
+        let (net, asset) = canonical_eip_scope("eip155:08453", "0xAbCdEf");
+        assert_eq!(net, "eip155:8453");
+        assert_eq!(asset, "0xabcdef");
     }
 
     /// A scheme with no defined identity fails closed rather than falling
