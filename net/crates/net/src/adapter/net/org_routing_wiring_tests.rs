@@ -5531,30 +5531,16 @@ async fn a_delayed_grant_notification_cannot_retire_a_successor_installation() {
     // Park the REMOVAL's notification after publication and gate release, before
     // its registry work. The install's notification must pass through freely, or
     // there is no successor to protect.
-    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
-    {
-        let release_rx = release_rx.clone();
-        // A one-shot latch, NOT a predicate on the movement. It was written
-        // that way because the first repair's `superseded_through` gave
-        // remove(N) and install(N+1) the same value; that mechanism is gone —
-        // the fence is a publication generation now, and the two DO differ —
-        // but the latch stays, because "distinguishable today" is not a
-        // property a future fence change preserves. The removal's notification
-        // is guaranteed first: nothing installs until `reached` is observed.
-        let parked = Arc::new(AtomicBool::new(false));
-        f.node.arm_grant_movement_hook(Arc::new(move |_movement| {
-            if parked.swap(true, Ordering::AcqRel) {
-                return;
-            }
-            let _ = reached_tx.try_send(());
-            release_rx
-                .lock()
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the witness must release the parked notification");
-        }));
-    }
+    //
+    // The shared one-shot latch, NOT a predicate on the movement. It was written
+    // that way because the first repair's `superseded_through` gave remove(N) and
+    // install(N+1) the same value; that mechanism is gone — the fence is a
+    // publication generation now, and the two DO differ — but the latch stays,
+    // because "distinguishable today" is not a property a future fence change
+    // preserves. The removal's notification is guaranteed first: nothing installs
+    // until `reached` is observed. The captured fence is not read here; what this
+    // witness asserts about the transition is the artifact it must not destroy.
+    let (reached_rx, release_tx, _parked_fence) = park_first_grant_notification(&f.node);
 
     let remover = {
         let node = f.node.clone();
@@ -5763,27 +5749,13 @@ async fn a_delayed_install_notification_cannot_retire_a_successor_removal_artifa
     assert!(until(|| f.node.org_routing_ready()).await, "healthy");
     let family = f.node.org_routing_family().expect("family");
 
-    // Park the FIRST notification — the install's. A one-shot latch rather than a
-    // predicate on the movement, for the same reason as W-W6: the transitions are
-    // not reliably distinguishable by value, and the install's notification is
-    // guaranteed first because nothing removes until `reached` is observed.
-    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
-    {
-        let release_rx = release_rx.clone();
-        let parked = Arc::new(AtomicBool::new(false));
-        f.node.arm_grant_movement_hook(Arc::new(move |_movement| {
-            if parked.swap(true, Ordering::AcqRel) {
-                return;
-            }
-            let _ = reached_tx.try_send(());
-            release_rx
-                .lock()
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the witness must release the parked notification");
-        }));
-    }
+    // Park the FIRST notification — the install's. The shared one-shot latch
+    // rather than a predicate on the movement, for the same reason as W-W6: the
+    // transitions are not reliably distinguishable by value, and the install's
+    // notification is guaranteed first because nothing removes until `reached` is
+    // observed. The captured fence is not read here, for the same reason it is
+    // not in W-W6.
+    let (reached_rx, release_tx, _parked_fence) = park_first_grant_notification(&f.node);
 
     let installer = {
         let node = f.node.clone();
