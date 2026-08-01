@@ -286,7 +286,8 @@ impl ProviderChannel for MeshPaymentChannel {
         // the message can say what is actually wrong.
         if caller != self.caller.entity_id() {
             return Err(ChannelError {
-                message: "the flow's caller identity does not match this channel's signing                           identity — a quote request must be signed by the identity it names"
+                message: "the flow's caller identity does not match this channel's signing \
+                          identity — a quote request must be signed by the identity it names"
                     .to_string(),
                 retryable: false,
             });

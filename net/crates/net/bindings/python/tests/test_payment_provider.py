@@ -239,5 +239,8 @@ def test_a_real_facilitator_url_is_never_silently_downgraded(mesh, tmp_path):
         # having used the mock.
         assert "payments-http" in str(e)
         return
-    # Built with payments-http: a real facilitator was constructed.
-    provider.close()
+    # Built with payments-http (which the published wheels enable): a real
+    # facilitator was constructed. Assert something that exists rather
+    # than tearing down — the binding exposes no close(), and the mesh
+    # fixture drops the node in its own finally.
+    assert len(provider.provider_entity_id) == 32

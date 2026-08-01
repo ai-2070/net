@@ -79,7 +79,8 @@ impl FacilitatorError {
 /// **Carries no tier, by construction.** A facilitator receipt justifies
 /// `observed` and nothing more — the x402 v2 spec gives facilitators no
 /// way to report finality — so the engine mints
-/// [`VerificationTier::Observed`] for every facilitator answer rather
+/// [`Observed`](crate::core::verification::VerificationTier::Observed)
+/// for every facilitator answer rather
 /// than reading a tier off one. `confirmed(n)` and `final` come only
 /// from an independent on-chain check
 /// ([`crate::checker::ChainChecker`]), which is what keeps a facilitator

@@ -12,8 +12,9 @@ import { CapabilityGateway, PaymentProvider, PaymentHttpClient, buildPricingTerm
 none of it. There is also no `@net-mesh/payments` package — the name is
 reserved and unpublished, and everything ships inside `@net-mesh/core`.
 
-Behind `payments` (default), `publish` (default), and the opt-in
-`payments-http`.
+Behind `payments`, `publish` and `payments-http` — all three in the
+default build. `payments-http` carries `HttpFacilitator`, so without it the
+only reachable settlement backend is the mock.
 
 ## Demand — pay to invoke
 
@@ -77,8 +78,6 @@ const terms = buildPricingTerms(
 // is a decision the operator makes out loud.
 provider.providerEntityId                 // Buffer (32B); the identity that issues quotes
 await provider.readBilling()              // string[] of net.billing.event@1
-
-const terms = buildPricingTerms(provider.providerEntityId, capability, requirementsJson)
 
 const pub = await provider.publishPaidTools(
   tools,                                  // [{ name, description?, inputSchema }]

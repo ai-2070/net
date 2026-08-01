@@ -109,6 +109,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    # `CreateFileW` + `CREATE_NEW` + `FILE_ATTRIBUTE_NORMAL`. It compiles
+    # today without this only because some other crate in the graph
+    # enables the module and Cargo unifies features — which is not a
+    # guarantee, and would break the moment that crate dropped it.
+    "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ] }
 
