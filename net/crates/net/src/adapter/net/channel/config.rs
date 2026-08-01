@@ -601,20 +601,55 @@ pub struct ResolvedConfig {
 /// `u16` fast-path hint into a list of canonical channels for receive-side
 /// dispatch (routine collisions at scale).
 ///
-/// Surface the deny-all misconfiguration loudly at registration time.
+/// Surface the deny-all misconfigurations loudly at registration time.
 ///
-/// `require_token = true` with no `token_roots` is a valid fail-closed
-/// state (nothing is authorized), but it's far more often a mistake —
-/// `with_require_token(true)` was called instead of
-/// `with_token_roots(...)`. Logging it at insert turns a silent
-/// "every publish and subscribe is denied" into an actionable warning.
-fn warn_if_fail_closed(config: &ChannelConfig) {
+/// Each of these is a legitimate fail-closed state that the
+/// authorization path handles correctly, and each is far more often a
+/// mistake. Fail-closed is the right behaviour and stays; what it lacks
+/// on its own is any way for the operator to find out, because a channel
+/// that denies everyone looks exactly like a channel nobody happens to
+/// be using. Logging at insert turns that into an actionable warning.
+///
+/// `is_prefix` distinguishes [`ChannelConfigRegistry::insert`] and
+/// [`ChannelConfigRegistry::insert_if_absent`] from their
+/// `insert_prefix*` counterparts — one of the two checks below depends
+/// on how the config is being registered, not just on its contents.
+fn warn_if_fail_closed(config: &ChannelConfig, is_prefix: bool) {
+    // `with_require_token(true)` called instead of
+    // `with_token_roots(...)`: there is no authority a chain could
+    // anchor to, so nothing is ever authorized.
     if config.require_token && config.token_roots.is_empty() {
         tracing::warn!(
             channel = config.channel_id.name().as_str(),
             "channel requires a token but has no token_roots: all publish \
              and subscribe will be denied (fail closed). Use \
              `with_token_roots(...)` to anchor a root of trust."
+        );
+    }
+    // An origin binding on an EXACT registration denies every
+    // subscriber. The binding's whole job is to split a requested name
+    // into "the prefix that matched" + "the dynamic suffix that must
+    // encode the subscriber", and an exact-match resolution reports no
+    // matched prefix — there is no suffix to check, so
+    // `OriginBinding::matches` fails closed on every request.
+    //
+    // The builder's rustdoc says it is "only meaningful on a
+    // prefix-registered config", but a channel that silently accepts
+    // nobody is not a documentation-sized failure: it is
+    // indistinguishable from an idle channel, and the peers being
+    // refused see a generic `Unauthorized`.
+    if is_prefix {
+        return;
+    }
+    if config.subscriber_origin_binding.is_some() {
+        tracing::warn!(
+            channel = config.channel_id.name().as_str(),
+            "channel has a subscriber_origin_binding but is registered by \
+             EXACT name: every subscribe will be denied (fail closed). The \
+             binding matches a dynamic suffix against the subscriber's own \
+             pinned origin, which only exists for a prefix registration — \
+             register it with `insert_prefix(...)` / \
+             `Mesh::register_channel_prefix(...)`."
         );
     }
 }
@@ -701,7 +736,7 @@ impl ChannelConfigRegistry {
     /// processes (the longest-length tiebreaker can never tie since
     /// DashMap deduplicates keys).
     pub fn insert_prefix(&self, prefix: impl Into<String>, config: ChannelConfig) {
-        warn_if_fail_closed(&config);
+        warn_if_fail_closed(&config, true);
         self.prefix_configs.insert(prefix.into(), config);
     }
 
@@ -720,7 +755,7 @@ impl ChannelConfigRegistry {
         match self.prefix_configs.entry(prefix.into()) {
             dashmap::mapref::entry::Entry::Occupied(_) => false,
             dashmap::mapref::entry::Entry::Vacant(slot) => {
-                warn_if_fail_closed(&config);
+                warn_if_fail_closed(&config, true);
                 slot.insert(config);
                 true
             }
@@ -824,7 +859,7 @@ impl ChannelConfigRegistry {
     /// anything auto-registering a default on behalf of a subsystem —
     /// want [`Self::insert_if_absent`] instead.
     pub fn insert(&self, config: ChannelConfig) {
-        warn_if_fail_closed(&config);
+        warn_if_fail_closed(&config, false);
         let name = config.channel_id.name().to_string();
         let hash = config.channel_id.hash();
         let wire_hash = config.channel_id.wire_hash();
@@ -858,7 +893,7 @@ impl ChannelConfigRegistry {
         let installed = match self.configs.entry(name.clone()) {
             dashmap::mapref::entry::Entry::Occupied(_) => false,
             dashmap::mapref::entry::Entry::Vacant(slot) => {
-                warn_if_fail_closed(&config);
+                warn_if_fail_closed(&config, false);
                 slot.insert(config);
                 true
             }
@@ -2360,6 +2395,53 @@ mod tests {
         let origin = 0xABCD_1234_5678_9ABCu64;
         let name = format!("{OB_PREFIX}{origin:016x}");
         assert!(!OB.authorizes(&name, None, Some(origin)));
+    }
+
+    /// The same fail-closed rule reached the way an operator actually
+    /// reaches it: registering an origin-bound config by EXACT name.
+    ///
+    /// `resolve_by_name` reports no matched prefix for an exact hit, so
+    /// the binding has nothing to split and denies every subscriber —
+    /// including the one peer whose origin the name encodes. Correct,
+    /// and completely invisible: a channel that accepts nobody looks
+    /// exactly like a channel nobody is using, and the refused peers see
+    /// a generic `Unauthorized`. `warn_if_fail_closed` logs this at
+    /// registration for that reason; this pins the behaviour the warning
+    /// is about.
+    #[test]
+    fn origin_bound_config_registered_by_exact_name_denies_everyone() {
+        let reg = ChannelConfigRegistry::new();
+        let origin = 0xABCD_1234_5678_9ABCu64;
+        let name = format!("{OB_PREFIX}{origin:016x}");
+
+        // The misregistration: `insert`, not `insert_prefix`.
+        reg.insert(
+            ChannelConfig::new(ChannelId::parse(&name).unwrap()).with_subscriber_origin_binding(OB),
+        );
+
+        let resolved = reg.resolve_by_name(&name).expect("exact entry resolves");
+        assert_eq!(
+            resolved.matched_prefix, None,
+            "an exact hit reports no matched prefix — this is the input that \
+             makes the binding fail closed"
+        );
+        assert!(
+            !OB.authorizes(&name, resolved.matched_prefix.as_deref(), Some(origin)),
+            "an exact-registered origin binding denies even the peer the name \
+             encodes; registering it as a prefix is the only working shape"
+        );
+
+        // Registered as a prefix instead, the same peer is admitted —
+        // so the denial above is about the registration, not the name.
+        let reg = ChannelConfigRegistry::new();
+        reg.insert_prefix(
+            OB_PREFIX,
+            ChannelConfig::new(ChannelId::parse("svc.replies.prefix").unwrap())
+                .with_subscriber_origin_binding(OB),
+        );
+        let resolved = reg.resolve_by_name(&name).expect("prefix entry resolves");
+        assert_eq!(resolved.matched_prefix.as_deref(), Some(OB_PREFIX));
+        assert!(OB.authorizes(&name, resolved.matched_prefix.as_deref(), Some(origin)));
     }
 
     /// Formatting is exact: no truncation, no case folding, no
