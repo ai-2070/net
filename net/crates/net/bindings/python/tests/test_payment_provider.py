@@ -226,7 +226,13 @@ def test_a_real_facilitator_url_is_never_silently_downgraded(mesh, tmp_path):
 
     The one outcome that must not happen is quietly falling back to the
     mock: an operator who configured a facilitator URL has stated they
-    want real settlement.
+    want real settlement. That has to be *asserted* on the success path —
+    a silent downgrade constructs successfully too, so "it built" proves
+    nothing.
+
+    ``registry_version`` is the observable difference: a real backend puts
+    the engine on the production revision, the mock on the dev one (which
+    carries the valueless ``mock:net`` asset).
     """
     try:
         provider = PaymentProvider(
@@ -239,8 +245,19 @@ def test_a_real_facilitator_url_is_never_silently_downgraded(mesh, tmp_path):
         # having used the mock.
         assert "payments-http" in str(e)
         return
-    # Built with payments-http (which the published wheels enable): a real
-    # facilitator was constructed. Assert something that exists rather
-    # than tearing down — the binding exposes no close(), and the mesh
-    # fixture drops the node in its own finally.
-    assert len(provider.provider_entity_id) == 32
+    # Built with payments-http (which the published wheels enable).
+    assert provider.registry_version == "net-production-1"
+
+
+def test_the_mock_backend_says_so_in_the_registry_revision(mesh, tmp_path):
+    """The other side of the same guarantee.
+
+    Asking for the mock gets the mock, so ``registry_version`` genuinely
+    discriminates rather than always reading "production".
+    """
+    provider = PaymentProvider(
+        mesh,
+        str(tmp_path / "engine.json"),
+        unsafe_dev_mock_facilitator=True,
+    )
+    assert provider.registry_version == "net-default-1"

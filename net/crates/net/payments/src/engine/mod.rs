@@ -1279,8 +1279,20 @@ impl PaymentEngine {
         Ok(decision)
     }
 
-    /// Re-run facilitator verification for a settled quote: tier upgrades
-    /// (late finality) or invalidation (reorg) land here.
+    /// Re-run facilitator verification for a settled quote — the
+    /// **invalidation** path (a reorg the facilitator now reports as
+    /// invalid).
+    ///
+    /// It cannot raise confidence. A facilitator receipt justifies
+    /// `observed` and nothing more (the v2 spec gives facilitators no way
+    /// to report finality), so the tier is minted at this boundary rather
+    /// than read off the response, and every valid answer here is
+    /// `observed`. A caller waiting on `confirmed(n)` or `final` stays
+    /// pending no matter how often this runs.
+    ///
+    /// Confidence upgrades come from
+    /// [`Self::re_verify_with_checker`], which reads the chain
+    /// independently and is the only producer of a higher tier.
     pub async fn re_verify(
         &self,
         quote_id: &str,
@@ -1898,12 +1910,21 @@ impl PaymentEngine {
     /// was lost is not re-servable on the same quote, matching the
     /// at-most-once retry safety of credentialed tools.
     ///
-    /// `binding`, when present, must be the paying identity's ed25519
-    /// signature over [`invocation_binding_transcript`] — possession
-    /// proof that the invoker is the payer. Present-but-invalid rejects;
-    /// absent falls back to bearer semantics (the quote id is
-    /// content-derived and unguessable), kept in P1 for pre-binding
-    /// callers.
+    /// `binding` must be the paying identity's ed25519 signature over
+    /// [`invocation_binding_transcript`] — possession proof that the
+    /// invoker is the payer. Present-but-invalid rejects.
+    ///
+    /// **Absent rejects too**, with
+    /// [`RedeemDenialReason::BindingRequired`]. A default engine requires
+    /// the binding: without it the quote id alone admits, and a quote id
+    /// travels through logs, proxies, and the caller's own tooling — a
+    /// bearer credential by accident rather than by decision.
+    ///
+    /// Bearer semantics survive only behind
+    /// [`Self::with_require_invocation_binding(false)`](Self::with_require_invocation_binding),
+    /// for pre-binding callers that cannot be upgraded yet. The quote id
+    /// is content-derived and unguessable, so that mode is not *broken* —
+    /// it is just a weaker claim than possession of the payer's key.
     pub async fn redeem_for_invocation(
         &self,
         tool_id: &str,

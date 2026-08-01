@@ -64,8 +64,11 @@ fn author_pricing_terms(
     // `PaymentProvider` picks `production_registry_v1` whenever a real
     // facilitator is configured, so this has to be able to follow.
     //
-    // `reference()` is signer-independent (it hashes the asset content), so the
-    // reference matches any party using the same revision.
+    // `reference()` hashes the whole registry, `signer` included — so it is
+    // signer-*dependent*, and `provider_entity_id` has to be the same identity
+    // the engine issues quotes under. A different id here produces a different
+    // reference for the same asset list, and the announced terms then name a
+    // registry revision no counterparty can match.
     let registry = if production_registry {
         net_payments::core::registry::production_registry_v1(provider.clone())
     } else {
@@ -239,13 +242,6 @@ mod provider {
         }
     }
 
-    /// A paid-capability provider over an embedded `NetMesh` node — the supply
-    /// side. Construction stands up one `PaymentEngine` behind the quote/pay
-    /// wire; `publishPaidTools` publishes priced tools gated by that same
-    /// engine, so a quote paid over the wire is the quote the gate redeems. Hold
-    /// the provider to keep the wire served.
-    ///
-    /// Construct with `new PaymentProvider(mesh, statePath, billingLogPath?)`.
     /// The node-holding state — the mesh node the provider serves over, plus the
     /// serve handle keeping the quote/pay services registered on it.
     /// [`close`](PaymentProvider::close) drops both so the node can be released.
@@ -255,10 +251,35 @@ mod provider {
         _serve: PaymentServeHandle,
     }
 
+    /// A paid-capability provider over an embedded `NetMesh` node — the supply
+    /// side. Construction stands up one `PaymentEngine` behind the quote/pay
+    /// wire; `publishPaidTools` publishes priced tools gated by that same
+    /// engine, so a quote paid over the wire is the quote the gate redeems. Hold
+    /// the provider to keep the wire served.
+    ///
+    /// Construction requires a settlement backend — there is no default, so
+    /// `new PaymentProvider(mesh, statePath)` and
+    /// `new PaymentProvider(mesh, statePath, billingLogPath)` both throw. Pass
+    /// either a real facilitator:
+    ///
+    /// ```js
+    /// new PaymentProvider(mesh, statePath, billingLogPath, facilitatorUrl)
+    /// ```
+    ///
+    /// or the in-process mock, which moves no value:
+    ///
+    /// ```js
+    /// new PaymentProvider(mesh, statePath, billingLogPath, null, null, true)
+    /// ```
+    ///
+    /// See [`new`](PaymentProvider::new) for why choosing is mandatory.
     #[napi]
     pub struct PaymentProvider {
         engine: Arc<PaymentEngine>,
         provider_entity_id: Vec<u8>,
+        /// The asset registry revision the engine issues quotes under, which
+        /// follows from the settlement backend that was chosen.
+        registry_version: String,
         /// The billing stream, when a `billingLogPath` was supplied — for the
         /// read-only `readBilling` surface. Holds no node reference.
         billing: Option<Arc<BillingLog>>,
@@ -343,6 +364,7 @@ mod provider {
                 facilitator_auth_token,
                 unsafe_dev_mock_facilitator.unwrap_or(false),
             )?;
+            let registry_version = registry.version.clone();
             // `AdmitAll` gates QUOTE issuance — correct for a paid tool (anyone
             // may quote; PAYMENT is the real gate on the serve).
             let billing = billing_log_path.map(|bp| Arc::new(BillingLog::new(bp)));
@@ -375,6 +397,7 @@ mod provider {
             Ok(Self {
                 engine,
                 provider_entity_id,
+                registry_version,
                 billing,
                 serving: Mutex::new(Some(Serving {
                     node,
@@ -399,6 +422,23 @@ mod provider {
         #[napi(getter)]
         pub fn provider_entity_id(&self) -> Buffer {
             Buffer::from(self.provider_entity_id.clone())
+        }
+
+        /// The asset registry revision this provider issues quotes under —
+        /// `"net-production-1"` behind a real facilitator, `"net-default-1"`
+        /// behind the mock (which additionally carries the valueless `mock:net`
+        /// asset).
+        ///
+        /// Two uses. It tells `buildPricingTerms` which revision to author
+        /// against (`productionRegistry: true` iff this reads
+        /// `"net-production-1"`), so announced terms and issued quotes name the
+        /// same revision. And it makes the settlement backend *observable*: the
+        /// one failure this surface must never have is quietly falling back to
+        /// the mock for an operator who configured a facilitator URL, and a
+        /// guarantee nothing can read is a guarantee nothing can test.
+        #[napi(getter)]
+        pub fn registry_version(&self) -> String {
+            self.registry_version.clone()
         }
 
         /// The immutable billing events this provider recorded, oldest first —

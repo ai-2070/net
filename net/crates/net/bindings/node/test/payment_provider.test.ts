@@ -243,19 +243,53 @@ describe.skipIf(!PaymentProvider)('PaymentProvider settlement backend', () => {
 
   it('never silently downgrades a real facilitator URL to the mock', async () => {
     await withProvider(async (mesh) => {
-      // Built without payments-http this throws and must say so; built with
-      // it, a real facilitator is constructed. The one outcome that must not
-      // happen is a quiet fallback to the mock.
+      // Two acceptable outcomes and one forbidden one. Built without
+      // payments-http, construction throws and the message says which feature
+      // is missing. Built with it, a real facilitator is constructed — and
+      // that has to be *asserted*, not assumed: a quiet fallback to the mock
+      // is exactly the regression this test is named for, and it would also
+      // construct successfully.
+      //
+      // `registryVersion` is the observable difference. A real backend puts
+      // the engine on the production revision; the mock puts it on the dev
+      // one, which carries the valueless `mock:net` asset.
+      let provider
       try {
-        const provider = new PaymentProvider(
+        provider = new PaymentProvider(
           mesh,
           tmp('real.state'),
           undefined,
           'https://facilitator.example.com',
         )
-        provider.close()
       } catch (e) {
         expect(String(e)).toMatch(/payments-http/)
+        return
+      }
+      try {
+        expect(provider.registryVersion).toBe('net-production-1')
+      } finally {
+        provider.close()
+      }
+    })
+  }, 20000)
+
+  it('the mock backend says so in the registry revision', async () => {
+    await withProvider(async (mesh) => {
+      // The other side of the same guarantee: asking for the mock gets the
+      // mock, so `registryVersion` genuinely discriminates rather than always
+      // reading "production".
+      const provider = new PaymentProvider(
+        mesh,
+        tmp('mock.state'),
+        undefined,
+        undefined,
+        undefined,
+        true,
+      )
+      try {
+        expect(provider.registryVersion).toBe('net-default-1')
+      } finally {
+        provider.close()
       }
     })
   }, 20000)

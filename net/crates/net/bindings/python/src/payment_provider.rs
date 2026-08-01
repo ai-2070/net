@@ -51,8 +51,11 @@ fn author_pricing_terms(
     // serving — `PaymentProvider` picks `production_registry_v1` whenever a
     // real facilitator is configured, so this has to be able to follow.
     //
-    // `reference()` is signer-independent (it hashes the asset content), so
-    // the reference matches any party using the same revision.
+    // `reference()` hashes the whole registry, `signer` included — so it is
+    // signer-*dependent*, and `provider_entity_id` has to be the same
+    // identity the engine issues quotes under. A different id here produces
+    // a different reference for the same asset list, and the announced
+    // terms then name a registry revision no counterparty can match.
     let registry = if production_registry {
         net_payments::core::registry::production_registry_v1(provider.clone())
     } else {
@@ -285,6 +288,9 @@ mod provider {
         node: Arc<MeshNode>,
         runtime: Arc<Runtime>,
         provider_entity_id: Vec<u8>,
+        /// The asset registry revision the engine issues quotes under, which
+        /// follows from the settlement backend that was chosen.
+        registry_version: String,
         /// The billing stream, when a `billing_log_path` was supplied — for the
         /// read-only `read_billing` surface.
         billing: Option<Arc<BillingLog>>,
@@ -376,6 +382,7 @@ mod provider {
                 facilitator_auth_token,
                 unsafe_dev_mock_facilitator,
             )?;
+            let registry_version = registry.version.clone();
             // `AdmitAll` gates QUOTE issuance — correct for a paid tool (anyone
             // may quote; PAYMENT is the real gate on the serve).
             let billing = billing_log_path.map(|bp| Arc::new(BillingLog::new(bp)));
@@ -411,6 +418,7 @@ mod provider {
                 node,
                 runtime,
                 provider_entity_id,
+                registry_version,
                 billing,
                 _serve: serve,
             })
@@ -421,6 +429,24 @@ mod provider {
         #[getter]
         fn provider_entity_id(&self) -> Vec<u8> {
             self.provider_entity_id.clone()
+        }
+
+        /// The asset registry revision this provider issues quotes under —
+        /// ``"net-production-1"`` behind a real facilitator,
+        /// ``"net-default-1"`` behind the mock (which additionally carries
+        /// the valueless ``mock:net`` asset).
+        ///
+        /// Two uses. It tells :func:`build_pricing_terms` which revision to
+        /// author against (``production_registry=True`` iff this reads
+        /// ``"net-production-1"``), so announced terms and issued quotes name
+        /// the same revision. And it makes the settlement backend
+        /// *observable*: the one failure this surface must never have is
+        /// quietly falling back to the mock for an operator who configured a
+        /// facilitator URL, and a guarantee nothing can read is a guarantee
+        /// nothing can test.
+        #[getter]
+        fn registry_version(&self) -> String {
+            self.registry_version.clone()
         }
 
         /// The immutable billing events this provider recorded, oldest first —

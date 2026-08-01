@@ -1,6 +1,8 @@
 """Outbound HTTP-402 client binding tests (PAYMENTS_LANGUAGE_SDKS_PLAN WS-P2).
 
-Build the extension with the opt-in ``payments-http`` feature::
+``payments-http`` is in the default feature set, so an ordinary
+``maturin develop`` builds these in. Naming the features explicitly also
+works, and is what a trimmed build has to do::
 
     maturin develop --features net,cortex,consent,mcp,payments,payments-http,extension-module
 

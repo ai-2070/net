@@ -109,10 +109,15 @@ pub enum DestinationPolicy {
     /// any client whose URL can be influenced by a model or a remote
     /// party.
     PublicOnly,
-    /// Public addresses plus loopback. The default for the outbound
-    /// door: it keeps the documented local-testing path working while
-    /// refusing link-local (including the cloud metadata address),
-    /// private, and carrier-NAT ranges.
+    /// Public addresses plus loopback. The **explicit opt-in for local
+    /// testing**, never a default: it keeps a loopback fixture server
+    /// reachable while still refusing link-local (including the cloud
+    /// metadata address), private, and carrier-NAT ranges.
+    ///
+    /// Not the outbound door's default — [`Self::PublicOnly`] is. A
+    /// default that admitted loopback would put every integration one
+    /// model-chosen URL away from an unauthenticated service on the same
+    /// host, which is the reachability an operator has to ask for.
     PublicOrLoopback,
     /// Public, loopback, and private/LAN ranges. For self-hosted
     /// deployments whose facilitator or RPC node is on an internal

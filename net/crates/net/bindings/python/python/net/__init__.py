@@ -831,8 +831,9 @@ else:
 
 # The outbound HTTP-402 client (pay an external x402 HTTP API through the
 # caller's own spend policy), sync + awaitable duals. Present iff the module
-# was built with the `payments-http` feature (an opt-in that pulls a bundled
-# HTTP/TLS stack — NOT in the default wheel).
+# was built with the `payments-http` feature, which is in the default feature
+# set — so the published wheels carry it. Still guarded: a trimmed build
+# (`--no-default-features`) can leave it out.
 try:
     from ._net import AsyncPaymentHttpClient, PaymentHttpClient
 except ImportError:
