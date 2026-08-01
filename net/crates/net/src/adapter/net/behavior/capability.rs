@@ -933,21 +933,30 @@ pub(crate) fn tags_match_scope(
                 continue; // matches the resolver: empty ids are not scopes
             }
             has_tenant = true;
-            tenant_hit |= match filter {
-                F::Tenant(t) => id == *t,
-                F::Tenants(wanted) => wanted.iter().any(|w| id == *w),
-                _ => false,
-            };
+            // Once a hit is recorded the selector list cannot change
+            // the outcome, so stop rescanning it. Matters for the
+            // `Tenants` / `Regions` list forms, where the inner scan is
+            // O(selectors) per tag and both sides are caller- or
+            // announcer-sized.
+            if !tenant_hit {
+                tenant_hit = match filter {
+                    F::Tenant(t) => id == *t,
+                    F::Tenants(wanted) => wanted.iter().any(|w| id == *w),
+                    _ => false,
+                };
+            }
         } else if let Some(name) = body.strip_prefix("region:") {
             if name.is_empty() {
                 continue;
             }
             has_region = true;
-            region_hit |= match filter {
-                F::Region(r) => name == *r,
-                F::Regions(wanted) => wanted.iter().any(|w| name == *w),
-                _ => false,
-            };
+            if !region_hit {
+                region_hit = match filter {
+                    F::Region(r) => name == *r,
+                    F::Regions(wanted) => wanted.iter().any(|w| name == *w),
+                    _ => false,
+                };
+            }
         }
         // `scope:global` is the default; presence is a no-op.
     }
@@ -4041,6 +4050,14 @@ mod tests {
     /// agree with `matches_scope(&scope_from_membership_tags(..))` (the
     /// readable reference) on every combination that matters. If these
     /// ever diverge, the fast path silently changes who is discoverable.
+    ///
+    /// SEMANTIC oracle only — it pins the verdict, nothing else. It does
+    /// NOT cover, and must not be read as covering: allocation counts or
+    /// selector-list cost under the fold locks; how many times the
+    /// subnet callback fires, or in what order; repeated evaluation for
+    /// a publisher present in several classes; or duplicate-tag
+    /// amplification. Those are performance properties and need their
+    /// own measurements.
     #[test]
     fn tags_match_scope_agrees_with_materialized_scope() {
         use super::super::fold::capability_bridge::scope_from_membership_tags;
