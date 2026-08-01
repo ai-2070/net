@@ -5584,9 +5584,25 @@ impl MeshNode {
                     // the whole point here.
                     //
                     // Announce failures are not fatal — the retry may
-                    // still succeed if the pin arrives by another route.
+                    // still succeed if the pin arrives by another route
+                    // — but they must not CONSUME the target's one
+                    // claim. The claim has to be taken before the send
+                    // (two callers racing on the same target must not
+                    // both announce), so a send that failed would
+                    // otherwise leave this target unable to ever get a
+                    // corrective announce until an unrelated peer
+                    // failure cleared the latch. Refund it: nothing was
+                    // broadcast, so there is nothing to bound.
                     if self.claim_corrective_announce(target_node_id) {
-                        let _ = self.reannounce_for_authorization().await;
+                        if let Err(e) = self.reannounce_for_authorization().await {
+                            tracing::debug!(
+                                target = format!("{target_node_id:#x}"),
+                                error = %e,
+                                "corrective capability announce failed to send; \
+                                 releasing the claim so a later call can retry"
+                            );
+                            self.release_corrective_announce(target_node_id);
+                        }
                     }
                     // Back off whether or not we announced. On the
                     // attempts after the latch is spent we are waiting

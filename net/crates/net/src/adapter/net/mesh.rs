@@ -2892,6 +2892,72 @@ fn evict_failed_peer_channel_state(
     rpc_corrective_announced.remove(&node_id);
 }
 
+/// Node-wide rate cap on corrective capability announces.
+///
+/// The per-target latch answers "has THIS peer already had its one
+/// corrective announce". It says nothing about the aggregate, and the
+/// aggregate is what hurts: a corrective announce bypasses the routine
+/// rate limit deliberately (that is the whole point — the routine path
+/// coalesces inside `min_announce_interval` and would return Ok without
+/// sending), and it goes to every connected peer. So each distinct
+/// rejecting target bought one mesh-wide broadcast, and a population of
+/// peers refusing our reply subscribe for any ordinary ACL reason could
+/// keep that running indefinitely.
+///
+/// A plain window counter rather than a token bucket: this is a safety
+/// valve on a path that should fire a handful of times after a
+/// reconnect, not a shaper for sustained traffic. Refundable, because
+/// claims are taken before the send and a send that failed broadcast
+/// nothing.
+#[cfg(feature = "cortex")]
+#[derive(Debug)]
+pub(super) struct CorrectiveAnnounceBudget {
+    /// `(window start, announces charged in this window)`.
+    state: parking_lot::Mutex<(Instant, u32)>,
+}
+
+#[cfg(feature = "cortex")]
+impl CorrectiveAnnounceBudget {
+    /// Corrective announces allowed per [`Self::WINDOW`], node-wide.
+    ///
+    /// Sized for the case this exists to serve — a node reconnecting
+    /// and re-pinning with a handful of RPC targets — while keeping the
+    /// pathological case bounded. A target refused by the budget is not
+    /// denied permanently: it keeps its claim and retries on a later
+    /// call.
+    const MAX_PER_WINDOW: u32 = 8;
+    const WINDOW: Duration = Duration::from_secs(10);
+
+    fn new(now: Instant) -> Self {
+        Self {
+            state: parking_lot::Mutex::new((now, 0)),
+        }
+    }
+
+    /// Charge one announce, or refuse if this window is exhausted.
+    fn try_spend(&self, now: Instant) -> bool {
+        let mut st = self.state.lock();
+        if now.duration_since(st.0) >= Self::WINDOW {
+            *st = (now, 0);
+        }
+        if st.1 >= Self::MAX_PER_WINDOW {
+            return false;
+        }
+        st.1 += 1;
+        true
+    }
+
+    /// Un-charge an announce that was never broadcast.
+    ///
+    /// Saturating: if the window rolled over between the spend and the
+    /// refund there is nothing to give back, and going negative would
+    /// hand out free capacity in the NEXT window.
+    fn refund(&self) {
+        let mut st = self.state.lock();
+        st.1 = st.1.saturating_sub(1);
+    }
+}
+
 /// Per-peer failure counters, and the reclamation floor that lets them
 /// be forgotten without breaking the fence they serve.
 ///
@@ -6920,6 +6986,11 @@ pub struct MeshNode {
     /// so a genuine reconnect can announce again.
     #[cfg(feature = "cortex")]
     rpc_corrective_announced: Arc<dashmap::DashSet<u64>>,
+    /// Node-wide cap on how many corrective announces the latch above
+    /// may authorize per window. See [`CorrectiveAnnounceBudget`] — the
+    /// latch bounds one target, this bounds the mesh-wide total.
+    #[cfg(feature = "cortex")]
+    rpc_corrective_budget: Arc<CorrectiveAnnounceBudget>,
     /// Per-peer failure counters, bumped every time that peer's session
     /// fails. The fence that stops an in-flight reply-subscribe from
     /// resurrecting `rpc_reply_subscriptions` state the failure path
@@ -8188,6 +8259,9 @@ impl MeshNode {
             Arc::new(dashmap::DashSet::new());
         #[cfg(feature = "cortex")]
         let rpc_corrective_announced_failure = rpc_corrective_announced.clone();
+        #[cfg(feature = "cortex")]
+        let rpc_corrective_budget: Arc<CorrectiveAnnounceBudget> =
+            Arc::new(CorrectiveAnnounceBudget::new(Instant::now()));
         // Per-peer failure counter fencing in-flight reply-subscribes;
         // see `MeshNode::peer_failure_generation`.
         #[cfg(feature = "cortex")]
@@ -8651,6 +8725,8 @@ impl MeshNode {
             rpc_reply_subscriptions,
             #[cfg(feature = "cortex")]
             rpc_corrective_announced,
+            #[cfg(feature = "cortex")]
+            rpc_corrective_budget,
             #[cfg(feature = "cortex")]
             rpc_peer_failure_gen,
             #[cfg(feature = "cortex")]
@@ -19522,9 +19598,59 @@ impl MeshNode {
     /// which clears the latch). See
     /// [`MembershipFailure::warrants_reannounce`] for why the `Unauthorized`
     /// filter alone is not sufficient.
+    /// Two bounds, checked in this order:
+    ///
+    /// 1. A node-wide window budget. The per-target latch alone bounds
+    ///    only ONE target: N distinct peers each rejecting our reply
+    ///    subscribe still bought N rate-limit-bypassing broadcasts, and
+    ///    a corrective announce goes to EVERY connected peer, not just
+    ///    the one that rejected us. So the aggregate was
+    ///    O(rejecting targets x peers) with nothing capping it — a set
+    ///    of peers that refuse for an ordinary ACL reason could drive
+    ///    sustained mesh-wide announce traffic.
+    /// 2. The per-target latch, so one peer cannot spend the budget
+    ///    repeatedly.
+    ///
+    /// Budget FIRST, and the latch is only consumed once the budget has
+    /// admitted. A target refused by the budget has not spent its one
+    /// claim and will get it on a later call — otherwise a burst would
+    /// permanently deny a corrective announce to whichever targets
+    /// happened to arrive during it, which is the opposite of what the
+    /// latch is for.
     #[cfg(feature = "cortex")]
     pub(super) fn claim_corrective_announce(&self, target: u64) -> bool {
-        self.rpc_corrective_announced.insert(target)
+        if self.rpc_corrective_announced.contains(&target) {
+            return false;
+        }
+        if !self.rpc_corrective_budget.try_spend(Instant::now()) {
+            return false;
+        }
+        // Racing callers: `insert` returns false for the loser, which
+        // then refunds so the budget is not charged twice for one target.
+        if self.rpc_corrective_announced.insert(target) {
+            true
+        } else {
+            self.rpc_corrective_budget.refund();
+            false
+        }
+    }
+
+    /// Give back a claim whose announcement never went out.
+    ///
+    /// `claim_corrective_announce` has to be taken BEFORE the send,
+    /// because two callers racing on the same target must not both
+    /// announce. But the send is best-effort and its error was
+    /// discarded, so a dropped datagram used up the target's single
+    /// claim and left its reply subscriptions rejected until an
+    /// unrelated peer failure cleared the latch or a routine
+    /// re-announce happened to land. Refunding on a failed send keeps
+    /// the bound (nothing was broadcast, so there is nothing to bound)
+    /// while letting a later RPC retry the repair.
+    #[cfg(feature = "cortex")]
+    pub(super) fn release_corrective_announce(&self, target: u64) {
+        if self.rpc_corrective_announced.remove(&target).is_some() {
+            self.rpc_corrective_budget.refund();
+        }
     }
 
     /// `peer`'s current failure generation. The fence for operations
@@ -36938,6 +37064,59 @@ mod membership_failure_tests {
             );
             seen.push(now);
         }
+    }
+
+    /// The per-target latch bounds ONE target; the budget bounds the
+    /// mesh-wide total. Without it, N distinct rejecting peers bought N
+    /// rate-limit-bypassing broadcasts, each fanned out to every
+    /// connected peer.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn corrective_announces_are_capped_node_wide_across_distinct_targets() {
+        let t0 = Instant::now();
+        let budget = CorrectiveAnnounceBudget::new(t0);
+
+        let allowed = (0..1_000u64).filter(|_| budget.try_spend(t0)).count();
+        assert_eq!(
+            allowed as u32,
+            CorrectiveAnnounceBudget::MAX_PER_WINDOW,
+            "a thousand distinct rejecting targets must not buy a thousand \
+             mesh-wide broadcasts"
+        );
+
+        // The window rolls, and capacity comes back — this is a rate
+        // cap, not a lifetime quota. A node that reconnects hours later
+        // must still be able to re-pin.
+        assert!(budget.try_spend(t0 + CorrectiveAnnounceBudget::WINDOW));
+    }
+
+    /// A refund returns capacity, and cannot manufacture it.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn a_refunded_corrective_announce_does_not_create_capacity() {
+        let t0 = Instant::now();
+        let budget = CorrectiveAnnounceBudget::new(t0);
+        for _ in 0..CorrectiveAnnounceBudget::MAX_PER_WINDOW {
+            assert!(budget.try_spend(t0));
+        }
+        assert!(!budget.try_spend(t0), "precondition: window exhausted");
+
+        // A send that failed broadcast nothing, so its charge comes back.
+        budget.refund();
+        assert!(budget.try_spend(t0), "the refunded slot must be reusable");
+        assert!(!budget.try_spend(t0), "…and only that one slot");
+
+        // Refunds beyond what was spent must not go negative — that
+        // would hand out free capacity in the NEXT window.
+        for _ in 0..100 {
+            budget.refund();
+        }
+        let after = (0..1_000u64).filter(|_| budget.try_spend(t0)).count();
+        assert!(
+            after as u32 <= CorrectiveAnnounceBudget::MAX_PER_WINDOW,
+            "over-refunding created {after} slots in a window capped at {}",
+            CorrectiveAnnounceBudget::MAX_PER_WINDOW
+        );
     }
 
     /// The table is actually bounded — the cap fires on its own rather
