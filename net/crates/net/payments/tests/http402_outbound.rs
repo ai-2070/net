@@ -651,8 +651,8 @@ async fn public_only_refuses_loopback_too() {
     );
 }
 
-/// Two paid fetches under a **stopped clock** are two payments and must
-/// consume two reservations.
+/// Repeated paid fetches under a **stopped clock** are each a payment and
+/// must each consume a reservation — three fetches, three reservations.
 ///
 /// The local pseudo-quote's id derives from provider + caller + terms
 /// hash + issued-at, and on this door the provider and caller are the

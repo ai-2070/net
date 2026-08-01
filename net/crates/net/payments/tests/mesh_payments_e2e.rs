@@ -166,6 +166,33 @@ impl World {
         )
     }
 
+    /// A signed quote request against this provider, correct in every
+    /// field except the ones a caller varies.
+    ///
+    /// The wire constants — service name, template, capability, lifetime —
+    /// live here and in `request_quote`, so a contract change touches one
+    /// place rather than every negative test. Each test below then differs
+    /// from a valid request in exactly the one way it is named for, which
+    /// is what makes its refusal attributable.
+    fn quote_request(
+        &self,
+        caller: &EntityKeypair,
+        nonce: &str,
+    ) -> net_payments::core::quote_request::QuoteRequest {
+        use net_payments::core::quote_request::QuoteRequest;
+        let mut request = QuoteRequest::new(
+            self.provider_id.clone(),
+            caller.entity_id().clone(),
+            &self.capability,
+            self.template.bytes(),
+            self.clock.now_ns(),
+            30_000_000_000,
+            nonce,
+        );
+        request.sign_with(caller).expect("sign");
+        request
+    }
+
     /// Send a hand-built quote request over the real wire, returning the
     /// provider's refusal text on rejection.
     ///
@@ -304,25 +331,15 @@ struct QuoteWireReply {
 /// field compares two claims from the same untrusted source.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_forged_caller_identity_is_refused_over_the_wire() {
-    use net_payments::core::quote_request::QuoteRequest;
-
     let w = World::start().await;
 
     let victim = EntityKeypair::generate();
     let attacker = EntityKeypair::generate();
-    let now_ns = w.clock.now_ns();
 
-    // The attacker builds a request naming the victim and signs it with
-    // its own key — the exact impersonation the old wire permitted.
-    let mut forged = QuoteRequest::new(
-        w.provider_id.clone(),
-        victim.entity_id().clone(),
-        &w.capability,
-        w.template.bytes(),
-        now_ns,
-        30_000_000_000,
-        "forged-nonce",
-    );
+    // A request naming the victim — correct in every other respect — with
+    // the attacker's signature over it instead of the victim's. The exact
+    // impersonation the old wire permitted.
+    let mut forged = w.quote_request(&victim, "forged-nonce");
     let payload = net_payments::core::canonical::signed_payload_bytes(&forged).expect("payload");
     let sig = attacker.try_sign(&payload).expect("sign");
     forged.signature = Some(net_payments::core::canonical::SignatureHex(sig.to_bytes()));
@@ -338,16 +355,7 @@ async fn a_forged_caller_identity_is_refused_over_the_wire() {
 
     // And the honest path still works, so the refusal is the signature
     // check rather than the wire being broken.
-    let mut honest = QuoteRequest::new(
-        w.provider_id.clone(),
-        victim.entity_id().clone(),
-        &w.capability,
-        w.template.bytes(),
-        w.clock.now_ns(),
-        30_000_000_000,
-        "honest-nonce",
-    );
-    honest.sign_with(&victim).expect("sign");
+    let honest = w.quote_request(&victim, "honest-nonce");
     assert!(
         w.request_quote(&honest).await.is_ok(),
         "the identity that holds the key still gets a quote"
@@ -358,20 +366,9 @@ async fn a_forged_caller_identity_is_refused_over_the_wire() {
 /// long as the request remains presentable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replayed_quote_request_is_refused() {
-    use net_payments::core::quote_request::QuoteRequest;
-
     let w = World::start().await;
     let caller = EntityKeypair::generate();
-    let mut request = QuoteRequest::new(
-        w.provider_id.clone(),
-        caller.entity_id().clone(),
-        &w.capability,
-        w.template.bytes(),
-        w.clock.now_ns(),
-        30_000_000_000,
-        "replay-me",
-    );
-    request.sign_with(&caller).expect("sign");
+    let request = w.quote_request(&caller, "replay-me");
 
     assert!(w.request_quote(&request).await.is_ok(), "first use");
     let refusal = w
@@ -388,21 +385,15 @@ async fn a_replayed_quote_request_is_refused() {
 /// though it is perfectly well signed — the destination bind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_for_another_provider_is_refused() {
-    use net_payments::core::quote_request::QuoteRequest;
-
     let w = World::start().await;
     let caller = EntityKeypair::generate();
     let elsewhere = EntityKeypair::generate().entity_id().clone();
 
-    let mut request = QuoteRequest::new(
-        elsewhere,
-        caller.entity_id().clone(),
-        &w.capability,
-        w.template.bytes(),
-        w.clock.now_ns(),
-        30_000_000_000,
-        "wrong-destination",
-    );
+    // The helper's request, re-addressed and re-signed: the destination is
+    // the only field that differs from one the provider would accept.
+    let mut request = w.quote_request(&caller, "wrong-destination");
+    request.provider = elsewhere;
+    request.signature = None;
     request.sign_with(&caller).expect("sign");
     let refusal = w
         .request_quote(&request)
@@ -415,15 +406,6 @@ async fn a_request_for_another_provider_is_refused() {
 
     // The same request, correctly addressed, is taken — so the refusal
     // above is the bind and not the wire.
-    let mut addressed = QuoteRequest::new(
-        w.provider_id.clone(),
-        caller.entity_id().clone(),
-        &w.capability,
-        w.template.bytes(),
-        w.clock.now_ns(),
-        30_000_000_000,
-        "right-destination",
-    );
-    addressed.sign_with(&caller).expect("sign");
+    let addressed = w.quote_request(&caller, "right-destination");
     assert!(w.request_quote(&addressed).await.is_ok());
 }

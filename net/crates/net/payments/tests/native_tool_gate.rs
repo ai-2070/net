@@ -203,35 +203,8 @@ async fn a_store_failure_fails_closed_without_leaking_internal_detail() {
     );
 }
 
-/// A `tracing::Layer` that records every event's fields as (name, value)
-/// pairs — precise enough to assert the emit site's *structured* fields
-/// by key + value, not a formatted-string substring.
-struct FieldCapture {
-    fields: std::sync::Arc<parking_lot::Mutex<Vec<(String, String)>>>,
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        struct Collector<'a>(&'a mut Vec<(String, String)>);
-        impl tracing::field::Visit for Collector<'_> {
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                self.0.push((field.name().to_string(), value.to_string()));
-            }
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                // `%x` (Display) records here via a wrapper whose Debug is
-                // the display string — no quotes to strip.
-                self.0
-                    .push((field.name().to_string(), format!("{value:?}")));
-            }
-        }
-        let mut buf = self.fields.lock();
-        event.record(&mut Collector(&mut buf));
-    }
-}
+mod tracing_capture;
+use tracing_capture::FieldCapture;
 
 /// The redeem-denial emit site carries typed fields, not prose: operators
 /// grep `reason` / `stage` / `recovery_class`, so those are a captured
