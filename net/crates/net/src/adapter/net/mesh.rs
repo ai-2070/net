@@ -13693,6 +13693,33 @@ impl MeshNode {
         ]
     }
 
+    /// Routing-actor loop iterations COMPLETED (OLB-2B.3b).
+    ///
+    /// The only externally-visible statement that no reconciliation pass is in
+    /// flight. Every other signal a witness could sample says something weaker:
+    /// an artifact is visible the moment `apply` stores it, which is before the
+    /// pass that installed it has settled and returned, and reconciliation
+    /// counters that merely stopped moving for a while are evidence of a
+    /// scheduler gap rather than of a finished pass. This advances at the actor's
+    /// park, so an observed advance is an iteration boundary.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn org_routing_actor_passes(&self) -> u64 {
+        self.routing_hooks
+            .passes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test-only: wake the routing actor exactly as first demand does.
+    ///
+    /// A pass woken this way with nothing pending builds nothing and installs
+    /// nothing — it takes the commit pin, finds an empty selection and settles —
+    /// so it is a PROBE of the actor's liveness rather than a mutation of its
+    /// state, which is what makes it usable as an idle barrier.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn mark_org_routing_work(&self) {
+        self.routing_work.mark();
+    }
+
     /// Slots asked for under an audience scope the production source does not
     /// serve — the grant plane, which is not capability-indexed. Never silently
     /// answered as "no providers" (OLB-2B-E3c).
