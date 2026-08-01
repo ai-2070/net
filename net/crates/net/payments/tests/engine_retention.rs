@@ -98,6 +98,12 @@ impl Fixture {
             self.path.clone(),
         )
         .unwrap()
+        // These tests redeem without presenting a binding: redemption is
+        // setup for what they actually assert, not the subject. The
+        // engine now requires the binding by default, so they opt out
+        // explicitly — `lifecycle_modes` carries the tests that cover the
+        // requirement itself.
+        .with_require_invocation_binding(false)
     }
 }
 
@@ -112,6 +118,12 @@ fn fixture_with_retention(retention_ns: Option<u64>) -> Fixture {
         f.path.clone(),
     )
     .unwrap()
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false)
     .with_billing_log(Arc::new(BillingLog::new(
         f.path.with_file_name("billing2.jsonl"),
     )))
@@ -138,6 +150,12 @@ fn fixture() -> Fixture {
             path.clone(),
         )
         .unwrap()
+        // These tests redeem without presenting a binding: redemption is
+        // setup for what they actually assert, not the subject. The
+        // engine now requires the binding by default, so they opt out
+        // explicitly — `lifecycle_modes` carries the tests that cover the
+        // requirement itself.
+        .with_require_invocation_binding(false)
         .with_billing_log(Arc::new(BillingLog::new(dir.path().join("billing.jsonl")))),
     );
     Fixture {

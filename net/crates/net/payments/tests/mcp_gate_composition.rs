@@ -122,7 +122,13 @@ fn world(profile: SpendProfile) -> World {
             registry.clone(),
             dir.path().join("engine.json"),
         )
-        .expect("engine"),
+        .expect("engine")
+        // These tests redeem without presenting a binding: redemption is
+        // setup for what they actually assert, not the subject. The
+        // engine now requires the binding by default, so they opt out
+        // explicitly — `lifecycle_modes` carries the tests that cover the
+        // requirement itself.
+        .with_require_invocation_binding(false),
     );
     let channel = Arc::new(InProcessProvider::new(engine.clone(), clock.clone()));
 

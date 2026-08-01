@@ -58,7 +58,13 @@ fn harness_with_policy(policy: Arc<dyn ProviderAdmissionPolicy>) -> Harness {
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .expect("engine");
+    .expect("engine")
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
     Harness {
         engine,
         facilitator,
@@ -725,7 +731,13 @@ async fn overpayment_is_an_exception_for_provider_policy_not_a_serve() {
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .unwrap();
+    .unwrap()
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
 
     let quote = engine
         .issue_quote(
@@ -781,7 +793,13 @@ async fn overpayment_retry_via_re_verify_never_auto_bills() {
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .unwrap();
+    .unwrap()
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
 
     let quote = engine
         .issue_quote(
@@ -928,6 +946,12 @@ async fn a_crashed_in_flight_claim_is_reclaimable_after_the_ttl() {
             dir.path().join("engine.json"),
         )
         .unwrap()
+        // These tests redeem without presenting a binding: redemption is
+        // setup for what they actually assert, not the subject. The
+        // engine now requires the binding by default, so they opt out
+        // explicitly — `lifecycle_modes` carries the tests that cover the
+        // requirement itself.
+        .with_require_invocation_binding(false)
         .with_in_flight_ttl_ns(1000),
     );
 
@@ -1017,6 +1041,12 @@ async fn a_lost_billing_append_is_recovered_on_retry() {
         dir.path().join("engine.json"),
     )
     .unwrap()
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false)
     .with_billing_log(billing_log.clone());
 
     let quote = engine
@@ -1554,11 +1584,74 @@ async fn requiring_the_binding_refuses_bearer_redemption() {
     assert_eq!(admitted, RedeemDecision::Admitted);
 }
 
-/// The default stays bearer-compatible: a provider that has not opted in
-/// still admits a binding-free redemption, so callers written before the
-/// binding existed keep working.
+/// The requirement is **on by default**: a freshly-constructed engine
+/// refuses a redemption that presents no binding.
+///
+/// Bearer redemption is the exposure, so it is not the default posture.
+/// This is the assertion that would break if someone flipped the default
+/// back for convenience.
 #[tokio::test]
-async fn the_binding_requirement_is_opt_in() {
+async fn the_binding_requirement_is_on_by_default() {
+    let provider = Arc::new(EntityKeypair::generate());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caller = EntityKeypair::generate();
+    // Deliberately NOT the shared harness: that one opts out, because its
+    // tests are about the lifecycle rather than the binding.
+    let engine = PaymentEngine::new(
+        provider.clone(),
+        Arc::new(MockFacilitator::new()),
+        Arc::new(AdmitAll),
+        default_mock_registry(provider.entity_id().clone()),
+        dir.path().join("engine.json"),
+    )
+    .expect("engine");
+
+    let quote = engine
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
+        .expect("quote");
+    let payload = payload_for(&quote, "payer-1");
+    engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .expect("engine");
+
+    let tool = CAPABILITY.split_once('/').expect("capability").1;
+    assert_eq!(
+        engine
+            .redeem_for_invocation(tool, &quote.quote_id, None)
+            .await
+            .expect("engine"),
+        RedeemDecision::Denied {
+            reason: RedeemDenialReason::BindingRequired
+        },
+        "a default engine must not admit a bearer redemption"
+    );
+
+    // The payer's binding still admits, so the default is a requirement
+    // rather than a wall.
+    let sig = caller
+        .try_sign(&invocation_binding_transcript(&quote.quote_id, tool))
+        .expect("sign");
+    assert_eq!(
+        engine
+            .redeem_for_invocation(tool, &quote.quote_id, Some(&sig.to_bytes()))
+            .await
+            .expect("engine"),
+        RedeemDecision::Admitted
+    );
+}
+
+/// The requirement can be turned off for a deployment whose callers
+/// predate the binding — the documented compatibility path, and the one
+/// this file's harness uses.
+#[tokio::test]
+async fn the_binding_requirement_can_be_disabled() {
     let h = harness();
     let quote = h.quote("2500");
     let payload = payload_for(&quote, "payer-1");
@@ -1574,6 +1667,6 @@ async fn the_binding_requirement_is_opt_in() {
             .await
             .expect("engine"),
         RedeemDecision::Admitted,
-        "the default must stay bearer-compatible"
+        "the opt-out must still admit a bearer redemption"
     );
 }

@@ -47,7 +47,13 @@ async fn settled_world(required_tier: VerificationTier) -> (World, PaymentDecisi
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .expect("engine");
+    .expect("engine")
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
 
     let requirements = X402Carry::author(&PaymentRequirements {
         scheme: MOCK_SCHEME.into(),
@@ -434,7 +440,13 @@ async fn the_recorded_settle_payer_reaches_the_checker_when_the_payload_names_no
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .expect("engine");
+    .expect("engine")
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
 
     let requirements = X402Carry::author(&PaymentRequirements {
         scheme: MOCK_SCHEME.into(),
@@ -526,7 +538,13 @@ async fn an_injected_nonce_does_not_override_the_provider_invoice_off_evm() {
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .expect("engine");
+    .expect("engine")
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
 
     // The provider authors an invoiceId in requirements.extra (exact-XRPL's
     // vocabulary); MOCK_NETWORK is not eip155.
@@ -631,7 +649,13 @@ async fn accept_eip155_inner(
         default_registry_v1(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .expect("engine");
+    .expect("engine")
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
     let requirements = X402Carry::author(&PaymentRequirements {
         scheme: "exact".into(),
         network: BASE_SEPOLIA.into(),

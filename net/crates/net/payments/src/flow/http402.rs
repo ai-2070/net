@@ -113,8 +113,19 @@ pub struct X402HttpFlow {
     /// provider-side idempotency: it is documented that one `fetch_paid`
     /// is one attempt. Two attempts are two payments and must be two
     /// reservations.
-    attempt: std::sync::atomic::AtomicU64,
+    ///
+    /// **Process-global, not per-flow.** Two `X402HttpFlow` values over
+    /// the same spend store would each start at zero, so their first
+    /// fetches would collide again under a stopped clock — the same bug
+    /// one scope out. Nothing about the counter is per-instance, so it
+    /// does not belong to an instance.
+    attempt: &'static std::sync::atomic::AtomicU64,
 }
+
+/// See [`X402HttpFlow::attempt`]. One counter per process, because two
+/// flows sharing a spend store must not mint the same reservation
+/// identity.
+static ATTEMPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl X402HttpFlow {
     pub fn new(
@@ -184,7 +195,7 @@ impl X402HttpFlow {
             clock,
             http,
             destinations,
-            attempt: std::sync::atomic::AtomicU64::new(0),
+            attempt: &ATTEMPT_SEQ,
         })
     }
 

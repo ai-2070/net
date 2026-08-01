@@ -233,8 +233,19 @@ pub struct MeshPaymentChannel {
     /// a replay. A counter cannot repeat within a process, and a
     /// transport-level retransmit re-sends the already-serialized request
     /// rather than re-deriving, so retry idempotency is unaffected.
-    request_seq: std::sync::atomic::AtomicU64,
+    ///
+    /// **Process-global, not per-channel.** Two channels for the same
+    /// caller would each start at zero, so under a stopped clock their
+    /// first requests derive one nonce and the provider refuses the
+    /// second as a replay — the same collision one scope out. The
+    /// counter's job is to be unique within the process, so it lives
+    /// there.
+    request_seq: &'static std::sync::atomic::AtomicU64,
 }
+
+/// See [`MeshPaymentChannel::request_seq`]. One counter per process, so
+/// two channels for one caller cannot derive the same nonce.
+static REQUEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl MeshPaymentChannel {
     pub fn new(mesh: Arc<Mesh>, caller: Arc<EntityKeypair>, clock: Arc<dyn Clock>) -> Self {
@@ -242,7 +253,7 @@ impl MeshPaymentChannel {
             mesh,
             caller,
             clock,
-            request_seq: std::sync::atomic::AtomicU64::new(0),
+            request_seq: &REQUEST_SEQ,
         }
     }
 

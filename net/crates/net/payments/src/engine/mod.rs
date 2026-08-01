@@ -661,7 +661,7 @@ impl PaymentEngine {
             in_flight_ttl_ns: 300_000_000_000,
             terminal_record_retention_ns: Some(DEFAULT_TERMINAL_RECORD_RETENTION_NS),
             billing_log: None,
-            require_invocation_binding: false,
+            require_invocation_binding: true,
         })
     }
 
@@ -753,10 +753,14 @@ impl PaymentEngine {
     /// it. Do not document this flag as protection against an on-path
     /// observer.
     ///
-    /// Defaults to `false` for compatibility with callers written before
-    /// the binding existed. New deployments should turn it on; a caller
-    /// built on [`crate::flow::CallerPaymentFlow`] always signs one when
-    /// its identity can sign.
+    /// **Defaults to `true`.** Bearer redemption is the exposure, so it
+    /// is not the default posture — a provider that wants it has to ask,
+    /// and the asking is visible at the call site.
+    ///
+    /// Pass `false` only for a deployment whose callers predate the
+    /// binding. A caller built on [`crate::flow::CallerPaymentFlow`]
+    /// always signs one when its identity can sign, so that set is small
+    /// and shrinking.
     pub fn with_require_invocation_binding(mut self, require: bool) -> Self {
         self.require_invocation_binding = require;
         self

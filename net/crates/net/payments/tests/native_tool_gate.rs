@@ -71,7 +71,13 @@ async fn the_engine_gate_redeems_a_paid_quote_exactly_once() {
             default_mock_registry(provider.entity_id().clone()),
             dir.path().join("engine.json"),
         )
-        .expect("engine"),
+        .expect("engine")
+        // These tests redeem without presenting a binding: redemption is
+        // setup for what they actually assert, not the subject. The
+        // engine now requires the binding by default, so they opt out
+        // explicitly — `lifecycle_modes` carries the tests that cover the
+        // requirement itself.
+        .with_require_invocation_binding(false),
     );
     let quote_id = paid_quote_id(&engine, &caller).await;
     let gate = EngineToolPaymentGate::new(engine.clone());
@@ -135,7 +141,13 @@ async fn a_store_failure_fails_closed_without_leaking_internal_detail() {
             default_mock_registry(provider.entity_id().clone()),
             state_path.clone(),
         )
-        .expect("engine"),
+        .expect("engine")
+        // These tests redeem without presenting a binding: redemption is
+        // setup for what they actually assert, not the subject. The
+        // engine now requires the binding by default, so they opt out
+        // explicitly — `lifecycle_modes` carries the tests that cover the
+        // requirement itself.
+        .with_require_invocation_binding(false),
     );
     let quote_id = paid_quote_id(&engine, &caller).await;
     let gate = EngineToolPaymentGate::new(engine.clone());
@@ -253,7 +265,13 @@ fn a_redeem_denial_emits_the_typed_tracing_fields() {
                     default_mock_registry(provider.entity_id().clone()),
                     dir.path().join("engine.json"),
                 )
-                .expect("engine"),
+                .expect("engine")
+                // These tests redeem without presenting a binding: redemption is
+                // setup for what they actually assert, not the subject. The
+                // engine now requires the binding by default, so they opt out
+                // explicitly — `lifecycle_modes` carries the tests that cover the
+                // requirement itself.
+                .with_require_invocation_binding(false),
             );
             let gate = EngineToolPaymentGate::new(engine);
             let err = gate
