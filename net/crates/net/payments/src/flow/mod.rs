@@ -288,6 +288,28 @@ pub(crate) async fn redeem_via_engine(
     }
 }
 
+/// A short, **non-authorizing** reference to a quote, for logs.
+///
+/// A quote id is a credential, not just an identifier: with bearer
+/// redemption enabled (no invocation binding presented), possession of
+/// the id is sufficient to consume the paid invocation — see
+/// [`crate::engine::PaymentEngine::redeem_for_invocation`]. Logging it
+/// in full puts a spendable credential in every log sink that scrapes
+/// the process, and the sites that log it are failure paths, where the
+/// quote is most likely to still be unredeemed.
+///
+/// Operators reading these lines need to *correlate* events, not to
+/// reconstruct the id, so they get a truncated hash instead. The domain
+/// separator keeps this from colliding with any other blake3 use in the
+/// crate; 8 bytes is ample to correlate within one process's logs and
+/// far too short to invert into a 32-byte transcript hash.
+pub(crate) fn quote_ref(quote_id: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"net.payments.log_ref@1");
+    hasher.update(quote_id.as_bytes());
+    hex::encode(&hasher.finalize().as_bytes()[..8])
+}
+
 /// Time source. There is no global clock — every timestamp in the flow
 /// comes from here, and tests inject fixed instants.
 pub trait Clock: Send + Sync {
@@ -751,14 +773,14 @@ impl CallerPaymentFlow {
                     }
                     Ok(_) => {
                         tracing::warn!(
-                            quote = %quote.quote_id,
+                            quote_ref = %quote_ref(&quote.quote_id),
                             "provider billing event does not bind this quote/caller/provider — dropped from proof"
                         );
                         serde_json::Value::Null
                     }
                     Err(e) => {
                         tracing::warn!(
-                            quote = %quote.quote_id,
+                            quote_ref = %quote_ref(&quote.quote_id),
                             error = %e,
                             "provider billing event failed verification — dropped from proof"
                         );
@@ -926,7 +948,7 @@ impl CallerPaymentFlow {
     /// over-counts the day budget (fail-closed direction).
     async fn release(&self, quote: &PaymentQuote, now_ns: u64) {
         if let Err(e) = self.spend.release_reservation(quote, now_ns).await {
-            tracing::warn!(quote = %quote.quote_id, error = %e, "spend reservation release failed");
+            tracing::warn!(quote_ref = %quote_ref(&quote.quote_id), error = %e, "spend reservation release failed");
         }
     }
 }

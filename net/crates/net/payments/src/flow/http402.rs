@@ -459,7 +459,7 @@ impl X402HttpFlow {
 
     async fn release(&self, quote: &PaymentQuote, now_ns: u64) {
         if let Err(e) = self.spend.release_reservation(quote, now_ns).await {
-            tracing::warn!(quote = %quote.quote_id, error = %e, "spend reservation release failed");
+            tracing::warn!(quote_ref = %super::quote_ref(&quote.quote_id), error = %e, "spend reservation release failed");
         }
     }
 }
