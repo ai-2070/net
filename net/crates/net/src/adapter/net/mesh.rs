@@ -2879,7 +2879,10 @@ impl MembershipFailure {
 fn evict_failed_peer_channel_state(
     node_id: u64,
     subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
-    #[cfg(feature = "cortex")] rpc_reply_subscriptions: &dashmap::DashMap<(u64, u64), ReplySubscription>,
+    #[cfg(feature = "cortex")] rpc_reply_subscriptions: &dashmap::DashMap<
+        (u64, u64),
+        ReplySubscription,
+    >,
     #[cfg(feature = "cortex")] rpc_corrective_announced: &dashmap::DashSet<u64>,
     #[cfg(feature = "cortex")] rpc_peer_failure_gen: &PeerFailureGenerations,
 ) {

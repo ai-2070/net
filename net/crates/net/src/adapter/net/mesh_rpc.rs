@@ -5664,11 +5664,11 @@ impl MeshNode {
                             // past MAX_REPLY_SUBSCRIPTIONS during a concurrent insert
                             // race is bounded by the number of concurrent callers,
                             // which operators tune separately.
-        // A missing snapshot means no attempt reported success, which the
-        // `last_err` return above already covers — so this is
-        // unreachable. Checked BEFORE the insert so the unreachable case
-        // cannot cache anything: the one thing this block must never do
-        // is leave a cache entry standing that nothing verified.
+                            // A missing snapshot means no attempt reported success, which the
+                            // `last_err` return above already covers — so this is
+                            // unreachable. Checked BEFORE the insert so the unreachable case
+                            // cannot cache anything: the one thing this block must never do
+                            // is leave a cache entry standing that nothing verified.
         let Some(gen_before) = gen_before else {
             return Err(RpcError::NoRoute {
                 target: target_node_id,
@@ -6484,11 +6484,17 @@ mod origin_cache_tests {
         // Same target, different services → distinct entries.
         registry.insert(
             (0xAA, h_a),
-            ReplySubscription { service: Arc::from("svc-a"), written_at_generation: 0 },
+            ReplySubscription {
+                service: Arc::from("svc-a"),
+                written_at_generation: 0,
+            },
         );
         registry.insert(
             (0xAA, h_b),
-            ReplySubscription { service: Arc::from("svc-b"), written_at_generation: 0 },
+            ReplySubscription {
+                service: Arc::from("svc-b"),
+                written_at_generation: 0,
+            },
         );
         assert!(super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-a"
@@ -6502,7 +6508,10 @@ mod origin_cache_tests {
         ));
         registry.insert(
             (0xBB, h_a),
-            ReplySubscription { service: Arc::from("svc-a"), written_at_generation: 0 },
+            ReplySubscription {
+                service: Arc::from("svc-a"),
+                written_at_generation: 0,
+            },
         );
         assert!(super::reply_subscription_covers(
             &registry, 0xBB, h_a, "svc-a"
@@ -6511,7 +6520,10 @@ mod origin_cache_tests {
         // value; the fast path keeps answering true.
         registry.insert(
             (0xAA, h_a),
-            ReplySubscription { service: Arc::from("svc-a"), written_at_generation: 0 },
+            ReplySubscription {
+                service: Arc::from("svc-a"),
+                written_at_generation: 0,
+            },
         );
         assert!(super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-a"
@@ -6533,7 +6545,10 @@ mod origin_cache_tests {
         // silently true for both.
         registry.insert(
             (0xAA, h_a),
-            ReplySubscription { service: Arc::from("svc-evil"), written_at_generation: 0 },
+            ReplySubscription {
+                service: Arc::from("svc-evil"),
+                written_at_generation: 0,
+            },
         );
         assert!(super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-evil"
