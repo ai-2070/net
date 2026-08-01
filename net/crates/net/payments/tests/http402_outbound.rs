@@ -186,11 +186,15 @@ fn http_response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> String 
 fn flow(profile: SpendProfile, dir: &tempfile::TempDir) -> X402HttpFlow {
     let caller = Arc::new(EntityKeypair::generate());
     let registry = default_mock_registry(caller.entity_id().clone());
-    X402HttpFlow::new(
+    // These servers bind loopback, which the default policy now refuses:
+    // an agent-supplied URL should not reach local admin surfaces, so
+    // local testing opts in rather than out.
+    X402HttpFlow::with_destination_policy(
         caller,
         SpendPolicyEngine::new(dir.path().join("spend.json"), profile),
         registry,
         Arc::new(TestClock),
+        net_payments::http_policy::DestinationPolicy::PublicOrLoopback,
     )
     .expect("flow")
 }
@@ -388,11 +392,13 @@ async fn solana_flow(
         },
     ));
 
-    let flow = X402HttpFlow::new(
+    let flow = X402HttpFlow::with_destination_policy(
         caller,
         SpendPolicyEngine::new(&spend_path, SpendProfile::Production),
         registry,
         Arc::new(TestClock),
+        // Loopback test server: opt in, since the default now refuses it.
+        net_payments::http_policy::DestinationPolicy::PublicOrLoopback,
     )
     .expect("flow")
     .with_signer("solana", signer);
@@ -513,11 +519,13 @@ async fn the_per_host_spend_override_binds_despite_the_port() {
 
     let caller = Arc::new(EntityKeypair::generate());
     let registry = default_mock_registry(caller.entity_id().clone());
-    let f = X402HttpFlow::new(
+    let f = X402HttpFlow::with_destination_policy(
         caller,
         SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest),
         registry,
         Arc::new(TestClock),
+        // Loopback test server: opt in, since the default now refuses it.
+        net_payments::http_policy::DestinationPolicy::PublicOrLoopback,
     )
     .expect("flow");
 
@@ -667,11 +675,13 @@ async fn repeated_paid_fetches_each_consume_budget_under_a_stopped_clock() {
     let registry = default_mock_registry(caller.entity_id().clone());
     // `TestClock` returns a constant — exactly the case that used to
     // collapse two payments into one reservation.
-    let f = X402HttpFlow::new(
+    let f = X402HttpFlow::with_destination_policy(
         caller,
         SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest),
         registry,
         Arc::new(TestClock),
+        // Loopback test server: opt in, since the default now refuses it.
+        net_payments::http_policy::DestinationPolicy::PublicOrLoopback,
     )
     .expect("flow");
 

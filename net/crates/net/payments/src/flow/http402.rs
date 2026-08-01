@@ -128,17 +128,22 @@ impl X402HttpFlow {
             spend,
             registry,
             clock,
-            // Default: public unicast plus loopback. This is the one
-            // money-path client whose URL may be chosen by a model rather
-            // than an operator, so the SSRF-shaped ranges — link-local
-            // (including the cloud metadata address), private/LAN,
-            // carrier-NAT, reserved — are refused by default. Loopback
-            // stays admitted because the local-testing path is documented
-            // and `is_payment_safe_url` already allows http to it.
+            // Default: public unicast only.
             //
-            // A host that passes agent-supplied URLs straight through
-            // should tighten this to `PublicOnly`.
-            crate::http_policy::DestinationPolicy::PublicOrLoopback,
+            // This is the one money-path client whose URL may be chosen
+            // by a model rather than an operator, so it gets the
+            // strictest policy and local testing opts *in* rather than
+            // out. Loopback was admitted here at first, on the reasoning
+            // that `is_payment_safe_url` already allows http to it — but
+            // that rule is about not putting a bearer authorization on
+            // the wire in the clear, which is a different question from
+            // what an agent-supplied URL should be allowed to reach.
+            // Loopback is where admin surfaces live.
+            //
+            // A local or self-hosted x402 server is reached by asking for
+            // it: `with_destination_policy(PublicOrLoopback)`, or
+            // `AllowPrivate` for a LAN node.
+            crate::http_policy::DestinationPolicy::PublicOnly,
         )
     }
 
@@ -462,8 +467,27 @@ impl X402HttpFlow {
         {
             Ok(r) => r,
             Err(e) => {
-                // Transport ambiguity after sending a payment: the
-                // reservation stands (fail-closed accounting).
+                // A destination-policy refusal is the one send failure
+                // that provably happened BEFORE anything left: it is
+                // raised inside the resolver, so no connection was made
+                // and no authorization was transmitted. Releasing is
+                // therefore correct rather than optimistic — and NOT
+                // releasing would let a permanent denial, which a caller
+                // may hit repeatedly on the same URL, eat the day's
+                // budget a fetch at a time.
+                //
+                // Every other send failure stays ambiguous: the payment
+                // may have landed, so the reservation stands (fail-closed
+                // accounting).
+                if crate::http_policy::is_policy_refusal(&e) {
+                    self.release(&quote, now_ns).await;
+                    return X402HttpOutcome::Denied {
+                        policy_reason: format!(
+                            "destination policy refused the paid retry (admits {}): {e}",
+                            self.destinations.describe()
+                        ),
+                    };
+                }
                 return X402HttpOutcome::Failed {
                     message: e.to_string(),
                     retryable: e.is_timeout() || e.is_connect(),

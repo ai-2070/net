@@ -228,6 +228,13 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         || (first & 0xffc0) == 0xfec0   // fec0::/10 site local (deprecated,
                                         // still routable on many stacks)
         || (first == 0x2001 && (s[1] & 0xff00) == 0x0d00) // 2001:db8::/32 doc
+        || (first == 0x2001 && s[1] == 0x0002)            // 2001:2::/48 benchmarking
+        // 64:ff9b::/96 well-known NAT64 and 64:ff9b:1::/48 local-use
+        // translation. Both carry an embedded IPv4 destination, so a
+        // translating host turns them into a v4 reach — including into
+        // the private ranges the v4 rules refuse. Left admitted, they are
+        // a way round every guard above.
+        || (first == 0x0064 && s[1] == 0xff9b)
         || first == 0x0100) // 100::/64  discard-only
 }
 
