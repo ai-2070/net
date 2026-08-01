@@ -345,7 +345,8 @@ pub struct MeshBlobAdapter {
     /// Optional auth guard used by [`Self::pin_authorized`] /
     /// [`Self::unpin_authorized`] / [`Self::delete_chunk_authorized`]
     /// to gate peer-initiated pin / unpin / delete ops against the
-    /// publishing chain's `(origin_hash, ChannelName)` ACL. `None`
+    /// publishing chain's `(AclPrincipal::Origin, ChannelName)` ACL.
+    /// `None`
     /// (the default) leaves the `*_authorized` variants as a
     /// misconfiguration — the unauth `pin` / `unpin` / `delete_chunk`
     /// variants are still reachable for system-internal callers
@@ -627,8 +628,8 @@ impl MeshBlobAdapter {
     /// Wire an [`AuthGuard`] handle so the `*_authorized` variants
     /// of [`Self::pin`] / [`Self::unpin`] / [`Self::delete_chunk`]
     /// can gate peer-initiated ops against the publishing chain's
-    /// `(origin_hash, ChannelName)` ACL. The unauth variants stay
-    /// reachable for system-internal callers (GC sweep,
+    /// `(AclPrincipal::Origin, ChannelName)` ACL. The unauth variants
+    /// stay reachable for system-internal callers (GC sweep,
     /// chain-fold-driven refcount maintenance).
     pub fn with_auth_guard(mut self, guard: Arc<AuthGuard>) -> Self {
         self.auth_guard = Some(guard);
@@ -954,7 +955,19 @@ impl MeshBlobAdapter {
 
     /// Pin `hash` against GC, gated by an
     /// [`AuthGuard::is_authorized_full`] check on
-    /// `(origin_hash, channel)`. Returns
+    /// `(operator, channel)`.
+    ///
+    /// `operator` MUST be an [`AclPrincipal::Origin`] carrying the
+    /// caller's `EntityId::origin_hash`. An [`AclPrincipal::Node`] is
+    /// rejected outright rather than looked up and missed — the
+    /// subscribe path grants exactly `Node(node_id)`, so accepting one
+    /// here would let "this peer subscribed to a channel" authorize
+    /// "this peer may mutate that channel's blobs". See
+    /// [`auth_allows_blob_op`] for the full argument; a future
+    /// network-facing call site that resolves its caller by node id must
+    /// convert to an origin rather than pass the node id through.
+    ///
+    /// Returns
     /// [`BlobError::Backend`] if the adapter has no guard
     /// configured (operator misconfiguration on the peer-facing
     /// path) or if the caller is not authorized for `channel`.
@@ -979,7 +992,8 @@ impl MeshBlobAdapter {
 
     /// Unpin `hash`, gated by an
     /// [`AuthGuard::is_authorized_full`] check on
-    /// `(origin_hash, channel)`. Returns
+    /// `(operator, channel)`. `operator` must be an
+    /// [`AclPrincipal::Origin`] — see [`Self::pin_authorized`]. Returns
     /// [`BlobError::Backend`] if no guard is configured or the
     /// caller is not authorized.
     pub fn unpin_authorized(
@@ -999,7 +1013,8 @@ impl MeshBlobAdapter {
 
     /// Delete a single chunk file by content hash, gated by an
     /// [`AuthGuard::is_authorized_full`] check on
-    /// `(origin_hash, channel)`. Mirrors
+    /// `(operator, channel)`. `operator` must be an
+    /// [`AclPrincipal::Origin`] — see [`Self::pin_authorized`]. Mirrors
     /// [`Self::delete_chunk`] on the success path; returns a typed
     /// `BlobError::Backend` if no guard is configured or the
     /// caller is not authorized.
@@ -2887,9 +2902,10 @@ impl MeshBlobAdapter {
     /// Mirrors the [`Self::pin_authorized`] / [`Self::unpin_authorized`]
     /// / [`Self::delete_chunk_authorized`] pattern: the adapter must
     /// have an [`AuthGuard`] configured, and the caller must be
-    /// authorized for `(origin_hash, channel)` per
-    /// [`auth_allows_blob_op`]. Returns [`BlobError::Unauthorized`]
-    /// on either failure.
+    /// authorized for `(operator, channel)` per
+    /// [`auth_allows_blob_op`], with `operator` an
+    /// [`AclPrincipal::Origin`] — see [`Self::pin_authorized`]. Returns
+    /// [`BlobError::Unauthorized`] on either failure.
     ///
     /// This is the peer-initiated / network-exposed repair entry.
     /// `repair_blob` walks the entire tree, fetches every chunk,

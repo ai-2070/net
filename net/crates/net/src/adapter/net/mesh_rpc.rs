@@ -5459,7 +5459,16 @@ impl MeshNode {
         // and the failure path evicts this registry — but it can only
         // evict entries that exist when it runs, and ours does not exist
         // yet. See `peer_failure_generation`.
-        let gen_before = self.peer_failure_generation(target_node_id);
+        //
+        // Re-taken per ATTEMPT below, not once for the whole loop. A
+        // failure between attempts is precisely what the retry recovers
+        // from, so comparing a later SUCCESSFUL subscribe against a
+        // pre-failure snapshot would discard a valid cache entry and
+        // report `NoRoute` for a call that had just succeeded — turning
+        // the self-healing R5 exists to provide back into the permanent
+        // failure it replaced. Only the snapshot belonging to the
+        // attempt that succeeded is meaningful.
+        let mut gen_before = self.peer_failure_generation(target_node_id);
         // Cap the registry. `len()` on DashMap is approximate under
         // concurrent churn (it sums shard counts under shard reads,
         // not a global lock), which is exactly the semantics we
@@ -5499,6 +5508,7 @@ impl MeshNode {
         // unchanged: one attempt, no announce, no sleep.
         let mut last_err = None;
         for attempt in 0..REPLY_SUBSCRIBE_ATTEMPTS {
+            gen_before = self.peer_failure_generation(target_node_id);
             match self
                 .subscribe_channel_reporting_reason(target_node_id, reply_channel.clone())
                 .await
@@ -5630,9 +5640,11 @@ impl MeshNode {
                             // which operators tune separately.
         registry.insert((target_node_id, service_hash), Arc::from(service));
 
-        // Fence. If the target's session failed at any point since the
-        // snapshot, the eviction that ran for it could not have removed
-        // the entry we only just inserted, so remove it ourselves. The
+        // Fence. If the target's session failed since the snapshot taken
+        // before the SUCCEEDING subscribe attempt, the eviction that ran
+        // for it could not have removed the entry we only just inserted,
+        // so remove it ourselves. Failures before that attempt are not
+        // our concern — the retry already recovered from them. The
         // subscribe we performed is void either way — the target dropped
         // its whole roster on failure — and leaving the entry behind
         // would make every subsequent call skip the re-subscribe and

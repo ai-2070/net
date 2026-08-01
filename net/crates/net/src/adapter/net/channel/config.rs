@@ -762,29 +762,49 @@ impl ChannelConfigRegistry {
     /// A caller with no registry (possible via the bare `MeshNode::new`
     /// path) simply has no channel ACLs in play and does not call this.
     ///
-    /// **All or nothing.** Both names are constructed and validated
-    /// before either config is installed. They are not the same length —
-    /// `.replies.prefix` is 7 bytes longer than `.requests` — so a
-    /// service name near [`MAX_NAME_LEN`] can yield a valid request
-    /// channel and an invalid reply sentinel. Installing the half that
-    /// fits would be the worst outcome available: the request channel
-    /// looks deliberately configured while replies silently fall through
-    /// to the registry's unregistered-channel policy, unbound, which is
-    /// exactly the H3 posture this function exists to close.
+    /// **All or nothing**, and validated against the names callers will
+    /// actually use.
     ///
-    /// So an unrepresentable `service` installs nothing, and both
-    /// channels are then governed by that policy together — visibly, and
-    /// consistently with each other.
+    /// Three names are in play and none of them is the same length:
     ///
-    /// [`MAX_NAME_LEN`]: super::name::MAX_NAME_LEN
+    /// | name | suffix bytes |
+    /// |---|---|
+    /// | `<service>.requests` | 9 |
+    /// | `<service>.replies.prefix` (sentinel) | 15 |
+    /// | `<service>.replies.<16 hex>` (real) | 25 |
+    ///
+    /// So there are two bands near the channel-name length limit where a
+    /// naive implementation half-succeeds, and they fail differently:
+    ///
+    /// - Request fits, sentinel does not. Installing the half that fits
+    ///   leaves the request channel looking deliberately configured
+    ///   while replies fall through to the unregistered-channel policy,
+    ///   unbound — the H3 posture, reached by accident.
+    /// - Both fit, but no REAL reply channel does. Everything looks
+    ///   installed, and then no caller can ever name a reply channel
+    ///   that validates, so calls hang until they time out. Checking the
+    ///   sentinel does not catch this: it is 10 bytes shorter than the
+    ///   thing it stands for.
+    ///
+    /// Hence the concrete probe below. The sentinel is still what gets
+    /// STORED — it must stay unroutable — but what gets VALIDATED is a
+    /// real per-caller name.
     pub fn install_rpc_service_defaults(&self, service: &str) {
         let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) else {
             return;
         };
+        // Probe, not a channel: every origin hash renders as exactly 16
+        // hex digits, so any value answers "does a per-caller reply
+        // channel fit under this service name?" for all of them.
+        if ChannelName::new(&format!("{service}.replies.{:016x}", 0u64)).is_err() {
+            return;
+        }
         // The sentinel name is never routed — it exists so the prefix
         // entry has a `ChannelId` to carry. Token gates on a prefix
         // entry evaluate against the requested CONCRETE channel (M1),
-        // not this.
+        // not this. Kept deliberately unroutable rather than reusing the
+        // probe: `<service>.replies.0000000000000000` is a name a real
+        // caller could hold, and a sentinel should not collide with one.
         let Ok(sentinel) = ChannelName::new(&format!("{service}.replies.prefix")) else {
             return;
         };
@@ -2462,51 +2482,104 @@ mod tests {
     /// NOTHING — not a half-configured pair where the requests channel
     /// exists and the reply prefix does not.
     ///
-    /// The LENGTH case is the one that matters and the one an
-    /// invalid-character name does not reach: the two suffixes differ in
-    /// size (`.replies.prefix` is 7 bytes longer than `.requests`), so
-    /// there is a band of service-name lengths where the request channel
-    /// validates and the reply sentinel does not. A character-invalid
-    /// name fails both and would pass this test against a
-    /// half-installing implementation.
+    /// The LENGTH cases are the ones that matter and the ones an
+    /// invalid-character name does not reach. There are TWO of them,
+    /// because the three names involved are three different lengths —
+    /// `.requests` is 9 bytes, the `.replies.prefix` sentinel is 15, and
+    /// a real `.replies.<16 hex>` is 25:
     ///
-    /// Installing only the request half is the worst available outcome:
-    /// it looks deliberately configured while replies fall through to
-    /// the unregistered-channel policy with no origin binding — the H3
-    /// posture, reached by accident.
+    /// - request fits, sentinel does not;
+    /// - both fit, but no real per-caller reply channel does.
+    ///
+    /// The second is the one a sentinel-based check misses, and it fails
+    /// worse than a visible refusal: everything looks installed, and
+    /// then every call hangs until it times out because no caller can
+    /// name a reply channel that validates.
+    ///
+    /// A character-invalid name fails all three and would pass this test
+    /// against an implementation that got either band wrong, which is
+    /// why the bands are enumerated explicitly with preconditions.
     #[test]
     fn rpc_service_defaults_install_nothing_for_an_unrepresentable_name() {
         use super::super::name::MAX_NAME_LEN;
 
-        // Sits in the band: `<service>.requests` fits, and
-        // `<service>.replies.prefix` is 7 bytes past the limit.
-        let near_limit = "s".repeat(MAX_NAME_LEN - ".requests".len());
+        // Band 1: request fits, sentinel does not.
+        let no_sentinel = "s".repeat(MAX_NAME_LEN - ".requests".len());
+        assert!(ChannelName::new(&format!("{no_sentinel}.requests")).is_ok());
         assert!(
-            ChannelName::new(&format!("{near_limit}.requests")).is_ok(),
-            "precondition: the request channel is representable…"
-        );
-        assert!(
-            ChannelName::new(&format!("{near_limit}.replies.prefix")).is_err(),
-            "…and the reply sentinel is not — otherwise this test proves nothing"
+            ChannelName::new(&format!("{no_sentinel}.replies.prefix")).is_err(),
+            "precondition: band 1 must have an unrepresentable sentinel"
         );
 
-        for service in [near_limit.as_str(), "bad name#with/invalid chars"] {
+        // Band 2: request AND sentinel fit; a real reply channel does not.
+        let no_real_reply = "s".repeat(MAX_NAME_LEN - ".replies.prefix".len());
+        assert!(ChannelName::new(&format!("{no_real_reply}.requests")).is_ok());
+        assert!(
+            ChannelName::new(&format!("{no_real_reply}.replies.prefix")).is_ok(),
+            "precondition: band 2's sentinel must VALIDATE — that is what \
+             makes checking the sentinel insufficient"
+        );
+        assert!(
+            ChannelName::new(&format!("{no_real_reply}.replies.{:016x}", 0u64)).is_err(),
+            "precondition: …while no real per-caller reply channel fits"
+        );
+
+        for (band, service) in [
+            ("no sentinel", no_sentinel.as_str()),
+            ("no real reply channel", no_real_reply.as_str()),
+            ("invalid characters", "bad name#with/invalid chars"),
+        ] {
             let reg = ChannelConfigRegistry::new();
             reg.install_rpc_service_defaults(service);
             assert_eq!(
                 reg.len(),
                 0,
-                "installed a request channel with no reply prefix to match it \
-                 (service len {})",
+                "[{band}] installed a request channel the reply side cannot \
+                 match (service len {})",
                 service.len()
             );
             assert_eq!(
                 reg.snapshot_prefixes().len(),
                 0,
-                "installed a reply prefix with no request channel (service len {})",
+                "[{band}] installed a reply prefix no caller can ever use \
+                 (service len {})",
                 service.len()
             );
         }
+    }
+
+    /// The largest service name that IS fully usable must still install.
+    ///
+    /// Paired with the refusal test above so the boundary is pinned from
+    /// both sides — a validator that is too strict silently stops
+    /// configuring services that work, which no test asserting "installs
+    /// nothing" would ever catch.
+    #[test]
+    fn rpc_service_defaults_install_at_the_longest_usable_service_name() {
+        use super::super::name::MAX_NAME_LEN;
+
+        let longest = "s".repeat(MAX_NAME_LEN - ".replies.0123456789abcdef".len());
+        let reg = ChannelConfigRegistry::new();
+        reg.install_rpc_service_defaults(&longest);
+
+        assert!(
+            reg.get_by_name(&format!("{longest}.requests")).is_some(),
+            "the longest fully-usable service name must still get its request \
+             channel"
+        );
+        let reply = format!("{longest}.replies.{:016x}", u64::MAX);
+        assert_eq!(
+            ChannelName::new(&reply).map(|_| ()),
+            Ok(()),
+            "precondition: this is the longest name where a real reply \
+             channel still fits"
+        );
+        assert_eq!(
+            reg.get_by_name(&reply)
+                .expect("the reply prefix must resolve it")
+                .subscriber_origin_binding,
+            Some(OriginBinding::OriginHashHex16)
+        );
     }
 
     // ---- H2 (2026-07-31 audit): install-if-absent must not clobber ----
