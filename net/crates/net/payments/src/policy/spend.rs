@@ -200,6 +200,31 @@ pub struct Reservation {
     pub asset: String,
     /// Atomic units reserved.
     pub amount: AtomicAmount,
+    /// How many attempts currently hold this reservation.
+    ///
+    /// A reservation is an **in-flight claim**, not merely a record that
+    /// one was taken once. Two attempts at the same quote — a retry
+    /// racing the original, two flows sharing the policy file — both see
+    /// the reservation and are both allowed, because the budget for that
+    /// quote is already committed. Releasing on the first failure would
+    /// then hand back budget the other attempt is still spending
+    /// against, and remove the record that makes it a retry at all: the
+    /// next attempt reserves afresh and `max_per_day` has been reopened
+    /// by an attempt that failed.
+    ///
+    /// So the count rises on each attempt and falls on each release, and
+    /// only the last release returns the amount to the counter. A
+    /// process that dies mid-attempt leaks a claim, which holds budget —
+    /// the fail-closed direction.
+    ///
+    /// Defaulted to 1 for stores written before this field existed: one
+    /// recorded reservation, one holder.
+    #[serde(default = "one_holder")]
+    pub holders: u32,
+}
+
+fn one_holder() -> u32 {
+    1
 }
 
 impl Reservation {
@@ -489,7 +514,15 @@ impl SpendPolicyEngine {
                 // told it needs approval — for spending it had already
                 // been allowed. The record is what lets us tell a retry
                 // from a second spend, so it gets consulted first.
-                if s.reservations.contains_key(&quote_id) {
+                //
+                // The holder count rises here and falls in
+                // `release_reservation`. See `Reservation::holders`: the
+                // claim has to outlive every attempt holding it, or one
+                // attempt's failure frees budget another is still
+                // spending against.
+                if let Some(existing) = s.reservations.get_mut(&quote_id) {
+                    existing.holders = existing.holders.saturating_add(1);
+                    dirty = true;
                     break 'decision SpendDecision::Allowed;
                 }
 
@@ -539,6 +572,7 @@ impl SpendPolicyEngine {
                         network: network.clone(),
                         asset: requirements_asset.clone(),
                         amount: amount.clone(),
+                        holders: 1,
                     },
                 );
                 dirty = true;
@@ -561,11 +595,15 @@ impl SpendPolicyEngine {
     /// where value verifiably did not move (provider rejected pre-settle,
     /// facilitator refused).
     ///
-    /// **Idempotent and owner-checked.** The release decrements exactly
-    /// what [`Self::check_and_reserve`] recorded for *this quote*, from
-    /// the counter it actually landed in, and then forgets the
-    /// reservation. A second release for the same quote finds nothing and
-    /// does nothing.
+    /// **Owner-checked and refcounted.** The release drops one holder of
+    /// this quote's claim (see [`Reservation::holders`]). When the last
+    /// one goes it decrements exactly what [`Self::check_and_reserve`]
+    /// recorded for *this quote*, from the counter it actually landed in,
+    /// and forgets the record. While another attempt still holds the
+    /// claim, nothing is returned — otherwise a failing retry hands back
+    /// budget the attempt beside it is still spending against, and
+    /// deletes the record that made it a retry. A release with no claim
+    /// on file finds nothing and does nothing.
     ///
     /// That is a change from the previous behaviour, and the reason is
     /// worth stating: release used to subtract a caller-supplied amount
@@ -595,19 +633,28 @@ impl SpendPolicyEngine {
                 .retain(|_, r| r.day + COUNTER_RETAIN_DAYS >= today);
             let mut dirty = s.reservations.len() != before;
 
-            if let Some(reservation) = s.reservations.remove(&quote_id) {
+            // One holder drops. Only when the last one does is the amount
+            // returned to the counter and the record forgotten — while
+            // another attempt still holds the claim, this quote's budget
+            // stays committed and the record stays, so that attempt keeps
+            // reading as a retry rather than a fresh spend.
+            if let Some(reservation) = s.reservations.get_mut(&quote_id) {
                 dirty = true;
-                let key = reservation.counter_key();
-                if let Some(raw) = s.counters.get(&key) {
-                    if let Ok(current) = AtomicAmount::parse(raw) {
-                        // Saturating only as a floor: the reservation
-                        // record means the amount is the one that went in,
-                        // so an underflow here would be corruption rather
-                        // than a mismatched caller.
-                        let reduced = current
-                            .checked_sub(&reservation.amount)
-                            .unwrap_or_else(|_| AtomicAmount::from_u128(0));
-                        s.counters.insert(key, reduced.to_canonical_string());
+                reservation.holders = reservation.holders.saturating_sub(1);
+                if reservation.holders == 0 {
+                    let reservation = s.reservations.remove(&quote_id).expect("just borrowed");
+                    let key = reservation.counter_key();
+                    if let Some(raw) = s.counters.get(&key) {
+                        if let Ok(current) = AtomicAmount::parse(raw) {
+                            // Saturating only as a floor: the reservation
+                            // record means the amount is the one that went
+                            // in, so an underflow here would be corruption
+                            // rather than a mismatched caller.
+                            let reduced = current
+                                .checked_sub(&reservation.amount)
+                                .unwrap_or_else(|_| AtomicAmount::from_u128(0));
+                            s.counters.insert(key, reduced.to_canonical_string());
+                        }
                     }
                 }
             }

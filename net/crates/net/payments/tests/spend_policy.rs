@@ -685,6 +685,75 @@ async fn releasing_twice_does_not_refund_twice() {
     );
 }
 
+/// A second attempt at one quote holds the reservation too, so the first
+/// attempt's failure cannot free budget the second is still spending.
+///
+/// Two attempts at the same quote both read as retries and are both
+/// allowed — the budget is already committed. If release forgot the
+/// record on the first call, the surviving attempt would lose the claim
+/// that made it a retry: its amount would be gone from the counter while
+/// its payment was still in flight, and the *next* attempt would reserve
+/// afresh. `max_per_day` reopened by an attempt that failed.
+#[tokio::test]
+async fn a_failing_attempt_cannot_release_a_claim_another_attempt_still_holds() {
+    let s = setup(SpendProfile::DevTest);
+    let quote = s.quote(mock_requirements("2500"), NOW);
+
+    // Two attempts at the same quote: the second is a retry.
+    for _ in 0..2 {
+        assert_eq!(
+            s.engine
+                .check_and_reserve(&quote, &s.registry, NOW)
+                .await
+                .unwrap(),
+            SpendDecision::Allowed
+        );
+    }
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(2500),
+        "one quote, one charge against the day"
+    );
+
+    // One attempt fails terminally and releases. The other is still
+    // paying, so nothing comes back yet.
+    s.engine.release_reservation(&quote, NOW).await.unwrap();
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(2500),
+        "budget another attempt still holds must not be returned"
+    );
+    assert!(
+        s.engine
+            .reservation(&quote.quote_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "and the record must survive, or the surviving attempt stops reading as a retry"
+    );
+
+    // The last holder releases: now the amount comes back and the record
+    // is gone.
+    s.engine.release_reservation(&quote, NOW).await.unwrap();
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(0)
+    );
+    assert!(s
+        .engine
+        .reservation(&quote.quote_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Still idempotent past zero.
+    s.engine.release_reservation(&quote, NOW).await.unwrap();
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(0)
+    );
+}
+
 /// Release finds the counter the reservation actually landed in, not the
 /// one the caller's clock points at now.
 ///

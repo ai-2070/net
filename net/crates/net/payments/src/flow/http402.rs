@@ -119,6 +119,13 @@ pub struct X402HttpFlow {
     /// fetches would collide again under a stopped clock — the same bug
     /// one scope out. Nothing about the counter is per-instance, so it
     /// does not belong to an instance.
+    ///
+    /// The counter alone is not enough either: it is unique *within* a
+    /// process, and a spend policy file is shared across processes. Two
+    /// programs run against the same store both start at zero and mint
+    /// the same identity, and the second attempt reads as a retry of the
+    /// first — the same collapse, one scope further out again. The
+    /// counter is therefore qualified by [`process_token`].
     attempt: &'static std::sync::atomic::AtomicU64,
 }
 
@@ -126,6 +133,32 @@ pub struct X402HttpFlow {
 /// flows sharing a spend store must not mint the same reservation
 /// identity.
 static ATTEMPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A short token distinguishing this process from any other sharing the
+/// spend policy file.
+///
+/// The pid alone would not do it: pids are reused after a process exits,
+/// and the exited process's reservations can still be on file. Mixing in
+/// the wall clock at first use makes reuse require the same pid *and* the
+/// same start nanosecond.
+///
+/// This is the one place in the crate that reads `SystemTime` rather than
+/// a [`Clock`], and deliberately: the injectable clock is the thing being
+/// defended against here — a stopped or coarse test clock is exactly what
+/// makes two attempts collide. Nothing monetary is decided from this
+/// value; it is a local bookkeeping label.
+fn process_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let pid = std::process::id();
+        let started_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let digest = blake3::hash(format!("{pid}:{started_ns}").as_bytes());
+        hex::encode(&digest.as_bytes()[..6])
+    })
+}
 
 impl X402HttpFlow {
     pub fn new(
@@ -414,7 +447,7 @@ impl X402HttpFlow {
             self.caller.entity_id().clone(),
             self.caller.entity_id().clone(),
             format!("x402-http/{intended_host}"),
-            Some(format!("x402-http-attempt:{attempt}")),
+            Some(format!("x402-http-attempt:{}:{attempt}", process_token())),
             requirements,
             match self.registry.reference() {
                 Ok(r) => r,
