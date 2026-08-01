@@ -25,8 +25,8 @@
 //!   replacement for the legacy `find_nodes_scoped`.
 
 use super::super::capability::{
-    tags_match_scope, CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope,
-    GpuVendor, ScopeFilter,
+    CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope, GpuVendor,
+    PreparedScope, ScopeFilter,
 };
 use super::super::org::OrgId;
 use super::super::org_revocation::OrgRevocationState;
@@ -1355,6 +1355,10 @@ pub fn find_nodes_matching_scoped(
     // filter the verdict comes entirely from the tags and the closure
     // is never called.
     let subnet_decides = matches!(scope, ScopeFilter::SameSubnet);
+    // Hoist the filter's selector lists into hash sets BEFORE taking the
+    // locks. Inside, each selector test is then O(1) rather than a scan
+    // of the caller's list per matching scope tag per candidate.
+    let prepared = PreparedScope::new(scope);
     let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
         let candidates = candidates.as_set();
@@ -1374,7 +1378,7 @@ pub fn find_nodes_matching_scoped(
             } else {
                 // `same_subnet` is unread on every arm reachable here,
                 // so the placeholder never affects the verdict.
-                tags_match_scope(&membership.tags, scope, false)
+                prepared.matches(&membership.tags, false)
             };
             if admitted {
                 acc.push(key.1);

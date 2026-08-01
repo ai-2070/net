@@ -118,24 +118,43 @@ impl SubnetPolicy {
     /// (re-parsing every tag, allocating a `HashSet<Tag>`) just to have
     /// it rendered straight back to strings.
     ///
-    /// Allocates one `Vec<&str>` for the sort — pointers, not tag
-    /// copies. The sort is load-bearing: rule resolution is
-    /// first-match-wins, and the fold stores tags in unspecified order,
-    /// so an unsorted scan could assign different subnets to the same
-    /// announcement on different receivers.
+    /// Allocation-free. [`Self::assign`] sorts the rendered tags and
+    /// takes the first match per rule; sorting is load-bearing there
+    /// because rule resolution is first-match-wins and tag order is
+    /// unspecified, so an unsorted scan could assign different subnets
+    /// to the same announcement on different receivers.
+    ///
+    /// The same winner is reachable without the sort: "first match in
+    /// sorted order" is exactly "the lexicographically smallest tag that
+    /// both matches the prefix and carries a mapped value", which one
+    /// borrowed pass per rule can select directly. This runs while the
+    /// capability fold's read locks are held, so the `Vec<&str>` it
+    /// used to allocate per candidate is worth removing.
     pub fn assign_from_rendered_tags(&self, tags: &[String]) -> SubnetId {
         let mut levels = [0u8; 4];
-        let mut sorted: Vec<&str> = tags.iter().map(String::as_str).collect();
-        sorted.sort_unstable();
 
         for rule in &self.rules {
-            for s in &sorted {
-                if let Some(value) = s.strip_prefix(&rule.tag_prefix) {
-                    if let Some(&level_value) = rule.values.get(value) {
-                        levels[rule.level as usize] = level_value;
-                        break; // first match wins for this rule
-                    }
+            // Smallest matching tag seen so far, with the level value it
+            // maps to. Mirrors `assign`'s post-sort `break`.
+            let mut winner: Option<(&str, u8)> = None;
+            for tag in tags {
+                let tag = tag.as_str();
+                let Some(value) = tag.strip_prefix(&rule.tag_prefix) else {
+                    continue;
+                };
+                let Some(&level_value) = rule.values.get(value) else {
+                    continue;
+                };
+                let better = match winner {
+                    Some((current, _)) => tag < current,
+                    None => true,
+                };
+                if better {
+                    winner = Some((tag, level_value));
                 }
+            }
+            if let Some((_, level_value)) = winner {
+                levels[rule.level as usize] = level_value;
             }
         }
 

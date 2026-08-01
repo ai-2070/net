@@ -900,12 +900,69 @@ pub(crate) fn matches_scope(
 /// `scope_from_membership_tags` is retained as the readable reference
 /// definition; `tags_match_scope_agrees_with_materialized_scope` pins
 /// the two to the same verdict across the matrix.
+/// Convenience wrapper that prepares and evaluates in one call.
+///
+/// NOT for the query path — it rebuilds the selector sets per call, and
+/// the query path must hoist them out of the locked region via
+/// [`PreparedScope::new`]. Kept for tests and single-shot callers, where
+/// the preparation cost is paid once anyway.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tags_match_scope(
     tags: &[String],
     filter: &ScopeFilter<'_>,
     same_subnet: bool,
 ) -> bool {
+    PreparedScope::new(filter).matches(tags, same_subnet)
+}
+
+/// A [`ScopeFilter`] with its selector lists hoisted into hash sets.
+///
+/// Built ONCE per query, before the capability fold's read locks are
+/// taken. The list forms (`Tenants` / `Regions`) otherwise cost
+/// `candidates × matching scope tags × selectors` inside the locked
+/// region, and both the candidate's tag count and the caller's selector
+/// count are unbounded — an announcer choosing many `scope:tenant:*`
+/// tags and a caller passing a long list multiply. Short-circuiting on a
+/// hit does not bound the MISS case, which is the one an adversary
+/// controls (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+///
+/// Single-selector forms need no set: the comparison is already O(1).
+pub(crate) struct PreparedScope<'a> {
+    filter: &'a ScopeFilter<'a>,
+    /// Populated only for [`ScopeFilter::Tenants`].
+    tenants: Option<HashSet<&'a str>>,
+    /// Populated only for [`ScopeFilter::Regions`].
+    regions: Option<HashSet<&'a str>>,
+}
+
+impl<'a> PreparedScope<'a> {
+    /// Hoist the selector lists. Call outside any fold lock.
+    pub(crate) fn new(filter: &'a ScopeFilter<'a>) -> Self {
+        let tenants = match filter {
+            ScopeFilter::Tenants(wanted) => Some(wanted.iter().copied().collect()),
+            _ => None,
+        };
+        let regions = match filter {
+            ScopeFilter::Regions(wanted) => Some(wanted.iter().copied().collect()),
+            _ => None,
+        };
+        Self {
+            filter,
+            tenants,
+            regions,
+        }
+    }
+
+    /// Evaluate one candidate's borrowed tags. Allocation-free, and
+    /// every selector test is O(1).
+    pub(crate) fn matches(&self, tags: &[String], same_subnet: bool) -> bool {
+        tags_match_prepared(tags, self, same_subnet)
+    }
+}
+
+fn tags_match_prepared(tags: &[String], prepared: &PreparedScope<'_>, same_subnet: bool) -> bool {
     use ScopeFilter as F;
+    let filter = prepared.filter;
 
     // Under `SameSubnet` every arm of `matches_scope` reduces to
     // `same_subnet` — including the `SubnetLocal` candidate arm — so the
@@ -941,7 +998,12 @@ pub(crate) fn tags_match_scope(
             if !tenant_hit {
                 tenant_hit = match filter {
                     F::Tenant(t) => id == *t,
-                    F::Tenants(wanted) => wanted.contains(&id),
+                    // O(1) against the hoisted set instead of a scan of
+                    // the caller's list per matching tag.
+                    F::Tenants(_) => prepared
+                        .tenants
+                        .as_ref()
+                        .is_some_and(|set| set.contains(id)),
                     _ => false,
                 };
             }
@@ -953,7 +1015,10 @@ pub(crate) fn tags_match_scope(
             if !region_hit {
                 region_hit = match filter {
                     F::Region(r) => name == *r,
-                    F::Regions(wanted) => wanted.contains(&name),
+                    F::Regions(_) => prepared
+                        .regions
+                        .as_ref()
+                        .is_some_and(|set| set.contains(name)),
                     _ => false,
                 };
             }
