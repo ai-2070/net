@@ -95,6 +95,26 @@ impl SubnetPolicy {
         Ok(self)
     }
 
+    /// True when some rule could assign a level a non-zero value — i.e.
+    /// this policy can produce a subnet other than [`SubnetId::GLOBAL`].
+    ///
+    /// False for [`Self::new`] with no rules added (documented there as
+    /// "all nodes get `SubnetId::GLOBAL`"), and also for a policy whose
+    /// every mapped value happens to be `0`, which assigns GLOBAL just
+    /// as surely while looking configured.
+    ///
+    /// Exists because "a policy is installed" is not the same question
+    /// as "peers can resolve to distinct subnets", and the caller that
+    /// asked — `MeshNode`'s startup diagnostic — needs the second. A
+    /// policy that can only ever answer GLOBAL puts every peer in the
+    /// same subnet as a GLOBAL local node, so nothing is inconsistent
+    /// and there is nothing to warn about.
+    pub fn can_assign_non_global(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.values.values().any(|&v| v != 0))
+    }
+
     /// Assign a subnet ID to a node based on its capability tags.
     ///
     /// Evaluates all rules against the node's tags. Unmatched levels

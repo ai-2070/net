@@ -8259,7 +8259,10 @@ impl MeshNode {
         // without going back through `config`.
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
-        if Self::subnet_policy_without_local_subnet(local_subnet, local_subnet_policy.is_some()) {
+        let policy_can_scope = local_subnet_policy
+            .as_ref()
+            .is_some_and(|p| p.can_assign_non_global());
+        if Self::subnet_policy_without_local_subnet(local_subnet, policy_can_scope) {
             tracing::warn!(
                 "subnet policy installed but local subnet is GLOBAL — \
                  with_subnet_policy assigns peers' subnets, not this node's; \
@@ -23773,6 +23776,13 @@ impl MeshNode {
     /// with no policy is the intended flat setup. Only the pair is
     /// suspect.
     ///
+    /// `policy_can_scope` is [`SubnetPolicy::can_assign_non_global`],
+    /// not `policy.is_some()`. A rule-less policy assigns `GLOBAL` to
+    /// every peer, so with a `GLOBAL` local subnet everything resolves
+    /// to the same subnet, `is_ancestor_of` holds both ways, and no
+    /// inversion exists — warning there would flag a valid flat
+    /// deployment for installing a no-op policy.
+    ///
     /// Recorded in
     /// CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md
     /// finding 2, where warning rather than failing closed was an
@@ -23780,8 +23790,8 @@ impl MeshNode {
     /// subscriber that never published a capability announcement from
     /// admitted to `Unauthorized`, since such a peer is absent from
     /// `peer_subnets` permanently rather than transiently.
-    fn subnet_policy_without_local_subnet(subnet: SubnetId, policy_installed: bool) -> bool {
-        policy_installed && subnet.is_global()
+    fn subnet_policy_without_local_subnet(subnet: SubnetId, policy_can_scope: bool) -> bool {
+        policy_can_scope && subnet.is_global()
     }
 
     /// `dest` is `None` when the peer's subnet has not been derived —
@@ -36426,19 +36436,71 @@ mod subnet_visible_unknown_tests {
     fn misconfiguration_warning_fires_only_on_policy_plus_global_subnet() {
         let scoped = SubnetId::new(&[3, 7]);
         let cases = [
-            // (subnet, policy_installed, should_warn)
+            // (subnet, policy_can_scope, should_warn)
             (SubnetId::GLOBAL, true, true), // the misconfiguration
             (SubnetId::GLOBAL, false, false), // flat mesh, intended
             (scoped, true, false),          // subnet-aware, intended
             (scoped, false, false),         // scoped but no peer resolution
         ];
-        for (subnet, policy_installed, should_warn) in cases {
+        for (subnet, policy_can_scope, should_warn) in cases {
             assert_eq!(
-                MeshNode::subnet_policy_without_local_subnet(subnet, policy_installed),
+                MeshNode::subnet_policy_without_local_subnet(subnet, policy_can_scope),
                 should_warn,
-                "subnet={subnet:?} policy_installed={policy_installed}"
+                "subnet={subnet:?} policy_can_scope={policy_can_scope}"
             );
         }
+    }
+
+    /// The second input is "can this policy produce a non-global
+    /// subnet", not "is a policy installed". A rule-less policy assigns
+    /// GLOBAL to everyone, so on a GLOBAL local node every peer resolves
+    /// to the same subnet and there is no inversion — warning there
+    /// would flag a valid flat deployment for installing a no-op policy.
+    #[test]
+    fn a_policy_that_cannot_scope_does_not_trigger_the_warning() {
+        use crate::adapter::net::SubnetRule;
+
+        let no_rules = SubnetPolicy::new();
+        assert!(
+            !no_rules.can_assign_non_global(),
+            "SubnetPolicy::new() is documented as assigning GLOBAL to all nodes"
+        );
+
+        // A rule with values but every one of them 0, which assigns
+        // GLOBAL just as surely while looking configured. `map` /
+        // `try_map` reject 0 as reserved, so this is only reachable
+        // through `SubnetRule`'s public `values` field — which is
+        // exactly why `can_assign_non_global` inspects the values
+        // rather than counting rules.
+        let mut zero_rule = SubnetRule::new("region:", 0);
+        zero_rule.values.insert("us".to_string(), 0);
+        zero_rule.values.insert("eu".to_string(), 0);
+        let all_zero = SubnetPolicy::new().add_rule(zero_rule);
+        assert!(!all_zero.can_assign_non_global());
+
+        // A rule with no values at all can never match.
+        let empty_rule = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0));
+        assert!(!empty_rule.can_assign_non_global());
+
+        let real = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 3));
+        assert!(real.can_assign_non_global());
+
+        for policy in [&no_rules, &all_zero, &empty_rule] {
+            assert!(
+                !MeshNode::subnet_policy_without_local_subnet(
+                    SubnetId::GLOBAL,
+                    policy.can_assign_non_global()
+                ),
+                "a policy that can only ever answer GLOBAL must not be warned about"
+            );
+        }
+        assert!(
+            MeshNode::subnet_policy_without_local_subnet(
+                SubnetId::GLOBAL,
+                real.can_assign_non_global()
+            ),
+            "a policy that CAN scope, with a global local subnet, is the case worth flagging"
+        );
     }
 
     /// The inversion the warning describes, pinned against
