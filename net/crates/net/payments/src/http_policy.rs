@@ -196,9 +196,18 @@ fn is_private_use(ip: IpAddr) -> bool {
 /// Public unicast: reachable on the internet and not special-purpose.
 ///
 /// `IpAddr::is_global` is still unstable, so the special-purpose ranges
-/// are enumerated here. The list is deliberately conservative — anything
-/// not recognised as globally routable unicast is refused, so a range
-/// this misses fails closed rather than open.
+/// are enumerated here.
+///
+/// **This is a blocklist, and it fails open.** Worth saying plainly,
+/// because the shape invites the opposite assumption: both helpers below
+/// are `!(known-bad)`, so a range nobody enumerated is treated as public
+/// unicast. An allowlist of the globally-routable space would fail closed
+/// instead, but it is not writable — "globally routable" is the
+/// complement of a registry that changes, not a set with a syntactic
+/// mark. So the enumeration is the guarantee, and it has to be kept:
+/// anything that reaches somewhere it should not needs a line here, and
+/// the v4-in-v6 embeddings in [`is_public_v6`] are the family that keeps
+/// growing.
 fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
@@ -218,6 +227,11 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || a == 0                    // "this network"
         || (a == 100 && (64..128).contains(&b))  // 100.64/10 carrier NAT
         || (a == 192 && b == 0)      // 192.0.0/24 IETF protocol assignments
+        // 192.88.99.0/24 — the 6to4 relay anycast prefix, deprecated by
+        // RFC 7526. The v6 side already refuses 2002::/16; this is the
+        // same tunnel's other end, and an address nobody configures on
+        // purpose.
+        || (a == 192 && b == 88 && ip.octets()[2] == 99)
         || (a == 198 && (18..20).contains(&b))   // 198.18/15 benchmarking
         || a >= 240) // 240/4 reserved (incl. 255.255.255.255)
 }
@@ -259,6 +273,13 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         // 6to4 configured. Same shape as the NAT64 and translated forms:
         // a v4 destination wearing a v6 address.
         || first == 0x2002
+        // 2001::/32 — Teredo. The last member of the same family, and the
+        // one this list originally missed: bits 32..64 are the Teredo
+        // *server*'s IPv4 address and the low 32 bits are the client's,
+        // obfuscated. On a host with Teredo configured — which is every
+        // Windows box that has ever had it enabled — that is again a v4
+        // reach wearing a v6 address, chosen by whoever supplied the URL.
+        || (first == 0x2001 && s[1] == 0x0000)
         || first == 0x0100) // 100::/64  discard-only
 }
 
@@ -594,6 +615,8 @@ mod tests {
             "2002:0a00:0005::1",        // 6to4, tunnel endpoint 10.0.0.5
             "2002:a9fe:a9fe::1",        // 6to4, tunnel endpoint 169.254.169.254
             "::ffff:0:169.254.169.254", // the metadata address, translated
+            "2001:0:4136:e378::1",      // Teredo, server 65.54.227.120
+            "2001:0:a00:5::1",          // Teredo, server 10.0.0.5
         ] {
             let ip: IpAddr = embedding.parse().expect(embedding);
             assert!(
@@ -620,11 +643,12 @@ mod tests {
             "172.16.0.1",
             "192.168.1.1",
             "169.254.169.254",
-            "100.64.0.1", // carrier NAT
-            "192.0.0.1",  // IETF protocol assignments
-            "198.18.0.1", // benchmarking
-            "224.0.0.1",  // multicast
-            "240.0.0.1",  // reserved
+            "100.64.0.1",  // carrier NAT
+            "192.0.0.1",   // IETF protocol assignments
+            "192.88.99.1", // 6to4 relay anycast (deprecated)
+            "198.18.0.1",  // benchmarking
+            "224.0.0.1",   // multicast
+            "240.0.0.1",   // reserved
             "255.255.255.255",
             "::",
             "::1",
@@ -641,7 +665,17 @@ mod tests {
                 "{r} must not be public"
             );
         }
-        for ok in ["1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+        for ok in [
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            // The neighbours of the two ranges added for the 6to4 /
+            // Teredo tunnels, so those rules are not over-broad: only
+            // 192.88.99/24 and only 2001:0::/32 are refused, not the
+            // /16s around them.
+            "192.88.100.1",
+            "2001:4860:4860::8888",
+        ] {
             let ip: IpAddr = ok.parse().expect(ok);
             assert!(
                 DestinationPolicy::PublicOnly.admits(ip),
