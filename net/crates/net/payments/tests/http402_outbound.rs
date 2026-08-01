@@ -186,11 +186,15 @@ fn http_response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> String 
 fn flow(profile: SpendProfile, dir: &tempfile::TempDir) -> X402HttpFlow {
     let caller = Arc::new(EntityKeypair::generate());
     let registry = default_mock_registry(caller.entity_id().clone());
-    X402HttpFlow::new(
+    // These servers bind loopback, which the default policy now refuses:
+    // an agent-supplied URL should not reach local admin surfaces, so
+    // local testing opts in rather than out.
+    X402HttpFlow::with_destination_policy(
         caller,
         SpendPolicyEngine::new(dir.path().join("spend.json"), profile),
         registry,
         Arc::new(TestClock),
+        net_payments::http_policy::DestinationPolicy::PublicOrLoopback,
     )
     .expect("flow")
 }
@@ -275,6 +279,55 @@ async fn policy_holds_before_anything_is_signed_or_sent() {
     assert!(
         server.received_payloads.lock().is_empty(),
         "no payment left the machine while policy holds"
+    );
+}
+
+/// Approving the held quote id and refetching pays — the approval is
+/// redeemable.
+///
+/// This is the whole point of returning a `quote_id` with the hold. The
+/// pseudo-quote's id carries a per-attempt component, and if that
+/// component advanced on every `fetch_paid` the retry would derive a
+/// *different* id, find no approval against it, and hold again: an
+/// operator could approve forever and the fetch would never go through.
+/// The counter therefore advances only once a reservation is actually
+/// taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_approved_hold_is_redeemable_on_the_next_fetch() {
+    let server = PaidServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = flow(SpendProfile::Production, &dir);
+
+    let X402HttpOutcome::RequiresPaymentApproval { quote_id, .. } = f.fetch_paid(&server.url).await
+    else {
+        panic!("expected the approval hold");
+    };
+
+    // The operator approves the id they were handed, through the shared
+    // policy file — the same store the flow reads.
+    let spend = SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::Production);
+    assert!(
+        spend.approve(&quote_id).await.expect("approve"),
+        "the held quote must be on file to approve"
+    );
+
+    let outcome = f.fetch_paid(&server.url).await;
+    assert!(
+        matches!(outcome, X402HttpOutcome::Paid { .. }),
+        "the approved quote must pay on retry, got {outcome:?}"
+    );
+    assert_eq!(
+        server.received_payloads.lock().len(),
+        1,
+        "exactly one payment, on the approved attempt"
+    );
+
+    // And the next fetch is a new payment, not a free ride on the
+    // approval: a fresh id, so a fresh hold.
+    let after = f.fetch_paid(&server.url).await;
+    assert!(
+        matches!(after, X402HttpOutcome::RequiresPaymentApproval { .. }),
+        "an approval authorizes one payment, not the host forever; got {after:?}"
     );
 }
 
@@ -388,11 +441,13 @@ async fn solana_flow(
         },
     ));
 
-    let flow = X402HttpFlow::new(
+    let flow = X402HttpFlow::with_destination_policy(
         caller,
         SpendPolicyEngine::new(&spend_path, SpendProfile::Production),
         registry,
         Arc::new(TestClock),
+        // Loopback test server: opt in, since the default now refuses it.
+        net_payments::http_policy::DestinationPolicy::PublicOrLoopback,
     )
     .expect("flow")
     .with_signer("solana", signer);
@@ -472,5 +527,234 @@ async fn a_solana_reject_keeps_the_reservation() {
             .unwrap(),
         AtomicAmount::from_u128(10_000),
         "a bearer-scheme reject must NOT release the reservation"
+    );
+}
+
+/// L1 regression: the per-host spend override binds to the URL's real
+/// host, so a tighter operator limit is not silently skipped.
+///
+/// The capability key is `x402-http/<host>`, and it used to come from
+/// splitting the raw URL on `://` and `/`. That returns the authority
+/// verbatim — including the port — so a key built from
+/// `http://127.0.0.1:54321/resource` read `x402-http/127.0.0.1:54321`
+/// and missed a configured `x402-http/127.0.0.1` override, falling back
+/// to `defaults`. Whenever the per-host limit is the *tighter* one (the
+/// reason an operator writes it), that fallback is a policy bypass.
+///
+/// Every test server here binds an ephemeral port, so the old spelling
+/// could never match a host-only override.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_per_host_spend_override_binds_despite_the_port() {
+    let server = PaidServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = dir.path().join("spend.json");
+
+    // A tight per-host override: far below the 2500 the server demands.
+    let configurer = SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest);
+    configurer
+        .configure(|_defaults, per_capability| {
+            per_capability.insert(
+                "x402-http/127.0.0.1".to_string(),
+                net_payments::policy::spend::SpendLimits {
+                    max_per_call: Some(AtomicAmount::from_u128(1)),
+                    max_per_day: None,
+                    allowed_networks: vec![],
+                    allowed_assets: vec![],
+                },
+            );
+        })
+        .await
+        .expect("configure");
+
+    let caller = Arc::new(EntityKeypair::generate());
+    let registry = default_mock_registry(caller.entity_id().clone());
+    let f = X402HttpFlow::with_destination_policy(
+        caller,
+        SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest),
+        registry,
+        Arc::new(TestClock),
+        // Loopback test server: opt in, since the default now refuses it.
+        net_payments::http_policy::DestinationPolicy::PublicOrLoopback,
+    )
+    .expect("flow");
+
+    // DevTest auto-allows mock spends, so reaching the approval hold can
+    // only be the per-host override biting.
+    let outcome = f.fetch_paid(&server.url).await;
+    let X402HttpOutcome::RequiresPaymentApproval { policy_reason, .. } = outcome else {
+        panic!(
+            "the per-host override must gate this spend — got {outcome:?} \
+             (a Paid outcome means the capability key missed the override)"
+        );
+    };
+    assert!(
+        policy_reason.contains("max_per_call"),
+        "the hold should name the per-call cap: {policy_reason}"
+    );
+    assert!(
+        server.received_payloads.lock().is_empty(),
+        "nothing may be signed or sent while the override holds"
+    );
+}
+
+/// L1, the fail-closed half: a URL the client cannot parse is denied
+/// rather than fetched under a guessed host key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unparseable_url_is_denied_not_fetched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = flow(SpendProfile::DevTest, &dir);
+    for bad in ["not-a-url", "://missing-scheme", "https://"] {
+        let outcome = f.fetch_paid(bad).await;
+        assert!(
+            matches!(outcome, X402HttpOutcome::Denied { .. }),
+            "`{bad}` must be denied, got {outcome:?}"
+        );
+    }
+}
+
+/// M4 regression: the destination policy applies to the **unpaid
+/// probe**, not just the paid retry.
+///
+/// The probe is the SSRF. It is the request an agent-supplied URL can
+/// aim at a link-local or internal address, and it fires before any
+/// policy the caller could otherwise interpose. The default policy
+/// (public unicast plus loopback) refuses the cloud metadata address,
+/// private/LAN ranges, and carrier-NAT space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_destination_policy_refuses_internal_addresses_on_the_probe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = flow(SpendProfile::DevTest, &dir);
+
+    // The cloud metadata address, the canonical SSRF target.
+    // Refused as a Denied policy outcome, NOT as a connect failure: the
+    // address must never be dialled at all. An IP literal is never
+    // resolved, so this is the check that catches it — the resolver
+    // cannot.
+    let outcome = f
+        .fetch_paid("http://169.254.169.254/latest/meta-data/")
+        .await;
+    match outcome {
+        X402HttpOutcome::Denied { policy_reason } => assert!(
+            policy_reason.contains("destination policy"),
+            "the refusal should name the policy: {policy_reason}"
+        ),
+        other => panic!("the metadata address must not be fetched, got {other:?}"),
+    }
+
+    // A private LAN address, likewise — and over https, so the scheme
+    // guard is not what refuses it.
+    let outcome = f.fetch_paid("https://10.0.0.5/resource").await;
+    assert!(
+        matches!(outcome, X402HttpOutcome::Denied { .. }),
+        "a private address must not be fetched, got {outcome:?}"
+    );
+
+    // IPv4-mapped IPv6 must not be a way around the v4 rules.
+    let outcome = f
+        .fetch_paid("http://[::ffff:169.254.169.254]/latest/")
+        .await;
+    assert!(
+        matches!(outcome, X402HttpOutcome::Denied { .. }),
+        "an IPv4-mapped metadata address must be refused, got {outcome:?}"
+    );
+}
+
+/// The `PublicOnly` policy — what a host passing agent-supplied URLs
+/// should choose — additionally refuses loopback, so a local admin
+/// surface is not reachable either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_only_refuses_loopback_too() {
+    let server = PaidServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caller = Arc::new(EntityKeypair::generate());
+    let registry = default_mock_registry(caller.entity_id().clone());
+    let strict = X402HttpFlow::with_destination_policy(
+        caller,
+        SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::DevTest),
+        registry,
+        Arc::new(TestClock),
+        net_payments::http_policy::DestinationPolicy::PublicOnly,
+    )
+    .expect("flow");
+
+    let outcome = strict.fetch_paid(&server.url).await;
+    assert!(
+        matches!(outcome, X402HttpOutcome::Denied { .. }),
+        "PublicOnly must refuse loopback, got {outcome:?}"
+    );
+    assert!(
+        server.received_payloads.lock().is_empty(),
+        "nothing may be signed or sent to a refused destination"
+    );
+
+    // The default policy still reaches the same loopback server, so the
+    // documented local-testing path is not collateral damage.
+    let dir2 = tempfile::tempdir().expect("tempdir");
+    let default = flow(SpendProfile::DevTest, &dir2);
+    assert!(
+        matches!(
+            default.fetch_paid(&server.url).await,
+            X402HttpOutcome::Paid { .. }
+        ),
+        "the default policy must still admit loopback"
+    );
+}
+
+/// Repeated paid fetches under a **stopped clock** are each a payment and
+/// must each consume a reservation — three fetches, three reservations.
+///
+/// The local pseudo-quote's id derives from provider + caller + terms
+/// hash + issued-at, and on this door the provider and caller are the
+/// same identity while the terms are whatever the server demanded. Under
+/// a fixed or coarse `Clock` two fetches of the same URL therefore derive
+/// the SAME quote id — and the spend engine treats a repeat reservation
+/// for one quote id as a retry. Money would leave twice while only the
+/// first fetch consumed budget, which is `max_per_day` failing exactly
+/// where it is the loss bound.
+///
+/// This door has no provider-side idempotency by design (one `fetch_paid`
+/// = one attempt), so each attempt gets its own reservation identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_paid_fetches_each_consume_budget_under_a_stopped_clock() {
+    let server = PaidServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = dir.path().join("spend.json");
+
+    let caller = Arc::new(EntityKeypair::generate());
+    let registry = default_mock_registry(caller.entity_id().clone());
+    // `TestClock` returns a constant — exactly the case that used to
+    // collapse two payments into one reservation.
+    let f = X402HttpFlow::with_destination_policy(
+        caller,
+        SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest),
+        registry,
+        Arc::new(TestClock),
+        // Loopback test server: opt in, since the default now refuses it.
+        net_payments::http_policy::DestinationPolicy::PublicOrLoopback,
+    )
+    .expect("flow");
+
+    for n in 1..=3 {
+        let outcome = f.fetch_paid(&server.url).await;
+        assert!(
+            matches!(outcome, X402HttpOutcome::Paid { .. }),
+            "fetch {n} should pay, got {outcome:?}"
+        );
+    }
+
+    // Three payments actually left the machine...
+    assert_eq!(
+        server.received_payloads.lock().len(),
+        3,
+        "three fetches means three payments"
+    );
+
+    // ...so three must be counted. Anything less is budget the caller
+    // spent without it being charged against the cap.
+    let checker = SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest);
+    assert_eq!(
+        checker.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(7500),
+        "every attempt must consume its own reservation"
     );
 }

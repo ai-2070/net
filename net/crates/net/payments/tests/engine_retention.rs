@@ -98,6 +98,12 @@ impl Fixture {
             self.path.clone(),
         )
         .unwrap()
+        // These tests redeem without presenting a binding: redemption is
+        // setup for what they actually assert, not the subject. The
+        // engine now requires the binding by default, so they opt out
+        // explicitly — `lifecycle_modes` carries the tests that cover the
+        // requirement itself.
+        .with_require_invocation_binding(false)
     }
 }
 
@@ -112,6 +118,12 @@ fn fixture_with_retention(retention_ns: Option<u64>) -> Fixture {
         f.path.clone(),
     )
     .unwrap()
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false)
     .with_billing_log(Arc::new(BillingLog::new(
         f.path.with_file_name("billing2.jsonl"),
     )))
@@ -138,6 +150,12 @@ fn fixture() -> Fixture {
             path.clone(),
         )
         .unwrap()
+        // These tests redeem without presenting a binding: redemption is
+        // setup for what they actually assert, not the subject. The
+        // engine now requires the binding by default, so they opt out
+        // explicitly — `lifecycle_modes` carries the tests that cover the
+        // requirement itself.
+        .with_require_invocation_binding(false)
         .with_billing_log(Arc::new(BillingLog::new(dir.path().join("billing.jsonl")))),
     );
     Fixture {
@@ -926,33 +944,8 @@ async fn accepting_a_payment_sweeps_eligible_records() {
 // What compaction does NOT bound
 // ============================================================================
 
-/// A `tracing::Layer` recording every event's fields as (name, value)
-/// pairs — the `native_tool_gate.rs` idiom, precise enough to assert the
-/// emit site's *structured* fields by key + value rather than by substring.
-struct FieldCapture {
-    fields: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        struct Collector<'a>(&'a mut Vec<(String, String)>);
-        impl tracing::field::Visit for Collector<'_> {
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                self.0.push((field.name().to_string(), value.to_string()));
-            }
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0
-                    .push((field.name().to_string(), format!("{value:?}")));
-            }
-        }
-        let mut buf = self.fields.lock();
-        event.record(&mut Collector(&mut buf));
-    }
-}
+mod tracing_capture;
+use tracing_capture::FieldCapture;
 
 /// Compaction bounds the *redeemed* population and nothing else: a record
 /// that is frozen, or paid but never redeemed, is retained indefinitely by

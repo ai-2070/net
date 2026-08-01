@@ -43,6 +43,22 @@ pub struct PaymentRequirements {
     /// original bytes for signing regardless) so an outbound payment to a
     /// real server whose requirements use `maxAmountRequired` parses
     /// rather than failing with "missing field `amount`".
+    ///
+    /// **The two spellings do not mean the same thing, and Net resolves
+    /// that in one direction: exact.** `maxAmountRequired` is a *ceiling*
+    /// in the deployed vocabulary — the most the server will accept —
+    /// whereas everything downstream here treats this field as the exact
+    /// price. The caller authors an authorization for the full figure, and
+    /// the engine demands exact equality on delivery (short-pay
+    /// invalidates and freezes; overpayment routes to a manual
+    /// `Overpayment` exception, never an auto-satisfy).
+    ///
+    /// So paying a `maxAmountRequired` server means paying its ceiling.
+    /// That is safe — spend policy caps every outbound payment and the
+    /// preserved bytes are what got signed — but it is not a negotiation,
+    /// and there is deliberately no partial-payment or counter-offer path.
+    /// Size `max_per_call` for an external host against its advertised
+    /// maximum.
     #[serde(alias = "maxAmountRequired")]
     pub amount: String,
     /// Scheme-scoped asset locator (token contract address / currency code).

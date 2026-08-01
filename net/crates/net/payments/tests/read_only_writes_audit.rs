@@ -241,6 +241,8 @@ fn spend_engine(
         symbol: "USDC".into(),
         display_name: None,
         equivalence_class: None,
+        eip712_name: None,
+        eip712_version: None,
     });
     let engine =
         SpendPolicyEngine::new(path, SpendProfile::Production).with_unsafe_mock_auto_allow(true);

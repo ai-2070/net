@@ -27,6 +27,7 @@ use net_payments::core::registry::default_registry_v1;
 use net_payments::flow::http402::{X402HttpFlow, X402HttpOutcome};
 use net_payments::flow::signer::SchemeSigner;
 use net_payments::flow::SystemClock;
+use net_payments::http_policy::DestinationPolicy;
 use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
 
 /// Project a [`X402HttpOutcome`] to `(statusJson, body)`. The status vocabulary
@@ -95,6 +96,14 @@ struct HttpConfig {
     policy_path: String,
     profile: String,
     unsafe_mock_auto_allow: bool,
+    /// Which destinations an outbound fetch may reach.
+    ///
+    /// Defaults to `PublicOnly`: this is the one door in the crate whose
+    /// URL can be chosen by a model. It is settable because it also has
+    /// to be — the binding hardcoded the strict policy with no opt-out,
+    /// which made a local or LAN x402 server unreachable rather than
+    /// merely guarded.
+    destinations: DestinationPolicy,
 }
 
 /// Build the outbound flow. The payer identity is ephemeral — there is no
@@ -109,8 +118,14 @@ fn build_flow(config: &HttpConfig, signer: Option<Arc<dyn SchemeSigner>>) -> Res
     let registry = default_registry_v1(caller.entity_id().clone());
     let spend = SpendPolicyEngine::new(&config.policy_path, profile)
         .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
-    let mut flow = X402HttpFlow::new(caller, spend, registry, Arc::new(SystemClock))
-        .map_err(|e| Error::from_reason(format!("payment-http: http client: {e}")))?;
+    let mut flow = X402HttpFlow::with_destination_policy(
+        caller,
+        spend,
+        registry,
+        Arc::new(SystemClock),
+        config.destinations,
+    )
+    .map_err(|e| Error::from_reason(format!("payment-http: http client: {e}")))?;
     if let Some(signer) = signer {
         flow = flow.with_signer("eip155", signer);
     }
@@ -144,11 +159,19 @@ impl PaymentHttpClient {
         payment_unsafe_mock_auto_allow: Option<bool>,
         payment_signer_address: Option<String>,
         payment_signer: Option<Function<'static, String, Promise<String>>>,
+        destination_policy: Option<String>,
     ) -> Result<Self> {
         let profile = payment_profile.unwrap_or_else(|| "production".to_string());
         // Validate the profile up front (a bad profile is a construction error,
         // not a first-fetch surprise).
         parse_profile(&profile)?;
+        // Same posture, and validated at the same moment: an unknown
+        // destination policy is a construction error, never a silent
+        // fall-back to either the default or something wider.
+        let destinations = match destination_policy.as_deref() {
+            Some(s) => DestinationPolicy::parse(s).map_err(Error::from_reason)?,
+            None => DestinationPolicy::PublicOnly,
+        };
         // The eip155 signer reference is both-or-neither; the JS callback
         // becomes a ThreadsafeFunction wrapped in ExternalSigner (typed intent
         // in, signature out — key material unrepresentable).
@@ -167,6 +190,7 @@ impl PaymentHttpClient {
                 policy_path: payment_policy_path,
                 profile,
                 unsafe_mock_auto_allow: payment_unsafe_mock_auto_allow.unwrap_or(false),
+                destinations,
             },
             signer,
             flow: Mutex::new(None),

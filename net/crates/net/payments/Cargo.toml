@@ -99,6 +99,33 @@ k256 = { version = "0.14", optional = true, default-features = false, features =
 sha3 = { version = "0.12", optional = true }
 tracing = "0.1"
 
+# Windows-only: the payment stores hold bearer material (preserved x402
+# payloads are signed EIP-3009 authorizations) and the signed billing
+# record. On unix they are created 0600; Windows has no mode, so the
+# equivalent is an explicit owner-only DACL, which needs these APIs.
+# Already in the workspace lock transitively — no new supply chain.
+
+# `O_NOFOLLOW` + `O_NONBLOCK` for the billing log's open. std exposes
+# `custom_flags` but not the flag values, and the alternative — checking
+# `symlink_metadata` and then opening — is a check the open does not share,
+# so a link can be swapped in between the two. Already in the workspace
+# lock via `net`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    # `CreateFileW` + `CREATE_NEW` + `FILE_ATTRIBUTE_NORMAL`. It compiles
+    # today without this only because some other crate in the graph
+    # enables the module and Cargo unifies features — which is not a
+    # guarantee, and would break the moment that crate dropped it.
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
 [features]
 # Implements `net_mcp::serve::PaymentFlow` for the caller flow, so the
 # gated-invoke composition can clear paid capabilities through this

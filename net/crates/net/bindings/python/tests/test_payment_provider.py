@@ -90,14 +90,18 @@ def mesh():
 
 
 def test_provider_prices_under_the_node_identity(mesh, tmp_path):
-    provider = PaymentProvider(mesh, str(tmp_path / "engine.json"))
+    provider = PaymentProvider(
+        mesh, str(tmp_path / "engine.json"), unsafe_dev_mock_facilitator=True
+    )
     # The provider prices + quotes under the node's own mesh identity.
     assert provider.provider_entity_id == mesh.entity_id
     assert len(provider.provider_entity_id) == 32
 
 
 def test_publish_paid_tools_requires_pricing(mesh, tmp_path):
-    provider = PaymentProvider(mesh, str(tmp_path / "engine.json"))
+    provider = PaymentProvider(
+        mesh, str(tmp_path / "engine.json"), unsafe_dev_mock_facilitator=True
+    )
 
     async def cb(_name, _args_json):
         return "ok"
@@ -112,6 +116,7 @@ def test_publish_paid_tools_serves_a_priced_tool(mesh, tmp_path):
         mesh,
         str(tmp_path / "engine.json"),
         billing_log_path=str(tmp_path / "billing.jsonl"),
+        unsafe_dev_mock_facilitator=True,
     )
     # The announced price for the "echo" tool, under this node's capability id.
     capability = f"{mesh.node_id}/echo"
@@ -138,6 +143,7 @@ def test_read_billing(mesh, tmp_path):
         mesh,
         str(tmp_path / "engine.json"),
         billing_log_path=str(tmp_path / "billing.jsonl"),
+        unsafe_dev_mock_facilitator=True,
     )
     assert provider.read_billing() == []
 
@@ -147,7 +153,9 @@ def test_read_billing_without_a_log_is_a_structured_error(mesh, tmp_path):
     # the net.payments.quote/pay services, and a second on the same node is
     # rejected (ServeError::AlreadyServing), so the no-log provider needs its own
     # node. Without a billing_log_path, reading is a structured error, not a crash.
-    no_log = PaymentProvider(mesh, str(tmp_path / "engine.json"))
+    no_log = PaymentProvider(
+        mesh, str(tmp_path / "engine.json"), unsafe_dev_mock_facilitator=True
+    )
     with pytest.raises(ValueError):
         no_log.read_billing()
 
@@ -155,7 +163,9 @@ def test_read_billing_without_a_log_is_a_structured_error(mesh, tmp_path):
 def test_publish_paid_tools_fails_closed_on_a_missing_price(mesh, tmp_path):
     # Every tool must be priced — a forgotten entry would publish that tool FREE,
     # so it is a fail-closed ValueError, not a silent free leak.
-    provider = PaymentProvider(mesh, str(tmp_path / "engine.json"))
+    provider = PaymentProvider(
+        mesh, str(tmp_path / "engine.json"), unsafe_dev_mock_facilitator=True
+    )
     terms = build_pricing_terms(
         provider.provider_entity_id, f"{mesh.node_id}/echo", json.dumps(MOCK_REQS)
     )
@@ -173,3 +183,140 @@ def test_publish_paid_tools_fails_closed_on_a_missing_price(mesh, tmp_path):
             cb,
             {"echo": terms},
         )
+
+
+# ---------------------------------------------------------------------------
+# H2: a settlement backend must be chosen explicitly
+# ---------------------------------------------------------------------------
+
+
+def test_provider_requires_an_explicit_settlement_backend(mesh, tmp_path):
+    """No default backend: constructing without one is an error.
+
+    This constructor used to build a MockFacilitator unconditionally, with
+    no way to reach a real one — so a provider could publish priced tools,
+    sign quotes with its real mesh identity, emit signed billing events,
+    and serve, while settlement moved nothing. Guessing "mock" for an
+    operator who has not decided is how a simulator ends up in front of
+    real customers.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        PaymentProvider(mesh, str(tmp_path / "engine.json"))
+    message = str(excinfo.value)
+    assert "no settlement backend" in message
+    # The error must name both ways out, not just fail.
+    assert "facilitator_url" in message
+    assert "unsafe_dev_mock_facilitator" in message
+
+
+def test_provider_refuses_both_backends_at_once(mesh, tmp_path):
+    """A real URL and the mock together is ambiguous, not a precedence rule."""
+    with pytest.raises(ValueError) as excinfo:
+        PaymentProvider(
+            mesh,
+            str(tmp_path / "engine.json"),
+            facilitator_url="https://facilitator.example.com",
+            unsafe_dev_mock_facilitator=True,
+        )
+    assert "not both" in str(excinfo.value)
+
+
+def test_a_real_facilitator_url_is_never_silently_downgraded(mesh, tmp_path):
+    """Without the payments-http feature, a real URL is a build error.
+
+    The one outcome that must not happen is quietly falling back to the
+    mock: an operator who configured a facilitator URL has stated they
+    want real settlement. That has to be *asserted* on the success path —
+    a silent downgrade constructs successfully too, so "it built" proves
+    nothing.
+
+    ``registry_version`` is the observable difference: a real backend puts
+    the engine on the production revision, the mock on the dev one (which
+    carries the valueless ``mock:net`` asset).
+    """
+    try:
+        provider = PaymentProvider(
+            mesh,
+            str(tmp_path / "engine.json"),
+            facilitator_url="https://facilitator.example.com",
+        )
+    except ValueError as e:
+        # Built without payments-http: must say so, and must not mention
+        # having used the mock.
+        assert "payments-http" in str(e)
+        return
+    # Built with payments-http (which the published wheels enable).
+    assert provider.registry_version == "net-production-1"
+
+
+def test_provider_authored_terms_follow_the_provider_registry(mesh, tmp_path):
+    """The provider-bound authoring cannot announce a revision it will not
+    quote under.
+
+    The free ``build_pricing_terms`` takes the provider id and the registry
+    choice as separate arguments, so both can disagree with the provider
+    that actually serves the quotes. ``provider.pricing_terms`` takes both
+    from the engine, which is why it is the one to reach for.
+    """
+    provider = PaymentProvider(
+        mesh,
+        str(tmp_path / "engine.json"),
+        unsafe_dev_mock_facilitator=True,
+    )
+    reqs = json.dumps(
+        [
+            {
+                "scheme": "mock",
+                "network": "mock:net",
+                "amount": "2500",
+                "asset": "musd",
+                "payTo": "mock-provider-settle-addr",
+                "maxTimeoutSeconds": 60,
+            }
+        ]
+    )
+    terms = json.loads(provider.pricing_terms("prov/echo", reqs))
+    assert terms["object"] == "net.pricing.terms@1"
+    assert terms["capability"] == "prov/echo"
+
+    # Byte-identical to the free function told the truth about this
+    # provider — which is the point: the method is the version that cannot
+    # be told a lie.
+    free = _net.build_pricing_terms(
+        bytes(provider.provider_entity_id),
+        "prov/echo",
+        reqs,
+        provider.registry_version == "net-production-1",
+    )
+    assert json.loads(free) == terms
+
+    # And an asset this provider's registry does not carry is refused at
+    # authoring rather than announced and refused later at quote time.
+    absent = json.dumps(
+        [
+            {
+                "scheme": "exact",
+                "network": "eip155:1",
+                "amount": "2500",
+                "asset": "0x0000000000000000000000000000000000000001",
+                "payTo": "0x0000000000000000000000000000000000000002",
+                "maxTimeoutSeconds": 60,
+            }
+        ]
+    )
+    with pytest.raises(ValueError):
+        provider.pricing_terms("prov/echo", absent)
+
+
+def test_the_mock_backend_says_so_in_the_registry_revision(mesh, tmp_path):
+    """The other side of the same guarantee.
+
+    Asking for the mock gets the mock, so ``registry_version`` genuinely
+    discriminates rather than always reading "production".
+    """
+    provider = PaymentProvider(
+        mesh,
+        str(tmp_path / "engine.json"),
+        unsafe_dev_mock_facilitator=True,
+    )
+    assert provider.registry_version == "net-default-1"

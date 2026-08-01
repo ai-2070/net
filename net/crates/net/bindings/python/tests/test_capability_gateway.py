@@ -276,16 +276,20 @@ def test_approval_verbs_round_trip_on_the_shared_store(paid_gateway):
     assert spent["status"] == "ok"
     assert spent["spent"] == "0"
 
-    # Approve a quote id: the record moves to approved (changed), and a
-    # second approve is idempotent.
+    # Approving an id nobody has asked about is a structured no-op, not a
+    # new record. The engine writes the pending record (with the exact
+    # provider-signed quote bytes attached) when it decides an approval is
+    # needed; minting one here would leave an approval carrying no quote
+    # bytes that the policy gate still reads as approved.
     approved = json.loads(paid_gateway.approve_payment("q-1"))
     assert approved["status"] == "ok"
     assert approved["quote_id"] == "q-1"
-    assert approved["changed"] is True
-    assert json.loads(paid_gateway.approve_payment("q-1"))["changed"] is False
+    assert approved["changed"] is False, "approving an unknown quote id must be a no-op"
 
-    # Reject removes it (changed), then a second reject is a no-op.
-    assert json.loads(paid_gateway.reject_payment("q-1"))["changed"] is True
+    # And it really did not create anything.
+    assert json.loads(paid_gateway.pending_payments())["pending"] == []
+
+    # Rejecting an unknown id is likewise a no-op rather than an error.
     assert json.loads(paid_gateway.reject_payment("q-1"))["changed"] is False
 
 
@@ -320,10 +324,11 @@ def test_async_approval_verbs_round_trip(mesh, tmp_path):
         return approved, pending, rejected
 
     approved, pending, rejected = asyncio.run(body())
-    assert approved["status"] == "ok" and approved["changed"] is True
-    # The approved quote is not *pending* (it's approved), so the list is empty.
+    # Same contract as the sync surface: an id nobody asked about is a
+    # structured no-op, and nothing is minted for it.
+    assert approved["status"] == "ok" and approved["changed"] is False
     assert pending["status"] == "ok" and pending["pending"] == []
-    assert rejected["changed"] is True
+    assert rejected["changed"] is False
 
 
 # ---------------------------------------------------------------------------

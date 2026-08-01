@@ -92,6 +92,22 @@ fn denial_for(
             v::PRIOR_UNKNOWN,
             Some("fix_payment_client"),
         ),
+        // Not a security row: the caller sent no possession proof, which
+        // for a provider that requires one is a client-configuration gap
+        // and not evidence of anyone attacking anything. It is safe to
+        // retry once the client signs the binding, but a fresh quote will
+        // not help — the quote is fine, the client is not — so
+        // `safe_to_requote` stays false and the action names the fix.
+        R::BindingRequired => (
+            v::CLASS_CALLER_CONFIGURATION_ERROR,
+            v::ACTOR_CALLER_OPERATOR,
+            false,
+            false,
+            false,
+            v::FUNDS_UNKNOWN,
+            v::PRIOR_UNKNOWN,
+            Some("fix_payment_client"),
+        ),
         // Security rows advise nothing: do not retry, do not just buy
         // another quote — report the mismatch.
         //
@@ -288,6 +304,57 @@ pub(crate) async fn redeem_via_engine(
     }
 }
 
+/// A short, **non-authorizing** reference to a quote, for logs.
+///
+/// A quote id is a credential, not just an identifier: with bearer
+/// redemption enabled (no invocation binding presented), possession of
+/// the id is sufficient to consume the paid invocation — see
+/// [`crate::engine::PaymentEngine::redeem_for_invocation`]. Logging it
+/// in full puts a spendable credential in every log sink that scrapes
+/// the process, and the sites that log it are failure paths, where the
+/// quote is most likely to still be unredeemed.
+///
+/// Operators reading these lines need to *correlate* events, not to
+/// reconstruct the id, so they get a truncated hash instead. The domain
+/// separator keeps this from colliding with any other blake3 use in the
+/// crate; 8 bytes is ample to correlate within one process's logs and
+/// far too short to invert into a 32-byte transcript hash.
+pub(crate) fn quote_ref(quote_id: &str) -> String {
+    // Keyed, and the key never leaves the process.
+    //
+    // An unkeyed digest here would not be one-way in practice: a quote id
+    // is `blake3(provider ‖ caller ‖ terms_hash ‖ issued_at_ns)`, and a
+    // log reader knows the provider, the caller and the announced terms.
+    // Only the issuance instant is unknown, and it is bounded by the log
+    // line's own timestamp — a few hours of nanoseconds is a small enough
+    // space to enumerate against a truncated digest. The "short hash"
+    // would hand back the credential it was meant to withhold.
+    //
+    // A per-process key defeats that: correlation still works within one
+    // process's logs, which is the entire operator need, while nobody
+    // holding only the logs can invert or precompute.
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        // Derived from `RandomState`, which the standard library seeds
+        // per-process from the OS. Used rather than a new rng dependency
+        // because this is a logging path, not the money path — the money
+        // path deliberately carries no rng at all.
+        use std::hash::{BuildHasher, Hasher as _};
+        let state = std::collections::hash_map::RandomState::new();
+        let mut key = [0u8; 32];
+        for (i, chunk) in key.chunks_mut(8).enumerate() {
+            let mut h = state.build_hasher();
+            h.write_u64(i as u64);
+            chunk.copy_from_slice(&h.finish().to_le_bytes());
+        }
+        key
+    });
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(b"net.payments.log_ref@1");
+    hasher.update(quote_id.as_bytes());
+    hex::encode(&hasher.finalize().as_bytes()[..8])
+}
+
 /// Time source. There is no global clock — every timestamp in the flow
 /// comes from here, and tests inject fixed instants.
 pub trait Clock: Send + Sync {
@@ -385,9 +452,16 @@ impl PayResponse {
 /// byte-preservation discipline holds across the channel).
 #[async_trait::async_trait]
 pub trait ProviderChannel: Send + Sync {
+    /// Request a quote.
+    ///
+    /// `provider` is the identity the caller *intends* to pay, taken from
+    /// the announced pricing terms. It is not decoration: the mesh
+    /// channel binds it into the signed quote request, which is what
+    /// stops a captured request being replayed to a different provider.
     async fn quote(
         &self,
         caller: &EntityId,
+        provider: &EntityId,
         capability: &str,
         template: &X402Carry<PaymentRequirements>,
     ) -> Result<Vec<u8>, ChannelError>;
@@ -430,6 +504,18 @@ impl InProcessProvider {
         self.required_tier = tier;
         self
     }
+
+    /// The provider identity quotes are signed with — the destination a
+    /// `net.payment.quote_request@1` must be addressed to.
+    pub fn provider_id(&self) -> &EntityId {
+        self.engine.provider_id()
+    }
+
+    /// The flow's clock, so a wire handler stamps freshness from the same
+    /// source the lifecycle does.
+    pub fn now_ns(&self) -> u64 {
+        self.clock.now_ns()
+    }
 }
 
 #[async_trait::async_trait]
@@ -437,9 +523,22 @@ impl ProviderChannel for InProcessProvider {
     async fn quote(
         &self,
         caller: &EntityId,
+        provider: &EntityId,
         capability: &str,
         template: &X402Carry<PaymentRequirements>,
     ) -> Result<Vec<u8>, ChannelError> {
+        // In-process there is no wire, so no signed request and nothing to
+        // forge — the caller identity is passed by the same process that
+        // owns it, and this channel cannot misrepresent its own engine.
+        //
+        // Deliberately NOT re-checked against `self.engine.provider_id()`
+        // here: the flow already compares the *signed quote's* provider
+        // against the announced terms, which is the security-relevant
+        // check (it catches a provider that signs a quote naming someone
+        // else, which an engine-identity comparison cannot). Duplicating
+        // it here only short-circuits that path and reclassifies a policy
+        // `Denied` as a transport `Failed`.
+        let _ = provider;
         // Provider policy runs inside issue_quote — never quote a caller
         // you'd deny.
         let quote = self
@@ -606,7 +705,12 @@ impl CallerPaymentFlow {
                         let _ = self.spend.clear_approval(&held_id).await;
                         match self
                             .provider
-                            .quote(self.caller.entity_id(), capability, template)
+                            .quote(
+                                self.caller.entity_id(),
+                                &terms.provider,
+                                capability,
+                                template,
+                            )
                             .await
                         {
                             Ok(b) => b,
@@ -623,7 +727,12 @@ impl CallerPaymentFlow {
             Ok(None) => {
                 match self
                     .provider
-                    .quote(self.caller.entity_id(), capability, template)
+                    .quote(
+                        self.caller.entity_id(),
+                        &terms.provider,
+                        capability,
+                        template,
+                    )
                     .await
                 {
                     Ok(b) => b,
@@ -751,14 +860,14 @@ impl CallerPaymentFlow {
                     }
                     Ok(_) => {
                         tracing::warn!(
-                            quote = %quote.quote_id,
+                            quote_ref = %quote_ref(&quote.quote_id),
                             "provider billing event does not bind this quote/caller/provider — dropped from proof"
                         );
                         serde_json::Value::Null
                     }
                     Err(e) => {
                         tracing::warn!(
-                            quote = %quote.quote_id,
+                            quote_ref = %quote_ref(&quote.quote_id),
                             error = %e,
                             "provider billing event failed verification — dropped from proof"
                         );
@@ -926,7 +1035,7 @@ impl CallerPaymentFlow {
     /// over-counts the day budget (fail-closed direction).
     async fn release(&self, quote: &PaymentQuote, now_ns: u64) {
         if let Err(e) = self.spend.release_reservation(quote, now_ns).await {
-            tracing::warn!(quote = %quote.quote_id, error = %e, "spend reservation release failed");
+            tracing::warn!(quote_ref = %quote_ref(&quote.quote_id), error = %e, "spend reservation release failed");
         }
     }
 }
@@ -1042,6 +1151,7 @@ mod denial_render_tests {
         vec![
             R::UnknownQuote,
             R::BindingMalformed,
+            R::BindingRequired,
             R::BindingRejected,
             R::PayerRecordCorrupt,
             R::QuoteFrozen {
@@ -1108,6 +1218,33 @@ mod denial_render_tests {
         }
     }
 
+    /// `binding_required` is a caller-configuration row, not a security
+    /// one.
+    ///
+    /// A caller that sent no possession proof to a provider that requires
+    /// one has a misconfigured client; it is not evidence that anyone is
+    /// attacking anything, and treating it as a security violation would
+    /// bury the real ones. It is safe to retry once the client signs —
+    /// but not safe to requote, because the quote was never the problem.
+    #[test]
+    fn binding_required_is_a_configuration_row_not_a_security_one() {
+        let d = denial_for(&R::BindingRequired, "t", "q");
+        assert_eq!(d.schematic.reason, "binding_required");
+        assert_eq!(
+            d.schematic.recovery.class, "caller_configuration_error",
+            "a missing proof is a client gap, not an attack"
+        );
+        assert_eq!(d.schematic.recovery.actor, "caller_operator");
+        assert!(
+            !d.schematic.recovery.safe_to_requote,
+            "a fresh quote does not fix an unsigned client"
+        );
+        // And it stays distinct from the security rows.
+        let rejected = denial_for(&R::BindingRejected, "t", "q");
+        assert_eq!(rejected.schematic.recovery.class, "security_violation");
+        assert_ne!(d.schematic.reason, rejected.schematic.reason);
+    }
+
     /// The review's split, rendered: an incomplete payment routes to
     /// "pay it, then retry"; a pending settlement routes to "wait and
     /// retry" — and the instrument fact differs (`none` vs `pending`).
@@ -1164,6 +1301,13 @@ mod denial_render_tests {
         assert_eq!(na(&R::UnknownQuote).as_deref(), Some("request_new_quote"));
         assert_eq!(
             na(&R::BindingMalformed).as_deref(),
+            Some("fix_payment_client")
+        );
+        // Missing a binding is a client gap, not an attack signal: it
+        // routes to the same fix, and NOT to a requote — the quote is
+        // fine, the client is not.
+        assert_eq!(
+            na(&R::BindingRequired).as_deref(),
             Some("fix_payment_client")
         );
         assert_eq!(na(&R::BindingRejected), None);

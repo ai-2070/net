@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use net::adapter::net::identity::EntityKeypair;
-use net_payments::checker::{ChainChecker, ChainVerdict, CheckerError, TransferQuery};
+use net_payments::checker::ChainVerdict;
 use net_payments::core::registry::{default_mock_registry, default_registry_v1};
 use net_payments::core::verification::{
     check_chain, InvalidationReason, VerificationStatus, VerificationTier, VerifierRef,
@@ -22,48 +22,11 @@ use net_payments::x402::payload::PaymentPayload;
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::X402Carry;
 
+mod scripted_checker;
+use scripted_checker::ScriptedChecker;
+
 const NOW: u64 = 1_000_000_000_000_000;
 const CAPABILITY: &str = "fixture-provider/fixture-tool";
-
-/// A checker with a scripted verdict queue; records the queries it got.
-struct ScriptedChecker {
-    verdicts: parking_lot::Mutex<Vec<ChainVerdict>>,
-    queries: parking_lot::Mutex<Vec<(String, String, Option<TransferQuery>)>>,
-}
-
-impl ScriptedChecker {
-    fn new(verdicts: Vec<ChainVerdict>) -> Self {
-        Self {
-            verdicts: parking_lot::Mutex::new(verdicts),
-            queries: parking_lot::Mutex::new(Vec::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl ChainChecker for ScriptedChecker {
-    fn reference(&self) -> VerifierRef {
-        VerifierRef {
-            identity: None,
-            endpoint: "independent-chain-check:scripted".into(),
-        }
-    }
-
-    async fn check(
-        &self,
-        network: &str,
-        transaction: &str,
-        query: Option<&TransferQuery>,
-    ) -> Result<ChainVerdict, CheckerError> {
-        self.queries
-            .lock()
-            .push((network.to_string(), transaction.to_string(), query.cloned()));
-        self.verdicts
-            .lock()
-            .pop()
-            .ok_or_else(|| CheckerError::retryable("script exhausted"))
-    }
-}
 
 struct World {
     engine: PaymentEngine,
@@ -84,7 +47,13 @@ async fn settled_world(required_tier: VerificationTier) -> (World, PaymentDecisi
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .expect("engine");
+    .expect("engine")
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
 
     let requirements = X402Carry::author(&PaymentRequirements {
         scheme: MOCK_SCHEME.into(),
@@ -198,6 +167,85 @@ async fn final_is_reachable_only_through_the_checker() {
     assert_eq!(tier, VerificationTier::Final);
     let status = w.engine.status(&w.quote_id).await.unwrap().unwrap();
     assert_eq!(status.tier, Some(VerificationTier::Final));
+}
+
+/// A facilitator re-check cannot lower confidence the chain has already
+/// earned.
+///
+/// The two re-verify paths mint different tiers on purpose: the checker
+/// reads the chain and can reach `confirmed(n)`/`final`, while
+/// `re_verify` takes a facilitator receipt and is capped at `observed`.
+/// So the events are not monotonic, and reading the *last* one reported
+/// a downgrade that never happened — a quote independently confirmed
+/// final went back to advertising `observed` the moment anything asked
+/// the facilitator again.
+///
+/// `QuoteStatus::tier` documents itself as the highest tier reached, and
+/// this is what makes that true.
+#[tokio::test]
+async fn a_facilitator_recheck_does_not_lower_a_tier_the_checker_reached() {
+    let (w, _) = settled_world(VerificationTier::Observed).await;
+
+    let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
+        tier: VerificationTier::Final,
+        delivered: Some("2500".into()),
+    }]);
+    w.engine
+        .re_verify_with_checker(&w.quote_id, &checker, VerificationTier::Final, NOW + 2)
+        .await
+        .expect("engine");
+    let raised = w.engine.status(&w.quote_id).await.unwrap().unwrap();
+    assert_eq!(raised.tier, Some(VerificationTier::Final));
+
+    // The facilitator answers valid, which is worth `observed` and is
+    // appended as such. The record's confidence must not follow it down.
+    w.engine
+        .re_verify(&w.quote_id, VerificationTier::Observed, NOW + 3)
+        .await
+        .expect("engine");
+    let after = w.engine.status(&w.quote_id).await.unwrap().unwrap();
+    assert!(
+        after.chain.len() > raised.chain.len(),
+        "the re-verify must actually have appended its observed event"
+    );
+    assert_eq!(
+        after.tier,
+        Some(VerificationTier::Final),
+        "a facilitator receipt cannot take back a checker's finality"
+    );
+}
+
+/// The high-water mark is not a ratchet: invalidation withdraws the
+/// verifications before it, so a reorged record stops advertising the
+/// confidence its settlement no longer has.
+#[tokio::test]
+async fn an_invalidation_resets_the_tier_it_withdraws() {
+    let (w, _) = settled_world(VerificationTier::Observed).await;
+
+    let up = ScriptedChecker::new(vec![ChainVerdict::Included {
+        tier: VerificationTier::Final,
+        delivered: Some("2500".into()),
+    }]);
+    w.engine
+        .re_verify_with_checker(&w.quote_id, &up, VerificationTier::Final, NOW + 2)
+        .await
+        .expect("engine");
+    assert_eq!(
+        w.engine.status(&w.quote_id).await.unwrap().unwrap().tier,
+        Some(VerificationTier::Final)
+    );
+
+    let reverted = ScriptedChecker::new(vec![ChainVerdict::Reverted]);
+    w.engine
+        .re_verify_with_checker(&w.quote_id, &reverted, VerificationTier::Final, NOW + 3)
+        .await
+        .expect("engine");
+    let after = w.engine.status(&w.quote_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.tier, None,
+        "a reverted settlement leaves no verified tier standing"
+    );
+    assert!(after.frozen.is_some(), "and the record freezes");
 }
 
 #[tokio::test]
@@ -430,7 +478,6 @@ impl net_payments::facilitator::Facilitator for PayerNamingFacilitator {
                 extra: None,
             })
             .map_err(|e| net_payments::facilitator::FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
     async fn settle(
@@ -450,7 +497,6 @@ impl net_payments::facilitator::Facilitator for PayerNamingFacilitator {
                 extensions: None,
             })
             .map_err(|e| net_payments::facilitator::FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 }
@@ -473,7 +519,13 @@ async fn the_recorded_settle_payer_reaches_the_checker_when_the_payload_names_no
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .expect("engine");
+    .expect("engine")
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
 
     let requirements = X402Carry::author(&PaymentRequirements {
         scheme: MOCK_SCHEME.into(),
@@ -565,7 +617,13 @@ async fn an_injected_nonce_does_not_override_the_provider_invoice_off_evm() {
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .expect("engine");
+    .expect("engine")
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
 
     // The provider authors an invoiceId in requirements.extra (exact-XRPL's
     // vocabulary); MOCK_NETWORK is not eip155.
@@ -648,13 +706,17 @@ const MERCHANT_ADDR: &str = "0x000000000000000000000000000000000000dEaD";
 // 0x + 64 hex — a well-formed EIP-3009 bytes32 nonce.
 const VALID_NONCE: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
 
-/// Settle one Base-Sepolia (eip155) quote at observed with the given
-/// opaque payload body and return the engine + quote id. Fresh engine per
-/// call: `PayerNamingFacilitator` reports a fixed transaction hash, so
+/// Stand up a Base-Sepolia (eip155) engine + quote + payload and run
+/// `accept_payment`, handing back the engine, the quote id, and the raw
+/// decision.
+///
+/// The two wrappers below differ only in what they do with the decision,
+/// so the setup lives here once. Each call builds a fresh engine on
+/// purpose: `PayerNamingFacilitator` reports a fixed transaction hash, so
 /// distinct quotes must not share a `consumed_transactions` namespace.
-async fn settled_eip155(
+async fn accept_eip155_inner(
     payload_body: serde_json::Value,
-) -> (PaymentEngine, String, tempfile::TempDir) {
+) -> (PaymentEngine, String, PaymentDecision, tempfile::TempDir) {
     let provider = Arc::new(EntityKeypair::generate());
     let caller = EntityKeypair::generate();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -665,7 +727,13 @@ async fn settled_eip155(
         default_registry_v1(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .expect("engine");
+    .expect("engine")
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
     let requirements = X402Carry::author(&PaymentRequirements {
         scheme: "exact".into(),
         network: BASE_SEPOLIA.into(),
@@ -673,7 +741,12 @@ async fn settled_eip155(
         asset: TESTNET_USDC.into(),
         pay_to: MERCHANT_ADDR.into(),
         max_timeout_seconds: 60,
-        extra: None,
+        // The registry pins this deployment's EIP-712 domain, so
+        // requirements that decline to name it are refused at
+        // `issue_quote`. They always were unusable — `typed_data` needs
+        // both fields to sign — but the refusal now lands at quote time
+        // instead of at the wallet.
+        extra: Some(serde_json::json!({ "name": "USDC", "version": "2" })),
     })
     .expect("author");
     let quote = engine
@@ -697,11 +770,27 @@ async fn settled_eip155(
         .accept_payment(&quote, &payload, VerificationTier::Confirmed(1), NOW + 1)
         .await
         .expect("accept");
+    (engine, quote.quote_id, decision, dir)
+}
+
+/// The raw acceptance decision — for cases where the interesting outcome
+/// is a refusal *before* settlement.
+async fn accept_eip155(payload_body: serde_json::Value) -> PaymentDecision {
+    accept_eip155_inner(payload_body).await.2
+}
+
+/// A settled eip155 quote, ready to re-verify. Asserts the settlement
+/// actually happened, so a test that meant to reach re-verification does
+/// not silently assert against a refusal.
+async fn settled_eip155(
+    payload_body: serde_json::Value,
+) -> (PaymentEngine, String, tempfile::TempDir) {
+    let (engine, quote_id, decision, dir) = accept_eip155_inner(payload_body).await;
     assert!(
         matches!(decision, PaymentDecision::PendingTier { .. }),
         "{decision:?}"
     );
-    (engine, quote.quote_id, dir)
+    (engine, quote_id, dir)
 }
 
 /// The happy path: a valid caller-signed nonce is threaded to the checker
@@ -733,36 +822,37 @@ async fn eip155_reverify_threads_the_signed_nonce() {
     );
 }
 
-/// Fail-closed: a missing or malformed `authorization.nonce` on eip155 is
-/// refused at re-verification — never silently downgraded to the weaker
-/// (token, from, to) bind by threading `None`. The checker is never even
-/// consulted (a settlement we cannot bind to the authorization must not
-/// be counted).
+/// Fail-closed, and now earlier than it used to be: an eip155 `exact`
+/// payload carrying no usable EIP-3009 authorization is refused at
+/// **accept**, so it never settles at all.
+///
+/// It used to settle and then be refused at re-verification, because the
+/// replay index keyed on the whole payload wrapper and did not care what
+/// the scheme object held. Keying replay on the scheme's own signed
+/// material (M5) means a payload with no authorization has no replay
+/// identity — and something the engine cannot identify is something it
+/// must not accept. The old late refusal is still there for a payload
+/// that has an authorization but a malformed nonce.
 #[tokio::test]
-async fn eip155_reverify_refuses_a_missing_or_malformed_nonce() {
-    // (a) No `authorization` in the payload at all.
-    let (engine, quote_id, _dir) =
-        settled_eip155(serde_json::json!({ "signature": "0xsig" })).await;
-    let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
-        tier: VerificationTier::Confirmed(3),
-        delivered: Some("2500".into()),
-    }]);
-    let decision = engine
-        .re_verify_with_checker(&quote_id, &checker, VerificationTier::Confirmed(1), NOW + 2)
-        .await
-        .expect("engine");
+async fn eip155_refuses_a_payload_with_no_usable_authorization() {
+    // (a) No `authorization` in the payload at all: refused at accept,
+    //     because there is no replay identity to key on. The payment
+    //     never settles, so there is nothing for a checker to be asked
+    //     about later.
+    let refused = accept_eip155(serde_json::json!({ "signature": "0xsig" })).await;
     assert!(
-        matches!(&decision, PaymentDecision::Rejected { reason: RejectReason::BadQuote(m) } if m.contains("authorization.nonce")),
-        "missing nonce must be refused, got {decision:?}"
-    );
-    assert!(
-        checker.queries.lock().is_empty(),
-        "the checker must not be consulted without a nonce bind"
+        matches!(&refused, PaymentDecision::Rejected { reason: RejectReason::BadQuote(m) } if m.contains("replay identity")),
+        "a payload with no authorization must be refused at accept, got {refused:?}"
     );
 
-    // (b) `authorization.nonce` present but not a 32-byte hex word.
-    let (engine, quote_id, _dir) =
-        settled_eip155(serde_json::json!({ "authorization": { "nonce": "not-a-nonce" } })).await;
+    // (b) A well-formed authorization whose nonce is not a 32-byte hex
+    //     word. This one HAS a replay identity, so it settles — and is
+    //     then refused at re-verification, where the nonce has to bind an
+    //     `AuthorizationUsed` event. The late refusal still matters.
+    let (engine, quote_id, _dir) = settled_eip155(serde_json::json!({
+        "authorization": { "from": MERCHANT_ADDR, "nonce": "not-a-nonce" }
+    }))
+    .await;
     let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
         tier: VerificationTier::Confirmed(3),
         delivered: Some("2500".into()),

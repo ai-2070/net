@@ -2928,9 +2928,41 @@ async fn publish_response_to_caller(
     mesh.publish(&publisher, payload).await.map(|_| ())
 }
 
+/// The runtime a client call was opened on, for [`spawn_cancel_publish`]
+/// to fall back to when Drop runs somewhere else.
+///
+/// Every client call is *created* inside a runtime, but it is not always
+/// *dropped* inside one. The owner can be a Python object freed by
+/// CPython's GC on the asyncio thread, a handle released across the C
+/// FFI, or a plain `drop()` in sync Rust — none of which have an ambient
+/// reactor. `tokio::spawn` panics there, and a panic in a `Drop` reached
+/// from `tp_dealloc` surfaces as an unraisable exception nobody can
+/// catch.
+///
+/// One handle for the process, not one per call: these calls all belong
+/// to the same `MeshNode`, and storing a `Handle` on four structs to say
+/// the same thing costs more than it explains.
+static CANCEL_PUBLISH_RT: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+/// Record the current runtime as the one to fire CANCEL frames on.
+///
+/// Called when a client call is opened — always from an `async fn`, so
+/// `try_current` always succeeds there. Idempotent, and first writer
+/// wins.
+pub(crate) fn remember_cancel_publish_runtime() {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let _ = CANCEL_PUBLISH_RT.set(handle);
+    }
+}
+
 /// Shared CANCEL-publish helper: spawn a task that fires a
 /// CANCEL event for `call_id` to `target` on the request channel.
 /// Both [`RpcStream::Drop`] and [`UnaryCallGuard::Drop`] use it.
+///
+/// Never panics on a foreign thread: prefers the ambient runtime, falls
+/// back to the one the call was opened on, and degrades to a log if
+/// neither exists (the process is tearing down, and the peer's
+/// keep-alive expiry is the backstop).
 fn spawn_cancel_publish(
     mesh: Arc<MeshNode>,
     target: u64,
@@ -2938,7 +2970,19 @@ fn spawn_cancel_publish(
     self_origin: u64,
     call_id: u64,
 ) {
-    tokio::spawn(async move {
+    let handle = tokio::runtime::Handle::try_current()
+        .ok()
+        .or_else(|| CANCEL_PUBLISH_RT.get().cloned());
+    let Some(handle) = handle else {
+        tracing::debug!(
+            call_id,
+            target_node = format!("{target:#x}"),
+            "rpc CANCEL: no runtime to publish on (dropped during teardown); \
+             relying on the peer's keep-alive expiry",
+        );
+        return;
+    };
+    handle.spawn(async move {
         let meta = EventMeta::new(DISPATCH_RPC_CANCEL, 0, self_origin, call_id, 0);
         let request_channel_id = ChannelId::new(request_channel);
         let request_channel_hash = request_channel_id.hash();
@@ -4155,6 +4199,8 @@ impl MeshNode {
         let deadline_ns = opts.deadline.map(instant_to_unix_nanos).unwrap_or(0);
         let observer = StreamingObserverState::new(Arc::clone(self), target_node_id, service, 0);
         let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
+        // See `remember_cancel_publish_runtime`.
+        remember_cancel_publish_runtime();
         Ok(ClientStreamCallRaw {
             mesh: Arc::clone(self),
             target_node_id,
@@ -4496,6 +4542,10 @@ impl MeshNode {
         // BOTH the sink AND stream halves drop, matching the
         // existing CANCEL-on-drop semantics.
         let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
+        // This handle may be dropped by a foreign thread — a Python
+        // object freed by GC, an FFI release — so record the runtime now,
+        // while we are certainly on one.
+        remember_cancel_publish_runtime();
         let inner = Arc::new(DuplexInner {
             mesh: Arc::clone(self),
             target_node_id,
@@ -4643,6 +4693,9 @@ impl MeshNode {
         // Cancel keep-alive lives on the returned RpcStream so the
         // watcher exits cleanly when the stream drops without cancel.
         let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
+        // See `remember_cancel_publish_runtime` — a stream handed to a
+        // binding can be dropped off-runtime.
+        remember_cancel_publish_runtime();
         Ok(RpcStream {
             mesh: Arc::clone(self),
             target_node_id,
@@ -5239,6 +5292,8 @@ impl MeshNode {
         //    `send_rpc_cancel` call).
         //  - the cancel_token path (same: leave completed=false,
         //    Drop emits CANCEL).
+        // See `remember_cancel_publish_runtime`.
+        remember_cancel_publish_runtime();
         let mut guard = UnaryCallGuard {
             pending: Arc::clone(&pending),
             mesh: Arc::clone(self),

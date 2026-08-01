@@ -42,7 +42,7 @@ use net_payments::core::canonical::canonical_bytes;
 use net_payments::core::registry::default_registry_v1;
 use net_payments::core::terms::PricingTerms;
 use net_payments::core::units::AtomicAmount;
-use net_payments::core::verification::{InvalidationReason, VerificationTier};
+use net_payments::core::verification::InvalidationReason;
 use net_payments::engine::{AdmitAll, PaymentDecision, PaymentEngine};
 use net_payments::facilitator::client::{HttpFacilitator, NoAuth};
 use net_payments::facilitator::packs;
@@ -204,11 +204,10 @@ async fn a_signed_verify_answers_structurally_live() {
         .await
         .expect("live /verify must answer structurally, never fail at the transport");
 
-    assert_eq!(
-        outcome.tier,
-        VerificationTier::Observed,
-        "receipts cap at observed"
-    );
+    // Receipts cap at `observed` structurally now: `VerifyOutcome` has no
+    // tier field, so there is nothing for a facilitator to claim and the
+    // engine mints the tier itself. The assertion that used to live here
+    // is enforced by the type.
     let view = outcome.response.view();
     if view.is_valid {
         println!("live /verify: VALID (payer {} is funded)", signer.address());

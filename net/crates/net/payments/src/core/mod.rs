@@ -10,6 +10,7 @@
 //! | `net.payment.verification@1` | tiered, chained, immutable |
 //! | `net.billing.event@1` | the signed usage record |
 //! | `net.payment.dispute@1` | reserved (P5); the tag exists, nothing else |
+//! | `net.payment.quote_request@1` | caller-signed request FOR a quote — the demand-side identity proof |
 //!
 //! There is no intent object — the client-signed x402 `PaymentPayload`
 //! travels in the invocation envelope.
@@ -18,6 +19,7 @@ pub mod billing_event;
 pub mod canonical;
 pub mod idempotency;
 pub mod quote;
+pub mod quote_request;
 pub mod registry;
 pub mod settlement_ref;
 pub mod terms;

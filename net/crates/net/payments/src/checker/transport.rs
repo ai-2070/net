@@ -3,11 +3,19 @@
 //! Every checker (`eip155`, `svm`, `xrpl`) POSTs a JSON body to a
 //! participant-configured RPC endpoint, reads a size-bounded response, and
 //! maps transport/HTTP failures to retryable/terminal
-//! [`CheckerError`](super::CheckerError)s. That machinery — the pinned-TLS
-//! client build, the [`MAX_RPC_BODY`] streaming cap (a hostile RPC must not
-//! be able to exhaust memory within the timeout), and the status→error
-//! classification — is security-sensitive and identical across chains, so
-//! it lives here once instead of three copies that must be kept in sync.
+//! [`CheckerError`](super::CheckerError)s.
+//!
+//! The security-sensitive parts — scheme enforcement, destination policy,
+//! the pinned-TLS client build, and the response cap — live in
+//! [`crate::http_policy`], shared with the facilitator client and the
+//! outbound HTTP-402 door so the three cannot drift. They did drift: this
+//! transport was for a while the only money-path client that accepted a
+//! cleartext `http://` endpoint to a remote host, which is the worst place
+//! for that hole to be. This is the path that mints `confirmed(n)` and
+//! `final` — the tiers that exist precisely so a facilitator need not be
+//! trusted. Over cleartext an on-path attacker fabricates receipts, block
+//! heights, and chain ids at will, and `ensure_chain_id` cannot help
+//! because it reads its answer from the same unauthenticated channel.
 //!
 //! What the transport deliberately does **not** do is interpret the
 //! response envelope: eip155/svm carry RPC errors in a top-level `error`
@@ -17,6 +25,7 @@
 use serde_json::Value;
 
 use super::CheckerError;
+use crate::http_policy::{self, DestinationPolicy, ReadError};
 
 /// JSON-RPC responses (a receipt/transaction with many logs or balances)
 /// are bounded but can be large; cap so a malicious/compromised RPC cannot
@@ -31,19 +40,40 @@ pub(super) struct RpcTransport {
 
 impl RpcTransport {
     /// Build a transport for `endpoint` with pinned TLS roots and a 15s
-    /// timeout. Errors terminally if the TLS config or client build fails.
+    /// timeout.
+    ///
+    /// **Refuses a cleartext endpoint to a non-loopback host** — the same
+    /// policy the facilitator client applies, and for a stronger reason:
+    /// a checker's answers are the independent leg of verification, so an
+    /// endpoint an attacker can rewrite is worth less than no checker at
+    /// all (it manufactures confidence rather than withholding it).
+    ///
+    /// The destination policy is [`DestinationPolicy::AllowPrivate`]: an
+    /// RPC endpoint is operator configuration, and a node on a LAN or on
+    /// loopback is an ordinary self-hosted deployment. What it still
+    /// refuses is the set nobody configures on purpose — link-local
+    /// (including the cloud metadata address), carrier-NAT, and reserved
+    /// ranges — so a templated or partially-substituted endpoint fails
+    /// closed instead of reaching instance metadata.
     pub(super) fn new(endpoint: impl Into<String>) -> Result<Self, CheckerError> {
-        let tls = crate::tls_roots::tls_config()
-            .map_err(|e| CheckerError::terminal(format!("http tls config: {e}")))?;
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .use_preconfigured_tls(tls)
-            .build()
-            .map_err(|e| CheckerError::terminal(format!("http client: {e}")))?;
-        Ok(Self {
-            endpoint: endpoint.into(),
-            http,
-        })
+        let endpoint = endpoint.into();
+        http_policy::require_secure_endpoint(&endpoint)
+            .map_err(|e| CheckerError::terminal(format!("rpc endpoint: {e}")))?;
+        // An IP-literal endpoint is dialled without a DNS lookup, so the
+        // resolver never sees it — check literals here, names at resolve
+        // time. Together they cover every host form.
+        if let Ok(url) = reqwest::Url::parse(&endpoint) {
+            http_policy::check_url_destination(&url, DestinationPolicy::AllowPrivate)
+                .map_err(|e| CheckerError::terminal(format!("rpc endpoint: {e}")))?;
+        }
+        let http = http_policy::client(
+            DestinationPolicy::AllowPrivate,
+            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(10),
+            reqwest::redirect::Policy::none(),
+        )
+        .map_err(|e| CheckerError::terminal(e.to_string()))?;
+        Ok(Self { endpoint, http })
     }
 
     /// The endpoint URL (for `reference()` and error messages).
@@ -66,28 +96,30 @@ impl RpcTransport {
             .send()
             .await
             .map_err(|e| {
-                if e.is_timeout() || e.is_connect() {
+                // A destination-policy refusal happens inside the
+                // resolver, so it arrives here as a connect error. It is
+                // a configuration fact, not a transient one — the policy
+                // will refuse the same address forever — so it must not
+                // be reported as retryable. This matches how the same
+                // refusal is classified for an IP literal, which is
+                // caught up front at construction.
+                if http_policy::is_policy_refusal(&e) {
+                    CheckerError::terminal(format!("rpc endpoint refused by policy: {e}"))
+                } else if e.is_timeout() || e.is_connect() {
                     CheckerError::retryable(e.to_string())
                 } else {
                     CheckerError::terminal(e.to_string())
                 }
             })?;
         let status = response.status();
-        // Bound the body: a hostile RPC could otherwise stream unbounded.
-        let mut response = response;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
+        let bytes = http_policy::read_bounded(response, MAX_RPC_BODY)
             .await
-            .map_err(|e| CheckerError::retryable(e.to_string()))?
-        {
-            if bytes.len().saturating_add(chunk.len()) > MAX_RPC_BODY {
-                return Err(CheckerError::terminal(format!(
-                    "{what} response exceeded the {MAX_RPC_BODY}-byte cap"
-                )));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+            .map_err(|e| match e {
+                // A body that overruns the cap is the peer misbehaving,
+                // not a transient fault: terminal.
+                ReadError::TooLarge { .. } => CheckerError::terminal(format!("{what}: {e}")),
+                ReadError::Transport(_) => CheckerError::retryable(e.to_string()),
+            })?;
         if !status.is_success() {
             return Err(if status.is_server_error() {
                 CheckerError::retryable(format!("{what} -> {status}"))

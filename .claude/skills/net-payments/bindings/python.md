@@ -101,7 +101,34 @@ from net import build_pricing_terms, PaymentProvider
 # 1) Stand up a provider over a STARTED mesh. state_path is the settlement store
 #    (durable + single-owner). One shared PaymentEngine serves the quote/pay wire
 #    AND gates the priced tools.
-provider = PaymentProvider(mesh, state_path, billing_log_path=None)
+#    A settlement backend is MANDATORY — there is no default. Either settle for
+#    real (needs the `payments-http` build feature):
+provider = PaymentProvider(
+    mesh, state_path,
+    billing_log_path=None,
+    facilitator_url="https://facilitator.example.com",
+    facilitator_auth_token=None,            # where the facilitator wants one
+)
+#    ...or opt explicitly into the in-process mock, which MOVES NO VALUE:
+provider = PaymentProvider(mesh, state_path, unsafe_dev_mock_facilitator=True)
+#    The caller's possession proof is required by DEFAULT — passing
+#    require_invocation_binding=True is redundant. Pass False only for a
+#    deployment whose callers predate the binding: without it the quote id
+#    alone redeems, and the quote id is not a secret.
+provider = PaymentProvider(
+    mesh, state_path,
+    facilitator_url="https://facilitator.example.com",
+    require_invocation_binding=False,   # the opt-out, not the opt-in
+)
+#    Terms must be authored under the SAME registry revision the provider
+#    quotes under — a real facilitator means the production registry:
+terms = build_pricing_terms(
+    provider.provider_entity_id, capability, requirements_json,
+    production_registry=True,
+)
+#    Passing neither raises; passing both raises. The mock lets a provider sign
+#    quotes, emit billing events, and serve while settling nothing, so choosing
+#    it is a decision the operator makes out loud.
 provider.provider_entity_id                 # 32 bytes — the identity that issues quotes
 provider.read_billing()                     # [net.billing.event@1 JSON, ...] (needs billing_log_path)
 
@@ -145,9 +172,19 @@ client = PaymentHttpClient(
     payment_profile="dev_test",
     payment_signer_address=None, payment_signer=None,   # same eip155 seam as the gateway
     identity=None,                       # optional payer Identity handle; ephemeral if omitted
+    destination_policy=None,             # "public_only" (default) | "public_or_loopback" | "allow_private"
 )
 status_json, body = client.fetch_paid(url)   # SYNC — (str, bytes)
 ```
+
+**`destination_policy` defaults to `public_only`, and that will refuse a
+`localhost` URL.** This is the one door whose URL an agent can choose, so the
+SSRF guard is on by default — a permissive default would put every integration
+one model-chosen URL away from an unauthenticated service on the same host.
+Reaching a local or self-hosted x402 server is done by asking for it:
+`"public_or_loopback"` for this machine, `"allow_private"` for an internal
+network. An unknown value raises rather than falling back, and there is no
+spelling that disables the guard entirely.
 
 `AsyncPaymentHttpClient` is the awaitable dual with the same constructor; its
 `fetch_paid` is a **coroutine** — `await` it, never call it bare:

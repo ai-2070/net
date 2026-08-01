@@ -194,6 +194,7 @@ pub struct Recovery {
 /// | `gate_missing` | admission | provider_configuration_error | provider_operator | false | false | false | no | none | `configure_payment_gate` |
 /// | `unknown_quote` | redeem | new_quote_required | caller_agent | false | false | true | no | none | `request_new_quote` |
 /// | `binding_malformed` | redeem | caller_configuration_error | caller_operator | false | false | false | unknown | unknown | `fix_payment_client` |
+/// | `binding_required` | redeem | caller_configuration_error | caller_operator | false | false | false | unknown | unknown | `fix_payment_client` |
 /// | `binding_rejected` | redeem | security_violation | caller_operator | false | false | false | unknown | unknown | — |
 /// | `payer_record_corrupt` | redeem | provider_configuration_error | provider_operator | false | false | false | unknown | unknown | `contact_provider_operator` |
 /// | `quote_frozen` | redeem | non_recoverable | caller_operator | false | false | false | unknown | unknown | — |

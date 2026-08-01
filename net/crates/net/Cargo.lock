@@ -2978,6 +2978,7 @@ dependencies = [
  "hdrhistogram",
  "hex",
  "k256",
+ "libc",
  "net-mesh",
  "net-mesh-mcp",
  "net-mesh-sdk",
@@ -2995,6 +2996,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-root-certs",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

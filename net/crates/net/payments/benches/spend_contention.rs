@@ -64,6 +64,26 @@ fn target_samples() -> usize {
 
 // ---- registry / quotes -----------------------------------------------------
 
+/// A value that changes iff the store file was rewritten.
+///
+/// The saves are atomic — write a temp, then rename over the path — so on
+/// unix the inode is the exact witness. Windows has no inode, and its
+/// rename does not necessarily change the file id, so fall back to the
+/// bytes: a rewrite that produced identical content is not a rewrite
+/// anyone here cares to distinguish.
+fn store_generation(path: &std::path::Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).unwrap().ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let bytes = std::fs::read(path).unwrap();
+        u64::from_le_bytes(blake3::hash(&bytes).as_bytes()[..8].try_into().unwrap())
+    }
+}
+
 /// A mock registry with `musd` plus `n_extra` independent assets
 /// `musd0..musdN` (each its own CAIP id ⇒ its own day counter) for P5c.
 fn registry(n_extra: usize) -> Arc<AssetRegistry> {
@@ -77,6 +97,10 @@ fn registry(n_extra: usize) -> Arc<AssetRegistry> {
             symbol: format!("MUSD{i}"),
             display_name: None,
             equivalence_class: None,
+            // Mock assets pin no EIP-712 domain: nothing signs a 3009
+            // authorization against them.
+            eip712_name: None,
+            eip712_version: None,
         });
     }
     Arc::new(reg)
@@ -663,7 +687,6 @@ fn main() {
         // so the ONLY reason to write is housekeeping pruning the now-stale
         // counters. Build it directly (a real network, not the `quote` helper
         // which hardcodes the mock network).
-        use std::os::unix::fs::MetadataExt as _;
         let future = NOW + 40 * NS_PER_DAY;
         let mut real = default_mock_registry(EntityKeypair::generate().entity_id().clone());
         real.assets.push(AssetEntry {
@@ -673,6 +696,11 @@ fn main() {
             symbol: "USDC".into(),
             display_name: None,
             equivalence_class: None,
+            // Unpinned: this quote is hard-denied on network enablement
+            // before any domain is built, so the benchmark has no reason
+            // to assert one.
+            eip712_name: None,
+            eip712_version: None,
         });
         let real = Arc::new(real);
         let real_q = PaymentQuote::new(
@@ -695,13 +723,14 @@ fn main() {
             future + TTL,
         );
 
-        // Before the prune: capture the inode.
-        let ino_before = std::fs::metadata(&path).unwrap().ino();
+        // Before the prune: capture the store's identity, so the
+        // assertions below can tell "rewritten" from "left alone".
+        let ino_before = store_generation(&path);
         let d = engine.check_and_reserve(&real_q, &real, future).await.unwrap();
         assert!(matches!(d, SpendDecision::Denied { .. }), "denied result preserved");
         // The prune was dirty and persisted (inode moved on an otherwise-clean
         // denial), and the stale counter is gone.
-        let ino_pruned = std::fs::metadata(&path).unwrap().ino();
+        let ino_pruned = store_generation(&path);
         assert_ne!(ino_before, ino_pruned, "dirty housekeeping transition persisted");
         assert_eq!(
             engine.spent_today(NET, ASSET, stale_day).await.unwrap(),
@@ -712,7 +741,7 @@ fn main() {
         // Now the state is clean: an equivalent denial must NOT rewrite.
         let d = engine.check_and_reserve(&real_q, &real, future).await.unwrap();
         assert!(matches!(d, SpendDecision::Denied { .. }));
-        let ino_clean = std::fs::metadata(&path).unwrap().ino();
+        let ino_clean = store_generation(&path);
         assert_eq!(ino_pruned, ino_clean, "no repeated cleanup write once the state is clean");
         println!(
             "  housekeeping: stale pruned + persisted, denial preserved, no repeat cleanup write — OK"

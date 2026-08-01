@@ -17,9 +17,11 @@
 //!   acquire parks a `spawn_blocking` thread for the whole wait, and
 //!   enough contending mutators starve the pool the holder's own tokio
 //!   I/O needs — deadlock. Async sleep parks no thread.
-//! - **Saves are atomic**: per-pid temp file, owner-only (0600) from
-//!   creation, `fsync` before the rename, temp removed on any failure.
-//!   Readers see the whole old file or the whole new file, never a tear.
+//! - **Saves are atomic**: per-pid temp file, owner-only from creation
+//!   (`0600` on unix, an explicit owner-only DACL on Windows — see the
+//!   crate-private `policy::file_mode`), `fsync` before the rename, temp
+//!   removed on any failure. Readers see the whole old file or the whole
+//!   new file, never a tear.
 //! - **Missing file = empty state** (the first-run case); a
 //!   present-but-unparseable file is [`StoreError::Corrupt`], never a
 //!   silent reset.
@@ -160,14 +162,38 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
 
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let result: Result<(), StoreError> = async {
-        let mut opts = tokio::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            // `mode` is inherent on tokio's OpenOptions (no trait import).
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&tmp).await.map_err(|e| StoreError::io(&tmp, e))?;
+        // Created with its permissions already in place — owner-only from
+        // the instant the name exists. This is why it is a create rather
+        // than an open-then-restrict: on Windows, access is evaluated when
+        // a handle is opened, so a reader that got in before a later DACL
+        // change keeps what it was granted for the life of that handle.
+        // There must be no window at all, not merely a short one.
+        //
+        // `create_new` also means a leftover temp from a crashed same-pid
+        // process cannot be silently reused with its old permissions.
+        // Off the reactor: `create_owner_only` is synchronous, and on
+        // Windows it is several blocking syscalls (token read, SDDL
+        // conversion, `CreateFileW`). A custom store path on a network or
+        // FUSE filesystem can make those slow, and every payment passes
+        // through here — a stalled worker would stall concurrent
+        // payments, not merely this one.
+        let tmp_for_create = tmp.clone();
+        let file = tokio::task::spawn_blocking(move || {
+            match super::file_mode::create_owner_only(&tmp_for_create) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Stale temp from a dead same-pid process. Remove and
+                    // retry once, so recovery needs no manual cleanup
+                    // while a live conflict still surfaces.
+                    let _ = std::fs::remove_file(&tmp_for_create);
+                    super::file_mode::create_owner_only(&tmp_for_create)
+                }
+                other => other,
+            }
+        })
+        .await
+        .map_err(|e| StoreError::io(&tmp, e))?
+        .map_err(|e| StoreError::io(&tmp, e))?;
+        let mut file = tokio::fs::File::from_std(file);
         use tokio::io::AsyncWriteExt as _;
         file.write_all(&bytes)
             .await

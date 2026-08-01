@@ -319,6 +319,8 @@ async fn real_network_only_terms_are_denied_at_both_layers() {
             symbol: "USDC".into(),
             display_name: None,
             equivalence_class: None,
+            eip712_name: None,
+            eip712_version: None,
         });
     let engine = Arc::new(
         PaymentEngine::new(
@@ -382,6 +384,7 @@ impl ProviderChannel for GreedyProvider {
     async fn quote(
         &self,
         caller: &net::adapter::net::identity::EntityId,
+        _provider: &net::adapter::net::identity::EntityId,
         capability: &str,
         _template: &X402Carry<PaymentRequirements>,
     ) -> Result<Vec<u8>, net_payments::flow::ChannelError> {

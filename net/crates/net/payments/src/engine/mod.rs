@@ -17,9 +17,15 @@
 //! - **Fail-closed** — a facilitator failure is a structured, retryable
 //!   decision for policy, never a silent serve.
 //!
-//! Provider policy runs at quote issuance (never quote a caller you'd
-//! deny — accepting a denied caller's payment creates refund obligations
-//! P0 doesn't have); the WS4 `payment_gate` re-checks before the handler.
+//! Provider admission runs at quote issuance and **only** there (never
+//! quote a caller you'd deny — accepting a denied caller's payment creates
+//! refund obligations P0 doesn't have). [`PaymentEngine::accept_payment`]
+//! and [`PaymentEngine::redeem_for_invocation`] deliberately do not
+//! re-run it: a signed quote is a commitment that stays redeemable until
+//! it expires, so **the quote TTL is the revocation window** — see
+//! [`ProviderAdmissionPolicy`]. The gate before the handler enforces
+//! *payment* (settled, billed, unfrozen, bound to this tool, unredeemed),
+//! not admission.
 //!
 //! The engine holds `Arc<dyn Facilitator>` — pointing P1 at a real
 //! facilitator is construction config, zero interface changes (that's
@@ -137,6 +143,24 @@ pub enum PaymentDecision {
 }
 
 /// Provider-side admission: never quote a caller you'd deny.
+///
+/// **Evaluated at quote issuance only.** There is exactly one call site
+/// ([`PaymentEngine::issue_quote`]), and that is the design, not an
+/// omission: a signed quote is a commitment, so it remains redeemable
+/// for its full validity window even if the caller's admission status
+/// changes afterwards. Consequences worth stating plainly:
+///
+/// - **The quote TTL is the revocation window.** Revoking a caller stops
+///   *new* quotes, not outstanding ones. A provider that needs revocation
+///   to bite within `N` seconds issues quotes with a TTL of `N`.
+/// - Re-checking at settlement or redemption would mean refusing a caller
+///   after they had paid, which needs a refund path the protocol does not
+///   have (`net.payment.dispute@1` is reserved, with no semantics).
+///
+/// Admission is also **not** an authentication boundary: it is evaluated
+/// against whatever caller identity the quote records. Establishing that
+/// the requester *is* that caller is a separate concern, upstream of this
+/// trait.
 pub trait ProviderAdmissionPolicy: Send + Sync {
     /// `Err(reason)` refuses quote issuance for this caller/capability.
     fn admit(&self, caller: &EntityId, capability: &str) -> Result<(), String>;
@@ -187,6 +211,14 @@ pub enum RedeemDenialReason {
     WrongToolBinding { capability: String, tool_id: String },
     #[error("quote already redeemed — one payment, one serve")]
     AlreadyRedeemed,
+    /// The provider requires the invocation binding and none was
+    /// presented. Distinct from [`BindingMalformed`](Self::BindingMalformed)
+    /// (a binding arrived but was not 64 bytes) and from
+    /// [`BindingRejected`](Self::BindingRejected) (it verified against the
+    /// wrong identity): this caller sent no proof of possession at all,
+    /// which is a client-configuration gap, not an attack signal.
+    #[error("this provider requires the invocation binding — no possession proof was presented")]
+    BindingRequired,
 }
 
 impl RedeemDenialReason {
@@ -203,6 +235,7 @@ impl RedeemDenialReason {
             Self::SettlementPending => "settlement_pending",
             Self::WrongToolBinding { .. } => "wrong_tool_binding",
             Self::AlreadyRedeemed => "already_redeemed",
+            Self::BindingRequired => "binding_required",
         }
     }
 
@@ -479,12 +512,32 @@ enum Claim {
     QuoteAlreadyPaid,
 }
 
-fn last_verified_tier(chain: &[VerificationEvent]) -> Option<VerificationTier> {
-    chain
-        .iter()
-        .rev()
-        .find(|e| matches!(e.status, VerificationStatus::Verified))
-        .map(|e| e.tier)
+/// The best confidence this record has actually reached.
+///
+/// A high-water mark, not the last event — because the chain's tiers are
+/// not monotonic. `re_verify` mints `Observed` and nothing higher (a
+/// facilitator receipt justifies no depth claim), so a facilitator
+/// re-check run after `re_verify_with_checker` had established
+/// `Confirmed(n)` or `Final` appends a *lower* tier than the record had
+/// already earned. Reading the last event reported that as a downgrade —
+/// through `QuoteStatus::tier`, whose own doc promises the highest tier
+/// reached, and through every idempotent `accept_payment` retry.
+///
+/// An `Invalidated` event resets the mark. Withdrawing the verifications
+/// before it is what invalidation *means*, so a reorged record must not
+/// keep advertising confidence its settlement no longer has.
+///
+/// `Exception` events neither raise nor reset it: an overpayment is an
+/// outcome for provider policy, not a statement about chain depth.
+fn best_verified_tier(chain: &[VerificationEvent]) -> Option<VerificationTier> {
+    chain.iter().fold(None, |best, e| match e.status {
+        VerificationStatus::Verified => Some(match best {
+            Some(b) if b.satisfies(&e.tier) => b,
+            _ => e.tier,
+        }),
+        VerificationStatus::Invalidated { .. } => None,
+        VerificationStatus::Exception { .. } => best,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -517,6 +570,10 @@ pub struct PaymentEngine {
     /// appended (durable JSONL + in-process subscribers). Idempotent
     /// retries republish nothing — one event per idempotency key.
     billing_log: Option<Arc<BillingLog>>,
+    /// Whether [`redeem_for_invocation`](Self::redeem_for_invocation)
+    /// refuses a redemption that presents no invocation binding.
+    /// See [`with_require_invocation_binding`](Self::with_require_invocation_binding).
+    require_invocation_binding: bool,
 }
 
 /// Default retention for terminal quote records: 6 hours past authoritative
@@ -624,6 +681,7 @@ impl PaymentEngine {
             in_flight_ttl_ns: 300_000_000_000,
             terminal_record_retention_ns: Some(DEFAULT_TERMINAL_RECORD_RETENTION_NS),
             billing_log: None,
+            require_invocation_binding: true,
         })
     }
 
@@ -689,6 +747,42 @@ impl PaymentEngine {
     /// Attach the billing stream/export surface.
     pub fn with_billing_log(mut self, log: Arc<BillingLog>) -> Self {
         self.billing_log = Some(log);
+        self
+    }
+
+    /// Require the invocation binding: refuse to redeem a quote unless the
+    /// invoker presents the paying identity's signature over
+    /// [`invocation_binding_transcript`].
+    ///
+    /// **What this closes.** Without it, possession of the quote id is
+    /// sufficient to consume the paid invocation, and the quote id is not
+    /// a secret in practice: it rides a request header on every paid
+    /// invoke, appears in the caller's payment proof, and is carried on
+    /// the billing event. Anything that learns one — a log sink, a
+    /// support bundle, an audit export — can spend it, and redemption is
+    /// at-most-once, so the legitimate payer then gets
+    /// `already_redeemed`. Requiring the binding means only the identity
+    /// that paid can redeem.
+    ///
+    /// **What this does not close.** The binding transcript covers the
+    /// quote and the tool, and the signature travels beside the quote id
+    /// on the invocation itself. An intermediary that observes the *paid
+    /// invocation* can copy both headers and front-run it. Closing that
+    /// needs channel binding or an authenticated transport identity, not
+    /// a bigger transcript — a visible, transferable signature cannot fix
+    /// it. Do not document this flag as protection against an on-path
+    /// observer.
+    ///
+    /// **Defaults to `true`.** Bearer redemption is the exposure, so it
+    /// is not the default posture — a provider that wants it has to ask,
+    /// and the asking is visible at the call site.
+    ///
+    /// Pass `false` only for a deployment whose callers predate the
+    /// binding. A caller built on [`crate::flow::CallerPaymentFlow`]
+    /// always signs one when its identity can sign, so that set is small
+    /// and shrinking.
+    pub fn with_require_invocation_binding(mut self, require: bool) -> Self {
+        self.require_invocation_binding = require;
         self
     }
 
@@ -790,29 +884,81 @@ impl PaymentEngine {
                 // transaction. The two guards are independent.
                 let retired =
                     prune_terminal(s, now_ns, terminal_record_retention_ns, expiry_tolerance_ns);
+                // Read before the `&mut` borrow below, which would
+                // otherwise rule out touching `consumed` while holding it.
+                let payload_consumed_elsewhere = s
+                    .consumed
+                    .get(&payload_hash)
+                    .is_some_and(|owner| *owner != quote_id);
+                // Set when a stale in-flight record is taken over by a
+                // different payload: the replay index still names the dead
+                // attempt's hash and has to move with the record. Applied
+                // once the borrow ends.
+                let mut rebind_consumed_from: Option<String> = None;
                 let claim: Claim = 'claim: {
                     if let Some(rec) = s.quotes.get_mut(&quote_id) {
                         if let Some(reason) = &rec.frozen {
                             break 'claim Claim::Frozen(reason.clone());
                         }
-                        if rec.payload_hash != payload_hash {
-                            break 'claim Claim::QuoteAlreadyPaid;
-                        }
+                        let same_payload = rec.payload_hash == payload_hash;
+
+                        // Commitment first, and only then the payload
+                        // comparison.
+                        //
+                        // This used to be the other way round: any
+                        // differing payload was `QuoteAlreadyPaid`, a
+                        // terminal rejection, whether or not the record had
+                        // actually paid anything. But the claim is taken
+                        // *before* the facilitator verifies (verification is
+                        // network I/O and does not hold the lock), so an
+                        // unverified attempt held the quote against everyone
+                        // else with a decision that reads "someone already
+                        // paid this".
+                        //
+                        // The semantic replay key is derived from the
+                        // authorization's `(from, nonce)` and scope — all of
+                        // which an observer of a real authorization knows.
+                        // So the attempt occupying the record need not be
+                        // the payer: a forged payload with a garbage
+                        // signature claims the same quote just as well, and
+                        // the real payer was told their quote was spent.
+                        //
+                        // A record that has billed or settled *is* bound to
+                        // the payload it holds, and a different one there is
+                        // genuinely a second payment for one quote. Below
+                        // that line, nothing is decided yet.
                         if let Some(billing) = &rec.billing {
+                            if !same_payload {
+                                break 'claim Claim::QuoteAlreadyPaid;
+                            }
                             break 'claim Claim::AlreadyServed(
                                 Box::new(billing.clone()),
-                                last_verified_tier(&rec.chain),
+                                best_verified_tier(&rec.chain),
                                 rec.billing_published,
                             );
                         }
+                        // Completion is atomic (chain push + in_flight=false
+                        // in one commit), so a non-empty chain and
+                        // `in_flight` are mutually exclusive and this order
+                        // is free to put settlement first.
+                        if !rec.chain.is_empty() {
+                            if !same_payload {
+                                break 'claim Claim::QuoteAlreadyPaid;
+                            }
+                            break 'claim Claim::AlreadySettled;
+                        }
                         if rec.in_flight {
-                            // Completion is atomic (chain push + in_flight=false
-                            // in one commit), so an in_flight record has an
-                            // empty chain: a prior attempt claimed it and then
-                            // crashed (or is still running) before completing.
-                            // Reclaim only after the TTL, refreshing the clock
-                            // so a concurrent retry still sees InProgress and
-                            // only one attempt re-runs verify/settle.
+                            // An attempt claimed this and has not finished:
+                            // still running, or the process died before it
+                            // could release. Reclaim only after the TTL,
+                            // refreshing the clock so a concurrent retry
+                            // still sees InProgress and only one attempt
+                            // re-runs verify/settle.
+                            //
+                            // `InProgress` is retryable, which is the whole
+                            // point — a caller told this comes back and
+                            // finds the quote free once the attempt ahead of
+                            // it fails verification and releases.
                             let stale = rec
                                 .in_flight_since_ns
                                 .map(|since| now_ns.saturating_sub(since) >= in_flight_ttl_ns)
@@ -820,20 +966,36 @@ impl PaymentEngine {
                             if !stale {
                                 break 'claim Claim::InProgress;
                             }
+                            // Stale, so the attempt holding it is gone.
+                            // Taking the record over with a different
+                            // payload rebinds it, and the replay index has
+                            // to follow — otherwise the dead attempt's hash
+                            // stays claimed forever and the live one is
+                            // never registered.
+                            if !same_payload {
+                                if payload_consumed_elsewhere {
+                                    break 'claim Claim::ReplayOtherQuote;
+                                }
+                                rebind_consumed_from = Some(std::mem::replace(
+                                    &mut rec.payload_hash,
+                                    payload_hash.clone(),
+                                ));
+                                rec.payload_b64 = BASE64.encode(payload.bytes());
+                            }
                             rec.in_flight_since_ns = Some(now_ns);
                             break 'claim Claim::Fresh;
                         }
-                        if !rec.chain.is_empty() {
-                            break 'claim Claim::AlreadySettled;
-                        }
+                        // Not in flight, nothing settled, nothing billed.
+                        // `release_claim` removes an unsettled record
+                        // outright, so this is unreachable in practice; take
+                        // it as a fresh claim rather than invent a state for
+                        // it.
                         rec.in_flight = true;
                         rec.in_flight_since_ns = Some(now_ns);
                         break 'claim Claim::Fresh;
                     }
-                    if let Some(other) = s.consumed.get(&payload_hash) {
-                        if *other != quote_id {
-                            break 'claim Claim::ReplayOtherQuote;
-                        }
+                    if payload_consumed_elsewhere {
+                        break 'claim Claim::ReplayOtherQuote;
                     }
                     // Built here, not before the closure: the two base64
                     // encodes below cover the *whole* preserved carries
@@ -866,7 +1028,7 @@ impl PaymentEngine {
                         billing: None,
                         billing_published: false,
                     };
-                    s.consumed.insert(payload_hash, quote_id.clone());
+                    s.consumed.insert(payload_hash.clone(), quote_id.clone());
                     s.quotes.insert(quote_id.clone(), record);
                     // The one site that grows the map, so the one site that
                     // can observe the store crossing the warn threshold.
@@ -888,6 +1050,11 @@ impl PaymentEngine {
                     }
                     Claim::Fresh
                 };
+                // The stale-takeover rebind, now that `rec` is released.
+                if let Some(dead) = rebind_consumed_from {
+                    s.consumed.remove(&dead);
+                    s.consumed.insert(payload_hash.clone(), quote_id.clone());
+                }
                 let dirty = matches!(claim, Claim::Fresh) || retired > 0;
                 (claim, dirty)
             })
@@ -995,7 +1162,11 @@ impl PaymentEngine {
         let transaction = settle.response.view().transaction.clone();
         let settle_network = settle.response.view().network.clone();
         let quoted_network = quote.requirements.view().network.clone();
-        let tier = settle.tier;
+        // A facilitator answer is `observed`, full stop — the engine mints
+        // the tier rather than reading one off the response, so no
+        // `Facilitator` implementation can promote its own receipt.
+        // Anything above `observed` comes from `re_verify_with_checker`.
+        let tier = VerificationTier::Observed;
         // The facilitator's settle-time payer claim, recorded below as a
         // chain fact. For schemes whose payload carries no on-chain payer
         // (exact-SVM's opaque wallet blob), a later independent re-check
@@ -1201,8 +1372,20 @@ impl PaymentEngine {
         Ok(decision)
     }
 
-    /// Re-run facilitator verification for a settled quote: tier upgrades
-    /// (late finality) or invalidation (reorg) land here.
+    /// Re-run facilitator verification for a settled quote — the
+    /// **invalidation** path (a reorg the facilitator now reports as
+    /// invalid).
+    ///
+    /// It cannot raise confidence. A facilitator receipt justifies
+    /// `observed` and nothing more (the v2 spec gives facilitators no way
+    /// to report finality), so the tier is minted at this boundary rather
+    /// than read off the response, and every valid answer here is
+    /// `observed`. A caller waiting on `confirmed(n)` or `final` stays
+    /// pending no matter how often this runs.
+    ///
+    /// Confidence upgrades come from
+    /// [`Self::re_verify_with_checker`], which reads the chain
+    /// independently and is the only producer of a higher tier.
     pub async fn re_verify(
         &self,
         quote_id: &str,
@@ -1252,7 +1435,9 @@ impl PaymentEngine {
         };
         let is_valid = verify.response.view().is_valid;
         let facilitator_reason = verify.response.view().invalid_reason.clone();
-        let tier = verify.tier;
+        // Same as the settle path: the facilitator's answer is `observed`
+        // regardless of what it would like to claim.
+        let tier = VerificationTier::Observed;
         // The amount this quote requires: re-verify must re-apply the
         // under/over/exact policy against the delivered amount recorded at
         // settlement, not trust the facilitator's `is_valid` boolean alone.
@@ -1653,7 +1838,7 @@ impl PaymentEngine {
                         // and the chain stays an append-only record of
                         // *facts*.
                         let reached =
-                            last_verified_tier(&rec.chain).unwrap_or(VerificationTier::Observed);
+                            best_verified_tier(&rec.chain).unwrap_or(VerificationTier::Observed);
                         Ok((
                             PaymentDecision::PendingTier {
                                 reached,
@@ -1818,18 +2003,35 @@ impl PaymentEngine {
     /// was lost is not re-servable on the same quote, matching the
     /// at-most-once retry safety of credentialed tools.
     ///
-    /// `binding`, when present, must be the paying identity's ed25519
-    /// signature over [`invocation_binding_transcript`] — possession
-    /// proof that the invoker is the payer. Present-but-invalid rejects;
-    /// absent falls back to bearer semantics (the quote id is
-    /// content-derived and unguessable), kept in P1 for pre-binding
-    /// callers.
+    /// `binding` must be the paying identity's ed25519 signature over
+    /// [`invocation_binding_transcript`] — possession proof that the
+    /// invoker is the payer. Present-but-invalid rejects.
+    ///
+    /// **Absent rejects too**, with
+    /// [`RedeemDenialReason::BindingRequired`]. A default engine requires
+    /// the binding: without it the quote id alone admits, and a quote id
+    /// travels through logs, proxies, and the caller's own tooling — a
+    /// bearer credential by accident rather than by decision.
+    ///
+    /// Bearer semantics survive only behind
+    /// [`Self::with_require_invocation_binding(false)`](Self::with_require_invocation_binding),
+    /// for pre-binding callers that cannot be upgraded yet. The quote id
+    /// is content-derived and unguessable, so that mode is not *broken* —
+    /// it is just a weaker claim than possession of the payer's key.
     pub async fn redeem_for_invocation(
         &self,
         tool_id: &str,
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<RedeemDecision, EngineError> {
+        if self.require_invocation_binding && binding.is_none() {
+            // Refused before the store is touched: nothing to look up, and
+            // a missing binding is a client-configuration fact that does
+            // not depend on whether the quote exists.
+            return Ok(RedeemDecision::Denied {
+                reason: RedeemDenialReason::BindingRequired,
+            });
+        }
         let binding = binding.map(<[u8]>::to_vec);
         let tool_id = tool_id.to_string();
         let quote_id = quote_id.to_string();
@@ -1962,13 +2164,70 @@ impl PaymentEngine {
         Ok(removed)
     }
 
+    /// The provider identity this engine signs with — the destination a
+    /// `net.payment.quote_request@1` must be addressed to.
+    pub fn provider_id(&self) -> &EntityId {
+        self.provider.entity_id()
+    }
+
+    /// Check that this engine's settlement backend will actually settle
+    /// every `(scheme, network)` in `requirements`, before they are
+    /// announced.
+    ///
+    /// The registry check answers a different question — is this an
+    /// asset the provider knows — and a provider that passes it can
+    /// still publish a route its facilitator has never handled. The
+    /// caller then picks that entry, signs an authorization, and the
+    /// discovery happens at settle time with their signature already
+    /// given away.
+    ///
+    /// A backend that cannot say what it supports (the mock, or any
+    /// other [`Facilitator`] that does not answer) passes. Refusing on
+    /// silence would turn every implementation without a discovery
+    /// surface into a failure, which is a worse trade than the gap.
+    ///
+    /// Network I/O: call at publication or configuration time, never per
+    /// payment.
+    pub async fn check_settlement_routes(
+        &self,
+        requirements: &[X402Carry<PaymentRequirements>],
+    ) -> Result<(), EngineError> {
+        let Some(pairs) = self
+            .facilitator
+            .supported_pairs()
+            .await
+            .map_err(|e| EngineError::State(format!("facilitator /supported: {e}")))?
+        else {
+            return Ok(());
+        };
+        for requirement in requirements {
+            let view = requirement.view();
+            let offered = pairs
+                .iter()
+                .any(|(scheme, network)| *scheme == view.scheme && *network == view.network);
+            if !offered {
+                let offers = pairs
+                    .iter()
+                    .map(|(s, n)| format!("({s}, {n})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(EngineError::State(format!(
+                    "the settlement backend does not settle ({}, {}) — refusing to announce a \
+                     price it cannot honour. It offers: [{offers}]",
+                    view.scheme, view.network
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Read-only lifecycle snapshot for gates and tests.
     pub async fn status(&self, quote_id: &str) -> Result<Option<QuoteStatus>, EngineError> {
         let state: EngineState = load_json(&self.state_path).await?;
         Ok(state.quotes.get(quote_id).map(|rec| QuoteStatus {
             frozen: rec.frozen.clone(),
             served: rec.served,
-            tier: last_verified_tier(&rec.chain),
+            tier: best_verified_tier(&rec.chain),
             billing_event_id: rec.billing.as_ref().map(|b| b.billing_event_id.clone()),
             chain: rec.chain.clone(),
         }))
