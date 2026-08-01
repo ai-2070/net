@@ -516,6 +516,35 @@ impl RegistryInner {
             .map_or(0, |keys| keys.values().sum())
     }
 
+    /// Give up ONE of `family`'s references to `key`, reporting whether that was
+    /// the slot's last reference and it must now be retired.
+    ///
+    /// Bookkeeping only: the caller commits the retirement, because retiring
+    /// touches the metrics and the capacity generation that live on the registry
+    /// rather than on this struct. Shared by the single-key release, the
+    /// whole-set release and the replacement transaction, so the three cannot
+    /// drift in how a reference is given up.
+    fn release_one(&mut self, family: FamilyId, key: &SlotKey) -> bool {
+        if let Some(keys) = self.families.get_mut(&family) {
+            if let Some(count) = keys.get_mut(key) {
+                *count -= 1;
+                if *count == 0 {
+                    keys.remove(key);
+                }
+            }
+            if keys.is_empty() {
+                self.families.remove(&family);
+            }
+        }
+        match self.slots.get_mut(key) {
+            Some(slot) => {
+                slot.refs -= 1;
+                slot.refs == 0
+            }
+            None => false,
+        }
+    }
+
     /// Allocate the next identity, or `None` when the space is exhausted.
     fn allocate_id(&mut self) -> Option<u64> {
         let next = self.next_id.checked_add(1)?;
@@ -689,11 +718,21 @@ impl RoutingFamily {
     }
 
     /// Acquire a COMPLETE demand set atomically, or nothing (OLB-2B.3b §4.1).
-    pub(crate) fn demand_set(
-        &self,
-        keys: Vec<SlotKey>,
-    ) -> Result<Vec<DemandHandle>, DemandRefused> {
+    pub(crate) fn demand_set(&self, keys: Vec<SlotKey>) -> Result<DemandSet, DemandRefused> {
         self.registry.demand_set(self.id, keys)
+    }
+
+    /// Atomically REPLACE `old` with the set for `new_keys`, charged on the
+    /// projected final footprint (OLB-2B.3b §4.3).
+    ///
+    /// On refusal `old` is untouched and still owns everything it owned, so the
+    /// caller's superseded entry stays fully live.
+    pub(crate) fn replace_demand_set(
+        &self,
+        old: &DemandSet,
+        new_keys: Vec<SlotKey>,
+    ) -> Result<DemandSet, DemandRefused> {
+        self.registry.replace_demand_set(self.id, old, new_keys)
     }
 
     /// Handles this family currently holds.
@@ -750,6 +789,85 @@ impl DemandHandle {
 impl Drop for DemandHandle {
     fn drop(&mut self) {
         self.registry.release(self.family, &self.key);
+    }
+}
+
+/// A family's COMPLETE demand set for one capability, owned as ONE object.
+///
+/// The unit of ownership is the SET, not the handle, and that is what makes an
+/// atomic replacement expressible: a replacement compares two key sets in one
+/// registry transaction and moves the release responsibility across, so the
+/// intersection is never released and re-acquired and nothing is ever charged
+/// twice. A `Vec<DemandHandle>` cannot express it — each handle releases itself
+/// on drop, so transferring one means defusing its `Drop`, and a per-handle
+/// defuse is exactly the double-release hazard this type removes.
+#[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+pub(crate) struct DemandSet {
+    registry: Arc<NodeOrgRoutingRegistry>,
+    family: FamilyId,
+    /// What this set NAMES, in deterministic key order.
+    ///
+    /// Immutable, and read on the lock-free path. Distinct from `held`, which is
+    /// what it still OWES a release for; after a replacement transfers the
+    /// references away the two differ, and that difference is the whole point.
+    keys: Vec<SlotKey>,
+    /// Publication cells, parallel to `keys`.
+    ///
+    /// Immutable and lock-free readable. Holding a cell is sound whatever
+    /// happens to the slot: a retired slot's cell simply reads empty, which is
+    /// the correct answer for a superseded set.
+    cells: Vec<Arc<ArcSwapOption<SlotBaseFacts>>>,
+    /// The RELEASE RESPONSIBILITY — the keys this set must still give back.
+    ///
+    /// Interior-mutable because the responsibility can move to a replacement set
+    /// while this one is still shared behind an `Arc`. There is no flag and no
+    /// `mem::forget`: the invariant is that a set releases precisely the keys it
+    /// contains at drop, and a transfer MOVES them, so at every instant exactly
+    /// one set owes each reference.
+    held: parking_lot::Mutex<Vec<SlotKey>>,
+}
+
+#[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+impl DemandSet {
+    /// The scopes this set names, in deterministic key order.
+    pub(crate) fn keys(&self) -> &[SlotKey] {
+        &self.keys
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The published artifact for the `index`-th contributor, UNVALIDATED —
+    /// exactly like its registry-side twin. Authority revalidation is the NODE
+    /// seam's job (`MeshNode::org_routing_base_facts`); the name says so.
+    pub(crate) fn base_facts_unvalidated(&self, index: usize) -> Option<Arc<SlotBaseFacts>> {
+        self.cells.get(index)?.load_full()
+    }
+
+    /// Test-only: what this set still owes a release for. A replacement moves
+    /// this to the successor, and a witness that could not see it would have to
+    /// infer the transfer from a handle count that a double-release also
+    /// produces.
+    #[cfg(test)]
+    pub(crate) fn held_for_test(&self) -> Vec<SlotKey> {
+        self.held.lock().clone()
+    }
+}
+
+impl Drop for DemandSet {
+    fn drop(&mut self) {
+        // Whatever is still owed, released as one transaction. After a
+        // replacement transferred them this is empty and the drop is a no-op —
+        // not because a flag says so, but because the keys are gone.
+        let owed = std::mem::take(&mut *self.held.lock());
+        if !owed.is_empty() {
+            self.registry.release_keys(self.family, &owed);
+        }
     }
 }
 
@@ -1066,7 +1184,7 @@ impl NodeOrgRoutingRegistry {
         self: &Arc<Self>,
         family: FamilyId,
         keys: Vec<SlotKey>,
-    ) -> Result<Vec<DemandHandle>, DemandRefused> {
+    ) -> Result<DemandSet, DemandRefused> {
         let mut keys = keys;
         keys.sort();
         keys.dedup();
@@ -1157,16 +1275,13 @@ impl NodeOrgRoutingRegistry {
             // `pending`, and it already holds every new identity.
             self.work.mark();
         }
-        Ok(keys
-            .into_iter()
-            .zip(cells)
-            .map(|(key, facts)| DemandHandle {
-                registry: self.clone(),
-                family,
-                key,
-                facts,
-            })
-            .collect())
+        Ok(DemandSet {
+            registry: self.clone(),
+            family,
+            keys: keys.clone(),
+            cells,
+            held: parking_lot::Mutex::new(keys),
+        })
     }
 
     /// Release one handle. The LAST reference retires the slot; a re-demand then
@@ -1174,39 +1289,218 @@ impl NodeOrgRoutingRegistry {
     #[allow(dead_code)]
     fn release(&self, family: FamilyId, key: &SlotKey) {
         let mut inner = self.inner.lock();
-        if let Some(keys) = inner.families.get_mut(&family) {
-            if let Some(count) = keys.get_mut(key) {
-                *count -= 1;
-                if *count == 0 {
-                    keys.remove(key);
-                }
-            }
-            if keys.is_empty() {
-                inner.families.remove(&family);
+        if inner.release_one(family, key) {
+            self.retire_committed(&mut inner, key);
+        }
+    }
+
+    /// Release EVERY key of a set in ONE registry transaction.
+    ///
+    /// One acquisition, not one per key: a set is released as a unit, so no
+    /// observer can see a partially-released set and the capacity generation
+    /// moves once for the whole retirement rather than interleaving with another
+    /// family's demand.
+    fn release_keys(&self, family: FamilyId, keys: &[SlotKey]) {
+        let mut inner = self.inner.lock();
+        for key in keys {
+            if inner.release_one(family, key) {
+                self.retire_committed(&mut inner, key);
             }
         }
-        let retire = match inner.slots.get_mut(key) {
-            Some(slot) => {
-                slot.refs -= 1;
-                slot.refs == 0
+    }
+
+    /// Commit the retirement of a slot whose last reference just went away.
+    fn retire_committed(&self, inner: &mut RegistryInner, key: &SlotKey) {
+        inner.slots.remove(key);
+        inner.pending.remove(key);
+        if let Some(bucket) = inner.slots_by_capability.get_mut(&key.capability) {
+            bucket.remove(key);
+            if bucket.is_empty() {
+                inner.slots_by_capability.remove(&key.capability);
             }
-            None => false,
+        }
+        self.metrics.slots_retired.fetch_add(1, Ordering::AcqRel);
+        // Node capacity genuinely moved. Published while the registry lock
+        // still covers the removal, so an observer that reads the new
+        // generation cannot then find the slot still there.
+        self.node_capacity_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Atomically REPLACE one family's demand set with another (OLB-2B.3b §4.3).
+    ///
+    /// Not "acquire the new set, then drop the old one". That charges the family
+    /// and the node at the TRANSIENT GROSS peak — every replacement handle while
+    /// every superseded handle is still charged — so a replacement that plainly
+    /// fits its final footprint is refused at the bound. A family holding 64 of
+    /// 64 whose width-2 capability loses an audience projects to
+    /// `64 - 2 + 1 = 63` and MUST succeed; charged gross it asks for 66.
+    ///
+    /// Nor "release the old set, then acquire the new one". That answers the
+    /// bound correctly and breaks the no-effect property instead: a refusal
+    /// would have already destroyed retained authority, and the re-acquisition
+    /// that was supposed to restore it can fail on its own.
+    ///
+    /// So: ONE transaction, charged on the PROJECTED FINAL footprint.
+    ///
+    /// ```text
+    /// common     = old ∩ new    reference kept EXACTLY as it is — no churn
+    /// old_only   = old \ new    released; credits node capacity only if LAST
+    /// new_only   = new \ old    charged; costs a node slot only if absent
+    ///
+    /// family:  held - |old_only| + |new_only|   <= MAX_HANDLES_PER_FAMILY
+    /// node:    slots - credited  + created      <= MAX_NODE_SLOTS
+    /// ```
+    ///
+    /// The node credit is deliberately conditional. An `old_only` slot another
+    /// family still demands does NOT retire, so it frees nothing and crediting
+    /// it would admit a 257th slot. The shared-old and last-reference cases are
+    /// separately witnessed for exactly that reason.
+    ///
+    /// Every refusal is decided before the first mutation, so a refused
+    /// replacement leaves handles, slots, refs, pending work, identities and
+    /// generations exactly as they were — and, because the caller keeps its
+    /// `DemandSet`, leaves the superseded entry fully live and owned.
+    fn replace_demand_set(
+        self: &Arc<Self>,
+        family: FamilyId,
+        old: &DemandSet,
+        new_keys: Vec<SlotKey>,
+    ) -> Result<DemandSet, DemandRefused> {
+        let mut new_keys = new_keys;
+        new_keys.sort();
+        new_keys.dedup();
+
+        // Lock order: the set's release responsibility, then the registry. The
+        // set's own `Drop` takes them in the same order, so the two cannot
+        // deadlock against each other.
+        let mut held = old.held.lock();
+
+        let mut queued = false;
+        let cells = {
+            let mut inner = self.inner.lock();
+
+            let old_only: Vec<SlotKey> = held
+                .iter()
+                .filter(|key| new_keys.binary_search(key).is_err())
+                .cloned()
+                .collect();
+            let new_only: Vec<SlotKey> = new_keys
+                .iter()
+                .filter(|key| held.binary_search(key).is_err())
+                .cloned()
+                .collect();
+
+            // FAMILY, on the projected final count.
+            let projected =
+                inner.family_handles(family).saturating_sub(old_only.len()) + new_only.len();
+            if projected > MAX_HANDLES_PER_FAMILY {
+                self.metrics
+                    .refused_family_at_capacity
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(DemandRefused::FamilyAtCapacity);
+            }
+
+            // NODE, on the projected final retained set. A slot is credited only
+            // when THIS reference is its last.
+            let credited = old_only
+                .iter()
+                .filter(|key| inner.slots.get(key).is_some_and(|slot| slot.refs == 1))
+                .count();
+            let created = new_only
+                .iter()
+                .filter(|key| !inner.slots.contains_key(key))
+                .count();
+            let projected_slots = inner.slots.len().saturating_sub(credited) + created;
+            if projected_slots > MAX_NODE_SLOTS {
+                self.metrics
+                    .refused_node_at_capacity
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(DemandRefused::NodeAtCapacity);
+            }
+
+            // IDENTITIES for genuinely new slots, reserved as one checked block.
+            let Some(reserved_through) = inner.next_id.checked_add(created as u64) else {
+                self.metrics
+                    .refused_id_space_exhausted
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(DemandRefused::IdSpaceExhausted);
+            };
+            let mut next_incarnation = inner.next_id;
+            inner.next_id = reserved_through;
+
+            // Every refusal is above this line. Nothing below can fail.
+
+            // Released FIRST, so the retained-slot count never rises above the
+            // projected final figure even inside the transaction.
+            for key in &old_only {
+                if inner.release_one(family, key) {
+                    self.retire_committed(&mut inner, key);
+                }
+            }
+            for key in &new_only {
+                match inner.slots.get_mut(key) {
+                    Some(slot) => slot.refs += 1,
+                    None => {
+                        next_incarnation += 1;
+                        let cell = Arc::new(ArcSwapOption::empty());
+                        inner.slots.insert(
+                            key.clone(),
+                            Slot {
+                                incarnation: next_incarnation,
+                                refs: 1,
+                                facts: cell,
+                            },
+                        );
+                        inner
+                            .slots_by_capability
+                            .entry(key.capability)
+                            .or_default()
+                            .insert(key.clone());
+                        inner.pending.insert(key.clone());
+                        queued = true;
+                    }
+                }
+                *inner
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .entry(key.clone())
+                    .or_insert(0) += 1;
+            }
+            debug_assert_eq!(next_incarnation, reserved_through, "reservation is exact");
+
+            // Cells for the WHOLE new set. A `common` key yields the very cell it
+            // already had, because its reference was never touched.
+            new_keys
+                .iter()
+                .map(|key| {
+                    inner
+                        .slots
+                        .get(key)
+                        .expect("every key of the new set is retained above")
+                        .facts
+                        .clone()
+                })
+                .collect::<Vec<_>>()
         };
-        if retire {
-            inner.slots.remove(key);
-            inner.pending.remove(key);
-            if let Some(bucket) = inner.slots_by_capability.get_mut(&key.capability) {
-                bucket.remove(key);
-                if bucket.is_empty() {
-                    inner.slots_by_capability.remove(&key.capability);
-                }
-            }
-            self.metrics.slots_retired.fetch_add(1, Ordering::AcqRel);
-            // Node capacity genuinely moved. Published while the registry lock
-            // still covers the removal, so an observer that reads the new
-            // generation cannot then find the slot still there.
-            self.node_capacity_generation.fetch_add(1, Ordering::AcqRel);
+
+        // The TRANSFER, and the only place it happens: the superseded set now
+        // owes nothing, because everything it owed is either still held (common)
+        // or has just been released (old_only). No flag decides this — the keys
+        // themselves moved, so exactly one set owes a release at every instant.
+        held.clear();
+        drop(held);
+
+        if queued {
+            self.work.mark();
         }
+        Ok(DemandSet {
+            registry: self.clone(),
+            family,
+            keys: new_keys.clone(),
+            cells,
+            held: parking_lot::Mutex::new(new_keys),
+        })
     }
 
     /// The RAW retained base facts for `key` — retention only, with NO
@@ -2865,8 +3159,8 @@ mod tests {
             ])
             .expect("acquired");
 
-        assert_eq!(handles[0].key, key(1, "nrpc:order"), "Owner first");
-        assert_eq!(handles[1].key.scope, grant, "Grant after");
+        assert_eq!(handles.keys()[0], key(1, "nrpc:order"), "Owner first");
+        assert_eq!(handles.keys()[1].scope, grant, "Grant after");
     }
 
     // -------------------------------------------------------------- lifecycle

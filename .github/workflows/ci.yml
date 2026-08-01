@@ -284,7 +284,7 @@ jobs:
         run: |
           set -o pipefail
           REG_MIN=36
-          STATE_MIN=25
+          STATE_MIN=31
           reg=$(cargo test --lib --features "$UNIT_FEATURES" \
                   behavior::org_routing_registry:: 2>&1 | tee /dev/stderr)
           state=$(cargo test --lib --features "$UNIT_FEATURES" \
@@ -347,6 +347,12 @@ jobs:
           a_refused_rederivation_leaves_the_entry_exactly_as_it_was
           a_current_warmed_entry_with_a_leased_audience_takes_no_lock
           the_capability_index_derives_exactly_what_the_full_scan_derives
+          a_narrowing_replacement_at_the_family_bound_is_charged_net
+          a_same_width_rotation_at_the_family_bound_is_charged_net
+          a_rotation_at_the_node_bound_retires_the_slot_it_transfers
+          a_rotation_at_the_node_bound_refuses_when_the_old_slot_is_shared
+          identity_exhaustion_during_a_replacement_refuses_with_no_effect
+          a_narrowing_replacement_needs_no_identity_after_exhaustion
           dropping_the_state_releases_every_demand"
           for required in $REQUIRED_STATE; do
             if ! printf "%s" "$state" | grep -q "$required"; then

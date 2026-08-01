@@ -23,9 +23,9 @@ use crate::adapter::net::behavior::org_grant_registry::{
 };
 use crate::adapter::net::behavior::org_routing::RegistryWork;
 use crate::adapter::net::behavior::org_routing_registry::{
-    GrantArtifactFence, NodeOrgRoutingRegistry, RegistryMetrics, ScopedDiscoveryAuthorityStamp,
-    ScopedSourceFacts, SlotSource, SourceCommitPin, SourceFacts, SourceSnapshot, SourceToken,
-    MAX_NODE_SLOTS,
+    DemandHandle, GrantArtifactFence, NodeOrgRoutingRegistry, RegistryMetrics,
+    ScopedDiscoveryAuthorityStamp, ScopedSourceFacts, SlotSource, SourceCommitPin, SourceFacts,
+    SourceSnapshot, SourceToken, MAX_NODE_SLOTS,
 };
 use std::time::Duration;
 
@@ -883,6 +883,19 @@ fn fill_to(state: &OrgRoutingState, leased: &ConsumerGrantSnapshot, handles: u32
     assert_eq!(state.handles(), handles as usize);
 }
 
+/// Warm grantless capabilities until the family holds exactly `target` handles.
+fn fill_to_total(state: &OrgRoutingState, leased: &ConsumerGrantSnapshot, target: usize) {
+    let mut seed = 0u32;
+    while state.handles() < target {
+        assert_eq!(
+            state.route_handle(&cap(&format!("nrpc:top{seed}")), leased),
+            RouteLookup::Warm
+        );
+        seed += 1;
+    }
+    assert_eq!(state.handles(), target);
+}
+
 /// Two leased DISCOVER grants for each of `capabilities`, so every one of them
 /// is a WIDTH-3 demand set (Owner + two audiences).
 fn wide_credentials(
@@ -1304,7 +1317,6 @@ fn concurrent_rederivations_spend_one_demand_set() {
     assert_eq!(state.handles(), 62);
 
     let leased = Arc::new(lease(&unleased, &grant, secret.expect("secret"), 1));
-    let stale = state.warm(&capability).expect("warm");
     let before = state.mutate_acquisitions();
 
     let start = Arc::new(std::sync::Barrier::new(4));
@@ -1313,10 +1325,9 @@ fn concurrent_rederivations_spend_one_demand_set() {
             let state = state.clone();
             let start = start.clone();
             let leased = leased.clone();
-            let stale = stale.clone();
             std::thread::spawn(move || {
                 start.wait();
-                state.rederive(&capability, &leased, stale)
+                state.rederive(&capability, &leased)
             })
         })
         .collect();
@@ -1327,8 +1338,6 @@ fn concurrent_rederivations_spend_one_demand_set() {
             "every rival adopts the winner's re-derivation"
         );
     }
-    drop(stale);
-
     assert_eq!(
         state.mutate_acquisitions() - before,
         4,
@@ -1345,6 +1354,25 @@ fn concurrent_rederivations_spend_one_demand_set() {
         state.warm(&capability).expect("warm").demanded(),
         &[owner_key(&capability), grant_key(&grant)]
     );
+    // The release responsibility was TRANSFERRED exactly once: the live entry
+    // owes its whole set, and no rival left a second set owing the same keys.
+    assert_eq!(
+        state
+            .warm(&capability)
+            .expect("warm")
+            .demands()
+            .held_for_test(),
+        vec![owner_key(&capability), grant_key(&grant)],
+        "the surviving set owes exactly what it names"
+    );
+    // And the width refusal state is not poisoned — the family still spends its
+    // last handle.
+    assert_eq!(
+        state.route_handle(&cap("nrpc:after"), &leased),
+        RouteLookup::Warm,
+        "a duplicate transfer would have refused and poisoned the width record"
+    );
+    assert_eq!(state.handles(), 64);
 }
 
 /// A re-derivation the family cannot afford changes NOTHING, and says so.
@@ -1434,44 +1462,377 @@ fn capacity_freed_by_a_supersession_is_spendable_again() {
         secret.expect("secret"),
         1,
     );
-    // A second width-2 capability, so there is something to be refused and then
-    // admitted once the supersession frees a handle.
+    // `wide` carries TWO leased audiences, so shedding them frees two handles —
+    // exactly what the refused width-2 capability needs. A one-handle release
+    // would leave `other` refused on the merits, and the witness would pass
+    // whether or not the width record was forgotten.
+    let (second, second_secret) = issue(wide, GrantRights::DISCOVER);
+    let leased = lease(&leased, &second, second_secret.expect("secret"), 2);
     let other = cap("nrpc:other");
     let (other_grant, other_secret) = issue(other, GrantRights::DISCOVER);
-    let leased = lease(&leased, &other_grant, other_secret.expect("secret"), 2);
-    let state = f.state(credentials(vec![grant.clone(), other_grant.clone()]));
+    let leased = lease(&leased, &other_grant, other_secret.expect("secret"), 3);
+    let state = f.state(credentials(vec![
+        grant.clone(),
+        second.clone(),
+        other_grant.clone(),
+    ]));
 
-    // `wide` is width 2 (Owner + the leased audience); 61 grantless fillers take
-    // the family to 63 of 64.
+    // `wide` is width 3; fillers take the family to EXACTLY 64 of 64 — the hard
+    // boundary, not the 63/64 near-boundary a transient overlap slips past.
     assert_eq!(state.route_handle(&wide, &leased), RouteLookup::Warm);
-    for i in 0..61u32 {
-        assert_eq!(
-            state.route_handle(&cap(&format!("nrpc:f{i}")), &leased),
-            RouteLookup::Warm
-        );
-    }
-    assert_eq!(state.handles(), 63);
+    assert_eq!(state.handles(), 3);
+    fill_to_total(&state, &leased, 64);
     assert_eq!(
         state.route_handle(&other, &leased),
         RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity)),
-        "63 + 2 does not fit"
+        "64 + 2 does not fit, and the refusal records width 2"
     );
 
-    // Remove `wide`'s lease. Its entry supersedes down to Owner alone, which
-    // FREES a handle — the one path on which this family's count falls.
+    // Shed BOTH of `wide`'s audiences. Projected: 64 - 3 + 1 = 62.
     let removed = leased
         .without(&grant.grant_id)
+        .expect("the record was there")
+        .without(&second.grant_id)
         .expect("the record was there");
     assert_eq!(state.route_handle(&wide, &removed), RouteLookup::Warm);
-    assert_eq!(state.handles(), 62, "the superseded audience was released");
+    assert_eq!(
+        state.handles(),
+        62,
+        "two superseded audiences were released"
+    );
+    assert_eq!(
+        state.warm(&wide).expect("warm").demanded(),
+        &[owner_key(&wide)]
+    );
 
-    // `other` is still width 2 under `removed`, and 62 + 2 = 64 now fits.
+    // `other` is still width 2 under `removed`, and 62 + 2 = 64 now fits — but
+    // only if the record taken before the supersession was forgotten.
     assert_eq!(
         state.route_handle(&other, &removed),
         RouteLookup::Warm,
         "capacity freed by a supersession must be reachable again"
     );
     assert_eq!(state.handles(), 64);
+}
+
+// ---------------- §4.3: replacement is charged on the PROJECTED footprint
+
+/// Retain distinct node slots under throwaway families until the node holds
+/// exactly `target`, returning the handles that keep them alive.
+fn fill_node_to(f: &Fixture, target: usize) -> Vec<DemandHandle> {
+    let mut held = Vec::new();
+    let mut family = f.registry.new_family().expect("family");
+    let mut in_family = 0usize;
+    let mut seed = 0u32;
+    while f.registry.retained_slots() < target {
+        if in_family == MAX_HANDLES_PER_FAMILY {
+            family = f.registry.new_family().expect("family");
+            in_family = 0;
+        }
+        held.push(
+            family
+                .demand(SlotKey {
+                    scope: PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
+                        grant_id: [0xF1; 32],
+                        audience_handle: [0xF1; 32],
+                    })
+                    .expect("private"),
+                    capability: cap(&format!("nrpc:nodefill{seed}")),
+                })
+                .expect("fill"),
+        );
+        in_family += 1;
+        seed += 1;
+    }
+    assert_eq!(f.registry.retained_slots(), target);
+    held
+}
+
+/// **The reviewer's schedule.** A family at its hard bound whose capability
+/// LOSES an audience projects to `64 - 2 + 1 = 63` and must succeed.
+///
+/// Dies to: acquiring the replacement set beside the superseded one and dropping
+/// it afterwards. That charges the transient GROSS peak — every replacement
+/// handle while every superseded handle is still charged — so this asks for 66
+/// and is refused at a bound its final footprint sits comfortably inside. The
+/// entry is then stuck: it can never shed the obsolete scope, because shedding
+/// it requires capacity the shedding itself would free.
+#[test]
+fn a_narrowing_replacement_at_the_family_bound_is_charged_net() {
+    let f = fixture();
+    let changing = cap("nrpc:changing");
+    let (grant, secret) = issue(changing, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![grant.clone()]));
+
+    assert_eq!(state.route_handle(&changing, &leased), RouteLookup::Warm);
+    assert_eq!(state.handles(), 2, "Owner + one leased audience");
+    fill_to_total(&state, &leased, 64);
+    assert_eq!(state.handles(), 64, "the family is EXACTLY at its bound");
+
+    // The audience goes away. Projected: 64 - 2 + 1 = 63.
+    let removed = leased
+        .without(&grant.grant_id)
+        .expect("the record was there");
+    assert_eq!(
+        state.route_handle(&changing, &removed),
+        RouteLookup::Warm,
+        "replacement capacity must be charged net of the entry it supersedes"
+    );
+    assert_eq!(state.handles(), 63);
+    assert_eq!(
+        state.warm(&changing).expect("warm").demanded(),
+        &[owner_key(&changing)],
+        "and the obsolete Grant scope is gone"
+    );
+    assert_eq!(f.metrics.refused_family_at_capacity(), 0);
+}
+
+/// A SAME-WIDTH rotation at the hard bound: `64 - 2 + 2 = 64` succeeds.
+///
+/// The case a "credit the old set first" shortcut gets wrong in the other
+/// direction, and the one that proves the intersection is preserved rather than
+/// released and re-taken: only the Grant scope moves, and the Owner scope's
+/// reference is never given up, so the family never dips below its bound and
+/// never rises above it.
+#[test]
+fn a_same_width_rotation_at_the_family_bound_is_charged_net() {
+    let f = fixture();
+    let changing = cap("nrpc:changing");
+    let (old_grant, old_secret) = issue(changing, GrantRights::DISCOVER);
+    let (new_grant, new_secret) = issue(changing, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &old_grant,
+        old_secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![old_grant.clone(), new_grant.clone()]));
+
+    assert_eq!(state.route_handle(&changing, &leased), RouteLookup::Warm);
+    fill_to_total(&state, &leased, 64);
+    assert_eq!(state.handles(), 64);
+    let slots_before = f.registry.retained_slots();
+
+    // Rotate the audience: the old lease is removed and the successor installed.
+    let rotated = lease(
+        &leased.without(&old_grant.grant_id).expect("was there"),
+        &new_grant,
+        new_secret.expect("secret"),
+        2,
+    );
+    assert_eq!(
+        state.route_handle(&changing, &rotated),
+        RouteLookup::Warm,
+        "a same-width rotation neither grows nor shrinks the footprint"
+    );
+
+    assert_eq!(state.handles(), 64, "still exactly at the bound");
+    assert_eq!(
+        state.warm(&changing).expect("warm").demanded(),
+        &[owner_key(&changing), grant_key(&new_grant)],
+        "the successor audience is retained"
+    );
+    assert!(
+        !state
+            .warm(&changing)
+            .expect("warm")
+            .demanded()
+            .contains(&grant_key(&old_grant)),
+        "and the superseded audience is not"
+    );
+    assert_eq!(
+        f.registry.retained_slots(),
+        slots_before,
+        "one slot retired as one was created"
+    );
+    assert_eq!(f.metrics.refused_family_at_capacity(), 0);
+}
+
+/// At the NODE bound, a rotation whose old exact slot RETIRES projects to
+/// `256 - 1 + 1 = 256` and succeeds.
+///
+/// Dies to: judging the new slot against a transient `256 + 1`. The old Grant
+/// slot is this family's alone, so the replacement retires it and the node's
+/// final retained count is unchanged — refusing here would strand every rotation
+/// on a full node forever, since no rotation can free the slot it is replacing
+/// without being allowed to replace it.
+#[test]
+fn a_rotation_at_the_node_bound_retires_the_slot_it_transfers() {
+    let f = fixture();
+    let changing = cap("nrpc:changing");
+    let (old_grant, old_secret) = issue(changing, GrantRights::DISCOVER);
+    let (new_grant, new_secret) = issue(changing, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &old_grant,
+        old_secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![old_grant.clone(), new_grant.clone()]));
+    assert_eq!(state.route_handle(&changing, &leased), RouteLookup::Warm);
+
+    let _fillers = fill_node_to(&f, MAX_NODE_SLOTS);
+    assert_eq!(f.registry.retained_slots(), MAX_NODE_SLOTS);
+
+    let rotated = lease(
+        &leased.without(&old_grant.grant_id).expect("was there"),
+        &new_grant,
+        new_secret.expect("secret"),
+        2,
+    );
+    assert_eq!(
+        state.route_handle(&changing, &rotated),
+        RouteLookup::Warm,
+        "the old exact slot retires as the new one is created"
+    );
+    assert_eq!(
+        f.registry.retained_slots(),
+        MAX_NODE_SLOTS,
+        "the node's final retained count is unchanged"
+    );
+    assert_eq!(
+        state.warm(&changing).expect("warm").demanded(),
+        &[owner_key(&changing), grant_key(&new_grant)]
+    );
+    assert_eq!(f.metrics.refused_node_at_capacity(), 0);
+}
+
+/// The CONTROL for the case above: when the old exact slot is SHARED, it does
+/// not retire, so the replacement genuinely needs a 257th slot and must refuse.
+///
+/// Without this, "credit every old-only slot" passes the retiring case and
+/// silently admits a slot past the node bound whenever another family still
+/// wants the one being replaced.
+#[test]
+fn a_rotation_at_the_node_bound_refuses_when_the_old_slot_is_shared() {
+    let f = fixture();
+    let changing = cap("nrpc:changing");
+    let (old_grant, old_secret) = issue(changing, GrantRights::DISCOVER);
+    let (new_grant, new_secret) = issue(changing, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &old_grant,
+        old_secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![old_grant.clone(), new_grant.clone()]));
+    assert_eq!(state.route_handle(&changing, &leased), RouteLookup::Warm);
+
+    // A SECOND owner of the very slot the rotation would give up.
+    let sharer = f.registry.new_family().expect("family");
+    let _shared = sharer
+        .demand(grant_key(&old_grant))
+        .expect("the slot is already retained, so this shares it");
+
+    let _fillers = fill_node_to(&f, MAX_NODE_SLOTS);
+    let handles_before = state.handles();
+    let entries_before = state.entries();
+
+    let rotated = lease(
+        &leased.without(&old_grant.grant_id).expect("was there"),
+        &new_grant,
+        new_secret.expect("secret"),
+        2,
+    );
+    assert_eq!(
+        state.route_handle(&changing, &rotated),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
+        "the shared old slot frees nothing, so the new one is genuinely a 257th"
+    );
+
+    assert_eq!(f.registry.retained_slots(), MAX_NODE_SLOTS, "no slot moved");
+    assert_eq!(state.handles(), handles_before, "no handle moved");
+    assert_eq!(state.entries(), entries_before);
+    assert_eq!(
+        state.warm(&changing).expect("still retained").demanded(),
+        &[owner_key(&changing), grant_key(&old_grant)],
+        "and the superseded entry is exactly what it was"
+    );
+}
+
+/// Identity exhaustion during a replacement that needs a NEW slot refuses with
+/// total no effect, and the old complete entry survives.
+#[test]
+fn identity_exhaustion_during_a_replacement_refuses_with_no_effect() {
+    let f = fixture();
+    let changing = cap("nrpc:changing");
+    let (old_grant, old_secret) = issue(changing, GrantRights::DISCOVER);
+    let (new_grant, new_secret) = issue(changing, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &old_grant,
+        old_secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![old_grant.clone(), new_grant.clone()]));
+    assert_eq!(state.route_handle(&changing, &leased), RouteLookup::Warm);
+    let handles_before = state.handles();
+    let slots_before = f.registry.retained_slots();
+
+    f.registry.exhaust_ids_for_test();
+
+    let rotated = lease(
+        &leased.without(&old_grant.grant_id).expect("was there"),
+        &new_grant,
+        new_secret.expect("secret"),
+        2,
+    );
+    assert_eq!(
+        state.route_handle(&changing, &rotated),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::IdSpaceExhausted)),
+    );
+    assert_eq!(f.metrics.refused_id_space_exhausted(), 1);
+    assert_eq!(state.handles(), handles_before, "nothing was released");
+    assert_eq!(f.registry.retained_slots(), slots_before);
+    assert_eq!(
+        state.warm(&changing).expect("still retained").demanded(),
+        &[owner_key(&changing), grant_key(&old_grant)],
+        "the old complete entry survives an exhausted replacement"
+    );
+}
+
+/// The CONTROL: a replacement that needs no fresh identity still succeeds after
+/// exhaustion.
+///
+/// Without it, "refuse every replacement once exhausted" passes the witness
+/// above. A narrowing replacement creates no slot, so the terminal identity
+/// space has nothing to say about it — and refusing would leave the family
+/// permanently unable to shed an obsolete scope.
+#[test]
+fn a_narrowing_replacement_needs_no_identity_after_exhaustion() {
+    let f = fixture();
+    let changing = cap("nrpc:changing");
+    let (grant, secret) = issue(changing, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("secret"),
+        1,
+    );
+    let state = f.state(credentials(vec![grant.clone()]));
+    assert_eq!(state.route_handle(&changing, &leased), RouteLookup::Warm);
+    assert_eq!(state.handles(), 2);
+
+    f.registry.exhaust_ids_for_test();
+
+    let removed = leased.without(&grant.grant_id).expect("was there");
+    assert_eq!(
+        state.route_handle(&changing, &removed),
+        RouteLookup::Warm,
+        "shedding a scope creates no slot, so exhaustion cannot refuse it"
+    );
+    assert_eq!(state.handles(), 1);
+    assert_eq!(
+        state.warm(&changing).expect("warm").demanded(),
+        &[owner_key(&changing)]
+    );
+    assert_eq!(f.metrics.refused_id_space_exhausted(), 0);
 }
 
 /// The currency check is on the LOCK-FREE path: a warmed entry that is still

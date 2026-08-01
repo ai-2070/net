@@ -84,11 +84,35 @@
 //! `demand_set_from`, so the warmed check and the miss path cannot disagree
 //! about what "leased" means.
 //!
-//! Re-derivation acquires the NEW set BEFORE releasing the old one, so a refusal
-//! leaves the entry exactly as it was — §4.1's no-effect property, restated on
-//! the lifecycle path. It then reports the refusal rather than the stale entry:
-//! answering `Warm` with a Grant plane known to be incomplete is the silent
-//! authority narrowing this slice exists to prevent.
+//! ## Re-derivation REPLACES, charged on the projected footprint (§4.3)
+//!
+//! A stale entry is not "acquire the new set, then drop the old one". That
+//! charges the family and the node at the transient GROSS peak — every
+//! replacement handle while every superseded handle is still charged — so a
+//! replacement whose FINAL footprint fits is refused at the bound:
+//!
+//! ```text
+//! family at 64/64, capability loses an audience
+//! projected   64 - 2 + 1 = 63     must succeed
+//! gross       64 + 1     = 65     refused
+//! ```
+//!
+//! An entry that cannot shed an obsolete scope without capacity that shedding it
+//! would itself free is stuck forever, so the bound would preserve exactly the
+//! stale authority §4.2 exists to correct.
+//!
+//! It is not "release the old set, then acquire the new one" either: that
+//! answers the bound and breaks no-effect instead, destroying retained authority
+//! before an acquisition that may fail.
+//!
+//! So re-derivation goes through ONE registry transaction that compares the two
+//! key sets and charges the projected final footprint —
+//! `RoutingFamily::replace_demand_set`. The intersection is never released and
+//! re-taken, the state asks its own refusal gate only for the MARGINAL cost
+//! (see `marginal_charge`), and a refusal leaves the superseded set owning
+//! everything it owned. A refused re-derivation reports the refusal rather than
+//! the stale entry: answering `Warm` with a Grant plane known to be incomplete
+//! is the silent authority narrowing this slice exists to prevent.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,8 +124,7 @@ use super::org::OrgId;
 use super::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant};
 use super::org_grant_registry::ConsumerGrantSnapshot;
 use super::org_routing_registry::{
-    DemandHandle, DemandRefused, PrivateAudienceScope, RoutingFamily, SlotKey,
-    MAX_HANDLES_PER_FAMILY,
+    DemandRefused, DemandSet, PrivateAudienceScope, RoutingFamily, SlotKey, MAX_HANDLES_PER_FAMILY,
 };
 use super::org_scoped_ingest::CapabilityAudienceScope;
 
@@ -279,6 +302,34 @@ fn demand_set_from<'a>(
     Some(keys)
 }
 
+/// What replacing `old` with `new` asks the FAMILY budget for.
+///
+/// The marginal cost, never the gross width: the intersection is kept in place
+/// by the replacement transaction, so it is neither released nor re-charged.
+/// Saturating, because a replacement can be net-negative — a capability that
+/// loses an audience gives a handle back — and a negative charge is simply
+/// zero, which no width record can block.
+///
+/// This is the STATE's gate estimate. The registry recomputes the projection
+/// authoritatively inside the transaction and is what actually refuses; this
+/// exists only so a family that is provably at its bound stops asking. Both
+/// sides are witnessed against the same schedules, so a drift between them
+/// shows up as a refusal that the registry does not agree with.
+///
+/// Both slices are sorted and deduplicated (`demand_set_for` sorts; `demanded`
+/// stores what it was acquired from), so membership is a binary search.
+fn marginal_charge(old: &[SlotKey], new: &[SlotKey]) -> usize {
+    let new_only = new
+        .iter()
+        .filter(|key| old.binary_search(key).is_err())
+        .count();
+    let old_only = old
+        .iter()
+        .filter(|key| new.binary_search(key).is_err())
+        .count();
+    new_only.saturating_sub(old_only)
+}
+
 /// One warmed capability entry: the family's COMPLETE retained demand for it.
 ///
 /// Ownership is the whole content of this type in 2B.3b. Dropping it releases
@@ -300,10 +351,11 @@ pub(crate) struct CapabilityRouteHandle {
     /// same `Vec` the acquisition was made from, so the two cannot describe
     /// different sets.
     demanded: Vec<SlotKey>,
-    /// The complete demand set, in deterministic key order. Owner first —
-    /// `SlotKey` sorts by scope, and `CapabilityAudienceScope::Owner` precedes
-    /// `Grant` — which is the order §3.1 projects in.
-    demands: Vec<DemandHandle>,
+    /// The complete demand set, owned as ONE object, in deterministic key order.
+    /// Owner first — `SlotKey` sorts by scope, and
+    /// `CapabilityAudienceScope::Owner` precedes `Grant` — which is the order
+    /// §3.1 projects in.
+    demands: DemandSet,
 }
 
 #[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
@@ -313,7 +365,7 @@ impl CapabilityRouteHandle {
     }
 
     /// The retained contributors, in projection order.
-    pub(crate) fn demands(&self) -> &[DemandHandle] {
+    pub(crate) fn demands(&self) -> &DemandSet {
         &self.demands
     }
 
@@ -668,7 +720,7 @@ impl OrgRoutingState {
             if self.leases_current(&entry, capability, leased) {
                 return RouteLookup::Warm;
             }
-            return self.rederive(capability, leased, entry);
+            return self.rederive(capability, leased);
         }
         self.acquire(capability, leased)
     }
@@ -699,52 +751,66 @@ impl OrgRoutingState {
         &self,
         capability: &CapabilityAuthorityId,
         leased: &ConsumerGrantSnapshot,
-        stale: Arc<CapabilityRouteHandle>,
     ) -> RouteLookup {
         let mut refusals = self.mutate.lock();
         self.mutate_acquisitions.fetch_add(1, Ordering::AcqRel);
 
-        // Re-check under the lock. A concurrent caller may have already
-        // re-derived this capability against the same lease movement, in which
-        // case there is nothing to do and its budget must not be spent twice —
-        // the same race the miss path re-checks for, on the lifecycle path.
-        match self.index.load().get(capability) {
-            Some(current) if self.leases_current(current, capability, leased) => {
-                return RouteLookup::Warm;
+        // Re-check under the lock, and supersede the entry the index holds NOW —
+        // never the one the caller loaded before taking it. A concurrent caller
+        // may have already re-derived this capability against the same lease
+        // movement, in which case there is nothing to do and its budget must not
+        // be spent twice; and if it has, the pre-lock entry is a set that has
+        // already given its references away, so replacing THAT would charge the
+        // successor's footprint gross.
+        let current = self.index.load().get(capability).cloned();
+        match current {
+            Some(current) => {
+                if self.leases_current(&current, capability, leased) {
+                    return RouteLookup::Warm;
+                }
+                self.acquire_under_mutate(&mut refusals, capability, leased, Some(&current))
             }
-            Some(_) => {}
             // Unreachable in 2B.3b — nothing removes an entry — but treating it
             // as a plain miss is the answer that retains nothing incorrectly.
-            None => return self.acquire_under_mutate(&mut refusals, capability, leased, None),
+            None => self.acquire_under_mutate(&mut refusals, capability, leased, None),
         }
-
-        self.acquire_under_mutate(&mut refusals, capability, leased, Some(stale))
     }
 
     /// Derive, gate, acquire and publish, under a held `mutate`.
     ///
-    /// `superseded` is the entry this acquisition REPLACES, if any. It is still
-    /// alive here on purpose: the new set is acquired BEFORE the old one is
-    /// released, so a refusal leaves the family holding exactly what it held
-    /// (§4.1's no-effect property on the lifecycle path). The cost is a
-    /// transient peak of `old + new` against the family bound, which is the
-    /// honest price of never tearing down retained authority for an acquisition
-    /// that may not succeed.
+    /// `superseded` is the entry this acquisition REPLACES, if any. A
+    /// replacement goes through the registry's atomic replacement rather than
+    /// acquiring a second set beside the first: the family and the node are
+    /// charged on the PROJECTED FINAL footprint, so a capability that loses an
+    /// audience at 64 of 64 projects to `64 - 2 + 1 = 63` and succeeds, where
+    /// charging it gross would ask for 66 and refuse a replacement that plainly
+    /// fits (§4.3). Refusal is still total no-effect, because the superseded set
+    /// is borrowed and keeps everything it owns unless the transaction commits.
     fn acquire_under_mutate(
         &self,
         refusals: &mut RefusalState,
         capability: &CapabilityAuthorityId,
         leased: &ConsumerGrantSnapshot,
-        superseded: Option<Arc<CapabilityRouteHandle>>,
+        superseded: Option<&Arc<CapabilityRouteHandle>>,
     ) -> RouteLookup {
-        // Derived BEFORE the refusal gate, because the gate is on the set's
-        // WIDTH and a width is not knowable without deriving. The derivation is
+        // Derived BEFORE the refusal gate, because the gate is on what the set
+        // COSTS and that is not knowable without deriving. The derivation is
         // pure and takes no registry lock, so a settled family pays a bounded
         // walk of one capability's grants and never reaches the lock itself.
         let Some(keys) = self.demand_set(capability, leased) else {
             return RouteLookup::Cold(ColdReason::NoOwnerScope);
         };
-        let width = keys.len();
+
+        // What this attempt asks the family budget for. A fresh acquisition asks
+        // for its whole width; a replacement asks only for its MARGINAL cost,
+        // because the intersection is never given up and re-taken. A replacement
+        // that is net-neutral or net-negative charges zero and is therefore
+        // never blocked by a width record — which is exactly right, since it
+        // cannot make the family's footprint grow.
+        let charge = match superseded {
+            Some(stale) => marginal_charge(stale.demanded(), &keys),
+            None => keys.len(),
+        };
 
         // The node capacity generation is read ONCE, before the attempt, and
         // the same value is what a refusal records. Reading it after a refusal
@@ -752,11 +818,17 @@ impl OrgRoutingState {
         // very retirement that would have made the attempt succeed, and the
         // family would then never retry.
         let generation = self.family.node_capacity_generation();
-        if !refusals.may_attempt(generation, width) {
-            return RouteLookup::Cold(self.settled_reason(refusals, width));
+        if !refusals.may_attempt(generation, charge) {
+            return RouteLookup::Cold(self.settled_reason(refusals, charge));
         }
 
-        match self.family.demand_set(keys.clone()) {
+        let acquired = match superseded {
+            Some(stale) => self
+                .family
+                .replace_demand_set(stale.demands(), keys.clone()),
+            None => self.family.demand_set(keys.clone()),
+        };
+        match acquired {
             Ok(demands) => {
                 let handle = Arc::new(CapabilityRouteHandle {
                     capability: *capability,
@@ -768,17 +840,17 @@ impl OrgRoutingState {
                 // is no window in which the index is half-built, because the
                 // index a reader can reach was never mutated in place.
                 self.index.store(Arc::new(self.index.load().with(handle)));
-                if let Some(stale) = superseded {
-                    // Released only now that the replacement is published and
-                    // live. The index no longer names it, so this is the last
-                    // reference a reader could not already have taken.
-                    drop(stale);
+                if superseded.is_some() {
+                    // The superseded set gave up its references INSIDE the
+                    // replacement transaction, so the family's footprint may
+                    // have fallen and a width record taken against the old one
+                    // no longer describes it.
                     refusals.on_supersession();
                 }
                 RouteLookup::Warm
             }
             Err(refusal) => {
-                refusals.record(refusal, generation, width);
+                refusals.record(refusal, generation, charge);
                 RouteLookup::Cold(ColdReason::Refused(refusal))
             }
         }

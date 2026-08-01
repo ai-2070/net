@@ -441,11 +441,8 @@ Three properties make that comparison sound:
   body, so the warmed check and the miss path cannot disagree about what "leased"
   means.
 
-**Re-derivation acquires before it releases.** The replacement set is acquired
-whole (§4.1) while the superseded entry is still retained, so a refusal leaves
-the family holding exactly what it held. The cost is a transient peak of
-`old + new` against the family bound; the alternative — releasing first — would
-tear down retained authority for an acquisition that may not succeed.
+**Re-derivation REPLACES; see §4.3 for how it is charged.** A refusal leaves the
+family holding exactly what it held.
 
 A refused re-derivation reports the **refusal**, not the stale entry. Answering
 `Warm` from a Grant plane known to be incomplete is the failure this section
@@ -461,6 +458,71 @@ bounded and deliberate: the call is taking the cold path anyway, which dominates
 a single uncontended lock acquisition by orders of magnitude. The lock this
 slice's boundary exists to keep off the hot path is the NODE-WIDE registry lock,
 and no refused re-derivation ever reaches it.
+
+### 4.3 Replacement is charged on the PROJECTED footprint
+
+A re-derivation is a REPLACEMENT, and how it is charged is a correctness
+property, not an optimisation.
+
+**Acquire-then-drop is wrong.** Acquiring the replacement set beside the
+superseded one charges the transient GROSS peak — every replacement handle while
+every superseded handle is still charged:
+
+```text
+family at 64/64, `changing` = {Owner, Grant(a)} loses its audience
+projected   64 - 2 + 1 = 63     must succeed
+gross       64 + 1     = 65     refused
+```
+
+The refusal is not conservative, it is a deadlock: the entry can never shed the
+obsolete scope, because shedding it requires capacity that shedding it would
+itself free. The bound then preserves exactly the stale authority §4.2 exists to
+correct, and it does so permanently.
+
+**Release-then-acquire is also wrong.** It answers the bound correctly and breaks
+the no-effect property instead: a refusal would have already destroyed retained
+authority, and the re-acquisition meant to restore it can fail on its own —
+against a node bound, or against an identity space that has since been spent.
+
+**So: one registry transaction, charged on the projected final footprint.**
+
+```text
+common     = old ∩ new     reference kept EXACTLY as it is — no churn
+old_only   = old \ new     released; credits node capacity only if LAST
+new_only   = new \ old     charged; costs a node slot only if absent
+
+family:  held  - |old_only| + |new_only|   <= MAX_HANDLES_PER_FAMILY
+node:    slots - credited   + created      <= MAX_NODE_SLOTS
+```
+
+The node credit is **conditional and that is the whole of it**. An `old_only`
+slot another family still demands does not retire, frees nothing, and crediting
+it would admit a 257th slot. The retiring and shared-old cases are separately
+witnessed, because "credit every old-only slot" passes the first and silently
+breaks the second.
+
+Identities are reserved only for `created` slots, so a replacement that sheds a
+scope needs none — a terminal identity space has nothing to say about it, and
+refusing there would strand the same shed-forever deadlock behind a different
+gate. Both directions are witnessed.
+
+**The state's gate asks for the MARGINAL cost.** §9's width record is about how
+many handles an attempt needs; for a replacement that is `|new_only| - |old_only|`,
+saturating at zero. A net-neutral or net-negative replacement charges nothing and
+can never be blocked by a width record, which is correct — it cannot make the
+family's footprint grow. The registry recomputes the projection authoritatively
+inside the transaction and is what actually refuses; the state's figure only
+stops a provably-doomed attempt from taking the node-wide lock.
+
+**Ownership: the set, not the handle.** The unit is `DemandSet` — one object, one
+`Drop`, one release transaction. A `Vec<DemandHandle>` cannot express an atomic
+replacement: each handle releases itself, so transferring one means defusing its
+`Drop`, and a per-handle defuse (`mem::forget`, or a "already released" flag) is
+precisely the double-release hazard. Instead the set carries the release
+RESPONSIBILITY as the keys it still owes, and a replacement MOVES them. No flag
+decides anything: a set releases exactly the keys it currently holds, so at every
+instant exactly one set owes each reference — including while the superseded
+entry is still shared behind an `Arc` that a reader may hold.
 
 ## 5. Ambiguity refuses publication; the cold plan produces the error
 
@@ -1387,7 +1449,13 @@ Every one selects exactly one test and dies to its own inverse mutation.
 | W-L3 | `a_rotated_audience_replaces_the_scope_it_supersedes` | rotation swaps the scope under one grant id | — (composite control for W-L2/W-L4) |
 | W-L4 | `a_rotated_away_scope_is_not_retained_under_its_own_id` | no aliasing through `grant_id` on the lifecycle path | compare `leased.get(id).is_some()` |
 | W-L5 | `a_refused_rederivation_leaves_the_entry_exactly_as_it_was` | total no-effect, and the refusal is REPORTED | answer `Warm` from the stale entry |
-| W-L6 | `capacity_freed_by_a_supersession_is_spendable_again` | the width record is forgotten when handles are released | keep the record across a supersession |
+| W-L6 | `capacity_freed_by_a_supersession_is_spendable_again` | the width record is forgotten when handles are released, at the HARD bound | keep the record across a supersession |
+| W-P1 | `a_narrowing_replacement_at_the_family_bound_is_charged_net` | `64 - 2 + 1 = 63` succeeds | charge the family the gross width instead of the projection |
+| W-P2 | `a_same_width_rotation_at_the_family_bound_is_charged_net` | `64 - 2 + 2 = 64` succeeds; the intersection never churns | as W-P1 |
+| W-P3 | `a_rotation_at_the_node_bound_retires_the_slot_it_transfers` | `256 - 1 + 1 = 256` succeeds | count the new slot against a transient `256 + 1` |
+| W-P4 | `a_rotation_at_the_node_bound_refuses_when_the_old_slot_is_shared` | a shared old slot frees nothing, so 257 refuses with no effect | credit every old-only slot unconditionally |
+| W-P5 | `identity_exhaustion_during_a_replacement_refuses_with_no_effect` | exhaustion refuses a slot-creating replacement, old entry intact | reserve identities after mutating |
+| W-P6 | `a_narrowing_replacement_needs_no_identity_after_exhaustion` | a shedding replacement needs no identity | — (control for W-P5) |
 | W-L7 | `a_current_warmed_entry_with_a_leased_audience_takes_no_lock` | the currency check is lock-free with a real Grant plane | perform it under the mutation lock |
 | W-L8 | `the_capability_index_derives_exactly_what_the_full_scan_derives` | the index is a filter, never a second admission rule | index only the first grant per capability |
 | W-L9 | `concurrent_rederivations_spend_one_demand_set` | one lease movement spends one demand set | drop the under-`mutate` re-check in `rederive` |
@@ -1415,7 +1483,7 @@ satisfiable by a weaker implementation:
 both directions in one test: always-retry reds its "not asked again" assertion,
 never-retry reds its post-retirement success.
 
-### 17.6a Three witnesses the mutation run found asserting more than they exercised
+### 17.6a Witnesses the mutation runs found asserting more than they exercised
 
 Both passed on their first writing. Both were repaired only because the inverse
 mutation was actually run, and in both cases reading the test would not have
@@ -1512,9 +1580,9 @@ the over-claim this process exists to catch.
 throughout. No security or race witness is retried.
 
 ```text
-slice witnesses          61 selected, 61 passed   (36 registry + 25 state)
+slice witnesses          67 selected, 67 passed   (36 registry + 31 state)
 routing/grant/scoped    291 selected, 291 passed
-inverse mutations        33 run, 32 RED, 1 GREEN (recorded, §17.6a)
+inverse mutations        39 run, 38 RED, 1 GREEN (recorded, §17.6a)
                          every row: exactly 1 test selected, restored + hash-verified
 fmt                     clean
 clippy --all-features --lib --bins                    clean
@@ -1590,21 +1658,48 @@ one-mutation-per-witness.
 | 30 | M-P3 | node gate: gate on `handles()` instead of the generation | `node_capacity_refusal_retries_only_when_the_generation_moves` (shared test with #28) | 1 | RED | `org_routing_state_tests.rs:768` |
 | 31 | M-P4 | drop the terminal `id_space_exhausted` arm | `identity_exhaustion_is_terminal_and_outranks_a_moving_generation` | 1 | RED | `org_routing_state_tests.rs:823` |
 | 32 | M-P5 | **two-site**: lift the registry demand bound + add an index-length bound | `the_family_bound_counts_demands_not_capabilities` | 1 | RED | `org_routing_state_tests.rs:695` |
-| 33 | M-P6 | leak an `Arc` on publication so the demand set never releases | `dropping_the_state_releases_every_demand` | 1 | RED | `org_routing_state_tests.rs:1575` |
+| 33 | M-P6 | leak an `Arc` on publication so the demand set never releases | `dropping_the_state_releases_every_demand` | 1 | RED | `org_routing_state_tests.rs:1936` |
+| 34 | M-X1 | family projection charged GROSS (`held + new.len()`) | `a_narrowing_replacement_at_the_family_bound_is_charged_net` | 1 | RED | `org_routing_state_tests.rs:1582` |
+| 35 | M-X2 | **shared** with #34 | `a_same_width_rotation_at_the_family_bound_is_charged_net` | 1 | RED | `org_routing_state_tests.rs:1629` |
+| 36 | M-X3 | node projection ignores the credit (`slots + created`) | `a_rotation_at_the_node_bound_retires_the_slot_it_transfers` | 1 | RED | `org_routing_state_tests.rs:1689` |
+| 37 | M-X4 | credit EVERY old-only slot (`credited = old_only.len()`) | `a_rotation_at_the_node_bound_refuses_when_the_old_slot_is_shared` | 1 | RED | `org_routing_state_tests.rs:1743` |
+| 38 | M-X5 | wrap the replacement's incarnation reservation | `identity_exhaustion_during_a_replacement_refuses_with_no_effect` | 1 | RED | `org_routing_registry.rs:1444` (production `debug_assert`) |
+| 39 | M-X6 | refuse EVERY replacement once the id space is spent | `a_narrowing_replacement_needs_no_identity_after_exhaustion` | 1 | RED | `org_routing_state_tests.rs:1825` |
 
 ```text
-33 runs   32 RED (31 assertion, 1 deadlock)   1 GREEN-NOT-KILLED
-          33/33 selected exactly one test
-          33/33 restored and SHA256-verified
+39 runs   38 RED (37 assertion, 1 deadlock)   1 GREEN-NOT-KILLED
+          39/39 selected exactly one test
+          39/39 restored and SHA256-verified
 ```
 
-**The total is 33, not 19.** The earlier figure was prose, not a ledger: it
+**The total is 39, not 19.** The earlier figure was prose, not a ledger: it
 counted the mutations the author believed had been run, with no row-by-row record
 to check it against, and it silently folded the shared runs and the three-way
-node-gate mutation into single entries. Twelve of the thirty-three are new with
-the HOLD-1 repair (M-R1..M-R3, M-L1..M-L9); the remaining twenty-one are the
-pre-existing set, re-run here because a mutation run proves the tree it ran
-against. Reconstructing it row by row is what surfaced #20.
+node-gate mutation into single entries. Eighteen of the thirty-nine are new with
+the HOLD repairs (M-R1..M-R3, M-L1..M-L9, M-X1..M-X6); the remaining twenty-one
+are the pre-existing set, re-run here because a mutation run proves the tree it
+ran against. Reconstructing it row by row is what surfaced #20.
+
+**Two rows changed meaning during the HOLD-2 rerun, and both are recorded rather
+than quietly re-anchored.**
+
+- **M-L8 stopped killing its witness.** Its old form (disable the under-`mutate`
+  re-check in `rederive`) is no longer a defect: with replacement charged on the
+  projected footprint, a redundant re-derivation of an already-current entry
+  computes `old_only = new_only = ∅`, charges zero and transfers the same keys —
+  it is idempotent, not an over-spend. The re-check is now a redundancy
+  optimisation, not a correctness gate, and this document does not claim
+  otherwise. The mutation was re-aimed at the defect the restructure DID close:
+  superseding the entry captured BEFORE the lock rather than the one the index
+  holds under it. That one is real — a pre-lock entry may already have
+  transferred its references away, so replacing it computes `old_only = ∅` and
+  charges the successor's whole footprint gross — and the witness reds on it.
+- **M-A5s briefly reported RED for the wrong reason.** Adapting the loop mutation
+  to the new `DemandSet` return type initially made it `mem::forget` each handle
+  as it went, which LEAKS the prefix instead of releasing it — a strictly
+  different production change, and one the state-level witness does catch. The
+  mutation was corrected to release the prefix on failure exactly as W-A5
+  intends, and the row went back to GREEN. It stays GREEN in the table above.
 
 Evidence: the run is reproducible from `run.ps1` and `ledger.tsv` under the
 out-of-repo scratch directory used for the matrix; nothing from it is committed.
