@@ -100,9 +100,11 @@ impl SubnetPolicy {
     /// Evaluates all rules against the node's tags. Unmatched levels
     /// remain zero (meaning "no restriction at that level").
     pub fn assign(&self, caps: &CapabilitySet) -> SubnetId {
-        // Phase A.5.N.2: caps.tags is HashSet<Tag>; render each tag
-        // to its wire-form string. `assign_from_rendered_tags` does the
-        // sort that makes first-match-wins deterministic.
+        // Phase A.5.N.2: caps.tags is HashSet<Tag>; render each tag to
+        // its wire-form string. Order is unspecified and deliberately
+        // left that way — `assign_from_rendered_tags` resolves each rule
+        // to the lexicographically smallest matching tag, so the verdict
+        // does not depend on it.
         let tag_strings: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
         self.assign_from_rendered_tags(&tag_strings)
     }
@@ -118,18 +120,26 @@ impl SubnetPolicy {
     /// (re-parsing every tag, allocating a `HashSet<Tag>`) just to have
     /// it rendered straight back to strings.
     ///
-    /// Allocation-free. [`Self::assign`] sorts the rendered tags and
-    /// takes the first match per rule; sorting is load-bearing there
-    /// because rule resolution is first-match-wins and tag order is
-    /// unspecified, so an unsorted scan could assign different subnets
-    /// to the same announcement on different receivers.
+    /// Allocation-free, and the deterministic tie-break is load-bearing
+    /// rather than cosmetic: tags reach this function in unspecified
+    /// order (the fold stores them as rendered strings, `assign` renders
+    /// them out of a `HashSet`), so without one, two receivers holding
+    /// the same announcement could assign it different subnets.
     ///
-    /// The same winner is reachable without the sort: "first match in
-    /// sorted order" is exactly "the lexicographically smallest tag that
-    /// both matches the prefix and carries a mapped value", which one
-    /// borrowed pass per rule can select directly. This runs while the
-    /// capability fold's read locks are held, so the `Vec<&str>` it
-    /// used to allocate per candidate is worth removing.
+    /// Each rule resolves to the LEXICOGRAPHICALLY SMALLEST tag that
+    /// both matches the rule's prefix and carries a mapped value —
+    /// selected in one borrowed pass per rule. This is the sole
+    /// definition; [`Self::assign`] delegates here rather than
+    /// implementing its own.
+    ///
+    /// It is also exactly what "sort the tags, take the first match per
+    /// rule" produced, which is what this replaced. Sorting allocated a
+    /// `Vec` per candidate, and this runs while the capability fold's
+    /// read locks are held, so selecting the minimum directly is worth
+    /// the slightly less obvious phrasing.
+    /// `assign_from_rendered_tags_is_order_independent` pins the
+    /// property; `assign_from_rendered_tags_agrees_with_assign` pins
+    /// that the two entry points cannot drift.
     pub fn assign_from_rendered_tags(&self, tags: &[String]) -> SubnetId {
         let mut levels = [0u8; 4];
 
