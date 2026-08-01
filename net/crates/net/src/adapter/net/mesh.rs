@@ -26441,27 +26441,36 @@ impl MeshNode {
     /// Scoped variant of [`Self::find_nodes_by_filter`]. Filters
     /// candidates through `scope` (derived from each peer's
     /// `scope:*` reserved tags) on top of the capability filter.
-    /// `SubnetLocal` peers and the [`ScopeFilter::SameSubnet`]
-    /// filter resolve same-subnet membership against
-    /// `peer_subnets`.
     ///
-    /// **Subnet resolution.** A candidate's subnet is resolved in two
-    /// steps, and an unresolvable candidate is excluded:
+    /// **Subnet resolution.** Every candidate except this node resolves
+    /// the same way: run the local `SubnetPolicy` over the tags of the
+    /// fold entry the query just selected. With no policy installed
+    /// there is nothing to resolve tags with, so the candidate is
+    /// unresolvable and excluded.
     ///
-    /// 1. `peer_subnets` — populated from a peer's own
-    ///    signature-verified DIRECT announcement.
-    /// 2. The capability fold — for a peer we only ever learned about
-    ///    through a relay. `peer_subnets` is deliberately not written
-    ///    for forwarded announcements, because `from_node` is the relay
-    ///    rather than the origin and writing the origin's subnet under
-    ///    the relay's id would let any last hop move a peer between
-    ///    subnets. But the origin's own tags ARE available on the
-    ///    indexed announcement, and `ann.node_id` is blake2s-bound to
-    ///    `ann.entity_id` at dispatch, so the fold entry is attributable
-    ///    to the origin. Running the local policy over those tags
-    ///    resolves the subnet without trusting the relay.
+    /// **`peer_subnets` is deliberately NOT consulted here.** That map
+    /// is a pre-apply sidecar: `handle_capability_announcement` writes
+    /// it before the announcement reaches the fold, and the fold's apply
+    /// outcome is never fed back. A stale announcement the fold REJECTS
+    /// still updates the sidecar, so the two can disagree:
     ///
-    /// This replaces a warm-up rule that admitted every unresolved
+    /// ```text
+    /// fold and peer_subnets hold v500 / subnet A
+    /// → the peer restarts and sends a valid signed v1 / subnet B
+    /// → peer_subnets becomes B
+    /// → the fold rejects v1 (generation 1 < 500) and keeps v500 / A
+    /// → a scoped query would select on v500's capabilities while
+    ///   judging its subnet by B
+    /// ```
+    ///
+    /// Reading the sidecar for direct peers and the fold for forwarded
+    /// ones also made resolution depend on HOW an announcement arrived,
+    /// which a single authoritative source removes. `peer_subnets`
+    /// remains correct for the direct-session and channel paths that
+    /// intentionally want the last thing a session peer said; it is
+    /// simply not the right input for a query against fold state.
+    ///
+    /// This also replaces a warm-up rule that admitted every unresolved
     /// candidate whenever a policy was installed. That window never
     /// closed for forwarded-only peers — the normal way peers are
     /// learned beyond a direct session — so `SameSubnet` returned peers
@@ -26469,12 +26478,11 @@ impl MeshNode {
     /// visible mesh-wide
     /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
     ///
-    /// Deriving at query time rather than caching into `peer_subnets` is
-    /// deliberate: the fold entry is the authoritative record and the
-    /// policy is read live, so there is no derived copy that can
-    /// disagree with the fold after an expiry, eviction, snapshot
-    /// restore, policy replacement, or a publisher restart that resets
-    /// its version counter.
+    /// Deriving at query time rather than caching is what makes the
+    /// lifecycle trivial: the fold entry is the authoritative record and
+    /// the policy is read live, so nothing survives an expiry, eviction,
+    /// snapshot restore, policy replacement, or a publisher restart to
+    /// disagree with the fold later.
     ///
     /// The derivation runs on tags borrowed from the SAME fold snapshot
     /// that selected the candidate, so a query can never mix a match
@@ -26484,6 +26492,12 @@ impl MeshNode {
     /// so an unknown peer is excluded rather than being treated as
     /// subnet `GLOBAL`, which would otherwise match a `GLOBAL` local
     /// subnet.
+    ///
+    /// Forwarded announcements are safe to resolve this way even though
+    /// `peer_subnets` deliberately skips them: `from_node` is the relay,
+    /// but `ann.node_id` is blake2s-bound to `ann.entity_id` at
+    /// dispatch, so the fold entry is attributable to the ORIGIN and its
+    /// tags are the origin's own.
     ///
     /// In signed mode (`require_signed_capabilities`, the secure
     /// default) every fold entry came from a verified announcement, so
@@ -26501,29 +26515,23 @@ impl MeshNode {
         scope: &ScopeFilter<'_>,
     ) -> Vec<u64> {
         let my_subnet = self.local_subnet;
-        let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
         let policy = self.local_subnet_policy.clone();
         super::behavior::fold::capability_bridge::find_nodes_matching_scoped(
             &self.capability_fold,
             filter,
             scope,
-            // Fold-pure, as the bridge requires: reads only
-            // `peer_subnets` and the policy, never the fold. The
-            // `DashMap` guard is dropped before returning (the `map`
-            // copies the `SubnetId` out), and no path takes the fold
-            // while holding a `peer_subnets` guard, so holding the
-            // fold read across this lookup cannot cycle.
+            // Fold-pure, as the bridge requires: reads only the policy
+            // and the borrowed tags it is handed, never the fold and
+            // never `peer_subnets`.
             |nid, tags| {
                 if nid == local_node_id {
                     return true;
                 }
-                if let Some(s) = peer_subnets.get(&nid).map(|e| *e.value()) {
-                    return s == my_subnet;
-                }
-                // Forwarded-only peer. Without a policy there is nothing
-                // to resolve tags with, so the candidate stays unknown
-                // and is excluded.
+                // Every other candidate resolves from the tags of the
+                // entry the snapshot just selected. Without a policy
+                // there is nothing to resolve them with, so the
+                // candidate stays unknown and is excluded.
                 match policy.as_ref() {
                     Some(policy) => policy.assign_from_rendered_tags(tags) == my_subnet,
                     None => false,
@@ -35973,6 +35981,153 @@ mod exact_expiry_timer_tests {
 #[cfg(test)]
 #[path = "org_routing_wiring_tests.rs"]
 mod org_routing_wiring_tests;
+
+#[cfg(test)]
+mod scoped_discovery_ignores_peer_subnets_tests {
+    //! `find_nodes_by_filter_scoped` must resolve a candidate's subnet
+    //! from the fold entry it selected, never from the `peer_subnets`
+    //! sidecar (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    //!
+    //! The sidecar is written by `handle_capability_announcement` BEFORE
+    //! the announcement reaches the fold, and the fold's apply outcome is
+    //! never fed back — so an announcement the fold REJECTS as stale
+    //! still updates it. Preferring it for direct peers meant a query
+    //! could select on one announcement's capabilities while judging its
+    //! subnet by another's.
+    //!
+    //! All three tests fail if the sidecar branch is reinstated.
+    use super::*;
+    use crate::adapter::net::behavior::capability::{
+        CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter,
+    };
+    use crate::adapter::net::SubnetRule;
+
+    /// Observer in subnet `[3]`, with a policy mapping `region:eu` to
+    /// `[4]` and `region:us` to `[3]`.
+    async fn observer() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let policy = Arc::new(
+            SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 3).map("eu", 4)),
+        );
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32])
+            .with_subnet(SubnetId::new(&[3]))
+            .with_subnet_policy(policy);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    fn signed_ann(kp: &EntityKeypair, version: u64, region: &str) -> CapabilityAnnouncement {
+        let caps = CapabilitySet::new()
+            .add_tag(format!("region:{region}"))
+            .add_tag("sidecar-canary");
+        let mut ann =
+            CapabilityAnnouncement::new(kp.node_id(), kp.entity_id().clone(), version, caps)
+                .with_ttl(300);
+        ann.sign(kp);
+        ann
+    }
+
+    /// The load-bearing witness. The sidecar claims the peer shares our
+    /// subnet; the peer's own announced tags say otherwise. The fold
+    /// entry is authoritative, so the peer must be excluded.
+    ///
+    /// Pre-fix the direct branch returned `peer_subnets` before ever
+    /// looking at the tags, so this returned the peer.
+    #[tokio::test]
+    async fn sidecar_cannot_admit_a_peer_the_fold_says_is_elsewhere() {
+        let node = observer().await;
+        let peer = EntityKeypair::generate();
+        let peer_id = peer.node_id();
+
+        // Fold: the peer is really in `[4]` (region:eu).
+        node.test_inject_capability_announcement(signed_ann(&peer, 500, "eu"));
+
+        // Sidecar disagrees — it says the peer is in OUR subnet. This is
+        // the shape a stale or out-of-order pre-apply write leaves behind.
+        node.peer_subnets.insert(peer_id, SubnetId::new(&[3]));
+
+        let filter = CapabilityFilter::new().require_tag("sidecar-canary");
+        assert!(
+            node.find_nodes_by_filter(&filter).contains(&peer_id),
+            "precondition: the peer must be indexed"
+        );
+
+        let same = node.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+        assert!(
+            !same.contains(&peer_id),
+            "SameSubnet must follow the fold entry's tags (region:eu → [4]), \
+             not the peer_subnets sidecar claiming [3]; got {same:?}"
+        );
+    }
+
+    /// The restart case the sidecar cannot represent: a valid signed
+    /// announcement whose generation the fold REJECTS must not move the
+    /// query's verdict, even though the sidecar would have taken it.
+    #[tokio::test]
+    async fn a_fold_rejected_stale_announcement_does_not_move_the_verdict() {
+        let node = observer().await;
+        let peer = EntityKeypair::generate();
+        let peer_id = peer.node_id();
+
+        // Accepted: v500 in `[4]`.
+        node.test_inject_capability_announcement(signed_ann(&peer, 500, "eu"));
+
+        // The peer restarts and its version counter resets. This
+        // announcement is perfectly valid and signed, but the fold
+        // rejects it (generation 1 < 500) and keeps v500 / eu. A
+        // sidecar write would have taken `us` and flipped the verdict.
+        node.test_inject_capability_announcement(signed_ann(&peer, 1, "us"));
+        node.peer_subnets.insert(peer_id, SubnetId::new(&[3]));
+
+        let filter = CapabilityFilter::new().require_tag("sidecar-canary");
+        let same = node.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+        assert!(
+            !same.contains(&peer_id),
+            "the fold rejected the v1 announcement, so the retained v500 \
+             (region:eu → [4]) must still decide; got {same:?}"
+        );
+    }
+
+    /// Same resolution regardless of how the announcement arrived: the
+    /// verdict comes from the retained entry either way. Pins the
+    /// direct-versus-forwarded equivalence.
+    #[tokio::test]
+    async fn resolution_does_not_depend_on_whether_a_sidecar_entry_exists() {
+        let filter = CapabilityFilter::new().require_tag("sidecar-canary");
+
+        // With a sidecar entry present (as a direct peer would have).
+        let with = observer().await;
+        let peer_a = EntityKeypair::generate();
+        with.test_inject_capability_announcement(signed_ann(&peer_a, 7, "us"));
+        with.peer_subnets
+            .insert(peer_a.node_id(), SubnetId::new(&[4]));
+        let with_result = with
+            .find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet)
+            .contains(&peer_a.node_id());
+
+        // Without one (as a forwarded-only peer would be).
+        let without = observer().await;
+        let peer_b = EntityKeypair::generate();
+        without.test_inject_capability_announcement(signed_ann(&peer_b, 7, "us"));
+        let without_result = without
+            .find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet)
+            .contains(&peer_b.node_id());
+
+        assert_eq!(
+            with_result, without_result,
+            "a peer announcing region:us (→ [3], our subnet) must resolve \
+             identically whether or not a sidecar entry exists"
+        );
+        assert!(
+            with_result,
+            "region:us maps to [3], the observer's own subnet, so both must \
+             be admitted"
+        );
+    }
+}
 
 #[cfg(test)]
 mod subnet_visible_unknown_tests {
