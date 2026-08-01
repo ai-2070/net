@@ -2978,6 +2978,7 @@ dependencies = [
  "hdrhistogram",
  "hex",
  "k256",
+ "libc",
  "net-mesh",
  "net-mesh-mcp",
  "net-mesh-sdk",

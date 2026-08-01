@@ -248,7 +248,15 @@ pub fn build_engine_with_mode(mode: MockMode) -> EngineFixture {
             registry.clone(),
             state_file.clone(),
         )
-        .expect("build PaymentEngine"),
+        .expect("build PaymentEngine")
+        // Bearer redemption: these benchmarks measure the store and
+        // settlement path, and every one of them redeems with `None`. The
+        // engine requires the invocation binding by default, so without
+        // this the harness would measure a denial rather than a lifecycle
+        // — and signing a binding per iteration would put an ed25519
+        // signature inside the thing being timed. `lifecycle_modes` owns
+        // the requirement's coverage.
+        .with_require_invocation_binding(false),
     );
     EngineFixture {
         engine,

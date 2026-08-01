@@ -237,13 +237,17 @@ pub struct RegistryRef {
 /// registry entries + facilitator config, never code; participants pin
 /// or override this default.
 ///
-/// **Includes the valueless mock asset**, so it is the right registry for
+/// **Includes every valueless asset** — the mock network *and* the
+/// testnets (Base Sepolia and friends) — so it is the right registry for
 /// conformance runs and dev harnesses and the wrong one for a deployment
-/// settling real money — see [`production_registry_v1`], which is the
-/// same revision minus `mock:net`. A registry entry is not on its own
-/// sufficient to spend (spend policy must also enable the network, and
-/// the mock network needs a dev profile or the explicit unsafe flag), but
-/// a provider settling for real has no reason to carry it.
+/// settling real money. [`production_registry_v1`] is the same lineage
+/// with all of those removed, not just `mock:net`; a caller reading this
+/// list should not expect testnet USDC to survive into it.
+///
+/// A registry entry is not on its own sufficient to spend (spend policy
+/// must also enable the network, and the mock network needs a dev profile
+/// or the explicit unsafe flag), but a provider settling for real has no
+/// reason to carry any of them.
 pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
     let mut registry = default_mock_registry(signer);
     registry.version = "net-default-1".to_string();
