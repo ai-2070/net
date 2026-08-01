@@ -118,16 +118,38 @@ impl SubnetPolicy {
     /// same subnet as a GLOBAL local node, so nothing is inconsistent
     /// and there is nothing to warn about.
     ///
-    /// Exact, not approximate: a non-zero mapping here always CAN be
-    /// assigned, because [`Self::assign_from_rendered_tags`] ignores
-    /// zero-valued mappings rather than writing them, so no later rule
-    /// can zero out an earlier one. Were zeros written, a policy could
-    /// hold non-zero values and still only ever answer GLOBAL, and this
-    /// would return `true` for it.
+    /// Exact, not approximate, on two counts:
+    ///
+    /// - A non-zero mapping always CAN be assigned, because
+    ///   [`Self::assign_from_rendered_tags`] ignores zero-valued
+    ///   mappings rather than writing them, so no later rule can zero
+    ///   out an earlier one. Were zeros written, a policy could hold
+    ///   non-zero values and still only ever answer GLOBAL.
+    /// - A mapping whose prefix and value are BOTH empty is skipped. It
+    ///   would match only the empty tag, and no announcement can carry
+    ///   one, so it can never fire.
+    ///
+    /// Both exclusions exist so this agrees with `assign` about the same
+    /// policy. A diagnostic that flags configurations which cannot
+    /// actually misbehave trains its reader to ignore it.
     pub fn can_assign_non_global(&self) -> bool {
-        self.rules
-            .iter()
-            .any(|rule| rule.values.values().any(|&v| v != 0))
+        self.rules.iter().any(|rule| {
+            rule.values.iter().any(|(value, &level_value)| {
+                // A mapping matches exactly the tag `tag_prefix + value`.
+                // With both halves empty that is the empty tag, which no
+                // announcement can carry: `Tag::parse` rejects `""` and
+                // no `Tag` renders to it. Counting it would report a
+                // policy as able to scope when `assign` can never make
+                // it do so.
+                //
+                // Only BOTH being empty is impossible. An empty `value`
+                // under a real prefix matches that prefix as a whole
+                // tag — `region:` parses (as `Tag::Legacy`) and renders
+                // back unchanged, so `region:` + `""` is reachable.
+                let matches_only_the_empty_tag = rule.tag_prefix.is_empty() && value.is_empty();
+                level_value != 0 && !matches_only_the_empty_tag
+            })
+        })
     }
 
     /// Assign a subnet ID to a node based on its capability tags.
@@ -391,6 +413,44 @@ mod tests {
             policy.can_assign_non_global(),
             "and the predicate must agree — this policy really can scope"
         );
+    }
+
+    /// A mapping with an empty prefix AND an empty value matches only
+    /// the empty tag, which no announcement can carry — `Tag::parse`
+    /// rejects `""` and no `Tag` renders to it. `can_assign_non_global`
+    /// must not count it, or the startup diagnostic fires at a policy
+    /// that cannot possibly misbehave.
+    ///
+    /// Reachable through the public builder, not just the fields:
+    /// `map` only rejects a level_value of 0, so this constructs.
+    #[test]
+    fn an_empty_prefix_and_value_cannot_match_any_tag() {
+        let impossible = SubnetPolicy::new().add_rule(SubnetRule::new("", 0).map("", 5));
+
+        // Nothing a real announcement carries can trip it.
+        for tag in ["gpu", "region:us", "hardware.gpu", "scope:tenant:acme"] {
+            assert_eq!(
+                impossible.assign_from_rendered_tags(&[tag.to_string()]),
+                SubnetId::GLOBAL,
+                "{tag} must not match an empty-prefix empty-value mapping"
+            );
+        }
+        assert!(
+            !impossible.can_assign_non_global(),
+            "a mapping that can never fire must not be reported as scoping"
+        );
+
+        // The near miss that IS reachable: an empty value under a real
+        // prefix matches that prefix as a whole tag. `region:` parses as
+        // a legacy tag and renders back unchanged, so this one fires and
+        // must still count.
+        let prefix_only = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("", 6));
+        assert_eq!(
+            prefix_only.assign_from_rendered_tags(&["region:".to_string()]),
+            SubnetId::new(&[6]),
+            "`region:` is a legal tag, so prefix + empty value is reachable"
+        );
+        assert!(prefix_only.can_assign_non_global());
     }
 
     /// The other direction: a rule whose ONLY values are `0` maps
