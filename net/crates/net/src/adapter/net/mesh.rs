@@ -13702,7 +13702,7 @@ impl MeshNode {
     /// counters that merely stopped moving for a while are evidence of a
     /// scheduler gap rather than of a finished pass. This advances at the actor's
     /// park, so an observed advance is an iteration boundary.
-    #[cfg(any(test, feature = "fixtures"))]
+    #[cfg(test)]
     pub(crate) fn org_routing_actor_passes(&self) -> u64 {
         self.routing_hooks
             .passes
@@ -13715,7 +13715,7 @@ impl MeshNode {
     /// nothing — it takes the commit pin, finds an empty selection and settles —
     /// so it is a PROBE of the actor's liveness rather than a mutation of its
     /// state, which is what makes it usable as an idle barrier.
-    #[cfg(any(test, feature = "fixtures"))]
+    #[cfg(test)]
     pub(crate) fn mark_org_routing_work(&self) {
         self.routing_work.mark();
     }
