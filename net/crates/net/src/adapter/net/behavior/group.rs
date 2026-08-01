@@ -97,13 +97,28 @@ pub const GROUP_TAG_PREFIX: &str = "group:";
 pub struct GroupId(pub(crate) [u8; 32]);
 
 impl PartialEq for GroupId {
-    /// Constant-time equality. A `GroupId` is a bearer secret —
+    /// Constant-time equality, retained defensively.
+    ///
+    /// The original rationale was that a `GroupId` is a bearer secret —
     /// knowing the 32 random bytes *is* membership — so a
-    /// data-dependent early-exit compare (the derived `PartialEq`)
-    /// leaks the secret through timing. Fold every byte difference
-    /// into one accumulator. Delegates to `subtle`'s audited,
-    /// optimizer-resistant `ConstantTimeEq` rather than a hand-rolled
-    /// `black_box` fold.
+    /// data-dependent early-exit compare would leak it through timing.
+    /// **That premise does not hold**: providers publish their
+    /// `allowed_groups` in a broadcast announcement, so the value
+    /// reaches every peer and relay within `MAX_CAPABILITY_HOPS`
+    /// regardless of how it compares. See the module docs.
+    ///
+    /// The implementation stays constant-time anyway, for two reasons.
+    /// It costs nothing on a 32-byte compare, and it does not depend on
+    /// the secrecy claim being true: if the entitlement primitive the
+    /// module docs describe ever lands and group ids become
+    /// issuer-signed rather than self-asserted, a timing-safe compare is
+    /// what that design would want, and a comparison that silently
+    /// regressed to early-exit in the meantime would be an easy thing to
+    /// miss. Delegates to `subtle`'s audited, optimizer-resistant
+    /// `ConstantTimeEq` rather than a hand-rolled `black_box` fold.
+    ///
+    /// What it must NOT be read as: evidence that group membership is
+    /// protected. It is advisory — see the module docs.
     ///
     /// Consistent with the derived `Hash`/`Eq` (equal bytes compare
     /// equal and hash equal), so use as a map key is unaffected.
