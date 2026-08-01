@@ -13,28 +13,36 @@ Findings are organised by severity. File paths are relative to repo root; line n
 
 All findings remediated. Each fix carries a regression test where one was meaningful; several are red-coupled (verified to fail against the old behaviour).
 
-| ID | Status | Commit |
-|----|--------|--------|
-| H1 | Fixed — `net.payment.quote_request@1`, a caller-signed envelope binding tag, destination provider, caller, capability, template hash, bounded freshness, and nonce; `SeenNonces` replay guard | `feat(payments): prove the caller identity on a quote request` |
-| H2 | Fixed — provider constructors require an explicit settlement backend (`facilitator_url` or `unsafe_dev_mock_facilitator`); neither is an error, both is an error, a real URL is never silently downgraded; `production_registry_v1` added | `fix(bindings): require an explicit settlement backend on PaymentProvider` |
-| H3 | Fixed — checker transport goes through the shared `http_policy`: scheme enforcement, destination policy, bounded reads | `fix(payments): one HTTP boundary policy for all three money-path clients` |
-| M1 | Fixed — `with_require_invocation_binding`, new `binding_required` denial reason mapped as a caller-configuration error; scope limits documented (closes off-path leakage, not an on-path observer) | `feat(payments): let a provider require the invocation binding` |
-| M2 | Fixed — `tier` removed from `VerifyOutcome`/`SettleOutcome`; the engine mints `Observed`; `MockMode::LateFinality` deleted and its test rewritten against a `ChainChecker` | `fix(payments): remove tier from facilitator outcomes…` |
-| M3 | Fixed — all four sites emit a domain-separated 8-byte `quote_ref` | `fix(payments): log a non-authorizing quote_ref, never the quote id` |
-| M4 | Fixed — bounded reads on both outbound bodies; destination policy enforced before the unpaid probe, via reqwest's resolver (rebinding-safe) plus a literal check (literals never resolve) | (with H3 commit) |
-| M5 | Fixed — replay identity from the scheme's signed material, namespaced `scheme + network + asset + authorization`; unknown schemes fail closed | `fix(payments): key replay on the scheme's signed material, fully namespaced` |
-| M6 | Fixed — doctrine deleted; admission is issuance-only and the quote TTL is the revocation window, pinned by a test that revokes mid-flight | `docs(payments): state that admission is issuance-only…` |
-| L1 | Fixed — capability key from `Url::host_str()`; unparseable URL is a denial | `fix(payments): derive the per-host spend key from the URL parser…` |
-| L2 | Fixed — `Reservation` records keyed by quote id; release is idempotent and owner-checked, independent of the caller's clock | `fix(payments): give spend reservations an owner…` |
-| L3 | Fixed — explicit protected owner-only DACL on Windows, applied pre-rename; `create_new` closes the stale-temp permission reuse | `fix(payments): owner-only payment stores on Windows too` |
-| L4 | Fixed — optional `eip712_name`/`eip712_version` on `AssetEntry`, enforced when pinned; module header corrected to state what is actually pinned | `fix(payments): make the EIP-712 domain pinnable…` |
-| L5 | Fixed — `checked_add` with a terminal error on overflow | `fix(payments): checked delivered-amount sum, approve() integrity…` |
-| L6 | Fixed — `approve()` no longer mints records for unknown ids; `maxAmountRequired` ceiling-vs-exact documented | (with L5 commit) |
-| H1 sub | Fixed — `RpcContext::caller_origin`'s doc corrected to match its source field | `docs(rpc): correct RpcContext::caller_origin authentication claim` |
+Rows cite the commit that **closed** the finding. Several were revised
+afterwards by later review — the "superseded by" column names the commit that
+now owns the mechanism, so reading the original alone does not describe the
+shipped code. Short hashes are on the branch; both reviews of this table failed
+to trace subjects by grep, which is why they are here.
+
+| ID | Status | Commit | Superseded by |
+|----|--------|--------|---------------|
+| H1 | Fixed — `net.payment.quote_request@1`, a caller-signed envelope binding tag, destination provider, caller, capability, template hash, bounded freshness, and nonce; `SeenNonces` replay guard | `a8668b521` `feat(payments): prove the caller identity on a quote request` | `d6139ac78` (bounded + per-caller guard), `b7de7755b`/`adcefc293` (deadline sweep), `de770fda3` (process-global sequence) |
+| H2 | Fixed — provider constructors require an explicit settlement backend (`facilitator_url` or `unsafe_dev_mock_facilitator`); neither is an error, both is an error, a real URL is never silently downgraded; `production_registry_v1` added | `74ce59f09` `fix(bindings): require an explicit settlement backend on PaymentProvider` | `4e5123105` (ship `payments-http` by default), `43a4a2e5b` (backend observable) |
+| H3 | Fixed — checker transport goes through the shared `http_policy`: scheme enforcement, destination policy, bounded reads | `b356fce20` `fix(payments): one HTTP boundary policy for all three money-path clients` | `83a255f48` (address-level cleartext rule) |
+| M1 | Fixed — `with_require_invocation_binding`, new `binding_required` denial reason mapped as a caller-configuration error; scope limits documented (closes off-path leakage, not an on-path observer) | `32777d355` `feat(payments): let a provider require the invocation binding` | `feb22f700`/`de770fda3` (required by default) |
+| M2 | Fixed — `tier` removed from `VerifyOutcome`/`SettleOutcome`; the engine mints `Observed`; `MockMode::LateFinality` deleted and its test rewritten against a `ChainChecker` | `e76eead8b` `fix(payments): remove tier from facilitator outcomes; the engine mints observed` | — |
+| M3 | Fixed — all four sites emit a domain-separated 8-byte `quote_ref` | `9329d0c54` `fix(payments): log a non-authorizing quote_ref, never the quote id` | `451e0afdc` — the reference is now **keyed** with a process-local secret; the unkeyed digest this commit shipped was invertible from the quote's construction inputs |
+| M4 | Fixed — bounded reads on both outbound bodies; destination policy enforced before the unpaid probe, via reqwest's resolver (rebinding-safe) plus a literal check (literals never resolve) | (with H3 commit) | `098b257fd`, `f82f900ec` (v4-in-v6 embeddings), `1402981fa` |
+| M5 | Fixed — replay identity from the scheme's signed material, namespaced `scheme + network + asset + authorization`; unknown schemes fail closed | `3acac5aab` `fix(payments): key replay on the scheme's signed material, fully namespaced` | `9da26e89e` (canonical EIP scope), `fda06512b` (`0x`-prefix normalization) |
+| M6 | Fixed — doctrine deleted; admission is issuance-only and the quote TTL is the revocation window, pinned by a test that revokes mid-flight | `a223b4614` `docs(payments): state that admission is issuance-only; quote TTL is the revocation window` | — |
+| L1 | Fixed — capability key from `Url::host_str()`; unparseable URL is a denial | `1ff81df30` `fix(payments): derive the per-host spend key from the URL parser, not string surgery` | — |
+| L2 | Fixed — `Reservation` records keyed by quote id; release is idempotent and owner-checked, independent of the caller's clock | `edc65fed6` `fix(payments): give spend reservations an owner, and make release idempotent` | `dbbe5909c` — a reservation is an in-flight claim (refcounted holders), not a past event |
+| L3 | Fixed — explicit protected owner-only DACL on Windows, applied pre-rename; `create_new` closes the stale-temp permission reuse | `be5c796f0` `fix(payments): owner-only payment stores on Windows too` | `a06e3fd30` (security descriptor at create, not after), `f82f900ec` (write through the handle), `5c2eb3a0b` (repair pre-existing, off the reactor) |
+| L4 | Fixed — optional `eip712_name`/`eip712_version` on `AssetEntry`, enforced when pinned; module header corrected to state what is actually pinned | `811b42e5b` `fix(payments): make the EIP-712 domain pinnable, and stop claiming it already was` | `3276adc79` — the shipped USDC entries now actually pin their domain; `811b42e5b` only made pinning *possible* |
+| L5 | Fixed — `checked_add` with a terminal error on overflow | `2b97c25ea` `fix(payments): checked delivered-amount sum, approve() integrity, exact-amount docs` | — |
+| L6 | Fixed — `approve()` no longer mints records for unknown ids; `maxAmountRequired` ceiling-vs-exact documented | (with L5 commit) | — |
+| H1 sub | Fixed — `RpcContext::caller_origin`'s doc corrected to match its source field | `81cdab6ce` `docs(rpc): correct RpcContext::caller_origin authentication claim` | — |
 
 **Two behaviour changes worth knowing about beyond the finding they fix.** An eip155 payload carrying no usable EIP-3009 authorization is now refused at *accept* rather than settling and failing at re-verification (M5) — something the engine cannot identify is something it must not accept. And `ProviderChannel::quote` takes the intended provider, so any custom channel implementation needs the new parameter (H1).
 
 **Not addressed, and not a finding — recorded so it is not mistaken for one.** M1 closes off-path quote-id leakage. An intermediary that observes the *paid invocation* can still copy the quote header and the binding signature together and front-run it. That needs channel binding or an authenticated transport identity; a visible, transferable signature cannot fix it however much the transcript covers. See M1's scope note.
+
+**Knowingly accepted: `fec0::/10` under `AllowPrivate`.** Automated review asked twice for the deprecated IPv6 site-local range to be carved out of `DestinationPolicy::AllowPrivate`, so a facilitator or checker bearer token could not be sent there. It was not, and the decision is deliberate rather than missed. `AllowPrivate` applies only to endpoints that are *operator configuration* — a facilitator URL or an RPC node someone typed into a config file — where reaching an operator's own network is the policy's entire purpose, and `fec0::/10` is that network as much as `fc00::/7` is. The agent-supplied path is `PublicOnly`, which refuses the range along with everything else outside `2000::/3`. The rationale lives beside the code in `http_policy::is_private_use`; revisit if `AllowPrivate` ever becomes reachable from a destination the operator did not choose.
 
 Verification at time of resolution: 281 payments tests passing across 29 suites, no warnings; `net-mesh` and `net-mesh-sdk` build clean with 231 SDK tests passing; both bindings compile under `payments` and `payments-http`.
 
