@@ -451,6 +451,7 @@ jobs:
           --test three_node_integration
           --test channel_auth
           --test channel_auth_hardening
+          --test channel_auth_origin_binding
           --test connect_post_start
           --test failure_detector_matrix
           --test parallel_bind_stress
