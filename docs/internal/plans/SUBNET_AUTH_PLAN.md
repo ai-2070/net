@@ -5,9 +5,9 @@ Status: **decision artifact + implementation plan** (Kyra's notes,
 `SubnetRights::PARTICIPATE` / general `SubnetAccessGrant` sketch. A full
 code trace confirms neither type was implemented. This plan defines the
 complete minimal authority loop needed by an enterprise deployment:
-hierarchical transport admission, bounded routing/export authority,
-session-compiled enforcement, signed revocation, and continued independent
-channel/resource authorization.
+hierarchical transport admission, full-`EntityId` session proof, bounded
+routing/export authority, session-compiled enforcement, signed revocation, and
+continued independent channel/resource authorization.
 
 Companions:
 
@@ -264,8 +264,9 @@ today shapes only channel fan-out. This is why subnet operations sit
 **Q4 — Where are hierarchical transport rights enforced?**
 At the authenticated session and the first live forwarding path:
 
-- `ATTACH` is checked when an authenticated peer presents a subnet-scoped
-  session. The grant subject must equal the AEAD-authenticated `NodeId`.
+- `ATTACH` is checked when an AEAD-protected peer presents a subnet-scoped
+  session. The grant subject is the full `EntityId`; that entity must sign a
+  one-use presentation bound to the current session and verifier challenge.
 - `ROUTE` is checked when forwarding with both endpoints inside the grant's
   subtree.
 - `EXPORT` is checked when forwarding crosses the grant subtree boundary.
@@ -312,9 +313,10 @@ distribution — not impossible instantaneous revocation without an online PDP.
 
 **Q7 — NAT, roaming, reconnect, replay, stale control delivery?**
 `peer_subnets` may disappear and be rebuilt because it is routing state.
-Authority does not: a reconnect re-authenticates `NodeId`, re-verifies the
-presented grant and current floors, and constructs a new immutable session
-context. NAT and address changes neither mint nor destroy a grant.
+Authority does not: a reconnect establishes fresh AEAD state, obtains a fresh
+verifier challenge, proves possession of the grant's full `EntityId`,
+re-verifies the grant and current floors, and constructs a new immutable
+session context. NAT and address changes neither mint nor destroy a grant.
 
 Control messages are transport only. A replayed signed fact cannot roll a
 receiver backward because revisions/floors are monotonic in their own scope;
@@ -359,8 +361,8 @@ right. The distinction is normative and independently witnessed.
 
 **Topology placement as authority.** Rejected. `MeshNodeConfig.subnet`,
 `peer_subnets`, `SubnetPolicy::assign`, and self-declared tags remain topology
-classification. A valid `SubnetGrant`, bound to the authenticated `NodeId`, is
-the only source of `ATTACH`/`ROUTE`/`EXPORT` authority.
+classification. A valid `SubnetGrant`, bound to a session-proven full
+`EntityId`, is the only source of `ATTACH`/`ROUTE`/`EXPORT` authority.
 
 **The subnet as a synthetic membership channel.** Rejected:
 
@@ -399,7 +401,7 @@ machine topology changes. It never synthesizes `ATTACH`, `ROUTE`, or `EXPORT`
 inside any member machine. Cross-machine use terminates at an exported
 provider boundary with separate org and provider admission.
 
-**Online per-packet policy decisions.** Rejected. Signatures, delegation,
+**Online per-packet policy decisions.** Rejected. Signatures, typed issuance,
 expiry, and revocation are resolved when constructing a session context.
 Forwarding consumes only that immutable context.
 
@@ -508,13 +510,24 @@ the four hierarchy levels. It does not allocate, parse strings, walk a graph,
 or consult policy. Its truth table is pinned before any caller lands:
 
 ```text
-A contains A                 true
-A contains A/B               true
-A/B contains A               false
-A/B contains A/C             false
-A/B contains A/B/C           true
-authority X/A contains Y/A   false
+scope A contains target A                 true
+scope A contains target A/B               true
+scope A/B contains target A               false
+scope A/B contains target A/C             false
+scope A/B contains target A/B/C           true
+authority X/A contains authority Y/A      false
+scope 0 contains target 0                 true
+scope 0 contains target A                 true
+scope A contains target 0                 false
 ```
+
+Path `0` is the authority-local root (`SubnetId::GLOBAL` in current topology
+code), not an absent or wildcard field. A protected grant at scope `0` is
+therefore an authority-root grant over every present and future path under that
+same `SubnetRef.authority`; issue it only when whole-installation authority is
+intended. A protected target `0` is contained only by scope `0`. Public/global
+sessions configured to require no subnet grant are a separate admission mode
+and never reinterpret a nonzero scope as containing target `0`.
 
 Parent authority over descendants is deliberate. A child that must be
 sovereign uses a distinct `authority`; v1 has no negative child ACL,
@@ -527,7 +540,7 @@ under a stable parent does not: parent grants deliberately cover future
 children. A compiled context from an incompatible epoch fails closed and is
 rebuilt off the packet path. A path is never reassigned within one epoch.
 
-### D2 — Four rights with exact boundary semantics
+### D2 — Three transport rights with exact boundary semantics
 
 ```rust
 bitflags! {
@@ -535,12 +548,12 @@ bitflags! {
         const ATTACH   = 1 << 0;
         const ROUTE    = 1 << 1;
         const EXPORT   = 1 << 2;
-        const DELEGATE = 1 << 3;
     }
 }
 ```
 
-Unknown bits are a decode error. No `PARTICIPATE`, `ADMIN`, `ASSIGN`, or
+Every other bit, including the previously sketched bit 3 `DELEGATE`, is a
+decode error. No `PARTICIPATE`, `ADMIN`, `ASSIGN`, leaf delegation, or
 open-ended action vocabulary exists in v1.
 
 | Operation | Required right |
@@ -551,12 +564,14 @@ open-ended action vocabulary exists in v1.
 | Advertise an intra-subtree route for `P` | `ROUTE(P)` |
 | Cross from inside `P` to outside `P`, or the reverse | `EXPORT(P)` |
 | Advertise an export boundary for `P` | `EXPORT(P)` |
-| Issue child right `R` at scope `C` | `DELEGATE(P)`, `R` held at `P`, and `P.contains(C)` |
+| Issue one leaf grant at scope `C` | separately verified `SubnetIssuerGrant`; not a `SubnetRights` bit |
 | Publish/subscribe | channel `PermissionToken`, independently |
 | Invoke a service/tool or mutate remote configuration | provider-local admission, independently |
 
-`ROUTE` and `EXPORT` do not imply each other. `DELEGATE` alone performs no
-operation. `ATTACH` never opens a channel or provider resource.
+`ROUTE` and `EXPORT` do not imply each other. `ATTACH` never opens a channel or
+provider resource. Issuance authority is deliberately absent from leaf
+`SubnetGrant`; it exists only in the separately typed one-hop issuer artifact
+in D3.
 
 This gives hierarchy the intended asymmetric behavior:
 
@@ -568,7 +583,7 @@ ATTACH(Vehicle B/vehicle/perception/camera-domain)
   does not permit attachment to perception, radar-domain, chassis, or vehicle
 ```
 
-### D3 — Fixed subnet credential; bounded delegation
+### D3 — Fixed leaf credential; one typed provisioning hop
 
 The wire artifact is domain-separated and independent from
 `PermissionToken`:
@@ -580,7 +595,7 @@ pub struct SubnetGrant {
     pub scope: TopologySubnetId,
     pub topology_epoch: u32,
     pub issuer: EntityId,
-    pub subject: NodeId,
+    pub subject: EntityId,
     pub rights: SubnetRights,
     pub generation: u32,
     pub not_before: u64,
@@ -589,6 +604,12 @@ pub struct SubnetGrant {
     pub signature: [u8; 64],
 }
 ```
+
+`EntityId` is the canonical 32-byte Ed25519 identity. `NodeId` is only the
+first eight bytes of a domain-separated BLAKE2s derivation and is not a
+security-strength credential subject. Routing, display, and bounded audit may
+derive `subject.node_id()` only after full subject verification. The signed
+wire artifact never substitutes the 64-bit derivative for `EntityId`.
 
 The canonical signed transcript starts with
 `b"net.subnet.grant.v1"` and encodes every field in one documented fixed
@@ -624,9 +645,17 @@ pub struct SubnetIssuerGrant {
 }
 ```
 
-There is no recursive chain in v1. The leaf must remain inside the issuer
-scope, contain only issuer-held rights, fit inside the issuer validity window,
-match its authority and topology epoch, and bind to the authenticated subject.
+There is no recursive chain in v1. A configured authority root may sign a leaf
+directly. Otherwise the authority root signs one `SubnetIssuerGrant` naming the
+provisioning `issuer`, and only that issuer may sign the leaf `SubnetGrant`.
+The issuer artifact itself is the issuance authority; `maximum_rights` contains
+only `ATTACH`, `ROUTE`, and `EXPORT` and caps the leaf's operational rights.
+
+The leaf must remain inside the issuer scope, contain only permitted rights,
+fit inside the issuer validity window, match its authority and topology epoch,
+and bind to the session-proven full `EntityId`. A `SubnetGrant` is always a
+terminal leaf. Bit 3 or any attempt to use a leaf as an issuer is rejected;
+there is no inert `DELEGATE` promise and no second provisioning hop.
 
 `nonce` makes credentials uniquely identifiable; it is not packet replay
 protection. The authenticated transport sequence/replay window protects
@@ -683,41 +712,90 @@ compares that integer with the current authority epoch; a mismatch denies and
 queues off-path revalidation. This deliberately permits broad, infrequent
 invalidation to keep revocation out of per-packet maps and ancestor walks.
 
-### D5 — Session compilation
+### D5 — Full-identity session proof and compilation
 
-Grant verification occurs after the transport authenticates the peer and
-before protected subnet admission:
+The AEAD session is necessary but does not, by itself, prove the leaf
+`EntityId`. Current Noise is `NKpsk0`: it authenticates the responder's 32-byte
+X25519 static while the initiator is anonymous. The separately maintained
+`peer_entity_ids` pin may corroborate identity, but it cannot replace
+proof-of-possession for a protected subnet grant.
 
-1. Authenticate the peer `NodeId` through the existing AEAD handshake.
-2. Decode the root or one-hop credential set.
-3. Require leaf `subject == authenticated NodeId`.
-4. Verify authority root, signatures, topology epoch, validity, lifetime
-   bound, scope containment, rights attenuation, and revocation floors.
-5. Compile one immutable context and install it on the session.
+After AEAD establishment and before protected subnet admission, the verifier
+sends a fresh one-use 32-byte challenge over that session. The grant subject
+returns a fixed, domain-separated presentation signed by its Ed25519 key:
+
+```rust
+pub struct SubnetAuthPresentation {
+    pub version: u8,
+    pub subject: EntityId,
+    pub credential_set_hash: [u8; 32],
+    pub session_id: u64,
+    pub verifier: EntityId,
+    pub verifier_nonce: [u8; 32],
+    pub target: SubnetRef,
+    pub requested_rights: SubnetRights,
+    pub signature: [u8; 64],
+}
+```
+
+The canonical signature transcript starts with
+`b"net.subnet.presentation.v1"`. The verifier nonce is generated for this
+session/admission attempt, retained only until verification, and consumed on
+accept or reject. A refresh obtains a new nonce. Binding the credential-set
+hash, current session ID, verifier identity, target, and requested rights
+prevents transfer to another grant, verifier, session, scope, or operation.
+The presentation travels inside AEAD but derives its authority from the
+subject signature.
+
+Verification is fail-closed and occurs off the forwarding path:
+
+1. Establish the AEAD session and issue a fresh verifier challenge.
+2. Decode the direct-root or one-issuer-hop credential set and presentation.
+3. Require `presentation.subject == leaf.subject` as full `EntityId` equality.
+4. Verify the presentation signature with `leaf.subject` and consume the
+   challenge.
+5. Require the current session ID, local verifier identity, nonce,
+   credential-set hash, requested target, and requested rights to match.
+6. Require `leaf.subject.node_id()` to equal the session's routing `NodeId`. If
+   `peer_entity_ids` already contains that routing key, require full `EntityId`
+   equality; do not install a missing pin yet.
+7. Verify the authority root or typed one-hop issuer, all grant signatures,
+   topology epoch, validity, lifetime bound, scope containment, rights
+   attenuation, and revocation floors.
+8. After every presentation and credential check succeeds, atomically
+   compare/install `routing NodeId → leaf.subject`. A racing or pre-existing
+   conflicting full identity fails closed and is never overwritten. A
+   deliberate 64-bit routing collision is therefore a refusal/availability
+   event, never credential aliasing or authority transfer.
+9. Derive `subject_node = leaf.subject.node_id()` only after full verification.
+10. Compile one immutable context and install it on the session.
 
 ```rust
 pub struct VerifiedSubnetContext {
     pub authority: EntityId,
     pub scope: TopologySubnetId,
     pub topology_epoch: u32,
-    pub subject: NodeId,
+    pub subject: EntityId,
+    pub subject_node: NodeId,
     pub rights: SubnetRights,
     pub generation: u32,
     pub subnet_auth_epoch: u64,
     pub expires_at: Instant,
-    pub grant_hash: [u8; 32],
+    pub credential_set_hash: [u8; 32],
 }
 ```
 
 V1 installs one authority-qualified subtree context per protected session.
 Nodes needing unrelated authorities use separate authenticated sessions; the
-hot path does not union arbitrary grant vectors.
+hot path does not union arbitrary grant vectors. The full subject and its
+compact routing derivative are compiled once; ordinary forwarding neither
+rehashes nor re-verifies either identity.
 
 The context is invalidated by connection replacement, expiry, an authority
 auth-epoch change, topology epoch change, explicit withdrawal, or authenticated
-subject-generation change. Revalidation checks the new floors against the
-credential scope, builds a replacement context, and atomically publishes it;
-a stale context is never mutated in place.
+subject-generation change. Revalidation uses a fresh challenge, checks the new
+floors against the credential scope, builds a replacement context, and
+atomically publishes it; a stale context is never mutated in place.
 
 ### D6 — Hot-path contract
 
@@ -828,6 +906,8 @@ unknown_authority
 unknown_subnet
 missing_grant
 wrong_subject
+invalid_subject_signature
+identity_pin_conflict
 wrong_authority
 wrong_topology_epoch
 scope_not_ancestor
@@ -839,15 +919,21 @@ lifetime_too_wide
 revoked
 stale_revocation_state
 issuer_not_authorized
-delegation_broadened
+issuer_attenuation_broadened
 wrong_session
+wrong_verifier
+wrong_challenge
+presentation_replayed
 invalid_control_fact
 resource_policy_denied
 ```
 
-Denials record subject, authority, scope, target, requested right, grant hash,
-generation, topology epoch, session identifier, decision, and reason. Logs do
-not contain full grants, payloads, private labels, or secrets by default.
+Denials record the claimed or verified subject's derived `NodeId`, authority,
+scope, target, requested right, credential-set hash, generation, topology
+epoch, session identifier, decision, and reason. Verification remains bound to
+the full `EntityId`; compact audit display does not weaken the decision. Logs
+do not contain full grants, presentations, payloads, private labels, or secrets
+by default.
 Successful packet forwarding does not allocate or emit a verbose record per
 packet; counters and sampled structured events cover the success path.
 
@@ -876,7 +962,8 @@ land RED before production behavior and every slice leaves the branch clean.
    geography, and customer membership from consuming compact path levels.
 3. Document `Visibility` and `peer_subnets` as propagation/topology state.
 4. Correct the false packet-header and stale API claims from §1.7.
-5. Add the canonical ancestor/self truth-table tests.
+5. Add the canonical ancestor/self truth-table tests, including all scope/target
+   `0` rows from D1.
 6. Add one registration diagnostic when topology visibility is configured
    without access control; keep soft channels valid.
 
@@ -910,6 +997,12 @@ ship a default-on compatibility bypass. If a deployed consumer is later named,
 any escape hatch is explicit, default false, loudly named
 `allow_unauthenticated_subnet_admission`, and separately reviewed.
 
+The release artifact for S1 includes an operator-facing breaking-change note:
+subnet-only or group-only allow lists hard-deny immediately after upgrade. It
+must describe how to inventory affected services, install real org/provider or
+node authority before rollout, and canary the denial reason. There is no silent
+warn period and no default-on bridge.
+
 ### S2 — Fixed credentials, hierarchy, and revocation
 
 **Create:**
@@ -922,19 +1015,19 @@ any escape hatch is explicit, default false, loudly named
 **Modify:**
 
 - `net/crates/net/src/adapter/net/subnet/mod.rs`
-- `net/crates/net/src/adapter/net/mesh.rs`
-- `net/crates/net/src/adapter/net/config.rs` (or the actual mesh-config module
-  confirmed during implementation)
+- `net/crates/net/src/adapter/net/mesh.rs` (`MeshNodeConfig` authority roots,
+  lifetime bound, and verifier ownership)
 
 **RED witnesses first:**
 
-- fixed hierarchy matrix from D1;
-- wrong authority/subject/epoch fail;
+- fixed hierarchy matrix from D1, including `0→0`, `0→X`, and `X↛0`;
+- wrong authority/full `EntityId`/epoch fail;
 - unknown rights/version/trailing bytes fail;
+- bit 3 (`DELEGATE`) is an unknown-rights decode error on a leaf grant;
 - direct root grant succeeds;
 - one-hop issuer succeeds only within scope, rights, and validity;
-- upward, sibling, cross-authority, widened-rights, widened-window, and second
-  delegation fail;
+- upward, sibling, cross-authority, widened-rights, widened-window, leaf-as-
+  issuer, and second provisioning hop fail;
 - equal compact paths under Vehicle A and Vehicle B authorities remain
   unrelated;
 - an `OrgMembershipCert`, `OrgDispatcherGrant`, or `OrgCapabilityGrant` cannot
@@ -964,6 +1057,13 @@ extract a universal grant framework in this slice.
 **RED witnesses first:**
 
 - protected session without grant denies;
+- grant without a full-`EntityId` presentation denies;
+- presentation signed by another entity denies even when compact routing state
+  is attacker-controlled in the fixture;
+- an existing `NodeId → EntityId` pin conflict denies atomically and is never
+  overwritten by the presentation path;
+- wrong/replayed nonce, session ID, verifier, credential-set hash, target, or
+  requested rights deny;
 - topology tag without grant denies;
 - fleet/org membership without a Vehicle B subnet grant cannot attach to any
   Vehicle B internal scope;
@@ -975,9 +1075,11 @@ extract a universal grant framework in this slice.
 - no signature-verifier call occurs after context installation during a packet
   burst.
 
-Compile and atomically install `VerifiedSubnetContext`. Missing or stale
-context denies by default. Keep public/global sessions configurable without a
-subnet grant.
+Issue and consume the one-use challenge, verify the presentation and complete
+credential set, atomically compare/install the `NodeId → EntityId` pin, then
+compile and atomically install `VerifiedSubnetContext`. Missing, stale,
+replayed, or identity-conflicting state denies by default. Keep public/global
+sessions configurable without a subnet grant.
 
 ### S4 — Live gateway forwarding and export boundary
 
@@ -1129,10 +1231,12 @@ The signed end-to-end suite proves:
 13. Raising a Vehicle B perception floor invalidates old perception-scoped
     internal grants while leaving BMW membership and unrelated chassis grants
     unchanged; a vehicle-root grant remains structurally dominant.
-14. Replaying the camera node's subnet grant from Outsider X fails subject
-    binding; copying public topology tags grants nothing.
-15. Reconnect after org or subnet revocation re-verifies the corresponding
-    authority and fails closed without manufacturing the other.
+14. Replaying the camera node's grant or presentation from Outsider X fails
+    full-`EntityId` subject proof; copying the derived `NodeId` or public
+    topology tags grants nothing.
+15. Reconnect after org or subnet revocation issues a fresh verifier challenge,
+    re-verifies the corresponding authority, and fails closed without
+    manufacturing the other.
 16. Reparenting or incompatible path reuse changes `topology_epoch` and
     invalidates old internal contexts before forwarding.
 17. A hostile control-channel publisher cannot forge an accepted subnet fact.
@@ -1151,15 +1255,16 @@ The architecture is accepted only while all of these remain true:
   check;
 - org credentials are verified by the existing call/admission paths, not by
   internal packet forwarding;
-- root or one-hop verification occurs only on admission/update;
+- root or one-hop credential verification and full-`EntityId` presentation
+  verification occur only on admission/update;
 - forwarding reads no credential chain and performs no signature operation;
 - rights are a strict `u8` mask;
 - floor checks during verification inspect only the bounded ancestor path;
 - topology changes and per-authority auth-epoch changes rebuild contexts
   off-path and publish atomically;
 - ordinary success auditing is counter/sampling based;
-- no arbitrary policy language, negative ACL, recursive delegation, or online
-  PDP enters v1.
+- no arbitrary policy language, negative ACL, recursive issuer chain, or
+  online PDP enters v1.
 
 Add a focused benchmark for `SubnetRef::contains` and the compiled `allows`
 check, plus instrumentation tests that fail if signature verification is
@@ -1175,6 +1280,16 @@ substitute for the end-to-end forwarding witness.
 - **Parent scope is powerful.** It deliberately covers present and future
   descendants. Issue the narrowest parent grant that matches operational
   responsibility. A sovereign child uses another authority, not a deny list.
+- **Scope `0` is whole-authority access.** It contains every path under that
+  installation authority. Provisioning tools label it explicitly as an
+  authority-root scope and must not render it as empty/unscoped.
+- **Compact identity is not credential identity.** `NodeId` remains useful for
+  routing and bounded audit, but only a fresh session-bound signature by the
+  full `EntityId` satisfies subject proof. Existing TOFU pins may corroborate
+  or conflict; they never downgrade the comparison.
+- **Issuer authority is typed.** Only `SubnetIssuerGrant` permits the single
+  provisioning hop. Leaf bit 3 is rejected, so no implementation can mistake
+  an inert `DELEGATE` bit for usable authority.
 - **Using the wrong axis recreates ambient authority.** Fleet, customer,
   region, and partner populations belong in org/capability authority, not in
   compact subnet paths. Internal product domains belong in the installation's
@@ -1208,17 +1323,17 @@ substitute for the end-to-end forwarding witness.
 | `src/adapter/net/subnet/id.rs` | S0 | canonical hierarchy operation/name |
 | `src/adapter/net/behavior/fold/capability_bridge.rs` | S1 | remove self-declared admission |
 | `src/adapter/net/mesh_rpc.rs` | S1 | callee-side verdict correction |
-| `src/adapter/net/subnet/auth.rs` | S2 | fixed grants, verifier, floors, context |
+| `src/adapter/net/subnet/auth.rs` | S2 | grants, presentation, verifier, floors, context |
 | `src/adapter/net/subnet/mod.rs` | S2, S5 | typed exports |
-| mesh configuration module | S2 | authority roots and lifetime bound |
+| `src/adapter/net/mesh.rs` / `MeshNodeConfig` | S2 | authority roots, lifetime bound, verifier owner |
 | authenticated session state | S3 | immutable context installation |
 | `src/adapter/net/subnet/gateway.rs` | S4 | ROUTE/EXPORT enforcement |
 | `src/adapter/net/protocol.rs` | S3, S4 | bounded admission/header wiring |
 | routed forwarding dispatch | S4 | live gateway consumer |
 | `src/adapter/net/subnet/control.rs` | S5 | four signed fact types |
 | `tests/subnet_axis_demotion.rs` | S1 | unsafe-axis regression matrix |
-| `tests/subnet_grant*.rs` | S2 | wire, hierarchy, delegation, revocation |
-| `tests/subnet_session_auth.rs` | S3 | admission/context lifecycle |
+| `tests/subnet_grant*.rs` | S2 | wire, hierarchy, typed issuance, revocation |
+| `tests/subnet_session_auth.rs` | S3 | presentation/admission/context lifecycle |
 | `tests/subnet_gateway_auth.rs` | S4 | forwarding boundaries |
 | `tests/subnet_org_boundary.rs` | S4 | horizontal/vertical composition |
 | `tests/subnet_control_facts.rs` | S5 | signed distribution and ordering |
@@ -1238,11 +1353,17 @@ must not guess or create duplicate state owners.
   synthesize `ATTACH`, `ROUTE`, or `EXPORT`, and subnet grants cannot synthesize
   org discovery/invocation authority.
 - Parent grants authorize self and descendants under the same authority;
-  child grants never authorize parent, sibling, or another authority.
-- `ATTACH`, `ROUTE`, `EXPORT`, and `DELEGATE` have the exact operation matrix
-  in D2, strict decoding, and no implication beyond explicit attenuation.
-- A grant is root-anchored, subject-bound, epoch/currentness checked, direct or
-  one-hop only, and compiled once into immutable session state.
+  child grants never authorize parent, sibling, or another authority; scope `0`
+  is explicitly whole-authority and only scope `0` contains target `0`.
+- `ATTACH`, `ROUTE`, and `EXPORT` have the exact operation matrix in D2.
+  Every other rights bit is rejected; leaf grants carry no issuance authority.
+- A grant is root-anchored, bound to the full `EntityId`, epoch/currentness
+  checked, and direct or signed by one typed provisioning issuer only.
+- Each admission/refresh verifies a fresh session-bound
+  `SubnetAuthPresentation`; `NodeId` equality alone never establishes the leaf
+  subject, and presentation replay or identity-pin conflict fails closed.
+- Successful verification compiles the full subject plus its derived routing
+  ID once into immutable session state.
 - Protected session admission, live route forwarding, and boundary export all
   fail closed without the exact right.
 - Channel and provider authorization remain independently enforced beneath
@@ -1268,7 +1389,7 @@ must not guess or create duplicate state owners.
 
 - arbitrary policy languages or online PDP dependence;
 - negative child ACLs or child override of parent authority;
-- recursive/arbitrary-depth delegation;
+- recursive/arbitrary-depth issuer chains or leaf delegation;
 - threshold or multi-owner subnet authorities;
 - JWT/X.509 compatibility layers;
 - policy dashboards;
