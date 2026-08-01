@@ -426,7 +426,7 @@ further items, recorded as 9-13 below.
 
 | # | Item | Resolution | Commit |
 | - | ---- | ---------- | ------ |
-| 9 | `rust_values` in the C-header parity guard never got `-12`, so the guard silently stopped covering `NET_ERR_INVALID_ARGUMENT` — a header could have dropped it and CI would pass | Derived from the variants via an exhaustive match; discriminants cross-checked against `c_int::from`. Verified live by deleting the enumerator from `net.go.h` and confirming the test fails, then restoring | `d1ac7e00c` |
+| 9 | `rust_values` in the C-header parity guard never got `-12`, so the guard silently stopped covering `NET_ERR_INVALID_ARGUMENT` — a header could have dropped it and CI would pass | Derived from the variants via an exhaustive match; discriminants cross-checked against `c_int::from`. Verified live by deleting the enumerator from `net.go.h` and confirming the test fails, then restoring. **Insufficient — superseded by item 15**: the header asserts iterate a separate `ALL` array, so a variant added to the enum and the match yet omitted from the list still passed | `d1ac7e00c`, then `2abee11cd` |
 | 10 | The new "nothing is withheld on the wire" bullet offered `any` as an unscoped query. `any` excludes `scope:subnet-local` — the one thing scope does withhold from a filter | Names plain `find_nodes_by_filter` / `findNodes` instead, and describes `any`'s floor. Fixed on both the Rust and TS surfaces | `7391b6f0a` |
 | 11 | `GroupId`'s `PartialEq` doc still asserted the bearer-secret premise the module docs had just retracted | Constant-time compare kept; justification no longer rests on secrecy, and states what it must not be read as | `ffc2ad874` |
 | 12 | Bridge rustdoc documented a one-arg `same_subnet_lookup`, two lines above the correct two-arg description; two sites also named `tags_match_scope` as the query path, which allocates for the list forms | Both corrected to `PreparedScope::matches`, noting the wrapper is not interchangeable inside the locked region | `c3483930b` |
@@ -492,7 +492,7 @@ reduce to it: a diagnostic that fires at configurations which cannot misbehave
 is not a conservative diagnostic. It is a diagnostic being trained out of the
 reader.
 
-### Verification at `9ae19d4ed`
+### Verification at `4c1f0fa54`
 
 | Check | Result |
 | ----- | ------ |
