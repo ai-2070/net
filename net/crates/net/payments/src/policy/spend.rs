@@ -324,12 +324,25 @@ impl SpendPolicyEngine {
         //     already-pending record is a no-op → clean);
         //   * a reservation landed in the day counter (always dirty).
         let decision = mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, |s| {
-            // Housekeeping: drop counters beyond the retention horizon.
+            // Housekeeping: drop counters beyond the retention horizon,
+            // and the reservations that pointed at them.
+            //
+            // Reservations are only removed by an explicit release, and a
+            // *successful* payment never releases — it has nothing to give
+            // back. So without this the map would grow with lifetime
+            // payment volume, on a file every payment parses and rewrites
+            // under a lock. Once a reservation's counter has aged out it
+            // can no longer be released meaningfully, so it is dead.
+            //
             // `retain` only ever removes, so a shrink means we pruned.
             let counters_before = s.counters.len();
             s.counters
                 .retain(|k, _| counter_day(k).is_some_and(|d| d + COUNTER_RETAIN_DAYS >= day));
-            let mut dirty = s.counters.len() != counters_before;
+            let reservations_before = s.reservations.len();
+            s.reservations
+                .retain(|_, r| r.day + COUNTER_RETAIN_DAYS >= day);
+            let mut dirty =
+                s.counters.len() != counters_before || s.reservations.len() != reservations_before;
 
             let approved = s
                 .approvals
@@ -466,6 +479,20 @@ impl SpendPolicyEngine {
                     }
                 }
 
+                // Ownership first: a reservation already on file for this
+                // quote means this is a retry, not a second spend.
+                //
+                // This has to come BEFORE the per-day cap. Checking it
+                // after would re-evaluate `max_per_day` against a total
+                // that already includes this very reservation, so a retry
+                // of the payment that happened to reach the cap would be
+                // told it needs approval — for spending it had already
+                // been allowed. The record is what lets us tell a retry
+                // from a second spend, so it gets consulted first.
+                if s.reservations.contains_key(&quote_id) {
+                    break 'decision SpendDecision::Allowed;
+                }
+
                 // Per-day counter: read, check, reserve — all under this lock.
                 let spent = match s.counters.get(&counter_key) {
                     Some(raw) => match AtomicAmount::parse(raw) {
@@ -501,13 +528,6 @@ impl SpendPolicyEngine {
                             );
                         }
                     }
-                }
-                // A reservation already on file for this quote means this
-                // is a retry, not a second spend. Reserving again would
-                // double-count it, and the whole point of keying by quote
-                // is that we can now tell.
-                if s.reservations.contains_key(&quote_id) {
-                    break 'decision SpendDecision::Allowed;
                 }
                 // Approved spend is still spending: it lands in the counter.
                 s.counters

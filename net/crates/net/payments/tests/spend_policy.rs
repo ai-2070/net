@@ -758,3 +758,102 @@ async fn reserving_the_same_quote_twice_counts_once() {
         "a retried reservation must not accumulate"
     );
 }
+
+/// A retry of a payment that reached `max_per_day` is still allowed.
+///
+/// The ownership check has to run before the cap. Evaluating
+/// `max_per_day` first would compare the cap against a total that already
+/// includes this very reservation, so a retry of the payment that
+/// happened to reach the cap would be told it needs approval — for
+/// spending it had already been allowed.
+#[tokio::test]
+async fn a_retry_at_the_daily_cap_is_still_allowed() {
+    let s = setup(SpendProfile::DevTest);
+    s.engine
+        .configure(|defaults, _| {
+            defaults.max_per_day = Some(AtomicAmount::from_u128(2500));
+        })
+        .await
+        .unwrap();
+
+    let quote = s.quote(mock_requirements("2500"), NOW);
+
+    // Reserves exactly up to the cap.
+    assert_eq!(
+        s.engine
+            .check_and_reserve(&quote, &s.registry, NOW)
+            .await
+            .unwrap(),
+        SpendDecision::Allowed
+    );
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(2500)
+    );
+
+    // The retry must not be told to seek approval for spending it has
+    // already been granted.
+    assert_eq!(
+        s.engine
+            .check_and_reserve(&quote, &s.registry, NOW)
+            .await
+            .unwrap(),
+        SpendDecision::Allowed,
+        "a retry at the cap must not require approval"
+    );
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(2500),
+        "and must not count twice"
+    );
+
+    // A genuinely new quote at the cap still holds, so the cap works.
+    let another = s.quote(mock_requirements("1"), NOW + 1);
+    assert!(matches!(
+        s.engine
+            .check_and_reserve(&another, &s.registry, NOW)
+            .await
+            .unwrap(),
+        SpendDecision::RequiresPaymentApproval { .. }
+    ));
+}
+
+/// Reservations do not accumulate forever.
+///
+/// A successful payment never releases — it has nothing to give back — so
+/// without pruning the map would grow with lifetime payment volume, on a
+/// file every payment parses and rewrites under a lock. Once a
+/// reservation's counter has aged out it can no longer be released
+/// meaningfully, so it is dead weight.
+#[tokio::test]
+async fn reservations_are_pruned_with_their_counters() {
+    let s = setup(SpendProfile::DevTest);
+    let old = s.quote(mock_requirements("2500"), NOW);
+    s.engine
+        .check_and_reserve(&old, &s.registry, NOW)
+        .await
+        .unwrap();
+    assert!(s.engine.reservation(&old.quote_id).await.unwrap().is_some());
+
+    // Well past the counter-retention horizon, a later reservation sweeps
+    // the stale one as it goes.
+    let much_later = NOW + NS_PER_DAY * 5;
+    let fresh = s.quote(mock_requirements("100"), much_later);
+    s.engine
+        .check_and_reserve(&fresh, &s.registry, much_later)
+        .await
+        .unwrap();
+
+    assert!(
+        s.engine.reservation(&old.quote_id).await.unwrap().is_none(),
+        "a reservation whose counter aged out must be swept"
+    );
+    assert!(
+        s.engine
+            .reservation(&fresh.quote_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the live reservation survives"
+    );
+}

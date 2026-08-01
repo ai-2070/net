@@ -184,6 +184,13 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
             }
             Err(e) => return Err(StoreError::io(&tmp, e)),
         };
+        // Restrict BEFORE any sensitive bytes land. On unix the mode is
+        // already set at creation; on Windows the file is created with the
+        // parent's inherited ACL, so writing first would leave the signed
+        // authorizations readable at a predictable `.tmp.<pid>` path for
+        // the whole write+fsync. The file is empty at this point, so a
+        // reader who wins the race gets nothing.
+        super::file_mode::restrict_to_owner(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
         use tokio::io::AsyncWriteExt as _;
         file.write_all(&bytes)
             .await
@@ -193,13 +200,6 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
         // never surface a truncated store.
         file.sync_all().await.map_err(|e| StoreError::io(&tmp, e))?;
         drop(file);
-        // Windows has no mode bits, so the owner-only guarantee is an
-        // explicit DACL. Applied to the temp *before* the rename, so the
-        // file is never readable at its final name with inherited
-        // permissions. A failure here is loud: a store whose permissions
-        // could not be restricted is not one to keep writing signed
-        // authorizations into.
-        super::file_mode::restrict_to_owner(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
         tokio::fs::rename(&tmp, path)
             .await
             .map_err(|e| StoreError::io(path, e))

@@ -455,10 +455,21 @@ impl X402HttpFlow {
         let body = match crate::http_policy::read_bounded(paid_response, MAX_RESOURCE_BODY).await {
             Ok(b) => b,
             Err(e) => {
+                // The status is already known here, so the reservation
+                // decision does not have to wait for the body. A non-2xx
+                // means the server refused, and for the chainless mock
+                // scheme a refusal is trustworthy enough to release —
+                // exactly as it is on the ordinary rejection path below.
+                // Without this, a server that refuses and then sends an
+                // oversized body consumes the caller's budget until
+                // retention sweeps it.
+                if !(200..300).contains(&status) && super::reject_releases_reservation(&quote) {
+                    self.release(&quote, now_ns).await;
+                }
                 return X402HttpOutcome::Failed {
                     message: format!("reading the paid response body: {e}"),
                     retryable: false,
-                }
+                };
             }
         };
 
