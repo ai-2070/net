@@ -112,8 +112,10 @@ pub struct AnnounceArgs {
     pub allow_nodes: Vec<String>,
 
     /// Allow-listed subnet ids — `<hex32>` or `subnet:<hex32>`.
-    /// ADVISORY ONLY: subnet membership is self-declared and this list
-    /// is broadcast mesh-wide. Use --allow-node for access control.
+    /// ROUTING ONLY: subnet membership is self-declared and this list
+    /// is broadcast mesh-wide, so it narrows candidate selection and
+    /// admits nobody. A capability restricted by this axis alone
+    /// denies every caller. Use --allow-node for access control.
     #[arg(long = "allow-subnet", num_args = 0.., value_name = "SUBNET")]
     pub allow_subnets: Vec<String>,
 
@@ -250,9 +252,11 @@ async fn run_nodes(
 /// so the one actionable instruction in a security warning was a clap
 /// parse error. `advisory_warning_names_only_real_flags` pins it.
 const ADVISORY_ALLOW_LIST_WARNING: &str = "\
-warning: --allow-subnet / --allow-group are ADVISORY and do not restrict access.
-         Membership is self-declared and this announcement publishes the
-         admitted values mesh-wide. Use --allow-node for access control.";
+warning: --allow-subnet / --allow-group do NOT admit anyone; they only narrow
+         routing. Membership is self-declared and this announcement publishes
+         the admitted values mesh-wide. A capability restricted by these axes
+         alone denies every caller. Use --allow-node (or org admission) for
+         access control.";
 
 /// Rejection message for a `--tag` value the parser refused.
 ///
@@ -344,9 +348,10 @@ async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     // itself, and this announcement publishes the admitted values to
     // every peer and relay within MAX_CAPABILITY_HOPS. Anyone who
     // receives it can claim a listed group or subnet with a one-line
-    // `add_tag`. An operator reaching for these flags is almost
-    // certainly trying to restrict access, so say plainly that they do
-    // not. `--allow-node` is the axis that holds.
+    // `add_tag`. Since S1 (SUBNET_AUTH_PLAN.md) these axes no longer
+    // admit at all — they narrow routing — so an announcement
+    // restricted by them alone denies every caller. `--allow-node` is
+    // the axis that holds.
     if !allowed_subnets.is_empty() || !allowed_groups.is_empty() {
         eprintln!("{ADVISORY_ALLOW_LIST_WARNING}");
     }

@@ -700,60 +700,14 @@ pub(crate) enum CapabilityScope {
     },
 }
 
-/// Parse `subnet:<hex32>` and `group:<hex64>` tags out of an
-/// announcement's tag set. Used at index time so the
-/// capability-auth `may_execute` gate can look up a peer's
-/// declared membership in O(1) without re-walking tags per call.
-///
-/// Multiple `subnet:` tags on one announcement are out of model:
-/// the substrate treats subnet membership as single-valued. To
-/// keep the gate verdict deterministic across receivers — a
-/// previous implementation read whichever subnet tag the
-/// `HashSet<Tag>` iterator surfaced first, which is hash-order
-/// dependent — multiple distinct subnet tags collapse to `None`
-/// and the announcement contributes no subnet membership. Single
-/// subnet tag works as expected. All distinct `group:` tags
-/// accumulate (deterministically sorted by byte value so receivers
-/// agree on iteration order); duplicates (Eq) are removed.
-///
-/// Kept (with `#[allow(dead_code)]`) for downstream consumers
-/// (capability_bridge translates the same shape onto the fold).
-/// The legacy `CapabilityIndex` caller was removed in Phase 3B
-/// of the multifold migration.
-#[allow(dead_code)]
-pub(crate) fn parse_membership_tags(
-    tags: &HashSet<Tag>,
-) -> (Option<super::subnet::SubnetId>, Vec<super::group::GroupId>) {
-    let mut subnet_candidates: Vec<super::subnet::SubnetId> = Vec::new();
-    let mut groups: Vec<super::group::GroupId> = Vec::new();
-    for tag in tags {
-        let rendered = tag.to_string();
-        if let Some(s) = super::subnet::SubnetId::from_tag(&rendered) {
-            if !subnet_candidates.contains(&s) {
-                subnet_candidates.push(s);
-            }
-            continue;
-        }
-        if let Some(g) = super::group::GroupId::from_tag(&rendered) {
-            if !groups.contains(&g) {
-                groups.push(g);
-            }
-        }
-    }
-    // Single distinct subnet → use it; zero or multiple → no
-    // subnet membership (multiple is out-of-model malformed and
-    // would otherwise pick a hash-order-dependent winner).
-    let subnet = if subnet_candidates.len() == 1 {
-        Some(subnet_candidates[0])
-    } else {
-        None
-    };
-    // Deterministic group order so receivers agree on iteration
-    // sequence regardless of local hash randomization. Lexicographic
-    // by byte value is stable and cheap on the 32-byte payload.
-    groups.sort_by_key(|g| g.0);
-    (subnet, groups)
-}
+// `parse_membership_tags` used to live here as a dead
+// `#[allow(dead_code)]` copy of the deterministic membership-tag
+// collapse rule (single distinct `subnet:` tag → Some, zero or
+// multiple → None; `group:` tags deduped and byte-sorted). Its one
+// live divergent sibling — a last-wins walk in
+// `fold::capability_bridge::derive_caller_axes` — now implements the
+// rule itself (SUBNET_AUTH_PLAN.md S1), so the dead copy is deleted
+// rather than kept as documentation that can drift again.
 
 /// Caller's intent for narrowing peer discovery by reserved scope
 /// tags. The legacy `CapabilityIndex::find_nodes_scoped` /

@@ -665,10 +665,11 @@ enum BridgePreflight {
 ///
 /// 1. captured-service equality (E0.2 P0) — a cross-service REQUEST
 ///    drops;
-/// 2. the public capability gate ([`capability_bridge::may_execute`],
-///    byte-for-byte the same call the unary/response-streaming paths
-///    already made) — skipped only for the `from_node == 0`
-///    loopback/test sentinel;
+/// 2. the public capability admission gate
+///    ([`capability_bridge::may_admit`] — `allowed_nodes` or the
+///    permissive all-empty default; the self-declared subnet/group
+///    axes never admit, per SUBNET_AUTH_PLAN.md S1) — skipped only
+///    for the `from_node == 0` loopback/test sentinel;
 /// 3. on accept, the authenticated response-route cache
 ///    ([`cache_authenticated_response_destination`]).
 ///
@@ -746,7 +747,7 @@ fn bridge_preflight(
     };
     let from_node = inbound.from_node;
     if from_node != 0
-        && !crate::adapter::net::behavior::fold::capability_bridge::may_execute(
+        && !crate::adapter::net::behavior::fold::capability_bridge::may_admit(
             mesh.capability_fold(),
             mesh.node_id(),
             tag,

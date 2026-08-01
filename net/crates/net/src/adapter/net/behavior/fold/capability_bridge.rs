@@ -759,26 +759,61 @@ impl std::fmt::Debug for CapabilitySetCache {
 /// - `target` must have an entry carrying `capability_tag`.
 /// - If `target`'s allow-lists are all empty, the call is
 ///   permitted (permissive default).
-/// - Otherwise the caller is admitted iff at least one populated
+/// - Otherwise the caller matches iff at least one populated
 ///   axis (node / subnet / group) matches. Caller's subnet and
 ///   groups are read from the caller's own fold entries via
-///   reserved `subnet:` / `group:` membership tags.
+///   `subnet:` / `group:` membership tags.
 ///
-/// # Strength of each axis
+/// # This is a ROUTING predicate — it must never gate admission
 ///
-/// Only `allowed_nodes` is load-bearing. `ann.node_id` is blake2s-bound
-/// to `entity_id` at dispatch, so a peer cannot present another node's
-/// identity.
-///
-/// `allowed_subnets` and `allowed_groups` are ADVISORY. Both read
-/// self-declared tags off the caller's own announcement, and the target
-/// publishes both lists in a broadcast announcement that forwards up to
-/// `MAX_CAPABILITY_HOPS` — so any peer that has seen one provider
-/// announcement learns the admitted values and can claim them with a
-/// single `add_tag`. Treat a match on those axes as a routing hint, not
-/// as authorisation, until the substrate grows an issuer-signed
-/// entitlement (see [`super::super::group`]).
+/// S1 of SUBNET_AUTH_PLAN.md: the `allowed_subnets` /
+/// `allowed_groups` axes read self-declared tags off the caller's
+/// own announcement, and the target publishes both lists in a
+/// broadcast announcement that forwards up to `MAX_CAPABILITY_HOPS`
+/// — any peer that has seen one provider announcement learns the
+/// admitted values and can claim them with a single `add_tag`. A
+/// match on those axes is therefore only useful to *narrow*: the
+/// caller-side `candidates.retain(...)` path uses this predicate to
+/// skip providers it cannot match, which admits nothing. The
+/// callee-side admission gate is [`may_admit`], where the
+/// self-declared axes never produce an admit.
 pub fn may_execute(
+    fold: &Fold<CapabilityFold>,
+    target_node: NodeId,
+    capability_tag: &str,
+    caller_node: NodeId,
+) -> bool {
+    fold.with_state(|state| {
+        let (caller_subnet, caller_groups) = derive_caller_axes(state, caller_node);
+        may_execute_with_caller(
+            state,
+            target_node,
+            capability_tag,
+            caller_node,
+            caller_subnet.as_ref(),
+            &caller_groups,
+        )
+    })
+}
+
+/// Callee-side admission gate (S1 of SUBNET_AUTH_PLAN.md).
+///
+/// Admits iff the target carries `capability_tag` AND either every
+/// allow-list is empty (permissive default) or `allowed_nodes`
+/// contains the caller. `ann.node_id` is blake2s-bound to
+/// `entity_id` at dispatch, so a peer cannot present another node's
+/// identity — that is the one load-bearing axis.
+///
+/// The self-declared `allowed_subnets` / `allowed_groups` axes never
+/// admit here: their values are publicly disclosed by the provider's
+/// own broadcast and claimable by any observer with one `add_tag`.
+/// A capability restricted by those axes alone denies every caller.
+/// Real membership admission is org/provider admission
+/// (`verify_org_admission`) or, for transport, a `SubnetGrant`.
+///
+/// [`may_execute`] keeps matching the self-declared axes for
+/// caller-side narrowing, which admits nothing.
+pub fn may_admit(
     fold: &Fold<CapabilityFold>,
     target_node: NodeId,
     capability_tag: &str,
@@ -790,8 +825,7 @@ pub fn may_execute(
         };
         let mut target_carries_tag = false;
         let mut allowed_nodes: Vec<u64> = Vec::new();
-        let mut allowed_subnets: Vec<super::super::subnet::SubnetId> = Vec::new();
-        let mut allowed_groups: Vec<super::super::group::GroupId> = Vec::new();
+        let mut restricted_by_demoted_axis = false;
         for k in keys {
             let Some(entry) = state.entries.get(k) else {
                 continue;
@@ -800,49 +834,16 @@ pub fn may_execute(
                 target_carries_tag = true;
             }
             allowed_nodes.extend(entry.payload.allowed_nodes.iter().copied());
-            allowed_subnets.extend(entry.payload.allowed_subnets.iter().copied());
-            allowed_groups.extend(entry.payload.allowed_groups.iter().cloned());
+            restricted_by_demoted_axis |= !entry.payload.allowed_subnets.is_empty()
+                || !entry.payload.allowed_groups.is_empty();
         }
         if !target_carries_tag {
             return false;
         }
-        if allowed_nodes.is_empty() && allowed_subnets.is_empty() && allowed_groups.is_empty() {
+        if allowed_nodes.is_empty() && !restricted_by_demoted_axis {
             return true;
         }
-        if allowed_nodes.contains(&caller_node) {
-            return true;
-        }
-        if !allowed_subnets.is_empty() || !allowed_groups.is_empty() {
-            let Some(caller_keys) = state.by_node.get(&caller_node) else {
-                return false;
-            };
-            let mut caller_subnet: Option<super::super::subnet::SubnetId> = None;
-            let mut caller_groups: Vec<super::super::group::GroupId> = Vec::new();
-            for k in caller_keys {
-                let Some(entry) = state.entries.get(k) else {
-                    continue;
-                };
-                for raw in &entry.payload.tags {
-                    if let Some(subnet) = super::super::subnet::SubnetId::from_tag(raw) {
-                        caller_subnet = Some(subnet);
-                    }
-                    if let Some(group) = super::super::group::GroupId::from_tag(raw) {
-                        caller_groups.push(group);
-                    }
-                }
-            }
-            if let Some(subnet) = caller_subnet {
-                if allowed_subnets.contains(&subnet) {
-                    return true;
-                }
-            }
-            for g in &caller_groups {
-                if allowed_groups.contains(g) {
-                    return true;
-                }
-            }
-        }
-        false
+        allowed_nodes.contains(&caller_node)
     })
 }
 
@@ -934,6 +935,18 @@ pub fn may_execute_batch(
 /// fold's `by_node` reverse index. `subnet:<hex>` / `group:<hex>`
 /// tags are mapped through `SubnetId::from_tag` / `GroupId::from_tag`.
 /// Returns `(None, Vec::new())` for an unknown caller.
+///
+/// The substrate treats subnet membership as single-valued, so
+/// multiple *distinct* `subnet:` tags are out-of-model malformed
+/// input and collapse to `None` (no membership). This keeps the
+/// verdict deterministic across receivers: the pre-S1 implementation
+/// kept whichever tag the entry walk surfaced last, which is
+/// wire-order dependent — two receivers holding the same signed
+/// announcement could disagree. Distinct `group:` tags accumulate,
+/// deduplicated and sorted by byte value so iteration order agrees
+/// everywhere. (This is the rule the retired
+/// `parse_membership_tags` in `behavior/capability.rs` documented;
+/// this is now its single live home.)
 fn derive_caller_axes(
     state: &super::state::FoldState<CapabilityFold>,
     caller_node: NodeId,
@@ -944,7 +957,7 @@ fn derive_caller_axes(
     let Some(caller_keys) = state.by_node.get(&caller_node) else {
         return (None, Vec::new());
     };
-    let mut caller_subnet = None;
+    let mut subnet_candidates: Vec<super::super::subnet::SubnetId> = Vec::new();
     let mut caller_groups: Vec<super::super::group::GroupId> = Vec::new();
     for k in caller_keys {
         let Some(entry) = state.entries.get(k) else {
@@ -952,13 +965,24 @@ fn derive_caller_axes(
         };
         for raw in &entry.payload.tags {
             if let Some(subnet) = super::super::subnet::SubnetId::from_tag(raw) {
-                caller_subnet = Some(subnet);
+                if !subnet_candidates.contains(&subnet) {
+                    subnet_candidates.push(subnet);
+                }
+                continue;
             }
             if let Some(group) = super::super::group::GroupId::from_tag(raw) {
-                caller_groups.push(group);
+                if !caller_groups.contains(&group) {
+                    caller_groups.push(group);
+                }
             }
         }
     }
+    let caller_subnet = if subnet_candidates.len() == 1 {
+        Some(subnet_candidates[0])
+    } else {
+        None
+    };
+    caller_groups.sort_by_key(|g| g.0);
     (caller_subnet, caller_groups)
 }
 
@@ -2472,6 +2496,174 @@ mod tests {
             vec![true, true, false],
             "subnet-allowed admits, group-allowed admits, foreign subnet denies"
         );
+    }
+
+    /// S1 (SUBNET_AUTH_PLAN.md): `may_admit` is the callee-side gate
+    /// and the self-declared subnet/group axes never admit there,
+    /// while `may_execute` keeps matching them for caller-side
+    /// narrowing. Same fold, same caller, deliberately divergent
+    /// verdicts — that divergence IS the fix, so it is pinned
+    /// directly rather than inferred from an integration test.
+    #[test]
+    fn may_admit_denies_what_may_execute_narrows_to() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let caller: NodeId = 0xCA;
+        let by_subnet: NodeId = 0xA1;
+        let by_group: NodeId = 0xA2;
+        let by_node: NodeId = 0xA4;
+        let open: NodeId = 0xA5;
+
+        let caller_subnet =
+            super::super::super::subnet::SubnetId::from_tag(&format!("subnet:{}", "11".repeat(16)))
+                .expect("parse caller subnet tag");
+        let caller_group =
+            super::super::super::group::GroupId::from_tag(&format!("group:{}", "33".repeat(32)))
+                .expect("parse caller group tag");
+
+        let caller_subnet_tag = caller_subnet.to_tag();
+        let caller_group_tag = caller_group.to_tag();
+        fold.apply(sign_member(
+            &kp,
+            caller,
+            0x100,
+            vec![caller_subnet_tag.as_str(), caller_group_tag.as_str()],
+            None,
+        ))
+        .expect("caller apply");
+
+        let restricted =
+            |node: NodeId,
+             nodes: Vec<u64>,
+             subnets: Vec<super::super::super::subnet::SubnetId>,
+             groups: Vec<super::super::super::group::GroupId>| {
+                SignedAnnouncement::sign(
+                    &kp,
+                    super::super::capability::CapabilityFold::KIND_ID,
+                    0x100,
+                    node,
+                    1,
+                    EnvelopeMeta::default(),
+                    CapabilityMembership {
+                        class_hash: 0x100,
+                        tags: vec!["nrpc:echo".into()],
+                        hardware: None,
+                        state: NodeState::Idle,
+                        region: None,
+                        price_quote: None,
+                        reflex_addr: None,
+                        allowed_nodes: nodes,
+                        allowed_subnets: subnets,
+                        allowed_groups: groups,
+                        metadata: std::collections::BTreeMap::new(),
+                        owner: None,
+                    },
+                )
+                .expect("sign restricted")
+            };
+        fold.apply(restricted(
+            by_subnet,
+            Vec::new(),
+            vec![caller_subnet],
+            Vec::new(),
+        ))
+        .expect("by_subnet apply");
+        fold.apply(restricted(
+            by_group,
+            Vec::new(),
+            Vec::new(),
+            vec![caller_group],
+        ))
+        .expect("by_group apply");
+        fold.apply(restricted(by_node, vec![caller], Vec::new(), Vec::new()))
+            .expect("by_node apply");
+        fold.apply(restricted(open, Vec::new(), Vec::new(), Vec::new()))
+            .expect("open apply");
+
+        // Routing predicate: the demoted axes still narrow.
+        assert!(may_execute(&fold, by_subnet, "nrpc:echo", caller));
+        assert!(may_execute(&fold, by_group, "nrpc:echo", caller));
+
+        // Admission gate: they do not admit.
+        assert!(
+            !may_admit(&fold, by_subnet, "nrpc:echo", caller),
+            "self-declared subnet membership must not admit",
+        );
+        assert!(
+            !may_admit(&fold, by_group, "nrpc:echo", caller),
+            "self-declared group membership must not admit",
+        );
+
+        // The load-bearing axis and the permissive default are intact.
+        assert!(may_admit(&fold, by_node, "nrpc:echo", caller));
+        assert!(may_admit(&fold, open, "nrpc:echo", caller));
+
+        // Unknown target / absent tag deny.
+        assert!(!may_admit(&fold, 0xDEAD, "nrpc:echo", caller));
+        assert!(!may_admit(&fold, by_node, "nrpc:other", caller));
+    }
+
+    /// S1: two distinct `subnet:` tags on one caller collapse to "no
+    /// membership" rather than the pre-S1 last-wins walk, so the
+    /// verdict cannot depend on entry/tag order. Both declared
+    /// subnets are in the target's allow-list, so last-wins would
+    /// have narrowed to `true` either way — the deterministic rule
+    /// yields `false`.
+    #[test]
+    fn multiple_subnet_tags_collapse_to_no_membership() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let caller: NodeId = 0xCB;
+        let target: NodeId = 0xA6;
+
+        let s1 =
+            super::super::super::subnet::SubnetId::from_tag(&format!("subnet:{}", "aa".repeat(16)))
+                .expect("parse s1");
+        let s2 =
+            super::super::super::subnet::SubnetId::from_tag(&format!("subnet:{}", "bb".repeat(16)))
+                .expect("parse s2");
+        let (t1, t2) = (s1.to_tag(), s2.to_tag());
+        fold.apply(sign_member(
+            &kp,
+            caller,
+            0x100,
+            vec![t1.as_str(), t2.as_str()],
+            None,
+        ))
+        .expect("caller apply");
+
+        fold.apply(
+            SignedAnnouncement::sign(
+                &kp,
+                super::super::capability::CapabilityFold::KIND_ID,
+                0x100,
+                target,
+                1,
+                EnvelopeMeta::default(),
+                CapabilityMembership {
+                    class_hash: 0x100,
+                    tags: vec!["nrpc:echo".into()],
+                    hardware: None,
+                    state: NodeState::Idle,
+                    region: None,
+                    price_quote: None,
+                    reflex_addr: None,
+                    allowed_nodes: Vec::new(),
+                    allowed_subnets: vec![s1, s2],
+                    allowed_groups: Vec::new(),
+                    metadata: std::collections::BTreeMap::new(),
+                    owner: None,
+                },
+            )
+            .expect("sign target"),
+        )
+        .expect("target apply");
+
+        assert!(
+            !may_execute(&fold, target, "nrpc:echo", caller),
+            "multiple distinct subnet tags contribute no membership",
+        );
+        assert!(!may_admit(&fold, target, "nrpc:echo", caller));
     }
 
     // ------------- OA-1: owner-cert ingest verification -------------
