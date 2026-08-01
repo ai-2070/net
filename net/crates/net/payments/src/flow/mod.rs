@@ -320,7 +320,36 @@ pub(crate) async fn redeem_via_engine(
 /// crate; 8 bytes is ample to correlate within one process's logs and
 /// far too short to invert into a 32-byte transcript hash.
 pub(crate) fn quote_ref(quote_id: &str) -> String {
-    let mut hasher = blake3::Hasher::new();
+    // Keyed, and the key never leaves the process.
+    //
+    // An unkeyed digest here would not be one-way in practice: a quote id
+    // is `blake3(provider ‖ caller ‖ terms_hash ‖ issued_at_ns)`, and a
+    // log reader knows the provider, the caller and the announced terms.
+    // Only the issuance instant is unknown, and it is bounded by the log
+    // line's own timestamp — a few hours of nanoseconds is a small enough
+    // space to enumerate against a truncated digest. The "short hash"
+    // would hand back the credential it was meant to withhold.
+    //
+    // A per-process key defeats that: correlation still works within one
+    // process's logs, which is the entire operator need, while nobody
+    // holding only the logs can invert or precompute.
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        // Derived from `RandomState`, which the standard library seeds
+        // per-process from the OS. Used rather than a new rng dependency
+        // because this is a logging path, not the money path — the money
+        // path deliberately carries no rng at all.
+        use std::hash::{BuildHasher, Hasher as _};
+        let state = std::collections::hash_map::RandomState::new();
+        let mut key = [0u8; 32];
+        for (i, chunk) in key.chunks_mut(8).enumerate() {
+            let mut h = state.build_hasher();
+            h.write_u64(i as u64);
+            chunk.copy_from_slice(&h.finish().to_le_bytes());
+        }
+        key
+    });
+    let mut hasher = blake3::Hasher::new_keyed(key);
     hasher.update(b"net.payments.log_ref@1");
     hasher.update(quote_id.as_bytes());
     hex::encode(&hasher.finalize().as_bytes()[..8])
