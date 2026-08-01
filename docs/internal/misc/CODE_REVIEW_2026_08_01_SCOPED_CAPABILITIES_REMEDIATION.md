@@ -171,22 +171,18 @@ not a rider on a review pass.
 **Therefore:** `subnet_visible` is unchanged. The residual gap stays open, by
 decision, and is recorded here so it is not rediscovered as an oversight.
 
-**Status: the chosen mitigation is NOT yet implemented.** Two changes are
-outstanding and neither exists in the tree as of `3e865a02e`:
+**Status: implemented in `2b9f77387`.** The `warn` fires at `MeshNode::new`
+through `MeshNode::subnet_policy_without_local_subnet`, which exists as a named
+predicate rather than an inline condition specifically so the conjunction can be
+pinned: `misconfiguration_warning_fires_only_on_policy_plus_global_subnet` walks
+all four combinations, since firing on either half alone would warn every
+correctly-configured deployment, flat or subnet-aware.
+`global_local_subnet_privileges_unresolved_peers_over_resolved_ones` pins the
+inversion against `subnet_visible` itself, so the warning's wording cannot drift
+from the behaviour it describes.
 
-1. A `warn` at `MeshNode::new` for `subnet_policy.is_some() && subnet.is_global()`.
-   `mesh.rs:8225-8226` copies the two settings independently with no check
-   between them.
-2. A qualifier on the audit's HIGH #2 row
-   (`SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md:42`), which still reads a
-   flat **Fixed** and does not record that fail-closed behaviour requires a
-   non-global `local_subnet`, nor that warning-only was a decision.
-
-Until both land, this section describes an intent, not a state. The warning's
-condition must be the *conjunction* — a policy with a scoped local subnet is
-correct, and a global local subnet with no policy is correct; only the pairing
-is suspect — so the test for it should pin all four combinations rather than
-either condition alone.
+The audit's HIGH #2 row is qualified in the same change. `subnet_visible` is
+unchanged, as decided.
 
 ---
 
@@ -406,6 +402,51 @@ against the first pass's assertion that drift was confined to findings 3-5.
 Finding 6 in particular is the one this review should have caught on its own:
 having established that `with_subnet_policy` does not set the local subnet, it
 did not check whether the API documentation said otherwise. It does.
+
+---
+
+## Resolution
+
+All eight findings are fixed. A third review pass (cubic, against the branch
+rather than this document) independently reproduced finding 1 and raised five
+further items, recorded as 9-13 below.
+
+| # | Resolution | Commit |
+| - | ---------- | ------ |
+| 1 | Warning text moved to `ADVISORY_ALLOW_LIST_WARNING`; `advisory_warning_names_only_real_flags` scans it for `--flag` tokens and asserts each is a real long on `AnnounceArgs` | `eefa288ad` |
+| 2 | `warn` at construction via `subnet_policy_without_local_subnet`; conjunction pinned across all four combinations; audit HIGH #2 row qualified. `subnet_visible` unchanged, by decision | `2b9f77387` |
+| 3 | Six comments corrected, not the two the finding named — fixing a subset would have left the file no more coherent | `0663a7af6` |
+| 4 | Allocation/oracle paragraphs moved onto `PreparedScope::matches`, where they are true | `62b5d9b10` |
+| 5 | Bound stated on `find_nodes_by_filter_scoped`, including what is *not* claimed | `5219d1e30` |
+| 6 | `local_subnet_policy()` corrected, plus `local_subnet()`, `with_subnet()`, `with_subnet_policy()` so the answer is the same wherever the reader arrives | `9c891de82` |
+| 7 | `peer_subnets` contract restated, with why absence is a steady state rather than a warm-up transient | `b90f31c93` |
+| 8 | `--tag` doc corrected; rejection message now built from `RESERVED_PREFIXES` (the hand-written list omitted `dataforts:`) | `eefa288ad` |
+
+### Third-pass items
+
+| # | Item | Resolution | Commit |
+| - | ---- | ---------- | ------ |
+| 9 | `rust_values` in the C-header parity guard never got `-12`, so the guard silently stopped covering `NET_ERR_INVALID_ARGUMENT` — a header could have dropped it and CI would pass | Derived from the variants via an exhaustive match; discriminants cross-checked against `c_int::from`. Verified live by deleting the enumerator from `net.go.h` and confirming the test fails, then restoring | `d1ac7e00c` |
+| 10 | The new "nothing is withheld on the wire" bullet offered `any` as an unscoped query. `any` excludes `scope:subnet-local` — the one thing scope does withhold from a filter | Names plain `find_nodes_by_filter` / `findNodes` instead, and describes `any`'s floor. Fixed on both the Rust and TS surfaces | `7391b6f0a` |
+| 11 | `GroupId`'s `PartialEq` doc still asserted the bearer-secret premise the module docs had just retracted | Constant-time compare kept; justification no longer rests on secrecy, and states what it must not be read as | `ffc2ad874` |
+| 12 | Bridge rustdoc documented a one-arg `same_subnet_lookup`, two lines above the correct two-arg description; two sites also named `tags_match_scope` as the query path, which allocates for the list forms | Both corrected to `PreparedScope::matches`, noting the wrapper is not interchangeable inside the locked region | `c3483930b` |
+| 13 | `assign` was documented as sorting; it delegates and sorts nothing | Describes the lexicographically-smallest-match tie-break, with the sort mentioned only as what it replaced | `90c18dfc1` |
+
+Item 9 is the one worth remembering: a drift guard that had itself drifted, and
+which reported green the whole time. Both this review's first pass and the audit
+it reviews had treated `-12` as covered because the headers were updated
+together — nobody checked whether the thing enforcing that had been.
+
+### Verification at `d1ac7e00c`
+
+| Check | Result |
+| ----- | ------ |
+| `cargo test --lib` (full) | 5373 passed, 0 failed, 1 ignored |
+| `cargo test --test capability_scope` | 8 passed, 0 failed |
+| `cargo test --bin net-mesh commands::cap` | 4 passed, 0 failed |
+| `cargo clippy --lib --all-features` | clean |
+| `cargo doc --no-deps --lib` | clean |
+| `tsc --noEmit` (sdk-ts) | clean |
 
 ---
 

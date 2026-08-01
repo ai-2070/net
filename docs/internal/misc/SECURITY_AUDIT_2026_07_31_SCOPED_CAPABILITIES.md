@@ -39,7 +39,7 @@ invalid filters instead of rejecting them.
 | # | Finding | Status |
 | - | ------- | ------ |
 | HIGH #1 | `allowed_groups` publishes its own secret | **Documented as advisory.** Behaviour unchanged by decision — disabling would break deployments relying on the axes today, including legitimate members. Corrected at every operator-facing surface: module docs, both announcement fields, `may_execute`, CLI flag help, and a runtime warning on `net cap announce`. Real fix deferred to the entitlement design. |
-| HIGH #2 | `ParentVisible` admits unresolved peers | **Fixed.** `subnet_visible` takes `Option<SubnetId>`; unknown no longer coerces to `GLOBAL`. Flat-mesh behaviour preserved via `source.is_global()`. |
+| HIGH #2 | `ParentVisible` admits unresolved peers | **Fixed for nodes with a non-global `local_subnet`.** `subnet_visible` takes `Option<SubnetId>`; unknown no longer coerces to `GLOBAL`. Flat-mesh behaviour preserved via `source.is_global()` — which means a node that installs a `SubnetPolicy` but leaves its own subnet at `GLOBAL` still admits every unresolved peer while rejecting resolved ones. That pairing is a misconfiguration and is now warned about at construction; closing it in `subnet_visible` was considered and declined (it would fail-close every direct subscriber that never announced capabilities). See CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md finding 2. |
 | HIGH #2 (issue 1) | Subnet membership self-asserted | **Open** — same root cause as HIGH #1; needs the entitlement primitive. |
 | MEDIUM | Multi-hop `SameSubnet` / `scope:subnet-local` leak | **Fixed.** Forwarded peers resolve from the origin's own tags on the indexed announcement. No sidecar, so no lifecycle divergence. |
 | MEDIUM | Converters widen invalid filters to `Any` | **Fixed.** All three native converters now error. |
@@ -68,6 +68,20 @@ A second review pass found six further items, all since addressed:
 | Stale contract docs | **Fixed** in NAPI, C ABI, CLI, and the bridge (the last was drift I introduced in the perf commit). |
 | Selector lists rescanned after a hit | **Fixed.** |
 | Equivalence test read as a performance oracle | **Documented.** It pins verdicts only; allocation, lock cost, and callback count are explicitly out of scope. |
+
+### Corrections to the addendum above (2026-08-01)
+
+Two rows in that table were not accurate when written. Recorded here rather than
+edited in place, since the point is that a "Fixed" claim went unverified.
+
+| Row | Correction |
+| --- | ---------- |
+| *Go remediation incomplete* — cites `go/header_parity_test.go` as the guard that caught the missing `-12` | That guard compares the two C headers against each other. The Rust-side guard, `cr22_c_header_parity_with_rust_neterror`, carried a hand-transcribed value list that was never given `-12` — so throughout this work it reported green while not covering the code the work added. Fixed in `d1ac7e00c`, now derived from the enum variants and verified to fail on a dropped enumerator. |
+| *Stale contract docs* — "**Fixed** in NAPI, C ABI, CLI, and the bridge" | The CLI fix replaced one wrong contract with another: `--tag` was documented as dropping reserved-prefix tags with a warning, but that path hard-errors. The bridge fix left a one-arg `same_subnet_lookup` signature two lines above the corrected two-arg description, and named `tags_match_scope` as the query path when it is `PreparedScope::matches`. Both corrected in `eefa288ad` and `c3483930b`. |
+
+Full third-pass results, including three further stale contracts in `mesh.rs`
+and `group.rs`, are in
+`CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md`.
 
 Verification — all passing:
 
