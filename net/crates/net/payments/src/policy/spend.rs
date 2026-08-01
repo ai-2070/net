@@ -639,10 +639,11 @@ impl SpendPolicyEngine {
     /// as approved — bypassing `max_per_call`, `max_per_day`, and
     /// `allowed_assets` for whatever quote later carried that id, while
     /// [`Self::approved_quote`] skipped it (no bytes to redeem). Reaching
-    /// that state requires a BLAKE3 preimage over the whole quote
-    /// transcript, so this is API integrity rather than a live attack
-    /// path — but "approve" should not be able to invent the thing it
-    /// approves.
+    /// that state requires a later quote to be issued with exactly that
+    /// id, and quote ids are content-derived — so it is a quote-id
+    /// collision, not something an attacker steers. This is API
+    /// integrity rather than a live attack path; "approve" simply should
+    /// not be able to invent the thing it approves.
     pub async fn approve(&self, quote_id: &str) -> Result<bool, SpendError> {
         let quote_id = quote_id.to_string();
         let changed = mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, move |s| {

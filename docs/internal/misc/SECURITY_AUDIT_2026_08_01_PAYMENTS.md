@@ -234,15 +234,15 @@ Doc contradiction to fix in the same change: `core/verification.rs:9` says *"Fac
 
 ### M3 — Quote ids are logged while the engine treats them as bearer credentials
 
-`flow/mod.rs:929`, `flow/mod.rs:754`, `flow/http402.rs:446`.
+`flow/mod.rs:754`, `flow/mod.rs:761`, `flow/mod.rs:929`, `flow/http402.rs:446`.
 
-The engine defines an unbound quote id as a bearer credential (`engine/mod.rs:1825`). It is logged in full at three sites:
+The engine defines an unbound quote id as a bearer credential (`engine/mod.rs:1825`). It is logged in full at **four** sites — two in billing-proof validation (`:754` and the adjacent `:761`), plus both reservation-release failures:
 
 ```rust
 tracing::warn!(quote = %quote.quote_id, error = %e, "spend reservation release failed");
 ```
 
-All three are **caller-side** — the payer logging its own id — so the exposure is to readers of the payer's logs (aggregation, shared hosts, support bundles), not to a remote attacker. Narrower than a leak to the counterparty, but still a credential in a log line, and these fire on the failure paths where a quote is most likely to be unredeemed.
+All four are **caller-side** — the payer logging its own id — so the exposure is to readers of the payer's logs (aggregation, shared hosts, support bundles), not to a remote attacker. Narrower than a leak to the counterparty, but still a credential in a log line, and these fire on the failure paths where a quote is most likely to be unredeemed.
 
 **Recommended fix.** Log a non-authorizing short hash (`blake3(quote_id)[..8]`) — the operator need here is correlation, not reconstruction. Closes on its own if M1(a) makes the binding mandatory.
 

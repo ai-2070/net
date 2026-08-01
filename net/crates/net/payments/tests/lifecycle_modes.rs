@@ -28,6 +28,9 @@ use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::settlement::SettlementResponse;
 use net_payments::x402::X402Carry;
 
+mod scripted_checker;
+use scripted_checker::ScriptedChecker;
+
 const NOW: u64 = 1_000_000_000_000_000;
 const TTL: u64 = 60_000_000_000;
 const CAPABILITY: &str = "fixture-provider/fixture-tool";
@@ -360,41 +363,6 @@ async fn wrong_amount_mode_rejects_with_no_charge_and_releases_the_payload() {
 // late finality — reached through the CHECKER, the only path that may
 // produce a tier above `observed`
 // ---------------------------------------------------------------------
-
-/// A checker with a scripted verdict queue, consumed front to back.
-struct ScriptedChecker {
-    verdicts: parking_lot::Mutex<std::collections::VecDeque<net_payments::checker::ChainVerdict>>,
-}
-
-impl ScriptedChecker {
-    fn new(verdicts: Vec<net_payments::checker::ChainVerdict>) -> Self {
-        Self {
-            verdicts: parking_lot::Mutex::new(verdicts.into()),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl net_payments::checker::ChainChecker for ScriptedChecker {
-    fn reference(&self) -> net_payments::core::verification::VerifierRef {
-        net_payments::core::verification::VerifierRef {
-            identity: None,
-            endpoint: "independent-chain-check:scripted".into(),
-        }
-    }
-
-    async fn check(
-        &self,
-        _network: &str,
-        _transaction: &str,
-        _query: Option<&net_payments::checker::TransferQuery>,
-    ) -> Result<net_payments::checker::ChainVerdict, net_payments::checker::CheckerError> {
-        self.verdicts
-            .lock()
-            .pop_front()
-            .ok_or_else(|| net_payments::checker::CheckerError::retryable("script exhausted"))
-    }
-}
 
 /// Serving is withheld until the required tier is reached, and the tier
 /// can only be reached by an independent on-chain check.

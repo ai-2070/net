@@ -1122,6 +1122,7 @@ mod denial_render_tests {
         vec![
             R::UnknownQuote,
             R::BindingMalformed,
+            R::BindingRequired,
             R::BindingRejected,
             R::PayerRecordCorrupt,
             R::QuoteFrozen {
@@ -1188,6 +1189,33 @@ mod denial_render_tests {
         }
     }
 
+    /// `binding_required` is a caller-configuration row, not a security
+    /// one.
+    ///
+    /// A caller that sent no possession proof to a provider that requires
+    /// one has a misconfigured client; it is not evidence that anyone is
+    /// attacking anything, and treating it as a security violation would
+    /// bury the real ones. It is safe to retry once the client signs —
+    /// but not safe to requote, because the quote was never the problem.
+    #[test]
+    fn binding_required_is_a_configuration_row_not_a_security_one() {
+        let d = denial_for(&R::BindingRequired, "t", "q");
+        assert_eq!(d.schematic.reason, "binding_required");
+        assert_eq!(
+            d.schematic.recovery.class, "caller_configuration_error",
+            "a missing proof is a client gap, not an attack"
+        );
+        assert_eq!(d.schematic.recovery.actor, "caller_operator");
+        assert!(
+            !d.schematic.recovery.safe_to_requote,
+            "a fresh quote does not fix an unsigned client"
+        );
+        // And it stays distinct from the security rows.
+        let rejected = denial_for(&R::BindingRejected, "t", "q");
+        assert_eq!(rejected.schematic.recovery.class, "security_violation");
+        assert_ne!(d.schematic.reason, rejected.schematic.reason);
+    }
+
     /// The review's split, rendered: an incomplete payment routes to
     /// "pay it, then retry"; a pending settlement routes to "wait and
     /// retry" — and the instrument fact differs (`none` vs `pending`).
@@ -1244,6 +1272,13 @@ mod denial_render_tests {
         assert_eq!(na(&R::UnknownQuote).as_deref(), Some("request_new_quote"));
         assert_eq!(
             na(&R::BindingMalformed).as_deref(),
+            Some("fix_payment_client")
+        );
+        // Missing a binding is a client gap, not an attack signal: it
+        // routes to the same fix, and NOT to a requote — the quote is
+        // fine, the client is not.
+        assert_eq!(
+            na(&R::BindingRequired).as_deref(),
             Some("fix_payment_client")
         );
         assert_eq!(na(&R::BindingRejected), None);

@@ -1496,7 +1496,8 @@ pub struct RpcContext {
     ///
     /// - the AEAD-verified *wire-session peer* is the node that
     ///   delivered the packet — the last hop, not necessarily the
-    ///   originator (see `RpcInboundEvent::session_node`);
+    ///   originator (it is `RpcInboundEvent::from_node`, the wire-session
+    ///   peer's `NodeId`);
     /// - [`RpcContext::org_admission`] carries a verified four-party
     ///   identity, but only for calls admitted through the
     ///   PROTECTED-service gate; it is `None` for public calls.
@@ -2144,8 +2145,10 @@ pub const STREAMING_REQUEST_PUMP_CAPACITY: usize = 1024;
 ///
 /// Bidi streaming plan (Phase B).
 pub struct RpcStreamingContext {
-    /// AEAD-verified caller `origin_hash`. Same source as
-    /// [`RpcContext::caller_origin`].
+    /// Caller's `origin_hash`, from the inbound packet header. Same
+    /// source, and the same caveat, as [`RpcContext::caller_origin`]:
+    /// **routing metadata, not identity authentication — do not
+    /// authorize on this.**
     pub caller_origin: u64,
     /// Caller-generated correlation id. Matches the initial
     /// REQUEST's `call_id` and every subsequent REQUEST_CHUNK /

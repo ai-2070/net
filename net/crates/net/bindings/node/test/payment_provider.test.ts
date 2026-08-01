@@ -16,6 +16,25 @@ import { tmpdir } from 'node:os'
 
 import { describe, expect, it } from 'vitest'
 
+/// A provider on the in-process mock backend.
+///
+/// The constructor's later parameters are positional and mostly
+/// `undefined` here, which makes every call site fragile to a signature
+/// change and hides the one argument that matters — the explicit opt-in
+/// to a settlement backend that moves no value. Naming it once keeps the
+/// intent visible and the positional churn in one place.
+function devProvider(mesh: NetMesh, statePath: string, billingLogPath?: string) {
+  return new PaymentProvider(
+    mesh,
+    statePath,
+    billingLogPath,
+    undefined, // facilitatorUrl
+    undefined, // facilitatorAuthToken
+    true, // unsafeDevMockFacilitator
+  )
+}
+
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const binding: any = await import('../index')
 const NetMesh = binding.NetMesh
@@ -88,7 +107,7 @@ describe.skipIf(!buildPricingTerms)('buildPricingTerms', () => {
 describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
   it('exposes a 32-byte provider entity id (the node identity)', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('id.state'), undefined, undefined, undefined, true)
+      const provider = devProvider(mesh, tmp('id.state'))
       const id = provider.providerEntityId
       expect(Buffer.isBuffer(id)).toBe(true)
       expect(id.length).toBe(32)
@@ -97,21 +116,21 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('readBilling without a billing log is a rejection, not a crash', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('nolog.state'), undefined, undefined, undefined, true)
+      const provider = devProvider(mesh, tmp('nolog.state'))
       await expect(provider.readBilling()).rejects.toThrow()
     })
   }, 20000)
 
   it('readBilling on a fresh billing log is empty', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('log.state'), tmp('log.billing'), undefined, undefined, true)
+      const provider = devProvider(mesh, tmp('log.state'), tmp('log.billing'))
       expect(await provider.readBilling()).toEqual([])
     })
   }, 20000)
 
   it('publishPaidTools fail-closes on an empty pricing map', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('empty.state'), undefined, undefined, undefined, true)
+      const provider = devProvider(mesh, tmp('empty.state'))
       // Empty pricing is a construction error (use NetMesh.publishTools for free).
       expect(() => provider.publishPaidTools([ECHO], noopHandler, {})).toThrow()
     })
@@ -119,7 +138,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('publishPaidTools fail-closes when a tool has no pricing entry', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('missing.state'), undefined, undefined, undefined, true)
+      const provider = devProvider(mesh, tmp('missing.state'))
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       const other = { ...ECHO, name: 'other' }
       // `other` has no pricing entry → it would publish FREE; reject instead.
@@ -131,7 +150,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('publishes a priced tool and serves it (handle lifecycle)', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('paid.state'), undefined, undefined, undefined, true)
+      const provider = devProvider(mesh, tmp('paid.state'))
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       // Pricing is keyed by the (lowered) tool name; `echo` is already
       // channel-safe so the key matches directly.
@@ -145,7 +164,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('a pricing key naming no published tool is a publish error', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('mismatch.state'), undefined, undefined, undefined, true)
+      const provider = devProvider(mesh, tmp('mismatch.state'))
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       // `echo` is priced (so the fail-closed completeness check passes), but the
       // extra `nope` key names no published tool → ServerPublisher rejects it
@@ -160,7 +179,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
     const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
     try {
       await mesh.start()
-      const provider = new PaymentProvider(mesh, tmp('close.state'), undefined, undefined, undefined, true)
+      const provider = devProvider(mesh, tmp('close.state'))
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       provider.close() // tears down the quote/pay wire + drops the node clone
       // readBilling has no billing log here → still a structured rejection, not

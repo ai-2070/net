@@ -56,9 +56,10 @@ use serde::{Deserialize, Serialize};
 
 use super::canonical::{EnvelopeError, ExtraFields, SignatureHex, SignedEnvelope};
 use super::versioning::ensure_tag;
-
-/// `net.payment.quote_request@1`.
-pub const TAG_QUOTE_REQUEST: &str = "net.payment.quote_request@1";
+// The tag lives in the versioning registry with every other envelope's, so
+// the wire string has exactly one definition. Re-exported here because
+// this is where readers of the envelope look for it.
+pub use super::versioning::TAG_QUOTE_REQUEST;
 
 /// The longest validity window a quote request may claim.
 ///

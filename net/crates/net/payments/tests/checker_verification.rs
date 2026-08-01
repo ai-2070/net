@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use net::adapter::net::identity::EntityKeypair;
-use net_payments::checker::{ChainChecker, ChainVerdict, CheckerError, TransferQuery};
+use net_payments::checker::ChainVerdict;
 use net_payments::core::registry::{default_mock_registry, default_registry_v1};
 use net_payments::core::verification::{
     check_chain, InvalidationReason, VerificationStatus, VerificationTier, VerifierRef,
@@ -22,48 +22,11 @@ use net_payments::x402::payload::PaymentPayload;
 use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::X402Carry;
 
+mod scripted_checker;
+use scripted_checker::ScriptedChecker;
+
 const NOW: u64 = 1_000_000_000_000_000;
 const CAPABILITY: &str = "fixture-provider/fixture-tool";
-
-/// A checker with a scripted verdict queue; records the queries it got.
-struct ScriptedChecker {
-    verdicts: parking_lot::Mutex<Vec<ChainVerdict>>,
-    queries: parking_lot::Mutex<Vec<(String, String, Option<TransferQuery>)>>,
-}
-
-impl ScriptedChecker {
-    fn new(verdicts: Vec<ChainVerdict>) -> Self {
-        Self {
-            verdicts: parking_lot::Mutex::new(verdicts),
-            queries: parking_lot::Mutex::new(Vec::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl ChainChecker for ScriptedChecker {
-    fn reference(&self) -> VerifierRef {
-        VerifierRef {
-            identity: None,
-            endpoint: "independent-chain-check:scripted".into(),
-        }
-    }
-
-    async fn check(
-        &self,
-        network: &str,
-        transaction: &str,
-        query: Option<&TransferQuery>,
-    ) -> Result<ChainVerdict, CheckerError> {
-        self.queries
-            .lock()
-            .push((network.to_string(), transaction.to_string(), query.cloned()));
-        self.verdicts
-            .lock()
-            .pop()
-            .ok_or_else(|| CheckerError::retryable("script exhausted"))
-    }
-}
 
 struct World {
     engine: PaymentEngine,
@@ -650,57 +613,14 @@ const VALID_NONCE: &str = "0x111111111111111111111111111111111111111111111111111
 /// opaque payload body and return the engine + quote id. Fresh engine per
 /// call: `PayerNamingFacilitator` reports a fixed transaction hash, so
 /// distinct quotes must not share a `consumed_transactions` namespace.
-/// Drive an eip155 payload to `accept_payment` and hand back the raw
-/// decision — for cases where the interesting outcome is a refusal
-/// *before* settlement rather than a settled quote.
-async fn accept_eip155(payload_body: serde_json::Value) -> PaymentDecision {
-    let provider = Arc::new(EntityKeypair::generate());
-    let caller = EntityKeypair::generate();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = PaymentEngine::new(
-        provider.clone(),
-        Arc::new(PayerNamingFacilitator),
-        Arc::new(AdmitAll),
-        default_registry_v1(provider.entity_id().clone()),
-        dir.path().join("engine.json"),
-    )
-    .expect("engine");
-    let requirements = X402Carry::author(&PaymentRequirements {
-        scheme: "exact".into(),
-        network: BASE_SEPOLIA.into(),
-        amount: "2500".into(),
-        asset: TESTNET_USDC.into(),
-        pay_to: MERCHANT_ADDR.into(),
-        max_timeout_seconds: 60,
-        extra: None,
-    })
-    .expect("author");
-    let quote = engine
-        .issue_quote(
-            caller.entity_id().clone(),
-            CAPABILITY,
-            requirements,
-            NOW,
-            60_000_000_000,
-        )
-        .expect("quote");
-    let payload = X402Carry::author(&PaymentPayload {
-        x402_version: 2,
-        resource: None,
-        accepted: quote.requirements.view().clone(),
-        payload: payload_body,
-        extensions: None,
-    })
-    .expect("payload");
-    engine
-        .accept_payment(&quote, &payload, VerificationTier::Confirmed(1), NOW + 1)
-        .await
-        .expect("accept")
-}
-
-async fn settled_eip155(
+/// Stand up an eip155 engine + quote + payload and run `accept_payment`,
+/// handing back the engine, the quote id, and the raw decision.
+///
+/// The two wrappers below differ only in what they do with the decision,
+/// so the setup lives here once.
+async fn accept_eip155_inner(
     payload_body: serde_json::Value,
-) -> (PaymentEngine, String, tempfile::TempDir) {
+) -> (PaymentEngine, String, PaymentDecision, tempfile::TempDir) {
     let provider = Arc::new(EntityKeypair::generate());
     let caller = EntityKeypair::generate();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -743,11 +663,27 @@ async fn settled_eip155(
         .accept_payment(&quote, &payload, VerificationTier::Confirmed(1), NOW + 1)
         .await
         .expect("accept");
+    (engine, quote.quote_id, decision, dir)
+}
+
+/// The raw acceptance decision — for cases where the interesting outcome
+/// is a refusal *before* settlement.
+async fn accept_eip155(payload_body: serde_json::Value) -> PaymentDecision {
+    accept_eip155_inner(payload_body).await.2
+}
+
+/// A settled eip155 quote, ready to re-verify. Asserts the settlement
+/// actually happened, so a test that meant to reach re-verification does
+/// not silently assert against a refusal.
+async fn settled_eip155(
+    payload_body: serde_json::Value,
+) -> (PaymentEngine, String, tempfile::TempDir) {
+    let (engine, quote_id, decision, dir) = accept_eip155_inner(payload_body).await;
     assert!(
         matches!(decision, PaymentDecision::PendingTier { .. }),
         "{decision:?}"
     );
-    (engine, quote.quote_id, dir)
+    (engine, quote_id, dir)
 }
 
 /// The happy path: a valid caller-signed nonce is threaded to the checker
