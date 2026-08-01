@@ -508,7 +508,13 @@ impl std::fmt::Display for ReadError {
 /// compromised endpoint that would otherwise stream until the timeout.
 pub async fn read_bounded(response: reqwest::Response, cap: usize) -> Result<Vec<u8>, ReadError> {
     if let Some(len) = response.content_length() {
-        if len as usize > cap {
+        // Widen the cap to `u64` rather than narrowing the length to
+        // `usize`. `content_length` is `u64` on every target; `usize` is
+        // 32 bits on some, and `len as usize` there truncates — a
+        // declared `4 GiB + 1` compares as `1` and sails past the check
+        // the cap exists to make. The streaming guard below would still
+        // stop it, but only after the peer had been let start.
+        if len > cap as u64 {
             return Err(ReadError::TooLarge { cap });
         }
     }
