@@ -53,14 +53,14 @@ pub use island::{
 };
 pub use metrics::{FoldMetrics, FoldStats};
 pub use reservation::{
-    JobId, ReservationAnnouncement, ReservationFold, ReservationQuery, ReservationRow,
+    holder_of, JobId, ReservationAnnouncement, ReservationFold, ReservationQuery, ReservationRow,
     ReservationState, ResourceId,
 };
 pub use routing::{RouteAnnouncement, RouteRow, RoutingFold, RoutingQuery};
 pub use snapshot::{FoldSnapshot, FoldSnapshotEntry};
 pub use state::{
-    ApplyOutcome, EntryTransition, FoldEntry, FoldError, FoldIndex, FoldState, MergeAction,
-    NoIndex, NodeId,
+    ApplyOutcome, BuildU64Hasher, EntryTransition, FoldEntry, FoldError, FoldIndex, FoldState,
+    FxU64Hasher, MergeAction, NoIndex, NodeId, NodeIdSet,
 };
 pub use wire::{EnvelopeMeta, SignedAnnouncement, WireError};
 
@@ -356,6 +356,9 @@ impl<K: FoldKind> Fold<K> {
         }
 
         let key = K::key_for(ann.node_id, &ann.payload);
+        // Copied out before the accept arms move `ann` into
+        // `build_entry` (§5). `NodeId` is `Copy`, so this is free.
+        let node_id = ann.node_id;
 
         let mut state = self.state.write();
         let mut index = self.index.write();
@@ -366,11 +369,11 @@ impl<K: FoldKind> Fold<K> {
         match action {
             MergeAction::Insert => {
                 // No existing entry to evict; install fresh.
-                let entry = build_entry::<K>(&ann);
+                let entry = build_entry::<K>(ann);
                 index.on_insert(&key, &entry.payload);
                 state
                     .by_node
-                    .entry(ann.node_id)
+                    .entry(node_id)
                     .or_default()
                     .insert(key.clone());
                 let audit = K::audit_event(EntryTransition::Created {
@@ -408,7 +411,7 @@ impl<K: FoldKind> Fold<K> {
                         state.by_node.remove(&old_entry.node_id);
                     }
                 }
-                let new_entry = build_entry::<K>(&ann);
+                let new_entry = build_entry::<K>(ann);
                 // PERF_AUDIT §4.5 — steady-state refresh (same
                 // tags/region/state, new generation/TTL) skips
                 // the index churn. The default
@@ -425,7 +428,7 @@ impl<K: FoldKind> Fold<K> {
                 }
                 state
                     .by_node
-                    .entry(ann.node_id)
+                    .entry(node_id)
                     .or_default()
                     .insert(key.clone());
                 let audit = K::audit_event(EntryTransition::Replaced {
@@ -646,7 +649,31 @@ impl<K: FoldKind> Fold<K> {
     /// diagnostics use this; production query paths should go
     /// through [`Self::query`] so [`FoldKind::query`] can use
     /// the secondary index.
+    ///
+    /// Deliberately **not** metered. A production read that is
+    /// replacing a [`Self::query`] call must use
+    /// [`Self::with_state_query`] instead, or the fold's query
+    /// counter silently loses that traffic.
     pub fn with_state<R>(&self, f: impl FnOnce(&FoldState<K>) -> R) -> R {
+        let state = self.state.read();
+        f(&state)
+    }
+
+    /// Metered borrow of the live state — [`Self::with_state`] plus
+    /// the query counter [`Self::query`] and
+    /// [`Self::with_state_and_index`] both bump.
+    ///
+    /// This is what a production read reaches for when it wants to
+    /// answer a question from borrowed state instead of a
+    /// [`FoldKind::Result`] the caller would immediately throw away
+    /// — e.g. "who holds this reservation?", which via
+    /// `ReservationQuery::State` allocates a one-row `Vec` per call.
+    /// Swapping such a call to the unmetered [`Self::with_state`]
+    /// would drop it out of the fold's query telemetry, which is a
+    /// silent operational regression rather than an optimization
+    /// (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+    pub fn with_state_query<R>(&self, f: impl FnOnce(&FoldState<K>) -> R) -> R {
+        self.metrics.on_query();
         let state = self.state.read();
         f(&state)
     }
@@ -769,16 +796,28 @@ impl<K: FoldKind> Drop for Fold<K> {
 /// Build a fresh [`FoldEntry`] from an accepted announcement.
 /// Computes `expires_at` from the announcement's `ttl_secs`
 /// override (or [`FoldKind::DEFAULT_TTL`] when absent).
-fn build_entry<K: FoldKind>(ann: &SignedAnnouncement<K::Payload>) -> FoldEntry<K> {
+///
+/// Takes the announcement **by value** and moves its payload into
+/// the entry. `Fold::apply` already owns the announcement and drops
+/// it immediately after, so the pre-2026-07-31 `&ann` +
+/// `payload.clone()` shape deep-cloned every accepted payload for
+/// nothing — a `CapabilityMembership` (tags Vec, metadata BTreeMap,
+/// three allow-list Vecs) on every capability announce, an
+/// `IslandRecord` on every island heartbeat, on every fold in the
+/// crate. See PERF_AUDIT_2026_07_31_GANG_SCHEDULER §5.
+fn build_entry<K: FoldKind>(ann: SignedAnnouncement<K::Payload>) -> FoldEntry<K> {
     let now = Instant::now();
     let ttl = ann
         .ttl_secs
         .map(|s| Duration::from_secs(s as u64))
         .unwrap_or(K::DEFAULT_TTL);
     FoldEntry {
-        payload: ann.payload.clone(),
         node_id: ann.node_id,
         generation: ann.generation,
+        // Moved last: reading the `Copy` scalars above after this
+        // partial move would still compile, but keeping the move at
+        // the end makes the ownership transfer obvious.
+        payload: ann.payload,
         received_at: now,
         expires_at: now.checked_add(ttl).unwrap_or(now),
     }

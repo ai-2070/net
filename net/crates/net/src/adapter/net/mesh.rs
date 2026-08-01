@@ -27252,10 +27252,18 @@ impl MeshNode {
 
     /// Reserve `island` under this node's identity: apply the
     /// `Reserved` transition to the local reservation fold — this
-    /// node's optimistic AP view (locked decision 2) — and broadcast
-    /// it to peers. Returns the local CAS outcome (`Won` if the
-    /// island was free/unheld in this node's view, `Lost` if already
-    /// held). `until_unix_us` is the takeover deadline.
+    /// node's optimistic AP view (locked decision 2) — and, **if the
+    /// local CAS accepted it**, broadcast it to peers. Returns the
+    /// local CAS outcome (`Won` if the island was free/unheld in this
+    /// node's view, `Lost` if already held). `until_unix_us` is the
+    /// takeover deadline.
+    ///
+    /// A `Lost` attempt is still signed, applied and metered, and
+    /// still consumes a generation — but it is not published: only
+    /// locally accepted reservation-fold transitions are publishable,
+    /// so this node never emits a reservation state its own CAS
+    /// rejected. See `apply_and_broadcast_reservation` (private) and
+    /// PERF_AUDIT_2026_07_31_GANG_SCHEDULER §4 for the reasoning.
     pub async fn reserve_island(
         &self,
         island: super::behavior::fold::IslandId,
@@ -27282,13 +27290,11 @@ impl MeshNode {
         &self,
         island: super::behavior::fold::IslandId,
     ) -> Result<super::behavior::gang::ClaimOutcome, AdapterError> {
-        use super::behavior::fold::ReservationQuery;
-        let held_by_us = self
-            .reservation_fold
-            .query(ReservationQuery::State(island))
-            .first()
-            .and_then(|(_, state)| state.holder())
-            == Some(self.node_id);
+        // Borrowed holder read — same metered query, without the
+        // one-row `Vec` `ReservationQuery::State` allocates
+        // (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+        let held_by_us =
+            super::behavior::fold::holder_of(&self.reservation_fold, island) == Some(self.node_id);
         if !held_by_us {
             return Ok(super::behavior::gang::ClaimOutcome::Lost);
         }
@@ -27320,7 +27326,25 @@ impl MeshNode {
 
     /// Build a signed reservation transition, apply it to the local
     /// reservation fold for the optimistic CAS outcome, and broadcast
-    /// it. Shared by [`Self::reserve_island`] / [`Self::release_island`].
+    /// it **only if that apply was accepted**. Shared by
+    /// [`Self::reserve_island`] / [`Self::release_island`].
+    ///
+    /// # Invariant
+    ///
+    /// > Only locally accepted reservation-fold transitions are
+    /// > publishable.
+    ///
+    /// The local CAS is the sole decision point, and it runs before
+    /// any publication decision — there is no pre-read, so no
+    /// expiry-boundary prediction, no skipped generation, and no
+    /// suppressed `applies_rejected` count. What changes on a
+    /// `Rejected` outcome is only that nothing goes on the wire.
+    ///
+    /// (`ReservationFold` implements no
+    /// [`FoldKind::audit_event`](super::behavior::fold::FoldKind::audit_event),
+    /// so there is no audit emission on this path to preserve or
+    /// suppress either way — see PERF_AUDIT_2026_07_31_GANG_SCHEDULER
+    /// §4.)
     async fn apply_and_broadcast_reservation(
         &self,
         island: super::behavior::fold::IslandId,
@@ -27345,29 +27369,54 @@ impl MeshNode {
             },
         )
         .map_err(|e| AdapterError::Connection(format!("reservation: sign failed: {e}")))?;
-        // Local optimistic CAS (this node's AP view), then propagate.
+        // Local optimistic CAS (this node's AP view) — the sole
+        // decision point.
         let outcome = self
             .reservation_fold
             .apply(ann.clone())
             .map_err(|e| AdapterError::Connection(format!("reservation: apply failed: {e}")))?;
-        // The broadcast is best-effort gossip (the local CAS already
-        // decided the AP outcome), but don't silently drop a failed
-        // propagation: the returned ClaimOutcome reflects only the local
-        // view, so a dropped error hides "won locally, peers not told"
-        // (review #10).
-        if let Err(e) = self.publish_fold_broadcast(&ann).await {
-            tracing::warn!(
-                island,
-                error = %e,
-                "reservation broadcast failed; local CAS applied but peers not notified",
-            );
-        }
-        Ok(match outcome {
+        match outcome {
             ApplyOutcome::Inserted | ApplyOutcome::Replaced => {
-                super::behavior::gang::ClaimOutcome::Won
+                // The broadcast is best-effort gossip (the local CAS
+                // already decided the AP outcome), but don't silently
+                // drop a failed propagation: the returned ClaimOutcome
+                // reflects only the local view, so a dropped error hides
+                // "won locally, peers not told" (review #10).
+                if let Err(e) = self.publish_fold_broadcast(&ann).await {
+                    tracing::warn!(
+                        island,
+                        error = %e,
+                        "reservation broadcast failed; local CAS applied but peers not notified",
+                    );
+                }
+                Ok(super::behavior::gang::ClaimOutcome::Won)
             }
-            ApplyOutcome::Rejected => super::behavior::gang::ClaimOutcome::Lost,
-        })
+            // ONLY LOCALLY ACCEPTED TRANSITIONS ARE PUBLISHABLE.
+            //
+            // A rejected transition stays locally attempted, locally
+            // metered (`applies_rejected`), generation-consuming, and
+            // returned as `Lost` — but it must never become replicated
+            // state. Broadcasting it published a reservation this node
+            // does not itself believe:
+            //
+            //     sign → reject locally → broadcast anyway → peer accepts
+            //
+            // which left the claimant holding `A` as `H` while an
+            // observer installed the losing claimant. ICB-4's W4 used to
+            // witness exactly that and disclaim it.
+            //
+            // Scope, deliberately: this fixes replication of a
+            // self-rejected transition. It does NOT address two nodes
+            // that both observe `Free` and both locally win — that is
+            // the known AP `Reserved` divergence, and the
+            // quorum/fencing edge into `Active` owns authoritative
+            // execution. See PERF_AUDIT_2026_07_31_GANG_SCHEDULER §4.
+            //
+            // Applies to release too, via this shared helper: a `Free`
+            // rejected after a holder-check race is likewise not
+            // publishable.
+            ApplyOutcome::Rejected => Ok(super::behavior::gang::ClaimOutcome::Lost),
+        }
     }
 
     /// Test-only helper — translate a legacy

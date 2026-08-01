@@ -468,6 +468,7 @@ jobs:
           --test org_ownership
           --test org_admission_wire
           --test gang_claim_node
+          --test gang_alloc_witness
           --test chain_discovery
           --test cross_lang_capability_fixtures
           --test migration_integration

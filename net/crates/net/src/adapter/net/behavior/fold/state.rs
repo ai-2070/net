@@ -30,6 +30,96 @@ use super::FoldKind;
 /// cryptographic identity.
 pub type NodeId = u64;
 
+/// Fast multiplicative mixer for hash keys built entirely out of
+/// `u64`s that are already well-distributed — fold ids
+/// ([`NodeId`], [`IslandId`](super::IslandId)) and the capability
+/// index's `(u64, u64)` keys.
+///
+/// Those ids are derived from already-hashed identity bytes, so
+/// collision resistance exists at construction and SipHash's DoS
+/// resistance adds nothing — it just charges ~15-25 ns of mixing per
+/// probe (PERF_AUDIT §4.6, PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+/// What makes that worth removing is the probe *count*: the gang
+/// matcher's `HostedByAny` scan probes once per topology entry, not
+/// once per candidate host.
+///
+/// # What a key type must satisfy to use this
+///
+/// **Well-distributed in its LOW bits specifically** — not merely
+/// collision-free. There is no finalizer: for the single-write case
+/// (which is every real use here), [`Hasher::finish`](std::hash::Hasher::finish) returns
+/// `v.wrapping_mul(FX_SEED)`, and multiplication only propagates
+/// entropy *upward* — bit `k` of the product depends only on bits
+/// `0..=k` of the input. `hashbrown` derives the bucket index from
+/// the low bits of the hash, so low-bit quality of the *input* is
+/// what carries the whole table.
+///
+/// That holds for the ids here because they are already digests
+/// (`NodeId` from identity bytes, `IslandId` = `hash(host, domain)`),
+/// where every bit is equidistributed. It would NOT hold for a
+/// counter, a left-shifted composite, a pointer, or anything with
+/// structural zeroes low down — those want a finalizer or a
+/// different hasher. This is the same trade `rustc-hash` makes, and
+/// the same caveat applies.
+///
+/// **One implementation, two aliases.** [`BuildU64Hasher`] here and
+/// `capability::BuildU64TupleHasher` both build this type; the
+/// arity lives in the alias names, not in the mixer, which only ever
+/// sees a sequence of `write_u64` calls. They were briefly two
+/// byte-identical copies — same constant, same fallback — which meant
+/// a correction to one (this note being the obvious candidate) would
+/// silently miss the other. Per-site rationale belongs on the aliases.
+#[derive(Default, Clone)]
+pub struct FxU64Hasher(u64);
+
+impl std::hash::Hasher for FxU64Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        // FxHash-style step: rotate, xor, multiply by a large odd
+        // constant. Well-distributed for already-hashed input.
+        const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(FX_SEED);
+    }
+
+    /// Defensive byte fallback — `Hash for u64` calls `write_u64`
+    /// directly, but routing an unexpected key type through here
+    /// must still mix rather than silently collapse.
+    ///
+    /// Two properties a caller arriving here should know, both
+    /// harmless for the `u64`-keyed sets this serves and neither
+    /// reachable from them:
+    ///
+    /// - An **empty slice** mixes nothing — `chunks(8)` yields no
+    ///   chunks, so the state stays at its `Default` of 0.
+    /// - `write(&[0u8])` produces exactly the state `write_u64(0)`
+    ///   does, because the short chunk is zero-padded. So this
+    ///   fallback does not domain-separate by length, and a key type
+    ///   that mixes byte writes with `u64` writes could collide
+    ///   across the two.
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(buf));
+        }
+    }
+}
+
+/// [`BuildHasher`](std::hash::BuildHasher) for [`FxU64Hasher`] over
+/// single-`u64` fold ids.
+pub type BuildU64Hasher = std::hash::BuildHasherDefault<FxU64Hasher>;
+
+/// A set of [`NodeId`]s hashed with [`FxU64Hasher`] — the
+/// candidate-host set the gang matcher builds and then probes once per
+/// topology entry.
+pub type NodeIdSet = HashSet<NodeId, BuildU64Hasher>;
+
 /// One entry in a fold: the payload most recently accepted for
 /// its key, plus the bookkeeping the runtime needs to expire,
 /// merge, and audit further announcements.
