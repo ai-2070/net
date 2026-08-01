@@ -175,8 +175,8 @@ mod aggregator_channel_registration_tests {
     //! where the drift actually happened.
 
     use super::*;
-    use ::net::adapter::net::channel::{ChannelConfigRegistry, OriginBinding};
     use crate::mesh::MeshBuilder;
+    use ::net::adapter::net::channel::{ChannelConfigRegistry, OriginBinding};
 
     async fn mesh() -> Mesh {
         MeshBuilder::new("127.0.0.1:0", &[0xA6u8; 32])
@@ -211,9 +211,7 @@ mod aggregator_channel_registration_tests {
             let reg = registry(&mesh);
             let resolved = reg
                 .resolve_by_name(&caller)
-                .unwrap_or_else(|| {
-                    panic!("{service}: the reply prefix must resolve for {caller}")
-                });
+                .unwrap_or_else(|| panic!("{service}: the reply prefix must resolve for {caller}"));
             assert_eq!(
                 resolved.matched_prefix.as_deref(),
                 Some(format!("{service}.replies.").as_str()),
