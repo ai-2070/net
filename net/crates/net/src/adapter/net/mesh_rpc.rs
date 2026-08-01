@@ -5454,21 +5454,30 @@ impl MeshNode {
         if reply_subscription_covers(&registry, target_node_id, service_hash, service) {
             return Ok(());
         }
-        // Snapshot BEFORE the subscribe `await`. Everything below this
-        // point can be overtaken by `target_node_id`'s session failing,
-        // and the failure path evicts this registry — but it can only
-        // evict entries that exist when it runs, and ours does not exist
-        // yet. See `peer_failure_generation`.
+        // The failure-generation snapshot the fence at the bottom
+        // compares against, recorded by the attempt that SUCCEEDS.
         //
-        // Re-taken per ATTEMPT below, not once for the whole loop. A
-        // failure between attempts is precisely what the retry recovers
-        // from, so comparing a later SUCCESSFUL subscribe against a
-        // pre-failure snapshot would discard a valid cache entry and
-        // report `NoRoute` for a call that had just succeeded — turning
-        // the self-healing R5 exists to provide back into the permanent
-        // failure it replaced. Only the snapshot belonging to the
-        // attempt that succeeded is meaningful.
-        let mut gen_before = self.peer_failure_generation(target_node_id);
+        // Each attempt snapshots BEFORE its subscribe `await`, because
+        // everything from there on can be overtaken by
+        // `target_node_id`'s session failing: the failure path evicts
+        // this registry, but it can only evict entries that exist when
+        // it runs, and ours does not exist yet. See
+        // `peer_failure_generation`.
+        //
+        // Per ATTEMPT, never once for the whole loop. A failure BETWEEN
+        // attempts is precisely what the retry recovers from, so fencing
+        // a later successful subscribe against a pre-failure snapshot
+        // would discard a valid cache entry and report `NoRoute` for a
+        // call that had just succeeded — turning the self-healing R5
+        // exists to provide back into the permanent failure it replaced.
+        // Only the snapshot belonging to the succeeding attempt means
+        // anything.
+        //
+        // Hence `None` here rather than a snapshot taken at this point:
+        // every read happens after the loop, so a value taken here could
+        // only ever be the wrong one, and seeding a placeholder would
+        // fence against a generation no attempt ever observed.
+        let mut gen_before: Option<u64> = None;
         // Cap the registry. `len()` on DashMap is approximate under
         // concurrent churn (it sums shard counts under shard reads,
         // not a global lock), which is exactly the semantics we
@@ -5508,12 +5517,13 @@ impl MeshNode {
         // unchanged: one attempt, no announce, no sleep.
         let mut last_err = None;
         for attempt in 0..REPLY_SUBSCRIBE_ATTEMPTS {
-            gen_before = self.peer_failure_generation(target_node_id);
+            let gen_this_attempt = self.peer_failure_generation(target_node_id);
             match self
                 .subscribe_channel_reporting_reason(target_node_id, reply_channel.clone())
                 .await
             {
                 Ok(()) => {
+                    gen_before = Some(gen_this_attempt);
                     last_err = None;
                     break;
                 }
@@ -5662,6 +5672,23 @@ impl MeshNode {
         // colliding service hash may have overwritten the slot, but that
         // caller's own fence covers its entry, and dropping a live slot
         // costs at most one idempotent re-subscribe.
+        //
+        // A missing snapshot means no attempt reported success, which
+        // the `last_err` return above already covers — so this is
+        // unreachable. It still tears the entry down rather than
+        // skipping the fence: the one thing this block must never do is
+        // leave a cache entry standing that nothing verified.
+        let Some(gen_before) = gen_before else {
+            registry.remove(&(target_node_id, service_hash));
+            return Err(RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!(
+                    "reply-channel subscribe to {target_node_id:#x} completed with \
+                     no recorded outcome; refusing to cache an unverified \
+                     subscription. Retry — the next call re-subscribes."
+                ),
+            });
+        };
         if self.peer_failure_generation(target_node_id) != gen_before {
             registry.remove(&(target_node_id, service_hash));
             return Err(RpcError::NoRoute {
