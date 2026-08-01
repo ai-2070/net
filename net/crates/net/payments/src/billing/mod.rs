@@ -112,10 +112,18 @@ impl BillingLog {
             // `mode` is inherent on tokio's OpenOptions (no trait import).
             opts.mode(0o600);
         }
+        let fresh = !tokio::fs::try_exists(&self.path).await.unwrap_or(false);
         let mut file = opts
             .open(&self.path)
             .await
             .map_err(|e| BillingError::io(&self.path, e))?;
+        if fresh {
+            // Windows has no mode bits; restrict the log the first time it
+            // is created. It holds the signed usage record, so the same
+            // owner-only guarantee the unix `mode(0o600)` above gives.
+            crate::policy::file_mode::restrict_to_owner(&self.path)
+                .map_err(|e| BillingError::io(&self.path, e))?;
+        }
         file.write_all(&line)
             .await
             .map_err(|e| BillingError::io(&self.path, e))?;

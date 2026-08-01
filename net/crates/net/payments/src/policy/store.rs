@@ -17,9 +17,11 @@
 //!   acquire parks a `spawn_blocking` thread for the whole wait, and
 //!   enough contending mutators starve the pool the holder's own tokio
 //!   I/O needs — deadlock. Async sleep parks no thread.
-//! - **Saves are atomic**: per-pid temp file, owner-only (0600) from
-//!   creation, `fsync` before the rename, temp removed on any failure.
-//!   Readers see the whole old file or the whole new file, never a tear.
+//! - **Saves are atomic**: per-pid temp file, owner-only from creation
+//!   (`0600` on unix, an explicit owner-only DACL on Windows — see
+//!   [`crate::policy::file_mode`]), `fsync` before the rename, temp
+//!   removed on any failure. Readers see the whole old file or the whole
+//!   new file, never a tear.
 //! - **Missing file = empty state** (the first-run case); a
 //!   present-but-unparseable file is [`StoreError::Corrupt`], never a
 //!   silent reset.
@@ -161,13 +163,27 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let result: Result<(), StoreError> = async {
         let mut opts = tokio::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        // `create_new` rather than `create`: a leftover temp from a
+        // crashed process with the same pid would otherwise be reopened
+        // and truncated, keeping whatever permissions it already had —
+        // `mode` only applies to a file this call creates.
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             // `mode` is inherent on tokio's OpenOptions (no trait import).
             opts.mode(0o600);
         }
-        let mut file = opts.open(&tmp).await.map_err(|e| StoreError::io(&tmp, e))?;
+        let mut file = match opts.open(&tmp).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Stale temp from a dead same-pid process. Remove it and
+                // retry once, so recovery does not require manual cleanup
+                // but a live conflict still surfaces.
+                let _ = tokio::fs::remove_file(&tmp).await;
+                opts.open(&tmp).await.map_err(|e| StoreError::io(&tmp, e))?
+            }
+            Err(e) => return Err(StoreError::io(&tmp, e)),
+        };
         use tokio::io::AsyncWriteExt as _;
         file.write_all(&bytes)
             .await
@@ -177,6 +193,13 @@ async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreErro
         // never surface a truncated store.
         file.sync_all().await.map_err(|e| StoreError::io(&tmp, e))?;
         drop(file);
+        // Windows has no mode bits, so the owner-only guarantee is an
+        // explicit DACL. Applied to the temp *before* the rename, so the
+        // file is never readable at its final name with inherited
+        // permissions. A failure here is loud: a store whose permissions
+        // could not be restricted is not one to keep writing signed
+        // authorizations into.
+        super::file_mode::restrict_to_owner(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
         tokio::fs::rename(&tmp, path)
             .await
             .map_err(|e| StoreError::io(path, e))

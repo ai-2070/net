@@ -20,7 +20,7 @@ use net_payments::core::canonical::canonical_bytes;
 use net_payments::core::registry::default_registry_v1;
 use net_payments::core::terms::PricingTerms;
 use net_payments::core::units::AtomicAmount;
-use net_payments::core::verification::{VerificationTier, VerifierRef};
+use net_payments::core::verification::VerifierRef;
 use net_payments::engine::{AdmitAll, PaymentEngine};
 use net_payments::facilitator::{Facilitator, FacilitatorError, SettleOutcome, VerifyOutcome};
 use net_payments::flow::signer::ExternalSvmSigner;

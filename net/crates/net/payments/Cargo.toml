@@ -99,6 +99,19 @@ k256 = { version = "0.14", optional = true, default-features = false, features =
 sha3 = { version = "0.12", optional = true }
 tracing = "0.1"
 
+# Windows-only: the payment stores hold bearer material (preserved x402
+# payloads are signed EIP-3009 authorizations) and the signed billing
+# record. On unix they are created 0600; Windows has no mode, so the
+# equivalent is an explicit owner-only DACL, which needs these APIs.
+# Already in the workspace lock transitively — no new supply chain.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 [features]
 # Implements `net_mcp::serve::PaymentFlow` for the caller flow, so the
 # gated-invoke composition can clear paid capabilities through this

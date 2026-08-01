@@ -42,7 +42,7 @@ use net_payments::core::canonical::canonical_bytes;
 use net_payments::core::registry::default_registry_v1;
 use net_payments::core::terms::PricingTerms;
 use net_payments::core::units::AtomicAmount;
-use net_payments::core::verification::{InvalidationReason, VerificationTier};
+use net_payments::core::verification::InvalidationReason;
 use net_payments::engine::{AdmitAll, PaymentDecision, PaymentEngine};
 use net_payments::facilitator::client::{HttpFacilitator, NoAuth};
 use net_payments::facilitator::packs;
