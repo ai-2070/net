@@ -650,6 +650,54 @@ const VALID_NONCE: &str = "0x111111111111111111111111111111111111111111111111111
 /// opaque payload body and return the engine + quote id. Fresh engine per
 /// call: `PayerNamingFacilitator` reports a fixed transaction hash, so
 /// distinct quotes must not share a `consumed_transactions` namespace.
+/// Drive an eip155 payload to `accept_payment` and hand back the raw
+/// decision — for cases where the interesting outcome is a refusal
+/// *before* settlement rather than a settled quote.
+async fn accept_eip155(payload_body: serde_json::Value) -> PaymentDecision {
+    let provider = Arc::new(EntityKeypair::generate());
+    let caller = EntityKeypair::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = PaymentEngine::new(
+        provider.clone(),
+        Arc::new(PayerNamingFacilitator),
+        Arc::new(AdmitAll),
+        default_registry_v1(provider.entity_id().clone()),
+        dir.path().join("engine.json"),
+    )
+    .expect("engine");
+    let requirements = X402Carry::author(&PaymentRequirements {
+        scheme: "exact".into(),
+        network: BASE_SEPOLIA.into(),
+        amount: "2500".into(),
+        asset: TESTNET_USDC.into(),
+        pay_to: MERCHANT_ADDR.into(),
+        max_timeout_seconds: 60,
+        extra: None,
+    })
+    .expect("author");
+    let quote = engine
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements,
+            NOW,
+            60_000_000_000,
+        )
+        .expect("quote");
+    let payload = X402Carry::author(&PaymentPayload {
+        x402_version: 2,
+        resource: None,
+        accepted: quote.requirements.view().clone(),
+        payload: payload_body,
+        extensions: None,
+    })
+    .expect("payload");
+    engine
+        .accept_payment(&quote, &payload, VerificationTier::Confirmed(1), NOW + 1)
+        .await
+        .expect("accept")
+}
+
 async fn settled_eip155(
     payload_body: serde_json::Value,
 ) -> (PaymentEngine, String, tempfile::TempDir) {
@@ -731,36 +779,37 @@ async fn eip155_reverify_threads_the_signed_nonce() {
     );
 }
 
-/// Fail-closed: a missing or malformed `authorization.nonce` on eip155 is
-/// refused at re-verification — never silently downgraded to the weaker
-/// (token, from, to) bind by threading `None`. The checker is never even
-/// consulted (a settlement we cannot bind to the authorization must not
-/// be counted).
+/// Fail-closed, and now earlier than it used to be: an eip155 `exact`
+/// payload carrying no usable EIP-3009 authorization is refused at
+/// **accept**, so it never settles at all.
+///
+/// It used to settle and then be refused at re-verification, because the
+/// replay index keyed on the whole payload wrapper and did not care what
+/// the scheme object held. Keying replay on the scheme's own signed
+/// material (M5) means a payload with no authorization has no replay
+/// identity — and something the engine cannot identify is something it
+/// must not accept. The old late refusal is still there for a payload
+/// that has an authorization but a malformed nonce.
 #[tokio::test]
-async fn eip155_reverify_refuses_a_missing_or_malformed_nonce() {
-    // (a) No `authorization` in the payload at all.
-    let (engine, quote_id, _dir) =
-        settled_eip155(serde_json::json!({ "signature": "0xsig" })).await;
-    let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
-        tier: VerificationTier::Confirmed(3),
-        delivered: Some("2500".into()),
-    }]);
-    let decision = engine
-        .re_verify_with_checker(&quote_id, &checker, VerificationTier::Confirmed(1), NOW + 2)
-        .await
-        .expect("engine");
+async fn eip155_refuses_a_payload_with_no_usable_authorization() {
+    // (a) No `authorization` in the payload at all: refused at accept,
+    //     because there is no replay identity to key on. The payment
+    //     never settles, so there is nothing for a checker to be asked
+    //     about later.
+    let refused = accept_eip155(serde_json::json!({ "signature": "0xsig" })).await;
     assert!(
-        matches!(&decision, PaymentDecision::Rejected { reason: RejectReason::BadQuote(m) } if m.contains("authorization.nonce")),
-        "missing nonce must be refused, got {decision:?}"
-    );
-    assert!(
-        checker.queries.lock().is_empty(),
-        "the checker must not be consulted without a nonce bind"
+        matches!(&refused, PaymentDecision::Rejected { reason: RejectReason::BadQuote(m) } if m.contains("replay identity")),
+        "a payload with no authorization must be refused at accept, got {refused:?}"
     );
 
-    // (b) `authorization.nonce` present but not a 32-byte hex word.
-    let (engine, quote_id, _dir) =
-        settled_eip155(serde_json::json!({ "authorization": { "nonce": "not-a-nonce" } })).await;
+    // (b) A well-formed authorization whose nonce is not a 32-byte hex
+    //     word. This one HAS a replay identity, so it settles — and is
+    //     then refused at re-verification, where the nonce has to bind an
+    //     `AuthorizationUsed` event. The late refusal still matters.
+    let (engine, quote_id, _dir) = settled_eip155(serde_json::json!({
+        "authorization": { "from": MERCHANT_ADDR, "nonce": "not-a-nonce" }
+    }))
+    .await;
     let checker = ScriptedChecker::new(vec![ChainVerdict::Included {
         tier: VerificationTier::Confirmed(3),
         delivered: Some("2500".into()),
