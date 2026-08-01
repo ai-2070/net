@@ -23,6 +23,12 @@
 //! the resolver reqwest uses, so the addresses it approves are exactly
 //! the addresses the client dials. There is no second lookup to disagree
 //! with the first.
+//!
+//! That argument holds only while the client resolves the target itself.
+//! A proxy resolves on the client's behalf, so a proxied request never
+//! reaches [`GuardedResolver`] at all — see [`client`], which therefore
+//! refuses to honour a system proxy for any policy that actually
+//! restricts anything.
 
 #![cfg(feature = "http-facilitator")]
 
@@ -373,9 +379,39 @@ pub fn is_policy_refusal(error: &reqwest::Error) -> bool {
     false
 }
 
+/// Does a client under `policy` honour `HTTP_PROXY` / `HTTPS_PROXY` /
+/// `ALL_PROXY` from the environment?
+///
+/// Only under [`DestinationPolicy::Unrestricted`], and the reason is that
+/// a proxy and a destination policy cannot both be in force.
+///
+/// `reqwest` reads those variables by default, and a proxied request
+/// resolves the target **at the proxy**: the client connects to the proxy
+/// and hands it the hostname, so [`GuardedResolver`] never sees the
+/// address that is actually reached. Every guarantee this module makes
+/// about destinations would evaporate on any host that happens to have
+/// `HTTPS_PROXY` set — silently, with nothing logged and nothing failing.
+/// That is the worst shape for a security control: present in the source,
+/// absent at run time, and invisible either way.
+///
+/// So the two are made mutually exclusive rather than left to interact.
+/// A policy that restricts anything gets `no_proxy()`, and an operator
+/// who genuinely needs an egress proxy asks for `Unrestricted` — which
+/// already means "the operator's choice is the policy", and is now
+/// *also* the way to say "and I accept that this client's destinations
+/// are the proxy's business, not ours". The trade is visible at the call
+/// site, which is where it belongs.
+pub fn honours_system_proxy(policy: DestinationPolicy) -> bool {
+    matches!(policy, DestinationPolicy::Unrestricted)
+}
+
 /// Build a money-path [`reqwest::Client`]: pinned TLS roots, the
 /// destination policy wired in as the resolver, and the supplied
 /// timeouts. Every money-path client is constructed through here.
+///
+/// System proxies are disabled unless the policy is
+/// [`DestinationPolicy::Unrestricted`] — see [`honours_system_proxy`] for
+/// why a proxy and a destination policy cannot both be in force.
 pub fn client(
     policy: DestinationPolicy,
     timeout: std::time::Duration,
@@ -384,12 +420,16 @@ pub fn client(
 ) -> Result<reqwest::Client, PolicyError> {
     let tls = crate::tls_roots::tls_config()
         .map_err(|e| PolicyError::new(format!("http tls config: {e}")))?;
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(connect_timeout)
         .redirect(redirects)
         .use_preconfigured_tls(tls)
-        .dns_resolver(Arc::new(GuardedResolver::new(policy)))
+        .dns_resolver(Arc::new(GuardedResolver::new(policy)));
+    if !honours_system_proxy(policy) {
+        builder = builder.no_proxy();
+    }
+    builder
         .build()
         .map_err(|e| PolicyError::new(format!("http client build: {e}")))
 }
@@ -606,6 +646,30 @@ mod tests {
             assert!(
                 DestinationPolicy::PublicOnly.admits(ip),
                 "{ok} must be public"
+            );
+        }
+    }
+
+    /// A destination policy and a system proxy are mutually exclusive:
+    /// exactly the policy that restricts nothing is the one allowed to
+    /// route through a proxy.
+    ///
+    /// The end-to-end proof — that a client built under a restricting
+    /// policy ignores `HTTPS_PROXY` and still refuses at the resolver —
+    /// lives in `tests/http_policy_proxy.rs`, which needs its own process
+    /// because the environment is not per-test.
+    #[test]
+    fn only_the_unrestricted_policy_may_route_through_a_proxy() {
+        assert!(honours_system_proxy(DestinationPolicy::Unrestricted));
+        for restricting in [
+            DestinationPolicy::PublicOnly,
+            DestinationPolicy::PublicOrLoopback,
+            DestinationPolicy::AllowPrivate,
+        ] {
+            assert!(
+                !honours_system_proxy(restricting),
+                "{restricting:?} restricts destinations, so a proxy — which resolves the target \
+                 itself — would make it unenforceable"
             );
         }
     }
