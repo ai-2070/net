@@ -58,21 +58,29 @@ async fn build_node() -> Arc<MeshNode> {
     )
 }
 
-/// Build a MeshNode pinned to a specific subnet. Used by the
-/// `SubnetLocal` test to set up same-subnet vs cross-subnet pairs;
-/// the discovery-side scope filter consults `MeshNode.local_subnet`
-/// as the caller's subnet and `peer_subnets` as the candidate's.
+/// Build a MeshNode pinned to a specific subnet, with NO
+/// `SubnetPolicy`. Used by the `SubnetLocal` tests to set up
+/// same-subnet vs cross-subnet pairs.
+///
+/// The discovery-side scope filter reads `MeshNode.local_subnet` as the
+/// caller's subnet and derives each candidate's from the tags on the
+/// fold entry the query selected, by running the local policy over
+/// them. With no policy there is nothing to resolve those tags with, so
+/// every non-self candidate is unresolvable and `SameSubnet` excludes
+/// it — which is what the without-policy tests below assert.
 async fn build_node_in_subnet(subnet: SubnetId) -> Arc<MeshNode> {
     let keypair = EntityKeypair::generate();
     let cfg = test_config().with_subnet(subnet);
     Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
 }
 
-/// Build a MeshNode with a subnet AND a `SubnetPolicy`. The policy
-/// is what makes `peer_subnets` populate on incoming announcements
-/// — without it, the dispatch handler skips the
-/// `policy.assign(&caps)` call entirely. Used by the P1 regression
-/// to exercise the warm-up-permissive branch.
+/// Build a MeshNode with a subnet AND a `SubnetPolicy`.
+///
+/// The policy is what lets scoped discovery resolve a candidate at all:
+/// `find_nodes_by_filter_scoped` runs it over the tags of the fold entry
+/// the query selected. It also gates the `peer_subnets` write in
+/// `handle_capability_announcement`, but that map is no longer read by
+/// the discovery path — only by the channel publish / subscribe paths.
 async fn build_node_with_policy(subnet: SubnetId, policy: Arc<SubnetPolicy>) -> Arc<MeshNode> {
     let keypair = EntityKeypair::generate();
     let cfg = test_config().with_subnet(subnet).with_subnet_policy(policy);
@@ -296,9 +304,12 @@ async fn find_best_node_scoped_picks_higher_scoring_within_tenant() {
 #[tokio::test]
 async fn subnet_local_scope_excludes_cross_subnet_peers() {
     // SubnetLocal is the strictest scope: providers tagged
-    // `scope:subnet-local` are visible only to peers in the
-    // same subnet. Exercises the same-subnet predicate plumbed
-    // from `MeshNode::peer_subnets` through the index closure.
+    // `scope:subnet-local` are visible only to peers in the same
+    // subnet. Exercises the same-subnet predicate the bridge invokes
+    // under `ScopeFilter::SameSubnet` — which resolves the candidate
+    // from the selected fold entry's tags, not from `peer_subnets`.
+    // These nodes carry no policy, so no candidate resolves and only
+    // the local node survives the filter.
     let subnet_x = SubnetId::new(&[3, 7]);
     let subnet_y = SubnetId::new(&[3, 8]);
 
@@ -338,12 +349,11 @@ async fn subnet_local_scope_excludes_cross_subnet_peers() {
     .await;
     assert!(arrived, "D did not see both announcements");
 
-    // No `local_subnet_policy` is installed on D, so its
-    // `peer_subnets` map stays permanently empty —
-    // `handle_capability_announcement` only writes that map when
-    // a policy is set. Treating "unknown" as "same subnet" in
-    // that configuration would silently leak every peer through
-    // `SameSubnet` (Cubic P1). The fix: without a policy, unknown
+    // No `local_subnet_policy` is installed on D, so there is nothing
+    // to resolve a candidate's tags with and every non-self candidate
+    // stays unknown. Treating "unknown" as "same subnet" in that
+    // configuration would silently leak every peer through
+    // `SameSubnet` (Cubic P1). The rule: without a policy, unknown
     // means unknown, and unknown is excluded.
     //
     // The raw `find_nodes_by_filter` still returns both A and B
@@ -487,7 +497,7 @@ async fn region_scope_filters_to_matching_region() {
 
 #[tokio::test]
 async fn same_subnet_without_policy_excludes_unresolved_peers() {
-    // No policy installed → `peer_subnets` cannot populate. A
+    // No policy installed → no candidate's subnet can be resolved. A
     // cross-subnet peer announcing into the index must NOT be
     // returned by `SameSubnet`, regardless of whether its
     // capability tags match the filter.
@@ -595,8 +605,13 @@ async fn same_subnet_resolves_forwarded_peers_from_the_fold() {
         same
     );
 
-    // The direct path still works alongside it: B handshook with D
-    // directly, so it resolves through `peer_subnets`.
+    // A directly-connected peer is not treated differently. B handshook
+    // with D, so it DOES have a `peer_subnets` entry — but that map is
+    // no longer consulted by scoped discovery, so B resolves from its
+    // own announced `region:us` tag through the fold, by the same code
+    // path as the forwarded peer above. That equivalence is the point;
+    // `resolution_does_not_depend_on_whether_a_sidecar_entry_exists`
+    // pins it directly.
     b.announce_capabilities(
         CapabilitySet::new()
             .add_tag("region:us") // policy → subnet [3], same as D
@@ -612,8 +627,9 @@ async fn same_subnet_resolves_forwarded_peers_from_the_fold() {
     .await;
     assert!(
         arrived,
-        "B (direct peer, resolved via peer_subnets) must still appear \
-         under SameSubnet"
+        "B is in [3] like D and announced `region:us`, so it must appear \
+         under SameSubnet — resolved from its own tags via the fold, the \
+         same way the forwarded peer is"
     );
 }
 
