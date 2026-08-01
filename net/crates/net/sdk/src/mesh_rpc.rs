@@ -1504,15 +1504,36 @@ mod auto_register_covers_every_serve_variant {
         );
     }
 
-    /// The helper must use the non-clobbering registry operations.
-    /// Pinned separately from the behavioural test so a revert to
-    /// plain `insert` / `insert_prefix` is named precisely.
+    /// The registration path must use the non-clobbering registry
+    /// operations. Pinned separately from the behavioural tests so a
+    /// revert to plain `insert` / `insert_prefix` is named precisely.
+    ///
+    /// Scans `mesh.rs`, not this file: the implementation now lives in
+    /// `Mesh::register_rpc_service_channels`, shared with the
+    /// `aggregator` module, which is gated on a different feature and
+    /// used to carry a copy that drifted. `auto_register_rpc_channels`
+    /// is a delegation, so the first half of this test pins that the
+    /// chain is intact and the second half pins the implementation.
     #[test]
     fn auto_register_uses_install_if_absent() {
-        let src = include_str!("mesh_rpc.rs");
-        let start = src
+        // The delegation itself.
+        let rpc_src = include_str!("mesh_rpc.rs");
+        let hop_start = rpc_src
             .find("pub(crate) fn auto_register_rpc_channels(")
             .expect("auto_register_rpc_channels must exist");
+        let hop = &rpc_src[hop_start..(hop_start + 1_000).min(rpc_src.len())];
+        assert!(
+            hop.contains("self.register_rpc_service_channels(service)"),
+            "regression: `auto_register_rpc_channels` must delegate to the \
+             shared `register_rpc_service_channels`, or `serve_rpc*` and the \
+             aggregator can drift apart again."
+        );
+
+        // The shared implementation.
+        let src = include_str!("mesh.rs");
+        let start = src
+            .find("pub(crate) fn register_rpc_service_channels(")
+            .expect("register_rpc_service_channels must exist");
         let end = (start + 3_000).min(src.len());
         let body = &src[start..end];
 
@@ -1522,6 +1543,11 @@ mod auto_register_covers_every_serve_variant {
              defaults via `insert_if_absent` / `insert_prefix_if_absent`. A \
              plain replacing insert silently destroys an ACL the operator \
              registered before serving — the exact defect this fix closed."
+        );
+        assert!(
+            body.contains("with_subscriber_origin_binding("),
+            "regression (H3): the reply prefix must be origin-bound, or any \
+             peer can subscribe to another caller's reply channel."
         );
         assert!(
             !body.contains("self.register_channel("),
