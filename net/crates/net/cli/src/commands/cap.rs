@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 use net_sdk::capabilities::{
     CapabilityAnnouncement, CapabilityGroupId as GroupId, CapabilitySet,
-    CapabilitySubnetId as SubnetId, Tag, MAX_ALLOW_LIST_LEN, RESERVED_PREFIXES,
+    CapabilitySubnetId as SubnetId, CapabilityTagError, Tag, MAX_ALLOW_LIST_LEN, RESERVED_PREFIXES,
 };
 use serde::Serialize;
 
@@ -256,17 +256,34 @@ warning: --allow-subnet / --allow-group are ADVISORY and do not restrict access.
 
 /// Rejection message for a `--tag` value the parser refused.
 ///
-/// Built from [`RESERVED_PREFIXES`] rather than a hand-written list: the
-/// previous hard-coded message omitted `dataforts:`, so a rejected
-/// `dataforts:foo` was reported against a list that did not contain the
-/// prefix it tripped.
-fn tag_rejected_message(tag: &str, err: &impl std::fmt::Display) -> String {
-    let reserved = RESERVED_PREFIXES.join("` / `");
-    format!(
-        "tag {tag:?} rejected: {err}. Reserved prefixes (`{reserved}`) cannot \
-         be set here; scope needs the SDK builders (with_tenant_scope / \
-         with_region_scope / with_subnet_local_scope)."
-    )
+/// Branches on the error, because the remediation differs and only one
+/// of them is about reserved prefixes. `--tag ""` used to be reported
+/// with the reserved-prefix list and a pointer at the scope builders,
+/// neither of which had anything to do with an empty string — the
+/// operator was sent to read about `scope:` over a missing value.
+///
+/// The reserved-prefix arm builds its list from [`RESERVED_PREFIXES`]
+/// rather than hand-writing it: the previous hard-coded list omitted
+/// `dataforts:`, so a rejected `dataforts:foo` was reported against a
+/// list not containing the prefix it tripped.
+///
+/// The match is exhaustive over [`CapabilityTagError`] so a new parser
+/// error cannot silently inherit the reserved-prefix wording.
+fn tag_rejected_message(tag: &str, err: &CapabilityTagError) -> String {
+    match err {
+        CapabilityTagError::ReservedPrefix { .. } => {
+            let reserved = RESERVED_PREFIXES.join("` / `");
+            format!(
+                "tag {tag:?} rejected: {err}. Reserved prefixes \
+                 (`{reserved}`) cannot be set here; scope needs the SDK \
+                 builders (with_tenant_scope / with_region_scope / \
+                 with_subnet_local_scope)."
+            )
+        }
+        CapabilityTagError::Empty => {
+            format!("tag {tag:?} rejected: {err}.")
+        }
+    }
 }
 
 /// Build the announcement's [`CapabilitySet`] from `--tag` values,
@@ -607,8 +624,8 @@ mod tests {
         );
     }
 
-    /// The rejection message is built from `RESERVED_PREFIXES`, so it
-    /// cannot omit a prefix the parser enforces. The hand-written
+    /// The reserved-prefix message is built from `RESERVED_PREFIXES`, so
+    /// it cannot omit a prefix the parser enforces. The hand-written
     /// version it replaced omitted `dataforts:`.
     #[test]
     fn tag_rejection_message_lists_every_reserved_prefix() {
@@ -620,5 +637,31 @@ mod tests {
                 "rejection message omits the reserved prefix `{prefix}`: {msg}"
             );
         }
+    }
+
+    /// An empty `--tag` is not a reserved-prefix problem, and must not
+    /// be diagnosed as one. It previously inherited the whole
+    /// reserved-prefix message, sending an operator who typed
+    /// `--tag ""` off to read about `scope:` and the SDK scope builders.
+    #[test]
+    fn an_empty_tag_is_not_diagnosed_as_a_reserved_prefix() {
+        let err = Tag::parse_user("").expect_err("empty tag must be rejected");
+        let msg = tag_rejected_message("", &err);
+
+        assert!(
+            !msg.contains("Reserved prefixes"),
+            "an empty tag must not be blamed on reserved prefixes: {msg}"
+        );
+        assert!(
+            !msg.contains("with_tenant_scope"),
+            "and must not point at the scope builders: {msg}"
+        );
+        assert!(
+            msg.contains("non-empty"),
+            "it should say what is actually wrong; got {msg}"
+        );
+
+        // And it still fails the announce build.
+        assert!(capability_set_from_tags(&[String::new()]).is_err());
     }
 }
