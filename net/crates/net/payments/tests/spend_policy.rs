@@ -101,6 +101,8 @@ async fn real_networks_deny_with_no_approval_path_even_with_the_unsafe_flag() {
         symbol: "USDC".into(),
         display_name: None,
         equivalence_class: None,
+        eip712_name: None,
+        eip712_version: None,
     });
     let engine = SpendPolicyEngine::new(dir.path().join("policy.json"), SpendProfile::DevTest)
         .with_unsafe_mock_auto_allow(true);
@@ -202,6 +204,8 @@ async fn an_enabled_real_network_spends_under_caps_and_holds_over_them() {
         symbol: "USDC".into(),
         display_name: None,
         equivalence_class: None,
+        eip712_name: None,
+        eip712_version: None,
     });
     let engine = SpendPolicyEngine::new(dir.path().join("policy.json"), SpendProfile::Production);
     engine
@@ -268,6 +272,8 @@ async fn an_enabled_real_network_spends_under_caps_and_holds_over_them() {
         symbol: "USDC".into(),
         display_name: None,
         equivalence_class: None,
+        eip712_name: None,
+        eip712_version: None,
     });
     let polygon = quote(
         X402Carry::author(&PaymentRequirements {
