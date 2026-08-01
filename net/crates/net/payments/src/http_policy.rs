@@ -198,16 +198,20 @@ fn is_private_use(ip: IpAddr) -> bool {
 /// `IpAddr::is_global` is still unstable, so the special-purpose ranges
 /// are enumerated here.
 ///
-/// **This is a blocklist, and it fails open.** Worth saying plainly,
-/// because the shape invites the opposite assumption: both helpers below
-/// are `!(known-bad)`, so a range nobody enumerated is treated as public
-/// unicast. An allowlist of the globally-routable space would fail closed
-/// instead, but it is not writable — "globally routable" is the
-/// complement of a registry that changes, not a set with a syntactic
-/// mark. So the enumeration is the guarantee, and it has to be kept:
-/// anything that reaches somewhere it should not needs a line here, and
-/// the v4-in-v6 embeddings in [`is_public_v6`] are the family that keeps
-/// growing.
+/// **The two halves fail differently, and it is worth knowing which is
+/// which.**
+///
+/// [`is_public_v6`] leads with an allowlist: RFC 4291 assigns global
+/// unicast to `2000::/3`, so the other seven eighths of the space are
+/// refused without anyone enumerating them. Only the special-purpose
+/// prefixes *inside* `2000::/3` are subtracted by name.
+///
+/// [`is_public_v4`] has no such boundary to lead with. "Globally
+/// routable" in v4 is the complement of a registry that changes, not a
+/// set with a syntactic mark, so that half stays `!(known-bad)` and
+/// fails open: a range nobody enumerated is treated as public. The
+/// enumeration is the guarantee there, and it has to be kept — anything
+/// that reaches somewhere it should not needs a line.
 fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
@@ -236,51 +240,66 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || a >= 240) // 240/4 reserved (incl. 255.255.255.255)
 }
 
+/// The v6 half, and the one place in this module that fails **closed**.
+///
+/// IPv6 has a boundary its v4 counterpart does not: RFC 4291 assigns
+/// global unicast to `2000::/3` and leaves the other seven eighths of
+/// the space reserved. That is a syntactic fact, not a registry lookup —
+/// so it can be an allowlist, and everything outside it is refused
+/// without anyone having to enumerate it. `4000::1` used to be admitted
+/// here for exactly that reason: no line named it.
+///
+/// Inside `2000::/3` the special-purpose assignments still have to be
+/// subtracted one by one, and that part is a blocklist with a
+/// blocklist's failure mode. The set is small and slow-moving, which is
+/// what makes it tractable.
+///
+/// Everything the old enumeration refused explicitly — `::/96`,
+/// `::ffff:0:0:0/96`, `fc00::/7`, `fe80::/10`, `fec0::/10`, `ff00::/8`,
+/// `64:ff9b::/96`, `100::/64` — is outside `2000::/3` and now falls to
+/// the gate. They keep their comments below the return so the reasoning
+/// survives the deletion of the branches.
 fn is_public_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
     let first = s[0];
-    // `::/96` — the deprecated IPv4-compatible block, plus `::` and
-    // `::1`. Refused wholesale rather than translated: `to_ipv4` would
-    // map `::1` to `0.0.0.1` and lose its loopback meaning, so the block
-    // is simply never public.
-    let ipv4_compatible_block = s[..6].iter().all(|seg| *seg == 0);
-    // `::ffff:0:0:0/96` — IPv4-**translated** (RFC 2765), one group along
-    // from the IPv4-*mapped* form `normalize` unwraps. `to_ipv4_mapped`
-    // does not match it, so without this rule `::ffff:0:10.0.0.5` reaches
-    // here as an opaque v6 address, passes every rule below, and on a
-    // host running a translator for this standardized prefix arrives at
-    // the private v4 address embedded in it.
-    let ipv4_translated_block = s[..4].iter().all(|seg| *seg == 0) && s[4] == 0xffff && s[5] == 0;
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        || ipv4_compatible_block
-        || ipv4_translated_block
-        || (first & 0xfe00) == 0xfc00   // fc00::/7  unique local
-        || (first & 0xffc0) == 0xfe80   // fe80::/10 link local
-        || (first & 0xffc0) == 0xfec0   // fec0::/10 site local (deprecated,
-                                        // still routable on many stacks)
-        || (first == 0x2001 && (s[1] & 0xff00) == 0x0d00) // 2001:db8::/32 doc
-        || (first == 0x2001 && s[1] == 0x0002)            // 2001:2::/48 benchmarking
-        // 64:ff9b::/96 well-known NAT64 and 64:ff9b:1::/48 local-use
-        // translation. Both carry an embedded IPv4 destination, so a
-        // translating host turns them into a v4 reach — including into
-        // the private ranges the v4 rules refuse. Left admitted, they are
-        // a way round every guard above.
-        || (first == 0x0064 && s[1] == 0xff9b)
+    // Global unicast, or nothing. This subsumes:
+    //
+    // - `::/96` (IPv4-compatible, plus `::` and `::1`) — refused
+    //   wholesale rather than translated, because `to_ipv4` would map
+    //   `::1` to `0.0.0.1` and lose its loopback meaning;
+    // - `::ffff:0:0:0/96` (IPv4-**translated**, RFC 2765) — one group
+    //   along from the IPv4-*mapped* form `normalize` unwraps, and
+    //   `to_ipv4_mapped` does not match it, so it would otherwise arrive
+    //   here as an opaque address carrying a private v4 destination;
+    // - `64:ff9b::/96` and `64:ff9b:1::/48` — well-known and local-use
+    //   NAT64, both an embedded v4 reach on a translating host;
+    // - `fc00::/7` unique local, `fe80::/10` link local, `fec0::/10`
+    //   site local (deprecated, still routed on many stacks);
+    // - `ff00::/8` multicast, and `100::/64` discard-only.
+    //
+    // `AllowPrivate` keeps reaching ULA and site-local addresses through
+    // [`is_private_use`], which is a separate question from whether an
+    // address is publicly routable.
+    if (first & 0xe000) != 0x2000 {
+        return false;
+    }
+    // Special-purpose assignments *within* global unicast. Two families:
+    // documentation/benchmarking prefixes that name no real host, and
+    // v4-in-v6 tunnel prefixes that turn an agent-supplied URL back into
+    // a v4 reach the v4 rules would have refused.
+    !((first == 0x2001 && (s[1] & 0xff00) == 0x0d00)  // 2001:db8::/32 documentation
+        || (first & 0xfff0) == 0x3ff0                 // 3fff::/20 documentation (RFC 9637)
+        || (first == 0x2001 && s[1] == 0x0002)        // 2001:2::/48 benchmarking
         // 2002::/16 — 6to4. The next 32 bits are the v4 tunnel endpoint,
         // so `2002:0a00:0005::` is a route to 10.0.0.5 on any host with
-        // 6to4 configured. Same shape as the NAT64 and translated forms:
-        // a v4 destination wearing a v6 address.
+        // 6to4 configured: a v4 destination wearing a v6 address.
         || first == 0x2002
-        // 2001::/32 — Teredo. The last member of the same family, and the
-        // one this list originally missed: bits 32..64 are the Teredo
-        // *server*'s IPv4 address and the low 32 bits are the client's,
-        // obfuscated. On a host with Teredo configured — which is every
-        // Windows box that has ever had it enabled — that is again a v4
-        // reach wearing a v6 address, chosen by whoever supplied the URL.
-        || (first == 0x2001 && s[1] == 0x0000)
-        || first == 0x0100) // 100::/64  discard-only
+        // 2001::/32 — Teredo. Bits 32..64 are the Teredo *server*'s IPv4
+        // address and the low 32 bits the client's, obfuscated. On a host
+        // with Teredo configured — every Windows box that has ever had it
+        // enabled — that is again a v4 reach wearing a v6 address, chosen
+        // by whoever supplied the URL.
+        || (first == 0x2001 && s[1] == 0x0000))
 }
 
 /// Apply the destination policy to a URL whose host is an **IP literal**.
@@ -622,6 +641,66 @@ mod tests {
             assert!(
                 !DestinationPolicy::PublicOnly.admits(ip),
                 "{embedding} carries an embedded v4 destination and must not be public"
+            );
+        }
+    }
+
+    /// Everything outside `2000::/3` is refused because it is outside
+    /// `2000::/3`, not because someone enumerated it.
+    ///
+    /// This is the case the old blocklist got wrong: `4000::1` names no
+    /// special-purpose prefix anybody had written down, so it passed
+    /// every rule and came out public. RFC 4291 assigns global unicast to
+    /// `2000::/3` and reserves the rest, so the gate can be an allowlist
+    /// and these need no line of their own.
+    #[test]
+    fn reserved_v6_space_outside_global_unicast_is_not_public() {
+        for reserved in [
+            "4000::1", // 4000::/3 reserved
+            "6000::1", // 6000::/3 reserved
+            "8000::1", // 8000::/3 reserved
+            "a000::1", // a000::/3 reserved
+            "c000::1", // c000::/3 reserved
+            "e000::1", // e000::/4 reserved
+            "f000::1", // f000::/5 reserved
+            "0800::1", // 0000::/3 reserved (outside the ::/96 special cases)
+            "1fff::1", // the last address below 2000::/3
+        ] {
+            let ip: IpAddr = reserved.parse().expect(reserved);
+            assert!(
+                !DestinationPolicy::PublicOnly.admits(ip),
+                "{reserved} is outside 2000::/3 and must not be public"
+            );
+        }
+        // The boundary itself is unicast and stays reachable — the gate
+        // must not swallow the space it exists to admit.
+        for global in ["2000::1", "3fff:ffff::1", "2606:4700:4700::1111"] {
+            let ip: IpAddr = global.parse().expect(global);
+            let admitted = DestinationPolicy::PublicOnly.admits(ip);
+            // `3fff::/20` is documentation and refused on its own merits;
+            // everything else in range is public.
+            assert_eq!(
+                admitted,
+                !global.starts_with("3fff:"),
+                "{global} classified wrongly at the 2000::/3 boundary"
+            );
+        }
+    }
+
+    /// Tightening `is_public_v6` must not narrow `AllowPrivate`, which
+    /// reaches ULA and site-local through `is_private_use` rather than
+    /// through the public test.
+    #[test]
+    fn allow_private_still_reaches_an_operators_own_v6_network() {
+        for lan in ["fc00::1", "fd12:3456::1", "fec0::1"] {
+            let ip: IpAddr = lan.parse().expect(lan);
+            assert!(
+                DestinationPolicy::AllowPrivate.admits(ip),
+                "{lan} is an operator's own network and AllowPrivate must reach it"
+            );
+            assert!(
+                !DestinationPolicy::PublicOnly.admits(ip),
+                "{lan} must still be refused by the strict policy"
             );
         }
     }
