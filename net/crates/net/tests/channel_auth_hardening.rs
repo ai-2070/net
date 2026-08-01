@@ -116,7 +116,7 @@ where
 /// `mesh.rs::subscriber_principal`: the subscribe path grants against a
 /// NODE ID, which [`AclPrincipal`] records in the key so it can never
 /// satisfy a storage-side lookup keyed on an entity origin hash (I1).
-fn origin_hash(node_id: u64) -> AclPrincipal {
+fn subscriber_principal(node_id: u64) -> AclPrincipal {
     AclPrincipal::Node(node_id)
 }
 
@@ -137,9 +137,11 @@ async fn auth_guard_populated_on_open_channel_subscribe() {
     a.registry
         .insert(ChannelConfig::new(ChannelId::new(channel.clone())));
 
-    let b_origin = origin_hash(b.mesh.node_id());
+    let b_principal = subscriber_principal(b.mesh.node_id());
     assert!(
-        !a.mesh.auth_guard().is_authorized_full(b_origin, &channel),
+        !a.mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel),
         "guard should be empty before subscribe",
     );
 
@@ -149,7 +151,11 @@ async fn auth_guard_populated_on_open_channel_subscribe() {
         .expect("subscribe");
 
     assert!(
-        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        wait_until(|| a
+            .mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel))
+        .await,
         "AuthGuard didn't admit B after a successful subscribe",
     );
 }
@@ -168,9 +174,13 @@ async fn auth_guard_revoked_on_unsubscribe() {
         .await
         .expect("subscribe");
 
-    let b_origin = origin_hash(b.mesh.node_id());
+    let b_principal = subscriber_principal(b.mesh.node_id());
     assert!(
-        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        wait_until(|| a
+            .mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel))
+        .await,
         "subscribe didn't populate the guard",
     );
 
@@ -180,7 +190,11 @@ async fn auth_guard_revoked_on_unsubscribe() {
         .expect("unsubscribe");
 
     assert!(
-        wait_until(|| !a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        wait_until(|| !a
+            .mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel))
+        .await,
         "unsubscribe didn't revoke the guard entry",
     );
 }
@@ -233,9 +247,13 @@ async fn auth_guard_populated_for_token_gated_subscribe() {
         .await
         .expect("subscribe with token");
 
-    let b_origin = origin_hash(b.mesh.node_id());
+    let b_principal = subscriber_principal(b.mesh.node_id());
     assert!(
-        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        wait_until(|| a
+            .mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel))
+        .await,
         "token-gated subscribe didn't populate the guard",
     );
 }
@@ -274,9 +292,13 @@ async fn publish_skips_revoked_subscriber() {
         .await
         .expect("subscribe");
 
-    let b_origin = origin_hash(b.mesh.node_id());
+    let b_principal = subscriber_principal(b.mesh.node_id());
     assert!(
-        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        wait_until(|| a
+            .mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel))
+        .await,
         "subscribe didn't populate the guard",
     );
 
@@ -293,7 +315,7 @@ async fn publish_skips_revoked_subscriber() {
 
     // Revoke B's guard entry directly. `roster` still lists B —
     // the fast path is the authority for the publish side.
-    a.mesh.auth_guard().revoke_channel(b_origin, &channel);
+    a.mesh.auth_guard().revoke_channel(b_principal, &channel);
 
     let report = a
         .mesh
@@ -418,9 +440,13 @@ async fn expired_token_evicts_subscriber_within_one_sweep() {
         .await
         .expect("subscribe with short token");
 
-    let b_origin = origin_hash(b.mesh.node_id());
+    let b_principal = subscriber_principal(b.mesh.node_id());
     assert!(
-        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        wait_until(|| a
+            .mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel))
+        .await,
         "subscribe didn't populate the guard",
     );
 
@@ -432,7 +458,11 @@ async fn expired_token_evicts_subscriber_within_one_sweep() {
     // Sweep should have pulled B off the roster and revoked the
     // guard entry. Give the async loop one more tick to land.
     assert!(
-        wait_until(|| !a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        wait_until(|| !a
+            .mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel))
+        .await,
         "expired-token sweep didn't revoke the guard",
     );
 
@@ -527,9 +557,13 @@ async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
         .await
         .expect("subscribe with short token");
 
-    let b_origin = origin_hash(b.mesh.node_id());
+    let b_principal = subscriber_principal(b.mesh.node_id());
     assert!(
-        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        wait_until(|| a
+            .mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel))
+        .await,
         "subscribe didn't populate the guard",
     );
 
@@ -557,7 +591,9 @@ async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
     // still fan out to B.
     tokio::time::sleep(Duration::from_millis(4_500)).await;
     assert!(
-        a.mesh.auth_guard().is_authorized_full(b_origin, &channel),
+        a.mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel),
         "sweep-disabled harness precondition: guard entry must persist past TTL",
     );
 
@@ -581,7 +617,9 @@ async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
     // Revocation should also have landed on the guard so future
     // publishes take the cheap `Denied` path.
     assert!(
-        !a.mesh.auth_guard().is_authorized_full(b_origin, &channel),
+        !a.mesh
+            .auth_guard()
+            .is_authorized_full(b_principal, &channel),
         "lazy expiry should have revoked the guard entry for the expired subscriber",
     );
 
