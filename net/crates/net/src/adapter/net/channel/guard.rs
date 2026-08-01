@@ -33,7 +33,7 @@
 //! `allow_channel` populates both tiers so a caller granted storage
 //! access can also continue sending packets on that channel.
 //!
-//! # `origin_hash` is an UNTYPED key over two different derivations
+//! # The ACL key carries its derivation
 //!
 //! Read this before wiring a new reader of the exact ACL.
 //!
@@ -44,28 +44,30 @@
 //! subscribe handler, on *every* accepted `Subscribe` — including
 //! channels with no gates configured at all.
 //!
-//! And that writer stores a **node id**
-//! (`mesh.rs::subscriber_origin_hash` is the identity function), while
-//! the blob gates read an **entity origin hash**
-//! (`EntityId::origin_hash`). Those are different blake2s derivations
-//! (`b"net-node-id-v1"` vs `b"net-origin-v1"`) — but both are bare
-//! `u64` and both are spelled `origin_hash` at every boundary, so
-//! nothing in the type system keeps them apart.
+//! Those subsystems identify a peer differently: the subscribe handler
+//! grants against a **node id**, while the blob gates authorize an
+//! **entity origin hash**. Both are `u64`, and both used to be spelled
+//! `origin_hash` at every boundary, so nothing kept them apart —
+//! meaning the day a peer-facing blob op resolved its caller by node
+//! id, "subscribed to an open channel" would silently have become "may
+//! pin, unpin, delete, and repair that channel's blobs".
 //!
-//! Today that separation is what prevents an escalation, and it holds
-//! only by accident: the peer-facing blob entry points have no
-//! production callers yet (`bin/net-blob.rs` notes they are reserved
-//! for the chain-fold). The day one of them resolves its caller by node
-//! id, "subscribed to an open channel" silently becomes "may pin,
-//! unpin, delete, and repair that channel's blobs".
+//! [`AclPrincipal`] now carries the derivation **in the key**:
+//! `Node(x)` and `Origin(x)` are distinct principals for identical `x`,
+//! so a grant written by one subsystem cannot satisfy a lookup made by
+//! the other even on a value collision. There is no `From<u64>`, so
+//! every call site states which it means.
 //!
-//! So: **a new reader of `is_authorized_full` must state which
-//! derivation it is passing, and must not assume an entry here implies
-//! any authorization beyond "this peer subscribed to this channel".**
-//! The durable fix is to newtype the key so `NodeId` and `OriginHash`
-//! stop being interchangeable, or to split the data-plane grant from
-//! the storage grant into separate maps; that refactor spans the blob
-//! and redex subsystems and is tracked separately.
+//! Two things this does NOT do, and which a new reader still owns:
+//!
+//! - An entry means only "this principal was granted this channel". For
+//!   the sole production writer that is "this peer subscribed", nothing
+//!   more — in particular it implies no storage authority.
+//! - It does not make the two derivations interchangeable-but-checked;
+//!   it makes them *disjoint*. A reader that needs to authorize a peer
+//!   it knows by node id against a grant recorded by origin hash must
+//!   resolve the identity properly, not re-wrap the scalar.
+//!
 //! (2026-07-31 channel-auth audit, I1.)
 
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -141,8 +143,8 @@ impl BloomCache {
     /// hashes to. Pulled out so the loom model can replay the
     /// same derivation without depending on `bloom_key`.
     #[inline]
-    fn indices(&self, origin_hash: u64, channel_hash: ChannelHash) -> (usize, usize) {
-        let key = bloom_key(origin_hash, channel_hash);
+    fn indices(&self, principal: AclPrincipal, channel_hash: ChannelHash) -> (usize, usize) {
+        let key = bloom_key(principal, channel_hash);
         let h1 = (key & self.bloom_mask) as usize;
         let h2 = ((key >> BLOOM_BITS) & self.bloom_mask) as usize;
         (h1, h2)
@@ -156,8 +158,8 @@ impl BloomCache {
     /// cache is provided by DashMap's per-shard mutex on the
     /// subsequent `verified.insert`, not by bloom ordering.
     #[inline]
-    pub fn mark(&self, origin_hash: u64, channel_hash: ChannelHash) {
-        let (h1, h2) = self.indices(origin_hash, channel_hash);
+    pub fn mark(&self, principal: AclPrincipal, channel_hash: ChannelHash) {
+        let (h1, h2) = self.indices(principal, channel_hash);
         self.set_bit(h1);
         self.set_bit(h2);
     }
@@ -178,8 +180,8 @@ impl BloomCache {
     /// (subprotocol handler's await, wire round-trip, or
     /// DashMap's Mutex via the verified-cache path).
     #[inline]
-    pub fn probe(&self, origin_hash: u64, channel_hash: ChannelHash) -> bool {
-        let (h1, h2) = self.indices(origin_hash, channel_hash);
+    pub fn probe(&self, principal: AclPrincipal, channel_hash: ChannelHash) -> bool {
+        let (h1, h2) = self.indices(principal, channel_hash);
         let bit1 = (self.bloom[h1 >> 3].load(Ordering::Relaxed) >> (h1 & 7)) & 1;
         let bit2 = (self.bloom[h2 >> 3].load(Ordering::Relaxed) >> (h2 & 7)) & 1;
         bit1 != 0 && bit2 != 0
@@ -216,6 +218,61 @@ impl BloomCache {
 impl Default for BloomCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Who an [`AuthGuard`] ACL entry is about.
+///
+/// The guard's ACL is one namespace shared by the data plane and the
+/// storage subsystems, and they identify a peer by **different
+/// derivations**: the subscribe handler stores a `node_id`
+/// (`EntityId::node_id`, blake2s over `b"net-node-id-v1"`), while the
+/// blob gates read an `EntityId::origin_hash` (blake2s over
+/// `b"net-origin-v1"`). Both are `u64` and both were spelled
+/// `origin_hash` at every boundary, so nothing stopped a caller from
+/// passing one where the other was meant — and the day a peer-facing
+/// blob op resolved its caller by node id, "subscribed to an open
+/// channel" would silently have meant "may pin, unpin, delete, and
+/// repair that channel's blobs".
+///
+/// The derivation is therefore part of the **key**, not a comment:
+/// `Node(x)` and `Origin(x)` are distinct principals even for identical
+/// `x`, so an entry written by one subsystem can never satisfy a lookup
+/// made by the other. There is deliberately no `From<u64>` and no
+/// `Deref` — every construction site has to say which it means.
+///
+/// (2026-07-31 channel-auth audit, I1.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AclPrincipal {
+    /// A peer's `node_id`. What the inbound `Subscribe` handler grants
+    /// against, and what the publish fan-out checks.
+    Node(u64),
+    /// An entity's `origin_hash`. What storage / blob authorization
+    /// uses.
+    Origin(u64),
+}
+
+impl AclPrincipal {
+    /// The underlying `u64`, for logs and metrics only. Deliberately
+    /// not `Into`/`Deref`: recovering the scalar must be an explicit
+    /// act, so it cannot silently re-enter an ACL as the wrong kind.
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        match self {
+            Self::Node(v) | Self::Origin(v) => v,
+        }
+    }
+
+    /// Domain separator folded into the bloom key so `Node(x)` and
+    /// `Origin(x)` do not share bloom bits — otherwise the cheap
+    /// `Denied` verdict could be skipped for a principal that was never
+    /// granted anything.
+    #[inline]
+    const fn domain(self) -> u8 {
+        match self {
+            Self::Node(_) => 0x01,
+            Self::Origin(_) => 0x02,
+        }
     }
 }
 
@@ -256,7 +313,7 @@ pub struct AuthGuard {
     /// reach of a medium-sized mesh; 64 bits pushes the collision
     /// floor to ~4 billion peers, which is no longer a plausible
     /// operating point.
-    verified: DashMap<(u64, ChannelHash), bool>,
+    verified: DashMap<(AclPrincipal, ChannelHash), bool>,
     /// Exact-identity ACL: `(origin_hash, canonical ChannelName) ->
     /// authorized`. Keys on the name string (not a hash) so that no
     /// two distinct channels can alias through a hash collision —
@@ -264,7 +321,7 @@ pub struct AuthGuard {
     /// `ChannelName` already implements `Hash + Eq` against its
     /// underlying validated `String`, so DashMap keys on the exact
     /// name comparison.
-    exact: DashMap<(u64, ChannelName), ()>,
+    exact: DashMap<(AclPrincipal, ChannelName), ()>,
     /// Count of `revoke()` calls since the last `rebuild_bloom()`.
     /// Bloom filters don't support deletion, so each revocation
     /// leaves stale bits in the bloom and the false-positive rate
@@ -311,12 +368,12 @@ impl AuthGuard {
     /// particular pins the "subscribe-completes-before-first-
     /// packet-arrives" no-false-deny property).
     #[inline]
-    pub fn check_fast(&self, origin_hash: u64, channel_hash: ChannelHash) -> AuthVerdict {
-        if !self.bloom.probe(origin_hash, channel_hash) {
+    pub fn check_fast(&self, principal: AclPrincipal, channel_hash: ChannelHash) -> AuthVerdict {
+        if !self.bloom.probe(principal, channel_hash) {
             return AuthVerdict::Denied;
         }
         // Bloom hit — check verified cache
-        if self.verified.contains_key(&(origin_hash, channel_hash)) {
+        if self.verified.contains_key(&(principal, channel_hash)) {
             AuthVerdict::Allowed
         } else {
             AuthVerdict::NeedsFullCheck
@@ -339,9 +396,9 @@ impl AuthGuard {
     /// `BloomCache` docstring for the full analysis of why
     /// `Relaxed` on the bloom is sufficient, and
     /// `tests/loom_models.rs` for the pinned invariants.
-    pub fn authorize(&self, origin_hash: u64, channel_hash: ChannelHash) {
-        self.bloom.mark(origin_hash, channel_hash);
-        self.verified.insert((origin_hash, channel_hash), true);
+    pub fn authorize(&self, principal: AclPrincipal, channel_hash: ChannelHash) {
+        self.bloom.mark(principal, channel_hash);
+        self.verified.insert((principal, channel_hash), true);
     }
 
     /// Revoke authorization for an (origin_hash, channel_hash) pair.
@@ -354,8 +411,8 @@ impl AuthGuard {
     /// schedule a `rebuild_bloom` when the dirty count crosses a
     /// deployment threshold and the false-positive rate makes the
     /// `NeedsFullCheck` fallback dominate the hot path.
-    pub fn revoke(&self, origin_hash: u64, channel_hash: ChannelHash) {
-        self.verified.remove(&(origin_hash, channel_hash));
+    pub fn revoke(&self, principal: AclPrincipal, channel_hash: ChannelHash) {
+        self.verified.remove(&(principal, channel_hash));
         self.revocations_since_rebuild
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -381,8 +438,8 @@ impl AuthGuard {
     /// `channel_hash` could theoretically alias under adversarial
     /// name selection, so non-data-plane decisions must key on the
     /// canonical name string.
-    pub fn is_authorized(&self, origin_hash: u64, channel_hash: ChannelHash) -> bool {
-        self.verified.contains_key(&(origin_hash, channel_hash))
+    pub fn is_authorized(&self, principal: AclPrincipal, channel_hash: ChannelHash) -> bool {
+        self.verified.contains_key(&(principal, channel_hash))
     }
 
     /// Grant `origin_hash` full (control-plane) access to `name`.
@@ -404,9 +461,9 @@ impl AuthGuard {
     /// - the fast-path bloom + verified cache, so the same origin
     ///   can continue sending packets on that channel via
     ///   [`Self::check_fast`] / [`Self::is_authorized`].
-    pub fn allow_channel(&self, origin_hash: u64, name: &ChannelName) {
-        self.exact.insert((origin_hash, name.clone()), ());
-        self.authorize(origin_hash, name.hash());
+    pub fn allow_channel(&self, principal: AclPrincipal, name: &ChannelName) {
+        self.exact.insert((principal, name.clone()), ());
+        self.authorize(principal, name.hash());
     }
 
     /// Revoke `origin_hash`'s full access to `name`.
@@ -416,9 +473,9 @@ impl AuthGuard {
     /// deletion), so the fast path may transition to
     /// [`AuthVerdict::NeedsFullCheck`] for this pair — the exact-map
     /// miss then fails the full check.
-    pub fn revoke_channel(&self, origin_hash: u64, name: &ChannelName) {
-        self.exact.remove(&(origin_hash, name.clone()));
-        self.revoke(origin_hash, name.hash());
+    pub fn revoke_channel(&self, principal: AclPrincipal, name: &ChannelName) {
+        self.exact.remove(&(principal, name.clone()));
+        self.revoke(principal, name.hash());
     }
 
     /// Exact authorization check keyed on the canonical `ChannelName`
@@ -427,8 +484,8 @@ impl AuthGuard {
     /// this cannot be bypassed by a hash collision between two
     /// different channel names — two distinct canonical names can
     /// never alias.
-    pub fn is_authorized_full(&self, origin_hash: u64, name: &ChannelName) -> bool {
-        self.exact.contains_key(&(origin_hash, name.clone()))
+    pub fn is_authorized_full(&self, principal: AclPrincipal, name: &ChannelName) -> bool {
+        self.exact.contains_key(&(principal, name.clone()))
     }
 
     /// Number of authorized pairs in the verified cache.
@@ -451,8 +508,8 @@ impl AuthGuard {
     pub fn rebuild_bloom(&mut self) {
         self.bloom.clear();
         for entry in self.verified.iter() {
-            let (origin_hash, channel_hash) = *entry.key();
-            self.bloom.mark(origin_hash, channel_hash);
+            let (principal, channel_hash) = *entry.key();
+            self.bloom.mark(principal, channel_hash);
         }
         // Reset the dirty counter so subsequent
         // `revocations_since_rebuild` queries reflect the post-
@@ -478,12 +535,20 @@ impl std::fmt::Debug for AuthGuard {
     }
 }
 
-/// Compute bloom filter key from (origin_hash, channel_hash).
+/// Compute bloom filter key from `(principal, channel_hash)`.
+///
+/// The principal's derivation is folded in as a domain byte, so
+/// `Node(x)` and `Origin(x)` occupy different bloom bits. Without it
+/// the two would share a slot: a lookup for a principal that was never
+/// granted anything could take a bloom hit off the other derivation's
+/// entry and fall through to the (correct, but far more expensive)
+/// verified-map check instead of the cheap `Denied` verdict.
 #[inline]
-fn bloom_key(origin_hash: u64, channel_hash: ChannelHash) -> u64 {
-    let mut buf = [0u8; 16];
-    buf[0..8].copy_from_slice(&origin_hash.to_le_bytes());
+fn bloom_key(principal: AclPrincipal, channel_hash: ChannelHash) -> u64 {
+    let mut buf = [0u8; 17];
+    buf[0..8].copy_from_slice(&principal.raw().to_le_bytes());
     buf[8..16].copy_from_slice(&channel_hash.to_le_bytes());
+    buf[16] = principal.domain();
     xxh3_64(&buf)
 }
 
@@ -491,42 +556,131 @@ fn bloom_key(origin_hash: u64, channel_hash: ChannelHash) -> u64 {
 mod tests {
     use super::*;
 
+    /// These tests model the DATA-PLANE user of the guard — the
+    /// subscribe/publish path — which grants and checks node ids.
+    /// Storage-side principals are `AclPrincipal::Origin` and are
+    /// exercised separately by
+    /// `node_and_origin_principals_are_disjoint`.
+    fn p(node_id: u64) -> AclPrincipal {
+        AclPrincipal::Node(node_id)
+    }
+
+    /// I1 (2026-07-31 audit): the escalation this refactor exists to
+    /// prevent, asserted directly.
+    ///
+    /// The ACL's only production writer is the subscribe handler, which
+    /// grants a NODE ID on every accepted `Subscribe` — including on
+    /// channels with no gates at all. Its storage-side readers
+    /// (`Redex::open_file`, the blob pin/unpin/delete/repair gates)
+    /// authorize an ENTITY ORIGIN HASH. Both are `u64`, and both used
+    /// to be spelled `origin_hash`, so the separation rested on the two
+    /// derivations never colliding — an observation about value
+    /// distribution, not an invariant.
+    ///
+    /// Here the values are deliberately made IDENTICAL, which is the
+    /// case the old code had no answer for. The grant must still not
+    /// satisfy the storage-side lookup.
+    #[test]
+    fn node_and_origin_principals_are_disjoint() {
+        let guard = AuthGuard::new();
+        let channel = ChannelName::new("tenant/private").unwrap();
+        // Same scalar, different derivations — the collision the
+        // untyped key could not distinguish.
+        const V: u64 = 0xDEAD_BEEF_CAFE_F00D;
+
+        // A peer subscribes: the data plane grants Node(V).
+        guard.allow_channel(AclPrincipal::Node(V), &channel);
+        assert!(
+            guard.is_authorized_full(AclPrincipal::Node(V), &channel),
+            "the subscribe grant itself must work"
+        );
+
+        // A storage caller authorizing Origin(V) must NOT be admitted
+        // by that grant. Pre-fix both were the bare `V` and this was
+        // indistinguishable from the line above.
+        assert!(
+            !guard.is_authorized_full(AclPrincipal::Origin(V), &channel),
+            "a subscribe grant (node id) must never satisfy a storage \
+             check (entity origin hash), even on an identical scalar — \
+             this is 'subscribed to a channel' silently becoming 'may \
+             delete that channel's blobs'"
+        );
+
+        // Symmetric: a storage grant does not admit the data plane.
+        let other = ChannelName::new("tenant/other").unwrap();
+        guard.allow_channel(AclPrincipal::Origin(V), &other);
+        assert!(guard.is_authorized_full(AclPrincipal::Origin(V), &other));
+        assert!(
+            !guard.is_authorized_full(AclPrincipal::Node(V), &other),
+            "a storage grant must not admit the data plane either"
+        );
+
+        // And the same holds on the hash-keyed fast path, so the cheap
+        // `Denied` verdict is not skipped via a shared bloom slot.
+        assert_eq!(
+            guard.check_fast(AclPrincipal::Origin(V), channel.hash()),
+            AuthVerdict::Denied,
+            "the bloom must domain-separate the two derivations"
+        );
+    }
+
+    /// Revocation is likewise per-derivation: dropping one must not
+    /// drop the other.
+    #[test]
+    fn revoking_one_derivation_leaves_the_other_intact() {
+        let guard = AuthGuard::new();
+        let channel = ChannelName::new("tenant/shared").unwrap();
+        const V: u64 = 0x0102_0304_0506_0708;
+
+        guard.allow_channel(AclPrincipal::Node(V), &channel);
+        guard.allow_channel(AclPrincipal::Origin(V), &channel);
+
+        guard.revoke_channel(AclPrincipal::Node(V), &channel);
+
+        assert!(!guard.is_authorized_full(AclPrincipal::Node(V), &channel));
+        assert!(
+            guard.is_authorized_full(AclPrincipal::Origin(V), &channel),
+            "revoking the data-plane grant must not revoke a storage grant \
+             that happens to share the same scalar"
+        );
+    }
+
     #[test]
     fn test_empty_guard_denies() {
         let guard = AuthGuard::new();
-        assert_eq!(guard.check_fast(0x1234, 0xABCD), AuthVerdict::Denied);
+        assert_eq!(guard.check_fast(p(0x1234), 0xABCD), AuthVerdict::Denied);
     }
 
     #[test]
     fn test_authorize_then_allow() {
         let guard = AuthGuard::new();
-        guard.authorize(0x1234, 0xABCD);
+        guard.authorize(p(0x1234), 0xABCD);
 
-        assert_eq!(guard.check_fast(0x1234, 0xABCD), AuthVerdict::Allowed);
+        assert_eq!(guard.check_fast(p(0x1234), 0xABCD), AuthVerdict::Allowed);
     }
 
     #[test]
     fn test_different_pair_denied() {
         let guard = AuthGuard::new();
-        guard.authorize(0x1234, 0xABCD);
+        guard.authorize(p(0x1234), 0xABCD);
 
         // Different origin
-        assert_ne!(guard.check_fast(0x5678, 0xABCD), AuthVerdict::Allowed);
+        assert_ne!(guard.check_fast(p(0x5678), 0xABCD), AuthVerdict::Allowed);
         // Different channel
-        assert_ne!(guard.check_fast(0x1234, 0x1111), AuthVerdict::Allowed);
+        assert_ne!(guard.check_fast(p(0x1234), 0x1111), AuthVerdict::Allowed);
     }
 
     #[test]
     fn test_revoke() {
         let guard = AuthGuard::new();
-        guard.authorize(0x1234, 0xABCD);
-        assert_eq!(guard.check_fast(0x1234, 0xABCD), AuthVerdict::Allowed);
+        guard.authorize(p(0x1234), 0xABCD);
+        assert_eq!(guard.check_fast(p(0x1234), 0xABCD), AuthVerdict::Allowed);
 
-        guard.revoke(0x1234, 0xABCD);
+        guard.revoke(p(0x1234), 0xABCD);
         // After revoke, bloom still has the bits but verified cache is empty.
         // Result should be NeedsFullCheck (bloom hit, cache miss).
         assert_eq!(
-            guard.check_fast(0x1234, 0xABCD),
+            guard.check_fast(p(0x1234), 0xABCD),
             AuthVerdict::NeedsFullCheck
         );
     }
@@ -534,16 +688,16 @@ mod tests {
     #[test]
     fn test_rebuild_bloom_after_revoke() {
         let mut guard = AuthGuard::new();
-        guard.authorize(0x1234, 0xABCD);
-        guard.authorize(0x5678, 0xBEEF);
+        guard.authorize(p(0x1234), 0xABCD);
+        guard.authorize(p(0x5678), 0xBEEF);
 
-        guard.revoke(0x1234, 0xABCD);
+        guard.revoke(p(0x1234), 0xABCD);
         guard.rebuild_bloom();
 
         // Revoked pair should now be Denied (bloom cleared)
-        assert_eq!(guard.check_fast(0x1234, 0xABCD), AuthVerdict::Denied);
+        assert_eq!(guard.check_fast(p(0x1234), 0xABCD), AuthVerdict::Denied);
         // Other pair should still be Allowed
-        assert_eq!(guard.check_fast(0x5678, 0xBEEF), AuthVerdict::Allowed);
+        assert_eq!(guard.check_fast(p(0x5678), 0xBEEF), AuthVerdict::Allowed);
     }
 
     #[test]
@@ -551,14 +705,14 @@ mod tests {
         let guard = AuthGuard::new();
 
         for i in 0..100u64 {
-            guard.authorize(i, (i * 7) as ChannelHash);
+            guard.authorize(p(i), (i * 7) as ChannelHash);
         }
 
         assert_eq!(guard.authorized_count(), 100);
 
         for i in 0..100u64 {
             assert_eq!(
-                guard.check_fast(i, (i * 7) as ChannelHash),
+                guard.check_fast(p(i), (i * 7) as ChannelHash),
                 AuthVerdict::Allowed,
                 "pair ({}, {}) should be allowed",
                 i,
@@ -570,13 +724,13 @@ mod tests {
     #[test]
     fn test_is_authorized() {
         let guard = AuthGuard::new();
-        assert!(!guard.is_authorized(0x1234, 0xABCD));
+        assert!(!guard.is_authorized(p(0x1234), 0xABCD));
 
-        guard.authorize(0x1234, 0xABCD);
-        assert!(guard.is_authorized(0x1234, 0xABCD));
+        guard.authorize(p(0x1234), 0xABCD);
+        assert!(guard.is_authorized(p(0x1234), 0xABCD));
 
-        guard.revoke(0x1234, 0xABCD);
-        assert!(!guard.is_authorized(0x1234, 0xABCD));
+        guard.revoke(p(0x1234), 0xABCD);
+        assert!(!guard.is_authorized(p(0x1234), 0xABCD));
     }
 
     #[test]
@@ -586,12 +740,12 @@ mod tests {
         let guard = AuthGuard::new();
 
         for i in 0..1000u64 {
-            guard.authorize(i, i as ChannelHash);
+            guard.authorize(p(i), i as ChannelHash);
         }
 
         let mut false_positives = 0;
         for i in 10000..20000u64 {
-            let verdict = guard.check_fast(i, i as ChannelHash);
+            let verdict = guard.check_fast(p(i), i as ChannelHash);
             if verdict != AuthVerdict::Denied {
                 false_positives += 1;
             }
@@ -618,23 +772,23 @@ mod tests {
         assert_eq!(legit as u32, forged as u32);
         assert_ne!(legit, forged);
 
-        guard.allow_channel(legit, &name);
+        guard.allow_channel(p(legit), &name);
 
         // Legit subscriber is admitted.
         assert_eq!(
-            guard.check_fast(legit, name.hash()),
+            guard.check_fast(p(legit), name.hash()),
             AuthVerdict::Allowed,
             "legit subscriber must be admitted"
         );
-        assert!(guard.is_authorized_full(legit, &name));
+        assert!(guard.is_authorized_full(p(legit), &name));
 
         // Forged subscriber (sharing only the low 32 bits) is rejected.
         assert_ne!(
-            guard.check_fast(forged, name.hash()),
+            guard.check_fast(p(forged), name.hash()),
             AuthVerdict::Allowed,
             "forged subscriber must not ride the legit grant"
         );
-        assert!(!guard.is_authorized_full(forged, &name));
+        assert!(!guard.is_authorized_full(p(forged), &name));
     }
 
     #[test]
@@ -679,13 +833,13 @@ mod tests {
         assert_ne!(name_a.as_str(), name_b.as_str());
 
         let origin: u64 = 0xDEAD_BEEF_CAFE_F00D;
-        guard.allow_channel(origin, &name_a);
+        guard.allow_channel(p(origin), &name_a);
 
         // The canonical 32-bit channel_hash for these two names is
         // (with overwhelming probability) distinct, so the fast-path
         // check_fast for B is Denied — even with a wire collision.
         // The exact-name path is unconditionally correct.
-        let fast_b = guard.check_fast(origin, name_b.hash());
+        let fast_b = guard.check_fast(p(origin), name_b.hash());
         if name_a.hash() == name_b.hash() {
             // Adversarial canonical collision: fast path may still
             // say Allowed; the exact backstop is what callers consult.
@@ -699,8 +853,8 @@ mod tests {
         // Exact check distinguishes them — this is what callers must
         // consult before trusting the fast-path verdict for any
         // authorization decision that survives past the AEAD backstop.
-        assert!(guard.is_authorized_full(origin, &name_a));
-        assert!(!guard.is_authorized_full(origin, &name_b));
+        assert!(guard.is_authorized_full(p(origin), &name_a));
+        assert!(!guard.is_authorized_full(p(origin), &name_b));
     }
 
     #[test]
@@ -718,7 +872,7 @@ mod tests {
             let g = Arc::clone(&guard);
             handles.push(thread::spawn(move || {
                 for i in 0..250u64 {
-                    g.authorize(t * 1000 + i, (t * 1000 + i) as ChannelHash);
+                    g.authorize(p(t * 1000 + i), (t * 1000 + i) as ChannelHash);
                 }
             }));
         }
@@ -728,7 +882,7 @@ mod tests {
             let g = Arc::clone(&guard);
             handles.push(thread::spawn(move || {
                 for i in 0..1000u64 {
-                    let _ = g.check_fast(i, i as ChannelHash);
+                    let _ = g.check_fast(p(i), i as ChannelHash);
                 }
             }));
         }
@@ -742,7 +896,7 @@ mod tests {
         for t in 0..4u64 {
             for i in 0..250u64 {
                 assert!(
-                    guard.is_authorized(t * 1000 + i, (t * 1000 + i) as ChannelHash),
+                    guard.is_authorized(p(t * 1000 + i), (t * 1000 + i) as ChannelHash),
                     "pair ({}, {}) should be authorized after concurrent insertion",
                     t * 1000 + i,
                     t * 1000 + i
@@ -788,7 +942,7 @@ mod tests {
             thread::spawn(move || {
                 start.wait();
                 for _ in 0..iters {
-                    guard.authorize(origin, channel);
+                    guard.authorize(p(origin), channel);
                 }
             })
         };
@@ -798,7 +952,7 @@ mod tests {
             thread::spawn(move || {
                 start.wait();
                 for _ in 0..iters {
-                    guard.revoke(origin, channel);
+                    guard.revoke(p(origin), channel);
                 }
             })
         };
@@ -812,8 +966,8 @@ mod tests {
             thread::spawn(move || {
                 start.wait();
                 for _ in 0..iters {
-                    let _ = guard.is_authorized(origin, channel);
-                    let _ = guard.check_fast(origin, channel);
+                    let _ = guard.is_authorized(p(origin), channel);
+                    let _ = guard.check_fast(p(origin), channel);
                 }
             })
         };
@@ -826,11 +980,11 @@ mod tests {
         // authorize → entry present" or "last op was revoke →
         // entry absent". Both are legitimate; asserting that
         // the state is NOT torn means the two calls round-trip.
-        let final_state = guard.is_authorized(origin, channel);
+        let final_state = guard.is_authorized(p(origin), channel);
         // Double-query to ensure read stability.
         assert_eq!(
             final_state,
-            guard.is_authorized(origin, channel),
+            guard.is_authorized(p(origin), channel),
             "two sequential is_authorized calls must agree — \
              torn read would indicate DashMap corruption",
         );
@@ -866,7 +1020,7 @@ mod tests {
             thread::spawn(move || {
                 start.wait();
                 for _ in 0..iters {
-                    guard.allow_channel(origin, &name);
+                    guard.allow_channel(p(origin), &name);
                 }
             })
         };
@@ -877,7 +1031,7 @@ mod tests {
             thread::spawn(move || {
                 start.wait();
                 for _ in 0..iters {
-                    guard.revoke_channel(origin, &name);
+                    guard.revoke_channel(p(origin), &name);
                 }
             })
         };
@@ -888,7 +1042,7 @@ mod tests {
             thread::spawn(move || {
                 start.wait();
                 for _ in 0..iters {
-                    let _ = guard.is_authorized_full(origin, &name);
+                    let _ = guard.is_authorized_full(p(origin), &name);
                 }
             })
         };
@@ -898,10 +1052,10 @@ mod tests {
         observer.join().expect("observer panicked");
 
         // Coherent terminal state — true or false, never torn.
-        let final_state = guard.is_authorized_full(origin, &name);
+        let final_state = guard.is_authorized_full(p(origin), &name);
         assert_eq!(
             final_state,
-            guard.is_authorized_full(origin, &name),
+            guard.is_authorized_full(p(origin), &name),
             "sequential is_authorized_full reads must agree",
         );
     }

@@ -22,9 +22,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::{
-    ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, EntityKeypair,
-    MeshNode, MeshNodeConfig, OnFailure, PermissionToken, PublishConfig, Reliability,
-    SocketBufferConfig, TokenCache, TokenScope,
+    AclPrincipal, ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher,
+    EntityKeypair, MeshNode, MeshNodeConfig, OnFailure, PermissionToken, PublishConfig,
+    Reliability, SocketBufferConfig, TokenCache, TokenScope,
 };
 use net::adapter::Adapter;
 
@@ -112,11 +112,12 @@ where
     cond()
 }
 
-/// `AuthGuard` keys on the full 64-bit subscriber `node_id` —
-/// matches the `subscriber_origin_hash` helper in `mesh.rs`. The
-/// prior 32-bit truncation birthday-collided at ~65 k peers.
-fn origin_hash(node_id: u64) -> u64 {
-    node_id
+/// The data-plane principal for a subscriber. Mirrors
+/// `mesh.rs::subscriber_principal`: the subscribe path grants against a
+/// NODE ID, which [`AclPrincipal`] records in the key so it can never
+/// satisfy a storage-side lookup keyed on an entity origin hash (I1).
+fn origin_hash(node_id: u64) -> AclPrincipal {
+    AclPrincipal::Node(node_id)
 }
 
 // ============================================================================

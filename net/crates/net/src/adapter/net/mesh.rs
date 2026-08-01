@@ -76,8 +76,9 @@ use super::behavior::sensing;
 use super::behavior::tag::Tag;
 use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
 use super::channel::{
-    AckReason, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelHash, ChannelId, ChannelName,
-    ChannelPublisher, OnFailure, PublishConfig, PublishReport, QueueGroupPolicy, SubscriberRoster,
+    AckReason, AclPrincipal, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelHash, ChannelId,
+    ChannelName, ChannelPublisher, OnFailure, PublishConfig, PublishReport, QueueGroupPolicy,
+    SubscriberRoster,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
@@ -2451,9 +2452,14 @@ fn routing_id(node_id: u64) -> u64 {
 /// 64-bit `node_id` (the value it already has in hand), which pushes
 /// the collision floor out of reach. The `src_id` field on wire
 /// packets is not consulted for authorization.
+/// Renamed from `subscriber_origin_hash` (I1): it never produced an
+/// `EntityId::origin_hash`, it returned the node id unchanged, and the
+/// old name invited exactly the confusion [`AclPrincipal`] now makes
+/// impossible — the storage/blob readers of the same ACL authorize an
+/// origin hash, a different derivation entirely.
 #[inline]
-fn subscriber_origin_hash(node_id: u64) -> u64 {
-    node_id
+fn subscriber_principal(node_id: u64) -> AclPrincipal {
+    AclPrincipal::Node(node_id)
 }
 
 /// Soft cap on the number of distinct services kept in
@@ -2830,7 +2836,7 @@ fn sweep_expired_subscribers(
                     cfg.reverify_subscribe(&r.chain, &entity_id, name.hash(), revocation, skew)
                 });
             if !authorized {
-                guard.revoke_channel(subscriber_origin_hash(node_id), name);
+                guard.revoke_channel(subscriber_principal(node_id), name);
                 roster.remove(&channel_id, node_id);
                 subscriber_chains.remove(&(node_id, name.hash()));
                 tracing::debug!(
@@ -19371,7 +19377,7 @@ impl MeshNode {
                     // change which capability tokens authorize the
                     // channel.
                     ctx.auth_guard
-                        .allow_channel(subscriber_origin_hash(from_node), &channel);
+                        .allow_channel(subscriber_principal(from_node), &channel);
                     let id = ChannelId::new(channel);
                     let mode = match queue_group {
                         None => crate::adapter::net::channel::SubscriptionMode::Broadcast,
@@ -19400,7 +19406,7 @@ impl MeshNode {
                 // publish stops admitting this subscriber even
                 // before the roster update is visible.
                 ctx.auth_guard
-                    .revoke_channel(subscriber_origin_hash(from_node), &channel);
+                    .revoke_channel(subscriber_principal(from_node), &channel);
                 let id = ChannelId::new(channel);
                 // Drop the retained subscribe chain so it can't be
                 // re-validated by the sweep and doesn't leak memory.
@@ -24234,7 +24240,7 @@ impl MeshNode {
                 return false;
             }
             // (2) Auth guard (bloom + verified cache).
-            let origin = subscriber_origin_hash(*peer_id);
+            let origin = subscriber_principal(*peer_id);
             let admitted = match auth_guard.check_fast(origin, channel_hash) {
                 AuthVerdict::Allowed => auth_guard.is_authorized_full(origin, &channel_name),
                 AuthVerdict::Denied => false,

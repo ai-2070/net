@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use net::adapter::net::channel::{AuthGuard, ChannelName};
+use net::adapter::net::channel::{AclPrincipal, AuthGuard, ChannelName};
 use net::adapter::net::redex::{
     OrderedAppender, Redex, RedexError, RedexEvent, RedexFile, RedexFileConfig, RedexFold,
     TypedRedexFile,
@@ -600,7 +600,7 @@ fn test_redex_auth_enforcement() {
     // in-process manager.
     let guard = Arc::new(AuthGuard::new());
     let name = cn("locked");
-    let r = Redex::with_auth(guard.clone(), 0xDEAD_BEEF);
+    let r = Redex::with_auth(guard.clone(), AclPrincipal::Origin(0xDEAD_BEEF));
     assert!(matches!(
         r.open_file(&name, RedexFileConfig::default()),
         Err(RedexError::Unauthorized)
@@ -608,7 +608,7 @@ fn test_redex_auth_enforcement() {
 
     // Authorize via the exact-identity path (required for storage
     // decisions) and retry.
-    guard.allow_channel(0xDEAD_BEEF, &name);
+    guard.allow_channel(AclPrincipal::Origin(0xDEAD_BEEF), &name);
     assert!(r.open_file(&name, RedexFileConfig::default()).is_ok());
 }
 
@@ -653,9 +653,9 @@ fn test_regression_auth_does_not_grant_access_via_u16_collision() {
     // Authorize ONLY the `allowed` channel. The colliding name
     // shares the 16-bit wire hash but is a distinct canonical name
     // (different `u32` canonical hash with overwhelming probability).
-    guard.allow_channel(0xDEAD_BEEF, &allowed);
+    guard.allow_channel(AclPrincipal::Origin(0xDEAD_BEEF), &allowed);
 
-    let r = Redex::with_auth(guard.clone(), 0xDEAD_BEEF);
+    let r = Redex::with_auth(guard.clone(), AclPrincipal::Origin(0xDEAD_BEEF));
 
     // Allowed name opens cleanly.
     assert!(r.open_file(&allowed, RedexFileConfig::default()).is_ok());

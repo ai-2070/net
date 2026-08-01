@@ -36,7 +36,7 @@ use crate::adapter::net::behavior::{
     is_blob_storage_unhealthy, BlobCapability, CapabilitySet, GravityCapability, GreedyCapability,
     TopologyScope,
 };
-use crate::adapter::net::channel::{AuthGuard, ChannelName};
+use crate::adapter::net::channel::{AclPrincipal, AuthGuard, ChannelName};
 
 /// G-1 verdict: should `local_caps` speculatively pull a blob
 /// originating from `publisher_caps`?
@@ -345,17 +345,25 @@ pub enum OverflowReject {
 /// channel name is intentionally NOT included — names can carry
 /// tenant / project identifiers and we don't want them flowing
 /// to client bindings via error strings.
+/// `operator` must be an [`AclPrincipal`], so the caller states which
+/// derivation of a peer identity it is authorizing. Blob operations
+/// authorize an `EntityId::origin_hash`, i.e.
+/// [`AclPrincipal::Origin`] — a `node_id` is a different derivation and
+/// will not match a grant made under it, which is the point: the
+/// subscribe path (the ACL's only production writer) grants
+/// [`AclPrincipal::Node`], and "this peer subscribed to a channel" must
+/// never read as "this peer may mutate that channel's blobs".
 pub fn auth_allows_blob_op(
     guard: &AuthGuard,
-    origin_hash: u64,
+    operator: AclPrincipal,
     channel: &ChannelName,
 ) -> Result<(), BlobError> {
-    if guard.is_authorized_full(origin_hash, channel) {
+    if guard.is_authorized_full(operator, channel) {
         Ok(())
     } else {
         Err(BlobError::Unauthorized(format!(
             "origin {:#x} not authorized",
-            origin_hash
+            operator.raw()
         )))
     }
 }
@@ -645,8 +653,8 @@ mod tests {
         let guard = AuthGuard::new();
         let origin = 0xDEAD_BEEF_u64;
         let channel = ChannelName::new("dataforts/test/auth").unwrap();
-        guard.allow_channel(origin, &channel);
-        assert!(auth_allows_blob_op(&guard, origin, &channel).is_ok());
+        guard.allow_channel(AclPrincipal::Origin(origin), &channel);
+        assert!(auth_allows_blob_op(&guard, AclPrincipal::Origin(origin), &channel).is_ok());
     }
 
     #[test]
@@ -654,7 +662,7 @@ mod tests {
         let guard = AuthGuard::new();
         let channel = ChannelName::new("dataforts/test/auth").unwrap();
         // No allow_channel call → veto.
-        let err = auth_allows_blob_op(&guard, 0xDEAD, &channel).unwrap_err();
+        let err = auth_allows_blob_op(&guard, AclPrincipal::Origin(0xDEAD), &channel).unwrap_err();
         assert!(matches!(err, BlobError::Unauthorized(_)));
     }
 
@@ -664,10 +672,10 @@ mod tests {
         let allowed = ChannelName::new("allowed/channel").unwrap();
         let other = ChannelName::new("other/channel").unwrap();
         let origin = 0xC0FFEE_u64;
-        guard.allow_channel(origin, &allowed);
+        guard.allow_channel(AclPrincipal::Origin(origin), &allowed);
         // Origin authorized for `allowed`, but op is against
         // `other` → veto.
-        let err = auth_allows_blob_op(&guard, origin, &other).unwrap_err();
+        let err = auth_allows_blob_op(&guard, AclPrincipal::Origin(origin), &other).unwrap_err();
         assert!(matches!(err, BlobError::Unauthorized(_)));
     }
 
@@ -713,7 +721,7 @@ mod tests {
         use std::sync::Arc;
         let guard: Arc<AuthGuard> = Arc::new(AuthGuard::new());
         let channel = ChannelName::new("dataforts/test").unwrap();
-        let _ = auth_allows_blob_op(&guard, 0, &channel);
+        let _ = auth_allows_blob_op(&guard, AclPrincipal::Origin(0), &channel);
     }
 
     // --- should_accept_overflow_from (G-7) ---

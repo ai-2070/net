@@ -15,7 +15,7 @@ pub use config::{
     ChannelConfig, ChannelConfigRegistry, OriginBinding, QueueGroupPolicy, ResolvedConfig,
     Visibility,
 };
-pub use guard::{AuthGuard, AuthVerdict};
+pub use guard::{AclPrincipal, AuthGuard, AuthVerdict};
 pub use membership::{
     AckReason, MembershipCodecError, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP,
 };
