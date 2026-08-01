@@ -34,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::traits::{Facilitator, FacilitatorError, SettleOutcome, VerifyOutcome};
-use crate::core::verification::{VerificationTier, VerifierRef};
+use crate::core::verification::VerifierRef;
 use crate::x402::payload::PaymentPayload;
 use crate::x402::requirements::PaymentRequirements;
 use crate::x402::settlement::{SettlementResponse, VerifyResponse};
@@ -344,7 +344,6 @@ impl Facilitator for HttpFacilitator {
             .map_err(|e| FacilitatorError::protocol(format!("/verify response: {e}")))?;
         Ok(VerifyOutcome {
             response,
-            tier: VerificationTier::Observed,
         })
     }
 
@@ -362,7 +361,6 @@ impl Facilitator for HttpFacilitator {
         // reports no finality; the chain checker owns everything above).
         Ok(SettleOutcome {
             response,
-            tier: VerificationTier::Observed,
         })
     }
 }

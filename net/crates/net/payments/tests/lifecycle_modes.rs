@@ -357,19 +357,65 @@ async fn wrong_amount_mode_rejects_with_no_charge_and_releases_the_payload() {
 }
 
 // ---------------------------------------------------------------------
-// late_finality
+// late finality — reached through the CHECKER, the only path that may
+// produce a tier above `observed`
 // ---------------------------------------------------------------------
 
+/// A checker with a scripted verdict queue, consumed front to back.
+struct ScriptedChecker {
+    verdicts: parking_lot::Mutex<std::collections::VecDeque<net_payments::checker::ChainVerdict>>,
+}
+
+impl ScriptedChecker {
+    fn new(verdicts: Vec<net_payments::checker::ChainVerdict>) -> Self {
+        Self {
+            verdicts: parking_lot::Mutex::new(verdicts.into()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl net_payments::checker::ChainChecker for ScriptedChecker {
+    fn reference(&self) -> net_payments::core::verification::VerifierRef {
+        net_payments::core::verification::VerifierRef {
+            identity: None,
+            endpoint: "independent-chain-check:scripted".into(),
+        }
+    }
+
+    async fn check(
+        &self,
+        _network: &str,
+        _transaction: &str,
+        _query: Option<&net_payments::checker::TransferQuery>,
+    ) -> Result<net_payments::checker::ChainVerdict, net_payments::checker::CheckerError> {
+        self.verdicts
+            .lock()
+            .pop_front()
+            .ok_or_else(|| net_payments::checker::CheckerError::retryable("script exhausted"))
+    }
+}
+
+/// Serving is withheld until the required tier is reached, and the tier
+/// can only be reached by an independent on-chain check.
+///
+/// This test used to drive the escalation through the mock *facilitator*,
+/// which reported `confirmed(1)` from its third verify. That is no longer
+/// expressible: `VerifyOutcome`/`SettleOutcome` carry no tier field, so a
+/// facilitator answer is `observed` by construction and the engine mints
+/// it. The property under test is unchanged — a `confirmed(1)` policy
+/// does not serve on a receipt — but the tier now comes from where the
+/// doctrine always said it did.
 #[tokio::test]
-async fn late_finality_withholds_serving_until_the_tier_is_reached() {
+async fn late_finality_withholds_serving_until_the_checker_reaches_the_tier() {
+    use net_payments::checker::ChainVerdict;
+
     let h = harness();
     let quote = h.quote("2500");
-    h.facilitator
-        .arm(quote.requirements.content_hash(), MockMode::LateFinality);
     let payload = payload_for(&quote, "payer-1");
     let required = VerificationTier::Confirmed(1);
 
-    // Settles, but the receipt is only `observed`.
+    // Settles, but a facilitator receipt is only ever `observed`.
     let first = h
         .engine
         .accept_payment(&quote, &payload, required, NOW + 1)
@@ -383,33 +429,56 @@ async fn late_finality_withholds_serving_until_the_tier_is_reached() {
                 required: VerificationTier::Confirmed(1)
             }
         ),
-        "got {first:?}"
+        "a receipt must not satisfy a confirmed(1) policy, got {first:?}"
     );
 
-    // Second verify: still observed (mock reaches confirmed on call 3).
-    let second = h
+    // Re-verifying against the facilitator cannot help, however many
+    // times it is asked: there is no tier for it to raise.
+    let again = h
         .engine
         .re_verify(&quote.quote_id, required, NOW + 2)
         .await
         .unwrap();
     assert!(
-        matches!(second, PaymentDecision::PendingTier { .. }),
-        "got {second:?}"
+        matches!(again, PaymentDecision::PendingTier { .. }),
+        "a facilitator re-verify can never reach confirmed(1), got {again:?}"
     );
 
-    // Third verify: confirmed(1) → served, billing emitted now.
-    let third = h
+    // The independent checker is the only thing that can. Not yet
+    // included: still pending, and no event is appended (pending is the
+    // absence of an answer, not a fact).
+    let checker = ScriptedChecker::new(vec![
+        ChainVerdict::Pending,
+        ChainVerdict::Included {
+            tier: VerificationTier::Confirmed(1),
+            delivered: Some("2500".into()),
+        },
+    ]);
+    let pending = h
         .engine
-        .re_verify(&quote.quote_id, required, NOW + 3)
+        .re_verify_with_checker(&quote.quote_id, &checker, required, NOW + 3)
         .await
         .unwrap();
-    let PaymentDecision::Served { billing, tier } = third else {
-        panic!("expected Served");
+    assert!(
+        matches!(pending, PaymentDecision::PendingTier { .. }),
+        "got {pending:?}"
+    );
+
+    // Included at confirmed(1) → served, billing emitted now.
+    let served = h
+        .engine
+        .re_verify_with_checker(&quote.quote_id, &checker, required, NOW + 4)
+        .await
+        .unwrap();
+    let PaymentDecision::Served { billing, tier } = served else {
+        panic!("expected Served, got {served:?}");
     };
     assert_eq!(tier, VerificationTier::Confirmed(1));
     billing.verify_signature().unwrap();
 
-    // The exact chain: observed (settle), observed (re-verify), confirmed.
+    // The exact chain: observed (settle), observed (facilitator
+    // re-verify), confirmed(1) (checker). The two `observed` events are
+    // the facilitator's ceiling, visible in the record.
     assert_eq!(
         h.chain_statuses(&quote.quote_id).await,
         vec![
@@ -423,7 +492,7 @@ async fn late_finality_withholds_serving_until_the_tier_is_reached() {
     // settle — and returns the same billing event.
     let retry = h
         .engine
-        .accept_payment(&quote, &payload, required, NOW + 4)
+        .accept_payment(&quote, &payload, required, NOW + 5)
         .await
         .unwrap();
     let PaymentDecision::Served {
@@ -654,7 +723,6 @@ impl Facilitator for OverpayingFacilitator {
                 extra: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
     async fn settle(
@@ -673,7 +741,6 @@ impl Facilitator for OverpayingFacilitator {
                 extensions: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 }
@@ -850,7 +917,6 @@ impl Facilitator for CrashSimFacilitator {
                 extra: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
     async fn settle(
@@ -869,7 +935,6 @@ impl Facilitator for CrashSimFacilitator {
                 extensions: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 }

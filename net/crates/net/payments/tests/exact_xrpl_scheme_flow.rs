@@ -81,7 +81,6 @@ impl Facilitator for XrplFacilitator {
                 extra: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 
@@ -103,7 +102,6 @@ impl Facilitator for XrplFacilitator {
                 extensions: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 }

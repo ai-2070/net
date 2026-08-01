@@ -50,7 +50,6 @@ impl Facilitator for ScriptedSettler {
                 extra: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 
@@ -70,7 +69,6 @@ impl Facilitator for ScriptedSettler {
                 extensions: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 }

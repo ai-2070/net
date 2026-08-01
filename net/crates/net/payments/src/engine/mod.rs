@@ -1019,7 +1019,11 @@ impl PaymentEngine {
         let transaction = settle.response.view().transaction.clone();
         let settle_network = settle.response.view().network.clone();
         let quoted_network = quote.requirements.view().network.clone();
-        let tier = settle.tier;
+        // A facilitator answer is `observed`, full stop — the engine mints
+        // the tier rather than reading one off the response, so no
+        // `Facilitator` implementation can promote its own receipt.
+        // Anything above `observed` comes from `re_verify_with_checker`.
+        let tier = VerificationTier::Observed;
         // The facilitator's settle-time payer claim, recorded below as a
         // chain fact. For schemes whose payload carries no on-chain payer
         // (exact-SVM's opaque wallet blob), a later independent re-check
@@ -1276,7 +1280,9 @@ impl PaymentEngine {
         };
         let is_valid = verify.response.view().is_valid;
         let facilitator_reason = verify.response.view().invalid_reason.clone();
-        let tier = verify.tier;
+        // Same as the settle path: the facilitator's answer is `observed`
+        // regardless of what it would like to claim.
+        let tier = VerificationTier::Observed;
         // The amount this quote requires: re-verify must re-apply the
         // under/over/exact policy against the delivered amount recorded at
         // settlement, not trust the facilitator's `is_valid` boolean alone.

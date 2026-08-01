@@ -76,7 +76,6 @@ impl Facilitator for ExactSchemeFacilitator {
                 extra: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 
@@ -96,7 +95,6 @@ impl Facilitator for ExactSchemeFacilitator {
                 extensions: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 }
@@ -240,7 +238,6 @@ impl Facilitator for RejectingExactFacilitator {
                 extra: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 

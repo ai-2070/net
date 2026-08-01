@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 
 use super::traits::{Facilitator, FacilitatorError, SettleOutcome, VerifyOutcome};
-use crate::core::verification::{VerificationTier, VerifierRef};
+use crate::core::verification::VerifierRef;
 use crate::x402::payload::PaymentPayload;
 use crate::x402::requirements::PaymentRequirements;
 use crate::x402::settlement::{SettlementResponse, VerifyResponse};
@@ -37,9 +37,6 @@ pub enum MockMode {
     /// Settle "succeeds" but delivers less than the requirements demanded
     /// (fee-shaped shortfall); verification of the delivered amount fails.
     WrongAmount,
-    /// Settle succeeds at `observed`; re-verifies only reach
-    /// `confirmed(1)` from the third call on.
-    LateFinality,
     /// Settle succeeds and the first verify passes (receipt issued); every
     /// later verify reports the tx reorged out → the engine must emit
     /// `invalidated {reason: reorg}` and freeze the quote.
@@ -175,57 +172,26 @@ impl Facilitator for MockFacilitator {
         // accept exactly these requirements bytes' terms.
         let bound = payload.view().accepted == *requirements.view();
 
-        let (view, tier) = match mode {
-            _ if !bound => (
-                Self::invalid("payload_requirements_mismatch"),
-                VerificationTier::Observed,
-            ),
+        let view = match mode {
+            _ if !bound => Self::invalid("payload_requirements_mismatch"),
             MockMode::VerificationTimeout => {
                 return Err(FacilitatorError::timeout(
                     "mock facilitator armed with verification_timeout",
                 ))
             }
-            MockMode::ExpiredRequirements => (
-                Self::invalid("expired_requirements"),
-                VerificationTier::Observed,
-            ),
-            MockMode::Replay => (
-                Self::invalid("payload_replayed"),
-                VerificationTier::Observed,
-            ),
-            MockMode::WrongAmount => (Self::invalid("wrong_amount"), VerificationTier::Observed),
-            MockMode::ReorgInvalidate if calls > 1 => {
-                (Self::invalid("reorged_out"), VerificationTier::Observed)
-            }
-            MockMode::LateFinality => {
-                let tier = if calls >= 3 {
-                    VerificationTier::Confirmed(1)
-                } else {
-                    VerificationTier::Observed
-                };
-                (
-                    VerifyResponse {
-                        is_valid: true,
-                        invalid_reason: None,
-                        payer: None,
-                        extra: None,
-                    },
-                    tier,
-                )
-            }
-            MockMode::Success | MockMode::ReorgInvalidate => (
-                VerifyResponse {
-                    is_valid: true,
-                    invalid_reason: None,
-                    payer: None,
-                    extra: None,
-                },
-                VerificationTier::Observed,
-            ),
+            MockMode::ExpiredRequirements => Self::invalid("expired_requirements"),
+            MockMode::Replay => Self::invalid("payload_replayed"),
+            MockMode::WrongAmount => Self::invalid("wrong_amount"),
+            MockMode::ReorgInvalidate if calls > 1 => Self::invalid("reorged_out"),
+            MockMode::Success | MockMode::ReorgInvalidate => VerifyResponse {
+                is_valid: true,
+                invalid_reason: None,
+                payer: None,
+                extra: None,
+            },
         };
         Ok(VerifyOutcome {
             response: Self::author_verify(&view)?,
-            tier,
         })
     }
 
@@ -279,7 +245,6 @@ impl Facilitator for MockFacilitator {
                 extensions: None,
             },
             MockMode::Success
-            | MockMode::LateFinality
             | MockMode::ReorgInvalidate
             | MockMode::VerificationTimeout => SettlementResponse {
                 success: true,
@@ -293,7 +258,6 @@ impl Facilitator for MockFacilitator {
         };
         Ok(SettleOutcome {
             response: Self::author_settle(&response)?,
-            tier: VerificationTier::Observed,
         })
     }
 }

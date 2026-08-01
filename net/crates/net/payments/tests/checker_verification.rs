@@ -430,7 +430,6 @@ impl net_payments::facilitator::Facilitator for PayerNamingFacilitator {
                 extra: None,
             })
             .map_err(|e| net_payments::facilitator::FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
     async fn settle(
@@ -450,7 +449,6 @@ impl net_payments::facilitator::Facilitator for PayerNamingFacilitator {
                 extensions: None,
             })
             .map_err(|e| net_payments::facilitator::FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 }

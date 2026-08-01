@@ -77,7 +77,6 @@ impl Facilitator for SvmFacilitator {
                 extra: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 
@@ -98,7 +97,6 @@ impl Facilitator for SvmFacilitator {
                 extensions: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 }
