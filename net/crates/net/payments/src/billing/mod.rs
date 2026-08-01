@@ -333,4 +333,53 @@ mod tests {
 
         assert_eq!(log.read_all().await.unwrap().len(), 2);
     }
+
+    /// A log that already exists is **reopened** and appended through —
+    /// the second-process-start case, on every platform.
+    ///
+    /// Nothing else covers this. The test above reuses one `BillingLog`,
+    /// so it only ever exercises the *create* path, and everything in
+    /// `file_mode` that reopens is either `#[cfg(unix)]` or never
+    /// fsyncs. The reopen goes down a different branch entirely
+    /// (`open_existing_no_follow` + `restrict_handle`), and on Windows
+    /// that branch asks for a hand-picked access mask —
+    /// `FILE_APPEND_DATA | READ_CONTROL | WRITE_DAC | SYNCHRONIZE`, with
+    /// no `FILE_READ_DATA` — which both the write and the `sync_all`
+    /// after it have to be satisfied by. A mask that is one right short
+    /// fails here and nowhere else.
+    #[tokio::test]
+    async fn a_log_left_by_an_earlier_process_is_reopened_and_appended_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("billing.jsonl");
+        let kp = EntityKeypair::generate();
+
+        // First process: creates the log.
+        let first = BillingLog::new(&path);
+        first.append(&signed_event(&kp, "q1")).await.unwrap();
+        drop(first);
+
+        // Second process: the name already exists, so this reopens.
+        // Twice, because the first append is what opens the handle and
+        // the second is what proves the held handle stays writable.
+        let second = BillingLog::new(&path);
+        second
+            .append(&signed_event(&kp, "q2"))
+            .await
+            .expect("appending through a reopened log must work");
+        second
+            .append(&signed_event(&kp, "q3"))
+            .await
+            .expect("the held handle must stay writable");
+
+        let events = second.read_all().await.unwrap();
+        assert_eq!(events.len(), 3, "the earlier record is extended, not lost");
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.quote_id.as_str())
+                .collect::<Vec<_>>(),
+            ["q1", "q2", "q3"],
+            "in order, and the reopen appended rather than truncated"
+        );
+    }
 }
