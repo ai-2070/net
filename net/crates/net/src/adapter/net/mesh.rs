@@ -2329,15 +2329,28 @@ impl MeshNodeConfig {
     }
 
     /// Pin this node to a specific subnet.
+    ///
+    /// This is the ONLY way to set the local subnet.
+    /// [`Self::with_subnet_policy`] does not do it — that policy applies
+    /// to peers. A subnet-scoped deployment wants both.
     pub fn with_subnet(mut self, subnet: SubnetId) -> Self {
         self.subnet = subnet;
         self
     }
 
-    /// Derive each peer's subnet locally by applying this policy to
+    /// Derive each PEER's subnet locally by applying this policy to
     /// their inbound [`CapabilityAnnouncement`]s. Mesh-wide policy
     /// consistency is assumed; mismatched policies lead to
     /// asymmetric views of peer subnets.
+    ///
+    /// Does not assign this node's own subnet — use
+    /// [`Self::with_subnet`] for that, and prefer setting both. A policy
+    /// with the local subnet left at [`SubnetId::GLOBAL`] resolves peers
+    /// but has no subnet identity to compare them against, which leaves
+    /// `Visibility::ParentVisible` admitting the peers it could NOT
+    /// resolve while rejecting the ones it could
+    /// (CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md,
+    /// finding 2).
     pub fn with_subnet_policy(mut self, policy: Arc<SubnetPolicy>) -> Self {
         self.subnet_policy = Some(policy);
         self
@@ -10206,15 +10219,42 @@ impl MeshNode {
     /// `MeshNodeConfig::subnet` (or `SubnetId::GLOBAL` when none was
     /// configured). Stable for the node's lifetime; the substrate
     /// doesn't reassign the local subnet at runtime.
+    ///
+    /// A [`SubnetPolicy`] never contributes to this value, however it is
+    /// configured — see [`Self::local_subnet_policy`].
     pub fn local_subnet(&self) -> SubnetId {
         self.local_subnet
     }
 
-    /// Read-only handle to the `SubnetPolicy` that derived this
-    /// node's `local_subnet`, when one was supplied. `None` when
-    /// the local subnet came from `MeshNodeConfig::subnet`
-    /// directly without going through a policy. Operator tools
-    /// surface this to explain "why is this node in subnet X."
+    /// Read-only handle to the `SubnetPolicy` this node applies to
+    /// OTHER peers, or `None` when per-peer subnet resolution is
+    /// disabled.
+    ///
+    /// **This policy does not assign this node's own subnet.** That
+    /// comes from [`MeshNodeConfig::with_subnet`] and nothing else — see
+    /// [`Self::local_subnet`]. The two settings are independent, and
+    /// `Some`/`None` here says nothing about where `local_subnet` came
+    /// from; it says only whether inbound announcements get resolved to
+    /// a subnet.
+    ///
+    /// This doc previously claimed the opposite — that the policy
+    /// "derived this node's `local_subnet`", with `None` meaning the
+    /// subnet came from config instead. No such distinction exists, and
+    /// the claim pointed operators at installing a policy as the way to
+    /// subnet a node. That configuration (`with_subnet_policy` without
+    /// `with_subnet`) leaves `local_subnet` at [`SubnetId::GLOBAL`],
+    /// which is precisely the case where an unresolved peer stays
+    /// visible under `ParentVisible` while a resolved one is rejected
+    /// (CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md,
+    /// finding 2). Set both.
+    ///
+    /// What the policy IS used for: deriving each peer's subnet, both
+    /// for the `peer_subnets` sidecar the channel paths read and — run
+    /// live against the selected fold entry's tags — for
+    /// [`Self::find_nodes_by_filter_scoped`] under
+    /// `ScopeFilter::SameSubnet`. Operator tooling can surface it to
+    /// explain "why did this node place *that peer* in subnet X"; it
+    /// cannot explain this node's own.
     pub fn local_subnet_policy(&self) -> Option<&Arc<SubnetPolicy>> {
         self.local_subnet_policy.as_ref()
     }
