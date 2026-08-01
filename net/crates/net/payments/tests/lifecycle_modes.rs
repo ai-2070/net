@@ -1059,6 +1059,91 @@ async fn a_denied_caller_is_never_quoted() {
     assert!(err.to_string().contains("admission denied"));
 }
 
+/// Admits until `revoked` is set, then denies — a caller whose
+/// allowlist entry is pulled while a quote of theirs is outstanding.
+struct RevocableAdmission {
+    revoked: std::sync::atomic::AtomicBool,
+}
+
+impl ProviderAdmissionPolicy for RevocableAdmission {
+    fn admit(&self, _caller: &EntityId, _capability: &str) -> Result<(), String> {
+        if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("caller revoked".into());
+        }
+        Ok(())
+    }
+}
+
+/// Admission is evaluated at quote issuance and **nowhere else** — a
+/// signed quote is a commitment that stays redeemable for its full
+/// validity window, so the quote TTL is the provider's revocation
+/// window.
+///
+/// This pins a deliberate decision, not an accident. The crate's docs
+/// used to claim a post-verification admission re-check existed; it
+/// never did, and the audit forced the choice between adding one and
+/// deleting the claim. Deleting won: re-checking after settlement means
+/// refusing a caller who has already paid, which needs a refund path the
+/// protocol does not have (`net.payment.dispute@1` is reserved, with no
+/// semantics shipped).
+///
+/// A future change that adds dynamic admission breaks this test **by
+/// design** — its author is meant to read this and land the refund story
+/// with it.
+#[tokio::test]
+async fn revoking_a_caller_does_not_invalidate_their_outstanding_quote() {
+    let policy = Arc::new(RevocableAdmission {
+        revoked: std::sync::atomic::AtomicBool::new(false),
+    });
+    let h = harness_with_policy(policy.clone());
+    let quote = h.quote("2500");
+    let payload = payload_for(&quote, "payer-1");
+
+    // The caller's admission is pulled after the quote is signed.
+    policy
+        .revoked
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // New quotes are refused from here on...
+    let err = h
+        .engine
+        .issue_quote(
+            h.caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("admission denied"));
+
+    // ...but the quote already issued still settles: admission is not
+    // re-evaluated at payment.
+    let decision = h
+        .engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .expect("engine");
+    assert!(
+        matches!(decision, PaymentDecision::Served { .. }),
+        "an outstanding quote must survive revocation, got {decision:?}"
+    );
+
+    // ...and still redeems: admission is not re-evaluated at the gate
+    // either. The gate enforces payment, not admission.
+    let tool = CAPABILITY.split_once('/').expect("capability").1;
+    let redeemed = h
+        .engine
+        .redeem_for_invocation(tool, &quote.quote_id, None)
+        .await
+        .expect("engine");
+    assert_eq!(
+        redeemed,
+        RedeemDecision::Admitted,
+        "the paid invocation must survive revocation of the payer"
+    );
+}
+
 #[tokio::test]
 async fn an_unregistered_asset_is_never_quoted() {
     let h = harness();

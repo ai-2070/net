@@ -9,8 +9,16 @@
 //!
 //! **Provider policy runs at quote issuance — never quote a caller you'd
 //! deny.** Accepting a denied caller's payment creates refund obligations
-//! the protocol doesn't want; authorize before accepting value. (The
-//! post-verification provider check is a re-check.)
+//! the protocol doesn't want; authorize before accepting value.
+//!
+//! Issuance is the **only** admission point, and that is deliberate: a
+//! signed quote is a commitment, so it stays redeemable until it expires.
+//! Admission is not re-evaluated at settlement or at redemption — removing
+//! a caller from the provider's allowlist does not invalidate quotes
+//! already issued to them, and **the quote's TTL is therefore the
+//! revocation window.** Providers who need faster revocation issue shorter
+//! quotes. (Re-checking later would mean refusing a caller after taking
+//! their money, which is exactly the refund obligation this design avoids.)
 //!
 //! One round: request → binding quote → accept or walk. No counter-offer
 //! object exists, and that absence is the rule.

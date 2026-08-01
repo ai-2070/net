@@ -17,9 +17,15 @@
 //! - **Fail-closed** — a facilitator failure is a structured, retryable
 //!   decision for policy, never a silent serve.
 //!
-//! Provider policy runs at quote issuance (never quote a caller you'd
-//! deny — accepting a denied caller's payment creates refund obligations
-//! P0 doesn't have); the WS4 `payment_gate` re-checks before the handler.
+//! Provider admission runs at quote issuance and **only** there (never
+//! quote a caller you'd deny — accepting a denied caller's payment creates
+//! refund obligations P0 doesn't have). [`PaymentEngine::accept_payment`]
+//! and [`PaymentEngine::redeem_for_invocation`] deliberately do not
+//! re-run it: a signed quote is a commitment that stays redeemable until
+//! it expires, so **the quote TTL is the revocation window** — see
+//! [`ProviderAdmissionPolicy`]. The gate before the handler enforces
+//! *payment* (settled, billed, unfrozen, bound to this tool, unredeemed),
+//! not admission.
 //!
 //! The engine holds `Arc<dyn Facilitator>` — pointing P1 at a real
 //! facilitator is construction config, zero interface changes (that's
@@ -137,6 +143,24 @@ pub enum PaymentDecision {
 }
 
 /// Provider-side admission: never quote a caller you'd deny.
+///
+/// **Evaluated at quote issuance only.** There is exactly one call site
+/// ([`PaymentEngine::issue_quote`]), and that is the design, not an
+/// omission: a signed quote is a commitment, so it remains redeemable
+/// for its full validity window even if the caller's admission status
+/// changes afterwards. Consequences worth stating plainly:
+///
+/// - **The quote TTL is the revocation window.** Revoking a caller stops
+///   *new* quotes, not outstanding ones. A provider that needs revocation
+///   to bite within `N` seconds issues quotes with a TTL of `N`.
+/// - Re-checking at settlement or redemption would mean refusing a caller
+///   after they had paid, which needs a refund path the protocol does not
+///   have (`net.payment.dispute@1` is reserved, with no semantics).
+///
+/// Admission is also **not** an authentication boundary: it is evaluated
+/// against whatever caller identity the quote records. Establishing that
+/// the requester *is* that caller is a separate concern, upstream of this
+/// trait.
 pub trait ProviderAdmissionPolicy: Send + Sync {
     /// `Err(reason)` refuses quote issuance for this caller/capability.
     fn admit(&self, caller: &EntityId, capability: &str) -> Result<(), String>;
