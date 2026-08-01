@@ -26474,9 +26474,16 @@ impl MeshNode {
     /// policy is read live, so there is no derived copy that can
     /// disagree with the fold after an expiry, eviction, snapshot
     /// restore, policy replacement, or a publisher restart that resets
-    /// its version counter. A candidate with no fold entry is
-    /// unresolvable and excluded — it is NOT treated as subnet
-    /// `GLOBAL`, which would otherwise match a `GLOBAL` local subnet.
+    /// its version counter.
+    ///
+    /// The derivation runs on tags borrowed from the SAME fold snapshot
+    /// that selected the candidate, so a query can never mix a match
+    /// against one announcement with a subnet computed from its
+    /// replacement. A candidate with no fold entry never reaches the
+    /// closure at all — the snapshot only yields entries that exist —
+    /// so an unknown peer is excluded rather than being treated as
+    /// subnet `GLOBAL`, which would otherwise match a `GLOBAL` local
+    /// subnet.
     ///
     /// In signed mode (`require_signed_capabilities`, the secure
     /// default) every fold entry came from a verified announcement, so
@@ -26497,12 +26504,17 @@ impl MeshNode {
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
         let policy = self.local_subnet_policy.clone();
-        let fold = self.capability_fold.clone();
         super::behavior::fold::capability_bridge::find_nodes_matching_scoped(
             &self.capability_fold,
             filter,
             scope,
-            |nid| {
+            // Fold-pure, as the bridge requires: reads only
+            // `peer_subnets` and the policy, never the fold. The
+            // `DashMap` guard is dropped before returning (the `map`
+            // copies the `SubnetId` out), and no path takes the fold
+            // while holding a `peer_subnets` guard, so holding the
+            // fold read across this lookup cannot cycle.
+            |nid, tags| {
                 if nid == local_node_id {
                     return true;
                 }
@@ -26512,18 +26524,8 @@ impl MeshNode {
                 // Forwarded-only peer. Without a policy there is nothing
                 // to resolve tags with, so the candidate stays unknown
                 // and is excluded.
-                let Some(policy) = policy.as_ref() else {
-                    return false;
-                };
-                // `_if_known` (not the plain synthesize) so a candidate
-                // with no fold entry returns None rather than an empty
-                // `CapabilitySet`, which the policy would assign to
-                // `SubnetId::GLOBAL` and wrongly match a GLOBAL local
-                // subnet.
-                match super::behavior::fold::capability_bridge::synthesize_capability_set_if_known(
-                    &fold, nid,
-                ) {
-                    Some(caps) => policy.assign(&caps) == my_subnet,
+                match policy.as_ref() {
+                    Some(policy) => policy.assign_from_rendered_tags(tags) == my_subnet,
                     None => false,
                 }
             },

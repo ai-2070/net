@@ -100,17 +100,36 @@ impl SubnetPolicy {
     /// Evaluates all rules against the node's tags. Unmatched levels
     /// remain zero (meaning "no restriction at that level").
     pub fn assign(&self, caps: &CapabilitySet) -> SubnetId {
-        let mut levels = [0u8; 4];
-
         // Phase A.5.N.2: caps.tags is HashSet<Tag>; render each tag
-        // to its wire-form string AND sort lexicographically so
-        // the first-match-wins resolution is deterministic across
-        // runs (HashSet iteration order is unspecified).
-        let mut tag_strings: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
-        tag_strings.sort();
+        // to its wire-form string. `assign_from_rendered_tags` does the
+        // sort that makes first-match-wins deterministic.
+        let tag_strings: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+        self.assign_from_rendered_tags(&tag_strings)
+    }
+
+    /// [`Self::assign`] against tags that are ALREADY in canonical
+    /// wire-string form — the shape the capability fold's
+    /// `CapabilityMembership` payload stores.
+    ///
+    /// Lets the scoped-discovery path derive a candidate's subnet from
+    /// the borrowed payload it is already holding, inside the same fold
+    /// snapshot that selected the candidate. Going through
+    /// [`Self::assign`] there would mean rebuilding a `CapabilitySet`
+    /// (re-parsing every tag, allocating a `HashSet<Tag>`) just to have
+    /// it rendered straight back to strings.
+    ///
+    /// Allocates one `Vec<&str>` for the sort — pointers, not tag
+    /// copies. The sort is load-bearing: rule resolution is
+    /// first-match-wins, and the fold stores tags in unspecified order,
+    /// so an unsorted scan could assign different subnets to the same
+    /// announcement on different receivers.
+    pub fn assign_from_rendered_tags(&self, tags: &[String]) -> SubnetId {
+        let mut levels = [0u8; 4];
+        let mut sorted: Vec<&str> = tags.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
 
         for rule in &self.rules {
-            for s in &tag_strings {
+            for s in &sorted {
                 if let Some(value) = s.strip_prefix(&rule.tag_prefix) {
                     if let Some(&level_value) = rule.values.get(value) {
                         levels[rule.level as usize] = level_value;
@@ -190,6 +209,72 @@ mod tests {
         let policy = SubnetPolicy::new();
         let caps = caps_with_tags(&["region:us-west"]);
         assert_eq!(policy.assign(&caps), SubnetId::GLOBAL);
+    }
+
+    /// `assign_from_rendered_tags` is what the scoped-discovery path
+    /// calls against borrowed fold payload tags. It must agree with
+    /// `assign` — if it drifts, a forwarded peer resolves to a
+    /// different subnet than the same node's direct announcement would,
+    /// and `SameSubnet` starts returning a different set depending on
+    /// how the announcement happened to arrive.
+    #[test]
+    fn assign_from_rendered_tags_agrees_with_assign() {
+        let policy = SubnetPolicy::new()
+            .add_rule(SubnetRule::new("region:", 0).map("us", 3).map("eu", 4))
+            .add_rule(SubnetRule::new("fleet:", 1).map("blue", 7).map("green", 8))
+            .add_rule(SubnetRule::new("unit:", 2).map("alpha", 2));
+
+        let tag_sets: Vec<Vec<&str>> = vec![
+            vec![],
+            vec!["region:us"],
+            vec!["region:eu", "fleet:green"],
+            vec!["region:us", "fleet:blue", "unit:alpha"],
+            // Unmatched values leave their level at zero.
+            vec!["region:antarctica"],
+            // Noise tags the policy has no rule for.
+            vec!["gpu", "hardware.gpu", "region:us", "scope:tenant:oem-123"],
+            // Two values for the SAME rule: first-match-wins after the
+            // sort, so both paths must pick the same one. This is the
+            // case an unsorted scan would decide by hash order.
+            vec!["region:us", "region:eu"],
+            vec!["region:eu", "region:us"],
+        ];
+
+        for tags in tag_sets {
+            let caps = caps_with_tags(&tags);
+            // The rendered form the fold payload stores.
+            let rendered: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+            assert_eq!(
+                policy.assign_from_rendered_tags(&rendered),
+                policy.assign(&caps),
+                "divergence for tags {tags:?}"
+            );
+        }
+    }
+
+    /// The sort is load-bearing, not cosmetic: the fold stores tags in
+    /// unspecified order, and rule resolution is first-match-wins. Two
+    /// receivers holding the same announcement in different orders must
+    /// still assign the same subnet.
+    #[test]
+    fn assign_from_rendered_tags_is_order_independent() {
+        let policy = SubnetPolicy::new().add_rule(
+            SubnetRule::new("region:", 0)
+                .map("us", 3)
+                .map("eu", 4)
+                .map("ap", 5),
+        );
+        let forward: Vec<String> = ["region:us", "region:eu", "region:ap"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let reversed: Vec<String> = forward.iter().rev().cloned().collect();
+
+        assert_eq!(
+            policy.assign_from_rendered_tags(&forward),
+            policy.assign_from_rendered_tags(&reversed),
+            "tag order must not change the assigned subnet"
+        );
     }
 
     #[test]
