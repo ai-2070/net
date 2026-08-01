@@ -11,8 +11,52 @@ same issue on every run until the anchor line changes, so raw comment count over
 roughly 2.5×. GitHub's own thread state is not a usable signal here: only 5 of 191 threads are marked
 resolved, so every finding was checked against the source rather than against the resolution flag.
 
-**Result: 15 of ~74 distinct findings are still open.** They are listed below, most severe first.
-Everything else is fixed — see [Verified closed](#verified-closed) for the summary.
+**Result: 15 of ~74 distinct findings were still open.** They are listed below, most severe first.
+Everything else was already fixed — see [Verified closed](#verified-closed) for the summary.
+
+## Status: all 15 resolved (2026-08-01)
+
+Fourteen were fixed; one turned out not to be a defect. One commit each, most with a
+red-coupled test.
+
+| # | Sev | Commit | Note |
+|---|-----|--------|------|
+| 1 | P1 | `e76722747` | `read_unaligned` for `TOKEN_USER` |
+| 2 | P1 | `e07ee4195` | `is_public_v6` leads with the `2000::/3` allowlist; the old branches fall to the gate |
+| 3 | P1 | `49eb93b5d` | `Facilitator::supported_pairs` + `PaymentEngine::check_settlement_routes`, wired into both bindings' `pricing_terms` |
+| 4 | P2 | `2318deed5` | `best_verified_tier` high-water mark; invalidation resets it |
+| 5 | P2 | `b3d4e6734` | Rust approval test asserts the no-op contract |
+| 6 | P2 | `3276adc79` | Both shipped USDC entries pin `USDC`/`2`; a test walks every `eip155:` entry |
+| 7 | P2 | `c4e1d2efa` | Contract corrected: a quote request is single-use, and `ReplayedNonce` names the recovery |
+| 8 | P2 | `b8a544660` | Commitment checked before the payload comparison; an unverified attempt reports `InProgress` |
+| 9 | P2 | — | **Kept deliberately.** `fec0::/10` under `AllowPrivate` is now recorded as accepted in the audit doc |
+| 10 | P2 | `c12d89f20` | `World` owns `provider_mesh` |
+| 11 | P3 | `a5c02fd35` | `Content-Length` compared in `u64` |
+| 12 | P3 | `d45fe448e` | `within_retention` subtracts from today, saturating |
+| 13 | P3 | `cadad8086` | `binding_required` row added |
+| 14 | P3 | `aea09094b` | Both binding pages show the opt-out, not a redundant opt-in |
+| 15 | P3 | `de57ced11` | **Not a defect** — see below |
+
+**Finding 15 was wrong, and the error is mine.** All twelve cited commit subjects exist on
+the branch. I listed the log newest-first, truncated at 40 entries, and concluded the earlier
+ones were absent; cubic reached the same wrong answer by a similar route. What is real is the
+traceability problem both reviews demonstrated: the rows are hard to verify, and several cite a
+commit whose mechanism was later replaced (M3's `quote_ref` was unkeyed when that commit
+shipped). The table now carries short hashes and a "superseded by" column.
+
+**Two findings were partly fixed already**, which is easy to miss when scanning by comment —
+#4 and #13 each had their code half done and their doc half missing, or the reverse.
+
+**Scope notes.** #8 does not close the race it describes; that needs signature verification
+inside the engine, which is the facilitator's job. It stops the engine reporting a terminal
+"already paid" about a quote nothing had paid for. #11 has no test: the truncation cannot be
+reproduced on a 64-bit host, so an assertion would pass either way.
+
+**Pre-existing failure, untouched:** `net-python`'s
+`payment_http::tests::a_fetch_to_an_unreachable_url_projects_transport_error` expects
+`transport_error` for `http://127.0.0.1:1/nope` and gets `denied` — `X402HttpFlow::new`
+defaults to `PublicOnly`, which refuses loopback. Verified failing at branch HEAD before any of
+this work. It needs the fixture to opt into `PublicOrLoopback`, or the test's premise updated.
 
 ---
 
