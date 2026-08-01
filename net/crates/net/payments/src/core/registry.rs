@@ -74,7 +74,8 @@ pub struct AssetEntry {
     ///
     /// The exact-EVM authoring path builds its signing domain from
     /// `requirements.extra.name` / `.version`, which are **supplied by
-    /// the counterparty**. When this field is set, [`Self::check_requirements`]
+    /// the counterparty**. When this field is set,
+    /// [`AssetRegistry::check_requirements`]
     /// requires the declared value to match, so the domain a caller signs
     /// under is one this registry revision vouched for rather than one
     /// the payee asserted.

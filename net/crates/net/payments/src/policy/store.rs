@@ -18,8 +18,8 @@
 //!   enough contending mutators starve the pool the holder's own tokio
 //!   I/O needs — deadlock. Async sleep parks no thread.
 //! - **Saves are atomic**: per-pid temp file, owner-only from creation
-//!   (`0600` on unix, an explicit owner-only DACL on Windows — see
-//!   [`crate::policy::file_mode`]), `fsync` before the rename, temp
+//!   (`0600` on unix, an explicit owner-only DACL on Windows — see the
+//!   crate-private `policy::file_mode`), `fsync` before the rename, temp
 //!   removed on any failure. Readers see the whole old file or the whole
 //!   new file, never a tear.
 //! - **Missing file = empty state** (the first-run case); a

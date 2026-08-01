@@ -372,7 +372,14 @@ impl SeenNonces {
             self.sweep(now_ns);
         }
         let key = (caller.clone(), nonce.to_string());
-        if self.seen.contains_key(&key) {
+        // Presence is not enough — the stored deadline decides. The sweep
+        // is amortized, so an entry can outlive its deadline for a while
+        // under low traffic, and testing membership alone would keep
+        // refusing a nonce long after the request carrying it stopped
+        // being presentable. A caller reusing a nonce for a *new* request
+        // is not replaying anything: the old one can no longer be
+        // accepted by `verify` either way.
+        if matches!(self.seen.get(&key), Some(deadline) if now_ns < *deadline) {
             return Err(QuoteRequestError::ReplayedNonce);
         }
         // Measured after any sweep, so capacity reflects what is actually
@@ -624,6 +631,43 @@ mod tests {
         );
         assert_eq!(
             seen.admit(&b, "shared", NOW + 1_000, NOW),
+            Err(QuoteRequestError::ReplayedNonce)
+        );
+    }
+
+    /// A nonce stops being replay-protected when its request stops being
+    /// presentable, whether or not a sweep has run.
+    ///
+    /// The sweep is amortized, so under low traffic an entry sits in the
+    /// map long past its deadline. Judging by membership alone would keep
+    /// refusing that nonce indefinitely — but the request carrying it can
+    /// no longer be accepted by `verify` either, so there is nothing left
+    /// to replay and the refusal is pure false positive.
+    #[test]
+    fn an_expired_nonce_is_admissible_again_before_any_sweep() {
+        let caller = EntityKeypair::generate().entity_id().clone();
+        // Large capacity: nothing here comes close to a sweep threshold,
+        // so the entry is still sitting in the map when it is re-offered.
+        let mut seen = SeenNonces::with_capacity(1_000_000);
+        let deadline = NOW + 1_000;
+
+        assert!(seen.admit(&caller, "n1", deadline, NOW).is_ok());
+        assert_eq!(
+            seen.admit(&caller, "n1", deadline, NOW),
+            Err(QuoteRequestError::ReplayedNonce),
+            "still presentable, so still a replay"
+        );
+
+        // One nanosecond past the deadline the entry is dead weight, not
+        // a guard.
+        assert!(
+            seen.admit(&caller, "n1", deadline + 5_000, deadline)
+                .is_ok(),
+            "an entry past its acceptance deadline must not refuse a fresh request"
+        );
+        // And the fresh deadline it just stored protects it again.
+        assert_eq!(
+            seen.admit(&caller, "n1", deadline + 5_000, deadline),
             Err(QuoteRequestError::ReplayedNonce)
         );
     }

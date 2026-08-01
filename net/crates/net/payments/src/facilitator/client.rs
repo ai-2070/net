@@ -14,7 +14,9 @@
 //! later independent check or audit will hash.
 //!
 //! Trust posture: a facilitator receipt can only ever justify tier
-//! [`VerificationTier::Observed`] — the v2 spec gives facilitators no
+//! [`crate::core::verification::VerificationTier::Observed`] — the tier
+//! is minted by the engine at this boundary, so the name is not in
+//! scope here to link unqualified. The v2 spec gives facilitators no
 //! way to report finality, and this client refuses to invent one.
 //! `confirmed(n)` / `final` come from the independent chain checker,
 //! which keeps the facilitator out of the trust root for anything above
