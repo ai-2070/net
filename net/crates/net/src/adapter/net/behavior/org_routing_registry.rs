@@ -1623,12 +1623,17 @@ impl NodeOrgRoutingRegistry {
             new_keys
                 .iter()
                 .map(|key| {
-                    inner
+                    // `expect_used` lint guard: a `common` key kept its
+                    // reference untouched and a `new_only` key was inserted or
+                    // bumped just above, so the lookup cannot miss; suppress
+                    // locally rather than `filter_map`, which would silently
+                    // misalign the `keys[i]` <-> `cells[i]` pairing.
+                    #[allow(clippy::expect_used)]
+                    let slot = inner
                         .slots
                         .get(key)
-                        .expect("every key of the new set is retained above")
-                        .facts
-                        .clone()
+                        .expect("every key of the new set is retained above");
+                    slot.facts.clone()
                 })
                 .collect::<Vec<_>>()
         };
