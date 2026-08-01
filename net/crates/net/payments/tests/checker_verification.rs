@@ -627,15 +627,14 @@ const MERCHANT_ADDR: &str = "0x000000000000000000000000000000000000dEaD";
 // 0x + 64 hex — a well-formed EIP-3009 bytes32 nonce.
 const VALID_NONCE: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
 
-/// Settle one Base-Sepolia (eip155) quote at observed with the given
-/// opaque payload body and return the engine + quote id. Fresh engine per
-/// call: `PayerNamingFacilitator` reports a fixed transaction hash, so
-/// distinct quotes must not share a `consumed_transactions` namespace.
-/// Stand up an eip155 engine + quote + payload and run `accept_payment`,
-/// handing back the engine, the quote id, and the raw decision.
+/// Stand up a Base-Sepolia (eip155) engine + quote + payload and run
+/// `accept_payment`, handing back the engine, the quote id, and the raw
+/// decision.
 ///
 /// The two wrappers below differ only in what they do with the decision,
-/// so the setup lives here once.
+/// so the setup lives here once. Each call builds a fresh engine on
+/// purpose: `PayerNamingFacilitator` reports a fixed transaction hash, so
+/// distinct quotes must not share a `consumed_transactions` namespace.
 async fn accept_eip155_inner(
     payload_body: serde_json::Value,
 ) -> (PaymentEngine, String, PaymentDecision, tempfile::TempDir) {

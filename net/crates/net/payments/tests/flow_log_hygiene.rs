@@ -51,10 +51,51 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
+        // Every value type, not just str/debug. The central assertion
+        // below is "no field carries the quote id" — a visitor with holes
+        // would let a regression that logs it through another type slip
+        // past silently, which is the one failure mode this test exists
+        // to prevent. `record_debug` is the catch-all `tracing` falls
+        // back to, but the typed methods are called in preference to it,
+        // so each has to be captured explicitly.
         struct Collector<'a>(&'a mut Vec<(String, String)>);
+        impl Collector<'_> {
+            fn put(&mut self, field: &tracing::field::Field, value: impl std::fmt::Display) {
+                self.0.push((field.name().to_string(), value.to_string()));
+            }
+        }
         impl tracing::field::Visit for Collector<'_> {
             fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                self.0.push((field.name().to_string(), value.to_string()));
+                self.put(field, value);
+            }
+            fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                self.put(field, value);
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.put(field, value);
+            }
+            fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
+                self.put(field, value);
+            }
+            fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+                self.put(field, value);
+            }
+            fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+                self.put(field, value);
+            }
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                self.put(field, value);
+            }
+            fn record_bytes(&mut self, field: &tracing::field::Field, value: &[u8]) {
+                self.0
+                    .push((field.name().to_string(), format!("{value:?}")));
+            }
+            fn record_error(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &(dyn std::error::Error + 'static),
+            ) {
+                self.put(field, value);
             }
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 self.0
@@ -73,6 +114,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
 struct ForgedBillingProvider {
     inner: Arc<dyn ProviderChannel>,
     provider_keys: Arc<EntityKeypair>,
+    /// The real paying identity, so the forged event differs from a valid
+    /// one in exactly one field.
+    caller_id: net::adapter::net::identity::EntityId,
 }
 
 #[async_trait::async_trait]
@@ -99,10 +143,16 @@ impl ProviderChannel for ForgedBillingProvider {
             return Ok(real);
         };
         // A self-consistent billing event for some OTHER quote: correct
-        // tag, correct id derivation, correctly signed — so it clears
-        // `from_json_bytes` and is rejected only by the quote bind.
+        // tag, correct id derivation, correctly signed — and correct on
+        // every other bind too, so the ONLY thing wrong with it is the
+        // quote id.
+        //
+        // The payer must therefore be the real caller, not the provider.
+        // Setting it to the provider would also trip the `payer == caller`
+        // check, and the test would pass without ever exercising the
+        // quote bind it names.
         let scope = net_payments::core::idempotency::IdempotencyScope {
-            caller: self.provider_keys.entity_id().clone(),
+            caller: self.caller_id.clone(),
             provider: self.provider_keys.entity_id().clone(),
             capability: CAPABILITY.to_string(),
             quote_id: "some-other-quote".to_string(),
@@ -117,7 +167,7 @@ impl ProviderChannel for ForgedBillingProvider {
             quote_id: "some-other-quote".to_string(),
             transaction: transaction.clone(),
             verification_ref: None,
-            payer: self.provider_keys.entity_id().clone(),
+            payer: self.caller_id.clone(),
             payee: self.provider_keys.entity_id().clone(),
             network: MOCK_NETWORK.to_string(),
             asset: "musd".to_string(),
@@ -174,9 +224,11 @@ fn flow_warnings_carry_a_short_quote_ref_never_the_quote_id() {
                 .expect("engine"),
             );
             let honest = Arc::new(InProcessProvider::new(engine, clock.clone()));
+            let caller = Arc::new(EntityKeypair::generate());
             let forging = Arc::new(ForgedBillingProvider {
                 inner: honest,
                 provider_keys: provider_keys.clone(),
+                caller_id: caller.entity_id().clone(),
             });
 
             let template = X402Carry::author(&PaymentRequirements {
@@ -200,7 +252,6 @@ fn flow_warnings_carry_a_short_quote_ref_never_the_quote_id() {
             )
             .expect("utf8");
 
-            let caller = Arc::new(EntityKeypair::generate());
             let flow = CallerPaymentFlow::new(
                 caller,
                 SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::DevTest),

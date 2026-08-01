@@ -31,11 +31,6 @@ impl ScriptedChecker {
             queries: parking_lot::Mutex::new(Vec::new()),
         }
     }
-
-    /// The `TransferQuery` from the nth call, if it carried one.
-    pub fn query(&self, n: usize) -> Option<TransferQuery> {
-        self.queries.lock().get(n).and_then(|q| q.2.clone())
-    }
 }
 
 #[async_trait]

@@ -48,82 +48,162 @@ async fn handshake(server: &Mesh, caller: &Mesh) {
     caller.inner().start();
 }
 
+/// A provider serving the payment wire over real loopback UDP, and
+/// everything a caller needs to transact with it: a whole
+/// [`CallerPaymentFlow`] for the lifecycle test, or the pieces to
+/// hand-build a quote request for the H1 wire tests below.
+///
+/// One fixture rather than two so the wire tests exercise the same
+/// provider the lifecycle test proves out — a divergence between the two
+/// setups would let an H1 refusal pass against a provider configured
+/// differently from the one that actually serves money.
+struct World {
+    caller_mesh: Arc<Mesh>,
+    caller_keys: Arc<EntityKeypair>,
+    provider_node: u64,
+    provider_id: net::adapter::net::identity::EntityId,
+    provider_log: Arc<BillingLog>,
+    registry: net_payments::core::registry::AssetRegistry,
+    capability: String,
+    template: X402Carry<PaymentRequirements>,
+    terms_json: String,
+    clock: Arc<dyn Clock>,
+    dir: tempfile::TempDir,
+    _serving: net_payments::flow::mesh::PaymentServeHandle,
+}
+
+impl World {
+    async fn start() -> Self {
+        let psk = [0x42u8; 32];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock: Arc<dyn Clock> = Arc::new(TestClock(std::sync::atomic::AtomicU64::new(
+            1_000_000_000_000_000,
+        )));
+
+        // ── machine B: the provider ───────────────────────────────
+        let provider_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
+            .expect("builder")
+            .build()
+            .await
+            .expect("provider mesh");
+        let caller_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
+            .expect("builder")
+            .build()
+            .await
+            .expect("caller mesh");
+        handshake(&provider_mesh, &caller_mesh).await;
+
+        let provider_keys = Arc::new(EntityKeypair::generate());
+        let registry = default_mock_registry(provider_keys.entity_id().clone());
+        let provider_log = Arc::new(BillingLog::new(dir.path().join("provider-billing.jsonl")));
+        let engine = Arc::new(
+            PaymentEngine::new(
+                provider_keys.clone(),
+                Arc::new(MockFacilitator::new()),
+                Arc::new(AdmitAll),
+                registry.clone(),
+                dir.path().join("engine.json"),
+            )
+            .expect("engine")
+            .with_billing_log(provider_log.clone()),
+        );
+        let in_process = Arc::new(InProcessProvider::new(engine, clock.clone()));
+        let serving = serve_payments(&provider_mesh, in_process).expect("serve payments");
+
+        // The capability id the mesh channel routes by: `<node_id>/<tool>`.
+        let capability = format!("{}/fixture-tool", provider_mesh.inner().node_id());
+
+        // The announced pricing (what publish would attach).
+        let template = X402Carry::author(&PaymentRequirements {
+            scheme: MOCK_SCHEME.into(),
+            network: MOCK_NETWORK.into(),
+            amount: "2500".into(),
+            asset: "musd".into(),
+            pay_to: "mock-provider-settle-addr".into(),
+            max_timeout_seconds: 60,
+            extra: None,
+        })
+        .expect("author");
+        let terms = PricingTerms::new(
+            provider_keys.entity_id().clone(),
+            capability.clone(),
+            vec![template.clone()],
+            registry.reference().expect("ref"),
+        );
+        let terms_json =
+            String::from_utf8(canonical_bytes(&terms).expect("canonicalize")).expect("utf8");
+
+        Self {
+            provider_node: provider_mesh.inner().node_id(),
+            provider_id: provider_keys.entity_id().clone(),
+            provider_log,
+            registry,
+            caller_mesh: Arc::new(caller_mesh),
+            caller_keys: Arc::new(EntityKeypair::generate()),
+            capability,
+            template,
+            terms_json,
+            clock,
+            dir,
+            _serving: serving,
+        }
+    }
+
+    /// ── machine A: the caller ── a flow whose spend policy lives at
+    /// `spend_path`, so a test can reopen the same policy to reconfigure
+    /// or approve against it.
+    fn caller_flow(&self, spend_path: &std::path::Path) -> CallerPaymentFlow {
+        CallerPaymentFlow::new(
+            self.caller_keys.clone(),
+            SpendPolicyEngine::new(spend_path, SpendProfile::DevTest),
+            self.registry.clone(),
+            Arc::new(MeshPaymentChannel::new(
+                self.caller_mesh.clone(),
+                self.caller_keys.clone(),
+                self.clock.clone(),
+            )),
+            self.clock.clone(),
+        )
+    }
+
+    /// Send a hand-built quote request over the real wire, returning the
+    /// provider's refusal text on rejection.
+    ///
+    /// The text matters. Every negative test here asserts a *specific*
+    /// refusal — the transport collapses the typed `QuoteRequestError` to
+    /// a string, so `is_err()` alone would also be satisfied by a decode
+    /// failure, a dead peer, or a handler panic, and the test would keep
+    /// passing after the check it names had been removed.
+    async fn request_quote(
+        &self,
+        request: &net_payments::core::quote_request::QuoteRequest,
+    ) -> Result<(), String> {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        let bytes = canonical_bytes(request).expect("canonical");
+        let reply: Result<QuoteWireReply, _> = self
+            .caller_mesh
+            .call_typed(
+                self.provider_node,
+                "net.payments.quote.v1",
+                &QuoteWire {
+                    request_b64: BASE64.encode(bytes),
+                    template_b64: BASE64.encode(self.template.bytes()),
+                },
+                Default::default(),
+            )
+            .await;
+        reply.map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_paid_lifecycle_crosses_the_wire() {
-    let psk = [0x42u8; 32];
-    let dir = tempfile::tempdir().expect("tempdir");
-    let clock: Arc<dyn Clock> = Arc::new(TestClock(std::sync::atomic::AtomicU64::new(
-        1_000_000_000_000_000,
-    )));
-
-    // ── machine B: the provider ────────────────────────────────────
-    let provider_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
-        .expect("builder")
-        .build()
-        .await
-        .expect("provider mesh");
-    let caller_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
-        .expect("builder")
-        .build()
-        .await
-        .expect("caller mesh");
-    handshake(&provider_mesh, &caller_mesh).await;
-
-    let provider_keys = Arc::new(EntityKeypair::generate());
-    let registry = default_mock_registry(provider_keys.entity_id().clone());
-    let provider_log = Arc::new(BillingLog::new(dir.path().join("provider-billing.jsonl")));
-    let engine = Arc::new(
-        PaymentEngine::new(
-            provider_keys.clone(),
-            Arc::new(MockFacilitator::new()),
-            Arc::new(AdmitAll),
-            registry.clone(),
-            dir.path().join("engine.json"),
-        )
-        .expect("engine")
-        .with_billing_log(provider_log.clone()),
-    );
-    let in_process = Arc::new(InProcessProvider::new(engine, clock.clone()));
-    let _serving = serve_payments(&provider_mesh, in_process).expect("serve payments");
-
-    // The capability id the mesh channel routes by: `<node_id>/<tool>`.
-    let capability = format!("{}/fixture-tool", provider_mesh.inner().node_id());
-
-    // The announced pricing (what publish would attach).
-    let template = X402Carry::author(&PaymentRequirements {
-        scheme: MOCK_SCHEME.into(),
-        network: MOCK_NETWORK.into(),
-        amount: "2500".into(),
-        asset: "musd".into(),
-        pay_to: "mock-provider-settle-addr".into(),
-        max_timeout_seconds: 60,
-        extra: None,
-    })
-    .expect("author");
-    let terms = PricingTerms::new(
-        provider_keys.entity_id().clone(),
-        capability.clone(),
-        vec![template],
-        registry.reference().expect("ref"),
-    );
-    let terms_json =
-        String::from_utf8(canonical_bytes(&terms).expect("canonicalize")).expect("utf8");
-
-    // ── machine A: the caller ──────────────────────────────────────
-    let caller_keys = Arc::new(EntityKeypair::generate());
-    let spend_path = dir.path().join("spend-policy.json");
-    let flow = CallerPaymentFlow::new(
-        caller_keys.clone(),
-        SpendPolicyEngine::new(&spend_path, SpendProfile::DevTest),
-        registry,
-        Arc::new(MeshPaymentChannel::new(
-            Arc::new(caller_mesh),
-            caller_keys,
-            clock.clone(),
-        )),
-        clock,
-    );
-
+    let w = World::start().await;
+    let (capability, terms_json) = (w.capability.clone(), w.terms_json.clone());
+    let provider_log = w.provider_log.clone();
+    let spend_path = w.dir.path().join("spend-policy.json");
+    let flow = w.caller_flow(&spend_path);
     // Auto-allow: quote, payload, and settlement all cross the wire;
     // the proof carries the provider-signed billing event back.
     let decision = flow.run(&capability, &terms_json).await;
@@ -195,6 +275,11 @@ async fn the_paid_lifecycle_crosses_the_wire() {
 /// it — which makes them a check on the *wire contract* rather than on an
 /// internal type, and lets them send requests the real channel would
 /// never build.
+///
+/// The mirror cannot drift silently: every test below finishes by sending
+/// a well-formed request and asserting it is *accepted*, so a rename on
+/// either side turns into a decode failure on the honest path rather than
+/// a refusal test that passes for the wrong reason.
 #[derive(serde::Serialize)]
 struct QuoteWire {
     request_b64: String,
@@ -205,100 +290,6 @@ struct QuoteWire {
 struct QuoteWireReply {
     #[allow(dead_code)]
     quote_b64: String,
-}
-
-/// A provider serving the payment wire, plus everything needed to hand-
-/// build a quote request at it.
-struct World {
-    caller_mesh: Arc<Mesh>,
-    provider_node: u64,
-    provider_id: net::adapter::net::identity::EntityId,
-    capability: String,
-    template: X402Carry<PaymentRequirements>,
-    clock: Arc<dyn Clock>,
-    _serving: net_payments::flow::mesh::PaymentServeHandle,
-    _dir: tempfile::TempDir,
-}
-
-impl World {
-    async fn start() -> Self {
-        let psk = [0x42u8; 32];
-        let dir = tempfile::tempdir().expect("tempdir");
-        let clock: Arc<dyn Clock> = Arc::new(TestClock(std::sync::atomic::AtomicU64::new(
-            1_000_000_000_000_000,
-        )));
-        let provider_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
-            .expect("builder")
-            .build()
-            .await
-            .expect("provider mesh");
-        let caller_mesh = MeshBuilder::new("127.0.0.1:0", &psk)
-            .expect("builder")
-            .build()
-            .await
-            .expect("caller mesh");
-        handshake(&provider_mesh, &caller_mesh).await;
-
-        let provider_keys = Arc::new(EntityKeypair::generate());
-        let registry = default_mock_registry(provider_keys.entity_id().clone());
-        let engine = Arc::new(
-            PaymentEngine::new(
-                provider_keys.clone(),
-                Arc::new(MockFacilitator::new()),
-                Arc::new(AdmitAll),
-                registry,
-                dir.path().join("engine.json"),
-            )
-            .expect("engine"),
-        );
-        let in_process = Arc::new(InProcessProvider::new(engine, clock.clone()));
-        let serving = serve_payments(&provider_mesh, in_process).expect("serve payments");
-        let capability = format!("{}/fixture-tool", provider_mesh.inner().node_id());
-        let template = X402Carry::author(&PaymentRequirements {
-            scheme: MOCK_SCHEME.into(),
-            network: MOCK_NETWORK.into(),
-            amount: "2500".into(),
-            asset: "musd".into(),
-            pay_to: "mock-provider-settle-addr".into(),
-            max_timeout_seconds: 60,
-            extra: None,
-        })
-        .expect("author");
-
-        Self {
-            provider_node: provider_mesh.inner().node_id(),
-            provider_id: provider_keys.entity_id().clone(),
-            caller_mesh: Arc::new(caller_mesh),
-            capability,
-            template,
-            clock,
-            _serving: serving,
-            _dir: dir,
-        }
-    }
-
-    /// Send a hand-built quote request over the real wire.
-    async fn request_quote(
-        &self,
-        request: &net_payments::core::quote_request::QuoteRequest,
-    ) -> Result<(), String> {
-        use base64::engine::general_purpose::STANDARD as BASE64;
-        use base64::Engine as _;
-        let bytes = canonical_bytes(request).expect("canonical");
-        let reply: Result<QuoteWireReply, _> = self
-            .caller_mesh
-            .call_typed(
-                self.provider_node,
-                "net.payments.quote.v1",
-                &QuoteWire {
-                    request_b64: BASE64.encode(bytes),
-                    template_b64: BASE64.encode(self.template.bytes()),
-                },
-                Default::default(),
-            )
-            .await;
-        reply.map(|_| ()).map_err(|e| e.to_string())
-    }
 }
 
 /// A forged quote request — naming a victim the attacker holds no key
@@ -336,10 +327,13 @@ async fn a_forged_caller_identity_is_refused_over_the_wire() {
     let sig = attacker.try_sign(&payload).expect("sign");
     forged.signature = Some(net_payments::core::canonical::SignatureHex(sig.to_bytes()));
 
-    let refusal = w.request_quote(&forged).await;
+    let refusal = w
+        .request_quote(&forged)
+        .await
+        .expect_err("a request signed by anyone but the identity it names must be refused");
     assert!(
-        refusal.is_err(),
-        "a request signed by anyone but the identity it names must be refused"
+        refusal.contains("signature"),
+        "the refusal must be the signature check, not some other failure: {refusal}"
     );
 
     // And the honest path still works, so the refusal is the signature
@@ -380,9 +374,13 @@ async fn a_replayed_quote_request_is_refused() {
     request.sign_with(&caller).expect("sign");
 
     assert!(w.request_quote(&request).await.is_ok(), "first use");
+    let refusal = w
+        .request_quote(&request)
+        .await
+        .expect_err("the same signed request must not be presentable twice");
     assert!(
-        w.request_quote(&request).await.is_err(),
-        "the same signed request must not be presentable twice"
+        refusal.contains("nonce was already used"),
+        "the refusal must be the replay guard: {refusal}"
     );
 }
 
@@ -406,8 +404,26 @@ async fn a_request_for_another_provider_is_refused() {
         "wrong-destination",
     );
     request.sign_with(&caller).expect("sign");
+    let refusal = w
+        .request_quote(&request)
+        .await
+        .expect_err("a request addressed to another provider must be refused");
     assert!(
-        w.request_quote(&request).await.is_err(),
-        "a request addressed to another provider must be refused"
+        refusal.contains("addressed to a different provider"),
+        "the refusal must be the destination bind: {refusal}"
     );
+
+    // The same request, correctly addressed, is taken — so the refusal
+    // above is the bind and not the wire.
+    let mut addressed = QuoteRequest::new(
+        w.provider_id.clone(),
+        caller.entity_id().clone(),
+        &w.capability,
+        w.template.bytes(),
+        w.clock.now_ns(),
+        30_000_000_000,
+        "right-destination",
+    );
+    addressed.sign_with(&caller).expect("sign");
+    assert!(w.request_quote(&addressed).await.is_ok());
 }
