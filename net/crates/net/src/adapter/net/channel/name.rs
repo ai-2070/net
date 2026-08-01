@@ -194,11 +194,19 @@ pub fn channel_hash(name: &str) -> ChannelHash {
 /// legitimate channel name. A token minted to join a queue group
 /// therefore cannot be replayed as a token for a channel, and vice
 /// versa, without needing a separate scope bit or wire format.
+///
+/// Calls [`channel_hash`] rather than repeating its body. The disjointness
+/// argument above is a statement about the two hashes living in ONE space,
+/// so it only holds while they are computed the same way. Inlining the
+/// primitive would let a future seed, domain-separation prefix, or
+/// algorithm change land on channel names and silently not on group
+/// grants — at which point the derivation this doc promises would be
+/// false, and the collision-freedom that rests on it unproven.
 #[inline]
 pub fn queue_group_hash(channel: &str, group: &str) -> ChannelHash {
     // One allocation on the subscribe slow path only; the data plane
     // never calls this.
-    xxh3_64(format!("{channel}#{group}").as_bytes())
+    channel_hash(&format!("{channel}#{group}"))
 }
 
 /// Compute the wire `u16` channel hash from a name string.

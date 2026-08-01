@@ -2228,6 +2228,34 @@ mod tests {
         assert_ne!(h, queue_group_hash("work/other", "workers"));
     }
 
+    /// …and they stay disjoint only while they stay in ONE hash space.
+    ///
+    /// The disjointness argument above is entirely about `#` being
+    /// outside the channel-name charset — which proves nothing unless
+    /// both sides are hashed the same way. `queue_group_hash` delegates
+    /// to `channel_hash` for that reason, and this pins the delegation:
+    /// a seed, a domain-separation prefix, or an algorithm change
+    /// applied to one and not the other would leave the test above
+    /// passing (the values would still differ) while the documented
+    /// derivation quietly became false, and grants minted before the
+    /// change would stop matching the ones checked after it.
+    #[test]
+    fn queue_group_hash_is_the_channel_hash_of_the_joined_name() {
+        for (channel, group) in [
+            ("work/queue", "workers"),
+            ("a", "b"),
+            ("svc.replies.deadbeefdeadbeef", "shard-3"),
+        ] {
+            assert_eq!(
+                queue_group_hash(channel, group),
+                channel_hash(&format!("{channel}#{group}")),
+                "queue_group_hash({channel:?}, {group:?}) no longer equals the \
+                 canonical hash of \"{channel}#{group}\" — the two have drifted \
+                 into separate hash spaces"
+            );
+        }
+    }
+
     // ---- M1 (2026-07-31 audit): gates key on the REQUESTED channel ----
 
     /// A token minted for one channel under a prefix must not authorize
