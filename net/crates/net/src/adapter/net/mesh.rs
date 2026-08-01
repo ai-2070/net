@@ -77,7 +77,7 @@ use super::behavior::tag::Tag;
 use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
 use super::channel::{
     AckReason, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelHash, ChannelId, ChannelName,
-    ChannelPublisher, OnFailure, PublishConfig, PublishReport, SubscriberRoster,
+    ChannelPublisher, OnFailure, PublishConfig, PublishReport, QueueGroupPolicy, SubscriberRoster,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
@@ -19353,8 +19353,13 @@ impl MeshNode {
                 token,
                 queue_group,
             } => {
-                let (accepted, reason) =
-                    Self::authorize_subscribe(&channel, from_node, token.as_deref(), ctx);
+                let (accepted, reason) = Self::authorize_subscribe(
+                    &channel,
+                    from_node,
+                    token.as_deref(),
+                    queue_group.as_deref(),
+                    ctx,
+                );
                 if accepted {
                     // Populate the AuthGuard fast path so publish
                     // fan-out can admit this subscriber in <10 ns
@@ -23511,6 +23516,7 @@ impl MeshNode {
         channel: &ChannelName,
         from_node: u64,
         token_bytes: Option<&[u8]>,
+        queue_group: Option<&str>,
         ctx: &DispatchCtx,
     ) -> (bool, Option<AckReason>) {
         // Rate-limit check runs first — a throttled peer short-
@@ -23760,14 +23766,59 @@ impl MeshNode {
             };
         };
 
-        if !cfg.can_subscribe(
-            &peer_caps,
-            &peer_entity,
-            requested_hash,
-            presented_chain.as_ref(),
-            revocation,
-            skew_secs,
-        ) {
+        // Queue-group membership (M2). Joining a group is an authority
+        // question, not a routing preference: every event goes to
+        // exactly ONE member, so a peer that joins a production group
+        // takes a share of its events and — by not processing them —
+        // destroys that share. Pre-fix the group name was an
+        // unauthenticated string straight off the wire with no config
+        // axis restricting who could join what.
+        //
+        // Not a confidentiality boundary: a peer that can subscribe at
+        // all can already take every event in Broadcast mode. This
+        // guards integrity and availability.
+        //
+        // Under `TokenBound` the group grant IS this request's
+        // subscribe authority — see `QueueGroupPolicy::TokenBound` for
+        // why it cannot be an additional credential (one chain per
+        // Subscribe on the wire). Capability filters still apply.
+        let authority_from_group_grant = match (queue_group, cfg.queue_group_policy) {
+            (Some(_), QueueGroupPolicy::Deny) => {
+                return (false, Some(AckReason::Unauthorized));
+            }
+            (Some(group), QueueGroupPolicy::TokenBound) => {
+                if !cfg.can_join_queue_group(
+                    &peer_entity,
+                    channel.as_str(),
+                    group,
+                    presented_chain.as_ref(),
+                    revocation,
+                    skew_secs,
+                ) || !cfg.caps_allow_subscribe(&peer_caps)
+                {
+                    tracing::debug!(
+                        from_node = format!("{:#x}", from_node),
+                        channel = channel.as_str(),
+                        group,
+                        "auth: queue-group join rejected — no grant naming this group"
+                    );
+                    return (false, Some(AckReason::Unauthorized));
+                }
+                true
+            }
+            _ => false,
+        };
+
+        if !authority_from_group_grant
+            && !cfg.can_subscribe(
+                &peer_caps,
+                &peer_entity,
+                requested_hash,
+                presented_chain.as_ref(),
+                revocation,
+                skew_secs,
+            )
+        {
             return (false, Some(AckReason::Unauthorized));
         }
 

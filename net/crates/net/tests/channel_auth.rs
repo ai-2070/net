@@ -566,6 +566,91 @@ async fn unregistered_channel_policy_governs_registry_less_nodes() {
     );
 }
 
+/// M2 (2026-07-31 audit): under `QueueGroupPolicy::TokenBound` a peer
+/// may join only the group its grant names.
+///
+/// Queue-group membership is a claim on other members' work: every
+/// event goes to exactly ONE member, so an attacker who joins a
+/// production group takes a share of its events and, by not processing
+/// them, destroys that share. Pre-fix the group name was an
+/// unauthenticated string taken straight off the wire, with no config
+/// axis restricting who could join what.
+#[tokio::test]
+async fn queue_group_join_requires_a_grant_for_that_group() {
+    use net::adapter::net::{queue_group_hash, QueueGroupPolicy};
+
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
+
+    let name = ChannelName::new("work/queue").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound),
+    );
+
+    // A grant for the "batch" group specifically.
+    let grant = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        queue_group_hash(name.as_str(), "batch"),
+        300,
+        0,
+    );
+
+    // Joining the granted group works.
+    b.mesh
+        .subscribe_channel_in_queue_group_with_token(
+            a.mesh.node_id(),
+            name.clone(),
+            "batch".to_string(),
+            grant.clone(),
+        )
+        .await
+        .expect("the granted queue group must be joinable");
+
+    // Joining a DIFFERENT group with the same grant must not.
+    let result = b
+        .mesh
+        .subscribe_channel_in_queue_group_with_token(
+            a.mesh.node_id(),
+            name.clone(),
+            "realtime".to_string(),
+            grant,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a grant for one queue group must not admit the holder to another — \
+         that is the work-stealing this policy exists to stop"
+    );
+
+    // And a plain channel-scoped SUBSCRIBE token — what an ordinary
+    // read-only subscriber holds — is not a worker grant.
+    let reader_token = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        name.hash(),
+        300,
+        0,
+    );
+    let result = b
+        .mesh
+        .subscribe_channel_in_queue_group_with_token(
+            a.mesh.node_id(),
+            name,
+            "batch".to_string(),
+            reader_token,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a channel-scoped subscribe token must not double as a queue-group \
+         worker grant, or the policy would be a no-op"
+    );
+}
+
 #[tokio::test]
 async fn tampered_announcement_signature_rejected() {
     use net::adapter::net::behavior::capability::CapabilityAnnouncement;

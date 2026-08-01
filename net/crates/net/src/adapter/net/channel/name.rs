@@ -176,6 +176,28 @@ pub fn channel_hash(name: &str) -> ChannelHash {
     xxh3_64(name.as_bytes())
 }
 
+/// Canonical hash for the *worker grant* on `(channel, queue_group)`.
+///
+/// A queue group is a work-distribution set: every published event goes
+/// to exactly ONE member. Membership is therefore an authority
+/// question, not a routing preference — a peer that joins a group takes
+/// a share of another member's work, and (if it does not process it)
+/// destroys it. Gating that needs a grant naming the *specific* group,
+/// which is what this hash identifies.
+///
+/// Derived as `channel_hash("<channel>#<group>")`. The `#` separator is
+/// deliberate: it is NOT in the channel-name charset (`a-z 0-9 - _ . /`),
+/// so a group-grant hash can never collide with the hash of any
+/// legitimate channel name. A token minted to join a queue group
+/// therefore cannot be replayed as a token for a channel, and vice
+/// versa, without needing a separate scope bit or wire format.
+#[inline]
+pub fn queue_group_hash(channel: &str, group: &str) -> ChannelHash {
+    // One allocation on the subscribe slow path only; the data plane
+    // never calls this.
+    xxh3_64(format!("{channel}#{group}").as_bytes())
+}
+
 /// Compute the wire `u16` channel hash from a name string.
 ///
 /// Uses xxh3_64 truncated to 16 bits, consistent with the existing

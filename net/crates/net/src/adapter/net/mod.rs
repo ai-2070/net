@@ -94,10 +94,10 @@ mod linux;
 
 pub use batch::AdaptiveBatcher;
 pub use channel::{
-    AckReason, AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError,
-    ChannelHash, ChannelId, ChannelName, ChannelPublisher, ChannelRegistry, MembershipMsg,
-    OnFailure, OriginBinding, PublishConfig, PublishReport, ResolvedConfig, SubscriberRoster,
-    Visibility, SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+    queue_group_hash, AckReason, AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry,
+    ChannelError, ChannelHash, ChannelId, ChannelName, ChannelPublisher, ChannelRegistry,
+    MembershipMsg, OnFailure, OriginBinding, PublishConfig, PublishReport, QueueGroupPolicy,
+    ResolvedConfig, SubscriberRoster, Visibility, SUBPROTOCOL_CHANNEL_MEMBERSHIP,
 };
 pub use compute::{
     DaemonError, DaemonFactoryRegistry, DaemonHost, DaemonHostConfig, DaemonRegistry, DaemonStats,

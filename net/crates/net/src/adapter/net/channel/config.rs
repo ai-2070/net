@@ -94,6 +94,55 @@ impl OriginBinding {
     }
 }
 
+/// Who may join a **queue group** on a channel.
+///
+/// Queue groups are work distribution: every published event is
+/// delivered to exactly one member of each group. So joining a group is
+/// not a routing preference, it is a claim on other members' work — an
+/// attacker who joins a production group receives a share of its events
+/// and, by not processing them, destroys that share. With `L` honest
+/// members and `A` attacker identities, attackers collectively take
+/// `A/(L+A)` of selections and each identity takes `1/(L+A)`; the
+/// attacker scales its share simply by joining under more identities.
+///
+/// Note this is an **integrity and availability** boundary, not a
+/// confidentiality one: a peer that can subscribe at all can already
+/// take every event by subscribing in `Broadcast` mode, so joining a
+/// group exposes nothing new. What it does is take work away from the
+/// members meant to do it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueueGroupPolicy {
+    /// Any peer that clears the channel's subscribe gate may join any
+    /// group. Historical behaviour, and the default so existing
+    /// deployments are unaffected.
+    #[default]
+    Unrestricted,
+    /// Refuse queue-group subscriptions entirely — broadcast only.
+    Deny,
+    /// A peer may join group `G` only by presenting a chain that
+    /// authorizes `SUBSCRIBE` on [`queue_group_hash(channel, G)`],
+    /// i.e. a grant that names the specific group.
+    ///
+    /// Under this policy the group grant **is** the subscribe
+    /// authority for that request — a worker does not additionally
+    /// need a channel-scoped token. It cannot: the `Subscribe` wire
+    /// message carries exactly one chain, so requiring both would make
+    /// worker subscription unrepresentable. The model an operator gets
+    /// is the intended one: channel-scoped tokens for readers,
+    /// group-scoped tokens for workers, and a reader's token is
+    /// explicitly not a worker grant. Capability filters still apply.
+    ///
+    /// An allowlist of group *names* would not do: group names are
+    /// operational constants, not secrets, so an attacker simply joins
+    /// an allowed one. Nor would a generic "may join queue groups"
+    /// scope bit — that separates readers from workers but still lets
+    /// any worker join any group on the channel. The authority has to
+    /// bind the peer to the group.
+    ///
+    /// [`queue_group_hash(channel, G)`]: super::queue_group_hash
+    TokenBound,
+}
+
 /// Channel visibility scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Visibility {
@@ -168,6 +217,10 @@ pub struct ChannelConfig {
     /// this **is** an access boundary — it is evaluated against the
     /// TOFU-pinned peer identity, which a peer cannot self-assert.
     pub subscriber_origin_binding: Option<OriginBinding>,
+    /// Who may join a queue group on this channel. See
+    /// [`QueueGroupPolicy`]; defaults to `Unrestricted`, which is the
+    /// historical behaviour.
+    pub queue_group_policy: QueueGroupPolicy,
     /// Default priority level for this channel's packets (0 = lowest).
     pub priority: u8,
     /// Default reliability mode for streams on this channel.
@@ -187,6 +240,7 @@ impl ChannelConfig {
             require_token: false,
             token_roots: Vec::new(),
             subscriber_origin_binding: None,
+            queue_group_policy: QueueGroupPolicy::default(),
             priority: 0,
             reliable: false,
             max_rate_pps: None,
@@ -265,6 +319,71 @@ impl ChannelConfig {
     pub fn with_subscriber_origin_binding(mut self, binding: OriginBinding) -> Self {
         self.subscriber_origin_binding = Some(binding);
         self
+    }
+
+    /// Do this node's advertised capabilities satisfy the channel's
+    /// `subscribe_caps` filter?
+    ///
+    /// Split out of [`Self::can_subscribe`] for the `TokenBound`
+    /// queue-group path, which supplies its own token authority (the
+    /// group grant) but must still apply the capability filter.
+    /// Advisory, like every cap filter — see the type docs.
+    pub fn caps_allow_subscribe(&self, node_caps: &CapabilitySet) -> bool {
+        match self.subscribe_caps {
+            Some(ref filter) => filter.matches(node_caps),
+            None => true,
+        }
+    }
+
+    /// Restrict who may join a queue group on this channel — see
+    /// [`QueueGroupPolicy`].
+    pub fn with_queue_group_policy(mut self, policy: QueueGroupPolicy) -> Self {
+        self.queue_group_policy = policy;
+        self
+    }
+
+    /// Does `chain` authorize this peer to join queue group `group` on
+    /// `channel`?
+    ///
+    /// Returns `true` when the channel places no restriction. Under
+    /// [`QueueGroupPolicy::TokenBound`] the chain must root at one of
+    /// this channel's `token_roots`, bind at its leaf to `entity_id`,
+    /// and authorize `SUBSCRIBE` on the derived group-grant hash — a
+    /// grant naming the specific group, not the channel.
+    ///
+    /// Fails closed: `Deny` refuses, and `TokenBound` with no chain (or
+    /// no roots) refuses.
+    pub fn can_join_queue_group(
+        &self,
+        entity_id: &EntityId,
+        channel: &str,
+        group: &str,
+        chain: Option<&TokenChain>,
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> bool {
+        match self.queue_group_policy {
+            QueueGroupPolicy::Unrestricted => true,
+            QueueGroupPolicy::Deny => false,
+            QueueGroupPolicy::TokenBound => {
+                if self.token_roots.is_empty() {
+                    return false;
+                }
+                let Some(chain) = chain else {
+                    return false;
+                };
+                chain
+                    .verify_authorizes(
+                        TokenScope::SUBSCRIBE,
+                        super::name::queue_group_hash(channel, group),
+                        entity_id,
+                        &self.token_roots,
+                        revocation,
+                        skew_secs,
+                    )
+                    .is_ok()
+            }
+        }
     }
 
     /// Set default priority.
@@ -887,7 +1006,7 @@ impl std::fmt::Debug for ChannelConfigRegistry {
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::{GpuInfo, GpuVendor, HardwareCapabilities};
-    use crate::adapter::net::channel::channel_hash;
+    use crate::adapter::net::channel::{channel_hash, queue_group_hash, ChannelName};
     use crate::adapter::net::identity::{EntityKeypair, PermissionToken};
 
     fn make_caps(gpu: bool) -> CapabilitySet {
@@ -1638,6 +1757,184 @@ mod tests {
         assert_eq!(removed.priority, 7);
         assert_eq!(reg.len(), 0);
         assert!(reg.get(hash).is_none());
+    }
+
+    // ---- M2 (2026-07-31 audit): queue-group membership authority ----
+
+    /// Default is unchanged: any subscriber may join any group.
+    #[test]
+    fn queue_group_unrestricted_by_default() {
+        let peer = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let config = ChannelConfig::new(ChannelId::parse("work/queue").unwrap());
+        assert_eq!(config.queue_group_policy, QueueGroupPolicy::Unrestricted);
+        assert!(config.can_join_queue_group(
+            peer.entity_id(),
+            "work/queue",
+            "workers",
+            None,
+            &rev,
+            0
+        ));
+    }
+
+    /// `Deny` refuses every group, chain or not.
+    #[test]
+    fn queue_group_deny_refuses_even_with_a_valid_chain() {
+        let owner = EntityKeypair::generate();
+        let peer = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let config = ChannelConfig::new(ChannelId::parse("work/queue").unwrap())
+            .with_token_roots(vec![owner.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::Deny);
+
+        let chain = direct_chain(
+            &owner,
+            &peer,
+            TokenScope::SUBSCRIBE,
+            queue_group_hash("work/queue", "workers"),
+        );
+        assert!(!config.can_join_queue_group(
+            peer.entity_id(),
+            "work/queue",
+            "workers",
+            Some(&chain),
+            &rev,
+            0
+        ));
+    }
+
+    /// The core M2 property: a grant for one group must not admit the
+    /// holder to a DIFFERENT group. An allowlist of group names could
+    /// not express this — names are operational constants, not secrets.
+    #[test]
+    fn queue_group_grant_binds_to_one_specific_group() {
+        let owner = EntityKeypair::generate();
+        let worker = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let channel = "work/queue";
+        let config = ChannelConfig::new(ChannelId::parse(channel).unwrap())
+            .with_token_roots(vec![owner.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound);
+
+        let chain = direct_chain(
+            &owner,
+            &worker,
+            TokenScope::SUBSCRIBE,
+            queue_group_hash(channel, "batch"),
+        );
+
+        assert!(
+            config.can_join_queue_group(
+                worker.entity_id(),
+                channel,
+                "batch",
+                Some(&chain),
+                &rev,
+                0
+            ),
+            "the granted group must be joinable"
+        );
+        assert!(
+            !config.can_join_queue_group(
+                worker.entity_id(),
+                channel,
+                "realtime",
+                Some(&chain),
+                &rev,
+                0
+            ),
+            "a grant for one group must not admit the holder to another — \
+             that is the work-stealing this policy exists to stop"
+        );
+    }
+
+    /// A plain channel-scoped SUBSCRIBE token is NOT a worker grant.
+    /// Otherwise every legitimate subscriber would silently keep the
+    /// ability to join any group and the policy would be a no-op.
+    #[test]
+    fn channel_subscribe_token_is_not_a_queue_group_grant() {
+        let owner = EntityKeypair::generate();
+        let reader = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let channel = "work/queue";
+        let id = ChannelId::parse(channel).unwrap();
+        let config = ChannelConfig::new(id.clone())
+            .with_token_roots(vec![owner.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound);
+
+        // Scoped to the CHANNEL, which is what an ordinary
+        // read-only subscriber (e.g. an auditor) would hold.
+        let chain = direct_chain(&owner, &reader, TokenScope::SUBSCRIBE, id.hash());
+
+        assert!(
+            config.can_subscribe(
+                &make_caps(false),
+                reader.entity_id(),
+                id.hash(),
+                Some(&chain),
+                &rev,
+                0
+            ),
+            "precondition: it is a valid subscribe credential"
+        );
+        assert!(
+            !config.can_join_queue_group(
+                reader.entity_id(),
+                channel,
+                "workers",
+                Some(&chain),
+                &rev,
+                0
+            ),
+            "a read-only subscriber must not be able to steal worker traffic"
+        );
+    }
+
+    /// TokenBound fails closed with no chain and with no roots.
+    #[test]
+    fn queue_group_token_bound_fails_closed() {
+        let owner = EntityKeypair::generate();
+        let peer = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let channel = "work/queue";
+
+        let rooted = ChannelConfig::new(ChannelId::parse(channel).unwrap())
+            .with_token_roots(vec![owner.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound);
+        assert!(
+            !rooted.can_join_queue_group(peer.entity_id(), channel, "w", None, &rev, 0),
+            "no chain presented → refuse"
+        );
+
+        let rootless = ChannelConfig::new(ChannelId::parse(channel).unwrap())
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound);
+        let chain = direct_chain(
+            &owner,
+            &peer,
+            TokenScope::SUBSCRIBE,
+            queue_group_hash(channel, "w"),
+        );
+        assert!(
+            !rootless.can_join_queue_group(peer.entity_id(), channel, "w", Some(&chain), &rev, 0),
+            "no roots to anchor against → refuse"
+        );
+    }
+
+    /// The `#` separator keeps group grants and channel grants in
+    /// disjoint hash spaces: `#` is outside the channel-name charset,
+    /// so no legitimate channel name can ever hash to a group grant.
+    #[test]
+    fn queue_group_hash_cannot_collide_with_a_channel_name() {
+        let h = queue_group_hash("work/queue", "workers");
+        // The only string that would produce it is not a legal name.
+        assert!(ChannelName::new("work/queue#workers").is_err());
+        assert_ne!(h, channel_hash("work/queue"));
+        assert_ne!(h, channel_hash("work/queueworkers"));
+        // Distinct groups on one channel are distinct grants.
+        assert_ne!(h, queue_group_hash("work/queue", "other"));
+        // Same group name on distinct channels are distinct grants.
+        assert_ne!(h, queue_group_hash("work/other", "workers"));
     }
 
     // ---- M1 (2026-07-31 audit): gates key on the REQUESTED channel ----
