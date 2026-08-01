@@ -2346,13 +2346,21 @@ impl MeshNodeConfig {
     /// asymmetric views of peer subnets.
     ///
     /// Does not assign this node's own subnet — use
-    /// [`Self::with_subnet`] for that, and prefer setting both. A policy
-    /// with the local subnet left at [`SubnetId::GLOBAL`] resolves peers
-    /// but has no subnet identity to compare them against, which leaves
+    /// [`Self::with_subnet`] for that, and prefer setting both.
+    ///
+    /// A policy that CAN assign a non-global subnet
+    /// ([`SubnetPolicy::can_assign_non_global`]) while the local subnet
+    /// is left at [`SubnetId::GLOBAL`] resolves peers but has no subnet
+    /// identity to compare them against, which leaves
     /// `Visibility::ParentVisible` admitting the peers it could NOT
     /// resolve while rejecting the ones it could
     /// (CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md,
-    /// finding 2).
+    /// finding 2). `MeshNode::new` warns on exactly that pairing.
+    ///
+    /// A rule-less or all-zero policy is exempt: it assigns `GLOBAL` to
+    /// everyone, so every peer lands in the same subnet as a `GLOBAL`
+    /// local node and nothing is inconsistent. Installing one does not
+    /// oblige you to add a local subnet.
     pub fn with_subnet_policy(mut self, policy: Arc<SubnetPolicy>) -> Self {
         self.subnet_policy = Some(policy);
         self
@@ -10278,11 +10286,15 @@ impl MeshNode {
     /// subnet came from config instead. No such distinction exists, and
     /// the claim pointed operators at installing a policy as the way to
     /// subnet a node. That configuration (`with_subnet_policy` without
-    /// `with_subnet`) leaves `local_subnet` at [`SubnetId::GLOBAL`],
-    /// which is precisely the case where an unresolved peer stays
-    /// visible under `ParentVisible` while a resolved one is rejected
+    /// `with_subnet`) leaves `local_subnet` at [`SubnetId::GLOBAL`] —
+    /// and when the policy can actually assign a non-global subnet
+    /// ([`SubnetPolicy::can_assign_non_global`]), that is precisely the
+    /// case where an unresolved peer stays visible under
+    /// `ParentVisible` while a resolved one is rejected
     /// (CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md,
-    /// finding 2). Set both.
+    /// finding 2). Set both. A policy that can only ever answer
+    /// `GLOBAL` is exempt — it puts every peer in the same subnet as a
+    /// `GLOBAL` local node.
     ///
     /// What the policy IS used for: deriving each peer's subnet, both
     /// for the `peer_subnets` sidecar the channel paths read and — run
@@ -23750,10 +23762,10 @@ impl MeshNode {
         }
     }
 
-    /// True for a node that installed a [`SubnetPolicy`] but left its
-    /// own subnet at [`SubnetId::GLOBAL`] — a configuration that
-    /// resolves peers into subnets while holding no subnet identity to
-    /// compare them against.
+    /// True for a node whose [`SubnetPolicy`] can assign a non-global
+    /// subnet while its own subnet is left at [`SubnetId::GLOBAL`] — a
+    /// configuration that resolves peers into subnets while holding no
+    /// subnet identity to compare them against.
     ///
     /// The consequence is confined to [`Visibility::ParentVisible`] and
     /// it is an inversion: `dest.is_ancestor_of(GLOBAL)` is false for
