@@ -144,6 +144,26 @@ impl X402HttpFlow {
 
     /// GET `url`, paying if the server demands it.
     pub async fn fetch_paid(&self, url: &str) -> X402HttpOutcome {
+        // -- [0] parse once, up front, and fail closed. Everything that
+        //    scopes policy to an origin — the demand-origin re-check below
+        //    and the `x402-http/<host>` capability key — reads its host
+        //    from THIS parse, never from string surgery on the raw URL.
+        //    A URL the client will happily send but we cannot parse is a
+        //    denial, not a request scoped to a guessed host.
+        let parsed = match reqwest::Url::parse(url) {
+            Ok(u) => u,
+            Err(e) => {
+                return X402HttpOutcome::Denied {
+                    policy_reason: format!("refusing to fetch an unparseable URL `{url}`: {e}"),
+                }
+            }
+        };
+        let Some(intended_host) = parsed.host_str().map(str::to_owned) else {
+            return X402HttpOutcome::Denied {
+                policy_reason: format!("refusing to fetch a URL with no host: `{url}`"),
+            };
+        };
+
         // -- [1] the unpaid attempt.
         let response = match self.http.get(url).send().await {
             Ok(r) => r,
@@ -187,16 +207,12 @@ impl X402HttpFlow {
         // so the capability key (`x402-http/<host>`) and the signed retry
         // can never be scoped to one origin while the demand — and the
         // pay_to/amount it dictates — was authored by another.
-        let intended_host = reqwest::Url::parse(url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned));
         let demand_host = response.url().host_str().map(str::to_owned);
-        if intended_host.is_some() && intended_host != demand_host {
+        if demand_host.as_deref() != Some(intended_host.as_str()) {
             return X402HttpOutcome::Failed {
                 message: format!(
-                    "402 demand origin `{}` does not match the intended host `{}`",
+                    "402 demand origin `{}` does not match the intended host `{intended_host}`",
                     demand_host.as_deref().unwrap_or("<none>"),
-                    intended_host.as_deref().unwrap_or("<none>"),
                 ),
                 retryable: false,
             };
@@ -273,7 +289,7 @@ impl X402HttpFlow {
         let quote = PaymentQuote::new(
             self.caller.entity_id().clone(),
             self.caller.entity_id().clone(),
-            format!("x402-http/{}", host_of(url)),
+            format!("x402-http/{intended_host}"),
             None,
             requirements,
             match self.registry.reference() {
@@ -468,16 +484,13 @@ fn is_payment_safe_url(url: &str) -> bool {
     }
 }
 
-/// The host segment of a URL, for the per-host capability key.
-fn host_of(url: &str) -> String {
-    url.split("://")
-        .nth(1)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("unknown-host")
-        .to_string()
-}
+// The per-host capability key comes from `Url::host_str()` on the single
+// parse at the top of `fetch_paid` — never from splitting the raw URL
+// string. A hand-rolled split returns the userinfo/port/case verbatim
+// (`api.example.com:443`, `API.example.com`, `user@api.example.com`),
+// which misses a configured `x402-http/api.example.com` spend override
+// and silently falls back to `defaults` — the wrong direction whenever
+// the operator's per-host limit is the tighter one.
 
 #[cfg(test)]
 mod tests {

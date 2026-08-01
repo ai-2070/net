@@ -474,3 +474,83 @@ async fn a_solana_reject_keeps_the_reservation() {
         "a bearer-scheme reject must NOT release the reservation"
     );
 }
+
+/// L1 regression: the per-host spend override binds to the URL's real
+/// host, so a tighter operator limit is not silently skipped.
+///
+/// The capability key is `x402-http/<host>`, and it used to come from
+/// splitting the raw URL on `://` and `/`. That returns the authority
+/// verbatim — including the port — so a key built from
+/// `http://127.0.0.1:54321/resource` read `x402-http/127.0.0.1:54321`
+/// and missed a configured `x402-http/127.0.0.1` override, falling back
+/// to `defaults`. Whenever the per-host limit is the *tighter* one (the
+/// reason an operator writes it), that fallback is a policy bypass.
+///
+/// Every test server here binds an ephemeral port, so the old spelling
+/// could never match a host-only override.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_per_host_spend_override_binds_despite_the_port() {
+    let server = PaidServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = dir.path().join("spend.json");
+
+    // A tight per-host override: far below the 2500 the server demands.
+    let configurer = SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest);
+    configurer
+        .configure(|_defaults, per_capability| {
+            per_capability.insert(
+                "x402-http/127.0.0.1".to_string(),
+                net_payments::policy::spend::SpendLimits {
+                    max_per_call: Some(AtomicAmount::from_u128(1)),
+                    max_per_day: None,
+                    allowed_networks: vec![],
+                    allowed_assets: vec![],
+                },
+            );
+        })
+        .await
+        .expect("configure");
+
+    let caller = Arc::new(EntityKeypair::generate());
+    let registry = default_mock_registry(caller.entity_id().clone());
+    let f = X402HttpFlow::new(
+        caller,
+        SpendPolicyEngine::new(&policy_path, SpendProfile::DevTest),
+        registry,
+        Arc::new(TestClock),
+    )
+    .expect("flow");
+
+    // DevTest auto-allows mock spends, so reaching the approval hold can
+    // only be the per-host override biting.
+    let outcome = f.fetch_paid(&server.url).await;
+    let X402HttpOutcome::RequiresPaymentApproval { policy_reason, .. } = outcome else {
+        panic!(
+            "the per-host override must gate this spend — got {outcome:?} \
+             (a Paid outcome means the capability key missed the override)"
+        );
+    };
+    assert!(
+        policy_reason.contains("max_per_call"),
+        "the hold should name the per-call cap: {policy_reason}"
+    );
+    assert!(
+        server.received_payloads.lock().is_empty(),
+        "nothing may be signed or sent while the override holds"
+    );
+}
+
+/// L1, the fail-closed half: a URL the client cannot parse is denied
+/// rather than fetched under a guessed host key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unparseable_url_is_denied_not_fetched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = flow(SpendProfile::DevTest, &dir);
+    for bad in ["not-a-url", "://missing-scheme", "https://"] {
+        let outcome = f.fetch_paid(bad).await;
+        assert!(
+            matches!(outcome, X402HttpOutcome::Denied { .. }),
+            "`{bad}` must be denied, got {outcome:?}"
+        );
+    }
+}
