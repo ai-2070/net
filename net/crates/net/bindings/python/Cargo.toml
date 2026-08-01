@@ -48,6 +48,7 @@ default = [
     "publish",
     "a2a",
     "payments",
+    "payments-http",
 ]
 # pyo3's optional-extension-module pattern (pyo3 FAQ). The importable
 # cdylib must NOT link libpython — the host interpreter supplies the
@@ -158,11 +159,15 @@ payments = ["mcp", "net", "dep:net-payments"]
 # Outbound HTTP-402 client (`PAYMENTS_LANGUAGE_SDKS_PLAN` WS-P2):
 # `PaymentHttpClient` / `AsyncPaymentHttpClient` over
 # `net-payments::flow::http402::X402HttpFlow` — paying an external x402 HTTP
-# API through the same spend policy + signers as the mesh gateway. Kept OUT
-# of the default wheel: it pulls `net-payments/http-facilitator`
-# (reqwest + rustls + bundled roots), a real size add the default features
-# don't otherwise carry — so it is an explicit build-time opt-in. Build with
-# `--features payments-http` (plus `extension-module` for a wheel).
+# API through the same spend policy + signers as the mesh gateway.
+#
+# **In the default wheel.** It was originally opt-in because it pulls
+# reqwest + rustls + bundled roots, a real size add. That tradeoff flipped
+# when `PaymentProvider` began requiring an explicit settlement backend:
+# `HttpFacilitator` lives behind this feature, so without it
+# `facilitator_url` can only ever error and the ONLY reachable backend is
+# the mock — the exact hole that change was closing. Paying for the size is
+# better than shipping a provider surface whose real path does not exist.
 payments-http = [
     "payments",
     "net-payments/http-facilitator",

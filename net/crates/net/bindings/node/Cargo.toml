@@ -46,6 +46,7 @@ default = [
     "mcp",
     "publish",
     "payments",
+    "payments-http",
     "delegation",
     "a2a",
     "org",
@@ -195,10 +196,15 @@ org = ["net", "cortex", "dep:net-sdk", "net-sdk/net", "net-sdk/cortex"]
 # for the `TaskExecutor` impl). Mirrors the Python `a2a` feature.
 a2a = ["delegation", "cortex"]
 # Outbound HTTP-402 client (`PAYMENTS_PY_TS_SDK_GAP_PLAN.md` B3):
-# `PaymentHttpClient` over `net-payments::flow::http402::X402HttpFlow`. Kept
-# OUT of the default `.node`: it pulls `net-payments/http-facilitator`
-# (reqwest + rustls + bundled roots), a real size add — an explicit opt-in,
-# mirroring the Python `payments-http`.
+# `PaymentHttpClient` over `net-payments::flow::http402::X402HttpFlow`.
+#
+# **In the default build.** It was originally opt-in because it pulls
+# reqwest + rustls + bundled roots, a real size add. That tradeoff flipped
+# when `PaymentProvider` began requiring an explicit settlement backend:
+# `HttpFacilitator` lives behind this feature, so without it `facilitatorUrl`
+# can only ever error and the ONLY reachable backend is the mock — which is
+# the exact hole that change was closing. Paying for the size is better than
+# shipping a provider surface whose real path does not exist.
 payments-http = ["payments", "net-payments/http-facilitator", "dep:base64"]
 
 [dependencies]
