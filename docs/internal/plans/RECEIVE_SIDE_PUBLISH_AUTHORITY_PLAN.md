@@ -57,8 +57,11 @@ The receiver cannot name the channel a packet belongs to:
 
 **Option 1 — authenticated canonical discriminator on the wire.**
 Stateless receiver; every packet self-describing. Costs a wire-format
-change affecting every publisher, version negotiation, and a
-mixed-version window during which the gate cannot fail closed. The wire
+change affecting every publisher, plus version negotiation and an
+explicit cutover: **either** reject old peers, which fails closed at the
+cost of a compatibility outage, **or** temporarily accept unlabelled
+traffic, during which H1 remains open. The insecure window is a
+consequence of the second choice, not inherent to the option. The wire
 header is `protocol::HEADER_SIZE` = **68 bytes**; widening
 `channel_hash` `u16 → u64` costs 6 bytes per packet, and carrying the
 full *name* — the only variant that resolves prefix channels — costs far
@@ -66,8 +69,24 @@ more.
 
 **Option 2 — receiver-owned `(session, stream_id) → ChannelName`,**
 established by a `PublishIntent` control exchange. No data-plane wire
-change, and the full name is available. D1–D9 are all objections to
-this option; D6 in particular may be disqualifying.
+change, and the full name is available. Its intent protocol faces the
+same cutover choice as Option 1 (D7).
+
+**Which defects bind which option.** Option 2 must answer all of
+D1–D9. **D5, D6, D8, and D9's authority-currentness requirements also
+constrain Option 1** — they are protocol-independent:
+
+- **D5** — carrying a canonical name does not stop unrestricted raw
+  traffic from entering the same unlabelled consumer.
+- **D6** — a self-describing packet supplies *identity*, not
+  *authority*. Option 1's receiver still needs trusted `ChannelConfig`,
+  token roots, and revocation state, and still does not have them.
+- **D8** — either option must authorize before stream side effects.
+- **D9 (currentness)** — either option must reflect policy that changed
+  after the packet was labelled or the mapping established.
+
+D6 in particular may be disqualifying for **both** options, not just
+Option 2.
 
 ## Defects any plan must answer
 
@@ -86,9 +105,24 @@ header.channel_hash == mapped_channel.wire_hash()
 ```
 
 and authority-sensitive dispatch should take its channel identity from
-the receiver-owned mapping, not the packet. Bit-48 aliasing remains:
-conflicting full names deriving one stream id must **poison** that
-stream, never replace the mapping.
+the receiver-owned mapping, not the packet.
+
+Bit-48 aliasing remains: two distinct full names can derive one stream
+id. The mandatory invariant is **reject the conflicting presentation**,
+never reinterpret or replace an incumbent mapping:
+
+```text
+vacant                          → install
+same stream + same exact name   → idempotent refresh
+same stream + different name    → reject the conflict; incumbent stands
+```
+
+Rev 2 required *poisoning* the stream instead. That was wrong: it lets
+any peer able to present a colliding name deny service to an already
+valid incumbent mapping — trading an authorization hole for a
+denial-of-service one. A plan may additionally close the session or
+poison the stream after repeated conflicts, but as **abuse policy**, not
+as the authorization invariant.
 
 ### D2 — the existing membership transport is unsafe for routed peers
 
@@ -296,8 +330,8 @@ No existing test covers hostile ingress publishing. At minimum:
 
 **Identity and aliasing (D1)**
 - authority for A + A's stream id + B's wire hint is rejected;
-- two names deriving one stream id poison it rather than one replacing
-  the other.
+- a conflicting name is rejected and can neither replace nor
+  reinterpret the incumbent mapping, which stays usable.
 
 **Transport and lifecycle (D2, D3, D7)**
 - intent and ACK reach the end-to-end peer, not a shared relay;
@@ -308,8 +342,19 @@ No existing test covers hostile ingress publishing. At minimum:
 - old/new version compatibility matrix.
 
 **Receiver policy (D6)**
-- an nRPC caller receiving replies, with no local config for its own
-  reply channel, still receives them;
+
+These must not presume the answer to D6. Under a fail-closed
+receiver-local policy model, a reply arriving with no established policy
+*must* fail — so the obligation is not "replies work without policy",
+it is that the chosen mechanism establishes policy and that its absence
+fails loudly:
+
+- a normal nRPC caller establishes receiver-trusted reply policy through
+  the selected mechanism (automatic role-specific registration, signed
+  policy installation, or whatever D6 settles on) and then receives
+  replies;
+- absent policy produces a **typed pre-send / call failure** — not a
+  silently dropped response, and not a permissive fallback;
 - live policy tightening and capability tightening take effect.
 
 **Isolation and side effects (D5, D8)**

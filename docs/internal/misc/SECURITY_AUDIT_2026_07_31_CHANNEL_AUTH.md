@@ -87,7 +87,7 @@ a patch and is costed in
 
 | ID | Status |
 |----|--------|
-| H1 | **Open — stop notice, not a plan.** Neither option may be implemented from the current document. Three review rounds found nine blocking defects (D1–D9), including one that may disqualify the session-state option outright: an nRPC **caller** installs no config for its own reply channel, so a receiver-side gate resolving policy locally would fail closed on every RPC reply (D6). Nine decisions must be settled before coding. Until it ships, `require_token` is a READ ACL. |
+| H1 | **Open — stop notice, not a plan.** Neither option may be implemented from the current document. Four review rounds found nine blocking defects (D1–D9). D5, D6, D8 and D9-currentness are protocol-independent, so they constrain *both* options — and D6 may disqualify both: an nRPC **caller** installs no config for its own reply channel, and a self-describing packet supplies identity, not authority, so neither design has trusted receiver-side policy to apply. Nine decisions must be settled before coding. Until it ships, `require_token` is a READ ACL. |
 | H2 | Fixed — `insert_if_absent` / `insert_prefix_if_absent`; `Mesh::register_channel_prefix` now exists; 8 per-variant witnesses. Also fixed a self-inflicted hash-index collision on re-registration. |
 | H3 | Fixed — `OriginBinding` on the reply prefix, evaluated against the pinned identity; unpinned rejects; nRPC client re-announces and retries. |
 | M1 | Fixed — requested channel threaded through every gate and retention key; publish-time denial now evicts from the roster. |
