@@ -67,14 +67,21 @@ A second review pass found six further items, all since addressed:
 | Selector lists rescanned after a hit | **Fixed.** |
 | Equivalence test read as a performance oracle | **Documented.** It pins verdicts only; allocation, lock cost, and callback count are explicitly out of scope. |
 
-Verification: 5368 lib tests, 8 `capability_scope`, 17 `capability_broadcast`,
-7 `subnet_enforcement`, 11 `channel_auth`, 7 `channel_auth_hardening`, 21 TS
-tests (against the built NAPI module), 4 Node binding unit tests — all passing.
-`cargo doc` clean; C header constant parity verified by direct comparison.
+Verification — all passing:
 
-Not executed: the Go test suite needs a built cdylib this environment lacks
-(`gofmt` parses every touched file, and header parity is checked directly, but
-the assertions have not been run).
+| Surface | Coverage |
+| ------- | -------- |
+| Rust lib | 5368 tests |
+| Rust integration | 8 `capability_scope`, 17 `capability_broadcast`, 32 `org_ownership`, 11 `channel_auth`, 9 `subnet_enforcement`, 7 `channel_auth_hardening` |
+| Node | 4 binding unit tests; 21 TS tests against the built NAPI module |
+| Python | 24 `test_capabilities.py` against the built PyO3 extension, including all three inverted rejection regressions verified by name |
+| Lint / docs | `cargo clippy --lib` and `cargo doc` clean |
+| C ABI | header constant parity verified by direct comparison across all three headers |
+
+Not executed: the Go test suite, which needs a built cdylib this environment
+lacks. `gofmt` parses every touched file and header parity is checked directly,
+but the Go assertions themselves have not been run — they are the one
+remaining gap.
 
 ---
 
