@@ -2442,21 +2442,26 @@ fn routing_id(node_id: u64) -> u64 {
     (node_id as u32) as u64
 }
 
-/// 64-bit origin-hash projection used as the `AuthGuard` key.
+/// The `AuthGuard` principal for a subscriber: its **node id**, tagged
+/// as [`AclPrincipal::Node`].
 ///
-/// A prior version truncated to `u32` so the key matched the
-/// routing-plane's 32-bit `src_id`, but truncating to 32 bits
-/// birthday-collides at ~65 k peers — inside the practical reach of
-/// a medium mesh — and lets one subscriber's grant admit a different
+/// Named `subscriber_origin_hash` until I1, and documented as a
+/// "64-bit origin-hash projection" — both wrong in the same way. It
+/// never produced an `EntityId::origin_hash`; it returned the node id
+/// unchanged. That mattered because the storage and blob readers of
+/// this same ACL authorize an actual origin hash, a different blake2s
+/// derivation, and the shared vocabulary is what made
+/// "subscribed to a channel" look interchangeable with "may mutate that
+/// channel's blobs". The derivation now rides in the key, so the two
+/// cannot alias even on an identical scalar.
+///
+/// The full 64 bits are used deliberately. A prior version truncated to
+/// `u32` so the key matched the routing plane's `src_id`, but that
+/// birthday-collides at ~65 k peers — inside the practical reach of a
+/// medium mesh — and would let one subscriber's grant admit a different
 /// subscriber's packets. The fan-out fast path keys on the full
-/// 64-bit `node_id` (the value it already has in hand), which pushes
-/// the collision floor out of reach. The `src_id` field on wire
-/// packets is not consulted for authorization.
-/// Renamed from `subscriber_origin_hash` (I1): it never produced an
-/// `EntityId::origin_hash`, it returned the node id unchanged, and the
-/// old name invited exactly the confusion [`AclPrincipal`] now makes
-/// impossible — the storage/blob readers of the same ACL authorize an
-/// origin hash, a different derivation entirely.
+/// `node_id` it already holds; the wire `src_id` field is not consulted
+/// for authorization at all.
 #[inline]
 fn subscriber_principal(node_id: u64) -> AclPrincipal {
     AclPrincipal::Node(node_id)

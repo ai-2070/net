@@ -1,7 +1,7 @@
 //! Wire-speed authorization guard for Net packets.
 //!
 //! The `AuthGuard` uses a bloom filter to authorize packets in under 10ns.
-//! Authorized `(origin_hash, channel_hash)` pairs are inserted at subscription
+//! Authorized `(principal, channel_hash)` pairs are inserted at subscription
 //! time (slow path). The per-packet fast path probes the bloom filter with
 //! no crypto, no heap allocation, and no pointer chasing.
 //!
@@ -122,7 +122,7 @@ use super::{ChannelHash, ChannelName};
 #[derive(Debug)]
 pub struct BloomCache {
     /// Bloom filter bits stored as bytes; one bit per
-    /// authorized `(origin_hash, channel_hash)` pair.
+    /// authorized `(principal, channel_hash)` pair.
     bloom: Vec<AtomicU8>,
     /// `2^BLOOM_BITS - 1`, used to mask hash outputs.
     bloom_mask: u64,
@@ -139,7 +139,7 @@ impl BloomCache {
         }
     }
 
-    /// Compute the two bit indices this `(origin, channel)`
+    /// Compute the two bit indices this `(principal, channel)`
     /// hashes to. Pulled out so the loom model can replay the
     /// same derivation without depending on `bloom_key`.
     #[inline]
@@ -305,16 +305,17 @@ pub struct AuthGuard {
     /// [`BloomCache`] for the memory-ordering contract this
     /// wrapper relies on.
     bloom: BloomCache,
-    /// Verified-positive cache: (origin_hash, channel_hash) -> authorized.
+    /// Verified-positive cache: `(principal, channel_hash) ->
+    /// authorized`.
     ///
-    /// `origin_hash` is a 64-bit subscriber projection — typically the
-    /// full `node_id` — rather than a 32-bit truncation. A 32-bit key
-    /// births-collides at ~65 k peers (√2^32), inside the practical
-    /// reach of a medium-sized mesh; 64 bits pushes the collision
-    /// floor to ~4 billion peers, which is no longer a plausible
-    /// operating point.
+    /// The principal carries the full 64-bit identity, not a 32-bit
+    /// truncation. A 32-bit key birthday-collides at ~65 k peers
+    /// (√2^32), inside the practical reach of a medium-sized mesh; 64
+    /// bits pushes the collision floor to ~4 billion peers, which is no
+    /// longer a plausible operating point. It also carries which
+    /// derivation produced it — see [`AclPrincipal`].
     verified: DashMap<(AclPrincipal, ChannelHash), bool>,
-    /// Exact-identity ACL: `(origin_hash, canonical ChannelName) ->
+    /// Exact-identity ACL: `(principal, canonical ChannelName) ->
     /// authorized`. Keys on the name string (not a hash) so that no
     /// two distinct channels can alias through a hash collision —
     /// this is the control-plane / storage authorization path.
@@ -380,7 +381,7 @@ impl AuthGuard {
         }
     }
 
-    /// Authorize an (origin_hash, channel_hash) pair.
+    /// Authorize a `(principal, channel_hash)` pair.
     ///
     /// Called at subscription time (slow path). Inserts into both the
     /// bloom filter and the verified cache.
@@ -401,7 +402,7 @@ impl AuthGuard {
         self.verified.insert((principal, channel_hash), true);
     }
 
-    /// Revoke authorization for an (origin_hash, channel_hash) pair.
+    /// Revoke authorization for a `(principal, channel_hash)` pair.
     ///
     /// Removes from verified cache. The bloom filter is not cleared
     /// (bloom filters don't support deletion), but the verified cache
@@ -442,7 +443,7 @@ impl AuthGuard {
         self.verified.contains_key(&(principal, channel_hash))
     }
 
-    /// Grant `origin_hash` full (control-plane) access to `name`.
+    /// Grant `principal` full (control-plane) access to `name`.
     ///
     /// # Sole production writer
     ///
@@ -466,7 +467,7 @@ impl AuthGuard {
         self.authorize(principal, name.hash());
     }
 
-    /// Revoke `origin_hash`'s full access to `name`.
+    /// Revoke `principal`'s full access to `name`.
     ///
     /// Removes from both the exact ACL and the fast-path verified
     /// cache. Bloom bits are not cleared (bloom filters don't support
