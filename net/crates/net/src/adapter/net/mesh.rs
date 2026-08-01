@@ -27259,8 +27259,11 @@ impl MeshNode {
     /// takeover deadline.
     ///
     /// A `Lost` attempt is still signed, applied and metered, and
-    /// still consumes a generation — but it is not published. See
-    /// [`Self::apply_and_broadcast_reservation`] for why.
+    /// still consumes a generation — but it is not published: only
+    /// locally accepted reservation-fold transitions are publishable,
+    /// so this node never emits a reservation state its own CAS
+    /// rejected. See `apply_and_broadcast_reservation` (private) and
+    /// PERF_AUDIT_2026_07_31_GANG_SCHEDULER §4 for the reasoning.
     pub async fn reserve_island(
         &self,
         island: super::behavior::fold::IslandId,

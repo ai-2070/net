@@ -47,7 +47,7 @@ pub type NodeId = u64;
 ///
 /// **Well-distributed in its LOW bits specifically** — not merely
 /// collision-free. There is no finalizer: for the single-write case
-/// (which is every real use here), [`Hasher::finish`] returns
+/// (which is every real use here), [`Hasher::finish`](std::hash::Hasher::finish) returns
 /// `v.wrapping_mul(FX_SEED)`, and multiplication only propagates
 /// entropy *upward* — bit `k` of the product depends only on bits
 /// `0..=k` of the input. `hashbrown` derives the bucket index from
