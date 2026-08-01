@@ -388,12 +388,48 @@ mod tests {
         let caller = Arc::new(EntityKeypair::generate());
         let registry = default_registry_v1(caller.entity_id().clone());
         let spend = SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::DevTest);
-        let flow =
-            X402HttpFlow::new(caller, spend, registry, Arc::new(SystemClock)).expect("build flow");
+        // `PublicOrLoopback`, not the `new()` default.
+        //
+        // The subject here is the *transport* projection, and reaching the
+        // transport at all means getting past the destination policy
+        // first. `new()` now defaults to `PublicOnly`, which refuses
+        // loopback before a socket is opened — so under the default this
+        // asserted `transport_error` and got `denied`, testing the SSRF
+        // guard by accident instead of the projection on purpose.
+        //
+        // Loopback is also the only address that fails fast and offline.
+        // A public unreachable address would trade this for a DNS lookup
+        // and a connect timeout on every CI run.
+        let flow = X402HttpFlow::with_destination_policy(
+            caller,
+            spend,
+            registry,
+            Arc::new(SystemClock),
+            net_payments::http_policy::DestinationPolicy::PublicOrLoopback,
+        )
+        .expect("build flow");
         // Port 1 is unreachable — the unpaid probe fails at the transport.
         let r = outcome_to_result(flow.fetch_paid("http://127.0.0.1:1/nope").await);
         let v: Value = serde_json::from_str(&r.json).expect("json");
         assert_eq!(v["status"], "transport_error");
         assert!(r.body.is_empty());
+    }
+
+    /// The default refuses loopback, and the test above must not be able
+    /// to hide that by opting out of it.
+    #[tokio::test]
+    async fn the_default_policy_refuses_loopback_before_it_dials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let caller = Arc::new(EntityKeypair::generate());
+        let registry = default_registry_v1(caller.entity_id().clone());
+        let spend = SpendPolicyEngine::new(dir.path().join("spend.json"), SpendProfile::DevTest);
+        let flow =
+            X402HttpFlow::new(caller, spend, registry, Arc::new(SystemClock)).expect("build flow");
+        let r = outcome_to_result(flow.fetch_paid("http://127.0.0.1:1/nope").await);
+        let v: Value = serde_json::from_str(&r.json).expect("json");
+        assert_eq!(
+            v["status"], "denied",
+            "an agent-supplied loopback URL is refused, not dialled"
+        );
     }
 }

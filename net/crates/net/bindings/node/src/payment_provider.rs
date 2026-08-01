@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn authors_canonical_decodable_pricing_terms() {
-        let terms = author_pricing_terms([7u8; 32], "prov/echo", MOCK_REQS).expect("author");
+        let terms = author_pricing_terms([7u8; 32], "prov/echo", MOCK_REQS, false).expect("author");
 
         // The typed decoder accepts it (tag + non-empty accepts[]).
         let parsed = PricingTerms::from_json_bytes(terms.as_bytes()).expect("decode");
@@ -653,7 +653,7 @@ mod tests {
             {"scheme":"mock","network":"mock:net","amount":"2500","asset":"musd","payTo":"a","maxTimeoutSeconds":60},
             {"scheme":"mock","network":"mock:net","amount":"5000","asset":"musd","payTo":"a","maxTimeoutSeconds":60}
         ]"#;
-        let terms = author_pricing_terms([7u8; 32], "prov/echo", two).expect("author");
+        let terms = author_pricing_terms([7u8; 32], "prov/echo", two, false).expect("author");
         assert_eq!(
             PricingTerms::from_json_bytes(terms.as_bytes())
                 .unwrap()
@@ -665,10 +665,55 @@ mod tests {
 
     #[test]
     fn empty_and_malformed_are_rejected() {
-        assert!(author_pricing_terms([1u8; 32], "prov/echo", "[]").is_err());
-        assert!(author_pricing_terms([1u8; 32], "prov/echo", "not json").is_err());
+        assert!(author_pricing_terms([1u8; 32], "prov/echo", "[]", false).is_err());
+        assert!(author_pricing_terms([1u8; 32], "prov/echo", "not json", false).is_err());
         // A requirement missing a required field (payTo) is a decode error.
         let bad = r#"[{"scheme":"mock","network":"mock:net","amount":"1","asset":"musd","maxTimeoutSeconds":60}]"#;
-        assert!(author_pricing_terms([1u8; 32], "prov/echo", bad).is_err());
+        assert!(author_pricing_terms([1u8; 32], "prov/echo", bad, false).is_err());
+    }
+
+    /// The `production_registry` flag has to *do* something, and this is
+    /// the cheapest statement of what.
+    ///
+    /// It went untested when it was added, which is how all five call
+    /// sites above kept passing three arguments to a four-argument
+    /// function: `--lib` and `clippy --lib` do not compile `#[cfg(test)]`,
+    /// so nothing typechecked this module until a job that runs the unit
+    /// tests did. A parameter nothing exercises is a parameter that drifts.
+    ///
+    /// `mock:net` is the sharp edge: it exists in the dev registry so the
+    /// conformance suite can drive the whole lifecycle without a chain,
+    /// and a provider settling real money has no reason to allowlist an
+    /// asset whose settlements move nothing.
+    #[test]
+    fn the_production_registry_refuses_the_valueless_mock_asset() {
+        assert!(
+            author_pricing_terms([7u8; 32], "prov/echo", MOCK_REQS, false).is_ok(),
+            "the dev registry carries mock:net"
+        );
+        let err = author_pricing_terms([7u8; 32], "prov/echo", MOCK_REQS, true)
+            .expect_err("the production registry must not price a valueless asset");
+        assert!(
+            err.contains("not in the selected registry"),
+            "the refusal must name the registry check: {err}"
+        );
+    }
+
+    /// Same terms, different registry revision — the two must not agree.
+    ///
+    /// `reference()` hashes the whole registry, so announcing under one
+    /// revision while quoting under another leaves discovery metadata
+    /// naming a registry the backend does not use. This pins that the flag
+    /// actually reaches the reference rather than being decorative.
+    #[test]
+    fn the_registry_revision_rides_the_authored_terms() {
+        // A real-money asset, so both registries carry it.
+        let base_usdc = r#"[{"scheme":"exact","network":"eip155:8453","asset":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","amount":"2500","payTo":"0xmerchant","maxTimeoutSeconds":60,"extra":{"name":"USDC","version":"2"}}]"#;
+        let dev = author_pricing_terms([7u8; 32], "prov/echo", base_usdc, false).expect("dev");
+        let prod = author_pricing_terms([7u8; 32], "prov/echo", base_usdc, true).expect("prod");
+        assert_ne!(
+            dev, prod,
+            "the announced terms must carry the registry revision they were authored under"
+        );
     }
 }
