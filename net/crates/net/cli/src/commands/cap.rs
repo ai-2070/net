@@ -577,7 +577,7 @@ mod tests {
     fn reserved_prefix_tags_are_rejected_not_dropped() {
         for prefix in RESERVED_PREFIXES {
             let tag = format!("{prefix}whatever");
-            let err = capability_set_from_tags(&[tag.clone()])
+            let err = capability_set_from_tags(std::slice::from_ref(&tag))
                 .err()
                 .unwrap_or_else(|| {
                     panic!("`{tag}` must fail the announce build, not be dropped from it")
