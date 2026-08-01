@@ -2858,14 +2858,6 @@ mod tests {
         ));
     }
 
-    /// Security audit H3: an unbounded TTL is rejected at issue time.
-    ///
-    /// Pre-fix `issue()` saturated `now + u64::MAX` into a token whose
-    /// `not_after == u64::MAX` — a never-expiring credential retirable
-    /// only via the advisory revocation floor. `try_issue` now returns
-    /// `TtlTooLong` for any `duration_secs > MAX_TOKEN_TTL_SECS`, and
-    /// the panicking `issue` wrapper turns that into a clear panic.
-    #[test]
     /// M3 (2026-07-31 audit): the TTL ceiling must hold on RECEIPT, not
     /// only at issuance.
     ///
@@ -3013,6 +3005,13 @@ mod tests {
         );
     }
 
+    /// Security audit H3: an unbounded TTL is rejected at issue time.
+    ///
+    /// Pre-fix `issue()` saturated `now + u64::MAX` into a token whose
+    /// `not_after == u64::MAX` — a never-expiring credential retirable
+    /// only via the advisory revocation floor. `try_issue` now returns
+    /// `TtlTooLong` for any `duration_secs > MAX_TOKEN_TTL_SECS`, and
+    /// the panicking `issue` wrapper turns that into a clear panic.
     #[test]
     fn issue_rejects_ttl_above_max() {
         let issuer = EntityKeypair::generate();

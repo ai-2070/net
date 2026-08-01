@@ -2842,40 +2842,69 @@ mod membership_failure_tests {
         );
     }
 
-    /// The peer-failure cleanup must evict the caller-side
-    /// reply-subscription cache alongside the retained subscribe chains.
+    /// The peer-failure cleanup must evict BOTH per-peer maps, and only
+    /// for the failed peer.
     ///
-    /// A source-scan witness, deliberately: the behavioural version
-    /// needs a real session to fail and then recover, which is both slow
-    /// and timing-dependent — and it would fail *silently* in the
-    /// direction that hides the bug (replies simply stop arriving). The
-    /// property that actually matters is structural, so it is pinned
-    /// structurally, next to the sibling cleanup it must stay beside.
-    ///
-    /// The bug: on failure the publisher drops our roster entry
-    /// (`roster.remove_peer`), but this cache is the CALLER's record of
-    /// "already subscribed" and short-circuits `ensure_reply_subscription`
-    /// entirely. Left populated, every later call to the recovered peer
-    /// skips both the re-subscribe and the corrective re-announce retry,
-    /// and its replies are dropped by a publisher that no longer has us
-    /// rostered.
+    /// Exercises `evict_failed_peer_channel_state` directly rather than
+    /// failing a live session. The previous version of this test was a
+    /// source scan, and it was worse than useless: `str::find` returned
+    /// the search literal inside the test itself — which sits earlier in
+    /// the file than the production call — so the window it asserted
+    /// over was its own source, and deleting the real eviction still
+    /// passed.
     #[test]
-    fn peer_failure_cleanup_evicts_the_reply_subscription_cache() {
-        let src = include_str!("mesh.rs");
-        let anchor = src
-            .find("subscriber_chains_failure.retain(")
-            .expect("the retained-chain cleanup must exist");
-        // Scan the cleanup block that follows the sibling eviction.
-        let window = &src[anchor..(anchor + 1_500).min(src.len())];
+    fn peer_failure_cleanup_evicts_only_the_failed_peers_state() {
+        const FAILED: u64 = 0xF0;
+        const HEALTHY: u64 = 0xB0;
+
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        #[cfg(feature = "cortex")]
+        let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
+
+        // Two channels for the failed peer, one for a healthy peer.
+        for (node, ch) in [(FAILED, 1u64), (FAILED, 2u64), (HEALTHY, 1u64)] {
+            chains.insert(
+                (node, ch),
+                RetainedChain::new(TokenChain { tokens: Vec::new() }),
+            );
+        }
+        #[cfg(feature = "cortex")]
+        for (target, svc) in [(FAILED, 10u64), (FAILED, 11u64), (HEALTHY, 10u64)] {
+            replies.insert((target, svc), Arc::from("svc"));
+        }
+
+        evict_failed_peer_channel_state(
+            FAILED,
+            &chains,
+            #[cfg(feature = "cortex")]
+            &replies,
+        );
 
         assert!(
-            window.contains("rpc_reply_subscriptions_failure.retain("),
-            "regression: the peer-failure cleanup no longer evicts \
-             `rpc_reply_subscriptions`. Without it a failed-then-recovered \
-             peer keeps a cache entry saying we are subscribed, so later \
-             calls skip the re-subscribe and their replies are silently \
-             dropped by a publisher that already evicted our roster entry."
+            chains.get(&(FAILED, 1)).is_none() && chains.get(&(FAILED, 2)).is_none(),
+            "the failed peer's retained subscribe chains must be dropped — \
+             otherwise they leak for the node's lifetime and a reused \
+             node_id could re-validate a stale chain"
         );
+        assert!(
+            chains.get(&(HEALTHY, 1)).is_some(),
+            "a healthy peer's state must survive another peer's failure"
+        );
+
+        #[cfg(feature = "cortex")]
+        {
+            assert!(
+                replies.get(&(FAILED, 10)).is_none() && replies.get(&(FAILED, 11)).is_none(),
+                "the failed peer's reply-subscription cache must be dropped — \
+                 the publisher already evicted our roster entry, so leaving \
+                 this makes later calls skip the re-subscribe and silently \
+                 lose every reply"
+            );
+            assert!(
+                replies.get(&(HEALTHY, 10)).is_some(),
+                "a healthy target's reply subscription must survive"
+            );
+        }
     }
 
     /// Collapsing back to `AdapterError` must preserve the historical
@@ -2899,6 +2928,37 @@ mod membership_failure_tests {
             "unexpected transport message: {msg}"
         );
     }
+}
+
+/// Drop every piece of per-peer channel state a failed peer leaves
+/// behind, in one place so it can be tested without failing a real
+/// session.
+///
+/// Both maps are keyed by node id in their first tuple position and
+/// both are invisible to the sweeps that would otherwise reclaim them:
+///
+/// - `subscriber_chains` — retained subscribe credentials. The expiry
+///   sweep iterates `peer_entity_ids`, which the failure path clears
+///   just before this, and a failed peer never sends the unsubscribe
+///   that would remove them. Left behind they leak for the node's
+///   lifetime, and a reused `node_id` could re-validate a stale chain.
+/// - `rpc_reply_subscriptions` — the CALLER-side record of "we already
+///   subscribed to our reply channel on this target", which
+///   short-circuits `ensure_reply_subscription` entirely. The target
+///   meanwhile evicts our roster entry on failure
+///   (`roster.remove_peer`, the mirror image on the publisher side), so
+///   leaving this populated means every later call to a recovered peer
+///   skips both the re-subscribe AND the corrective re-announce retry —
+///   and its replies are dropped by a publisher that no longer has us
+///   rostered, silently, because the caller believes it is subscribed.
+fn evict_failed_peer_channel_state(
+    node_id: u64,
+    subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
+    #[cfg(feature = "cortex")] rpc_reply_subscriptions: &dashmap::DashMap<(u64, u64), Arc<str>>,
+) {
+    subscriber_chains.retain(|(nid, _), _| *nid != node_id);
+    #[cfg(feature = "cortex")]
+    rpc_reply_subscriptions.retain(|(target, _), _| *target != node_id);
 }
 
 /// Rolling-window auth-failure tracker, one entry per peer.
@@ -8354,28 +8414,12 @@ impl MeshNode {
             // failure; the capability fold is now consistent
             // with them.
             capability_fold_failure.evict_node(node_id, "failure-detector");
-            // Drop any retained subscribe token chains for this peer.
-            // The sweep can no longer reach them (it iterates
-            // `peer_entity_ids`, just cleared above), and a failed peer
-            // never sends the unsubscribe that would otherwise remove
-            // them — so without this they leak for the node's lifetime,
-            // and a reused `node_id` could re-validate a stale chain.
-            subscriber_chains_failure.retain(|(nid, _), _| *nid != node_id);
-            // Drop this peer's reply-subscription cache entries.
-            //
-            // That cache is the CALLER-side record of "we already
-            // subscribed to our reply channel on this target", and it
-            // short-circuits `ensure_reply_subscription` entirely. The
-            // target, meanwhile, evicts our roster entry when the
-            // session fails (`roster.remove_peer`, just above, is the
-            // mirror image on the publisher side). Leaving the cache
-            // populated across that means every later call to the
-            // recovered peer skips both the re-subscribe AND the
-            // corrective re-announce retry, and its replies are
-            // dropped by a publisher that no longer has us rostered —
-            // silently, since the caller believes it is subscribed.
-            #[cfg(feature = "cortex")]
-            rpc_reply_subscriptions_failure.retain(|(target, _), _| *target != node_id);
+            evict_failed_peer_channel_state(
+                node_id,
+                &subscriber_chains_failure,
+                #[cfg(feature = "cortex")]
+                &rpc_reply_subscriptions_failure,
+            );
             // RT-5: tell the mesh this peer is unreachable via us —
             // receivers drop their `(node_id, via=us)` routes within
             // one flood instead of waiting for the 3× session_timeout
