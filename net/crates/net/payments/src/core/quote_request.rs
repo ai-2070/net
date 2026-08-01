@@ -456,8 +456,20 @@ impl SeenNonces {
             });
         }
 
-        self.seen.insert(key, accept_until_ns);
-        *self.per_caller.entry(caller.clone()).or_insert(0) += 1;
+        // The quota counts ENTRIES, so it only moves when an entry is
+        // actually added. `insert` on a key already present replaces —
+        // the map does not grow — and that case is reachable on the
+        // legal path above: an expired-but-unswept nonce is admitted
+        // again, because the request carrying the old one can no longer
+        // be presented. Incrementing unconditionally charged the caller
+        // twice for one entry, and the drift only cleared at the next
+        // sweep (amortized at `capacity/8`, so a long time under
+        // ordinary traffic). A caller could then be refused
+        // `CallerReplayQuotaExhausted` while holding fewer nonces than
+        // its share.
+        if self.seen.insert(key, accept_until_ns).is_none() {
+            *self.per_caller.entry(caller.clone()).or_insert(0) += 1;
+        }
         self.earliest_deadline = self.earliest_deadline.min(accept_until_ns);
         Ok(())
     }
@@ -771,6 +783,59 @@ mod tests {
         assert_eq!(
             seen.admit(&caller, "n1", deadline + 5_000, deadline),
             Err(QuoteRequestError::ReplayedNonce)
+        );
+    }
+
+    /// Re-admitting an expired nonce replaces its entry, so it must not
+    /// also charge the caller's quota a second time.
+    ///
+    /// `insert` on a key already present does not grow the map, but the
+    /// quota counter was incremented regardless — so one entry could be
+    /// counted twice, and the drift persisted until the next sweep
+    /// (amortized, so a long time under ordinary traffic). The caller was
+    /// then refused for exceeding a share it had not reached.
+    ///
+    /// The invariant is exact and is asserted as such: the per-caller
+    /// count is the number of entries that caller holds, at every point.
+    #[test]
+    fn re_admitting_an_expired_nonce_does_not_charge_the_quota_twice() {
+        let caller = EntityKeypair::generate().entity_id().clone();
+        // Room for four apiece, and a sweep threshold (capacity/8, floored
+        // at 1)... deliberately never reached: the bug only shows while
+        // the stale entry is still in the map.
+        let mut seen = SeenNonces::with_capacities(64, 4);
+
+        assert!(seen.admit(&caller, "n", NOW + 10, NOW).is_ok());
+        // Past the deadline the old entry is dead weight, so this is a
+        // fresh request that happens to reuse the string — admissible,
+        // and it REPLACES rather than adds.
+        assert!(seen.admit(&caller, "n", NOW + 30, NOW + 20).is_ok());
+        assert_eq!(seen.len(), 1, "one nonce, one entry");
+
+        // Three more distinct nonces fit under a share of four.
+        for nonce in ["a", "b", "c"] {
+            assert!(
+                seen.admit(&caller, nonce, NOW + 40, NOW + 20).is_ok(),
+                "`{nonce}` is the {}th live nonce under a share of 4 — it must be admitted",
+                seen.len() + 1
+            );
+        }
+        assert_eq!(seen.len(), 4, "four live nonces, exactly the share");
+
+        // And the share is still enforced: the fifth is refused, for the
+        // real reason rather than a phantom one.
+        assert_eq!(
+            seen.admit(&caller, "d", NOW + 40, NOW + 20),
+            Err(QuoteRequestError::CallerReplayQuotaExhausted { capacity: 4 })
+        );
+
+        // Releasing the replaced nonce gives back exactly one slot, not
+        // the two it had been charged.
+        seen.release(&caller, "n");
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.admit(&caller, "d", NOW + 40, NOW + 20).is_ok(),
+            "one release must free exactly one slot"
         );
     }
 
