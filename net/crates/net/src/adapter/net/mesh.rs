@@ -7855,9 +7855,15 @@ pub struct MeshNode {
     /// Subnet policy applied to inbound `CapabilityAnnouncement`s.
     /// `None` disables per-peer subnet tracking.
     local_subnet_policy: Option<Arc<SubnetPolicy>>,
-    /// Per-peer subnet map. Keys are `node_id`; values are the
-    /// subnet derived from each peer's most recent announcement via
-    /// `local_subnet_policy`.
+    /// Per-peer subnet map — **routing state, not authenticated
+    /// membership** (SUBNET_AUTH_PLAN.md). Keys are `node_id`; values
+    /// are the subnet derived from each peer's most recent
+    /// announcement via `local_subnet_policy`. The announcement is
+    /// signature-verified, but its *tags* are the peer's own claim,
+    /// so an entry here places a peer in the topology; it never
+    /// authorizes one. Visibility filtering built on this map is a
+    /// propagation filter; protected channels pair it with token
+    /// enforcement.
     ///
     /// **Absence means "not derived", and must stay that way.** Readers
     /// preserve it as `Option<SubnetId>` and hand `None` to

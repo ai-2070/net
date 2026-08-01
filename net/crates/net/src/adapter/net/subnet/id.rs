@@ -1,23 +1,41 @@
-//! Hierarchical subnet identifier.
+//! Hierarchical subnet identifier — a **topology coordinate, not an
+//! authority**.
 //!
-//! Encodes a 4-level hierarchy (region/fleet/vehicle/subsystem) into a `u32`.
-//! Each level gets 8 bits (256 values). Parent/child/sibling relationships
-//! are resolved with bitwise operations at wire speed.
+//! Encodes a 4-level hierarchy into a `u32`. Each level gets 8 bits
+//! (256 values). Parent/child/sibling relationships are resolved with
+//! bitwise operations at wire speed.
 //!
 //! ```text
 //! subnet_id (u32):
 //!   [level_0: 8 bits] [level_1: 8 bits] [level_2: 8 bits] [level_3: 8 bits]
-//!    ^region (256)     ^fleet (256)       ^vehicle (256)     ^subsystem (256)
 //! ```
+//!
+//! # Topology is not authority
+//!
+//! A `SubnetId` says *where a node sits* in one installation's local
+//! hierarchy (a vehicle, machine, or site — not a fleet directory;
+//! fleet membership lives in org identity). Holding, deriving, or
+//! claiming a `SubnetId` grants nothing: channel access needs a
+//! channel token, provider effects need provider admission, and
+//! protected transport rights (`ATTACH`/`ROUTE`/`EXPORT`) need a
+//! `SubnetGrant` under an authority-qualified `SubnetRef`
+//! (SUBNET_AUTH_PLAN.md). The security-facing alias for this type is
+//! [`TopologySubnetId`]; the plain name `SubnetId` remains for the
+//! existing topology/visibility surface.
 
 /// Maximum number of hierarchy levels.
 pub const MAX_DEPTH: u8 = 4;
 
 /// Hierarchical subnet identifier.
 ///
-/// Zero (`0x00000000`) means global / no subnet. Trailing zeros mean
-/// "no sub-level specified" — `SubnetId::new(&[3, 7])` represents
-/// region=3, fleet=7, with no vehicle or subsystem restriction.
+/// Zero (`0x00000000`) means global / no subnet — as a *grant scope*
+/// under an authority it is the authority-local root, covering every
+/// path (see [`Self::is_ancestor_or_self_of`]). Trailing zeros mean
+/// "no sub-level specified" — `SubnetId::new(&[3, 7])` restricts the
+/// first two levels and leaves the deeper two unrestricted. Level
+/// meanings are operator-chosen within one installation's hierarchy;
+/// fleet, customer, and geography populations belong in org identity,
+/// not in these four levels.
 ///
 /// `Ord` is derived on the inner `u32` representation. The order
 /// has no semantic meaning for the hierarchy (it does NOT match
@@ -141,14 +159,48 @@ impl SubnetId {
     /// Check if `self` is an ancestor of `other` (prefix match).
     ///
     /// Global is ancestor of everything. A subnet is its own ancestor.
+    /// Same relation as [`Self::is_ancestor_or_self_of`]; that name is
+    /// the canonical one for security-facing scope containment.
     #[inline]
     pub fn is_ancestor_of(self, other: Self) -> bool {
+        self.is_ancestor_or_self_of(other)
+    }
+
+    /// Canonical fixed-width scope-containment operation
+    /// (SUBNET_AUTH_PLAN.md D1): `true` iff `self` is `target` or an
+    /// ancestor of `target` in the 4-level prefix hierarchy.
+    ///
+    /// One masked `u32` comparison — no allocation, no string
+    /// parsing, no graph walk, no policy lookup. `SubnetGrant` scope
+    /// checks and the compiled forwarding context reduce to this
+    /// operation, so its truth table is pinned by test before any
+    /// caller lands:
+    ///
+    /// ```text
+    /// scope A     contains target A       true
+    /// scope A     contains target A/B     true
+    /// scope A/B   contains target A       false
+    /// scope A/B   contains target A/C     false
+    /// scope A/B   contains target A/B/C   true
+    /// scope 0     contains target 0       true
+    /// scope 0     contains target A       true   (authority-local root)
+    /// scope A     contains target 0       false
+    /// ```
+    ///
+    /// Path `0` ([`Self::GLOBAL`]) is the authority-local root, not an
+    /// absent or wildcard value: a scope of `0` covers every present
+    /// and future path under its authority, and a target of `0` is
+    /// contained only by scope `0`. Authority qualification (equal
+    /// paths under different authorities are unrelated) lives one
+    /// layer up on `SubnetRef`; this method compares paths only.
+    #[inline]
+    pub fn is_ancestor_or_self_of(self, target: Self) -> bool {
         if self.is_global() {
             return true;
         }
         let d = self.depth();
         let mask = Self::mask_for_depth(d);
-        (self.0 & mask) == (other.0 & mask)
+        (self.0 & mask) == (target.0 & mask)
     }
 
     /// Check if two IDs are in the same subnet (identical values).
@@ -244,6 +296,19 @@ impl std::str::FromStr for SubnetId {
     }
 }
 
+/// Security-facing name for the compact topology coordinate
+/// (SUBNET_AUTH_PLAN.md D1).
+///
+/// The subnet-auth surface (`SubnetRef`, `SubnetGrant`,
+/// `VerifiedSubnetContext`) names this type `TopologySubnetId` to keep
+/// the distinction audible at call sites: a `TopologySubnetId` is a
+/// *path* inside one installation's hierarchy, and only an
+/// authority-qualified `SubnetRef { authority, path }` is a security
+/// target. Equal path bits under two authorities are unrelated.
+///
+/// Same type, same wire encoding — the alias changes no behavior.
+pub type TopologySubnetId = SubnetId;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +386,42 @@ mod tests {
 
         // Self is ancestor of self
         assert!(fleet.is_ancestor_of(fleet));
+    }
+
+    /// The canonical scope-containment truth table from
+    /// SUBNET_AUTH_PLAN.md D1, pinned before any security caller
+    /// lands. Every row is stated explicitly rather than derived in a
+    /// loop so a semantic change breaks a named, greppable line.
+    #[test]
+    fn ancestor_or_self_truth_table() {
+        let a = SubnetId::new(&[3]);
+        let a_b = SubnetId::new(&[3, 7]);
+        let a_c = SubnetId::new(&[3, 8]);
+        let a_b_c = SubnetId::new(&[3, 7, 2]);
+        let zero = SubnetId::GLOBAL;
+
+        // scope A contains target A
+        assert!(a.is_ancestor_or_self_of(a));
+        // scope A contains target A/B
+        assert!(a.is_ancestor_or_self_of(a_b));
+        // scope A/B does not contain target A
+        assert!(!a_b.is_ancestor_or_self_of(a));
+        // scope A/B does not contain target A/C
+        assert!(!a_b.is_ancestor_or_self_of(a_c));
+        // scope A/B contains target A/B/C
+        assert!(a_b.is_ancestor_or_self_of(a_b_c));
+        // scope 0 contains target 0
+        assert!(zero.is_ancestor_or_self_of(zero));
+        // scope 0 contains target A (authority-local root)
+        assert!(zero.is_ancestor_or_self_of(a));
+        assert!(zero.is_ancestor_or_self_of(a_b_c));
+        // scope A does not contain target 0
+        assert!(!a.is_ancestor_or_self_of(zero));
+        assert!(!a_b_c.is_ancestor_or_self_of(zero));
+
+        // `is_ancestor_of` is the same relation under the legacy name.
+        assert_eq!(a.is_ancestor_of(a_b), a.is_ancestor_or_self_of(a_b));
+        assert_eq!(a_b.is_ancestor_of(zero), a_b.is_ancestor_or_self_of(zero));
     }
 
     #[test]

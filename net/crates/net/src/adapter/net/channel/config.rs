@@ -144,11 +144,29 @@ pub enum QueueGroupPolicy {
 }
 
 /// Channel visibility scope.
+///
+/// # Visibility is a propagation filter, not an access boundary
+///
+/// Visibility is evaluated against *topology state* — the local
+/// node's configured subnet and a per-peer subnet derived from each
+/// peer's own self-declared capability tags. A peer that misdeclares
+/// its tags can place itself wherever the local `SubnetPolicy` maps
+/// those tags; visibility narrows where traffic propagates, it does
+/// not decide who is allowed in. A protected channel must pair a
+/// scoped visibility with token enforcement (`token_roots`): the
+/// lying peer may pass the visibility test, but it cannot forge the
+/// channel token. Purely soft channels (scoped visibility, no token
+/// gate) are valid — they are a routing decision, and registration
+/// logs one info-level note so that decision is recorded
+/// (SUBNET_AUTH_PLAN.md Q1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Visibility {
-    /// Packets never leave the subnet.
+    /// Propagation limited to the same subnet. A routing filter —
+    /// pair with `token_roots` if the channel must exclude anyone.
     SubnetLocal,
-    /// Visible to the parent subnet but not siblings.
+    /// Propagates to the parent subnet but not siblings. A routing
+    /// filter — pair with `token_roots` if the channel must exclude
+    /// anyone.
     ParentVisible,
     /// Explicitly exported to specific target subnets.
     Exported,
@@ -614,6 +632,36 @@ pub struct ResolvedConfig {
 /// [`ChannelConfigRegistry::insert_if_absent`] from their
 /// `insert_prefix*` counterparts — one of the two checks below depends
 /// on how the config is being registered, not just on its contents.
+/// Record the "visibility without access control" decision at
+/// registration time (SUBNET_AUTH_PLAN.md S0).
+///
+/// A `SubnetLocal` / `ParentVisible` channel with no token gate and
+/// no origin binding is a *soft* channel: its visibility narrows
+/// propagation against peer-declared topology, and nothing
+/// cryptographic keeps a misdeclaring peer out. That is a legitimate
+/// routing configuration — hence `info`, not `warn`, and no behavior
+/// change — but it looks identical to an operator who believed
+/// `SubnetLocal` was an access boundary, so the decision gets one
+/// recorded line. Capability filters don't count as access control
+/// here: they match self-advertised tags (advisory by their own
+/// rustdoc above).
+fn note_if_visibility_only(config: &ChannelConfig) {
+    let scoped = matches!(
+        config.visibility,
+        Visibility::SubnetLocal | Visibility::ParentVisible
+    );
+    if scoped && !config.token_required() && config.subscriber_origin_binding.is_none() {
+        tracing::info!(
+            channel = config.channel_id.name().as_str(),
+            visibility = ?config.visibility,
+            "channel has subnet-scoped visibility but no token gate or \
+             origin binding: visibility is a propagation filter over \
+             peer-declared topology, not an access boundary. If this \
+             channel must exclude anyone, add `with_token_roots(...)`."
+        );
+    }
+}
+
 fn warn_if_fail_closed(config: &ChannelConfig, is_prefix: bool) {
     // `with_require_token(true)` called instead of
     // `with_token_roots(...)`: there is no authority a chain could
@@ -737,6 +785,7 @@ impl ChannelConfigRegistry {
     /// DashMap deduplicates keys).
     pub fn insert_prefix(&self, prefix: impl Into<String>, config: ChannelConfig) {
         warn_if_fail_closed(&config, true);
+        note_if_visibility_only(&config);
         self.prefix_configs.insert(prefix.into(), config);
     }
 
@@ -756,6 +805,7 @@ impl ChannelConfigRegistry {
             dashmap::mapref::entry::Entry::Occupied(_) => false,
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 warn_if_fail_closed(&config, true);
+                note_if_visibility_only(&config);
                 slot.insert(config);
                 true
             }
@@ -860,6 +910,7 @@ impl ChannelConfigRegistry {
     /// want [`Self::insert_if_absent`] instead.
     pub fn insert(&self, config: ChannelConfig) {
         warn_if_fail_closed(&config, false);
+        note_if_visibility_only(&config);
         let name = config.channel_id.name().to_string();
         let hash = config.channel_id.hash();
         let wire_hash = config.channel_id.wire_hash();
@@ -894,6 +945,7 @@ impl ChannelConfigRegistry {
             dashmap::mapref::entry::Entry::Occupied(_) => false,
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 warn_if_fail_closed(&config, false);
+                note_if_visibility_only(&config);
                 slot.insert(config);
                 true
             }
