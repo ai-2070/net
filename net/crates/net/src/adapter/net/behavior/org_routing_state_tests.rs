@@ -452,14 +452,22 @@ fn a_rotated_audience_handle_is_not_leased_under_its_own_id() {
         1,
     );
 
-    // A DIFFERENT signed grant reusing the id, under a different handle. Its
-    // scope is not leased, because the installed record's handle is the other
-    // one.
-    let mut rotated = (*grant).clone();
-    if let Some(binding) = rotated.discovery.as_mut() {
-        binding.audience_handle = [0xEE; 32];
-    }
-    let rotated = Arc::new(rotated);
+    // A DIFFERENT, PROPERLY SIGNED grant reusing the id, under a fresh audience
+    // handle. Its scope is not leased, because the installed record's handle is
+    // the other one.
+    //
+    // Built through `issue_reusing_id` rather than by editing a clone's binding:
+    // an edited clone is a grant no validator would accept, so a witness driven
+    // by one can pass while the production path — where a same-id rotation is a
+    // genuinely different signed authority that installs through
+    // `validate_consumer_record` — is never exercised at all.
+    let (rotated, _successor_secret) = issue_reusing_id(capability, grant.grant_id);
+    assert_eq!(rotated.grant_id, grant.grant_id, "the id is REUSED");
+    assert_ne!(
+        rotated.discovery.as_ref().expect("binding").audience_handle,
+        grant.discovery.as_ref().expect("binding").audience_handle,
+        "under a different handle"
+    );
 
     let keys = demand_set_for(&credentials(vec![rotated.clone()]), &capability, &leased)
         .expect("owner scope");
