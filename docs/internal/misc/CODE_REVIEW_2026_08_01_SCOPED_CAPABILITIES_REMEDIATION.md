@@ -437,13 +437,34 @@ which reported green the whole time. Both this review's first pass and the audit
 it reviews had treated `-12` as covered because the headers were updated
 together — nobody checked whether the thing enforcing that had been.
 
-### Verification at `d1ac7e00c`
+### Fourth-pass items
+
+A further pass raised six more. Two invalidated earlier fixes of mine, which is
+the useful part: the `-12` repair was incomplete, and the CLI guard I wrote for
+finding 8 tested the wrong thing.
+
+| # | Item | Resolution | Commit |
+| - | ---- | ---------- | ------ |
+| 14 | **P1, not reproduced.** `SameSubnet` was said to misclassify multi-class publishers, because the subnet comes from the entry the capability filter selected while the fold keys `(class_hash, NodeId)`. Real hazard, wrong premise: `translate_announcement` pins `class_hash: 0` for every `CapabilityAnnouncement`, so announcements REPLACE one entry rather than accumulating siblings — every non-zero `class_hash` writer in the crate is `#[cfg(test)]`. Also, the "previous path" it compares against was last-announcement-wins via `peer_subnets`, not a union | No behaviour change. Verified end-to-end (two announcements, second dropping `region:us`, leave one entry at class 0) and pinned, since the safety was an undocumented accident of the cutover sentinel. Test fails if sharding lands; doc says the fix is `tags_union_for` | `167518734` |
+| 15 | The `-12` guard fix was insufficient — exhaustiveness forces a match arm, but the header asserts iterate a separate `ALL` array, so a variant in the enum and the match but not the list still passed | `NetError` now declared through a `net_error_codes!` macro emitting the enum and the table together. Verified by adding a variant to the enum *alone* and watching the guard fail | `2abee11cd` |
+| 16 | The construction warning fired for any installed policy, including a rule-less one — which assigns `GLOBAL` to every peer, so nothing is inconsistent and a valid flat deployment got flagged | Gated on `SubnetPolicy::can_assign_non_global()`. Inspects values, not rule count: a rule whose values are all `0` assigns `GLOBAL` too, reachable through the public `values` field since `map` rejects `0` | `b6795d0e1` |
+| 17 | `SubnetPolicy` contract item 2 still said "first tag wins per rule", contradicting the smallest-tag rule documented below it as "the sole definition" | Restated; the test named `first_tag_wins_within_a_single_rule` renamed to match what it always asserted | `5c9707363` |
+| 18 | `with_subnet` claimed to be "the ONLY way to set the local subnet"; `MeshNodeConfig::subnet` is public | Qualified as the builder method | `5c9707363` |
+| 19 | The finding-8 guard asserted `Tag::parse_user` errors — a library guarantee that would stay green if `cap announce` reverted to `add_tag`-and-drop, the exact regression it existed to prevent | Tag-building extracted as `capability_set_from_tags` and the test pointed at it, plus coverage for whole-announcement failure and for duplicates. Verified by reintroducing the regression and watching both fail | `20d978efc` |
+
+Items 15 and 19 are the pattern worth carrying forward: a guard written against
+the wrong subject reads exactly like a guard that works. Both had passed every
+run. Neither would have failed on the regression it was named for. Every guard
+added or repaired in this pass was therefore checked by reintroducing the defect
+and confirming the failure, rather than by observing it green.
+
+### Verification at `20d978efc`
 
 | Check | Result |
 | ----- | ------ |
-| `cargo test --lib` (full) | 5373 passed, 0 failed, 1 ignored |
+| `cargo test --lib` (full) | 5375 passed, 0 failed, 1 ignored |
 | `cargo test --test capability_scope` | 8 passed, 0 failed |
-| `cargo test --bin net-mesh commands::cap` | 4 passed, 0 failed |
+| `cargo test --bin net-mesh commands::cap` | 6 passed, 0 failed |
 | `cargo clippy --lib --all-features` | clean |
 | `cargo doc --no-deps --lib` | clean |
 | `tsc --noEmit` (sdk-ts) | clean |
