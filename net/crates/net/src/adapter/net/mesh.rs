@@ -24037,8 +24037,13 @@ impl MeshNode {
         // failed publish already revoked the guard entry, so subsequent
         // publishes stop at `check_fast == Denied`, and the sweep — now
         // able to run — sees the retained chain as valid and does
-        // nothing, because it never calls `allow_channel`. Only peer
-        // disconnect or an explicit re-subscribe cleared it.
+        // nothing, because it never calls `allow_channel`. Nothing
+        // periodic cleared it: recovery needed the peer to go away, or
+        // to say something that drops its per-peer state — an explicit
+        // re-subscribe, or an `Unsubscribe` (which revokes the guard
+        // entry, removes the retained chain and drops the roster entry).
+        // All of those are peer-driven; the publisher could not repair
+        // itself.
         //
         // `set_token_cache`'s documented contract already said
         // "when unset, `require_token` channels always reject". This

@@ -266,7 +266,8 @@ where
 /// Register the request/reply channels a served nRPC service needs, through the
 /// NODE's registry so the SDK and binding paths register identically.
 ///
-/// Delegates to [`ChannelConfigRegistry::install_rpc_service_defaults`], the
+/// Delegates to
+/// [`net::adapter::net::ChannelConfigRegistry::install_rpc_service_defaults`], the
 /// single implementation shared with `Mesh::serve_rpc*` and the aggregator.
 ///
 /// It did not, until R9. This function was a third copy of the registration and

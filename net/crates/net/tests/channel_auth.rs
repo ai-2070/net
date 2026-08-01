@@ -470,7 +470,11 @@ async fn token_gated_prefix_channel_subscribes_and_delivers() {
 /// group's events and they are dropped rather than delivered to a
 /// working member. Installing a cache later did not repair it — the
 /// guard entry was already revoked and the sweep never re-grants — so
-/// only peer disconnect or an explicit re-subscribe cleared it.
+/// clearing it took the peer going away or sending something that drops
+/// its per-peer state (an explicit re-subscribe, or an `Unsubscribe`,
+/// which revokes the guard entry, removes the retained chain and drops
+/// the roster entry). Every one of those is peer-driven: the publisher
+/// had no way to repair itself.
 ///
 /// `set_token_cache` already documented "when unset, `require_token`
 /// channels always reject". This makes that true.
