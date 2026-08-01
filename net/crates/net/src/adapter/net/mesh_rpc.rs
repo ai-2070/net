@@ -5454,6 +5454,12 @@ impl MeshNode {
         if reply_subscription_covers(&registry, target_node_id, service_hash, service) {
             return Ok(());
         }
+        // Snapshot BEFORE the subscribe `await`. Everything below this
+        // point can be overtaken by `target_node_id`'s session failing,
+        // and the failure path evicts this registry — but it can only
+        // evict entries that exist when it runs, and ours does not exist
+        // yet. See `peer_failure_generation`.
+        let gen_before = self.peer_failure_generation(target_node_id);
         // Cap the registry. `len()` on DashMap is approximate under
         // concurrent churn (it sums shard counts under shard reads,
         // not a global lock), which is exactly the semantics we
@@ -5623,6 +5629,36 @@ impl MeshNode {
                             // race is bounded by the number of concurrent callers,
                             // which operators tune separately.
         registry.insert((target_node_id, service_hash), Arc::from(service));
+
+        // Fence. If the target's session failed at any point since the
+        // snapshot, the eviction that ran for it could not have removed
+        // the entry we only just inserted, so remove it ourselves. The
+        // subscribe we performed is void either way — the target dropped
+        // its whole roster on failure — and leaving the entry behind
+        // would make every subsequent call skip the re-subscribe and
+        // publish replies into a channel we are not rostered on.
+        //
+        // Order matters: insert THEN check. Checking first would leave
+        // the same gap one step earlier. Because the eviction bumps the
+        // generation after its retain, observing a change here means the
+        // retain has already happened and cannot take our entry later.
+        //
+        // `remove` unconditionally rather than
+        // `remove_if(value == service)`: a concurrent caller for a
+        // colliding service hash may have overwritten the slot, but that
+        // caller's own fence covers its entry, and dropping a live slot
+        // costs at most one idempotent re-subscribe.
+        if self.peer_failure_generation(target_node_id) != gen_before {
+            registry.remove(&(target_node_id, service_hash));
+            return Err(RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!(
+                    "session with {target_node_id:#x} failed while subscribing to the \
+                     reply channel; the target dropped our roster entry, so the \
+                     subscribe did not survive. Retry — the next call re-subscribes."
+                ),
+            });
+        }
         Ok(())
     }
 }

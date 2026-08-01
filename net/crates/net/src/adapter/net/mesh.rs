@@ -2808,189 +2808,6 @@ impl MembershipFailure {
     }
 }
 
-#[cfg(test)]
-mod membership_failure_tests {
-    use super::*;
-
-    /// Only the origin-binding `Unauthorized` warrants a corrective
-    /// re-announce.
-    ///
-    /// That re-announce deliberately bypasses the announce rate limit,
-    /// so this predicate is what stops one unreachable or throttling
-    /// target from turning every RPC attempt into two extra
-    /// rate-limit-bypassing capability broadcasts.
-    #[test]
-    fn only_unauthorized_warrants_a_corrective_reannounce() {
-        assert!(
-            MembershipFailure::Rejected(Some(AckReason::Unauthorized)).warrants_reannounce(),
-            "Unauthorized is the retryable origin-binding rejection"
-        );
-
-        // RateLimited especially must NOT: the peer is already asking
-        // us to slow down, so re-announcing adds load and cannot help.
-        for reason in [
-            AckReason::RateLimited,
-            AckReason::UnknownChannel,
-            AckReason::TooManyChannels,
-        ] {
-            assert!(
-                !MembershipFailure::Rejected(Some(reason)).warrants_reannounce(),
-                "{reason:?} must not trigger a rate-limit-bypassing re-announce"
-            );
-        }
-
-        assert!(!MembershipFailure::Rejected(None).warrants_reannounce());
-        assert!(
-            !MembershipFailure::Transport(AdapterError::Connection("peer gone".into()))
-                .warrants_reannounce(),
-            "a peer that is simply gone must not drive re-announces"
-        );
-    }
-
-    /// The peer-failure cleanup must evict BOTH per-peer maps, and only
-    /// for the failed peer.
-    ///
-    /// Exercises `evict_failed_peer_channel_state` directly rather than
-    /// failing a live session. The previous version of this test was a
-    /// source scan, and it was worse than useless: `str::find` returned
-    /// the search literal inside the test itself — which sits earlier in
-    /// the file than the production call — so the window it asserted
-    /// over was its own source, and deleting the real eviction still
-    /// passed.
-    #[test]
-    fn peer_failure_cleanup_evicts_only_the_failed_peers_state() {
-        const FAILED: u64 = 0xF0;
-        const HEALTHY: u64 = 0xB0;
-
-        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
-        #[cfg(feature = "cortex")]
-        let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
-
-        // Two channels for the failed peer, one for a healthy peer.
-        for (node, ch) in [(FAILED, 1u64), (FAILED, 2u64), (HEALTHY, 1u64)] {
-            chains.insert(
-                (node, ch),
-                RetainedChain::new(TokenChain { tokens: Vec::new() }),
-            );
-        }
-        #[cfg(feature = "cortex")]
-        for (target, svc) in [(FAILED, 10u64), (FAILED, 11u64), (HEALTHY, 10u64)] {
-            replies.insert((target, svc), Arc::from("svc"));
-        }
-
-        #[cfg(feature = "cortex")]
-        let announced: dashmap::DashSet<u64> = dashmap::DashSet::new();
-        #[cfg(feature = "cortex")]
-        {
-            announced.insert(FAILED);
-            announced.insert(HEALTHY);
-        }
-
-        evict_failed_peer_channel_state(
-            FAILED,
-            &chains,
-            #[cfg(feature = "cortex")]
-            &replies,
-            #[cfg(feature = "cortex")]
-            &announced,
-        );
-
-        assert!(
-            chains.get(&(FAILED, 1)).is_none() && chains.get(&(FAILED, 2)).is_none(),
-            "the failed peer's retained subscribe chains must be dropped — \
-             otherwise they leak for the node's lifetime and a reused \
-             node_id could re-validate a stale chain"
-        );
-        assert!(
-            chains.get(&(HEALTHY, 1)).is_some(),
-            "a healthy peer's state must survive another peer's failure"
-        );
-
-        #[cfg(feature = "cortex")]
-        {
-            assert!(
-                replies.get(&(FAILED, 10)).is_none() && replies.get(&(FAILED, 11)).is_none(),
-                "the failed peer's reply-subscription cache must be dropped — \
-                 the publisher already evicted our roster entry, so leaving \
-                 this makes later calls skip the re-subscribe and silently \
-                 lose every reply"
-            );
-            assert!(
-                replies.get(&(HEALTHY, 10)).is_some(),
-                "a healthy target's reply subscription must survive"
-            );
-            assert!(
-                !announced.contains(&FAILED),
-                "the corrective-announce latch must clear on failure, so a \
-                 genuine reconnect can re-announce"
-            );
-            assert!(
-                announced.contains(&HEALTHY),
-                "…but only for the failed peer — a peer that merely keeps \
-                 rejecting us stays latched"
-            );
-        }
-    }
-
-    /// The corrective re-announce is bounded to ONE per target.
-    ///
-    /// `Unauthorized` is not specific to the origin pin — the publisher
-    /// also returns it for cap-filter, token, visibility, queue-group
-    /// and missing-TokenCache rejections — and the membership wire
-    /// cannot carry a finer reason without a versioned cutover (an
-    /// unknown reason byte is a hard decode error on existing peers).
-    /// So the amplification is bounded structurally instead: a target
-    /// that keeps refusing us for an unrelated reason costs at most one
-    /// rate-limit-bypassing broadcast, not one per RPC.
-    #[cfg(feature = "cortex")]
-    #[test]
-    fn corrective_announce_is_claimed_at_most_once_per_target() {
-        let latch: dashmap::DashSet<u64> = dashmap::DashSet::new();
-        const A: u64 = 1;
-        const B: u64 = 2;
-
-        assert!(latch.insert(A), "first claim for a target succeeds");
-        assert!(
-            !latch.insert(A),
-            "a second claim for the same target must not"
-        );
-        assert!(latch.insert(B), "a different target is independent");
-
-        // Failure clears only that target's latch.
-        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
-        let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
-        evict_failed_peer_channel_state(A, &chains, &replies, &latch);
-
-        assert!(
-            latch.insert(A),
-            "after failure the target may be claimed again"
-        );
-        assert!(!latch.insert(B), "an unaffected target stays latched");
-    }
-
-    /// Collapsing back to `AdapterError` must preserve the historical
-    /// rejection text, since callers surface it to users.
-    #[test]
-    fn rejection_stringifies_to_the_historical_message() {
-        let msg = MembershipFailure::Rejected(Some(AckReason::Unauthorized))
-            .into_adapter_error()
-            .to_string();
-        assert!(
-            msg.contains("membership request rejected") && msg.contains("Unauthorized"),
-            "unexpected rejection message: {msg}"
-        );
-
-        // Transport failures pass through untouched.
-        let msg = MembershipFailure::Transport(AdapterError::Connection("no session".into()))
-            .into_adapter_error()
-            .to_string();
-        assert!(
-            msg.contains("no session"),
-            "unexpected transport message: {msg}"
-        );
-    }
-}
-
 /// Drop every piece of per-peer channel state a failed peer leaves
 /// behind, in one place so it can be tested without failing a real
 /// session.
@@ -3016,17 +2833,36 @@ mod membership_failure_tests {
 ///   corrective re-announces. Clearing it on failure is what makes a
 ///   genuine reconnect able to re-announce again, while a peer that
 ///   merely keeps rejecting us stays latched.
+///
+/// Eviction alone is not sufficient for `rpc_reply_subscriptions`,
+/// because a `ensure_reply_subscription` already past its subscribe
+/// `await` will insert AFTER this runs and restore precisely the stale
+/// "we are subscribed" state we just cleared. So this also bumps
+/// `rpc_peer_failure_gen`, the fence that lets such an insert detect it
+/// spanned a failure and roll itself back.
+///
+/// The bump is LAST, after the retain. Ordering it that way means an
+/// observed generation change implies the retain has already run, so
+/// the two never race into a window where the fence fires but the
+/// eviction has not happened yet. (The reverse order would also be
+/// safe — the retain would remove the entry instead — but this way the
+/// rollback is the only mechanism that has to be right.)
 fn evict_failed_peer_channel_state(
     node_id: u64,
     subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
     #[cfg(feature = "cortex")] rpc_reply_subscriptions: &dashmap::DashMap<(u64, u64), Arc<str>>,
     #[cfg(feature = "cortex")] rpc_corrective_announced: &dashmap::DashSet<u64>,
+    #[cfg(feature = "cortex")] rpc_peer_failure_gen: &dashmap::DashMap<u64, u64>,
 ) {
     subscriber_chains.retain(|(nid, _), _| *nid != node_id);
     #[cfg(feature = "cortex")]
     rpc_reply_subscriptions.retain(|(target, _), _| *target != node_id);
     #[cfg(feature = "cortex")]
     rpc_corrective_announced.remove(&node_id);
+    #[cfg(feature = "cortex")]
+    {
+        *rpc_peer_failure_gen.entry(node_id).or_insert(0) += 1;
+    }
 }
 
 /// Rolling-window auth-failure tracker, one entry per peer.
@@ -6956,6 +6792,26 @@ pub struct MeshNode {
     /// so a genuine reconnect can announce again.
     #[cfg(feature = "cortex")]
     rpc_corrective_announced: Arc<dashmap::DashSet<u64>>,
+    /// Per-peer failure counter, bumped every time that peer's session
+    /// fails. The fence that stops an in-flight reply-subscribe from
+    /// resurrecting `rpc_reply_subscriptions` state the failure path
+    /// just evicted — see `MeshNode::peer_failure_generation`.
+    ///
+    /// Absent means "never failed"; the fence compares `Option<u64>`,
+    /// not a value defaulted to zero, so a first-ever subscribe (absent
+    /// → absent) is distinguishable from one that spanned a failure
+    /// (absent → `Some(1)`).
+    ///
+    /// **Not capped, deliberately.** Entries accumulate one per distinct
+    /// peer that has failed at least once — the same order as the peer
+    /// set, at 16 bytes each, and node ids only enter after an
+    /// authenticated session. Evicting under a cap would be a
+    /// correctness hole rather than a memory win: a cleared counter
+    /// re-reads as absent, so a subscribe that snapshotted absent before
+    /// the peer failed would compare absent-to-absent and keep the stale
+    /// entry — exactly the state this fence exists to prevent.
+    #[cfg(feature = "cortex")]
+    rpc_peer_failure_gen: Arc<dashmap::DashMap<u64, u64>>,
     /// nRPC services the local node currently handles (registered
     /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
     /// drops). `announce_capabilities` merges these as
@@ -8216,6 +8072,12 @@ impl MeshNode {
             Arc::new(dashmap::DashSet::new());
         #[cfg(feature = "cortex")]
         let rpc_corrective_announced_failure = rpc_corrective_announced.clone();
+        // Per-peer failure counter fencing in-flight reply-subscribes;
+        // see `MeshNode::peer_failure_generation`.
+        #[cfg(feature = "cortex")]
+        let rpc_peer_failure_gen: Arc<dashmap::DashMap<u64, u64>> = Arc::new(dashmap::DashMap::new());
+        #[cfg(feature = "cortex")]
+        let rpc_peer_failure_gen_failure = rpc_peer_failure_gen.clone();
         // RT-4: event-pingwave gate + the clones the `on_recovery`
         // closure captures (it runs before `Self` exists, so it
         // can't call `emit_event_pingwave`).
@@ -8502,6 +8364,8 @@ impl MeshNode {
                 &rpc_reply_subscriptions_failure,
                 #[cfg(feature = "cortex")]
                 &rpc_corrective_announced_failure,
+                #[cfg(feature = "cortex")]
+                &rpc_peer_failure_gen_failure,
             );
             // RT-5: tell the mesh this peer is unreachable via us —
             // receivers drop their `(node_id, via=us)` routes within
@@ -8670,6 +8534,8 @@ impl MeshNode {
             rpc_reply_subscriptions,
             #[cfg(feature = "cortex")]
             rpc_corrective_announced,
+            #[cfg(feature = "cortex")]
+            rpc_peer_failure_gen,
             #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(LocalServiceRegistry::new(local_caps_changed.clone())),
             #[cfg(feature = "tool")]
@@ -19542,6 +19408,35 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub(super) fn claim_corrective_announce(&self, target: u64) -> bool {
         self.rpc_corrective_announced.insert(target)
+    }
+
+    /// How many times `peer`'s session has failed, or `None` if it never
+    /// has. The fence for operations that span an `await` and then write
+    /// per-peer state the failure path evicts.
+    ///
+    /// The problem it solves: `ensure_reply_subscription` reads the
+    /// cache, subscribes (an `await`, so the peer can fail underneath
+    /// it), then records "subscribed". The failure path's eviction runs
+    /// during that gap and finds nothing to evict; the insert lands
+    /// afterwards. The caller is now cached as subscribed to a target
+    /// that dropped it from the roster on failure — so every later call
+    /// short-circuits the re-subscribe, and the target publishes replies
+    /// to a channel we are no longer rostered on. They are dropped
+    /// silently: no error, no timeout on the subscribe, just replies
+    /// that never arrive until the process restarts.
+    ///
+    /// Usage: snapshot before the `await`, compare after the write, and
+    /// undo the write if it moved.
+    ///
+    /// Returns `Option` rather than defaulting to `0` on purpose. A
+    /// first-ever subscribe sees `None` both times and correctly keeps
+    /// its entry; if absence collapsed to `0`, it would be
+    /// indistinguishable from a counter reset and the fence would have
+    /// a silent hole. (This is also why the map is never pruned — see
+    /// the field's docs.)
+    #[cfg(feature = "cortex")]
+    pub(super) fn peer_failure_generation(&self, peer: u64) -> Option<u64> {
+        self.rpc_peer_failure_gen.get(&peer).map(|e| *e.value())
     }
 
     /// Bare subscribe that reports the publisher's rejection reason as
@@ -36607,3 +36502,274 @@ mod exact_expiry_timer_tests {
 #[cfg(test)]
 #[path = "org_routing_wiring_tests.rs"]
 mod org_routing_wiring_tests;
+
+// NOTE: this test module lives at the END of the file ON PURPOSE, for
+// the same reason spelled out above `committed_flush_stall_tests`: the
+// heartbeat drift check in session.rs treats the FIRST column-0
+// `#[cfg(test)] mod` as the production/test boundary. This module was
+// originally added next to `MembershipFailure` a few hundred lines in,
+// which hid the real `session.build_heartbeat()` caller behind that
+// boundary and left `mesh_rs_production_callers_match_allowlist` red.
+#[cfg(test)]
+mod membership_failure_tests {
+    use super::*;
+
+    /// Only the origin-binding `Unauthorized` warrants a corrective
+    /// re-announce.
+    ///
+    /// That re-announce deliberately bypasses the announce rate limit,
+    /// so this predicate is what stops one unreachable or throttling
+    /// target from turning every RPC attempt into two extra
+    /// rate-limit-bypassing capability broadcasts.
+    #[test]
+    fn only_unauthorized_warrants_a_corrective_reannounce() {
+        assert!(
+            MembershipFailure::Rejected(Some(AckReason::Unauthorized)).warrants_reannounce(),
+            "Unauthorized is the retryable origin-binding rejection"
+        );
+
+        // RateLimited especially must NOT: the peer is already asking
+        // us to slow down, so re-announcing adds load and cannot help.
+        for reason in [
+            AckReason::RateLimited,
+            AckReason::UnknownChannel,
+            AckReason::TooManyChannels,
+        ] {
+            assert!(
+                !MembershipFailure::Rejected(Some(reason)).warrants_reannounce(),
+                "{reason:?} must not trigger a rate-limit-bypassing re-announce"
+            );
+        }
+
+        assert!(!MembershipFailure::Rejected(None).warrants_reannounce());
+        assert!(
+            !MembershipFailure::Transport(AdapterError::Connection("peer gone".into()))
+                .warrants_reannounce(),
+            "a peer that is simply gone must not drive re-announces"
+        );
+    }
+
+    /// The peer-failure cleanup must evict BOTH per-peer maps, and only
+    /// for the failed peer.
+    ///
+    /// Exercises `evict_failed_peer_channel_state` directly rather than
+    /// failing a live session. The previous version of this test was a
+    /// source scan, and it was worse than useless: `str::find` returned
+    /// the search literal inside the test itself — which sits earlier in
+    /// the file than the production call — so the window it asserted
+    /// over was its own source, and deleting the real eviction still
+    /// passed.
+    #[test]
+    fn peer_failure_cleanup_evicts_only_the_failed_peers_state() {
+        const FAILED: u64 = 0xF0;
+        const HEALTHY: u64 = 0xB0;
+
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        #[cfg(feature = "cortex")]
+        let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
+
+        // Two channels for the failed peer, one for a healthy peer.
+        for (node, ch) in [(FAILED, 1u64), (FAILED, 2u64), (HEALTHY, 1u64)] {
+            chains.insert(
+                (node, ch),
+                RetainedChain::new(TokenChain { tokens: Vec::new() }),
+            );
+        }
+        #[cfg(feature = "cortex")]
+        for (target, svc) in [(FAILED, 10u64), (FAILED, 11u64), (HEALTHY, 10u64)] {
+            replies.insert((target, svc), Arc::from("svc"));
+        }
+
+        #[cfg(feature = "cortex")]
+        let announced: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        #[cfg(feature = "cortex")]
+        {
+            announced.insert(FAILED);
+            announced.insert(HEALTHY);
+        }
+        #[cfg(feature = "cortex")]
+        let gens: dashmap::DashMap<u64, u64> = dashmap::DashMap::new();
+
+        evict_failed_peer_channel_state(
+            FAILED,
+            &chains,
+            #[cfg(feature = "cortex")]
+            &replies,
+            #[cfg(feature = "cortex")]
+            &announced,
+            #[cfg(feature = "cortex")]
+            &gens,
+        );
+
+        assert!(
+            chains.get(&(FAILED, 1)).is_none() && chains.get(&(FAILED, 2)).is_none(),
+            "the failed peer's retained subscribe chains must be dropped — \
+             otherwise they leak for the node's lifetime and a reused \
+             node_id could re-validate a stale chain"
+        );
+        assert!(
+            chains.get(&(HEALTHY, 1)).is_some(),
+            "a healthy peer's state must survive another peer's failure"
+        );
+
+        #[cfg(feature = "cortex")]
+        {
+            assert!(
+                replies.get(&(FAILED, 10)).is_none() && replies.get(&(FAILED, 11)).is_none(),
+                "the failed peer's reply-subscription cache must be dropped — \
+                 the publisher already evicted our roster entry, so leaving \
+                 this makes later calls skip the re-subscribe and silently \
+                 lose every reply"
+            );
+            assert!(
+                replies.get(&(HEALTHY, 10)).is_some(),
+                "a healthy target's reply subscription must survive"
+            );
+            assert!(
+                !announced.contains(&FAILED),
+                "the corrective-announce latch must clear on failure, so a \
+                 genuine reconnect can re-announce"
+            );
+            assert!(
+                announced.contains(&HEALTHY),
+                "…but only for the failed peer — a peer that merely keeps \
+                 rejecting us stays latched"
+            );
+            assert_eq!(
+                gens.get(&FAILED).map(|e| *e.value()),
+                Some(1),
+                "the failure generation must advance, or a reply-subscribe \
+                 already past its await cannot tell it spanned this failure \
+                 and will restore the cache entry we just evicted"
+            );
+            assert!(
+                gens.get(&HEALTHY).is_none(),
+                "a healthy peer's generation must stay ABSENT, not zero — the \
+                 fence distinguishes the two"
+            );
+        }
+    }
+
+    /// The eviction alone cannot close the reply-subscription hole,
+    /// because the racing insert has not happened yet when it runs. This
+    /// pins the generation half: the sequence a subscribe spanning a
+    /// failure actually observes.
+    ///
+    /// Models the interleaving rather than driving it — forcing a real
+    /// session failure to land inside `ensure_reply_subscription`'s
+    /// `await` is not something the test harness can schedule
+    /// deterministically. What is pinned here is the property the fence
+    /// depends on: the generation an insert reads afterwards differs
+    /// from the one it snapshotted before, INCLUDING the first-failure
+    /// case where the snapshot was absent.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn a_subscribe_spanning_a_failure_observes_a_generation_change() {
+        const TARGET: u64 = 0xC0FFEE;
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
+        let latch: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        let gens: dashmap::DashMap<u64, u64> = dashmap::DashMap::new();
+
+        // 1. The subscribe snapshots. Never failed → absent.
+        let gen_before = gens.get(&TARGET).map(|e| *e.value());
+        assert_eq!(gen_before, None);
+
+        // 2. The peer fails mid-`await`. The eviction finds nothing to
+        //    evict — the entry does not exist yet. This is the whole
+        //    defect: cleanup ran, and it was a no-op.
+        evict_failed_peer_channel_state(TARGET, &chains, &replies, &latch, &gens);
+        assert!(
+            replies.is_empty(),
+            "precondition: the eviction had nothing to remove"
+        );
+
+        // 3. The subscribe completes and records itself.
+        replies.insert((TARGET, 7), Arc::from("svc"));
+
+        // 4. The fence fires: absent → Some(1).
+        let gen_after = gens.get(&TARGET).map(|e| *e.value());
+        assert_ne!(
+            gen_after, gen_before,
+            "absent-before vs present-after must compare unequal; if absence \
+             defaulted to 0 this would read 0 == 0 and the stale entry would \
+             survive the very first failure"
+        );
+
+        // 5. …and a second failure is likewise distinguishable, so the
+        //    fence keeps working for a peer that flaps.
+        let gen_before = gen_after;
+        evict_failed_peer_channel_state(TARGET, &chains, &replies, &latch, &gens);
+        assert_ne!(gens.get(&TARGET).map(|e| *e.value()), gen_before);
+
+        // A subscribe that did NOT span a failure must be left alone.
+        const QUIET: u64 = 0xD00D;
+        let quiet_before = gens.get(&QUIET).map(|e| *e.value());
+        replies.insert((QUIET, 7), Arc::from("svc"));
+        assert_eq!(
+            gens.get(&QUIET).map(|e| *e.value()),
+            quiet_before,
+            "no failure, no rollback — the fence must not cost the happy path \
+             its cache entry"
+        );
+    }
+
+    /// The corrective re-announce is bounded to ONE per target.
+    ///
+    /// `Unauthorized` is not specific to the origin pin — the publisher
+    /// also returns it for cap-filter, token, visibility, queue-group
+    /// and missing-TokenCache rejections — and the membership wire
+    /// cannot carry a finer reason without a versioned cutover (an
+    /// unknown reason byte is a hard decode error on existing peers).
+    /// So the amplification is bounded structurally instead: a target
+    /// that keeps refusing us for an unrelated reason costs at most one
+    /// rate-limit-bypassing broadcast, not one per RPC.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn corrective_announce_is_claimed_at_most_once_per_target() {
+        let latch: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        const A: u64 = 1;
+        const B: u64 = 2;
+
+        assert!(latch.insert(A), "first claim for a target succeeds");
+        assert!(
+            !latch.insert(A),
+            "a second claim for the same target must not"
+        );
+        assert!(latch.insert(B), "a different target is independent");
+
+        // Failure clears only that target's latch.
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        let replies: dashmap::DashMap<(u64, u64), Arc<str>> = dashmap::DashMap::new();
+        let gens: dashmap::DashMap<u64, u64> = dashmap::DashMap::new();
+        evict_failed_peer_channel_state(A, &chains, &replies, &latch, &gens);
+
+        assert!(
+            latch.insert(A),
+            "after failure the target may be claimed again"
+        );
+        assert!(!latch.insert(B), "an unaffected target stays latched");
+    }
+
+    /// Collapsing back to `AdapterError` must preserve the historical
+    /// rejection text, since callers surface it to users.
+    #[test]
+    fn rejection_stringifies_to_the_historical_message() {
+        let msg = MembershipFailure::Rejected(Some(AckReason::Unauthorized))
+            .into_adapter_error()
+            .to_string();
+        assert!(
+            msg.contains("membership request rejected") && msg.contains("Unauthorized"),
+            "unexpected rejection message: {msg}"
+        );
+
+        // Transport failures pass through untouched.
+        let msg = MembershipFailure::Transport(AdapterError::Connection("no session".into()))
+            .into_adapter_error()
+            .to_string();
+        assert!(
+            msg.contains("no session"),
+            "unexpected transport message: {msg}"
+        );
+    }
+}
