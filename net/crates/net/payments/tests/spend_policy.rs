@@ -606,3 +606,137 @@ async fn approve_grants_a_held_quote_and_refuses_to_invent_one() {
         "the held bytes must be the exact quote that was approved"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// L2: reservations are owner-tracked and release is idempotent
+// ---------------------------------------------------------------------------
+
+/// A second release for the same quote is a no-op, and cannot free
+/// budget belonging to anything else.
+///
+/// The counters are aggregate (`day|network|asset`), so before the
+/// reservation record existed, release had to be told the amount and the
+/// day again and could not tell a first release from a second. Two
+/// releases subtracted twice; and because the underflow saturated to
+/// zero, one over-large release wiped the whole day's counter for that
+/// pair — freeing budget for every unrelated reservation in the same
+/// bucket and reopening `max_per_day` as a loss bound.
+#[tokio::test]
+async fn releasing_twice_does_not_refund_twice() {
+    let s = setup(SpendProfile::DevTest);
+    let first = s.quote(mock_requirements("2500"), NOW);
+    let second = s.quote(mock_requirements("1000"), NOW + 1);
+
+    assert_eq!(
+        s.engine.check_and_reserve(&first, &s.registry, NOW).await.unwrap(),
+        SpendDecision::Allowed
+    );
+    assert_eq!(
+        s.engine.check_and_reserve(&second, &s.registry, NOW).await.unwrap(),
+        SpendDecision::Allowed
+    );
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(3500)
+    );
+
+    // Release the first: its own amount comes off, nothing else moves.
+    s.engine.release_reservation(&first, NOW).await.unwrap();
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(1000),
+        "only the released quote's amount comes off"
+    );
+
+    // Release it again, and again: idempotent. The second quote's
+    // reservation is untouched.
+    s.engine.release_reservation(&first, NOW).await.unwrap();
+    s.engine.release_reservation(&first, NOW).await.unwrap();
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(1000),
+        "a repeat release must not refund again"
+    );
+
+    // And the surviving reservation is still on file, so it can still be
+    // released exactly once.
+    assert!(s.engine.reservation(&second.quote_id).await.unwrap().is_some());
+    assert!(s.engine.reservation(&first.quote_id).await.unwrap().is_none());
+    s.engine.release_reservation(&second, NOW).await.unwrap();
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(0)
+    );
+}
+
+/// Release finds the counter the reservation actually landed in, not the
+/// one the caller's clock points at now.
+///
+/// A payment reserved just before UTC midnight and released just after
+/// used to decrement the *new* day's counter — freeing budget on a day
+/// nothing was spent. The reservation record carries its own day, so the
+/// caller's clock is no longer part of the correctness argument.
+#[tokio::test]
+async fn release_uses_the_reservations_own_day_not_the_callers_clock() {
+    let s = setup(SpendProfile::DevTest);
+    let quote = s.quote(mock_requirements("2500"), NOW);
+    s.engine
+        .check_and_reserve(&quote, &s.registry, NOW)
+        .await
+        .unwrap();
+
+    // Something else spends on the following day.
+    let tomorrow = NOW + NS_PER_DAY;
+    let other = s.quote(mock_requirements("1000"), tomorrow);
+    s.engine
+        .check_and_reserve(&other, &s.registry, tomorrow)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.engine
+            .spent_today("mock:net", "musd", tomorrow)
+            .await
+            .unwrap(),
+        AtomicAmount::from_u128(1000)
+    );
+
+    // Release the first quote with a clock that has rolled over.
+    s.engine.release_reservation(&quote, tomorrow).await.unwrap();
+
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(0),
+        "the release must land on the day the reservation was taken"
+    );
+    assert_eq!(
+        s.engine
+            .spent_today("mock:net", "musd", tomorrow)
+            .await
+            .unwrap(),
+        AtomicAmount::from_u128(1000),
+        "and must not touch another day's budget"
+    );
+}
+
+/// Reserving the same quote twice is a retry, not a second spend.
+#[tokio::test]
+async fn reserving_the_same_quote_twice_counts_once() {
+    let s = setup(SpendProfile::DevTest);
+    let quote = s.quote(mock_requirements("2500"), NOW);
+
+    for _ in 0..3 {
+        assert_eq!(
+            s.engine
+                .check_and_reserve(&quote, &s.registry, NOW)
+                .await
+                .unwrap(),
+            SpendDecision::Allowed
+        );
+    }
+    assert_eq!(
+        s.engine.spent_today("mock:net", "musd", NOW).await.unwrap(),
+        AtomicAmount::from_u128(2500),
+        "a retried reservation must not accumulate"
+    );
+}

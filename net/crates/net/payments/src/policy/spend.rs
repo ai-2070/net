@@ -177,6 +177,37 @@ pub struct ApprovalRecord {
     pub quote_b64: String,
 }
 
+/// One outstanding reservation, keyed by the quote that took it.
+///
+/// The per-day counters are aggregate — `{day}|{network}|{asset}` — so on
+/// their own they record *how much* was reserved and nothing about *by
+/// whom*. Release then had to be told the amount and the day again, and
+/// had no way to tell a first release from a second: two releases for one
+/// quote subtracted twice, and an over-large release saturated the whole
+/// day's counter to zero, erasing every other reservation for that pair.
+///
+/// This record is the ownership the counter lacks. Release looks up the
+/// exact reservation, decrements what it actually reserved, and removes
+/// it — so a second release finds nothing and is a no-op, and the
+/// caller's clock stops being part of the correctness argument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reservation {
+    /// The day bucket the reservation landed in, so release finds the
+    /// same counter regardless of when it runs.
+    pub day: u64,
+    pub network: String,
+    /// The x402 asset locator, as it appears in the counter key.
+    pub asset: String,
+    /// Atomic units reserved.
+    pub amount: AtomicAmount,
+}
+
+impl Reservation {
+    fn counter_key(&self) -> String {
+        format!("{}|{}|{}", self.day, self.network, self.asset)
+    }
+}
+
 /// On-disk shape. Struct wrapper (not a bare map) for schema headroom,
 /// per the store convention.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -195,6 +226,11 @@ pub struct SpendPolicyFile {
     /// Approval records keyed by quote id.
     #[serde(default)]
     approvals: BTreeMap<String, ApprovalRecord>,
+    /// Outstanding reservations, keyed by quote id — the ownership the
+    /// aggregate counters cannot express. Additive: a store written by an
+    /// older build simply has none, and its releases stay best-effort.
+    #[serde(default)]
+    reservations: BTreeMap<String, Reservation>,
 }
 
 /// The caller-side spend gate over one shared policy file.
@@ -266,7 +302,8 @@ impl SpendPolicyEngine {
         let quote_id = quote.quote_id.clone();
         let capability = quote.capability.clone();
         let day = now_ns / NS_PER_DAY;
-        let counter_key = format!("{day}|{network}|{}", requirements.asset);
+        let requirements_asset = requirements.asset.clone();
+        let counter_key = format!("{day}|{network}|{requirements_asset}");
         // The quote's canonical bytes are held with a pending approval so a
         // post-approval retry redeems this exact provider-signed quote. They
         // are computed lazily inside `require` (below) — see the note there.
@@ -465,9 +502,25 @@ impl SpendPolicyEngine {
                         }
                     }
                 }
+                // A reservation already on file for this quote means this
+                // is a retry, not a second spend. Reserving again would
+                // double-count it, and the whole point of keying by quote
+                // is that we can now tell.
+                if s.reservations.contains_key(&quote_id) {
+                    break 'decision SpendDecision::Allowed;
+                }
                 // Approved spend is still spending: it lands in the counter.
                 s.counters
                     .insert(counter_key.clone(), new_total.to_canonical_string());
+                s.reservations.insert(
+                    quote_id.clone(),
+                    Reservation {
+                        day,
+                        network: network.clone(),
+                        asset: requirements_asset.clone(),
+                        amount: amount.clone(),
+                    },
+                );
                 dirty = true;
                 SpendDecision::Allowed
             };
@@ -484,38 +537,71 @@ impl SpendPolicyEngine {
         Ok(decision)
     }
 
-    /// Release a reservation made by [`Self::check_and_reserve`] after a
-    /// terminal failure where value verifiably did not move (provider
-    /// rejected pre-settle, facilitator refused). Saturating at zero;
-    /// callers treat failure as over-counting (the fail-closed
-    /// direction), never as blocked spending.
+    /// Release the reservation this quote took, after a terminal failure
+    /// where value verifiably did not move (provider rejected pre-settle,
+    /// facilitator refused).
+    ///
+    /// **Idempotent and owner-checked.** The release decrements exactly
+    /// what [`Self::check_and_reserve`] recorded for *this quote*, from
+    /// the counter it actually landed in, and then forgets the
+    /// reservation. A second release for the same quote finds nothing and
+    /// does nothing.
+    ///
+    /// That is a change from the previous behaviour, and the reason is
+    /// worth stating: release used to subtract a caller-supplied amount
+    /// from a counter derived from the caller's *current* clock, with no
+    /// record of what had been reserved. Two releases subtracted twice,
+    /// and because the underflow saturated to zero, one over-large
+    /// release wiped the entire day's counter for that
+    /// `(network, asset)` — freeing budget for every unrelated
+    /// reservation in the same bucket and reopening `max_per_day` as a
+    /// loss bound.
+    ///
+    /// `now_ns` no longer selects the counter — the reservation record
+    /// carries its own day — and is used only to retire records whose
+    /// counters have already aged out.
     pub async fn release_reservation(
         &self,
         quote: &PaymentQuote,
         now_ns: u64,
     ) -> Result<(), SpendError> {
-        let requirements = quote.requirements.view();
-        let amount = AtomicAmount::parse(&requirements.amount)
-            .map_err(|e| SpendError::Malformed(e.to_string()))?;
-        let key = format!(
-            "{}|{}|{}",
-            now_ns / NS_PER_DAY,
-            requirements.network,
-            requirements.asset
-        );
-        mutate_json::<SpendPolicyFile, _, _>(&self.path, move |s| {
-            if let Some(raw) = s.counters.get(&key) {
-                if let Ok(current) = AtomicAmount::parse(raw) {
-                    let reduced = current
-                        .checked_sub(&amount)
-                        .unwrap_or_else(|_| AtomicAmount::from_u128(0));
-                    s.counters
-                        .insert(key.clone(), reduced.to_canonical_string());
+        let quote_id = quote.quote_id.clone();
+        let today = now_ns / NS_PER_DAY;
+        mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, move |s| {
+            // Housekeeping: a reservation whose counter has aged past the
+            // retention horizon can never be released meaningfully again.
+            let before = s.reservations.len();
+            s.reservations
+                .retain(|_, r| r.day + COUNTER_RETAIN_DAYS >= today);
+            let mut dirty = s.reservations.len() != before;
+
+            if let Some(reservation) = s.reservations.remove(&quote_id) {
+                dirty = true;
+                let key = reservation.counter_key();
+                if let Some(raw) = s.counters.get(&key) {
+                    if let Ok(current) = AtomicAmount::parse(raw) {
+                        // Saturating only as a floor: the reservation
+                        // record means the amount is the one that went in,
+                        // so an underflow here would be corruption rather
+                        // than a mismatched caller.
+                        let reduced = current
+                            .checked_sub(&reservation.amount)
+                            .unwrap_or_else(|_| AtomicAmount::from_u128(0));
+                        s.counters.insert(key, reduced.to_canonical_string());
+                    }
                 }
             }
+            ((), dirty)
         })
         .await?;
         Ok(())
+    }
+
+    /// The reservation currently on file for `quote_id`, if any.
+    /// Diagnostics and tests.
+    pub async fn reservation(&self, quote_id: &str) -> Result<Option<Reservation>, SpendError> {
+        let state: SpendPolicyFile = load_json(&self.path).await?;
+        Ok(state.reservations.get(quote_id).cloned())
     }
 
     /// Operator-only verb: approve a specific quote. Resolves through the
