@@ -22,46 +22,66 @@ Companions:
 
 ## The model
 
-Four planes, one fixed-width authorization path:
+Five orthogonal planes, one fixed-width subnet authorization path:
 
-```
-Subnet     = hierarchical topology + transport scope
-Channel    = data-plane publish/subscribe authority
-Resource   = provider-local effect authority
-Control    = signed transport admission, route, and export grants
+```text
+Organization = horizontal federation across independently operating nodes
+Subnet       = vertical topology + transport scope inside one composed system
+Channel      = data-plane publish/subscribe authority
+Resource     = provider-local effect authority
+Control      = signed transport admission, route, and export grants
 ```
 
 | Question | Correct primitive |
 |---|---|
-| Where should traffic propagate? | Hierarchical subnet topology + `Visibility` |
-| May this authenticated node attach to this subnet? | `SubnetGrant::ATTACH` |
+| Does this node belong to the fleet/enterprise? | `OrgMembershipCert` |
+| May it dispatch for its org over a capability? | `OrgDispatcherGrant` |
+| May one org discover/invoke another org's capability? | `OrgCapabilityGrant` + per-call proof |
+| Where should traffic propagate inside a machine/installation? | Hierarchical subnet topology + `Visibility` |
+| May this authenticated node attach to this internal subtree? | `SubnetGrant::ATTACH` |
 | Who may publish or subscribe? | Channel `PermissionToken` chain |
-| Who may invoke a service/tool? | Capability/provider admission (org grants) |
-| Who may forward inside a subtree? | `SubnetGrant::ROUTE` |
-| Who may cross a subtree boundary? | `SubnetGrant::EXPORT` |
-| How are revocation updates distributed? | Existing transport carrying independently signed floors |
-| Who owns this machine? | Operator/org delegation — not subnet placement |
+| Who may invoke a service/tool? | Org/provider admission; provider remains final |
+| Who may forward inside an internal subtree? | `SubnetGrant::ROUTE` |
+| Who may cross an internal subtree boundary? | `SubnetGrant::EXPORT` |
+| How are subnet revocation updates distributed? | Existing transport carrying independently signed floors |
+| Who owns this machine? | Operator/product-root authority — not fleet membership or subnet placement |
+
+The intended deployment split is:
+
+```text
+organizations federate machines horizontally
+subnets compose each machine or installation vertically
+```
+
+A compact subnet path is not a fleet directory. Fleet scale lives in stable
+org membership and node identities; each vehicle, machine, site, or other
+installation owns an authority-qualified local hierarchy. This avoids trying
+to encode millions of fleet members into the four-level `TopologySubnetId`.
 
 The invariants that generate every decision below:
 
-> **Topology assignment grants access to nothing. A verified grant rooted at
-> an ancestor applies downward to its descendant subtree. Channel and
-> provider authorization remain independent.**
+> **Topology assignment grants access to nothing. A verified subnet grant
+> rooted at an ancestor applies downward to its descendant subtree. Org,
+> channel, and provider authorization remain independent.**
 
-A parent grant does not become blanket resource authority. It establishes
-only the named transport right over that subtree:
-
-```
+```text
+OrgMembershipCert != OrgDispatcherGrant != OrgCapabilityGrant
+OrgMembershipCert != SubnetGrant
+SubnetGrant::EXPORT != fleet/provider invocation authority
 reachability != authentication != authorization
 topology assignment != transport admission
 transport admission != channel access != provider effect
 ```
 
-The implementation verifies signatures at session establishment and grant
-updates. The packet/forwarding path reads an immutable verified context and
-performs only authority equality, a fixed-width hierarchy-prefix comparison,
-a generation check, and a rights-bit test. No packet performs token-chain
-verification or online policy lookup.
+A parent subnet grant establishes only the named transport right over that
+installation subtree. It does not make a fleet peer an internal machine
+member, and it does not open a channel or provider resource.
+
+The implementation verifies subnet signatures at session establishment and
+grant updates. The packet/forwarding path reads an immutable verified context
+and performs only authority equality, a fixed-width hierarchy-prefix
+comparison, epoch comparisons, expiry, and a rights-bit test. No packet
+performs token-chain verification or online policy lookup.
 
 ## 1. What the code says today
 
@@ -211,7 +231,8 @@ it is the security bug this plan fixes first:
 
 ## 2. Decision record
 
-Answers to the eight questions the trace was commissioned to settle.
+Answers to the original eight trace questions plus the deployment-axis
+decision that makes the hierarchy scale to an enterprise fleet.
 
 **Q1 — Is `Visibility::SubnetLocal` explicitly topology-only?**
 Not yet in code or docs; it is *implemented* as an authorization verdict
@@ -303,7 +324,7 @@ establishment. Grant nonces provide artifact uniqueness, not packet replay
 protection.
 
 **Q8 — Which current `subnet:*` / `allowed_subnets` checks are unsafe?**
-Unsafe as authorization: the *** subnet/group admission (§1.6) — the
+Unsafe as authorization: the callee-side subnet/group admission (§1.6) — the
 first behavior fix. Unsafe as doctrine: the `behavior/subnet.rs` module doc
 (§1.2) and the fail-open unknown-peer inversion warning (§1.3) — language/docs
 fixes, since visibility is routing. Acceptable as routing and explicitly
@@ -311,6 +332,21 @@ kept: `peer_subnets`-driven fan-out filtering, scoped discovery's same-subnet
 filter (`mesh.rs:27609–27621` — already documented as a non-boundary), and
 caller-side provider filtering in `call_service*` (`mesh_rpc.rs:4797–4808`,
 `:4905–4913`), which narrows candidates and admits nothing.
+
+**Q9 — Do organizations represent fleet access while subnets represent
+vertical integration access?**
+Yes, with "access" kept precise. Organizations federate independent machines
+horizontally: membership proves belonging, dispatcher grants authorize a
+caller to act for its org, capability grants authorize cross-org
+discover/invoke, and provider admission remains final. Subnets compose one
+machine/site/installation vertically: a product-local grant authorizes
+`ATTACH`, `ROUTE`, or `EXPORT` over an authority-qualified internal subtree.
+
+Fleet membership never creates internal subnet authority. A subnet grant never
+creates fleet discovery/invocation authority. They meet only at a bounded
+exported provider boundary, where gateway `EXPORT` and the applicable
+org/provider proof are both required. Compact subnet paths therefore describe
+local product hierarchy, never fleet membership or global vehicle identity.
 
 ## 3. Rejected designs (recorded permanently)
 
@@ -352,11 +388,93 @@ child that must be sovereign uses a different authority-qualified
 `SubnetRef`; it does not add deny precedence, exception lists, or runtime
 policy evaluation to the packet path.
 
+**Fleet membership encoded as subnet hierarchy.** Rejected. A compact
+four-level path is a local integration coordinate, not a global vehicle,
+customer, geography, or fleet directory. Autonomous machines federate through
+org identity and org grants; their internal subnets remain authority-local.
+
+**Org membership as internal subnet admission.** Rejected. An
+`OrgMembershipCert` proves belonging and may outlive routing, location, and
+machine topology changes. It never synthesizes `ATTACH`, `ROUTE`, or `EXPORT`
+inside any member machine. Cross-machine use terminates at an exported
+provider boundary with separate org and provider admission.
+
 **Online per-packet policy decisions.** Rejected. Signatures, delegation,
 expiry, and revocation are resolved when constructing a session context.
 Forwarding consumes only that immutable context.
 
 ## 4. Design
+
+### D0 — Horizontal organizations; vertical subnets
+
+Organizations and subnets are independent authority coordinates, not two ways
+to express the same membership set.
+
+An organization federates independently operating machines:
+
+```text
+BMW Org
+├── Vehicle A
+├── Vehicle B
+├── Vehicle C
+├── roadside edge node
+└── fleet service
+```
+
+`OrgMembershipCert` proves belonging only. An `OrgDispatcherGrant` empowers a
+specific dispatcher to act for its org over a capability. An
+`OrgCapabilityGrant` empowers one org to discover and/or invoke a capability
+on another org's providers. The provider verifies the per-call proof and keeps
+final policy. No org artifact attaches its holder to another machine's
+internal subnet.
+
+Each composed product or installation has a separate vertical hierarchy:
+
+```text
+Vehicle B subnet authority
+└── vehicle
+    ├── perception
+    │   ├── world-model
+    │   ├── camera-domain
+    │   └── radar-domain
+    ├── chassis
+    │   ├── braking
+    │   └── steering
+    ├── cabin
+    └── connectivity
+```
+
+The `SubnetRef.authority` is the vehicle/product-instance or installation
+root, or a purpose-specific infrastructure root provisioned for it. It may be
+issued or attested under BMW operational processes, but it is not inferred
+from BMW org membership. The compact path is local to that authority; vehicle
+identity and fleet scale never consume hierarchy levels.
+
+The product gateway composes the planes without collapsing them:
+
+```text
+Vehicle B internal world-model provider
+    + gateway EXPORT over the required internal subtree
+    + fleet-facing capability boundary
+    + caller OrgDispatcherGrant / OrgCapabilityGrant as applicable
+    + provider-local admission
+    = authorized horizontal use of the exported capability
+```
+
+A fleet peer may therefore invoke Vehicle B's bounded `perception.roi`
+provider without receiving `ATTACH` to Vehicle B, its camera domain, or any
+other internal subtree. `EXPORT` authorizes the gateway side of the boundary;
+it does not authorize the external caller or publish the internal nodes.
+
+Org and subnet currentness are independent. Revoking Vehicle B's org
+membership removes fleet belonging/dispatch context without rewriting its
+internal subnet grants. Raising a Vehicle B subtree floor revokes internal
+transport credentials without changing fleet membership. A severe compromise
+may do both, but neither revocation plane impersonates the other.
+
+This automotive mapping is the canonical v1 example, but the generic rule is
+broader: organizations federate autonomous systems; subnets compose one
+system, site, or installation internally.
 
 ### D1 — Authority-qualified hierarchical identity
 
@@ -443,11 +561,11 @@ operation. `ATTACH` never opens a channel or provider resource.
 This gives hierarchy the intended asymmetric behavior:
 
 ```text
-ATTACH(BMW/Europe)
-  permits transport attachment to Europe, Germany, Munich, Austria, ...
+ATTACH(Vehicle B/vehicle)
+  permits attachment to perception, world-model, chassis, cabin, ...
 
-ATTACH(BMW/Europe/Germany/Munich)
-  does not permit attachment to Germany, Leipzig, Austria, or Europe
+ATTACH(Vehicle B/vehicle/perception/camera-domain)
+  does not permit attachment to perception, radar-domain, chassis, or vehicle
 ```
 
 ### D3 — Fixed subnet credential; bounded delegation
@@ -548,10 +666,11 @@ pub struct SubnetRevocationFloor {
 ```
 
 For credential scope `S`, verification uses the maximum applicable floor on
-`S`'s fixed-depth ancestor path. A floor at `BMW/Europe/Germany` invalidates
-older grants scoped to Germany and its descendants without affecting Austria
-or a structurally dominant Europe grant. A floor at `BMW/Europe` covers every
-grant scoped to the European subtree.
+`S`'s fixed-depth ancestor path. A floor at `Vehicle B/vehicle/perception`
+invalidates older grants scoped to perception and its descendants without
+affecting chassis or a structurally dominant vehicle-root grant. A floor at
+`Vehicle B/vehicle` covers every grant scoped to that vehicle's internal
+subtree. It has no effect on Vehicle B's `OrgMembershipCert`.
 
 Floor application is monotonic by `(scope, topology_epoch)`. Credential
 revocation and control-fact ordering are not the same counter. A verifier may
@@ -637,20 +756,37 @@ string parsing, allocation, online lookup, or verbose success-audit
 construction. The context read is immutable; topology and floor updates
 invalidate contexts off-path.
 
-### D7 — Composition with channels and resources
+### D7 — Composition with organizations, channels, and resources
 
-Transport admission is necessary only for protected subnet transport and is
-never sufficient for a protected effect:
+Transport admission is necessary only for protected internal transport and is
+never sufficient for horizontal fleet cooperation or a protected effect:
 
 ```text
-subnet context  → may transport/reach
-channel token   → may PUBLISH/SUBSCRIBE
-provider grant  → may INVOKE/use/effect
+OrgMembershipCert  → belongs to an organization
+OrgDispatcherGrant → may dispatch for that organization over a capability
+OrgCapabilityGrant → grantee org may discover/invoke provider-org capability
+subnet context      → may attach/route/export inside one installation authority
+channel token       → may PUBLISH/SUBSCRIBE
+provider admission  → may INVOKE/use/effect; provider remains final
 ```
+
+For a fleet-facing call from Vehicle A to Vehicle B:
+
+```text
+Vehicle B gateway has SubnetGrant::EXPORT for the internal provider boundary
+AND Vehicle A presents the required org dispatcher/capability proof
+AND Vehicle B's provider-local admission accepts the call
+```
+
+The resulting call crosses a bounded provider boundary. Vehicle A receives no
+`VerifiedSubnetContext` under Vehicle B's authority and cannot address Vehicle
+B's internal camera, radar, chassis, or control nodes. Conversely, an internal
+Vehicle B node with `ATTACH` has no fleet dispatch or provider authority unless
+it separately holds the corresponding org/resource credentials.
 
 `Visibility::SubnetLocal`, `ParentVisible`, and `Exported` remain propagation
 filters. A protected subnet-local channel still requires a channel token.
-`peer_subnets` and self-declared tags never populate
+`peer_subnets`, self-declared tags, and `OrgMembershipCert` never populate
 `VerifiedSubnetContext`.
 
 The existing open receive-side publish-authority issue (H1) remains separate.
@@ -735,10 +871,13 @@ land RED before production behavior and every slice leaves the branch clean.
 
 1. Rename the security-facing distinction to `TopologySubnetId` versus
    `SubnetRef` without changing wire behavior.
-2. Document `Visibility` and `peer_subnets` as propagation/topology state.
-3. Correct the false packet-header and stale API claims from §1.7.
-4. Add the canonical ancestor/self truth-table tests.
-5. Add one registration diagnostic when topology visibility is configured
+2. Document organizations as horizontal machine federation and subnets as
+   vertical per-machine/per-installation composition. Prohibit fleet identity,
+   geography, and customer membership from consuming compact path levels.
+3. Document `Visibility` and `peer_subnets` as propagation/topology state.
+4. Correct the false packet-header and stale API claims from §1.7.
+5. Add the canonical ancestor/self truth-table tests.
+6. Add one registration diagnostic when topology visibility is configured
    without access control; keep soft channels valid.
 
 **Gate:** focused subnet/config docs tests, `cargo fmt --check`, clippy, docs
@@ -796,6 +935,10 @@ any escape hatch is explicit, default false, loudly named
 - one-hop issuer succeeds only within scope, rights, and validity;
 - upward, sibling, cross-authority, widened-rights, widened-window, and second
   delegation fail;
+- equal compact paths under Vehicle A and Vehicle B authorities remain
+  unrelated;
+- an `OrgMembershipCert`, `OrgDispatcherGrant`, or `OrgCapabilityGrant` cannot
+  decode or verify as any subnet credential;
 - empty roots fail closed;
 - child and parent floors apply monotonically to credential scopes in the
   correct subtree; a child floor does not revoke a parent-scoped grant;
@@ -822,6 +965,8 @@ extract a universal grant framework in this slice.
 
 - protected session without grant denies;
 - topology tag without grant denies;
+- fleet/org membership without a Vehicle B subnet grant cannot attach to any
+  Vehicle B internal scope;
 - subject-bound valid parent grant attaches to a child;
 - child grant cannot attach upward or to a sibling;
 - reconnect re-verifies and cannot manufacture authority;
@@ -846,6 +991,7 @@ subnet grant.
 **Create:**
 
 - `net/crates/net/tests/subnet_gateway_auth.rs`
+- `net/crates/net/tests/subnet_org_boundary.rs`
 
 **RED witnesses first:**
 
@@ -856,6 +1002,10 @@ subnet grant.
 - parent `ROUTE` covers descendants;
 - wrong authority with equal path bits fails;
 - forwarded traffic preserves authenticated origin and gateway context;
+- Vehicle A's fleet credentials cannot address Vehicle B's internal nodes;
+- Vehicle B's exported provider boundary requires gateway `EXPORT` plus the
+  existing org/provider admission proof, with neither substituting for the
+  other;
 - `Visibility::Exported` remains unsatisfiable until this enforcement is live.
 
 Populate the real compact subnet ID on the forwarding header, wire
@@ -883,6 +1033,8 @@ exist between commits.
 - a newer gateway fact does not suppress a legitimate export-policy fact;
 - replay/reorder never rolls state backward;
 - delayed floor behavior matches the documented bounded-stale contract;
+- a subnet floor changes no org membership/grant state, and org membership
+  revocation changes no internal subnet floor;
 - channel membership grants no gateway right;
 - a valid fact verifies identically via channel, local provisioning, and a
   Dataforts/config-bundle fixture;
@@ -893,49 +1045,100 @@ reserved namespace or rely on channel publisher identity for fact authority.
 
 ## 6. Required end-to-end evidence
 
-Use one authority tree:
+Use one horizontal organization with two independently operating vehicles:
 
 ```text
-OEM
-└── Europe
-    ├── Germany
-    │   ├── Munich
-    │   └── Leipzig
-    └── Austria
+BMW Org
+├── Vehicle A
+├── Vehicle B
+└── fleet service
+
+Partner Org
+└── authorized diagnostic client
+```
+
+Give each vehicle its own authority-local vertical hierarchy. Vehicle B is the
+provider under test:
+
+```text
+Vehicle B subnet authority
+└── vehicle
+    ├── perception
+    │   ├── world-model
+    │   ├── camera-domain
+    │   └── radar-domain
+    ├── chassis
+    │   ├── braking
+    │   └── steering
+    └── connectivity
 ```
 
 Provision:
 
 ```text
-controller E   ATTACH + ROUTE at Europe
-gateway G      ATTACH + ROUTE + EXPORT at Germany
-vehicle M      ATTACH at Munich
-vehicle L      ATTACH at Leipzig
-outsider X     no grant
+Vehicle A
+  BMW OrgMembershipCert
+  OrgDispatcherGrant for perception.roi
+  no Vehicle B SubnetGrant
+
+Vehicle B gateway
+  BMW OrgMembershipCert
+  ATTACH + ROUTE at Vehicle B/vehicle
+  EXPORT at Vehicle B/vehicle/perception/world-model
+  provider-local admission for perception.roi
+
+Vehicle B camera node
+  ATTACH at Vehicle B/vehicle/perception/camera-domain
+
+Partner diagnostic client
+  Partner Org membership
+  OrgCapabilityGrant for one exported diagnostic capability
+  no Vehicle B SubnetGrant
+
+Outsider X
+  no valid org or subnet credential
 ```
 
 The signed end-to-end suite proves:
 
-1. E attaches to Europe and every descendant.
-2. M cannot attach to Germany, Leipzig, Austria, or Europe.
-3. X cannot attach by copying valid public topology tags.
-4. E routes Munich ↔ Leipzig under its Europe `ROUTE` scope.
-5. G routes inside Germany and exports across the Germany boundary, but not
-   across an unrelated authority boundary.
-6. M cannot route or export.
-7. E cannot subscribe to a protected Munich channel without a channel token.
-8. E cannot invoke a protected Munich service without provider-local
-   authority.
-9. Replaying M's grant from X fails subject binding.
-10. A Germany floor invalidates old Germany/Munich/Leipzig-scoped grants but
-    leaves Austria and a parent Europe-scoped controller current.
-11. A Europe floor invalidates the full European subtree.
-12. Reconnect after revocation or expiry fails closed.
-13. Reparenting/topology-epoch change invalidates old contexts before new
-    forwarding.
-14. A hostile control-channel publisher cannot forge an accepted fact.
-15. The packet hot path performs zero signature verifications, zero string
-    parses, and zero policy-service calls after context installation.
+1. Vehicle A and Vehicle B belong to the BMW fleet, but neither membership
+   certificate creates internal `ATTACH` authority on the other vehicle.
+2. Vehicle A invokes Vehicle B's exported `perception.roi` capability with the
+   required dispatcher/per-call proof and provider acceptance.
+3. The successful fleet call exposes the bounded world-model provider, not
+   Vehicle B's camera, radar, chassis, or internal addresses.
+4. Vehicle A cannot establish a Vehicle B subnet session, even with valid BMW
+   membership and a valid perception dispatcher grant.
+5. Vehicle B's gateway requires `ROUTE` for internal forwarding and `EXPORT`
+   for the world-model boundary; removing either exact right denies that
+   transition without changing Vehicle A's org credentials.
+6. The camera node cannot attach upward to perception/vehicle or sideways to
+   radar/chassis.
+7. A Vehicle B parent grant reaches its internal descendants without per-child
+   grants.
+8. Equal compact paths under Vehicle A and Vehicle B authorities remain
+   unrelated.
+9. The Partner Org's `OrgCapabilityGrant` reaches only its exported diagnostic
+   provider; it grants no internal Vehicle B attachment.
+10. A protected internal channel still requires its channel token despite a
+    valid parent subnet context.
+11. A valid subnet context still cannot invoke a provider without the required
+    org/provider authority.
+12. Revoking Vehicle B's BMW membership blocks subsequent fleet-authorized
+    calls while leaving its internal subnet floor/context state independent.
+13. Raising a Vehicle B perception floor invalidates old perception-scoped
+    internal grants while leaving BMW membership and unrelated chassis grants
+    unchanged; a vehicle-root grant remains structurally dominant.
+14. Replaying the camera node's subnet grant from Outsider X fails subject
+    binding; copying public topology tags grants nothing.
+15. Reconnect after org or subnet revocation re-verifies the corresponding
+    authority and fails closed without manufacturing the other.
+16. Reparenting or incompatible path reuse changes `topology_epoch` and
+    invalidates old internal contexts before forwarding.
+17. A hostile control-channel publisher cannot forge an accepted subnet fact.
+18. The subnet packet hot path performs zero signature verifications, zero
+    string parses, and zero policy-service calls after context installation;
+    fleet cardinality is absent from the compact hierarchy check.
 
 ## 7. Performance and complexity budget
 
@@ -944,6 +1147,10 @@ The architecture is accepted only while all of these remain true:
 - topology depth is fixed and bounded by the compact ID format;
 - ancestor checks are fixed-width integer/prefix operations;
 - one protected session installs one immutable authority/subtree context;
+- fleet cardinality and org audience size do not affect the subnet hierarchy
+  check;
+- org credentials are verified by the existing call/admission paths, not by
+  internal packet forwarding;
 - root or one-hop verification occurs only on admission/update;
 - forwarding reads no credential chain and performs no signature operation;
 - rights are a strict `u8` mask;
@@ -968,6 +1175,13 @@ substitute for the end-to-end forwarding witness.
 - **Parent scope is powerful.** It deliberately covers present and future
   descendants. Issue the narrowest parent grant that matches operational
   responsibility. A sovereign child uses another authority, not a deny list.
+- **Using the wrong axis recreates ambient authority.** Fleet, customer,
+  region, and partner populations belong in org/capability authority, not in
+  compact subnet paths. Internal product domains belong in the installation's
+  subnet hierarchy, not in org membership.
+- **Boundary composition can be under-enforced.** An exported provider requires
+  both gateway `EXPORT` and the existing org/provider proof. Integration tests
+  remove each independently; neither is treated as an alternative.
 - **Revocation is bounded stale.** Maximum grant lifetime and floor-refresh
   policy are deployment parameters surfaced explicitly to operators.
 - **Topology mutation invalidates caches.** `topology_epoch` is mandatory in
@@ -1006,6 +1220,7 @@ substitute for the end-to-end forwarding witness.
 | `tests/subnet_grant*.rs` | S2 | wire, hierarchy, delegation, revocation |
 | `tests/subnet_session_auth.rs` | S3 | admission/context lifecycle |
 | `tests/subnet_gateway_auth.rs` | S4 | forwarding boundaries |
+| `tests/subnet_org_boundary.rs` | S4 | horizontal/vertical composition |
 | `tests/subnet_control_facts.rs` | S5 | signed distribution and ordering |
 
 Paths described as session/config/dispatch modules must be replaced with exact
@@ -1016,6 +1231,12 @@ must not guess or create duplicate state owners.
 
 - `TopologySubnetId` and `SubnetRef` are distinct; self-declared state never
   satisfies hard authorization.
+- Org membership federates independent machines horizontally; compact subnet
+  paths describe vertical integration inside one authority-local installation
+  and never encode fleet membership.
+- `OrgMembershipCert`, `OrgDispatcherGrant`, and `OrgCapabilityGrant` cannot
+  synthesize `ATTACH`, `ROUTE`, or `EXPORT`, and subnet grants cannot synthesize
+  org discovery/invocation authority.
 - Parent grants authorize self and descendants under the same authority;
   child grants never authorize parent, sibling, or another authority.
 - `ATTACH`, `ROUTE`, `EXPORT`, and `DELEGATE` have the exact operation matrix
@@ -1026,6 +1247,10 @@ must not guess or create duplicate state owners.
   fail closed without the exact right.
 - Channel and provider authorization remain independently enforced beneath
   parent-to-child reachability.
+- A fleet peer can invoke an exported bounded provider without acquiring any
+  subnet context under the provider machine's internal authority.
+- Org revocation and subnet-floor revocation are independently monotonic and
+  independently witnessed.
 - Subtree revocation floors and per-kind control revisions are monotonic and
   do not share an accidental global counter.
 - An accepted floor increments a per-authority auth epoch; stale contexts fail
@@ -1048,6 +1273,9 @@ must not guess or create duplicate state owners.
 - JWT/X.509 compatibility layers;
 - policy dashboards;
 - cross-authority subnet federation negotiation;
+- encoding fleet, customer, geography, or partner membership in compact subnet
+  hierarchy levels;
+- treating an org certificate as a machine-internal subnet credential;
 - universal public grant/token API;
 - org credential migration onto a shared kernel;
 - mesh-wide reserved channel namespace;
