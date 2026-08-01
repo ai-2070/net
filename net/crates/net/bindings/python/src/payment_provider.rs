@@ -308,16 +308,26 @@ mod provider {
         /// available backend is the mock, and asking for a real one is a
         /// build error rather than a silent downgrade.
         ///
-        /// ``require_invocation_binding=True`` refuses to serve a paid
-        /// invocation unless the caller presents the paying identity's
-        /// signature over the invocation-binding transcript. Without it
-        /// the quote id alone redeems, and the quote id is not a secret:
-        /// it rides a request header on every paid invoke and is carried
-        /// on the billing event, so anything that learns one can spend
-        /// it. Defaults to ``False`` for compatibility with callers
-        /// written before the binding existed; new deployments should
-        /// turn it on. It closes off-path leakage of the quote id, not an
-        /// intermediary that observes the paid invocation itself.
+        /// ``require_invocation_binding`` **defaults to True**: a paid
+        /// invocation is refused unless the caller presents the paying
+        /// identity's signature over the invocation-binding transcript.
+        ///
+        /// Without it the quote id alone redeems, and the quote id is not
+        /// a secret — it rides a request header on every paid invoke and
+        /// is carried on the billing event, so anything that learns one
+        /// can spend it. Defaulting off would mean every provider stayed
+        /// exposed unless its operator found the flag, which is not a
+        /// posture a payments surface should ship.
+        ///
+        /// Pass ``False`` only for a deployment whose callers predate the
+        /// binding. Anything built on ``CapabilityGateway`` already signs
+        /// one whenever its identity can sign.
+        ///
+        /// Scope: this closes **off-path** leakage of the quote id (logs,
+        /// billing records, proofs). It does not stop an intermediary
+        /// that observes the paid invocation itself and copies both
+        /// headers — that needs channel binding, not a bigger
+        /// signature.
         #[new]
         #[pyo3(signature = (
             mesh,
@@ -326,7 +336,7 @@ mod provider {
             facilitator_url=None,
             facilitator_auth_token=None,
             unsafe_dev_mock_facilitator=false,
-            require_invocation_binding=false,
+            require_invocation_binding=true,
         ))]
         #[allow(clippy::too_many_arguments)]
         fn new(

@@ -286,16 +286,25 @@ mod provider {
         /// the mock, and asking for a real one is a build error rather than a
         /// silent downgrade.
         ///
-        /// `requireInvocationBinding: true` refuses to serve a paid
-        /// invocation unless the caller presents the paying identity's
-        /// signature over the invocation-binding transcript. Without it the
-        /// quote id alone redeems, and the quote id is not a secret: it rides
-        /// a request header on every paid invoke and is carried on the billing
-        /// event, so anything that learns one can spend it. Defaults to
-        /// `false` for compatibility with callers written before the binding
-        /// existed; new deployments should turn it on. It closes off-path
-        /// leakage of the quote id, not an intermediary that observes the paid
-        /// invocation itself.
+        /// `requireInvocationBinding` **defaults to `true`**: a paid
+        /// invocation is refused unless the caller presents the paying
+        /// identity's signature over the invocation-binding transcript.
+        ///
+        /// Without it the quote id alone redeems, and the quote id is not a
+        /// secret — it rides a request header on every paid invoke and is
+        /// carried on the billing event, so anything that learns one can spend
+        /// it. Defaulting off would mean every provider stayed exposed unless
+        /// its operator found the flag, which is not a posture a payments
+        /// surface should ship.
+        ///
+        /// Pass `false` only for a deployment whose callers predate the
+        /// binding. Anything built on `CapabilityGateway` already signs one
+        /// whenever its identity can sign.
+        ///
+        /// Scope: this closes **off-path** leakage of the quote id (logs,
+        /// billing records, proofs). It does not stop an intermediary that
+        /// observes the paid invocation itself and copies both headers — that
+        /// needs channel binding, not a bigger signature.
         #[napi(constructor)]
         #[allow(clippy::too_many_arguments)]
         pub fn new(
@@ -336,7 +345,7 @@ mod provider {
                 PathBuf::from(state_path),
             )
             .map_err(|e| Error::from_reason(format!("payment engine: {e}")))?
-            .with_require_invocation_binding(require_invocation_binding.unwrap_or(false));
+            .with_require_invocation_binding(require_invocation_binding.unwrap_or(true));
             if let Some(b) = &billing {
                 engine = engine.with_billing_log(b.clone());
             }
