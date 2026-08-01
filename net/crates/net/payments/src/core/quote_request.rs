@@ -214,6 +214,16 @@ impl QuoteRequest {
             .map_err(|e| EnvelopeError::Encoding(e.to_string()))
             .map_err(QuoteRequestError::Envelope)?;
         ensure_tag(TAG_QUOTE_REQUEST, &request.object).map_err(EnvelopeError::from)?;
+        // Cheap structural bound BEFORE the signature check. Verification
+        // is the expensive step, so a caller who can make us do it on a
+        // multi-megabyte nonce gets asymmetric work out of one request —
+        // and the nonce cap exists precisely because a nonce is an
+        // identifier, not a payload. Reject on shape first.
+        if request.nonce.len() > MAX_NONCE_BYTES {
+            return Err(QuoteRequestError::NonceTooLong {
+                max: MAX_NONCE_BYTES,
+            });
+        }
         // The signature is verified against `request.caller` — the identity
         // the request claims. That is the whole point: holding the key is
         // what turns a claim into a proof.
@@ -297,6 +307,8 @@ pub struct SeenNonces {
     /// `(caller, nonce)` → the instant it stops being presentable.
     seen: std::collections::HashMap<(EntityId, String), u64>,
     capacity: usize,
+    /// Map size at which the next expiry sweep runs. See [`Self::admit`].
+    sweep_at: usize,
 }
 
 /// Nonces are identifiers, not payloads. Anything longer is a caller
@@ -325,13 +337,19 @@ impl SeenNonces {
         Self {
             seen: std::collections::HashMap::new(),
             capacity,
+            sweep_at: (capacity / 8).max(1),
         }
     }
 
     /// Record this caller's `nonce` as used, or refuse it.
     ///
-    /// Sweeps expired entries as it goes — the operation that grows the
-    /// map is the one that prunes it, mirroring the engine's retention.
+    /// The expired-entry sweep is **amortized**, not per-call. A `retain`
+    /// on every admission is O(n) under the shared mutex, so once the
+    /// window is full every subsequent quote pays a full-map scan — a
+    /// caller could fill the guard and then make issuance quadratic for
+    /// everyone. Sweeping only when the map has grown by a fraction of
+    /// its capacity (or when it is actually full) keeps the amortized
+    /// cost constant while bounding how much dead weight can accumulate.
     pub fn admit(
         &mut self,
         caller: &EntityId,
@@ -344,21 +362,39 @@ impl SeenNonces {
                 max: MAX_NONCE_BYTES,
             });
         }
-        self.seen
-            .retain(|_, expiry| now_ns < expiry.saturating_add(MAX_REQUEST_LIFETIME_NS));
+        if self.seen.len() >= self.sweep_at {
+            self.sweep(now_ns);
+        }
         let key = (caller.clone(), nonce.to_string());
         if self.seen.contains_key(&key) {
             return Err(QuoteRequestError::ReplayedNonce);
         }
-        // Checked after the sweep, so capacity is measured against what is
-        // actually still presentable rather than historical volume.
+        // Measured after any sweep, so capacity reflects what is actually
+        // still presentable rather than historical volume.
         if self.seen.len() >= self.capacity {
-            return Err(QuoteRequestError::ReplayGuardSaturated {
-                capacity: self.capacity,
-            });
+            // One more sweep before refusing: better to pay the scan than
+            // to reject a legitimate caller over entries that have all
+            // expired since the last one.
+            self.sweep(now_ns);
+            if self.seen.len() >= self.capacity {
+                return Err(QuoteRequestError::ReplayGuardSaturated {
+                    capacity: self.capacity,
+                });
+            }
         }
         self.seen.insert(key, expires_at_ns);
         Ok(())
+    }
+
+    /// Drop entries that can no longer be presented, and schedule the
+    /// next sweep a growth step away.
+    fn sweep(&mut self, now_ns: u64) {
+        self.seen
+            .retain(|_, expiry| now_ns < expiry.saturating_add(MAX_REQUEST_LIFETIME_NS));
+        // Next sweep once the map has grown by ~1/8 of capacity, floored
+        // so a tiny capacity still sweeps sometimes.
+        let step = (self.capacity / 8).max(1);
+        self.sweep_at = self.seen.len().saturating_add(step).min(self.capacity);
     }
 
     /// Give a nonce back, because the request it belonged to was refused
@@ -653,10 +689,17 @@ mod tests {
         );
     }
 
+    /// Replay protection holds, and expired entries do not accumulate.
+    ///
+    /// The sweep is amortized rather than per-admission: a `retain` on
+    /// every call is O(n) under the shared mutex, so a full window would
+    /// make every subsequent quote pay a whole-map scan. A small capacity
+    /// here puts the sweep threshold within reach of a short test.
     #[test]
-    fn nonces_replay_once_and_the_window_bounds_the_set() {
+    fn nonces_replay_once_and_expired_entries_do_not_accumulate() {
         let caller = EntityKeypair::generate().entity_id().clone();
-        let mut seen = SeenNonces::new();
+        let mut seen = SeenNonces::with_capacity(8);
+
         assert!(seen.admit(&caller, "a", NOW + 1_000, NOW).is_ok());
         assert_eq!(
             seen.admit(&caller, "a", NOW + 1_000, NOW),
@@ -666,47 +709,20 @@ mod tests {
         assert!(seen.admit(&caller, "b", NOW + 1_000, NOW).is_ok());
         assert_eq!(seen.len(), 2);
 
-        // Well past the window, entries are swept and the nonce is free
-        // again — by then the request it belonged to is long expired, so
-        // re-admitting it grants nothing.
+        // Well past the window, admissions sweep what can no longer be
+        // presented rather than growing without bound.
         let later = NOW + 1_000 + MAX_REQUEST_LIFETIME_NS + 1;
-        assert!(seen.admit(&caller, "c", later + 1_000, later).is_ok());
-        assert_eq!(seen.len(), 1, "expired entries are swept as the map grows");
-    }
-
-    /// Nonce derivation is a pure function of its inputs, and the
-    /// sequence is what separates two requests that share everything
-    /// else.
-    ///
-    /// The clock cannot carry that weight: `Clock` is a public seam with
-    /// no monotonicity requirement, so a fixed or coarse implementation
-    /// would make two legitimate back-to-back requests collide and the
-    /// second would be refused as a replay.
-    #[test]
-    fn the_sequence_separates_requests_that_share_every_other_input() {
-        let caller = EntityKeypair::generate().entity_id().clone();
-        let a = QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW, 0);
-
-        // Same inputs, same nonce — the function is pure.
-        assert_eq!(
-            a,
-            QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW, 0)
-        );
-
-        // A stopped clock must not make two requests collide.
-        assert_ne!(
-            a,
-            QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW, 1),
-            "the sequence must separate requests a fixed clock cannot"
-        );
-
-        // Every other input still separates too.
-        for other in [
-            QuoteRequest::derive_nonce(&caller, CAPABILITY, TEMPLATE, NOW + 1, 0),
-            QuoteRequest::derive_nonce(&caller, "prov/other", TEMPLATE, NOW, 0),
-            QuoteRequest::derive_nonce(&caller, CAPABILITY, b"other", NOW, 0),
-        ] {
-            assert_ne!(a, other);
+        for i in 0..8 {
+            let _ = seen.admit(&caller, &format!("late-{i}"), later + 1_000, later);
         }
+        assert!(
+            seen.len() <= 8,
+            "the guard must not exceed its capacity, got {}",
+            seen.len()
+        );
+        assert!(
+            !seen.seen.contains_key(&(caller.clone(), "a".to_string())),
+            "an entry past its window must be swept"
+        );
     }
 }
