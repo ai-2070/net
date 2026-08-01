@@ -88,7 +88,7 @@ describe.skipIf(!buildPricingTerms)('buildPricingTerms', () => {
 describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
   it('exposes a 32-byte provider entity id (the node identity)', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('id.state'))
+      const provider = new PaymentProvider(mesh, tmp('id.state'), undefined, undefined, undefined, true)
       const id = provider.providerEntityId
       expect(Buffer.isBuffer(id)).toBe(true)
       expect(id.length).toBe(32)
@@ -97,21 +97,21 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('readBilling without a billing log is a rejection, not a crash', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('nolog.state'))
+      const provider = new PaymentProvider(mesh, tmp('nolog.state'), undefined, undefined, undefined, true)
       await expect(provider.readBilling()).rejects.toThrow()
     })
   }, 20000)
 
   it('readBilling on a fresh billing log is empty', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('log.state'), tmp('log.billing'))
+      const provider = new PaymentProvider(mesh, tmp('log.state'), tmp('log.billing'), undefined, undefined, true)
       expect(await provider.readBilling()).toEqual([])
     })
   }, 20000)
 
   it('publishPaidTools fail-closes on an empty pricing map', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('empty.state'))
+      const provider = new PaymentProvider(mesh, tmp('empty.state'), undefined, undefined, undefined, true)
       // Empty pricing is a construction error (use NetMesh.publishTools for free).
       expect(() => provider.publishPaidTools([ECHO], noopHandler, {})).toThrow()
     })
@@ -119,7 +119,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('publishPaidTools fail-closes when a tool has no pricing entry', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('missing.state'))
+      const provider = new PaymentProvider(mesh, tmp('missing.state'), undefined, undefined, undefined, true)
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       const other = { ...ECHO, name: 'other' }
       // `other` has no pricing entry → it would publish FREE; reject instead.
@@ -131,7 +131,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('publishes a priced tool and serves it (handle lifecycle)', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('paid.state'))
+      const provider = new PaymentProvider(mesh, tmp('paid.state'), undefined, undefined, undefined, true)
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       // Pricing is keyed by the (lowered) tool name; `echo` is already
       // channel-safe so the key matches directly.
@@ -145,7 +145,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('a pricing key naming no published tool is a publish error', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('mismatch.state'))
+      const provider = new PaymentProvider(mesh, tmp('mismatch.state'), undefined, undefined, undefined, true)
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       // `echo` is priced (so the fail-closed completeness check passes), but the
       // extra `nope` key names no published tool → ServerPublisher rejects it
@@ -160,7 +160,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
     const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
     try {
       await mesh.start()
-      const provider = new PaymentProvider(mesh, tmp('close.state'))
+      const provider = new PaymentProvider(mesh, tmp('close.state'), undefined, undefined, undefined, true)
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       provider.close() // tears down the quote/pay wire + drops the node clone
       // readBilling has no billing log here → still a structured rejection, not
@@ -176,5 +176,68 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
       // the shutdown ran (a second shutdown after success is a no-op).
       await mesh.shutdown().catch(() => {})
     }
+  }, 20000)
+})
+
+// ---------------------------------------------------------------------------
+// H2: a settlement backend must be chosen explicitly
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!PaymentProvider)('PaymentProvider settlement backend', () => {
+  // This constructor used to build a MockFacilitator unconditionally, with no
+  // way to reach a real one — so a provider could publish priced tools, sign
+  // quotes with its real mesh identity, emit signed billing events, and serve,
+  // while settlement moved nothing. Guessing "mock" for an operator who has
+  // not decided is how a simulator ends up in front of real customers.
+  it('refuses to construct without an explicit backend', async () => {
+    await withProvider(async (mesh) => {
+      expect(() => new PaymentProvider(mesh, tmp('nobackend.state'))).toThrow(
+        /no settlement backend/,
+      )
+    })
+  }, 20000)
+
+  it('names both ways out rather than just failing', async () => {
+    await withProvider(async (mesh) => {
+      expect(() => new PaymentProvider(mesh, tmp('names.state'))).toThrow(/facilitatorUrl/)
+      expect(() => new PaymentProvider(mesh, tmp('names2.state'))).toThrow(
+        /unsafeDevMockFacilitator/,
+      )
+    })
+  }, 20000)
+
+  it('refuses a real URL and the mock together', async () => {
+    await withProvider(async (mesh) => {
+      expect(
+        () =>
+          new PaymentProvider(
+            mesh,
+            tmp('both.state'),
+            undefined,
+            'https://facilitator.example.com',
+            undefined,
+            true,
+          ),
+      ).toThrow(/not both/)
+    })
+  }, 20000)
+
+  it('never silently downgrades a real facilitator URL to the mock', async () => {
+    await withProvider(async (mesh) => {
+      // Built without payments-http this throws and must say so; built with
+      // it, a real facilitator is constructed. The one outcome that must not
+      // happen is a quiet fallback to the mock.
+      try {
+        const provider = new PaymentProvider(
+          mesh,
+          tmp('real.state'),
+          undefined,
+          'https://facilitator.example.com',
+        )
+        provider.close()
+      } catch (e) {
+        expect(String(e)).toMatch(/payments-http/)
+      }
+    })
   }, 20000)
 })

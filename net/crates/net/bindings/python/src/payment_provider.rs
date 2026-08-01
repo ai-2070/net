@@ -163,6 +163,86 @@ mod provider {
     // scaffolding the paid path delegates to.
     use crate::publish::{mesh_over, mesh_publish_tools_configured, PyLocalPublicationHandle};
 
+    /// Choose the settlement backend, or fail closed.
+    ///
+    /// Returns the facilitator plus the asset registry that goes with it:
+    /// a real backend gets `production_registry_v1` (no `mock:net` entry —
+    /// a provider settling real money has no reason to allowlist an asset
+    /// whose settlements move nothing), the mock gets the dev registry
+    /// that includes it.
+    ///
+    /// There is deliberately no default. A provider that does not say how
+    /// it settles is a provider whose operator has not decided, and
+    /// guessing "mock" for them is how a simulator ends up in front of
+    /// real customers.
+    fn resolve_facilitator(
+        entity_id: net::adapter::net::identity::EntityId,
+        facilitator_url: Option<String>,
+        facilitator_auth_token: Option<String>,
+        unsafe_dev_mock: bool,
+    ) -> PyResult<(
+        Arc<dyn net_payments::facilitator::Facilitator>,
+        net_payments::core::registry::AssetRegistry,
+    )> {
+        match (facilitator_url, unsafe_dev_mock) {
+            (Some(_), true) => Err(PyValueError::new_err(
+                "PaymentProvider: pass either facilitator_url or \
+                 unsafe_dev_mock_facilitator=True, not both — the mock settles \
+                 nothing, so pairing it with a real facilitator URL is \
+                 ambiguous about which one you meant",
+            )),
+            (None, false) => Err(PyValueError::new_err(
+                "PaymentProvider: no settlement backend configured. Pass \
+                 facilitator_url=\"https://...\" to settle for real (build with \
+                 --features payments-http), or unsafe_dev_mock_facilitator=True \
+                 to settle against the in-process mock, which moves no value. \
+                 There is no default: a provider that publishes priced tools \
+                 without a real facilitator serves for free.",
+            )),
+            (None, true) => {
+                // stderr, not `tracing`: a Python embedder usually has no
+                // subscriber installed, and a warning nobody sees is the
+                // same as no warning. This one has to land.
+                eprintln!(
+                    "WARNING: PaymentProvider is using the MOCK facilitator. Quotes are \
+                     signed, billing events are emitted, and tools are served — but NO \
+                     VALUE MOVES. Development and conformance only."
+                );
+                Ok((
+                    Arc::new(MockFacilitator::new()),
+                    default_registry_v1(entity_id),
+                ))
+            }
+            #[cfg(feature = "payments-http")]
+            (Some(url), false) => {
+                use net_payments::facilitator::client::{AuthProvider, BearerAuth, HttpFacilitator, NoAuth};
+                let auth: Arc<dyn AuthProvider> = match facilitator_auth_token {
+                    Some(token) => Arc::new(BearerAuth::new(token)),
+                    None => Arc::new(NoAuth),
+                };
+                let facilitator = HttpFacilitator::new(&url, auth).map_err(|e| {
+                    PyValueError::new_err(format!("PaymentProvider facilitator: {e}"))
+                })?;
+                Ok((
+                    Arc::new(facilitator),
+                    net_payments::core::registry::production_registry_v1(entity_id),
+                ))
+            }
+            #[cfg(not(feature = "payments-http"))]
+            (Some(_), false) => {
+                let _ = facilitator_auth_token;
+                Err(PyValueError::new_err(
+                    "PaymentProvider: facilitator_url needs the `payments-http` \
+                     build feature (it pulls reqwest + rustls). Rebuild with \
+                     --features payments-http, or pass \
+                     unsafe_dev_mock_facilitator=True for a mock backend. \
+                     Refusing to silently downgrade a real facilitator URL to \
+                     the mock.",
+                ))
+            }
+        }
+    }
+
     /// A paid-capability provider over an embedded `NetMesh` node — the supply
     /// side. Construction stands up one `PaymentEngine` behind the quote/pay
     /// wire; :meth:`publish_paid_tools` publishes priced tools gated by that
@@ -188,12 +268,41 @@ mod provider {
         /// **must be durable + single-owner** (a temp path loses paid quotes
         /// across restarts). ``billing_log_path`` optionally records the
         /// immutable ``net.billing.event@1`` stream.
+        ///
+        /// **A settlement backend must be chosen explicitly.** Pass
+        /// ``facilitator_url`` (plus ``facilitator_auth_token`` where the
+        /// facilitator requires one) to settle for real, or
+        /// ``unsafe_dev_mock_facilitator=True`` to settle against the
+        /// in-process mock, which moves no value. Supplying neither is an
+        /// error, and supplying both is an error.
+        ///
+        /// This constructor used to build a ``MockFacilitator``
+        /// unconditionally, with no way to reach a real one: a provider
+        /// could publish priced tools, sign quotes with its real mesh
+        /// identity, emit signed billing events, and serve — while
+        /// settlement moved nothing. Choosing is now mandatory, and the
+        /// unsafe option says so in its name.
+        ///
+        /// ``facilitator_url`` requires the ``payments-http`` build
+        /// feature (it pulls reqwest + rustls); without it, the only
+        /// available backend is the mock, and asking for a real one is a
+        /// build error rather than a silent downgrade.
         #[new]
-        #[pyo3(signature = (mesh, state_path, billing_log_path=None))]
+        #[pyo3(signature = (
+            mesh,
+            state_path,
+            billing_log_path=None,
+            facilitator_url=None,
+            facilitator_auth_token=None,
+            unsafe_dev_mock_facilitator=false,
+        ))]
         fn new(
             mesh: &crate::mesh_bindings::NetMesh,
             state_path: String,
             billing_log_path: Option<String>,
+            facilitator_url: Option<String>,
+            facilitator_auth_token: Option<String>,
+            unsafe_dev_mock_facilitator: bool,
         ) -> PyResult<Self> {
             let node = mesh.node_arc_clone()?;
             let runtime = mesh.runtime_arc();
@@ -206,13 +315,18 @@ mod provider {
             let provider = Arc::new(sdk_mesh.entity_keypair().clone());
             let entity_id = provider.entity_id().clone();
             let provider_entity_id = entity_id.as_bytes().to_vec();
-            let registry = default_registry_v1(entity_id);
+            let (facilitator, registry) = resolve_facilitator(
+                entity_id,
+                facilitator_url,
+                facilitator_auth_token,
+                unsafe_dev_mock_facilitator,
+            )?;
             // `AdmitAll` gates QUOTE issuance — correct for a paid tool (anyone
             // may quote; PAYMENT is the real gate on the serve).
             let billing = billing_log_path.map(|bp| Arc::new(BillingLog::new(bp)));
             let mut engine = PaymentEngine::new(
                 provider,
-                Arc::new(MockFacilitator::new()),
+                facilitator,
                 Arc::new(AdmitAll),
                 registry,
                 PathBuf::from(state_path),

@@ -167,6 +167,14 @@ pub struct RegistryRef {
 /// real-money target), Solana SPL-USDC, and XRP (XRPL rung, Mode A). Network enablement is
 /// registry entries + facilitator config, never code; participants pin
 /// or override this default.
+///
+/// **Includes the valueless mock asset**, so it is the right registry for
+/// conformance runs and dev harnesses and the wrong one for a deployment
+/// settling real money — see [`production_registry_v1`], which is the
+/// same revision minus `mock:net`. A registry entry is not on its own
+/// sufficient to spend (spend policy must also enable the network, and
+/// the mock network needs a dev profile or the explicit unsafe flag), but
+/// a provider settling for real has no reason to carry it.
 pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
     let mut registry = default_mock_registry(signer);
     registry.version = "net-default-1".to_string();
@@ -219,6 +227,29 @@ pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
             equivalence_class: None,
         },
     ]);
+    registry
+}
+
+/// [`default_registry_v1`] with the valueless mock asset removed — the
+/// registry for a deployment that settles real money.
+///
+/// The mock asset exists so the conformance suite can drive the whole
+/// lifecycle without a chain, which makes it exactly the thing a
+/// production provider should not be carrying: `mock:net` settlements
+/// move no value, and a registry is an allowlist, so the cheapest way to
+/// not accept one is to not list it.
+///
+/// Note the registry revision differs from `default_registry_v1`'s — the
+/// `{version, hash}` reference envelopes bind covers the asset list, so
+/// these are genuinely different pinned revisions and a quote issued
+/// under one will not verify under the other. That is the intended
+/// behaviour: which assets a provider accepts is part of what it signed.
+pub fn production_registry_v1(signer: EntityId) -> AssetRegistry {
+    let mut registry = default_registry_v1(signer);
+    registry.version = "net-production-1".to_string();
+    registry
+        .assets
+        .retain(|entry| entry.id.chain().namespace() != "mock");
     registry
 }
 
@@ -294,6 +325,54 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The production registry is the v1 asset set minus the valueless
+    /// mock asset — a provider settling real money should not carry an
+    /// allowlist entry for a network whose settlements move nothing.
+    #[test]
+    fn the_production_registry_carries_no_mock_asset() {
+        let signer = EntityKeypair::generate().entity_id().clone();
+        let dev = default_registry_v1(signer.clone());
+        let prod = production_registry_v1(signer);
+
+        assert!(
+            dev.assets.iter().any(|e| e.x402_asset == "musd"),
+            "the dev registry keeps the mock asset for conformance runs"
+        );
+        assert!(
+            !prod.assets.iter().any(|e| e.x402_asset == "musd"),
+            "the production registry must not list the mock asset"
+        );
+        assert_eq!(
+            prod.assets.len(),
+            dev.assets.len() - 1,
+            "only the mock asset is removed"
+        );
+
+        // Every real network survives.
+        for asset in ["USDC", "XRP"] {
+            assert!(
+                prod.assets.iter().any(|e| e.symbol == asset),
+                "{asset} must survive"
+            );
+        }
+
+        // A mock requirement hard-rejects against the production registry.
+        let mock = mock_requirements("musd", None);
+        assert!(matches!(
+            prod.check_requirements(&mock).unwrap_err(),
+            RegistryError::UnknownAsset { .. }
+        ));
+
+        // The revisions are distinct: which assets a provider accepts is
+        // part of what it signed, so a quote issued under one does not
+        // verify under the other.
+        assert_ne!(dev.version, prod.version);
+        assert_ne!(
+            dev.reference().unwrap().hash,
+            prod.reference().unwrap().hash
+        );
     }
 
     #[test]

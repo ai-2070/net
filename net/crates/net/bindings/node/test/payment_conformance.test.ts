@@ -110,7 +110,7 @@ describe.skipIf(!HAS_ALL)('paid lifecycle conformance (two-node)', () => {
       await Promise.all([provider.start(), caller.start()])
 
       // Provider prices + serves an echo tool, admitting remote callers.
-      pp = new PaymentProvider(provider, tmp('prov.state'))
+      pp = new PaymentProvider(provider, tmp('prov.state'), undefined, undefined, undefined, true)
       const terms = buildPricingTerms(pp.providerEntityId, 'prov/echo', MOCK_REQS)
       pubHandle = await pp.publishPaidTools(
         [ECHO],

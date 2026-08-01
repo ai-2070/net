@@ -101,7 +101,19 @@ from net import build_pricing_terms, PaymentProvider
 # 1) Stand up a provider over a STARTED mesh. state_path is the settlement store
 #    (durable + single-owner). One shared PaymentEngine serves the quote/pay wire
 #    AND gates the priced tools.
-provider = PaymentProvider(mesh, state_path, billing_log_path=None)
+#    A settlement backend is MANDATORY — there is no default. Either settle for
+#    real (needs the `payments-http` build feature):
+provider = PaymentProvider(
+    mesh, state_path,
+    billing_log_path=None,
+    facilitator_url="https://facilitator.example.com",
+    facilitator_auth_token=None,            # where the facilitator wants one
+)
+#    ...or opt explicitly into the in-process mock, which MOVES NO VALUE:
+provider = PaymentProvider(mesh, state_path, unsafe_dev_mock_facilitator=True)
+#    Passing neither raises; passing both raises. The mock lets a provider sign
+#    quotes, emit billing events, and serve while settling nothing, so choosing
+#    it is a decision the operator makes out loud.
 provider.provider_entity_id                 # 32 bytes — the identity that issues quotes
 provider.read_billing()                     # [net.billing.event@1 JSON, ...] (needs billing_log_path)
 

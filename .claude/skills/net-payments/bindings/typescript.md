@@ -50,7 +50,18 @@ A denial carries a `failure` object (the `net.payment.failure@1` schematic)
 Source: `net/crates/net/bindings/node/src/payment_provider.rs`.
 
 ```ts
-const provider = new PaymentProvider(mesh, statePath, billingLogPath /* ? */)
+// A settlement backend is MANDATORY — there is no default. Either settle for
+// real (needs the `payments-http` build feature):
+const provider = new PaymentProvider(
+  mesh, statePath, billingLogPath /* ? */,
+  'https://facilitator.example.com',       // facilitatorUrl
+  undefined,                               // facilitatorAuthToken, where wanted
+)
+// ...or opt explicitly into the in-process mock, which MOVES NO VALUE:
+const dev = new PaymentProvider(mesh, statePath, undefined, undefined, undefined, true)
+// Passing neither throws; passing both throws. The mock lets a provider sign
+// quotes, emit billing events, and serve while settling nothing, so choosing it
+// is a decision the operator makes out loud.
 provider.providerEntityId                 // Buffer (32B); the identity that issues quotes
 await provider.readBilling()              // string[] of net.billing.event@1
 
