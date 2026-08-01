@@ -59,6 +59,19 @@ const provider = new PaymentProvider(
 )
 // ...or opt explicitly into the in-process mock, which MOVES NO VALUE:
 const dev = new PaymentProvider(mesh, statePath, undefined, undefined, undefined, true)
+// Require the caller's possession proof (recommended for new deployments):
+// without it the quote id alone redeems, and it is not a secret.
+const strict = new PaymentProvider(
+  mesh, statePath, undefined,
+  'https://facilitator.example.com', undefined, undefined,
+  true,  // requireInvocationBinding
+)
+// Terms must be authored under the SAME registry revision the provider quotes
+// under — a real facilitator means the production registry:
+const terms = buildPricingTerms(
+  provider.providerEntityId, capability, requirementsJson,
+  true,  // productionRegistry
+)
 // Passing neither throws; passing both throws. The mock lets a provider sign
 // quotes, emit billing events, and serve while settling nothing, so choosing it
 // is a decision the operator makes out loud.

@@ -111,6 +111,19 @@ provider = PaymentProvider(
 )
 #    ...or opt explicitly into the in-process mock, which MOVES NO VALUE:
 provider = PaymentProvider(mesh, state_path, unsafe_dev_mock_facilitator=True)
+#    Require the caller's possession proof (recommended for new deployments):
+#    without it the quote id alone redeems, and it is not a secret.
+provider = PaymentProvider(
+    mesh, state_path,
+    facilitator_url="https://facilitator.example.com",
+    require_invocation_binding=True,
+)
+#    Terms must be authored under the SAME registry revision the provider
+#    quotes under — a real facilitator means the production registry:
+terms = build_pricing_terms(
+    provider.provider_entity_id, capability, requirements_json,
+    production_registry=True,
+)
 #    Passing neither raises; passing both raises. The mock lets a provider sign
 #    quotes, emit billing events, and serve while settling nothing, so choosing
 #    it is a decision the operator makes out loud.

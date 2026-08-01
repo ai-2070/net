@@ -38,6 +38,7 @@ fn author_pricing_terms(
     provider_entity_id: [u8; 32],
     capability: &str,
     requirements_json: &str,
+    production_registry: bool,
 ) -> std::result::Result<String, String> {
     let reqs: Vec<PaymentRequirements> = serde_json::from_str(requirements_json).map_err(|e| {
         format!("requirementsJson must be a JSON array of x402 PaymentRequirements objects: {e}")
@@ -57,10 +58,19 @@ fn author_pricing_terms(
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| format!("author payment requirement: {e}"))?;
     let provider = EntityId::from_bytes(provider_entity_id);
-    // The v1 default registry (mock + survey networks). Its `reference()` is
-    // signer-independent (it hashes the asset content), so it matches any caller
-    // authoring quotes under the same default registry.
-    let registry = default_registry_v1(provider.clone());
+    // The registry revision these terms are announced under. It must match the
+    // one the provider's engine issues quotes under, or discovery metadata
+    // names a different revision than the backend actually serving —
+    // `PaymentProvider` picks `production_registry_v1` whenever a real
+    // facilitator is configured, so this has to be able to follow.
+    //
+    // `reference()` is signer-independent (it hashes the asset content), so the
+    // reference matches any party using the same revision.
+    let registry = if production_registry {
+        net_payments::core::registry::production_registry_v1(provider.clone())
+    } else {
+        default_registry_v1(provider.clone())
+    };
     let reference = registry
         .reference()
         .map_err(|e| format!("registry reference: {e}"))?;
@@ -81,11 +91,18 @@ fn author_pricing_terms(
 /// Returns the canonical, byte-preserved terms string — opaque downstream and
 /// echoed verbatim at discovery. Throws on a bad entity id, malformed JSON, or
 /// an empty list.
+///
+/// `productionRegistry` must match the provider that will quote these terms: a
+/// `PaymentProvider` built with a real `facilitatorUrl` issues quotes under the
+/// production registry revision (no mock asset), so its announced terms should
+/// be authored with `true`. Announcing one revision while quoting under another
+/// leaves discovery metadata naming a registry the backend does not use.
 #[napi]
 pub fn build_pricing_terms(
     provider_entity_id: Buffer,
     capability: String,
     requirements_json: String,
+    production_registry: Option<bool>,
 ) -> Result<String> {
     let id: [u8; 32] = provider_entity_id.as_ref().try_into().map_err(|_| {
         Error::from_reason(format!(
@@ -93,7 +110,13 @@ pub fn build_pricing_terms(
             provider_entity_id.len()
         ))
     })?;
-    author_pricing_terms(id, &capability, &requirements_json).map_err(Error::from_reason)
+    author_pricing_terms(
+        id,
+        &capability,
+        &requirements_json,
+        production_registry.unwrap_or(false),
+    )
+    .map_err(Error::from_reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +285,19 @@ mod provider {
         /// pulls reqwest + rustls); without it, the only available backend is
         /// the mock, and asking for a real one is a build error rather than a
         /// silent downgrade.
+        ///
+        /// `requireInvocationBinding: true` refuses to serve a paid
+        /// invocation unless the caller presents the paying identity's
+        /// signature over the invocation-binding transcript. Without it the
+        /// quote id alone redeems, and the quote id is not a secret: it rides
+        /// a request header on every paid invoke and is carried on the billing
+        /// event, so anything that learns one can spend it. Defaults to
+        /// `false` for compatibility with callers written before the binding
+        /// existed; new deployments should turn it on. It closes off-path
+        /// leakage of the quote id, not an intermediary that observes the paid
+        /// invocation itself.
         #[napi(constructor)]
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             mesh: &NetMesh,
             state_path: String,
@@ -270,6 +305,7 @@ mod provider {
             facilitator_url: Option<String>,
             facilitator_auth_token: Option<String>,
             unsafe_dev_mock_facilitator: Option<bool>,
+            require_invocation_binding: Option<bool>,
         ) -> Result<Self> {
             let node = mesh.node_arc_clone().map_err(|_| {
                 Error::from_reason("payment provider: mesh node has been shut down")
@@ -299,7 +335,8 @@ mod provider {
                 registry,
                 PathBuf::from(state_path),
             )
-            .map_err(|e| Error::from_reason(format!("payment engine: {e}")))?;
+            .map_err(|e| Error::from_reason(format!("payment engine: {e}")))?
+            .with_require_invocation_binding(require_invocation_binding.unwrap_or(false));
             if let Some(b) = &billing {
                 engine = engine.with_billing_log(b.clone());
             }

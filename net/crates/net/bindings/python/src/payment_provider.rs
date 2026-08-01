@@ -25,6 +25,7 @@ fn author_pricing_terms(
     provider_entity_id: [u8; 32],
     capability: &str,
     requirements_json: &str,
+    production_registry: bool,
 ) -> Result<String, String> {
     let reqs: Vec<PaymentRequirements> = serde_json::from_str(requirements_json).map_err(|e| {
         format!("requirements_json must be a JSON array of x402 PaymentRequirements objects: {e}")
@@ -44,10 +45,19 @@ fn author_pricing_terms(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("author payment requirement: {e}"))?;
     let provider = EntityId::from_bytes(provider_entity_id);
-    // The v1 default registry (mock + survey networks). Its `reference()` is
-    // signer-independent (it hashes the asset content), so it matches any
-    // caller authoring quotes under the same default registry.
-    let registry = default_registry_v1(provider.clone());
+    // The registry revision these terms are announced under. It must match
+    // the one the provider's engine issues quotes under, or discovery
+    // metadata names a different revision than the backend actually
+    // serving — `PaymentProvider` picks `production_registry_v1` whenever a
+    // real facilitator is configured, so this has to be able to follow.
+    //
+    // `reference()` is signer-independent (it hashes the asset content), so
+    // the reference matches any party using the same revision.
+    let registry = if production_registry {
+        net_payments::core::registry::production_registry_v1(provider.clone())
+    } else {
+        default_registry_v1(provider.clone())
+    };
     let reference = registry
         .reference()
         .map_err(|e| format!("registry reference: {e}"))?;
@@ -68,11 +78,20 @@ fn author_pricing_terms(
 /// asset)``. Returns the canonical, byte-preserved terms string, opaque
 /// downstream and echoed verbatim at discovery. Raises ``ValueError`` on a bad
 /// entity id, malformed JSON, or an empty list.
+///
+/// ``production_registry`` must match the provider that will quote these
+/// terms: a :class:`PaymentProvider` built with a real ``facilitator_url``
+/// issues quotes under the production registry revision (no mock asset),
+/// so its announced terms should be authored with ``True``. Announcing one
+/// revision while quoting under another leaves discovery metadata naming a
+/// registry the backend does not use.
 #[pyfunction]
+#[pyo3(signature = (provider_entity_id, capability, requirements_json, production_registry=false))]
 pub fn build_pricing_terms(
     provider_entity_id: Vec<u8>,
     capability: &str,
     requirements_json: &str,
+    production_registry: bool,
 ) -> PyResult<String> {
     let id: [u8; 32] = provider_entity_id.as_slice().try_into().map_err(|_| {
         PyValueError::new_err(format!(
@@ -80,7 +99,8 @@ pub fn build_pricing_terms(
             provider_entity_id.len()
         ))
     })?;
-    author_pricing_terms(id, capability, requirements_json).map_err(PyValueError::new_err)
+    author_pricing_terms(id, capability, requirements_json, production_registry)
+        .map_err(PyValueError::new_err)
 }
 
 #[cfg(test)]
@@ -91,7 +111,7 @@ mod tests {
 
     #[test]
     fn authors_canonical_decodable_pricing_terms() {
-        let terms = author_pricing_terms([7u8; 32], "prov/echo", MOCK_REQS).expect("author");
+        let terms = author_pricing_terms([7u8; 32], "prov/echo", MOCK_REQS, false).expect("author");
 
         // The typed decoder accepts it (tag + non-empty accepts[]).
         let parsed = PricingTerms::from_json_bytes(terms.as_bytes()).expect("decode");
@@ -112,7 +132,7 @@ mod tests {
             {"scheme":"mock","network":"mock:net","amount":"2500","asset":"musd","payTo":"a","maxTimeoutSeconds":60},
             {"scheme":"mock","network":"mock:net","amount":"5000","asset":"musd","payTo":"a","maxTimeoutSeconds":60}
         ]"#;
-        let terms = author_pricing_terms([7u8; 32], "prov/echo", two).expect("author");
+        let terms = author_pricing_terms([7u8; 32], "prov/echo", two, false).expect("author");
         assert_eq!(
             PricingTerms::from_json_bytes(terms.as_bytes())
                 .unwrap()
@@ -124,11 +144,11 @@ mod tests {
 
     #[test]
     fn empty_and_malformed_are_rejected() {
-        assert!(author_pricing_terms([1u8; 32], "prov/echo", "[]").is_err());
-        assert!(author_pricing_terms([1u8; 32], "prov/echo", "not json").is_err());
+        assert!(author_pricing_terms([1u8; 32], "prov/echo", "[]", false).is_err());
+        assert!(author_pricing_terms([1u8; 32], "prov/echo", "not json", false).is_err());
         // A requirement missing a required field (payTo) is a decode error.
         let bad = r#"[{"scheme":"mock","network":"mock:net","amount":"1","asset":"musd","maxTimeoutSeconds":60}]"#;
-        assert!(author_pricing_terms([1u8; 32], "prov/echo", bad).is_err());
+        assert!(author_pricing_terms([1u8; 32], "prov/echo", bad, false).is_err());
     }
 }
 
@@ -287,6 +307,17 @@ mod provider {
         /// feature (it pulls reqwest + rustls); without it, the only
         /// available backend is the mock, and asking for a real one is a
         /// build error rather than a silent downgrade.
+        ///
+        /// ``require_invocation_binding=True`` refuses to serve a paid
+        /// invocation unless the caller presents the paying identity's
+        /// signature over the invocation-binding transcript. Without it
+        /// the quote id alone redeems, and the quote id is not a secret:
+        /// it rides a request header on every paid invoke and is carried
+        /// on the billing event, so anything that learns one can spend
+        /// it. Defaults to ``False`` for compatibility with callers
+        /// written before the binding existed; new deployments should
+        /// turn it on. It closes off-path leakage of the quote id, not an
+        /// intermediary that observes the paid invocation itself.
         #[new]
         #[pyo3(signature = (
             mesh,
@@ -295,7 +326,9 @@ mod provider {
             facilitator_url=None,
             facilitator_auth_token=None,
             unsafe_dev_mock_facilitator=false,
+            require_invocation_binding=false,
         ))]
+        #[allow(clippy::too_many_arguments)]
         fn new(
             mesh: &crate::mesh_bindings::NetMesh,
             state_path: String,
@@ -303,6 +336,7 @@ mod provider {
             facilitator_url: Option<String>,
             facilitator_auth_token: Option<String>,
             unsafe_dev_mock_facilitator: bool,
+            require_invocation_binding: bool,
         ) -> PyResult<Self> {
             let node = mesh.node_arc_clone()?;
             let runtime = mesh.runtime_arc();
@@ -331,7 +365,8 @@ mod provider {
                 registry,
                 PathBuf::from(state_path),
             )
-            .map_err(|e| PyRuntimeError::new_err(format!("payment engine: {e}")))?;
+            .map_err(|e| PyRuntimeError::new_err(format!("payment engine: {e}")))?
+            .with_require_invocation_binding(require_invocation_binding);
             if let Some(b) = &billing {
                 engine = engine.with_billing_log(b.clone());
             }
