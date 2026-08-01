@@ -654,6 +654,112 @@ async fn queue_group_join_requires_a_grant_for_that_group() {
     );
 }
 
+/// A `TokenBound` queue-group worker must work end to end — join
+/// accepted AND events actually delivered.
+///
+/// `TokenBound` cannot be configured without `token_roots`, and roots
+/// make `token_required()` true, which makes the publish path re-verify
+/// every admitted subscriber's retained chain on every packet. That
+/// re-check asked the chain about the CHANNEL hash, but a group grant
+/// authorizes `queue_group_hash(channel, group)` — a deliberately
+/// different hash, so that a reader's channel token cannot double as a
+/// worker grant. The question therefore had no answer, the worker was
+/// revoked and de-rostered before its first event, and the feature was
+/// unusable: accepted with a successful Ack, then silently starved.
+///
+/// The subscribe-side test above passed throughout — it never published.
+#[tokio::test]
+async fn token_bound_queue_group_worker_receives_events() {
+    use net::adapter::net::{queue_group_hash, QueueGroupPolicy};
+
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
+
+    let name = ChannelName::new("work/delivery").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(name.clone()))
+            .with_token_roots(vec![a.keypair.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound),
+    );
+
+    let grant = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        queue_group_hash(name.as_str(), "batch"),
+        300,
+        0,
+    );
+    b.mesh
+        .subscribe_channel_in_queue_group_with_token(
+            a.mesh.node_id(),
+            name.clone(),
+            "batch".to_string(),
+            grant,
+        )
+        .await
+        .expect("the granted queue group must be joinable");
+
+    // The publisher is the channel's own root, so it needs a PUBLISH
+    // grant to itself to clear its own gate.
+    let self_token = PermissionToken::issue(
+        &a.keypair,
+        a.keypair.entity_id().clone(),
+        TokenScope::PUBLISH,
+        name.hash(),
+        300,
+        0,
+    );
+    a.mesh.set_publish_chain(
+        &name,
+        net::adapter::net::identity::TokenChain::single(self_token),
+    );
+
+    let publisher = ChannelPublisher::new(
+        name.clone(),
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    );
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"work-item"))
+        .await
+        .expect("publish must be authorized");
+    assert_eq!(
+        report.delivered, 1,
+        "a worker admitted by a group grant must actually receive the group's \
+         events, not be revoked by a publish-time re-check asking its grant \
+         about the channel instead of the group"
+    );
+
+    // Publish-time denial de-rosters as well as revoking, so a surviving
+    // roster entry is the sharpest evidence the re-check agreed.
+    assert!(
+        a.mesh
+            .roster()
+            .is_subscribed(b.mesh.node_id(), &ChannelId::new(name.clone())),
+        "the worker must still be rostered after a publish — a failed \
+         re-check evicts it, which on a queue group means that group's \
+         events are dropped rather than delivered"
+    );
+
+    // Second publish: the first one flips `signatures_verified`, so this
+    // takes the presigned re-check path. Both paths must agree about
+    // which hash the grant answers for.
+    let report = a
+        .mesh
+        .publish(&publisher, Bytes::from_static(b"work-item-2"))
+        .await
+        .expect("publish must be authorized");
+    assert_eq!(
+        report.delivered, 1,
+        "the presigned re-check path must use the same grant hash as the \
+         full one — it skips signatures, not scope"
+    );
+}
+
 /// `QueueGroupPolicy::Deny` must hold on a channel that has NO other
 /// gate — which is the shape it is most likely to be reached for.
 ///

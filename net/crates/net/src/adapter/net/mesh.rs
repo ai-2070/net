@@ -76,9 +76,9 @@ use super::behavior::sensing;
 use super::behavior::tag::Tag;
 use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
 use super::channel::{
-    AckReason, AclPrincipal, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelHash, ChannelId,
-    ChannelName, ChannelPublisher, OnFailure, PublishConfig, PublishReport, QueueGroupPolicy,
-    SubscriberRoster,
+    queue_group_hash, AckReason, AclPrincipal, AuthGuard, AuthVerdict, ChannelConfigRegistry,
+    ChannelHash, ChannelId, ChannelName, ChannelPublisher, OnFailure, PublishConfig, PublishReport,
+    QueueGroupPolicy, SubscriberRoster,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
@@ -1073,13 +1073,35 @@ fn routed_rotation_outcome(
 /// check.
 struct RetainedChain {
     chain: TokenChain,
+    /// The `ChannelHash` this chain was ADMITTED on — the question the
+    /// subscribe gate actually asked of it, which the publish-time
+    /// re-check and the sweep must keep asking.
+    ///
+    /// Usually the requested channel's own hash. It is NOT that for a
+    /// [`QueueGroupPolicy::TokenBound`] worker: under that policy the
+    /// group grant *is* the subscribe authority, and it authorizes
+    /// [`queue_group_hash(channel, group)`](queue_group_hash) — a
+    /// deliberately different hash, so a reader's channel token cannot
+    /// double as a worker grant.
+    ///
+    /// Recording it is what keeps the two re-check paths honest.
+    /// `TokenBound` requires `token_roots`, which makes
+    /// `token_required()` true, which makes the publish path re-verify
+    /// every admitted subscriber's chain on every packet. Re-verifying
+    /// against the CHANNEL hash asked a question the worker's grant was
+    /// never meant to answer, so it failed, and the worker was revoked
+    /// and de-rostered before its first delivery — accepted with a
+    /// successful Ack and then silently starved. Same shape as the
+    /// prefix-channel defect (M1), one hash further along.
+    grant_hash: ChannelHash,
     signatures_verified: AtomicBool,
 }
 
 impl RetainedChain {
-    fn new(chain: TokenChain) -> Self {
+    fn new(chain: TokenChain, grant_hash: ChannelHash) -> Self {
         Self {
             chain,
+            grant_hash,
             signatures_verified: AtomicBool::new(false),
         }
     }
@@ -3035,10 +3057,16 @@ fn sweep_expired_subscribers(
             // The periodic sweep is the cold authoritative re-check; it
             // always re-verifies signatures (full `reverify_subscribe`)
             // rather than trusting the publish path's cached flag.
+            //
+            // Against `r.grant_hash`, the hash the subscribe gate
+            // admitted this chain on — see `RetainedChain::grant_hash`.
+            // A `TokenBound` queue-group worker's grant names the group,
+            // not the channel, so re-asking about the channel here would
+            // evict every worker on the first sweep.
             let authorized = subscriber_chains
                 .get(&(node_id, name.hash()))
                 .is_some_and(|r| {
-                    cfg.reverify_subscribe(&r.chain, &entity_id, name.hash(), revocation, skew)
+                    cfg.reverify_subscribe(&r.chain, &entity_id, r.grant_hash, revocation, skew)
                 });
             if !authorized {
                 guard.revoke_channel(subscriber_principal(node_id), name);
@@ -24152,7 +24180,11 @@ impl MeshNode {
         // subscribe authority — see `QueueGroupPolicy::TokenBound` for
         // why it cannot be an additional credential (one chain per
         // Subscribe on the wire). Capability filters still apply.
-        let authority_from_group_grant = match (queue_group, cfg.queue_group_policy) {
+        //
+        // Yields the hash the group grant was verified against, which
+        // is NOT the channel's — see `RetainedChain::grant_hash` for why
+        // that distinction has to survive past this function.
+        let group_grant_hash = match (queue_group, cfg.queue_group_policy) {
             (Some(_), QueueGroupPolicy::Deny) => {
                 return (false, Some(AckReason::Unauthorized));
             }
@@ -24174,12 +24206,12 @@ impl MeshNode {
                     );
                     return (false, Some(AckReason::Unauthorized));
                 }
-                true
+                Some(queue_group_hash(channel.as_str(), group))
             }
-            _ => false,
+            _ => None,
         };
 
-        if !authority_from_group_grant
+        if group_grant_hash.is_none()
             && !cfg.can_subscribe(
                 &peer_caps,
                 &peer_entity,
@@ -24212,8 +24244,17 @@ impl MeshNode {
             // subscriber was accepted and then revoked before its first
             // delivery. `Unsubscribe` also removes by the real hash, so
             // the sentinel-keyed entry leaked until peer failure.
-            ctx.subscriber_chains
-                .insert((from_node, requested_hash), RetainedChain::new(chain));
+            //
+            // The KEY is the requested channel — that is how the publish
+            // path and `Unsubscribe` find this entry. What the chain was
+            // verified AGAINST is carried separately, because for a
+            // `TokenBound` worker the two are deliberately different
+            // hashes and the re-check has to keep asking the admitting
+            // question. See `RetainedChain::grant_hash`.
+            ctx.subscriber_chains.insert(
+                (from_node, requested_hash),
+                RetainedChain::new(chain, group_grant_hash.unwrap_or(requested_hash)),
+            );
         }
         (true, None)
     }
@@ -24642,18 +24683,27 @@ impl MeshNode {
                         // re-checked every packet. Avoids N × up-to-8
                         // signature verifies per publish on a high-fanout
                         // channel.
+                        //
+                        // Re-verified against `r.grant_hash`, the hash
+                        // the subscribe gate admitted this chain on —
+                        // not `channel_hash`. They coincide for an
+                        // ordinary subscriber; for a `TokenBound`
+                        // queue-group worker the grant names the GROUP,
+                        // and asking it about the channel instead
+                        // revoked every such worker on its first
+                        // packet. See `RetainedChain::grant_hash`.
                         if r.signatures_verified.load(Ordering::Relaxed) {
                             cfg.reverify_subscribe_presigned(
                                 &r.chain,
                                 &entity,
-                                channel_hash,
+                                r.grant_hash,
                                 revocation,
                                 skew,
                             )
                         } else if cfg.reverify_subscribe(
                             &r.chain,
                             &entity,
-                            channel_hash,
+                            r.grant_hash,
                             revocation,
                             skew,
                         ) {
@@ -31646,10 +31696,14 @@ mod fold_publisher_helpers_tests {
             3600,
             0,
         ));
-        node.subscriber_chains
-            .insert((dead, channel_hash), RetainedChain::new(chain.clone()));
-        node.subscriber_chains
-            .insert((live, channel_hash), RetainedChain::new(chain));
+        node.subscriber_chains.insert(
+            (dead, channel_hash),
+            RetainedChain::new(chain.clone(), channel_hash),
+        );
+        node.subscriber_chains.insert(
+            (live, channel_hash),
+            RetainedChain::new(chain, channel_hash),
+        );
         assert_eq!(node.subscriber_chains.len(), 2);
 
         node.failure_detector.heartbeat(dead, addr);
@@ -36686,7 +36740,7 @@ mod membership_failure_tests {
         for (node, ch) in [(FAILED, 1u64), (FAILED, 2u64), (HEALTHY, 1u64)] {
             chains.insert(
                 (node, ch),
-                RetainedChain::new(TokenChain { tokens: Vec::new() }),
+                RetainedChain::new(TokenChain { tokens: Vec::new() }, ch),
             );
         }
         #[cfg(feature = "cortex")]
