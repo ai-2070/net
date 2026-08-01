@@ -10266,11 +10266,12 @@ impl MeshNode {
     /// disabled.
     ///
     /// **This policy does not assign this node's own subnet.** That
-    /// comes from [`MeshNodeConfig::with_subnet`] and nothing else — see
-    /// [`Self::local_subnet`]. The two settings are independent, and
-    /// `Some`/`None` here says nothing about where `local_subnet` came
-    /// from; it says only whether inbound announcements get resolved to
-    /// a subnet.
+    /// comes from `MeshNodeConfig::subnet` — set through
+    /// [`MeshNodeConfig::with_subnet`] or assigned directly, the field
+    /// being public — see [`Self::local_subnet`]. The two settings are
+    /// independent, and `Some`/`None` here says nothing about where
+    /// `local_subnet` came from; it says only whether inbound
+    /// announcements get resolved to a subnet.
     ///
     /// This doc previously claimed the opposite — that the policy
     /// "derived this node's `local_subnet`", with `None` meaning the
