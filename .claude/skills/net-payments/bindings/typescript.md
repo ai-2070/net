@@ -99,9 +99,21 @@ handle.serving; handle.tools; await handle.withdraw(); handle.stop()
 ## Outbound HTTP-402 — opt-in `payments-http`
 
 ```ts
-const client = new PaymentHttpClient(paymentPolicyPath, paymentProfile, false, signerAddress, signer)
+const client = new PaymentHttpClient(
+  paymentPolicyPath, paymentProfile, false, signerAddress, signer,
+  'public_only',  // destinationPolicy — the default; see below
+)
 const [statusJson, body] = await client.fetchPaid(url)   // [string, Buffer]
 ```
+
+**`destinationPolicy` defaults to `public_only`, and that will refuse a
+`localhost` URL.** This is the one door whose URL an agent can choose, so the
+SSRF guard is on by default — a permissive default would put every integration
+one model-chosen URL away from an unauthenticated service on the same host.
+Reaching a local or self-hosted x402 server is done by asking for it:
+`'public_or_loopback'` for this machine, `'allow_private'` for an internal
+network. An unknown value throws rather than falling back, and there is no
+spelling that disables the guard entirely.
 
 ## Three Node-specific obligations
 

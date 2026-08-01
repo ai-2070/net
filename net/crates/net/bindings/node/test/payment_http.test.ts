@@ -17,7 +17,15 @@ const PaymentHttpClient = binding.PaymentHttpClient
 
 // A port that refuses connections, so the unpaid probe fails at the transport
 // without any network dependency — the client projects `transport_error`.
+//
+// Reaching the transport at all means clearing the destination policy first,
+// and the default is `public_only`, which refuses loopback before a socket is
+// opened. So the clients below opt into `public_or_loopback`: the subject of
+// these tests is the outcome projection, not the SSRF guard, and asserting
+// `transport_error` under the default would have been asserting the guard by
+// accident. `theDefaultRefusesLoopback` covers the other side.
 const UNREACHABLE = 'http://127.0.0.1:1/nope'
+const LOOPBACK_OK = 'public_or_loopback'
 
 const tmpPolicy = (name: string): string =>
   `${tmpdir()}/net-http-${name}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
@@ -34,7 +42,14 @@ describe.skipIf(!PaymentHttpClient)('PaymentHttpClient', () => {
   })
 
   it('fetchPaid returns a [statusJson, body] pair', async () => {
-    const client = new PaymentHttpClient(tmpPolicy('fetch'), 'dev_test')
+    const client = new PaymentHttpClient(
+      tmpPolicy('fetch'),
+      'dev_test',
+      false,
+      undefined,
+      undefined,
+      LOOPBACK_OK,
+    )
     const [statusJson, body] = await client.fetchPaid(UNREACHABLE)
     const parsed = JSON.parse(statusJson)
     expect(parsed.status).toBe('transport_error')
@@ -51,11 +66,40 @@ describe.skipIf(!PaymentHttpClient)('PaymentHttpClient', () => {
       false,
       '0x209693Bc6afc0C5328bA36FaF03C514EF312287C',
       signer,
+      LOOPBACK_OK,
     )
     // The signer is wired but not called for an unreachable (unpaid) fetch.
     const [statusJson] = await client.fetchPaid(UNREACHABLE)
     expect(JSON.parse(statusJson).status).toBe('transport_error')
   }, 20000)
+
+  it('defaults to public_only, so an agent-supplied loopback URL is refused', async () => {
+    // The guard the two tests above opt out of. Without this, widening
+    // the default would go unnoticed — both of them would keep passing.
+    const client = new PaymentHttpClient(tmpPolicy('default'), 'dev_test')
+    const [statusJson] = await client.fetchPaid(UNREACHABLE)
+    expect(JSON.parse(statusJson).status).toBe('denied')
+  }, 20000)
+
+  it('an unknown destination policy is a construction error', () => {
+    expect(
+      () =>
+        new PaymentHttpClient(tmpPolicy('badpol'), 'dev_test', false, undefined, undefined, 'yolo'),
+    ).toThrow()
+    // `unrestricted` exists on the enum but not on this door — a fetch URL
+    // can come from a model, so there is no spelling of "no restriction".
+    expect(
+      () =>
+        new PaymentHttpClient(
+          tmpPolicy('unres'),
+          'dev_test',
+          false,
+          undefined,
+          undefined,
+          'unrestricted',
+        ),
+    ).toThrow()
+  })
 
   it('a signer address without its callback is a construction error', () => {
     expect(

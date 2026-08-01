@@ -201,15 +201,30 @@ describe.skipIf(!CapabilityGateway)('CapabilityGateway payments', () => {
       expect(spent.status).toBe('ok')
       expect(spent.spent).toBe('0')
 
-      // Approve a quote id: moves to approved (changed), idempotent second call.
+      // Approving an id nobody has asked about is a structured no-op, not
+      // a new record.
+      //
+      // The engine writes the pending record when it decides an approval
+      // is needed, and attaches the provider-signed quote bytes to it.
+      // Minting one here would leave an approval carrying no quote that
+      // the policy gate still reads as approved — an operator saying yes
+      // to something nobody can produce. `payment_conformance.test.ts`
+      // covers the `changed: true` path, where a real held quote exists.
       const approved = JSON.parse(await gw.approvePayment('q-1'))
       expect(approved.status).toBe('ok')
-      expect(approved.changed).toBe(true)
-      expect(JSON.parse(await gw.approvePayment('q-1')).changed).toBe(false)
+      // The status-JSON is built by serde in Rust and parsed here, so the
+      // key is `quote_id` — napi's camelCase conversion applies to method
+      // and field names, not to the contents of a JSON string.
+      expect(approved.quote_id).toBe('q-1')
+      expect(approved.changed).toBe(false)
 
-      // Reject removes it (changed), then a no-op.
-      expect(JSON.parse(await gw.rejectPayment('q-1')).changed).toBe(true)
-      expect(JSON.parse(await gw.rejectPayment('q-1')).changed).toBe(false)
+      // And it really did not create anything.
+      expect(JSON.parse(await gw.pendingPayments()).pending).toEqual([])
+
+      // Rejecting an unknown id is likewise a no-op rather than an error.
+      const rejected = JSON.parse(await gw.rejectPayment('q-1'))
+      expect(rejected.status).toBe('ok')
+      expect(rejected.changed).toBe(false)
     })
   })
 

@@ -157,6 +157,32 @@ impl DestinationPolicy {
             Self::PublicOnly => "public only",
         }
     }
+
+    /// Parse the wire vocabulary the bindings expose.
+    ///
+    /// One spelling per variant and no aliases, because this widens an
+    /// SSRF guard: a typo has to be an error, never a silent fallback to
+    /// something more permissive *or* to the default. `SpendProfile::parse`
+    /// takes the same line for the same reason.
+    ///
+    /// `unrestricted` is deliberately absent. It exists for endpoints that
+    /// are pure operator configuration — a facilitator URL, an RPC node —
+    /// and the outbound HTTP-402 door is the one place a URL can come
+    /// from a model. There is no spelling of "no restriction at all" for
+    /// an agent-supplied fetch.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "public_only" => Ok(Self::PublicOnly),
+            "public_or_loopback" => Ok(Self::PublicOrLoopback),
+            "allow_private" => Ok(Self::AllowPrivate),
+            other => Err(format!(
+                "unknown destination policy `{other}` — one of `public_only` (the default; \
+                 correct whenever a fetch URL can be influenced by a model), \
+                 `public_or_loopback` (a local x402 server), or `allow_private` (a \
+                 self-hosted server on an internal network)"
+            )),
+        }
+    }
 }
 
 /// Unwrap IPv4-**mapped** IPv6 (`::ffff:127.0.0.1`) to the v4 address it
@@ -707,6 +733,39 @@ mod tests {
             assert!(
                 !DestinationPolicy::PublicOnly.admits(ip),
                 "{lan} must still be refused by the strict policy"
+            );
+        }
+    }
+
+    /// The parse vocabulary is a security boundary: an unrecognised
+    /// spelling must be an error, not a quiet fall-back to either the
+    /// default or something wider.
+    #[test]
+    fn the_destination_vocabulary_rejects_what_it_does_not_know() {
+        assert_eq!(
+            DestinationPolicy::parse("public_only"),
+            Ok(DestinationPolicy::PublicOnly)
+        );
+        assert_eq!(
+            DestinationPolicy::parse("public_or_loopback"),
+            Ok(DestinationPolicy::PublicOrLoopback)
+        );
+        assert_eq!(
+            DestinationPolicy::parse("allow_private"),
+            Ok(DestinationPolicy::AllowPrivate)
+        );
+        // No aliases, no case-folding, no `unrestricted` on this door.
+        for unknown in [
+            "unrestricted",
+            "PublicOnly",
+            "public-or-loopback",
+            "loopback",
+            "",
+            "yolo",
+        ] {
+            assert!(
+                DestinationPolicy::parse(unknown).is_err(),
+                "`{unknown}` must not parse"
             );
         }
     }

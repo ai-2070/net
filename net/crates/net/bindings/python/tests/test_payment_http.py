@@ -35,7 +35,15 @@ if PaymentHttpClient is None:
 
 # A port that refuses connections, so the unpaid probe fails at the transport
 # without any network dependency — the client projects `transport_error`.
+#
+# Reaching the transport at all means clearing the destination policy first,
+# and the default is `public_only`, which refuses loopback before a socket is
+# opened. So the clients below opt into `public_or_loopback`: the subject of
+# these tests is the outcome projection, not the SSRF guard, and asserting
+# `transport_error` under the default would have been asserting the guard by
+# accident. `test_the_default_refuses_loopback` covers the other side.
 UNREACHABLE = "http://127.0.0.1:1/nope"
+LOOPBACK_OK = "public_or_loopback"
 
 
 @pytest.fixture()
@@ -43,6 +51,7 @@ def client(tmp_path):
     return PaymentHttpClient(
         payment_policy_path=str(tmp_path / "spend-policy.json"),
         payment_profile="dev_test",
+        destination_policy=LOOPBACK_OK,
     )
 
 
@@ -89,12 +98,43 @@ def test_no_kwarg_accepts_key_material(tmp_path):
             )
 
 
+def test_the_default_refuses_loopback(tmp_path):
+    """The guard the fixture opts out of.
+
+    Without this, widening the default would go unnoticed — every test
+    above would keep passing.
+    """
+    strict = PaymentHttpClient(
+        payment_policy_path=str(tmp_path / "spend-policy.json"),
+        payment_profile="dev_test",
+    )
+    status_json, _ = strict.fetch_paid(UNREACHABLE)
+    assert json.loads(status_json)["status"] == "denied"
+
+
+def test_an_unknown_destination_policy_is_a_construction_error(tmp_path):
+    for bad in ("yolo", "PublicOnly", "public-or-loopback"):
+        with pytest.raises(ValueError):
+            PaymentHttpClient(
+                payment_policy_path=str(tmp_path / "spend-policy.json"),
+                destination_policy=bad,
+            )
+    # `unrestricted` exists on the enum but not on this door — a fetch URL
+    # can come from a model, so there is no spelling of "no restriction".
+    with pytest.raises(ValueError):
+        PaymentHttpClient(
+            payment_policy_path=str(tmp_path / "spend-policy.json"),
+            destination_policy="unrestricted",
+        )
+
+
 def test_async_fetch_paid_returns_a_tuple(tmp_path):
     if AsyncPaymentHttpClient is None:
         pytest.skip("AsyncPaymentHttpClient not built")
     gw = AsyncPaymentHttpClient(
         payment_policy_path=str(tmp_path / "spend-policy.json"),
         payment_profile="dev_test",
+        destination_policy=LOOPBACK_OK,
     )
 
     async def body():

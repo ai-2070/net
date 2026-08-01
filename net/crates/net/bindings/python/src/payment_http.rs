@@ -24,6 +24,7 @@ use net::adapter::net::identity::EntityKeypair;
 use net_payments::core::registry::default_registry_v1;
 use net_payments::flow::http402::{X402HttpFlow, X402HttpOutcome};
 use net_payments::flow::SystemClock;
+use net_payments::http_policy::DestinationPolicy;
 use net_payments::policy::spend::{SpendPolicyEngine, SpendProfile};
 
 use crate::capability_gateway::{python_external_signer, unbind_signer, PaymentConfig};
@@ -114,6 +115,7 @@ fn outcome_to_result(outcome: X402HttpOutcome) -> HttpFetchResult {
 fn build_flow(
     identity: Option<&crate::identity::Identity>,
     config: PaymentConfig,
+    destinations: DestinationPolicy,
 ) -> PyResult<X402HttpFlow> {
     // Vocabulary lives once in core (`SpendProfile::parse`).
     let profile =
@@ -131,12 +133,34 @@ fn build_flow(
     let spend = SpendPolicyEngine::new(&config.policy_path, profile)
         .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
 
-    let mut flow = X402HttpFlow::new(caller, spend, registry, Arc::new(SystemClock))
-        .map_err(|e| PyRuntimeError::new_err(format!("http client: {e}")))?;
+    let mut flow = X402HttpFlow::with_destination_policy(
+        caller,
+        spend,
+        registry,
+        Arc::new(SystemClock),
+        destinations,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("http client: {e}")))?;
     if let Some((address, callable)) = config.signer {
         flow = flow.with_signer("eip155", python_external_signer(address, callable));
     }
     Ok(flow)
+}
+
+/// `destination_policy` → [`DestinationPolicy`], defaulting to
+/// `public_only`.
+///
+/// An outbound 402 fetch URL is the one destination in this crate that a
+/// *model* can choose, so the SSRF guard is on unless an operator says
+/// otherwise. Saying otherwise is also the only way to reach a local or
+/// LAN x402 server — the binding hardcoded `PublicOnly` with no opt-out,
+/// which made self-hosted servers unreachable rather than merely
+/// guarded.
+fn parse_destinations(destination_policy: Option<String>) -> PyResult<DestinationPolicy> {
+    match destination_policy.as_deref() {
+        Some(s) => DestinationPolicy::parse(s).map_err(PyValueError::new_err),
+        None => Ok(DestinationPolicy::PublicOnly),
+    }
 }
 
 /// Collect the payment kwargs, requiring a policy path (the spend gate).
@@ -186,7 +210,11 @@ struct HttpClientState {
 }
 
 impl HttpClientState {
-    fn new(identity: Option<&crate::identity::Identity>, config: PaymentConfig) -> PyResult<Self> {
+    fn new(
+        identity: Option<&crate::identity::Identity>,
+        config: PaymentConfig,
+        destinations: DestinationPolicy,
+    ) -> PyResult<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -196,7 +224,7 @@ impl HttpClientState {
         // a reactor at construction.
         let flow = {
             let _guard = runtime.enter();
-            build_flow(identity, config)?
+            build_flow(identity, config, destinations)?
         };
         Ok(Self {
             flow: Arc::new(flow),
@@ -219,7 +247,8 @@ pub struct PyPaymentHttpClient {
 #[pymethods]
 impl PyPaymentHttpClient {
     #[new]
-    #[pyo3(signature = (payment_policy_path, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None, identity=None))]
+    #[pyo3(signature = (payment_policy_path, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None, identity=None, destination_policy=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         payment_policy_path: String,
         payment_profile: Option<String>,
@@ -227,7 +256,9 @@ impl PyPaymentHttpClient {
         payment_signer_address: Option<String>,
         payment_signer: Option<Bound<'_, PyAny>>,
         identity: Option<&crate::identity::Identity>,
+        destination_policy: Option<String>,
     ) -> PyResult<Self> {
+        let destinations = parse_destinations(destination_policy)?;
         let config = collect_required(
             Some(payment_policy_path),
             payment_profile,
@@ -236,7 +267,7 @@ impl PyPaymentHttpClient {
             payment_signer,
         )?;
         Ok(Self {
-            state: HttpClientState::new(identity, config)?,
+            state: HttpClientState::new(identity, config, destinations)?,
         })
     }
 
@@ -270,7 +301,8 @@ pub struct PyAsyncPaymentHttpClient {
 #[pymethods]
 impl PyAsyncPaymentHttpClient {
     #[new]
-    #[pyo3(signature = (payment_policy_path, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None, identity=None))]
+    #[pyo3(signature = (payment_policy_path, payment_profile=None, payment_unsafe_mock_auto_allow=false, payment_signer_address=None, payment_signer=None, identity=None, destination_policy=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         payment_policy_path: String,
         payment_profile: Option<String>,
@@ -278,7 +310,9 @@ impl PyAsyncPaymentHttpClient {
         payment_signer_address: Option<String>,
         payment_signer: Option<Bound<'_, PyAny>>,
         identity: Option<&crate::identity::Identity>,
+        destination_policy: Option<String>,
     ) -> PyResult<Self> {
+        let destinations = parse_destinations(destination_policy)?;
         let config = collect_required(
             Some(payment_policy_path),
             payment_profile,
@@ -287,7 +321,7 @@ impl PyAsyncPaymentHttpClient {
             payment_signer,
         )?;
         Ok(Self {
-            state: HttpClientState::new(identity, config)?,
+            state: HttpClientState::new(identity, config, destinations)?,
         })
     }
 
@@ -405,7 +439,7 @@ mod tests {
             spend,
             registry,
             Arc::new(SystemClock),
-            net_payments::http_policy::DestinationPolicy::PublicOrLoopback,
+            DestinationPolicy::PublicOrLoopback,
         )
         .expect("build flow");
         // Port 1 is unreachable — the unpaid probe fails at the transport.

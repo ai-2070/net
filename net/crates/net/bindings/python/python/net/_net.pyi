@@ -3346,6 +3346,7 @@ class PaymentHttpClient:
         payment_signer_address: Optional[str] = None,
         payment_signer: Optional[Callable[[str], str]] = None,
         identity: Optional["Identity"] = None,
+        destination_policy: Optional[str] = None,
     ) -> None:
         """Build a client over the shared spend-policy store at
         ``payment_policy_path`` (**required** — the spend gate). The payment
@@ -3357,7 +3358,20 @@ class PaymentHttpClient:
         callback; key material never crosses the boundary). ``identity`` is
         an optional payer :class:`Identity` handle; omit it for an ephemeral
         one (the caller id is bookkeeping on this path — spend is tracked by
-        ``(network, asset, day)``, not by caller)."""
+        ``(network, asset, day)``, not by caller).
+
+        ``destination_policy`` is the SSRF guard: ``"public_only"``
+        (default), ``"public_or_loopback"``, or ``"allow_private"``. An
+        unknown value raises rather than falling back.
+
+        The default is strict because this is the one door whose URL an
+        agent can choose — a permissive default would put every
+        integration one model-chosen URL away from an unauthenticated
+        service on the same host. It is settable because a local or
+        self-hosted x402 server has to be reachable by asking for it:
+        pass ``"public_or_loopback"`` for a server on this machine, or
+        ``"allow_private"`` for one on an internal network. There is no
+        spelling that disables the guard entirely."""
         ...
 
     def fetch_paid(self, url: str) -> tuple[str, bytes]:
@@ -3387,6 +3401,7 @@ class AsyncPaymentHttpClient:
         payment_signer_address: Optional[str] = None,
         payment_signer: Optional[Callable[[str], str]] = None,
         identity: Optional["Identity"] = None,
+        destination_policy: Optional[str] = None,
     ) -> None:
         """Same as :class:`PaymentHttpClient`."""
         ...

@@ -82,6 +82,33 @@ The spend-policy surface is identical to `caller.md`: over-cap yields
 `RequiresPaymentApproval`, an operator `approve`s, the next call proceeds. A
 network with no configured signer is `Denied`, never a silent fallback.
 
+### The destination policy is `PublicOnly`, and `localhost` is refused
+
+`new()` builds with `DestinationPolicy::PublicOnly`. This is the one door in the
+crate whose URL can be chosen by a *model*, and a permissive default would put
+every integration one model-chosen URL away from an unauthenticated service on
+the same host — so an agent-supplied `http://localhost:8080/…` is `Denied`
+before a socket is opened, not dialled.
+
+A local or self-hosted x402 server is reached by **asking for it**:
+
+```rust
+let flow = X402HttpFlow::with_destination_policy(
+    caller, spend, registry, clock,
+    DestinationPolicy::PublicOrLoopback,   // or AllowPrivate for a LAN server
+)?;
+```
+
+The bindings take the same choice as a string — `destination_policy` /
+`destinationPolicy`, one of `public_only` (default), `public_or_loopback`,
+`allow_private`. An unknown value is a construction error rather than a
+fall-back, and `unrestricted` is deliberately not spellable here.
+
+The guard is address-level, so it is not bypassable by spelling: hostnames are
+checked at resolve time (rebinding-safe), IP literals before the send, and the
+v4-in-v6 embeddings (`::ffff:`, NAT64, 6to4, Teredo) are refused as the v4
+addresses they reach.
+
 ## Python + Node — `PaymentHttpClient` (opt-in `payments-http`)
 
 The demand surface for this flow, in **both** Python and Node. Behind an
@@ -96,13 +123,17 @@ client = PaymentHttpClient(
     payment_profile="dev_test",
     payment_signer_address=None, payment_signer=None,   # eip155 seam (svm/xrpl deferred on this path)
     identity=None,                       # optional payer Identity; ephemeral if omitted
+    destination_policy=None,             # "public_only" (default) — see above; localhost needs "public_or_loopback"
 )
 status_json, body = client.fetch_paid(url)   # (str, bytes)
 ```
 
 ```ts
 // Node — same shape; the eip155 signer callback is async (Promise).
-const client = new PaymentHttpClient(paymentPolicyPath, 'dev_test', false, signerAddress, signer)
+const client = new PaymentHttpClient(
+  paymentPolicyPath, 'dev_test', false, signerAddress, signer,
+  'public_only',  // destinationPolicy — localhost needs 'public_or_loopback'
+)
 const [statusJson, body] = await client.fetchPaid(url)   // [string, Buffer]
 ```
 
