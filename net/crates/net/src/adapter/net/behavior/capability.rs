@@ -779,10 +779,17 @@ pub(crate) fn parse_membership_tags(
 ///   and their list forms). A tenant filter therefore narrows away only
 ///   *cooperating* peers that scoped themselves elsewhere — an
 ///   adversary simply omits the tag and stays visible.
-/// - **Nothing is withheld on the wire.** An unscoped query
-///   ([`Self::Any`], or plain `find_nodes_by_filter`) returns what a
-///   scoped one filters out. Scope keeps unrelated tenants out of your
-///   own placement decisions; it does not keep your providers secret.
+/// - **Nothing is withheld on the wire.** Plain `find_nodes_by_filter`
+///   — no scope filter at all — returns everything a tenant or region
+///   query filters out, because the filtering happens locally at query
+///   time and the announcements arrived either way. Scope keeps
+///   unrelated tenants out of your own placement decisions; it does not
+///   keep your providers secret.
+///
+///   [`Self::Any`] is NOT that unfiltered query: it still excludes
+///   candidates tagged `scope:subnet-local`, which only
+///   [`Self::SameSubnet`] returns. `Any` means "every candidate that did
+///   not opt out of cross-subnet discovery", not "every candidate".
 ///
 /// Wire-level scope with forwarder enforcement is deferred — see
 /// `docs/internal/plans/SCOPED_CAPABILITIES_PLAN.md` and

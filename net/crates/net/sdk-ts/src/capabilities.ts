@@ -398,10 +398,17 @@ export function capabilityFilterToNapi(f: CapabilityFilter): NapiCapabilityFilte
  *   EVERY `tenant` and `region` query. A tenant filter narrows away
  *   only *cooperating* peers that scoped themselves elsewhere — an
  *   adversary simply omits the tag and stays visible.
- * - **Nothing is withheld on the wire.** An unscoped query (`any`, or
- *   plain `findNodes`) returns what a scoped one filters out. Scope
- *   keeps unrelated tenants out of your own placement decisions; it
- *   does not keep your providers secret.
+ * - **Nothing is withheld on the wire.** Plain `findNodes` — no scope
+ *   filter at all — returns everything a `tenant` or `region` query
+ *   filters out, because the filtering happens locally at query time
+ *   and the announcements arrived either way. Scope keeps unrelated
+ *   tenants out of your own placement decisions; it does not keep your
+ *   providers secret.
+ *
+ *   Note `any` is NOT the unfiltered query: it still excludes peers
+ *   tagged `scope:subnet-local`, which only `sameSubnet` returns. `any`
+ *   is "every peer that did not opt out of cross-subnet discovery", not
+ *   "every peer".
  */
 export type ScopeFilter =
   | { kind: 'any' }
