@@ -325,8 +325,29 @@ pub fn production_registry_v1(signer: EntityId) -> AssetRegistry {
     registry.version = "net-production-1".to_string();
     registry
         .assets
-        .retain(|entry| entry.id.chain().namespace() != "mock");
+        .retain(|entry| !is_valueless_chain(entry.id.chain()));
     registry
+}
+
+/// Chains whose assets move nothing of value: the mock network and the
+/// public testnets.
+///
+/// A registry is an allowlist, so the cheapest way for a provider not to
+/// accept a valueless settlement is not to list it. Dropping `mock:net`
+/// while keeping Base Sepolia would leave the "production" registry able
+/// to quote testnet USDC — settled, billed, and served for tokens with a
+/// faucet behind them, which is the same hole one layer down.
+fn is_valueless_chain(chain: &ChainId) -> bool {
+    match chain.namespace() {
+        "mock" => true,
+        // Base Sepolia. Enumerated rather than pattern-matched because
+        // there is no syntactic mark for "testnet" in CAIP-2 — a new
+        // testnet has to be added here deliberately, which is the right
+        // failure direction: forgetting one leaves it listed and visible
+        // rather than silently dropping a real chain.
+        "eip155" => matches!(chain.reference(), "84532" | "11155111" | "5" | "17000"),
+        _ => false,
+    }
 }
 
 /// The P0 default registry: the mock network's asset only. Real networks
@@ -422,17 +443,27 @@ mod tests {
             !prod.assets.iter().any(|e| e.x402_asset == "musd"),
             "the production registry must not list the mock asset"
         );
+        // The mock asset AND the testnet entry are both gone: a registry
+        // that still listed Base Sepolia could quote faucet USDC, which
+        // is the same valueless-settlement hole one layer down.
+        assert!(
+            !prod
+                .assets
+                .iter()
+                .any(|e| e.id.chain().as_str() == "eip155:84532"),
+            "the production registry must not list a testnet asset"
+        );
         assert_eq!(
             prod.assets.len(),
-            dev.assets.len() - 1,
-            "only the mock asset is removed"
+            dev.assets.len() - 2,
+            "exactly the mock and testnet entries are removed"
         );
 
-        // Every real network survives.
-        for asset in ["USDC", "XRP"] {
+        // Every real-money network survives.
+        for chain in ["eip155:8453", "xrpl:0"] {
             assert!(
-                prod.assets.iter().any(|e| e.symbol == asset),
-                "{asset} must survive"
+                prod.assets.iter().any(|e| e.id.chain().as_str() == chain),
+                "{chain} must survive"
             );
         }
 

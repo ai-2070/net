@@ -64,16 +64,32 @@ impl X402View for PaymentPayload {
     }
 }
 
+/// Canonical form of a hex value whose `0x` prefix and letter case carry
+/// no meaning: lowercased, prefix stripped.
+///
+/// Used for the eip155 authorizer, nonce and contract address. All three
+/// are treated as prefix-optional and case-insensitive elsewhere in the
+/// stack (`is_eip3009_nonce` strips the prefix; the checker compares
+/// addresses with `eq_ignore_ascii_case`), so two spellings of one
+/// authorization must not become two replay identities.
+fn hex_key(value: &str) -> String {
+    let lowered = value.to_ascii_lowercase();
+    lowered
+        .strip_prefix("0x")
+        .map(str::to_owned)
+        .unwrap_or(lowered)
+}
+
 /// Canonicalize the `(network, asset)` scope a replay identity is keyed
 /// under, so two spellings of one on-chain scope collapse to one key.
 ///
-/// Only `eip155` is normalized, and only in the two ways where a
-/// difference in spelling provably is not a difference in meaning:
+/// Only `eip155` is normalized, and only where a difference in spelling
+/// provably is not a difference in meaning:
 ///
 /// - the CAIP-2 reference is a decimal chain id, so `eip155:08453`
 ///   re-renders as `eip155:8453`;
-/// - the asset is a hex contract address whose EIP-55 checksum casing
-///   carries no on-chain meaning, so it lowercases.
+/// - the asset is a hex contract address, so its `0x` prefix and EIP-55
+///   checksum casing are stripped ([`hex_key`]).
 ///
 /// Everything else passes through untouched. Solana mints are base58,
 /// where case *is* significant and lowercasing would merge distinct
@@ -90,7 +106,7 @@ fn canonical_eip_scope(network: &str, asset: &str) -> (String, String) {
         Ok(chain_id) => format!("eip155:{chain_id}"),
         Err(_) => network.to_string(),
     };
-    (network, asset.to_ascii_lowercase())
+    (network, hex_key(asset))
 }
 
 impl X402Carry<PaymentPayload> {
@@ -157,13 +173,14 @@ impl X402Carry<PaymentPayload> {
                 let nonce = auth.get("nonce").and_then(|v| v.as_str()).ok_or_else(|| {
                     X402Error::Invalid("exact-eip155 authorization carries no `nonce`".into())
                 })?;
-                // Addresses and hex nonces are case-insensitive on the wire
-                // (EIP-55 checksums vary), so normalize — otherwise a
-                // re-cased resubmission would mint a fresh identity.
-                vec![
-                    from.to_ascii_lowercase().into_bytes(),
-                    nonce.to_ascii_lowercase().into_bytes(),
-                ]
+                // Normalize both spellings that carry no meaning: the
+                // `0x` prefix is optional (`is_eip3009_nonce` and the
+                // settlement signer both accept a bare-hex nonce), and
+                // EIP-55 checksum casing varies. Without stripping the
+                // prefix, `0xabc…` and `abc…` are the same authorization
+                // with two replay identities — the same bypass re-casing
+                // would give.
+                vec![hex_key(from).into_bytes(), hex_key(nonce).into_bytes()]
             }
             ("exact", "solana") => {
                 // The partially-signed versioned transaction. Hash the
@@ -433,6 +450,54 @@ mod tests {
         );
     }
 
+    /// The `0x` prefix is optional everywhere else in the stack, so it
+    /// must not be a way to mint a second replay identity for one
+    /// authorization.
+    ///
+    /// `is_eip3009_nonce` accepts a bare-hex nonce and the settlement
+    /// signer's `decode_bytes32` does too — so `0xabc…` and `abc…` are
+    /// the same nonce to everything that matters. If the replay key
+    /// disagreed, re-spelling the prefix would satisfy a second quote
+    /// with one authorization.
+    #[test]
+    fn the_0x_prefix_is_not_a_second_replay_identity() {
+        let base: X402Carry<PaymentPayload> =
+            X402Carry::from_bytes(FIXTURE.as_bytes().to_vec()).unwrap();
+
+        // Same authorization, nonce and payer written without `0x`.
+        let bare = FIXTURE
+            .replace(
+                "\"nonce\": \"0xf3746613c2d920b5fdabc0856f2aeb2d4f88ee6037b8cc5d04a71a4462f13480\"",
+                "\"nonce\": \"f3746613c2d920b5fdabc0856f2aeb2d4f88ee6037b8cc5d04a71a4462f13480\"",
+            )
+            .replace("\"from\": \"0xPayer\"", "\"from\": \"Payer\"");
+        let bare: X402Carry<PaymentPayload> = X402Carry::from_bytes(bare.into_bytes()).unwrap();
+
+        assert_ne!(
+            base.content_hash(),
+            bare.content_hash(),
+            "the preserved bytes really do differ"
+        );
+        assert_eq!(
+            base.replay_key().unwrap(),
+            bare.replay_key().unwrap(),
+            "an optional prefix must not mint a second identity"
+        );
+
+        // The asset spelling likewise.
+        let bare_asset = FIXTURE.replace(
+            "\"asset\": \"0x036CbD53842c5426634e7929541eC2318f3dCF7e\"",
+            "\"asset\": \"036cbd53842c5426634e7929541ec2318f3dcf7e\"",
+        );
+        let bare_asset: X402Carry<PaymentPayload> =
+            X402Carry::from_bytes(bare_asset.into_bytes()).unwrap();
+        assert_eq!(
+            base.replay_key().unwrap(),
+            bare_asset.replay_key().unwrap(),
+            "the contract address prefix must not mint a second identity"
+        );
+    }
+
     /// The normalization is scoped to eip155 and must not merge scopes
     /// that only *look* similar. Solana mints are base58, where case is
     /// significant — lowercasing them would turn a missed replay into a
@@ -454,10 +519,12 @@ mod tests {
         let (net, _) = canonical_eip_scope("eip155:not-a-number", "0xAbC");
         assert_eq!(net, "eip155:not-a-number");
 
-        // And the eip155 case really does normalize.
+        // And the eip155 case really does normalize — chain id numerically,
+        // contract address by case AND `0x` prefix.
         let (net, asset) = canonical_eip_scope("eip155:08453", "0xAbCdEf");
         assert_eq!(net, "eip155:8453");
-        assert_eq!(asset, "0xabcdef");
+        assert_eq!(asset, "abcdef");
+        assert_eq!(canonical_eip_scope("eip155:1", "AbCdEf").1, "abcdef");
     }
 
     /// A scheme with no defined identity fails closed rather than falling
