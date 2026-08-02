@@ -170,15 +170,23 @@ Caveats that bound what this plan may assume:
   precedent is `install_rpc_service_defaults` (`channel/config.rs:827`)
   using `insert_if_absent` / `insert_prefix_if_absent`.
 
-### 1.5 Gateway machinery exists but is dead, and nothing gates the gateway role
+### 1.5 Gateway policy machinery is dead; the live relay is unauthenticated
 
 - `SubnetGateway::should_forward` (`subnet/gateway.rs:168`),
   `add_peer` (`:98`), and `export_channel` (`:112`) have **zero
   production call sites** — tests only. The export table is permanently
   empty in a running node.
+- The only live multi-hop forwarding path is the pre-AEAD relay branch in
+  `mesh.rs`: it parses `RoutingHeader`, looks up a destination to
+  `SocketAddr`, increments the outer hop count, and forwards the unchanged
+  inner packet without possessing its end-to-end key.
+- That routed packet has no adjacent-hop authenticator. `RoutingHeader.src_id`
+  is truncated and mutable, UDP source addresses do not identify a logical
+  peer, and the inner AAD cannot be verified by the relay.
 - `NetHeader.subnet_id` (`protocol.rs:197`) is AAD-covered and
   wire-serialized but **always zero** — `with_subnet` is called only from
-  tests.
+  tests. Even if populated, it would be an unverifiable origin claim at the
+  current relay.
 - There is **no gateway declaration or advertisement protocol**: a node
   becomes "a gateway" by locally calling `set_channel_configs`
   (`mesh.rs:19510–19514`).
@@ -188,9 +196,11 @@ Caveats that bound what this plan may assume:
   `(subject, axis, value, validity)` entitlement does not exist in the
   substrate.
 
-Consequence: "where must ROUTE/EXPORT authority be checked" has no live
-answer today because no cross-subnet forwarding path is live. The grant
-must land **with** the first live gateway wiring, not before it (§3, S3).
+Consequence: `ROUTE`/`EXPORT` must be enforced in the live relay, but a verified
+context cannot be selected from its current inputs. D6 and S4 add exact
+session attachments, a self-held gateway credential, authenticated next-hop
+identity, and an adjacent-hop packet authenticator before enabling protected
+forwarding.
 
 ### 1.6 `allowed_subnets` is a hard invocation gate on a self-declared value
 
@@ -267,16 +277,20 @@ At the authenticated session and the first live forwarding path:
 - `ATTACH` is checked when an AEAD-protected peer presents a subnet-scoped
   session. The grant subject is the full `EntityId`; that entity must sign a
   one-use presentation bound to the current session and verifier challenge.
-- `ROUTE` is checked when forwarding with both endpoints inside the grant's
-  subtree.
-- `EXPORT` is checked when forwarding crosses the grant subtree boundary.
+- `ROUTE` is checked against the gateway's self-held credential when both
+  exact authenticated hop attachments are inside its grant subtree.
+- `EXPORT` is checked against that self-held credential when the adjacent-hop
+  transition crosses its grant subtree boundary.
 - A local operator configuring their own node still acts through local
   machine authority; a remote configuration mutation remains a
   provider-local capability invocation, not a subnet `ADMIN` shortcut.
 
-The existing gateway methods have no production call sites (§1.5), so the
-first forwarding slice must wire the check and the consumer together. It may
-not ship an ungated gateway first or a grant artifact with no live check.
+The existing gateway policy methods have no production call sites (§1.5), while
+the live relay has no adjacent-hop packet authentication. The forwarding slice
+must first bind every protected routed packet to an admitted ingress session
+and authenticated next hop, then wire the local gateway check into that live
+consumer. It may not infer either endpoint from a claimed header field or ship
+an ungated protected gateway first.
 
 **Q5 — Should channel tokens be generalized before implementing subnet
 grants?**
@@ -321,9 +335,10 @@ session context. NAT and address changes neither mint nor destroy a grant.
 Control messages are transport only. A replayed signed fact cannot roll a
 receiver backward because revisions/floors are monotonic in their own scope;
 an unsigned or wrongly scoped fact changes no state. Operation replay is
-handled by the authenticated transport sequence window after session
-establishment. Grant nonces provide artifact uniqueness, not packet replay
-protection.
+handled by the end-to-end transport sequence window after session
+establishment; protected relays additionally use the D6 adjacent-hop sequence
+window before forwarding. Grant nonces provide artifact uniqueness, not packet
+replay protection.
 
 **Q8 — Which current `subnet:*` / `allowed_subnets` checks are unsafe?**
 Unsafe as authorization: the callee-side subnet/group admission (§1.6) — the
@@ -560,9 +575,9 @@ open-ended action vocabulary exists in v1.
 |---|---|
 | Establish a session scoped to target `T` | `ATTACH(P)` and `P.contains(T)` |
 | Originate ordinary traffic in `T` | session has valid `ATTACH(P)` and `P.contains(T)` |
-| Forward with source and destination inside `P` | `ROUTE(P)` |
+| Gateway forwards between exact authenticated hop attachments inside `P` | gateway holds `ROUTE(P)` |
 | Advertise an intra-subtree route for `P` | `ROUTE(P)` |
-| Cross from inside `P` to outside `P`, or the reverse | `EXPORT(P)` |
+| Gateway's adjacent-hop transition crosses `P`'s boundary | gateway holds `EXPORT(P)` |
 | Advertise an export boundary for `P` | `EXPORT(P)` |
 | Issue one leaf grant at scope `C` | separately verified `SubnetIssuerGrant`; not a `SubnetRights` bit |
 | Publish/subscribe | channel `PermissionToken`, independently |
@@ -773,6 +788,9 @@ Verification is fail-closed and occurs off the forwarding path:
 ```rust
 pub struct VerifiedSubnetContext {
     pub authority: EntityId,
+    /// Exact attachment requested in `SubnetAuthPresentation.target`.
+    pub attachment: TopologySubnetId,
+    /// Root of the subtree the credential permits.
     pub scope: TopologySubnetId,
     pub topology_epoch: u32,
     pub subject: EntityId,
@@ -785,11 +803,15 @@ pub struct VerifiedSubnetContext {
 }
 ```
 
-V1 installs one authority-qualified subtree context per protected session.
-Nodes needing unrelated authorities use separate authenticated sessions; the
-hot path does not union arbitrary grant vectors. The full subject and its
-compact routing derivative are compiled once; ordinary forwarding neither
-rehashes nor re-verifies either identity.
+V1 installs one authority-qualified context per protected session. `attachment`
+and `scope` are deliberately different: `attachment` is the exact admitted
+topology point from the presentation target, while `scope` is the credential's
+possibly broader subtree ceiling. A parent-scoped grant attached at
+`vehicle/perception/camera-domain` does not make that peer's source location the
+whole `vehicle` subtree. Nodes needing unrelated authorities use separate
+authenticated sessions; the hot path does not union arbitrary grant vectors.
+The full subject and its compact routing derivative are compiled once;
+ordinary forwarding neither rehashes nor re-verifies either identity.
 
 The context is invalidated by connection replacement, expiry, an authority
 auth-epoch change, topology epoch change, explicit withdrawal, or authenticated
@@ -797,42 +819,170 @@ subject-generation change. Revalidation uses a fresh challenge, checks the new
 floors against the credential scope, builds a replacement context, and
 atomically publishes it; a stale context is never mutated in place.
 
-### D6 — Hot-path contract
+### D6 — Authenticated adjacent-hop forwarding contract
 
-The packet/header carries the compact `TopologySubnetId`; the authenticated
-session supplies the authority and verified scope. The fast path performs:
+S4's production trace changes the original assumption. The only live relay is
+`mesh.rs`'s pre-AEAD, header-only branch. `NetRouter::route_packet` and
+`NetProxy` have no production callers. At that branch:
+
+- `NetHeader.subnet_id` is an end-to-end-AAD-covered origin field that the relay
+  cannot verify;
+- `RoutingHeader.src_id` and the UDP source address do not authenticate a peer;
+- `peer_subnets` is self-declared topology metadata;
+- `RoutingTable::lookup` returns only a `SocketAddr`, not the identity of the
+  next hop; and
+- the current routed packet is not carried inside an authenticated session with
+  the relay.
+
+None of those values may select a `VerifiedSubnetContext`. Looking up a
+cryptographic context by an unauthenticated routing claim would still be
+unauthenticated forwarding.
+
+Protected forwarding is therefore **adjacent-hop authenticated** while the
+inner packet remains end-to-end encrypted. Every protected route edge has an
+ordinary Noise session between adjacent nodes, and both sides complete D5
+admission for that edge. S4 adds a fixed authenticated route-hop envelope around
+the untouched inner Net packet:
+
+```text
+route-hop-v1
+  hop_session_id: u64
+  hop_sequence: u64
+  mutable RoutingHeader
+  inner Net packet bytes, unchanged
+  tag: 16-byte keyed BLAKE2s MAC
+```
+
+`NoiseHandshake::into_session_keys` derives separate directional
+`route-hop-tx-v1` / `route-hop-rx-v1` keys from the full handshake hash before
+it is discarded. Route-hop keys are never packet-AEAD keys and have an
+independent sequence space. The MAC computes the existing keyed
+`Blake2sMac256` primitive and transmits its first 16 bytes, domain-separated
+with `b"net.subnet.route-hop.v1"`; its transcript covers the hop session ID,
+hop sequence, the complete routing header, and every byte of the inner packet.
+Verification uses constant-time tag equality and a bounded replay window. Each
+gateway verifies
+and removes the incoming tag, increments the outer routing hop count, then
+creates a new tag for the authenticated next-hop session. The inner
+`NetHeader`, ciphertext, and end-to-end AEAD tag are never rewritten.
+
+A protected route-table result is identity-qualified:
 
 ```rust
-fn allows(
-    ctx: &VerifiedSubnetContext,
-    current_topology_epoch: u32,
-    current_subnet_auth_epoch: u64,
-    target: TopologySubnetId,
-    right: SubnetRights,
-) -> bool {
-    ctx.topology_epoch == current_topology_epoch
-        && ctx.subnet_auth_epoch == current_subnet_auth_epoch
-        && ctx.scope.is_ancestor_or_self_of(target)
-        && ctx.rights.contains(right)
-        && !ctx.is_expired()
+pub struct AuthenticatedNextHop {
+    pub node_id: NodeId,
+    pub addr: SocketAddr,
 }
 ```
 
-Forwarding applies exact boundary rules:
+The live peer session for `node_id` must match the route-hop session and address
+incarnation. NAT rebinding updates the address without changing the authenticated
+next-hop identity. An untagged legacy routing header, unknown/stale hop session,
+replayed sequence, invalid MAC, missing adjacent admission, or address/session
+conflict denies before forwarding. Public/global routing may retain the legacy
+path as a separately configured mode, but a protected route can never downgrade
+to it.
+
+The source and destination used by the gateway are exact **hop-local attachment
+points**, not the grant scopes and not the final packet's claimed subnet:
 
 ```rust
-inside_source = ctx.scope.is_ancestor_or_self_of(source);
-inside_target = ctx.scope.is_ancestor_or_self_of(target);
-
-inside_source && inside_target  => require ROUTE
-inside_source != inside_target  => require EXPORT
-otherwise                       => context is irrelevant; deny/use another context
+let source = ingress_peer_context.attachment;
+let target = egress_peer_context.attachment;
 ```
 
-Production forwarding performs no signature verification, chain walk,
-string parsing, allocation, online lookup, or verbose success-audit
-construction. The context read is immutable; topology and floor updates
-invalidate contexts off-path.
+The ingress context comes from the session that verified the route-hop MAC. The
+egress context comes from `AuthenticatedNextHop.node_id`'s current admitted
+session. Both contexts must contain `ATTACH`, match the same authority and
+current topology epoch, and remain live. On a multi-hop route, every gateway
+applies this rule to its adjacent ingress/egress transition; the gateway where a
+subtree boundary is actually crossed enforces `EXPORT`. The final endpoint
+still authenticates the original source through the untouched end-to-end
+session. V1 does not claim that an intermediate gateway authenticates the
+original end-to-end sender; origin-aware middlebox policy would require a
+separate signed route capability and is out of scope.
+
+Forwarding authority belongs to the gateway itself, not to either peer. S4
+loads separately typed immutable local entries:
+
+```rust
+pub struct VerifiedGatewayContext {
+    pub authority: EntityId,
+    pub attachment: TopologySubnetId,
+    pub scope: TopologySubnetId,
+    pub topology_epoch: u32,
+    pub subject: EntityId,
+    pub rights: SubnetRights,
+    pub generation: u32,
+    pub subnet_auth_epoch: u64,
+    pub expires_at: Instant,
+    pub credential_set_hash: [u8; 32],
+}
+
+pub const MAX_GATEWAY_CONTEXTS_PER_AUTHORITY: usize = 32;
+
+pub struct VerifiedGatewayContextSet {
+    pub authority: EntityId,
+    // Immutable, deduplicated by scope, operator-capped.
+    pub entries: Box<[VerifiedGatewayContext]>,
+}
+```
+
+Each entry is compiled off-path from a direct-root or one-issuer-hop credential
+set only when `leaf.subject == local EntityKeypair.entity_id()`, the local
+attachment is inside the leaf scope, and every ordinary D4/D5 credential,
+epoch, floor, validity, and rights check passes. Duplicate scopes may combine
+only rights from simultaneously current verified credentials;
+refresh/revocation recomputes the entry atomically and never accumulates stale
+rights. The published set is immutable, authority-local, and capped by
+`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`. It is indexed by scope off-path. One
+transition enumerates only the source and target ancestor paths and therefore
+performs at most `2 * (TopologySubnetId::MAX_DEPTH + 1)` — currently ten —
+immutable scope lookups; it never scans an operator-sized grant vector. A
+self-challenge adds no security because the process already holds the private
+key; remote session contexts may never be silently reused as local gateway
+authority.
+
+A narrow configured boundary cannot be bypassed by a broader `ROUTE` grant. The
+fixed forwarding decision evaluates every applicable local scope:
+
+```rust
+same_authority_and_epoch(local_set, ingress, egress)
+    && ingress.rights.contains(ATTACH)
+    && egress.rights.contains(ATTACH)
+    && all_local_entries_are_current()
+
+crossed = entries where
+    entry.scope.contains(source) != entry.scope.contains(target)
+
+if crossed is non-empty:
+    require EXPORT on every crossed entry
+else:
+    require at least one entry containing both endpoints with ROUTE
+```
+
+For the BMW fixture, `ROUTE(vehicle)` cannot authorize a transition out of
+`world-model` when a local `EXPORT(world-model)` boundary entry applies. A
+transition crossing two explicitly configured sibling boundaries requires
+`EXPORT` for both. Entries containing neither endpoint are irrelevant.
+
+Cross-authority transparent subnet routing remains outside v1. Fleet or partner
+traffic terminates at the exported provider boundary and then uses organization
+and provider-local admission as D7 specifies.
+
+`NetHeader.subnet_id` may remain an immutable origin hint for endpoint
+consistency checks and diagnostics, but S4 never uses it to establish gateway
+authority. Gateway TTL enforcement uses the mutable outer
+`RoutingHeader.ttl/hop_count`; the AAD-covered inner `NetHeader.hop_ttl` remains
+unmodified and is not passed to the dormant `SubnetGateway::should_forward`
+contract.
+
+Production protected forwarding performs one fixed symmetric route-hop MAC
+verification and one generation, plus immutable session/context lookups,
+fixed-width hierarchy/epoch/rights checks, and a bounded replay-window update.
+It performs no signature verification, credential-chain walk, string parsing,
+policy interpretation, online lookup, or verbose success-audit construction.
+Topology and floor changes invalidate contexts off-path.
 
 ### D7 — Composition with organizations, channels, and resources
 
@@ -1068,6 +1218,9 @@ extract a universal grant framework in this slice.
 - fleet/org membership without a Vehicle B subnet grant cannot attach to any
   Vehicle B internal scope;
 - subject-bound valid parent grant attaches to a child;
+- the compiled context stores that exact child as `attachment` while retaining
+  the parent grant root separately as `scope`;
+- forwarding cannot substitute `scope` for `attachment`;
 - child grant cannot attach upward or to a sibling;
 - reconnect re-verifies and cannot manufacture authority;
 - expiry, authority auth epoch, topology epoch, subject generation, and connection
@@ -1079,41 +1232,115 @@ Issue and consume the one-use challenge, verify the presentation and complete
 credential set, atomically compare/install the `NodeId → EntityId` pin, then
 compile and atomically install `VerifiedSubnetContext`. Missing, stale,
 replayed, or identity-conflicting state denies by default. Keep public/global
-sessions configurable without a subnet grant.
+sessions configurable without a subnet grant. Populate
+`VerifiedSubnetContext.attachment` from the already verified
+`presentation.target.path`; this is a compiled-state addition, not a new wire
+field.
 
-### S4 — Live gateway forwarding and export boundary
+### S4 — Authenticated live gateway forwarding and export boundary
+
+S4 has two independently committed and signed sub-slices. S4A may land dark;
+S4B may not begin until S4A is signed. No protected deployment accepts legacy
+untagged relay traffic between them.
+
+#### S4A — Exact attachments, local gateway authority, and dark route-hop wire
 
 **Modify:**
 
-- `net/crates/net/src/adapter/net/subnet/gateway.rs`
+- `net/crates/net/src/adapter/net/subnet/auth.rs`
+- `net/crates/net/src/adapter/net/crypto.rs`
+- `net/crates/net/src/adapter/net/session.rs`
+- `net/crates/net/src/adapter/net/route.rs`
 - `net/crates/net/src/adapter/net/mesh.rs`
-- `net/crates/net/src/adapter/net/protocol.rs`
-- the exact routed-forwarding dispatch module found during the S4 trace
 
 **Create:**
 
-- `net/crates/net/tests/subnet_gateway_auth.rs`
-- `net/crates/net/tests/subnet_org_boundary.rs`
+- focused route-hop wire/MAC/replay tests in the actual module test surface;
+- `net/crates/net/tests/subnet_gateway_local_auth.rs`.
 
 **RED witnesses first:**
 
+- `VerifiedSubnetContext.attachment` equals the exact presentation target, not
+  a broader grant scope;
+- a parent-scoped credential attached at a child cannot be treated as sourced
+  from the parent root;
+- the local gateway credential subject must equal the process's full
+  `EntityId`;
+- a peer context cannot substitute for `VerifiedGatewayContext`;
+- local gateway entries are bounded/deduplicated by scope and stale rights do
+  not accumulate across refresh/revocation;
+- broad `ROUTE(vehicle)` cannot bypass an applicable narrower
+  `EXPORT(world-model)` boundary;
+- crossing two explicitly configured sibling boundaries requires both export
+  entries;
+- route-hop tx/rx keys agree across adjacent peers, differ by direction, and
+  differ from packet AEAD keys;
+- route-hop tags cover session, sequence, complete routing header, and every
+  inner packet byte;
+- wrong key, tag, session, sequence, header, or inner byte denies;
+- duplicate/out-of-window sequence denies;
+- route lookup returns authenticated next-hop `NodeId` plus address;
+- a NAT/address update cannot change next-hop identity;
+- protected mode rejects an untagged legacy route packet;
+- the dark wire changes no public/global forwarding behavior.
+
+Derive the route-hop keys during `NoiseHandshake::into_session_keys`, add the
+fixed envelope and bounded replay state, qualify route entries by next-hop
+identity, compile the bounded local gateway context set off-path, and carry
+exact attachments in compiled peer contexts. Keep protected forwarding
+disabled/fail-closed in production dispatch until S4B.
+
+#### S4B — Production relay enforcement and export activation
+
+**Modify:**
+
+- `net/crates/net/src/adapter/net/subnet/gateway.rs`;
+- the live pre-AEAD relay branch in `net/crates/net/src/adapter/net/mesh.rs`;
+- channel export wiring only where required to activate
+  `Visibility::Exported`.
+
+**Create:**
+
+- `net/crates/net/tests/subnet_gateway_auth.rs`;
+- `net/crates/net/tests/subnet_org_boundary.rs`.
+
+**RED witnesses first:**
+
+- UDP source, `RoutingHeader.src_id`, `NetHeader.subnet_id`, and
+  `peer_subnets` cannot select forwarding authority;
+- no valid route-hop tag means no protected forward;
+- missing/stale ingress admission, egress admission, or local gateway context
+  independently denies;
+- ingress and egress contexts require `ATTACH` and exact current attachment;
 - `ATTACH` cannot forward;
-- `ROUTE(P)` forwards only when both endpoints are under `P`;
-- `EXPORT(P)` crosses exactly `P`'s boundary;
-- child `ROUTE` cannot route parent or sibling traffic;
-- parent `ROUTE` covers descendants;
-- wrong authority with equal path bits fails;
-- forwarded traffic preserves authenticated origin and gateway context;
+- local `ROUTE(P)` forwards only when both hop attachments are under `P`;
+- local `EXPORT(P)` crosses exactly `P`'s boundary;
+- child `ROUTE` cannot route a parent or sibling transition;
+- parent `ROUTE` covers descendant transitions;
+- wrong authority or topology epoch with equal path bits fails;
+- a two-gateway route re-authenticates each adjacent hop while preserving the
+  untouched end-to-end inner packet;
+- a boundary gateway, not an earlier internal gateway, is where `EXPORT` is
+  required;
+- an invalid or replayed hop tag drops before route/context use;
+- outer `RoutingHeader.ttl/hop_count` expires normally while inner
+  `NetHeader.hop_ttl` remains untouched;
 - Vehicle A's fleet credentials cannot address Vehicle B's internal nodes;
 - Vehicle B's exported provider boundary requires gateway `EXPORT` plus the
   existing org/provider admission proof, with neither substituting for the
   other;
-- `Visibility::Exported` remains unsatisfiable until this enforcement is live.
+- `Visibility::Exported` remains unsatisfiable until this enforcement is live;
+- no protected route can downgrade to the public/global legacy path.
 
-Populate the real compact subnet ID on the forwarding header, wire
-`SubnetGateway::should_forward` into production dispatch, and activate
-`Exported` only in the same signed slice. No ungated forwarding transition may
-exist between commits.
+Wire the authenticated route-hop envelope into the only live relay branch.
+Resolve ingress identity from the verified hop session, resolve egress identity
+from `AuthenticatedNextHop`, load their exact attachments, and evaluate the
+local `VerifiedGatewayContextSet` using D6. Verify before forwarding, mutate only
+the outer routing header, then create the next-hop tag. Do not wire the dormant
+`NetRouter::route_packet`, `NetProxy`, or legacy
+`SubnetGateway::should_forward` as a substitute. Activate `Exported` only in
+this signed sub-slice; no ungated forwarding transition may exist between
+commits.
 
 ### S5 — Signed facts and revocation distribution
 
@@ -1211,9 +1438,10 @@ The signed end-to-end suite proves:
    Vehicle B's camera, radar, chassis, or internal addresses.
 4. Vehicle A cannot establish a Vehicle B subnet session, even with valid BMW
    membership and a valid perception dispatcher grant.
-5. Vehicle B's gateway requires `ROUTE` for internal forwarding and `EXPORT`
-   for the world-model boundary; removing either exact right denies that
-   transition without changing Vehicle A's org credentials.
+5. Vehicle B's gateway verifies its own local credential and requires `ROUTE`
+   for internal adjacent-hop forwarding and `EXPORT` at the world-model
+   boundary; removing either exact right denies that transition without
+   changing Vehicle A's org credentials.
 6. The camera node cannot attach upward to perception/vehicle or sideways to
    radar/chassis.
 7. A Vehicle B parent grant reaches its internal descendants without per-child
@@ -1240,9 +1468,16 @@ The signed end-to-end suite proves:
 16. Reparenting or incompatible path reuse changes `topology_epoch` and
     invalidates old internal contexts before forwarding.
 17. A hostile control-channel publisher cannot forge an accepted subnet fact.
-18. The subnet packet hot path performs zero signature verifications, zero
-    string parses, and zero policy-service calls after context installation;
-    fleet cardinality is absent from the compact hierarchy check.
+18. The subnet packet hot path performs only its fixed adjacent-hop symmetric
+    MAC/replay operation plus compiled integer checks: zero signature
+    verifications, zero string parses, and zero policy-service calls after
+    context installation; fleet cardinality is absent from the hierarchy
+    check.
+19. Forging UDP source, `RoutingHeader.src_id`, `NetHeader.subnet_id`, or
+    `peer_subnets` cannot select an ingress context or pass a protected relay.
+20. A two-gateway internal route authenticates and re-tags each adjacent hop,
+    uses exact admitted attachments at each transition, and preserves the
+    end-to-end inner packet byte-for-byte.
 
 ## 7. Performance and complexity budget
 
@@ -1250,7 +1485,8 @@ The architecture is accepted only while all of these remain true:
 
 - topology depth is fixed and bounded by the compact ID format;
 - ancestor checks are fixed-width integer/prefix operations;
-- one protected session installs one immutable authority/subtree context;
+- one protected session installs one immutable
+  authority/attachment/subtree context;
 - fleet cardinality and org audience size do not affect the subnet hierarchy
   check;
 - org credentials are verified by the existing call/admission paths, not by
@@ -1258,6 +1494,10 @@ The architecture is accepted only while all of these remain true:
 - root or one-hop credential verification and full-`EntityId` presentation
   verification occur only on admission/update;
 - forwarding reads no credential chain and performs no signature operation;
+- each protected relay hop performs exactly one fixed symmetric MAC verify and
+  one MAC generation under separately derived directional keys;
+- route-hop sequence/replay state is fixed-size and bounded per adjacent
+  session;
 - rights are a strict `u8` mask;
 - floor checks during verification inspect only the bounded ancestor path;
 - topology changes and per-authority auth-epoch changes rebuild contexts
@@ -1266,11 +1506,13 @@ The architecture is accepted only while all of these remain true:
 - no arbitrary policy language, negative ACL, recursive issuer chain, or
   online PDP enters v1.
 
-Add a focused benchmark for `SubnetRef::contains` and the compiled `allows`
-check, plus instrumentation tests that fail if signature verification is
-called from steady-state forwarding. The benchmark records regression against
-the pre-change routing baseline; no flattering isolated microbenchmark is a
-substitute for the end-to-end forwarding witness.
+Add focused benchmarks for `SubnetRef::contains`, the compiled transition
+check, and the full authenticated route-hop relay over representative packet
+sizes. Instrumentation fails if signature or credential verification is called
+from steady-state forwarding. Record route-hop MAC cost separately from the
+fixed hierarchy decision and against the pre-change routing baseline; no
+flattering isolated microbenchmark substitutes for the end-to-end forwarding
+witness.
 
 ## 8. Risks and containment
 
@@ -1302,9 +1544,18 @@ substitute for the end-to-end forwarding witness.
 - **Topology mutation invalidates caches.** `topology_epoch` is mandatory in
   grants, facts, and verified contexts; reparenting cannot preserve old
   ancestry authority.
-- **Gateway code is currently dormant.** S4 wires the first live forwarding
-  consumer and authority check in the same slice, with no intermediate
-  ungated state.
+- **The live relay is not session-authenticated hop by hop.** A UDP address or
+  routing header cannot select a verified peer context. S4A adds a dedicated
+  route-hop authenticator and identity-qualified next hop before S4B activates
+  protected forwarding.
+- **Grant scope is not source location.** S3 compiles the exact admitted
+  attachment separately. Gateway decisions use ingress/egress attachments and
+  the local gateway's self-held scope; substituting a broad peer scope would
+  overstate where the packet entered.
+- **Per-hop authentication has measurable cost.** It is one symmetric MAC in
+  and out, never a signature or policy interpreter. The S4 benchmark reports
+  the full-packet cost and may stop the slice if it violates the routing budget;
+  trusting an unauthenticated header is not an allowed optimization.
 - **Open receive-side channel publish authority.** Control facts remain safe
   because signatures, not arrival, establish authority. This plan does not
   claim an unauthorized peer cannot inject bytes.
@@ -1323,19 +1574,23 @@ substitute for the end-to-end forwarding witness.
 | `src/adapter/net/subnet/id.rs` | S0 | canonical hierarchy operation/name |
 | `src/adapter/net/behavior/fold/capability_bridge.rs` | S1 | remove self-declared admission |
 | `src/adapter/net/mesh_rpc.rs` | S1 | callee-side verdict correction |
-| `src/adapter/net/subnet/auth.rs` | S2 | grants, presentation, verifier, floors, context |
+| `src/adapter/net/subnet/auth.rs` | S2, S3, S4A | grants, presentation, exact attachment, verifier, floors, peer/local contexts |
 | `src/adapter/net/subnet/mod.rs` | S2, S5 | typed exports |
 | `src/adapter/net/mesh.rs` / `MeshNodeConfig` | S2 | authority roots, lifetime bound, verifier owner |
-| authenticated session state | S3 | immutable context installation |
-| `src/adapter/net/subnet/gateway.rs` | S4 | ROUTE/EXPORT enforcement |
-| `src/adapter/net/protocol.rs` | S3, S4 | bounded admission/header wiring |
-| routed forwarding dispatch | S4 | live gateway consumer |
+| authenticated session state | S3, S4A | immutable context installation and route-hop key/replay state |
+| `src/adapter/net/crypto.rs` | S4A | separately derived directional route-hop keys/MAC |
+| `src/adapter/net/route.rs` | S4A | authenticated route-hop envelope and identity-qualified next hop |
+| `src/adapter/net/subnet/gateway.rs` | S4B | local ROUTE/EXPORT transition enforcement |
+| `src/adapter/net/protocol.rs` | S3 | bounded admission/header wiring; inner subnet/TTL fields remain non-authoritative at relays |
+| live pre-AEAD relay in `src/adapter/net/mesh.rs` | S4B | authenticated production gateway consumer |
 | `src/adapter/net/subnet/control.rs` | S5 | four signed fact types |
 | `tests/subnet_axis_demotion.rs` | S1 | unsafe-axis regression matrix |
 | `tests/subnet_grant*.rs` | S2 | wire, hierarchy, typed issuance, revocation |
 | `tests/subnet_session_auth.rs` | S3 | presentation/admission/context lifecycle |
-| `tests/subnet_gateway_auth.rs` | S4 | forwarding boundaries |
-| `tests/subnet_org_boundary.rs` | S4 | horizontal/vertical composition |
+| `tests/subnet_gateway_local_auth.rs` | S4A | self-held gateway authority and exact attachment |
+| route-hop module/integration tests | S4A | wire, MAC coverage, replay, next-hop identity |
+| `tests/subnet_gateway_auth.rs` | S4B | forwarding boundaries |
+| `tests/subnet_org_boundary.rs` | S4B | horizontal/vertical composition |
 | `tests/subnet_control_facts.rs` | S5 | signed distribution and ordering |
 
 Paths described as session/config/dispatch modules must be replaced with exact
@@ -1362,10 +1617,12 @@ must not guess or create duplicate state owners.
 - Each admission/refresh verifies a fresh session-bound
   `SubnetAuthPresentation`; `NodeId` equality alone never establishes the leaf
   subject, and presentation replay or identity-pin conflict fails closed.
-- Successful verification compiles the full subject plus its derived routing
-  ID once into immutable session state.
+- Successful verification compiles the full subject, derived routing ID,
+  exact admitted attachment, and broader credential scope once into immutable
+  session state.
 - Protected session admission, live route forwarding, and boundary export all
-  fail closed without the exact right.
+  fail closed without exact peer attachments, a verified self-held gateway
+  right, and an authenticated adjacent-hop packet binding.
 - Channel and provider authorization remain independently enforced beneath
   parent-to-child reachability.
 - A fleet peer can invoke an exported bounded provider without acquiring any
@@ -1378,8 +1635,9 @@ must not guess or create duplicate state owners.
   one integer comparison before off-path revalidation.
 - Reconnect, roaming, NAT, roster eviction, topology change, replay, and stale
   control delivery cannot mint authority or roll verifier state backward.
-- Steady-state forwarding performs only bounded hierarchy/epoch/rights checks
-  and no cryptographic or online-policy work.
+- Steady-state protected forwarding performs only the fixed route-hop symmetric
+  MAC/replay operation and bounded hierarchy/epoch/rights checks: no signature,
+  credential-chain, allocation-heavy policy, or online-policy work.
 - Existing `PermissionToken` wire bytes/signatures remain unchanged.
 - Every slice passes its focused witnesses, existing subnet/channel/capability
   suites, `cargo fmt --check`, both repository CI clippy configurations, docs
