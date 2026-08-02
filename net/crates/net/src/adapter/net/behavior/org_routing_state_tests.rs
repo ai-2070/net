@@ -1189,8 +1189,7 @@ fn a_rotated_audience_replaces_the_scope_it_supersedes() {
     let (original, original_secret) = issue(capability, GrantRights::DISCOVER);
     // A genuinely signed replacement REUSING the id, over a different audience.
     let (rotated, successor_secret) = issue_reusing_id(capability, original.grant_id);
-    let original_secret = Some(original_secret.expect("DISCOVER mints a secret"));
-    let successor_secret = Some(successor_secret);
+    let original_secret = original_secret.expect("DISCOVER mints a secret");
     let original_handle = original.discovery.expect("binding").audience_handle;
     let rotated_handle = rotated.discovery.expect("binding").audience_handle;
     assert_ne!(original_handle, rotated_handle);
@@ -1201,7 +1200,7 @@ fn a_rotated_audience_replaces_the_scope_it_supersedes() {
     let leased = lease(
         &ConsumerGrantSnapshot::empty(),
         &original,
-        original_secret.expect("secret"),
+        original_secret,
         1,
     );
     let state = f.state(credentials(vec![original.clone(), rotated.clone()]));
@@ -1217,7 +1216,7 @@ fn a_rotated_audience_replaces_the_scope_it_supersedes() {
     let rotated_lease = lease(
         &remove(&leased, &original.grant_id, 100),
         &rotated,
-        successor_secret.expect("secret"),
+        successor_secret,
         2,
     );
     assert_eq!(
