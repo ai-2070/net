@@ -1554,6 +1554,16 @@ struct DispatchCtx {
     /// Per-peer subnet map, written by the capability-announcement
     /// dispatch and read by the subscribe gate + publish fan-out.
     peer_subnets: Arc<DashMap<u64, SubnetId>>,
+    /// Compiled per-session peer subnet contexts (S3), read by the
+    /// protected relay gate to resolve hop attachments.
+    subnet_contexts: Arc<SubnetContextStore>,
+    /// This node's own forwarding authority (S4A). None means this
+    /// node is not a protected gateway and forwards nothing protected.
+    subnet_gateway_contexts: Arc<arc_swap::ArcSwapOption<VerifiedGatewayContextSet>>,
+    /// Floor state, for the auth epoch a compiled context is pinned to.
+    subnet_floors: Arc<SubnetFloorRegistry>,
+    /// Topology epoch the relay evaluates against.
+    subnet_topology_epoch: Arc<std::sync::atomic::AtomicU32>,
     /// See the matching field doc on `MeshNode`. Cloned in at
     /// dispatch-start time; the inline `subnet_visible` call site
     /// in `authorize_subscribe` records forward/drop decisions
@@ -15350,6 +15360,10 @@ impl MeshNode {
             local_subnet: self.local_subnet,
             local_subnet_policy: self.local_subnet_policy.clone(),
             peer_subnets: self.peer_subnets.clone(),
+            subnet_contexts: self.subnet_contexts.clone(),
+            subnet_gateway_contexts: self.subnet_gateway_contexts.clone(),
+            subnet_floors: self.subnet_floors.clone(),
+            subnet_topology_epoch: self.subnet_topology_epoch.clone(),
             subnet_gateway: self.subnet_gateway.clone(),
             peer_entity_ids: self.peer_entity_ids.clone(),
             origin_hash_to_node: self.origin_hash_to_node.clone(),
@@ -15708,6 +15722,15 @@ impl MeshNode {
         let is_routed =
             first2 == ROUTING_MAGIC && data.len() >= ROUTING_HEADER_SIZE + protocol::HEADER_SIZE;
         let is_direct = first2 == MAGIC;
+        // An authenticated route-hop envelope (SUBNET_AUTH_PLAN.md D6)
+        // carries its own discriminator so protected and legacy routed
+        // traffic can never alias. Everything about it — including
+        // whether this node is even a gateway — is decided inside
+        // `relay_protected_hop`, which authenticates before it acts.
+        if first2 == super::subnet::route_hop::ROUTE_HOP_MAGIC {
+            Self::relay_protected_hop(&data, ctx);
+            return;
+        }
         if !is_routed && !is_direct {
             // Malformed / unrecognized prefix — drop silently.
             return;
@@ -15784,6 +15807,20 @@ impl MeshNode {
                     // which it can use as a reply path. `router.start()`'s
                     // internal scheduler has a separate ephemeral socket
                     // and would make `source` unusable for replies.
+                    //
+                    // A node holding gateway credentials is in PROTECTED
+                    // mode and will not relay an untagged legacy packet
+                    // (SUBNET_AUTH_PLAN.md D6): a protected route may
+                    // never downgrade to the public path. Protected
+                    // traffic arrives as a route-hop envelope and is
+                    // handled above, before this branch is reached.
+                    if ctx.subnet_gateway_contexts.load().is_some() {
+                        tracing::debug!(
+                            dest = format!("{:#x}", routing_header.dest_id),
+                            "subnet: refusing to relay an untagged legacy route packet in protected mode",
+                        );
+                        return;
+                    }
                     if routing_header.is_expired() {
                         return;
                     }
@@ -15905,6 +15942,138 @@ impl MeshNode {
         session.touch();
     }
 
+    /// Relay one authenticated route-hop envelope (SUBNET_AUTH_PLAN.md
+    /// D6, slice S4B).
+    ///
+    /// Every step precedes any side effect — no route lookup, no TTL
+    /// mutation, no buffer mutation, no send happens until the hop is
+    /// authenticated and the transition authorized:
+    ///
+    /// 1. resolve the ingress session by `hop_session_id` (NOT by UDP
+    ///    source, `RoutingHeader.src_id`, `NetHeader.subnet_id`, or
+    ///    `peer_subnets` — none of those authenticate anyone);
+    /// 2. verify the hop MAC and admit the sequence once;
+    /// 3. load the ingress peer's admitted context;
+    /// 4. resolve the egress hop by IDENTITY and load its context;
+    /// 5. evaluate this node's own gateway authority over the two
+    ///    hop-local attachments;
+    /// 6. only then decrement the outer TTL and re-tag for the next
+    ///    hop. The inner packet is copied through byte for byte.
+    fn relay_protected_hop(data: &[u8], ctx: &DispatchCtx) {
+        use super::subnet::route_hop;
+
+        let Some(local_set) = ctx.subnet_gateway_contexts.load_full() else {
+            // Not a protected gateway: an envelope is not ours to relay.
+            return;
+        };
+
+        // (1) Ingress identity comes from the hop session id alone.
+        let Ok(peeked) = route_hop::parse(data) else {
+            return;
+        };
+        let Some(ingress_node) = ctx
+            .session_id_to_node
+            .get(&peeked.hop_session_id)
+            .map(|e| *e.value())
+        else {
+            return;
+        };
+        let Some(ingress_session) = ctx
+            .peers
+            .get(&ingress_node)
+            .map(|e| e.value().session.clone())
+        else {
+            return;
+        };
+        if ingress_session.session_id() != peeked.hop_session_id {
+            return;
+        }
+
+        // (2) Authenticate the hop. A bad tag or replayed sequence
+        // stops here, before any route or context lookup.
+        let opened = match ingress_session.open_route_hop(data) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::debug!(
+                    from = format!("{ingress_node:#x}"),
+                    reason = %e,
+                    "subnet: dropping route-hop envelope",
+                );
+                return;
+            }
+        };
+
+        // TTL on the OUTER routing header only; the inner
+        // `NetHeader.hop_ttl` is AAD-covered and never touched.
+        if opened.header.is_expired() {
+            return;
+        }
+
+        let epoch = ctx.subnet_topology_epoch.load(Ordering::Acquire);
+        let auth_epoch = ctx.subnet_floors.auth_epoch(&local_set.authority);
+        let now = super::subnet::admission::unix_now_secs();
+
+        // (3) Ingress attachment — from the admitted context on the
+        // exact session that authenticated the hop.
+        let Some(ingress_ctx) = ctx
+            .subnet_contexts
+            .get_for_session(ingress_node, ingress_session.session_id())
+        else {
+            return;
+        };
+
+        // (4) Egress by identity, then its admitted context.
+        let Some(routed_addr) = ctx.router.routing_table().lookup(opened.header.dest_id) else {
+            return;
+        };
+        let Some(egress_node) = ctx.addr_to_node.get(&routed_addr).map(|e| *e.value()) else {
+            return;
+        };
+        let Some(egress_session) = ctx
+            .peers
+            .get(&egress_node)
+            .map(|e| e.value().session.clone())
+        else {
+            return;
+        };
+        let Some(egress_ctx) = ctx
+            .subnet_contexts
+            .get_for_session(egress_node, egress_session.session_id())
+        else {
+            return;
+        };
+        let egress_addr = match ctx.peers.get(&egress_node) {
+            Some(p) => p.addr,
+            None => return,
+        };
+        if ctx.partition_filter.contains(&egress_addr) {
+            return;
+        }
+
+        // (5) This node's own authority over the two hop-local
+        // attachments.
+        if let Err(denial) =
+            local_set.authorize_transition(&ingress_ctx, &egress_ctx, epoch, auth_epoch, now)
+        {
+            tracing::debug!(
+                ingress = format!("{ingress_node:#x}"),
+                egress = format!("{egress_node:#x}"),
+                reason = ?denial,
+                "subnet: protected forward denied",
+            );
+            return;
+        }
+
+        // (6) Authorized. Mutate only the outer routing header, then
+        // re-tag for the next authenticated hop.
+        let mut fwd_header = opened.header;
+        fwd_header.forward();
+        let out = egress_session.seal_route_hop(&fwd_header, opened.inner);
+        let socket = ctx.socket.clone();
+        tokio::spawn(async move {
+            let _ = socket.send_to(&out, egress_addr).await;
+        });
+    }
     /// Handle a routed handshake packet that arrived at this node.
     ///
     /// Two cases, discriminated by whether we have a pending initiator

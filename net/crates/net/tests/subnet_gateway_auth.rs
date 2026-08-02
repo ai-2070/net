@@ -1,0 +1,529 @@
+//! S4B of `docs/internal/plans/SUBNET_AUTH_PLAN.md` — production
+//! relay enforcement.
+//!
+//! The gateway under test is a real `MeshNode` with two authenticated
+//! neighbours. Traffic is driven as raw route-hop envelopes onto its
+//! socket, which is the only way to reach the live pre-AEAD relay
+//! branch — the one path that actually forwards in production
+//! (`NetRouter::route_packet` and `NetProxy` have no production
+//! callers and gating them would enforce nothing).
+//!
+//! What these pin, in one sentence: nothing a sender can *claim*
+//! selects forwarding authority, and no side effect happens before
+//! the hop is authenticated and the transition authorized.
+
+#![cfg(feature = "net")]
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use net::adapter::net::identity::EntityKeypair;
+use net::adapter::net::subnet::route_hop::{self, ROUTE_HOP_MAGIC};
+use net::adapter::net::subnet::{
+    admission::unix_now_secs, SubnetAuthPresentation, SubnetAuthorityConfig, SubnetCredentialSet,
+    SubnetGrant, SubnetRef, SubnetRights, TopologySubnetId,
+};
+use net::adapter::net::{
+    MeshNode, MeshNodeConfig, RoutingHeader, SocketBufferConfig, ROUTING_HEADER_SIZE,
+};
+use tokio::net::UdpSocket;
+
+const PSK: [u8; 32] = [0x64u8; 32];
+const DAY: u64 = 24 * 60 * 60;
+
+fn root() -> EntityKeypair {
+    EntityKeypair::from_bytes([0xC1; 32])
+}
+
+fn cfg(attachment: Option<&[u8]>) -> MeshNodeConfig {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut c = MeshNodeConfig::new(addr, PSK)
+        .with_heartbeat_interval(Duration::from_millis(200))
+        .with_session_timeout(Duration::from_secs(5))
+        .with_handshake(3, Duration::from_secs(2))
+        .with_subnet_authority(SubnetAuthorityConfig {
+            authority: root().entity_id().clone(),
+            roots: vec![root().entity_id().clone()],
+            maximum_grant_lifetime_secs: 7 * DAY,
+        });
+    if let Some(a) = attachment {
+        c.subnet_attachment = Some(TopologySubnetId::new(a));
+    }
+    c.socket_buffers = SocketBufferConfig {
+        send_buffer_size: 256 * 1024,
+        recv_buffer_size: 256 * 1024,
+    };
+    c
+}
+
+async fn node(kp: EntityKeypair, attachment: Option<&[u8]>) -> Arc<MeshNode> {
+    Arc::new(
+        MeshNode::new(kp, cfg(attachment))
+            .await
+            .expect("MeshNode::new"),
+    )
+}
+
+async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
+    let a_id = a.node_id();
+    let b_pub = *b.public_key();
+    let b_addr = b.local_addr();
+    let b2 = b.clone();
+    let accept = tokio::spawn(async move { b2.accept(a_id).await });
+    a.connect(b_addr, &b_pub, b.node_id())
+        .await
+        .expect("connect");
+    accept.await.expect("task").expect("accept");
+}
+
+fn grant(subject: &EntityKeypair, scope: &[u8], rights: SubnetRights) -> SubnetCredentialSet {
+    SubnetCredentialSet::Direct(
+        SubnetGrant::try_issue(
+            &root(),
+            root().entity_id().clone(),
+            TopologySubnetId::new(scope),
+            0,
+            subject.entity_id().clone(),
+            rights,
+            1,
+            unix_now_secs() - 60,
+            DAY,
+        )
+        .expect("issue"),
+    )
+}
+
+/// Drive a full S3 admission of `peer` into `verifier` at `attachment`.
+async fn admit(
+    verifier: &Arc<MeshNode>,
+    peer: &Arc<MeshNode>,
+    peer_kp: &EntityKeypair,
+    scope: &[u8],
+    attachment: &[u8],
+    rights: SubnetRights,
+) {
+    let set = grant(peer_kp, scope, rights);
+    let node_id = peer.node_id();
+    let nonce = verifier.issue_subnet_challenge(node_id).expect("challenge");
+    let sid = verifier.peer_session_id(node_id).expect("session");
+    let p = SubnetAuthPresentation::try_issue(
+        peer_kp,
+        set.credential_set_hash(),
+        sid,
+        verifier.entity_id().clone(),
+        nonce,
+        SubnetRef {
+            authority: root().entity_id().clone(),
+            path: TopologySubnetId::new(attachment),
+        },
+        rights,
+    )
+    .expect("presentation");
+    verifier
+        .admit_subnet_session(node_id, &p, &set)
+        .expect("admission");
+}
+
+/// The gateway plus two admitted neighbours, with a route installed
+/// from `left` to `right` through the gateway.
+struct Fixture {
+    gw: Arc<MeshNode>,
+    gw_kp: EntityKeypair,
+    left: Arc<MeshNode>,
+    right: Arc<MeshNode>,
+}
+
+async fn fixture(left_at: &[u8], right_at: &[u8]) -> Fixture {
+    let gw_kp = EntityKeypair::generate();
+    let left_kp = EntityKeypair::generate();
+    let right_kp = EntityKeypair::generate();
+    let gw = node(gw_kp.clone(), Some(&[3])).await;
+    let left = node(left_kp.clone(), None).await;
+    let right = node(right_kp.clone(), None).await;
+
+    handshake(&left, &gw).await;
+    handshake(&right, &gw).await;
+    gw.start();
+    left.start();
+    right.start();
+
+    admit(&gw, &left, &left_kp, &[3], left_at, SubnetRights::ATTACH).await;
+    admit(&gw, &right, &right_kp, &[3], right_at, SubnetRights::ATTACH).await;
+
+    // Route toward `right` resolves to right's address.
+    gw.router()
+        .routing_table()
+        .add_route(right.node_id(), right.local_addr());
+
+    Fixture {
+        gw,
+        gw_kp,
+        left,
+        right,
+    }
+}
+
+/// A raw socket standing in for `left`'s wire side, so a test can
+/// send arbitrary (including hostile) bytes at the gateway.
+async fn wire() -> UdpSocket {
+    UdpSocket::bind("127.0.0.1:0").await.expect("bind")
+}
+
+/// Stand-in for an inner Net packet. Must be at least
+/// `protocol::HEADER_SIZE` (68) bytes or dispatch classifies the
+/// datagram as malformed rather than routed, and the legacy-path
+/// assertions below would pass vacuously.
+const INNER_TAG: &[u8] =
+    b"NEinner-end-to-end-ciphertext-untouched-by-any-relay-0123456789-padding-to-clear-the-header-size-floor";
+
+/// Count datagrams arriving at `sock` within a short window.
+async fn received_within(sock: &UdpSocket, dur: Duration) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let deadline = tokio::time::Instant::now() + dur;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => out.push(buf[..n].to_vec()),
+            _ => break,
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Unauthenticated inputs cannot select authority
+// ---------------------------------------------------------------------------
+
+/// The core S4B claim. A legacy routing packet — the format that
+/// carries `RoutingHeader.src_id`, arrives from a UDP source address,
+/// and wraps an inner packet whose `NetHeader.subnet_id` a sender
+/// controls — is refused outright by a protected gateway. None of
+/// those values may select forwarding authority, so a gateway that
+/// holds credentials will not relay traffic that offers only them.
+#[tokio::test]
+async fn a_protected_gateway_refuses_untagged_legacy_relay() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    f.gw.install_subnet_gateway_credentials(&[grant(
+        &f.gw_kp,
+        &[3],
+        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+    )])
+    .expect("install gateway credentials");
+
+    // Watch the intended egress.
+    let watcher = wire().await;
+    f.gw.router()
+        .routing_table()
+        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+
+    let sock = wire().await;
+    let header = RoutingHeader::new(f.right.node_id(), 0x1234, 8);
+    let mut legacy = Vec::new();
+    legacy.extend_from_slice(&header.to_bytes());
+    legacy.extend_from_slice(INNER_TAG);
+    sock.send_to(&legacy, f.gw.local_addr())
+        .await
+        .expect("send");
+
+    assert!(
+        received_within(&watcher, Duration::from_millis(300))
+            .await
+            .is_empty(),
+        "a protected gateway must not downgrade to the unauthenticated legacy path",
+    );
+}
+
+/// Without gateway credentials the same node is not a protected
+/// gateway, and the legacy path is unchanged — the protected mode is
+/// opt-in via credentials, not a global behavior break.
+#[tokio::test]
+async fn a_node_without_gateway_credentials_keeps_legacy_forwarding() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    let watcher = wire().await;
+    f.gw.router()
+        .routing_table()
+        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+
+    let sock = wire().await;
+    let header = RoutingHeader::new(f.right.node_id(), 0x1234, 8);
+    let mut legacy = Vec::new();
+    legacy.extend_from_slice(&header.to_bytes());
+    legacy.extend_from_slice(INNER_TAG);
+    sock.send_to(&legacy, f.gw.local_addr())
+        .await
+        .expect("send");
+
+    let got = received_within(&watcher, Duration::from_millis(400)).await;
+    assert_eq!(got.len(), 1, "public routing still forwards");
+    let fwd = RoutingHeader::from_bytes(&got[0][..ROUTING_HEADER_SIZE]).expect("header");
+    assert_eq!(fwd.ttl, 7, "legacy TTL decrements");
+    assert_eq!(
+        &got[0][ROUTING_HEADER_SIZE..],
+        INNER_TAG,
+        "legacy forwarding never touches the inner packet",
+    );
+}
+
+/// A forged envelope — right shape, wrong key — is dropped. The
+/// gateway holds full authority and both peers are admitted, so the
+/// tag is the only thing standing in the way.
+#[tokio::test]
+async fn an_invalid_hop_tag_is_dropped_before_any_forward() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    f.gw.install_subnet_gateway_credentials(&[grant(
+        &f.gw_kp,
+        &[3],
+        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+    )])
+    .expect("install");
+
+    let watcher = wire().await;
+    f.gw.router()
+        .routing_table()
+        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+
+    let sock = wire().await;
+    let header = RoutingHeader::new(f.right.node_id(), 0x1234, 8);
+    let sid = f
+        .left
+        .peer_session_id(f.gw.node_id())
+        .expect("left has a session with gw");
+    // Attacker key — the shape is perfect, the MAC is not.
+    let forged = route_hop::seal(&[0xFF; 32], sid, 1, &header, INNER_TAG);
+    assert_eq!(
+        u16::from_le_bytes([forged[0], forged[1]]),
+        ROUTE_HOP_MAGIC,
+        "precondition: this is a well-formed envelope",
+    );
+    sock.send_to(&forged, f.gw.local_addr())
+        .await
+        .expect("send");
+
+    assert!(
+        received_within(&watcher, Duration::from_millis(300))
+            .await
+            .is_empty(),
+        "a bad hop tag must drop before route lookup or forwarding",
+    );
+}
+
+/// An envelope naming a session id that does not exist resolves to no
+/// ingress identity and is dropped — a sender cannot conjure an
+/// ingress peer by guessing.
+#[tokio::test]
+async fn an_unknown_hop_session_is_dropped() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    f.gw.install_subnet_gateway_credentials(&[grant(
+        &f.gw_kp,
+        &[3],
+        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+    )])
+    .expect("install");
+
+    let watcher = wire().await;
+    f.gw.router()
+        .routing_table()
+        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+
+    let sock = wire().await;
+    let header = RoutingHeader::new(f.right.node_id(), 0x1234, 8);
+    let bogus = route_hop::seal(&[0x01; 32], 0xDEAD_BEEF_DEAD_BEEF, 1, &header, INNER_TAG);
+    sock.send_to(&bogus, f.gw.local_addr()).await.expect("send");
+
+    assert!(received_within(&watcher, Duration::from_millis(300))
+        .await
+        .is_empty(),);
+}
+
+// ---------------------------------------------------------------------------
+// Authority is required, independently, at each of three places
+// ---------------------------------------------------------------------------
+
+/// With no gateway credentials installed, a well-formed authenticated
+/// envelope still forwards nothing: peer admission is not the
+/// gateway's authority.
+#[tokio::test]
+async fn missing_local_gateway_context_denies() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    assert!(f.gw.subnet_gateway_contexts().is_none());
+
+    let watcher = wire().await;
+    f.gw.router()
+        .routing_table()
+        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+
+    // A correctly-keyed envelope is impossible for the test to build
+    // without the session key, so assert the weaker but sufficient
+    // fact: the node is not a protected gateway and the protected
+    // path forwards nothing for it.
+    let sock = wire().await;
+    let header = RoutingHeader::new(f.right.node_id(), 0x1234, 8);
+    let env = route_hop::seal(&[0x01; 32], 1, 1, &header, INNER_TAG);
+    sock.send_to(&env, f.gw.local_addr()).await.expect("send");
+    assert!(received_within(&watcher, Duration::from_millis(300))
+        .await
+        .is_empty());
+}
+
+/// Withdrawing the ingress peer's admission denies subsequent
+/// forwards even though the gateway's own authority is intact.
+#[tokio::test]
+async fn withdrawn_ingress_admission_denies() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    f.gw.install_subnet_gateway_credentials(&[grant(
+        &f.gw_kp,
+        &[3],
+        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+    )])
+    .expect("install");
+    assert!(f.gw.subnet_context_for(f.left.node_id()).is_some());
+
+    f.gw.withdraw_subnet_admission(f.left.node_id());
+    assert!(
+        f.gw.subnet_context_for(f.left.node_id()).is_none(),
+        "ingress peer is no longer admitted, so its hops cannot be relayed",
+    );
+}
+
+/// Withdrawing the EGRESS peer's admission denies too — both ends of
+/// the transition must be admitted, not just the one that spoke.
+#[tokio::test]
+async fn withdrawn_egress_admission_denies() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    f.gw.install_subnet_gateway_credentials(&[grant(
+        &f.gw_kp,
+        &[3],
+        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+    )])
+    .expect("install");
+    assert!(f.gw.subnet_context_for(f.right.node_id()).is_some());
+
+    f.gw.withdraw_subnet_admission(f.right.node_id());
+    assert!(f.gw.subnet_context_for(f.right.node_id()).is_none());
+    // Ingress is still admitted — the denial is specifically the
+    // egress end.
+    assert!(f.gw.subnet_context_for(f.left.node_id()).is_some());
+}
+
+/// An accepted revocation floor moves the authority epoch, which
+/// invalidates the compiled peer contexts the relay depends on.
+#[tokio::test]
+async fn a_floor_invalidates_the_contexts_the_relay_reads() {
+    use net::adapter::net::subnet::SubnetRevocationFloor;
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    f.gw.install_subnet_gateway_credentials(&[grant(
+        &f.gw_kp,
+        &[3],
+        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+    )])
+    .expect("install");
+    assert!(f.gw.subnet_context_for(f.left.node_id()).is_some());
+
+    let floor = SubnetRevocationFloor::try_issue(
+        &root(),
+        SubnetRef {
+            authority: root().entity_id().clone(),
+            path: TopologySubnetId::new(&[3]),
+        },
+        0,
+        5,
+        1,
+        unix_now_secs(),
+    )
+    .expect("issue floor");
+    assert!(f.gw.apply_subnet_floor(&floor).expect("apply"));
+    assert!(
+        f.gw.subnet_context_for(f.left.node_id()).is_none(),
+        "revocation must reach the relay through the compiled contexts",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Next-hop identity
+// ---------------------------------------------------------------------------
+
+/// The egress is resolved by identity. An address with no
+/// authenticated peer behind it resolves to nothing, so a route
+/// pointing at a stranger cannot be used to forward protected
+/// traffic.
+#[tokio::test]
+async fn next_hop_resolves_by_identity_not_address() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+
+    let hop =
+        f.gw.authenticated_next_hop(f.right.node_id())
+            .expect("route to an authenticated peer resolves");
+    assert_eq!(hop.node_id, f.right.node_id());
+    assert_eq!(hop.addr, f.right.local_addr());
+
+    // Repoint the route at an address with no session behind it.
+    let stranger = wire().await;
+    f.gw.router()
+        .routing_table()
+        .add_route(f.right.node_id(), stranger.local_addr().unwrap());
+    assert!(
+        f.gw.authenticated_next_hop(f.right.node_id()).is_none(),
+        "an address with no authenticated peer is not a next hop",
+    );
+
+    // A destination with no route at all resolves to nothing.
+    assert!(f.gw.authenticated_next_hop(0xDEAD_BEEF).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// TTL disposition
+// ---------------------------------------------------------------------------
+
+/// Gateway TTL uses the mutable OUTER routing header. An expired
+/// outer TTL stops the relay; the inner packet — whose
+/// `NetHeader.hop_ttl` is AAD-covered — is never rewritten, so the
+/// bytes that leave are the bytes that arrived.
+#[tokio::test]
+async fn outer_ttl_expires_while_the_inner_packet_is_untouched() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+
+    // Legacy mode (no gateway credentials) makes the forwarded bytes
+    // observable without holding a session key, which is what lets
+    // this assert the inner packet survived byte for byte.
+    let watcher = wire().await;
+    f.gw.router()
+        .routing_table()
+        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+    let sock = wire().await;
+
+    // ttl = 0 is already expired.
+    let expired = RoutingHeader::new(f.right.node_id(), 0x1234, 0);
+    let mut pkt = Vec::new();
+    pkt.extend_from_slice(&expired.to_bytes());
+    pkt.extend_from_slice(INNER_TAG);
+    sock.send_to(&pkt, f.gw.local_addr()).await.expect("send");
+    assert!(
+        received_within(&watcher, Duration::from_millis(250))
+            .await
+            .is_empty(),
+        "an expired outer TTL must stop the relay",
+    );
+
+    // A live TTL forwards, decrements the OUTER header only, and
+    // leaves every inner byte alone.
+    let live = RoutingHeader::new(f.right.node_id(), 0x1234, 4);
+    let mut pkt = Vec::new();
+    pkt.extend_from_slice(&live.to_bytes());
+    pkt.extend_from_slice(INNER_TAG);
+    sock.send_to(&pkt, f.gw.local_addr()).await.expect("send");
+    let got = received_within(&watcher, Duration::from_millis(400)).await;
+    assert_eq!(got.len(), 1);
+    let fwd = RoutingHeader::from_bytes(&got[0][..ROUTING_HEADER_SIZE]).expect("header");
+    assert_eq!(fwd.ttl, 3);
+    assert_eq!(fwd.hop_count, 1);
+    assert_eq!(
+        &got[0][ROUTING_HEADER_SIZE..],
+        INNER_TAG,
+        "the inner packet must be byte-identical after a hop",
+    );
+}

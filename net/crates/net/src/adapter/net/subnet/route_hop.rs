@@ -42,8 +42,18 @@ use crate::adapter::net::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 /// Domain separator for the route-hop MAC transcript.
 pub const ROUTE_HOP_MAC_DOMAIN: &[u8] = b"net.subnet.route-hop.v1";
 
-/// Envelope prefix: `hop_session_id` (8) + `hop_sequence` (8).
-pub const ROUTE_HOP_PREFIX_SIZE: usize = 16;
+/// Wire discriminator, `"RH"`.
+///
+/// Not in the plan's D6 field list, but dispatch classifies an
+/// inbound datagram on its first two bytes (`ROUTING_MAGIC` /
+/// `MAGIC`), and a bare `hop_session_id` there is random — it would
+/// alias a legacy routing packet roughly once in 65 536. An explicit
+/// magic keeps classification exact instead of probabilistic, and
+/// rides in the MAC transcript like every other byte.
+pub const ROUTE_HOP_MAGIC: u16 = 0x5248;
+
+/// Envelope prefix: magic (2) + `hop_session_id` (8) + `hop_sequence` (8).
+pub const ROUTE_HOP_PREFIX_SIZE: usize = 18;
 
 /// Truncated MAC length. 16 bytes of a 256-bit keyed BLAKE2s: forgery
 /// costs 2^128 online attempts against a key that dies with the
@@ -149,6 +159,7 @@ pub fn seal(
     let mut header_bytes = [0u8; ROUTING_HEADER_SIZE];
     header.write_at(&mut header_bytes);
     let mut out = Vec::with_capacity(ROUTE_HOP_OVERHEAD + ROUTING_HEADER_SIZE + inner.len());
+    out.extend_from_slice(&ROUTE_HOP_MAGIC.to_le_bytes());
     out.extend_from_slice(&hop_session_id.to_le_bytes());
     out.extend_from_slice(&hop_sequence.to_le_bytes());
     out.extend_from_slice(&header_bytes);
@@ -182,10 +193,16 @@ pub fn parse(buf: &[u8]) -> Result<OpenedHop<'_>, RouteHopError> {
     if buf.len() < ROUTE_HOP_OVERHEAD + ROUTING_HEADER_SIZE {
         return Err(RouteHopError::Malformed);
     }
-    let hop_session_id =
-        u64::from_le_bytes(buf[0..8].try_into().map_err(|_| RouteHopError::Malformed)?);
+    if u16::from_le_bytes([buf[0], buf[1]]) != ROUTE_HOP_MAGIC {
+        return Err(RouteHopError::Malformed);
+    }
+    let hop_session_id = u64::from_le_bytes(
+        buf[2..10]
+            .try_into()
+            .map_err(|_| RouteHopError::Malformed)?,
+    );
     let hop_sequence = u64::from_le_bytes(
-        buf[8..16]
+        buf[10..18]
             .try_into()
             .map_err(|_| RouteHopError::Malformed)?,
     );
@@ -320,14 +337,20 @@ mod tests {
         // Wrong key.
         assert_eq!(open(&[0x22; 32], &buf).unwrap_err(), RouteHopError::BadTag);
 
-        // Session id.
+        // Magic — classification, so it fails as malformed rather
+        // than as a bad tag.
         let mut t = buf.clone();
         t[0] ^= 1;
+        assert_eq!(open(&KEY, &t).unwrap_err(), RouteHopError::Malformed);
+
+        // Session id.
+        let mut t = buf.clone();
+        t[2] ^= 1;
         assert_eq!(open(&KEY, &t).unwrap_err(), RouteHopError::BadTag);
 
         // Sequence.
         let mut t = buf.clone();
-        t[8] ^= 1;
+        t[10] ^= 1;
         assert_eq!(open(&KEY, &t).unwrap_err(), RouteHopError::BadTag);
 
         // Every byte of the routing header, including TTL and hop
@@ -365,9 +388,23 @@ mod tests {
     #[test]
     fn short_buffers_are_malformed_not_panics() {
         for len in 0..(ROUTE_HOP_OVERHEAD + ROUTING_HEADER_SIZE) {
-            let buf = vec![0u8; len];
+            let mut buf = vec![0u8; len];
+            if len >= 2 {
+                buf[0..2].copy_from_slice(&ROUTE_HOP_MAGIC.to_le_bytes());
+            }
             assert_eq!(open(&KEY, &buf).unwrap_err(), RouteHopError::Malformed);
         }
+    }
+
+    /// A legacy routing packet must never be mistaken for an
+    /// envelope: the discriminator is what keeps protected and
+    /// public traffic from aliasing.
+    #[test]
+    fn a_legacy_routing_packet_is_not_an_envelope() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&header().to_bytes());
+        legacy.extend_from_slice(INNER);
+        assert_eq!(open(&KEY, &legacy).unwrap_err(), RouteHopError::Malformed);
     }
 
     #[test]

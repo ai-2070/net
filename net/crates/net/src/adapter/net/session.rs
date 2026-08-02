@@ -16,6 +16,7 @@ use std::time::Instant;
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
+use super::subnet::route_hop::HopReplayWindow;
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
 use super::pool::SharedLocalPool;
@@ -127,6 +128,16 @@ pub struct NetSession {
     /// packet (which then re-publishes the same value), and the
     /// resolver itself is the source of truth.
     cached_node_id: AtomicU64,
+    /// Key for MACing route-hop envelopes this node sends on this
+    /// edge. See [`Self::seal_route_hop`].
+    route_hop_tx_key: [u8; 32],
+    /// Key for verifying route-hop envelopes received on this edge.
+    route_hop_rx_key: [u8; 32],
+    /// This edge's outbound hop sequence — separate from the packet
+    /// AEAD counter by design.
+    route_hop_tx_seq: AtomicU64,
+    /// Sliding replay window over inbound hop sequences.
+    route_hop_replay: parking_lot::Mutex<HopReplayWindow>,
 }
 
 /// Sentinel `stream_id` used in the header of subprotocol control
@@ -174,7 +185,42 @@ impl NetSession {
             recently_closed: DashMap::new(),
             control_tx_seq: AtomicU64::new(0),
             cached_node_id: AtomicU64::new(0),
+            // Unlike `tx_key`, the route-hop keys ARE retained: a
+            // relay MACs every forwarded hop, and a MAC has no
+            // nonce-reuse hazard to route around — the sequence is an
+            // explicit transcript field, not derived counter state.
+            route_hop_tx_key: keys.route_hop_tx_key,
+            route_hop_rx_key: keys.route_hop_rx_key,
+            route_hop_tx_seq: AtomicU64::new(0),
+            route_hop_replay: parking_lot::Mutex::new(HopReplayWindow::new()),
         }
+    }
+
+    /// Wrap `inner` in an authenticated route-hop envelope for this
+    /// edge (SUBNET_AUTH_PLAN.md D6).
+    ///
+    /// The sequence is this edge's own, independent of the packet
+    /// AEAD counter, so hop accounting can never disturb the
+    /// end-to-end session being carried.
+    pub fn seal_route_hop(&self, header: &super::route::RoutingHeader, inner: &[u8]) -> Vec<u8> {
+        let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
+        super::subnet::route_hop::seal(&self.route_hop_tx_key, self.session_id, seq, header, inner)
+    }
+
+    /// Verify an inbound route-hop envelope and admit its sequence
+    /// exactly once.
+    ///
+    /// Returns the opened hop on success. A bad tag is rejected before
+    /// the replay window is touched, so a forged packet cannot burn a
+    /// sequence slot the legitimate peer still needs.
+    pub fn open_route_hop<'a>(
+        &self,
+        buf: &'a [u8],
+    ) -> Result<super::subnet::route_hop::OpenedHop<'a>, super::subnet::route_hop::RouteHopError>
+    {
+        let opened = super::subnet::route_hop::open(&self.route_hop_rx_key, buf)?;
+        self.route_hop_replay.lock().admit(opened.hop_sequence)?;
+        Ok(opened)
     }
 
     /// Read the cached peer `NodeId` resolution. Returns `None`
