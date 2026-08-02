@@ -26,9 +26,10 @@ pub use auth::{
     build_gateway_context_set, compile_gateway_context, ExpectedBinding, ForwardDenial,
     SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig, SubnetBoundarySet,
     SubnetCredentialSet, SubnetFloorRegistry, SubnetGrant, SubnetIssuerGrant, SubnetRef,
-    SubnetRevocationFloor, SubnetRights, VerifiedGatewayContext, VerifiedGatewayContextSet,
-    VerifiedSubnetAuthority, VerifiedSubnetContext, MAX_GATEWAY_CONTEXTS_PER_AUTHORITY,
+    SubnetRevocationFloor, SubnetRights, TransitionDecision, VerifiedGatewayContext,
+    VerifiedGatewayContextSet, VerifiedSubnetAuthority, VerifiedSubnetContext,
+    MAX_GATEWAY_CONTEXTS_PER_AUTHORITY, MAX_TRANSITION_PROBES,
 };
 pub use error::SubnetError;
 pub use gateway::{DropReason, ForwardDecision, SubnetGateway};
-pub use id::{SubnetId, TopologySubnetId};
+pub use id::{AncestorPath, SubnetId, TopologySubnetId, MAX_ANCESTOR_PATH};

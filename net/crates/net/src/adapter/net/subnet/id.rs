@@ -26,6 +26,13 @@
 /// Maximum number of hierarchy levels.
 pub const MAX_DEPTH: u8 = 4;
 
+/// Longest possible ancestor chain: every level plus the global root.
+///
+/// This is the constant that makes protected-forwarding cost a
+/// function of the hierarchy rather than of an operator's grant count
+/// — see [`SubnetId::ancestor_path`].
+pub const MAX_ANCESTOR_PATH: usize = MAX_DEPTH as usize + 1;
+
 /// Hierarchical subnet identifier.
 ///
 /// Zero (`0x00000000`) means global / no subnet — as a *grant scope*
@@ -203,6 +210,46 @@ impl SubnetId {
         (self.0 & mask) == (target.0 & mask)
     }
 
+    /// Walk this path and every ancestor of it, deepest first, ending
+    /// at [`Self::GLOBAL`].
+    ///
+    /// `3.7.2` yields `3.7.2`, `3.7`, `3`, `global`. At most
+    /// [`MAX_ANCESTOR_PATH`] items, always.
+    ///
+    /// This is the enumeration that lets scope questions be answered
+    /// by *lookup* rather than by scan. Every scope containing a given
+    /// path is on that path's ancestor chain and nowhere else, so a
+    /// caller holding an index keyed by scope can probe the four-odd
+    /// candidates directly instead of testing containment against each
+    /// scope it happens to hold. See
+    /// `VerifiedGatewayContextSet::authorize_transition`.
+    #[inline]
+    pub fn ancestor_path(self) -> AncestorPath {
+        AncestorPath { next: Some(self) }
+    }
+
+    /// The deepest path that contains both `self` and `other`.
+    ///
+    /// Their longest common prefix: `3.7.2` and `3.7.9` share `3.7`;
+    /// `3.7` and `4.1` share `global`. A path contains both `self` and
+    /// `other` **iff** it is an ancestor-or-self of this result, which
+    /// is what bounds a two-endpoint containment question to one
+    /// ancestor chain instead of two.
+    ///
+    /// A zero level terminates the comparison rather than matching,
+    /// because zero means "level unset", not "level equal to zero".
+    pub fn common_ancestor(self, other: Self) -> Self {
+        let mut d = 0u8;
+        while d < MAX_DEPTH {
+            let (a, b) = (self.level(d), other.level(d));
+            if a == 0 || b == 0 || a != b {
+                break;
+            }
+            d += 1;
+        }
+        Self(self.0 & Self::mask_for_depth(d))
+    }
+
     /// Check if two IDs are in the same subnet (identical values).
     #[inline]
     pub const fn is_same_subnet(self, other: Self) -> bool {
@@ -238,6 +285,38 @@ impl SubnetId {
         }
     }
 }
+
+/// Iterator over a path and its ancestors, deepest first
+/// ([`SubnetId::ancestor_path`]).
+///
+/// Yields at most [`MAX_ANCESTOR_PATH`] items and never allocates, so
+/// a packet path can walk it on the stack.
+#[derive(Debug, Clone, Copy)]
+pub struct AncestorPath {
+    next: Option<SubnetId>,
+}
+
+impl Iterator for AncestorPath {
+    type Item = SubnetId;
+
+    fn next(&mut self) -> Option<SubnetId> {
+        let current = self.next?;
+        // GLOBAL is its own parent, so termination has to be explicit
+        // rather than falling out of the walk.
+        self.next = (!current.is_global()).then(|| current.parent());
+        Some(current)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = match self.next {
+            None => 0,
+            Some(id) => id.depth() as usize + 1,
+        };
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for AncestorPath {}
 
 impl std::fmt::Display for SubnetId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -422,6 +501,108 @@ mod tests {
         // `is_ancestor_of` is the same relation under the legacy name.
         assert_eq!(a.is_ancestor_of(a_b), a.is_ancestor_or_self_of(a_b));
         assert_eq!(a_b.is_ancestor_of(zero), a_b.is_ancestor_or_self_of(zero));
+    }
+
+    /// The ancestor chain is the candidate set for every scope
+    /// question, so its length bound is what makes forwarding cost
+    /// independent of how many grants a gateway holds.
+    #[test]
+    fn ancestor_path_is_deepest_first_and_bounded() {
+        let full: Vec<SubnetId> = SubnetId::new(&[1, 2, 3, 4]).ancestor_path().collect();
+        assert_eq!(
+            full,
+            vec![
+                SubnetId::new(&[1, 2, 3, 4]),
+                SubnetId::new(&[1, 2, 3]),
+                SubnetId::new(&[1, 2]),
+                SubnetId::new(&[1]),
+                SubnetId::GLOBAL,
+            ],
+        );
+        assert_eq!(full.len(), MAX_ANCESTOR_PATH);
+
+        // GLOBAL is its own parent; the walk must still terminate.
+        assert_eq!(
+            SubnetId::GLOBAL.ancestor_path().collect::<Vec<_>>(),
+            vec![SubnetId::GLOBAL],
+        );
+
+        // Every path is bounded, and `size_hint` matches what is
+        // actually produced — a caller sizing a stack buffer from it
+        // must not be lied to.
+        for raw in [
+            0x00000000u32,
+            0x03000000,
+            0x03070000,
+            0x03070200,
+            0x01020304,
+        ] {
+            let id = SubnetId::from_raw(raw);
+            let path = id.ancestor_path();
+            let predicted = path.len();
+            let walked: Vec<SubnetId> = path.collect();
+            assert_eq!(predicted, walked.len(), "size_hint must be exact for {id}");
+            assert!(walked.len() <= MAX_ANCESTOR_PATH);
+            assert_eq!(walked[0], id, "the path starts at self");
+            assert_eq!(*walked.last().unwrap(), SubnetId::GLOBAL, "and ends global");
+        }
+    }
+
+    /// Containment against two endpoints reduces to containment
+    /// against one: a scope holds both iff it holds their common
+    /// ancestor. Stated exhaustively over a small hierarchy so the
+    /// reduction is pinned, not assumed.
+    #[test]
+    fn common_ancestor_is_the_meet_of_the_containment_order() {
+        let cases = [
+            (&[3u8, 7, 2][..], &[3u8, 7, 9][..], &[3u8, 7][..]),
+            (&[3, 7, 2], &[3, 8, 2], &[3]),
+            (&[3, 7], &[4, 7], &[]),
+            (&[3, 7], &[3, 7], &[3, 7]),
+            (&[3, 7], &[3], &[3]),
+            (&[3], &[], &[]),
+            (&[], &[], &[]),
+        ];
+        for (a, b, expected) in cases {
+            let (a, b) = (SubnetId::new(a), SubnetId::new(b));
+            let meet = SubnetId::new(expected);
+            assert_eq!(a.common_ancestor(b), meet, "{a} ∧ {b}");
+            assert_eq!(b.common_ancestor(a), meet, "commutative: {b} ∧ {a}");
+        }
+
+        // The property the index depends on: over every pair in a
+        // small hierarchy, "contains both" and "contains the meet"
+        // are the same predicate.
+        let universe: Vec<SubnetId> = [
+            &[][..],
+            &[3][..],
+            &[4][..],
+            &[3, 7][..],
+            &[3, 8][..],
+            &[3, 7, 2][..],
+            &[3, 7, 9][..],
+        ]
+        .iter()
+        .map(|l| SubnetId::new(l))
+        .collect();
+        for &a in &universe {
+            for &b in &universe {
+                let meet = a.common_ancestor(b);
+                for &scope in &universe {
+                    let contains_both =
+                        scope.is_ancestor_or_self_of(a) && scope.is_ancestor_or_self_of(b);
+                    assert_eq!(
+                        contains_both,
+                        scope.is_ancestor_or_self_of(meet),
+                        "scope {scope} vs {a}/{b} (meet {meet})",
+                    );
+                }
+                // And the meet is always reachable by walking either
+                // endpoint's chain, which is what the probe loop does.
+                assert!(a.ancestor_path().any(|s| s == meet));
+                assert!(b.ancestor_path().any(|s| s == meet));
+            }
+        }
     }
 
     #[test]

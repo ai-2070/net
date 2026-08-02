@@ -21,6 +21,7 @@ use net::adapter::net::subnet::{
     ForwardDenial, SubnetAuthError, SubnetAuthorityConfig, SubnetBoundarySet, SubnetCredentialSet,
     SubnetFloorRegistry, SubnetGrant, SubnetRights, TopologySubnetId, VerifiedGatewayContext,
     VerifiedGatewayContextSet, VerifiedSubnetContext, MAX_GATEWAY_CONTEXTS_PER_AUTHORITY,
+    MAX_TRANSITION_PROBES,
 };
 
 const DAY: u64 = 24 * 60 * 60;
@@ -581,6 +582,451 @@ fn peers_must_be_attached_and_current() {
         set.authorize_transition(&expired, &ok, &bset, 0, 0, now())
             .unwrap_err(),
         ForwardDenial::ContextNotCurrent,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// off-path scope index (D6)
+// ---------------------------------------------------------------------------
+
+/// Build a gateway entry directly, bypassing credential compilation.
+///
+/// `compile_gateway_context` requires every scope to contain the local
+/// attachment, so credentials alone can only ever produce one ancestor
+/// chain — at most five entries. These index tests need a set far
+/// wider than that to show that width does not cost anything, which is
+/// exactly the case a credential path cannot construct.
+fn raw_entry(
+    root: &EntityKeypair,
+    local: &EntityKeypair,
+    scope: TopologySubnetId,
+    rights: SubnetRights,
+) -> VerifiedGatewayContext {
+    VerifiedGatewayContext {
+        authority: root.entity_id().clone(),
+        attachment: scope,
+        scope,
+        topology_epoch: 0,
+        subject: local.entity_id().clone(),
+        rights,
+        generation: 1,
+        subnet_auth_epoch: 0,
+        expires_at: now() + DAY,
+        credential_set_hash: [0; 32],
+    }
+}
+
+/// The reason the index exists: what a transition costs must not
+/// depend on how much an operator provisioned.
+///
+/// The same decision is evaluated against a two-entry gateway and a
+/// gateway holding the maximum, with the boundary inventory likewise
+/// padded. If evaluation still walked either collection, the wide case
+/// would probe more. It must not probe even one more.
+#[test]
+fn transition_cost_is_independent_of_how_much_is_held() {
+    let root = kp(1);
+    let local = kp(9);
+    let a = kp(2);
+    let b = kp(3);
+
+    let x = peer_ctx(&root, &a, &[3, 7, 1], &[3], SubnetRights::ATTACH);
+    let y = peer_ctx(&root, &b, &[3, 7, 2], &[3], SubnetRights::ATTACH);
+
+    // Narrow: exactly what this transition needs.
+    let narrow_entries = vec![
+        raw_entry(
+            &root,
+            &local,
+            TopologySubnetId::new(&[3]),
+            SubnetRights::ROUTE,
+        ),
+        raw_entry(
+            &root,
+            &local,
+            TopologySubnetId::new(&[3, 7]),
+            SubnetRights::ATTACH,
+        ),
+    ];
+    // Wide: the same two, buried among the maximum number of
+    // irrelevant scopes.
+    let mut wide_entries = narrow_entries.clone();
+    let mut filler = 0u8;
+    while wide_entries.len() < MAX_GATEWAY_CONTEXTS_PER_AUTHORITY {
+        filler += 1;
+        let scope = TopologySubnetId::new(&[200, filler]);
+        wide_entries.push(raw_entry(&root, &local, scope, SubnetRights::ROUTE));
+    }
+    assert_eq!(wide_entries.len(), MAX_GATEWAY_CONTEXTS_PER_AUTHORITY);
+
+    let narrow = gateway_set(&root, narrow_entries);
+    let wide = gateway_set(&root, wide_entries);
+
+    // Same asymmetry on the boundary side: one declared boundary
+    // versus many, none of which lie between these two endpoints.
+    let few = boundaries(&root, &[&[9, 9]]);
+    let many_scopes: Vec<[u8; 2]> = (1..=64u8).map(|i| [201, i]).collect();
+    let many = SubnetBoundarySet::new(
+        root.entity_id().clone(),
+        0,
+        many_scopes.iter().map(|s| TopologySubnetId::new(s)),
+    );
+
+    let baseline = narrow.authorize_transition_probed(&x, &y, &few, 0, 0, now());
+    assert_eq!(baseline.verdict, Ok(()), "the narrow gateway authorizes");
+
+    for (label, set, bset) in [
+        ("wide gateway", &wide, &few),
+        ("wide boundaries", &narrow, &many),
+        ("both wide", &wide, &many),
+    ] {
+        let decision = set.authorize_transition_probed(&x, &y, bset, 0, 0, now());
+        assert_eq!(
+            decision.verdict, baseline.verdict,
+            "{label}: the verdict must not change",
+        );
+        assert_eq!(
+            decision.probes, baseline.probes,
+            "{label}: probes must not grow with what is held",
+        );
+    }
+}
+
+/// The advertised ceiling holds across every shape of transition, not
+/// just the convenient ones.
+///
+/// Deepest attachments, disjoint branches, identical endpoints, a
+/// boundary at every level of both chains — whichever branch the
+/// decision takes, it stays under [`MAX_TRANSITION_PROBES`].
+#[test]
+fn probe_count_never_exceeds_the_advertised_bound() {
+    let root = kp(1);
+    let local = kp(9);
+    let a = kp(2);
+    let b = kp(3);
+
+    // A boundary at every level of both chains, so the crossing branch
+    // probes as much as it possibly can.
+    let bset = boundaries(
+        &root,
+        &[
+            &[1],
+            &[1, 2],
+            &[1, 2, 3],
+            &[1, 2, 3, 4],
+            &[9],
+            &[9, 8],
+            &[9, 8, 7],
+            &[9, 8, 7, 6],
+        ],
+    );
+    // Hold EXPORT and ROUTE at every one of those scopes plus the
+    // root, so no branch short-circuits early on a missing right.
+    let mut entries = vec![raw_entry(
+        &root,
+        &local,
+        TopologySubnetId::GLOBAL,
+        SubnetRights::ROUTE,
+    )];
+    for scope in [
+        &[1u8][..],
+        &[1, 2][..],
+        &[1, 2, 3][..],
+        &[1, 2, 3, 4][..],
+        &[9][..],
+        &[9, 8][..],
+        &[9, 8, 7][..],
+        &[9, 8, 7, 6][..],
+    ] {
+        entries.push(raw_entry(
+            &root,
+            &local,
+            TopologySubnetId::new(scope),
+            SubnetRights::EXPORT.union(SubnetRights::ROUTE),
+        ));
+    }
+    let set = gateway_set(&root, entries);
+
+    let paths: [&[u8]; 7] = [
+        &[],
+        &[1],
+        &[1, 2],
+        &[1, 2, 3],
+        &[1, 2, 3, 4],
+        &[9, 8, 7, 6],
+        &[5, 5, 5, 5],
+    ];
+    let mut saw_crossing = false;
+    let mut saw_internal = false;
+    for source in paths {
+        for target in paths {
+            let x = peer_ctx(&root, &a, source, &[], SubnetRights::ATTACH);
+            let y = peer_ctx(&root, &b, target, &[], SubnetRights::ATTACH);
+            let decision = set.authorize_transition_probed(&x, &y, &bset, 0, 0, now());
+            assert!(
+                decision.probes <= MAX_TRANSITION_PROBES,
+                "{:?} -> {:?} cost {} probes, over the bound of {MAX_TRANSITION_PROBES}",
+                source,
+                target,
+                decision.probes,
+            );
+            // Both branches must actually be exercised, or the bound
+            // is only proven for whichever one happened to run.
+            if source == target {
+                saw_internal = true;
+            } else if TopologySubnetId::new(source).common_ancestor(TopologySubnetId::new(target))
+                != TopologySubnetId::new(source)
+            {
+                saw_crossing = true;
+            }
+        }
+    }
+    assert!(saw_internal && saw_crossing, "both branches were exercised");
+}
+
+/// The index must decide exactly what the collection walk it replaced
+/// decided.
+///
+/// The reference below is the previous implementation verbatim: test
+/// every declared boundary for a crossing, then scan every entry for
+/// one containing both endpoints. Over an exhaustive matrix of
+/// endpoints, boundary inventories, and held rights, the two must
+/// agree on every verdict — a faster decision that is a different
+/// decision is not an optimization.
+#[test]
+fn the_index_decides_exactly_what_the_scan_decided() {
+    fn reference(
+        set: &VerifiedGatewayContextSet,
+        source: TopologySubnetId,
+        target: TopologySubnetId,
+        declared: &[TopologySubnetId],
+    ) -> Result<(), ForwardDenial> {
+        let mut crossed_any = false;
+        for boundary in declared {
+            if boundary.is_ancestor_or_self_of(source) == boundary.is_ancestor_or_self_of(target) {
+                continue;
+            }
+            crossed_any = true;
+            let satisfied = set
+                .entries
+                .iter()
+                .any(|e| &e.scope == boundary && e.rights.contains(SubnetRights::EXPORT));
+            if !satisfied {
+                return Err(ForwardDenial::ExportMissing);
+            }
+        }
+        if crossed_any {
+            return Ok(());
+        }
+        let routed = set.entries.iter().any(|e| {
+            e.rights.contains(SubnetRights::ROUTE)
+                && e.scope.is_ancestor_or_self_of(source)
+                && e.scope.is_ancestor_or_self_of(target)
+        });
+        if routed {
+            Ok(())
+        } else {
+            Err(ForwardDenial::RouteMissing)
+        }
+    }
+
+    let root = kp(1);
+    let local = kp(9);
+    let a = kp(2);
+    let b = kp(3);
+
+    let universe: Vec<&[u8]> = vec![
+        &[],
+        &[3],
+        &[3, 7],
+        &[3, 7, 1],
+        &[3, 7, 2],
+        &[3, 8],
+        &[4],
+        &[4, 1],
+    ];
+    // Every scope that can appear as a boundary or as a held right.
+    let scopes: Vec<TopologySubnetId> = universe
+        .iter()
+        .map(|p| TopologySubnetId::new(p))
+        .collect::<Vec<_>>();
+
+    // A spread of boundary inventories, including none and all.
+    let inventories: Vec<Vec<TopologySubnetId>> = vec![
+        vec![],
+        vec![TopologySubnetId::new(&[3, 7])],
+        vec![TopologySubnetId::new(&[3, 7, 1])],
+        vec![
+            TopologySubnetId::new(&[3, 7]),
+            TopologySubnetId::new(&[3, 8]),
+        ],
+        vec![
+            TopologySubnetId::new(&[3]),
+            TopologySubnetId::new(&[3, 7, 1]),
+        ],
+        scopes.clone(),
+    ];
+
+    // A spread of held rights, including gaps that force denials.
+    let rights_sets: Vec<SubnetRights> = vec![
+        SubnetRights::ATTACH,
+        SubnetRights::ROUTE,
+        SubnetRights::EXPORT,
+        SubnetRights::ROUTE.union(SubnetRights::EXPORT),
+    ];
+
+    let mut compared = 0usize;
+    let mut agreed_ok = 0usize;
+    for (holding, rights) in rights_sets.iter().enumerate() {
+        // Hold `rights` at half the scopes and ATTACH at the rest, so
+        // the two implementations must agree about partial coverage
+        // rather than about a uniformly-permissive gateway.
+        let entries: Vec<VerifiedGatewayContext> = scopes
+            .iter()
+            .enumerate()
+            .map(|(i, &scope)| {
+                let held = if (i + holding) % 2 == 0 {
+                    *rights
+                } else {
+                    SubnetRights::ATTACH
+                };
+                raw_entry(&root, &local, scope, held)
+            })
+            .collect();
+        let set = gateway_set(&root, entries);
+
+        for declared in &inventories {
+            let bset =
+                SubnetBoundarySet::new(root.entity_id().clone(), 0, declared.iter().copied());
+            for source in &universe {
+                for target in &universe {
+                    let x = peer_ctx(&root, &a, source, &[], SubnetRights::ATTACH);
+                    let y = peer_ctx(&root, &b, target, &[], SubnetRights::ATTACH);
+                    let actual = set.authorize_transition(&x, &y, &bset, 0, 0, now());
+                    let expected = reference(
+                        &set,
+                        TopologySubnetId::new(source),
+                        TopologySubnetId::new(target),
+                        declared,
+                    );
+                    assert_eq!(
+                        actual, expected,
+                        "disagreement: {source:?} -> {target:?}, boundaries {declared:?}, \
+                         rights {rights:?} (holding {holding})",
+                    );
+                    compared += 1;
+                    if actual.is_ok() {
+                        agreed_ok += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(compared > 1000, "matrix must be broad, compared {compared}");
+    // Guard against a matrix that only ever denies: agreement on
+    // "everything is refused" would prove nothing about the index.
+    assert!(
+        agreed_ok > 0 && agreed_ok < compared,
+        "matrix must contain both authorizations and denials, got {agreed_ok}/{compared}",
+    );
+}
+
+/// The set folds epochs across its entries so the packet path can
+/// check currency without walking them. That fold is only sound if the
+/// entries agree, so a mixed set is refused at publication rather than
+/// silently resolved.
+#[test]
+fn entries_from_different_epochs_cannot_be_published_as_one_set() {
+    let root = kp(1);
+    let local = kp(9);
+
+    let mut later_topology = raw_entry(
+        &root,
+        &local,
+        TopologySubnetId::new(&[3, 7]),
+        SubnetRights::ROUTE,
+    );
+    later_topology.topology_epoch = 1;
+    assert_eq!(
+        build_gateway_context_set(
+            root.entity_id(),
+            vec![
+                raw_entry(
+                    &root,
+                    &local,
+                    TopologySubnetId::new(&[3]),
+                    SubnetRights::ROUTE
+                ),
+                later_topology,
+            ],
+        )
+        .unwrap_err(),
+        SubnetAuthError::MixedGatewayEpochs,
+    );
+
+    let mut later_auth = raw_entry(
+        &root,
+        &local,
+        TopologySubnetId::new(&[3, 7]),
+        SubnetRights::ROUTE,
+    );
+    later_auth.subnet_auth_epoch = 1;
+    assert_eq!(
+        build_gateway_context_set(
+            root.entity_id(),
+            vec![
+                raw_entry(
+                    &root,
+                    &local,
+                    TopologySubnetId::new(&[3]),
+                    SubnetRights::ROUTE
+                ),
+                later_auth,
+            ],
+        )
+        .unwrap_err(),
+        SubnetAuthError::MixedGatewayEpochs,
+    );
+
+    // The published fold reports the tightest expiry, which is what
+    // the constant-time currency check compares against.
+    let mut short = raw_entry(
+        &root,
+        &local,
+        TopologySubnetId::new(&[3, 7]),
+        SubnetRights::ROUTE,
+    );
+    short.expires_at = now() + 60;
+    let set = gateway_set(
+        &root,
+        vec![
+            raw_entry(
+                &root,
+                &local,
+                TopologySubnetId::new(&[3]),
+                SubnetRights::ROUTE,
+            ),
+            short,
+        ],
+    );
+    assert_eq!(set.earliest_expiry, now() + 60);
+    assert_eq!(set.topology_epoch, 0);
+    assert_eq!(set.subnet_auth_epoch, 0);
+
+    // And that fold denies once the shortest-lived credential lapses,
+    // even though the other entry is still valid.
+    let a = kp(2);
+    let b = kp(3);
+    let x = peer_ctx(&root, &a, &[3, 7, 1], &[3], SubnetRights::ATTACH);
+    let y = peer_ctx(&root, &b, &[3, 7, 2], &[3], SubnetRights::ATTACH);
+    let bset = boundaries(&root, &[]);
+    set.authorize_transition(&x, &y, &bset, 0, 0, now())
+        .expect("current while every entry is");
+    assert_eq!(
+        set.authorize_transition(&x, &y, &bset, 0, 0, now() + 61)
+            .unwrap_err(),
+        ForwardDenial::ContextNotCurrent,
+        "the set stops authorizing when its shortest-lived entry does",
     );
 }
 

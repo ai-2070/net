@@ -36,7 +36,7 @@ use blake2::{
 use dashmap::DashMap;
 use ed25519_dalek::Signature;
 
-use super::id::TopologySubnetId;
+use super::id::{TopologySubnetId, MAX_DEPTH};
 use crate::adapter::net::identity::{EntityId, EntityKeypair};
 
 /// Domain prefix for the leaf grant's ed25519 transcript.
@@ -192,6 +192,15 @@ pub enum SubnetAuthError {
     /// More distinct local gateway scopes than
     /// [`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`].
     TooManyGatewayContexts,
+    /// Entries compiled against different topology or auth epochs were
+    /// offered as one gateway set.
+    ///
+    /// The set folds those epochs into one value at publication so the
+    /// packet path can check currency in constant time; that fold is
+    /// only sound if every entry agrees. A mixed set means the caller
+    /// merged compilations from either side of an epoch bump, and the
+    /// honest answer is to recompile, not to pick a winner.
+    MixedGatewayEpochs,
     /// ed25519 verification failed.
     InvalidSignature,
     /// Structural decode failure: wrong length, unknown version,
@@ -224,6 +233,7 @@ impl std::fmt::Display for SubnetAuthError {
             Self::WrongChallenge => "wrong_challenge",
             Self::IdentityPinConflict => "identity_pin_conflict",
             Self::TooManyGatewayContexts => "too_many_gateway_contexts",
+            Self::MixedGatewayEpochs => "mixed_gateway_epochs",
             Self::InvalidSignature => "invalid_signature",
             Self::InvalidFormat => "invalid_format",
             Self::InvalidValidityWindow => "invalid_validity_window",
@@ -1454,9 +1464,56 @@ pub struct VerifiedGatewayContext {
 /// per-transition evaluation into an operator-sized scan.
 pub const MAX_GATEWAY_CONTEXTS_PER_AUTHORITY: usize = 32;
 
+/// Immutable scope→rights index, compiled once at publication.
+///
+/// Sorted by raw scope so a lookup is a binary search over one small
+/// contiguous array. The point is not that the array is short — with a
+/// single local attachment the entry scopes already form one ancestor
+/// chain — but that the packet path asks *"what do I hold at exactly
+/// this path?"* instead of *"which of my entries contains this
+/// path?"*. The first question is answered by lookup at a bounded set
+/// of candidate paths; the second is a walk of the context collection,
+/// and its cost is whatever an operator provisioned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayScopeIndex {
+    /// `(scope.raw(), rights)`, ascending by scope, one entry per
+    /// distinct scope.
+    by_scope: Box<[(u32, SubnetRights)]>,
+}
+
+impl GatewayScopeIndex {
+    /// Build from already-deduplicated entries. Off the packet path by
+    /// construction: publication is the only caller.
+    fn build(entries: &[VerifiedGatewayContext]) -> Self {
+        let mut by_scope: Vec<(u32, SubnetRights)> =
+            entries.iter().map(|e| (e.scope.raw(), e.rights)).collect();
+        by_scope.sort_unstable_by_key(|(scope, _)| *scope);
+        Self {
+            by_scope: by_scope.into_boxed_slice(),
+        }
+    }
+
+    /// Rights held at **exactly** `scope`, if any. One probe.
+    ///
+    /// Deliberately exact rather than containment-aware: containment
+    /// is the caller's ancestor walk, and folding it in here would put
+    /// the scan back.
+    #[inline]
+    fn rights_at(&self, scope: TopologySubnetId) -> Option<SubnetRights> {
+        self.by_scope
+            .binary_search_by_key(&scope.raw(), |(candidate, _)| *candidate)
+            .ok()
+            .map(|i| self.by_scope[i].1)
+    }
+}
+
 /// The immutable, authority-local set of this node's forwarding
 /// authorities, deduplicated by scope and capped by
 /// [`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`].
+///
+/// Everything the packet path needs is precomputed here: the scope
+/// index, and the epochs and earliest expiry folded across every entry
+/// so currency is a constant-time comparison rather than a walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedGatewayContextSet {
     /// Authority every entry belongs to.
@@ -1465,7 +1522,35 @@ pub struct VerifiedGatewayContextSet {
     /// revocation recompute the whole set atomically rather than
     /// mutating entries, so stale rights can never accumulate.
     pub entries: Box<[VerifiedGatewayContext]>,
+    /// Topology epoch shared by every entry.
+    pub topology_epoch: u32,
+    /// Authority auth epoch shared by every entry.
+    pub subnet_auth_epoch: u64,
+    /// Tightest expiry across every entry. The whole set stops
+    /// authorizing when the shortest-lived credential in it does —
+    /// checking the minimum is exactly checking all of them.
+    pub earliest_expiry: u64,
+    /// Off-path scope index. Private: it is derived state, and a
+    /// caller able to supply its own could desynchronize it from
+    /// `entries` and silently grant rights no credential carries.
+    index: GatewayScopeIndex,
 }
+
+/// Ceiling on index probes for one protected transition, and the
+/// reason forwarding cost cannot be inflated by provisioning.
+///
+/// A boundary can only separate the two attachments if it lies on one
+/// of their ancestor chains strictly below their common ancestor, so
+/// there are at most `MAX_DEPTH` boundary probes per endpoint, plus at
+/// most one `EXPORT` probe per boundary actually crossed:
+/// `4 × MAX_DEPTH`. The internal-`ROUTE` path is strictly cheaper —
+/// `2 × MAX_DEPTH` boundary probes and at most `MAX_ANCESTOR_PATH`
+/// `ROUTE` probes — so this bounds both branches.
+///
+/// Every term is a hierarchy constant. Neither the number of grants a
+/// gateway holds nor the number of boundaries an operator declares
+/// appears anywhere in it.
+pub const MAX_TRANSITION_PROBES: u32 = 4 * MAX_DEPTH as u32;
 
 /// The mandatory inventory of protected boundaries for one authority.
 ///
@@ -1490,33 +1575,63 @@ pub struct VerifiedGatewayContextSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubnetBoundarySet {
     /// Authority these boundaries belong to.
-    pub authority: EntityId,
+    authority: EntityId,
     /// Topology epoch they were declared under. A boundary means
     /// nothing once paths are reinterpreted.
-    pub topology_epoch: u32,
-    /// Subtree roots whose edge is a protected boundary. Crossing one
-    /// requires `EXPORT` held at exactly that scope.
-    pub boundaries: Box<[TopologySubnetId]>,
+    topology_epoch: u32,
+    /// Subtree roots whose edge is a protected boundary, ascending by
+    /// raw path and deduplicated. Crossing one requires `EXPORT` held
+    /// at exactly that scope.
+    ///
+    /// Private because the sort order is load-bearing: the packet path
+    /// asks "is this exact path a boundary?" by binary search, so an
+    /// unsorted set built by struct literal would silently answer
+    /// "no" and turn a declared boundary into an internal transition.
+    boundaries: Box<[TopologySubnetId]>,
 }
 
 impl SubnetBoundarySet {
-    /// Build a boundary set, deduplicating scopes.
+    /// Build a boundary set, deduplicating and ordering scopes.
     pub fn new(
         authority: EntityId,
         topology_epoch: u32,
         boundaries: impl IntoIterator<Item = TopologySubnetId>,
     ) -> Self {
-        let mut seen: Vec<TopologySubnetId> = Vec::new();
-        for b in boundaries {
-            if !seen.contains(&b) {
-                seen.push(b);
-            }
-        }
+        let mut sorted: Vec<TopologySubnetId> = boundaries.into_iter().collect();
+        sorted.sort_unstable_by_key(|b| b.raw());
+        sorted.dedup();
         Self {
             authority,
             topology_epoch,
-            boundaries: seen.into_boxed_slice(),
+            boundaries: sorted.into_boxed_slice(),
         }
+    }
+
+    /// Authority these boundaries belong to.
+    pub fn authority(&self) -> &EntityId {
+        &self.authority
+    }
+
+    /// Topology epoch they were declared under.
+    pub fn topology_epoch(&self) -> u32 {
+        self.topology_epoch
+    }
+
+    /// The declared boundaries, ascending by path.
+    pub fn boundaries(&self) -> &[TopologySubnetId] {
+        &self.boundaries
+    }
+
+    /// Is `scope` **exactly** a declared boundary? One probe.
+    ///
+    /// Exact, not containment: the packet path supplies the candidate
+    /// paths from the endpoints' ancestor chains, which is what keeps
+    /// this from becoming a walk of the inventory.
+    #[inline]
+    fn is_boundary(&self, scope: TopologySubnetId) -> bool {
+        self.boundaries
+            .binary_search_by_key(&scope.raw(), |b| b.raw())
+            .is_ok()
     }
 }
 
@@ -1534,6 +1649,23 @@ pub enum ForwardDenial {
     /// The transition is wholly internal but no local entry contains
     /// both attachments with `ROUTE`.
     RouteMissing,
+}
+
+/// A transition verdict together with the number of index probes it
+/// cost.
+///
+/// The probe count exists so the bound in [`MAX_TRANSITION_PROBES`] is
+/// *observable* rather than asserted in prose: a test can pin that
+/// evaluating the same transition against a two-entry gateway and a
+/// thirty-two-entry gateway costs identically. It is a `u32` counter
+/// on a path that already does keyed hashing per packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransitionDecision {
+    /// Authorized, or why not.
+    pub verdict: Result<(), ForwardDenial>,
+    /// Index probes performed — never more than
+    /// [`MAX_TRANSITION_PROBES`].
+    pub probes: u32,
 }
 
 impl VerifiedGatewayContextSet {
@@ -1557,8 +1689,9 @@ impl VerifiedGatewayContextSet {
     /// two declared sibling boundaries needs `EXPORT` for both.
     ///
     /// Cost is bounded by the hierarchy, not the operator's grant
-    /// count: containment is a fixed-width prefix test over the two
-    /// endpoints' ancestor paths.
+    /// count — see [`Self::authorize_transition_probed`], which is
+    /// this method plus the probe count that makes the bound
+    /// checkable.
     pub fn authorize_transition(
         &self,
         ingress: &VerifiedSubnetContext,
@@ -1568,10 +1701,47 @@ impl VerifiedGatewayContextSet {
         current_subnet_auth_epoch: u64,
         now_secs: u64,
     ) -> Result<(), ForwardDenial> {
+        self.authorize_transition_probed(
+            ingress,
+            egress,
+            boundaries,
+            current_topology_epoch,
+            current_subnet_auth_epoch,
+            now_secs,
+        )
+        .verdict
+    }
+
+    /// [`Self::authorize_transition`], reporting how many index probes
+    /// the decision cost.
+    ///
+    /// Neither the entry array nor the boundary inventory is walked.
+    /// Both are keyed by exact scope and probed only at the paths that
+    /// can possibly matter: a boundary separates the two attachments
+    /// only if it lies on one of their ancestor chains strictly below
+    /// their common ancestor, and a scope contains both attachments
+    /// only if it contains their common ancestor. Those two facts turn
+    /// "search what I hold" into "look up what I hold here", which is
+    /// what keeps [`MAX_TRANSITION_PROBES`] free of any provisioning
+    /// term.
+    pub fn authorize_transition_probed(
+        &self,
+        ingress: &VerifiedSubnetContext,
+        egress: &VerifiedSubnetContext,
+        boundaries: &SubnetBoundarySet,
+        current_topology_epoch: u32,
+        current_subnet_auth_epoch: u64,
+        now_secs: u64,
+    ) -> TransitionDecision {
+        let refuse = |denial| TransitionDecision {
+            verdict: Err(denial),
+            probes: 0,
+        };
+
         if boundaries.authority != self.authority
             || boundaries.topology_epoch != current_topology_epoch
         {
-            return Err(ForwardDenial::ContextNotCurrent);
+            return refuse(ForwardDenial::ContextNotCurrent);
         }
         // Both hop peers must be admitted under the same authority and
         // epoch this node's own credentials were verified against, and
@@ -1582,60 +1752,91 @@ impl VerifiedGatewayContextSet {
                 || peer.subnet_auth_epoch != current_subnet_auth_epoch
                 || now_secs >= peer.expires_at
             {
-                return Err(ForwardDenial::ContextNotCurrent);
+                return refuse(ForwardDenial::ContextNotCurrent);
             }
             if !peer.rights.contains(SubnetRights::ATTACH) {
-                return Err(ForwardDenial::AttachMissing);
+                return refuse(ForwardDenial::AttachMissing);
             }
         }
-        // Every local entry must be current too — a stale gateway
-        // credential authorizes nothing.
-        if self.entries.iter().any(|e| {
-            e.topology_epoch != current_topology_epoch
-                || e.subnet_auth_epoch != current_subnet_auth_epoch
-                || now_secs >= e.expires_at
-        }) {
-            return Err(ForwardDenial::ContextNotCurrent);
+        // Local currency, in constant time. The epochs and the tightest
+        // expiry were folded across every entry at publication, so a
+        // stale credential is caught by three comparisons rather than
+        // by walking the set looking for one. An empty set has nothing
+        // to be stale and denies below on rights instead.
+        if !self.entries.is_empty()
+            && (self.topology_epoch != current_topology_epoch
+                || self.subnet_auth_epoch != current_subnet_auth_epoch
+                || now_secs >= self.earliest_expiry)
+        {
+            return refuse(ForwardDenial::ContextNotCurrent);
         }
 
         let source = ingress.attachment;
         let target = egress.attachment;
+        let common = source.common_ancestor(target);
+        let mut probes = 0u32;
 
         // Boundaries come from the declared inventory, so a crossing
         // stays a crossing whether or not a credential satisfies it.
+        //
+        // Candidates are only the two strict chains below `common`: a
+        // path containing both endpoints contains `common` and so is
+        // at or above it, and a path containing neither is on no chain
+        // at all. Either way it is not crossed, so it is not worth a
+        // probe.
         let mut crossed_any = false;
-        for boundary in boundaries.boundaries.iter() {
-            if boundary.is_ancestor_or_self_of(source) == boundary.is_ancestor_or_self_of(target) {
-                continue;
-            }
-            crossed_any = true;
-            // EXPORT must be held at exactly the crossed scope. A
-            // wider EXPORT elsewhere is authority over a different
-            // boundary, not this one.
-            let satisfied = self
-                .entries
-                .iter()
-                .any(|e| &e.scope == boundary && e.rights.contains(SubnetRights::EXPORT));
-            if !satisfied {
-                return Err(ForwardDenial::ExportMissing);
+        for endpoint in [source, target] {
+            for scope in endpoint.ancestor_path() {
+                if scope == common {
+                    break;
+                }
+                probes += 1;
+                if !boundaries.is_boundary(scope) {
+                    continue;
+                }
+                crossed_any = true;
+                // EXPORT must be held at exactly the crossed scope. A
+                // wider EXPORT elsewhere is authority over a different
+                // boundary, not this one.
+                probes += 1;
+                let exports = self
+                    .index
+                    .rights_at(scope)
+                    .is_some_and(|r| r.contains(SubnetRights::EXPORT));
+                if !exports {
+                    return TransitionDecision {
+                        verdict: Err(ForwardDenial::ExportMissing),
+                        probes,
+                    };
+                }
             }
         }
         if crossed_any {
-            return Ok(());
+            return TransitionDecision {
+                verdict: Ok(()),
+                probes,
+            };
         }
 
-        // Wholly internal: one entry must contain both endpoints and
-        // carry ROUTE. Single pass — the earlier version walked the
-        // entry array twice per transition.
-        let routed = self.entries.iter().any(|entry| {
-            entry.rights.contains(SubnetRights::ROUTE)
-                && entry.scope.is_ancestor_or_self_of(source)
-                && entry.scope.is_ancestor_or_self_of(target)
-        });
-        if routed {
-            Ok(())
-        } else {
-            Err(ForwardDenial::RouteMissing)
+        // Wholly internal: some held scope must contain both endpoints
+        // and carry ROUTE. A scope contains both iff it contains their
+        // common ancestor, so the candidates are one chain, not two.
+        for scope in common.ancestor_path() {
+            probes += 1;
+            let routes = self
+                .index
+                .rights_at(scope)
+                .is_some_and(|r| r.contains(SubnetRights::ROUTE));
+            if routes {
+                return TransitionDecision {
+                    verdict: Ok(()),
+                    probes,
+                };
+            }
+        }
+        TransitionDecision {
+            verdict: Err(ForwardDenial::RouteMissing),
+            probes,
         }
     }
 }
@@ -1699,7 +1900,15 @@ pub fn compile_gateway_context(
 /// rights from surviving inside a surviving entry.
 ///
 /// Rejects a set exceeding [`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`]
-/// distinct scopes, or any entry from a different authority.
+/// distinct scopes, any entry from a different authority, or entries
+/// compiled against different epochs
+/// ([`SubnetAuthError::MixedGatewayEpochs`]).
+///
+/// This is where the packet path's off-path state is built: the scope
+/// index, and the epochs and earliest expiry folded across every
+/// entry. All of it is derived from `compiled` and none of it is
+/// reachable for mutation afterwards, so what forwarding consults can
+/// never drift from what was verified.
 pub fn build_gateway_context_set(
     authority: &EntityId,
     compiled: Vec<VerifiedGatewayContext>,
@@ -1708,6 +1917,16 @@ pub fn build_gateway_context_set(
     for entry in compiled {
         if &entry.authority != authority {
             return Err(SubnetAuthError::WrongAuthority);
+        }
+        // The set publishes one topology/auth epoch pair for the whole
+        // collection; entries straddling an epoch bump would make that
+        // fold a lie, so they are refused rather than reconciled.
+        if let Some(first) = entries.first() {
+            if entry.topology_epoch != first.topology_epoch
+                || entry.subnet_auth_epoch != first.subnet_auth_epoch
+            {
+                return Err(SubnetAuthError::MixedGatewayEpochs);
+            }
         }
         match entries.iter_mut().find(|e| e.scope == entry.scope) {
             Some(existing) => {
@@ -1722,9 +1941,24 @@ pub fn build_gateway_context_set(
     if entries.len() > MAX_GATEWAY_CONTEXTS_PER_AUTHORITY {
         return Err(SubnetAuthError::TooManyGatewayContexts);
     }
+    let topology_epoch = entries.first().map_or(0, |e| e.topology_epoch);
+    let subnet_auth_epoch = entries.first().map_or(0, |e| e.subnet_auth_epoch);
+    // An empty set never authorizes anything, so its expiry is
+    // vacuous; u64::MAX keeps the currency check from firing ahead of
+    // the rights check that is the real reason it denies.
+    let earliest_expiry = entries
+        .iter()
+        .map(|e| e.expires_at)
+        .min()
+        .unwrap_or(u64::MAX);
+    let index = GatewayScopeIndex::build(&entries);
     Ok(VerifiedGatewayContextSet {
         authority: authority.clone(),
         entries: entries.into_boxed_slice(),
+        topology_epoch,
+        subnet_auth_epoch,
+        earliest_expiry,
+        index,
     })
 }
 

@@ -935,11 +935,24 @@ epoch, floor, validity, and rights check passes. Duplicate scopes may combine
 only rights from simultaneously current verified credentials;
 refresh/revocation recomputes the entry atomically and never accumulates stale
 rights. The published set is immutable, authority-local, and capped by
-`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`. It is indexed by scope off-path. One
-transition enumerates only the source and target ancestor paths and therefore
-performs at most `2 * (TopologySubnetId::MAX_DEPTH + 1)` — currently ten —
-immutable scope lookups; it never scans an operator-sized grant vector. A
-self-challenge adds no security because the process already holds the private
+`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`. It is indexed by scope off-path: the
+scope→rights index, the shared topology/auth epochs, and the tightest expiry
+across every entry are all folded in at publication, so the packet path both
+looks rights up and checks currency without walking anything.
+
+One transition enumerates only the source and target ancestor paths, and only
+the part of them strictly below the two attachments' common ancestor — a
+boundary above that point contains both endpoints and so cannot separate them.
+The ceiling is `MAX_TRANSITION_PROBES = 4 * TopologySubnetId::MAX_DEPTH`,
+currently sixteen: at most `MAX_DEPTH` boundary probes per endpoint plus at most
+one `EXPORT` probe per boundary actually crossed. The internal-`ROUTE` branch is
+cheaper — at most `2 * MAX_DEPTH` boundary probes plus `MAX_DEPTH + 1` `ROUTE`
+probes. No term in either bound mentions how many grants a gateway holds or how
+many boundaries an operator declares; `authorize_transition_probed` reports the
+count so this is pinned by test rather than asserted here, and the boundary
+inventory is likewise probed by exact path rather than scanned.
+
+A self-challenge adds no security because the process already holds the private
 key; remote session contexts may never be silently reused as local gateway
 authority.
 
@@ -1085,7 +1098,12 @@ the full `EntityId`; compact audit display does not weaken the decision. Logs
 do not contain full grants, presentations, payloads, private labels, or secrets
 by default.
 Successful packet forwarding does not allocate or emit a verbose record per
-packet; counters and sampled structured events cover the success path.
+packet; counters and sampled structured events cover the success path. The
+sealing primitive writes into a caller-owned buffer (`route_hop::seal_into`,
+sized by `sealed_len`) and the relay holds one per worker, so the steady state
+allocates nothing; `tests/subnet_route_hop_alloc.rs` counts real allocator calls
+through a global allocator rather than trusting the signature, since a
+`seal_into` that built a `Vec` internally would type-check identically.
 
 ## 5. Implementation slices
 
