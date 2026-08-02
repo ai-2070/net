@@ -64,9 +64,15 @@ pub const ROUTE_HOP_TAG_SIZE: usize = 16;
 pub const ROUTE_HOP_OVERHEAD: usize = ROUTE_HOP_PREFIX_SIZE + ROUTE_HOP_TAG_SIZE;
 
 /// How far behind the highest accepted sequence a hop packet may
-/// arrive and still be considered. Reordering is normal on a UDP
-/// edge; unbounded tolerance would be a replay window.
-pub const ROUTE_HOP_REPLAY_WINDOW: u64 = 1024;
+/// arrive and still be admitted. Reordering is normal on a UDP edge;
+/// unbounded tolerance would BE a replay window rather than bound one.
+///
+/// This is exactly the bitmap width in [`HopReplayWindow`], not an
+/// independent policy number. S4A advertised 1024 while storing 128
+/// bits, so sequences 129..=1024 behind passed the staleness bound
+/// and then indexed a bit that did not exist. Anything wider needs
+/// wider storage, not a larger constant.
+pub const ROUTE_HOP_REPLAY_WINDOW: u64 = 128;
 
 /// An identity-qualified next hop (SUBNET_AUTH_PLAN.md D6).
 ///
@@ -169,13 +175,18 @@ pub fn seal(
     out
 }
 
-/// A verified inbound hop envelope. Borrows the inner packet rather
-/// than copying it — the relay re-emits those exact bytes.
+/// A MAC-verified inbound hop envelope. Borrows the inner packet
+/// rather than copying it — the relay re-emits those exact bytes.
+///
+/// Reachable only through [`open`], so holding one means the tag
+/// verified. Replay admission is a separate step the session performs
+/// (`NetSession::open_route_hop`); this type does not assert it.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenedHop<'a> {
     /// Adjacent session the tag verified under.
     pub hop_session_id: u64,
-    /// Per-edge sequence, already replay-checked by the caller.
+    /// Per-edge sequence. Verified as part of the transcript; whether
+    /// it has been *admitted* is the caller's replay window to say.
     pub hop_sequence: u64,
     /// The mutable outer routing header.
     pub header: RoutingHeader,
@@ -183,13 +194,35 @@ pub struct OpenedHop<'a> {
     pub inner: &'a [u8],
 }
 
-/// Parse the envelope WITHOUT verifying the tag.
+/// The only thing readable before authentication: which session's key
+/// to try.
 ///
-/// Split from [`open`] only so a caller can read `hop_session_id` to
-/// select the right key before verification. Nothing downstream of a
-/// bare `parse` may be trusted; `open` is the authenticating entry
-/// point.
-pub fn parse(buf: &[u8]) -> Result<OpenedHop<'_>, RouteHopError> {
+/// Deliberately NOT [`OpenedHop`]. Returning the post-verification
+/// type from an unverified parse made the two indistinguishable to the
+/// type system, so a caller could reach `header`/`inner` off a buffer
+/// whose MAC had never been checked and nothing would complain. This
+/// carries the session id and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnauthenticatedHopPrefix {
+    /// Claimed adjacent session. A claim, not a fact, until
+    /// [`open`] verifies the tag under that session's key.
+    pub hop_session_id: u64,
+}
+
+/// Read the session id from an envelope without verifying anything.
+///
+/// The only legitimate use is selecting a key to hand to [`open`],
+/// which is the authenticating entry point.
+pub fn parse_prefix(buf: &[u8]) -> Result<UnauthenticatedHopPrefix, RouteHopError> {
+    let opened = parse_unverified(buf)?;
+    Ok(UnauthenticatedHopPrefix {
+        hop_session_id: opened.hop_session_id,
+    })
+}
+
+/// Structural decode without MAC verification. Private: everything it
+/// returns is attacker-controlled until [`open`] says otherwise.
+fn parse_unverified(buf: &[u8]) -> Result<OpenedHop<'_>, RouteHopError> {
     if buf.len() < ROUTE_HOP_OVERHEAD + ROUTING_HEADER_SIZE {
         return Err(RouteHopError::Malformed);
     }
@@ -224,7 +257,7 @@ pub fn parse(buf: &[u8]) -> Result<OpenedHop<'_>, RouteHopError> {
 /// Tag comparison is constant time: a timing oracle on the tag would
 /// let an attacker forge one byte at a time.
 pub fn open<'a>(key: &[u8; 32], buf: &'a [u8]) -> Result<OpenedHop<'a>, RouteHopError> {
-    let opened = parse(buf)?;
+    let opened = parse_unverified(buf)?;
     let header_start = ROUTE_HOP_PREFIX_SIZE;
     let header_end = header_start + ROUTING_HEADER_SIZE;
     let expected = compute_tag(
@@ -272,7 +305,14 @@ impl HopReplayWindow {
 
     /// Admit `sequence` exactly once. Returns `Err(Replay)` for a
     /// duplicate or for anything older than the window.
+    ///
+    /// Bit `i` of `seen` marks `highest - 1 - i`, so the bitmap
+    /// represents exactly `1..=ROUTE_HOP_REPLAY_WINDOW` behind the
+    /// highest — the shift arithmetic and the staleness bound share
+    /// that one constant, which is what keeps a sequence from being
+    /// simultaneously "in window" and unrepresentable.
     pub fn admit(&mut self, sequence: u64) -> Result<(), RouteHopError> {
+        const W: u64 = ROUTE_HOP_REPLAY_WINDOW;
         if !self.started {
             self.started = true;
             self.highest = sequence;
@@ -280,11 +320,21 @@ impl HopReplayWindow {
         }
         if sequence > self.highest {
             let advance = sequence - self.highest;
-            // Mark the previous highest as seen, then shift.
-            self.seen = if advance >= 128 {
+            // The old highest lands at bit `advance - 1`; older marks
+            // shift up by `advance` and fall off the top.
+            //
+            // `advance == W` is its own arm: the old highest is still
+            // representable (last slot), but `seen << W` would be a
+            // shift overflow. Folding it into the `>= W` clear-all
+            // branch was the S4A bug — it wiped the bitmap while
+            // leaving that sequence inside the staleness bound, so a
+            // duplicate exactly `W` behind was re-admitted.
+            self.seen = if advance > W {
                 0
+            } else if advance == W {
+                1u128 << (W - 1)
             } else {
-                ((self.seen << 1) | 1) << (advance - 1)
+                (self.seen << advance) | (1u128 << (advance - 1))
             };
             self.highest = sequence;
             return Ok(());
@@ -293,10 +343,14 @@ impl HopReplayWindow {
             return Err(RouteHopError::Replay);
         }
         let behind = self.highest - sequence;
-        if behind > ROUTE_HOP_REPLAY_WINDOW || behind > 128 {
+        if behind > W {
             return Err(RouteHopError::Replay);
         }
-        let bit = 1u128 << (behind - 1);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "behind is bounded by W = 128 immediately above, so the cast is exact"
+        )]
+        let bit = 1u128 << ((behind - 1) as u32);
         if self.seen & bit != 0 {
             return Err(RouteHopError::Replay);
         }
@@ -434,6 +488,81 @@ mod tests {
             w.admit(10_000 - ROUTE_HOP_REPLAY_WINDOW - 1).unwrap_err(),
             RouteHopError::Replay,
         );
+    }
+
+    /// Kyra's S4A RED witness: an advance of exactly the window width
+    /// used to clear the bitmap while leaving the displaced sequence
+    /// inside the staleness bound, so the duplicate was re-admitted.
+    #[test]
+    fn a_duplicate_exactly_one_window_behind_is_refused() {
+        let mut w = HopReplayWindow::new();
+        assert!(w.admit(100).is_ok());
+        assert!(w.admit(100 + ROUTE_HOP_REPLAY_WINDOW).is_ok());
+        assert_eq!(
+            w.admit(100).unwrap_err(),
+            RouteHopError::Replay,
+            "a sequence exactly one window behind must stay marked seen",
+        );
+    }
+
+    /// Exhaustive behaviour around the boundary, for every advance and
+    /// offset at and either side of the window width. The bitmap and
+    /// the staleness bound must agree everywhere: a sequence is either
+    /// representable and remembered, or out of window and refused —
+    /// never accepted twice.
+    #[test]
+    fn window_boundary_matrix() {
+        const W: u64 = ROUTE_HOP_REPLAY_WINDOW;
+        let base = 1_000_000u64;
+
+        // Duplicates at each offset that is still in window are always
+        // refused, whatever advance moved us there.
+        for advance in [W - 1, W, W + 1] {
+            for offset in 1..=W {
+                let mut w = HopReplayWindow::new();
+                assert!(w.admit(base).is_ok());
+                // The sequence we will try to replay.
+                let victim = base + advance - offset;
+                if victim != base {
+                    // Only pre-admit when it is not the base itself.
+                    if victim > base {
+                        assert!(w.admit(victim).is_ok(), "advance={advance} offset={offset}");
+                    } else {
+                        continue;
+                    }
+                }
+                assert!(w.admit(base + advance).is_ok());
+                assert_eq!(
+                    w.admit(victim).unwrap_err(),
+                    RouteHopError::Replay,
+                    "advance={advance} offset={offset}: an admitted sequence must never be re-admitted",
+                );
+            }
+        }
+
+        // Exactly one past the window is refused as stale, not
+        // silently accepted.
+        let mut w = HopReplayWindow::new();
+        assert!(w.admit(base).is_ok());
+        assert_eq!(w.admit(base - W - 1).unwrap_err(), RouteHopError::Replay);
+        // Exactly at the window is admissible when never seen before.
+        let mut w = HopReplayWindow::new();
+        assert!(w.admit(base).is_ok());
+        assert!(
+            w.admit(base - W).is_ok(),
+            "the far edge of the window is representable and must be usable",
+        );
+        assert_eq!(w.admit(base - W).unwrap_err(), RouteHopError::Replay);
+    }
+
+    /// A very large jump must not panic (shift overflow) and must
+    /// forget everything older than the new window.
+    #[test]
+    fn a_huge_advance_neither_panics_nor_remembers() {
+        let mut w = HopReplayWindow::new();
+        assert!(w.admit(1).is_ok());
+        assert!(w.admit(u64::MAX / 2).is_ok());
+        assert_eq!(w.admit(1).unwrap_err(), RouteHopError::Replay);
     }
 
     /// A tag from one edge must not verify on another: directional

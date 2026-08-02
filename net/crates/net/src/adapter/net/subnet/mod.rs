@@ -24,10 +24,10 @@ pub use admission::{SubnetChallengeStore, SubnetContextStore};
 pub use assignment::{SubnetPolicy, SubnetRule};
 pub use auth::{
     build_gateway_context_set, compile_gateway_context, ExpectedBinding, ForwardDenial,
-    SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig, SubnetCredentialSet,
-    SubnetFloorRegistry, SubnetGrant, SubnetIssuerGrant, SubnetRef, SubnetRevocationFloor,
-    SubnetRights, VerifiedGatewayContext, VerifiedGatewayContextSet, VerifiedSubnetAuthority,
-    VerifiedSubnetContext, MAX_GATEWAY_CONTEXTS_PER_AUTHORITY,
+    SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig, SubnetBoundarySet,
+    SubnetCredentialSet, SubnetFloorRegistry, SubnetGrant, SubnetIssuerGrant, SubnetRef,
+    SubnetRevocationFloor, SubnetRights, VerifiedGatewayContext, VerifiedGatewayContextSet,
+    VerifiedSubnetAuthority, VerifiedSubnetContext, MAX_GATEWAY_CONTEXTS_PER_AUTHORITY,
 };
 pub use error::SubnetError;
 pub use gateway::{DropReason, ForwardDecision, SubnetGateway};

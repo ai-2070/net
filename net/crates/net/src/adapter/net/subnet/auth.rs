@@ -1467,6 +1467,59 @@ pub struct VerifiedGatewayContextSet {
     pub entries: Box<[VerifiedGatewayContext]>,
 }
 
+/// The mandatory inventory of protected boundaries for one authority.
+///
+/// Boundaries and the rights that satisfy them must come from
+/// **different** surfaces. S4A discovered boundaries from the gateway's
+/// own credential set, which inverted revocation: dropping an
+/// `EXPORT(world-model)` credential removed the world-model entry, so
+/// the crossing stopped being a crossing and a broader
+/// `ROUTE(vehicle)` silently carried the same traffic. Removing a
+/// credential widened authority.
+///
+/// Here the boundary exists independently of any credential. Removing
+/// `EXPORT(world-model)` leaves the boundary standing and unsatisfied,
+/// which denies — the fail-closed direction. An absent boundary set
+/// denies every protected transition outright, so a gateway cannot
+/// gain authority by forgetting to configure one.
+///
+/// V1 sources this from operator configuration; S5's signed
+/// `ExportPolicy` fact is the distribution mechanism, and it replaces
+/// the whole set atomically for the same reason the credential set is
+/// republished whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubnetBoundarySet {
+    /// Authority these boundaries belong to.
+    pub authority: EntityId,
+    /// Topology epoch they were declared under. A boundary means
+    /// nothing once paths are reinterpreted.
+    pub topology_epoch: u32,
+    /// Subtree roots whose edge is a protected boundary. Crossing one
+    /// requires `EXPORT` held at exactly that scope.
+    pub boundaries: Box<[TopologySubnetId]>,
+}
+
+impl SubnetBoundarySet {
+    /// Build a boundary set, deduplicating scopes.
+    pub fn new(
+        authority: EntityId,
+        topology_epoch: u32,
+        boundaries: impl IntoIterator<Item = TopologySubnetId>,
+    ) -> Self {
+        let mut seen: Vec<TopologySubnetId> = Vec::new();
+        for b in boundaries {
+            if !seen.contains(&b) {
+                seen.push(b);
+            }
+        }
+        Self {
+            authority,
+            topology_epoch,
+            boundaries: seen.into_boxed_slice(),
+        }
+    }
+}
+
 /// Why a protected forwarding transition was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardDenial {
@@ -1489,30 +1542,37 @@ impl VerifiedGatewayContextSet {
     /// subnet.
     ///
     /// ```text
-    /// crossed = entries where scope.contains(source) != scope.contains(target)
-    /// if crossed is non-empty: require EXPORT on EVERY crossed entry
+    /// crossed = BOUNDARIES where b.contains(source) != b.contains(target)
+    /// if crossed is non-empty: require EXPORT held at EVERY crossed boundary
     /// else:                    require one entry containing both, with ROUTE
     /// ```
     ///
-    /// Ordering the crossed-boundary test first is what stops a broad
-    /// `ROUTE(vehicle)` from carrying traffic out through a narrower
-    /// configured `EXPORT(world-model)` boundary: the narrow entry is
-    /// crossed by that transition, so its `EXPORT` is demanded
-    /// regardless of what any wider entry permits. A transition
-    /// crossing two configured sibling boundaries needs `EXPORT` on
-    /// both. Entries containing neither endpoint are irrelevant.
+    /// `boundaries` is a separate mandatory surface, not this set —
+    /// see [`SubnetBoundarySet`] for why inferring boundaries from the
+    /// credentials that satisfy them let revocation widen authority.
+    /// The crossed test runs first, so a broad `ROUTE(vehicle)` cannot
+    /// carry traffic out through a declared `world-model` boundary:
+    /// that boundary is crossed, so `EXPORT` at exactly its scope is
+    /// demanded regardless of what any wider entry permits. Crossing
+    /// two declared sibling boundaries needs `EXPORT` for both.
     ///
-    /// Cost is bounded by the hierarchy, not by the operator's grant
-    /// count: containment is a fixed-width prefix test, and a
-    /// transition touches at most the two endpoints' ancestor paths.
+    /// Cost is bounded by the hierarchy, not the operator's grant
+    /// count: containment is a fixed-width prefix test over the two
+    /// endpoints' ancestor paths.
     pub fn authorize_transition(
         &self,
         ingress: &VerifiedSubnetContext,
         egress: &VerifiedSubnetContext,
+        boundaries: &SubnetBoundarySet,
         current_topology_epoch: u32,
         current_subnet_auth_epoch: u64,
         now_secs: u64,
     ) -> Result<(), ForwardDenial> {
+        if boundaries.authority != self.authority
+            || boundaries.topology_epoch != current_topology_epoch
+        {
+            return Err(ForwardDenial::ContextNotCurrent);
+        }
         // Both hop peers must be admitted under the same authority and
         // epoch this node's own credentials were verified against, and
         // both must actually be attached (ATTACH), not merely known.
@@ -1541,15 +1601,22 @@ impl VerifiedGatewayContextSet {
         let source = ingress.attachment;
         let target = egress.attachment;
 
+        // Boundaries come from the declared inventory, so a crossing
+        // stays a crossing whether or not a credential satisfies it.
         let mut crossed_any = false;
-        for entry in self.entries.iter() {
-            let inside_source = entry.scope.is_ancestor_or_self_of(source);
-            let inside_target = entry.scope.is_ancestor_or_self_of(target);
-            if inside_source == inside_target {
+        for boundary in boundaries.boundaries.iter() {
+            if boundary.is_ancestor_or_self_of(source) == boundary.is_ancestor_or_self_of(target) {
                 continue;
             }
             crossed_any = true;
-            if !entry.rights.contains(SubnetRights::EXPORT) {
+            // EXPORT must be held at exactly the crossed scope. A
+            // wider EXPORT elsewhere is authority over a different
+            // boundary, not this one.
+            let satisfied = self
+                .entries
+                .iter()
+                .any(|e| &e.scope == boundary && e.rights.contains(SubnetRights::EXPORT));
+            if !satisfied {
                 return Err(ForwardDenial::ExportMissing);
             }
         }
@@ -1557,10 +1624,13 @@ impl VerifiedGatewayContextSet {
             return Ok(());
         }
 
+        // Wholly internal: one entry must contain both endpoints and
+        // carry ROUTE. Single pass — the earlier version walked the
+        // entry array twice per transition.
         let routed = self.entries.iter().any(|entry| {
-            entry.scope.is_ancestor_or_self_of(source)
+            entry.rights.contains(SubnetRights::ROUTE)
+                && entry.scope.is_ancestor_or_self_of(source)
                 && entry.scope.is_ancestor_or_self_of(target)
-                && entry.rights.contains(SubnetRights::ROUTE)
         });
         if routed {
             Ok(())

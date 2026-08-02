@@ -18,7 +18,7 @@
 use net::adapter::net::identity::EntityKeypair;
 use net::adapter::net::subnet::{
     admission::unix_now_secs, auth::compile_gateway_context, build_gateway_context_set,
-    ForwardDenial, SubnetAuthError, SubnetAuthorityConfig, SubnetCredentialSet,
+    ForwardDenial, SubnetAuthError, SubnetAuthorityConfig, SubnetBoundarySet, SubnetCredentialSet,
     SubnetFloorRegistry, SubnetGrant, SubnetRights, TopologySubnetId, VerifiedGatewayContext,
     VerifiedGatewayContextSet, VerifiedSubnetContext, MAX_GATEWAY_CONTEXTS_PER_AUTHORITY,
 };
@@ -115,6 +115,16 @@ fn gateway_set(
     build_gateway_context_set(root.entity_id(), entries).expect("build set")
 }
 
+/// Declared boundary inventory — a separate surface from the
+/// credentials that satisfy it.
+fn boundaries(root: &EntityKeypair, scopes: &[&[u8]]) -> SubnetBoundarySet {
+    SubnetBoundarySet::new(
+        root.entity_id().clone(),
+        0,
+        scopes.iter().map(|s| TopologySubnetId::new(s)),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // attachment vs scope
 // ---------------------------------------------------------------------------
@@ -141,6 +151,7 @@ fn attachment_is_the_exact_admitted_point_not_the_grant_scope() {
 #[test]
 fn forwarding_uses_attachment_not_scope() {
     let root = kp(1);
+    let bset = boundaries(&root, &[&[3, 7, 1]]);
     let local = kp(9);
     let camera = kp(2);
     let outside = kp(3);
@@ -174,7 +185,7 @@ fn forwarding_uses_attachment_not_scope() {
     // crossing and the EXPORT entry governs it. Had the rule used
     // `scope`, both peers would look like `[3]` and this would be a
     // plain internal ROUTE.
-    set.authorize_transition(&inside, &out, 0, 0, now())
+    set.authorize_transition(&inside, &out, &bset, 0, 0, now())
         .expect("EXPORT(world-model) authorizes the crossing");
 
     // Remove EXPORT from the boundary entry: the same transition now
@@ -193,7 +204,7 @@ fn forwarding_uses_attachment_not_scope() {
     );
     assert_eq!(
         no_export
-            .authorize_transition(&inside, &out, 0, 0, now())
+            .authorize_transition(&inside, &out, &bset, 0, 0, now())
             .unwrap_err(),
         ForwardDenial::ExportMissing,
     );
@@ -332,6 +343,7 @@ fn gateway_set_is_capped_and_authority_homogeneous() {
 #[test]
 fn broad_route_cannot_bypass_a_narrower_export_boundary() {
     let root = kp(1);
+    let bset = boundaries(&root, &[&[3, 7, 1]]);
     let local = kp(9);
     let a = kp(2);
     let b = kp(3);
@@ -348,7 +360,7 @@ fn broad_route_cannot_bypass_a_narrower_export_boundary() {
     let outside = peer_ctx(&root, &b, &[3, 8], &[3, 8], SubnetRights::ATTACH);
 
     assert_eq!(
-        set.authorize_transition(&inside, &outside, 0, 0, now())
+        set.authorize_transition(&inside, &outside, &bset, 0, 0, now())
             .unwrap_err(),
         ForwardDenial::ExportMissing,
         "ROUTE(vehicle) must not authorize a crossing of the world-model boundary",
@@ -359,6 +371,7 @@ fn broad_route_cannot_bypass_a_narrower_export_boundary() {
 #[test]
 fn crossing_two_sibling_boundaries_requires_both_exports() {
     let root = kp(1);
+    let bset = boundaries(&root, &[&[3, 7], &[3, 8]]);
     let local = kp(9);
     let a = kp(2);
     let b = kp(3);
@@ -375,7 +388,7 @@ fn crossing_two_sibling_boundaries_requires_both_exports() {
         ],
     );
     assert_eq!(
-        one.authorize_transition(&in_left, &in_right, 0, 0, now())
+        one.authorize_transition(&in_left, &in_right, &bset, 0, 0, now())
             .unwrap_err(),
         ForwardDenial::ExportMissing,
     );
@@ -388,13 +401,14 @@ fn crossing_two_sibling_boundaries_requires_both_exports() {
             gateway_entry(&root, &local, &[3, 8], SubnetRights::EXPORT),
         ],
     );
-    both.authorize_transition(&in_left, &in_right, 0, 0, now())
+    both.authorize_transition(&in_left, &in_right, &bset, 0, 0, now())
         .expect("both boundaries export");
 }
 
 #[test]
 fn route_covers_internal_transitions_and_attach_alone_forwards_nothing() {
     let root = kp(1);
+    let bset = boundaries(&root, &[]);
     let local = kp(9);
     let a = kp(2);
     let b = kp(3);
@@ -406,7 +420,7 @@ fn route_covers_internal_transitions_and_attach_alone_forwards_nothing() {
         &root,
         vec![gateway_entry(&root, &local, &[3], SubnetRights::ROUTE)],
     )
-    .authorize_transition(&x, &y, 0, 0, now())
+    .authorize_transition(&x, &y, &bset, 0, 0, now())
     .expect("parent ROUTE covers descendants");
 
     // ATTACH alone forwards nothing.
@@ -415,15 +429,15 @@ fn route_covers_internal_transitions_and_attach_alone_forwards_nothing() {
             &root,
             vec![gateway_entry(&root, &local, &[3], SubnetRights::ATTACH)],
         )
-        .authorize_transition(&x, &y, 0, 0, now())
+        .authorize_transition(&x, &y, &bset, 0, 0, now())
         .unwrap_err(),
         ForwardDenial::RouteMissing,
         "ATTACH is admission, never forwarding",
     );
 
-    // A child-scoped ROUTE cannot route a sibling transition: the
-    // child scope contains one endpoint but not the other, so it is a
-    // crossing that its rights do not cover.
+    // A child-scoped ROUTE cannot route a sibling transition: it
+    // contains one endpoint but not the other, so no entry covers the
+    // pair.
     assert_eq!(
         gateway_set(
             &root,
@@ -434,9 +448,94 @@ fn route_covers_internal_transitions_and_attach_alone_forwards_nothing() {
                 SubnetRights::ROUTE
             )],
         )
-        .authorize_transition(&x, &y, 0, 0, now())
+        .authorize_transition(&x, &y, &bset, 0, 0, now())
         .unwrap_err(),
+        ForwardDenial::RouteMissing,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Boundaries are declared, not inferred from credentials
+// ---------------------------------------------------------------------------
+
+/// The S4A review's blocker 4. Boundaries used to be discovered from
+/// the gateway's own credential set, which inverted revocation:
+/// dropping `EXPORT(world-model)` deleted the world-model entry, the
+/// crossing stopped being a crossing, and a broader `ROUTE(vehicle)`
+/// silently carried the same traffic. Removing a credential widened
+/// authority.
+///
+/// With the boundary declared separately, the same removal leaves the
+/// boundary standing and unsatisfied — which denies.
+#[test]
+fn revoking_an_export_credential_denies_rather_than_widening() {
+    let root = kp(1);
+    let local = kp(9);
+    let a = kp(2);
+    let b = kp(3);
+    // world-model is a declared boundary regardless of credentials.
+    let bset = boundaries(&root, &[&[3, 7, 1]]);
+    let inside = peer_ctx(&root, &a, &[3, 7, 1], &[3], SubnetRights::ATTACH);
+    let outside = peer_ctx(&root, &b, &[3, 8], &[3], SubnetRights::ATTACH);
+
+    // With EXPORT at the boundary the crossing is authorized.
+    let with_export = gateway_set(
+        &root,
+        vec![
+            gateway_entry(&root, &local, &[3], SubnetRights::ROUTE),
+            gateway_entry(&root, &local, &[3, 7, 1], SubnetRights::EXPORT),
+        ],
+    );
+    with_export
+        .authorize_transition(&inside, &outside, &bset, 0, 0, now())
+        .expect("EXPORT at the declared boundary authorizes the crossing");
+
+    // Revoke ONLY the EXPORT credential, leaving the broad ROUTE. The
+    // boundary is still declared, so the crossing still requires an
+    // EXPORT nobody holds.
+    let revoked = gateway_set(
+        &root,
+        vec![gateway_entry(&root, &local, &[3], SubnetRights::ROUTE)],
+    );
+    assert_eq!(
+        revoked
+            .authorize_transition(&inside, &outside, &bset, 0, 0, now())
+            .unwrap_err(),
         ForwardDenial::ExportMissing,
+        "revoking EXPORT must deny, never fall back to the broader ROUTE",
+    );
+}
+
+/// A boundary set for the wrong authority or a superseded topology
+/// epoch is not usable: boundaries mean nothing once paths are
+/// reinterpreted, and one authority's boundaries do not govern
+/// another's.
+#[test]
+fn boundary_sets_are_authority_and_epoch_bound() {
+    let root = kp(1);
+    let other = kp(5);
+    let local = kp(9);
+    let a = kp(2);
+    let b = kp(3);
+    let set = gateway_set(
+        &root,
+        vec![gateway_entry(&root, &local, &[3], SubnetRights::ROUTE)],
+    );
+    let x = peer_ctx(&root, &a, &[3, 7, 1], &[3], SubnetRights::ATTACH);
+    let y = peer_ctx(&root, &b, &[3, 7, 2], &[3], SubnetRights::ATTACH);
+
+    let foreign = boundaries(&other, &[]);
+    assert_eq!(
+        set.authorize_transition(&x, &y, &foreign, 0, 0, now())
+            .unwrap_err(),
+        ForwardDenial::ContextNotCurrent,
+    );
+
+    let stale_epoch = SubnetBoundarySet::new(root.entity_id().clone(), 7, []);
+    assert_eq!(
+        set.authorize_transition(&x, &y, &stale_epoch, 0, 0, now())
+            .unwrap_err(),
+        ForwardDenial::ContextNotCurrent,
     );
 }
 
@@ -445,6 +544,7 @@ fn route_covers_internal_transitions_and_attach_alone_forwards_nothing() {
 #[test]
 fn peers_must_be_attached_and_current() {
     let root = kp(1);
+    let bset = boundaries(&root, &[]);
     let local = kp(9);
     let a = kp(2);
     let b = kp(3);
@@ -457,26 +557,28 @@ fn peers_must_be_attached_and_current() {
     // Peer holding ROUTE but not ATTACH is not an endpoint.
     let unattached = peer_ctx(&root, &b, &[3, 8], &[3], SubnetRights::ROUTE);
     assert_eq!(
-        set.authorize_transition(&ok, &unattached, 0, 0, now())
+        set.authorize_transition(&ok, &unattached, &bset, 0, 0, now())
             .unwrap_err(),
         ForwardDenial::AttachMissing,
     );
 
     // Wrong topology epoch.
     assert_eq!(
-        set.authorize_transition(&ok, &ok, 1, 0, now()).unwrap_err(),
+        set.authorize_transition(&ok, &ok, &bset, 1, 0, now())
+            .unwrap_err(),
         ForwardDenial::ContextNotCurrent,
     );
     // Stale auth epoch.
     assert_eq!(
-        set.authorize_transition(&ok, &ok, 0, 1, now()).unwrap_err(),
+        set.authorize_transition(&ok, &ok, &bset, 0, 1, now())
+            .unwrap_err(),
         ForwardDenial::ContextNotCurrent,
     );
     // Expired peer context.
     let mut expired = ok.clone();
     expired.expires_at = now() - 1;
     assert_eq!(
-        set.authorize_transition(&expired, &ok, 0, 0, now())
+        set.authorize_transition(&expired, &ok, &bset, 0, 0, now())
             .unwrap_err(),
         ForwardDenial::ContextNotCurrent,
     );
@@ -486,6 +588,7 @@ fn peers_must_be_attached_and_current() {
 #[test]
 fn cross_authority_peers_are_not_forwardable() {
     let root = kp(1);
+    let bset = boundaries(&root, &[]);
     let other = kp(5);
     let local = kp(9);
     let a = kp(2);
@@ -496,7 +599,7 @@ fn cross_authority_peers_are_not_forwardable() {
     let ours = peer_ctx(&root, &a, &[3, 7], &[3], SubnetRights::ATTACH);
     let theirs = peer_ctx(&other, &a, &[3, 7], &[3], SubnetRights::ATTACH);
     assert_eq!(
-        set.authorize_transition(&ours, &theirs, 0, 0, now())
+        set.authorize_transition(&ours, &theirs, &bset, 0, 0, now())
             .unwrap_err(),
         ForwardDenial::ContextNotCurrent,
     );

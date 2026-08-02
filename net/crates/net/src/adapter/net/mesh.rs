@@ -495,9 +495,9 @@ use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{
     route_hop::AuthenticatedNextHop, DropReason, SubnetAuthError, SubnetAuthPresentation,
-    SubnetAuthorityConfig, SubnetChallengeStore, SubnetContextStore, SubnetCredentialSet,
-    SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy, SubnetRevocationFloor,
-    VerifiedGatewayContextSet, VerifiedSubnetContext,
+    SubnetAuthorityConfig, SubnetBoundarySet, SubnetChallengeStore, SubnetContextStore,
+    SubnetCredentialSet, SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy,
+    SubnetRevocationFloor, VerifiedGatewayContextSet, VerifiedSubnetContext,
 };
 use super::subprotocol::stream_window::{
     StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_WINDOW_SIZE,
@@ -1560,6 +1560,8 @@ struct DispatchCtx {
     /// This node's own forwarding authority (S4A). None means this
     /// node is not a protected gateway and forwards nothing protected.
     subnet_gateway_contexts: Arc<arc_swap::ArcSwapOption<VerifiedGatewayContextSet>>,
+    /// Declared protected boundaries; absence denies protected forwarding.
+    subnet_boundaries: Arc<arc_swap::ArcSwapOption<SubnetBoundarySet>>,
     /// Floor state, for the auth epoch a compiled context is pinned to.
     subnet_floors: Arc<SubnetFloorRegistry>,
     /// Topology epoch the relay evaluates against.
@@ -7928,6 +7930,10 @@ pub struct MeshNode {
     /// operator installs gateway credentials, which is what keeps a
     /// non-gateway node from forwarding protected traffic at all.
     subnet_gateway_contexts: Arc<arc_swap::ArcSwapOption<VerifiedGatewayContextSet>>,
+    /// Declared protected boundaries. Mandatory for protected
+    /// forwarding: absence denies, so a gateway cannot gain authority
+    /// by omitting the inventory.
+    subnet_boundaries: Arc<arc_swap::ArcSwapOption<SubnetBoundarySet>>,
     /// This node's own attachment point, used when compiling the
     /// gateway context set and as the local end of a transition.
     subnet_local_attachment: SubnetId,
@@ -9100,6 +9106,7 @@ impl MeshNode {
             subnet_contexts,
             subnet_topology_epoch: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             subnet_gateway_contexts: Arc::new(arc_swap::ArcSwapOption::empty()),
+            subnet_boundaries: Arc::new(arc_swap::ArcSwapOption::empty()),
             subnet_local_attachment,
             peer_subnets,
             // Gateway is installed lazily by `set_channel_configs`;
@@ -11047,6 +11054,22 @@ impl MeshNode {
         Ok(())
     }
 
+    /// Declare this node's protected boundaries (SUBNET_AUTH_PLAN.md
+    /// D6). Replaces the whole set atomically.
+    ///
+    /// Mandatory for protected forwarding: with no set declared, every
+    /// protected transition denies. Boundaries are deliberately NOT
+    /// derived from the gateway's credentials — otherwise revoking an
+    /// `EXPORT` credential would delete the boundary it was meant to
+    /// guard and a broader `ROUTE` would inherit the traffic.
+    pub fn declare_subnet_boundaries(&self, set: SubnetBoundarySet) {
+        self.subnet_boundaries.store(Some(Arc::new(set)));
+    }
+
+    /// The declared boundary set, if any.
+    pub fn subnet_boundaries(&self) -> Option<Arc<SubnetBoundarySet>> {
+        self.subnet_boundaries.load_full()
+    }
     /// This node's published gateway authority, or `None` when it
     /// holds none — in which case it forwards no protected traffic.
     pub fn subnet_gateway_contexts(&self) -> Option<Arc<VerifiedGatewayContextSet>> {
@@ -11062,9 +11085,21 @@ impl MeshNode {
     /// address without changing the hop identity, and an unknown or
     /// unauthenticated address resolves to nothing at all.
     pub fn authenticated_next_hop(&self, dest_id: u64) -> Option<AuthenticatedNextHop> {
-        let routed_addr = self.router.routing_table().lookup(dest_id)?;
-        let node_id = self.addr_to_node.get(&routed_addr).map(|e| *e.value())?;
+        // Identity comes from the route entry, which bound it at
+        // install time. Resolving it here through `addr_to_node`
+        // instead would let an address reused by a different
+        // authenticated peer silently retarget this route.
+        let (node_id, bound_addr) = self.router.routing_table().lookup_authenticated(dest_id)?;
+        // The live peer entry supplies the CURRENT address, so a NAT
+        // rebind follows the identity rather than stranding it.
         let addr = self.peers.get(&node_id)?.addr;
+        if addr != bound_addr {
+            // Address moved under a bound identity: keep the route
+            // pointing at the same peer.
+            self.router
+                .routing_table()
+                .rebind_authenticated_route(dest_id, node_id, addr);
+        }
         Some(AuthenticatedNextHop { node_id, addr })
     }
     /// Explicitly withdraw a peer's subnet admission — outstanding
@@ -15362,6 +15397,7 @@ impl MeshNode {
             peer_subnets: self.peer_subnets.clone(),
             subnet_contexts: self.subnet_contexts.clone(),
             subnet_gateway_contexts: self.subnet_gateway_contexts.clone(),
+            subnet_boundaries: self.subnet_boundaries.clone(),
             subnet_floors: self.subnet_floors.clone(),
             subnet_topology_epoch: self.subnet_topology_epoch.clone(),
             subnet_gateway: self.subnet_gateway.clone(),
@@ -15968,7 +16004,7 @@ impl MeshNode {
         };
 
         // (1) Ingress identity comes from the hop session id alone.
-        let Ok(peeked) = route_hop::parse(data) else {
+        let Ok(peeked) = route_hop::parse_prefix(data) else {
             return;
         };
         let Some(ingress_node) = ctx
@@ -16022,11 +16058,14 @@ impl MeshNode {
             return;
         };
 
-        // (4) Egress by identity, then its admitted context.
-        let Some(routed_addr) = ctx.router.routing_table().lookup(opened.header.dest_id) else {
-            return;
-        };
-        let Some(egress_node) = ctx.addr_to_node.get(&routed_addr).map(|e| *e.value()) else {
+        // (4) Egress by IDENTITY bound into the route entry — not by
+        // resolving an address through the mutable reverse map, which
+        // would let address reuse retarget the route.
+        let Some((egress_node, _bound_addr)) = ctx
+            .router
+            .routing_table()
+            .lookup_authenticated(opened.header.dest_id)
+        else {
             return;
         };
         let Some(egress_session) = ctx
@@ -16052,9 +16091,20 @@ impl MeshNode {
 
         // (5) This node's own authority over the two hop-local
         // attachments.
-        if let Err(denial) =
-            local_set.authorize_transition(&ingress_ctx, &egress_ctx, epoch, auth_epoch, now)
-        {
+        // Boundaries are a separate mandatory surface; without one,
+        // protected forwarding denies rather than treating "no
+        // declared boundaries" as "everything is internal".
+        let Some(boundaries) = ctx.subnet_boundaries.load_full() else {
+            return;
+        };
+        if let Err(denial) = local_set.authorize_transition(
+            &ingress_ctx,
+            &egress_ctx,
+            &boundaries,
+            epoch,
+            auth_epoch,
+            now,
+        ) {
             tracing::debug!(
                 ingress = format!("{ingress_node:#x}"),
                 egress = format!("{egress_node:#x}"),

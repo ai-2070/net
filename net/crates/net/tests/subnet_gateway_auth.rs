@@ -447,32 +447,67 @@ async fn a_floor_invalidates_the_contexts_the_relay_reads() {
 // Next-hop identity
 // ---------------------------------------------------------------------------
 
-/// The egress is resolved by identity. An address with no
-/// authenticated peer behind it resolves to nothing, so a route
-/// pointing at a stranger cannot be used to forward protected
-/// traffic.
+/// A legacy (address-only) route carries no identity, so it cannot
+/// select protected forwarding authority — it resolves to nothing
+/// rather than to whoever currently answers at that address.
 #[tokio::test]
-async fn next_hop_resolves_by_identity_not_address() {
+async fn a_legacy_route_is_not_an_authenticated_next_hop() {
     let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
-
-    let hop =
-        f.gw.authenticated_next_hop(f.right.node_id())
-            .expect("route to an authenticated peer resolves");
-    assert_eq!(hop.node_id, f.right.node_id());
-    assert_eq!(hop.addr, f.right.local_addr());
-
-    // Repoint the route at an address with no session behind it.
-    let stranger = wire().await;
-    f.gw.router()
-        .routing_table()
-        .add_route(f.right.node_id(), stranger.local_addr().unwrap());
+    // `fixture` installs the route with the legacy `add_route`.
     assert!(
         f.gw.authenticated_next_hop(f.right.node_id()).is_none(),
-        "an address with no authenticated peer is not a next hop",
+        "an address-only route must not be usable for protected forwarding",
     );
-
-    // A destination with no route at all resolves to nothing.
     assert!(f.gw.authenticated_next_hop(0xDEAD_BEEF).is_none());
+}
+
+/// Identity is bound into the route entry at install time, so it is
+/// the stable half of a next hop.
+///
+/// Two inverse properties, which is the point of binding it there
+/// instead of resolving an address through a mutable map: an address
+/// change follows the identity, and a *different* identity arriving
+/// at the old address inherits nothing.
+#[tokio::test]
+async fn route_identity_survives_address_change_and_resists_address_reuse() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    let right_id = f.right.node_id();
+    let table = f.gw.router().routing_table();
+
+    table.add_authenticated_route(right_id, f.right.local_addr(), right_id);
+    let hop =
+        f.gw.authenticated_next_hop(right_id)
+            .expect("an identity-bound route resolves");
+    assert_eq!(hop.node_id, right_id);
+    assert_eq!(hop.addr, f.right.local_addr());
+
+    // NAT rebind: the address moves under the SAME identity.
+    let moved: SocketAddr = "127.0.0.1:59999".parse().unwrap();
+    assert!(
+        table.rebind_authenticated_route(right_id, right_id, moved),
+        "an address change under the bound identity is permitted",
+    );
+    let (id, addr) = table
+        .lookup_authenticated(right_id)
+        .expect("route still present");
+    assert_eq!(id, right_id, "identity is unchanged by an address move");
+    assert_eq!(addr, moved);
+
+    // Address reuse: a DIFFERENT identity cannot take the route over,
+    // which is exactly what resolving identity from a mutable address
+    // map would have allowed.
+    let interloper = f.left.node_id();
+    assert!(
+        !table.rebind_authenticated_route(right_id, interloper, f.left.local_addr()),
+        "a different identity must not inherit an existing protected route",
+    );
+    let (id, _) = table
+        .lookup_authenticated(right_id)
+        .expect("route still present");
+    assert_eq!(
+        id, right_id,
+        "the bound identity must survive an attempted takeover",
+    );
 }
 
 // ---------------------------------------------------------------------------

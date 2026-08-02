@@ -414,6 +414,22 @@ impl Default for SchedulerStreamStats {
 pub struct RouteEntry {
     /// Next hop address
     pub next_hop: SocketAddr,
+    /// Authenticated identity of the next hop, when the route was
+    /// installed with one (`SUBNET_AUTH_PLAN.md` D6).
+    ///
+    /// Protected forwarding needs the hop's *identity*, and an
+    /// address is not one. Resolving identity after the fact through
+    /// a mutable address→node map lets an address reused by a
+    /// different authenticated peer silently retarget every route
+    /// pointing at it. Binding it here instead means the identity is
+    /// fixed when the route is installed: an address change may move
+    /// `next_hop` under an already-bound identity
+    /// ([`RouteEntry::rebind_addr`]), but a new identity at the old
+    /// address inherits nothing.
+    ///
+    /// `None` for public/legacy routes, which carry no protected
+    /// traffic.
+    pub next_hop_id: Option<u64>,
     /// Metric (lower is better)
     pub metric: u16,
     /// Route is active
@@ -427,6 +443,7 @@ impl RouteEntry {
     pub fn new(next_hop: SocketAddr) -> Self {
         Self {
             next_hop,
+            next_hop_id: None,
             metric: 1,
             active: true,
             updated_at: Instant::now(),
@@ -437,10 +454,38 @@ impl RouteEntry {
     pub fn with_metric(next_hop: SocketAddr, metric: u16) -> Self {
         Self {
             next_hop,
+            next_hop_id: None,
             metric,
             active: true,
             updated_at: Instant::now(),
         }
+    }
+
+    /// Create an identity-bound route entry usable for protected
+    /// forwarding.
+    pub fn authenticated(next_hop: SocketAddr, next_hop_id: u64) -> Self {
+        Self {
+            next_hop,
+            next_hop_id: Some(next_hop_id),
+            metric: 1,
+            active: true,
+            updated_at: Instant::now(),
+        }
+    }
+
+    /// Move an identity-bound route to a new address without changing
+    /// who it points at — the NAT-rebind case.
+    ///
+    /// Refuses when `identity` is not the bound one, so a different
+    /// peer cannot take over an existing protected route by arriving
+    /// at the same place.
+    pub fn rebind_addr(&mut self, identity: u64, new_addr: SocketAddr) -> bool {
+        if self.next_hop_id != Some(identity) {
+            return false;
+        }
+        self.next_hop = new_addr;
+        self.updated_at = Instant::now();
+        true
     }
 }
 
@@ -623,6 +668,48 @@ impl RoutingTable {
             .get(&dest_id)
             .filter(|r| r.active && r.updated_at.elapsed() <= max_age)
             .map(|r| r.next_hop)
+    }
+
+    /// Install an identity-bound route for protected forwarding.
+    pub fn add_authenticated_route(&self, dest_id: u64, next_hop: SocketAddr, next_hop_id: u64) {
+        if self
+            .routes
+            .insert(dest_id, RouteEntry::authenticated(next_hop, next_hop_id))
+            .is_none()
+        {
+            self.num_routes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Like [`Self::lookup`], but yields the route's bound next-hop
+    /// identity alongside its address, and only for routes that have
+    /// one.
+    ///
+    /// This is the protected-forwarding lookup: it answers "who is the
+    /// next hop", where plain `lookup` answers only "where do I send".
+    /// A legacy route returns `None` rather than an unauthenticated
+    /// guess.
+    pub fn lookup_authenticated(&self, dest_id: u64) -> Option<(u64, SocketAddr)> {
+        let max_age = self.max_route_age();
+        self.routes
+            .get(&dest_id)
+            .filter(|r| r.active && r.updated_at.elapsed() <= max_age)
+            .and_then(|r| r.next_hop_id.map(|id| (id, r.next_hop)))
+    }
+
+    /// Move an identity-bound route to a new address under the same
+    /// identity. Returns `false` when the route is absent, legacy, or
+    /// bound to a different identity.
+    pub fn rebind_authenticated_route(
+        &self,
+        dest_id: u64,
+        identity: u64,
+        new_addr: SocketAddr,
+    ) -> bool {
+        match self.routes.get_mut(&dest_id) {
+            Some(mut r) => r.rebind_addr(identity, new_addr),
+            None => false,
+        }
     }
 
     /// Like [`Self::lookup`], but returns `None` if the installed
