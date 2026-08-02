@@ -1609,14 +1609,23 @@ satisfiable by a weaker implementation:
 both directions in one test: always-retry reds its "not asked again" assertion,
 never-retry reds its post-retirement success.
 
-### 17.6a Witnesses the mutation runs found asserting more than they exercised
+### 17.6a Over-claims the mutation runs found, and one predicate not claimed
 
-Both passed on their first writing. Both were repaired only because the inverse
-mutation was actually run, and in both cases reading the test would not have
-found it — the same failure mode as W-G3, W-G13 and W-W13, on new material.
+FOUR findings, numbered below in the order they appear. The first two are
+witnesses that PASSED on their first writing and were repaired only because the
+inverse mutation was actually run — in both cases reading the test would not
+have found it, the same failure mode as W-G3, W-G13 and W-W13 on new material.
+The third is a matrix row that claimed a coupling it never had. The fourth is a
+predicate this document deliberately does NOT claim a witness for.
 
-**W-N2's rights gate is not observable in the demand set, and the first version
-claimed it was.** A grant carrying no DISCOVER right carries no discovery
+One mutation that was rejected rather than repaired is recorded between the
+second and the third. It carries no ordinal on purpose: it is a finding about a
+MUTATION, not about a witness, so numbering it would make the count disagree
+with itself — the same arithmetic care §15's "five occurrences, not three" and
+the "62 of 64" correction below were written with.
+
+**First — W-N2's rights gate is not observable in the demand set, and the first
+version claimed it was.** A grant carrying no DISCOVER right carries no discovery
 binding, so it names no audience; any scope synthesized for it is one the LEASE
 check then rejects, because no installed record holds a synthesized handle. W-N1's
 gate therefore structurally subsumes W-N2's, and the demand set is identical
@@ -1639,8 +1648,8 @@ plainly that it is not independently observable further downstream. That is the
 honest statement; a witness constructed to imply otherwise would be the
 over-claim this process exists to catch.
 
-**The concurrency witness asserted an end state the defect also produces.** Two
-distinct problems:
+**Second — the concurrency witness asserted an end state the defect also
+produces.** Two distinct problems:
 
 - driven through `route_handle`, the outcome was the scheduler's — a winner that
   published before a rival reached the LOCK-FREE check sent that rival home early,
@@ -1663,14 +1672,15 @@ distinct problems:
   here rather than left, because a design that misstates the schedule its own
   witness runs is how a later reader "fixes" the test to match the prose.)
 
-A third mutation was rejected rather than its witness: "bound the family by
+**The aside, carrying no ordinal.** One mutation in the same run was rejected
+rather than its witness: "bound the family by
 `family_handles + 1`" is not the entry bound it claimed to be, because
 `family_handles` already counts handles — at 64 handles it refuses either way.
 The entry bound is a two-site mutation (lift the registry's demand bound, add an
 index-length bound in the state), and the witness reds on that.
 
-**The third was found by the HOLD-1 rerun, in a row this document had already
-written down.** §17.6's entry for `a_refused_entry_retains_no_partial_demand`
+**Third — found by the HOLD-1 rerun, in a row this document had already written
+down.** §17.6's entry for `a_refused_entry_retains_no_partial_demand`
 claimed it dies to "the same two mutations as W-A1 and W-A5". W-A1's mutation
 does kill it (M-A1s, RED). **W-A5's does not** (M-A5s, GREEN), and the reason is
 structural rather than accidental: W-A5's mutation replaces the atomic
@@ -1685,10 +1695,10 @@ the only test that sees it.
 
 The row is corrected above rather than deleted: the witness is sound and its
 W-A1 coupling is real. What was wrong was the claim of a second coupling it never
-had — the same over-claim shape as the two below, surviving because the earlier
-matrix counted mutations rather than recording one row per run.
+had — the same over-claim shape as the first two above, surviving because the
+earlier matrix counted mutations rather than recording one row per run.
 
-**A fourth, also from the HOLD-1 repair, is recorded the same way.** `settled_reason`'s
+**Fourth — also from the HOLD-1 repair, recorded the same way.** `settled_reason`'s
 family arm asks `family_spent_at(width)` rather than "has this family ever been
 refused". Replacing it with the weaker predicate is NOT independently observable:
 the arm is only reached once `may_attempt` has already returned false, and the

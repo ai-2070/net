@@ -452,14 +452,22 @@ fn a_rotated_audience_handle_is_not_leased_under_its_own_id() {
         1,
     );
 
-    // A DIFFERENT signed grant reusing the id, under a different handle. Its
-    // scope is not leased, because the installed record's handle is the other
-    // one.
-    let mut rotated = (*grant).clone();
-    if let Some(binding) = rotated.discovery.as_mut() {
-        binding.audience_handle = [0xEE; 32];
-    }
-    let rotated = Arc::new(rotated);
+    // A DIFFERENT, PROPERLY SIGNED grant reusing the id, under a fresh audience
+    // handle. Its scope is not leased, because the installed record's handle is
+    // the other one.
+    //
+    // Built through `issue_reusing_id` rather than by editing a clone's binding:
+    // an edited clone is a grant no validator would accept, so a witness driven
+    // by one can pass while the production path — where a same-id rotation is a
+    // genuinely different signed authority that installs through
+    // `validate_consumer_record` — is never exercised at all.
+    let (rotated, _successor_secret) = issue_reusing_id(capability, grant.grant_id);
+    assert_eq!(rotated.grant_id, grant.grant_id, "the id is REUSED");
+    assert_ne!(
+        rotated.discovery.as_ref().expect("binding").audience_handle,
+        grant.discovery.as_ref().expect("binding").audience_handle,
+        "under a different handle"
+    );
 
     let keys = demand_set_for(&credentials(vec![rotated.clone()]), &capability, &leased)
         .expect("owner scope");
@@ -787,6 +795,103 @@ fn node_capacity_refusal_retries_only_when_the_generation_moves() {
         "the retry succeeds on the freed capacity"
     );
     assert_eq!(state.entries(), 1);
+}
+
+/// `NodeAtCapacity` is retryable on AUTHORITY movement too, not only on a
+/// retirement.
+///
+/// The gap a generation-only gate leaves is self-sustaining rather than merely
+/// slow. A family refused for `Owner + Grant` whose Grant lease is then removed
+/// derives `Owner` alone on its next miss — a key another family already
+/// retains, so it creates no slot and a full node is no obstacle to it at all.
+/// But nothing retired, so the capacity generation stands still, and the family
+/// is left waiting for a signal that its own narrowing can never produce.
+///
+/// Dies to: recording only the node capacity generation, which leaves the
+/// narrowed set refused forever. The repeat block dies to dropping the cache, so
+/// the retry stays gated on real movement rather than on the rate of calls.
+#[test]
+fn node_capacity_refusal_retries_when_the_demand_narrows_without_a_retirement() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
+    let leased = lease(
+        &ConsumerGrantSnapshot::empty(),
+        &grant,
+        secret.expect("DISCOVER mints a secret"),
+        1,
+    );
+
+    // The node is FULL, and one of the slots filling it is the very Owner key
+    // this family will need. That is what makes the narrowed set free of node
+    // capacity: it creates nothing, so being full cannot refuse it.
+    let mut held = Vec::new();
+    let mut fillers = Vec::new();
+    for chunk in 0..4u32 {
+        let filler = f.registry.new_family().expect("family");
+        for i in 0..64u32 {
+            let key = if (chunk, i) == (0, 0) {
+                owner_key(&capability)
+            } else {
+                SlotKey {
+                    scope: PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
+                        grant_id: [0x5A; 32],
+                        audience_handle: [0x5A; 32],
+                    })
+                    .expect("private"),
+                    capability: cap(&format!("nrpc:fill{}", chunk * 64 + i)),
+                }
+            };
+            held.push(filler.demand(key).expect("fill"));
+        }
+        fillers.push(filler);
+    }
+    assert_eq!(f.registry.retained_slots(), MAX_NODE_SLOTS);
+
+    let state = f.state(credentials(vec![grant.clone()]));
+    assert_eq!(
+        state.route_handle(&capability, &leased),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
+        "Owner + Grant needs a slot a full node cannot create"
+    );
+    assert_eq!(f.metrics.refused_node_at_capacity(), 1);
+
+    let generation = f.registry.node_capacity_generation();
+    for _ in 0..16 {
+        assert_eq!(
+            state.route_handle(&capability, &leased),
+            RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity))
+        );
+    }
+    assert_eq!(
+        f.metrics.refused_node_at_capacity(),
+        1,
+        "neither signal moved, so the registry is not asked the identical \
+         question again"
+    );
+
+    // The Grant lease goes away. NOTHING retires: the node is still full and the
+    // capacity generation stands exactly where the refusal left it.
+    let narrowed = remove(&leased, &grant.grant_id, 2);
+    assert_eq!(
+        state.route_handle(&capability, &narrowed),
+        RouteLookup::Warm,
+        "the narrowed set creates no slot, so the full node cannot refuse it"
+    );
+    assert_eq!(
+        f.registry.node_capacity_generation(),
+        generation,
+        "and it warmed without a single retirement — the signal a \
+         generation-only gate would have been waiting on"
+    );
+    assert_eq!(state.entries(), 1);
+    assert_eq!(state.handles(), 1, "Owner alone; the Grant scope is gone");
+    assert_eq!(
+        f.registry.retained_slots(),
+        MAX_NODE_SLOTS,
+        "it SHARES the owner slot rather than creating a 257th"
+    );
+    drop(held);
 }
 
 /// `IdSpaceExhausted` is TERMINAL — never retried, not even when the node

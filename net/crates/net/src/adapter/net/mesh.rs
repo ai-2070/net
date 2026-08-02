@@ -11310,8 +11310,19 @@ impl MeshNode {
     /// Called with the consumer-Grant gate **already released**, which is item
     /// 10's literal requirement and also the lock-order one: `pin_if_current`
     /// takes that gate and then the registry lock, so touching the registry
-    /// beneath the gate would invert the frozen order. The `debug_assert` below
-    /// makes the release observable rather than assumed.
+    /// beneath the gate would invert the frozen order.
+    ///
+    /// The release is STRUCTURAL, not asserted. Each caller holds the gate in a
+    /// scoped block that ends before this call, so the guard is dropped by the
+    /// same brace that produced the values passed here. An earlier revision tried
+    /// to make it observable with `debug_assert!(gate.try_lock().is_some())`, and
+    /// that probe was wrong in two ways at once: `try_lock` answers whether the
+    /// gate is AVAILABLE, not whether THIS thread holds it, so a second publisher
+    /// legitimately mid-transition panicked debug and test builds; and on the
+    /// path where it succeeded it briefly took the very gate the discipline says
+    /// must not be held here. There is no ownership-safe form of the check —
+    /// `parking_lot::Mutex` records no holder — so the discipline is enforced
+    /// where it is expressible, at the call sites' scoping.
     ///
     /// Ordering, per design §2A.2:
     ///
@@ -11334,10 +11345,6 @@ impl MeshNode {
         &self,
         movement: &super::behavior::org_routing_registry::GrantScopeMovement,
     ) {
-        debug_assert!(
-            self.consumer_grant_gate.mu.try_lock().is_some(),
-            "the consumer-Grant gate must be RELEASED before routing is              notified (item 10); holding it here inverts the commit pin's              gate -> registry lock order"
-        );
         #[cfg(test)]
         {
             self.consumer_grant_movements.fetch_add(1, Ordering::AcqRel);
@@ -13684,6 +13691,33 @@ impl MeshNode {
             self.routing_registry_metrics.recaptures_restarted(),
             self.routing_registry_metrics.settlements_refused(),
         ]
+    }
+
+    /// Routing-actor loop iterations COMPLETED (OLB-2B.3b).
+    ///
+    /// The only externally-visible statement that no reconciliation pass is in
+    /// flight. Every other signal a witness could sample says something weaker:
+    /// an artifact is visible the moment `apply` stores it, which is before the
+    /// pass that installed it has settled and returned, and reconciliation
+    /// counters that merely stopped moving for a while are evidence of a
+    /// scheduler gap rather than of a finished pass. This advances at the actor's
+    /// park, so an observed advance is an iteration boundary.
+    #[cfg(test)]
+    pub(crate) fn org_routing_actor_passes(&self) -> u64 {
+        self.routing_hooks
+            .passes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test-only: wake the routing actor exactly as first demand does.
+    ///
+    /// A pass woken this way with nothing pending builds nothing and installs
+    /// nothing — it takes the commit pin, finds an empty selection and settles —
+    /// so it is a PROBE of the actor's liveness rather than a mutation of its
+    /// state, which is what makes it usable as an idle barrier.
+    #[cfg(test)]
+    pub(crate) fn mark_org_routing_work(&self) {
+        self.routing_work.mark();
     }
 
     /// Slots asked for under an audience scope the production source does not

@@ -171,8 +171,8 @@ opaque authority-epoch comparison:
 9. per-request sorting of Ready candidates is prohibited; the fallback
    vector is sorted once at rebuild (§9);
 10. exact-provider fan-out is hard-bounded (32 sensed providers per
-    capability, 64 retained authority-scoped route demands per client
-    state) with deterministic truncation and
+    capability, 64 retained authority-scoped route demands per
+    `OrgRoutingState` clone family) with deterministic truncation and
     `org_sensing_truncated_total` (§7);
 11. `OrgClient`'s internals are pinned to four operations — maintain
     candidates, maintain leases, project route sets, select — never a

@@ -52,27 +52,55 @@ async fn until(mut f: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// Sample the reconciliation counters once they have provably STOPPED moving.
+/// Sample the reconciliation counters at a proven ACTOR-IDLE point.
 ///
-/// A witness that asserts an exact delta has to know its baseline is a
-/// completed state. Sampling straight after an `until(..artifact exists..)` does
-/// not: the artifact becomes visible before the pass that installed it finishes
+/// A witness that asserts an exact delta has to know its baseline is a completed
+/// state. Sampling straight after an `until(..artifact exists..)` does not: the
+/// artifact becomes visible before the pass that installed it finishes
 /// accounting, so a warm-up install can land on the far side of the sample and
 /// show up as the transition's own work.
+///
+/// Equal counter samples do not fix that either, and the earlier form of this
+/// helper — three equal samples 20ms apart — was the same vacuous gate in a
+/// longer shape. Counters that stopped moving are evidence of a SCHEDULING GAP:
+/// a pass spends its reconstruction phase holding no lock and touching no
+/// metric, for as long as the sampler is willing to call that quiet. What is
+/// needed is an ITERATION BOUNDARY, and only the actor can report one.
+///
+/// So this drives the barrier rather than waiting to be convinced by it:
+///
+/// ```text
+/// mark registry work   -> wake the actor exactly as first demand wakes it
+/// wait for a pass      -> an iteration boundary, reported by the actor itself
+/// again                -> so the second pass STARTED after the first finished
+/// re-read              -> counters unchanged across the window, nothing pending
+/// ```
+///
+/// Twice, not once. One wake produces exactly one pass, so a single probe cannot
+/// distinguish the pass it woke from one that was already in flight and would
+/// have run anyway. After two boundaries, whatever was in flight when this call
+/// began has completed and at least one whole pass has run inside the window.
+///
+/// The probe cannot manufacture the work it is measuring: a pass woken with
+/// nothing pending selects nothing, builds nothing and settles. And if it does
+/// find work owed — a re-queue, a restarted recapture — the counters move, the
+/// loop notices, and it asks again rather than returning a baseline that is
+/// still warming.
 async fn quiesced_counts(node: &MeshNode) -> [u64; 7] {
-    let mut last = node.org_routing_reconciliation_counts();
-    let mut still = 0;
-    for _ in 0..200 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let now = node.org_routing_reconciliation_counts();
-        if now == last {
-            still += 1;
-            if still == 3 {
-                return last;
-            }
-        } else {
-            still = 0;
-            last = now;
+    for _ in 0..100 {
+        let before = node.org_routing_reconciliation_counts();
+        for _ in 0..2 {
+            let passes = node.org_routing_actor_passes();
+            node.mark_org_routing_work();
+            assert!(
+                until(|| node.org_routing_actor_passes() > passes).await,
+                "the routing actor never completed a pass, so no exact delta is \
+                 measurable"
+            );
+        }
+        let (_retained, pending) = node.org_routing_slots();
+        if pending == 0 && node.org_routing_reconciliation_counts() == before {
+            return before;
         }
     }
     panic!("the routing actor never quiesced, so no exact delta is measurable");
@@ -5531,30 +5559,16 @@ async fn a_delayed_grant_notification_cannot_retire_a_successor_installation() {
     // Park the REMOVAL's notification after publication and gate release, before
     // its registry work. The install's notification must pass through freely, or
     // there is no successor to protect.
-    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
-    {
-        let release_rx = release_rx.clone();
-        // A one-shot latch, NOT a predicate on the movement. It was written
-        // that way because the first repair's `superseded_through` gave
-        // remove(N) and install(N+1) the same value; that mechanism is gone —
-        // the fence is a publication generation now, and the two DO differ —
-        // but the latch stays, because "distinguishable today" is not a
-        // property a future fence change preserves. The removal's notification
-        // is guaranteed first: nothing installs until `reached` is observed.
-        let parked = Arc::new(AtomicBool::new(false));
-        f.node.arm_grant_movement_hook(Arc::new(move |_movement| {
-            if parked.swap(true, Ordering::AcqRel) {
-                return;
-            }
-            let _ = reached_tx.try_send(());
-            release_rx
-                .lock()
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the witness must release the parked notification");
-        }));
-    }
+    //
+    // The shared one-shot latch, NOT a predicate on the movement. It was written
+    // that way because the first repair's `superseded_through` gave remove(N) and
+    // install(N+1) the same value; that mechanism is gone — the fence is a
+    // publication generation now, and the two DO differ — but the latch stays,
+    // because "distinguishable today" is not a property a future fence change
+    // preserves. The removal's notification is guaranteed first: nothing installs
+    // until `reached` is observed. The captured fence is not read here; what this
+    // witness asserts about the transition is the artifact it must not destroy.
+    let (reached_rx, release_tx, _parked_fence) = park_first_grant_notification(&f.node);
 
     let remover = {
         let node = f.node.clone();
@@ -5763,27 +5777,13 @@ async fn a_delayed_install_notification_cannot_retire_a_successor_removal_artifa
     assert!(until(|| f.node.org_routing_ready()).await, "healthy");
     let family = f.node.org_routing_family().expect("family");
 
-    // Park the FIRST notification — the install's. A one-shot latch rather than a
-    // predicate on the movement, for the same reason as W-W6: the transitions are
-    // not reliably distinguishable by value, and the install's notification is
-    // guaranteed first because nothing removes until `reached` is observed.
-    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
-    {
-        let release_rx = release_rx.clone();
-        let parked = Arc::new(AtomicBool::new(false));
-        f.node.arm_grant_movement_hook(Arc::new(move |_movement| {
-            if parked.swap(true, Ordering::AcqRel) {
-                return;
-            }
-            let _ = reached_tx.try_send(());
-            release_rx
-                .lock()
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the witness must release the parked notification");
-        }));
-    }
+    // Park the FIRST notification — the install's. The shared one-shot latch
+    // rather than a predicate on the movement, for the same reason as W-W6: the
+    // transitions are not reliably distinguishable by value, and the install's
+    // notification is guaranteed first because nothing removes until `reached` is
+    // observed. The captured fence is not read here, for the same reason it is
+    // not in W-W6.
+    let (reached_rx, release_tx, _parked_fence) = park_first_grant_notification(&f.node);
 
     let installer = {
         let node = f.node.clone();
