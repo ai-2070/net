@@ -463,6 +463,7 @@ jobs:
           --test subnet_gateway_local_auth
           --test subnet_grant
           --test subnet_grant_hierarchy
+          --test subnet_org_boundary
           --test subnet_revocation
           --test subnet_route_hop_alloc
           --test subnet_session_auth
