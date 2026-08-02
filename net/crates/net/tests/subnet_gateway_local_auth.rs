@@ -21,7 +21,7 @@ use net::adapter::net::subnet::{
     ForwardDenial, SubnetAuthError, SubnetAuthorityConfig, SubnetBoundarySet, SubnetCredentialSet,
     SubnetFloorRegistry, SubnetGrant, SubnetRights, TopologySubnetId, VerifiedGatewayContext,
     VerifiedGatewayContextSet, VerifiedSubnetContext, MAX_GATEWAY_CONTEXTS_PER_AUTHORITY,
-    MAX_TRANSITION_PROBES,
+    MAX_TRANSITION_LOOKUPS,
 };
 
 const DAY: u64 = 24 * 60 * 60;
@@ -268,11 +268,11 @@ fn entries_dedupe_by_scope_and_take_the_tightest_expiry() {
     export.expires_at = now() + 3600;
 
     let set = gateway_set(&root, vec![route, export]);
-    assert_eq!(set.entries.len(), 1, "same scope collapses to one entry");
-    assert!(set.entries[0].rights.contains(SubnetRights::ROUTE));
-    assert!(set.entries[0].rights.contains(SubnetRights::EXPORT));
+    assert_eq!(set.entries().len(), 1, "same scope collapses to one entry");
+    assert!(set.entries()[0].rights.contains(SubnetRights::ROUTE));
+    assert!(set.entries()[0].rights.contains(SubnetRights::EXPORT));
     assert_eq!(
-        set.entries[0].expires_at,
+        set.entries()[0].expires_at,
         now() + 3600,
         "merged entry expires with the shortest-lived credential",
     );
@@ -291,16 +291,16 @@ fn stale_rights_do_not_accumulate_across_recompile() {
             gateway_entry(&root, &local, &[3], SubnetRights::EXPORT),
         ],
     );
-    assert!(both.entries[0].rights.contains(SubnetRights::EXPORT));
+    assert!(both.entries()[0].rights.contains(SubnetRights::EXPORT));
 
     // EXPORT credential revoked/expired: recompile from what remains.
     let after = gateway_set(
         &root,
         vec![gateway_entry(&root, &local, &[3], SubnetRights::ROUTE)],
     );
-    assert!(after.entries[0].rights.contains(SubnetRights::ROUTE));
+    assert!(after.entries()[0].rights.contains(SubnetRights::ROUTE));
     assert!(
-        !after.entries[0].rights.contains(SubnetRights::EXPORT),
+        !after.entries()[0].rights.contains(SubnetRights::EXPORT),
         "a rights bit must not survive the credential that granted it",
     );
 }
@@ -616,15 +616,21 @@ fn raw_entry(
     }
 }
 
-/// The reason the index exists: what a transition costs must not
+/// The reason the index exists: the *shape* of a transition must not
 /// depend on how much an operator provisioned.
 ///
 /// The same decision is evaluated against a two-entry gateway and a
 /// gateway holding the maximum, with the boundary inventory likewise
 /// padded. If evaluation still walked either collection, the wide case
-/// would probe more. It must not probe even one more.
+/// would issue more lookups. It must not issue even one more.
+///
+/// This pins lookup *calls*, not CPU cost. Each call is a binary
+/// search, so wider inventories still cost more comparisons inside a
+/// call — the claim being defended is that no linear credential or
+/// boundary scan survives on the packet path, not that forwarding is
+/// literally inventory-independent.
 #[test]
-fn transition_cost_is_independent_of_how_much_is_held() {
+fn lookup_count_does_not_grow_with_what_is_held() {
     let root = kp(1);
     let local = kp(9);
     let a = kp(2);
@@ -672,7 +678,7 @@ fn transition_cost_is_independent_of_how_much_is_held() {
         many_scopes.iter().map(|s| TopologySubnetId::new(s)),
     );
 
-    let baseline = narrow.authorize_transition_probed(&x, &y, &few, 0, 0, now());
+    let baseline = narrow.authorize_transition_counted(&x, &y, &few, 0, 0, now());
     assert_eq!(baseline.verdict, Ok(()), "the narrow gateway authorizes");
 
     for (label, set, bset) in [
@@ -680,13 +686,13 @@ fn transition_cost_is_independent_of_how_much_is_held() {
         ("wide boundaries", &narrow, &many),
         ("both wide", &wide, &many),
     ] {
-        let decision = set.authorize_transition_probed(&x, &y, bset, 0, 0, now());
+        let decision = set.authorize_transition_counted(&x, &y, bset, 0, 0, now());
         assert_eq!(
             decision.verdict, baseline.verdict,
             "{label}: the verdict must not change",
         );
         assert_eq!(
-            decision.probes, baseline.probes,
+            decision.lookup_calls, baseline.lookup_calls,
             "{label}: probes must not grow with what is held",
         );
     }
@@ -697,9 +703,9 @@ fn transition_cost_is_independent_of_how_much_is_held() {
 ///
 /// Deepest attachments, disjoint branches, identical endpoints, a
 /// boundary at every level of both chains — whichever branch the
-/// decision takes, it stays under [`MAX_TRANSITION_PROBES`].
+/// decision takes, it stays under [`MAX_TRANSITION_LOOKUPS`].
 #[test]
-fn probe_count_never_exceeds_the_advertised_bound() {
+fn lookup_count_never_exceeds_the_advertised_bound() {
     let root = kp(1);
     let local = kp(9);
     let a = kp(2);
@@ -762,13 +768,13 @@ fn probe_count_never_exceeds_the_advertised_bound() {
         for target in paths {
             let x = peer_ctx(&root, &a, source, &[], SubnetRights::ATTACH);
             let y = peer_ctx(&root, &b, target, &[], SubnetRights::ATTACH);
-            let decision = set.authorize_transition_probed(&x, &y, &bset, 0, 0, now());
+            let decision = set.authorize_transition_counted(&x, &y, &bset, 0, 0, now());
             assert!(
-                decision.probes <= MAX_TRANSITION_PROBES,
-                "{:?} -> {:?} cost {} probes, over the bound of {MAX_TRANSITION_PROBES}",
+                decision.lookup_calls <= MAX_TRANSITION_LOOKUPS,
+                "{:?} -> {:?} cost {} lookups, over the bound of {MAX_TRANSITION_LOOKUPS}",
                 source,
                 target,
-                decision.probes,
+                decision.lookup_calls,
             );
             // Both branches must actually be exercised, or the bound
             // is only proven for whichever one happened to run.
@@ -793,6 +799,13 @@ fn probe_count_never_exceeds_the_advertised_bound() {
 /// endpoints, boundary inventories, and held rights, the two must
 /// agree on every verdict — a faster decision that is a different
 /// decision is not an optimization.
+///
+/// The universe deliberately includes interior-zero paths (`3.0.7`,
+/// `3.0.9`). The first version of this oracle drew only from tidy
+/// `SubnetId::new` paths, and agreed with the reference everywhere
+/// *because both were being asked about inputs that never triggered the
+/// broken meet*. A differential test is only as good as its domain, and
+/// the domain here has to be what the wire decoders accept.
 #[test]
 fn the_index_decides_exactly_what_the_scan_decided() {
     fn reference(
@@ -808,7 +821,7 @@ fn the_index_decides_exactly_what_the_scan_decided() {
             }
             crossed_any = true;
             let satisfied = set
-                .entries
+                .entries()
                 .iter()
                 .any(|e| &e.scope == boundary && e.rights.contains(SubnetRights::EXPORT));
             if !satisfied {
@@ -818,7 +831,7 @@ fn the_index_decides_exactly_what_the_scan_decided() {
         if crossed_any {
             return Ok(());
         }
-        let routed = set.entries.iter().any(|e| {
+        let routed = set.entries().iter().any(|e| {
             e.rights.contains(SubnetRights::ROUTE)
                 && e.scope.is_ancestor_or_self_of(source)
                 && e.scope.is_ancestor_or_self_of(target)
@@ -844,12 +857,20 @@ fn the_index_decides_exactly_what_the_scan_decided() {
         &[3, 8],
         &[4],
         &[4, 1],
+        // Interior zeros: the shape the first version of this oracle
+        // could not see, and the one that widened authority.
+        &[3, 0, 7],
+        &[3, 0, 9],
     ];
     // Every scope that can appear as a boundary or as a held right.
     let scopes: Vec<TopologySubnetId> = universe
         .iter()
         .map(|p| TopologySubnetId::new(p))
         .collect::<Vec<_>>();
+    assert!(
+        scopes.contains(&TopologySubnetId::from_raw(0x03_00_07_00)),
+        "the differential domain must contain interior-zero paths",
+    );
 
     // A spread of boundary inventories, including none and all.
     let inventories: Vec<Vec<TopologySubnetId>> = vec![
@@ -931,6 +952,152 @@ fn the_index_decides_exactly_what_the_scan_decided() {
     );
 }
 
+/// Kyra's S4A-index RED: an interior zero in a path must not
+/// manufacture a boundary crossing, letting `EXPORT` stand in for
+/// `ROUTE`.
+///
+/// `3.0.7` is an ordinary constructible path — `SubnetId::new(&[3, 0,
+/// 7])`, and every wire decoder reaches the same value through
+/// `from_raw` with no canonical rejection. When `common_ancestor`
+/// stopped at the first zero it answered `3` for `3.0.7 ∧ 3.0.7`, so a
+/// transition between two *identical* attachments looked like it
+/// crossed a boundary declared at `3.0.7`. A gateway holding only
+/// `EXPORT(3.0.7)` was then authorized for a transition that requires
+/// `ROUTE` — authority widening produced by a path shape, with no
+/// credential involved and nothing revoked.
+///
+/// The previous meet witness built its universe from paths without
+/// interior zeros, which is exactly why it passed.
+#[test]
+fn interior_zero_paths_do_not_manufacture_a_crossing() {
+    let root = kp(1);
+    let local = kp(9);
+    let a = kp(2);
+    let b = kp(3);
+
+    let interior_zero = TopologySubnetId::new(&[3, 0, 7]);
+    assert_eq!(
+        interior_zero.raw(),
+        0x03_00_07_00,
+        "the path under test really does carry an interior zero",
+    );
+
+    let bset = SubnetBoundarySet::new(root.entity_id().clone(), 0, [interior_zero]);
+    // EXPORT at the boundary, and no ROUTE anywhere.
+    let set = gateway_set(
+        &root,
+        vec![raw_entry(
+            &root,
+            &local,
+            interior_zero,
+            SubnetRights::EXPORT,
+        )],
+    );
+
+    // Both peers attached at the SAME point. There is no such thing as
+    // crossing a boundary to reach yourself.
+    let x = peer_ctx(&root, &a, &[3, 0, 7], &[3], SubnetRights::ATTACH);
+    let y = peer_ctx(&root, &b, &[3, 0, 7], &[3], SubnetRights::ATTACH);
+
+    assert_eq!(
+        set.authorize_transition(&x, &y, &bset, 0, 0, now())
+            .unwrap_err(),
+        ForwardDenial::RouteMissing,
+        "an internal transition requires ROUTE; EXPORT must never substitute for it",
+    );
+
+    // Granting ROUTE at that scope is what actually authorizes it.
+    let routed = gateway_set(
+        &root,
+        vec![raw_entry(
+            &root,
+            &local,
+            interior_zero,
+            SubnetRights::EXPORT.union(SubnetRights::ROUTE),
+        )],
+    );
+    routed
+        .authorize_transition(&x, &y, &bset, 0, 0, now())
+        .expect("ROUTE at the attachment authorizes the internal transition");
+
+    // And a real crossing of that same boundary still needs EXPORT, so
+    // the repair did not simply stop detecting the boundary.
+    let outside = peer_ctx(&root, &b, &[3, 0, 9], &[3], SubnetRights::ATTACH);
+    set.authorize_transition(&x, &outside, &bset, 0, 0, now())
+        .expect("EXPORT authorizes a genuine crossing out of 3.0.7");
+    assert_eq!(
+        gateway_set(
+            &root,
+            vec![raw_entry(&root, &local, interior_zero, SubnetRights::ROUTE)],
+        )
+        .authorize_transition(&x, &outside, &bset, 0, 0, now())
+        .unwrap_err(),
+        ForwardDenial::ExportMissing,
+        "a genuine crossing still demands EXPORT",
+    );
+}
+
+/// Kyra's second S4A-index RED, structurally: removing authority must
+/// never leave authority active.
+///
+/// The forwarding decision consults a private compiled index; the
+/// entries, epochs and expiry it is derived from used to be public
+/// fields. Assigning an empty `entries` left the index still granting
+/// `ROUTE`, while the emptiness shortcut skipped the currency check —
+/// so clearing a gateway's authority *kept* it authorized.
+///
+/// The repair is that no field is independently assignable, which makes
+/// the original reproduction not compile. What remains testable is the
+/// property that motivated it: the only way to change a published set
+/// is to publish another one, and doing so with nothing in it
+/// authorizes nothing.
+#[test]
+fn removing_authority_never_leaves_authority_active() {
+    let root = kp(1);
+    let local = kp(9);
+    let a = kp(2);
+    let b = kp(3);
+    let bset = boundaries(&root, &[]);
+
+    let x = peer_ctx(&root, &a, &[3, 7, 1], &[3], SubnetRights::ATTACH);
+    let y = peer_ctx(&root, &b, &[3, 7, 2], &[3], SubnetRights::ATTACH);
+
+    let granted = gateway_set(
+        &root,
+        vec![raw_entry(
+            &root,
+            &local,
+            TopologySubnetId::new(&[3]),
+            SubnetRights::ROUTE,
+        )],
+    );
+    granted
+        .authorize_transition(&x, &y, &bset, 0, 0, now())
+        .expect("ROUTE(3) authorizes the internal transition");
+    assert_eq!(granted.entries().len(), 1);
+
+    // Republishing with nothing revokes completely: the derived index
+    // is rebuilt from the same input, so there is no stale half left
+    // behind to keep answering.
+    let cleared = gateway_set(&root, vec![]);
+    assert!(cleared.entries().is_empty());
+    assert_eq!(
+        cleared
+            .authorize_transition(&x, &y, &bset, 0, 0, now())
+            .unwrap_err(),
+        ForwardDenial::RouteMissing,
+        "a set with no entries must grant nothing",
+    );
+
+    // `entries()` hands out a shared slice, never a mutable handle, so
+    // a diagnostic reader cannot become a writer.
+    let observed: &[VerifiedGatewayContext] = granted.entries();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(granted.topology_epoch(), 0);
+    assert_eq!(granted.subnet_auth_epoch(), 0);
+    assert!(granted.earliest_expiry() > now());
+}
+
 /// The set folds epochs across its entries so the packet path can
 /// check currency without walking them. That fold is only sound if the
 /// entries agree, so a mixed set is refused at publication rather than
@@ -1009,9 +1176,9 @@ fn entries_from_different_epochs_cannot_be_published_as_one_set() {
             short,
         ],
     );
-    assert_eq!(set.earliest_expiry, now() + 60);
-    assert_eq!(set.topology_epoch, 0);
-    assert_eq!(set.subnet_auth_epoch, 0);
+    assert_eq!(set.earliest_expiry(), now() + 60);
+    assert_eq!(set.topology_epoch(), 0);
+    assert_eq!(set.subnet_auth_epoch(), 0);
 
     // And that fold denies once the shortest-lived credential lapses,
     // even though the other entry is still valid.

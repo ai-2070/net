@@ -161,9 +161,18 @@ pub fn compute_tag(
 ///
 /// The envelope is fixed-overhead, so a forwarder can size — or reuse
 /// — a buffer before it has done any work.
+///
+/// Saturating rather than wrapping. Real packets are bounded well below
+/// this by `MAX_PACKET_SIZE`, so the difference is unreachable in
+/// production, but an unchecked `+` on a public helper panics in debug
+/// builds and wraps in release ones for pathological lengths — and a
+/// wrapped length would be a *small* number, which [`seal_into`] would
+/// then happily accept as a fitting buffer. Saturating turns that into
+/// `usize::MAX`, which no buffer satisfies, so the failure direction is
+/// `BufferTooSmall`.
 #[inline]
 pub const fn sealed_len(inner_len: usize) -> usize {
-    ROUTE_HOP_OVERHEAD + ROUTING_HEADER_SIZE + inner_len
+    (ROUTE_HOP_OVERHEAD + ROUTING_HEADER_SIZE).saturating_add(inner_len)
 }
 
 /// Serialize an authenticated hop envelope into a caller-owned buffer,

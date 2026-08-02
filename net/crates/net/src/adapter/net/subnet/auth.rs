@@ -1493,6 +1493,12 @@ impl GatewayScopeIndex {
         }
     }
 
+    /// Whether this index grants anything at all.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.by_scope.is_empty()
+    }
+
     /// Rights held at **exactly** `scope`, if any. One probe.
     ///
     /// Deliberately exact rather than containment-aware: containment
@@ -1514,43 +1520,59 @@ impl GatewayScopeIndex {
 /// Everything the packet path needs is precomputed here: the scope
 /// index, and the epochs and earliest expiry folded across every entry
 /// so currency is a constant-time comparison rather than a walk.
+///
+/// # Every field is private, deliberately
+///
+/// The index is derived from `entries`, and the epochs and expiry are
+/// folded from them. Any field left publicly writable lets those views
+/// disagree — and the failure is not symmetric. Assigning an empty
+/// `entries` used to leave the compiled index still granting `ROUTE`
+/// while the emptiness shortcut skipped the currency check, so
+/// *removing* authority left authority active. Publication replaces the
+/// whole value; nothing here is independently assignable, and the
+/// accessors are read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedGatewayContextSet {
     /// Authority every entry belongs to.
-    pub authority: EntityId,
+    authority: EntityId,
     /// Compiled entries. Immutable once published; refresh and
     /// revocation recompute the whole set atomically rather than
     /// mutating entries, so stale rights can never accumulate.
-    pub entries: Box<[VerifiedGatewayContext]>,
+    entries: Box<[VerifiedGatewayContext]>,
     /// Topology epoch shared by every entry.
-    pub topology_epoch: u32,
+    topology_epoch: u32,
     /// Authority auth epoch shared by every entry.
-    pub subnet_auth_epoch: u64,
+    subnet_auth_epoch: u64,
     /// Tightest expiry across every entry. The whole set stops
     /// authorizing when the shortest-lived credential in it does —
     /// checking the minimum is exactly checking all of them.
-    pub earliest_expiry: u64,
-    /// Off-path scope index. Private: it is derived state, and a
-    /// caller able to supply its own could desynchronize it from
-    /// `entries` and silently grant rights no credential carries.
+    earliest_expiry: u64,
+    /// Off-path scope index, and the thing that actually authorizes.
     index: GatewayScopeIndex,
 }
 
-/// Ceiling on index probes for one protected transition, and the
-/// reason forwarding cost cannot be inflated by provisioning.
+/// Ceiling on indexed lookups for one protected transition.
 ///
 /// A boundary can only separate the two attachments if it lies on one
 /// of their ancestor chains strictly below their common ancestor, so
-/// there are at most `MAX_DEPTH` boundary probes per endpoint, plus at
-/// most one `EXPORT` probe per boundary actually crossed:
+/// there are at most `MAX_DEPTH` boundary lookups per endpoint, plus at
+/// most one `EXPORT` lookup per boundary actually crossed:
 /// `4 × MAX_DEPTH`. The internal-`ROUTE` path is strictly cheaper —
-/// `2 × MAX_DEPTH` boundary probes and at most `MAX_ANCESTOR_PATH`
-/// `ROUTE` probes — so this bounds both branches.
+/// `2 × MAX_DEPTH` boundary lookups and at most `MAX_ANCESTOR_PATH`
+/// `ROUTE` lookups — so this bounds both branches.
 ///
-/// Every term is a hierarchy constant. Neither the number of grants a
-/// gateway holds nor the number of boundaries an operator declares
-/// appears anywhere in it.
-pub const MAX_TRANSITION_PROBES: u32 = 4 * MAX_DEPTH as u32;
+/// # What this does and does not claim
+///
+/// It counts **lookup calls**, not comparisons or memory accesses.
+/// Each call is a binary search, so the real work is about
+/// `MAX_DEPTH × log(boundary_count)` plus
+/// `MAX_DEPTH × log(grant_count)`. The honest claim is therefore: a
+/// depth-bounded number of indexed lookups, with no linear credential
+/// or boundary scan anywhere on the packet path. It is *not* a claim
+/// of literal inventory-independent CPU cost — the grant count is
+/// capped by [`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`], but the boundary
+/// inventory is currently uncapped, so its logarithm is real.
+pub const MAX_TRANSITION_LOOKUPS: u32 = 4 * MAX_DEPTH as u32;
 
 /// The mandatory inventory of protected boundaries for one authority.
 ///
@@ -1651,21 +1673,53 @@ pub enum ForwardDenial {
     RouteMissing,
 }
 
-/// A transition verdict together with the number of index probes it
+/// A transition verdict together with the number of indexed lookups it
 /// cost.
 ///
-/// The probe count exists so the bound in [`MAX_TRANSITION_PROBES`] is
+/// The count exists so the bound in [`MAX_TRANSITION_LOOKUPS`] is
 /// *observable* rather than asserted in prose: a test can pin that
 /// evaluating the same transition against a two-entry gateway and a
-/// thirty-two-entry gateway costs identically. It is a `u32` counter
-/// on a path that already does keyed hashing per packet.
+/// thirty-two-entry gateway issues the same number of lookups. It is a
+/// `u32` counter on a path that already does keyed hashing per packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransitionDecision {
     /// Authorized, or why not.
     pub verdict: Result<(), ForwardDenial>,
-    /// Index probes performed — never more than
-    /// [`MAX_TRANSITION_PROBES`].
-    pub probes: u32,
+    /// Index lookup calls performed — never more than
+    /// [`MAX_TRANSITION_LOOKUPS`]. Each is a binary search, so this is
+    /// a count of calls, not of comparisons.
+    pub lookup_calls: u32,
+}
+
+impl VerifiedGatewayContextSet {
+    /// Authority every entry belongs to.
+    pub fn authority(&self) -> &EntityId {
+        &self.authority
+    }
+
+    /// The compiled entries, for diagnostics and operator display.
+    ///
+    /// Read-only on purpose: the forwarding decision consults the
+    /// derived index, not this slice, and letting a caller replace it
+    /// would let the two disagree.
+    pub fn entries(&self) -> &[VerifiedGatewayContext] {
+        &self.entries
+    }
+
+    /// Topology epoch shared by every entry.
+    pub fn topology_epoch(&self) -> u32 {
+        self.topology_epoch
+    }
+
+    /// Authority auth epoch shared by every entry.
+    pub fn subnet_auth_epoch(&self) -> u64 {
+        self.subnet_auth_epoch
+    }
+
+    /// Tightest expiry across every entry.
+    pub fn earliest_expiry(&self) -> u64 {
+        self.earliest_expiry
+    }
 }
 
 impl VerifiedGatewayContextSet {
@@ -1688,10 +1742,9 @@ impl VerifiedGatewayContextSet {
     /// demanded regardless of what any wider entry permits. Crossing
     /// two declared sibling boundaries needs `EXPORT` for both.
     ///
-    /// Cost is bounded by the hierarchy, not the operator's grant
-    /// count — see [`Self::authorize_transition_probed`], which is
-    /// this method plus the probe count that makes the bound
-    /// checkable.
+    /// Cost is bounded by the hierarchy depth rather than by a linear
+    /// scan — see [`Self::authorize_transition_counted`], which is this
+    /// method plus the lookup count that makes the bound checkable.
     pub fn authorize_transition(
         &self,
         ingress: &VerifiedSubnetContext,
@@ -1701,7 +1754,7 @@ impl VerifiedGatewayContextSet {
         current_subnet_auth_epoch: u64,
         now_secs: u64,
     ) -> Result<(), ForwardDenial> {
-        self.authorize_transition_probed(
+        self.authorize_transition_counted(
             ingress,
             egress,
             boundaries,
@@ -1712,19 +1765,23 @@ impl VerifiedGatewayContextSet {
         .verdict
     }
 
-    /// [`Self::authorize_transition`], reporting how many index probes
-    /// the decision cost.
+    /// [`Self::authorize_transition`], reporting how many indexed
+    /// lookups the decision cost.
     ///
     /// Neither the entry array nor the boundary inventory is walked.
-    /// Both are keyed by exact scope and probed only at the paths that
-    /// can possibly matter: a boundary separates the two attachments
-    /// only if it lies on one of their ancestor chains strictly below
-    /// their common ancestor, and a scope contains both attachments
-    /// only if it contains their common ancestor. Those two facts turn
-    /// "search what I hold" into "look up what I hold here", which is
-    /// what keeps [`MAX_TRANSITION_PROBES`] free of any provisioning
-    /// term.
-    pub fn authorize_transition_probed(
+    /// Both are keyed by exact scope and consulted only at the paths
+    /// that can possibly matter: a boundary separates the two
+    /// attachments only if it lies on one of their ancestor chains
+    /// strictly below their common ancestor, and a scope contains both
+    /// attachments only if it contains their common ancestor. Those two
+    /// facts turn "search what I hold" into "look up what I hold here".
+    ///
+    /// Both facts rest on [`TopologySubnetId::common_ancestor`] being
+    /// the true meet of the containment order over the **raw** path
+    /// domain, interior zeros included — when it was not, a transition
+    /// between two identical attachments could appear to cross a
+    /// boundary and let `EXPORT` stand in for `ROUTE`.
+    pub fn authorize_transition_counted(
         &self,
         ingress: &VerifiedSubnetContext,
         egress: &VerifiedSubnetContext,
@@ -1735,7 +1792,7 @@ impl VerifiedGatewayContextSet {
     ) -> TransitionDecision {
         let refuse = |denial| TransitionDecision {
             verdict: Err(denial),
-            probes: 0,
+            lookup_calls: 0,
         };
 
         if boundaries.authority != self.authority
@@ -1761,9 +1818,14 @@ impl VerifiedGatewayContextSet {
         // Local currency, in constant time. The epochs and the tightest
         // expiry were folded across every entry at publication, so a
         // stale credential is caught by three comparisons rather than
-        // by walking the set looking for one. An empty set has nothing
-        // to be stale and denies below on rights instead.
-        if !self.entries.is_empty()
+        // by walking the set looking for one.
+        //
+        // The emptiness test reads the INDEX, not `entries`: the index
+        // is what grants rights below, so the thing that authorizes and
+        // the thing that gates currency are the same object. (Both are
+        // private and built together, so they cannot disagree — this is
+        // belt and braces for the direction that fails open.)
+        if !self.index.is_empty()
             && (self.topology_epoch != current_topology_epoch
                 || self.subnet_auth_epoch != current_subnet_auth_epoch
                 || now_secs >= self.earliest_expiry)
@@ -1774,7 +1836,7 @@ impl VerifiedGatewayContextSet {
         let source = ingress.attachment;
         let target = egress.attachment;
         let common = source.common_ancestor(target);
-        let mut probes = 0u32;
+        let mut lookup_calls = 0u32;
 
         // Boundaries come from the declared inventory, so a crossing
         // stays a crossing whether or not a credential satisfies it.
@@ -1783,14 +1845,20 @@ impl VerifiedGatewayContextSet {
         // path containing both endpoints contains `common` and so is
         // at or above it, and a path containing neither is on no chain
         // at all. Either way it is not crossed, so it is not worth a
-        // probe.
+        // lookup.
+        //
+        // When the two attachments are equal, `common` is the
+        // attachment itself and both loops terminate immediately —
+        // there is no such thing as crossing a boundary to reach
+        // yourself, and treating one as crossed is exactly how EXPORT
+        // came to substitute for ROUTE.
         let mut crossed_any = false;
         for endpoint in [source, target] {
             for scope in endpoint.ancestor_path() {
                 if scope == common {
                     break;
                 }
-                probes += 1;
+                lookup_calls += 1;
                 if !boundaries.is_boundary(scope) {
                     continue;
                 }
@@ -1798,7 +1866,7 @@ impl VerifiedGatewayContextSet {
                 // EXPORT must be held at exactly the crossed scope. A
                 // wider EXPORT elsewhere is authority over a different
                 // boundary, not this one.
-                probes += 1;
+                lookup_calls += 1;
                 let exports = self
                     .index
                     .rights_at(scope)
@@ -1806,7 +1874,7 @@ impl VerifiedGatewayContextSet {
                 if !exports {
                     return TransitionDecision {
                         verdict: Err(ForwardDenial::ExportMissing),
-                        probes,
+                        lookup_calls,
                     };
                 }
             }
@@ -1814,7 +1882,7 @@ impl VerifiedGatewayContextSet {
         if crossed_any {
             return TransitionDecision {
                 verdict: Ok(()),
-                probes,
+                lookup_calls,
             };
         }
 
@@ -1822,7 +1890,7 @@ impl VerifiedGatewayContextSet {
         // and carry ROUTE. A scope contains both iff it contains their
         // common ancestor, so the candidates are one chain, not two.
         for scope in common.ancestor_path() {
-            probes += 1;
+            lookup_calls += 1;
             let routes = self
                 .index
                 .rights_at(scope)
@@ -1830,13 +1898,13 @@ impl VerifiedGatewayContextSet {
             if routes {
                 return TransitionDecision {
                     verdict: Ok(()),
-                    probes,
+                    lookup_calls,
                 };
             }
         }
         TransitionDecision {
             verdict: Err(ForwardDenial::RouteMissing),
-            probes,
+            lookup_calls,
         }
     }
 }

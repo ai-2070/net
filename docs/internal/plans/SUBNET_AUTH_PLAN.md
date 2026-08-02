@@ -943,14 +943,31 @@ looks rights up and checks currency without walking anything.
 One transition enumerates only the source and target ancestor paths, and only
 the part of them strictly below the two attachments' common ancestor — a
 boundary above that point contains both endpoints and so cannot separate them.
-The ceiling is `MAX_TRANSITION_PROBES = 4 * TopologySubnetId::MAX_DEPTH`,
-currently sixteen: at most `MAX_DEPTH` boundary probes per endpoint plus at most
-one `EXPORT` probe per boundary actually crossed. The internal-`ROUTE` branch is
-cheaper — at most `2 * MAX_DEPTH` boundary probes plus `MAX_DEPTH + 1` `ROUTE`
-probes. No term in either bound mentions how many grants a gateway holds or how
-many boundaries an operator declares; `authorize_transition_probed` reports the
-count so this is pinned by test rather than asserted here, and the boundary
-inventory is likewise probed by exact path rather than scanned.
+The ceiling is `MAX_TRANSITION_LOOKUPS = 4 * TopologySubnetId::MAX_DEPTH`,
+currently sixteen: at most `MAX_DEPTH` boundary lookups per endpoint plus at
+most one `EXPORT` lookup per boundary actually crossed. The internal-`ROUTE`
+branch is cheaper — at most `2 * MAX_DEPTH` boundary lookups plus
+`MAX_DEPTH + 1` `ROUTE` lookups. `authorize_transition_counted` reports the
+count so this is pinned by test rather than asserted here.
+
+That constant counts **lookup calls, not CPU cost**. Each call is a binary
+search, so the real work is about `MAX_DEPTH * log(boundary_count)` plus
+`MAX_DEPTH * log(grant_count)`. The grant count is capped by
+`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`; the boundary inventory is not capped
+today, so its logarithm is real. The claim this design supports is therefore a
+depth-bounded number of indexed lookups with no linear credential or boundary
+scan on the packet path — not literal inventory-independent forwarding cost.
+
+Both reductions rest on `TopologySubnetId::common_ancestor` being the true meet
+of the containment order over the **raw** path domain. Interior zeros (`3.0.7`)
+are constructible and every wire decoder reaches them through `from_raw` with no
+canonical rejection, so a meet that stopped at the first zero level reported
+`3.0.7 ∧ 3.0.7 = 3`. A transition between two identical attachments then
+appeared to cross a boundary declared at `3.0.7`, and a gateway holding only
+`EXPORT(3.0.7)` was authorized for an internal transition requiring `ROUTE` —
+authority widening produced by a path shape, with no credential involved.
+Differential and containment oracles must therefore draw from raw paths, not
+from the tidy subset a canonical constructor makes convenient.
 
 A self-challenge adds no security because the process already holds the private
 key; remote session contexts may never be silently reused as local gateway
@@ -1100,10 +1117,24 @@ by default.
 Successful packet forwarding does not allocate or emit a verbose record per
 packet; counters and sampled structured events cover the success path. The
 sealing primitive writes into a caller-owned buffer (`route_hop::seal_into`,
-sized by `sealed_len`) and the relay holds one per worker, so the steady state
-allocates nothing; `tests/subnet_route_hop_alloc.rs` counts real allocator calls
-through a global allocator rather than trusting the signature, since a
-`seal_into` that built a `Vec` internally would type-check identically.
+sized by `sealed_len`) and the relay holds one **fixed-capacity** array per
+worker, sized at compile time for `MAX_PACKET_SIZE`. A growable buffer is not
+sufficient: it still calls the allocator on its first packet and again at every
+new high-water mark, and both are inside forwarding.
+`tests/subnet_route_hop_alloc.rs` counts real allocator calls through a global
+allocator rather than trusting the signature, since a `seal_into` that built a
+`Vec` internally would type-check identically. That witness covers the
+primitive, not the production branch; a production-path allocation witness is
+owed when the E2E relay harness lands, because nothing today would catch
+`relay_protected_hop` regressing to the allocating API.
+
+Forwarding sheds load by **dropping**. When the egress socket is not ready the
+hop is dropped and counted. Copying the datagram onto the heap and spawning a
+task to await the send converts downstream congestion into unbounded heap and
+scheduler pressure at exactly the moment the node should be shedding it, and an
+authenticated peer able to keep the socket blocked could grow that queue without
+limit. If queuing is ever wanted here it must be an explicitly bounded
+worker-owned ring, never one spawned task per datagram.
 
 ## 5. Implementation slices
 

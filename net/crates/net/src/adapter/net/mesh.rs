@@ -1628,6 +1628,17 @@ struct DispatchCtx {
     auth_throttle_duration: Duration,
 }
 
+/// Capacity of the per-worker protected-forwarding buffer.
+///
+/// An inbound datagram is bounded by [`protocol::MAX_PACKET_SIZE`], so
+/// the largest envelope this node can ever re-emit is that plus the
+/// fixed route-hop overhead. Sizing for the maximum up front is what
+/// makes the buffer genuinely allocation-free: a `Vec` that grew on
+/// demand still called the allocator on its first packet and again at
+/// every new high-water mark, which is inside the forwarding path.
+const PROTECTED_FORWARD_BUF_SIZE: usize =
+    super::subnet::route_hop::sealed_len(protocol::MAX_PACKET_SIZE);
+
 thread_local! {
     /// Reusable serialization buffer for protected forwarding
     /// (SUBNET_AUTH_PLAN.md D6).
@@ -1637,12 +1648,16 @@ thread_local! {
     /// work happens, so there is nothing an owned `Vec` per packet buys
     /// beyond an allocator round trip and a cold destination line.
     ///
+    /// A fixed array, not a growable `Vec`: `const`-initialized storage
+    /// with no heap behind it cannot allocate on any packet, first or
+    /// otherwise. It costs one fixed allotment per worker thread.
+    ///
     /// Thread-local rather than a shared pool: the buffer is borrowed
-    /// for the length of one `seal_into` plus one non-blocking
-    /// `try_send_to` and never across an await, so there is no
-    /// contention to manage and no lock to hold. It grows to the
-    /// largest envelope this worker has forwarded and then stops.
-    static FORWARD_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// for one `seal_into` plus one non-blocking `try_send_to` and
+    /// never across an await, so there is no contention to manage and
+    /// no lock to hold.
+    static FORWARD_BUF: std::cell::RefCell<[u8; PROTECTED_FORWARD_BUF_SIZE]> =
+        const { std::cell::RefCell::new([0u8; PROTECTED_FORWARD_BUF_SIZE]) };
 }
 
 /// Result passed through the pending-ack oneshot.
@@ -16066,7 +16081,7 @@ impl MeshNode {
         }
 
         let epoch = ctx.subnet_topology_epoch.load(Ordering::Acquire);
-        let auth_epoch = ctx.subnet_floors.auth_epoch(&local_set.authority);
+        let auth_epoch = ctx.subnet_floors.auth_epoch(local_set.authority());
         let now = super::subnet::admission::unix_now_secs();
 
         // (3) Ingress attachment — from the admitted context on the
@@ -16135,40 +16150,39 @@ impl MeshNode {
         }
 
         // (6) Authorized. Mutate only the outer routing header, then
-        // re-tag for the next authenticated hop, into a buffer this
-        // worker keeps across packets. Forwarding is the one path here
-        // that runs per packet per hop, so a fresh `Vec` on it is an
-        // allocator round trip and a cold cache line between a packet
-        // arriving and leaving.
+        // re-tag for the next authenticated hop, into this worker's
+        // fixed buffer. Forwarding is the one path here that runs per
+        // packet per hop, so a fresh `Vec` on it is an allocator round
+        // trip and a cold cache line between a packet arriving and
+        // leaving.
         let mut fwd_header = opened.header;
         fwd_header.forward();
         FORWARD_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
-            let needed = super::subnet::route_hop::sealed_len(opened.inner.len());
-            if buf.len() < needed {
-                // Grows to a high-water mark and stays there; a relay
-                // sees the same MTU forever, so this settles after the
-                // first few packets.
-                buf.resize(needed, 0);
-            }
-            let Ok(n) =
-                egress_session.seal_route_hop_into(&mut buf[..needed], &fwd_header, opened.inner)
+            // Sized for MAX_PACKET_SIZE at compile time, so this cannot
+            // fail for anything the socket can deliver. Refuse rather
+            // than grow: growing here would allocate on the packet path,
+            // which is what the fixed buffer exists to prevent.
+            let Ok(n) = egress_session.seal_route_hop_into(&mut buf[..], &fwd_header, opened.inner)
             else {
                 return;
             };
-            match ctx.socket.try_send_to(&buf[..n], egress_addr) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Socket is full right now. Only here do we pay for
-                    // an owned copy, because the borrow cannot outlive
-                    // this frame.
-                    let owned = buf[..n].to_vec();
-                    let socket = ctx.socket.clone();
-                    tokio::spawn(async move {
-                        let _ = socket.send_to(&owned, egress_addr).await;
-                    });
-                }
-                Err(_) => {}
+            // UDP forwarding sheds load by dropping. A full egress
+            // socket means the far side is already behind, and the
+            // alternative — copying the datagram onto the heap and
+            // spawning a task to await the send — converts downstream
+            // congestion into unbounded heap and scheduler pressure at
+            // exactly the moment this node should be shedding it. An
+            // authenticated peer could hold the socket blocked and make
+            // that queue grow without limit. If queuing is ever wanted
+            // here it has to be an explicitly bounded worker-owned ring,
+            // not one spawned task per datagram.
+            if let Err(e) = ctx.socket.try_send_to(&buf[..n], egress_addr) {
+                tracing::debug!(
+                    egress = format!("{egress_node:#x}"),
+                    reason = %e,
+                    "subnet: dropping authorized hop, egress socket not ready",
+                );
             }
         });
     }

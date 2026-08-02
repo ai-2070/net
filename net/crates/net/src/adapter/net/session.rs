@@ -1925,6 +1925,62 @@ mod tests {
         }
     }
 
+    /// A refused seal must not consume a hop sequence.
+    ///
+    /// `seal_route_hop_into` takes the next sequence with a
+    /// `fetch_add`, which is not undoable. Checking capacity after
+    /// taking it would burn a sequence number on a purely local sizing
+    /// mistake, opening a gap in this edge's sequence space that the
+    /// peer's replay window then has to absorb for no reason. The
+    /// capacity check therefore runs first, and this pins that ordering
+    /// by observing the sequence actually emitted.
+    #[test]
+    fn a_refused_seal_does_not_consume_a_hop_sequence() {
+        use super::super::route::RoutingHeader;
+        use super::super::subnet::route_hop::{parse_prefix, sealed_len, RouteHopError};
+
+        let session = NetSession::new(test_keys(), "127.0.0.1:9999".parse().unwrap(), 4, false);
+        let header = RoutingHeader::new(0xDEAD_BEEF, 0x1234, 8);
+        let inner = b"an inner packet the relay never looks inside";
+        let needed = sealed_len(inner.len());
+
+        // Burn sequence 0 so the test is about the *next* one rather
+        // than about a fresh counter reading zero either way.
+        let mut ok_buf = vec![0u8; needed];
+        session
+            .seal_route_hop_into(&mut ok_buf, &header, inner)
+            .expect("exact size fits");
+        assert_eq!(sequence_of(&ok_buf), 0);
+
+        // Several refusals, each one byte short of enough.
+        for short in [0usize, 1, needed - 1] {
+            let mut tiny = vec![0u8; short];
+            assert_eq!(
+                session.seal_route_hop_into(&mut tiny, &header, inner),
+                Err(RouteHopError::BufferTooSmall),
+                "a {short}-byte buffer must be refused",
+            );
+        }
+
+        // The next accepted seal gets sequence 1, not 4.
+        let mut next_buf = vec![0u8; needed];
+        session
+            .seal_route_hop_into(&mut next_buf, &header, inner)
+            .expect("exact size fits");
+        assert_eq!(
+            sequence_of(&next_buf),
+            1,
+            "refused seals must not advance the hop sequence",
+        );
+
+        fn sequence_of(buf: &[u8]) -> u64 {
+            // The sequence sits in the prefix; read it back off the
+            // wire rather than trusting an internal counter.
+            parse_prefix(buf).expect("a sealed envelope parses");
+            u64::from_le_bytes(buf[10..18].try_into().expect("8 bytes"))
+        }
+    }
+
     #[test]
     fn test_session_creation() {
         let keys = test_keys();

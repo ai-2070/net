@@ -28,7 +28,7 @@ pub use auth::{
     SubnetCredentialSet, SubnetFloorRegistry, SubnetGrant, SubnetIssuerGrant, SubnetRef,
     SubnetRevocationFloor, SubnetRights, TransitionDecision, VerifiedGatewayContext,
     VerifiedGatewayContextSet, VerifiedSubnetAuthority, VerifiedSubnetContext,
-    MAX_GATEWAY_CONTEXTS_PER_AUTHORITY, MAX_TRANSITION_PROBES,
+    MAX_GATEWAY_CONTEXTS_PER_AUTHORITY, MAX_TRANSITION_LOOKUPS,
 };
 pub use error::SubnetError;
 pub use gateway::{DropReason, ForwardDecision, SubnetGateway};

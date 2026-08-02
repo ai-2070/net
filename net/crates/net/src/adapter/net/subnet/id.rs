@@ -236,15 +236,30 @@ impl SubnetId {
     /// is what bounds a two-endpoint containment question to one
     /// ancestor chain instead of two.
     ///
-    /// A zero level terminates the comparison rather than matching,
-    /// because zero means "level unset", not "level equal to zero".
+    /// # Interior zeros
+    ///
+    /// Comparison runs to `min(depth, other.depth())` and compares
+    /// levels for equality — a zero level inside that span matches
+    /// another zero and does **not** terminate the walk. `3.0.7` is a
+    /// real, constructible path (`SubnetId::new(&[3, 0, 7])`, and every
+    /// wire decoder reaches it through [`Self::from_raw`]), and its
+    /// significant length is three.
+    ///
+    /// Stopping at the first zero instead broke the containment
+    /// reduction above: `common_ancestor(3.0.7, 3.0.7)` answered `3`
+    /// rather than `3.0.7`, which made a transition between two
+    /// *identical* attachments look like it crossed a boundary at
+    /// `3.0.7`. A gateway holding only `EXPORT(3.0.7)` was then
+    /// authorized for an internal transition that requires `ROUTE` —
+    /// authority widening from a path shape, with no credential
+    /// involved. See `interior_zero_paths_do_not_manufacture_a_crossing`.
     pub fn common_ancestor(self, other: Self) -> Self {
+        // Bounded by the shallower significant length: beyond it, one
+        // side is unset rather than zero-valued, and "unset" is not a
+        // match.
+        let limit = self.depth().min(other.depth());
         let mut d = 0u8;
-        while d < MAX_DEPTH {
-            let (a, b) = (self.level(d), other.level(d));
-            if a == 0 || b == 0 || a != b {
-                break;
-            }
+        while d < limit && self.level(d) == other.level(d) {
             d += 1;
         }
         Self(self.0 & Self::mask_for_depth(d))
@@ -602,6 +617,92 @@ mod tests {
                 assert!(a.ancestor_path().any(|s| s == meet));
                 assert!(b.ancestor_path().any(|s| s == meet));
             }
+        }
+    }
+
+    /// The meet property over the **raw** path domain, not just the
+    /// tidy paths a test author reaches for.
+    ///
+    /// The previous suite built its universe from `SubnetId::new` with
+    /// no interior zeros, so it never contained `3.0.7` — and the meet
+    /// was wrong for exactly those paths. Every decoder on the wire
+    /// side (`SubnetGrant`, `SubnetIssuerGrant`, `SubnetRevocationFloor`,
+    /// `SubnetAuthPresentation`) reaches `from_raw` without canonical
+    /// rejection, so this domain is what the security surface actually
+    /// accepts.
+    ///
+    /// Exhaustive over a 3-value alphabet at every level: 81 paths,
+    /// 6561 pairs, 531 441 containment triples.
+    #[test]
+    fn the_meet_property_holds_over_raw_paths_including_interior_zeros() {
+        let alphabet = [0u8, 3, 7];
+        let mut universe = Vec::with_capacity(81);
+        for &a in &alphabet {
+            for &b in &alphabet {
+                for &c in &alphabet {
+                    for &d in &alphabet {
+                        universe.push(SubnetId::from_raw(
+                            (a as u32) << 24 | (b as u32) << 16 | (c as u32) << 8 | (d as u32),
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(universe.len(), 81);
+        assert!(
+            universe.contains(&SubnetId::from_raw(0x03_00_07_00)),
+            "the domain must include the interior-zero path that broke the meet",
+        );
+
+        for &a in &universe {
+            for &b in &universe {
+                let meet = a.common_ancestor(b);
+                assert_eq!(meet, b.common_ancestor(a), "commutative: {a} ∧ {b}");
+                // The load-bearing reduction: containing both endpoints
+                // and containing their meet must be the same predicate,
+                // or the forwarding decision is asking a different
+                // question than it believes it is.
+                for &scope in &universe {
+                    let contains_both =
+                        scope.is_ancestor_or_self_of(a) && scope.is_ancestor_or_self_of(b);
+                    assert_eq!(
+                        contains_both,
+                        scope.is_ancestor_or_self_of(meet),
+                        "scope {scope} vs {a}/{b} (meet {meet})",
+                    );
+                }
+                // The probe loop walks each endpoint's chain and stops
+                // at the meet, so the meet has to actually be on both.
+                assert!(
+                    a.ancestor_path().any(|s| s == meet),
+                    "meet {meet} missing from the chain of {a}",
+                );
+                assert!(
+                    b.ancestor_path().any(|s| s == meet),
+                    "meet {meet} missing from the chain of {b}",
+                );
+            }
+        }
+    }
+
+    /// A path is its own meet. Trivial, and false before the interior
+    /// zero repair: `3.0.7 ∧ 3.0.7` answered `3`.
+    #[test]
+    fn a_path_is_its_own_common_ancestor() {
+        for raw in [
+            0x00_00_00_00u32,
+            0x03_00_00_00,
+            0x03_00_07_00,
+            0x03_00_00_09,
+            0x00_00_00_09,
+            0x03_07_02_05,
+        ] {
+            let id = SubnetId::from_raw(raw);
+            assert_eq!(
+                id.common_ancestor(id),
+                id,
+                "{id} ({raw:#010x}) must be its own meet",
+            );
         }
     }
 
