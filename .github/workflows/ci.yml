@@ -443,7 +443,7 @@ jobs:
 
       # === Net mesh + capability + discovery + migration + nRPC dispatch ==
       # All --features net tests share one compile.
-      - name: Net mesh, capability, migration, nRPC dispatch
+      - name: Net mesh, capability, subnets, migration, nRPC dispatch
         if: ${{ !cancelled() }}
         run: >
           cargo nextest run --no-fail-fast --no-tests=fail --features "net fixtures"
