@@ -132,7 +132,10 @@ which is exactly the doctrinal line this plan draws.
   *more* privileged than resolved ones — a warning, not a failure.
 - `Visibility::Exported` is unsatisfiable on the subscribe path
   (`subnet_visible` hard-codes `false`, `mesh.rs:24675`) and the export
-  table is consulted only by dead code (§1.5).
+  table is consulted only by dead code (§1.5). **Closed in S4B**: the
+  subscribe gate and publish fan-out now resolve the gateway's export
+  table and admit exactly the declared targets, an absent or empty rule
+  denying and an underivable peer subnet staying closed.
 
 So today visibility is *worse* than a routing filter: it is presented as
 an authorization verdict (`Unauthorized`) while being computed from
@@ -1379,7 +1382,22 @@ disabled/fail-closed in production dispatch until S4B.
   existing org/provider admission proof, with neither substituting for the
   other;
 - `Visibility::Exported` remains unsatisfiable until this enforcement is live;
+- once live, an `Exported` channel admits exactly the subnets its export rule
+  declares — a target covering its whole subtree, an absent or empty rule
+  denying, and an underivable peer subnet denying with no permissive flat-mesh
+  fallback;
 - no protected route can downgrade to the public/global legacy path.
+
+**Known limitation carried by the export activation.** `SubnetGateway`'s export
+table is keyed by the 16-bit wire channel hash, because the packet-level path
+sees only that field in a header. The subscribe gate and publish fan-out hold
+the canonical `u64` and truncate to match, so two channels sharing a wire
+bucket share export rules and one channel's targets can widen another's
+propagation. This is a visibility leak rather than an authority bypass —
+visibility is a propagation filter and a protected channel pairs it with token
+enforcement keyed on the canonical hash. Closing it means re-keying the export
+table and the `net gateway export` operator surface on the `u64`, which is a
+public API change and therefore a separate slice.
 
 Wire the authenticated route-hop envelope into the only live relay branch.
 Resolve ingress identity from the verified hop session, resolve egress identity

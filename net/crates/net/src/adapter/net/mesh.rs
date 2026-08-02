@@ -1630,14 +1630,34 @@ struct DispatchCtx {
 
 /// Capacity of the per-worker protected-forwarding buffer.
 ///
-/// An inbound datagram is bounded by [`protocol::MAX_PACKET_SIZE`], so
-/// the largest envelope this node can ever re-emit is that plus the
-/// fixed route-hop overhead. Sizing for the maximum up front is what
-/// makes the buffer genuinely allocation-free: a `Vec` that grew on
-/// demand still called the allocator on its first packet and again at
-/// every new high-water mark, which is inside the forwarding path.
-const PROTECTED_FORWARD_BUF_SIZE: usize =
-    super::subnet::route_hop::sealed_len(protocol::MAX_PACKET_SIZE);
+/// A re-sealed hop is exactly as long as the one that arrived: the
+/// envelope overhead is a constant and the inner packet is copied
+/// through byte for byte, so output length equals input length. An
+/// inbound datagram is bounded by [`protocol::MAX_PACKET_SIZE`] —
+/// that is what the receive path reserves — which makes this the exact
+/// ceiling rather than an estimate. It was previously
+/// `sealed_len(MAX_PACKET_SIZE)`, which double-counted the overhead an
+/// arriving envelope already carries.
+///
+/// Sizing for the maximum up front is what makes the buffer genuinely
+/// allocation-free: a `Vec` that grew on demand still called the
+/// allocator on its first packet and again at every new high-water
+/// mark, both inside the forwarding path.
+const PROTECTED_FORWARD_BUF_SIZE: usize = protocol::MAX_PACKET_SIZE;
+
+// The identity above, checked rather than trusted. The largest inner
+// packet a maximum-sized envelope can carry must re-seal back into
+// exactly this buffer — if the envelope overhead ever changes shape,
+// this fails at compile time instead of silently dropping full-sized
+// hops at runtime.
+const _: () = assert!(
+    super::subnet::route_hop::sealed_len(
+        protocol::MAX_PACKET_SIZE
+            - super::subnet::route_hop::ROUTE_HOP_OVERHEAD
+            - ROUTING_HEADER_SIZE,
+    ) == PROTECTED_FORWARD_BUF_SIZE,
+    "the protected forwarding buffer must hold exactly one maximum-sized re-sealed hop",
+);
 
 thread_local! {
     /// Reusable serialization buffer for protected forwarding
@@ -24850,7 +24870,24 @@ impl MeshNode {
         // through as unknown rather than coerced to GLOBAL, which used
         // to open every `ParentVisible` channel to unresolved peers.
         let peer_subnet = ctx.peer_subnets.get(&from_node).map(|e| *e.value());
-        let visible = Self::subnet_visible(ctx.local_subnet, peer_subnet, cfg.visibility);
+        // Only `Exported` consults the export table, so the lookup is
+        // skipped entirely for every other visibility mode.
+        let export_targets = if cfg.visibility == Visibility::Exported {
+            // The export table is keyed by the 16-bit wire hash, which
+            // is what the packet-level gateway sees in a header. See
+            // `subnet_visible` for what that truncation costs.
+            ctx.subnet_gateway
+                .as_ref()
+                .and_then(|gw| gw.export_targets(channel.wire_hash()))
+        } else {
+            None
+        };
+        let visible = Self::subnet_visible(
+            ctx.local_subnet,
+            peer_subnet,
+            cfg.visibility,
+            export_targets.as_deref(),
+        );
         if let Some(gw) = ctx.subnet_gateway.as_ref() {
             if visible {
                 gw.record_forward();
@@ -25297,7 +25334,40 @@ impl MeshNode {
     /// subnet-scoped, an underivable peer fails closed. That pair of
     /// arms reproduces the previous verdict for every input except the
     /// vulnerable one.
-    fn subnet_visible(source: SubnetId, dest: Option<SubnetId>, visibility: Visibility) -> bool {
+    /// `export_targets` supplies the destination subnets this channel
+    /// has been explicitly exported to, resolved by the caller from the
+    /// gateway's export table
+    /// ([`SubnetGateway::export_targets`](super::subnet::SubnetGateway::export_targets)).
+    /// It is consulted only for [`Visibility::Exported`]; every other
+    /// mode ignores it, so callers pass `None` unless the channel is
+    /// actually exported.
+    ///
+    /// `Exported` used to answer `false` unconditionally, which made
+    /// the mode unusable rather than merely strict — a channel
+    /// configured as `Exported` reached nobody, and the export table
+    /// the operator populated was consulted only by the packet-level
+    /// gateway, never by the subscribe gate or the publish fan-out.
+    ///
+    /// # Known limitation: the export table is keyed by wire hash
+    ///
+    /// `SubnetGateway`'s table is keyed by the 16-bit wire hash,
+    /// because the packet-level path only ever sees that field in a
+    /// header. Callers here hold the canonical `u64` and truncate to
+    /// match, so two channels sharing a wire bucket share export rules
+    /// — one channel's targets can widen another's propagation.
+    ///
+    /// This is a visibility leak, not an authority bypass: visibility
+    /// is a propagation filter, and a protected channel pairs it with
+    /// token enforcement that is keyed on the canonical hash. Closing
+    /// it properly means re-keying the export table and the
+    /// `net gateway export` operator surface on the `u64`, which is a
+    /// separate change to a public API.
+    fn subnet_visible(
+        source: SubnetId,
+        dest: Option<SubnetId>,
+        visibility: Visibility,
+        export_targets: Option<&[SubnetId]>,
+    ) -> bool {
         match visibility {
             Visibility::Global => true,
             Visibility::SubnetLocal => match dest {
@@ -25316,7 +25386,21 @@ impl MeshNode {
                     None => source.is_global(),
                 }
             }
-            Visibility::Exported => false,
+            Visibility::Exported => match dest {
+                // A declared target covers its whole subtree, matching
+                // the containment semantics `SubnetGateway::should_forward`
+                // already applies to the same table — exporting to a
+                // fleet reaches the vehicles in it.
+                Some(dest) => export_targets
+                    .is_some_and(|targets| targets.iter().any(|t| t.is_ancestor_of(dest))),
+                // Unknown peer subnet stays closed. This is the HIGH #2
+                // shape: an underivable peer must never be admitted by
+                // a mode whose whole purpose is an explicit
+                // destination list. Unlike the arms above there is no
+                // permissive flat-mesh fallback, because "exported to
+                // nowhere in particular" is not a meaningful rule.
+                None => false,
+            },
         }
     }
 
@@ -25577,13 +25661,28 @@ impl MeshNode {
             .as_ref()
             .map(|c| c.token_required())
             .unwrap_or(false);
+        // Resolved once for the whole fan-out: the channel is fixed, so
+        // this is one export-table lookup per publish rather than one
+        // per subscriber. Skipped entirely unless the channel is
+        // actually `Exported`.
+        let export_targets = if visibility == Visibility::Exported {
+            // Keyed by the 16-bit wire hash, matching the table the
+            // packet-level gateway consults. See `subnet_visible`.
+            self.subnet_gateway
+                .as_ref()
+                .and_then(|gw| gw.export_targets(channel_name.wire_hash()))
+        } else {
+            None
+        };
+        let export_targets = export_targets.as_deref();
         subscribers.retain(|peer_id| {
             // (1) Subnet visibility. Cheap check first — a peer in
             // the wrong subnet should short-circuit before any
             // auth-cache probing.
             // `None` = subnet not derived; see `subnet_visible`.
             let peer_subnet = self.peer_subnets.get(peer_id).map(|e| *e.value());
-            let visible = Self::subnet_visible(self.local_subnet, peer_subnet, visibility);
+            let visible =
+                Self::subnet_visible(self.local_subnet, peer_subnet, visibility, export_targets);
             if let Some(gw) = self.subnet_gateway.as_ref() {
                 if visible {
                     gw.record_forward();
@@ -38018,7 +38117,7 @@ mod subnet_visible_unknown_tests {
     #[test]
     fn parent_visible_rejects_unknown_peer_subnet_when_scoped() {
         assert!(
-            !MeshNode::subnet_visible(SCOPED(), None, Visibility::ParentVisible),
+            !MeshNode::subnet_visible(SCOPED(), None, Visibility::ParentVisible, None),
             "unknown peer subnet must fail closed under ParentVisible on a \
              subnet-scoped node; coercing it to GLOBAL made every unresolved \
              peer a universal ancestor"
@@ -38030,7 +38129,7 @@ mod subnet_visible_unknown_tests {
     #[test]
     fn subnet_local_rejects_unknown_peer_subnet_when_scoped() {
         assert!(
-            !MeshNode::subnet_visible(SCOPED(), None, Visibility::SubnetLocal),
+            !MeshNode::subnet_visible(SCOPED(), None, Visibility::SubnetLocal, None),
             "unknown peer subnet must fail closed under SubnetLocal"
         );
     }
@@ -38044,7 +38143,7 @@ mod subnet_visible_unknown_tests {
     fn unscoped_node_still_admits_unknown_peer_subnet() {
         for visibility in [Visibility::SubnetLocal, Visibility::ParentVisible] {
             assert!(
-                MeshNode::subnet_visible(SubnetId::GLOBAL, None, visibility),
+                MeshNode::subnet_visible(SubnetId::GLOBAL, None, visibility, None),
                 "a node with no subnet of its own must keep admitting \
                  unresolved peers under {visibility:?} (flat-mesh compat)"
             );
@@ -38142,12 +38241,12 @@ mod subnet_visible_unknown_tests {
     fn global_local_subnet_privileges_unresolved_peers_over_resolved_ones() {
         let resolved = Some(SubnetId::new(&[3]));
         assert!(
-            !MeshNode::subnet_visible(SubnetId::GLOBAL, resolved, Visibility::ParentVisible),
+            !MeshNode::subnet_visible(SubnetId::GLOBAL, resolved, Visibility::ParentVisible, None),
             "a peer whose subnet resolved to [3] is not an ancestor of GLOBAL, \
              so it is rejected"
         );
         assert!(
-            MeshNode::subnet_visible(SubnetId::GLOBAL, None, Visibility::ParentVisible),
+            MeshNode::subnet_visible(SubnetId::GLOBAL, None, Visibility::ParentVisible, None),
             "yet an unresolved peer takes the permissive unknown arm and is \
              admitted — being unresolvable is more privileged than being \
              resolved, which is what the construction warning exists to flag"
@@ -38169,34 +38268,124 @@ mod subnet_visible_unknown_tests {
         assert!(MeshNode::subnet_visible(
             child,
             Some(child),
-            Visibility::SubnetLocal
+            Visibility::SubnetLocal,
+            None,
         ));
         assert!(!MeshNode::subnet_visible(
             child,
             Some(sibling),
-            Visibility::SubnetLocal
+            Visibility::SubnetLocal,
+            None,
         ));
         // ParentVisible is strictly upward: ancestor yes, sibling no.
         assert!(MeshNode::subnet_visible(
             child,
             Some(parent),
-            Visibility::ParentVisible
+            Visibility::ParentVisible,
+            None,
         ));
         assert!(!MeshNode::subnet_visible(
             child,
             Some(sibling),
-            Visibility::ParentVisible
+            Visibility::ParentVisible,
+            None,
         ));
         // Global ignores subnets entirely, including unknown ones.
-        assert!(MeshNode::subnet_visible(child, None, Visibility::Global));
-        // Exported is unconditionally closed here.
+        assert!(MeshNode::subnet_visible(
+            child,
+            None,
+            Visibility::Global,
+            None
+        ));
+        // Exported with no declared targets is closed - an export table
+        // that was never populated exports nothing.
         assert!(!MeshNode::subnet_visible(
             child,
             Some(parent),
-            Visibility::Exported
+            Visibility::Exported,
+            None,
         ));
     }
+
+    /// `Exported` reads the declared target list.
+    ///
+    /// It used to answer `false` for every input, which made the mode
+    /// dead rather than strict: an operator could populate the export
+    /// table and the subscribe gate and publish fan-out would still
+    /// admit nobody. Only the packet-level `SubnetGateway` consulted
+    /// the table.
+    #[test]
+    fn exported_admits_exactly_the_declared_targets() {
+        let local = SubnetId::new(&[3, 7, 2]);
+        let fleet = SubnetId::new(&[3, 7]);
+        let vehicle = SubnetId::new(&[3, 7, 9]);
+        let other_fleet = SubnetId::new(&[3, 8]);
+
+        let exported_to = |targets: &[SubnetId], dest: SubnetId| {
+            MeshNode::subnet_visible(local, Some(dest), Visibility::Exported, Some(targets))
+        };
+
+        // An exact target is admitted.
+        assert!(exported_to(&[other_fleet], other_fleet));
+        // A target covers its whole subtree, matching the containment
+        // rule `SubnetGateway::should_forward` applies to this same
+        // table: exporting to a fleet reaches vehicles inside it.
+        assert!(exported_to(&[fleet], vehicle));
+        // A destination outside every target is refused.
+        assert!(!exported_to(&[fleet], other_fleet));
+        // A target BELOW the destination does not admit it — export is
+        // not symmetric, and `3.7` is not reached by exporting to
+        // something inside it.
+        assert!(!exported_to(&[vehicle], fleet));
+        // Any one matching target in a list is enough.
+        assert!(exported_to(&[vehicle, other_fleet], other_fleet));
+        // An empty target list admits nobody.
+        assert!(!exported_to(&[], other_fleet));
+
+        // An underivable peer subnet stays closed even with targets
+        // declared. This is the HIGH #2 shape: unlike SubnetLocal and
+        // ParentVisible there is no permissive flat-mesh arm, because
+        // "exported to nowhere in particular" is not a rule.
+        assert!(!MeshNode::subnet_visible(
+            local,
+            None,
+            Visibility::Exported,
+            Some(&[fleet]),
+        ));
+        assert!(!MeshNode::subnet_visible(
+            SubnetId::GLOBAL,
+            None,
+            Visibility::Exported,
+            Some(&[SubnetId::GLOBAL]),
+        ));
+
+        // A GLOBAL target is the authority-local root and covers
+        // everything — the one way to declare an unrestricted export.
+        assert!(exported_to(&[SubnetId::GLOBAL], other_fleet));
+    }
+
+    /// The export lookup is skipped unless the channel is `Exported`,
+    /// so targets supplied by mistake cannot widen another mode.
+    #[test]
+    fn declared_targets_do_not_affect_other_visibility_modes() {
+        let local = SubnetId::new(&[3, 7, 2]);
+        let sibling = SubnetId::new(&[3, 8]);
+        let wide: &[SubnetId] = &[SubnetId::GLOBAL];
+
+        for visibility in [
+            Visibility::SubnetLocal,
+            Visibility::ParentVisible,
+            Visibility::Global,
+        ] {
+            assert_eq!(
+                MeshNode::subnet_visible(local, Some(sibling), visibility, Some(wide)),
+                MeshNode::subnet_visible(local, Some(sibling), visibility, None),
+                "{visibility:?} must ignore export targets entirely",
+            );
+        }
+    }
 }
+
 // NOTE: this test module lives at the END of the file ON PURPOSE, for
 // the same reason spelled out above `committed_flush_stall_tests`: the
 // heartbeat drift check in session.rs treats the FIRST column-0
@@ -38607,6 +38796,138 @@ mod membership_failure_tests {
         assert!(
             msg.contains("no session"),
             "unexpected transport message: {msg}"
+        );
+    }
+}
+
+/// Source pins for the protected-forwarding hot path
+/// (SUBNET_AUTH_PLAN.md D6).
+///
+/// The runtime allocation witness in `tests/subnet_route_hop_alloc.rs`
+/// proves the *primitive* — `seal_into` writing into a caller-owned
+/// buffer — allocates nothing. It cannot prove the production branch
+/// still uses it: `relay_protected_hop` reverting to the allocating
+/// `seal_route_hop`, or the worker buffer becoming a growable `Vec`,
+/// would both leave that witness green.
+///
+/// Measuring the production branch at runtime needs the E2E relay
+/// harness (the relay runs on a tokio worker thread, and reception
+/// allocates per packet, so neither a global counter nor a per-packet
+/// marginal is a clean signal there). Until that lands, these pins
+/// cover the two specific regressions by inspecting the source, in the
+/// same style as the `NetSocket` receive-path pins in `transport.rs`.
+///
+/// A structural guard is weaker than a measurement and is not a
+/// substitute for one.
+#[cfg(test)]
+mod protected_forward_allocation_pins {
+    /// `mesh.rs` with comment-only lines removed, so prose that
+    /// mentions a banned construct cannot trip the pins.
+    fn source_without_comments() -> String {
+        include_str!("mesh.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Body of one method in the `impl MeshNode` block, by name.
+    fn method_body(src: &str, name: &str) -> String {
+        let start = src
+            .find(&format!("    fn {name}("))
+            .unwrap_or_else(|| panic!("{name} must exist in mesh.rs"));
+        let rest = &src[start + 1..];
+        let end = rest
+            .find("\n    fn ")
+            .map(|i| start + 1 + i)
+            .unwrap_or(src.len());
+        src[start..end].to_string()
+    }
+
+    /// The relay must serialize through the buffer-writing API. The
+    /// allocating `seal_route_hop` returns a fresh `Vec` per hop, which
+    /// is the exact regression Kyra's S4A review found.
+    #[test]
+    fn relay_protected_hop_does_not_allocate_per_packet() {
+        let src = source_without_comments();
+        let body = method_body(&src, "relay_protected_hop");
+
+        // Needles assembled at runtime so this test's own source does
+        // not match itself when the file is inspected.
+        let allocating_seal = format!("seal_route_hop{}", "(");
+        assert!(
+            !body.contains(&allocating_seal),
+            "relay_protected_hop must not call the allocating seal_route_hop; \
+             use seal_route_hop_into with the worker buffer",
+        );
+        assert!(
+            body.contains(&format!("seal_route_hop_into{}", "(")),
+            "relay_protected_hop must seal through the caller-owned buffer API",
+        );
+
+        for banned in [
+            format!("to_vec{}", "()"),
+            format!("vec!{}", "["),
+            format!("Vec::{}", "with_capacity"),
+            format!("Vec::{}", "new"),
+            format!(".resize{}", "("),
+            format!("to_owned{}", "()"),
+        ] {
+            assert!(
+                !body.contains(&banned),
+                "relay_protected_hop must not allocate on the packet path, found `{banned}`",
+            );
+        }
+
+        // Load shedding is a drop, never a queue. One spawned task per
+        // datagram turns downstream congestion into unbounded heap and
+        // scheduler pressure, reachable by any authenticated peer that
+        // can keep the egress socket blocked.
+        assert!(
+            !body.contains(&format!("tokio::{}", "spawn")),
+            "relay_protected_hop must drop when the egress socket is not ready, \
+             not spawn a send task per datagram",
+        );
+        assert!(
+            body.contains(&format!("try_send_to{}", "(")),
+            "the relay egress must be the non-blocking send",
+        );
+    }
+
+    /// The worker buffer must be fixed storage. A `Vec` still calls the
+    /// allocator on its first packet and at every new high-water mark,
+    /// both inside forwarding.
+    #[test]
+    fn the_worker_forward_buffer_is_fixed_not_growable() {
+        let src = source_without_comments();
+        let start = src
+            .find("static FORWARD_BUF")
+            .expect("FORWARD_BUF must exist in mesh.rs");
+        // A fixed window rather than "up to the first `;`" — the array
+        // type itself contains a semicolon, and rustfmt may wrap the
+        // declaration across lines. Whitespace is collapsed so the
+        // needles below match either layout.
+        let window: String = src[start..]
+            .chars()
+            .take(240)
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let decl = window.as_str();
+
+        assert!(
+            decl.contains("[u8; PROTECTED_FORWARD_BUF_SIZE]"),
+            "FORWARD_BUF must be a fixed array, got: {decl}",
+        );
+        assert!(
+            !decl.contains(&format!("Vec<{}>", "u8")),
+            "FORWARD_BUF must not be a growable Vec, got: {decl}",
+        );
+        assert!(
+            decl.contains("const {"),
+            "FORWARD_BUF must be const-initialized so no thread pays a first-touch \
+             allocation, got: {decl}",
         );
     }
 }

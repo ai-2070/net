@@ -113,6 +113,23 @@ impl SubnetGateway {
         self.export_table.insert(channel_hash, targets);
     }
 
+    /// The declared export targets for `channel_hash`, if this channel
+    /// has any.
+    ///
+    /// `None` means no rule was ever declared, which for a
+    /// [`Visibility::Exported`] channel is a closed door rather than an
+    /// open one — an export table that has not been populated exports
+    /// nothing.
+    ///
+    /// Returns an owned snapshot so the caller can hold it across a
+    /// fan-out without keeping a map guard alive. The publish path
+    /// resolves this once per channel, not once per subscriber.
+    pub fn export_targets(&self, channel_hash: u16) -> Option<Vec<SubnetId>> {
+        self.export_table
+            .get(&channel_hash)
+            .map(|entry| entry.value().clone())
+    }
+
     /// Snapshot of the export table as `(channel_hash, targets)`
     /// pairs, sorted by `channel_hash` for stable output. Used by
     /// operator tooling (`net gateway exports`) to render the
