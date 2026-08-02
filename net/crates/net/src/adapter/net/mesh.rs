@@ -1628,6 +1628,23 @@ struct DispatchCtx {
     auth_throttle_duration: Duration,
 }
 
+thread_local! {
+    /// Reusable serialization buffer for protected forwarding
+    /// (SUBNET_AUTH_PLAN.md D6).
+    ///
+    /// Relaying is the one operation in this file that runs per packet
+    /// per hop, and the route-hop envelope's size is known before any
+    /// work happens, so there is nothing an owned `Vec` per packet buys
+    /// beyond an allocator round trip and a cold destination line.
+    ///
+    /// Thread-local rather than a shared pool: the buffer is borrowed
+    /// for the length of one `seal_into` plus one non-blocking
+    /// `try_send_to` and never across an await, so there is no
+    /// contention to manage and no lock to hold. It grows to the
+    /// largest envelope this worker has forwarded and then stops.
+    static FORWARD_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Result passed through the pending-ack oneshot.
 #[derive(Debug, Clone)]
 pub(crate) struct MembershipAck {
@@ -15983,7 +16000,10 @@ impl MeshNode {
     ///
     /// Every step precedes any side effect — no route lookup, no TTL
     /// mutation, no buffer mutation, no send happens until the hop is
-    /// authenticated and the transition authorized:
+    /// authenticated and the transition authorized. The reusable
+    /// forwarding buffer is touched last, in step 6, for the same
+    /// reason: a packet that will not be forwarded must not be
+    /// serialized:
     ///
     /// 1. resolve the ingress session by `hop_session_id` (NOT by UDP
     ///    source, `RoutingHeader.src_id`, `NetHeader.subnet_id`, or
@@ -16115,15 +16135,44 @@ impl MeshNode {
         }
 
         // (6) Authorized. Mutate only the outer routing header, then
-        // re-tag for the next authenticated hop.
+        // re-tag for the next authenticated hop, into a buffer this
+        // worker keeps across packets. Forwarding is the one path here
+        // that runs per packet per hop, so a fresh `Vec` on it is an
+        // allocator round trip and a cold cache line between a packet
+        // arriving and leaving.
         let mut fwd_header = opened.header;
         fwd_header.forward();
-        let out = egress_session.seal_route_hop(&fwd_header, opened.inner);
-        let socket = ctx.socket.clone();
-        tokio::spawn(async move {
-            let _ = socket.send_to(&out, egress_addr).await;
+        FORWARD_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            let needed = super::subnet::route_hop::sealed_len(opened.inner.len());
+            if buf.len() < needed {
+                // Grows to a high-water mark and stays there; a relay
+                // sees the same MTU forever, so this settles after the
+                // first few packets.
+                buf.resize(needed, 0);
+            }
+            let Ok(n) =
+                egress_session.seal_route_hop_into(&mut buf[..needed], &fwd_header, opened.inner)
+            else {
+                return;
+            };
+            match ctx.socket.try_send_to(&buf[..n], egress_addr) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Socket is full right now. Only here do we pay for
+                    // an owned copy, because the borrow cannot outlive
+                    // this frame.
+                    let owned = buf[..n].to_vec();
+                    let socket = ctx.socket.clone();
+                    tokio::spawn(async move {
+                        let _ = socket.send_to(&owned, egress_addr).await;
+                    });
+                }
+                Err(_) => {}
+            }
         });
     }
+
     /// Handle a routed handshake packet that arrived at this node.
     ///
     /// Two cases, discriminated by whether we have a pending initiator

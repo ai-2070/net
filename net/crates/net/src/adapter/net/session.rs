@@ -197,11 +197,43 @@ impl NetSession {
     }
 
     /// Wrap `inner` in an authenticated route-hop envelope for this
-    /// edge (SUBNET_AUTH_PLAN.md D6).
+    /// edge, writing into a caller-owned buffer
+    /// (SUBNET_AUTH_PLAN.md D6).
     ///
     /// The sequence is this edge's own, independent of the packet
     /// AEAD counter, so hop accounting can never disturb the
     /// end-to-end session being carried.
+    ///
+    /// This is the form the forwarding path uses: the buffer belongs
+    /// to the forwarder and is reused across packets, so relaying does
+    /// not allocate. Size it with
+    /// [`route_hop::sealed_len`](super::subnet::route_hop::sealed_len).
+    ///
+    /// A too-small buffer is refused *before* a sequence is taken —
+    /// burning one on a local sizing mistake would open a gap in this
+    /// edge's sequence space for no reason.
+    pub fn seal_route_hop_into(
+        &self,
+        out: &mut [u8],
+        header: &super::route::RoutingHeader,
+        inner: &[u8],
+    ) -> Result<usize, super::subnet::route_hop::RouteHopError> {
+        if out.len() < super::subnet::route_hop::sealed_len(inner.len()) {
+            return Err(super::subnet::route_hop::RouteHopError::BufferTooSmall);
+        }
+        let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
+        super::subnet::route_hop::seal_into(
+            out,
+            &self.route_hop_tx_key,
+            self.session_id,
+            seq,
+            header,
+            inner,
+        )
+    }
+
+    /// Allocating form of [`Self::seal_route_hop_into`], for callers
+    /// off the forwarding path.
     pub fn seal_route_hop(&self, header: &super::route::RoutingHeader, inner: &[u8]) -> Vec<u8> {
         let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
         super::subnet::route_hop::seal(&self.route_hop_tx_key, self.session_id, seq, header, inner)

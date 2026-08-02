@@ -94,7 +94,7 @@ pub struct AuthenticatedNextHop {
     pub addr: std::net::SocketAddr,
 }
 
-/// Why a route-hop envelope was refused.
+/// Why a route-hop operation failed, in either direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteHopError {
     /// Too short to hold prefix + routing header + tag.
@@ -106,6 +106,10 @@ pub enum RouteHopError {
     BadTag,
     /// Sequence already seen, or older than the replay window.
     Replay,
+    /// Outbound only: the caller's buffer cannot hold the sealed
+    /// envelope. The one failure here that is a local sizing mistake
+    /// rather than an attacker's doing — see [`sealed_len`].
+    BufferTooSmall,
 }
 
 impl std::fmt::Display for RouteHopError {
@@ -115,6 +119,7 @@ impl std::fmt::Display for RouteHopError {
             Self::BadRoutingHeader => "route_hop_bad_routing_header",
             Self::BadTag => "route_hop_bad_tag",
             Self::Replay => "route_hop_replay",
+            Self::BufferTooSmall => "route_hop_buffer_too_small",
         })
     }
 }
@@ -152,9 +157,74 @@ pub fn compute_tag(
     tag
 }
 
-/// Serialize an authenticated hop envelope.
+/// Exact sealed size for an inner packet of `inner_len` bytes.
 ///
-/// Layout: `hop_session_id ‖ hop_sequence ‖ routing_header ‖ inner ‖ tag`.
+/// The envelope is fixed-overhead, so a forwarder can size — or reuse
+/// — a buffer before it has done any work.
+#[inline]
+pub const fn sealed_len(inner_len: usize) -> usize {
+    ROUTE_HOP_OVERHEAD + ROUTING_HEADER_SIZE + inner_len
+}
+
+/// Serialize an authenticated hop envelope into a caller-owned buffer,
+/// returning the number of bytes written.
+///
+/// Layout:
+/// `magic ‖ hop_session_id ‖ hop_sequence ‖ routing_header ‖ inner ‖ tag`.
+///
+/// This is the primitive; [`seal`] is the allocating convenience over
+/// it. Forwarding is the one path here that runs per packet per hop,
+/// and a `Vec` per hop puts an allocator call — and a free, and the
+/// cache miss on fresh memory — between a packet arriving and leaving.
+/// Nothing about the envelope needs ownership: the size is known in
+/// advance from [`sealed_len`], and every byte is written exactly once
+/// in order. So the buffer belongs to whatever is doing the
+/// forwarding, which can hold one per worker and reuse it forever.
+///
+/// Writes nothing at all when `out` is too small: a partially-filled
+/// buffer that a caller might still send would be worse than a clean
+/// refusal.
+pub fn seal_into(
+    out: &mut [u8],
+    key: &[u8; 32],
+    hop_session_id: u64,
+    hop_sequence: u64,
+    header: &RoutingHeader,
+    inner: &[u8],
+) -> Result<usize, RouteHopError> {
+    let total = sealed_len(inner.len());
+    if out.len() < total {
+        return Err(RouteHopError::BufferTooSmall);
+    }
+    let header_end = ROUTE_HOP_PREFIX_SIZE + ROUTING_HEADER_SIZE;
+    let inner_end = header_end + inner.len();
+
+    out[0..2].copy_from_slice(&ROUTE_HOP_MAGIC.to_le_bytes());
+    out[2..10].copy_from_slice(&hop_session_id.to_le_bytes());
+    out[10..ROUTE_HOP_PREFIX_SIZE].copy_from_slice(&hop_sequence.to_le_bytes());
+    header.write_at(&mut out[ROUTE_HOP_PREFIX_SIZE..header_end]);
+    out[header_end..inner_end].copy_from_slice(inner);
+
+    // Tag the header bytes as they now sit in the buffer, so what is
+    // authenticated is literally what will be sent.
+    let tag = compute_tag(
+        key,
+        hop_session_id,
+        hop_sequence,
+        &out[ROUTE_HOP_PREFIX_SIZE..header_end],
+        inner,
+    );
+    out[inner_end..total].copy_from_slice(&tag);
+    Ok(total)
+}
+
+/// Allocating form of [`seal_into`], for tests and any caller not on
+/// the forwarding path.
+#[expect(
+    clippy::expect_used,
+    reason = "the buffer is sized by sealed_len on the line above, which is the same length \
+              seal_into checks against; a failure here would be a contradiction in this module"
+)]
 pub fn seal(
     key: &[u8; 32],
     hop_session_id: u64,
@@ -162,16 +232,9 @@ pub fn seal(
     header: &RoutingHeader,
     inner: &[u8],
 ) -> Vec<u8> {
-    let mut header_bytes = [0u8; ROUTING_HEADER_SIZE];
-    header.write_at(&mut header_bytes);
-    let mut out = Vec::with_capacity(ROUTE_HOP_OVERHEAD + ROUTING_HEADER_SIZE + inner.len());
-    out.extend_from_slice(&ROUTE_HOP_MAGIC.to_le_bytes());
-    out.extend_from_slice(&hop_session_id.to_le_bytes());
-    out.extend_from_slice(&hop_sequence.to_le_bytes());
-    out.extend_from_slice(&header_bytes);
-    out.extend_from_slice(inner);
-    let tag = compute_tag(key, hop_session_id, hop_sequence, &header_bytes, inner);
-    out.extend_from_slice(&tag);
+    let mut out = vec![0u8; sealed_len(inner.len())];
+    seal_into(&mut out, key, hop_session_id, hop_sequence, header, inner)
+        .expect("a buffer sized by sealed_len always fits");
     out
 }
 
@@ -437,6 +500,88 @@ mod tests {
         let last = t.len() - 1;
         t[last] ^= 1;
         assert_eq!(open(&KEY, &t).unwrap_err(), RouteHopError::BadTag);
+    }
+
+    /// The caller-owned form must produce exactly the bytes the
+    /// allocating form does — otherwise the two would drift and the
+    /// forwarding path would be authenticating something subtly
+    /// different from what everything else is tested against.
+    #[test]
+    fn seal_into_matches_seal_byte_for_byte() {
+        for inner_len in [0usize, 1, 47, 1200] {
+            let inner: Vec<u8> = (0..inner_len).map(|i| (i % 251) as u8).collect();
+            let allocated = seal(&KEY, 9, 3, &header(), &inner);
+
+            let mut owned = vec![0xAAu8; sealed_len(inner_len)];
+            let n = seal_into(&mut owned, &KEY, 9, 3, &header(), &inner).expect("fits exactly");
+
+            assert_eq!(n, sealed_len(inner_len), "sealed_len must be exact");
+            assert_eq!(n, allocated.len());
+            assert_eq!(owned, allocated, "inner_len {inner_len}");
+            open(&KEY, &owned).expect("the buffer form still verifies");
+        }
+    }
+
+    /// A buffer larger than needed is written only where it should be,
+    /// and the reported length is what a caller may send. Sending the
+    /// whole buffer would append trailing garbage inside the tag's
+    /// coverage boundary.
+    #[test]
+    fn seal_into_writes_only_the_sealed_prefix() {
+        let mut buf = [0x5Au8; 512];
+        let n = seal_into(&mut buf, &KEY, 1, 1, &header(), INNER).expect("plenty of room");
+        assert_eq!(n, sealed_len(INNER.len()));
+        assert!(
+            buf[n..].iter().all(|&b| b == 0x5A),
+            "bytes past the envelope must be untouched",
+        );
+        open(&KEY, &buf[..n]).expect("the prefix is a complete envelope");
+    }
+
+    /// A short buffer is refused, and refused *cleanly* — a caller
+    /// that ignored the error must not find a half-written envelope
+    /// sitting in its buffer looking sendable.
+    #[test]
+    fn seal_into_refuses_a_short_buffer_without_writing() {
+        let needed = sealed_len(INNER.len());
+        for len in [0usize, 1, ROUTE_HOP_PREFIX_SIZE, needed - 1] {
+            let mut buf = vec![0u8; len];
+            assert_eq!(
+                seal_into(&mut buf, &KEY, 1, 1, &header(), INNER).unwrap_err(),
+                RouteHopError::BufferTooSmall,
+                "len {len} must not be accepted",
+            );
+            assert!(
+                buf.iter().all(|&b| b == 0),
+                "len {len}: nothing may be written on refusal",
+            );
+        }
+        // Exactly enough is enough.
+        let mut exact = vec![0u8; needed];
+        assert_eq!(
+            seal_into(&mut exact, &KEY, 1, 1, &header(), INNER),
+            Ok(needed),
+        );
+    }
+
+    /// Reusing one buffer across differently-sized packets must not
+    /// leave a longer previous packet's tail inside a shorter one.
+    #[test]
+    fn a_reused_buffer_does_not_leak_the_previous_packet() {
+        let mut buf = vec![0u8; sealed_len(2048)];
+        let long = vec![0xEEu8; 1500];
+        let short = b"short".to_vec();
+
+        let n_long = seal_into(&mut buf, &KEY, 1, 1, &header(), &long).expect("fits");
+        open(&KEY, &buf[..n_long]).expect("long verifies");
+
+        let n_short = seal_into(&mut buf, &KEY, 1, 2, &header(), &short).expect("fits");
+        let opened = open(&KEY, &buf[..n_short]).expect("short verifies after long");
+        assert_eq!(
+            opened.inner,
+            &short[..],
+            "the shorter packet must not inherit the longer one's bytes",
+        );
     }
 
     #[test]
