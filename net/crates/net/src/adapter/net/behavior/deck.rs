@@ -784,7 +784,13 @@ impl DeckClient {
     /// Snapshot of the gateway's export table as
     /// `(channel_hash, target_subnets)` pairs, sorted by
     /// `channel_hash`. Empty when no gateway is installed.
-    pub fn gateway_exports(&self) -> Vec<(u16, Vec<SubnetId>)> {
+    ///
+    /// The hash is the canonical `u64` channel identity, not the wire
+    /// `u16` hint — export rules are channel policy and are keyed
+    /// exactly, so operator output names exactly one channel.
+    pub fn gateway_exports(
+        &self,
+    ) -> Vec<(crate::adapter::net::channel::ChannelHash, Vec<SubnetId>)> {
         self.mesh
             .as_ref()
             .and_then(|m| m.gateway())

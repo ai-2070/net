@@ -24873,12 +24873,14 @@ impl MeshNode {
         // Only `Exported` consults the export table, so the lookup is
         // skipped entirely for every other visibility mode.
         let export_targets = if cfg.visibility == Visibility::Exported {
-            // The export table is keyed by the 16-bit wire hash, which
-            // is what the packet-level gateway sees in a header. See
-            // `subnet_visible` for what that truncation costs.
+            // `requested_hash` is the canonical hash of the channel the
+            // peer actually asked for — the same identity every token
+            // gate and retention key above uses, and correct for a
+            // prefix-matched config where `cfg.channel_id.hash()` is a
+            // family sentinel rather than this request.
             ctx.subnet_gateway
                 .as_ref()
-                .and_then(|gw| gw.export_targets(channel.wire_hash()))
+                .and_then(|gw| gw.export_targets(requested_hash))
         } else {
             None
         };
@@ -25348,20 +25350,20 @@ impl MeshNode {
     /// the operator populated was consulted only by the packet-level
     /// gateway, never by the subscribe gate or the publish fan-out.
     ///
-    /// # Known limitation: the export table is keyed by wire hash
+    /// # Export policy is keyed canonically
     ///
-    /// `SubnetGateway`'s table is keyed by the 16-bit wire hash,
-    /// because the packet-level path only ever sees that field in a
-    /// header. Callers here hold the canonical `u64` and truncate to
-    /// match, so two channels sharing a wire bucket share export rules
-    /// — one channel's targets can widen another's propagation.
+    /// `export_targets` is resolved from `SubnetGateway`'s table by the
+    /// **canonical** [`ChannelHash`](super::channel::ChannelHash), never
+    /// the 16-bit wire hint. The wire hash is documented as a fast-path
+    /// filter with routine collisions; keying policy on it meant two
+    /// unrelated channels sharing a bucket shared export rules, so
+    /// declaring targets for one silently declared them for the other.
     ///
-    /// This is a visibility leak, not an authority bypass: visibility
-    /// is a propagation filter, and a protected channel pairs it with
-    /// token enforcement that is keyed on the canonical hash. Closing
-    /// it properly means re-keying the export table and the
-    /// `net gateway export` operator surface on the `u64`, which is a
-    /// separate change to a public API.
+    /// Nothing downstream rescues that. Visibility and token
+    /// enforcement are separate mechanisms, a tokenless channel has
+    /// nothing else in front of it, and an attacker can choose a
+    /// colliding name on purpose. See
+    /// `exported_policy_does_not_alias_across_a_wire_hash_collision`.
     fn subnet_visible(
         source: SubnetId,
         dest: Option<SubnetId>,
@@ -25666,11 +25668,13 @@ impl MeshNode {
         // per subscriber. Skipped entirely unless the channel is
         // actually `Exported`.
         let export_targets = if visibility == Visibility::Exported {
-            // Keyed by the 16-bit wire hash, matching the table the
-            // packet-level gateway consults. See `subnet_visible`.
+            // `channel_hash` is the canonical hash of the channel being
+            // published — the same identity the auth guard below keys
+            // on. Never the wire hint: that is a fast-path filter with
+            // routine collisions, and channel policy must be exact.
             self.subnet_gateway
                 .as_ref()
-                .and_then(|gw| gw.export_targets(channel_name.wire_hash()))
+                .and_then(|gw| gw.export_targets(channel_hash))
         } else {
             None
         };
@@ -38364,6 +38368,73 @@ mod subnet_visible_unknown_tests {
         assert!(exported_to(&[SubnetId::GLOBAL], other_fleet));
     }
 
+    /// The composed decision the live call sites perform must not
+    /// alias across a wire-hash collision.
+    ///
+    /// `authorize_subscribe` and the publish fan-out resolve export
+    /// targets from the gateway and hand them here. Both hold the
+    /// canonical `u64` (`requested_hash` / `channel_hash`); keying that
+    /// lookup on the wire `u16` hint let one channel's export rule
+    /// decide another channel's propagation, because the hint has
+    /// routine collisions by design.
+    #[test]
+    fn exported_policy_does_not_alias_across_a_wire_hash_collision() {
+        use crate::adapter::net::channel::{ChannelConfigRegistry, ChannelId, ChannelName};
+        use crate::adapter::net::subnet::SubnetGateway;
+
+        // Two distinct channels sharing a wire bucket.
+        let mut seen = std::collections::HashMap::<u16, String>::new();
+        let (first, second) = loop {
+            let name = format!("collision/{}", seen.len());
+            let id = ChannelId::parse(&name).unwrap();
+            if let Some(existing) = seen.get(&id.wire_hash()) {
+                break (
+                    ChannelName::new(existing).unwrap(),
+                    ChannelName::new(&name).unwrap(),
+                );
+            }
+            seen.insert(id.wire_hash(), name);
+        };
+        assert_eq!(first.wire_hash(), second.wire_hash());
+        assert_ne!(first.hash(), second.hash());
+
+        let gw = SubnetGateway::new(
+            SubnetId::new(&[3, 7]),
+            std::sync::Arc::new(ChannelConfigRegistry::new()),
+        );
+        let target = SubnetId::new(&[3, 8]);
+        gw.export_channel_by_name(&first, vec![target]);
+
+        // Resolved exactly as the two live call sites resolve it.
+        let targets_for = |name: &ChannelName| gw.export_targets(name.hash());
+        let visible_to = |name: &ChannelName| {
+            let t = targets_for(name);
+            MeshNode::subnet_visible(
+                SubnetId::new(&[3, 7]),
+                Some(target),
+                Visibility::Exported,
+                t.as_deref(),
+            )
+        };
+
+        assert!(
+            visible_to(&first),
+            "the exported channel reaches its declared target"
+        );
+        assert!(
+            !visible_to(&second),
+            "a channel sharing only a wire bucket must not inherit that export rule",
+        );
+
+        // And the reverse assignment stays separate.
+        gw.export_channel_by_name(&second, vec![SubnetId::new(&[4])]);
+        assert!(visible_to(&first));
+        assert!(
+            !visible_to(&second),
+            "the second channel is exported elsewhere, not to this target",
+        );
+    }
+
     /// The export lookup is skipped unless the channel is `Exported`,
     /// so targets supplied by mistake cannot widen another mode.
     #[test]
@@ -38892,6 +38963,57 @@ mod protected_forward_allocation_pins {
             body.contains(&format!("try_send_to{}", "(")),
             "the relay egress must be the non-blocking send",
         );
+    }
+
+    /// Export policy must be resolved by canonical channel identity at
+    /// both live call sites.
+    ///
+    /// The composed behaviour is pinned by
+    /// `exported_policy_does_not_alias_across_a_wire_hash_collision`.
+    /// This guards the specific way it regressed: reaching for the wire
+    /// hint at the call site, which type-checks fine because both are
+    /// integers and silently aliases channels that share a 16-bit
+    /// bucket.
+    #[test]
+    fn export_lookups_use_canonical_channel_identity() {
+        let src = source_without_comments();
+        let wire = format!("wire_hash{}", "()");
+
+        for method in ["authorize_subscribe", "publish_to_subscribers"] {
+            let Some(start) = src.find(&format!("    fn {method}(")).or_else(|| {
+                src.find(&format!("    async fn {method}("))
+                    .or_else(|| src.find(&format!("    pub fn {method}(")))
+            }) else {
+                continue;
+            };
+            let rest = &src[start + 1..];
+            let end = rest
+                .find("\n    fn ")
+                .map(|i| start + 1 + i)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+            if !body.contains("export_targets") {
+                continue;
+            }
+            assert!(
+                !body.contains(&wire),
+                "{method} must resolve export targets by canonical ChannelHash, not the wire hint",
+            );
+        }
+
+        // Whatever the enclosing function is named, no export lookup
+        // anywhere may be keyed on the wire hint.
+        for (i, _) in src.match_indices("export_targets(") {
+            let arg_end = src[i..]
+                .find(')')
+                .map(|j| i + j)
+                .unwrap_or_else(|| src.len());
+            let call = &src[i..arg_end];
+            assert!(
+                !call.contains("wire_hash"),
+                "export_targets must never be called with a wire hash: `{call}`",
+            );
+        }
     }
 
     /// The worker buffer must be fixed storage. A `Vec` still calls the

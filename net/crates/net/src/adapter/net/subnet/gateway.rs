@@ -9,7 +9,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use super::id::SubnetId;
-use crate::adapter::net::channel::{ChannelConfigRegistry, Visibility};
+use crate::adapter::net::channel::{ChannelConfigRegistry, ChannelHash, ChannelName, Visibility};
 
 /// Reason a packet was dropped at a gateway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,9 +61,19 @@ pub struct SubnetGateway {
     /// mutates the export table — lets `MeshNode` keep its
     /// gateway behind an `Arc` without an outer `Mutex`.
     peer_subnets: parking_lot::RwLock<Vec<SubnetId>>,
-    /// Export table: channel_hash -> allowed destination subnets.
-    /// Only consulted for `Visibility::Exported` channels.
-    export_table: DashMap<u16, Vec<SubnetId>>,
+    /// Export table: canonical [`ChannelHash`] -> allowed destination
+    /// subnets. Only consulted for `Visibility::Exported` channels.
+    ///
+    /// Keyed on the canonical `u64`, never the wire `u16` hint. This
+    /// table is channel **policy**, and the wire hash is documented as
+    /// a fast-path filter with routine collisions — keying policy on it
+    /// meant two unrelated channels that happened to share a 16-bit
+    /// bucket shared export rules, so declaring targets for one silently
+    /// declared them for the other. An attacker can pick a colliding
+    /// name deliberately, and no other gate rescues it: visibility is a
+    /// separate mechanism from token enforcement, and a tokenless
+    /// channel has nothing else in front of it.
+    export_table: DashMap<ChannelHash, Vec<SubnetId>>,
     /// Channel config registry for looking up visibility. Shared
     /// `Arc` so the gateway sees the same registry the host
     /// `MeshNode` mutates through `set_channel_configs` /
@@ -108,9 +118,28 @@ impl SubnetGateway {
         self.peer_subnets.read().clone()
     }
 
-    /// Export a channel to specific subnets.
-    pub fn export_channel(&self, channel_hash: u16, targets: Vec<SubnetId>) {
+    /// Export a channel to specific subnets, by canonical
+    /// [`ChannelHash`].
+    ///
+    /// Prefer [`Self::export_channel_by_name`] where the name is in
+    /// hand — it derives the canonical hash itself, so a caller cannot
+    /// hand this the wire hint by mistake.
+    pub fn export_channel(&self, channel_hash: ChannelHash, targets: Vec<SubnetId>) {
         self.export_table.insert(channel_hash, targets);
+    }
+
+    /// Export a channel to specific subnets, by name.
+    ///
+    /// The operator-facing form: the canonical hash is derived here, so
+    /// the 16-bit wire hint cannot reach a policy key through this
+    /// door.
+    pub fn export_channel_by_name(&self, channel: &ChannelName, targets: Vec<SubnetId>) {
+        self.export_channel(channel.hash(), targets);
+    }
+
+    /// The declared export targets for a channel, by name.
+    pub fn export_targets_by_name(&self, channel: &ChannelName) -> Option<Vec<SubnetId>> {
+        self.export_targets(channel.hash())
     }
 
     /// The declared export targets for `channel_hash`, if this channel
@@ -124,7 +153,7 @@ impl SubnetGateway {
     /// Returns an owned snapshot so the caller can hold it across a
     /// fan-out without keeping a map guard alive. The publish path
     /// resolves this once per channel, not once per subscriber.
-    pub fn export_targets(&self, channel_hash: u16) -> Option<Vec<SubnetId>> {
+    pub fn export_targets(&self, channel_hash: ChannelHash) -> Option<Vec<SubnetId>> {
         self.export_table
             .get(&channel_hash)
             .map(|entry| entry.value().clone())
@@ -134,8 +163,8 @@ impl SubnetGateway {
     /// pairs, sorted by `channel_hash` for stable output. Used by
     /// operator tooling (`net gateway exports`) to render the
     /// current set of explicit cross-subnet allow-rules.
-    pub fn exports(&self) -> Vec<(u16, Vec<SubnetId>)> {
-        let mut out: Vec<(u16, Vec<SubnetId>)> = self
+    pub fn exports(&self) -> Vec<(ChannelHash, Vec<SubnetId>)> {
+        let mut out: Vec<(ChannelHash, Vec<SubnetId>)> = self
             .export_table
             .iter()
             .map(|e| (*e.key(), e.value().clone()))
@@ -148,7 +177,7 @@ impl SubnetGateway {
     /// `None` if the channel is not in the export table. Used by
     /// `net gateway export <channel>` to render the current
     /// allow-list before an operator mutates it.
-    pub fn exports_for_channel(&self, channel_hash: u16) -> Option<Vec<SubnetId>> {
+    pub fn exports_for_channel(&self, channel_hash: ChannelHash) -> Option<Vec<SubnetId>> {
         self.export_table
             .get(&channel_hash)
             .map(|e| e.value().clone())
@@ -178,15 +207,34 @@ impl SubnetGateway {
         self.local_subnet
     }
 
-    /// Make a forwarding decision for a packet crossing this gateway.
+    /// Make a forwarding decision for a channel crossing this gateway.
     ///
-    /// Reads only header fields: `subnet_id`, `channel_hash`, `hop_ttl`, `hop_count`.
-    /// No decryption, no payload inspection.
+    /// Reads only routing-level facts: source/destination subnet, the
+    /// **canonical** channel identity, and the hop budget. No
+    /// decryption, no payload inspection.
+    ///
+    /// # Why this takes a canonical hash
+    ///
+    /// It used to take the wire `u16` from `NetHeader.channel_hash`,
+    /// which is a fast-path filter hint with routine collisions. That
+    /// is sufficient for a *hint* and unsound for *policy*: two
+    /// unrelated channels sharing a bucket would share visibility and
+    /// export rules. The registry lookup already refused to answer on a
+    /// wire collision, which made the config side fail closed, but the
+    /// export table below was keyed on the same 16 bits and had no such
+    /// guard.
+    ///
+    /// A caller holding only `NetHeader.channel_hash` therefore cannot
+    /// perform channel-specific policy at all, and must either carry
+    /// authenticated canonical identity in a future protocol shape or
+    /// fail closed. It must not widen the hint into a policy key —
+    /// `wire_hash as u64` does not recover the missing 48 bits, it just
+    /// hides the aliasing behind a wider type.
     pub fn should_forward(
         &self,
         source_subnet: SubnetId,
         dest_subnet: SubnetId,
-        channel_hash: u16,
+        channel_hash: ChannelHash,
         hop_ttl: u8,
         hop_count: u8,
     ) -> ForwardDecision {
@@ -208,17 +256,16 @@ impl SubnetGateway {
             return ForwardDecision::Drop(DropReason::TtlExpired);
         }
 
-        // Look up channel visibility by the wire `u16` hash — that's
-        // what the inbound packet header carries here. `get_by_wire_hash`
-        // returns `None` both for unknown channels and on wire-bucket
-        // collisions. In either case the gateway cannot prove the
-        // channel is allowed to cross a subnet boundary, so we must
+        // Look up channel visibility by canonical hash. `get` returns
+        // `None` both for unknown channels and on the (far rarer)
+        // canonical collision. In either case the gateway cannot prove
+        // the channel is allowed to cross a subnet boundary, so we must
         // drop rather than forward. Defaulting to `Global` would
         // silently leak traffic when a `SubnetLocal` channel collides
         // with any other config.
         let visibility = self
             .channel_configs
-            .get_by_wire_hash(channel_hash)
+            .get(channel_hash)
             .map(|c| c.visibility)
             .unwrap_or(Visibility::SubnetLocal);
 
@@ -304,14 +351,14 @@ mod tests {
 
     use crate::adapter::net::channel::ChannelName;
 
-    fn make_channel(name: &str, vis: Visibility, reg: &ChannelConfigRegistry) -> u16 {
+    fn make_channel(name: &str, vis: Visibility, reg: &ChannelConfigRegistry) -> ChannelHash {
         let id = ChannelId::new(ChannelName::new(name).unwrap());
-        // `should_forward` operates on the wire `u16` hash (that's
-        // what the packet header carries); return the wire hash for
-        // the gateway-side test exercises.
-        let wire = id.wire_hash();
+        // `should_forward` keys on the CANONICAL hash. The wire `u16`
+        // is a fast-path filter hint with routine collisions and must
+        // never carry channel policy.
+        let hash = id.hash();
         reg.insert(ChannelConfig::new(id).with_visibility(vis));
-        wire
+        hash
     }
 
     /// Default `hop_ttl` for tests that aren't testing TTL itself.
@@ -494,54 +541,148 @@ mod tests {
         assert_eq!(decision, ForwardDecision::Drop(DropReason::SubnetLocal));
     }
 
-    #[test]
-    fn test_regression_collision_between_subnet_local_and_global_drops() {
-        // Regression: gateway used `unwrap_or(Visibility::Global)` when the
-        // registry returned `None`. After the wire-keyed lookup was
-        // fixed to return `None` on `u16` wire-bucket collisions,
-        // that fallback recreated the exact leak the registry fix was
-        // meant to prevent — a `SubnetLocal` channel colliding with a
-        // `Global` channel would still be forwarded across subnet
-        // boundaries.
-        //
-        // Fix: default to `SubnetLocal` on `None`, so a collision
-        // forces a drop rather than a permissive forward. The
-        // collision space exercised here is the wire `u16` bucket
-        // (what `should_forward` keys on), not the canonical `u32`.
+    /// Find two distinct channel names whose wire `u16` hints collide
+    /// while their canonical `u64` identities differ.
+    ///
+    /// Searched rather than hard-coded so the pair stays valid if the
+    /// hash function is ever changed; the loop terminates quickly
+    /// because the wire space is only 65 536 buckets.
+    fn colliding_wire_pair() -> (ChannelName, ChannelName) {
         let mut seen = std::collections::HashMap::<u16, String>::new();
-        let (name1, name2) = loop {
-            let name = format!("gw-ch-{}", seen.len());
-            let wire = ChannelId::parse(&name).unwrap().wire_hash();
-            if let Some(existing) = seen.get(&wire) {
-                break (existing.clone(), name);
+        loop {
+            let name = format!("collision/{}", seen.len());
+            let id = ChannelId::parse(&name).unwrap();
+            if let Some(existing) = seen.get(&id.wire_hash()) {
+                let first = ChannelName::new(existing).unwrap();
+                let second = ChannelName::new(&name).unwrap();
+                assert_eq!(
+                    first.wire_hash(),
+                    second.wire_hash(),
+                    "precondition: wire hints must collide",
+                );
+                assert_ne!(
+                    first.hash(),
+                    second.hash(),
+                    "precondition: canonical identities must differ",
+                );
+                return (first, second);
             }
-            seen.insert(wire, name);
-        };
+            seen.insert(id.wire_hash(), name);
+        }
+    }
 
+    /// Export policy must not alias across a wire-hash collision.
+    ///
+    /// The export table was keyed by the wire `u16`, so declaring
+    /// targets for one channel silently declared them for every other
+    /// channel in the same 16-bit bucket. The wire hash is documented
+    /// as a fast-path hint with routine collisions; the canonical `u64`
+    /// is the identity ACL, storage, config, and policy key on. Keying
+    /// policy on the hint violated that contract, and an attacker can
+    /// pick a colliding name deliberately.
+    #[test]
+    fn export_policy_does_not_alias_across_a_wire_hash_collision() {
+        let (first, second) = colliding_wire_pair();
         let reg = Arc::new(ChannelConfigRegistry::new());
-        let id1 = ChannelId::parse(&name1).unwrap();
-        let id2 = ChannelId::parse(&name2).unwrap();
-        let colliding_wire = id1.wire_hash();
+        let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
+
+        let x = SubnetId::new(&[2]);
+        let y = SubnetId::new(&[3]);
+
+        // Declaring targets for the first channel must say nothing
+        // about the second.
+        gw.export_channel_by_name(&first, vec![x]);
+        assert_eq!(gw.export_targets_by_name(&first), Some(vec![x]));
         assert_eq!(
-            id1.wire_hash(),
-            id2.wire_hash(),
-            "precondition: wire hashes must collide"
+            gw.export_targets_by_name(&second),
+            None,
+            "a colliding wire bucket must not inherit another channel's export rule",
         );
 
-        reg.insert(ChannelConfig::new(id1).with_visibility(Visibility::SubnetLocal));
-        reg.insert(ChannelConfig::new(id2).with_visibility(Visibility::Global));
+        // Declaring targets for the second must not disturb the first.
+        gw.export_channel_by_name(&second, vec![y]);
+        assert_eq!(gw.export_targets_by_name(&first), Some(vec![x]));
+        assert_eq!(gw.export_targets_by_name(&second), Some(vec![y]));
+
+        // The operator snapshot names two distinct rules, not one.
+        let snap = gw.exports();
+        assert_eq!(snap.len(), 2, "each canonical channel is its own rule");
+        assert_eq!(gw.exports_for_channel(first.hash()), Some(vec![x]));
+        assert_eq!(gw.exports_for_channel(second.hash()), Some(vec![y]));
+
+        // And the wire hint is not a key here at all: widening it to
+        // `u64` recovers none of the missing 48 bits.
+        assert_eq!(
+            gw.exports_for_channel(u64::from(first.wire_hash())),
+            None,
+            "the wire hint must not address the policy table",
+        );
+    }
+
+    #[test]
+    fn test_regression_collision_between_subnet_local_and_global_drops() {
+        // Regression: gateway used `unwrap_or(Visibility::Global)` when
+        // the registry returned `None`, which recreated the exact leak
+        // the registry's collision refusal was meant to prevent — a
+        // `SubnetLocal` channel colliding with a `Global` one would
+        // still be forwarded across subnet boundaries.
+        //
+        // Fix: default to `SubnetLocal` on `None`, so a collision
+        // forces a drop rather than a permissive forward.
+        //
+        // `should_forward` now keys on the canonical hash, so the
+        // wire-bucket collision this used to exercise no longer reaches
+        // the visibility lookup at all — which is the stronger
+        // property. What still must hold is the fail-closed default for
+        // a channel the registry cannot resolve.
+        let (first, second) = colliding_wire_pair();
+        let reg = Arc::new(ChannelConfigRegistry::new());
+        reg.insert(
+            ChannelConfig::new(ChannelId::new(first.clone()))
+                .with_visibility(Visibility::SubnetLocal),
+        );
+        reg.insert(
+            ChannelConfig::new(ChannelId::new(second.clone())).with_visibility(Visibility::Global),
+        );
 
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
-        // A colliding wire hash must not produce a permissive forward.
-        let decision = gw.should_forward(
-            SubnetId::new(&[1]),
-            SubnetId::new(&[2]),
-            colliding_wire,
-            TEST_TTL,
-            0,
+        // Each colliding channel now gets its OWN verdict rather than
+        // whichever one won the bucket.
+        assert_eq!(
+            gw.should_forward(
+                SubnetId::new(&[1]),
+                SubnetId::new(&[2]),
+                first.hash(),
+                TEST_TTL,
+                0,
+            ),
+            ForwardDecision::Drop(DropReason::SubnetLocal),
         );
-        assert_eq!(decision, ForwardDecision::Drop(DropReason::SubnetLocal));
+        assert_eq!(
+            gw.should_forward(
+                SubnetId::new(&[1]),
+                SubnetId::new(&[2]),
+                second.hash(),
+                TEST_TTL,
+                0,
+            ),
+            ForwardDecision::Forward,
+        );
+
+        // An unresolvable channel still fails closed rather than
+        // defaulting to `Global`.
+        assert_eq!(
+            gw.should_forward(
+                SubnetId::new(&[1]),
+                SubnetId::new(&[2]),
+                0xDEAD_BEEF_DEAD_BEEF,
+                TEST_TTL,
+                0,
+            ),
+            ForwardDecision::Drop(DropReason::SubnetLocal),
+            "a channel the registry cannot resolve must not be forwarded",
+        );
     }
 
     #[test]
@@ -591,7 +732,7 @@ mod tests {
         gw.export_channel(0x20, vec![]);
 
         let snap = gw.exports();
-        let keys: Vec<u16> = snap.iter().map(|(k, _)| *k).collect();
+        let keys: Vec<ChannelHash> = snap.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec![0x10, 0x20, 0x42]);
         assert_eq!(snap[0].1, vec![SubnetId::new(&[5])]);
         assert_eq!(snap[2].1, vec![SubnetId::new(&[2]), SubnetId::new(&[3])],);

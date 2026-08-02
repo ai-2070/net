@@ -1521,14 +1521,17 @@ use net::adapter::net::{
 };
 
 /// Helper: register a channel with the given visibility and return its
-/// wire `u16` hash (matches `SubnetGateway::should_forward`'s
-/// `channel_hash` argument, which is the per-packet wire field).
-fn register_channel(registry: &ChannelConfigRegistry, name: &str, vis: Visibility) -> u16 {
+/// canonical `u64` hash.
+///
+/// `SubnetGateway::should_forward` keys on the canonical identity, not
+/// the wire `u16` hint — the hint has routine collisions by design and
+/// channel policy has to be exact.
+fn register_channel(registry: &ChannelConfigRegistry, name: &str, vis: Visibility) -> u64 {
     let id = ChannelId::parse(name).expect("invalid channel name");
-    let wire = id.wire_hash();
+    let hash = id.hash();
     let config = ChannelConfig::new(id).with_visibility(vis);
     registry.insert(config);
-    wire
+    hash
 }
 
 /// 9.1 — Gateway blocks SubnetLocal traffic at boundary.

@@ -1388,16 +1388,27 @@ disabled/fail-closed in production dispatch until S4B.
   fallback;
 - no protected route can downgrade to the public/global legacy path.
 
-**Known limitation carried by the export activation.** `SubnetGateway`'s export
-table is keyed by the 16-bit wire channel hash, because the packet-level path
-sees only that field in a header. The subscribe gate and publish fan-out hold
-the canonical `u64` and truncate to match, so two channels sharing a wire
-bucket share export rules and one channel's targets can widen another's
-propagation. This is a visibility leak rather than an authority bypass —
-visibility is a propagation filter and a protected channel pairs it with token
-enforcement keyed on the canonical hash. Closing it means re-keying the export
-table and the `net gateway export` operator surface on the `u64`, which is a
-public API change and therefore a separate slice.
+**Export policy is keyed on canonical channel identity.** `SubnetGateway`'s
+export table, `export_channel`, `export_targets`, `exports`,
+`exports_for_channel`, and `should_forward` all take the canonical
+`ChannelHash` (`u64`). The 16-bit wire hash on `NetHeader.channel_hash` is
+documented as a fast-path filter hint with routine collisions, and the
+canonical hash is the substrate-wide key for ACL, storage, config, and policy.
+An earlier revision keyed the export table on the wire hint, so two unrelated
+channels sharing a bucket shared export rules and declaring targets for one
+silently declared them for the other.
+
+Nothing downstream rescues that: visibility and token enforcement are separate
+mechanisms, a tokenless channel has nothing else in front of it, and a
+colliding name can be chosen deliberately. Widening the hint (`wire_hash as
+u64`) is equally wrong — the missing 48 bits are not recoverable. A caller that
+holds only `NetHeader.channel_hash` cannot perform channel-specific export
+policy at all and must either carry authenticated canonical identity in a
+future protocol shape or fail closed.
+
+The operator surface prefers names (`export_channel_by_name`,
+`export_targets_by_name`), deriving the canonical hash internally so the hint
+cannot reach a policy key through that door.
 
 Wire the authenticated route-hop envelope into the only live relay branch.
 Resolve ingress identity from the verified hop session, resolve egress identity
