@@ -36,7 +36,11 @@ use crate::{theme, widgets};
 /// directly from the fixture.
 #[derive(Clone, Debug)]
 pub(crate) struct ExportRow {
-    pub channel_hash: u16,
+    /// CANONICAL channel identity (u64), matching the substrate's
+    /// export table. Never the 16-bit wire hint: export rules are
+    /// channel policy, and the hint has routine collisions by design,
+    /// so two unrelated channels would render as one row.
+    pub channel_hash: u64,
     pub channel_name: Option<String>,
     pub visibility: Option<Visibility>,
     pub targets: Vec<SubnetId>,
@@ -90,12 +94,12 @@ fn resolve_rows(deck: &Arc<DeckClient>) -> Vec<ExportRow> {
         return Vec::new();
     }
     // Hash → (name, visibility) lookup. Built once per render.
-    // `channel_wire_hash` re-queries the registry per channel;
+    // `channel_canonical_hash` re-queries the registry per channel;
     // the channel count is small in practice (operator
     // tooling), so the per-row cost is negligible.
-    let mut meta: HashMap<u16, (String, Visibility)> = HashMap::new();
+    let mut meta: HashMap<u64, (String, Visibility)> = HashMap::new();
     for (name, vis) in deck.channels() {
-        if let Some(h) = deck.channel_wire_hash(&name) {
+        if let Some(h) = deck.channel_canonical_hash(&name) {
             meta.insert(h, (name, vis));
         }
     }
@@ -249,7 +253,7 @@ fn render_table(
                 Cell::from(Span::styled(name_text, name_style)),
                 Cell::from(Span::styled(vis_text, theme::cyan())),
                 Cell::from(Span::styled(
-                    format!("{:#06x}", row.channel_hash),
+                    format!("{:#018x}", row.channel_hash),
                     theme::dim(),
                 )),
                 Cell::from(Span::styled(target_text, theme::text())),

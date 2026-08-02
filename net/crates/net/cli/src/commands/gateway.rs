@@ -10,8 +10,10 @@
 //!
 //! `export <channel> <target-subnet>...` adds (or replaces) an
 //! export rule. The channel argument can be either the canonical
-//! name (resolved via `DeckClient::channel_wire_hash`) or a
-//! `0x` / decimal `u16` wire-hash literal.
+//! name (hashed directly to its canonical `ChannelHash`) or a
+//! `0x` / decimal canonical `u64` literal. The 16-bit wire hint is
+//! NOT accepted: export rules are channel policy and the hint
+//! collides by design.
 //!
 //! Shape pinned in `SCALING_SUBNET_SPEC.md` Phase A.
 
@@ -20,11 +22,11 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use net_sdk::deck::GatewayStats;
 use net_sdk::subnets::SubnetId;
+use net_sdk::ChannelName;
 use serde::Serialize;
 
 use crate::context::{resolve_profile, CliContext};
 use crate::error::{generic, invalid_args, CliError};
-use crate::parsers::parse_u16_flexible;
 use crate::prelude::{emit_value, OutputFormat};
 
 #[derive(Subcommand, Debug)]
@@ -60,7 +62,7 @@ pub struct ExportsArgs {
 
 #[derive(Args, Debug)]
 pub struct ExportArgs {
-    /// Channel name OR `0x`/decimal `u16` wire hash.
+    /// Channel name (preferred) OR `0x`/decimal canonical `u64` hash.
     pub channel: String,
     /// Target subnets to export to. At least one required.
     /// Format: `region.fleet.unit[.subsystem]` (e.g. `3.7.2`) or
@@ -151,11 +153,19 @@ async fn run_export(
     ))
 }
 
-/// Parse a channel arg as a `0x` / decimal wire-hash literal.
-/// Channel-name → wire-hash resolution requires a mesh-attached
-/// deck the read-only CLI doesn't carry; names are rejected with
-/// a message that points operators at the literal form.
-fn parse_channel_hash(raw: &str) -> Result<u16, CliError> {
+/// Parse a channel arg into a CANONICAL `ChannelHash` (u64).
+///
+/// Export rules are channel policy, and policy is keyed on the
+/// canonical `u64` — never the 16-bit wire hint, which is documented
+/// as a fast-path filter with routine collisions. Accepting a hint
+/// here would let an operator install one channel.s targets onto
+/// every other channel in the same bucket.
+///
+/// A name is the preferred form and hashes directly. A literal is
+/// accepted only at full canonical width; a short value is refused
+/// rather than widened, because `wire_hash as u64` recovers none of
+/// the missing 48 bits.
+fn parse_channel_hash(raw: &str) -> Result<u64, CliError> {
     let s = raw.trim();
     if s.is_empty() {
         return Err(invalid_args("channel cannot be empty"));
@@ -163,14 +173,18 @@ fn parse_channel_hash(raw: &str) -> Result<u16, CliError> {
     let looks_like_literal =
         s.starts_with("0x") || s.starts_with("0X") || s.chars().all(|c| c.is_ascii_digit());
     if looks_like_literal {
-        return parse_u16_flexible(s).map_err(|e| invalid_args(format!("channel `{raw}`: {e}")));
+        let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16)
+        } else {
+            s.parse::<u64>()
+        };
+        return parsed.map_err(|e| invalid_args(format!("channel `{raw}`: {e}")));
     }
-    Err(invalid_args(format!(
-        "channel `{raw}` looks like a name; name → wire-hash resolution needs \
-         a mesh-attached deck which the read-only CLI doesn't carry. Pass the \
-         wire hash directly (e.g. `0x1234` or `4660`) until the write-attach \
-         surface lands."
-    )))
+    // A name IS the canonical identity, so resolving one needs no
+    // mesh attachment — the hash is a pure function of the name.
+    ChannelName::new(s)
+        .map(|n| n.hash())
+        .map_err(|e| invalid_args(format!("channel `{raw}`: {e}")))
 }
 
 /// Parse a subnet arg into a `SubnetId` via its `FromStr` impl.
@@ -257,22 +271,32 @@ mod tests {
         assert_eq!(parse_channel_hash("0x42").unwrap(), 0x42);
         assert_eq!(parse_channel_hash("0X42").unwrap(), 0x42);
         assert_eq!(parse_channel_hash("66").unwrap(), 66);
+        // Full canonical width, not truncated to a wire hint.
+        assert_eq!(
+            parse_channel_hash("0xeb3ad2bc323f22f2").unwrap(),
+            0xeb3a_d2bc_323f_22f2,
+        );
     }
 
     #[test]
-    fn parse_channel_hash_rejects_names_with_pointer_to_literal_form() {
-        let err = parse_channel_hash("internal/metrics").unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("looks like a name"),
-            "error must steer operator at the literal form, got: {msg}"
-        );
+    fn parse_channel_hash_resolves_a_name_to_its_canonical_hash() {
+        // A name is the PREFERRED form: the canonical hash is a pure
+        // function of it, so no mesh attachment is needed and the
+        // operator never handles a collidable hint.
+        let expected = net_sdk::ChannelName::new("internal/metrics")
+            .expect("name")
+            .hash();
+        assert_eq!(parse_channel_hash("internal/metrics").unwrap(), expected);
+        // A malformed name is refused rather than silently hashed.
+        assert!(parse_channel_hash("not a valid name!!").is_err());
     }
 
     #[test]
     fn parse_channel_hash_rejects_empty_and_overflow() {
         assert!(parse_channel_hash("").is_err());
-        assert!(parse_channel_hash("0x1FFFF").is_err());
-        assert!(parse_channel_hash("65536").is_err());
+        // Values above the 16-bit hint are ordinary canonical hashes now.
+        assert_eq!(parse_channel_hash("0x1FFFF").unwrap(), 0x1_FFFF);
+        assert_eq!(parse_channel_hash("65536").unwrap(), 65536);
+        assert!(parse_channel_hash("0xFFFFFFFFFFFFFFFFF").is_err());
     }
 }

@@ -633,12 +633,11 @@ async fn a_valid_protected_hop_is_forwarded_and_retagged() {
     );
 
     // Seal a genuine hop on the left↔gateway edge.
-    let left_to_gw = f
-        .left
-        .peer_session_for_test(f.gw.node_id())
-        .expect("left has a session to the gateway");
     let header = RoutingHeader::new(f.right.node_id(), f.left.node_id() as u32, 8);
-    let envelope = left_to_gw.seal_route_hop(&header, INNER_TAG);
+    let envelope = f
+        .left
+        .seal_route_hop_to_peer(f.gw.node_id(), &header, INNER_TAG)
+        .expect("left has a session to the gateway");
 
     // Sent from an unrelated socket on purpose: ingress identity comes
     // from the hop session id, never from the UDP source address. If
@@ -663,26 +662,31 @@ async fn a_valid_protected_hop_is_forwarded_and_retagged() {
     // Re-tagged under the EGRESS edge key: the gateway→right session,
     // not the one it arrived on. Opening it proves the MAC verifies and
     // the sequence is admitted exactly once.
-    let gw_to_right = f
+    let (out_header, out_inner) = f
         .right
-        .peer_session_for_test(f.gw.node_id())
-        .expect("right has a session to the gateway");
-    let opened = gw_to_right
-        .open_route_hop(out)
+        .open_route_hop_from_peer(f.gw.node_id(), out)
         .expect("the forwarded hop verifies under the egress edge key");
 
     // The inner end-to-end packet is byte-identical.
     assert_eq!(
-        opened.inner, INNER_TAG,
+        out_inner, INNER_TAG,
         "the relay must not touch the inner packet",
     );
     // Only the outer routing header moved, and only downward.
-    assert_eq!(opened.header.dest_id, f.right.node_id());
-    assert!(
-        opened.header.hop_count > header.hop_count || opened.header.ttl < header.ttl,
-        "the outer TTL/hop budget must be consumed exactly once: {:?} -> {:?}",
-        (header.ttl, header.hop_count),
-        (opened.header.ttl, opened.header.hop_count),
+    assert_eq!(out_header.dest_id, f.right.node_id());
+    // EXACTLY once, on both fields. A disjunction here would pass if
+    // the relay decremented twice, incremented twice, or moved only
+    // one field — the prose says "exactly once", so the assertion has
+    // to say it too.
+    assert_eq!(
+        out_header.ttl,
+        header.ttl - 1,
+        "outer TTL must be decremented exactly once",
+    );
+    assert_eq!(
+        out_header.hop_count,
+        header.hop_count + 1,
+        "outer hop_count must be incremented exactly once",
     );
 
     // The same envelope replayed at the gateway is refused, so the
@@ -721,12 +725,11 @@ async fn a_valid_hop_without_route_authority_is_not_forwarded() {
         .gw
         .set_peer_addr_for_test(f.right.node_id(), watcher.local_addr().expect("addr")));
 
-    let left_to_gw = f
-        .left
-        .peer_session_for_test(f.gw.node_id())
-        .expect("session");
     let header = RoutingHeader::new(f.right.node_id(), f.left.node_id() as u32, 8);
-    let envelope = left_to_gw.seal_route_hop(&header, INNER_TAG);
+    let envelope = f
+        .left
+        .seal_route_hop_to_peer(f.gw.node_id(), &header, INNER_TAG)
+        .expect("session");
 
     let sock = wire().await;
     sock.send_to(&envelope, f.gw.local_addr())

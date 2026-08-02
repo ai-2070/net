@@ -10775,31 +10775,94 @@ impl MeshNode {
     /// the protected-forwarding witness uses it to seal a genuine
     /// route-hop envelope under a real edge key.
     ///
-    /// Not feature-gated: it was `nat-traversal`-only, which is why the
-    /// protected relay had no positive witness — a test could send
-    /// invalid envelopes but never a valid one.
+    /// Gated, not merely `#[doc(hidden)]`. Hiding documentation is not
+    /// access control: handing out the live `NetSession` exposes
+    /// sealing and opening to every ordinary build. The protected
+    /// relay's witness needs only to seal or open ONE envelope, which
+    /// is what [`Self::seal_route_hop_to_peer`] and
+    /// [`Self::open_route_hop_from_peer`] provide.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures", feature = "nat-traversal"))]
     pub fn peer_session_for_test(&self, node_id: u64) -> Option<Arc<NetSession>> {
         self.peers.get(&node_id).map(|e| e.value().session.clone())
     }
 
-    /// Test-only: repoint a peer's recorded address without touching
-    /// its session.
+    /// Seal ONE route-hop envelope on the edge to `node_id`.
+    ///
+    /// The narrow form of what a protected-forwarding witness needs:
+    /// it consumes a hop sequence on that edge and returns the bytes,
+    /// without handing the caller the session, its keys, or its replay
+    /// state.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures", feature = "nat-traversal"))]
+    pub fn seal_route_hop_to_peer(
+        &self,
+        node_id: u64,
+        header: &super::route::RoutingHeader,
+        inner: &[u8],
+    ) -> Option<Vec<u8>> {
+        let session = self
+            .peers
+            .get(&node_id)
+            .map(|e| e.value().session.clone())?;
+        Some(session.seal_route_hop(header, inner))
+    }
+
+    /// Open ONE route-hop envelope received on the edge to `node_id`,
+    /// admitting its sequence exactly once.
+    ///
+    /// Returns the outer routing header and a copy of the inner packet.
+    /// `None` covers "no such peer" and "did not verify" alike — a
+    /// witness asserts on the successful shape, and the failure reasons
+    /// are already pinned by the `route_hop` module tests.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures", feature = "nat-traversal"))]
+    pub fn open_route_hop_from_peer(
+        &self,
+        node_id: u64,
+        buf: &[u8],
+    ) -> Option<(super::route::RoutingHeader, Vec<u8>)> {
+        let session = self
+            .peers
+            .get(&node_id)
+            .map(|e| e.value().session.clone())?;
+        let opened = session.open_route_hop(buf).ok()?;
+        Some((opened.header, opened.inner.to_vec()))
+    }
+
+    /// Test-only: move a peer to a new address CONSISTENTLY — peer
+    /// record, authenticated route binding, and both address indexes.
     ///
     /// The protected relay reads the egress address from the peer
     /// snapshot, so a witness that wants to OBSERVE a forwarded hop has
-    /// to be able to put an inspectable socket there. The session,
-    /// keys, and admitted context are untouched, so the packet is
-    /// sealed under the real egress edge key and stays verifiable.
+    /// to put an inspectable socket there. The session, keys, and
+    /// admitted context are untouched, so the hop is still sealed under
+    /// the real egress edge key and stays verifiable.
+    ///
+    /// Writing only `PeerInfo.addr` produced state production cannot
+    /// reach: the route stayed bound to the old address while the peer
+    /// claimed a new one. The relay's pre-seal incarnation check
+    /// rejects exactly that disagreement, so a witness built on the
+    /// torn version was asserting against a shape the real system never
+    /// has. This models a NAT rebind instead, which is the real
+    /// operation.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures", feature = "nat-traversal"))]
     pub fn set_peer_addr_for_test(&self, node_id: u64, addr: SocketAddr) -> bool {
-        match self.peers.get_mut(&node_id) {
-            Some(mut peer) => {
-                peer.addr = addr;
-                true
-            }
-            None => false,
-        }
+        let Some(mut peer) = self.peers.get_mut(&node_id) else {
+            return false;
+        };
+        let old = peer.addr;
+        peer.addr = addr;
+        drop(peer);
+        self.peer_addrs.insert(node_id, addr);
+        self.addr_to_node.remove(&old);
+        self.addr_to_node.insert(addr, node_id);
+        // Follow the identity, exactly as the live rebind path does.
+        self.router
+            .routing_table()
+            .rebind_authenticated_route(node_id, node_id, addr);
+        true
     }
 
     /// Build a [`MigrationIdentityContext`](crate::adapter::net::subprotocol::MigrationIdentityContext)
@@ -16140,7 +16203,7 @@ impl MeshNode {
         // (4) Egress by IDENTITY bound into the route entry — not by
         // resolving an address through the mutable reverse map, which
         // would let address reuse retarget the route.
-        let Some((egress_node, _bound_addr)) = ctx
+        let Some((egress_node, bound_addr)) = ctx
             .router
             .routing_table()
             .lookup_authenticated(opened.header.dest_id)
@@ -16214,14 +16277,24 @@ impl MeshNode {
         // decision was made against a session that no longer exists;
         // emit nothing rather than tag under a dead key or aim a valid
         // tag at a new address.
-        let still_current = ctx
-            .peers
-            .get(&egress_node)
-            .is_some_and(|e| e.value().session.session_id() == egress_session_id);
+        // Both halves of the incarnation, plus the route's own binding.
+        // Checking only the session id would miss an address change
+        // under the same session; ignoring `bound_addr` would let the
+        // route and the peer disagree about where the hop goes. The hot
+        // path drops on any disagreement rather than reconstructing
+        // identity from an address — a legitimate NAT rebind is repaired
+        // off-path under the same bound identity by
+        // `authenticated_next_hop`.
+        let still_current = ctx.peers.get(&egress_node).is_some_and(|e| {
+            let peer = e.value();
+            peer.session.session_id() == egress_session_id
+                && peer.addr == egress_addr
+                && egress_addr == bound_addr
+        });
         if !still_current {
             tracing::debug!(
                 egress = format!("{egress_node:#x}"),
-                "subnet: egress session changed mid-admission, dropping",
+                "subnet: egress incarnation changed mid-admission, dropping",
             );
             return;
         }
@@ -16537,7 +16610,22 @@ impl MeshNode {
             }
         };
         ctx.peer_addrs.insert(peer_node_id, source);
-        ctx.router.add_direct_route(peer_node_id, source);
+        // LEGACY on purpose. `peer_node_id` is the remote end-to-end
+        // peer; `source` is the immediate upstream relay's address.
+        // For a routed handshake those are not the same node, so
+        // binding `next_hop_id = peer_node_id` here would assert a
+        // false adjacency: a route claiming the remote endpoint as its
+        // next-hop identity while pointing at an intermediate relay's
+        // address. Protected forwarding would then select the remote
+        // endpoint's session and seal a tag the adjacent relay cannot
+        // verify.
+        //
+        // Route-hop authority is selected from the exact authenticated
+        // ADJACENT peer. Until this path can supply that identity from
+        // the ingress session that actually carried the handshake, the
+        // route stays address-only and protected forwarding fails
+        // closed on it.
+        ctx.router.add_route(peer_node_id, source);
         ctx.session_id_to_node
             .insert(registered_session_id, peer_node_id);
         // Fresh session incarnation (Vacant or accepted rotation) →
