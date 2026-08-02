@@ -458,6 +458,11 @@ jobs:
           --test peer_death_evicts_peer_map
           --test send_subprotocol_malformed
           --test subnet_enforcement
+          --test subnet_axis_demotion
+          --test subnet_grant
+          --test subnet_grant_hierarchy
+          --test subnet_revocation
+          --test subnet_session_auth
           --test integration_placement_filter_callback
           --test capability_broadcast
           --test capability_multihop
