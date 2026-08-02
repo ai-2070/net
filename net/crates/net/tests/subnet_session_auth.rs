@@ -216,6 +216,54 @@ async fn valid_presentation_compiles_a_context() {
     ));
 }
 
+/// A parent-scoped grant presented for a child admits the child: the
+/// compiled context records that exact child as `attachment` while
+/// retaining the parent grant root separately as `scope`. Substituting
+/// `scope` for `attachment` would place this one peer everywhere
+/// beneath the parent (SUBNET_AUTH_PLAN.md D5/D6).
+#[tokio::test]
+async fn parent_grant_attached_at_a_child_records_both_points() {
+    let f = fixture().await;
+    let sub_id = f.subject.node_id();
+    // Grant scoped at the vehicle root [3].
+    let set = grant_for(&f.root, &f.subject_kp, &[3], SubnetRights::ATTACH, DAY);
+    let nonce = f
+        .verifier
+        .issue_subnet_challenge(sub_id)
+        .expect("challenge");
+    let sid = session_id_of(&f.verifier, sub_id);
+    // …presented for the camera domain [3, 7, 2].
+    let p = present(
+        &f.subject_kp,
+        &set,
+        sid,
+        &f.verifier,
+        nonce,
+        &f.root,
+        &[3, 7, 2],
+        SubnetRights::ATTACH,
+    );
+    let ctx = f
+        .verifier
+        .admit_subnet_session(sub_id, &p, &set)
+        .expect("a parent grant admits a child attachment");
+
+    assert_eq!(
+        ctx.attachment,
+        TopologySubnetId::new(&[3, 7, 2]),
+        "attachment is the exact presented target",
+    );
+    assert_eq!(
+        ctx.scope,
+        TopologySubnetId::new(&[3]),
+        "scope remains the credential's broader ceiling",
+    );
+    assert_ne!(
+        ctx.attachment, ctx.scope,
+        "the two must stay distinguishable — forwarding reads attachment",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // No grant / no proof
 // ---------------------------------------------------------------------------
@@ -680,23 +728,26 @@ async fn expired_grant_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Forwarding-right selection (feeds S4)
+// A peer context is not forwarding authority
 // ---------------------------------------------------------------------------
 
-/// The boundary rule a gateway will consume: both endpoints inside
-/// the scope ⇒ ROUTE; exactly one inside ⇒ EXPORT; neither ⇒ the
-/// context is irrelevant.
+/// A peer that proves ROUTE for itself grants this node nothing. The
+/// verifier's own forwarding authority comes from credentials naming
+/// the verifier as subject (`install_subnet_gateway_credentials`), and
+/// admitting a peer never publishes one. `subnet_gateway_local_auth.rs`
+/// pins the decision rule itself; this pins the separation.
 #[tokio::test]
-async fn required_forwarding_right_follows_the_boundary() {
+async fn admitting_a_peer_confers_no_gateway_authority() {
     let f = fixture().await;
     let sub_id = f.subject.node_id();
-    let set = grant_for(
-        &f.root,
-        &f.subject_kp,
-        SCOPE,
-        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
-        DAY,
+    assert!(
+        f.verifier.subnet_gateway_contexts().is_none(),
+        "precondition: the verifier holds no gateway authority",
     );
+
+    // The peer proves ATTACH *and* ROUTE for itself.
+    let rights = SubnetRights::ATTACH.union(SubnetRights::ROUTE);
+    let set = grant_for(&f.root, &f.subject_kp, SCOPE, rights, DAY);
     let nonce = f
         .verifier
         .issue_subnet_challenge(sub_id)
@@ -710,30 +761,25 @@ async fn required_forwarding_right_follows_the_boundary() {
         nonce,
         &f.root,
         SCOPE,
-        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+        rights,
     );
     let ctx = f
         .verifier
         .admit_subnet_session(sub_id, &p, &set)
         .expect("admit");
+    assert!(ctx.rights.contains(SubnetRights::ROUTE));
 
-    let inside_a = TopologySubnetId::new(&[3, 7, 1]);
-    let inside_b = TopologySubnetId::new(&[3, 7, 2]);
-    let outside = TopologySubnetId::new(&[4]);
-    assert_eq!(
-        ctx.required_forwarding_right(inside_a, inside_b),
-        Some(SubnetRights::ROUTE)
+    assert!(
+        f.verifier.subnet_gateway_contexts().is_none(),
+        "a peer's proven ROUTE must never become the verifier's forwarding authority",
     );
-    assert_eq!(
-        ctx.required_forwarding_right(inside_a, outside),
-        Some(SubnetRights::EXPORT)
-    );
-    assert_eq!(
-        ctx.required_forwarding_right(outside, inside_a),
-        Some(SubnetRights::EXPORT)
-    );
-    assert_eq!(ctx.required_forwarding_right(outside, outside), None);
 
-    // ATTACH alone never authorizes forwarding.
-    assert!(!ctx.allows(0, 0, unix_now_secs(), outside, SubnetRights::EXPORT));
+    // And the peer's own credentials cannot be installed as this
+    // node's gateway authority: the subject is not this process.
+    assert_eq!(
+        f.verifier
+            .install_subnet_gateway_credentials(&[set])
+            .unwrap_err(),
+        SubnetAuthError::WrongSubject,
+    );
 }

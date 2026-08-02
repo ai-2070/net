@@ -18,13 +18,16 @@ pub mod auth;
 mod error;
 mod gateway;
 mod id;
+pub mod route_hop;
 
 pub use admission::{SubnetChallengeStore, SubnetContextStore};
 pub use assignment::{SubnetPolicy, SubnetRule};
 pub use auth::{
-    ExpectedBinding, SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig,
-    SubnetCredentialSet, SubnetFloorRegistry, SubnetGrant, SubnetIssuerGrant, SubnetRef,
-    SubnetRevocationFloor, SubnetRights, VerifiedSubnetAuthority, VerifiedSubnetContext,
+    build_gateway_context_set, compile_gateway_context, ExpectedBinding, ForwardDenial,
+    SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig, SubnetCredentialSet,
+    SubnetFloorRegistry, SubnetGrant, SubnetIssuerGrant, SubnetRef, SubnetRevocationFloor,
+    SubnetRights, VerifiedGatewayContext, VerifiedGatewayContextSet, VerifiedSubnetAuthority,
+    VerifiedSubnetContext, MAX_GATEWAY_CONTEXTS_PER_AUTHORITY,
 };
 pub use error::SubnetError;
 pub use gateway::{DropReason, ForwardDecision, SubnetGateway};

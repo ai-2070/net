@@ -494,9 +494,10 @@ use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{
-    DropReason, SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig,
-    SubnetChallengeStore, SubnetContextStore, SubnetCredentialSet, SubnetFloorRegistry,
-    SubnetGateway, SubnetId, SubnetPolicy, SubnetRevocationFloor, VerifiedSubnetContext,
+    route_hop::AuthenticatedNextHop, DropReason, SubnetAuthError, SubnetAuthPresentation,
+    SubnetAuthorityConfig, SubnetChallengeStore, SubnetContextStore, SubnetCredentialSet,
+    SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy, SubnetRevocationFloor,
+    VerifiedGatewayContextSet, VerifiedSubnetContext,
 };
 use super::subprotocol::stream_window::{
     StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_WINDOW_SIZE,
@@ -1759,6 +1760,14 @@ pub struct MeshNodeConfig {
     /// fail-closed for authority claims, no effect on plain
     /// topology/visibility operation.
     pub subnet_authorities: Vec<SubnetAuthorityConfig>,
+    /// This node's own attachment point inside its authority's
+    /// hierarchy, for protected forwarding (SUBNET_AUTH_PLAN.md D6).
+    /// Defaults to [Self::subnet] — the topology coordinate and the
+    /// security attachment are usually the same point, but they are
+    /// separate settings because the former is unauthenticated
+    /// routing state and the latter is checked against a credential
+    /// scope.
+    pub subnet_attachment: Option<SubnetId>,
     /// Visibility applied on publish when a channel has **no**
     /// registered config in the local
     /// [`ChannelConfigRegistry`]. Defaults to
@@ -2099,6 +2108,7 @@ impl MeshNodeConfig {
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
             subnet_authorities: Vec::new(),
+            subnet_attachment: None,
             default_visibility: Visibility::Global,
             unregistered_channels: UnregisteredChannelPolicy::default(),
             min_announce_interval: Duration::from_secs(10),
@@ -7901,6 +7911,16 @@ pub struct MeshNode {
     /// reinterpreting the hierarchy bumps it, invalidating every
     /// context minted under the old meaning.
     subnet_topology_epoch: Arc<std::sync::atomic::AtomicU32>,
+    /// This node's OWN forwarding authority, compiled from self-held
+    /// credentials (SUBNET_AUTH_PLAN.md D6). Distinct from the peer
+    /// contexts above: a peer proving it may attach says nothing
+    /// about whether this node may relay for it. None until an
+    /// operator installs gateway credentials, which is what keeps a
+    /// non-gateway node from forwarding protected traffic at all.
+    subnet_gateway_contexts: Arc<arc_swap::ArcSwapOption<VerifiedGatewayContextSet>>,
+    /// This node's own attachment point, used when compiling the
+    /// gateway context set and as the local end of a transition.
+    subnet_local_attachment: SubnetId,
     /// Per-peer subnet map — **routing state, not authenticated
     /// membership** (SUBNET_AUTH_PLAN.md). Keys are `node_id`; values
     /// are the subnet derived from each peer's most recent
@@ -8776,6 +8796,7 @@ impl MeshNode {
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
         let subnet_authorities = config.subnet_authorities.clone();
+        let subnet_local_attachment = config.subnet_attachment.unwrap_or(local_subnet);
         let policy_can_scope = local_subnet_policy
             .as_ref()
             .is_some_and(|p| p.can_assign_non_global());
@@ -9068,6 +9089,8 @@ impl MeshNode {
             subnet_challenges,
             subnet_contexts,
             subnet_topology_epoch: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            subnet_gateway_contexts: Arc::new(arc_swap::ArcSwapOption::empty()),
+            subnet_local_attachment,
             peer_subnets,
             // Gateway is installed lazily by `set_channel_configs`;
             // a node without an installed registry has no gateway
@@ -10967,6 +10990,73 @@ impl MeshNode {
         Ok(changed)
     }
 
+    /// Compile and publish this node's OWN forwarding authority from
+    /// self-held credential sets (SUBNET_AUTH_PLAN.md D6).
+    ///
+    /// Every set must name this process as its leaf subject; a
+    /// credential issued to another node can never become this node's
+    /// gateway authority, and a remote peer's admitted session is
+    /// never silently reused as one. No challenge is involved — the
+    /// process already holds the private key, so a self-challenge
+    /// would prove nothing that possession does not.
+    ///
+    /// The whole set is recompiled and published atomically. Refresh
+    /// and revocation therefore replace it wholesale rather than
+    /// merging into a live set, which is what stops a revoked
+    /// credential's rights from surviving inside a surviving entry.
+    pub fn install_subnet_gateway_credentials(
+        &self,
+        sets: &[SubnetCredentialSet],
+    ) -> Result<(), SubnetAuthError> {
+        if sets.is_empty() {
+            self.subnet_gateway_contexts.store(None);
+            return Ok(());
+        }
+        let authority = sets[0].leaf().authority.clone();
+        let config = self
+            .subnet_authority_config(&authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        let epoch = self.subnet_topology_epoch.load(Ordering::Acquire);
+        let now = crate::adapter::net::subnet::admission::unix_now_secs();
+        let mut compiled = Vec::with_capacity(sets.len());
+        for set in sets {
+            compiled.push(crate::adapter::net::subnet::auth::compile_gateway_context(
+                set,
+                self.entity_id(),
+                self.subnet_local_attachment,
+                config,
+                epoch,
+                &self.subnet_floors,
+                now,
+                crate::adapter::net::identity::TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
+            )?);
+        }
+        let set =
+            crate::adapter::net::subnet::auth::build_gateway_context_set(&authority, compiled)?;
+        self.subnet_gateway_contexts.store(Some(Arc::new(set)));
+        Ok(())
+    }
+
+    /// This node's published gateway authority, or `None` when it
+    /// holds none — in which case it forwards no protected traffic.
+    pub fn subnet_gateway_contexts(&self) -> Option<Arc<VerifiedGatewayContextSet>> {
+        self.subnet_gateway_contexts.load_full()
+    }
+
+    /// Resolve `dest_id` to an identity-qualified next hop.
+    ///
+    /// The routing table answers with an address, which cannot select
+    /// a cryptographic context. This resolves that address to the
+    /// authenticated peer whose session terminates there, and then
+    /// reports THAT peer's current address — so a NAT rebind moves the
+    /// address without changing the hop identity, and an unknown or
+    /// unauthenticated address resolves to nothing at all.
+    pub fn authenticated_next_hop(&self, dest_id: u64) -> Option<AuthenticatedNextHop> {
+        let routed_addr = self.router.routing_table().lookup(dest_id)?;
+        let node_id = self.addr_to_node.get(&routed_addr).map(|e| *e.value())?;
+        let addr = self.peers.get(&node_id)?.addr;
+        Some(AuthenticatedNextHop { node_id, addr })
+    }
     /// Explicitly withdraw a peer's subnet admission — outstanding
     /// challenges and any compiled context. One of the invalidation
     /// triggers in SUBNET_AUTH_PLAN.md D5; the peer must re-present

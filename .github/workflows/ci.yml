@@ -459,6 +459,7 @@ jobs:
           --test send_subprotocol_malformed
           --test subnet_enforcement
           --test subnet_axis_demotion
+          --test subnet_gateway_local_auth
           --test subnet_grant
           --test subnet_grant_hierarchy
           --test subnet_revocation

@@ -189,6 +189,9 @@ pub enum SubnetAuthError {
     /// A different full `EntityId` is already pinned to this routing
     /// `NodeId` — refused, never overwritten.
     IdentityPinConflict,
+    /// More distinct local gateway scopes than
+    /// [`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`].
+    TooManyGatewayContexts,
     /// ed25519 verification failed.
     InvalidSignature,
     /// Structural decode failure: wrong length, unknown version,
@@ -220,6 +223,7 @@ impl std::fmt::Display for SubnetAuthError {
             Self::WrongVerifier => "wrong_verifier",
             Self::WrongChallenge => "wrong_challenge",
             Self::IdentityPinConflict => "identity_pin_conflict",
+            Self::TooManyGatewayContexts => "too_many_gateway_contexts",
             Self::InvalidSignature => "invalid_signature",
             Self::InvalidFormat => "invalid_format",
             Self::InvalidValidityWindow => "invalid_validity_window",
@@ -1340,7 +1344,20 @@ pub struct ExpectedBinding {
 pub struct VerifiedSubnetContext {
     /// Authority the credentials verified under.
     pub authority: EntityId,
-    /// Granted subtree root.
+    /// The exact admitted topology point — `presentation.target.path`,
+    /// verified to lie inside `scope`.
+    ///
+    /// This, not [`Self::scope`], is where the peer *is*. A grant
+    /// scoped at `vehicle` and presented for
+    /// `vehicle/perception/camera-domain` admits the camera domain
+    /// only; treating `scope` as the peer's location would place that
+    /// one peer everywhere beneath `vehicle` at once and let a
+    /// gateway mistake an internal transition for a boundary
+    /// crossing (or the reverse). Forwarding reads `attachment`.
+    pub attachment: TopologySubnetId,
+    /// Ceiling: the root of the subtree the credential permits. Bounds
+    /// what `attachment` may be and what a re-presentation may claim;
+    /// it is never itself a location.
     pub scope: TopologySubnetId,
     /// Topology epoch verified against.
     pub topology_epoch: u32,
@@ -1382,25 +1399,263 @@ impl VerifiedSubnetContext {
             && self.rights.contains(right)
     }
 
-    /// Forwarding boundary rule (D6): traffic with both endpoints
-    /// inside the scope needs `ROUTE`; traffic crossing the boundary
-    /// needs `EXPORT`; traffic wholly outside is not this context's
-    /// business. Returns the required right, or `None` when the
-    /// context is irrelevant to the transition.
-    #[inline]
-    pub fn required_forwarding_right(
+    // A peer context deliberately exposes NO forwarding decision.
+    // Forwarding authority belongs to the gateway itself
+    // ([`VerifiedGatewayContextSet::authorize_transition`]); a peer
+    // proving it may attach somewhere says nothing about whether THIS
+    // node may relay for it. See SUBNET_AUTH_PLAN.md D6.
+}
+
+// ---------------------------------------------------------------------------
+// Local gateway authority (S4A / D6)
+// ---------------------------------------------------------------------------
+
+/// One locally-held forwarding authority, compiled from a credential
+/// whose subject is THIS process (SUBNET_AUTH_PLAN.md D6).
+///
+/// Deliberately a distinct type from [`VerifiedSubnetContext`]: a
+/// remote peer's admitted session may never be silently reused as
+/// local gateway authority. The peer context answers "where is that
+/// peer, and what did it prove"; this answers "what may this node do
+/// with traffic between two such peers".
+///
+/// No challenge is involved. A self-challenge adds nothing because the
+/// process already holds the private key; what is required instead is
+/// `leaf.subject == local EntityKeypair.entity_id()`, checked at
+/// compile time in [`compile_gateway_context`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGatewayContext {
+    /// Authority the credential verified under.
+    pub authority: EntityId,
+    /// This node's own attachment point within `scope`.
+    pub attachment: TopologySubnetId,
+    /// The subtree this entry's rights apply to. Boundary decisions
+    /// test containment against THIS.
+    pub scope: TopologySubnetId,
+    /// Topology epoch verified against.
+    pub topology_epoch: u32,
+    /// The local entity — equal to this process's `EntityId`.
+    pub subject: EntityId,
+    /// Rights held over `scope`.
+    pub rights: SubnetRights,
+    /// Leaf generation at verification time.
+    pub generation: u32,
+    /// Authority auth epoch at verification time.
+    pub subnet_auth_epoch: u64,
+    /// Leaf expiry (unix seconds, exclusive).
+    pub expires_at: u64,
+    /// Hash of the credentials that produced this entry.
+    pub credential_set_hash: [u8; 32],
+}
+
+/// Operator cap on locally-held gateway entries per authority. A
+/// gateway legitimately holds a few (e.g. `ROUTE(vehicle)` plus
+/// `EXPORT(world-model)`); an unbounded set would turn the
+/// per-transition evaluation into an operator-sized scan.
+pub const MAX_GATEWAY_CONTEXTS_PER_AUTHORITY: usize = 32;
+
+/// The immutable, authority-local set of this node's forwarding
+/// authorities, deduplicated by scope and capped by
+/// [`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGatewayContextSet {
+    /// Authority every entry belongs to.
+    pub authority: EntityId,
+    /// Compiled entries. Immutable once published; refresh and
+    /// revocation recompute the whole set atomically rather than
+    /// mutating entries, so stale rights can never accumulate.
+    pub entries: Box<[VerifiedGatewayContext]>,
+}
+
+/// Why a protected forwarding transition was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardDenial {
+    /// An ingress/egress context is missing, expired, or minted under
+    /// a different authority or topology epoch than the local set.
+    ContextNotCurrent,
+    /// A hop peer's admitted context does not carry `ATTACH`.
+    AttachMissing,
+    /// The transition crosses a configured boundary and some crossed
+    /// entry lacks `EXPORT`.
+    ExportMissing,
+    /// The transition is wholly internal but no local entry contains
+    /// both attachments with `ROUTE`.
+    RouteMissing,
+}
+
+impl VerifiedGatewayContextSet {
+    /// The D6 forwarding decision, evaluated over hop-local
+    /// **attachments** — never grant scopes, never a wire-claimed
+    /// subnet.
+    ///
+    /// ```text
+    /// crossed = entries where scope.contains(source) != scope.contains(target)
+    /// if crossed is non-empty: require EXPORT on EVERY crossed entry
+    /// else:                    require one entry containing both, with ROUTE
+    /// ```
+    ///
+    /// Ordering the crossed-boundary test first is what stops a broad
+    /// `ROUTE(vehicle)` from carrying traffic out through a narrower
+    /// configured `EXPORT(world-model)` boundary: the narrow entry is
+    /// crossed by that transition, so its `EXPORT` is demanded
+    /// regardless of what any wider entry permits. A transition
+    /// crossing two configured sibling boundaries needs `EXPORT` on
+    /// both. Entries containing neither endpoint are irrelevant.
+    ///
+    /// Cost is bounded by the hierarchy, not by the operator's grant
+    /// count: containment is a fixed-width prefix test, and a
+    /// transition touches at most the two endpoints' ancestor paths.
+    pub fn authorize_transition(
         &self,
-        source: TopologySubnetId,
-        target: TopologySubnetId,
-    ) -> Option<SubnetRights> {
-        let inside_source = self.scope.is_ancestor_or_self_of(source);
-        let inside_target = self.scope.is_ancestor_or_self_of(target);
-        match (inside_source, inside_target) {
-            (true, true) => Some(SubnetRights::ROUTE),
-            (true, false) | (false, true) => Some(SubnetRights::EXPORT),
-            (false, false) => None,
+        ingress: &VerifiedSubnetContext,
+        egress: &VerifiedSubnetContext,
+        current_topology_epoch: u32,
+        current_subnet_auth_epoch: u64,
+        now_secs: u64,
+    ) -> Result<(), ForwardDenial> {
+        // Both hop peers must be admitted under the same authority and
+        // epoch this node's own credentials were verified against, and
+        // both must actually be attached (ATTACH), not merely known.
+        for peer in [ingress, egress] {
+            if peer.authority != self.authority
+                || peer.topology_epoch != current_topology_epoch
+                || peer.subnet_auth_epoch != current_subnet_auth_epoch
+                || now_secs >= peer.expires_at
+            {
+                return Err(ForwardDenial::ContextNotCurrent);
+            }
+            if !peer.rights.contains(SubnetRights::ATTACH) {
+                return Err(ForwardDenial::AttachMissing);
+            }
+        }
+        // Every local entry must be current too — a stale gateway
+        // credential authorizes nothing.
+        if self.entries.iter().any(|e| {
+            e.topology_epoch != current_topology_epoch
+                || e.subnet_auth_epoch != current_subnet_auth_epoch
+                || now_secs >= e.expires_at
+        }) {
+            return Err(ForwardDenial::ContextNotCurrent);
+        }
+
+        let source = ingress.attachment;
+        let target = egress.attachment;
+
+        let mut crossed_any = false;
+        for entry in self.entries.iter() {
+            let inside_source = entry.scope.is_ancestor_or_self_of(source);
+            let inside_target = entry.scope.is_ancestor_or_self_of(target);
+            if inside_source == inside_target {
+                continue;
+            }
+            crossed_any = true;
+            if !entry.rights.contains(SubnetRights::EXPORT) {
+                return Err(ForwardDenial::ExportMissing);
+            }
+        }
+        if crossed_any {
+            return Ok(());
+        }
+
+        let routed = self.entries.iter().any(|entry| {
+            entry.scope.is_ancestor_or_self_of(source)
+                && entry.scope.is_ancestor_or_self_of(target)
+                && entry.rights.contains(SubnetRights::ROUTE)
+        });
+        if routed {
+            Ok(())
+        } else {
+            Err(ForwardDenial::RouteMissing)
         }
     }
+}
+
+/// Compile one local gateway entry from a self-held credential set.
+///
+/// Beyond the ordinary D4/D5 credential checks this requires
+/// `leaf.subject == local_keypair_entity`, so a credential issued to
+/// some other node can never become this node's forwarding authority,
+/// and `local_attachment` to lie inside the leaf scope.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors verify_credential_set's explicit trusted-input list; a struct would hide \
+              which inputs the caller must supply from local state"
+)]
+pub fn compile_gateway_context(
+    set: &SubnetCredentialSet,
+    local_entity: &EntityId,
+    local_attachment: TopologySubnetId,
+    config: &SubnetAuthorityConfig,
+    current_topology_epoch: u32,
+    floors: &SubnetFloorRegistry,
+    now_secs: u64,
+    skew_secs: u64,
+) -> Result<VerifiedGatewayContext, SubnetAuthError> {
+    if &set.leaf().subject != local_entity {
+        return Err(SubnetAuthError::WrongSubject);
+    }
+    let verified = verify_credential_set(
+        set,
+        local_entity,
+        config,
+        current_topology_epoch,
+        floors,
+        now_secs,
+        skew_secs,
+    )?;
+    if !verified.scope.is_ancestor_or_self_of(local_attachment) {
+        return Err(SubnetAuthError::ScopeNotAncestor);
+    }
+    Ok(VerifiedGatewayContext {
+        authority: verified.authority,
+        attachment: local_attachment,
+        scope: verified.scope,
+        topology_epoch: verified.topology_epoch,
+        subject: verified.subject,
+        rights: verified.rights,
+        generation: verified.generation,
+        subnet_auth_epoch: verified.subnet_auth_epoch,
+        expires_at: verified.expires_at,
+        credential_set_hash: verified.credential_set_hash,
+    })
+}
+
+/// Build the immutable published set from compiled entries.
+///
+/// Entries with the same scope are combined by rights union — but only
+/// across simultaneously-current credentials, because the caller
+/// recompiles the whole set on refresh or revocation rather than
+/// merging into a live one. That is what keeps a revoked credential's
+/// rights from surviving inside a surviving entry.
+///
+/// Rejects a set exceeding [`MAX_GATEWAY_CONTEXTS_PER_AUTHORITY`]
+/// distinct scopes, or any entry from a different authority.
+pub fn build_gateway_context_set(
+    authority: &EntityId,
+    compiled: Vec<VerifiedGatewayContext>,
+) -> Result<VerifiedGatewayContextSet, SubnetAuthError> {
+    let mut entries: Vec<VerifiedGatewayContext> = Vec::with_capacity(compiled.len());
+    for entry in compiled {
+        if &entry.authority != authority {
+            return Err(SubnetAuthError::WrongAuthority);
+        }
+        match entries.iter_mut().find(|e| e.scope == entry.scope) {
+            Some(existing) => {
+                existing.rights = existing.rights.union(entry.rights);
+                // Keep the tightest expiry so the merged entry cannot
+                // outlive the shorter-lived credential behind it.
+                existing.expires_at = existing.expires_at.min(entry.expires_at);
+            }
+            None => entries.push(entry),
+        }
+    }
+    if entries.len() > MAX_GATEWAY_CONTEXTS_PER_AUTHORITY {
+        return Err(SubnetAuthError::TooManyGatewayContexts);
+    }
+    Ok(VerifiedGatewayContextSet {
+        authority: authority.clone(),
+        entries: entries.into_boxed_slice(),
+    })
 }
 
 /// Verify a presentation + credential set and compile the session
@@ -1485,6 +1740,9 @@ pub fn verify_admission(
 
     Ok(VerifiedSubnetContext {
         authority: verified.authority,
+        // The exact point admitted, checked above to lie inside the
+        // credential scope. Never widened to `scope`.
+        attachment: presentation.target.path,
         scope: verified.scope,
         topology_epoch: verified.topology_epoch,
         subject_node: verified.subject.node_id(),

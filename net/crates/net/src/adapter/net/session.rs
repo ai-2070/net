@@ -1839,6 +1839,11 @@ mod tests {
             // surface. `MeshNode::peer_static_x25519` treats zeros
             // as "not available" and returns `None`.
             remote_static_pub: [0u8; 32],
+            // Same story: no handshake hash to derive route-hop keys
+            // from. Distinct constants rather than zeros so a test
+            // that accidentally relied on tx == rx would fail.
+            route_hop_tx_key: [0x51u8; 32],
+            route_hop_rx_key: [0x15u8; 32],
         }
     }
 
