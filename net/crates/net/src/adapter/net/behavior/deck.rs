@@ -840,14 +840,32 @@ impl DeckClient {
         Some(cfg.channel_id.wire_hash())
     }
 
-    /// Lookup a channel's canonical `ChannelHash` (u64). Same
-    /// shape as [`Self::channel_wire_hash`] but returns the full
-    /// 64-bit hash callers use for fold + ACL lookups.
+    /// Lookup the canonical [`ChannelHash`] of the **concrete channel
+    /// name requested**, provided a config covers it.
+    ///
+    /// The registry lookup proves configuration exists — including
+    /// through a prefix registration — but the hash returned is always
+    /// the hash of `channel_name` itself, never the matched config's
+    /// `channel_id`.
+    ///
+    /// That distinction is the whole point. For a prefix registration
+    /// `sensors/**` matching a request for `sensors/camera/front`, the
+    /// matched config's `channel_id` is the family sentinel, so
+    /// returning its hash gave an operator an identity the live path
+    /// never uses: `authorize_subscribe` keys on `requested_hash` and
+    /// the fan-out on the published channel's own hash. Policy
+    /// installed under the sentinel would simply never be found.
     pub fn channel_canonical_hash(&self, channel_name: &str) -> Option<ChannelHash> {
         let mesh = self.mesh.as_ref()?;
         let registry = mesh.channel_configs()?;
-        let cfg = registry.get_by_name(channel_name)?;
-        Some(cfg.channel_id.hash())
+        // Presence check only — the matched config may be a prefix
+        // family, and its id is not this channel's identity.
+        registry.get_by_name(channel_name)?;
+        Some(
+            crate::adapter::net::channel::ChannelName::new(channel_name)
+                .ok()?
+                .hash(),
+        )
     }
 
     /// `true` when a live [`AggregatorDaemon`] is installed via
@@ -2403,7 +2421,7 @@ mod tests {
         registry.insert(
             ChannelConfig::new(metrics_id.clone()).with_visibility(Visibility::SubnetLocal),
         );
-        mesh.set_channel_configs(registry);
+        mesh.set_channel_configs(registry.clone());
         let mesh = Arc::new(mesh);
 
         let deck = DeckClient::from_runtime(&runtime, OperatorIdentity::generate())
@@ -2436,6 +2454,36 @@ mod tests {
         assert_eq!(
             deck.channel_canonical_hash("internal/metrics"),
             Some(metrics_id.hash()),
+        );
+
+        // A PREFIX registration must yield the CONCRETE requested
+        // channel.s identity, not the family sentinel. The live
+        // subscribe gate keys on `requested_hash` and the fan-out on
+        // the published channel.s own hash, so an operator handed the
+        // sentinel would install policy neither path ever looks up.
+        let family = ChannelId::parse("sensors/family-sentinel").expect("family");
+        registry.insert_prefix(
+            "sensors/",
+            ChannelConfig::new(family.clone()).with_visibility(Visibility::Exported),
+        );
+        let concrete = "sensors/camera/front";
+        let concrete_hash = crate::adapter::net::channel::ChannelName::new(concrete)
+            .expect("name")
+            .hash();
+        assert_ne!(
+            concrete_hash,
+            family.hash(),
+            "precondition: the family sentinel is a different identity",
+        );
+        assert_eq!(
+            deck.channel_canonical_hash(concrete),
+            Some(concrete_hash),
+            "a prefix-covered request must resolve to its own canonical hash",
+        );
+        assert_eq!(
+            deck.channel_canonical_hash("unconfigured/elsewhere"),
+            None,
+            "coverage is still required — the lookup proves configuration exists",
         );
 
         let _ = runtime.shutdown().await;

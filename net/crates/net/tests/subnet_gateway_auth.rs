@@ -151,10 +151,11 @@ async fn fixture(left_at: &[u8], right_at: &[u8]) -> Fixture {
     admit(&gw, &left, &left_kp, &[3], left_at, SubnetRights::ATTACH).await;
     admit(&gw, &right, &right_kp, &[3], right_at, SubnetRights::ATTACH).await;
 
-    // Route toward `right` resolves to right's address.
-    gw.router()
-        .routing_table()
-        .add_route(right.node_id(), right.local_addr());
+    // The route toward `right` is installed by the handshake itself
+    // now: a direct peer is identity-qualified by construction, so
+    // `add_direct_route` binds `next_hop_id`. Installing a legacy
+    // `add_route` here would overwrite that and silently disable
+    // protected egress resolution.
 
     Fixture {
         gw,
@@ -178,6 +179,10 @@ const INNER_TAG: &[u8] =
     b"NEinner-end-to-end-ciphertext-untouched-by-any-relay-0123456789-padding-to-clear-the-header-size-floor";
 
 /// Count datagrams arriving at `sock` within a short window.
+///
+/// Callers that repoint a peer.s address at the watcher see that
+/// peer.s ordinary traffic too (heartbeats, announcements), so
+/// protected-forwarding assertions filter with [`route_hops`].
 async fn received_within(sock: &UdpSocket, dur: Duration) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let deadline = tokio::time::Instant::now() + dur;
@@ -453,12 +458,30 @@ async fn a_floor_invalidates_the_contexts_the_relay_reads() {
 #[tokio::test]
 async fn a_legacy_route_is_not_an_authenticated_next_hop() {
     let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
-    // `fixture` installs the route with the legacy `add_route`.
+    // A learned multi-hop route for a node that is NOT a direct peer:
+    // address only, no bound identity. Direct peers get an
+    // identity-qualified entry from the handshake, so the distinction
+    // has to be drawn on a route that legitimately has no identity.
+    const LEARNED: u64 = 0xDEAD_BEEF;
+    f.gw.router()
+        .routing_table()
+        .add_route(LEARNED, f.right.local_addr());
     assert!(
-        f.gw.authenticated_next_hop(f.right.node_id()).is_none(),
+        f.gw.router().routing_table().lookup(LEARNED).is_some(),
+        "precondition: the legacy route resolves for ordinary routing",
+    );
+    assert!(
+        f.gw.authenticated_next_hop(LEARNED).is_none(),
         "an address-only route must not be usable for protected forwarding",
     );
-    assert!(f.gw.authenticated_next_hop(0xDEAD_BEEF).is_none());
+    assert!(f.gw.authenticated_next_hop(0x0BAD_0BAD).is_none());
+
+    // And the direct peer DOES resolve, which is what makes protected
+    // egress possible at all.
+    assert!(
+        f.gw.authenticated_next_hop(f.right.node_id()).is_some(),
+        "a direct peer must be identity-qualified by the handshake",
+    );
 }
 
 /// Identity is bound into the route entry at install time, so it is
@@ -561,4 +584,170 @@ async fn outer_ttl_expires_while_the_inner_packet_is_untouched() {
         INNER_TAG,
         "the inner packet must be byte-identical after a hop",
     );
+}
+
+// ---------------------------------------------------------------------------
+// The positive witness
+// ---------------------------------------------------------------------------
+
+/// A VALID protected hop is authenticated, authorized, forwarded, and
+/// re-tagged under the egress edge key — with the inner packet
+/// byte-identical and only the outer TTL moved.
+///
+/// Every other protected test in this file sends a deliberately invalid
+/// datagram and asserts nothing comes out. That shape cannot distinguish
+/// "correctly refused" from "the protected branch forwards nothing at
+/// all", and for a while it did not: `add_authenticated_route` had no
+/// production caller, so `lookup_authenticated` never resolved and every
+/// authorized hop died at egress lookup. The whole slice would have
+/// stayed green while forwarding was dead.
+///
+/// This is the test that fails if the protected branch drops valid
+/// packets, skips the transition check, mutates TTL before authorizing,
+/// seals under the wrong key, or re-tags incorrectly.
+#[tokio::test]
+async fn a_valid_protected_hop_is_forwarded_and_retagged() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    f.gw.install_subnet_gateway_credentials(&[grant(
+        &f.gw_kp,
+        &[3],
+        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+    )])
+    .expect("install gateway credentials");
+    // No declared boundary: both attachments are inside the vehicle, so
+    // this is an internal transition and ROUTE governs it.
+    f.gw.declare_subnet_boundaries(net::adapter::net::subnet::SubnetBoundarySet::new(
+        root().entity_id().clone(),
+        0,
+        [],
+    ));
+
+    // Observe the egress. The relay reads the egress address from the
+    // peer snapshot, so the watcher goes there — the session, keys and
+    // admitted context of `right` are untouched, which is what keeps
+    // the emitted tag verifiable below.
+    let watcher = wire().await;
+    assert!(
+        f.gw.set_peer_addr_for_test(f.right.node_id(), watcher.local_addr().expect("addr")),
+        "the egress peer must exist",
+    );
+
+    // Seal a genuine hop on the left↔gateway edge.
+    let left_to_gw = f
+        .left
+        .peer_session_for_test(f.gw.node_id())
+        .expect("left has a session to the gateway");
+    let header = RoutingHeader::new(f.right.node_id(), f.left.node_id() as u32, 8);
+    let envelope = left_to_gw.seal_route_hop(&header, INNER_TAG);
+
+    // Sent from an unrelated socket on purpose: ingress identity comes
+    // from the hop session id, never from the UDP source address. If
+    // the relay were reading the source address this would fail.
+    let sock = wire().await;
+    sock.send_to(&envelope, f.gw.local_addr())
+        .await
+        .expect("send");
+
+    let got = received_within(&watcher, Duration::from_millis(500)).await;
+    let hops = route_hops(&got);
+    assert_eq!(hops.len(), 1, "exactly one hop must be forwarded");
+    let out = hops[0];
+
+    // It is a protected envelope, not a downgrade to the legacy path.
+    assert_eq!(
+        u16::from_le_bytes([out[0], out[1]]),
+        ROUTE_HOP_MAGIC,
+        "a protected hop must be re-emitted protected",
+    );
+
+    // Re-tagged under the EGRESS edge key: the gateway→right session,
+    // not the one it arrived on. Opening it proves the MAC verifies and
+    // the sequence is admitted exactly once.
+    let gw_to_right = f
+        .right
+        .peer_session_for_test(f.gw.node_id())
+        .expect("right has a session to the gateway");
+    let opened = gw_to_right
+        .open_route_hop(out)
+        .expect("the forwarded hop verifies under the egress edge key");
+
+    // The inner end-to-end packet is byte-identical.
+    assert_eq!(
+        opened.inner, INNER_TAG,
+        "the relay must not touch the inner packet",
+    );
+    // Only the outer routing header moved, and only downward.
+    assert_eq!(opened.header.dest_id, f.right.node_id());
+    assert!(
+        opened.header.hop_count > header.hop_count || opened.header.ttl < header.ttl,
+        "the outer TTL/hop budget must be consumed exactly once: {:?} -> {:?}",
+        (header.ttl, header.hop_count),
+        (opened.header.ttl, opened.header.hop_count),
+    );
+
+    // The same envelope replayed at the gateway is refused, so the
+    // forward above consumed its ingress sequence.
+    sock.send_to(&envelope, f.gw.local_addr())
+        .await
+        .expect("send replay");
+    let after_replay = received_within(&watcher, Duration::from_millis(300)).await;
+    assert!(
+        route_hops(&after_replay).is_empty(),
+        "a replayed hop envelope must not be forwarded a second time",
+    );
+}
+
+/// The positive path still requires authorization: same valid envelope,
+/// same authenticated edge, but the gateway holds no ROUTE over the
+/// transition. Nothing is emitted.
+///
+/// Paired with the test above this is the discriminating inverse — one
+/// proves forwarding happens, the other proves it happens *because* the
+/// transition was authorized.
+#[tokio::test]
+async fn a_valid_hop_without_route_authority_is_not_forwarded() {
+    let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
+    // ATTACH only — admission, never forwarding.
+    f.gw.install_subnet_gateway_credentials(&[grant(&f.gw_kp, &[3], SubnetRights::ATTACH)])
+        .expect("install gateway credentials");
+    f.gw.declare_subnet_boundaries(net::adapter::net::subnet::SubnetBoundarySet::new(
+        root().entity_id().clone(),
+        0,
+        [],
+    ));
+
+    let watcher = wire().await;
+    assert!(f
+        .gw
+        .set_peer_addr_for_test(f.right.node_id(), watcher.local_addr().expect("addr")));
+
+    let left_to_gw = f
+        .left
+        .peer_session_for_test(f.gw.node_id())
+        .expect("session");
+    let header = RoutingHeader::new(f.right.node_id(), f.left.node_id() as u32, 8);
+    let envelope = left_to_gw.seal_route_hop(&header, INNER_TAG);
+
+    let sock = wire().await;
+    sock.send_to(&envelope, f.gw.local_addr())
+        .await
+        .expect("send");
+
+    let got = received_within(&watcher, Duration::from_millis(300)).await;
+    assert!(
+        route_hops(&got).is_empty(),
+        "ATTACH is not forwarding authority, however valid the hop is",
+    );
+}
+
+/// Only the route-hop envelopes among `datagrams`.
+///
+/// A watcher standing in for a peer's address also receives that peer's
+/// ordinary traffic. Counting raw datagrams would make a
+/// protected-forwarding assertion pass or fail on heartbeat timing.
+fn route_hops(datagrams: &[Vec<u8>]) -> Vec<&Vec<u8>> {
+    datagrams
+        .iter()
+        .filter(|d| d.len() >= 2 && u16::from_le_bytes([d[0], d[1]]) == ROUTE_HOP_MAGIC)
+        .collect()
 }

@@ -10771,11 +10771,35 @@ impl MeshNode {
 
     /// Test/debug accessor for the live [`NetSession`] to a peer.
     /// Integration tests use it to drive session-level state (e.g. open
-    /// a stream to make a session "busy" for the upgrade C3 gate).
+    /// a stream to make a session "busy" for the upgrade C3 gate), and
+    /// the protected-forwarding witness uses it to seal a genuine
+    /// route-hop envelope under a real edge key.
+    ///
+    /// Not feature-gated: it was `nat-traversal`-only, which is why the
+    /// protected relay had no positive witness — a test could send
+    /// invalid envelopes but never a valid one.
     #[doc(hidden)]
-    #[cfg(feature = "nat-traversal")]
     pub fn peer_session_for_test(&self, node_id: u64) -> Option<Arc<NetSession>> {
         self.peers.get(&node_id).map(|e| e.value().session.clone())
+    }
+
+    /// Test-only: repoint a peer's recorded address without touching
+    /// its session.
+    ///
+    /// The protected relay reads the egress address from the peer
+    /// snapshot, so a witness that wants to OBSERVE a forwarded hop has
+    /// to be able to put an inspectable socket there. The session,
+    /// keys, and admitted context are untouched, so the packet is
+    /// sealed under the real egress edge key and stays verifiable.
+    #[doc(hidden)]
+    pub fn set_peer_addr_for_test(&self, node_id: u64, addr: SocketAddr) -> bool {
+        match self.peers.get_mut(&node_id) {
+            Some(mut peer) => {
+                peer.addr = addr;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Build a [`MigrationIdentityContext`](crate::adapter::net::subprotocol::MigrationIdentityContext)
@@ -13631,7 +13655,7 @@ impl MeshNode {
             }
         };
 
-        self.router.add_route(peer_node_id, peer_addr);
+        self.router.add_direct_route(peer_node_id, peer_addr);
         self.peer_addrs.insert(peer_node_id, peer_addr);
         // Old direct address of a re-handshaking peer, captured
         // before `displaced` is consumed below (RT-5: address
@@ -13781,7 +13805,7 @@ impl MeshNode {
         // insert.
         let session_id = session.session_id();
 
-        self.router.add_route(peer_node_id, peer_addr);
+        self.router.add_direct_route(peer_node_id, peer_addr);
 
         let displaced = self.peers.insert(
             peer_node_id,
@@ -16123,22 +16147,30 @@ impl MeshNode {
         else {
             return;
         };
-        let Some(egress_session) = ctx
-            .peers
-            .get(&egress_node)
-            .map(|e| e.value().session.clone())
+        // ONE snapshot of the egress peer: session handle, its id, and
+        // its address, all from the same incarnation. Reading the
+        // session here and the address again later could seal under an
+        // old session and send to a re-handshaked peer's new address —
+        // the far side would drop it, so it fails closed, but the
+        // packet would have been authorized against one incarnation and
+        // emitted against another. The guard is released immediately;
+        // nothing below holds a map guard across authorization or
+        // crypto.
+        let Some((egress_session, egress_session_id, egress_addr)) =
+            ctx.peers.get(&egress_node).map(|e| {
+                let peer = e.value();
+                (peer.session.clone(), peer.session.session_id(), peer.addr)
+            })
         else {
             return;
         };
+        // The egress attachment is bound to the snapshotted incarnation,
+        // not to whatever session the peer holds by the time we send.
         let Some(egress_ctx) = ctx
             .subnet_contexts
-            .get_for_session(egress_node, egress_session.session_id())
+            .get_for_session(egress_node, egress_session_id)
         else {
             return;
-        };
-        let egress_addr = match ctx.peers.get(&egress_node) {
-            Some(p) => p.addr,
-            None => return,
         };
         if ctx.partition_filter.contains(&egress_addr) {
             return;
@@ -16177,6 +16209,22 @@ impl MeshNode {
         // leaving.
         let mut fwd_header = opened.header;
         fwd_header.forward();
+        // Re-check the egress incarnation right before sealing. If the
+        // peer re-handshaked between authorization and here, the
+        // decision was made against a session that no longer exists;
+        // emit nothing rather than tag under a dead key or aim a valid
+        // tag at a new address.
+        let still_current = ctx
+            .peers
+            .get(&egress_node)
+            .is_some_and(|e| e.value().session.session_id() == egress_session_id);
+        if !still_current {
+            tracing::debug!(
+                egress = format!("{egress_node:#x}"),
+                "subnet: egress session changed mid-admission, dropping",
+            );
+            return;
+        }
         FORWARD_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             // Sized for MAX_PACKET_SIZE at compile time, so this cannot
@@ -16489,7 +16537,7 @@ impl MeshNode {
             }
         };
         ctx.peer_addrs.insert(peer_node_id, source);
-        ctx.router.add_route(peer_node_id, source);
+        ctx.router.add_direct_route(peer_node_id, source);
         ctx.session_id_to_node
             .insert(registered_session_id, peer_node_id);
         // Fresh session incarnation (Vacant or accepted rotation) →
@@ -38979,22 +39027,36 @@ mod protected_forward_allocation_pins {
         let src = source_without_comments();
         let wire = format!("wire_hash{}", "()");
 
-        for method in ["authorize_subscribe", "publish_to_subscribers"] {
-            let Some(start) = src.find(&format!("    fn {method}(")).or_else(|| {
-                src.find(&format!("    async fn {method}("))
-                    .or_else(|| src.find(&format!("    pub fn {method}(")))
-            }) else {
-                continue;
-            };
+        // Both live call sites, by their REAL names. The first version
+        // of this pin looked for `publish_to_subscribers`, which does
+        // not exist — the fan-out is `publish_many` — and skipped the
+        // missing method silently, so half of this guard was vacuous.
+        // A name that cannot be located now fails rather than passes.
+        for method in ["authorize_subscribe", "publish_many"] {
+            let start = [
+                "    fn ",
+                "    async fn ",
+                "    pub fn ",
+                "    pub async fn ",
+            ]
+            .iter()
+            .find_map(|prefix| src.find(&format!("{prefix}{method}(")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{method} must exist in mesh.rs — this pin is worthless if it \
+                         silently skips a call site that was renamed",
+                )
+            });
             let rest = &src[start + 1..];
             let end = rest
                 .find("\n    fn ")
                 .map(|i| start + 1 + i)
                 .unwrap_or(src.len());
             let body = &src[start..end];
-            if !body.contains("export_targets") {
-                continue;
-            }
+            assert!(
+                body.contains("export_targets"),
+                "{method} must resolve export targets — if the lookup moved, move this pin",
+            );
             assert!(
                 !body.contains(&wire),
                 "{method} must resolve export targets by canonical ChannelHash, not the wire hint",

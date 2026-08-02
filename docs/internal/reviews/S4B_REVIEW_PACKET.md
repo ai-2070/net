@@ -35,13 +35,17 @@ d365df7ead182c12fe34e5bf55ec8c516e179bf7  off-path scope index
 01ebae486845a58e8afc969eec6d5a3c3df395b1  cross-plane composition contract
 ```
 
-`19edebe615b89fbadca612d23170fa5118d4b632` (S4A as written) remains on
-HOLD and is not part of this candidate.
+`19edebe615b89fbadca612d23170fa5118d4b632` **is** in the candidate's
+ancestry — the earlier claim that it "is not part of this candidate"
+was graph-false. The correct statement: the exact historical revision
+remains HOLD as written, and later additive commits repair aggregate
+behaviour. The same holds for `186d1667f`.
 
 ## Behaviour map
 
 | # | Behaviour | Production site | Witness | Commit |
 |---|---|---|---|---|
+| 0 | **A valid protected hop is forwarded at all** | `NetRouter::add_direct_route` installing identity-qualified routes at session establishment; `relay_protected_hop` | `a_valid_protected_hop_is_forwarded_and_retagged` + `a_valid_hop_without_route_authority_is_not_forwarded` | this repair |
 | 1 | Protected-frame classification and downgrade refusal | `mesh.rs` dispatch arm on `ROUTE_HOP_MAGIC`; protected-mode branch refusing untagged legacy relay | `subnet_gateway_auth.rs`; `a_legacy_routing_packet_is_not_an_envelope` | 7d34ecfbb |
 | 2 | Exact ingress-session resolution | `relay_protected_hop` step 1 — `parse_prefix` → `session_id_to_node` → session id equality | `subnet_gateway_auth.rs` | 7d34ecfbb, cf1cc1cd3 (`parse_prefix` typing) |
 | 3 | MAC verification before replay mutation | `NetSession::open_route_hop` — `route_hop::open` then `admit` | `every_transcript_field_is_covered`; `a_tag_does_not_verify_under_the_reverse_direction_key` | 7d34ecfbb |
@@ -65,40 +69,73 @@ HOLD and is not part of this candidate.
 
 ## Gate at the candidate head
 
+These are **local** runs, with the exact commands. They are not the
+candidate-wide CI result: the `integration-net-core` job is one of five
+integration families plus separate unit, clippy, doc, and SDK jobs, so a
+count from the command below is not "the gate". Read exact-head CI for
+the authoritative per-job numbers.
+
 ```text
-net-core integration:  374 passed, 0 failed
-lib unit tests:       5470 passed, 0 failed, 1 ignored
-cargo fmt --check:    clean
-clippy --all-features --lib --bins -D warnings:            clean
-clippy --all-features --all-targets -D warnings (-A test): clean
-cargo doc RUSTDOCFLAGS=-D warnings:                        clean
-git diff --check:                                          clean
-integration-guard (every tests/*.rs pinned to a CI step):  clean
+# suite list scraped from the integration-net-core job in ci.yml
+cargo nextest run --features net $(--test flags from integration-net-core)
+  → 376 tests run: 376 passed, 0 skipped   (48 suites)
+
+cargo test --features net --lib
+  → 5470 passed, 0 failed, 1 ignored
+
+cargo fmt --check                                            clean
+cargo clippy --all-features --lib --bins -- -D warnings      clean
+cargo clippy --all-features --all-targets -- -D warnings \
+  -A clippy::unwrap_used -A clippy::expect_used \
+  -A clippy::undocumented_unsafe_blocks \
+  -A clippy::multiple_unsafe_ops_per_block                   clean
+RUSTDOCFLAGS="-D warnings" cargo doc --features net --no-deps  clean
+git diff --check                                             clean
+integration-guard scrape (every tests/*.rs pinned)           clean
 ```
+
+An earlier revision of this packet cited "374 integration tests" as the
+candidate-wide gate. That was one local command's count presented as
+something broader; the exact CI step reports its own numbers and those
+are what a reviewer should read.
 
 CI registration added under `integration-net-core`:
 `subnet_route_hop_alloc`, `subnet_org_boundary`.
 
-## Mutation controls performed
+## Mutation controls — reported, for independent rerun
 
-Each of these was verified to fail before being trusted:
+These are **maintainer-reported** controls, not candidate-bound
+evidence. Each was performed by editing the named production line,
+running the named test, observing RED, and reverting. Reproduce by
+applying the mutation at the candidate head and running the command:
 
 ```text
-restore zero-terminating common_ancestor
-  → interior_zero_paths_do_not_manufacture_a_crossing RED
-    (unwrap_err on Ok(()) — the false authorization)
+subnet/id.rs common_ancestor → zero-terminating form
+  cargo test --features net --test subnet_gateway_local_auth interior_zero
+  → RED: unwrap_err() on Ok(()) — the false authorization
 
-allocating seal in the measured loop
-  → 512 allocations / 512 hops
+tests/subnet_route_hop_alloc.rs: allocating seal in the measured loop
+  cargo test --features net --test subnet_route_hop_alloc
+  → RED: 512 allocations / 512 hops
 
-relay reverted to seal_route_hop
-  → relay_protected_hop_does_not_allocate_per_packet RED
+mesh.rs relay → seal_route_hop (allocating)
+  cargo test --features net --lib protected_forward_allocation_pins
+  → RED: "must not call the allocating seal_route_hop"
 
-export lookup widened to u64::from(wire_hash())
-  → export_lookups_use_canonical_channel_identity RED
+mesh.rs export lookup → u64::from(channel.wire_hash())
+  cargo test --features net --lib export_lookups_use_canonical
+  → RED: "must resolve export targets by canonical ChannelHash"
+
+router.rs add_direct_route → add_route (the dead-forwarding regression)
+  cargo test --features net --test subnet_gateway_auth a_valid_protected_hop
+  → RED: "exactly one hop must be forwarded"
+
+deck.rs channel_canonical_hash → cfg.channel_id.hash()
+  cargo test --features net --lib deck::tests::deck_with_mesh
+  → RED: "a prefix-covered request must resolve to its own canonical hash"
 
 set.entries = Box::new([])
-  → E0616 (field is private)
+  → E0616: field `entries` of struct `VerifiedGatewayContextSet` is private
 ```
 
 ## Explicitly open
