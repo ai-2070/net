@@ -362,7 +362,7 @@ jobs:
 
   # --- Family A: bare bus/FFI + net mesh -------------------------------
   integration-net-core:
-    name: Integration — net core (bus/FFI, mesh, capability, migration, nRPC dispatch)
+    name: Integration — net core (bus/FFI, mesh, capability, subnets, migration, nRPC dispatch)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
