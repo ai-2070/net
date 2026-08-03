@@ -555,19 +555,76 @@ pub const MAX_STREAM_STATS: usize = 65_536;
 struct DestRoutes {
     ordinary: Option<RouteEntry>,
     protected: Option<RouteEntry>,
-    /// Conservative change counter for compare-and-set writers
-    /// ([`RoutingTable::observe`] / [`RoutingTable::install_if_unchanged`]).
+    /// Table-wide, never-reused transition token for compare-and-set
+    /// writers ([`RoutingTable::observe`] /
+    /// [`RoutingTable::install_if_unchanged`] /
+    /// [`RoutingTable::apply_failure_if_unchanged`]).
     ///
-    /// Advances on every mutation attempt, including ones that change
-    /// nothing (a refused withdrawal, say). Over-counting is the safe
-    /// direction: a conditional writer can only be made to SKIP its
-    /// write, never to overwrite state it did not observe.
-    generation: u64,
+    /// Drawn from a single monotonic counter on the table rather than
+    /// counted per destination. A per-destination counter recycles:
+    /// removing the last candidate deletes it, and the next insert
+    /// starts again at 1, so an observation taken before the removal
+    /// would compare equal to completely different state installed
+    /// after it — immediate ABA, not theoretical exhaustion.
+    ///
+    /// Advances whenever the candidate SET observably changes — a
+    /// candidate installed, removed, replaced, retargeted, rebound, or
+    /// re-metered — including partial changes such as a stale sweep
+    /// that drops one candidate and keeps the other.
+    ///
+    /// It deliberately does NOT advance for a pure freshness refresh
+    /// (`updated_at` moving under an unchanged candidate). Stamping
+    /// those too is "safe" in the sense that a conditional writer can
+    /// only be made to skip — but pingwave refreshes arrive every
+    /// heartbeat, so it made every compare-and-set that spans more
+    /// than a moment fail in production, which is a liveness bug
+    /// wearing a safety costume. What a conditional writer needs to
+    /// detect is another writer having CHANGED the state it observed;
+    /// a refresh changes nothing it reasoned about.
+    token: u64,
+}
+
+/// One candidate's identity for change detection — everything a
+/// conditional writer reasons about, and nothing that merely ages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CandidateFingerprint {
+    next_hop: SocketAddr,
+    next_hop_id: Option<u64>,
+    metric: u16,
+    active: bool,
+}
+
+/// Both candidates' fingerprints. Comparing two of these answers
+/// "did another writer change what I observed?" without treating a
+/// freshness refresh as a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DestFingerprint {
+    ordinary: Option<CandidateFingerprint>,
+    protected: Option<CandidateFingerprint>,
 }
 
 impl DestRoutes {
     fn is_empty(&self) -> bool {
         self.ordinary.is_none() && self.protected.is_none()
+    }
+
+    /// Everything about the candidate set a conditional writer could
+    /// have reasoned about — deliberately excluding `updated_at`, so a
+    /// pure freshness refresh is not mistaken for another writer's
+    /// change. See the `token` field doc.
+    fn fingerprint(&self) -> DestFingerprint {
+        let of = |e: &Option<RouteEntry>| {
+            e.as_ref().map(|e| CandidateFingerprint {
+                next_hop: e.next_hop,
+                next_hop_id: e.next_hop_id,
+                metric: e.metric,
+                active: e.active,
+            })
+        };
+        DestFingerprint {
+            ordinary: of(&self.ordinary),
+            protected: of(&self.protected),
+        }
     }
 
     fn candidates(&self) -> impl Iterator<Item = &RouteEntry> {
@@ -595,18 +652,113 @@ impl DestRoutes {
     fn protected_live(&self, max_age: std::time::Duration) -> Option<&RouteEntry> {
         self.protected.as_ref().filter(|e| Self::live(e, max_age))
     }
+
+    fn view(entry: &RouteEntry, max_age: std::time::Duration) -> RouteCandidateView {
+        RouteCandidateView {
+            next_hop: entry.next_hop,
+            next_hop_id: entry.next_hop_id,
+            metric: entry.metric,
+            live: Self::live(&entry, max_age),
+        }
+    }
+
+    fn observe(&self, max_age: std::time::Duration) -> RouteObservation {
+        RouteObservation {
+            token: self.token,
+            ordinary: self.ordinary.as_ref().map(|e| Self::view(e, max_age)),
+            protected: self.protected.as_ref().map(|e| Self::view(e, max_age)),
+            effective: self.effective(max_age).map(|e| Self::view(e, max_age)),
+        }
+    }
+}
+
+/// One candidate as a caller sees it — enough to decide what to keep,
+/// what to replace, and with what provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteCandidateView {
+    /// Where this candidate sends.
+    pub next_hop: SocketAddr,
+    /// Its bound identity — `Some` exactly for the protected candidate.
+    pub next_hop_id: Option<u64>,
+    /// Metric, for ranking against the other candidate.
+    pub metric: u16,
+    /// Whether it is currently active and unexpired. A stale candidate
+    /// is still returned so a caller can decide to REMOVE it, but it
+    /// must never be treated as evidence of reachability.
+    pub live: bool,
 }
 
 /// A point-in-time reading of a destination's routing state, for
-/// compare-and-set writers. See [`RoutingTable::install_if_unchanged`].
+/// compare-and-set writers. See [`RoutingTable::install_if_unchanged`]
+/// and [`RoutingTable::apply_failure_if_unchanged`].
+///
+/// Candidate-aware on purpose: a reading that recorded only the
+/// effective route cannot express "remove the failed candidate and
+/// leave the other one alone", which is what a failure transition
+/// actually needs to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteObservation {
-    /// The destination's change counter when this was read.
-    pub generation: u64,
-    /// The effective next hop at that moment, if any.
-    pub next_hop: Option<SocketAddr>,
-    /// The effective next hop's bound identity at that moment.
-    pub next_hop_id: Option<u64>,
+    /// The transition token the destination carried when read.
+    pub token: u64,
+    /// The ordinary candidate at that moment.
+    pub ordinary: Option<RouteCandidateView>,
+    /// The protected candidate at that moment.
+    pub protected: Option<RouteCandidateView>,
+    /// The candidate ordinary forwarding would have used.
+    pub effective: Option<RouteCandidateView>,
+}
+
+impl RouteObservation {
+    /// Was any candidate live — i.e. did this destination actually
+    /// resolve for forwarding?
+    pub fn reachable(&self) -> bool {
+        self.effective.is_some()
+    }
+}
+
+/// The provenance a caller is installing an alternate WITH.
+///
+/// Deliberately supplied by the caller rather than inferred at write
+/// time from address ownership. Direct adjacency proves who receives
+/// the next hop; it does not prove that peer ever advertised
+/// reachability to this destination, and inferring `Protected` from
+/// "the alternate's address currently belongs to a direct peer" would
+/// manufacture protected evidence out of a graph guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlternateProvenance {
+    /// Table/graph/fallback evidence — ordinary forwarding only.
+    Ordinary,
+    /// Carried over from an existing PROTECTED candidate, which is
+    /// already the authenticated adjacent hop's advertised reachability
+    /// for this destination.
+    Protected(u64),
+}
+
+/// What one candidate transition did. Returned atomically by the
+/// transition operations, so a caller never has to re-read the table
+/// to learn what it just produced (a re-read can observe a THIRD
+/// party's write and attribute it to itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransitionOutcome {
+    /// The token the destination carries after this transition.
+    pub token: u64,
+    /// Whether any candidate was removed.
+    pub removed_any: bool,
+    /// Whether an alternate was installed.
+    pub installed: bool,
+    /// The effective next hop before the transition.
+    pub effective_before: Option<SocketAddr>,
+    /// The effective next hop after it.
+    pub effective_after: Option<SocketAddr>,
+    /// Whether the destination still resolves for forwarding.
+    pub reachable_after: bool,
+}
+
+impl TransitionOutcome {
+    /// Did the path traffic actually takes change?
+    pub fn effective_changed(&self) -> bool {
+        self.effective_before != self.effective_after
+    }
 }
 
 /// Routing table for stream-to-destination mapping
@@ -629,6 +781,15 @@ pub struct RoutingTable {
     /// docs/internal/misc/PERF_AUDIT_2026_06_08_BENCHMARK_WINS.md §2/§4.
     num_routes: AtomicUsize,
     num_streams: AtomicUsize,
+    /// Monotonic source of transition tokens. Table-wide and never
+    /// reused, so a destination that is removed and reinserted can
+    /// never present a token an earlier observation already saw.
+    next_token: AtomicU64,
+    /// Set once the token space is exhausted. Every compare-and-set
+    /// operation then refuses: wrapping would start handing out tokens
+    /// an old observation could match, which is precisely the ABA the
+    /// token exists to prevent. Fail closed, not around.
+    tokens_exhausted: std::sync::atomic::AtomicBool,
 }
 
 impl RoutingTable {
@@ -641,7 +802,28 @@ impl RoutingTable {
             max_route_age_nanos: AtomicU64::new(u64::MAX),
             num_routes: AtomicUsize::new(0),
             num_streams: AtomicUsize::new(0),
+            // Starts at 1 so 0 is never a live token: a defaulted
+            // `DestRoutes` can never accidentally match an observation.
+            next_token: AtomicU64::new(1),
+            tokens_exhausted: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Draw the next never-reused transition token.
+    fn issue_token(&self) -> u64 {
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        if token == u64::MAX {
+            self.tokens_exhausted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        token
+    }
+
+    /// Whether compare-and-set operations must refuse. See
+    /// [`Self::tokens_exhausted`].
+    fn cas_poisoned(&self) -> bool {
+        self.tokens_exhausted
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get local node ID
@@ -659,8 +841,13 @@ impl RoutingTable {
         match self.routes.entry(dest_id) {
             Entry::Occupied(mut o) => {
                 let slot = o.get_mut();
+                let before = slot.fingerprint();
                 let r = f(slot);
-                slot.generation = slot.generation.wrapping_add(1);
+                // Stamp only on an observable change — see the `token`
+                // field doc for why a freshness refresh must not.
+                if slot.fingerprint() != before {
+                    slot.token = self.issue_token();
+                }
                 if slot.is_empty() {
                     o.remove();
                     self.num_routes.fetch_sub(1, Ordering::Relaxed);
@@ -671,7 +858,7 @@ impl RoutingTable {
                 let mut fresh = DestRoutes::default();
                 let r = f(&mut fresh);
                 if !fresh.is_empty() {
-                    fresh.generation = 1;
+                    fresh.token = self.issue_token();
                     v.insert(fresh);
                     self.num_routes.fetch_add(1, Ordering::Relaxed);
                 }
@@ -786,16 +973,103 @@ impl RoutingTable {
         });
     }
 
-    /// Remove a destination outright — both candidates.
+    /// Retire every PROTECTED candidate bound to `identity`, across
+    /// all destinations. Returns how many were retired.
+    ///
+    /// Called when an authenticated adjacency ends in a way that does
+    /// not replace it with an equivalent one — a direct session
+    /// displaced by a routed end-to-end session, say. Every protected
+    /// candidate whose `next_hop_id` is that peer was evidence about an
+    /// adjacency that no longer exists, so it is invalidated rather
+    /// than migrated: a routed session is not a weaker version of the
+    /// direct one, it is different evidence entirely, and it cannot
+    /// carry protected forwarding at all.
+    ///
+    /// Ordinary candidates are untouched — they never depended on the
+    /// adjacency.
+    pub fn invalidate_protected_via(&self, identity: u64) -> usize {
+        let mut retired = 0usize;
+        let mut emptied: Vec<u64> = Vec::new();
+        for mut dest in self.routes.iter_mut() {
+            if dest
+                .protected
+                .as_ref()
+                .is_some_and(|e| e.next_hop_id == Some(identity))
+            {
+                dest.protected = None;
+                dest.token = self.issue_token();
+                retired += 1;
+                if dest.is_empty() {
+                    emptied.push(*dest.key());
+                }
+            }
+        }
+        // Drop destinations left with no candidates, after the
+        // iteration releases its shard guards.
+        for dest_id in emptied {
+            self.routes.remove_if(&dest_id, |_, d| d.is_empty());
+            self.num_routes.fetch_sub(1, Ordering::Relaxed);
+        }
+        retired
+    }
+
+    /// Remove the ORDINARY candidate — the symmetric counterpart of
+    /// [`Self::add_route`], which writes only that slot.
+    ///
+    /// This is what a caller undoing its own manual/legacy install
+    /// wants. Removing the protected candidate too would let an
+    /// ordinary-only API delete authenticated state it never created.
+    pub fn remove_ordinary_route(&self, dest_id: u64) -> Option<RouteEntry> {
+        self.mutate(dest_id, |d| d.ordinary.take())
+    }
+
+    /// Remove the PROTECTED candidate, but only when it is bound to
+    /// `identity` — the owner's own retraction.
+    pub fn remove_protected_route_if_owned(
+        &self,
+        dest_id: u64,
+        identity: u64,
+    ) -> Option<RouteEntry> {
+        self.mutate(dest_id, |d| {
+            if d.protected
+                .as_ref()
+                .is_some_and(|e| e.next_hop_id == Some(identity))
+            {
+                d.protected.take()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Remove a destination outright — BOTH candidates, regardless of
+    /// provenance or ownership.
+    ///
+    /// Explicitly administrative: it crosses the provenance boundary
+    /// every other operation respects, so it is named for what it does
+    /// rather than reading like the inverse of `add_route` (it is not —
+    /// see [`Self::remove_ordinary_route`]).
     ///
     /// Returns the protected candidate if there was one, else the
     /// ordinary one.
-    pub fn remove_route(&self, dest_id: u64) -> Option<RouteEntry> {
+    pub fn remove_destination_all_candidates(&self, dest_id: u64) -> Option<RouteEntry> {
         self.mutate(dest_id, |d| {
             let taken = d.protected.take().or_else(|| d.ordinary.take());
             d.ordinary = None;
             taken
         })
+    }
+
+    /// Deprecated alias for [`Self::remove_destination_all_candidates`].
+    ///
+    /// Kept so existing callers keep compiling, but the name is
+    /// misleading now that `add_route` writes one slot and this clears
+    /// both. New code should say which it means.
+    #[deprecated(note = "asymmetric with add_route: use remove_ordinary_route, \
+                remove_protected_route_if_owned, or \
+                remove_destination_all_candidates")]
+    pub fn remove_route(&self, dest_id: u64) -> Option<RouteEntry> {
+        self.remove_destination_all_candidates(dest_id)
     }
 
     /// Remove what the authenticated sender `identity` actually OWNS at
@@ -819,28 +1093,77 @@ impl RoutingTable {
     ///   unrelated legacy routes sitting at the shared relay tuple,
     ///   which belong to the relay, not to it.
     ///
-    /// Returns `true` if anything was removed.
+    /// Returns a [`TransitionOutcome`] describing what actually
+    /// changed, NOT merely whether something was removed.
+    ///
+    /// With two candidates per destination, "a candidate was removed"
+    /// and "this node can no longer reach the destination" are
+    /// different facts. A caller that treats the first as the second
+    /// disrupts sensing and cascades an "unreachable via me"
+    /// withdrawal while a live alternate candidate is still installed
+    /// right there. The outcome reports the effective path before and
+    /// after and whether the destination is still reachable, so the
+    /// caller can distinguish removing a hidden candidate (nothing to
+    /// announce), switching the effective path (re-anchor locally),
+    /// and genuinely losing the destination (promote or cascade).
     pub fn remove_route_if_from_hop(
         &self,
         dest_id: u64,
         next_hop: SocketAddr,
         identity: u64,
         sender_is_direct: bool,
-    ) -> bool {
-        self.mutate(dest_id, |d| {
-            let mut removed = false;
+    ) -> TransitionOutcome {
+        let max_age = self.max_route_age();
+        let mut outcome = self.mutate(dest_id, |d| {
+            let effective_before = d.effective(max_age).map(|e| e.next_hop);
+            let mut removed_any = false;
             if d.protected
                 .as_ref()
                 .is_some_and(|e| e.next_hop_id == Some(identity))
             {
                 d.protected = None;
-                removed = true;
+                removed_any = true;
             }
             if sender_is_direct && d.ordinary.as_ref().is_some_and(|e| e.next_hop == next_hop) {
                 d.ordinary = None;
-                removed = true;
+                removed_any = true;
             }
-            removed
+            let effective_after = d.effective(max_age).map(|e| e.next_hop);
+            TransitionOutcome {
+                token: 0,
+                removed_any,
+                installed: false,
+                effective_before,
+                effective_after,
+                reachable_after: effective_after.is_some(),
+            }
+        });
+        outcome.token = self.token_of(dest_id);
+        outcome
+    }
+
+    /// Remove the ORDINARY candidate for `dest_id` iff its `next_hop`
+    /// still equals `expected_next_hop` — the provenance-specific
+    /// rollback for a caller that installed an ordinary route.
+    ///
+    /// Rollback must undo exactly what it did. Scanning both slots by
+    /// address lets an ordinary registration's failure erase a
+    /// protected candidate that merely shares the address.
+    pub fn remove_ordinary_route_if_next_hop_is(
+        &self,
+        dest_id: u64,
+        expected_next_hop: SocketAddr,
+    ) -> bool {
+        self.mutate(dest_id, |d| {
+            if d.ordinary
+                .as_ref()
+                .is_some_and(|e| e.next_hop == expected_next_hop)
+            {
+                d.ordinary = None;
+                true
+            } else {
+                false
+            }
         })
     }
 
@@ -922,7 +1245,7 @@ impl RoutingTable {
                 }
             }
             if moved_here > 0 {
-                dest.generation = dest.generation.wrapping_add(1);
+                dest.token = self.issue_token();
                 migrated += moved_here;
             }
         }
@@ -982,18 +1305,12 @@ impl RoutingTable {
         })
     }
 
-    /// Read a destination's current state for a later conditional
-    /// write. Pair with [`Self::install_if_unchanged`].
+    /// Read a destination's full candidate state for a later
+    /// conditional write. Pair with [`Self::install_if_unchanged`] or
+    /// [`Self::apply_failure_if_unchanged`].
     pub fn observe(&self, dest_id: u64) -> Option<RouteObservation> {
         let max_age = self.max_route_age();
-        self.routes.get(&dest_id).map(|d| {
-            let effective = d.effective(max_age);
-            RouteObservation {
-                generation: d.generation,
-                next_hop: effective.map(|e| e.next_hop),
-                next_hop_id: effective.and_then(|e| e.next_hop_id),
-            }
-        })
+        self.routes.get(&dest_id).map(|d| d.observe(max_age))
     }
 
     /// Install a route ONLY if the destination has not changed since
@@ -1008,26 +1325,150 @@ impl RoutingTable {
     /// exists. Selection-time filtering does not help — the race is at
     /// mutation time.
     ///
-    /// `identity` picks the slot: `Some` writes the protected
-    /// candidate, `None` the ordinary one. Returns `true` if the write
-    /// happened.
+    /// `provenance` picks the slot. Returns the produced
+    /// [`TransitionOutcome`] — including the new token — when the
+    /// write happened, `None` when it was refused.
+    ///
+    /// Returning the token ATOMICALLY matters: a caller that wrote and
+    /// then re-read to learn "its" token can observe a third party's
+    /// write in between and record that as its own state, which is how
+    /// a later recovery ends up undoing a newer writer.
     pub fn install_if_unchanged(
         &self,
         dest_id: u64,
         observed: RouteObservation,
         next_hop: SocketAddr,
-        identity: Option<u64>,
-    ) -> bool {
+        provenance: AlternateProvenance,
+    ) -> Option<TransitionOutcome> {
+        if self.cas_poisoned() {
+            return None;
+        }
+        let max_age = self.max_route_age();
         self.mutate(dest_id, |d| {
-            if d.generation != observed.generation {
-                return false;
+            if d.token != observed.token {
+                return None;
             }
-            match identity {
-                Some(id) => d.protected = Some(RouteEntry::authenticated(next_hop, id)),
-                None => d.ordinary = Some(RouteEntry::new(next_hop)),
+            let effective_before = d.effective(max_age).map(|e| e.next_hop);
+            match provenance {
+                AlternateProvenance::Protected(id) => {
+                    d.protected = Some(RouteEntry::authenticated(next_hop, id));
+                }
+                AlternateProvenance::Ordinary => d.ordinary = Some(RouteEntry::new(next_hop)),
             }
-            true
+            let effective_after = d.effective(max_age).map(|e| e.next_hop);
+            Some(TransitionOutcome {
+                // Filled in by `mutate` after the token is stamped.
+                token: 0,
+                removed_any: false,
+                installed: true,
+                effective_before,
+                effective_after,
+                reachable_after: effective_after.is_some(),
+            })
         })
+        .map(|mut outcome| {
+            outcome.token = self.token_of(dest_id);
+            outcome
+        })
+    }
+
+    /// Apply a peer-failure transition to ONE destination atomically:
+    /// verify the observation, remove every candidate the failure
+    /// invalidates, keep every candidate it does not, and install the
+    /// caller's alternate only if the destination would otherwise be
+    /// left unreachable.
+    ///
+    /// This exists because a failure is a CANDIDATE event, not a
+    /// destination event. Writing an alternate into one slot while
+    /// leaving the failed candidate in the other is not a repair:
+    ///
+    /// - a failed PROTECTED candidate left behind keeps
+    ///   `lookup_authenticated` handing protected forwarding a dead
+    ///   hop, however good the ordinary alternate installed beside it;
+    /// - a failed ORDINARY candidate left behind can stay *effective*
+    ///   on metric while a protected alternate sits unused beside it.
+    ///
+    /// The alternate's provenance is the caller's to state — see
+    /// [`AlternateProvenance`].
+    ///
+    /// Returns `None` if the observation is stale (or the token space
+    /// is exhausted), in which case nothing was touched.
+    pub fn apply_failure_if_unchanged(
+        &self,
+        dest_id: u64,
+        observed: RouteObservation,
+        failed_identity: u64,
+        failed_addr: SocketAddr,
+        alternate: Option<(SocketAddr, AlternateProvenance)>,
+    ) -> Option<TransitionOutcome> {
+        if self.cas_poisoned() {
+            return None;
+        }
+        let max_age = self.max_route_age();
+        self.mutate(dest_id, |d| {
+            if d.token != observed.token {
+                return None;
+            }
+            let effective_before = d.effective(max_age).map(|e| e.next_hop);
+
+            // Remove exactly what the failure invalidates. Ownership
+            // is per candidate, matching the withdrawal rule: the
+            // protected candidate by bound identity (its address may
+            // have drifted), the ordinary one by address.
+            let mut removed_any = false;
+            if d.protected
+                .as_ref()
+                .is_some_and(|e| e.next_hop_id == Some(failed_identity))
+            {
+                d.protected = None;
+                removed_any = true;
+            }
+            if d.ordinary
+                .as_ref()
+                .is_some_and(|e| e.next_hop == failed_addr)
+            {
+                d.ordinary = None;
+                removed_any = true;
+            }
+
+            // Install only if nothing live survives. A surviving
+            // candidate is real evidence; replacing it with a graph
+            // guess would be a downgrade.
+            let mut installed = false;
+            if d.effective(max_age).is_none() {
+                if let Some((addr, provenance)) = alternate {
+                    match provenance {
+                        AlternateProvenance::Protected(id) => {
+                            d.protected = Some(RouteEntry::authenticated(addr, id));
+                        }
+                        AlternateProvenance::Ordinary => {
+                            d.ordinary = Some(RouteEntry::new(addr));
+                        }
+                    }
+                    installed = true;
+                }
+            }
+
+            let effective_after = d.effective(max_age).map(|e| e.next_hop);
+            Some(TransitionOutcome {
+                token: 0,
+                removed_any,
+                installed,
+                effective_before,
+                effective_after,
+                reachable_after: effective_after.is_some(),
+            })
+        })
+        .map(|mut outcome| {
+            outcome.token = self.token_of(dest_id);
+            outcome
+        })
+    }
+
+    /// The destination's current token, or 0 if it no longer exists
+    /// (an emptied destination is removed, and 0 is never issued).
+    fn token_of(&self, dest_id: u64) -> u64 {
+        self.routes.get(&dest_id).map(|d| d.token).unwrap_or(0)
     }
 
     /// Like [`Self::lookup`], but returns `None` if the installed
@@ -1068,12 +1509,50 @@ impl RoutingTable {
         dest_id: u64,
         keep: impl Fn(&RouteEntry) -> bool,
     ) -> Option<SocketAddr> {
+        self.alternate_candidate_where(dest_id, keep).map(|c| c.0)
+    }
+
+    /// Like [`Self::alternate_where`], but also reports the alternate's
+    /// PROVENANCE, so a caller installing it can carry that forward
+    /// instead of re-deriving it from address ownership.
+    ///
+    /// Tie-break matches the primary lookup exactly: on equal metric
+    /// the protected candidate wins. Iterating the slots in
+    /// declaration order and taking `min_by_key` silently gave the
+    /// opposite precedence to `lookup`, so the "alternate" could be a
+    /// different candidate than the one traffic was actually using.
+    fn alternate_candidate_where(
+        &self,
+        dest_id: u64,
+        keep: impl Fn(&RouteEntry) -> bool,
+    ) -> Option<(SocketAddr, AlternateProvenance)> {
         let max_age = self.max_route_age();
         self.routes.get(&dest_id).and_then(|d| {
             d.candidates()
                 .filter(|e| DestRoutes::live(e, max_age) && keep(e))
-                .min_by_key(|e| e.metric)
-                .map(|e| e.next_hop)
+                // `min_by_key` keeps the FIRST minimum; ordering
+                // protected-first makes ties resolve protected.
+                .min_by_key(|e| (e.metric, u8::from(e.next_hop_id.is_none())))
+                .map(|e| {
+                    let provenance = match e.next_hop_id {
+                        Some(id) => AlternateProvenance::Protected(id),
+                        None => AlternateProvenance::Ordinary,
+                    };
+                    (e.next_hop, provenance)
+                })
+        })
+    }
+
+    /// [`Self::lookup_alternate_excluding`], reporting provenance —
+    /// the form the failure transition uses.
+    pub fn alternate_candidate_excluding(
+        &self,
+        dest_id: u64,
+        exclude_next_hop: SocketAddr,
+        exclude_identity: u64,
+    ) -> Option<(SocketAddr, AlternateProvenance)> {
+        self.alternate_candidate_where(dest_id, |e| {
+            e.next_hop != exclude_next_hop && e.next_hop_id != Some(exclude_identity)
         })
     }
 
@@ -1086,13 +1565,25 @@ impl RoutingTable {
     pub fn sweep_stale(&self, max_age: std::time::Duration) -> usize {
         let mut removed = 0;
         self.routes.retain(|_, dest| {
+            let mut dropped_here = false;
             for slot in [&mut dest.ordinary, &mut dest.protected] {
                 if slot
                     .as_ref()
                     .is_some_and(|e| e.updated_at.elapsed() > max_age)
                 {
                     *slot = None;
+                    dropped_here = true;
                 }
+            }
+            // A PARTIAL sweep is still a mutation: dropping one
+            // candidate while the other survives changes the candidate
+            // set and can change the effective route. Publishing a
+            // fresh token here is what stops an observation taken
+            // before the sweep from passing a conditional write after
+            // it — the destination survives, so nothing else would
+            // have re-stamped it.
+            if dropped_here && !dest.is_empty() {
+                dest.token = self.issue_token();
             }
             let keep = !dest.is_empty();
             if !keep {
@@ -1259,13 +1750,25 @@ impl RoutingTable {
             .collect()
     }
 
+    /// Age a destination's candidates by `by`, so staleness behaviour
+    /// can be exercised without sleeping. Test seam — `fixtures`-gated
+    /// so it cannot be reached from a production build.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    pub fn backdate_for_test(&self, dest_id: u64, by: std::time::Duration) {
+        self.backdate(dest_id, by);
+    }
+
     /// Test-only: age a destination's candidates by `by`, so staleness
     /// behaviour can be exercised without sleeping.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fixtures"))]
     fn backdate(&self, dest_id: u64, by: std::time::Duration) {
-        let stale = Instant::now()
-            .checked_sub(by)
-            .expect("test host uptime should exceed the backdate window");
+        // `checked_sub` rather than `-`: on a host whose uptime is
+        // shorter than `by` (Windows `Instant` is bounded by boot) the
+        // subtraction would overflow. Falling back to "now" simply
+        // doesn't age the entry, so the calling test fails on its own
+        // assertion instead of panicking inside the seam.
+        let stale = Instant::now().checked_sub(by).unwrap_or_else(Instant::now);
         self.mutate(dest_id, |d| {
             for e in [d.ordinary.as_mut(), d.protected.as_mut()]
                 .into_iter()
@@ -1613,9 +2116,9 @@ mod tests {
         table.add_route_with_metric(0x12, b, 9); // worse metric — kept, no add
         assert_eq!(table.route_count(), 3);
 
-        assert!(table.remove_route(0x10).is_some());
+        assert!(table.remove_destination_all_candidates(0x10).is_some());
         assert_eq!(table.route_count(), 2);
-        assert!(table.remove_route(0x999).is_none()); // absent — no change
+        assert!(table.remove_destination_all_candidates(0x999).is_none()); // absent — no change
         assert_eq!(table.route_count(), 2);
 
         table.record_in(1, 10);
@@ -1930,11 +2433,15 @@ mod tests {
         let observed = table.observe(DEST).expect("present");
 
         // Uncontended: the conditional write lands.
-        assert!(table.install_if_unchanged(DEST, observed, c, None));
+        assert!(table
+            .install_if_unchanged(DEST, observed, c, AlternateProvenance::Ordinary)
+            .is_some());
         assert_eq!(table.lookup(DEST), Some(c));
 
         // A stale observation cannot overwrite the newer state.
-        assert!(!table.install_if_unchanged(DEST, observed, d, None));
+        assert!(table
+            .install_if_unchanged(DEST, observed, d, AlternateProvenance::Ordinary)
+            .is_none());
         assert_eq!(
             table.lookup(DEST),
             Some(c),
@@ -1956,12 +2463,17 @@ mod tests {
         // Bound to C at address X: B's withdrawal from X must miss.
         table.add_authenticated_route_with_metric(0xAAA, x, C, 3);
         assert!(
-            !table.remove_route_if_from_hop(0xAAA, x, B, true),
+            !table
+                .remove_route_if_from_hop(0xAAA, x, B, true)
+                .removed_any,
             "a withdrawal must not remove a route bound to another identity"
         );
         assert_eq!(table.lookup_authenticated(0xAAA), Some((C, x)));
-        // C's own withdrawal removes it.
-        assert!(table.remove_route_if_from_hop(0xAAA, x, C, true));
+        // C's own withdrawal removes it — and with no candidate left,
+        // the destination is genuinely unreachable.
+        let outcome = table.remove_route_if_from_hop(0xAAA, x, C, true);
+        assert!(outcome.removed_any);
+        assert!(!outcome.reachable_after);
         assert_eq!(table.lookup(0xAAA), None);
 
         // REBIND RACE: the binding's address drifted off the sender's
@@ -1970,7 +2482,9 @@ mod tests {
         // candidate, so the authenticated owner still removes it.
         table.add_authenticated_route_with_metric(0xDDD, x, B, 3);
         assert!(
-            table.remove_route_if_from_hop(0xDDD, y, B, true),
+            table
+                .remove_route_if_from_hop(0xDDD, y, B, true)
+                .removed_any,
             "an authenticated owner must remove its own binding despite address drift"
         );
         assert_eq!(table.lookup(0xDDD), None);
@@ -1978,7 +2492,11 @@ mod tests {
         // DIRECT LEGACY: the sender genuinely owns the address in both
         // indexes, so the legacy entry there is its own to withdraw.
         table.add_route(0xBBB, x);
-        assert!(table.remove_route_if_from_hop(0xBBB, x, B, true));
+        assert!(
+            table
+                .remove_route_if_from_hop(0xBBB, x, B, true)
+                .removed_any
+        );
         assert_eq!(table.lookup(0xBBB), None);
 
         // SHARED RELAY: a routed sender records the RELAY's address,
@@ -1986,11 +2504,51 @@ mod tests {
         // relay and must survive.
         table.add_route(0xCCC, x);
         assert!(
-            !table.remove_route_if_from_hop(0xCCC, x, B, false),
+            !table
+                .remove_route_if_from_hop(0xCCC, x, B, false)
+                .removed_any,
             "an unconfirmed (routed) sender must not remove legacy routes \
              at a shared relay address"
         );
         assert_eq!(table.lookup(0xCCC), Some(x));
+    }
+
+    /// A withdrawal that removes ONE candidate while a live one
+    /// survives is not a loss of reachability — the outcome must say
+    /// so, or the caller cascades "unreachable via me" over a working
+    /// route.
+    #[test]
+    fn withdrawal_outcome_distinguishes_candidate_loss_from_unreachability() {
+        let table = RoutingTable::new(0x1111);
+        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let via_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        const B: u64 = 0xB;
+        const DEST: u64 = 0xD70;
+
+        // Ordinary candidate through B (metric 1, so it is effective)
+        // and a protected candidate through C.
+        table.add_route(DEST, via_b);
+        table.add_authenticated_route_with_metric(DEST, via_c, 0xC, 3);
+        assert_eq!(table.lookup(DEST), Some(via_b));
+
+        // B withdraws its ordinary candidate: removed, effective path
+        // MOVES to the protected candidate, destination still reachable.
+        let outcome = table.remove_route_if_from_hop(DEST, via_b, B, true);
+        assert!(outcome.removed_any);
+        assert!(outcome.reachable_after, "the protected candidate survives");
+        assert!(
+            outcome.effective_changed(),
+            "traffic now takes another path"
+        );
+        assert_eq!(outcome.effective_before, Some(via_b));
+        assert_eq!(outcome.effective_after, Some(via_c));
+
+        // A withdrawal that matches nothing reports no removal and no
+        // change — the caller must not act on it at all.
+        let outcome = table.remove_route_if_from_hop(DEST, via_b, B, true);
+        assert!(!outcome.removed_any);
+        assert!(outcome.reachable_after);
+        assert!(!outcome.effective_changed());
     }
 
     /// The learned-route writer contract: strictly-better replaces,

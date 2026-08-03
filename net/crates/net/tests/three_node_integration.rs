@@ -1788,8 +1788,8 @@ async fn test_failure_detector_lifecycle() {
     let recovered_cb = recovered_nodes.clone();
 
     let detector = FailureDetector::with_config(config)
-        .on_failure(move |id| failed_cb.lock().unwrap().push(id))
-        .on_recovery(move |id| recovered_cb.lock().unwrap().push(id));
+        .on_failure(move |event| failed_cb.lock().unwrap().push(event.node_id))
+        .on_recovery(move |event| recovered_cb.lock().unwrap().push(event.node_id));
 
     let node_a: u64 = 0x1111;
     let node_b: u64 = 0x2222;
@@ -2355,7 +2355,9 @@ async fn test_mesh_relay_tamper_detected() {
     // whole point of the provenance split. Drop the direct route first
     // so the relay route is the only candidate; this test needs B to
     // physically receive the datagram in order to tamper with it.
-    a.router().routing_table().remove_route(nid_c);
+    a.router()
+        .routing_table()
+        .remove_destination_all_candidates(nid_c);
     a.router().add_route(nid_c, addr_b);
     a.start();
     c.start();
@@ -3454,7 +3456,19 @@ async fn test_mesh_node_auto_reroute_recovery() {
     r1.unwrap();
     r2.unwrap();
 
-    // Route to C goes through B
+    // Route to C goes through B. The A↔C handshake above installed an
+    // identity-bound direct route to C; drop it first, or the manual
+    // relay route cannot become effective — an ordinary candidate does
+    // not displace an authenticated adjacency at equal metric, and the
+    // reroute/recovery this test exercises would be invisible behind
+    // the direct path. (Recovery installs ORDINARY by design: a direct
+    // adjacency with B is not evidence that B advertised reachability
+    // to C, so recovery cannot re-manufacture a protected candidate
+    // here either.)
+    node_a
+        .router()
+        .routing_table()
+        .remove_destination_all_candidates(nid_c);
     node_a.router().add_route(nid_c, addr_b);
 
     node_a.start();

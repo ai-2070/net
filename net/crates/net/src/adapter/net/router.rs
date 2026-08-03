@@ -751,9 +751,17 @@ impl NetRouter {
             .add_authenticated_route(peer_node_id, peer_addr, peer_node_id);
     }
 
-    /// Remove a route
+    /// Remove the ORDINARY route — the inverse of [`Self::add_route`],
+    /// which installs one.
+    ///
+    /// Symmetric on purpose: an ordinary-only installer must not have
+    /// an all-candidate remover behind the same name, or a caller
+    /// undoing its own manual route silently deletes authenticated
+    /// state it never created. Administrative removal of everything a
+    /// destination knows is
+    /// [`RoutingTable::remove_destination_all_candidates`].
     pub fn remove_route(&self, dest_id: u64) {
-        self.routing_table.remove_route(dest_id);
+        self.routing_table.remove_ordinary_route(dest_id);
     }
 
     /// Route a packet (called from receive loop)

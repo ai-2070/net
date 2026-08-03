@@ -813,10 +813,26 @@ impl Mesh {
 
     // ---- Routing ----
 
-    /// Add a route to a destination node.
+    /// Add an ORDINARY route to a destination node.
     ///
-    /// Packets sent to `dest_node_id` via `send()` will be forwarded
-    /// through `next_hop_addr`.
+    /// This installs a *candidate*, not an override. Each destination
+    /// holds at most one ordinary candidate (manual installs like this
+    /// one, plus pingwave-learned routes) and at most one protected
+    /// candidate (identity-bound, learned from an authenticated
+    /// adjacent session). Forwarding selects the lowest-metric live
+    /// candidate, and on an equal metric the protected one wins.
+    ///
+    /// So packets to `dest_node_id` follow `next_hop_addr` only while
+    /// no better — or equally good, identity-bound — candidate exists.
+    /// A manual route cannot displace an authenticated direct
+    /// adjacency, and cannot make protected forwarding resolve at all:
+    /// only an authenticated learning path installs a protected
+    /// candidate. Calling this with a route the mesh already knows
+    /// better is a no-op in effect, not an error.
+    ///
+    /// Remove it with [`Self::remove_route`], which removes the
+    /// ordinary candidate this installed and leaves authenticated
+    /// state alone.
     pub fn add_route(&self, dest_node_id: u64, next_hop_addr: &str) -> Result<()> {
         let addr: SocketAddr = next_hop_addr
             .parse()
@@ -825,7 +841,12 @@ impl Mesh {
         Ok(())
     }
 
-    /// Remove a route.
+    /// Remove the ordinary route added by [`Self::add_route`].
+    ///
+    /// Removes only the manual/ordinary candidate. Routes the mesh
+    /// learned for itself — and any authenticated (protected)
+    /// candidate — are unaffected, so this cannot be used to strip a
+    /// destination's authenticated state.
     pub fn remove_route(&self, dest_node_id: u64) {
         self.node.router().remove_route(dest_node_id);
     }

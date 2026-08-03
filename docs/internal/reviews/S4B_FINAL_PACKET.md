@@ -13,10 +13,16 @@ later commits repair aggregate behaviour, they do not retroactively
 sign an earlier head.
 
 ```text
+19edebe615b89fbadca612d23170fa5118d4b632   REJECT / HOLD — S4A
+    (exact historical label; NOT an S4B disposition)
+186d1667fd2f5b6f80e057d65686abfcde89ded4   S4B HOLD as written
+    (Exported activation — export policy aliased on the u16 wire hash)
+6fa7ab8dd92481e4e0e8e8636263cf5f28b95b68   canonical export key
+    (breaking; repaired 186d1667f's aliasing)
 71581680890a08198efd0895ec4450655bc0dacc   accepted S4A repair scope
 b0ce4b3280cd95b44ce3a52e81f7670db02f51f7   S4B HOLD
-19edebe615b89fbadca612d23170fa5118d4b632   S4B HOLD as written
-186d1667fd2f5b6f80e057d65686abfcde89ded4   S4B HOLD as written
+01ebae486845a58e8afc969eec6d5a3c3df395b1   cross-plane composition
+    (S4B contract test; carried in the prior packet's provenance)
 1211c4f25e203d3c9bc24338a4d0aaf48a22832a   S4B HOLD
     (direct route + one-hop witness accepted)
 c5adef63f6b9fe06c3eb546748980fc0ec49d225   S4B HOLD
@@ -30,6 +36,12 @@ dfe54dbeb1314f11035ab4d8d10ed8576a5df736   packet HOLD
      withdrawal ownership and route provenance incomplete)
 3754d530518a65e0afef942187a5d20a11e3ab6f   packet HOLD
     (implementation not signable; historical pins absent)
+0b6cb551d573085cde8bb8a88c715713b7dd5a4a   S4B HOLD
+    (provenance CONTAINER accepted in direction; lifecycle
+     transitions still single-entry / cross-provenance)
+0f0403dadef2c7fd78ada4793b1672fa63e00fa9   packet HOLD
+    (implementation not signable; provenance and invariant
+     descriptions inaccurate)
 
 candidate head (this packet's subject):
   0b6cb551d573085cde8bb8a88c715713b7dd5a4a
@@ -179,16 +191,19 @@ registered peer. The pingwave writer now installs
 in a comment at the install site.
 
 The authenticated learning path for the same edge is the capability
-announcement (`from_node` = the AEAD-resolved session peer); its
-equal-metric same-address install upgrades the pingwave's legacy entry
-in place. This also makes the learned-route witnesses DETERMINISTIC:
+announcement (`from_node` = the AEAD-resolved session peer). Since the
+provenance split it does NOT upgrade the pingwave's entry in place —
+it lands in its own protected slot, which is what stops a forged
+ordinary route from occupying the destination against it. This also
+makes the learned-route witnesses DETERMINISTIC:
 only capability learning can satisfy an `authenticated_next_hop` poll,
 so a broken capability writer cannot be masked by the pingwave path.
 
 ### 3. High — withdrawal and failure invalidation are identity-qualified
 
 ```text
-withdrawal  RoutingTable::remove_route_if_from_hop(dest, addr, sender)
+withdrawal  RoutingTable::remove_route_if_from_hop(dest, addr, sender,
+            sender_is_direct)
             removes iff next_hop == addr AND (next_hop_id is None
             OR == Some(sender)) — a sender may withdraw its own bound
             route or a legacy entry at its address, never a route
@@ -231,21 +246,49 @@ the stale migration returns 0.
 
 ```text
 same addr + same identity   → refresh
-same addr + no identity     → identity upgrade + refresh
 same addr + conflicting id  → no rewrite, no refresh
 different next hop          → no rewrite, NO refresh
 ```
 
+(The "no identity yet → upgrade in place" case from the round-3 text
+no longer exists: since the provenance split the protected slot is
+separate, so an authenticated arrival lands there directly rather
+than upgrading an ordinary entry.)
+
 Evidence from live peer C can no longer keep a dead route through B
-fresh forever while the single-entry table refuses to switch — the
-installed route ages out normally. (The legacy writer is unchanged;
-legacy entries carry no protected traffic. A future multi-route table
-may retain the alternate separately.)
+fresh forever while the table refuses to switch — the installed route
+ages out normally. The ordinary writer's own refresh rule is
+unchanged; ordinary candidates carry no protected traffic.
 
 Witness: `another_peer_cannot_refresh_the_installed_route` — the
 installed route is backdated, an equal-metric announcement arrives
 through another peer, and the route stays stale with its binding
 untouched.
+
+### F. Transition tokens track observable CHANGE, not mutation attempts
+
+The first cut of the token stamped a fresh value on every mutation
+attempt, on the reasoning that over-stamping is the safe direction (a
+conditional writer can only be made to skip). That is true about
+safety and wrong about liveness: pingwave freshness refreshes arrive
+every heartbeat and touch `updated_at` on an otherwise unchanged
+candidate, so every compare-and-set spanning more than a moment
+failed. `test_mesh_node_auto_reroute_recovery` caught it — recovery
+could never restore, because a refresh had always re-stamped the
+destination first.
+
+The token now advances only when the candidate SET observably changes
+(address, identity, metric, active flag, presence — in either slot),
+which is exactly what a conditional writer reasoned about. A pure
+freshness refresh leaves it alone. This does not reintroduce ABA: the
+counter is table-wide and monotonic, so a destination that changes
+`A → B → A` gets two distinct tokens, not the same one back.
+
+Worth noting the same test was previously GREEN for a bad reason —
+round-4 recovery bound the identity of whoever owned the alternate's
+address, manufacturing a protected candidate at B for destination C.
+That is the unsound inference this round removes, so the test had to
+be repointed at a destination whose route genuinely rides through B.
 
 ## What this candidate does NOT claim
 
@@ -373,7 +416,7 @@ end. Witnesses:
 
 ## Gate at the candidate head
 
-Local runs at `35d63fe6d`, exact commands:
+Local runs at `0b6cb551d`, exact commands:
 
 ```text
 cargo test --features net --lib
