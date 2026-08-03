@@ -1657,6 +1657,48 @@ impl SubnetBoundarySet {
     }
 }
 
+/// The immutable binding of one exported nRPC service to one exact
+/// protected crossing (SUBNET_AUTH_PLAN.md D7).
+///
+/// Captured by a `serve_rpc_subnet_exported` registration and never
+/// mutated afterwards: the service exports through exactly this
+/// authority-qualified path, declared under exactly this topology
+/// epoch. The epoch is load-bearing — if paths are reinterpreted
+/// under a newer epoch, an old registration must stay dark until
+/// explicitly re-registered; it must not silently transfer to the
+/// same path bits with a new meaning.
+///
+/// Deliberately NO target organization and NO caller subnet:
+/// organization admission already controls who may ask, and the
+/// external caller never joins the provider's subnet at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubnetExportBinding {
+    /// The exact crossing the service exports through.
+    subnet: SubnetRef,
+    /// The topology epoch the binding was declared under.
+    topology_epoch: u32,
+}
+
+impl SubnetExportBinding {
+    /// Bind to exactly `subnet` under exactly `topology_epoch`.
+    pub fn new(subnet: SubnetRef, topology_epoch: u32) -> Self {
+        Self {
+            subnet,
+            topology_epoch,
+        }
+    }
+
+    /// The bound authority-qualified crossing.
+    pub fn subnet(&self) -> &SubnetRef {
+        &self.subnet
+    }
+
+    /// The topology epoch the binding was declared under.
+    pub fn topology_epoch(&self) -> u32 {
+        self.topology_epoch
+    }
+}
+
 /// Why a protected forwarding transition was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardDenial {
@@ -1763,6 +1805,64 @@ impl VerifiedGatewayContextSet {
             now_secs,
         )
         .verdict
+    }
+
+    /// May a locally-registered service export through the exact
+    /// crossing `binding` names, RIGHT NOW? (SUBNET_AUTH_PLAN.md D7 —
+    /// the exported-nRPC composition decision.)
+    ///
+    /// Deliberately NOT [`Self::authorize_transition`]: that decision
+    /// orders two admitted subnet contexts across a hop, and the
+    /// externally org-authorized nRPC caller intentionally holds no
+    /// such context. This one asks only about the PROVIDER's side —
+    /// whether this gateway currently has the authority to expose a
+    /// result through the declared boundary:
+    ///
+    /// - one authority across binding, boundary set, and this set;
+    /// - one topology epoch across binding, boundary set, this set,
+    ///   AND the node's current epoch — a binding declared under a
+    ///   reinterpreted hierarchy stays dark until re-registered;
+    /// - this set's auth epoch equals the CURRENT floor-registry
+    ///   epoch (a signed floor kills it), and it is unexpired;
+    /// - the binding path is EXACTLY a declared boundary;
+    /// - `EXPORT` is held at EXACTLY that path. Exact means exact:
+    ///   `EXPORT` at `vehicle` does not satisfy a service bound to
+    ///   `world-model` — no ancestor inheritance, per the same rule
+    ///   the packet path applies at crossed boundaries.
+    ///
+    /// Missing boundary state, epoch drift, revocation, expiry, and
+    /// absent exact `EXPORT` all deny. Two probes, no inventory walk.
+    pub fn authorize_service_export(
+        &self,
+        binding: &SubnetExportBinding,
+        boundaries: &SubnetBoundarySet,
+        current_topology_epoch: u32,
+        current_subnet_auth_epoch: u64,
+        now_secs: u64,
+    ) -> Result<(), ForwardDenial> {
+        let scope = binding.subnet();
+        if scope.authority != self.authority || scope.authority != *boundaries.authority() {
+            return Err(ForwardDenial::ContextNotCurrent);
+        }
+        if binding.topology_epoch() != current_topology_epoch
+            || self.topology_epoch != current_topology_epoch
+            || boundaries.topology_epoch() != current_topology_epoch
+        {
+            return Err(ForwardDenial::ContextNotCurrent);
+        }
+        if self.subnet_auth_epoch != current_subnet_auth_epoch {
+            return Err(ForwardDenial::ContextNotCurrent);
+        }
+        if now_secs >= self.earliest_expiry {
+            return Err(ForwardDenial::ContextNotCurrent);
+        }
+        if !boundaries.is_boundary(scope.path) {
+            return Err(ForwardDenial::ExportMissing);
+        }
+        match self.index.rights_at(scope.path) {
+            Some(rights) if rights.contains(SubnetRights::EXPORT) => Ok(()),
+            _ => Err(ForwardDenial::ExportMissing),
+        }
     }
 
     /// [`Self::authorize_transition`], reporting how many indexed
@@ -1942,7 +2042,19 @@ pub fn compile_gateway_context(
         now_secs,
         skew_secs,
     )?;
-    if !verified.scope.is_ancestor_or_self_of(local_attachment) {
+    // The containment requirement applies to ATTACH: a credential that
+    // claims where this node BELONGS must cover where it actually
+    // attaches. A ROUTE- or EXPORT-only credential is DELEGATED
+    // forwarding authority over an exact scope — the plan's own
+    // provisioning ("EXPORT at world-model" on a vehicle-attached
+    // gateway) names a scope the gateway is not attached under, and
+    // the signed credential naming this gateway as subject is what
+    // authorizes that delegation. Demanding containment for those
+    // conflated "where I am" with "what I may forward" and made an
+    // exact descendant EXPORT grant impossible to compile.
+    if verified.rights.contains(SubnetRights::ATTACH)
+        && !verified.scope.is_ancestor_or_self_of(local_attachment)
+    {
         return Err(SubnetAuthError::ScopeNotAncestor);
     }
     Ok(VerifiedGatewayContext {

@@ -625,6 +625,7 @@ jobs:
           --test integration_nrpc_loopback
           --test integration_nrpc_mesh
           --test integration_nrpc_protected
+          --test subnet_auth_e2e
           --test integration_nrpc_streaming
           --test integration_nrpc_client_streaming
           --test integration_nrpc_duplex
