@@ -1,4 +1,4 @@
-# OLB-2B.3 — warmed-call boundary design, revision 5 (for review)
+# OLB-2B.3 — warmed-call boundary design, revision 6 (for review)
 
 **Status: SIGNED as a DESIGN at `1c1b652e6`** =
 `OLB_2B3_BOUNDARY_DESIGN_HEAD`. A design signature only — it authorizes no
@@ -70,6 +70,39 @@ the *other* branch's rows query-visible — which is the question that actually
 decides whether they can be cached. Confirming an obstacle is not understanding
 the mechanism behind it, and the second failure above is a security defect I
 would have specified into existence.
+
+## 0.2 What revision 5 over-built
+
+**It grew a second capacity/authority model beside the registry.** 2B.3b's
+refusal handling accreted family-global memoization — a sticky
+family-capacity width, a `(node capacity generation, lease revision)` cache, a
+terminal identity-exhaustion flag, and a separate replacement-refusal cache —
+each added to repair the previous one's wrongness. The accretion itself was
+the signal: a family-global record answers a per-capability question, and it
+kept failing because it does not possess the registry's exact marginal facts.
+Under ONE generation and revision, capability A can need a new node slot while
+capability B's required slots all exist through another family; A can need a
+fresh identity while B only shares slots that exist. Identity exhaustion means
+"cannot mint another slot identity", never "cannot acquire an existing slot".
+Every family-global cache promoted a marginal resource failure into a
+family-wide routing verdict.
+
+Revision 6 removes the memoization from correctness decisions entirely (§9).
+On a cold miss or stale entry: take the family mutation lock, derive the exact
+set, ask the authoritative registry, return its result. The warmed path is
+untouched — one atomic snapshot load, one map lookup, one `Arc` clone — so
+only cold and refused calls can reach the registry. This was an UNMEASURED
+cold-path optimisation promoted into a correctness surface; if measurement
+ever shows permanently-cold callers hammering the registry lock, the repair is
+a cache keyed by the exact marginal request — never another family-global
+approximation.
+
+**It also mis-derived the snapshot-ordering classification.** `note_snapshot`
+loaded the high-water, branched, and then `fetch_max`ed — ignoring the value
+`fetch_max` returned. A stalled older snapshot could pass the load, resume
+after a newer one advanced the high-water, and still answer `Newer` (§4.4).
+The repair derives the classification from the single `fetch_max`'s returned
+prior value, so it reflects the actual linearization order by construction.
 
 ---
 
@@ -450,14 +483,14 @@ exists to prevent, so the caller takes the current-authority cold path instead:
 bounded degradation, correct authority. The stale entry stays retained and the
 capability keeps reporting cold until the lease moves again or capacity frees.
 
-**What re-derivation costs when it is refused.** The registry is asked once (§9
-settles every later attempt locally), but the family-local mutation lock IS taken
-on each subsequent call for that capability, because the entry is stale and the
-check that says so is cheap while the decision that acts on it is not. That is
-bounded and deliberate: the call is taking the cold path anyway, which dominates
-a single uncontended lock acquisition by orders of magnitude. The lock this
-slice's boundary exists to keep off the hot path is the NODE-WIDE registry lock,
-and no refused re-derivation ever reaches it.
+**What re-derivation costs when it is refused.** Each such call takes the
+family-local mutation lock, re-derives, and asks the registry again (§9 —
+refusals are never memoized), because the entry is stale and only the registry
+holds the marginal facts that decide whether the repair now fits. That is
+bounded and deliberate: the call is taking the cold path anyway, which
+dominates the lock acquisition and the registry transaction by orders of
+magnitude, and the lock this slice's boundary exists to keep off the hot path
+is reached only at the rate of cold and refused calls — never by a warmed hit.
 
 ### 4.3 Replacement is charged on the PROJECTED footprint
 
@@ -506,13 +539,12 @@ scope needs none — a terminal identity space has nothing to say about it, and
 refusing there would strand the same shed-forever deadlock behind a different
 gate. Both directions are witnessed.
 
-**The state's gate asks for the MARGINAL cost.** §9's width record is about how
-many handles an attempt needs; for a replacement that is `|new_only| - |old_only|`,
-saturating at zero. A net-neutral or net-negative replacement charges nothing and
-can never be blocked by a width record, which is correct — it cannot make the
-family's footprint grow. The registry recomputes the projection authoritatively
-inside the transaction and is what actually refuses; the state's figure only
-stops a provably-doomed attempt from taking the node-wide lock.
+**The registry's projection is the only gate.** It computes the projection
+authoritatively inside the transaction and is what refuses. The state keeps no
+estimate of its own in front of it (§9): an earlier revision pre-gated
+attempts on a locally recorded refusal width, which was a second copy of the
+registry's arithmetic — free to disagree with it, and blind to the marginal
+facts (which slots exist, which are shared) that the projection turns on.
 
 **Retirement clears the cell it abandons.** A slot's publication cell is an
 `Arc` that outstanding readers still hold — a superseded `DemandSet`, or any
@@ -572,6 +604,21 @@ revision == high-water   → the transition already in force
 revision >  high-water   → advance, then proceed
 ```
 
+**The classification IS `fetch_max`'s return value.** One atomic
+`fetch_max(revision)`, and the three-way answer is `revision.cmp(&previous)`
+over the prior value that operation observed. Revision 5's shape — load,
+branch, then a `fetch_max` whose result was ignored — left a window: revision
+6 loads a high-water of 5 and stalls, revision 9 advances it to 9, revision 6
+resumes, its `fetch_max(6)` changes nothing, and it nevertheless answers
+`Newer` — so an already-superseded snapshot passed the lock-free gate, and if
+its retained demand happened to look current it was served warm without
+reaching the under-lock stale check. Deriving the answer from the observed
+prior value makes the classification reflect the linearization order by
+construction; no interleaving exists in which the two can disagree, so the
+property is structural rather than separately witnessed. The under-lock
+re-check in the mutation path remains: the high-water can still advance
+between a caller's gate and its lock acquisition.
+
 Three consequences worth stating plainly:
 
 - **`Terminal` outranks every ordinary publication**, because no installation can
@@ -595,11 +642,10 @@ authority as though it were this older snapshot's, which is the same
 authority-confusion in the opposite direction. It takes the current-authority
 cold path — what it would have done had it not raced at all.
 
-### 4.5 A replacement does not inherit the fresh path's refusal caches
+### 4.5 Refusal caches — REMOVED by revision 6
 
-The fresh caches answer "can this family take MORE". A replacement frequently
-asks the opposite, and each fresh cache suppresses a replacement that is not
-about it:
+Revision 5's version of this section existed to stop the fresh path's refusal
+caches suppressing replacements they were not about:
 
 ```text
 terminal id space  + a replacement creating NO slot  → needs no identity
@@ -607,20 +653,15 @@ node full at G     + a net-negative replacement      → frees capacity
 node full at G     + a self-crediting rotation       → moves capacity
 ```
 
-Every one of those is self-sustaining: the transaction being suppressed is the
-one that would free or move the capacity the cache is waiting on, so the wake
-condition can never arrive and the entry keeps its obsolete scope forever.
-
-A replacement therefore has its OWN cache, gated on the **reference-release
-generation** rather than the node capacity generation. The distinction is load
-bearing: a replacement also becomes satisfiable when another family stops SHARING
-a slot this replacement wants to give up — nothing retires, node capacity never
-moves, and the projection has still genuinely changed. That is a bounded, exact
-wake condition, not a per-call retry, so the node-wide lock is not hammered.
-
-Refusals do not cross between the two paths in either direction: a replacement
-refusal never writes the sticky width or the terminal flag, and the fresh path's
-signed sticky/retryable/terminal semantics are exactly as before.
+Each of those is self-sustaining under a cache: the transaction being
+suppressed is the one that would free or move the capacity the cache is
+waiting on, so the wake condition can never arrive. Revision 5's answer was a
+SECOND cache with its own wake condition (the reference-release generation).
+Revision 6's answer is §0.2's: there are no refusal caches at all, fresh or
+replacement, so there is nothing for a replacement to wrongly inherit and no
+wake condition to strand it. Every cold or stale attempt asks the registry,
+whose projection is current by construction. The schedules above remain
+witnessed — as registry-projection properties, not cache-domain ones.
 
 ### 4.6 The under-lock recheck validates the CALLER's snapshot
 
@@ -715,13 +756,35 @@ Warmed read: `index.load()` → handle → `route_set.load()`. No SDK-state mute
 registry mutex. **Not a `DashMap`** — internally sharded locking would leave the
 contract unproven while appearing to satisfy it.
 
-## 9. Refusal semantics, per class
+## 9. Refusal semantics: the registry's verdict, passed through
 
-| Refusal | Policy |
-|---|---|
-| `FamilyAtCapacity` | **sticky cold** for the family's lifetime — no eviction, entries live until the family dies |
-| `NodeAtCapacity` | **retryable**, gated on a node capacity generation; retry only if it moved |
-| `IdSpaceExhausted` | **terminal — never retry** |
+A refusal is the REGISTRY's verdict, reported to the caller verbatim and
+memoized nowhere. On every cold miss and every stale entry the state takes the
+family mutation lock, derives the exact current demand set, asks the registry,
+and returns its answer. The three classes still exist — `FamilyAtCapacity`,
+`NodeAtCapacity`, `IdSpaceExhausted` — but they are statements the registry
+makes about ONE attempt's exact marginal cost, never records the family keeps
+about its future.
+
+Family-side memoization of any class is FORBIDDEN, not deferred (§0.2). Each
+class, cached family-globally, answers the wrong capability:
+
+```text
+FamilyAtCapacity   demand sets have variable width; a wide refusal says
+                   nothing about a narrow set that still fits
+NodeAtCapacity     "needs a new slot" is per-capability: under the SAME
+                   generation and revision, another capability's slots may all
+                   already exist through other families
+IdSpaceExhausted   "cannot mint another identity" is not "cannot acquire an
+                   existing slot"; a set that creates nothing needs no identity
+```
+
+The warmed read path is unaffected: one atomic index load, one map lookup, one
+`Arc` clone, no lock (§8). Only cold and refused calls can reach the registry,
+so the retry rate is the rate of cold traffic, not of warmed calls. If
+measurement ever shows permanently-cold callers contending on the registry
+lock, the escalation is a cache keyed by the exact marginal request being
+refused — never a family-global approximation of the registry's accounting.
 
 ## 10. 2B.3d-pre — the coherent current-authority cold plan
 
@@ -830,7 +893,7 @@ because "clear both conditionally" is exactly the phrasing that hides them.
 | Slice | Content | Public call path |
 |---|---|---|
 | **2B.3c-pre** | **The §2A currentness substrate FIRST** — exact installation stamp in the source epoch, wake/invalidation edge, non-aliasing installation identity, commit-pin coverage — **then** Grant-scoped `SlotBaseFacts` service: exact installed DISCOVER authority and provenance only | unchanged |
-| **2B.3b** | `OrgRoutingState`; lock-free capability index; atomic complete demand-set acquisition; demand set from actually-leased DISCOVER audiences; Option-A accounting + plan correction; refusal capacity generation; `CapabilityRouteHandle` ownership | unchanged |
+| **2B.3b** | `OrgRoutingState`; lock-free capability index; atomic complete demand-set acquisition; demand set from actually-leased DISCOVER audiences; Option-A accounting + plan correction; registry-authoritative refusal pass-through (§9); `CapabilityRouteHandle` ownership | unchanged |
 | **2B.3c** | Per-slot `ScopedUnsensedRoutePool` publication (second cell); coherent direct/session projection; exact scoped source vector and deadlines; publish-if-current. **No union pool, no caller INVOKE matching.** | unchanged |
 | **2B.3d-pre** | Coherent current-authority cold-plan seam; existing errors, ordering, counts and provider choice preserved | unchanged |
 | **2B.3d** | Family projection over exact retained scoped pools; ambiguity refuses publication; family-only deadline refresh; warmed validation; one preselected route; final validation adjacent to `MeshNode::call`; zero routing locks, zero scans, one send. **Every temporary consumer `allow(dead_code)` disappears here.** | **changes** |
@@ -1388,7 +1451,10 @@ format/diff check; exact-SHA GitHub conclusions; clean canonical state.
 
 **Status: IMPLEMENTED + WITNESSED — NOT SIGNED.** Authorized by the user after
 the 2B.3c-pre signature at `OLB_2B3C_PRE_SIGNED_HEAD`. That signature does not
-extend here.
+extend here. The revision-6 repair (§0.2) — the `fetch_max` ordering fix and
+the removal of family-global refusal memoization — is folded into this section
+in place; the superseded refusal-cache record is §17.6c's ledger, kept as
+archaeology.
 
 ### 17.1 Scope, exactly
 
@@ -1399,7 +1465,7 @@ The §13 row, and nothing beside it:
 3. atomic complete demand-set acquisition;
 4. the demand set derived from actually-leased DISCOVER audiences;
 5. Option-A accounting, with its required normative-plan correction;
-6. refusal capacity generation;
+6. registry-authoritative refusal pass-through (§9);
 7. `CapabilityRouteHandle` ownership.
 
 Public call path unchanged. `OrgCapabilityRegistration` untouched.
@@ -1409,7 +1475,7 @@ Public call path unchanged. `OrgCapabilityRegistration` untouched.
 ```text
 behavior/org_routing_state.rs      NEW — OrgRoutingState, CapabilityIndex,
                                    CapabilityRouteHandle, the demand derivation,
-                                   the refusal policy
+                                   the snapshot ordering gate
 behavior/org_routing_registry.rs   demand_set (atomic acquisition), the node
                                    capacity generation, and the two bounds made
                                    crate-visible
@@ -1448,10 +1514,10 @@ that legitimately found no granted provider.
 a `DashMap`: sharded locking is usually uncontended, so a witness would pass by
 luck rather than by the contract holding.
 
-Design §8 sketches that lock as `Mutex<()>`; it guards the refusal bookkeeping
-instead of nothing, because that state is read and written on exactly the miss
-path the lock already delimits. What §8 pins is preserved: the read path takes no
-lock, the mutation path takes exactly one.
+The lock is the literal `Mutex<()>` §8 sketches. An intermediate revision had
+it guard refusal bookkeeping; that bookkeeping is removed (§0.2, §9), and with
+it the deviation. The read path takes no lock, the mutation path takes exactly
+one, and there is no state under the lock beyond the index publication itself.
 
 **A miss re-checks the index under the mutation lock.** Two threads can miss
 concurrently and only one may spend the family's budget; the loser adopts the
@@ -1476,57 +1542,23 @@ capability entries    <= 64     STRUCTURAL — every entry holds >= 1 demand
 The entry ceiling is derived, never separately counted; a second counter would be
 free to disagree with the first.
 
-| Refusal | Policy | What the gate is |
-|---|---|---|
-| `FamilyAtCapacity` | sticky **from the refused WIDTH up** | the narrowest width ever refused. Demand sets have variable width and the registry refuses on `held + width > 64`, so a refusal is a statement about a width, not about the family |
-| `NodeAtCapacity` | retryable | a node capacity generation that advances **only on slot retirement**. Not `slots.len()`, which a retire-then-demand pair leaves equal while capacity genuinely moved; not advanced on demand, since growth cannot free capacity |
-| `IdSpaceExhausted` | terminal | a flag that outranks the retryable class. Exhaustion is irreversible by construction, so a generation that moves afterwards says nothing about it |
+**Refusals are the registry's verdicts, passed through (§9).** The registry
+refuses on `held + width > 64` for the family, on the new distinct slots a set
+would create for the node, and on the identities those created slots need. The
+state records none of it: every cold or stale attempt derives the exact
+current set and asks again. The class taxonomy — `FamilyAtCapacity`,
+`NodeAtCapacity`, `IdSpaceExhausted` — reaches the caller verbatim so the
+2B.3d cold path can report it, and implies no retry policy beyond "ask again
+when you have reason to".
 
-The generation is read once, before the attempt, and a refusal records that same
-value. Reading it after the refusal would record a generation that may already
-have moved because of the very retirement that would have made the attempt
-succeed, and the family would then never retry.
-
-**`FamilyAtCapacity` is a width, not a flag.** A single Boolean is INVALID here,
-and the repair that replaced it is not a refinement of a conservative
-approximation — the flag suppressed demand the family could afford:
-
-```text
-family holds 62 of 64
-capability `wide`   Owner + two leased DISCOVER audiences = 3   → refused
-capability `narrow` Owner                                  = 1   → MUST warm
-```
-
-Under one `family_at_capacity: bool`, `wide`'s refusal answers `narrow` — and
-every later capability, for the family's LIFETIME, without ever asking the
-registry. Two spendable handles become permanently unreachable, and the family
-reports `FamilyAtCapacity` while not being at capacity.
-
-What the refusal actually established is `held + refused_width > 64`. The handle
-count never falls except across a supersession (§4.2), so the implication holds
-upward and only upward:
-
-```text
-width >= refused_width   → provably refused, settle locally, do not ask
-width <  refused_width   → unknown, ask the registry
-```
-
-The record keeps the **narrowest** width refused. A wider later refusal adds
-nothing the narrower one did not already say, and taking the wider value would
-re-open sets already proven not to fit.
-
-It converges, so it is not a licence to hammer the node-wide lock: an attempt
-reaches the registry only when its width is strictly below the record, and being
-refused there lowers the record. Widths are bounded by 64 and every demand set
-contains at least the Owner scope, so a family can be refused at most 64 times
-before the record reaches 1 — the old flag's exact behaviour, arrived at only
-once it is actually true.
-
-**A supersession clears it.** Re-derivation is the one path on which the family's
-handle count falls, which is the exact premise the upward implication rests on.
-Terminal exhaustion and the node generation are NOT cleared: neither is a
-statement about this family's budget, and clearing them would manufacture
-retries against a node that is still full or an id space that can never recover.
+An earlier revision of this section specified a sticky width record, a
+generation-gated node cache and a terminal flag, then §4.5's replacement
+cache to protect replacements from the first three. The width-record essay
+that stood here is retired with the mechanism — §0.2 records why the whole
+family of caches, not just the Boolean flag it repaired, answered the wrong
+capability. The node capacity generation itself remains a registry fact
+(advancing only on slot retirement), still exposed for witnesses that assert
+sharing creates and retires nothing.
 
 ### 17.6 Witnesses
 
@@ -1548,16 +1580,13 @@ Every one selects exactly one test and dies to its own inverse mutation.
 | — | `demands_are_exact_on_capability_and_grantee` | exact on both | — (positive control) |
 | §8 | `a_warmed_lookup_takes_no_lock` | the counter form | take the mutation lock on the read path |
 | §8 | `a_warmed_lookup_completes_while_the_mutation_lock_is_held` | the real contention form | make the read path depend on that lock |
-| §8 | `concurrent_misses_acquire_one_demand_set` | one entry, one budget spend, no poisoned sticky refusal | drop the under-lock re-check |
-| §9 | `family_capacity_refusal_is_sticky_for_the_family` | sticky at a uniform width; the registry is asked ONCE | drop the width gate (always attempt) |
-| W-R1 | `a_wide_refusal_does_not_poison_residual_capacity` | a wide refusal leaves narrow residual capacity spendable | record a family-global flag instead of the width |
-| W-R2 | `a_refusal_settles_every_wider_set_without_the_registry` | every set at or above the refused width settles locally | keep the WIDEST refused width instead of the narrowest |
+| §8 | `concurrent_misses_acquire_one_demand_set` | one entry, one budget spend, no registry refusal provoked | drop the under-lock re-check |
+| §9 | `a_spent_family_budget_refuses_from_the_registry_every_time` | every attempt is the registry's verdict; warmed entries keep serving | memoize the refusal family-globally |
 | W-L1 | `a_newly_leased_audience_joins_a_warmed_entry` | an audience leased after warming joins the demand set | return the warmed entry without checking lease currency; drop the MISSING direction |
 | W-L2 | `a_removed_audience_leaves_a_warmed_entry` | a removed audience leaves it | drop the OBSOLETE direction |
 | W-L3 | `a_rotated_audience_replaces_the_scope_it_supersedes` | rotation swaps the scope under one grant id | — (composite control for W-L2/W-L4) |
 | W-L4 | `a_rotated_away_scope_is_not_retained_under_its_own_id` | no aliasing through `grant_id` on the lifecycle path | compare `leased.get(id).is_some()` |
 | W-L5 | `a_refused_rederivation_leaves_the_entry_exactly_as_it_was` | total no-effect, and the refusal is REPORTED | answer `Warm` from the stale entry |
-| W-L6 | `capacity_freed_by_a_supersession_is_spendable_again` | the width record is forgotten when handles are released, at the HARD bound | keep the record across a supersession |
 | W-P1 | `a_narrowing_replacement_at_the_family_bound_is_charged_net` | `64 - 2 + 1 = 63` succeeds | charge the family the gross width instead of the projection |
 | W-P2 | `a_same_width_rotation_at_the_family_bound_is_charged_net` | `64 - 2 + 2 = 64` succeeds; the intersection never churns | as W-P1 |
 | W-P3 | `a_rotation_at_the_node_bound_retires_the_slot_it_transfers` | `256 - 1 + 1 = 256` succeeds | count the new slot against a transient `256 + 1` |
@@ -1570,10 +1599,7 @@ Every one selects exactly one test and dies to its own inverse mutation.
 | W-S4 | `a_stale_incarnation_apply_cannot_republish_a_cleared_cell` | a real quantum reaches only the live incarnation | — (control for W-S1) |
 | W-O1 | `release_one_cannot_decrement_a_reference_a_family_does_not_hold` | the family reference authorizes the global decrement | drop the `NotHeld` guard |
 | W-O2 | `an_already_transferred_set_cannot_be_replaced_again` | single-use transfer | drop the `held != keys` guard |
-| W-C1 | `a_cached_terminal_refusal_does_not_block_a_zero_identity_replacement` | a replacement does not inherit the terminal cache | gate replacement on the fresh caches |
-| W-C2 | `a_cached_node_refusal_does_not_block_a_self_crediting_replacement` | nor the node cache at unchanged G | **shared** with W-C1 |
-| W-C3 | `a_shared_old_replacement_retries_when_the_sharer_releases` | the wake condition is the REFERENCE-RELEASE generation | gate on the node capacity generation |
-| W-C4 | `a_replacement_refusal_leaves_the_fresh_path_untouched` | refusals do not cross between the paths | record a replacement refusal into the fresh caches |
+| W-C3 | `a_shared_old_replacement_succeeds_when_the_sharer_releases` | a sharer's release changes the projection with no retirement | — (control for W-P4: the shared→exclusive transition) |
 | W-M1 | `the_under_lock_miss_recheck_validates_the_callers_snapshot` | the recheck is a currency check, not an existence check | re-check `is_some()` and return `Warm` |
 | W-M2 | `the_under_lock_miss_recheck_sees_a_removal` | same, for a removal | **shared** with W-M1 |
 | W-M3 | `the_under_lock_miss_recheck_sees_a_rotation` | same, for a rotation | — (control for W-M1/W-M2) |
@@ -1585,8 +1611,10 @@ Every one selects exactly one test and dies to its own inverse mutation.
 | W-L7 | `a_current_warmed_entry_with_a_leased_audience_takes_no_lock` | the currency check is lock-free with a real Grant plane | perform it under the mutation lock |
 | W-L8 | `the_capability_index_derives_exactly_what_the_full_scan_derives` | the index is a filter, never a second admission rule | index only the first grant per capability |
 | W-L9 | `concurrent_rederivations_spend_one_demand_set` | one lease movement spends one demand set | drop the under-`mutate` re-check in `rederive` |
-| §9 | `node_capacity_refusal_retries_only_when_the_generation_moves` | retryable, gated | always retry; never retry; gate on a count |
-| §9 | `identity_exhaustion_is_terminal_and_outranks_a_moving_generation` | terminal | drop the terminal arm |
+| §9 | `a_full_node_refuses_every_attempt_until_a_retirement` | pass-through, and ONE retirement is the whole recovery | memoize on the capacity generation |
+| §9 | `a_narrowed_demand_warms_on_a_full_node_without_a_retirement` | a set creating no slot cannot be refused by a full node | suppress on a family-global node record |
+| §9 | `identity_exhaustion_refuses_a_set_that_needs_a_new_slot` | the terminal class reaches the caller verbatim | — (positive control) |
+| §9 | `identity_exhaustion_does_not_refuse_a_set_of_existing_slots` | exhaustion is about MINTING an identity, never acquiring a slot | a family-global terminal flag |
 | §4 | `the_family_bound_counts_demands_not_capabilities` | Option-A accounting | bound by index entries instead (two sites) |
 | §4.1 | `a_refused_entry_retains_no_partial_demand` | no partial entry survives a refusal, at the STATE layer | W-A1's mutation (shared, M-A1s); it is not the test W-A1 selects, and it asserts the index and entry count W-A1 does not. NOT W-A5's — see §17.6a |
 | §17.4 | `dropping_the_state_releases_every_demand` | ownership is the whole lifecycle | leak the demand set |
@@ -1601,13 +1629,17 @@ satisfiable by a weaker implementation:
 - **W-A2b is W-A2's control.** "Count every key" and "count every new key" both
   refuse W-A2's case, so W-A2 alone does not distinguish the implementation from
   a strictly worse one that never shares a slot.
-- **The terminal witness moves the node capacity generation** — the signal the
-  retryable class watches — and requires nothing to change. Without that, a
-  terminal flag and a retryable one are indistinguishable.
+- **The exhaustion pair arms the would-be cache first.** The existing-slots
+  witness is refused an unrelated new-slot capability before its zero-identity
+  set warms, so a family-global terminal record — were one reintroduced —
+  would be armed and would red it. Without that ordering, "refuse everything
+  after exhaustion" and "refuse what needs an identity" are indistinguishable.
 
-`node_capacity_refusal_retries_only_when_the_generation_moves` is checked in
-both directions in one test: always-retry reds its "not asked again" assertion,
-never-retry reds its post-retirement success.
+The `note_snapshot` ordering fix carries no witness of its own: the stale
+classification required an interleaving between a load and the `fetch_max`
+that no longer exist as separate operations, so the property is structural
+(§4.4) and stated as such rather than implied by a test that cannot select
+for it.
 
 ### 17.6a Over-claims the mutation runs found, and one predicate not claimed
 
@@ -1710,7 +1742,25 @@ asserted by a test that would pass either way. This is the same discipline the
 two repairs above came out of: a witness constructed to imply otherwise would be
 the over-claim this process exists to catch.
 
+**Revision-6 note.** The findings above are kept as the record of the process
+that produced them; the machinery several of them describe —
+`settled_reason`, `family_spent_at`, the sticky width, the caches — no longer
+exists (§0.2). Where a finding motivated a witness that survives (the
+concurrency pair's budget-not-end-state assertions), the witness stands with
+its rationale reworded to the registry-refusal metric; where it only defended
+a cache's internal consistency, both the mutation and the witness are retired
+with the cache in §17.6c.
+
 ### 17.6b Gates, and one unreproduced failure
+
+**These figures are the last full run against the PRE-repair tree** (through
+the HOLD-3 rerun). The revision-6 repair (§0.2) collapses the witness set —
+the refusal-cache witnesses are retired with the mechanism, the §9
+pass-through witnesses replace them — so the closure/signature pass owes
+fresh figures for the repaired tree: the focused witness groups, exact-head
+CI, and a mutation rerun of the CORE matrix (the §17.6c rows not marked
+retired). The archaeology below is evidence about the tree it ran against,
+nothing newer.
 
 `CARGO_INCREMENTAL=0`, `cargo nextest -j 1 --no-tests=fail --retries 0`
 throughout. No security or race witness is retried.
@@ -1766,6 +1816,15 @@ an earlier revision of this document reported "39 final rows" against a log that
 held 43, because four IDs had been re-run and both attempts were still counted.
 
 ### 17.6c The mutation ledger
+
+**Pre-repair archaeology.** This ledger proves the tree it ran against, which
+is the pre-revision-6 tree. Twelve rows pinned the removed refusal machinery
+and are RETIRED with it — M-R1..M-R3 (the width record), M-L9
+(`on_supersession`), M-P1..M-P4 (the node/terminal gates), M-Y6..M-Y9 (the
+replacement cache and cross-path domain separation). The remaining rows are
+the CORE matrix — derivation, accounting, ownership, projection, ordering,
+lock-freedom — and are what the closure pass re-runs against the repaired
+tree. Nothing here is evidence for the repaired tree.
 
 One row per mutation RUN, against the final tree. `Selected` is the number of
 tests the filter actually ran; the source file is restored from a pristine copy

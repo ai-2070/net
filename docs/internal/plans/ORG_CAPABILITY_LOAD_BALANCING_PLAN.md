@@ -803,10 +803,11 @@ struct OrgRoutingState {
     // behind an ArcSwap, rebuilt copy-on-write. The read path is one atomic
     // load, one map lookup and one Arc clone, and takes NO lock.
     index: ArcSwap<CapabilityIndex>,
-    // Taken on miss, insert and drop ONLY — never by a warmed read. It guards
-    // the refusal bookkeeping, which is read and written on exactly the miss
-    // path it already delimits.
-    mutate: Mutex<RefusalState>,
+    // Taken on miss, insert and drop ONLY — never by a warmed read. Guards
+    // nothing beyond the mutation path itself: refusals are the registry's
+    // verdicts, asked for on every cold or stale attempt and memoized nowhere
+    // (design §9).
+    mutate: Mutex<()>,
     // ownership handle only; no task/timer/reconciler
 
     // NOT YET IMPLEMENTED — OLB-2B.3c/2B.3d.
@@ -819,8 +820,8 @@ pub struct OrgClient {
 }
 ```
 
-**Staged ownership.** 2B.3b implements the index, the entries it points at, and
-the refusal bookkeeping — nothing else. A `CapabilityRouteHandle` owns a demand
+**Staged ownership.** 2B.3b implements the index and the entries it points at —
+nothing else. A `CapabilityRouteHandle` owns a demand
 set and no route: there is no `OrgRouteSet`, no route-set cell, no scoped pool,
 no candidate, no provider list, no selection and no projection in it, and the
 module deliberately cannot express them. The selector state above is commented
@@ -1116,14 +1117,20 @@ the last reference retires the shared slot/lease state.
 > granted provider — a silent authority narrowing presenting as a routing
 > preference.
 >
-> **The three refusals are three different policies**, and collapsing them breaks
-> in a different direction each time:
->
-> | Refusal | Policy | Why not the others |
-> |---|---|---|
-> | family at capacity | **sticky** for the family's lifetime | entries are never evicted, so a spent budget stays spent; retrying re-derives and re-locks forever |
-> | node at capacity | **retryable**, gated on a node capacity generation that advances only on slot RETIREMENT | the bound is node-wide, so an ungated retry has every family hammering one lock; gating on retained-slot COUNT misses a retire-then-demand pair |
-> | identity exhausted | **terminal — never retry** | exhaustion is irreversible by construction, so no later signal can make an attempt worth taking |
+> **The three refusals are the REGISTRY's verdicts, passed through** (design
+> §9, corrected by the revision-6 repair). An earlier revision of this note
+> assigned each class a family-side retry policy — sticky, generation-gated,
+> terminal — implemented as family-global memoization. That memoization
+> answered per-capability questions from family-wide records and kept being
+> wrong: a wide refusal said nothing about a narrow set that still fits; "the
+> node is full" said nothing about a set whose slots all already exist through
+> other families; "no more identities can be minted" said nothing about
+> acquiring existing slots. It is removed, not refined. On a cold miss or a
+> stale entry the state takes the family mutation lock, derives the exact set,
+> asks the registry, and returns its answer; the warmed path stays one atomic
+> load, one lookup, one `Arc` clone. Only cold and refused calls reach the
+> registry, and any future caching must be keyed by the exact marginal
+> request, never by the family.
 
 One long-lived node-owned routing actor consumes all families' dirty work. It
 owns a bounded dirty-capability set plus `RebuildAll`, one single-flight build,

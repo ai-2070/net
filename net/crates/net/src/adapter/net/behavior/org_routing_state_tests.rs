@@ -9,9 +9,10 @@
 //!   that must change nothing (W-L1..W-L5);
 //! - **§8 lock-free lookup** — both zero-lock forms, an end-to-end counter and a
 //!   real contention witness against the actual mutex;
-//! - **§9 refusal policy** — spent-from-a-width, retryable-on-a-generation, and
-//!   terminal, each with the control that stops a collapsed implementation
-//!   passing (W-R1, W-R2).
+//! - **§9 refusal pass-through** — a refusal is the REGISTRY's verdict,
+//!   reported verbatim and memoized nowhere: a full family or node refuses, a
+//!   demand that needs none of the exhausted resource warms, and recovery
+//!   takes exactly one moved input, never a cache invalidation.
 
 #![allow(clippy::disallowed_methods)]
 
@@ -567,10 +568,9 @@ fn a_warmed_lookup_completes_while_the_mutation_lock_is_held() {
 ///   duplicate acquisition is self-cleaning: the second publication replaces the
 ///   first index entry, the displaced `CapabilityRouteHandle` drops, and its
 ///   demands release — so the final count is 1 either way and an assertion on it
-///   is satisfied by the defect. What does NOT clean up is the refusal a
-///   transient over-spend produces, and `FamilyAtCapacity` is **sticky for the
-///   family's lifetime** (§9). One redundant acquisition can therefore poison a
-///   family permanently, which is the real harm and the thing to assert.
+///   is satisfied by the defect. What does NOT clean up is the REGISTRY refusal
+///   a transient over-spend provokes, which the refusal metric records and a
+///   correct run never produces.
 #[test]
 fn concurrent_misses_acquire_one_demand_set() {
     let capability = cap("nrpc:read");
@@ -633,28 +633,29 @@ fn concurrent_misses_acquire_one_demand_set() {
     assert_eq!(
         f.metrics.refused_family_at_capacity(),
         0,
-        "no rival was refused, so no sticky refusal was recorded"
+        "no rival was refused at the registry"
     );
 
-    // The family is NOT poisoned: it still has room for its 64th demand.
+    // And the family still has room for its 64th demand.
     assert_eq!(
         state.route_handle(&cap("nrpc:after"), &leased),
         RouteLookup::Warm,
-        "a transient over-spend would have set the sticky flag and blocked this"
+        "a transient over-spend would have been refused above"
     );
     assert_eq!(state.handles(), 64);
 }
 
-// ------------------------------------------------- §9: the refusal policy
+// -------------------------------------------- §9: refusal is pass-through
 
-/// `FamilyAtCapacity` is STICKY for the family's lifetime.
+/// A spent family budget refuses, and the verdict is the REGISTRY's: every
+/// cold attempt asks it again, because no local record can know what the next
+/// derived set will cost.
 ///
-/// Dies to: dropping the sticky flag, which makes every later cold call
-/// re-derive the set and re-take the registry lock to be refused again. Sticky
-/// is exact rather than merely conservative here because this state never evicts
-/// an entry, so a spent budget stays spent.
+/// Dies to: memoizing the refusal — the removed family-global cache answered
+/// later, differently-shaped sets from an earlier refusal, having never asked
+/// the registry (§9).
 #[test]
-fn family_capacity_refusal_is_sticky_for_the_family() {
+fn a_spent_family_budget_refuses_from_the_registry_every_time() {
     let f = fixture();
     let state = f.state(credentials(Vec::new()));
     let leased = ConsumerGrantSnapshot::empty();
@@ -667,7 +668,7 @@ fn family_capacity_refusal_is_sticky_for_the_family() {
     assert_eq!(state.handles(), 64, "the budget is exactly spent");
     assert_eq!(state.entries(), 64, "64 grantless capabilities fit");
 
-    for i in 0..32u32 {
+    for i in 0..3u32 {
         assert_eq!(
             state.route_handle(&cap(&format!("nrpc:over{i}")), &leased),
             RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity)),
@@ -675,11 +676,11 @@ fn family_capacity_refusal_is_sticky_for_the_family() {
     }
     assert_eq!(
         f.metrics.refused_family_at_capacity(),
-        1,
-        "the registry is asked ONCE; every later miss is settled locally"
+        3,
+        "every attempt is the registry's refusal, not a replayed one"
     );
-    // Warmed entries keep working — sticky means no new entries, not a dead
-    // family.
+    // A refusal is bounded degradation, never a dead family: warmed entries
+    // keep serving.
     assert_eq!(
         state.route_handle(&cap("nrpc:c0"), &leased),
         RouteLookup::Warm
@@ -727,14 +728,16 @@ fn the_family_bound_counts_demands_not_capabilities() {
     );
 }
 
-/// `NodeAtCapacity` is RETRYABLE, gated on the node capacity generation.
+/// A full node refuses `NodeAtCapacity` on every attempt, and ONE retirement
+/// is what frees the next one — no cache invalidation in between, because
+/// there is no cache.
 ///
-/// Dies to: dropping the generation gate, which makes every later miss re-derive
-/// and re-take the node-wide registry lock while the node is provably still
-/// full. Also dies to gating on `retained_slots()` instead, which a
-/// retire-then-demand pair leaves unchanged.
+/// Dies to: memoizing the refusal on the node capacity generation — the
+/// removed family-global cache answered every capability's next miss from one
+/// capability's refusal, and a generation that stands still suppressed demand
+/// whose shape had since changed (§9).
 #[test]
-fn node_capacity_refusal_retries_only_when_the_generation_moves() {
+fn a_full_node_refuses_every_attempt_until_a_retirement() {
     let f = fixture();
     let mut held = Vec::new();
     let mut fillers = Vec::new();
@@ -761,57 +764,40 @@ fn node_capacity_refusal_retries_only_when_the_generation_moves() {
     let state = f.state(credentials(Vec::new()));
     let leased = ConsumerGrantSnapshot::empty();
     let capability = cap("nrpc:read");
-    assert_eq!(
-        state.route_handle(&capability, &leased),
-        RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity))
-    );
-    assert_eq!(f.metrics.refused_node_at_capacity(), 1);
-
-    let generation = f.registry.node_capacity_generation();
-    for _ in 0..32 {
+    for attempt in 1..=3u64 {
         assert_eq!(
             state.route_handle(&capability, &leased),
             RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity))
         );
+        assert_eq!(
+            f.metrics.refused_node_at_capacity(),
+            attempt,
+            "every attempt is the registry's refusal, not a replayed one"
+        );
     }
-    assert_eq!(
-        f.metrics.refused_node_at_capacity(),
-        1,
-        "the registry is not asked again while the generation stands still"
-    );
-    assert_eq!(f.registry.node_capacity_generation(), generation);
 
-    // Free one slot. The generation moves, and the very next miss retries.
+    // Free one slot: the very next attempt succeeds on the freed capacity.
     held.pop();
     assert_eq!(f.registry.retained_slots(), MAX_NODE_SLOTS - 1);
-    assert_ne!(
-        f.registry.node_capacity_generation(),
-        generation,
-        "a retirement is what moves it"
-    );
     assert_eq!(
         state.route_handle(&capability, &leased),
         RouteLookup::Warm,
-        "the retry succeeds on the freed capacity"
+        "one retirement is the whole recovery story"
     );
     assert_eq!(state.entries(), 1);
 }
 
-/// `NodeAtCapacity` is retryable on AUTHORITY movement too, not only on a
-/// retirement.
+/// A demand that narrows to slots that ALREADY EXIST warms on a full node
+/// with no retirement at all: `NodeAtCapacity` is a statement about CREATING
+/// slots, never about sharing ones another family retains.
 ///
-/// The gap a generation-only gate leaves is self-sustaining rather than merely
-/// slow. A family refused for `Owner + Grant` whose Grant lease is then removed
-/// derives `Owner` alone on its next miss — a key another family already
-/// retains, so it creates no slot and a full node is no obstacle to it at all.
-/// But nothing retired, so the capacity generation stands still, and the family
-/// is left waiting for a signal that its own narrowing can never produce.
-///
-/// Dies to: recording only the node capacity generation, which leaves the
-/// narrowed set refused forever. The repeat block dies to dropping the cache, so
-/// the retry stays gated on real movement rather than on the rate of calls.
+/// This is the schedule the removed cache got wrong (§9): a family refused for
+/// `Owner + Grant` whose Grant lease is then removed derives `Owner` alone —
+/// a key another family already retains, so a full node is no obstacle to it
+/// — but nothing retired, so the cached generation stood still and suppressed
+/// an attempt the registry would have granted.
 #[test]
-fn node_capacity_refusal_retries_when_the_demand_narrows_without_a_retirement() {
+fn a_narrowed_demand_warms_on_a_full_node_without_a_retirement() {
     let f = fixture();
     let capability = cap("nrpc:read");
     let (grant, secret) = issue(capability, GrantRights::DISCOVER);
@@ -854,21 +840,7 @@ fn node_capacity_refusal_retries_when_the_demand_narrows_without_a_retirement() 
         RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
         "Owner + Grant needs a slot a full node cannot create"
     );
-    assert_eq!(f.metrics.refused_node_at_capacity(), 1);
-
     let generation = f.registry.node_capacity_generation();
-    for _ in 0..16 {
-        assert_eq!(
-            state.route_handle(&capability, &leased),
-            RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity))
-        );
-    }
-    assert_eq!(
-        f.metrics.refused_node_at_capacity(),
-        1,
-        "neither signal moved, so the registry is not asked the identical \
-         question again"
-    );
 
     // The Grant lease goes away. NOTHING retires: the node is still full and the
     // capacity generation stands exactly where the refusal left it.
@@ -881,8 +853,7 @@ fn node_capacity_refusal_retries_when_the_demand_narrows_without_a_retirement() 
     assert_eq!(
         f.registry.node_capacity_generation(),
         generation,
-        "and it warmed without a single retirement — the signal a \
-         generation-only gate would have been waiting on"
+        "and it warmed without a single retirement"
     );
     assert_eq!(state.entries(), 1);
     assert_eq!(state.handles(), 1, "Owner alone; the Grant scope is gone");
@@ -894,29 +865,13 @@ fn node_capacity_refusal_retries_when_the_demand_narrows_without_a_retirement() 
     drop(held);
 }
 
-/// `IdSpaceExhausted` is TERMINAL — never retried, not even when the node
-/// capacity generation moves.
-///
-/// The control is the point. Without "and the generation moving changes
-/// nothing", a terminal flag and a retryable one are indistinguishable in a
-/// witness that only counts refusals, because nothing in it ever moves the
-/// signal the retryable class watches.
+/// An exhausted identity space refuses a set that needs a NEW slot — the
+/// registry's verdict, reported verbatim on every attempt.
 #[test]
-fn identity_exhaustion_is_terminal_and_outranks_a_moving_generation() {
+fn identity_exhaustion_refuses_a_set_that_needs_a_new_slot() {
     let f = fixture();
     let state = f.state(credentials(Vec::new()));
     let leased = ConsumerGrantSnapshot::empty();
-    let spare = f.registry.new_family().expect("family");
-    let parked = spare
-        .demand(SlotKey {
-            scope: PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
-                grant_id: [0x77; 32],
-                audience_handle: [0x77; 32],
-            })
-            .expect("private"),
-            capability: cap("nrpc:parked"),
-        })
-        .expect("parked");
 
     f.registry.exhaust_ids_for_test();
     assert_eq!(
@@ -924,27 +879,42 @@ fn identity_exhaustion_is_terminal_and_outranks_a_moving_generation() {
         RouteLookup::Cold(ColdReason::Refused(DemandRefused::IdSpaceExhausted))
     );
     assert_eq!(f.metrics.refused_id_space_exhausted(), 1);
+}
 
-    // Retire a slot: the node capacity generation moves, which is exactly the
-    // signal `NodeAtCapacity` retries on.
-    let before = f.registry.node_capacity_generation();
-    drop(parked);
-    assert_ne!(f.registry.node_capacity_generation(), before);
+/// The control, and the exact wrongness the removed terminal cache had (§9):
+/// exhaustion means "cannot MINT another slot identity", never "cannot acquire
+/// an existing slot". A capability whose whole demand set is already retained
+/// through another family allocates no identity and must warm.
+///
+/// Dies to: a family-global terminal flag, which promoted one capability's
+/// marginal identity failure into a family-wide routing verdict for demand
+/// that needed no identity at all.
+#[test]
+fn identity_exhaustion_does_not_refuse_a_set_of_existing_slots() {
+    let f = fixture();
+    let capability = cap("nrpc:read");
+    let holder = f.registry.new_family().expect("family");
+    let _preheld = holder.demand(owner_key(&capability)).expect("pre-retains");
+    let state = f.state(credentials(Vec::new()));
+    let leased = ConsumerGrantSnapshot::empty();
 
-    for _ in 0..16 {
-        assert_eq!(
-            state.route_handle(&cap("nrpc:read"), &leased),
-            RouteLookup::Cold(ColdReason::Refused(DemandRefused::IdSpaceExhausted))
-        );
-        assert_eq!(
-            state.route_handle(&cap("nrpc:other"), &leased),
-            RouteLookup::Cold(ColdReason::Refused(DemandRefused::IdSpaceExhausted))
-        );
-    }
+    f.registry.exhaust_ids_for_test();
+    // An unrelated capability that DOES need a new slot is refused first, so a
+    // family-global terminal record — were one to exist — would be armed.
     assert_eq!(
-        f.metrics.refused_id_space_exhausted(),
+        state.route_handle(&cap("nrpc:unrelated"), &leased),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::IdSpaceExhausted))
+    );
+    assert_eq!(
+        state.route_handle(&capability, &leased),
+        RouteLookup::Warm,
+        "no identity is allocated for a slot that already exists"
+    );
+    assert_eq!(state.handles(), 1);
+    assert_eq!(
+        f.registry.retained_slots(),
         1,
-        "terminal means the registry is never asked again, whatever moves"
+        "it SHARES the pre-retained slot rather than creating one"
     );
 }
 
@@ -1004,19 +974,6 @@ fn a_refused_entry_retains_no_partial_demand() {
     );
 }
 
-// ------------------------------- §9: residual capacity under mixed widths
-
-/// Fill `state` to exactly `handles` demands with grantless capabilities.
-fn fill_to(state: &OrgRoutingState, leased: &ConsumerGrantSnapshot, handles: u32) {
-    for i in 0..handles {
-        assert_eq!(
-            state.route_handle(&cap(&format!("nrpc:fill{i}")), leased),
-            RouteLookup::Warm
-        );
-    }
-    assert_eq!(state.handles(), handles as usize);
-}
-
 /// Warm grantless capabilities until the family holds exactly `target` handles.
 fn fill_to_total(state: &OrgRoutingState, leased: &ConsumerGrantSnapshot, target: usize) {
     let mut seed = 0u32;
@@ -1028,131 +985,6 @@ fn fill_to_total(state: &OrgRoutingState, leased: &ConsumerGrantSnapshot, target
         seed += 1;
     }
     assert_eq!(state.handles(), target);
-}
-
-/// Two leased DISCOVER grants for each of `capabilities`, so every one of them
-/// is a WIDTH-3 demand set (Owner + two audiences).
-fn wide_credentials(
-    capabilities: &[CapabilityAuthorityId],
-) -> (FamilyDiscoveryCredentials, ConsumerGrantSnapshot) {
-    let mut grants = Vec::new();
-    let mut leased = ConsumerGrantSnapshot::empty();
-    let mut seq = 0u64;
-    for capability in capabilities {
-        for _ in 0..2 {
-            let (grant, secret) = issue(*capability, GrantRights::DISCOVER);
-            seq += 1;
-            leased = lease(&leased, &grant, secret.expect("secret"), seq);
-            grants.push(grant);
-        }
-    }
-    (credentials(grants), leased)
-}
-
-/// **The residual-capacity property.** A refusal of a WIDE demand set says
-/// nothing about a NARROW one that still fits.
-///
-/// Dies to: one `family_at_capacity: bool` for the whole family. Demand sets
-/// have variable width, so "this family was refused" is not "this family is
-/// full" — at 62 of 64 a width-3 capability is refused and a width-1 one has
-/// room. The flag suppressed every later set for the family's LIFETIME, having
-/// never asked the registry, so the two spare handles became unreachable.
-#[test]
-fn a_wide_refusal_does_not_poison_residual_capacity() {
-    let f = fixture();
-    let wide = cap("nrpc:wide");
-    let (credentials, leased) = wide_credentials(&[wide]);
-    let state = f.state(credentials);
-
-    // 62 of 64 spent: two handles remain.
-    fill_to(&state, &leased, 62);
-    let entries = state.entries();
-
-    // `wide` needs Owner + two leased audiences = 3, and only 2 remain.
-    assert_eq!(
-        state.route_handle(&wide, &leased),
-        RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity)),
-        "a width-3 set does not fit in two handles"
-    );
-    assert_eq!(state.handles(), 62, "and it retained none of them");
-    assert_eq!(state.entries(), entries, "and published no entry");
-
-    // The two spare handles are STILL SPENDABLE. This is the assertion the
-    // family-global flag failed.
-    assert_eq!(
-        state.route_handle(&cap("nrpc:narrow"), &leased),
-        RouteLookup::Warm,
-        "a wide refusal must not globally poison residual capacity"
-    );
-    assert_eq!(state.handles(), 63);
-    assert_eq!(state.entries(), entries + 1);
-}
-
-/// The other half, and the control that stops the repair becoming a licence to
-/// hammer the registry: a refusal at width W settles every set of width >= W
-/// LOCALLY, without asking the registry again.
-///
-/// Dies to: dropping the width record entirely (always attempt), which re-derives
-/// and re-takes the node-wide registry lock on every later cold call — the waste
-/// the sticky arm existed to prevent. Also dies to recording the WIDEST refused
-/// width instead of the narrowest, which re-opens sets already proven not to fit.
-#[test]
-fn a_refusal_settles_every_wider_set_without_the_registry() {
-    let f = fixture();
-    let first = cap("nrpc:wide1");
-    let second = cap("nrpc:wide2");
-    let (credentials, leased) = wide_credentials(&[first, second]);
-    let state = f.state(credentials);
-
-    fill_to(&state, &leased, 62);
-    assert_eq!(
-        state.route_handle(&first, &leased),
-        RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity))
-    );
-    assert_eq!(f.metrics.refused_family_at_capacity(), 1);
-
-    // A DIFFERENT capability of the same width. Provably cannot fit, so the
-    // registry must not be asked.
-    for _ in 0..32 {
-        assert_eq!(
-            state.route_handle(&second, &leased),
-            RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity))
-        );
-    }
-    assert_eq!(
-        f.metrics.refused_family_at_capacity(),
-        1,
-        "every set at or above the refused width is settled locally"
-    );
-
-    // Spending the residual capacity and then being refused at width 1 lowers
-    // the record to its floor, after which everything is settled locally — the
-    // old flag's exact behaviour, reached only once it is actually true.
-    assert_eq!(
-        state.route_handle(&cap("nrpc:narrow0"), &leased),
-        RouteLookup::Warm
-    );
-    assert_eq!(
-        state.route_handle(&cap("nrpc:narrow1"), &leased),
-        RouteLookup::Warm
-    );
-    assert_eq!(state.handles(), 64, "the budget is now genuinely spent");
-    assert_eq!(
-        state.route_handle(&cap("nrpc:narrow2"), &leased),
-        RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity))
-    );
-    assert_eq!(f.metrics.refused_family_at_capacity(), 2);
-    for _ in 0..32 {
-        assert_eq!(
-            state.route_handle(&cap("nrpc:narrow3"), &leased),
-            RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity))
-        );
-    }
-    assert_eq!(
-        f.metrics.refused_family_at_capacity(),
-        2,
-        "the registry is asked at most once per DISTINCT narrower width",
-    );
 }
 
 // --------------------------- §4.2: the demand set is current, not first-seen
@@ -1492,12 +1324,11 @@ fn concurrent_rederivations_spend_one_demand_set() {
         vec![owner_key(&capability), grant_key(&grant)],
         "the surviving set owes exactly what it names"
     );
-    // And the width refusal state is not poisoned — the family still spends its
-    // last handle.
+    // And the family still spends its last handle.
     assert_eq!(
         state.route_handle(&cap("nrpc:after"), &leased),
         RouteLookup::Warm,
-        "a duplicate transfer would have refused and poisoned the width record"
+        "a duplicate transfer would have been refused above"
     );
     assert_eq!(state.handles(), 64);
 }
@@ -1556,85 +1387,11 @@ fn a_refused_rederivation_leaves_the_entry_exactly_as_it_was() {
         "the entry is exactly what it was, still retained, still Owner-only"
     );
 
-    // And the registry is not asked again for a width already proven not to fit.
-    let asked = f.metrics.refused_family_at_capacity();
-    for _ in 0..16 {
-        assert_eq!(
-            state.route_handle(&capability, &leased),
-            RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity))
-        );
-    }
-    assert_eq!(f.metrics.refused_family_at_capacity(), asked);
-}
-
-/// Capacity a SUPERSESSION frees is spendable again.
-///
-/// The one path on which a family's handle count can FALL: re-derivation
-/// publishes a narrower set and releases the wider one it replaced. The width
-/// record's soundness rests on the count never falling, so this is exactly where
-/// it has to be forgotten.
-///
-/// Dies to: keeping the width record across a supersession. The freed handles
-/// are real and the registry would grant them, but the family never asks — the
-/// same unreachable-residual-capacity defect the width model repaired, arriving
-/// through the back door.
-#[test]
-fn capacity_freed_by_a_supersession_is_spendable_again() {
-    let f = fixture();
-    let wide = cap("nrpc:wide");
-    let (grant, secret) = issue(wide, GrantRights::DISCOVER);
-    let leased = lease(
-        &ConsumerGrantSnapshot::empty(),
-        &grant,
-        secret.expect("secret"),
-        1,
-    );
-    // `wide` carries TWO leased audiences, so shedding them frees two handles —
-    // exactly what the refused width-2 capability needs. A one-handle release
-    // would leave `other` refused on the merits, and the witness would pass
-    // whether or not the width record was forgotten.
-    let (second, second_secret) = issue(wide, GrantRights::DISCOVER);
-    let leased = lease(&leased, &second, second_secret.expect("secret"), 2);
-    let other = cap("nrpc:other");
-    let (other_grant, other_secret) = issue(other, GrantRights::DISCOVER);
-    let leased = lease(&leased, &other_grant, other_secret.expect("secret"), 3);
-    let state = f.state(credentials(vec![
-        grant.clone(),
-        second.clone(),
-        other_grant.clone(),
-    ]));
-
-    // `wide` is width 3; fillers take the family to EXACTLY 64 of 64 — the hard
-    // boundary, not the 63/64 near-boundary a transient overlap slips past.
-    assert_eq!(state.route_handle(&wide, &leased), RouteLookup::Warm);
-    assert_eq!(state.handles(), 3);
-    fill_to_total(&state, &leased, 64);
+    // Every later attempt is the registry's refusal again — reported, never
+    // replayed — and each one still changes nothing.
     assert_eq!(
-        state.route_handle(&other, &leased),
-        RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity)),
-        "64 + 2 does not fit, and the refusal records width 2"
-    );
-
-    // Shed BOTH of `wide`'s audiences. Projected: 64 - 3 + 1 = 62.
-    let removed = remove(&leased, &grant.grant_id, 100);
-    let removed = remove(&removed, &second.grant_id, 101);
-    assert_eq!(state.route_handle(&wide, &removed), RouteLookup::Warm);
-    assert_eq!(
-        state.handles(),
-        62,
-        "two superseded audiences were released"
-    );
-    assert_eq!(
-        state.warm(&wide).expect("warm").demanded(),
-        &[owner_key(&wide)]
-    );
-
-    // `other` is still width 2 under `removed`, and 62 + 2 = 64 now fits — but
-    // only if the record taken before the supersession was forgotten.
-    assert_eq!(
-        state.route_handle(&other, &removed),
-        RouteLookup::Warm,
-        "capacity freed by a supersession must be reachable again"
+        state.route_handle(&capability, &leased),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity))
     );
     assert_eq!(state.handles(), 64);
 }
@@ -1957,107 +1714,19 @@ fn a_narrowing_replacement_needs_no_identity_after_exhaustion() {
     assert_eq!(f.metrics.refused_id_space_exhausted(), 0);
 }
 
-// ------------- §4.4/4.5/4.6: stale readers, ownership, ordering, races
+// ------------------ §4.4/4.6: stale readers, ownership, ordering, races
 
-/// A cached TERMINAL fresh refusal must not block a replacement that needs no
-/// identity at all (§4.5).
-///
-/// Dies to: gating replacement on the fresh-acquisition caches. The family's
-/// terminal flag is about taking MORE; shedding a scope creates no slot and
-/// needs no identity, and suppressing it strands the obsolete scope forever —
-/// the wake condition can never arrive, because exhaustion is irreversible.
-#[test]
-fn a_cached_terminal_refusal_does_not_block_a_zero_identity_replacement() {
-    let f = fixture();
-    let capability = cap("nrpc:changing");
-    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
-    let leased = lease(
-        &ConsumerGrantSnapshot::empty(),
-        &grant,
-        secret.expect("secret"),
-        1,
-    );
-    let state = f.state(credentials(vec![grant.clone()]));
-    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
-    assert_eq!(state.handles(), 2);
-
-    // An UNRELATED fresh capability records the terminal refusal in THIS
-    // family's cache.
-    f.registry.exhaust_ids_for_test();
-    assert_eq!(
-        state.route_handle(&cap("nrpc:unrelated"), &leased),
-        RouteLookup::Cold(ColdReason::Refused(DemandRefused::IdSpaceExhausted)),
-    );
-
-    // The audience disappears. The replacement creates nothing.
-    let removed = remove(&leased, &grant.grant_id, 100);
-    assert_eq!(
-        state.route_handle(&capability, &removed),
-        RouteLookup::Warm,
-        "a cached terminal refusal is not a statement about shedding a scope"
-    );
-    assert_eq!(state.handles(), 1);
-    assert_eq!(
-        state.warm(&capability).expect("warm").demanded(),
-        &[owner_key(&capability)]
-    );
-}
-
-/// A cached `NodeAtCapacity(G)` fresh refusal must not block a self-crediting
-/// replacement at unchanged G (§4.5).
-///
-/// Dies to: gating replacement on the node capacity generation. The generation
-/// cannot move until this very replacement retires the slot, so the gate waits
-/// on the transaction it is suppressing.
-#[test]
-fn a_cached_node_refusal_does_not_block_a_self_crediting_replacement() {
-    let f = fixture();
-    let capability = cap("nrpc:changing");
-    let (grant, secret) = issue(capability, GrantRights::DISCOVER);
-    let leased = lease(
-        &ConsumerGrantSnapshot::empty(),
-        &grant,
-        secret.expect("secret"),
-        1,
-    );
-    let state = f.state(credentials(vec![grant.clone()]));
-    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
-
-    let _fillers = fill_node_to(&f, MAX_NODE_SLOTS);
-    let generation = f.registry.node_capacity_generation();
-
-    // An UNRELATED fresh capability records NodeAtCapacity(G).
-    assert_eq!(
-        state.route_handle(&cap("nrpc:unrelated"), &leased),
-        RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
-    );
-    assert_eq!(f.registry.node_capacity_generation(), generation);
-
-    // Shedding the audience frees a slot. G has not moved yet — it moves
-    // BECAUSE of this replacement.
-    let removed = remove(&leased, &grant.grant_id, 100);
-    assert_eq!(
-        state.route_handle(&capability, &removed),
-        RouteLookup::Warm,
-        "the gate must not wait on the generation this transaction itself moves"
-    );
-    assert_eq!(state.handles(), 1);
-    assert_ne!(
-        f.registry.node_capacity_generation(),
-        generation,
-        "and it did move it"
-    );
-}
-
-/// A replacement refused at a full node retries once ANOTHER family stops
+/// A replacement refused at a full node succeeds once ANOTHER family stops
 /// sharing the old slot — even though nothing retired and the node capacity
 /// generation never moved.
 ///
-/// Dies to: gating replacement on the node capacity generation instead of the
-/// reference-release generation. A shared reference going away frees no slot and
-/// moves no capacity, yet it is exactly what makes the projection succeed.
+/// The projection genuinely changes when a shared reference goes away: the
+/// old slot becomes this family's alone, so giving it up now credits the node
+/// bound. (The removed replacement cache gated this retry on the
+/// reference-release generation; without any cache the next attempt simply
+/// asks the registry, whose projection is current by construction.)
 #[test]
-fn a_shared_old_replacement_retries_when_the_sharer_releases() {
+fn a_shared_old_replacement_succeeds_when_the_sharer_releases() {
     let f = fixture();
     let capability = cap("nrpc:changing");
     let (old_grant, old_secret) = issue(capability, GrantRights::DISCOVER);
@@ -2101,118 +1770,6 @@ fn a_shared_old_replacement_retries_when_the_sharer_releases() {
         state.route_handle(&capability, &rotated),
         RouteLookup::Warm,
         "but the projection changed, and the replacement must be retried"
-    );
-}
-
-/// A replacement refusal must not poison the FRESH path (§4.5).
-#[test]
-fn a_replacement_refusal_leaves_the_fresh_path_untouched() {
-    let f = fixture();
-    let capability = cap("nrpc:changing");
-    let (old_grant, old_secret) = issue(capability, GrantRights::DISCOVER);
-    let (new_grant, new_secret) = issue(capability, GrantRights::DISCOVER);
-    let leased = lease(
-        &ConsumerGrantSnapshot::empty(),
-        &old_grant,
-        old_secret.expect("secret"),
-        1,
-    );
-    let state = f.state(credentials(vec![old_grant.clone(), new_grant.clone()]));
-    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
-
-    let sharer = f.registry.new_family().expect("family");
-    let _shared = sharer.demand(grant_key(&old_grant)).expect("shares");
-
-    // A slot this family will later demand FRESH, pre-retained by someone else.
-    // A fresh set over an already-retained key costs no node capacity, so it is
-    // serviceable at a full node — unless the fresh gate has been poisoned.
-    let preheld = cap("nrpc:preheld");
-    let holder = f.registry.new_family().expect("family");
-    let _preheld = holder.demand(owner_key(&preheld)).expect("pre-retains");
-
-    let _fillers = fill_node_to(&f, MAX_NODE_SLOTS);
-
-    let rotated = lease(
-        &remove(&leased, &old_grant.grant_id, 100),
-        &new_grant,
-        new_secret.expect("secret"),
-        101,
-    );
-    assert_eq!(
-        state.route_handle(&capability, &rotated),
-        RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
-        "the shared old slot frees nothing, so the rotation is a 257th"
-    );
-
-    // THE ASSERTION: the fresh path is untouched. This capability's whole demand
-    // set is one already-retained slot, so it costs no node capacity and must
-    // warm — which it cannot do if the replacement's refusal was written into
-    // the fresh node cache.
-    assert_eq!(
-        state.route_handle(&preheld, &rotated),
-        RouteLookup::Warm,
-        "a replacement refusal must not settle the FRESH acquisition path"
-    );
-    assert_eq!(
-        f.registry.retained_slots(),
-        MAX_NODE_SLOTS,
-        "and it created no slot, because the key was already retained"
-    );
-}
-
-/// A genuinely impossible replacement asks the registry ONCE and then settles
-/// locally until the release generation moves (§4.5).
-///
-/// The bounded-retry half of the replacement gate. Giving a replacement its own
-/// cache is what stops the fresh caches deadlocking it; this is what stops that
-/// exemption becoming a licence to take the node-wide lock on every call for a
-/// stale entry that cannot be repaired.
-///
-/// Dies to: dropping the replacement cache (attempt every time), which is the
-/// mutation W-C1 also selects — the two halves of one decision.
-#[test]
-fn a_repeatedly_impossible_replacement_asks_the_registry_once() {
-    let f = fixture();
-    let capability = cap("nrpc:changing");
-    let (old_grant, old_secret) = issue(capability, GrantRights::DISCOVER);
-    let (new_grant, new_secret) = issue(capability, GrantRights::DISCOVER);
-    let leased = lease(
-        &ConsumerGrantSnapshot::empty(),
-        &old_grant,
-        old_secret.expect("secret"),
-        1,
-    );
-    let state = f.state(credentials(vec![old_grant.clone(), new_grant.clone()]));
-    assert_eq!(state.route_handle(&capability, &leased), RouteLookup::Warm);
-
-    // A sharer keeps the old slot alive, so the rotation genuinely needs a 257th.
-    let sharer = f.registry.new_family().expect("family");
-    let _shared = sharer.demand(grant_key(&old_grant)).expect("shares");
-    let _fillers = fill_node_to(&f, MAX_NODE_SLOTS);
-
-    let rotated = lease(
-        &remove(&leased, &old_grant.grant_id, 100),
-        &new_grant,
-        new_secret.expect("secret"),
-        101,
-    );
-    assert_eq!(
-        state.route_handle(&capability, &rotated),
-        RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
-    );
-    let asked = f.metrics.refused_node_at_capacity();
-    assert_eq!(asked, 1, "the registry is asked once");
-
-    for _ in 0..32 {
-        assert_eq!(
-            state.route_handle(&capability, &rotated),
-            RouteLookup::Cold(ColdReason::Refused(DemandRefused::NodeAtCapacity)),
-        );
-    }
-    assert_eq!(
-        f.metrics.refused_node_at_capacity(),
-        asked,
-        "and not again while nothing has been released"
     );
 }
 

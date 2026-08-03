@@ -1,24 +1,33 @@
 //! OLB-2B.3b: the clone-family routing state.
 //!
-//! One `OrgRoutingState` per clone family. It owns three things and nothing
-//! else: a lock-free capability index, the `CapabilityRouteHandle`s that index
-//! points at, and the refusal bookkeeping that decides whether a miss may try
-//! to acquire demand again.
+//! One `OrgRoutingState` per clone family. It owns two things and nothing
+//! else: a lock-free capability index and the `CapabilityRouteHandle`s that
+//! index points at.
 //!
 //! ```text
 //! OrgRoutingState
-//!   index    ArcSwap<CapabilityIndex>      immutable, bounded; the READ path
-//!   mutate   parking_lot::Mutex<Refusal>   miss / insert / drop ONLY
+//!   index    ArcSwap<CapabilityIndex>   immutable, bounded; the READ path
+//!   mutate   parking_lot::Mutex<()>     miss / insert / drop ONLY
 //! ```
 //!
-//! Design §8 sketches `mutate` as `Mutex<()>`. It guards the refusal
-//! bookkeeping here instead of nothing, because that state is read and written
-//! on exactly the miss path the lock already delimits — a separate `Mutex<()>`
-//! beside separately-synchronized refusal state would be two things to keep in
-//! step where one will do, and would let a refusal be recorded against a
-//! capacity generation sampled outside the section that acted on it. What §8
-//! actually pins is preserved exactly: the READ path takes no lock, and the
-//! mutation path takes exactly one.
+//! `mutate` is exactly the `Mutex<()>` design §8 sketches. An earlier revision
+//! had it guard family-global refusal memoization — a sticky family-capacity
+//! width, a `(node capacity generation, lease revision)` cache, a terminal
+//! exhaustion flag and a replacement-refusal cache — so a settled family could
+//! refuse locally without asking the registry. That memoization is REMOVED,
+//! not refined (design §9): a family-global record answers a per-capability
+//! question, and it kept being wrong because it does not hold the registry's
+//! exact marginal facts. Two capabilities under ONE generation and revision
+//! can need entirely different marginal resources — one needs a new node slot
+//! where the other's slots all already exist through another family; one needs
+//! a fresh identity where the other only shares slots that exist. A cached
+//! refusal therefore promoted a marginal resource failure into a family-wide
+//! routing verdict. On a cold miss or a stale entry this state now takes
+//! `mutate`, derives the exact set, asks the authoritative registry, and
+//! returns its answer — every time. Only cold and refused calls can reach the
+//! registry; if measurement ever shows permanently-cold callers contending on
+//! its lock, the repair is a cache keyed by the exact marginal request, never
+//! a family-global approximation.
 //!
 //! **The read path takes no lock.** `index.load()` is one atomic; the handle it
 //! yields is an `Arc` clone. `mutate` is never touched by a hit. It is not a
@@ -109,9 +118,8 @@
 //! key sets and charges the projected final footprint —
 //! `DemandSet::replace` — rooted in the superseded set's OWN registry and family
 //! identity, so no caller can offer another family's set as the basis. The
-//! intersection is never released and
-//! re-taken, the state asks its own refusal gate only for the MARGINAL cost
-//! (see `marginal_charge`), and a refusal leaves the superseded set owning
+//! intersection is never released and re-taken, and a refusal leaves the
+//! superseded set owning
 //! everything it owned. A refused re-derivation reports the refusal rather than
 //! the stale entry: answering `Warm` with a Grant plane known to be incomplete
 //! is the silent authority narrowing this slice exists to prevent.
@@ -305,34 +313,6 @@ fn demand_set_from<'a>(
     Some(keys)
 }
 
-/// What replacing `old` with `new` asks the FAMILY budget for.
-///
-/// The marginal cost, never the gross width: the intersection is kept in place
-/// by the replacement transaction, so it is neither released nor re-charged.
-/// Saturating, because a replacement can be net-negative — a capability that
-/// loses an audience gives a handle back — and a negative charge is simply
-/// zero, which no width record can block.
-///
-/// This is the STATE's gate estimate. The registry recomputes the projection
-/// authoritatively inside the transaction and is what actually refuses; this
-/// exists only so a family that is provably at its bound stops asking. Both
-/// sides are witnessed against the same schedules, so a drift between them
-/// shows up as a refusal that the registry does not agree with.
-///
-/// Both slices are sorted and deduplicated (`demand_set_for` sorts; `demanded`
-/// stores what it was acquired from), so membership is a binary search.
-fn marginal_charge(old: &[SlotKey], new: &[SlotKey]) -> usize {
-    let new_only = new
-        .iter()
-        .filter(|key| old.binary_search(key).is_err())
-        .count();
-    let old_only = old
-        .iter()
-        .filter(|key| new.binary_search(key).is_err())
-        .count();
-    new_only.saturating_sub(old_only)
-}
-
 /// One warmed capability entry: the family's COMPLETE retained demand for it.
 ///
 /// Ownership is the whole content of this type in 2B.3b. Dropping it releases
@@ -477,194 +457,10 @@ pub(crate) enum ColdReason {
     /// Never served and never acted on. The caller takes the current-authority
     /// cold path, which is what it would have done had it not raced at all.
     SnapshotSuperseded,
-    /// Demand was refused, with the class deciding whether a later miss retries
-    /// (§9).
+    /// The registry refused the acquisition. The class is the REGISTRY's
+    /// verdict, reported verbatim and memoized nowhere (design §9) — a later
+    /// miss for the same capability asks the registry again.
     Refused(DemandRefused),
-}
-
-/// Whether a refusal class may ever be attempted again, and on what.
-///
-/// Three classes, three policies, and they are genuinely different — collapsing
-/// them would break in a different direction each time (§9):
-///
-/// ```text
-/// FamilyAtCapacity   sticky FROM THE REFUSED WIDTH UP
-/// NodeAtCapacity     retryable, on node capacity OR authority movement
-/// IdSpaceExhausted   terminal — never retry
-/// ```
-#[derive(Debug, Default)]
-pub(crate) struct RefusalState {
-    /// The NARROWEST demand-set width this family has been refused
-    /// `FamilyAtCapacity` at, or `None` if it never has.
-    ///
-    /// A width, not a flag, and the difference is a correctness one. Demand sets
-    /// have VARIABLE width — Owner alone is one, Owner plus two leased DISCOVER
-    /// audiences is three — and the registry refuses on
-    /// `held + width > MAX_HANDLES_PER_FAMILY`. A family holding 62 of 64 that
-    /// is refused a width-3 capability still has room for a width-1 one, so a
-    /// single flag set by the wide refusal would suppress every narrow set that
-    /// still fits, for the family's lifetime, having never asked the registry.
-    /// That is not conservatism; the family is simply not at capacity.
-    ///
-    /// What IS exact is the implication from the refused width UP. The refusal
-    /// established `held + refused > 64`, and this state only ever grows its
-    /// handle count except when it supersedes an entry (see
-    /// [`Self::on_supersession`]), so for any `width >= refused` the same
-    /// inequality holds and asking again is provably pointless.
-    ///
-    /// It converges, so it is not a licence to hammer the registry: an attempt
-    /// only reaches the lock when its width is strictly BELOW the recorded one,
-    /// and a refusal there lowers the record. Widths are bounded by
-    /// [`MAX_HANDLES_PER_FAMILY`], so a family can be refused at most that many
-    /// times before `Some(1)` — the old flag's exact behaviour — blocks
-    /// everything, since every demand set contains at least the Owner scope.
-    family_at_capacity_from: Option<usize>,
-    /// Set once the identity space is exhausted.
-    ///
-    /// TERMINAL, and terminal outranks the retryable class. Exhaustion is
-    /// irreversible by construction — the allocator is checked and never wraps —
-    /// so a node capacity generation that moves afterwards says nothing about
-    /// it. A family that retried on that signal would attempt acquisition
-    /// forever on a node that can never satisfy it.
-    id_space_exhausted: bool,
-    /// The reference-release generation observed at the last REPLACEMENT
-    /// refusal, with the class it was refused as.
-    ///
-    /// A REPLACEMENT gets its own cache, and must not inherit the fresh path's
-    /// (§4.5). The fresh caches answer "can this family take MORE", and a
-    /// replacement often asks the opposite question:
-    ///
-    /// ```text
-    /// terminal id space  + a replacement creating NO slot   → needs no identity
-    /// node full at G     + a net-negative replacement       → frees capacity
-    /// node full at G     + a self-crediting rotation        → moves capacity
-    /// ```
-    ///
-    /// Each of those is suppressed by a fresh-path cache that is not about it,
-    /// and the suppression is self-sustaining: the very transaction that would
-    /// free or move the capacity is the one being refused, so the wake condition
-    /// can never arrive. The entry then keeps an obsolete scope forever.
-    ///
-    /// The gate is the REFERENCE-RELEASE generation, not the node capacity one,
-    /// because a replacement also becomes satisfiable when another family stops
-    /// SHARING a slot without retiring it — no retirement, no capacity movement,
-    /// and yet the projection genuinely changed.
-    replace_refused: Option<(u64, DemandRefused)>,
-    /// The node capacity generation AND the lease revision observed at the last
-    /// `NodeAtCapacity` refusal, or `None` if there has not been one.
-    ///
-    /// TWO wake conditions, because the refusal is a statement about
-    /// `retained slots + the NEW slots this set needs` and both halves move
-    /// independently:
-    ///
-    /// ```text
-    /// a slot retired                 → the node capacity generation moves
-    /// the family's authority moved   → the lease revision moves
-    /// ```
-    ///
-    /// The generation ALONE is not enough, and the gap is self-sustaining rather
-    /// than merely slow. A family refused for `Owner + Grant` whose Grant lease
-    /// is then removed derives `Owner` alone on its next miss — a key another
-    /// family may already retain, so it needs no new slot and no node capacity
-    /// whatsoever — but nothing retired, so the generation stands still and the
-    /// attempt is suppressed. Nothing this family can do moves the signal it is
-    /// waiting on, so it stays cold for a demand it no longer has: the refusal
-    /// cache preserving exactly the authority §4.2 exists to correct.
-    ///
-    /// The revision is EXACT for what it adds. A demand set is a pure function
-    /// of (credentials, capability, leased), and credentials are fixed for the
-    /// family's lifetime, so while the revision stands still no set this family
-    /// derives for a given capability can have changed — an attempt would ask
-    /// the registry the identical question.
-    ///
-    /// It is deliberately CONSERVATIVE across capabilities, exactly as the bare
-    /// generation gate already was: one registry attempt per (generation,
-    /// revision) pair, whichever capability spends it. That is the property that
-    /// keeps this a cache rather than a licence to hammer the lock — the retry
-    /// rate is the rate of real movement in either domain, never the rate of
-    /// calls — and it is the same discipline [`Self::replace_refused`] follows.
-    node_at_capacity_at: Option<(u64, u64)>,
-}
-
-impl RefusalState {
-    /// Whether the family budget is provably spent for a set of exactly `width`.
-    fn family_spent_at(&self, width: usize) -> bool {
-        self.family_at_capacity_from
-            .is_some_and(|refused| width >= refused)
-    }
-
-    /// Whether a FRESH acquisition may be attempted for a set of exactly
-    /// `width` derived under `revision`, given the CURRENT node capacity
-    /// generation.
-    ///
-    /// Sticky from the refused width up, terminal on exhaustion, and retryable
-    /// on EITHER node capacity movement or authority movement — see
-    /// [`Self::node_at_capacity_at`] for why the generation alone strands a
-    /// family whose demand has since narrowed.
-    fn may_attempt(&self, node_capacity_generation: u64, revision: u64, width: usize) -> bool {
-        if self.id_space_exhausted || self.family_spent_at(width) {
-            return false;
-        }
-        self.node_at_capacity_at.is_none_or(|(at, at_revision)| {
-            at != node_capacity_generation || at_revision != revision
-        })
-    }
-
-    /// Whether a REPLACEMENT may be attempted, given the current
-    /// reference-release generation.
-    ///
-    /// Deliberately consults NONE of the fresh-path caches — see
-    /// [`Self::replace_refused`]. Its own cache is exact for what it gates: a
-    /// replacement refused with nothing released since is refused for the same
-    /// reason, and any release at all may have changed the projection.
-    fn may_attempt_replacement(&self, ref_release_generation: u64) -> bool {
-        self.replace_refused
-            .is_none_or(|(at, _)| at != ref_release_generation)
-    }
-
-    fn record_replacement_refusal(&mut self, refusal: DemandRefused, ref_release_generation: u64) {
-        self.replace_refused = Some((ref_release_generation, refusal));
-    }
-
-    fn record(
-        &mut self,
-        refusal: DemandRefused,
-        node_capacity_generation: u64,
-        revision: u64,
-        width: usize,
-    ) {
-        match refusal {
-            DemandRefused::FamilyAtCapacity => {
-                // Keep the NARROWEST. A later, wider refusal says nothing the
-                // narrower one did not already say, and taking the wider value
-                // would re-open sets already proven not to fit.
-                self.family_at_capacity_from = Some(match self.family_at_capacity_from {
-                    Some(recorded) => recorded.min(width),
-                    None => width,
-                });
-            }
-            DemandRefused::IdSpaceExhausted => self.id_space_exhausted = true,
-            DemandRefused::NodeAtCapacity => {
-                // BOTH coordinates, recorded together. Either moving is a
-                // genuine reason to ask again, and recording only the
-                // generation is what let a narrowed demand stay suppressed.
-                self.node_at_capacity_at = Some((node_capacity_generation, revision));
-            }
-        }
-    }
-
-    /// Forget the family-capacity record because an entry was SUPERSEDED.
-    ///
-    /// The width record is sound only while the family's handle count never
-    /// falls, which is true of every path except re-derivation: that one
-    /// publishes a new demand set and releases the set it replaced, so handles
-    /// the earlier refusal counted against may now be free. Terminal exhaustion
-    /// and the node generation are untouched — neither is a statement about this
-    /// family's budget, and clearing them here would manufacture retries against
-    /// a node that is still full or an id space that can never recover.
-    fn on_supersession(&mut self) {
-        self.family_at_capacity_from = None;
-    }
 }
 
 /// The clone-family routing state (design §8).
@@ -685,7 +481,7 @@ pub(crate) struct OrgRoutingState {
     /// The READ path. One atomic load, no lock, ever.
     index: ArcSwap<CapabilityIndex>,
     /// Miss / insert / drop ONLY. Never taken by a hit.
-    mutate: parking_lot::Mutex<RefusalState>,
+    mutate: parking_lot::Mutex<()>,
     /// The newest publication transition this family has acted on (§4.4),
     /// encoded by `encode_revision`.
     ///
@@ -727,7 +523,7 @@ impl OrgRoutingState {
             grants_by_capability,
             index: ArcSwap::from_pointee(CapabilityIndex::default()),
             snapshot_high_water: AtomicU64::new(0),
-            mutate: parking_lot::Mutex::new(RefusalState::default()),
+            mutate: parking_lot::Mutex::new(()),
             mutate_acquisitions: AtomicU64::new(0),
         }
     }
@@ -870,23 +666,37 @@ impl OrgRoutingState {
     /// Where `leased` sits against everything this family has already acted on,
     /// advancing the high-water when it is newer.
     ///
-    /// Lock-free, and free in the steady state: a repeat call under the same
-    /// snapshot is one `Acquire` load and no write. Freshness advances even when
-    /// the movement is IRRELEVANT to this capability and no re-derivation
+    /// ONE atomic operation, and the classification is derived from ITS return
+    /// value — never from a separately loaded sample. The earlier
+    /// load-then-branch shape left a window:
+    ///
+    /// ```text
+    /// revision 6 loads high-water 5, stalls
+    /// revision 9 advances the high-water to 9
+    /// revision 6 resumes; fetch_max(6) changes nothing
+    /// revision 6 nevertheless answers Newer
+    /// ```
+    ///
+    /// — so an already-superseded snapshot passed the lock-free ordering gate,
+    /// and if its retained demand happened to look current it was served warm
+    /// without reaching the under-lock stale check. Deriving the answer from
+    /// the value `fetch_max` actually observed makes the classification
+    /// reflect the linearization order by construction: no interleaving
+    /// exists in which the two can disagree, which is why this property is
+    /// structural rather than separately witnessed. Freshness advances even
+    /// when the movement is IRRELEVANT to this capability and no re-derivation
     /// follows — otherwise an unrelated newer publication would leave the
     /// high-water behind and let a stalled older snapshot overwrite it later.
     fn note_snapshot(&self, leased: &ConsumerGrantSnapshot) -> SnapshotOrder {
         let revision = encode_revision(leased.revision());
-        let high_water = self.snapshot_high_water.load(Ordering::Acquire);
-        if revision < high_water {
-            return SnapshotOrder::Older;
+        let previous = self
+            .snapshot_high_water
+            .fetch_max(revision, Ordering::AcqRel);
+        match revision.cmp(&previous) {
+            std::cmp::Ordering::Less => SnapshotOrder::Older,
+            std::cmp::Ordering::Equal => SnapshotOrder::Current,
+            std::cmp::Ordering::Greater => SnapshotOrder::Newer,
         }
-        if revision > high_water {
-            self.snapshot_high_water
-                .fetch_max(revision, Ordering::AcqRel);
-            return SnapshotOrder::Newer;
-        }
-        SnapshotOrder::Current
     }
 
     /// The MUTATION path: a miss, or a warmed entry that is stale for THIS
@@ -902,7 +712,7 @@ impl OrgRoutingState {
         capability: &CapabilityAuthorityId,
         leased: &ConsumerGrantSnapshot,
     ) -> RouteLookup {
-        let mut refusals = self.mutate.lock();
+        let mutate = self.mutate.lock();
         self.mutate_acquisitions.fetch_add(1, Ordering::AcqRel);
 
         // Re-check the SNAPSHOT ORDER under the lock (§4.4). `route_handle`
@@ -925,13 +735,13 @@ impl OrgRoutingState {
                 if self.leases_current(&current, capability, leased) {
                     return RouteLookup::Warm;
                 }
-                self.acquire_under_mutate(&mut refusals, capability, leased, Some(&current))
+                self.acquire_under_mutate(&mutate, capability, leased, Some(&current))
             }
-            None => self.acquire_under_mutate(&mut refusals, capability, leased, None),
+            None => self.acquire_under_mutate(&mutate, capability, leased, None),
         }
     }
 
-    /// Derive, gate, acquire and publish, under a held `mutate`.
+    /// Derive, acquire and publish, under a held `mutate`.
     ///
     /// `superseded` is the entry this acquisition REPLACES, if any. A
     /// replacement goes through the registry's atomic replacement rather than
@@ -941,37 +751,25 @@ impl OrgRoutingState {
     /// charging it gross would ask for 66 and refuse a replacement that plainly
     /// fits (§4.3). Refusal is still total no-effect, because the superseded set
     /// is borrowed and keeps everything it owns unless the transaction commits.
+    ///
+    /// There is NO refusal gate in front of the registry, and no refusal is
+    /// recorded behind it. The registry is the sole authority on family
+    /// capacity, node capacity and the identity space; it is asked on every
+    /// attempt and its verdict is returned verbatim (see the module doc for
+    /// why the family-global memoization that used to live here was removed).
     fn acquire_under_mutate(
         &self,
-        refusals: &mut RefusalState,
+        _mutate: &parking_lot::MutexGuard<'_, ()>,
         capability: &CapabilityAuthorityId,
         leased: &ConsumerGrantSnapshot,
         superseded: Option<&Arc<CapabilityRouteHandle>>,
     ) -> RouteLookup {
-        // Derived BEFORE the refusal gate, because the gate is on what the set
-        // COSTS and that is not knowable without deriving. The derivation is
-        // pure and takes no registry lock, so a settled family pays a bounded
-        // walk of one capability's grants and never reaches the lock itself.
+        // The derivation is pure and takes no registry lock: a family with no
+        // representable Owner scope never reaches the registry at all.
         let Some(keys) = self.demand_set(capability, leased) else {
             return RouteLookup::Cold(ColdReason::NoOwnerScope);
         };
 
-        // What this attempt asks the family budget for. A fresh acquisition asks
-        // for its whole width; a replacement asks only for its MARGINAL cost,
-        // because the intersection is never given up and re-taken. A replacement
-        // that is net-neutral or net-negative charges zero and is therefore
-        // never blocked by a width record — which is exactly right, since it
-        // cannot make the family's footprint grow.
-        let charge = match superseded {
-            Some(stale) => marginal_charge(stale.demanded(), &keys),
-            None => keys.len(),
-        };
-
-        // The node capacity generation is read ONCE, before the attempt, and
-        // the same value is what a refusal records. Reading it after a refusal
-        // would record a generation that may already have moved because of the
-        // very retirement that would have made the attempt succeed, and the
-        // family would then never retry.
         let revision = encode_revision(leased.revision());
 
         // Two DIFFERENT snapshots claiming ONE transition identity is an
@@ -983,28 +781,6 @@ impl OrgRoutingState {
         if superseded.is_some_and(|stale| stale.derived_at == revision) {
             return RouteLookup::Cold(ColdReason::SnapshotSuperseded);
         }
-
-        // A REPLACEMENT is gated on the reference-release generation, a FRESH
-        // acquisition on the node capacity generation and the fresh caches
-        // (§4.5). Applying the fresh caches to a replacement deadlocks it
-        // against its own wake condition: the transaction being suppressed is
-        // the one that would free or move the very capacity the cache is
-        // waiting on.
-        let release_generation = self.family.ref_release_generation();
-        if superseded.is_some() {
-            if !refusals.may_attempt_replacement(release_generation) {
-                let refusal = refusals
-                    .replace_refused
-                    .map_or(DemandRefused::NodeAtCapacity, |(_, refusal)| refusal);
-                return RouteLookup::Cold(ColdReason::Refused(refusal));
-            }
-        } else {
-            let generation = self.family.node_capacity_generation();
-            if !refusals.may_attempt(generation, revision, charge) {
-                return RouteLookup::Cold(self.settled_reason(refusals, charge));
-            }
-        }
-        let generation = self.family.node_capacity_generation();
 
         // A replacement is driven through the SUPERSEDED SET ITSELF, which
         // carries its own registry and family identity. No argument exists
@@ -1044,43 +820,9 @@ impl OrgRoutingState {
                 // be refused even if no read ever observed the newer one.
                 self.snapshot_high_water
                     .fetch_max(revision, Ordering::AcqRel);
-                if superseded.is_some() {
-                    // The superseded set gave up its references INSIDE the
-                    // replacement transaction, so the family's footprint may
-                    // have fallen and a width record taken against the old one
-                    // no longer describes it.
-                    refusals.on_supersession();
-                }
                 RouteLookup::Warm
             }
-            Err(refusal) => {
-                if superseded.is_some() {
-                    // A replacement refusal records against the release
-                    // generation and NEVER against the fresh caches: a
-                    // replacement that could not fit says nothing about whether
-                    // this family may take more, and writing it into the sticky
-                    // width or the terminal flag would suppress fresh
-                    // acquisitions that are still perfectly serviceable.
-                    refusals.record_replacement_refusal(refusal, release_generation);
-                } else {
-                    refusals.record(refusal, generation, revision, charge);
-                }
-                RouteLookup::Cold(ColdReason::Refused(refusal))
-            }
-        }
-    }
-
-    /// The refusal a settled family reports without attempting acquisition.
-    ///
-    /// Terminal before spent-at-this-width before retryable, so the reported
-    /// reason is the one that actually stops the attempt.
-    fn settled_reason(&self, refusals: &RefusalState, width: usize) -> ColdReason {
-        if refusals.id_space_exhausted {
-            ColdReason::Refused(DemandRefused::IdSpaceExhausted)
-        } else if refusals.family_spent_at(width) {
-            ColdReason::Refused(DemandRefused::FamilyAtCapacity)
-        } else {
-            ColdReason::Refused(DemandRefused::NodeAtCapacity)
+            Err(refusal) => RouteLookup::Cold(ColdReason::Refused(refusal)),
         }
     }
 
@@ -1103,7 +845,7 @@ impl OrgRoutingState {
     /// the REAL lock rather than a stand-in and prove a contender's `try_lock`
     /// fails while a warmed lookup completes.
     #[cfg(test)]
-    pub(crate) fn mutate_lock_for_test(&self) -> &parking_lot::Mutex<RefusalState> {
+    pub(crate) fn mutate_lock_for_test(&self) -> &parking_lot::Mutex<()> {
         &self.mutate
     }
 }
