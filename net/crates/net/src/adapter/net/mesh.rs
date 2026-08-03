@@ -11700,11 +11700,29 @@ impl MeshNode {
     /// its member overwritten by this writer's stale read (the
     /// lost-update a naive load-modify-store would allow).
     fn publish_gateway_member(&self, gateway: Option<Arc<VerifiedGatewayContextSet>>) {
-        self.subnet_gateway_authority
-            .rcu(|current| SubnetGatewayAuthorityState {
+        self.publish_gateway_member_paced(gateway, &|| {});
+    }
+
+    /// [`Self::publish_gateway_member`] with an after-capture hook:
+    /// `after_capture` runs INSIDE the rcu closure — after the current
+    /// aggregate has been captured, before the compare-and-swap
+    /// attempt — and therefore once more per retry. Production passes
+    /// a no-op; the deterministic lost-update witness uses the hook to
+    /// hold a writer inside exactly the window where a naive
+    /// load-modify-store loses a concurrent publication.
+    fn publish_gateway_member_paced(
+        &self,
+        gateway: Option<Arc<VerifiedGatewayContextSet>>,
+        after_capture: &(dyn Fn() + Sync),
+    ) {
+        self.subnet_gateway_authority.rcu(|current| {
+            let next = SubnetGatewayAuthorityState {
                 gateway: gateway.clone(),
                 boundaries: current.boundaries.clone(),
-            });
+            };
+            after_capture();
+            next
+        });
     }
 
     /// Declare this node's protected boundaries (SUBNET_AUTH_PLAN.md
@@ -11716,15 +11734,42 @@ impl MeshNode {
     /// `EXPORT` credential would delete the boundary it was meant to
     /// guard and a broader `ROUTE` would inherit the traffic.
     pub fn declare_subnet_boundaries(&self, set: SubnetBoundarySet) {
+        self.declare_subnet_boundaries_paced(set, &|| {});
+    }
+
+    /// The mirror of [`Self::publish_gateway_member_paced`]: replace
+    /// ONLY the boundaries member, preserving the latest gateway
+    /// member under contention, with the same after-capture hook
+    /// discipline (no-op in production).
+    fn declare_subnet_boundaries_paced(
+        &self,
+        set: SubnetBoundarySet,
+        after_capture: &(dyn Fn() + Sync),
+    ) {
         let boundaries = Some(Arc::new(set));
-        // The mirror of `publish_gateway_member`: replace ONLY the
-        // boundaries member, preserving the latest gateway member
-        // under contention.
-        self.subnet_gateway_authority
-            .rcu(|current| SubnetGatewayAuthorityState {
+        self.subnet_gateway_authority.rcu(|current| {
+            let next = SubnetGatewayAuthorityState {
                 gateway: current.gateway.clone(),
                 boundaries: boundaries.clone(),
-            });
+            };
+            after_capture();
+            next
+        });
+    }
+
+    /// Test-only (fixtures): [`Self::declare_subnet_boundaries`]
+    /// through the SAME production rcu path, exposing the
+    /// after-capture hook so the deterministic lost-update witness can
+    /// hold this writer between its capture and its compare-and-swap.
+    /// The hook runs once more per retry — observing a second
+    /// invocation is observing the rcu retry itself.
+    #[cfg(feature = "fixtures")]
+    pub fn test_declare_subnet_boundaries_paced(
+        &self,
+        set: SubnetBoundarySet,
+        after_capture: &(dyn Fn() + Sync),
+    ) {
+        self.declare_subnet_boundaries_paced(set, after_capture);
     }
 
     /// The published gateway export authority — credentials and

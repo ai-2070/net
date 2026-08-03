@@ -989,11 +989,13 @@ async fn publication_of_either_member_invalidates_captured_export_facts() {
     let _ = std::fs::remove_dir_all(&f.dir);
 }
 
-/// Concurrent credential and boundary publication loses NEITHER
-/// update: each writer replaces only its own member through a
-/// compare-and-retry swap, so the final aggregate carries the last
-/// gateway set AND the last boundary set. A naive load-modify-store
-/// would let one writer resurrect the other's superseded member.
+/// SUPPLEMENTAL stress evidence: two uncontrolled writer storms over
+/// the two members. This does NOT by itself distinguish rcu from a
+/// naive load-modify-store (an uncontrolled schedule rarely holds a
+/// stale capture across the other writer's publication) — the
+/// deterministic proof is
+/// `a_held_stale_capture_cannot_lose_the_concurrent_publication`
+/// below, which forces exactly that schedule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_publication_loses_neither_authority_surface() {
     let vehicle_b = build_vehicle_b().await;
@@ -1053,6 +1055,100 @@ async fn concurrent_publication_loses_neither_authority_surface() {
         boundaries.boundaries(),
         &[TopologySubnetId::new(WORLD_MODEL)],
         "the boundary writer's FINAL world-model set must survive the credential storm",
+    );
+}
+
+/// THE deterministic lost-update witness (D7 evidence closure): a
+/// barrier-forced schedule in which the boundary writer captures the
+/// aggregate, is HELD inside its capture→compare-and-swap window
+/// while the gateway writer publishes, and only then resumes.
+///
+/// Production `ArcSwap::rcu` loses the CAS, re-captures the gateway
+/// writer's publication, and lands (G1, B1) — the pacing hook running
+/// a second time IS the observed retry. The naive load-modify-store
+/// inverse stores its stale capture verbatim: one hook invocation,
+/// the gateway publication lost, and this test REDs. Verified by
+/// mutation control against exactly that inverse (see the commit
+/// message); the storm test above remains as supplemental stress.
+#[cfg(feature = "fixtures")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_stale_capture_cannot_lose_the_concurrent_publication() {
+    let vehicle_b = build_vehicle_b().await;
+    let vb_kp = EntityKeypair::from_bytes(VEHICLE_B_SEED);
+
+    // Initial aggregate (G0, B0): the one-entry gateway set and the
+    // camera boundary.
+    vehicle_b
+        .install_subnet_gateway_credentials(&gateway_credentials_without_export(&vb_kp))
+        .expect("install G0");
+    vehicle_b.declare_subnet_boundaries(SubnetBoundarySet::new(
+        vb_subnet_root().entity_id().clone(),
+        0,
+        [TopologySubnetId::new(CAMERA)],
+    ));
+
+    let captured = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+
+    let b = vehicle_b.clone();
+    let (cap, rel, calls) = (captured.clone(), release.clone(), hook_calls.clone());
+    let schedule = tokio::task::spawn_blocking(move || {
+        let writer_b = b.clone();
+        let boundary_writer = std::thread::spawn(move || {
+            // B1 = the canonical world-model boundary, through the
+            // PRODUCTION rcu path with the pacing hook.
+            writer_b.test_declare_subnet_boundaries_paced(
+                SubnetBoundarySet::new(
+                    vb_subnet_root().entity_id().clone(),
+                    0,
+                    [TopologySubnetId::new(WORLD_MODEL)],
+                ),
+                &|| {
+                    // First capture: rendezvous, then hold until the
+                    // gateway writer has published. A retry passes
+                    // straight through — it is a FRESH capture.
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        cap.wait();
+                        rel.wait();
+                    }
+                },
+            );
+        });
+
+        // The boundary writer now holds a (G0, B0) capture. Publish
+        // G1 — the canonical two-entry set — inside its window.
+        captured.wait();
+        b.install_subnet_gateway_credentials(&gateway_credentials_with_export(
+            &EntityKeypair::from_bytes(VEHICLE_B_SEED),
+        ))
+        .expect("publish G1 mid-window");
+        release.wait();
+        boundary_writer.join().expect("boundary writer");
+    });
+    schedule.await.expect("schedule");
+
+    let observed_hook_calls = hook_calls.load(Ordering::SeqCst);
+    assert!(
+        observed_hook_calls >= 2,
+        "the boundary writer must LOSE its stale compare-and-swap and          re-capture (saw {observed_hook_calls} hook call(s)): a single          capture means its stale view was stored verbatim over the          gateway publication",
+    );
+    assert_eq!(
+        vehicle_b
+            .subnet_gateway_contexts()
+            .expect("gateway member present")
+            .entries()
+            .len(),
+        2,
+        "G1 must survive the boundary writer's held stale capture",
+    );
+    assert_eq!(
+        vehicle_b
+            .subnet_boundaries()
+            .expect("boundary member present")
+            .boundaries(),
+        &[TopologySubnetId::new(WORLD_MODEL)],
+        "B1 must land beside the surviving G1",
     );
 }
 
