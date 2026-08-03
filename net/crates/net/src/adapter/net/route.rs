@@ -534,7 +534,7 @@ pub const MAX_STREAM_STATS: usize = 65_536;
 /// mutate authenticated state:
 ///
 /// - `ordinary` — pingwaves (unauthenticated UDP datagrams), routed
-///   end-to-end installs, manual/legacy installs, reroute fallbacks.
+///   end-to-end installs, manual/legacy installs.
 ///   Usable for ordinary forwarding only.
 /// - `protected` — identity-bound, written only by writers whose
 ///   next-hop identity came from an authenticated adjacent session.
@@ -557,8 +557,8 @@ struct DestRoutes {
     protected: Option<RouteEntry>,
     /// Table-wide, never-reused transition token for compare-and-set
     /// writers ([`RoutingTable::observe`] /
-    /// [`RoutingTable::install_if_unchanged`] /
-    /// [`RoutingTable::apply_failure_if_unchanged`]).
+    /// [`RoutingTable::install_metered_if_unchanged`] /
+    /// [`RoutingTable::remove_failed_candidates_if_unchanged`]).
     ///
     /// Drawn from a single monotonic counter on the table rather than
     /// counted per destination. A per-destination counter recycles:
@@ -581,26 +581,15 @@ struct DestRoutes {
     /// wearing a safety costume. What a conditional writer needs to
     /// detect is another writer having CHANGED the state it observed;
     /// a refresh changes nothing it reasoned about.
-    token: u64,
-    /// When the last candidate left, for a destination kept as a
-    /// TOMBSTONE.
     ///
-    /// An emptied destination used to be deleted outright, which threw
-    /// away its token. Absence carries no token, so an observation of
-    /// an absent destination could not be distinguished from an
-    /// observation taken before a full absent → present → absent cycle:
-    /// a conditional writer that removed the last candidate, and a
-    /// recovery matching against what it removed, were reasoning about
-    /// "nothing here" rather than about a specific state.
-    ///
-    /// Keeping the record with both slots empty preserves the token
-    /// across that boundary, so removal is a transition like any other.
-    /// Tombstones are collected by [`RoutingTable::sweep_stale`] once
-    /// they age out; collection can only make a later conditional write
-    /// be REFUSED (the observation stops resolving), never wrongly
-    /// admitted, because any destination re-created afterwards draws a
+    /// A destination whose last candidate leaves is REMOVED, not kept
+    /// as an empty record. Absence therefore carries no token, and a
+    /// conditional writer observing an absent destination simply
+    /// declines. Nothing needs to tell one absence from another any
+    /// more: no writer restores state into an absence it created
+    /// earlier — fresh evidence re-creates the destination under a
     /// fresh never-reused token.
-    emptied_at: Option<Instant>,
+    token: u64,
 }
 
 /// One candidate's identity for change detection — everything a
@@ -708,8 +697,9 @@ pub struct RouteCandidateView {
 }
 
 /// A point-in-time reading of a destination's routing state, for
-/// compare-and-set writers. See [`RoutingTable::install_if_unchanged`]
-/// and [`RoutingTable::apply_failure_if_unchanged`].
+/// compare-and-set writers. See
+/// [`RoutingTable::install_metered_if_unchanged`] and
+/// [`RoutingTable::remove_failed_candidates_if_unchanged`].
 ///
 /// Candidate-aware on purpose: a reading that recorded only the
 /// effective route cannot express "remove the failed candidate and
@@ -735,21 +725,22 @@ impl RouteObservation {
     }
 }
 
-/// The provenance a caller is installing an alternate WITH.
+/// The provenance a caller is installing a route WITH.
 ///
 /// Deliberately supplied by the caller rather than inferred at write
 /// time from address ownership. Direct adjacency proves who receives
 /// the next hop; it does not prove that peer ever advertised
 /// reachability to this destination, and inferring `Protected` from
-/// "the alternate's address currently belongs to a direct peer" would
-/// manufacture protected evidence out of a graph guess.
+/// "the address currently belongs to a direct peer" would manufacture
+/// protected evidence out of a liveness fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlternateProvenance {
-    /// Table/graph/fallback evidence — ordinary forwarding only.
+    /// Unauthenticated evidence — ordinary forwarding only.
     Ordinary,
-    /// Carried over from an existing PROTECTED candidate, which is
-    /// already the authenticated adjacent hop's advertised reachability
-    /// for this destination.
+    /// Evidence from an authenticated adjacent session — the identity
+    /// it is bound to. The one non-advertisement source is a recovered
+    /// peer's OWN route, where the live session terminating at the
+    /// peer is itself the authentication.
     Protected(u64),
 }
 
@@ -881,34 +872,35 @@ impl RoutingTable {
                 if slot.fingerprint() != before {
                     slot.token = self.issue_token();
                 }
-                let now_empty = slot.is_empty();
-                // Count only destinations that actually have a
-                // candidate. A tombstone is a record of a token, not a
-                // route, and both directions of the transition are
-                // accounted here rather than at the removal sites — an
+                let token = slot.token;
+                // The last candidate leaving takes the destination with
+                // it — an absent destination means "no current
+                // evidence", and nothing restores state into an absence
+                // any more, so there is no earlier token to preserve.
+                // The count is maintained here, beside the removal,
+                // rather than at the (conditional) removal sites — an
                 // unconditional decrement beside a CONDITIONAL removal
                 // is how the count drifts away from the table.
-                match (was_empty, now_empty) {
-                    (false, true) => {
-                        slot.emptied_at = Some(Instant::now());
+                // (`was_empty` guards the accounting: a persistent
+                // empty entry cannot exist under this scheme, but the
+                // count must stay exact even against a stray one.)
+                if slot.is_empty() {
+                    o.remove();
+                    if !was_empty {
                         self.num_routes.fetch_sub(1, Ordering::Relaxed);
                     }
-                    (true, false) => {
-                        slot.emptied_at = None;
-                        self.num_routes.fetch_add(1, Ordering::Relaxed);
-                    }
-                    _ => {}
+                } else if was_empty {
+                    self.num_routes.fetch_add(1, Ordering::Relaxed);
                 }
-                (r, slot.token)
+                (r, token)
             }
             Entry::Vacant(v) => {
                 let mut fresh = DestRoutes::default();
                 let r = f(&mut fresh);
                 if fresh.is_empty() {
                     // Nothing was installed into a destination that did
-                    // not exist. Leave no tombstone: there is no earlier
-                    // state for one to preserve, and manufacturing them
-                    // here would let any lookup-shaped miss allocate.
+                    // not exist — leave nothing behind, so a
+                    // lookup-shaped miss can never allocate.
                     return (r, 0);
                 }
                 fresh.token = self.issue_token();
@@ -1046,28 +1038,36 @@ impl RoutingTable {
     /// Ordinary candidates are untouched — they never depended on the
     /// adjacency.
     pub fn invalidate_protected_via(&self, identity: u64) -> usize {
+        // Two phases, so the removal runs under the entry guard that
+        // also maintains the token and the count (`mutate`), instead of
+        // editing entries in place mid-iteration. The re-check inside
+        // `mutate` makes the collected key a hint, not a decision: a
+        // binding that changed between the scan and the removal is
+        // left alone.
+        let candidates: Vec<u64> = self
+            .routes
+            .iter()
+            .filter(|d| {
+                d.protected
+                    .as_ref()
+                    .is_some_and(|e| e.next_hop_id == Some(identity))
+            })
+            .map(|d| *d.key())
+            .collect();
         let mut retired = 0usize;
-        for mut dest in self.routes.iter_mut() {
-            if dest
-                .protected
-                .as_ref()
-                .is_some_and(|e| e.next_hop_id == Some(identity))
-            {
-                dest.protected = None;
-                dest.token = self.issue_token();
-                retired += 1;
-                // The destination stays as a tombstone carrying the
-                // token this retirement produced, and the count follows
-                // it here, under the same shard guard that emptied it.
-                // The previous shape re-visited each emptied key after
-                // the iteration and decremented unconditionally beside a
-                // `remove_if` that could legitimately decline — a
-                // concurrent install refilling the destination left the
-                // entry present and the count one short, permanently.
-                if dest.is_empty() {
-                    dest.emptied_at = Some(Instant::now());
-                    self.num_routes.fetch_sub(1, Ordering::Relaxed);
+        for dest_id in candidates {
+            if self.mutate(dest_id, |d| {
+                if d.protected
+                    .as_ref()
+                    .is_some_and(|e| e.next_hop_id == Some(identity))
+                {
+                    d.protected = None;
+                    true
+                } else {
+                    false
                 }
+            }) {
+                retired += 1;
             }
         }
         retired
@@ -1406,80 +1406,34 @@ impl RoutingTable {
     }
 
     /// Read a destination's full candidate state for a later
-    /// conditional write. Pair with [`Self::install_if_unchanged`] or
-    /// [`Self::apply_failure_if_unchanged`].
+    /// conditional write. Pair with
+    /// [`Self::install_metered_if_unchanged`] or
+    /// [`Self::remove_failed_candidates_if_unchanged`].
     pub fn observe(&self, dest_id: u64) -> Option<RouteObservation> {
         let max_age = self.max_route_age();
         self.routes.get(&dest_id).map(|d| d.observe(max_age))
     }
 
-    /// Install a route ONLY if the destination has not changed since
-    /// `observed` was read — the compare-and-set form every
-    /// event-driven rewriter (failure reroute, recovery restore) must
-    /// use.
+    /// Install a route with an explicit metric and provenance, ONLY if
+    /// the destination has not changed since `observed` was read — the
+    /// compare-and-set form every event-driven rewriter must use.
     ///
-    /// Those callers snapshot the table, do expensive selection work
-    /// (graph scans, peer probes), and only then write. Between the two
-    /// a fresh authenticated route can land; an unconditional write
-    /// would clobber it with a decision made about state that no longer
-    /// exists. Selection-time filtering does not help — the race is at
-    /// mutation time.
+    /// Those callers read peer state, decide, and only then write.
+    /// Between the two a fresh authenticated route can land; an
+    /// unconditional write would clobber it with a decision made about
+    /// state that no longer exists. Decision-time filtering does not
+    /// help — the race is at mutation time.
     ///
-    /// `provenance` picks the slot. Returns the produced
-    /// [`TransitionOutcome`] — including the new token — when the
-    /// write happened, `None` when it was refused.
+    /// `provenance` picks the slot; the caller states the metric it is
+    /// installing (metric 1 is the claim of an adjacency and nothing
+    /// else). Returns the produced [`TransitionOutcome`] — including
+    /// the new token — when the write happened, `None` when it was
+    /// refused.
     ///
     /// Returning the token ATOMICALLY matters: a caller that wrote and
     /// then re-read to learn "its" token can observe a third party's
-    /// write in between and record that as its own state, which is how
-    /// a later recovery ends up undoing a newer writer.
-    pub fn install_if_unchanged(
-        &self,
-        dest_id: u64,
-        observed: RouteObservation,
-        next_hop: SocketAddr,
-        provenance: AlternateProvenance,
-    ) -> Option<TransitionOutcome> {
-        if self.cas_poisoned() {
-            return None;
-        }
-        let max_age = self.max_route_age();
-        let (outcome, token) = self.mutate_with_token(dest_id, |d| {
-            if d.token != observed.token {
-                return None;
-            }
-            let effective_before = d.effective(max_age).map(|e| e.next_hop);
-            match provenance {
-                AlternateProvenance::Protected(id) => {
-                    d.protected = Some(RouteEntry::authenticated(next_hop, id));
-                }
-                AlternateProvenance::Ordinary => d.ordinary = Some(RouteEntry::new(next_hop)),
-            }
-            let effective_after = d.effective(max_age).map(|e| e.next_hop);
-            Some(TransitionOutcome {
-                // Stamped from under the entry guard below.
-                token: 0,
-                removed_any: false,
-                installed: true,
-                effective_before,
-                effective_after,
-                reachable_after: effective_after.is_some(),
-            })
-        });
-        outcome.map(|mut outcome| {
-            outcome.token = token;
-            outcome
-        })
-    }
-
-    /// Install a route with an explicit METRIC and provenance, only if
-    /// the destination has not changed since `observed` was read.
-    ///
-    /// [`Self::install_if_unchanged`] always writes metric 1, which is
-    /// the right claim for a candidate that IS the adjacency and the
-    /// wrong one for anything restored on a peer's behalf: a route that
-    /// was three hops away does not become adjacent because its next hop
-    /// came back. Recovery states the metric it is restoring.
+    /// write in between and record that as its own — which is how a
+    /// conditional undo ends up undoing a newer writer.
     pub fn install_metered_if_unchanged(
         &self,
         dest_id: u64,
@@ -1523,32 +1477,29 @@ impl RoutingTable {
 
     /// Apply a peer-failure transition to ONE destination atomically:
     /// verify the observation, remove every candidate the failure
-    /// invalidates, keep every candidate it does not, and install the
-    /// caller's alternate only if the destination would otherwise be
-    /// left unreachable.
+    /// invalidates, and keep every candidate it does not.
     ///
-    /// This exists because a failure is a CANDIDATE event, not a
-    /// destination event. Writing an alternate into one slot while
-    /// leaving the failed candidate in the other is not a repair:
+    /// Removal is ALL failure handling does. A failure invalidates the
+    /// evidence that depended on the failed peer; it does not know a
+    /// replacement path, and manufacturing one here converted "some
+    /// peer is alive" into "that peer may route this destination". A
+    /// surviving candidate simply wins the next lookup; a destination
+    /// left with nothing becomes unreachable, which is the truthful
+    /// answer until discovery produces fresh evidence.
     ///
-    /// - a failed PROTECTED candidate left behind keeps
-    ///   `lookup_authenticated` handing protected forwarding a dead
-    ///   hop, however good the ordinary alternate installed beside it;
-    /// - a failed ORDINARY candidate left behind can stay *effective*
-    ///   on metric while a protected alternate sits unused beside it.
-    ///
-    /// The alternate's provenance is the caller's to state — see
-    /// [`AlternateProvenance`].
+    /// The transition is still a CANDIDATE event, not a destination
+    /// event: ownership is per candidate, matching the withdrawal rule
+    /// — the protected candidate by bound identity (its address may
+    /// have drifted), the ordinary one by address.
     ///
     /// Returns `None` if the observation is stale (or the token space
     /// is exhausted), in which case nothing was touched.
-    pub fn apply_failure_if_unchanged(
+    pub fn remove_failed_candidates_if_unchanged(
         &self,
         dest_id: u64,
         observed: RouteObservation,
         failed_identity: u64,
         failed_addr: SocketAddr,
-        alternate: Option<(SocketAddr, AlternateProvenance)>,
     ) -> Option<TransitionOutcome> {
         if self.cas_poisoned() {
             return None;
@@ -1559,11 +1510,6 @@ impl RoutingTable {
                 return None;
             }
             let effective_before = d.effective(max_age).map(|e| e.next_hop);
-
-            // Remove exactly what the failure invalidates. Ownership
-            // is per candidate, matching the withdrawal rule: the
-            // protected candidate by bound identity (its address may
-            // have drifted), the ordinary one by address.
             let mut removed_any = false;
             if d.protected
                 .as_ref()
@@ -1579,30 +1525,11 @@ impl RoutingTable {
                 d.ordinary = None;
                 removed_any = true;
             }
-
-            // Install only if nothing live survives. A surviving
-            // candidate is real evidence; replacing it with a graph
-            // guess would be a downgrade.
-            let mut installed = false;
-            if d.effective(max_age).is_none() {
-                if let Some((addr, provenance)) = alternate {
-                    match provenance {
-                        AlternateProvenance::Protected(id) => {
-                            d.protected = Some(RouteEntry::authenticated(addr, id));
-                        }
-                        AlternateProvenance::Ordinary => {
-                            d.ordinary = Some(RouteEntry::new(addr));
-                        }
-                    }
-                    installed = true;
-                }
-            }
-
             let effective_after = d.effective(max_age).map(|e| e.next_hop);
             Some(TransitionOutcome {
                 token: 0,
                 removed_any,
-                installed,
+                installed: false,
                 effective_before,
                 effective_after,
                 reachable_after: effective_after.is_some(),
@@ -1614,89 +1541,47 @@ impl RoutingTable {
         })
     }
 
-    /// Like [`Self::lookup`], but returns `None` if the installed
-    /// route's `next_hop` equals `exclude_next_hop`. Used by
-    /// [`crate::adapter::net::ReroutePolicy`] so a single failed-peer
-    /// check against the routing table answers "do I have a usable
-    /// alternate?" — if `Some(addr)`, use it directly; if `None`,
-    /// fall back to a graph-based alternate lookup.
+    /// Install a route into a destination that has NO entry at all —
+    /// the compare-and-set form for a writer whose observation was
+    /// "absent".
     ///
-    /// Picks the lowest-metric live candidate that is not excluded,
-    /// across both slots.
-    pub fn lookup_alternate(
+    /// Recovery needs this exactly once: a failure that removed a
+    /// peer's last candidate removed the destination with it, so the
+    /// recovery that reinstalls the route to that peer ITSELF (from
+    /// the peer's live session — current evidence, not a saved record)
+    /// observes absence. Declining when ANY entry exists is the same
+    /// discipline as the token check: presence means another writer
+    /// has spoken since the observation, and its evidence is newer.
+    pub fn install_metered_if_absent(
         &self,
         dest_id: u64,
-        exclude_next_hop: SocketAddr,
-    ) -> Option<SocketAddr> {
-        self.alternate_where(dest_id, |e| e.next_hop != exclude_next_hop)
-    }
-
-    /// [`Self::lookup_alternate`] with an identity exclusion: refuses a
-    /// candidate identity-bound to `exclude_identity`, even at a
-    /// different address. Failure rerouting needs this — a failed
-    /// peer's route whose address drifted off the excluded one must
-    /// not be offered as its own alternate.
-    pub fn lookup_alternate_excluding(
-        &self,
-        dest_id: u64,
-        exclude_next_hop: SocketAddr,
-        exclude_identity: u64,
-    ) -> Option<SocketAddr> {
-        self.alternate_where(dest_id, |e| {
-            e.next_hop != exclude_next_hop && e.next_hop_id != Some(exclude_identity)
-        })
-    }
-
-    fn alternate_where(
-        &self,
-        dest_id: u64,
-        keep: impl Fn(&RouteEntry) -> bool,
-    ) -> Option<SocketAddr> {
-        self.alternate_candidate_where(dest_id, keep).map(|c| c.0)
-    }
-
-    /// Like [`Self::alternate_where`], but also reports the alternate's
-    /// PROVENANCE, so a caller installing it can carry that forward
-    /// instead of re-deriving it from address ownership.
-    ///
-    /// Tie-break matches the primary lookup exactly: on equal metric
-    /// the protected candidate wins. Iterating the slots in
-    /// declaration order and taking `min_by_key` silently gave the
-    /// opposite precedence to `lookup`, so the "alternate" could be a
-    /// different candidate than the one traffic was actually using.
-    fn alternate_candidate_where(
-        &self,
-        dest_id: u64,
-        keep: impl Fn(&RouteEntry) -> bool,
-    ) -> Option<(SocketAddr, AlternateProvenance)> {
-        let max_age = self.max_route_age();
-        self.routes.get(&dest_id).and_then(|d| {
-            d.candidates()
-                .filter(|e| DestRoutes::live(e, max_age) && keep(e))
-                // `min_by_key` keeps the FIRST minimum; ordering
-                // protected-first makes ties resolve protected.
-                .min_by_key(|e| (e.metric, u8::from(e.next_hop_id.is_none())))
-                .map(|e| {
-                    let provenance = match e.next_hop_id {
-                        Some(id) => AlternateProvenance::Protected(id),
-                        None => AlternateProvenance::Ordinary,
-                    };
-                    (e.next_hop, provenance)
-                })
-        })
-    }
-
-    /// [`Self::lookup_alternate_excluding`], reporting provenance —
-    /// the form the failure transition uses.
-    pub fn alternate_candidate_excluding(
-        &self,
-        dest_id: u64,
-        exclude_next_hop: SocketAddr,
-        exclude_identity: u64,
-    ) -> Option<(SocketAddr, AlternateProvenance)> {
-        self.alternate_candidate_where(dest_id, |e| {
-            e.next_hop != exclude_next_hop && e.next_hop_id != Some(exclude_identity)
-        })
+        next_hop: SocketAddr,
+        provenance: AlternateProvenance,
+        metric: u16,
+    ) -> bool {
+        if self.cas_poisoned() {
+            return false;
+        }
+        use dashmap::mapref::entry::Entry;
+        match self.routes.entry(dest_id) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(v) => {
+                let mut fresh = DestRoutes::default();
+                match provenance {
+                    AlternateProvenance::Protected(id) => {
+                        fresh.protected =
+                            Some(RouteEntry::authenticated_with_metric(next_hop, id, metric));
+                    }
+                    AlternateProvenance::Ordinary => {
+                        fresh.ordinary = Some(RouteEntry::with_metric(next_hop, metric));
+                    }
+                }
+                fresh.token = self.issue_token();
+                v.insert(fresh);
+                self.num_routes.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+        }
     }
 
     /// Drop every candidate older than `max_age`. Returns the number of
@@ -1706,24 +1591,15 @@ impl RoutingTable {
     /// Called periodically from the heartbeat loop to keep dead routes
     /// out of the table.
     ///
-    /// A destination emptied here becomes a TOMBSTONE rather than
-    /// vanishing, so the transition that emptied it still has a token
-    /// for a conditional writer to compare against — absence carries
-    /// none. Tombstones themselves are collected on a later sweep once
-    /// they have aged out; collection can only make a later conditional
-    /// write be refused, never wrongly admitted.
+    /// A destination emptied here leaves the table with its last
+    /// candidate: absence means "no current evidence". A conditional
+    /// writer whose observation predates the sweep declines — the
+    /// observation no longer resolves — and can never be wrongly
+    /// admitted, because a destination re-created by fresh evidence
+    /// draws a fresh never-reused token.
     pub fn sweep_stale(&self, max_age: std::time::Duration) -> usize {
         let mut emptied = 0usize;
         self.routes.retain(|_, dest| {
-            if dest.is_empty() {
-                // An existing tombstone. Collect it once it is older
-                // than the same window; until then it is the only
-                // record of the token its removal produced. It was
-                // already uncounted when it was emptied.
-                return dest
-                    .emptied_at
-                    .is_some_and(|at| at.elapsed() <= max_age.saturating_mul(2));
-            }
             let mut dropped_here = false;
             for slot in [&mut dest.ordinary, &mut dest.protected] {
                 if slot
@@ -1734,21 +1610,25 @@ impl RoutingTable {
                     dropped_here = true;
                 }
             }
+            if dest.is_empty() {
+                // Count only a destination THIS sweep emptied — a stray
+                // pre-existing empty entry (which the mutate path no
+                // longer produces) was already uncounted, and counting
+                // it again would drift `num_routes` below the table.
+                if dropped_here {
+                    emptied += 1;
+                }
+                return false;
+            }
             // A PARTIAL sweep is still a mutation: dropping one
             // candidate while the other survives changes the candidate
             // set and can change the effective route. Publishing a
             // fresh token here is what stops an observation taken
             // before the sweep from passing a conditional write after
             // it — the destination survives, so nothing else would
-            // have re-stamped it. An emptying sweep publishes one for
-            // the same reason; that it left no candidate behind does
-            // not make it less of a transition.
+            // have re-stamped it.
             if dropped_here {
                 dest.token = self.issue_token();
-            }
-            if dest.is_empty() {
-                dest.emptied_at = Some(Instant::now());
-                emptied += 1;
             }
             true
         });
@@ -1938,18 +1818,6 @@ impl RoutingTable {
                 e.updated_at = stale;
             }
         });
-    }
-
-    /// Test-only: age a TOMBSTONE by `by`, so its collection can be
-    /// exercised without sleeping.
-    #[cfg(test)]
-    fn backdate_emptied_at(&self, dest_id: u64, by: std::time::Duration) {
-        let stale = Instant::now().checked_sub(by).unwrap_or_else(Instant::now);
-        if let Some(mut d) = self.routes.get_mut(&dest_id) {
-            if d.emptied_at.is_some() {
-                d.emptied_at = Some(stale);
-            }
-        }
     }
 
     /// Test-only: the protected candidate, ignoring staleness.
@@ -2607,19 +2475,40 @@ mod tests {
 
         // Uncontended: the conditional write lands.
         assert!(table
-            .install_if_unchanged(DEST, observed, c, AlternateProvenance::Ordinary)
+            .install_metered_if_unchanged(DEST, observed, c, AlternateProvenance::Ordinary, 1)
             .is_some());
         assert_eq!(table.lookup(DEST), Some(c));
 
         // A stale observation cannot overwrite the newer state.
         assert!(table
-            .install_if_unchanged(DEST, observed, d, AlternateProvenance::Ordinary)
+            .install_metered_if_unchanged(DEST, observed, d, AlternateProvenance::Ordinary, 1)
             .is_none());
         assert_eq!(
             table.lookup(DEST),
             Some(c),
             "a write conditioned on state that no longer exists must skip",
         );
+    }
+
+    /// The absent-form conditional write is the same discipline with
+    /// "absent" as the observation: it installs only into a
+    /// destination with NO entry, and declines the moment anything
+    /// exists — presence means a newer writer has spoken.
+    #[test]
+    fn install_metered_if_absent_declines_once_anything_exists() {
+        let table = RoutingTable::new(0x1111);
+        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        const DEST: u64 = 0xD65;
+
+        assert!(table.install_metered_if_absent(DEST, b, AlternateProvenance::Protected(0xB), 1));
+        assert_eq!(table.lookup_authenticated(DEST), Some((0xB, b)));
+
+        assert!(
+            !table.install_metered_if_absent(DEST, c, AlternateProvenance::Ordinary, 1),
+            "presence — even of an unrelated candidate — must decline the write"
+        );
+        assert_eq!(table.lookup(DEST), Some(b));
     }
 
     /// Withdrawal removal is identity-qualified: a sender can remove
@@ -2812,57 +2701,62 @@ mod tests {
         assert_eq!(table.lookup(0x2222), None);
         assert_eq!(table.lookup(0x3333), Some(addr_b));
 
-        // Sweep drops the stale CANDIDATE and stops counting the
-        // destination.
+        // Sweep drops the stale CANDIDATE, and the emptied destination
+        // leaves the table with it — absence means "no current
+        // evidence", and nothing needs its token afterwards.
         let emptied = table.sweep_stale(Duration::from_millis(50));
         assert_eq!(emptied, 1);
         assert_eq!(table.route_count(), 1, "only the fresh destination counts");
         assert_eq!(table.lookup(0x2222), None);
         assert!(table.all_routes().iter().all(|(d, _)| *d != 0x2222));
-
-        // The record survives as a TOMBSTONE, carrying the token the
-        // emptying transition produced. That is what lets a conditional
-        // writer tell "I removed the last candidate" from "someone
-        // removed it, something re-created it, and someone removed it
-        // again" — absence carries no token to compare.
-        let tombstone = table
-            .observe(0x2222)
-            .expect("an emptied destination keeps its transition token");
-        assert!(!tombstone.reachable());
-        assert!(tombstone.ordinary.is_none() && tombstone.protected.is_none());
-        assert_ne!(tombstone.token, 0);
+        assert!(
+            table.observe(0x2222).is_none(),
+            "an emptied destination is gone, not an empty record"
+        );
+        assert!(table.routes.get(&0x2222).is_none());
         assert!(table.routes.get(&0x3333).is_some());
 
-        // A later sweep, once the tombstone itself has aged out,
-        // collects it.
-        table.backdate_emptied_at(0x2222, Duration::from_millis(500));
+        // A second sweep finds nothing new to empty.
         let emptied_again = table.sweep_stale(Duration::from_millis(50));
-        assert_eq!(emptied_again, 0, "a tombstone is not re-counted");
-        assert!(table.routes.get(&0x2222).is_none());
+        assert_eq!(emptied_again, 0);
     }
 
-    /// A destination that is removed, re-created, and removed again
-    /// must not report the same token both times. Recovery matches on
-    /// exactly this to decide whether the state it is undoing is still
-    /// its own.
+    /// Absence carries no token, and does not need one: a conditional
+    /// writer whose observation predates the removal declines against
+    /// the RE-CREATED destination too, because re-creation draws a
+    /// fresh never-reused token. The full absent → present → absent
+    /// cycle can never replay a stale compare-and-set.
     #[test]
-    fn an_absent_destination_keeps_a_unique_token_across_a_full_cycle() {
+    fn a_recreated_destination_refuses_a_pre_removal_observation() {
         let table = RoutingTable::new(0x1111);
         let addr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let newer: SocketAddr = "127.0.0.1:3000".parse().unwrap();
 
         table.add_route(0x2222, addr);
-        table.remove_ordinary_route(0x2222);
-        let first_absence = table.observe(0x2222).expect("tombstone").token;
+        let stale = table.observe(0x2222).expect("present");
 
-        table.add_route(0x2222, addr);
         table.remove_ordinary_route(0x2222);
-        let second_absence = table.observe(0x2222).expect("tombstone").token;
-
-        assert_ne!(
-            first_absence, second_absence,
-            "absent → present → absent must be distinguishable; equal tokens \
-             would let a stale writer's compare-and-set pass across a full cycle"
+        assert!(
+            table.observe(0x2222).is_none(),
+            "removing the last candidate removes the destination"
         );
+
+        // Re-created by fresh evidence: a new table-wide token.
+        table.add_route(0x2222, addr);
+        assert!(
+            table
+                .install_metered_if_unchanged(
+                    0x2222,
+                    stale,
+                    newer,
+                    AlternateProvenance::Ordinary,
+                    1
+                )
+                .is_none(),
+            "a stale observation must not pass against re-created state — \
+             the fresh token is what makes the ABA cycle visible"
+        );
+        assert_eq!(table.lookup(0x2222), Some(addr));
     }
 
     #[test]
@@ -2903,38 +2797,6 @@ mod tests {
 
         // Rolling back a non-existent route is a no-op, returns false.
         assert!(!table.remove_route_if_next_hop_is(0x4444, newer));
-    }
-
-    #[test]
-    fn test_lookup_alternate() {
-        let table = RoutingTable::new(0x1);
-        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-
-        // Empty table — no alternate.
-        assert!(table.lookup_alternate(0x4444, b).is_none());
-
-        // Install `(0x4444 → B)`. Excluding B returns None; excluding
-        // C returns B (the installed entry).
-        table.add_route(0x4444, b);
-        assert_eq!(table.lookup_alternate(0x4444, b), None);
-        assert_eq!(table.lookup_alternate(0x4444, c), Some(b));
-    }
-
-    #[test]
-    fn test_lookup_alternate_respects_staleness() {
-        use std::time::Duration;
-        let table = RoutingTable::new(0x1);
-        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
-        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-
-        table.add_route(0x4444, b);
-        // Backdate the entry so `updated_at.elapsed() > max_route_age`.
-        table.backdate(0x4444, Duration::from_millis(200));
-        table.set_max_route_age(Duration::from_millis(50));
-
-        // Even though the next_hop isn't excluded, staleness drops it.
-        assert!(table.lookup_alternate(0x4444, c).is_none());
     }
 
     // ========================================================================

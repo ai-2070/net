@@ -8577,14 +8577,13 @@ impl MeshNode {
             ProximityConfig::default(),
         ));
 
-        // Create reroute policy with proximity graph for topology-aware
-        // alternates. The reverse address index lets its installs bind
-        // the identity of a confirmed-direct next hop (D6) instead of
-        // stranding protected forwarding on an address-only entry.
+        // Create the reroute policy. It removes candidates a failure
+        // invalidates and installs a recovered peer's own route from
+        // its live session — replacement paths come from discovery
+        // (pingwaves, announcements, handshakes), never from failure
+        // handling, so the policy needs no graph or address index.
         let reroute_policy = Arc::new(
             ReroutePolicy::new(router.routing_table().clone(), peer_addrs.clone())
-                .with_proximity_graph(proximity_graph.clone())
-                .with_addr_to_node(addr_to_node.clone())
                 .with_peer_snapshot({
                     // ONE reading per peer, so a failure/recovery
                     // callback that outlives the session it concerns
@@ -9066,8 +9065,11 @@ impl MeshNode {
             // destination is live. So we withdraw on the failure, remove
             // the now-dead direct edge, and let a subsequent FRESH
             // pingwave re-advertise reachability if the peer really
-            // remains reachable through another path — `rp_failure` still
-            // reroutes us locally in the meantime.
+            // remains reachable through another path — `rp_failure`
+            // meanwhile removes our own invalidated candidates, so a
+            // surviving local alternate takes over immediately and a
+            // destination with none is truthfully unreachable until
+            // that re-advertisement.
             if enable_route_withdraw {
                 spawn_route_withdrawal_flood(
                     &route_withdraw_seq_failure,

@@ -3297,9 +3297,13 @@ async fn test_partition_asymmetric_three_node() {
 // Automatic rerouting
 // ============================================================================
 
-/// Auto-reroute: A sends to C via B. B dies. The reroute policy
-/// automatically updates the route to C directly. No manual
-/// add_route/remove_route calls — the failure detector triggers it.
+/// Failure-driven invalidation, end to end: A holds two candidates for
+/// C — the authenticated direct adjacency from the handshake and a
+/// manual ordinary candidate via B. B dies. The reroute policy removes
+/// the via-B candidate automatically (no manual add_route/remove_route
+/// calls — the failure detector triggers it), and the SURVIVING direct
+/// evidence carries traffic. Nothing is synthesized in the dead
+/// candidate's place.
 #[tokio::test]
 async fn test_mesh_node_auto_reroute() {
     let ports = find_ports(3).await;
@@ -3350,7 +3354,9 @@ async fn test_mesh_node_auto_reroute() {
     r1.unwrap();
     r2.unwrap();
 
-    // Route to C goes through B
+    // An ordinary candidate for C via B, beside the authenticated
+    // direct candidate the A↔C handshake installed. B's death must
+    // remove exactly the via-B one.
     node_a.router().add_route(nid_c, addr_b);
     node_b.router().add_route(nid_c, addr_c);
 
@@ -3359,34 +3365,44 @@ async fn test_mesh_node_auto_reroute() {
     node_c.start();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Verify reroute policy has no active reroutes
-    assert_eq!(node_a.reroute_policy().active_reroutes(), 0);
+    // No failure has removed anything yet.
+    use std::sync::atomic::Ordering as AtOrd;
+    assert_eq!(
+        node_a.reroute_policy().reroute_count.load(AtOrd::Relaxed),
+        0
+    );
 
-    // Phase 1: send via B — works
+    // Phase 1: send — works (both candidates present)
     let batch1 = make_batch(0, 5, "before_auto_reroute");
     node_a.send_routed(nid_c, &batch1).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let c_before = node_c.poll_shard(0, None, 100).await.unwrap();
-    assert!(!c_before.events.is_empty(), "C should receive via B");
+    assert!(!c_before.events.is_empty(), "C should receive");
 
     // Phase 2: kill B
     node_b.shutdown().await.unwrap();
 
-    // Wait for failure detection + automatic reroute
+    // Wait for failure detection + automatic invalidation
     // Heartbeat interval=200ms, timeout=600ms, miss_threshold=3
     // Detection should happen within ~2s
     tokio::time::sleep(Duration::from_millis(2500)).await;
     node_a.failure_detector().check_all();
 
-    // The reroute policy should have triggered automatically
+    // The reroute policy removed the via-B candidate automatically…
     assert!(
-        node_a.reroute_policy().active_reroutes() > 0,
-        "reroute policy should have rerouted after B's failure"
+        node_a.reroute_policy().reroute_count.load(AtOrd::Relaxed) > 0,
+        "the failure must have removed the candidates it invalidated"
+    );
+    // …and did NOT leave the dead hop effective.
+    assert_ne!(
+        node_a.router().routing_table().lookup(nid_c),
+        Some(addr_b),
+        "the via-B candidate must be gone after B's failure"
     );
 
-    // Phase 3: send again — should reach C via auto-rerouted path (direct)
-    // NO manual route update — the reroute policy did it automatically
+    // Phase 3: send again — reaches C over the SURVIVING direct
+    // evidence. NO manual route update, and nothing was synthesized.
     let batch2 = make_batch(0, 5, "after_auto_reroute");
     node_a.send_routed(nid_c, &batch2).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -3410,8 +3426,14 @@ async fn test_mesh_node_auto_reroute() {
     node_c.shutdown().await.unwrap();
 }
 
-/// Auto-reroute recovery: B dies → auto-reroute → B comes back →
-/// original route restored automatically.
+/// Recovery, end to end: B is partitioned away → the failure removes
+/// both B's own route and the downstream candidate riding through B →
+/// the partition heals → recovery installs the route to B ITSELF from
+/// the live session (a false-positive suspicion recovers on the SAME
+/// session, so no handshake reruns to do it). The downstream
+/// destination is NOT restored from memory — it returns only through
+/// discovery, and B advertises nothing here, so through-B it stays
+/// gone.
 #[tokio::test]
 async fn test_mesh_node_auto_reroute_recovery() {
     let ports = find_ports(3).await;
@@ -3456,15 +3478,12 @@ async fn test_mesh_node_auto_reroute_recovery() {
     r1.unwrap();
     r2.unwrap();
 
-    // Route to C goes through B. The A↔C handshake above installed an
-    // identity-bound direct route to C; drop it first, or the manual
-    // relay route cannot become effective — an ordinary candidate does
-    // not displace an authenticated adjacency at equal metric, and the
-    // reroute/recovery this test exercises would be invisible behind
-    // the direct path. (Recovery installs ORDINARY by design: a direct
-    // adjacency with B is not evidence that B advertised reachability
-    // to C, so recovery cannot re-manufacture a protected candidate
-    // here either.)
+    // A downstream candidate riding through B. The A↔C handshake above
+    // installed an identity-bound direct route to C; drop it first, or
+    // the manual via-B candidate cannot become effective — an ordinary
+    // candidate does not displace an authenticated adjacency at equal
+    // metric, and the invalidation this test exercises would be
+    // invisible behind the direct path.
     node_a
         .router()
         .routing_table()
@@ -3480,12 +3499,19 @@ async fn test_mesh_node_auto_reroute_recovery() {
     node_a.block_peer(addr_b);
     node_b.block_peer(addr_a);
 
-    // Wait for detection + auto-reroute
+    // Wait for detection + automatic invalidation
     tokio::time::sleep(Duration::from_millis(2500)).await;
     node_a.failure_detector().check_all();
+    use std::sync::atomic::Ordering as AtOrd;
     assert!(
-        node_a.reroute_policy().active_reroutes() > 0,
-        "should auto-reroute"
+        node_a.reroute_policy().reroute_count.load(AtOrd::Relaxed) > 0,
+        "the failure must have removed the candidates it invalidated"
+    );
+    assert_ne!(
+        node_a.router().routing_table().lookup(nid_c),
+        Some(addr_b),
+        "the via-B candidate must be gone while B is partitioned away \
+         (C may be re-learned DIRECT from its own pingwaves; never via B)"
     );
 
     // Heal partition — B sends heartbeats again → failure detector recovers B
@@ -3495,19 +3521,26 @@ async fn test_mesh_node_auto_reroute_recovery() {
     // Wait for recovery heartbeats
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // Recovery should restore the original route
+    // Recovery writes exactly one route: B's own, from the live
+    // session that just resumed heartbeating — no handshake reran to
+    // install it, so this is the recovery hook's doing (pingwave
+    // re-learning can land it too; either way it must be present and
+    // must be B's current address).
     assert_eq!(
-        node_a.reroute_policy().active_reroutes(),
-        0,
-        "original route should be restored after B recovers"
+        node_a.router().routing_table().lookup(nid_b),
+        Some(addr_b),
+        "the recovered peer's own route must be back"
     );
 
-    // Verify the route points back to B
-    let next_hop = node_a.router().routing_table().lookup(nid_c);
-    assert_eq!(
-        next_hop,
+    // The downstream destination is NOT restored from memory. B never
+    // advertised C (they hold no session in this topology), so a via-B
+    // route to C reappearing could only have come from restoration —
+    // which no longer exists.
+    assert_ne!(
+        node_a.router().routing_table().lookup(nid_c),
         Some(addr_b),
-        "route to C should be restored through B"
+        "recovery must not resurrect the downstream via-B candidate; \
+         that route returns only when discovery re-advertises it"
     );
 
     node_a.shutdown().await.unwrap();
@@ -4172,9 +4205,9 @@ async fn test_multi_hop_routing_pingwave_installs_indirect_route() {
 
 /// DV plan: after pingwave propagation, `ProximityGraph::path_to` must
 /// return a real multi-hop path — not `None`. Previously `edges` was
-/// never populated, so `path_to` always returned `None` and
-/// `ReroutePolicy` fell back to "any direct peer". This is the primary
-/// before/after for the DV plan: `path_to` is now usable.
+/// never populated, so `path_to` always returned `None`. This is the
+/// primary before/after for the DV plan: `path_to` is usable by the
+/// discovery/topology surfaces that consult the graph.
 #[tokio::test]
 async fn test_regression_dv_path_to_returns_multi_hop() {
     let ports = find_ports(3).await;

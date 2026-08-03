@@ -876,11 +876,6 @@ impl Mesh {
         self.node.proximity_graph().node_count()
     }
 
-    /// Number of active reroutes (routes using alternates after failure).
-    pub fn active_reroutes(&self) -> usize {
-        self.node.reroute_policy().active_reroutes()
-    }
-
     // ---- Streams ----
 
     /// Open (or look up) a logical stream to a peer. See
