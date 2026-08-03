@@ -490,6 +490,7 @@ jobs:
           --test error_kind_mirror
           --test event_pingwave
           --test route_withdraw
+          --test routed_transport_availability
 
   # --- Family B: NAT traversal + port mapping + RedEX ------------------
   integration-nat-redex:
