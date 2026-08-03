@@ -962,16 +962,11 @@ async fn publication_of_either_member_invalidates_captured_export_facts() {
     );
 
     // Republishing the SAME credential content still replaces the
-    // aggregate: identity, not content, is the stamp's fingerprint.
-    let before = f.vehicle_b.subnet_gateway_authority();
+    // aggregate snapshot the stamp fingerprints: identity, not
+    // content, is the invalidation trigger — so captured facts die.
     f.vehicle_b
         .install_subnet_gateway_credentials(&gateway_credentials_with_export(&f.vb_kp))
         .expect("republish identical credentials");
-    let after = f.vehicle_b.subnet_gateway_authority();
-    assert!(
-        !Arc::ptr_eq(&before, &after),
-        "a credential publication must replace the aggregate snapshot",
-    );
     assert!(
         !facts.is_current(&f.vehicle_b),
         "captured facts must be invalidated by a credential publication",
@@ -981,13 +976,7 @@ async fn publication_of_either_member_invalidates_captured_export_facts() {
     let facts =
         verify_subnet_export(&f.vehicle_b, &binding, &ClockSample::now()).expect("recapture");
     assert!(facts.is_current(&f.vehicle_b));
-    let before = f.vehicle_b.subnet_gateway_authority();
     declare_world_model_boundary(&f.vehicle_b, 0);
-    let after = f.vehicle_b.subnet_gateway_authority();
-    assert!(
-        !Arc::ptr_eq(&before, &after),
-        "a boundary publication must replace the aggregate snapshot",
-    );
     assert!(
         !facts.is_current(&f.vehicle_b),
         "captured facts must be invalidated by a boundary publication",
@@ -1049,23 +1038,150 @@ async fn concurrent_publication_loses_neither_authority_surface() {
     creds.await.expect("credential writer");
     bounds.await.expect("boundary writer");
 
-    let state = vehicle_b.subnet_gateway_authority();
-    let gateway = state
-        .gateway
-        .as_ref()
+    let gateway = vehicle_b
+        .subnet_gateway_contexts()
         .expect("gateway member survived the storm");
     assert_eq!(
         gateway.entries().len(),
         2,
         "the credential writer's FINAL two-entry set must survive the boundary storm",
     );
-    let boundaries = state
-        .boundaries
-        .as_ref()
+    let boundaries = vehicle_b
+        .subnet_boundaries()
         .expect("boundary member survived the storm");
     assert_eq!(
         boundaries.boundaries(),
         &[TopologySubnetId::new(WORLD_MODEL)],
         "the boundary writer's FINAL world-model set must survive the credential storm",
     );
+}
+
+/// Provider-side authority movement is never charged to the caller's
+/// failed-admission budget (D7). Vehicle B republishes IDENTICAL
+/// canonical credentials in a tight loop — content stays valid, so
+/// the only denial a call can hit is the §9.5 stability seam
+/// observing the aggregate identity move mid-verification
+/// (`AuthorityChanged`). The provider's budget here is deliberately
+/// TINY (2 failures, 1/s refill): if those denials were charged, the
+/// honest caller's bucket would exhaust within the storm and the
+/// post-storm call would be throttled `Unavailable` even under
+/// restored, stable authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_authority_churn_never_charges_the_caller() {
+    use net::adapter::net::behavior::org_admission_replay::AdmissionRateLimitConfig;
+
+    let vehicle_b = {
+        let mut cfg = base_config()
+            .with_subnet_authority(SubnetAuthorityConfig {
+                authority: vb_subnet_root().entity_id().clone(),
+                roots: vec![vb_subnet_root().entity_id().clone()],
+                maximum_grant_lifetime_secs: 7 * DAY,
+            })
+            .with_admission_rate_limit(AdmissionRateLimitConfig {
+                max_failed_per_peer: 2,
+                refill_per_sec: 1,
+                max_tracked_peers: 64,
+            });
+        cfg.subnet_attachment = Some(TopologySubnetId::new(VEHICLE));
+        Arc::new(
+            MeshNode::new(EntityKeypair::from_bytes(VEHICLE_B_SEED), cfg)
+                .await
+                .expect("MeshNode::new vehicle B"),
+        )
+    };
+    let vehicle_a = build_vehicle_a().await;
+    let vb_kp = EntityKeypair::from_bytes(VEHICLE_B_SEED);
+    bring_up(&vehicle_a, &vehicle_b).await;
+    let dir = install_bmw_authority(&vehicle_b, "limiter-churn");
+    let provider = vehicle_b.entity_id().clone();
+
+    declare_world_model_boundary(&vehicle_b, 0);
+    vehicle_b
+        .install_subnet_gateway_credentials(&gateway_credentials_with_export(&vb_kp))
+        .expect("install credentials");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = vehicle_b
+        .serve_rpc_subnet_exported(
+            SERVICE,
+            Arc::new(RoiHandler {
+                calls: calls.clone(),
+                attribution_ok: Arc::new(AtomicBool::new(false)),
+                proof_stripped: Arc::new(AtomicBool::new(false)),
+                expected_caller: vehicle_a.entity_id().clone(),
+                expected_org: bmw().org_id(),
+                expected_provider: provider.clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            world_model_binding(0),
+            Arc::new(|_| true),
+        )
+        .expect("serve");
+
+    // Storm: republish the SAME canonical set continuously while the
+    // caller issues valid calls. Every deny is provider-side identity
+    // movement; the caller's proofs are impeccable throughout.
+    let stop = Arc::new(AtomicBool::new(false));
+    let churn_stop = stop.clone();
+    let churn_b = vehicle_b.clone();
+    let churn_kp = vb_kp.clone();
+    let churn = tokio::task::spawn_blocking(move || {
+        while !churn_stop.load(Ordering::SeqCst) {
+            churn_b
+                .install_subnet_gateway_credentials(&gateway_credentials_with_export(&churn_kp))
+                .expect("churn republish");
+        }
+    });
+
+    let mut denials = 0usize;
+    let mut admits = 0usize;
+    for _ in 0..300 {
+        if denials >= 8 {
+            break;
+        }
+        match vehicle_a
+            .call(
+                vehicle_b.node_id(),
+                SERVICE,
+                Bytes::from_static(b"roi?"),
+                call_opts(Some(fleet_intent(provider.clone()))),
+            )
+            .await
+        {
+            Ok(_) => admits += 1,
+            Err(RpcError::ServerError { status: 0x0009, .. }) => denials += 1,
+            Err(other) => panic!("churn denial must be explicit, got {other:?}"),
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    churn.await.expect("churn writer");
+    assert!(
+        denials >= 8,
+        "the storm produced only {denials} stability denials in 300 calls — \
+         the witness needs the mid-verification window to be hit",
+    );
+
+    // The budget is 2; the caller just absorbed >= 8 provider-side
+    // denials. Under restored, stable authority the very next call
+    // must ADMIT — which it cannot if those denials were charged.
+    let reply = vehicle_a
+        .call(
+            vehicle_b.node_id(),
+            SERVICE,
+            Bytes::from_static(b"roi?"),
+            call_opts(Some(fleet_intent(provider.clone()))),
+        )
+        .await
+        .expect(
+            "a caller that only ever presented valid proofs must not be \
+             throttled by the provider's own authority churn",
+        );
+    assert_eq!(reply.body.as_ref(), b"roi-window");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        admits + 1,
+        "the handler ran exactly once per ADMITTED call — every churn \
+         denial left it dark",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

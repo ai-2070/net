@@ -1280,8 +1280,21 @@ async fn admit_and_dispatch_protected(
         Err(denied) => {
             // §6 — charge the failure. A denial is what an attacker produces;
             // a legitimate caller's admissions succeed and cost nothing.
-            mesh.admission_rate_limiter()
-                .on_failure(from_node, clock.monotonic);
+            //
+            // EXCEPT `AuthorityChanged` (D7): the §9.5 stability recheck
+            // failing means the PROVIDER's security view moved mid-
+            // verification — an org authority/floor swap, or a subnet
+            // gateway/boundary republication under a subnet-exported
+            // registration. That is provider-side state movement, not
+            // malformed caller behavior, and charging it would let the
+            // provider's own churn exhaust an honest caller's budget.
+            if !matches!(
+                denied,
+                crate::adapter::net::behavior::org_admission::AdmissionDenied::AuthorityChanged
+            ) {
+                mesh.admission_rate_limiter()
+                    .on_failure(from_node, clock.monotonic);
+            }
             tracing::warn!(service = service, reason = ?denied, "nrpc: org admission denied");
             emit_admission_denial(
                 mesh,

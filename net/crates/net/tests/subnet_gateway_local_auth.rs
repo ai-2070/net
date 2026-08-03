@@ -236,23 +236,64 @@ fn gateway_credential_subject_must_be_the_local_entity() {
     assert_eq!(err, SubnetAuthError::WrongSubject);
 }
 
-/// The local attachment must lie inside the credential's scope.
+/// The scope/attachment relation is CLAIM-dependent (D7):
+///
+/// - an ATTACH-bearing credential claims where the node BELONGS, so
+///   its scope must contain the local attachment;
+/// - a ROUTE/EXPORT-only credential is delegated forwarding
+///   authority, valid when scope and attachment lie on ONE hierarchy
+///   chain — either may contain the other — because a scope on an
+///   unrelated branch has no path through this gateway at all.
 #[test]
-fn local_attachment_must_be_inside_the_credential_scope() {
+fn scope_and_attachment_must_be_hierarchy_chained() {
     let root = kp(1);
     let local = kp(9);
-    let err = compile_gateway_context(
-        &grant(&root, &local, &[3, 7], SubnetRights::ROUTE),
-        local.entity_id(),
-        TopologySubnetId::new(&[4]),
-        &config(&root),
-        0,
-        &SubnetFloorRegistry::new(),
-        now(),
-        60,
-    )
-    .unwrap_err();
-    assert_eq!(err, SubnetAuthError::ScopeNotAncestor);
+    let compile = |scope: &[u8], attachment: &[u8], rights: SubnetRights| {
+        compile_gateway_context(
+            &grant(&root, &local, scope, rights),
+            local.entity_id(),
+            TopologySubnetId::new(attachment),
+            &config(&root),
+            0,
+            &SubnetFloorRegistry::new(),
+            now(),
+            60,
+        )
+    };
+
+    // Delegated DESCENDANT forwarding authority compiles: the plan's
+    // own provisioning shape (vehicle-attached gateway, EXPORT at
+    // world-model / ROUTE at perception).
+    compile(&[3, 7, 1], &[3], SubnetRights::EXPORT).expect("descendant EXPORT delegation compiles");
+    compile(&[3, 7], &[3], SubnetRights::ROUTE).expect("descendant ROUTE delegation compiles");
+    // Ancestor forwarding authority remains allowed, as before.
+    compile(&[3], &[3, 7], SubnetRights::ROUTE).expect("ancestor ROUTE compiles");
+
+    // An UNRELATED branch is not delegation — there is no path
+    // through this gateway for it.
+    assert_eq!(
+        compile(&[3, 7], &[4], SubnetRights::ROUTE).unwrap_err(),
+        SubnetAuthError::ScopeNotAncestor,
+        "unrelated-branch ROUTE must not compile",
+    );
+    assert_eq!(
+        compile(&[3, 7], &[4], SubnetRights::EXPORT).unwrap_err(),
+        SubnetAuthError::ScopeNotAncestor,
+        "unrelated-branch EXPORT must not compile",
+    );
+    // ATTACH claims placement: containment is required even where a
+    // forwarding-only credential would chain.
+    assert_eq!(
+        compile(&[3, 7], &[4], SubnetRights::ATTACH).unwrap_err(),
+        SubnetAuthError::ScopeNotAncestor,
+        "unrelated-branch ATTACH must not compile",
+    );
+    assert_eq!(
+        compile(&[3, 7], &[3], SubnetRights::ATTACH).unwrap_err(),
+        SubnetAuthError::ScopeNotAncestor,
+        "an ATTACH claim scoped to a DESCENDANT of the attachment is \
+         still a placement the node does not hold",
+    );
 }
 
 /// Entries dedupe by scope with a rights union, and the merged entry

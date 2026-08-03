@@ -295,7 +295,7 @@ pub fn verify_provider_authority(
 ///
 /// The stamp identity follows [`AdmissionStamp`]'s discipline over
 /// ONE fingerprint: `Arc::as_ptr` of the single published
-/// [`SubnetGatewayAuthorityState`] aggregate the decision was made
+/// `SubnetGatewayAuthorityState` aggregate the decision was made
 /// against, plus the two epoch integers. One pointer, deliberately —
 /// fingerprinting the gateway and boundary members separately let a
 /// replacement land BETWEEN the two loads of the stability check and

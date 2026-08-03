@@ -2640,13 +2640,13 @@ impl MeshNodeConfig {
 /// boundary publications cannot overwrite each other's member the
 /// way a naive load-modify-store would.
 #[derive(Debug)]
-pub struct SubnetGatewayAuthorityState {
+pub(crate) struct SubnetGatewayAuthorityState {
     /// This node's own compiled forwarding authority (S4A), or
     /// `None` when it holds none and forwards nothing protected.
-    pub gateway: Option<Arc<VerifiedGatewayContextSet>>,
+    pub(crate) gateway: Option<Arc<VerifiedGatewayContextSet>>,
     /// The declared protected boundaries (S4B), or `None` — which
     /// denies every protected transition and every subnet export.
-    pub boundaries: Option<Arc<SubnetBoundarySet>>,
+    pub(crate) boundaries: Option<Arc<SubnetBoundarySet>>,
 }
 
 /// How this node reaches a peer, and what the recorded address proves.
@@ -11731,14 +11731,16 @@ impl MeshNode {
     /// boundaries together, as the ONE coherent snapshot every
     /// consumer that needs both must read once. The aggregate's Arc
     /// identity changes on every publication of either member, which
-    /// is what the D7 admission stamp fingerprints.
-    pub fn subnet_gateway_authority(&self) -> Arc<SubnetGatewayAuthorityState> {
+    /// is what the D7 admission stamp fingerprints. Crate-internal:
+    /// the aggregate is a publication mechanism, not API surface —
+    /// external callers read the two public convenience accessors.
+    pub(crate) fn subnet_gateway_authority(&self) -> Arc<SubnetGatewayAuthorityState> {
         self.subnet_gateway_authority.load_full()
     }
 
     /// The declared boundary set, if any. Derived from ONE aggregate
     /// load; a caller that also needs the credential set must use
-    /// [`Self::subnet_gateway_authority`] instead of pairing the two
+    /// the crate-internal aggregate accessor instead of pairing the two
     /// convenience accessors — separate loads can tear.
     pub fn subnet_boundaries(&self) -> Option<Arc<SubnetBoundarySet>> {
         self.subnet_gateway_authority.load().boundaries.clone()

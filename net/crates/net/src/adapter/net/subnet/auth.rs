@@ -2042,18 +2042,30 @@ pub fn compile_gateway_context(
         now_secs,
         skew_secs,
     )?;
-    // The containment requirement applies to ATTACH: a credential that
-    // claims where this node BELONGS must cover where it actually
-    // attaches. A ROUTE- or EXPORT-only credential is DELEGATED
-    // forwarding authority over an exact scope — the plan's own
-    // provisioning ("EXPORT at world-model" on a vehicle-attached
-    // gateway) names a scope the gateway is not attached under, and
-    // the signed credential naming this gateway as subject is what
-    // authorizes that delegation. Demanding containment for those
-    // conflated "where I am" with "what I may forward" and made an
-    // exact descendant EXPORT grant impossible to compile.
-    if verified.rights.contains(SubnetRights::ATTACH)
-        && !verified.scope.is_ancestor_or_self_of(local_attachment)
+    // The scope/attachment relation differs by what the credential
+    // CLAIMS:
+    //
+    // - ATTACH says where this node BELONGS, so its scope must
+    //   contain the actual attachment — placement cannot be claimed
+    //   for a subtree the node is not in.
+    // - A ROUTE- or EXPORT-only credential is DELEGATED forwarding
+    //   authority. The plan's own provisioning ("EXPORT at
+    //   world-model" on a vehicle-attached gateway) names a scope
+    //   the gateway is not attached under, and the signed credential
+    //   naming this gateway as subject is what authorizes that
+    //   delegation — demanding containment there conflated "where I
+    //   am" with "what I may forward". But delegation is still
+    //   HIERARCHY-CHAINED: the scope and the attachment must lie on
+    //   one ancestor chain (either may contain the other). A scope
+    //   on an unrelated branch has no path through this gateway at
+    //   all, and compiling it would let a root mint forwarding
+    //   authority that placement can never exercise.
+    let scope_contains_attachment = verified.scope.is_ancestor_or_self_of(local_attachment);
+    if verified.rights.contains(SubnetRights::ATTACH) {
+        if !scope_contains_attachment {
+            return Err(SubnetAuthError::ScopeNotAncestor);
+        }
+    } else if !scope_contains_attachment && !local_attachment.is_ancestor_or_self_of(verified.scope)
     {
         return Err(SubnetAuthError::ScopeNotAncestor);
     }
