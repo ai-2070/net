@@ -154,12 +154,22 @@ impl ReroutePolicy {
             None => return, // unknown node, nothing to reroute
         };
 
-        // Find all routes whose next-hop is the failed peer
+        // Find all routes riding through the failed peer —
+        // identity-qualified: an identity-bound entry is affected iff
+        // it is bound to the failed peer (its address may even have
+        // drifted); a legacy entry is affected by the address match,
+        // as before. An address match alone must not reroute a route
+        // identity-bound to a DIFFERENT peer that happens to sit at a
+        // reused or shared address — that peer supplied its own route
+        // evidence and did not fail.
         let affected: Vec<u64> = self
             .routing_table
             .all_routes()
             .into_iter()
-            .filter(|(_, entry)| entry.next_hop == failed_addr)
+            .filter(|(_, entry)| match entry.next_hop_id {
+                Some(id) => id == failed_node_id,
+                None => entry.next_hop == failed_addr,
+            })
             .map(|(dest_id, _)| dest_id)
             .collect();
 
@@ -192,9 +202,14 @@ impl ReroutePolicy {
         // next_hop and corrupt recovery.
         let mut rerouted = 0usize;
         for dest_id in &affected {
+            // Identity-aware exclusion: an identity-bound route can be
+            // in `affected` via its binding while its ADDRESS drifted
+            // off `failed_addr` — the address-only exclusion would
+            // then hand the failed peer's own route back as its
+            // "alternate".
             let alt_addr = self
                 .routing_table
-                .lookup_alternate(*dest_id, failed_addr)
+                .lookup_alternate_excluding(*dest_id, failed_addr, failed_node_id)
                 .or_else(|| self.find_graph_alternate_for(failed_node_id, *dest_id))
                 .or_else(|| {
                     self.peer_addrs
@@ -660,5 +675,45 @@ mod tests {
         let bare = ReroutePolicy::new(rt.clone(), peers.clone());
         bare.install_route(0x7777, addr_c);
         assert_eq!(rt.lookup_authenticated(0x7777), None);
+    }
+
+    /// Failure invalidation is identity-qualified: when B fails at
+    /// address X, a route identity-bound to C that sits at X (address
+    /// reuse / shared relay) is NOT rerouted, a legacy entry at X is,
+    /// and a route bound to B is rerouted even from a DRIFTED address.
+    #[test]
+    fn failure_invalidation_never_affects_another_identity_at_a_reused_address() {
+        let rt = make_routing_table();
+        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let x: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let drifted: SocketAddr = "127.0.0.1:2999".parse().unwrap();
+        let addr_d: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        peers.insert(0x2222u64, x); // failing peer B, at X
+        peers.insert(0x4444u64, addr_d); // surviving alternate D
+
+        // Bound to C at B's address (reuse), legacy at B's address,
+        // and bound to B at an address that already drifted off X.
+        rt.add_authenticated_route_with_metric(0x5555, x, 0x3333, 3);
+        rt.add_route(0x6666, x);
+        rt.add_authenticated_route_with_metric(0x7777, drifted, 0x2222, 3);
+
+        let policy = ReroutePolicy::new(rt.clone(), peers);
+        policy.on_failure(0x2222);
+
+        assert_eq!(
+            rt.lookup_authenticated(0x5555),
+            Some((0x3333, x)),
+            "a route bound to another identity must survive B's failure"
+        );
+        assert_eq!(
+            rt.lookup(0x6666),
+            Some(addr_d),
+            "the legacy entry at B's address reroutes to the alternate"
+        );
+        assert_eq!(
+            rt.lookup(0x7777),
+            Some(addr_d),
+            "a route bound to B reroutes even though its address drifted"
+        );
     }
 }

@@ -483,6 +483,21 @@ impl Default for SharedHopReplayWindow {
     }
 }
 
+/// RAII release for [`SharedHopReplayWindow`]'s claim. Dropping —
+/// including on an unwind — publishes the fields (`Release`) and
+/// frees the claim, so a panicking caller can never leave the window
+/// permanently claimed and every later packet dropping as
+/// `Contended`.
+struct ReplayClaim<'a>(&'a SharedHopReplayWindow);
+
+impl Drop for ReplayClaim<'_> {
+    fn drop(&mut self) {
+        self.0
+            .claimed
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
 impl SharedHopReplayWindow {
     /// Empty window. `const`, so a session embeds it inline — no
     /// first-packet (or any-packet) allocation.
@@ -497,20 +512,36 @@ impl SharedHopReplayWindow {
         }
     }
 
+    /// One compare-exchange claim attempt. `None` means another
+    /// caller holds the window right now — the caller drops, it never
+    /// waits. Private: the tests use it directly to make contention
+    /// DETERMINISTIC (hold the claim, assert `admit` refuses) instead
+    /// of hoping a thread race manifests one.
+    fn try_claim(&self) -> Option<ReplayClaim<'_>> {
+        use core::sync::atomic::Ordering;
+        // `.then(..)`, NOT `.then_some(..)`: the guard must be
+        // constructed lazily, only on a WON claim. `then_some` builds
+        // its argument eagerly, and dropping that temporary on the
+        // lost-claim path would run `ReplayClaim::drop` — releasing
+        // the claim the OTHER caller legitimately holds. The
+        // deterministic contention witness below turns red on exactly
+        // that regression.
+        self.claimed
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+            .then(|| ReplayClaim(self))
+    }
+
     /// Admit `sequence` exactly once — [`HopReplayWindow::admit`]'s
     /// contract, plus [`RouteHopError::Contended`] for a concurrent
     /// second caller. The window state is unchanged on every error.
     pub fn admit(&self, sequence: u64) -> Result<(), RouteHopError> {
         use core::sync::atomic::Ordering;
-        if self
-            .claimed
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        let Some(claim) = self.try_claim() else {
             return Err(RouteHopError::Contended);
-        }
-        // Exclusive until the release below. Run the one tested
-        // admission algorithm on a local copy rather than a second
+        };
+        // Exclusive until `claim` drops. Run the one tested admission
+        // algorithm on a local copy rather than a second
         // implementation on the atomics.
         let mut window = HopReplayWindow {
             highest: self.highest.load(Ordering::Relaxed),
@@ -530,7 +561,7 @@ impl SharedHopReplayWindow {
                 .store((window.seen >> 64) as u64, Ordering::Relaxed);
             self.started.store(window.started, Ordering::Relaxed);
         }
-        self.claimed.store(false, Ordering::Release);
+        drop(claim);
         result
     }
 }
@@ -867,6 +898,34 @@ mod tests {
                 "step {i} (seq {seq}): the shared window must give the plain window's verdict",
             );
         }
+    }
+
+    /// Contention witnessed DETERMINISTICALLY — no thread race to
+    /// hope for: while one caller holds the claim, `admit` refuses
+    /// with `Contended` (mutating nothing, judging nothing — even a
+    /// would-be duplicate is refused as contended, not as replay);
+    /// the moment the claim drops (RAII), the window is free and its
+    /// state is exactly what it was before the contended interval.
+    #[test]
+    fn a_held_claim_makes_admission_refuse_contended() {
+        let w = SharedHopReplayWindow::new();
+        assert!(w.admit(1).is_ok());
+
+        let claim = w.try_claim().expect("uncontended claim succeeds");
+        assert_eq!(w.admit(2).unwrap_err(), RouteHopError::Contended);
+        assert_eq!(
+            w.admit(1).unwrap_err(),
+            RouteHopError::Contended,
+            "a contended caller gets no replay verdict at all",
+        );
+        drop(claim);
+
+        assert!(w.admit(2).is_ok(), "the dropped claim frees the window");
+        assert_eq!(
+            w.admit(1).unwrap_err(),
+            RouteHopError::Replay,
+            "state survived the contended interval untouched",
+        );
     }
 
     /// Concurrent misuse fails CLOSED. Hammer one shared window from

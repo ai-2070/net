@@ -632,12 +632,22 @@ impl RoutingTable {
     /// replace the entry that could carry the identity.
     ///
     /// What an equal-or-worse arrival can never do is *rewrite* an
-    /// installed identity: a peer announcing the same metric from the
-    /// same address must not steal an existing binding
-    /// (`Some(other) != Some(next_hop_id)` leaves the entry exactly as
-    /// it was, and deliberately does NOT refresh it — a conflicting
-    /// claim on the same address is evidence of address reuse, not of
-    /// reachability, so the conflicted entry is left to age out).
+    /// installed identity — or *refresh* a route it does not carry.
+    /// Freshness belongs to the installed adjacent identity/path:
+    ///
+    /// - same address + same identity → refresh;
+    /// - same address + no installed identity → upgrade + refresh;
+    /// - same address + conflicting identity → no rewrite, no refresh
+    ///   (a conflicting claim is evidence of address reuse, not of
+    ///   reachability — the conflicted entry is left to age out);
+    /// - different next hop → no rewrite, **no refresh**. Another
+    ///   authenticated peer proving an alternate path exists is not
+    ///   evidence the installed path is alive; letting it renew the
+    ///   installed binding would pin a blackholed protected route
+    ///   fresh forever while the table refuses to switch to the
+    ///   alternate. (The legacy writer's refresh rule is unchanged —
+    ///   legacy entries carry no protected traffic. A future
+    ///   multi-route table may retain the alternate separately.)
     pub fn add_authenticated_route_with_metric(
         &self,
         dest_id: u64,
@@ -679,14 +689,11 @@ impl RoutingTable {
                             // both the rewrite and the refresh.
                             Some(_) => {}
                         }
-                    } else {
-                        // Different next hop at equal/worse metric —
-                        // keep the installed route, refresh freshness:
-                        // the alternate path's arrival is evidence the
-                        // destination is still reachable (same rule as
-                        // `add_route_with_metric`).
-                        e.updated_at = Instant::now();
                     }
+                    // Different next hop at equal/worse metric: keep
+                    // the installed route AND its age. See the doc
+                    // comment — alternate reachability is not
+                    // freshness evidence for the installed path.
                 }
             }
         }
@@ -700,11 +707,54 @@ impl RoutingTable {
         })
     }
 
+    /// Remove the route for `dest_id` only if it rides through the
+    /// authenticated sender `identity` at `next_hop` — the
+    /// identity-qualified form route WITHDRAWAL must use.
+    ///
+    /// An address match alone is not ownership: under address reuse
+    /// (or a shared relay address) peer B's withdrawal arriving from
+    /// address X must not tear down a route identity-bound to peer C
+    /// that happens to sit at X. The rule:
+    ///
+    /// - identity-bound entry → removed only when the binding IS the
+    ///   sender (`next_hop_id == Some(identity)`) and the address
+    ///   matches;
+    /// - legacy entry → removed on the address match, as before (it
+    ///   carries no identity to protect).
+    ///
+    /// Returns `true` if the entry was removed.
+    pub fn remove_route_if_from_hop(
+        &self,
+        dest_id: u64,
+        next_hop: SocketAddr,
+        identity: u64,
+    ) -> bool {
+        let removed = self
+            .routes
+            .remove_if(&dest_id, |_, entry| {
+                entry.next_hop == next_hop
+                    && match entry.next_hop_id {
+                        Some(id) => id == identity,
+                        None => true,
+                    }
+            })
+            .is_some();
+        if removed {
+            self.num_routes.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
+    }
+
     /// Remove the route for `dest_id` only if its current `next_hop`
     /// still equals `expected_next_hop`. Used by rollback paths that
     /// registered a specific route and need to undo it without clobbering
     /// a newer concurrently-written entry. Returns `true` if the entry
     /// was removed.
+    ///
+    /// Address-only: correct for undoing a write THIS node just made
+    /// (the caller knows exactly what it installed). Withdrawal — a
+    /// claim from a REMOTE sender — must use
+    /// [`Self::remove_route_if_from_hop`] instead.
     pub fn remove_route_if_next_hop_is(&self, dest_id: u64, expected_next_hop: SocketAddr) -> bool {
         let removed = self
             .routes
@@ -730,11 +780,16 @@ impl RoutingTable {
     /// [`Self::remove_route_if_next_hop_is`] (used by the RT-5 route
     /// withdrawal receive path) silently miss those entries.
     ///
-    /// Matching is identity-first, address-second:
+    /// An entry moves only when the caller owns BOTH halves of it:
     ///
-    /// - An entry **bound to `identity`** follows the identity to
-    ///   `new`, exactly as [`RouteEntry::rebind_addr`] would — even if
-    ///   its recorded address had already drifted from `old`.
+    /// - An entry **bound to `identity` and still at `old`** follows
+    ///   the identity to `new`. Requiring the expected old address is
+    ///   what makes a STALE migration harmless: two accepted
+    ///   re-handshakes for the same peer can serialize their peer-map
+    ///   replacement but finish these migrations in the opposite
+    ///   order, and identity equality alone would let the older
+    ///   `A→B` roll back the newer `A→C`. The older caller's routes
+    ///   no longer point at `A`, so it matches nothing and returns 0.
     /// - An entry **bound to a different identity** is never touched,
     ///   even when its `next_hop` equals `old`: the address may have
     ///   been reused, and an address match must not retarget a route
@@ -748,8 +803,7 @@ impl RoutingTable {
         let mut migrated = 0;
         for mut entry in self.routes.iter_mut() {
             let moves = match entry.next_hop_id {
-                Some(id) if id == identity => entry.next_hop != new,
-                Some(_) => false,
+                Some(id) => id == identity && entry.next_hop == old,
                 None => entry.next_hop == old,
             };
             if moves {
@@ -840,6 +894,29 @@ impl RoutingTable {
             .get(&dest_id)
             .filter(|r| {
                 r.active && r.updated_at.elapsed() <= max_age && r.next_hop != exclude_next_hop
+            })
+            .map(|r| r.next_hop)
+    }
+
+    /// [`Self::lookup_alternate`] with an identity exclusion: refuses
+    /// the entry when it is identity-bound to `exclude_identity`, even
+    /// at a different address. Failure rerouting needs this — a failed
+    /// peer's route whose address drifted off the excluded one must
+    /// not be offered as its own alternate.
+    pub fn lookup_alternate_excluding(
+        &self,
+        dest_id: u64,
+        exclude_next_hop: SocketAddr,
+        exclude_identity: u64,
+    ) -> Option<SocketAddr> {
+        let max_age = self.max_route_age();
+        self.routes
+            .get(&dest_id)
+            .filter(|r| {
+                r.active
+                    && r.updated_at.elapsed() <= max_age
+                    && r.next_hop != exclude_next_hop
+                    && r.next_hop_id != Some(exclude_identity)
             })
             .map(|r| r.next_hop)
     }
@@ -1460,6 +1537,107 @@ mod tests {
             "another identity's binding must not be retargeted by an address match"
         );
         assert_eq!(table.lookup(0xCCC), Some(new), "legacy migrates by address");
+    }
+
+    /// A STALE migration cannot roll a route backward: after a newer
+    /// migration moved the peer's routes A→C, a delayed older A→B
+    /// migration for the SAME identity matches nothing (its expected
+    /// old address is gone) and returns 0. `install_peer` releases
+    /// the peer-map entry before migrating routes, so two accepted
+    /// re-handshakes can finish their migrations in the opposite
+    /// order — this is what makes that harmless.
+    #[test]
+    fn migrate_next_hop_stale_caller_cannot_roll_back() {
+        let table = RoutingTable::new(0x1111);
+        let a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        const P: u64 = 0x22;
+
+        table.add_authenticated_route_with_metric(0xAAA, a, P, 3);
+        // Newer migration lands first: A → C.
+        assert_eq!(table.migrate_next_hop(a, c, P), 1);
+        assert_eq!(table.lookup_authenticated(0xAAA), Some((P, c)));
+        // Older migration finishes late: A → B. Its expected old
+        // address no longer matches anything — nothing moves.
+        assert_eq!(table.migrate_next_hop(a, b, P), 0);
+        assert_eq!(
+            table.lookup_authenticated(0xAAA),
+            Some((P, c)),
+            "a stale same-identity migration must not roll the route backward"
+        );
+    }
+
+    /// Freshness belongs to the installed path: an equal-metric
+    /// authenticated arrival through a DIFFERENT next hop neither
+    /// rewrites nor refreshes the installed (stale) route, so a dead
+    /// protected route cannot be pinned fresh by an alternate peer's
+    /// evidence and ages out normally.
+    #[test]
+    fn another_peer_cannot_refresh_the_installed_route() {
+        use std::time::Duration;
+        let table = RoutingTable::new(0x1111);
+        let via_a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        const A: u64 = 0xA;
+        const B: u64 = 0xB;
+        const DEST: u64 = 0xD60;
+
+        table.add_authenticated_route_with_metric(DEST, via_a, A, 3);
+        // Backdate the installed route so it is stale. `checked_sub`
+        // for the same Windows-uptime reason as the sweep test above.
+        let stale_ts = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .expect("test host uptime should exceed 200ms");
+        table.routes.get_mut(&DEST).unwrap().updated_at = stale_ts;
+        table.set_max_route_age(Duration::from_millis(50));
+        assert_eq!(table.lookup(DEST), None, "precondition: stale");
+
+        // Equal-metric evidence through B must not renew A's binding.
+        table.add_authenticated_route_with_metric(DEST, via_b, B, 3);
+        assert_eq!(
+            table.lookup(DEST),
+            None,
+            "an alternate path's arrival must not refresh the installed route"
+        );
+        // The binding itself also survived untouched — stale, not
+        // rewritten to B.
+        let e = table.routes.get(&DEST).unwrap();
+        assert_eq!(e.next_hop_id, Some(A));
+        assert_eq!(e.next_hop, via_a);
+    }
+
+    /// Withdrawal removal is identity-qualified: a sender can remove
+    /// its own bound route or a legacy entry at its address — never a
+    /// route identity-bound to another peer at a reused address.
+    #[test]
+    fn remove_route_if_from_hop_is_identity_qualified() {
+        let table = RoutingTable::new(0x1111);
+        let x: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let y: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        const B: u64 = 0xB;
+        const C: u64 = 0xC;
+
+        // Bound to C at address X: B's withdrawal from X must miss.
+        table.add_authenticated_route_with_metric(0xAAA, x, C, 3);
+        assert!(
+            !table.remove_route_if_from_hop(0xAAA, x, B),
+            "a withdrawal must not remove a route bound to another identity"
+        );
+        assert_eq!(table.lookup_authenticated(0xAAA), Some((C, x)));
+        // C's own withdrawal removes it.
+        assert!(table.remove_route_if_from_hop(0xAAA, x, C));
+        assert_eq!(table.lookup(0xAAA), None);
+
+        // Legacy entry at X: removable by any sender at that address
+        // (there is no identity to protect), as before.
+        table.add_route(0xBBB, x);
+        assert!(table.remove_route_if_from_hop(0xBBB, x, B));
+
+        // Wrong address never matches, bound or not.
+        table.add_authenticated_route_with_metric(0xCCC, x, B, 3);
+        assert!(!table.remove_route_if_from_hop(0xCCC, y, B));
+        assert_eq!(table.lookup_authenticated(0xCCC), Some((B, x)));
     }
 
     /// The learned-route writer contract: strictly-better replaces,

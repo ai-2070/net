@@ -13752,7 +13752,13 @@ impl MeshNode {
             }
         };
 
-        self.router.add_direct_route(peer_node_id, peer_addr);
+        // Route installation is MODE-SCOPED — see the match below. A
+        // single unconditional `add_direct_route` here was the
+        // initiator-side false adjacency: `connect_via` installs the
+        // REMOTE endpoint under the RELAY's address, and binding that
+        // pair as an authenticated adjacency made protected forwarding
+        // select the endpoint's end-to-end session while aiming the
+        // envelope at the relay, which cannot authenticate it.
         self.peer_addrs.insert(peer_node_id, peer_addr);
         // Old direct address of a re-handshaking peer, captured
         // before `displaced` is consumed below (RT-5: address
@@ -13790,6 +13796,10 @@ impl MeshNode {
         self.route_withdraw_gate.forget_sender(peer_node_id);
         match addr_mode {
             AddrInstallMode::DirectOverwrite => {
+                // A direct handshake IS an authenticated adjacency:
+                // destination and next hop are the same session peer,
+                // so the route carries `next_hop_id` by construction.
+                self.router.add_direct_route(peer_node_id, peer_addr);
                 // Re-handshake from a NEW direct address (NAT
                 // rebind): repoint any multi-hop routes still
                 // carrying this peer's previous address, and drop
@@ -13797,8 +13807,7 @@ impl MeshNode {
                 // pingwave refreshes never rewrite an installed
                 // `next_hop`, so without this migration those routes
                 // keep the old address forever and address-keyed ops
-                // — notably the RT-5 withdrawal match
-                // (`remove_route_if_next_hop_is`) — silently miss
+                // — notably the RT-5 withdrawal match — silently miss
                 // them, degrading withdrawals to age-out for this
                 // peer (RT-5 review Finding 6).
                 if let Some(old_addr) = displaced_addr {
@@ -13815,6 +13824,16 @@ impl MeshNode {
                 self.addr_to_node.insert(peer_addr, peer_node_id);
             }
             AddrInstallMode::RoutedPreserve => {
+                // A routed end-to-end session is NOT an authenticated
+                // adjacent route-hop session: the recorded address is
+                // the immediate relay's, and the session authenticates
+                // the far endpoint, not the relay. Install a LEGACY
+                // route only — ordinary traffic reaches the endpoint
+                // via the relay, while `lookup_authenticated` refuses
+                // to resolve it. The entry may become protected-capable
+                // later only through an authenticated learning path
+                // that binds the actual adjacent relay's identity.
+                self.router.add_route(peer_node_id, peer_addr);
                 self.addr_to_node.entry(peer_addr).or_insert(peer_node_id);
             }
         }
@@ -15858,33 +15877,31 @@ impl MeshNode {
                 // edge) that a withdrawal just removed (RT-5 review). We
                 // install/refresh the route only for an ACCEPTED
                 // pingwave, and forward only an accepted-and-live one.
-                // D6 identity for the learned route. The reverse index
-                // nominated `from_node_id`, but that map is mutable and
-                // an address can be reused, so the nomination alone is
-                // not an identity. Bind `next_hop_id` only when the
-                // peer registry's CURRENT address for that identity
-                // agrees with `source` — the same forward confirmation
-                // the protected relay applies at egress. On
-                // disagreement the route still installs for legacy
-                // forwarding, but carries no identity, so protected
-                // forwarding refuses to resolve it rather than
-                // resolving it to whoever answers at the address.
-                let sender_confirmed = ctx
-                    .peers
-                    .get(&from_node_id)
-                    .is_some_and(|p| p.value().addr == source);
+                // A pingwave installs a LEGACY route, never an
+                // identity-bound one. Pingwaves are unauthenticated
+                // UDP datagrams: resolving `from_node_id` through the
+                // reverse index and even cross-checking the peer
+                // registry's current address is two ADDRESS registries
+                // agreeing — no authenticated session carried or
+                // verified this datagram. A spoofed packet using a
+                // registered peer's source tuple could otherwise
+                // install a better route identity-bound to that
+                // innocent peer, poisoning protected routing toward a
+                // hop that supplied no route evidence. D6 requires the
+                // bound identity to come from the authenticated
+                // adjacent sender; until pingwaves are themselves
+                // adjacent-session authenticated, the route they
+                // install stays address-only — usable by ordinary
+                // routing, unresolvable by protected forwarding. The
+                // authenticated learning path for the same edge is the
+                // capability announcement, whose sender is the
+                // AEAD-resolved session peer; its equal-metric
+                // same-address install upgrades this legacy entry in
+                // place (`add_authenticated_route_with_metric`).
                 let install_learned_route = || {
-                    let table = ctx.router.routing_table();
-                    if sender_confirmed {
-                        table.add_authenticated_route_with_metric(
-                            origin_nid,
-                            source,
-                            from_node_id,
-                            metric,
-                        );
-                    } else {
-                        table.add_route_with_metric(origin_nid, source, metric);
-                    }
+                    ctx.router
+                        .routing_table()
+                        .add_route_with_metric(origin_nid, source, metric);
                 };
                 let from_graph_id = node_id_to_graph_id(from_node_id);
                 let admission = ctx
@@ -21136,14 +21153,18 @@ impl MeshNode {
         // elsewhere.
         ctx.proximity_graph
             .remove_edge(node_id_to_graph_id(from_node), node_id_to_graph_id(dest));
-        // Drop exactly (dest, next_hop == sender). If our route to
-        // dest goes elsewhere, nothing changed for us and the
-        // cascade stops here — that scoping is what makes the
-        // whole scheme loop-safe.
+        // Drop exactly (dest, next_hop == sender) — IDENTITY-qualified:
+        // the sender may only withdraw a route that is bound to it (or
+        // a legacy entry at its address); an identity-bound route
+        // belonging to another peer that happens to sit at a reused or
+        // shared address is not the sender's to tear down. If our
+        // route to dest goes elsewhere, nothing changed for us and the
+        // cascade stops here — that scoping is what makes the whole
+        // scheme loop-safe.
         let route_dropped = ctx
             .router
             .routing_table()
-            .remove_route_if_next_hop_is(dest, via_addr);
+            .remove_route_if_from_hop(dest, via_addr, from_node);
         // SI-5 (§4.8): losing our route toward `dest` expires every
         // observation we hold from it — continuity is a claim about
         // the live stream's path, and the stream now rides an
@@ -34000,6 +34021,226 @@ mod heartbeat_aead_tests {
         assert!(
             !node.addr_to_node.contains_key(&old_addr),
             "C4: the displaced addr's stale reverse mapping must be removed",
+        );
+    }
+
+    /// A routed (`connect_via`) install is NOT an authenticated
+    /// adjacency. The session authenticates the far endpoint while
+    /// the recorded address is the immediate relay's, so the route it
+    /// installs must be LEGACY: ordinary lookup resolves the relay
+    /// address, `lookup_authenticated` resolves nothing. Binding the
+    /// pair (the pre-fix behavior — `install_peer` called
+    /// `add_direct_route` unconditionally before inspecting the mode)
+    /// made protected forwarding select the endpoint's end-to-end
+    /// session and aim the envelope at the relay, which cannot
+    /// authenticate it.
+    #[tokio::test]
+    async fn a_routed_install_is_not_an_authenticated_adjacency() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x2Eu8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let dest_id = 0x0DE5_7000u64;
+        let relay_addr: SocketAddr = "10.8.8.8:9100".parse().unwrap();
+        let (keys, _) = make_session_keys();
+        node.install_peer(dest_id, relay_addr, keys, AddrInstallMode::RoutedPreserve);
+
+        assert_eq!(
+            node.router.routing_table().lookup(dest_id),
+            Some(relay_addr),
+            "ordinary routing reaches the endpoint via the relay",
+        );
+        assert_eq!(
+            node.router.routing_table().lookup_authenticated(dest_id),
+            None,
+            "a routed end-to-end session must not resolve as an authenticated next hop",
+        );
+        assert!(node.authenticated_next_hop(dest_id).is_none());
+
+        // The inverse of the inverse: a DIRECT install still binds.
+        let direct_id = 0x0D12_EC70u64;
+        let direct_addr: SocketAddr = "10.8.8.9:9100".parse().unwrap();
+        let (keys, _) = make_session_keys();
+        node.install_peer(
+            direct_id,
+            direct_addr,
+            keys,
+            AddrInstallMode::DirectOverwrite,
+        );
+        assert_eq!(
+            node.router.routing_table().lookup_authenticated(direct_id),
+            Some((direct_id, direct_addr)),
+            "a direct handshake is identity-qualified by construction",
+        );
+    }
+
+    /// The consistent-move seam refuses — with ZERO mutation — when
+    /// the peer's direct route is absent, legacy, or bound to another
+    /// identity. A refused move must leave the peer record, both
+    /// address indexes, and the routing table exactly as they were.
+    #[tokio::test]
+    async fn set_peer_addr_for_test_refuses_without_tearing_state() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x2Fu8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0x5EA1_0001u64;
+        let home: SocketAddr = "10.6.6.6:9100".parse().unwrap();
+        let moved: SocketAddr = "10.7.7.7:7100".parse().unwrap();
+        let (keys, _) = make_session_keys();
+        node.install_peer(peer_id, home, keys, AddrInstallMode::DirectOverwrite);
+
+        let assert_untouched = |case: &str| {
+            assert_eq!(
+                node.peers.get(&peer_id).map(|p| p.value().addr),
+                Some(home),
+                "{case}: PeerInfo.addr must be untouched",
+            );
+            assert_eq!(
+                node.peer_addrs.get(&peer_id).map(|e| *e),
+                Some(home),
+                "{case}: peer_addrs must be untouched",
+            );
+            assert_eq!(
+                node.addr_to_node.get(&home).map(|e| *e),
+                Some(peer_id),
+                "{case}: the home reverse-index entry must be untouched",
+            );
+            assert!(
+                !node.addr_to_node.contains_key(&moved),
+                "{case}: the target address must not be indexed",
+            );
+        };
+
+        // Absent direct route.
+        node.router.routing_table().remove_route(peer_id);
+        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert_untouched("absent route");
+
+        // Legacy (identity-less) direct route.
+        node.router.add_route(peer_id, home);
+        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert_untouched("legacy route");
+        assert_eq!(
+            node.router.routing_table().lookup(peer_id),
+            Some(home),
+            "legacy route: the entry itself must be untouched",
+        );
+
+        // Route bound to a DIFFERENT identity.
+        const OTHER: u64 = 0x07_14u64;
+        node.router.routing_table().remove_route(peer_id);
+        node.router
+            .routing_table()
+            .add_authenticated_route(peer_id, home, OTHER);
+        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert_untouched("conflicting identity");
+        assert_eq!(
+            node.router.routing_table().lookup_authenticated(peer_id),
+            Some((OTHER, home)),
+            "conflicting identity: the binding must be untouched",
+        );
+    }
+
+    /// A successful consistent move evicts the OLD reverse-index
+    /// entry only when this peer still owns it: a concurrently reused
+    /// address that has been re-indexed to another owner keeps that
+    /// owner's mapping.
+    #[tokio::test]
+    async fn set_peer_addr_for_test_leaves_a_reused_old_address_with_its_owner() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x30u8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0x5EA1_0002u64;
+        let home: SocketAddr = "10.6.6.7:9100".parse().unwrap();
+        let moved: SocketAddr = "10.7.7.8:7100".parse().unwrap();
+        let (keys, _) = make_session_keys();
+        node.install_peer(peer_id, home, keys, AddrInstallMode::DirectOverwrite);
+
+        // Concurrent reuse: another peer now owns the home address in
+        // the reverse index.
+        const OTHER: u64 = 0x07_15u64;
+        node.addr_to_node.insert(home, OTHER);
+
+        assert!(node.set_peer_addr_for_test(peer_id, moved));
+        assert_eq!(
+            node.addr_to_node.get(&home).map(|e| *e),
+            Some(OTHER),
+            "the reused old address must stay indexed to its new owner",
+        );
+        assert_eq!(node.addr_to_node.get(&moved).map(|e| *e), Some(peer_id));
+        assert_eq!(
+            node.peers.get(&peer_id).map(|p| p.value().addr),
+            Some(moved),
+        );
+        assert_eq!(
+            node.router.routing_table().lookup_authenticated(peer_id),
+            Some((peer_id, moved)),
+            "the authenticated route follows the identity to the new address",
+        );
+    }
+
+    /// A forged tag must not burn a replay slot: after a bad-tag
+    /// envelope at some sequence is rejected, the legitimate envelope
+    /// carrying the SAME sequence still admits exactly once. MAC
+    /// verification runs before replay admission, so an attacker who
+    /// can flip bytes cannot deny the real packet its slot.
+    #[test]
+    fn a_bad_tag_does_not_burn_the_replay_sequence() {
+        let (init_keys, resp_keys) = make_session_keys();
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let sender = NetSession::new(init_keys, addr, 4, false);
+        let receiver = NetSession::new(resp_keys, addr, 4, false);
+
+        let header = crate::adapter::net::route::RoutingHeader::new(0xD57, 0x51C, 4);
+        let envelope = sender.seal_route_hop(&header, b"inner-bytes-inner-bytes");
+
+        let mut tampered = envelope.clone();
+        *tampered.last_mut().expect("non-empty") ^= 1;
+        assert!(
+            receiver.open_route_hop(&tampered).is_err(),
+            "the tampered envelope must be rejected",
+        );
+        assert!(
+            receiver.open_route_hop(&envelope).is_ok(),
+            "the legitimate envelope's sequence must still admit after the forgery",
+        );
+        assert!(receiver.open_route_hop(&envelope).is_err(), "…exactly once",);
+    }
+
+    /// A fresh session incarnation starts a fresh replay window: a
+    /// hop sequence the OLD incarnation had seen admits again under
+    /// the new one, because replay state belongs to the session, not
+    /// the edge.
+    #[test]
+    fn a_new_session_incarnation_starts_a_fresh_replay_window() {
+        let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let header = crate::adapter::net::route::RoutingHeader::new(0xD57, 0x51C, 4);
+
+        let (init_keys, resp_keys) = make_session_keys();
+        let old_sender = NetSession::new(init_keys, addr, 4, false);
+        let old_receiver = NetSession::new(resp_keys, addr, 4, false);
+        let env = old_sender.seal_route_hop(&header, b"first-incarnation");
+        assert!(old_receiver.open_route_hop(&env).is_ok());
+        assert!(old_receiver.open_route_hop(&env).is_err(), "seen: seq 0");
+
+        // Re-handshake: a new incarnation of the same edge. Its first
+        // envelope carries hop sequence 0 again — the sequence the
+        // old incarnation had already seen — and must admit.
+        let (init_keys, resp_keys) = make_session_keys();
+        let new_sender = NetSession::new(init_keys, addr, 4, false);
+        let new_receiver = NetSession::new(resp_keys, addr, 4, false);
+        let env = new_sender.seal_route_hop(&header, b"second-incarnation");
+        assert!(
+            new_receiver.open_route_hop(&env).is_ok(),
+            "a fresh incarnation must not inherit the old replay window",
         );
     }
 

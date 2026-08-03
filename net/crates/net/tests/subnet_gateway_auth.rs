@@ -743,25 +743,28 @@ async fn a_valid_hop_without_route_authority_is_not_forwarded() {
     );
 }
 
-/// The LEARNED-route positive witness. A protected hop whose
-/// destination is NOT adjacent to the gateway rides a route the
-/// gateway learned through production propagation — never one this
-/// test installed by hand — and is forwarded to the authenticated
-/// ADJACENT next hop with the remote destination untouched.
+/// The learned-route FIRST-HOP production witness — one credentialed
+/// gateway, its first protected relay. (The live two-gateway flow is
+/// the pair of tests below; this one deliberately proves less: that a
+/// route learned through production propagation selects the
+/// authenticated ADJACENT hop for a NON-adjacent destination.)
 ///
 /// Topology: `left ↔ gw ↔ right ↔ dest`. The gateway's only knowledge
-/// of `dest` is what the production learning writers install from
-/// traffic arriving via `right` (its own pingwave flood and the
-/// forwarded capability announcement — both fire here; whichever
-/// lands, both now bind the session-authenticated adjacent peer).
-/// The direct-adjacency witness above cannot distinguish "protected
-/// forwarding works" from "protected forwarding works only when the
-/// destination happens to be the next hop"; this is the test that
-/// fails if learned routes install without identity, bind the
-/// advertised origin or the destination instead of the adjacent
-/// peer, or resolve identity from an address at egress time.
+/// of `dest` is what production learning installs from traffic
+/// arriving via `right`. The convergence poll is DETERMINISTIC about
+/// which writer satisfies it: pingwaves are unauthenticated datagrams
+/// and install legacy (address-only) routes that can never resolve
+/// through `authenticated_next_hop`, so the only writer able to
+/// satisfy the poll is capability-announcement learning — the exact
+/// path this test drives with `announce_capabilities`. A mutation
+/// breaking that writer cannot be masked by the pingwave path.
+///
+/// This is the test that fails if learned routes install without
+/// identity, bind the advertised origin or the destination instead of
+/// the adjacent peer, or resolve identity from an address at egress
+/// time.
 #[tokio::test]
-async fn a_learned_route_forwards_protected_hops_to_the_authenticated_adjacent_hop() {
+async fn a_production_learned_route_selects_the_authenticated_first_hop() {
     use net::adapter::net::behavior::capability::CapabilitySet;
 
     let gw_kp = EntityKeypair::generate();
@@ -882,6 +885,220 @@ async fn a_learned_route_forwards_protected_hops_to_the_authenticated_adjacent_h
         out_header.hop_count,
         header.hop_count + 1,
         "outer hop_count must be incremented exactly once",
+    );
+}
+
+/// Two credentialed gateways in a line, for the live multi-hop
+/// witnesses: `left ↔ gw1 ↔ gw2 ↔ dest`. Both gateways hold admitted
+/// contexts for their neighbours; `gw2_rights` decides whether the
+/// SECOND gateway may forward (the positive witness grants ROUTE, the
+/// inverse withholds it). gw1 always holds ROUTE, so every difference
+/// observed at the destination side is gw2's doing.
+struct TwoGatewayFixture {
+    gw1: Arc<MeshNode>,
+    gw2: Arc<MeshNode>,
+    left: Arc<MeshNode>,
+    dest: Arc<MeshNode>,
+}
+
+async fn two_gateway_fixture(gw2_rights: SubnetRights) -> TwoGatewayFixture {
+    use net::adapter::net::behavior::capability::CapabilitySet;
+
+    let gw1_kp = EntityKeypair::generate();
+    let gw2_kp = EntityKeypair::generate();
+    let left_kp = EntityKeypair::generate();
+    let dest_kp = EntityKeypair::generate();
+    let gw1 = node(gw1_kp.clone(), Some(&[3])).await;
+    let gw2 = node(gw2_kp.clone(), Some(&[3])).await;
+    let left = node(left_kp.clone(), None).await;
+    let dest = node(dest_kp.clone(), None).await;
+
+    // Line topology; every handshake precedes every start().
+    handshake(&left, &gw1).await;
+    handshake(&gw2, &gw1).await;
+    handshake(&dest, &gw2).await;
+    gw1.start();
+    gw2.start();
+    left.start();
+    dest.start();
+
+    // gw1's two hop-local attachments: left in, gw2 out.
+    admit(
+        &gw1,
+        &left,
+        &left_kp,
+        &[3],
+        &[3, 7, 1],
+        SubnetRights::ATTACH,
+    )
+    .await;
+    admit(&gw1, &gw2, &gw2_kp, &[3], &[3, 7, 2], SubnetRights::ATTACH).await;
+    // gw2's two hop-local attachments: gw1 in, dest out.
+    admit(&gw2, &gw1, &gw1_kp, &[3], &[3, 7, 2], SubnetRights::ATTACH).await;
+    admit(
+        &gw2,
+        &dest,
+        &dest_kp,
+        &[3],
+        &[3, 7, 3],
+        SubnetRights::ATTACH,
+    )
+    .await;
+
+    gw1.install_subnet_gateway_credentials(&[grant(
+        &gw1_kp,
+        &[3],
+        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+    )])
+    .expect("install gw1 credentials");
+    gw2.install_subnet_gateway_credentials(&[grant(&gw2_kp, &[3], gw2_rights)])
+        .expect("install gw2 credentials");
+    for gw in [&gw1, &gw2] {
+        gw.declare_subnet_boundaries(net::adapter::net::subnet::SubnetBoundarySet::new(
+            root().entity_id().clone(),
+            0,
+            [],
+        ));
+    }
+
+    // Production learning: dest announces; gw2 receives it direct
+    // (hop 0 — its route to dest is the handshake's authenticated
+    // adjacency), gw1 receives it forwarded through gw2 (hop 1) and
+    // installs the identity-bound learned route. As in the first-hop
+    // witness, only capability learning can satisfy the identity
+    // poll — pingwave installs are legacy by design.
+    dest.announce_capabilities(CapabilitySet::new().add_tag("two-gateway-witness"))
+        .await
+        .expect("announce");
+    let dest_id = dest.node_id();
+    let gw2_id = gw2.node_id();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(hop) = gw1.authenticated_next_hop(dest_id) {
+            assert_eq!(
+                hop.node_id, gw2_id,
+                "gw1's learned route must bind gw2, its authenticated adjacent hop",
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "gw1 never learned an identity-bound route to dest through \
+             production propagation",
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    TwoGatewayFixture {
+        gw1,
+        gw2,
+        left,
+        dest,
+    }
+}
+
+/// The LIVE two-gateway positive witness. One protected envelope
+/// crosses TWO production relays — `left → gw1 → gw2 → dest-side
+/// watcher` — with gw1's route to the remote destination established
+/// only through production propagation via gw2.
+///
+/// Both relays run the full production path on a real receive loop:
+/// classification, ingress MAC + replay, authenticated route lookup,
+/// local transition authorization, TTL mutation, re-tag under the
+/// next edge key. Nothing between gw1 and gw2 is intercepted — the
+/// inter-gateway leg lands on gw2's real socket. Only the FINAL leg
+/// is observed, by standing a watcher at gw2's view of `dest`, and
+/// the captured envelope must verify under the gw2↔dest edge key
+/// with the destination and inner bytes untouched and the hop budget
+/// moved exactly TWICE.
+#[tokio::test]
+async fn a_protected_hop_traverses_two_credentialed_gateways() {
+    let f = two_gateway_fixture(SubnetRights::ATTACH.union(SubnetRights::ROUTE)).await;
+    let dest_id = f.dest.node_id();
+
+    // Observe only the last leg: gw2's egress toward dest.
+    let watcher = wire().await;
+    assert!(f
+        .gw2
+        .set_peer_addr_for_test(dest_id, watcher.local_addr().expect("addr")));
+
+    let header = RoutingHeader::new(dest_id, f.left.node_id() as u32, 8);
+    let envelope = f
+        .left
+        .seal_route_hop_to_peer(f.gw1.node_id(), &header, INNER_TAG)
+        .expect("left has a session to gw1");
+    let sock = wire().await;
+    sock.send_to(&envelope, f.gw1.local_addr())
+        .await
+        .expect("send");
+
+    let got = received_within(&watcher, Duration::from_millis(1000)).await;
+    let hops = route_hops(&got);
+    assert_eq!(
+        hops.len(),
+        1,
+        "exactly one hop must arrive at the destination side",
+    );
+    let out = hops[0];
+
+    // The captured envelope is the SECOND relay's output: it verifies
+    // under the gw2↔dest edge key, which gw1 does not hold.
+    let (out_header, out_inner) = f
+        .dest
+        .open_route_hop_from_peer(f.gw2.node_id(), out)
+        .expect("the final hop verifies under the gw2↔dest edge key");
+    assert_eq!(
+        out_header.dest_id, dest_id,
+        "the destination must ride through BOTH relays unchanged",
+    );
+    assert_eq!(
+        out_inner, INNER_TAG,
+        "neither relay may touch the inner packet",
+    );
+    assert_eq!(
+        out_header.ttl,
+        header.ttl - 2,
+        "outer TTL must be decremented exactly once per relay",
+    );
+    assert_eq!(
+        out_header.hop_count,
+        header.hop_count + 2,
+        "outer hop_count must be incremented exactly once per relay",
+    );
+}
+
+/// The second gateway's authority is load-bearing, not decorative:
+/// same topology, same learned route, same valid envelope — but gw2
+/// holds only ATTACH. gw1 (which holds ROUTE) forwards the hop to
+/// gw2, and gw2 refuses the transition, so nothing reaches the
+/// destination side. A mutation that made the second relay skip its
+/// own authorization would turn this test red.
+#[tokio::test]
+async fn a_second_gateway_without_route_authority_stops_the_hop() {
+    let f = two_gateway_fixture(SubnetRights::ATTACH).await;
+    let dest_id = f.dest.node_id();
+
+    let watcher = wire().await;
+    assert!(f
+        .gw2
+        .set_peer_addr_for_test(dest_id, watcher.local_addr().expect("addr")));
+
+    let header = RoutingHeader::new(dest_id, f.left.node_id() as u32, 8);
+    let envelope = f
+        .left
+        .seal_route_hop_to_peer(f.gw1.node_id(), &header, INNER_TAG)
+        .expect("left has a session to gw1");
+    let sock = wire().await;
+    sock.send_to(&envelope, f.gw1.local_addr())
+        .await
+        .expect("send");
+
+    let got = received_within(&watcher, Duration::from_millis(500)).await;
+    assert!(
+        route_hops(&got).is_empty(),
+        "without ROUTE at the second gateway, no protected hop may reach \
+         the destination side — first-relay authority must not carry the \
+         packet through the second",
     );
 }
 
