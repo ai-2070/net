@@ -125,6 +125,7 @@ pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
 pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
     LossSimulator, NodeStatus, PeerFailureEvent, RecoveryAction, RecoveryManager, RecoveryStats,
+    VerdictStatus,
 };
 pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
