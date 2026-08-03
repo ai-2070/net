@@ -53,6 +53,14 @@ Pair them with [`opensrc`](https://github.com/vercel-labs/opensrc) so the agent 
 npx -y opensrc@latest path ai-2070/net
 ```
 
+### Give the agent the source too
+
+[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
+
+```bash
+npx -y opensrc@latest path ai-2070/net
+```
+
 ## Contents
 
 - [Install](#install)
