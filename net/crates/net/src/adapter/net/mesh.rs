@@ -496,8 +496,9 @@ use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{
     route_hop::AuthenticatedNextHop, DropReason, SubnetAuthError, SubnetAuthPresentation,
     SubnetAuthorityConfig, SubnetBoundarySet, SubnetChallengeStore, SubnetContextStore,
-    SubnetCredentialSet, SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy,
-    SubnetRevocationFloor, VerifiedGatewayContextSet, VerifiedSubnetContext,
+    SubnetControlFact, SubnetControlOutcome, SubnetControlStore, SubnetCredentialSet,
+    SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy, SubnetRevocationFloor,
+    VerifiedGatewayContextSet, VerifiedSubnetContext,
 };
 use super::subprotocol::stream_window::{
     StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_WINDOW_SIZE,
@@ -1615,6 +1616,16 @@ struct DispatchCtx {
     subnet_boundaries: Arc<arc_swap::ArcSwapOption<SubnetBoundarySet>>,
     /// Floor state, for the auth epoch a compiled context is pinned to.
     subnet_floors: Arc<SubnetFloorRegistry>,
+    /// S5 control-fact store, shared with the node handle so the
+    /// channel arrival path and local provisioning apply into one
+    /// state.
+    subnet_control: Arc<SubnetControlStore>,
+    /// Anchored subnet authorities, for verifying channel-borne
+    /// control facts at dispatch.
+    subnet_authorities: Arc<Vec<SubnetAuthorityConfig>>,
+    /// Precomputed publish stream id of the control-facts channel;
+    /// `None` disables the channel arrival path.
+    subnet_control_stream_id: Option<u64>,
     /// Topology epoch the relay evaluates against.
     subnet_topology_epoch: Arc<std::sync::atomic::AtomicU32>,
     /// See the matching field doc on `MeshNode`. Cloned in at
@@ -1883,6 +1894,18 @@ pub struct MeshNodeConfig {
     /// routing state and the latter is checked against a credential
     /// scope.
     pub subnet_attachment: Option<SubnetId>,
+    /// Channel whose events this node additionally treats as subnet
+    /// control facts (SUBNET_AUTH_PLAN.md S5/D8). `None` disables
+    /// channel-borne facts; local provisioning
+    /// ([`MeshNode::apply_subnet_control_fact`]) works either way.
+    ///
+    /// This is an ORDINARY configured channel — no reserved
+    /// namespace — and it confers no authority: every fact is
+    /// verified against the configured subnet authority roots
+    /// exactly as if it had been provisioned locally, whoever
+    /// published it. A channel token may gate readership when facts
+    /// are confidential; it never gates fact validity.
+    pub subnet_control_channel: Option<ChannelName>,
     /// Visibility applied on publish when a channel has **no**
     /// registered config in the local
     /// [`ChannelConfigRegistry`]. Defaults to
@@ -2224,6 +2247,7 @@ impl MeshNodeConfig {
             subnet_policy: None,
             subnet_authorities: Vec::new(),
             subnet_attachment: None,
+            subnet_control_channel: None,
             default_visibility: Visibility::Global,
             unregistered_channels: UnregisteredChannelPolicy::default(),
             min_announce_interval: Duration::from_secs(10),
@@ -2554,6 +2578,14 @@ impl MeshNodeConfig {
     /// set fails closed.
     pub fn with_subnet_authority(mut self, config: SubnetAuthorityConfig) -> Self {
         self.subnet_authorities.push(config);
+        self
+    }
+
+    /// Treat events arriving on `channel` as subnet control facts
+    /// (S5). The channel grants no authority — see
+    /// [`Self::subnet_control_channel`].
+    pub fn with_subnet_control_channel(mut self, channel: ChannelName) -> Self {
+        self.subnet_control_channel = Some(channel);
         self
     }
 
@@ -8190,12 +8222,23 @@ pub struct MeshNode {
     /// Per-authority trust anchors for protected subnet credentials
     /// (SUBNET_AUTH_PLAN.md S2). Copied from
     /// `MeshNodeConfig::subnet_authorities`; empty means every
-    /// protected subnet assertion fails closed.
-    subnet_authorities: Vec<SubnetAuthorityConfig>,
+    /// protected subnet assertion fails closed. `Arc` so the
+    /// dispatch context can verify channel-borne control facts
+    /// against the same anchors without a copy.
+    subnet_authorities: Arc<Vec<SubnetAuthorityConfig>>,
     /// Applied revocation-floor state + per-authority auth epochs
     /// for subnet credentials. Session admission (S3) verifies
     /// against this registry and pins the epoch it saw.
     subnet_floors: Arc<SubnetFloorRegistry>,
+    /// Verified subnet control-fact state (S5): descriptors, gateway
+    /// advertisements, export policies. Floors flow into
+    /// `subnet_floors` instead — one revocation authority, not two.
+    subnet_control: Arc<SubnetControlStore>,
+    /// Precomputed publish stream id of the configured control-facts
+    /// channel (`MeshNodeConfig::subnet_control_channel`), so the
+    /// receive path's test is one u64 compare. `None` disables the
+    /// channel arrival path.
+    subnet_control_stream_id: Option<u64>,
     /// Outstanding one-use admission challenges this node has issued
     /// as verifier (SUBNET_AUTH_PLAN.md D5).
     subnet_challenges: Arc<SubnetChallengeStore>,
@@ -9136,8 +9179,16 @@ impl MeshNode {
         // without going back through `config`.
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
-        let subnet_authorities = config.subnet_authorities.clone();
+        let subnet_authorities = Arc::new(config.subnet_authorities.clone());
         let subnet_local_attachment = config.subnet_attachment.unwrap_or(local_subnet);
+        // One u64, computed once: the receive path discriminates the
+        // control-facts channel by its full publish stream id (63
+        // canonical hash bits), never the collision-prone u16 wire
+        // hint.
+        let subnet_control_stream_id = config
+            .subnet_control_channel
+            .as_ref()
+            .map(|name| Self::publish_stream_id(&ChannelId::new(name.clone())));
         let policy_can_scope = local_subnet_policy
             .as_ref()
             .is_some_and(|p| p.can_assign_non_global());
@@ -9441,6 +9492,8 @@ impl MeshNode {
             local_subnet_policy,
             subnet_authorities,
             subnet_floors: Arc::new(SubnetFloorRegistry::new()),
+            subnet_control: Arc::new(SubnetControlStore::new()),
+            subnet_control_stream_id,
             subnet_challenges,
             subnet_contexts,
             subnet_topology_epoch: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -11338,11 +11391,16 @@ impl MeshNode {
     pub fn advance_subnet_topology_epoch(&self) -> u32 {
         let next = self.subnet_topology_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let dropped = self.subnet_contexts.invalidate_stale_topology(next);
-        if dropped > 0 {
+        // Control facts for the superseded epochs can never be read
+        // again (reads are epoch-exact and the epoch only advances) —
+        // collect them with the same move that invalidates contexts.
+        let purged = self.subnet_control.purge_stale_epochs(next);
+        if dropped > 0 || purged > 0 {
             tracing::info!(
                 topology_epoch = next,
                 dropped,
-                "subnet: topology epoch advanced; invalidated contexts from the prior epoch"
+                purged_control_facts = purged,
+                "subnet: topology epoch advanced; invalidated prior-epoch state"
             );
         }
         next
@@ -11461,12 +11519,24 @@ impl MeshNode {
         let config = self
             .subnet_authority_config(&floor.scope.authority)
             .ok_or(SubnetAuthError::UnknownAuthority)?;
-        let changed = self.subnet_floors.apply(floor, config)?;
+        Self::apply_floor_with(floor, config, &self.subnet_floors, &self.subnet_contexts)
+    }
+
+    /// The floor transition itself — registry apply plus the
+    /// stale-context invalidation the auth-epoch move demands. One
+    /// body for both arrival shapes: the typed local API above and
+    /// the channel/bundle byte path below, so distribution cannot
+    /// drift from provisioning.
+    fn apply_floor_with(
+        floor: &SubnetRevocationFloor,
+        config: &SubnetAuthorityConfig,
+        floors: &SubnetFloorRegistry,
+        contexts: &SubnetContextStore,
+    ) -> Result<bool, SubnetAuthError> {
+        let changed = floors.apply(floor, config)?;
         if changed {
-            let epoch = self.subnet_floors.auth_epoch(&floor.scope.authority);
-            let dropped = self
-                .subnet_contexts
-                .invalidate_stale_epoch(&floor.scope.authority, epoch);
+            let epoch = floors.auth_epoch(&floor.scope.authority);
+            let dropped = contexts.invalidate_stale_epoch(&floor.scope.authority, epoch);
             tracing::info!(
                 subnet_auth_epoch = epoch,
                 dropped,
@@ -11474,6 +11544,72 @@ impl MeshNode {
             );
         }
         Ok(changed)
+    }
+
+    /// Verify and apply one wire-form subnet control fact
+    /// (SUBNET_AUTH_PLAN.md S5/D8) — the ONE entry every arrival
+    /// path shares. A fact published on the configured channel, one
+    /// provisioned locally through this method, and one loaded from
+    /// a configuration bundle are the same bytes through the same
+    /// checks: strict decode, authority config lookup, root-anchored
+    /// signature, validity window where the kind has one, and
+    /// per-`(SubnetRef, kind)` revision monotonicity.
+    ///
+    /// Floors route into the S2 floor registry (advancing the auth
+    /// epoch and dropping invalidated contexts); the three
+    /// descriptive kinds land in [`Self::subnet_control_store`].
+    /// `Ok(applied: false)` is the designed replay/reorder no-op.
+    pub fn apply_subnet_control_fact(
+        &self,
+        bytes: &[u8],
+    ) -> Result<SubnetControlOutcome, SubnetAuthError> {
+        Self::apply_subnet_control_fact_with(
+            bytes,
+            &self.subnet_authorities,
+            &self.subnet_control,
+            &self.subnet_floors,
+            &self.subnet_contexts,
+        )
+    }
+
+    /// [`Self::apply_subnet_control_fact`] over explicit handles, so
+    /// the dispatch path (which has no `&MeshNode`) runs the very
+    /// same code.
+    fn apply_subnet_control_fact_with(
+        bytes: &[u8],
+        authorities: &[SubnetAuthorityConfig],
+        control: &SubnetControlStore,
+        floors: &SubnetFloorRegistry,
+        contexts: &SubnetContextStore,
+    ) -> Result<SubnetControlOutcome, SubnetAuthError> {
+        let fact = SubnetControlFact::from_bytes(bytes)?;
+        let config = authorities
+            .iter()
+            .find(|c| c.authority == fact.scope().authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        let applied = match &fact {
+            SubnetControlFact::RevocationFloor(floor) => {
+                Self::apply_floor_with(floor, config, floors, contexts)?
+            }
+            _ => control.apply(
+                &fact,
+                config,
+                crate::adapter::net::subnet::admission::unix_now_secs(),
+                crate::adapter::net::identity::TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
+            )?,
+        };
+        Ok(SubnetControlOutcome {
+            kind: fact.kind(),
+            applied,
+        })
+    }
+
+    /// Verified control-fact state (S5): the current descriptor,
+    /// gateway advertisement, and export policy per authority-
+    /// qualified scope. Floors are not here — their applied state is
+    /// [`Self::subnet_floor_registry`].
+    pub fn subnet_control_store(&self) -> &Arc<SubnetControlStore> {
+        &self.subnet_control
     }
 
     /// Compile and publish this node's OWN forwarding authority from
@@ -15954,6 +16090,9 @@ impl MeshNode {
             subnet_gateway_contexts: self.subnet_gateway_contexts.clone(),
             subnet_boundaries: self.subnet_boundaries.clone(),
             subnet_floors: self.subnet_floors.clone(),
+            subnet_control: self.subnet_control.clone(),
+            subnet_authorities: self.subnet_authorities.clone(),
+            subnet_control_stream_id: self.subnet_control_stream_id,
             subnet_topology_epoch: self.subnet_topology_epoch.clone(),
             subnet_gateway: self.subnet_gateway.clone(),
             peer_entity_ids: self.peer_entity_ids.clone(),
@@ -18323,6 +18462,43 @@ impl MeshNode {
         } else {
             0
         };
+
+        // S5: subnet control facts riding the configured channel
+        // (SUBNET_AUTH_PLAN.md D8). Discriminated by the full publish
+        // stream id — 63 canonical channel-hash bits; the u16 wire
+        // hint collides — and NON-exclusive: subscribers on the
+        // channel still receive these events through the shard queue
+        // below. The bytes go to the same root-anchored verifier
+        // every arrival path uses. Channel membership and publication
+        // establish no fact authority, so a hostile publisher's
+        // injected bytes are verified into inertness here rather
+        // than filtered by privilege — which is also why rejects log
+        // at debug, not warn: on an open channel they are expected
+        // traffic, not an anomaly worth an operator page.
+        if ctx.subnet_control_stream_id == Some(stream_id) {
+            for event_data in &events {
+                match Self::apply_subnet_control_fact_with(
+                    event_data.as_ref(),
+                    &ctx.subnet_authorities,
+                    &ctx.subnet_control,
+                    &ctx.subnet_floors,
+                    &ctx.subnet_contexts,
+                ) {
+                    Ok(outcome) if outcome.applied => tracing::info!(
+                        from_node = format!("{from_node:#x}"),
+                        kind = ?outcome.kind,
+                        "subnet: control fact applied from channel"
+                    ),
+                    // Stale revision / replay — the designed no-op.
+                    Ok(_) => {}
+                    Err(err) => tracing::debug!(
+                        from_node = format!("{from_node:#x}"),
+                        %err,
+                        "subnet: control-channel bytes rejected (inert)"
+                    ),
+                }
+            }
+        }
 
         // Credit-window bookkeeping: charge only *accepted* inbound
         // bytes against the stream's RxCreditState. `on_receive`

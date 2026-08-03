@@ -15,6 +15,7 @@
 pub mod admission;
 mod assignment;
 pub mod auth;
+pub mod control;
 mod error;
 mod gateway;
 mod id;
@@ -29,6 +30,10 @@ pub use auth::{
     SubnetRevocationFloor, SubnetRights, TransitionDecision, VerifiedGatewayContext,
     VerifiedGatewayContextSet, VerifiedSubnetAuthority, VerifiedSubnetContext,
     MAX_GATEWAY_CONTEXTS_PER_AUTHORITY, MAX_TRANSITION_LOOKUPS,
+};
+pub use control::{
+    GatewayAdvertisement, SubnetControlFact, SubnetControlOutcome, SubnetControlStore,
+    SubnetDescriptor, SubnetExportPolicy, SubnetFactKind, MAX_EXPORTED_CHANNELS,
 };
 pub use error::SubnetError;
 pub use gateway::{DropReason, ForwardDecision, SubnetGateway};

@@ -467,6 +467,7 @@ jobs:
           --test subnet_revocation
           --test subnet_route_hop_alloc
           --test subnet_session_auth
+          --test subnet_control_facts
           --test integration_placement_filter_callback
           --test capability_broadcast
           --test capability_multihop

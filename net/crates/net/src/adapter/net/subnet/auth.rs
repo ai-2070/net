@@ -2129,14 +2129,14 @@ pub fn verify_admission(
 }
 
 // ---------------------------------------------------------------------------
-// Wire helpers
+// Wire helpers (shared with the S5 control-fact family in `control.rs`)
 // ---------------------------------------------------------------------------
 
 #[expect(
     clippy::unwrap_used,
     reason = "callers pre-check exact buffer length; fixed-width slicing is statically infallible"
 )]
-fn read_32(bytes: &[u8], off: &mut usize) -> [u8; 32] {
+pub(super) fn read_32(bytes: &[u8], off: &mut usize) -> [u8; 32] {
     let out: [u8; 32] = bytes[*off..*off + 32].try_into().unwrap();
     *off += 32;
     out
@@ -2146,7 +2146,7 @@ fn read_32(bytes: &[u8], off: &mut usize) -> [u8; 32] {
     clippy::unwrap_used,
     reason = "callers pre-check exact buffer length; fixed-width slicing is statically infallible"
 )]
-fn read_u32(bytes: &[u8], off: &mut usize) -> u32 {
+pub(super) fn read_u32(bytes: &[u8], off: &mut usize) -> u32 {
     let out = u32::from_le_bytes(bytes[*off..*off + 4].try_into().unwrap());
     *off += 4;
     out
@@ -2156,7 +2156,7 @@ fn read_u32(bytes: &[u8], off: &mut usize) -> u32 {
     clippy::unwrap_used,
     reason = "callers pre-check exact buffer length; fixed-width slicing is statically infallible"
 )]
-fn read_u64(bytes: &[u8], off: &mut usize) -> u64 {
+pub(super) fn read_u64(bytes: &[u8], off: &mut usize) -> u64 {
     let out = u64::from_le_bytes(bytes[*off..*off + 8].try_into().unwrap());
     *off += 8;
     out
