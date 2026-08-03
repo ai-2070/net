@@ -33,7 +33,7 @@ Consider a robotics deployment that uses Zenoh to distribute camera frames, tele
 A service in that deployment can:
 
 1. read and query the required data through Zenoh;
-2. implement an operation such as `inspect_region` or `get_local_model`;
+2. implement an operation that inspects a region or returns a local model;
 3. publish that operation through Net as a capability;
 4. return the result through the Net invocation, stream, or artifact associated with the work.
 
