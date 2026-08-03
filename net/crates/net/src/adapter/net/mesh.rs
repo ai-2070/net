@@ -11693,6 +11693,47 @@ impl MeshNode {
         Ok(())
     }
 
+    /// Test-only (fixtures): [`Self::install_subnet_gateway_credentials`]
+    /// through the SAME production compile + publication path, exposing
+    /// the after-capture hook so the deterministic lost-update witness
+    /// can hold THIS writer between its capture and its
+    /// compare-and-swap (the mirror of
+    /// [`Self::test_declare_subnet_boundaries_paced`]).
+    #[cfg(feature = "fixtures")]
+    pub fn test_install_subnet_gateway_credentials_paced(
+        &self,
+        sets: &[SubnetCredentialSet],
+        after_capture: &(dyn Fn() + Sync),
+    ) -> Result<(), SubnetAuthError> {
+        if sets.is_empty() {
+            self.publish_gateway_member_paced(None, after_capture);
+            return Ok(());
+        }
+        let authority = sets[0].leaf().authority.clone();
+        let config = self
+            .subnet_authority_config(&authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        let epoch = self.subnet_topology_epoch.load(Ordering::Acquire);
+        let now = crate::adapter::net::subnet::admission::unix_now_secs();
+        let mut compiled = Vec::with_capacity(sets.len());
+        for set in sets {
+            compiled.push(crate::adapter::net::subnet::auth::compile_gateway_context(
+                set,
+                self.entity_id(),
+                self.subnet_local_attachment,
+                config,
+                epoch,
+                &self.subnet_floors,
+                now,
+                crate::adapter::net::identity::TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
+            )?);
+        }
+        let set =
+            crate::adapter::net::subnet::auth::build_gateway_context_set(&authority, compiled)?;
+        self.publish_gateway_member_paced(Some(Arc::new(set)), after_capture);
+        Ok(())
+    }
+
     /// Replace ONLY the gateway member of the published authority
     /// aggregate, preserving whatever boundaries member is latest at
     /// the moment of the swap. `rcu` retries on contention, so a
@@ -11715,11 +11756,30 @@ impl MeshNode {
         gateway: Option<Arc<VerifiedGatewayContextSet>>,
         after_capture: &(dyn Fn() + Sync),
     ) {
-        self.subnet_gateway_authority.rcu(|current| {
-            let next = SubnetGatewayAuthorityState {
+        self.publish_authority_member(
+            &|current| SubnetGatewayAuthorityState {
                 gateway: gateway.clone(),
                 boundaries: current.boundaries.clone(),
-            };
+            },
+            after_capture,
+        );
+    }
+
+    /// THE one compare-and-retry publication primitive. Both authority
+    /// writers route through here, so the retry mechanism is a single
+    /// implementation rather than two parallel ones a future writer
+    /// could let drift: `update` builds the next aggregate FROM the
+    /// captured current (each member writer preserves the other's
+    /// latest member), and `after_capture` — a production no-op — runs
+    /// inside the rcu closure, after the capture and before the
+    /// compare-and-swap, once more per retry.
+    fn publish_authority_member(
+        &self,
+        update: &(dyn Fn(&SubnetGatewayAuthorityState) -> SubnetGatewayAuthorityState + Sync),
+        after_capture: &(dyn Fn() + Sync),
+    ) {
+        self.subnet_gateway_authority.rcu(|current| {
+            let next = update(current);
             after_capture();
             next
         });
@@ -11747,14 +11807,13 @@ impl MeshNode {
         after_capture: &(dyn Fn() + Sync),
     ) {
         let boundaries = Some(Arc::new(set));
-        self.subnet_gateway_authority.rcu(|current| {
-            let next = SubnetGatewayAuthorityState {
+        self.publish_authority_member(
+            &|current| SubnetGatewayAuthorityState {
                 gateway: current.gateway.clone(),
                 boundaries: boundaries.clone(),
-            };
-            after_capture();
-            next
-        });
+            },
+            after_capture,
+        );
     }
 
     /// Test-only (fixtures): [`Self::declare_subnet_boundaries`]

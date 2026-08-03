@@ -1058,18 +1058,22 @@ async fn concurrent_publication_loses_neither_authority_surface() {
     );
 }
 
-/// THE deterministic lost-update witness (D7 evidence closure): a
-/// barrier-forced schedule in which the boundary writer captures the
-/// aggregate, is HELD inside its capture→compare-and-swap window
-/// while the gateway writer publishes, and only then resumes.
+/// THE deterministic lost-update witness (D7 evidence closure), in
+/// BOTH directions: each writer takes one turn as the held-stale
+/// party, so a naive rewrite of EITHER writer — or of the one shared
+/// compare-and-retry primitive both route through — REDs here.
 ///
-/// Production `ArcSwap::rcu` loses the CAS, re-captures the gateway
-/// writer's publication, and lands (G1, B1) — the pacing hook running
-/// a second time IS the observed retry. The naive load-modify-store
-/// inverse stores its stale capture verbatim: one hook invocation,
-/// the gateway publication lost, and this test REDs. Verified by
-/// mutation control against exactly that inverse (see the commit
-/// message); the storm test above remains as supplemental stress.
+/// Phase A: the boundary writer captures (G0, B0) and is HELD inside
+/// its capture→compare-and-swap window; the gateway writer publishes
+/// G1; the boundary writer resumes, loses the CAS, re-captures, and
+/// lands (G1, B1). Phase B mirrors it: the GATEWAY writer is held on
+/// a (G1, B1) capture while the boundary writer publishes B2; the
+/// gateway writer retries and lands (G2, B2). In each phase the
+/// pacing hook running a second time IS the observed retry; a naive
+/// load-modify-store held writer stores its stale capture verbatim —
+/// one hook invocation, the concurrent publication lost, RED.
+/// Verified by per-writer and shared-primitive mutation control (see
+/// the commit message); the storm test above remains supplemental.
 #[cfg(feature = "fixtures")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_held_stale_capture_cannot_lose_the_concurrent_publication() {
@@ -1149,6 +1153,68 @@ async fn a_held_stale_capture_cannot_lose_the_concurrent_publication() {
             .boundaries(),
         &[TopologySubnetId::new(WORLD_MODEL)],
         "B1 must land beside the surviving G1",
+    );
+
+    // ---- Phase B: the GATEWAY writer is the held-stale party -------
+    // From (G1, B1): hold the gateway writer's (G2) capture, publish
+    // B2 mid-window, release. G2 is the one-entry set; B2 is the
+    // camera boundary — fresh values so a lost update is visible.
+    let captured_b = Arc::new(std::sync::Barrier::new(2));
+    let release_b = Arc::new(std::sync::Barrier::new(2));
+    let gw_hook_calls = Arc::new(AtomicUsize::new(0));
+
+    let b = vehicle_b.clone();
+    let (cap_b, rel_b, gw_calls) = (captured_b.clone(), release_b.clone(), gw_hook_calls.clone());
+    let schedule_b = tokio::task::spawn_blocking(move || {
+        let writer_b = b.clone();
+        let gateway_writer = std::thread::spawn(move || {
+            writer_b
+                .test_install_subnet_gateway_credentials_paced(
+                    &gateway_credentials_without_export(&EntityKeypair::from_bytes(VEHICLE_B_SEED)),
+                    &|| {
+                        if gw_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            cap_b.wait();
+                            rel_b.wait();
+                        }
+                    },
+                )
+                .expect("paced gateway publish");
+        });
+
+        // The gateway writer now holds a (G1, B1) capture. Publish B2
+        // inside its window.
+        captured_b.wait();
+        b.declare_subnet_boundaries(SubnetBoundarySet::new(
+            vb_subnet_root().entity_id().clone(),
+            0,
+            [TopologySubnetId::new(CAMERA)],
+        ));
+        release_b.wait();
+        gateway_writer.join().expect("gateway writer");
+    });
+    schedule_b.await.expect("schedule B");
+
+    let observed_gw_calls = gw_hook_calls.load(Ordering::SeqCst);
+    assert!(
+        observed_gw_calls >= 2,
+        "the GATEWAY writer must LOSE its stale compare-and-swap and          re-capture (saw {observed_gw_calls} hook call(s)): a single          capture means its stale view was stored verbatim over the          boundary publication",
+    );
+    assert_eq!(
+        vehicle_b
+            .subnet_gateway_contexts()
+            .expect("gateway member present")
+            .entries()
+            .len(),
+        1,
+        "G2 must land beside the surviving B2",
+    );
+    assert_eq!(
+        vehicle_b
+            .subnet_boundaries()
+            .expect("boundary member present")
+            .boundaries(),
+        &[TopologySubnetId::new(CAMERA)],
+        "B2 must survive the gateway writer's held stale capture",
     );
 }
 
