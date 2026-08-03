@@ -2348,6 +2348,14 @@ async fn test_mesh_relay_tamper_detected() {
     r1.unwrap();
     r2.unwrap();
 
+    // Force the relay onto the path. The A↔C handshake above installed
+    // an identity-bound direct route to C (metric 1), and an ordinary
+    // route can no longer displace it — an unauthenticated equal-metric
+    // claim must never beat an authenticated adjacency, which is the
+    // whole point of the provenance split. Drop the direct route first
+    // so the relay route is the only candidate; this test needs B to
+    // physically receive the datagram in order to tamper with it.
+    a.router().routing_table().remove_route(nid_c);
     a.router().add_route(nid_c, addr_b);
     a.start();
     c.start();

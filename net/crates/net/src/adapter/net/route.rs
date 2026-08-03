@@ -525,10 +525,94 @@ impl RouteEntry {
 /// rarely exceed a few thousand concurrent stream IDs.
 pub const MAX_STREAM_STATS: usize = 65_536;
 
+/// What one destination knows, split by the PROVENANCE of the
+/// evidence that produced it.
+///
+/// The two candidates are kept in separate slots rather than
+/// competing for a single entry, because they carry different
+/// evidence and an unauthenticated writer must never be able to
+/// mutate authenticated state:
+///
+/// - `ordinary` — pingwaves (unauthenticated UDP datagrams), routed
+///   end-to-end installs, manual/legacy installs, reroute fallbacks.
+///   Usable for ordinary forwarding only.
+/// - `protected` — identity-bound, written only by writers whose
+///   next-hop identity came from an authenticated adjacent session.
+///   The ONLY slot [`RoutingTable::lookup_authenticated`] reads.
+///
+/// Before the split, "pingwaves install legacy routes" meant only
+/// that their own output had no `next_hop_id` — it did not stop them
+/// mutating authenticated state. A spoofable pingwave could still
+/// (1) replace an authenticated entry outright by claiming a better
+/// metric, (2) keep an authenticated entry through another peer
+/// fresh forever, or (3) occupy the destination with a forged
+/// metric-2 route so a legitimate metric-3 capability route could
+/// never restore protected reachability. With separate slots, an
+/// unauthenticated write cannot reach the protected candidate at
+/// all — not its identity, address, metric, or freshness — and the
+/// authenticated writer always has a slot to land in.
+#[derive(Debug, Clone, Default)]
+struct DestRoutes {
+    ordinary: Option<RouteEntry>,
+    protected: Option<RouteEntry>,
+    /// Conservative change counter for compare-and-set writers
+    /// ([`RoutingTable::observe`] / [`RoutingTable::install_if_unchanged`]).
+    ///
+    /// Advances on every mutation attempt, including ones that change
+    /// nothing (a refused withdrawal, say). Over-counting is the safe
+    /// direction: a conditional writer can only be made to SKIP its
+    /// write, never to overwrite state it did not observe.
+    generation: u64,
+}
+
+impl DestRoutes {
+    fn is_empty(&self) -> bool {
+        self.ordinary.is_none() && self.protected.is_none()
+    }
+
+    fn candidates(&self) -> impl Iterator<Item = &RouteEntry> {
+        self.ordinary.iter().chain(self.protected.iter())
+    }
+
+    fn live(entry: &&RouteEntry, max_age: std::time::Duration) -> bool {
+        entry.active && entry.updated_at.elapsed() <= max_age
+    }
+
+    /// The candidate ordinary forwarding should use: the lowest-metric
+    /// live candidate, ties going to the protected one — identity-bound
+    /// evidence is strictly stronger than an equal-metric
+    /// unauthenticated claim.
+    fn effective(&self, max_age: std::time::Duration) -> Option<&RouteEntry> {
+        let o = self.ordinary.as_ref().filter(|e| Self::live(e, max_age));
+        let p = self.protected.as_ref().filter(|e| Self::live(e, max_age));
+        match (o, p) {
+            (Some(o), Some(p)) => Some(if o.metric < p.metric { o } else { p }),
+            (Some(o), None) => Some(o),
+            (None, p) => p,
+        }
+    }
+
+    fn protected_live(&self, max_age: std::time::Duration) -> Option<&RouteEntry> {
+        self.protected.as_ref().filter(|e| Self::live(e, max_age))
+    }
+}
+
+/// A point-in-time reading of a destination's routing state, for
+/// compare-and-set writers. See [`RoutingTable::install_if_unchanged`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteObservation {
+    /// The destination's change counter when this was read.
+    pub generation: u64,
+    /// The effective next hop at that moment, if any.
+    pub next_hop: Option<SocketAddr>,
+    /// The effective next hop's bound identity at that moment.
+    pub next_hop_id: Option<u64>,
+}
+
 /// Routing table for stream-to-destination mapping
 pub struct RoutingTable {
-    /// Node ID -> next hop address
-    routes: DashMap<u64, RouteEntry>,
+    /// Node ID -> the destination's ordinary / protected candidates
+    routes: DashMap<u64, DestRoutes>,
     /// Stream ID -> per-stream stats
     stream_stats: DashMap<u64, SchedulerStreamStats>,
     /// Local node ID
@@ -566,57 +650,76 @@ impl RoutingTable {
         self.local_id
     }
 
-    /// Add or update a direct route.
-    ///
-    /// Called by `MeshNode::connect` and `::accept` as part of direct
-    /// session setup. Unconditionally inserts — a direct route is always
-    /// preferred over any indirect one (direct uses default metric 1;
-    /// indirect routes installed from pingwaves carry `hop_count + 2`, so
-    /// they're never below 2). Also refreshes `updated_at`.
-    pub fn add_route(&self, dest_id: u64, next_hop: SocketAddr) {
-        // insert returns the previous value; None == genuinely new key.
-        if self
-            .routes
-            .insert(dest_id, RouteEntry::new(next_hop))
-            .is_none()
-        {
-            self.num_routes.fetch_add(1, Ordering::Relaxed);
+    /// Apply `f` to a destination's candidate set, maintaining the
+    /// destination count, the generation counter, and the "no empty
+    /// destinations" invariant. Every route mutation funnels through
+    /// here so those three can never drift apart.
+    fn mutate<R>(&self, dest_id: u64, f: impl FnOnce(&mut DestRoutes) -> R) -> R {
+        use dashmap::mapref::entry::Entry;
+        match self.routes.entry(dest_id) {
+            Entry::Occupied(mut o) => {
+                let slot = o.get_mut();
+                let r = f(slot);
+                slot.generation = slot.generation.wrapping_add(1);
+                if slot.is_empty() {
+                    o.remove();
+                    self.num_routes.fetch_sub(1, Ordering::Relaxed);
+                }
+                r
+            }
+            Entry::Vacant(v) => {
+                let mut fresh = DestRoutes::default();
+                let r = f(&mut fresh);
+                if !fresh.is_empty() {
+                    fresh.generation = 1;
+                    v.insert(fresh);
+                    self.num_routes.fetch_add(1, Ordering::Relaxed);
+                }
+                r
+            }
         }
     }
 
-    /// Add or update a route with an explicit metric.
+    /// Add or update the ORDINARY (unauthenticated) route.
     ///
-    /// Used by the pingwave-driven route installer. The existing entry
-    /// is replaced only if the new metric is **strictly better** (lower)
-    /// than the existing one — this keeps a direct route from being
-    /// overwritten by an indirect one that crafts the same metric (a
-    /// misbehaving or malicious peer that announces metric 1 must not
-    /// be able to displace a real direct route). On equal metrics the
-    /// existing entry is kept but its `updated_at` is refreshed, so the
-    /// arrival of a same-quality alternate path is treated as evidence
-    /// the destination is still reachable.
+    /// Called by routed end-to-end installs and legacy/manual callers.
+    /// Unconditionally replaces the ordinary candidate — a direct route
+    /// is always preferred over any indirect one (metric 1; pingwave
+    /// routes carry `hop_count + 2`, never below 2) — and refreshes
+    /// `updated_at`.
+    ///
+    /// Non-destructive to authenticated state by construction: this
+    /// writes only the ordinary slot, so a routed (`connect_via`)
+    /// install can no longer erase an authenticated learned route to
+    /// the same endpoint. A routed end-to-end session contributes no
+    /// adjacency evidence, and must not delete stronger evidence.
+    pub fn add_route(&self, dest_id: u64, next_hop: SocketAddr) {
+        self.mutate(dest_id, |d| {
+            d.ordinary = Some(RouteEntry::new(next_hop));
+        });
+    }
+
+    /// Add or update the ORDINARY route with an explicit metric.
+    ///
+    /// Used by the pingwave-driven route installer. Within the ordinary
+    /// slot the existing candidate is replaced only if the new metric is
+    /// **strictly better** — a peer that crafts an equal metric must not
+    /// displace an installed route — and on equal/worse metrics the
+    /// existing candidate is kept but refreshed, since an alternate
+    /// path's arrival is evidence the destination is still reachable.
+    ///
+    /// Both of those rules apply ONLY among unauthenticated candidates.
+    /// This writer cannot see, replace, or refresh the protected
+    /// candidate: an unauthenticated datagram is not evidence about an
+    /// authenticated adjacency, in either direction.
     pub fn add_route_with_metric(&self, dest_id: u64, next_hop: SocketAddr, metric: u16) {
-        use dashmap::mapref::entry::Entry;
-        match self.routes.entry(dest_id) {
-            Entry::Vacant(v) => {
-                v.insert(RouteEntry::with_metric(next_hop, metric));
-                self.num_routes.fetch_add(1, Ordering::Relaxed);
+        self.mutate(dest_id, |d| match d.ordinary.as_mut() {
+            None => d.ordinary = Some(RouteEntry::with_metric(next_hop, metric)),
+            Some(e) if metric < e.metric => {
+                *e = RouteEntry::with_metric(next_hop, metric);
             }
-            Entry::Occupied(mut o) => {
-                if metric < o.get().metric {
-                    o.insert(RouteEntry::with_metric(next_hop, metric));
-                } else {
-                    // Existing route is at least as good. Keep it, but
-                    // refresh its freshness — if the existing route is
-                    // still installed, the alternate path's arrival is
-                    // evidence the destination is reachable, so the
-                    // installed route shouldn't time out just because
-                    // its own heartbeat happens less often than
-                    // pingwaves.
-                    o.get_mut().updated_at = Instant::now();
-                }
-            }
-        }
+            Some(e) => e.updated_at = Instant::now(),
+        });
     }
 
     /// Add or update a *learned* route that binds the authenticated
@@ -645,9 +748,16 @@ impl RoutingTable {
     ///   evidence the installed path is alive; letting it renew the
     ///   installed binding would pin a blackholed protected route
     ///   fresh forever while the table refuses to switch to the
-    ///   alternate. (The legacy writer's refresh rule is unchanged —
-    ///   legacy entries carry no protected traffic. A future
+    ///   alternate. (The ordinary writer's refresh rule is unchanged —
+    ///   ordinary candidates carry no protected traffic. A future
     ///   multi-route table may retain the alternate separately.)
+    ///
+    /// The "no identity yet" case is now structural rather than an
+    /// in-place upgrade: an ordinary candidate lives in its own slot,
+    /// so an authenticated arrival always has an empty protected slot
+    /// to land in regardless of what any pingwave installed. That is
+    /// what keeps a forged legacy route from suppressing protected
+    /// reachability forever.
     pub fn add_authenticated_route_with_metric(
         &self,
         dest_id: u64,
@@ -655,115 +765,109 @@ impl RoutingTable {
         next_hop_id: u64,
         metric: u16,
     ) {
-        use dashmap::mapref::entry::Entry;
-        match self.routes.entry(dest_id) {
-            Entry::Vacant(v) => {
-                v.insert(RouteEntry::authenticated_with_metric(
+        self.mutate(dest_id, |d| match d.protected.as_mut() {
+            None => {
+                d.protected = Some(RouteEntry::authenticated_with_metric(
                     next_hop,
                     next_hop_id,
                     metric,
                 ));
-                self.num_routes.fetch_add(1, Ordering::Relaxed);
             }
-            Entry::Occupied(mut o) => {
-                if metric < o.get().metric {
-                    o.insert(RouteEntry::authenticated_with_metric(
-                        next_hop,
-                        next_hop_id,
-                        metric,
-                    ));
-                } else {
-                    let e = o.get_mut();
-                    if e.next_hop == next_hop {
-                        match e.next_hop_id {
-                            // Same address, no identity yet: bind it.
-                            None => {
-                                e.next_hop_id = Some(next_hop_id);
-                                e.updated_at = Instant::now();
-                            }
-                            // Same address, same identity: freshness.
-                            Some(id) if id == next_hop_id => {
-                                e.updated_at = Instant::now();
-                            }
-                            // Same address, DIFFERENT identity: refuse
-                            // both the rewrite and the refresh.
-                            Some(_) => {}
-                        }
-                    }
-                    // Different next hop at equal/worse metric: keep
-                    // the installed route AND its age. See the doc
-                    // comment — alternate reachability is not
-                    // freshness evidence for the installed path.
+            Some(e) if metric < e.metric => {
+                *e = RouteEntry::authenticated_with_metric(next_hop, next_hop_id, metric);
+            }
+            Some(e) => {
+                // Equal or worse. Only the installed path may refresh
+                // itself, and only under its own identity.
+                if e.next_hop == next_hop && e.next_hop_id == Some(next_hop_id) {
+                    e.updated_at = Instant::now();
                 }
             }
-        }
+        });
     }
 
-    /// Remove a route
+    /// Remove a destination outright — both candidates.
+    ///
+    /// Returns the protected candidate if there was one, else the
+    /// ordinary one.
     pub fn remove_route(&self, dest_id: u64) -> Option<RouteEntry> {
-        self.routes.remove(&dest_id).map(|(_, v)| {
-            self.num_routes.fetch_sub(1, Ordering::Relaxed);
-            v
+        self.mutate(dest_id, |d| {
+            let taken = d.protected.take().or_else(|| d.ordinary.take());
+            d.ordinary = None;
+            taken
         })
     }
 
-    /// Remove the route for `dest_id` only if it rides through the
-    /// authenticated sender `identity` at `next_hop` — the
-    /// identity-qualified form route WITHDRAWAL must use.
+    /// Remove what the authenticated sender `identity` actually OWNS at
+    /// `next_hop` — the predicate route WITHDRAWAL must use.
     ///
-    /// An address match alone is not ownership: under address reuse
-    /// (or a shared relay address) peer B's withdrawal arriving from
-    /// address X must not tear down a route identity-bound to peer C
-    /// that happens to sit at X. The rule:
+    /// Ownership differs by candidate, and neither half is an address
+    /// match alone:
     ///
-    /// - identity-bound entry → removed only when the binding IS the
-    ///   sender (`next_hop_id == Some(identity)`) and the address
-    ///   matches;
-    /// - legacy entry → removed on the address match, as before (it
-    ///   carries no identity to protect).
+    /// - **protected** — `next_hop_id == Some(identity)` is sufficient,
+    ///   and the address is deliberately NOT required. `install_peer`
+    ///   publishes the peer record and session index before migrating
+    ///   routes, so an authenticated withdrawal can legitimately arrive
+    ///   under the new session while the binding still carries the old
+    ///   address. Requiring the address there made the handler drop the
+    ///   graph edge and then return without removing the route, leaving
+    ///   route and graph state inconsistent until age-out.
+    /// - **ordinary** — the address must match AND `sender_is_direct`
+    ///   must confirm the sender genuinely owns that address (forward
+    ///   and reverse indexes agree). A routed end-to-end peer records
+    ///   its RELAY's address; without the confirmation it could remove
+    ///   unrelated legacy routes sitting at the shared relay tuple,
+    ///   which belong to the relay, not to it.
     ///
-    /// Returns `true` if the entry was removed.
+    /// Returns `true` if anything was removed.
     pub fn remove_route_if_from_hop(
         &self,
         dest_id: u64,
         next_hop: SocketAddr,
         identity: u64,
+        sender_is_direct: bool,
     ) -> bool {
-        let removed = self
-            .routes
-            .remove_if(&dest_id, |_, entry| {
-                entry.next_hop == next_hop
-                    && match entry.next_hop_id {
-                        Some(id) => id == identity,
-                        None => true,
-                    }
-            })
-            .is_some();
-        if removed {
-            self.num_routes.fetch_sub(1, Ordering::Relaxed);
-        }
-        removed
+        self.mutate(dest_id, |d| {
+            let mut removed = false;
+            if d.protected
+                .as_ref()
+                .is_some_and(|e| e.next_hop_id == Some(identity))
+            {
+                d.protected = None;
+                removed = true;
+            }
+            if sender_is_direct && d.ordinary.as_ref().is_some_and(|e| e.next_hop == next_hop) {
+                d.ordinary = None;
+                removed = true;
+            }
+            removed
+        })
     }
 
-    /// Remove the route for `dest_id` only if its current `next_hop`
-    /// still equals `expected_next_hop`. Used by rollback paths that
-    /// registered a specific route and need to undo it without clobbering
-    /// a newer concurrently-written entry. Returns `true` if the entry
-    /// was removed.
+    /// Remove any candidate for `dest_id` whose `next_hop` still equals
+    /// `expected_next_hop`. Used by rollback paths that registered a
+    /// specific route and need to undo it without clobbering a newer
+    /// concurrently-written entry. Returns `true` if anything was
+    /// removed.
     ///
     /// Address-only: correct for undoing a write THIS node just made
     /// (the caller knows exactly what it installed). Withdrawal — a
     /// claim from a REMOTE sender — must use
     /// [`Self::remove_route_if_from_hop`] instead.
     pub fn remove_route_if_next_hop_is(&self, dest_id: u64, expected_next_hop: SocketAddr) -> bool {
-        let removed = self
-            .routes
-            .remove_if(&dest_id, |_, entry| entry.next_hop == expected_next_hop)
-            .is_some();
-        if removed {
-            self.num_routes.fetch_sub(1, Ordering::Relaxed);
-        }
-        removed
+        self.mutate(dest_id, |d| {
+            let mut removed = false;
+            for slot in [&mut d.ordinary, &mut d.protected] {
+                if slot
+                    .as_ref()
+                    .is_some_and(|e| e.next_hop == expected_next_hop)
+                {
+                    *slot = None;
+                    removed = true;
+                }
+            }
+            removed
+        })
     }
 
     /// Repoint the routes that ride through a re-handshaking peer at
@@ -800,76 +904,130 @@ impl RoutingTable {
         if old == new {
             return 0;
         }
-        let mut migrated = 0;
-        for mut entry in self.routes.iter_mut() {
-            let moves = match entry.next_hop_id {
-                Some(id) => id == identity && entry.next_hop == old,
-                None => entry.next_hop == old,
-            };
-            if moves {
-                entry.next_hop = new;
-                entry.updated_at = Instant::now();
-                migrated += 1;
+        let mut migrated = 0usize;
+        for mut dest in self.routes.iter_mut() {
+            let mut moved_here = 0usize;
+            if let Some(e) = dest.protected.as_mut() {
+                if e.next_hop_id == Some(identity) && e.next_hop == old {
+                    e.next_hop = new;
+                    e.updated_at = Instant::now();
+                    moved_here += 1;
+                }
+            }
+            if let Some(e) = dest.ordinary.as_mut() {
+                if e.next_hop == old {
+                    e.next_hop = new;
+                    e.updated_at = Instant::now();
+                    moved_here += 1;
+                }
+            }
+            if moved_here > 0 {
+                dest.generation = dest.generation.wrapping_add(1);
+                migrated += moved_here;
             }
         }
         migrated
     }
 
-    /// Look up next hop for destination.
+    /// Look up next hop for destination — the ordinary forwarding
+    /// lookup, over whichever candidate is currently effective.
     ///
-    /// Returns `None` for stale routes — an entry whose `updated_at` is
-    /// older than the configured `max_route_age` (default: very large;
-    /// call [`Self::set_max_route_age`] to enable expiry). Stale entries
-    /// stay in the map until a periodic [`Self::sweep_stale`] call removes
-    /// them.
+    /// Returns `None` for stale routes — a candidate whose `updated_at`
+    /// is older than the configured `max_route_age` (default: very
+    /// large; call [`Self::set_max_route_age`] to enable expiry). Stale
+    /// candidates stay in the map until a periodic [`Self::sweep_stale`]
+    /// call removes them.
     pub fn lookup(&self, dest_id: u64) -> Option<SocketAddr> {
         let max_age = self.max_route_age();
         self.routes
             .get(&dest_id)
-            .filter(|r| r.active && r.updated_at.elapsed() <= max_age)
-            .map(|r| r.next_hop)
+            .and_then(|d| d.effective(max_age).map(|e| e.next_hop))
     }
 
     /// Install an identity-bound route for protected forwarding.
     pub fn add_authenticated_route(&self, dest_id: u64, next_hop: SocketAddr, next_hop_id: u64) {
-        if self
-            .routes
-            .insert(dest_id, RouteEntry::authenticated(next_hop, next_hop_id))
-            .is_none()
-        {
-            self.num_routes.fetch_add(1, Ordering::Relaxed);
-        }
+        self.mutate(dest_id, |d| {
+            d.protected = Some(RouteEntry::authenticated(next_hop, next_hop_id));
+        });
     }
 
-    /// Like [`Self::lookup`], but yields the route's bound next-hop
-    /// identity alongside its address, and only for routes that have
-    /// one.
+    /// The PROTECTED candidate's identity and address — the
+    /// protected-forwarding lookup. It answers "who is the next hop",
+    /// where plain `lookup` answers only "where do I send".
     ///
-    /// This is the protected-forwarding lookup: it answers "who is the
-    /// next hop", where plain `lookup` answers only "where do I send".
-    /// A legacy route returns `None` rather than an unauthenticated
-    /// guess.
+    /// Reads the protected slot alone: an ordinary candidate, however
+    /// good its metric and whoever installed it, resolves to `None`
+    /// rather than to an unauthenticated guess.
     pub fn lookup_authenticated(&self, dest_id: u64) -> Option<(u64, SocketAddr)> {
         let max_age = self.max_route_age();
-        self.routes
-            .get(&dest_id)
-            .filter(|r| r.active && r.updated_at.elapsed() <= max_age)
-            .and_then(|r| r.next_hop_id.map(|id| (id, r.next_hop)))
+        self.routes.get(&dest_id).and_then(|d| {
+            d.protected_live(max_age)
+                .and_then(|e| e.next_hop_id.map(|id| (id, e.next_hop)))
+        })
     }
 
-    /// Move an identity-bound route to a new address under the same
-    /// identity. Returns `false` when the route is absent, legacy, or
-    /// bound to a different identity.
+    /// Move the protected candidate to a new address under the same
+    /// identity. Returns `false` when it is absent or bound to a
+    /// different identity.
     pub fn rebind_authenticated_route(
         &self,
         dest_id: u64,
         identity: u64,
         new_addr: SocketAddr,
     ) -> bool {
-        match self.routes.get_mut(&dest_id) {
-            Some(mut r) => r.rebind_addr(identity, new_addr),
-            None => false,
-        }
+        self.mutate(dest_id, |d| {
+            d.protected
+                .as_mut()
+                .is_some_and(|e| e.rebind_addr(identity, new_addr))
+        })
+    }
+
+    /// Read a destination's current state for a later conditional
+    /// write. Pair with [`Self::install_if_unchanged`].
+    pub fn observe(&self, dest_id: u64) -> Option<RouteObservation> {
+        let max_age = self.max_route_age();
+        self.routes.get(&dest_id).map(|d| {
+            let effective = d.effective(max_age);
+            RouteObservation {
+                generation: d.generation,
+                next_hop: effective.map(|e| e.next_hop),
+                next_hop_id: effective.and_then(|e| e.next_hop_id),
+            }
+        })
+    }
+
+    /// Install a route ONLY if the destination has not changed since
+    /// `observed` was read — the compare-and-set form every
+    /// event-driven rewriter (failure reroute, recovery restore) must
+    /// use.
+    ///
+    /// Those callers snapshot the table, do expensive selection work
+    /// (graph scans, peer probes), and only then write. Between the two
+    /// a fresh authenticated route can land; an unconditional write
+    /// would clobber it with a decision made about state that no longer
+    /// exists. Selection-time filtering does not help — the race is at
+    /// mutation time.
+    ///
+    /// `identity` picks the slot: `Some` writes the protected
+    /// candidate, `None` the ordinary one. Returns `true` if the write
+    /// happened.
+    pub fn install_if_unchanged(
+        &self,
+        dest_id: u64,
+        observed: RouteObservation,
+        next_hop: SocketAddr,
+        identity: Option<u64>,
+    ) -> bool {
+        self.mutate(dest_id, |d| {
+            if d.generation != observed.generation {
+                return false;
+            }
+            match identity {
+                Some(id) => d.protected = Some(RouteEntry::authenticated(next_hop, id)),
+                None => d.ordinary = Some(RouteEntry::new(next_hop)),
+            }
+            true
+        })
     }
 
     /// Like [`Self::lookup`], but returns `None` if the installed
@@ -879,28 +1037,19 @@ impl RoutingTable {
     /// alternate?" — if `Some(addr)`, use it directly; if `None`,
     /// fall back to a graph-based alternate lookup.
     ///
-    /// Today the routing table stores one entry per destination, so
-    /// the "alternate" is either the current entry (if not excluded)
-    /// or nothing. When the table grows to hold ranked alternates
-    /// per destination, the signature stays the same and the
-    /// implementation picks the lowest-metric non-excluded entry.
+    /// Picks the lowest-metric live candidate that is not excluded,
+    /// across both slots.
     pub fn lookup_alternate(
         &self,
         dest_id: u64,
         exclude_next_hop: SocketAddr,
     ) -> Option<SocketAddr> {
-        let max_age = self.max_route_age();
-        self.routes
-            .get(&dest_id)
-            .filter(|r| {
-                r.active && r.updated_at.elapsed() <= max_age && r.next_hop != exclude_next_hop
-            })
-            .map(|r| r.next_hop)
+        self.alternate_where(dest_id, |e| e.next_hop != exclude_next_hop)
     }
 
-    /// [`Self::lookup_alternate`] with an identity exclusion: refuses
-    /// the entry when it is identity-bound to `exclude_identity`, even
-    /// at a different address. Failure rerouting needs this — a failed
+    /// [`Self::lookup_alternate`] with an identity exclusion: refuses a
+    /// candidate identity-bound to `exclude_identity`, even at a
+    /// different address. Failure rerouting needs this — a failed
     /// peer's route whose address drifted off the excluded one must
     /// not be offered as its own alternate.
     pub fn lookup_alternate_excluding(
@@ -909,27 +1058,43 @@ impl RoutingTable {
         exclude_next_hop: SocketAddr,
         exclude_identity: u64,
     ) -> Option<SocketAddr> {
-        let max_age = self.max_route_age();
-        self.routes
-            .get(&dest_id)
-            .filter(|r| {
-                r.active
-                    && r.updated_at.elapsed() <= max_age
-                    && r.next_hop != exclude_next_hop
-                    && r.next_hop_id != Some(exclude_identity)
-            })
-            .map(|r| r.next_hop)
+        self.alternate_where(dest_id, |e| {
+            e.next_hop != exclude_next_hop && e.next_hop_id != Some(exclude_identity)
+        })
     }
 
-    /// Remove all routes whose `updated_at` is older than `max_age`.
-    /// Returns the number of entries removed.
+    fn alternate_where(
+        &self,
+        dest_id: u64,
+        keep: impl Fn(&RouteEntry) -> bool,
+    ) -> Option<SocketAddr> {
+        let max_age = self.max_route_age();
+        self.routes.get(&dest_id).and_then(|d| {
+            d.candidates()
+                .filter(|e| DestRoutes::live(e, max_age) && keep(e))
+                .min_by_key(|e| e.metric)
+                .map(|e| e.next_hop)
+        })
+    }
+
+    /// Drop every candidate older than `max_age`, and the destination
+    /// itself once it has none left. Returns the number of
+    /// DESTINATIONS removed (what `route_count` counts).
     ///
     /// Called periodically from the heartbeat loop to keep dead routes
     /// out of the table.
     pub fn sweep_stale(&self, max_age: std::time::Duration) -> usize {
         let mut removed = 0;
-        self.routes.retain(|_, entry| {
-            let keep = entry.updated_at.elapsed() <= max_age;
+        self.routes.retain(|_, dest| {
+            for slot in [&mut dest.ordinary, &mut dest.protected] {
+                if slot
+                    .as_ref()
+                    .is_some_and(|e| e.updated_at.elapsed() > max_age)
+                {
+                    *slot = None;
+                }
+            }
+            let keep = !dest.is_empty();
             if !keep {
                 removed += 1;
             }
@@ -1041,27 +1206,86 @@ impl RoutingTable {
         self.num_streams.load(Ordering::Relaxed)
     }
 
-    /// Mark route as inactive (on failure)
+    /// Mark a destination's candidates inactive (on failure)
     pub fn deactivate_route(&self, dest_id: u64) {
-        if let Some(mut entry) = self.routes.get_mut(&dest_id) {
-            entry.active = false;
-        }
+        self.mutate(dest_id, |d| {
+            for e in [d.ordinary.as_mut(), d.protected.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                e.active = false;
+            }
+        });
     }
 
-    /// Reactivate route
+    /// Reactivate a destination's candidates
     pub fn activate_route(&self, dest_id: u64) {
-        if let Some(mut entry) = self.routes.get_mut(&dest_id) {
-            entry.active = true;
-            entry.updated_at = Instant::now();
-        }
+        self.mutate(dest_id, |d| {
+            for e in [d.ordinary.as_mut(), d.protected.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                e.active = true;
+                e.updated_at = Instant::now();
+            }
+        });
     }
 
-    /// Get all routes (for debugging/stats)
+    /// Get the effective route per destination (for debugging/stats).
     pub fn all_routes(&self) -> Vec<(u64, RouteEntry)> {
+        let max_age = self.max_route_age();
         self.routes
             .iter()
-            .map(|r| (*r.key(), r.value().clone()))
+            .filter_map(|r| r.value().effective(max_age).map(|e| (*r.key(), e.clone())))
             .collect()
+    }
+
+    /// Every candidate, both provenances, per destination.
+    ///
+    /// Callers deciding whether a destination is AFFECTED by an event
+    /// (a peer failing, say) must consider both slots: a destination
+    /// can ride through the subject peer on either candidate, and
+    /// looking only at the effective one would silently miss the other.
+    pub fn all_route_candidates(&self) -> Vec<(u64, RouteEntry)> {
+        self.routes
+            .iter()
+            .flat_map(|r| {
+                let dest = *r.key();
+                r.value()
+                    .candidates()
+                    .map(|e| (dest, e.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Test-only: age a destination's candidates by `by`, so staleness
+    /// behaviour can be exercised without sleeping.
+    #[cfg(test)]
+    fn backdate(&self, dest_id: u64, by: std::time::Duration) {
+        let stale = Instant::now()
+            .checked_sub(by)
+            .expect("test host uptime should exceed the backdate window");
+        self.mutate(dest_id, |d| {
+            for e in [d.ordinary.as_mut(), d.protected.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                e.updated_at = stale;
+            }
+        });
+    }
+
+    /// Test-only: the protected candidate, ignoring staleness.
+    #[cfg(test)]
+    fn protected_of(&self, dest_id: u64) -> Option<RouteEntry> {
+        self.routes.get(&dest_id).and_then(|d| d.protected.clone())
+    }
+
+    /// Test-only: the ordinary candidate, ignoring staleness.
+    #[cfg(test)]
+    fn ordinary_of(&self, dest_id: u64) -> Option<RouteEntry> {
+        self.routes.get(&dest_id).and_then(|d| d.ordinary.clone())
     }
 
     /// Clean up idle streams (no activity for given duration)
@@ -1584,12 +1808,8 @@ mod tests {
         const DEST: u64 = 0xD60;
 
         table.add_authenticated_route_with_metric(DEST, via_a, A, 3);
-        // Backdate the installed route so it is stale. `checked_sub`
-        // for the same Windows-uptime reason as the sweep test above.
-        let stale_ts = Instant::now()
-            .checked_sub(Duration::from_millis(200))
-            .expect("test host uptime should exceed 200ms");
-        table.routes.get_mut(&DEST).unwrap().updated_at = stale_ts;
+        // Backdate the installed route so it is stale.
+        table.backdate(DEST, Duration::from_millis(200));
         table.set_max_route_age(Duration::from_millis(50));
         assert_eq!(table.lookup(DEST), None, "precondition: stale");
 
@@ -1602,9 +1822,124 @@ mod tests {
         );
         // The binding itself also survived untouched — stale, not
         // rewritten to B.
-        let e = table.routes.get(&DEST).unwrap();
+        let e = table.protected_of(DEST).expect("candidate present");
         assert_eq!(e.next_hop_id, Some(A));
         assert_eq!(e.next_hop, via_a);
+    }
+
+    /// PROVENANCE ISOLATION. An unauthenticated writer must not be
+    /// able to touch authenticated route state in any way — not its
+    /// identity, address, metric, or freshness — and must never be
+    /// able to suppress protected reachability.
+    ///
+    /// The three mutations Kyra named, in order.
+    #[test]
+    fn unauthenticated_writes_cannot_reach_authenticated_route_state() {
+        use std::time::Duration;
+        let table = RoutingTable::new(0x1111);
+        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let via_a: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        const B: u64 = 0xB;
+        const DEST: u64 = 0xD61;
+
+        // (1) authenticated metric-3 through B, then a spoofable
+        // pingwave claiming a BETTER metric-2 through A.
+        table.add_authenticated_route_with_metric(DEST, via_b, B, 3);
+        let before = table.protected_of(DEST).expect("installed");
+        table.add_route_with_metric(DEST, via_a, 2);
+        let after = table.protected_of(DEST).expect("still installed");
+        assert_eq!(after.next_hop_id, Some(B), "identity unchanged");
+        assert_eq!(after.next_hop, via_b, "address unchanged");
+        assert_eq!(after.metric, 3, "metric unchanged");
+        assert_eq!(after.updated_at, before.updated_at, "freshness unchanged");
+        assert_eq!(
+            table.lookup_authenticated(DEST),
+            Some((B, via_b)),
+            "protected forwarding still resolves the authenticated hop",
+        );
+
+        // (2) a backdated authenticated route stays stale however many
+        // pingwaves arrive through an unrelated peer.
+        table.backdate(DEST, Duration::from_millis(200));
+        table.set_max_route_age(Duration::from_millis(50));
+        table.add_route_with_metric(DEST, via_a, 2);
+        table.add_route_with_metric(DEST, via_a, 2);
+        assert_eq!(
+            table.lookup_authenticated(DEST),
+            None,
+            "an unauthenticated writer cannot keep a dead protected route alive",
+        );
+
+        // (3) a forged legacy route installed FIRST must not stop a
+        // later legitimate capability route from restoring protected
+        // reachability — even at a worse metric.
+        const DEST2: u64 = 0xD62;
+        let table = RoutingTable::new(0x1111);
+        table.add_route_with_metric(DEST2, via_a, 2); // forged, better
+        table.add_authenticated_route_with_metric(DEST2, via_b, B, 3); // real, worse
+        assert_eq!(
+            table.lookup_authenticated(DEST2),
+            Some((B, via_b)),
+            "the authenticated candidate has its own slot; a forged \
+             better-metric legacy route cannot occupy the destination",
+        );
+        // Ordinary forwarding still prefers the better metric — the
+        // provenance split changes protected resolution, not ordinary
+        // best-path selection.
+        assert_eq!(table.lookup(DEST2), Some(via_a));
+    }
+
+    /// A routed (`connect_via`) end-to-end install writes only the
+    /// ordinary candidate, so it cannot erase an authenticated learned
+    /// route to the same endpoint.
+    #[test]
+    fn an_ordinary_install_does_not_erase_the_authenticated_candidate() {
+        let table = RoutingTable::new(0x1111);
+        let real_hop: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let relay: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        const ADJ: u64 = 0xAD;
+        const DEST: u64 = 0xD63;
+
+        table.add_authenticated_route_with_metric(DEST, real_hop, ADJ, 3);
+        table.add_route(DEST, relay); // the RoutedPreserve install
+        assert_eq!(
+            table.lookup_authenticated(DEST),
+            Some((ADJ, real_hop)),
+            "a routed end-to-end session contributes no adjacency and \
+             must not delete stronger evidence",
+        );
+        assert_eq!(
+            table.lookup(DEST),
+            Some(relay),
+            "ordinary traffic still follows the fresh metric-1 relay route",
+        );
+    }
+
+    /// A conditional write lands only while the destination is
+    /// unchanged; any intervening mutation makes it skip rather than
+    /// clobber.
+    #[test]
+    fn install_if_unchanged_skips_after_an_intervening_write() {
+        let table = RoutingTable::new(0x1111);
+        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let d: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        const DEST: u64 = 0xD64;
+
+        table.add_route(DEST, b);
+        let observed = table.observe(DEST).expect("present");
+
+        // Uncontended: the conditional write lands.
+        assert!(table.install_if_unchanged(DEST, observed, c, None));
+        assert_eq!(table.lookup(DEST), Some(c));
+
+        // A stale observation cannot overwrite the newer state.
+        assert!(!table.install_if_unchanged(DEST, observed, d, None));
+        assert_eq!(
+            table.lookup(DEST),
+            Some(c),
+            "a write conditioned on state that no longer exists must skip",
+        );
     }
 
     /// Withdrawal removal is identity-qualified: a sender can remove
@@ -1621,23 +1956,41 @@ mod tests {
         // Bound to C at address X: B's withdrawal from X must miss.
         table.add_authenticated_route_with_metric(0xAAA, x, C, 3);
         assert!(
-            !table.remove_route_if_from_hop(0xAAA, x, B),
+            !table.remove_route_if_from_hop(0xAAA, x, B, true),
             "a withdrawal must not remove a route bound to another identity"
         );
         assert_eq!(table.lookup_authenticated(0xAAA), Some((C, x)));
         // C's own withdrawal removes it.
-        assert!(table.remove_route_if_from_hop(0xAAA, x, C));
+        assert!(table.remove_route_if_from_hop(0xAAA, x, C, true));
         assert_eq!(table.lookup(0xAAA), None);
 
-        // Legacy entry at X: removable by any sender at that address
-        // (there is no identity to protect), as before.
-        table.add_route(0xBBB, x);
-        assert!(table.remove_route_if_from_hop(0xBBB, x, B));
+        // REBIND RACE: the binding's address drifted off the sender's
+        // current one (peer record and session index publish before
+        // route migration). Identity alone is ownership for a bound
+        // candidate, so the authenticated owner still removes it.
+        table.add_authenticated_route_with_metric(0xDDD, x, B, 3);
+        assert!(
+            table.remove_route_if_from_hop(0xDDD, y, B, true),
+            "an authenticated owner must remove its own binding despite address drift"
+        );
+        assert_eq!(table.lookup(0xDDD), None);
 
-        // Wrong address never matches, bound or not.
-        table.add_authenticated_route_with_metric(0xCCC, x, B, 3);
-        assert!(!table.remove_route_if_from_hop(0xCCC, y, B));
-        assert_eq!(table.lookup_authenticated(0xCCC), Some((B, x)));
+        // DIRECT LEGACY: the sender genuinely owns the address in both
+        // indexes, so the legacy entry there is its own to withdraw.
+        table.add_route(0xBBB, x);
+        assert!(table.remove_route_if_from_hop(0xBBB, x, B, true));
+        assert_eq!(table.lookup(0xBBB), None);
+
+        // SHARED RELAY: a routed sender records the RELAY's address,
+        // which it does not own. The legacy route there belongs to the
+        // relay and must survive.
+        table.add_route(0xCCC, x);
+        assert!(
+            !table.remove_route_if_from_hop(0xCCC, x, B, false),
+            "an unconfirmed (routed) sender must not remove legacy routes \
+             at a shared relay address"
+        );
+        assert_eq!(table.lookup(0xCCC), Some(x));
     }
 
     /// The learned-route writer contract: strictly-better replaces,
@@ -1714,19 +2067,13 @@ mod tests {
         table.add_route(0x2222, addr_a);
         table.add_route(0x3333, addr_b);
 
-        // Backdate 0x2222's entry so it looks stale. `checked_sub`
-        // avoids the overflow panic that fires on hosts with
-        // system uptime < the subtracted duration (Windows
+        // Backdate 0x2222's entry so it looks stale. `backdate` uses
+        // `checked_sub` to avoid the overflow panic that fires on hosts
+        // with system uptime < the subtracted duration (Windows
         // Instant is bounded by boot). The 200ms / 50ms pair
         // tests the same staleness invariant without hour-scale
         // uptime requirements.
-        let stale_ts = Instant::now()
-            .checked_sub(Duration::from_millis(200))
-            .expect("test host uptime should exceed 200ms");
-        {
-            let mut e = table.routes.get_mut(&0x2222).unwrap();
-            e.updated_at = stale_ts;
-        }
+        table.backdate(0x2222, Duration::from_millis(200));
 
         // With a small max-age, the backdated entry is stale but the
         // fresh one is still visible.
@@ -1806,16 +2153,7 @@ mod tests {
 
         table.add_route(0x4444, b);
         // Backdate the entry so `updated_at.elapsed() > max_route_age`.
-        // `checked_sub` avoids the overflow panic that fires on
-        // hosts with system uptime < the subtracted duration
-        // (Windows Instant is bounded by boot).
-        let stale_ts = Instant::now()
-            .checked_sub(Duration::from_millis(200))
-            .expect("test host uptime should exceed 200ms");
-        {
-            let mut e = table.routes.get_mut(&0x4444).unwrap();
-            e.updated_at = stale_ts;
-        }
+        table.backdate(0x4444, Duration::from_millis(200));
         table.set_max_route_age(Duration::from_millis(50));
 
         // Even though the next_hop isn't excluded, staleness drops it.
@@ -1872,8 +2210,7 @@ mod tests {
         // After the race, the entry must exist and its metric
         // must be the lowest any thread offered.
         let entry = table
-            .routes
-            .get(&dest)
+            .ordinary_of(dest)
             .expect("route must exist after all threads inserted");
         assert_eq!(
             entry.metric, 1,
@@ -1932,7 +2269,7 @@ mod tests {
             "direct route (metric=1) must not be displaced by any \
              concurrent indirect insert with metric >= 2",
         );
-        let entry = table.routes.get(&dest).unwrap();
+        let entry = table.ordinary_of(dest).unwrap();
         assert_eq!(entry.metric, 1, "metric must still be 1 (direct)");
     }
 

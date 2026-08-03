@@ -928,6 +928,28 @@ mod tests {
         );
     }
 
+    /// The claim is released by an UNWIND, not merely by a normal
+    /// return: a panic inside the admission window must not leave the
+    /// session permanently claimed, dropping every later packet as
+    /// `Contended`. Exercised by panicking while a claim is held and
+    /// then admitting again.
+    #[test]
+    fn a_panic_while_claimed_does_not_wedge_the_window() {
+        let w = SharedHopReplayWindow::new();
+        assert!(w.admit(1).is_ok());
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _claim = w.try_claim().expect("uncontended");
+            panic!("simulated panic inside the admission window");
+        }));
+        assert!(caught.is_err(), "the panic must propagate to the caller");
+
+        // The RAII guard ran during the unwind, so the window is free
+        // and its state is intact.
+        assert!(w.admit(2).is_ok(), "the window must not be left claimed");
+        assert_eq!(w.admit(1).unwrap_err(), RouteHopError::Replay);
+    }
+
     /// Concurrent misuse fails CLOSED. Hammer one shared window from
     /// many threads with overlapping sequence ranges: no verdict may
     /// be anything but Ok / Replay / Contended, each sequence is

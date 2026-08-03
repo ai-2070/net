@@ -4310,6 +4310,26 @@ const ROUTE_WITHDRAW_DAMP_WINDOW: Duration = Duration::from_secs(1);
 /// convergence under a cascade storm — never a correctness loss.
 const MAX_INFLIGHT_ROUTE_WITHDRAW_CASCADES: usize = 64;
 
+/// Number of shards backing `MeshNode::install_locks`.
+///
+/// The lock serializes a peer's whole install transition on the
+/// control path (`install_peer_cas`). Sharding keeps the set
+/// fixed-size — no per-peer allocation, no lifecycle, no unbounded
+/// growth from peers that come and go — at the cost of two different
+/// peers occasionally sharing one. That collision costs a single
+/// uncontended-in-practice lock acquisition on a path that has just
+/// completed a Noise handshake.
+const INSTALL_LOCK_SHARDS: usize = 64;
+
+/// Which `install_locks` shard serializes `node_id`.
+///
+/// `node_id`s are hash-derived, so the low bits are already well
+/// distributed; masking is enough and keeps this branch-free.
+#[inline]
+fn install_lock_shard(node_id: u64) -> usize {
+    (node_id as usize) & (INSTALL_LOCK_SHARDS - 1)
+}
+
 /// Damper admission for one route-withdrawal flood, keyed by
 /// `(dest, exclude)`.
 ///
@@ -7473,6 +7493,13 @@ pub struct MeshNode {
     pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
+    /// Per-peer serialization of the whole install transition —
+    /// CONTROL PATH ONLY (see `install_peer_cas`). Sharded rather than
+    /// per-NodeID so the set is fixed-size and needs no lifecycle of
+    /// its own; contention between two different peers landing in the
+    /// same shard costs one uncontended-in-practice lock on a path
+    /// that already ran a Noise handshake.
+    install_locks: Arc<[parking_lot::Mutex<()>; INSTALL_LOCK_SHARDS]>,
     /// Automatic reroute policy
     reroute_policy: Arc<ReroutePolicy>,
     /// Node ID → SocketAddr map (shared with reroute policy)
@@ -8352,7 +8379,17 @@ impl MeshNode {
         let reroute_policy = Arc::new(
             ReroutePolicy::new(router.routing_table().clone(), peer_addrs.clone())
                 .with_proximity_graph(proximity_graph.clone())
-                .with_addr_to_node(addr_to_node.clone()),
+                .with_addr_to_node(addr_to_node.clone())
+                .with_peer_incarnation({
+                    // A failure/recovery callback that outlives the
+                    // session it concerns must not rewrite routes
+                    // belonging to a replacement session of the same
+                    // NodeID.
+                    let peers = peers.clone();
+                    Arc::new(move |node_id: u64| {
+                        peers.get(&node_id).map(|p| p.value().session.session_id())
+                    })
+                }),
         );
 
         // Subscriber roster for channel fan-out; also wired into the
@@ -9054,6 +9091,7 @@ impl MeshNode {
             pending_handshakes,
             pending_direct_initiators,
             proximity_graph,
+            install_locks: Arc::new(std::array::from_fn(|_| parking_lot::Mutex::new(()))),
             reroute_policy,
             peer_addrs,
             partition_filter,
@@ -13706,6 +13744,24 @@ impl MeshNode {
     ) -> bool {
         use dashmap::mapref::entry::Entry;
 
+        // Serialize the WHOLE install transition for this peer.
+        //
+        // The `peers` entry lock alone orders only the peer-record
+        // swap; every sidecar below (peer_addrs, the route, both
+        // address indexes, the session index, the withdrawal gate,
+        // learned-route migration) is published after it is released.
+        // Two installs could therefore serialize peer state A → B → C
+        // and then finish sidecars C-then-B, leaving `peers` holding C
+        // while the route, addresses and session index named B — a peer
+        // snapshot that is not coherent with itself. The egress
+        // incarnation check fails closed on that, but protected
+        // availability is gone until something else repairs it.
+        //
+        // Control path only: handshake completion and direct-path
+        // upgrades take this; nothing on the packet path does. Held
+        // across no `.await` — the whole transition is synchronous.
+        let _install = self.install_locks[install_lock_shard(peer_node_id)].lock();
+
         let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
@@ -13923,48 +13979,58 @@ impl MeshNode {
         // insert.
         let session_id = session.session_id();
 
-        self.router.add_direct_route(peer_node_id, peer_addr);
+        // Same whole-transition serialization as `install_peer_cas`:
+        // this publishes the identical sidecar set and must not
+        // interleave with a concurrent install for the same peer. The
+        // guard is scoped to the synchronous block — `parking_lot`
+        // guards are not `Send`, so the compiler enforces that it can
+        // never be held across the `.await`s below.
+        {
+            let _install = self.install_locks[install_lock_shard(peer_node_id)].lock();
 
-        let displaced = self.peers.insert(
-            peer_node_id,
-            PeerInfo {
-                node_id: peer_node_id,
-                addr: peer_addr,
-                session,
-                remote_static_pub,
-                // `accept` runs before `start()`, so the routed-
-                // dispatch replay guard is moot; leave empty.
-                last_initiator_ephemeral: None,
-            },
-        );
-        self.addr_to_node.insert(peer_addr, peer_node_id);
+            self.router.add_direct_route(peer_node_id, peer_addr);
 
-        self.peer_addrs.insert(peer_node_id, peer_addr);
-        // Re-handshake from a new direct address: migrate multi-hop
-        // routes off the peer's previous address and drop its stale
-        // reverse-index entry — see the matching comment in
-        // `install_peer`'s DirectOverwrite arm (RT-5 review
-        // Finding 6).
-        if let Some(old_addr) = displaced.as_ref().map(|d| d.addr) {
-            if old_addr != peer_addr {
-                self.router
-                    .routing_table()
-                    .migrate_next_hop(old_addr, peer_addr, peer_node_id);
-                self.addr_to_node
-                    .remove_if(&old_addr, |_, n| *n == peer_node_id);
+            let displaced = self.peers.insert(
+                peer_node_id,
+                PeerInfo {
+                    node_id: peer_node_id,
+                    addr: peer_addr,
+                    session,
+                    remote_static_pub,
+                    // `accept` runs before `start()`, so the routed-
+                    // dispatch replay guard is moot; leave empty.
+                    last_initiator_ephemeral: None,
+                },
+            );
+            self.addr_to_node.insert(peer_addr, peer_node_id);
+
+            self.peer_addrs.insert(peer_node_id, peer_addr);
+            // Re-handshake from a new direct address: migrate multi-hop
+            // routes off the peer's previous address and drop its stale
+            // reverse-index entry — see the matching comment in
+            // `install_peer`'s DirectOverwrite arm (RT-5 review
+            // Finding 6).
+            if let Some(old_addr) = displaced.as_ref().map(|d| d.addr) {
+                if old_addr != peer_addr {
+                    self.router
+                        .routing_table()
+                        .migrate_next_hop(old_addr, peer_addr, peer_node_id);
+                    self.addr_to_node
+                        .remove_if(&old_addr, |_, n| *n == peer_node_id);
+                }
             }
+            // PERF_AUDIT §2.4: evict the displaced session's reverse-
+            // index entry before installing the fresh one — see the
+            // matching comment in `install_peer`.
+            if let Some(old) = displaced {
+                self.session_id_to_node
+                    .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
+            }
+            self.session_id_to_node.insert(session_id, peer_node_id);
+            // See the matching comment in `install_peer` — fresh
+            // incarnation, fresh withdrawal-seq gate history.
+            self.route_withdraw_gate.forget_sender(peer_node_id);
         }
-        // PERF_AUDIT §2.4: evict the displaced session's reverse-
-        // index entry before installing the fresh one — see the
-        // matching comment in `install_peer`.
-        if let Some(old) = displaced {
-            self.session_id_to_node
-                .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
-        }
-        self.session_id_to_node.insert(session_id, peer_node_id);
-        // See the matching comment in `install_peer` — fresh
-        // incarnation, fresh withdrawal-seq gate history.
-        self.route_withdraw_gate.forget_sender(peer_node_id);
 
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
@@ -15892,12 +15958,16 @@ impl MeshNode {
                 // adjacent sender; until pingwaves are themselves
                 // adjacent-session authenticated, the route they
                 // install stays address-only — usable by ordinary
-                // routing, unresolvable by protected forwarding. The
-                // authenticated learning path for the same edge is the
-                // capability announcement, whose sender is the
-                // AEAD-resolved session peer; its equal-metric
-                // same-address install upgrades this legacy entry in
-                // place (`add_authenticated_route_with_metric`).
+                // routing, unresolvable by protected forwarding.
+                //
+                // This writes the ORDINARY candidate, which is a
+                // separate slot from the protected one: a pingwave can
+                // neither mutate authenticated route state nor occupy
+                // the destination against it, whatever metric it
+                // claims. The authenticated learning path for the same
+                // edge is the capability announcement, whose sender is
+                // the AEAD-resolved session peer; it always has an
+                // empty protected slot to land in.
                 let install_learned_route = || {
                     ctx.router
                         .routing_table()
@@ -21153,18 +21223,25 @@ impl MeshNode {
         // elsewhere.
         ctx.proximity_graph
             .remove_edge(node_id_to_graph_id(from_node), node_id_to_graph_id(dest));
-        // Drop exactly (dest, next_hop == sender) — IDENTITY-qualified:
-        // the sender may only withdraw a route that is bound to it (or
-        // a legacy entry at its address); an identity-bound route
-        // belonging to another peer that happens to sit at a reused or
-        // shared address is not the sender's to tear down. If our
-        // route to dest goes elsewhere, nothing changed for us and the
-        // cascade stops here — that scoping is what makes the whole
-        // scheme loop-safe.
-        let route_dropped = ctx
-            .router
-            .routing_table()
-            .remove_route_if_from_hop(dest, via_addr, from_node);
+        // Drop exactly what the sender OWNS toward `dest`. Ownership is
+        // per provenance: its own identity binding (address-independent,
+        // so a rebind race that left the binding on the old address is
+        // still withdrawable), or a legacy entry at an address it is
+        // confirmed to own directly. `sender_is_direct` requires the
+        // forward and reverse indexes to agree — a routed peer records
+        // its RELAY's address, and the legacy routes sitting at that
+        // shared tuple belong to the relay, not to it. If our route to
+        // dest goes elsewhere, nothing changed for us and the cascade
+        // stops here — that scoping is what makes the whole scheme
+        // loop-safe.
+        let sender_is_direct = ctx.peer_addrs.get(&from_node).map(|e| *e.value()) == Some(via_addr)
+            && ctx.addr_to_node.get(&via_addr).map(|e| *e.value()) == Some(from_node);
+        let route_dropped = ctx.router.routing_table().remove_route_if_from_hop(
+            dest,
+            via_addr,
+            from_node,
+            sender_is_direct,
+        );
         // SI-5 (§4.8): losing our route toward `dest` expires every
         // observation we hold from it — continuity is a claim about
         // the live stream's path, and the stream now rides an
@@ -34024,6 +34101,91 @@ mod heartbeat_aead_tests {
         );
     }
 
+    /// The whole install transition is serialized per peer: a slow
+    /// installer cannot publish its sidecars after a newer one has
+    /// completed, leaving `peers` naming one incarnation while the
+    /// route, addresses and session index name another.
+    ///
+    /// Two installers race for the same peer from different threads.
+    /// Whichever wins, every sidecar must name the SAME incarnation as
+    /// the peer record — that self-consistency is the property the
+    /// lock exists to provide (before it, the sidecar writes could
+    /// interleave in the opposite order from the peer-record swap).
+    #[tokio::test]
+    async fn concurrent_installs_leave_a_self_consistent_peer_snapshot() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x31u8; 32]);
+        let node = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        );
+
+        let peer_id = 0xBA55_0001u64;
+        let addr_b: SocketAddr = "10.4.4.4:9100".parse().unwrap();
+        let addr_c: SocketAddr = "10.5.5.5:9100".parse().unwrap();
+
+        for round in 0..64 {
+            let (keys_b, _) = make_session_keys();
+            let (keys_c, _) = make_session_keys();
+            let sid_b = keys_b.session_id;
+            let sid_c = keys_c.session_id;
+
+            let n1 = node.clone();
+            let n2 = node.clone();
+            let t1 = std::thread::spawn(move || {
+                n1.install_peer(peer_id, addr_b, keys_b, AddrInstallMode::DirectOverwrite);
+            });
+            let t2 = std::thread::spawn(move || {
+                n2.install_peer(peer_id, addr_c, keys_c, AddrInstallMode::DirectOverwrite);
+            });
+            t1.join().expect("installer B");
+            t2.join().expect("installer C");
+
+            // Read the peer record, then check every sidecar against
+            // THAT incarnation.
+            let (winner_sid, winner_addr) = node
+                .peers
+                .get(&peer_id)
+                .map(|p| (p.value().session.session_id(), p.value().addr))
+                .expect("a peer record exists");
+            assert!(
+                winner_sid == sid_b || winner_sid == sid_c,
+                "round {round}: the winner must be one of the two installs",
+            );
+            let expected_addr = if winner_sid == sid_b { addr_b } else { addr_c };
+            assert_eq!(
+                winner_addr, expected_addr,
+                "round {round}: PeerInfo.addr must match the winning session",
+            );
+            assert_eq!(
+                node.peer_addrs.get(&peer_id).map(|e| *e),
+                Some(expected_addr),
+                "round {round}: peer_addrs must name the winning incarnation",
+            );
+            assert_eq!(
+                node.session_id_to_node.get(&winner_sid).map(|e| *e),
+                Some(peer_id),
+                "round {round}: the session index must name the winner",
+            );
+            assert_eq!(
+                node.session_id_to_node.len(),
+                1,
+                "round {round}: the loser's session index entry must be gone",
+            );
+            assert_eq!(
+                node.addr_to_node.get(&expected_addr).map(|e| *e),
+                Some(peer_id),
+                "round {round}: the winning address must be indexed",
+            );
+            assert_eq!(
+                node.router.routing_table().lookup_authenticated(peer_id),
+                Some((peer_id, expected_addr)),
+                "round {round}: the direct route must ride the winning address",
+            );
+        }
+    }
+
     /// A routed (`connect_via`) install is NOT an authenticated
     /// adjacency. The session authenticates the far endpoint while
     /// the recorded address is the immediate relay's, so the route it
@@ -34213,6 +34375,64 @@ mod heartbeat_aead_tests {
             "the legitimate envelope's sequence must still admit after the forgery",
         );
         assert!(receiver.open_route_hop(&envelope).is_err(), "…exactly once",);
+    }
+
+    /// The PRODUCTION re-handshake path resets replay state: after
+    /// `install_peer` replaces a peer's session, the new incarnation
+    /// admits a hop sequence the displaced one had already consumed.
+    ///
+    /// The pure-session witness below constructs two session pairs
+    /// directly; this one drives the real installer, so it also covers
+    /// the case where the replacement is published through the peer
+    /// map rather than constructed in isolation.
+    #[tokio::test]
+    async fn a_production_re_handshake_resets_the_replay_window() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x32u8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0x2E01_0001u64;
+        let peer_addr: SocketAddr = "10.3.3.3:9100".parse().unwrap();
+        let header = crate::adapter::net::route::RoutingHeader::new(peer_id, 0x51C, 4);
+
+        // First incarnation: the peer's sending side is the far half of
+        // the same handshake, so its envelope verifies on our session.
+        let (far_keys, near_keys) = make_session_keys();
+        node.install_peer(
+            peer_id,
+            peer_addr,
+            near_keys,
+            AddrInstallMode::DirectOverwrite,
+        );
+        let far = NetSession::new(far_keys, peer_addr, 4, false);
+        let env = far.seal_route_hop(&header, b"first-incarnation");
+        assert!(
+            node.open_route_hop_from_peer(peer_id, &env).is_some(),
+            "the first envelope must verify and admit",
+        );
+        assert!(
+            node.open_route_hop_from_peer(peer_id, &env).is_none(),
+            "…exactly once",
+        );
+
+        // Re-handshake through the production installer.
+        let (far_keys, near_keys) = make_session_keys();
+        node.install_peer(
+            peer_id,
+            peer_addr,
+            near_keys,
+            AddrInstallMode::DirectOverwrite,
+        );
+        let far = NetSession::new(far_keys, peer_addr, 4, false);
+        let env = far.seal_route_hop(&header, b"second-incarnation");
+        assert!(
+            node.open_route_hop_from_peer(peer_id, &env).is_some(),
+            "the replacement incarnation must start from a fresh replay \
+             window — its first hop carries sequence 0, which the \
+             displaced session had already consumed",
+        );
     }
 
     /// A fresh session incarnation starts a fresh replay window: a

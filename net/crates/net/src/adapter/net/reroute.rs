@@ -33,8 +33,12 @@ struct SavedRoute {
     /// `peer_addrs[failed_node_id]` at recovery time.
     failed_node_id: u64,
     /// The alternate we rerouted to
-    #[allow(dead_code)]
     alternate: SocketAddr,
+    /// The destination's generation immediately AFTER we installed
+    /// `alternate`. Recovery restores only while the table still holds
+    /// exactly that state: anything else means a newer writer has
+    /// spoken since, and a stale recovery must not undo it.
+    alternate_generation: u64,
 }
 
 /// Policy that automatically reroutes traffic when peers fail.
@@ -60,6 +64,12 @@ pub struct ReroutePolicy {
     /// (tests, benches), every install falls back to the legacy
     /// identity-less form.
     addr_to_node: Option<Arc<DashMap<SocketAddr, u64>>>,
+    /// Probe for a peer's current session incarnation, so a delayed
+    /// failure/recovery callback can tell that the peer it is about has
+    /// since been replaced by a fresh session. Absent in tests/benches
+    /// that model no session lifecycle.
+    #[allow(clippy::type_complexity)]
+    peer_incarnation: Option<Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>>,
     /// Proximity graph for multi-hop alternate selection
     proximity_graph: Option<Arc<ProximityGraph>>,
     /// Saved original routes for recovery (dest_node_id → saved route)
@@ -96,6 +106,7 @@ impl ReroutePolicy {
             routing_table,
             peer_addrs,
             addr_to_node: None,
+            peer_incarnation: None,
             proximity_graph: None,
             saved_routes: DashMap::new(),
             reroute_count: AtomicU64::new(0),
@@ -118,6 +129,17 @@ impl ReroutePolicy {
         self
     }
 
+    /// Wire a peer-incarnation probe so failure/recovery decisions can
+    /// be abandoned when the peer they concern has been replaced by a
+    /// fresh session mid-callback.
+    pub fn with_peer_incarnation(
+        mut self,
+        probe: Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>,
+    ) -> Self {
+        self.peer_incarnation = Some(probe);
+        self
+    }
+
     /// The identity to bind for a next hop at `addr`, iff the reverse
     /// index and the forward map agree it is that peer's own DIRECT
     /// session address. Disagreement (a relayed entry, a stale index,
@@ -130,16 +152,33 @@ impl ReroutePolicy {
     }
 
     /// Install `dest → addr`, identity-bound when `addr` is a
-    /// confirmed direct peer's own address. Unconditional (metric-1)
-    /// like the legacy `add_route`, since both call sites deliberately
-    /// replace whatever entry is present.
-    fn install_route(&self, dest_id: u64, addr: SocketAddr) {
-        match self.direct_identity_for(addr) {
-            Some(node_id) => self
-                .routing_table
-                .add_authenticated_route(dest_id, addr, node_id),
-            None => self.routing_table.add_route(dest_id, addr),
-        }
+    /// confirmed direct peer's own address — but ONLY while the
+    /// destination still matches `observed`.
+    ///
+    /// Both call sites (failure reroute, recovery restore) select
+    /// asynchronously from an event callback, so an unconditional write
+    /// would let a stale decision clobber a route installed while the
+    /// selection ran. Returns `true` if the write landed.
+    fn install_route_if_unchanged(
+        &self,
+        dest_id: u64,
+        observed: crate::adapter::net::route::RouteObservation,
+        addr: SocketAddr,
+    ) -> bool {
+        self.routing_table.install_if_unchanged(
+            dest_id,
+            observed,
+            addr,
+            self.direct_identity_for(addr),
+        )
+    }
+
+    /// The peer's current session incarnation, when a probe is wired.
+    /// `None` both when no probe exists and when the peer is absent —
+    /// callers compare two readings, so either way an unchanged
+    /// reading means "no replacement observed".
+    fn incarnation_of(&self, node_id: u64) -> Option<u64> {
+        self.peer_incarnation.as_ref().and_then(|p| p(node_id))
     }
 
     /// Called when the failure detector marks a peer as failed.
@@ -153,18 +192,23 @@ impl ReroutePolicy {
             Some(addr) => *addr,
             None => return, // unknown node, nothing to reroute
         };
+        // The incarnation this failure is ABOUT. A delayed callback for
+        // a dead session must not reroute routes belonging to a
+        // replacement session of the same NodeID that has since
+        // handshaked — those are fresh evidence about a live peer.
+        let failed_incarnation = self.incarnation_of(failed_node_id);
 
-        // Find all routes riding through the failed peer —
-        // identity-qualified: an identity-bound entry is affected iff
-        // it is bound to the failed peer (its address may even have
-        // drifted); a legacy entry is affected by the address match,
-        // as before. An address match alone must not reroute a route
-        // identity-bound to a DIFFERENT peer that happens to sit at a
-        // reused or shared address — that peer supplied its own route
-        // evidence and did not fail.
-        let affected: Vec<u64> = self
+        // Find all destinations riding through the failed peer, over
+        // BOTH candidates — identity-qualified: a bound candidate is
+        // affected iff it is bound to the failed peer (its address may
+        // even have drifted); an ordinary candidate is affected by the
+        // address match. An address match alone must not reroute a
+        // route identity-bound to a DIFFERENT peer that happens to sit
+        // at a reused or shared address — that peer supplied its own
+        // route evidence and did not fail.
+        let mut affected: Vec<u64> = self
             .routing_table
-            .all_routes()
+            .all_route_candidates()
             .into_iter()
             .filter(|(_, entry)| match entry.next_hop_id {
                 Some(id) => id == failed_node_id,
@@ -172,6 +216,8 @@ impl ReroutePolicy {
             })
             .map(|(dest_id, _)| dest_id)
             .collect();
+        affected.sort_unstable();
+        affected.dedup();
 
         if affected.is_empty() {
             return;
@@ -181,18 +227,24 @@ impl ReroutePolicy {
         // topology doesn't blackhole traffic through a peer that happens
         // to reach some but not all affected destinations.
         //
-        // Resolution order, per destination:
-        //   1. Routing table: `lookup_alternate(dest, failed_addr)`.
-        //      Today's table stores one entry per destination, so this
-        //      returns `None` when the affected entry *is* the
-        //      failed-peer entry — forward-compat scaffolding for a
-        //      future multi-route table.
-        //   2. Proximity graph: `find_graph_alternate_for(...)` BFS.
-        //   3. Last-resort fallback: any direct peer that isn't the
-        //      failed one. Best-effort — if the fallback peer can't
-        //      actually reach `dest_id`, the packet is dropped rather
-        //      than blackholed; the failure detector will mark that
-        //      peer dead next cycle if it's unreachable.
+        // Resolution order, per destination. EVERY source excludes both
+        // the failed identity and the failed transport (address) — a
+        // routed peer records its relay's address, so an identity-only
+        // exclusion would select a candidate whose only path is the
+        // dead one:
+        //   1. Routing table: `lookup_alternate_excluding(...)`. The
+        //      table holds an ordinary and a protected candidate per
+        //      destination, so this can genuinely answer with the other
+        //      one when only the failed peer's candidate is excluded.
+        //   2. Proximity graph: `find_graph_alternate_for(...)` BFS,
+        //      preferring a hop whose forward/reverse indexes agree so
+        //      protected recovery lands on one that can carry identity.
+        //   3. Last-resort fallback: any direct peer that is neither
+        //      the failed identity nor on its address. Best-effort — if
+        //      the fallback peer can't actually reach `dest_id`, the
+        //      packet is dropped rather than blackholed; the failure
+        //      detector will mark that peer dead next cycle if it's
+        //      unreachable.
         //
         // `saved_routes` preserves the *original* next_hop so that
         // recovery can restore the pre-failure route. Use
@@ -202,34 +254,70 @@ impl ReroutePolicy {
         // next_hop and corrupt recovery.
         let mut rerouted = 0usize;
         for dest_id in &affected {
-            // Identity-aware exclusion: an identity-bound route can be
-            // in `affected` via its binding while its ADDRESS drifted
-            // off `failed_addr` — the address-only exclusion would
-            // then hand the failed peer's own route back as its
-            // "alternate".
+            // Observe BEFORE selection: everything below (graph scans,
+            // peer probes) takes time, and the write at the end is
+            // conditioned on this exact reading.
+            let Some(observed) = self.routing_table.observe(*dest_id) else {
+                continue; // destination vanished under us
+            };
+            // Identity-aware exclusion: a bound candidate can be in
+            // `affected` via its binding while its ADDRESS drifted off
+            // `failed_addr` — the address-only exclusion would then
+            // hand the failed peer's own route back as its "alternate".
             let alt_addr = self
                 .routing_table
                 .lookup_alternate_excluding(*dest_id, failed_addr, failed_node_id)
-                .or_else(|| self.find_graph_alternate_for(failed_node_id, *dest_id))
+                .or_else(|| self.find_graph_alternate_for(failed_node_id, failed_addr, *dest_id))
                 .or_else(|| {
+                    // Last-resort fallback: any direct peer that is
+                    // neither the failed identity NOR sitting on the
+                    // failed transport. A routed peer records its
+                    // relay's address, so an identity-only exclusion
+                    // would "reroute" straight back onto the dead
+                    // address — and then degrade the route to legacy
+                    // when direct confirmation fails.
                     self.peer_addrs
                         .iter()
-                        .find(|e| *e.key() != failed_node_id)
+                        .find(|e| *e.key() != failed_node_id && *e.value() != failed_addr)
                         .map(|e| *e.value())
                 });
             let alt_addr = match alt_addr {
                 Some(a) => a,
                 None => continue, // truly nothing to try
             };
+            // The peer may have been replaced by a fresh incarnation
+            // while we were selecting — this failure is not about that
+            // peer.
+            if self.incarnation_of(failed_node_id) != failed_incarnation {
+                continue;
+            }
 
+            // Conditional write: skip if anything touched this
+            // destination since `observed` (a fresh authenticated route
+            // landing mid-selection is exactly the case that must not
+            // be clobbered).
+            if !self.install_route_if_unchanged(*dest_id, observed, alt_addr) {
+                continue;
+            }
+            // Record what we actually installed, including the
+            // generation it produced, so recovery can tell whether its
+            // own alternate is still the current state.
+            let installed_generation = self
+                .routing_table
+                .observe(*dest_id)
+                .map(|o| o.generation)
+                .unwrap_or_default();
             self.saved_routes
                 .entry(*dest_id)
-                .and_modify(|existing| existing.alternate = alt_addr)
+                .and_modify(|existing| {
+                    existing.alternate = alt_addr;
+                    existing.alternate_generation = installed_generation;
+                })
                 .or_insert(SavedRoute {
                     failed_node_id,
                     alternate: alt_addr,
+                    alternate_generation: installed_generation,
                 });
-            self.install_route(*dest_id, alt_addr);
             rerouted += 1;
         }
 
@@ -254,37 +342,57 @@ impl ReroutePolicy {
     ///
     /// Returns the address of the best alternate, or None if the graph
     /// has no suggestions.
-    fn find_graph_alternate_for(&self, failed_node_id: u64, dest_id: u64) -> Option<SocketAddr> {
+    /// Every candidate source excludes the failed TRANSPORT as well as
+    /// the failed identity: a routed peer records the failed relay's
+    /// address, so an identity-only exclusion would select a peer whose
+    /// only path is the dead address.
+    fn find_graph_alternate_for(
+        &self,
+        failed_node_id: u64,
+        failed_addr: SocketAddr,
+        dest_id: u64,
+    ) -> Option<SocketAddr> {
         let graph = self.proximity_graph.as_ref()?;
         let dest_graph_id = node_id_to_graph_id(dest_id);
+        let usable = |nid: u64| -> Option<SocketAddr> {
+            if nid == failed_node_id || nid == 0 {
+                return None;
+            }
+            let addr = self.peer_addrs.get(&nid).map(|e| *e.value())?;
+            if addr == failed_addr {
+                return None;
+            }
+            Some(addr)
+        };
 
         if let Some(path) = graph.path_to(&dest_graph_id) {
-            // path[0] is self; scan forward for the first hop that
-            // (a) isn't the failed node, and (b) is a directly-connected
-            // peer we can send UDP to.
+            // path[0] is self; scan forward for the first hop that is
+            // neither the failed node nor on its transport, and is a
+            // directly-connected peer we can send UDP to. Prefer one
+            // whose forward/reverse indexes agree, so protected
+            // recovery lands on a hop that can carry an identity.
+            let mut fallback = None;
             for hop in path.iter().skip(1) {
-                let nid = graph_id_to_node_id(hop);
-                if nid == failed_node_id {
+                let Some(addr) = usable(graph_id_to_node_id(hop)) else {
                     continue;
+                };
+                if self.direct_identity_for(addr).is_some() {
+                    return Some(addr);
                 }
-                if let Some(addr) = self.peer_addrs.get(&nid) {
-                    return Some(*addr);
-                }
+                fallback.get_or_insert(addr);
+            }
+            if let Some(addr) = fallback {
+                return Some(addr);
             }
         }
 
-        // Fallback: any direct peer from the graph that isn't the failed
-        // node. Not topology-aware for this specific destination, but
-        // better than nothing.
-        for node in graph.all_nodes() {
-            let nid = graph_id_to_node_id(&node.node_id);
-            if nid != failed_node_id && nid != 0 {
-                if let Some(addr) = self.peer_addrs.get(&nid) {
-                    return Some(*addr);
-                }
-            }
-        }
-        None
+        // Fallback: any direct peer from the graph that is neither the
+        // failed node nor on its transport. Not topology-aware for this
+        // specific destination, but better than nothing.
+        graph
+            .all_nodes()
+            .into_iter()
+            .find_map(|node| usable(graph_id_to_node_id(&node.node_id)))
     }
 
     /// Called when the failure detector marks a peer as recovered.
@@ -310,33 +418,52 @@ impl ReroutePolicy {
             None => return,
         };
 
-        // Find routes that were rerouted away from this peer.
-        let to_restore: Vec<u64> = self
+        // Find routes that were rerouted away from this peer, with the
+        // exact alternate state each reroute produced.
+        let to_restore: Vec<(u64, u64)> = self
             .saved_routes
             .iter()
             .filter(|e| e.value().failed_node_id == recovered_node_id)
-            .map(|e| *e.key())
+            .map(|e| (*e.key(), e.value().alternate_generation))
             .collect();
 
         if to_restore.is_empty() {
             return;
         }
 
-        // Restore original routes — using the CURRENT addr, which
-        // may differ from the addr at on_failure time if the peer
-        // rebinds.
-        for dest_id in &to_restore {
-            self.install_route(*dest_id, recovered_addr);
+        // Restore original routes — using the CURRENT addr, which may
+        // differ from the addr at on_failure time if the peer rebinds.
+        //
+        // Restoration is conditional on the destination still holding
+        // exactly the alternate this policy installed. A newer writer
+        // (a fresh authenticated learned route, another failure's
+        // reroute) means the pre-failure path is no longer the right
+        // answer, and a stale recovery must not undo it. The saved
+        // entry is dropped either way: this recovery event is spent,
+        // and leaving it would retry the same stale restore forever.
+        let mut restored = 0usize;
+        for (dest_id, alternate_generation) in &to_restore {
             self.saved_routes.remove(dest_id);
+            let Some(observed) = self.routing_table.observe(*dest_id) else {
+                continue;
+            };
+            if observed.generation != *alternate_generation {
+                continue;
+            }
+            if self.install_route_if_unchanged(*dest_id, observed, recovered_addr) {
+                restored += 1;
+            }
         }
 
+        if restored == 0 {
+            return;
+        }
         self.recovery_count.fetch_add(1, Ordering::Relaxed);
 
         tracing::info!(
             recovered_node = format!("{:#x}", recovered_node_id),
-            restored_routes = to_restore.len(),
-            "restored {} routes to recovered peer",
-            to_restore.len()
+            restored_routes = restored,
+            "restored {restored} routes to recovered peer",
         );
     }
 
@@ -662,7 +789,9 @@ mod tests {
         let relay_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         peers.insert(0x5555u64, relay_addr); // D records its relay's addr
         addr_to_node.insert(relay_addr, 0x3333u64); // ...which C owns
-        policy.install_route(0x6666, relay_addr);
+        rt.add_route(0x6666, relay_addr); // seed so there is state to observe
+        let observed = rt.observe(0x6666).expect("present");
+        assert!(policy.install_route_if_unchanged(0x6666, observed, relay_addr));
         assert_eq!(rt.lookup(0x6666), Some(relay_addr));
         assert_eq!(
             rt.lookup_authenticated(0x6666),
@@ -673,8 +802,116 @@ mod tests {
 
         // No index wired at all → legacy behavior, as before.
         let bare = ReroutePolicy::new(rt.clone(), peers.clone());
-        bare.install_route(0x7777, addr_c);
+        rt.add_route(0x7777, addr_c);
+        let observed = rt.observe(0x7777).expect("present");
+        assert!(bare.install_route_if_unchanged(0x7777, observed, addr_c));
         assert_eq!(rt.lookup_authenticated(0x7777), None);
+    }
+
+    /// A route installed BETWEEN the failure snapshot and the write
+    /// survives: the reroute is conditioned on the state it selected
+    /// against, so a stale decision skips instead of clobbering.
+    #[test]
+    fn a_fresh_route_landing_mid_failure_is_not_clobbered() {
+        let rt = make_routing_table();
+        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        peers.insert(0x2222u64, addr_b);
+        peers.insert(0x3333u64, addr_c);
+        rt.add_route(0x4444, addr_b);
+
+        let policy = ReroutePolicy::new(rt.clone(), peers.clone());
+
+        // Model the race directly against the conditional writer: the
+        // observation is taken, THEN a fresh route lands, THEN the
+        // reroute tries to write.
+        let observed = rt.observe(0x4444).expect("present");
+        rt.add_authenticated_route(0x4444, addr_c, 0x3333); // fresh, mid-selection
+        assert!(
+            !policy.install_route_if_unchanged(0x4444, observed, addr_c),
+            "a write conditioned on pre-race state must not land",
+        );
+        assert_eq!(
+            rt.lookup_authenticated(0x4444),
+            Some((0x3333, addr_c)),
+            "the freshly installed authenticated route must survive the stale reroute",
+        );
+    }
+
+    /// A stale RECOVERY cannot undo a newer route: restoration is
+    /// conditional on the destination still holding exactly the
+    /// alternate this policy installed.
+    #[test]
+    fn a_route_installed_after_the_reroute_survives_recovery() {
+        let rt = make_routing_table();
+        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_d: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        peers.insert(0x2222u64, addr_b);
+        peers.insert(0x3333u64, addr_c);
+        peers.insert(0x4444u64, addr_d);
+        rt.add_route(0x5555, addr_b);
+
+        let policy = ReroutePolicy::new(rt.clone(), peers.clone());
+        policy.on_failure(0x2222);
+        assert_ne!(rt.lookup(0x5555), Some(addr_b), "precondition: rerouted");
+
+        // A newer writer speaks after the reroute.
+        rt.add_authenticated_route(0x5555, addr_d, 0x4444);
+
+        policy.on_recovery(0x2222);
+        assert_eq!(
+            rt.lookup_authenticated(0x5555),
+            Some((0x4444, addr_d)),
+            "a stale recovery must not restore over a newer route",
+        );
+        assert_eq!(
+            policy.active_reroutes(),
+            0,
+            "the spent recovery drops its saved entry either way",
+        );
+    }
+
+    /// A delayed failure callback must not touch routes belonging to a
+    /// REPLACEMENT session of the same NodeID.
+    #[test]
+    fn a_delayed_failure_does_not_reroute_a_new_incarnation() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
+
+        let rt = make_routing_table();
+        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        peers.insert(0x2222u64, addr_b);
+        peers.insert(0x3333u64, addr_c);
+        rt.add_authenticated_route(0x4444, addr_b, 0x2222);
+
+        // The probe reports a NEW incarnation the moment the policy
+        // re-reads it — i.e. B re-handshaked while selection ran.
+        let reads = Arc::new(AtomicU64::new(0));
+        let probe_reads = reads.clone();
+        let policy = ReroutePolicy::new(rt.clone(), peers.clone()).with_peer_incarnation(Arc::new(
+            move |node_id| {
+                if node_id != 0x2222 {
+                    return Some(1);
+                }
+                Some(probe_reads.fetch_add(1, AtOrd::Relaxed))
+            },
+        ));
+
+        policy.on_failure(0x2222);
+        assert_eq!(
+            rt.lookup_authenticated(0x4444),
+            Some((0x2222, addr_b)),
+            "a failure about a dead session must not rewrite the \
+             replacement incarnation's route",
+        );
+        assert!(
+            reads.load(AtOrd::Relaxed) >= 2,
+            "the probe is re-read at write time"
+        );
     }
 
     /// Failure invalidation is identity-qualified: when B fails at
@@ -715,5 +952,35 @@ mod tests {
             Some(addr_d),
             "a route bound to B reroutes even though its address drifted"
         );
+    }
+
+    /// No alternate source may select the FAILED TRANSPORT. A routed
+    /// peer records its relay's address, so excluding only the failed
+    /// NodeID would "reroute" straight back onto the dead address.
+    #[test]
+    fn alternate_selection_excludes_the_failed_transport() {
+        let rt = make_routing_table();
+        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let relay_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let live_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+
+        // R is the failing relay at X; D is a ROUTED peer that records
+        // R's address as its own transport; C is genuinely elsewhere.
+        peers.insert(0x2222u64, relay_addr); // R (failing)
+        peers.insert(0x4444u64, relay_addr); // D — routed via R
+        peers.insert(0x3333u64, live_addr); // C — live alternate
+
+        rt.add_route(0x5555, relay_addr);
+
+        let policy = ReroutePolicy::new(rt.clone(), peers);
+        policy.on_failure(0x2222);
+
+        let chosen = rt.lookup(0x5555).expect("a route remains installed");
+        assert_ne!(
+            chosen, relay_addr,
+            "the failed transport must not be selected as its own alternate, \
+             however the candidate peer is reached",
+        );
+        assert_eq!(chosen, live_addr, "the genuinely live peer is chosen");
     }
 }

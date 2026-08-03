@@ -250,12 +250,19 @@ async fn a_protected_gateway_refuses_untagged_legacy_relay() {
 async fn a_node_without_gateway_credentials_keeps_legacy_forwarding() {
     let f = fixture(&[3, 7, 1], &[3, 7, 2]).await;
     let watcher = wire().await;
+    // A LEARNED destination, not a direct peer: an ordinary route is
+    // the only candidate for it, which is what public forwarding
+    // actually rides. Pointing a direct peer's destination at a
+    // watcher with `add_route` would not redirect anything — the
+    // handshake's identity-bound candidate lives in its own slot and
+    // wins the metric-1 tie, by design.
+    const LEARNED: u64 = 0x0FF1_CE01;
     f.gw.router()
         .routing_table()
-        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+        .add_route(LEARNED, watcher.local_addr().unwrap());
 
     let sock = wire().await;
-    let header = RoutingHeader::new(f.right.node_id(), 0x1234, 8);
+    let header = RoutingHeader::new(LEARNED, 0x1234, 8);
     let mut legacy = Vec::new();
     legacy.extend_from_slice(&header.to_bytes());
     legacy.extend_from_slice(INNER_TAG);
@@ -547,15 +554,19 @@ async fn outer_ttl_expires_while_the_inner_packet_is_untouched() {
 
     // Legacy mode (no gateway credentials) makes the forwarded bytes
     // observable without holding a session key, which is what lets
-    // this assert the inner packet survived byte for byte.
+    // this assert the inner packet survived byte for byte. The
+    // destination is a LEARNED one rather than a direct peer, so the
+    // ordinary route installed here is the only candidate for it —
+    // see the note in the legacy-forwarding test above.
+    const LEARNED: u64 = 0x0FF1_CE02;
     let watcher = wire().await;
     f.gw.router()
         .routing_table()
-        .add_route(f.right.node_id(), watcher.local_addr().unwrap());
+        .add_route(LEARNED, watcher.local_addr().unwrap());
     let sock = wire().await;
 
     // ttl = 0 is already expired.
-    let expired = RoutingHeader::new(f.right.node_id(), 0x1234, 0);
+    let expired = RoutingHeader::new(LEARNED, 0x1234, 0);
     let mut pkt = Vec::new();
     pkt.extend_from_slice(&expired.to_bytes());
     pkt.extend_from_slice(INNER_TAG);
@@ -569,7 +580,7 @@ async fn outer_ttl_expires_while_the_inner_packet_is_untouched() {
 
     // A live TTL forwards, decrements the OUTER header only, and
     // leaves every inner byte alone.
-    let live = RoutingHeader::new(f.right.node_id(), 0x1234, 4);
+    let live = RoutingHeader::new(LEARNED, 0x1234, 4);
     let mut pkt = Vec::new();
     pkt.extend_from_slice(&live.to_bytes());
     pkt.extend_from_slice(INNER_TAG);
