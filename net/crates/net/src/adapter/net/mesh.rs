@@ -1609,11 +1609,11 @@ struct DispatchCtx {
     /// Compiled per-session peer subnet contexts (S3), read by the
     /// protected relay gate to resolve hop attachments.
     subnet_contexts: Arc<SubnetContextStore>,
-    /// This node's own forwarding authority (S4A). None means this
-    /// node is not a protected gateway and forwards nothing protected.
-    subnet_gateway_contexts: Arc<arc_swap::ArcSwapOption<VerifiedGatewayContextSet>>,
-    /// Declared protected boundaries; absence denies protected forwarding.
-    subnet_boundaries: Arc<arc_swap::ArcSwapOption<SubnetBoundarySet>>,
+    /// This node's gateway export authority — credentials AND
+    /// boundaries — as ONE published aggregate. See
+    /// [`SubnetGatewayAuthorityState`] for why the two must not
+    /// publish independently.
+    subnet_gateway_authority: Arc<arc_swap::ArcSwap<SubnetGatewayAuthorityState>>,
     /// Floor state, for the auth epoch a compiled context is pinned to.
     subnet_floors: Arc<SubnetFloorRegistry>,
     /// S5 control-fact store, shared with the node handle so the
@@ -2617,6 +2617,36 @@ impl MeshNodeConfig {
         self.unregistered_channels = policy;
         self
     }
+}
+
+/// One coherently-published view of this node's gateway export
+/// authority: the compiled credential set (S4A) and the declared
+/// protected boundaries (S4B), TOGETHER.
+///
+/// The two members used to publish through independent
+/// `ArcSwapOption`s, and every consumer that read both — the
+/// protected relay, the D7 subnet-export gate and its §9.5 stability
+/// stamp — could observe a TORN view: one load from before a
+/// wholesale replacement and one from after, with both pointers
+/// individually "current". A credential replacement landing between
+/// a stability check's two loads could then revalidate an admission
+/// against authority that no longer existed. Publishing one
+/// immutable aggregate makes a single load a coherent snapshot, and
+/// the aggregate pointer a sufficient identity for the stamp.
+///
+/// The two publication APIs each replace ONLY their own member,
+/// through a compare-and-retry update
+/// ([`arc_swap::ArcSwapAny::rcu`]), so concurrent credential and
+/// boundary publications cannot overwrite each other's member the
+/// way a naive load-modify-store would.
+#[derive(Debug)]
+pub struct SubnetGatewayAuthorityState {
+    /// This node's own compiled forwarding authority (S4A), or
+    /// `None` when it holds none and forwards nothing protected.
+    pub gateway: Option<Arc<VerifiedGatewayContextSet>>,
+    /// The declared protected boundaries (S4B), or `None` — which
+    /// denies every protected transition and every subnet export.
+    pub boundaries: Option<Arc<SubnetBoundarySet>>,
 }
 
 /// How this node reaches a peer, and what the recorded address proves.
@@ -8250,17 +8280,17 @@ pub struct MeshNode {
     /// reinterpreting the hierarchy bumps it, invalidating every
     /// context minted under the old meaning.
     subnet_topology_epoch: Arc<std::sync::atomic::AtomicU32>,
-    /// This node's OWN forwarding authority, compiled from self-held
-    /// credentials (SUBNET_AUTH_PLAN.md D6). Distinct from the peer
-    /// contexts above: a peer proving it may attach says nothing
-    /// about whether this node may relay for it. None until an
-    /// operator installs gateway credentials, which is what keeps a
-    /// non-gateway node from forwarding protected traffic at all.
-    subnet_gateway_contexts: Arc<arc_swap::ArcSwapOption<VerifiedGatewayContextSet>>,
-    /// Declared protected boundaries. Mandatory for protected
-    /// forwarding: absence denies, so a gateway cannot gain authority
-    /// by omitting the inventory.
-    subnet_boundaries: Arc<arc_swap::ArcSwapOption<SubnetBoundarySet>>,
+    /// This node's OWN forwarding authority — the compiled credential
+    /// set (SUBNET_AUTH_PLAN.md D6) and the declared protected
+    /// boundaries — published as ONE immutable aggregate. Distinct
+    /// from the peer contexts above: a peer proving it may attach
+    /// says nothing about whether this node may relay for it. The
+    /// gateway member is `None` until an operator installs
+    /// credentials; the boundaries member is `None` until declared —
+    /// and either absence denies. One aggregate, deliberately: see
+    /// [`SubnetGatewayAuthorityState`] for the torn-view hazard two
+    /// independent publications carried.
+    subnet_gateway_authority: Arc<arc_swap::ArcSwap<SubnetGatewayAuthorityState>>,
     /// This node's own attachment point, used when compiling the
     /// gateway context set and as the local end of a transition.
     subnet_local_attachment: SubnetId,
@@ -9497,8 +9527,12 @@ impl MeshNode {
             subnet_challenges,
             subnet_contexts,
             subnet_topology_epoch: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            subnet_gateway_contexts: Arc::new(arc_swap::ArcSwapOption::empty()),
-            subnet_boundaries: Arc::new(arc_swap::ArcSwapOption::empty()),
+            subnet_gateway_authority: Arc::new(arc_swap::ArcSwap::from_pointee(
+                SubnetGatewayAuthorityState {
+                    gateway: None,
+                    boundaries: None,
+                },
+            )),
             subnet_local_attachment,
             peer_subnets,
             // Gateway is installed lazily by `set_channel_configs`;
@@ -11631,7 +11665,7 @@ impl MeshNode {
         sets: &[SubnetCredentialSet],
     ) -> Result<(), SubnetAuthError> {
         if sets.is_empty() {
-            self.subnet_gateway_contexts.store(None);
+            self.publish_gateway_member(None);
             return Ok(());
         }
         let authority = sets[0].leaf().authority.clone();
@@ -11655,8 +11689,22 @@ impl MeshNode {
         }
         let set =
             crate::adapter::net::subnet::auth::build_gateway_context_set(&authority, compiled)?;
-        self.subnet_gateway_contexts.store(Some(Arc::new(set)));
+        self.publish_gateway_member(Some(Arc::new(set)));
         Ok(())
+    }
+
+    /// Replace ONLY the gateway member of the published authority
+    /// aggregate, preserving whatever boundaries member is latest at
+    /// the moment of the swap. `rcu` retries on contention, so a
+    /// concurrent [`Self::declare_subnet_boundaries`] can never have
+    /// its member overwritten by this writer's stale read (the
+    /// lost-update a naive load-modify-store would allow).
+    fn publish_gateway_member(&self, gateway: Option<Arc<VerifiedGatewayContextSet>>) {
+        self.subnet_gateway_authority
+            .rcu(|current| SubnetGatewayAuthorityState {
+                gateway: gateway.clone(),
+                boundaries: current.boundaries.clone(),
+            });
     }
 
     /// Declare this node's protected boundaries (SUBNET_AUTH_PLAN.md
@@ -11668,17 +11716,38 @@ impl MeshNode {
     /// `EXPORT` credential would delete the boundary it was meant to
     /// guard and a broader `ROUTE` would inherit the traffic.
     pub fn declare_subnet_boundaries(&self, set: SubnetBoundarySet) {
-        self.subnet_boundaries.store(Some(Arc::new(set)));
+        let boundaries = Some(Arc::new(set));
+        // The mirror of `publish_gateway_member`: replace ONLY the
+        // boundaries member, preserving the latest gateway member
+        // under contention.
+        self.subnet_gateway_authority
+            .rcu(|current| SubnetGatewayAuthorityState {
+                gateway: current.gateway.clone(),
+                boundaries: boundaries.clone(),
+            });
     }
 
-    /// The declared boundary set, if any.
-    pub fn subnet_boundaries(&self) -> Option<Arc<SubnetBoundarySet>> {
-        self.subnet_boundaries.load_full()
+    /// The published gateway export authority — credentials and
+    /// boundaries together, as the ONE coherent snapshot every
+    /// consumer that needs both must read once. The aggregate's Arc
+    /// identity changes on every publication of either member, which
+    /// is what the D7 admission stamp fingerprints.
+    pub fn subnet_gateway_authority(&self) -> Arc<SubnetGatewayAuthorityState> {
+        self.subnet_gateway_authority.load_full()
     }
-    /// This node's published gateway authority, or `None` when it
+
+    /// The declared boundary set, if any. Derived from ONE aggregate
+    /// load; a caller that also needs the credential set must use
+    /// [`Self::subnet_gateway_authority`] instead of pairing the two
+    /// convenience accessors — separate loads can tear.
+    pub fn subnet_boundaries(&self) -> Option<Arc<SubnetBoundarySet>> {
+        self.subnet_gateway_authority.load().boundaries.clone()
+    }
+    /// This node's published gateway credential set, or `None` when it
     /// holds none — in which case it forwards no protected traffic.
+    /// Same single-aggregate-load caveat as [`Self::subnet_boundaries`].
     pub fn subnet_gateway_contexts(&self) -> Option<Arc<VerifiedGatewayContextSet>> {
-        self.subnet_gateway_contexts.load_full()
+        self.subnet_gateway_authority.load().gateway.clone()
     }
 
     /// Resolve `dest_id` to an identity-qualified next hop.
@@ -16087,8 +16156,7 @@ impl MeshNode {
             local_subnet_policy: self.local_subnet_policy.clone(),
             peer_subnets: self.peer_subnets.clone(),
             subnet_contexts: self.subnet_contexts.clone(),
-            subnet_gateway_contexts: self.subnet_gateway_contexts.clone(),
-            subnet_boundaries: self.subnet_boundaries.clone(),
+            subnet_gateway_authority: self.subnet_gateway_authority.clone(),
             subnet_floors: self.subnet_floors.clone(),
             subnet_control: self.subnet_control.clone(),
             subnet_authorities: self.subnet_authorities.clone(),
@@ -16570,7 +16638,7 @@ impl MeshNode {
                     // never downgrade to the public path. Protected
                     // traffic arrives as a route-hop envelope and is
                     // handled above, before this branch is reached.
-                    if ctx.subnet_gateway_contexts.load().is_some() {
+                    if ctx.subnet_gateway_authority.load().gateway.is_some() {
                         tracing::debug!(
                             dest = format!("{:#x}", routing_header.dest_id),
                             "subnet: refusing to relay an untagged legacy route packet in protected mode",
@@ -16725,7 +16793,14 @@ impl MeshNode {
     fn relay_protected_hop(data: &[u8], ctx: &DispatchCtx) {
         use super::subnet::route_hop;
 
-        let Some(local_set) = ctx.subnet_gateway_contexts.load_full() else {
+        // ONE authority snapshot for the whole relay decision:
+        // credentials and boundaries come from the same published
+        // aggregate, so a wholesale replacement landing mid-relay can
+        // never pair a pre-replacement credential set with a
+        // post-replacement boundary set (or the inverse). The guard is
+        // a lock-free, allocation-free load.
+        let authority_state = ctx.subnet_gateway_authority.load();
+        let Some(local_set) = authority_state.gateway.as_deref() else {
             // Not a protected gateway: an envelope is not ours to relay.
             return;
         };
@@ -16828,14 +16903,15 @@ impl MeshNode {
         // attachments.
         // Boundaries are a separate mandatory surface; without one,
         // protected forwarding denies rather than treating "no
-        // declared boundaries" as "everything is internal".
-        let Some(boundaries) = ctx.subnet_boundaries.load_full() else {
+        // declared boundaries" as "everything is internal". Read from
+        // the SAME aggregate snapshot as the credential set above.
+        let Some(boundaries) = authority_state.boundaries.as_deref() else {
             return;
         };
         if let Err(denial) = local_set.authorize_transition(
             &ingress_ctx,
             &egress_ctx,
-            &boundaries,
+            boundaries,
             epoch,
             auth_epoch,
             now,

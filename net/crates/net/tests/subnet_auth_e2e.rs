@@ -933,3 +933,139 @@ fn gateway_compiler_accepts_delegated_descendant_export_but_not_attach() {
         "an ATTACH-bearing credential must still contain the attachment",
     );
 }
+
+// ===========================================================================
+// Coherent-publication witnesses (review HOLD on 4e74216e0): gateway
+// credentials and boundaries publish as ONE aggregate, so a captured
+// admission stamp can never present a torn "both current" view.
+// ===========================================================================
+
+/// Publishing EITHER member — credentials or boundaries — changes the
+/// aggregate's snapshot identity and invalidates previously captured
+/// export facts, even when the republished content is identical. The
+/// stamp fingerprints the one aggregate pointer, so there is no pair
+/// of loads for a replacement to land between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publication_of_either_member_invalidates_captured_export_facts() {
+    use net::adapter::net::behavior::admission_clock::ClockSample;
+    use net::adapter::net::org_admission_gate::verify_subnet_export;
+
+    let f = fleet_fixture("coherent-stamp").await;
+    let binding = world_model_binding(0);
+
+    // Captured against the current aggregate: current.
+    let facts =
+        verify_subnet_export(&f.vehicle_b, &binding, &ClockSample::now()).expect("capture facts");
+    assert!(
+        facts.is_current(&f.vehicle_b),
+        "freshly captured facts are current"
+    );
+
+    // Republishing the SAME credential content still replaces the
+    // aggregate: identity, not content, is the stamp's fingerprint.
+    let before = f.vehicle_b.subnet_gateway_authority();
+    f.vehicle_b
+        .install_subnet_gateway_credentials(&gateway_credentials_with_export(&f.vb_kp))
+        .expect("republish identical credentials");
+    let after = f.vehicle_b.subnet_gateway_authority();
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "a credential publication must replace the aggregate snapshot",
+    );
+    assert!(
+        !facts.is_current(&f.vehicle_b),
+        "captured facts must be invalidated by a credential publication",
+    );
+
+    // Same for the boundaries member.
+    let facts =
+        verify_subnet_export(&f.vehicle_b, &binding, &ClockSample::now()).expect("recapture");
+    assert!(facts.is_current(&f.vehicle_b));
+    let before = f.vehicle_b.subnet_gateway_authority();
+    declare_world_model_boundary(&f.vehicle_b, 0);
+    let after = f.vehicle_b.subnet_gateway_authority();
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "a boundary publication must replace the aggregate snapshot",
+    );
+    assert!(
+        !facts.is_current(&f.vehicle_b),
+        "captured facts must be invalidated by a boundary publication",
+    );
+
+    // And the calls still work end to end after both republications.
+    f.call(true)
+        .await
+        .expect("still admitted after republication");
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+/// Concurrent credential and boundary publication loses NEITHER
+/// update: each writer replaces only its own member through a
+/// compare-and-retry swap, so the final aggregate carries the last
+/// gateway set AND the last boundary set. A naive load-modify-store
+/// would let one writer resurrect the other's superseded member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_publication_loses_neither_authority_surface() {
+    let vehicle_b = build_vehicle_b().await;
+    let vb_kp = EntityKeypair::from_bytes(VEHICLE_B_SEED);
+
+    // Two writers storm the two members concurrently. The credential
+    // writer alternates one-entry / two-entry sets and ends on the
+    // two-entry canonical set; the boundary writer alternates a
+    // camera-only set with the canonical world-model set and ends on
+    // world-model. Each writer's FINAL publication must survive the
+    // other's entire storm.
+    const ROUNDS: usize = 200;
+    let b1 = vehicle_b.clone();
+    let k1 = vb_kp.clone();
+    let creds = tokio::task::spawn_blocking(move || {
+        for i in 0..ROUNDS {
+            let set = if i % 2 == 0 {
+                gateway_credentials_without_export(&k1)
+            } else {
+                gateway_credentials_with_export(&k1)
+            };
+            b1.install_subnet_gateway_credentials(&set)
+                .expect("install");
+        }
+        // Final: the canonical two-entry set.
+        b1.install_subnet_gateway_credentials(&gateway_credentials_with_export(&k1))
+            .expect("final install");
+    });
+    let b2 = vehicle_b.clone();
+    let bounds = tokio::task::spawn_blocking(move || {
+        for i in 0..ROUNDS {
+            let path = if i % 2 == 0 { CAMERA } else { WORLD_MODEL };
+            b2.declare_subnet_boundaries(SubnetBoundarySet::new(
+                vb_subnet_root().entity_id().clone(),
+                0,
+                [TopologySubnetId::new(path)],
+            ));
+        }
+        // Final: the canonical world-model boundary.
+        declare_world_model_boundary(&b2, 0);
+    });
+    creds.await.expect("credential writer");
+    bounds.await.expect("boundary writer");
+
+    let state = vehicle_b.subnet_gateway_authority();
+    let gateway = state
+        .gateway
+        .as_ref()
+        .expect("gateway member survived the storm");
+    assert_eq!(
+        gateway.entries().len(),
+        2,
+        "the credential writer's FINAL two-entry set must survive the boundary storm",
+    );
+    let boundaries = state
+        .boundaries
+        .as_ref()
+        .expect("boundary member survived the storm");
+    assert_eq!(
+        boundaries.boundaries(),
+        &[TopologySubnetId::new(WORLD_MODEL)],
+        "the boundary writer's FINAL world-model set must survive the credential storm",
+    );
+}

@@ -24,8 +24,8 @@ use super::behavior::org_revocation::{
 };
 use super::cortex::{RpcCodecError, RpcHeader, RpcRequestPayload};
 use super::identity::EntityId;
-use super::mesh::MeshNode;
-use super::subnet::{SubnetBoundarySet, SubnetExportBinding, VerifiedGatewayContextSet};
+use super::mesh::{MeshNode, SubnetGatewayAuthorityState};
+use super::subnet::SubnetExportBinding;
 
 /// blake3 `derive_key` context for the canonical org-RPC request
 /// digest (E1.7). Distinct, versioned domain string so a future wire
@@ -293,41 +293,35 @@ pub fn verify_provider_authority(
 /// wholesale, floors raise the auth epoch, and topology epochs
 /// advance — any of which must darken an existing registration.
 ///
-/// The stamp identity follows [`AdmissionStamp`]'s discipline:
-/// `Arc::as_ptr` of the immutable snapshots the decision was made
-/// against (both ArcSwap-published, so replacement changes the
-/// pointer) plus the two epoch integers, with the Arcs PINNED for
-/// the admission's lifetime so an address cannot be reused by a
+/// The stamp identity follows [`AdmissionStamp`]'s discipline over
+/// ONE fingerprint: `Arc::as_ptr` of the single published
+/// [`SubnetGatewayAuthorityState`] aggregate the decision was made
+/// against, plus the two epoch integers. One pointer, deliberately —
+/// fingerprinting the gateway and boundary members separately let a
+/// replacement land BETWEEN the two loads of the stability check and
+/// present a torn "both current" view. The aggregate Arc is PINNED
+/// for the admission's lifetime so its address cannot be reused by a
 /// replacement mid-check (ABA).
 pub struct SubnetExportFacts {
-    gateway_ptr: usize,
-    boundaries_ptr: usize,
+    aggregate_ptr: usize,
     topology_epoch: u32,
     subnet_auth_epoch: u64,
-    /// Pinned decision snapshots — see the ABA note above.
-    _gateway: Arc<VerifiedGatewayContextSet>,
-    _boundaries: Arc<SubnetBoundarySet>,
+    /// The authority whose floor epoch the stamp pins.
+    authority: EntityId,
+    /// Pinned decision snapshot — see the ABA note above.
+    _aggregate: Arc<SubnetGatewayAuthorityState>,
 }
 
 impl SubnetExportFacts {
     /// `true` iff the live export state is IDENTICALLY the state this
-    /// admission verified: same published gateway-context set, same
-    /// published boundary set (snapshot identity, not field
-    /// comparison), same topology epoch, same subnet auth epoch.
+    /// admission verified: the SAME published authority aggregate
+    /// (one load, one pointer compare — coherent by construction),
+    /// same topology epoch, same subnet auth epoch.
     pub fn is_current(&self, mesh: &MeshNode) -> bool {
-        let gateway_ptr = mesh
-            .subnet_gateway_contexts()
-            .map_or(0, |g| Arc::as_ptr(&g) as *const () as usize);
-        let boundaries_ptr = mesh
-            .subnet_boundaries()
-            .map_or(0, |b| Arc::as_ptr(&b) as *const () as usize);
-        gateway_ptr == self.gateway_ptr
-            && boundaries_ptr == self.boundaries_ptr
+        let live = mesh.subnet_gateway_authority();
+        Arc::as_ptr(&live) as *const () as usize == self.aggregate_ptr
             && mesh.subnet_topology_epoch() == self.topology_epoch
-            && mesh
-                .subnet_floor_registry()
-                .auth_epoch(self._gateway.authority())
-                == self.subnet_auth_epoch
+            && mesh.subnet_floor_registry().auth_epoch(&self.authority) == self.subnet_auth_epoch
     }
 }
 
@@ -336,8 +330,11 @@ impl SubnetExportFacts {
 /// reason as an unavailable org authority, deliberately not
 /// disclosing WHICH term failed — unless ALL of:
 ///
-/// - a gateway context set and a boundary set are installed;
-/// - [`VerifiedGatewayContextSet::authorize_service_export`] accepts
+/// - the ONE published authority aggregate carries both a gateway
+///   context set and a boundary set (a single load, so the pair is
+///   coherent by construction — never one member from before a
+///   replacement and one from after);
+/// - [`authorize_service_export`] accepts
 ///   the binding against them, the node's CURRENT topology epoch,
 ///   the CURRENT floor-registry auth epoch, and one wall-clock
 ///   sample (authority match, epoch match, unexpired, exact declared
@@ -345,16 +342,23 @@ impl SubnetExportFacts {
 ///
 /// On success returns the facts + stamp for the §9.5 stability
 /// recheck.
+///
+/// [`authorize_service_export`]: super::subnet::VerifiedGatewayContextSet::authorize_service_export
 pub fn verify_subnet_export(
     mesh: &MeshNode,
     binding: &SubnetExportBinding,
     clock: &ClockSample,
 ) -> Result<SubnetExportFacts, AdmissionDenied> {
-    let gateway = mesh
-        .subnet_gateway_contexts()
+    // ONE aggregate load; both snapshots come from the same immutable
+    // object.
+    let state = mesh.subnet_gateway_authority();
+    let gateway = state
+        .gateway
+        .as_deref()
         .ok_or(AdmissionDenied::ProviderAuthorityUnavailable)?;
-    let boundaries = mesh
-        .subnet_boundaries()
+    let boundaries = state
+        .boundaries
+        .as_deref()
         .ok_or(AdmissionDenied::ProviderAuthorityUnavailable)?;
     let topology_epoch = mesh.subnet_topology_epoch();
     let subnet_auth_epoch = mesh
@@ -363,19 +367,18 @@ pub fn verify_subnet_export(
     gateway
         .authorize_service_export(
             binding,
-            &boundaries,
+            boundaries,
             topology_epoch,
             subnet_auth_epoch,
             clock.wall_secs(),
         )
         .map_err(|_| AdmissionDenied::ProviderAuthorityUnavailable)?;
     Ok(SubnetExportFacts {
-        gateway_ptr: Arc::as_ptr(&gateway) as *const () as usize,
-        boundaries_ptr: Arc::as_ptr(&boundaries) as *const () as usize,
+        aggregate_ptr: Arc::as_ptr(&state) as *const () as usize,
         topology_epoch,
         subnet_auth_epoch,
-        _gateway: gateway,
-        _boundaries: boundaries,
+        authority: binding.subnet().authority.clone(),
+        _aggregate: state,
     })
 }
 
