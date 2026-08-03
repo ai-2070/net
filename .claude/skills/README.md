@@ -15,6 +15,16 @@ Net looks like Kafka/NATS on the surface but has no broker. Net Payments looks l
 npx skills add ai-2070/net-claude-skill -g
 ```
 
+## Give the agent the source too
+
+[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
+
+```bash
+npx -y opensrc@latest path ai-2070/net
+```
+
+## More on the skills
+
 The [`skills` CLI](https://github.com/vercel-labs/skills) detects which coding agents you have, asks which skills you want, and puts them where that agent looks — `~/.claude/skills/` for Claude Code, `~/.codex/skills/` for Codex. Drop `-g` for a project install instead (`.claude/skills/` or `.agents/skills/`), checked in and shared with your team.
 
 To skip the prompts and say exactly what you want:
