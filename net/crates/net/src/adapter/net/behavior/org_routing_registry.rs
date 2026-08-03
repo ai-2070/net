@@ -3159,6 +3159,32 @@ mod tests {
             f.registry.base_facts_unvalidated(&beyond).is_none(),
             "the refused key is cold/unretained"
         );
+
+        // The STRUCTURAL pool bound (design §4, §18.3): pool publications
+        // live on slot cells and nowhere else, so 256 retained slots can each
+        // own one pool — and the refused 257th key has no cell for a pool to
+        // exist in. The install seam is a per-slot store, so against a refused
+        // key it is a no-op rather than an allocation.
+        let first = key(1, "nrpc:n0");
+        f.registry.install_facts_for_test(first.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&first).expect("facts");
+        f.registry.install_unsensed_pool_for_test(
+            &first,
+            Arc::new(ScopedUnsensedRoutePool::for_test(base)),
+        );
+        assert!(
+            f.registry.unsensed_pool_for_test(&first).is_some(),
+            "a retained slot owns its pool publication"
+        );
+        f.registry.install_unsensed_pool_for_test(
+            &beyond,
+            Arc::new(ScopedUnsensedRoutePool::for_test(facts())),
+        );
+        assert!(
+            f.registry.unsensed_pool_for_test(&beyond).is_none(),
+            "no slot, no cell, no 257th pool — the bound is structural, not \
+             counted"
+        );
     }
 
     /// An exhausted identity space refuses deterministically: no slot retained, no
@@ -3729,6 +3755,62 @@ mod tests {
             f.registry.unsensed_pool_for_test(&k).is_none(),
             "and the superseded facts' pool is not beside them"
         );
+    }
+
+    /// The SUCCESSOR of a replacement stays index-aligned across both planes:
+    /// for every index, the successor's cells are the registry's cells for
+    /// `successor.keys()[index]`, never another contributor's.
+    ///
+    /// Dies to: reversing the successor's collected cell vector
+    /// (`cells.reverse()` in `replace_demand_set`) — a mutation the seven
+    /// witnesses above all survive, because the acquisition-alignment witness
+    /// never exercises replacement and the transfer witness reads through the
+    /// OLD set. Misaligned, a future projection would read one contributor's
+    /// facts and pool under another contributor's key. Found by the
+    /// independent evidence audit of `3dbee8514`, where exactly that mutation
+    /// ran 49/49 green.
+    #[test]
+    fn a_replacement_successor_stays_index_aligned_across_both_planes() {
+        let f = fixture();
+        let family = f.family();
+        let a = key(1, "nrpc:align");
+        let b = key(2, "nrpc:align");
+        let c = key(3, "nrpc:align");
+        let old = family
+            .demand_set(vec![a.clone(), b.clone()])
+            .expect("acquired");
+
+        // B is COMMON and C is FRESH: the successor mixes a kept cell pair
+        // with a newly created one, which is exactly where a collection-order
+        // defect can hide.
+        let successor = old.replace(vec![b.clone(), c.clone()]).expect("replaced");
+
+        // Distinct artifacts per contributor, on BOTH planes — `facts()`
+        // allocates a fresh `Arc` each call, so pointer identity
+        // distinguishes them even with identical content.
+        for k in successor.keys().to_vec() {
+            f.registry.install_facts_for_test(k.clone(), facts());
+            let base = f.registry.base_facts_unvalidated(&k).expect("facts");
+            f.registry.install_unsensed_pool_for_test(
+                &k,
+                Arc::new(ScopedUnsensedRoutePool::for_test(base)),
+            );
+        }
+        for (index, k) in successor.keys().to_vec().iter().enumerate() {
+            let facts_via_set = successor.base_facts_unvalidated(index).expect("facts");
+            let facts_via_registry = f.registry.base_facts_unvalidated(k).expect("facts");
+            assert!(
+                Arc::ptr_eq(&facts_via_set, &facts_via_registry),
+                "successor contributor {index} reads its OWN key's facts"
+            );
+            let pool_via_set = successor.unsensed_pool_unvalidated(index).expect("pool");
+            let pool_via_registry = f.registry.unsensed_pool_for_test(k).expect("pool");
+            assert!(
+                Arc::ptr_eq(&pool_via_set, &pool_via_registry),
+                "and its OWN key's pool — the pairing survives a replacement"
+            );
+        }
+        drop(old);
     }
 
     /// `release_one` cannot decrement a global slot reference for a family that

@@ -283,7 +283,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          REG_MIN=42
+          REG_MIN=50
           STATE_MIN=41
           reg=$(cargo test --lib --features "$UNIT_FEATURES" \
                   behavior::org_routing_registry:: 2>&1 | tee /dev/stderr)
@@ -324,7 +324,15 @@ jobs:
           a_fresh_demand_after_retirement_gets_a_fresh_cell
           a_stale_incarnation_apply_cannot_republish_a_cleared_cell
           release_one_cannot_decrement_a_reference_a_family_does_not_hold
-          an_already_transferred_set_cannot_be_replaced_again"
+          an_already_transferred_set_cannot_be_replaced_again
+          a_demand_handle_couples_both_publication_cells
+          a_demand_set_couples_both_cells_per_contributor
+          retiring_the_last_reference_clears_both_cells
+          a_transfer_leaves_the_common_keys_pool_published
+          facts_invalidation_clears_the_derived_pool
+          a_stale_observation_invalidates_neither_plane
+          installing_newer_facts_clears_the_superseded_pool
+          a_replacement_successor_stays_index_aligned_across_both_planes"
           for required in $REQUIRED; do
             if ! printf "%s" "$reg" | grep -q "$required"; then
               echo "::error::required org_routing_registry witness missing: $required"

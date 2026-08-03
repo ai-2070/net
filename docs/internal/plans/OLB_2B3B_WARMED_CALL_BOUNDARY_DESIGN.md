@@ -2015,7 +2015,8 @@ in this section.
 
 ### 18.0 Progress
 
-- **Step 1 — the second cell (§1.1): IMPLEMENTED + WITNESSED.**
+- **Step 1 — the second cell (§1.1): IMPLEMENTED; final-state lifecycle,
+  identity coupling and successor alignment WITNESSED.**
   `ScopedUnsensedRoutePool` lands with its publication identity only —
   `derived_from`, the exact facts artifact, compared by `Arc::ptr_eq` exactly
   as `invalidate_if_stale` compares facts. `SlotCells` moves both cells as ONE
@@ -2024,18 +2025,39 @@ in this section.
   the delayed reader invalidation, grant-scope movement, authority movement,
   terminal exhaustion, expiry retirement, slot retirement, and the actor's
   phase-5 install. `DemandHandle` and `DemandSet` clone both cells under the
-  one acquisition that takes the reference. Seven witnesses: handle coupling,
-  per-contributor set coupling, retirement clears both, transfer clears
-  neither, facts invalidation clears the derived pool, the delayed-invalidator
-  rule with its adjacent control, and newer-facts-install clears the
-  superseded pool. The routing payload is deliberately absent — the type's
-  only producer is step 2, and production pool cells are `None` until it
-  lands.
-- **Step 2 — the actor build cycle: NOT STARTED.** The pool payload (provider
-  and proven owner relation, direct/session eligibility under ONE coherent
-  session generation, scoped source vector, scoped deadlines), capture → build
-  off-lock → revalidate → publish-if-current, pool-side exact invalidation,
-  mixed-generation refusal, and the remaining §18.3 witnesses.
+  one acquisition that takes the reference.
+
+  Eight witnesses: handle coupling, per-contributor set coupling, retirement
+  clears both, transfer clears neither, facts invalidation clears the derived
+  pool, the delayed-invalidator rule with its adjacent control,
+  newer-facts-install clears the superseded pool, and SUCCESSOR
+  index-alignment across a replacement. The eighth exists because the
+  independent evidence audit of `3dbee8514` ran `cells.reverse()` in
+  `replace_demand_set` against the first seven and they stayed green — the
+  acquisition-alignment witness never exercises replacement, and the transfer
+  witness reads through the OLD set. The structural 256-pool bound is
+  witnessed inside the pinned 257th-slot test: no slot, no cell, no pool.
+
+  **What is deliberately NOT claimed:** the pool-first PUBLICATION-ORDER
+  interleaving inside `take_facts`/`install_facts` is implemented but not
+  witnessed. The seven final-state witnesses cannot distinguish it — both
+  stores complete before any assertion runs — and a deterministic
+  interleaving witness needs a concurrent reader timed between two adjacent
+  atomic stores, which is Step 2's real producer/consumer path (its
+  publish-if-current reader is exactly such an observer). That evidence is
+  OWED BY STEP 2, stated here so the claim cannot silently widen.
+
+  The routing payload is deliberately absent — the type's only producer is
+  step 2, and production pool cells are `None` until it lands. The
+  candidate-bound mutation evidence for this step is §18.0a.
+- **Step 2 — the actor build cycle: NOT STARTED, and not authorized to
+  proceed until the Step 1 evidence packet is independently accepted.** The
+  pool payload (provider and proven owner relation, direct/session
+  eligibility under ONE coherent session generation, scoped source vector,
+  scoped deadlines), capture → build off-lock → revalidate →
+  publish-if-current, pool-side exact invalidation, mixed-generation refusal,
+  the deferred publication-order interleaving evidence, and the remaining
+  §18.3 witnesses.
 
 ### 18.1 Scope, exactly
 
