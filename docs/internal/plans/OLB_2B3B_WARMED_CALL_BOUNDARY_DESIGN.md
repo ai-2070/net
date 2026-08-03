@@ -1582,6 +1582,7 @@ Every one selects exactly one test and dies to its own inverse mutation.
 | §8 | `a_warmed_lookup_completes_while_the_mutation_lock_is_held` | the real contention form | make the read path depend on that lock |
 | §8 | `concurrent_misses_acquire_one_demand_set` | one entry, one budget spend, no registry refusal provoked | drop the under-lock re-check |
 | §9 | `a_spent_family_budget_refuses_from_the_registry_every_time` | every attempt is the registry's verdict; warmed entries keep serving | memoize the refusal family-globally |
+| W-R1 | `a_wide_refusal_does_not_poison_residual_capacity` | at 62/64 a width-3 refusal leaves a width-1 capability warmable | reintroduce ANY family-wide refusal record, whatever its key |
 | W-L1 | `a_newly_leased_audience_joins_a_warmed_entry` | an audience leased after warming joins the demand set | return the warmed entry without checking lease currency; drop the MISSING direction |
 | W-L2 | `a_removed_audience_leaves_a_warmed_entry` | a removed audience leaves it | drop the OBSOLETE direction |
 | W-L3 | `a_rotated_audience_replaces_the_scope_it_supersedes` | rotation swaps the scope under one grant id | — (composite control for W-L2/W-L4) |

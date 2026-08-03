@@ -263,7 +263,7 @@ jobs:
 
       # OLB-2B.3b: the clone-family routing-state witnesses — the atomic
       # demand-set acquisition in `behavior::org_routing_registry::tests` and the
-      # capability index / demand lifecycle / refusal policy in
+      # capability index / demand lifecycle / refusal pass-through in
       # `behavior::org_routing_state::tests`.
       #
       # Same reasoning as the two gates above, and the same failure it forecloses:
@@ -284,7 +284,7 @@ jobs:
         run: |
           set -o pipefail
           REG_MIN=42
-          STATE_MIN=45
+          STATE_MIN=41
           reg=$(cargo test --lib --features "$UNIT_FEATURES" \
                   behavior::org_routing_registry:: 2>&1 | tee /dev/stderr)
           state=$(cargo test --lib --features "$UNIT_FEATURES" \
@@ -338,12 +338,12 @@ jobs:
           a_warmed_lookup_completes_while_the_mutation_lock_is_held
           concurrent_misses_acquire_one_demand_set
           concurrent_rederivations_spend_one_demand_set
-          family_capacity_refusal_is_sticky_for_the_family
+          a_spent_family_budget_refuses_from_the_registry_every_time
           a_wide_refusal_does_not_poison_residual_capacity
-          a_refusal_settles_every_wider_set_without_the_registry
-          capacity_freed_by_a_supersession_is_spendable_again
-          node_capacity_refusal_retries_only_when_the_generation_moves
-          identity_exhaustion_is_terminal_and_outranks_a_moving_generation
+          a_full_node_refuses_every_attempt_until_a_retirement
+          a_narrowed_demand_warms_on_a_full_node_without_a_retirement
+          identity_exhaustion_refuses_a_set_that_needs_a_new_slot
+          identity_exhaustion_does_not_refuse_a_set_of_existing_slots
           the_family_bound_counts_demands_not_capabilities
           a_refused_entry_retains_no_partial_demand
           a_newly_leased_audience_joins_a_warmed_entry
@@ -359,15 +359,11 @@ jobs:
           a_rotation_at_the_node_bound_refuses_when_the_old_slot_is_shared
           identity_exhaustion_during_a_replacement_refuses_with_no_effect
           a_narrowing_replacement_needs_no_identity_after_exhaustion
-          a_cached_terminal_refusal_does_not_block_a_zero_identity_replacement
-          a_cached_node_refusal_does_not_block_a_self_crediting_replacement
-          a_shared_old_replacement_retries_when_the_sharer_releases
-          a_replacement_refusal_leaves_the_fresh_path_untouched
+          a_shared_old_replacement_succeeds_when_the_sharer_releases
           the_under_lock_miss_recheck_validates_the_callers_snapshot
           the_under_lock_miss_recheck_sees_a_removal
           the_under_lock_miss_recheck_sees_a_rotation
           the_under_lock_miss_race_retains_the_newest_snapshot
-          a_repeatedly_impossible_replacement_asks_the_registry_once
           a_stalled_older_install_cannot_overwrite_a_newer_removal
           a_stalled_older_removal_cannot_overwrite_a_newer_install
           a_terminal_snapshot_cannot_be_overwritten_by_an_ordinary_one

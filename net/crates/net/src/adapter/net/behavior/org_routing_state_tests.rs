@@ -687,6 +687,53 @@ fn a_spent_family_budget_refuses_from_the_registry_every_time() {
     );
 }
 
+/// **The residual-capacity schedule, kept executable.** A refusal of a WIDE
+/// demand set says nothing about a NARROW one that still fits: at 62 of 64 a
+/// width-3 capability is refused, and a width-1 capability must still warm.
+///
+/// This is the exact cross-capability regression that justified removing the
+/// family-global refusal record — one wide refusal answered every later
+/// capability for the family's lifetime, having never asked the registry, so
+/// two spendable handles became permanently unreachable. The no-cache design
+/// makes the behavior structurally likely, not guaranteed, which is why the
+/// schedule stays a witness: it dies to ANY reintroduced family-wide refusal
+/// record, whatever its key.
+#[test]
+fn a_wide_refusal_does_not_poison_residual_capacity() {
+    let f = fixture();
+    let wide = cap("nrpc:wide");
+    let mut grants = Vec::new();
+    let mut leased = ConsumerGrantSnapshot::empty();
+    for i in 0..2u32 {
+        let (grant, secret) = issue(wide, GrantRights::DISCOVER);
+        leased = lease(&leased, &grant, secret.expect("secret"), u64::from(i) + 1);
+        grants.push(grant);
+    }
+    let state = f.state(credentials(grants));
+
+    // 62 of 64 spent: two handles remain.
+    fill_to_total(&state, &leased, 62);
+    let entries = state.entries();
+
+    // `wide` needs Owner + two leased audiences = 3, and only 2 remain.
+    assert_eq!(
+        state.route_handle(&wide, &leased),
+        RouteLookup::Cold(ColdReason::Refused(DemandRefused::FamilyAtCapacity)),
+        "a width-3 set does not fit in two handles"
+    );
+    assert_eq!(state.handles(), 62, "and it retained none of them");
+    assert_eq!(state.entries(), entries, "and published no entry");
+
+    // The two spare handles are STILL SPENDABLE by a DIFFERENT capability.
+    assert_eq!(
+        state.route_handle(&cap("nrpc:narrow"), &leased),
+        RouteLookup::Warm,
+        "a wide refusal must not poison residual capacity"
+    );
+    assert_eq!(state.handles(), 63);
+    assert_eq!(state.entries(), entries + 1);
+}
+
 /// Option-A accounting: the family bound is on DEMANDS, not capabilities.
 ///
 /// This is the property the plan text was corrected to state. One leased
