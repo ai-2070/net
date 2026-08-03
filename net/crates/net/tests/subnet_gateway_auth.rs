@@ -743,6 +743,148 @@ async fn a_valid_hop_without_route_authority_is_not_forwarded() {
     );
 }
 
+/// The LEARNED-route positive witness. A protected hop whose
+/// destination is NOT adjacent to the gateway rides a route the
+/// gateway learned through production propagation — never one this
+/// test installed by hand — and is forwarded to the authenticated
+/// ADJACENT next hop with the remote destination untouched.
+///
+/// Topology: `left ↔ gw ↔ right ↔ dest`. The gateway's only knowledge
+/// of `dest` is what the production learning writers install from
+/// traffic arriving via `right` (its own pingwave flood and the
+/// forwarded capability announcement — both fire here; whichever
+/// lands, both now bind the session-authenticated adjacent peer).
+/// The direct-adjacency witness above cannot distinguish "protected
+/// forwarding works" from "protected forwarding works only when the
+/// destination happens to be the next hop"; this is the test that
+/// fails if learned routes install without identity, bind the
+/// advertised origin or the destination instead of the adjacent
+/// peer, or resolve identity from an address at egress time.
+#[tokio::test]
+async fn a_learned_route_forwards_protected_hops_to_the_authenticated_adjacent_hop() {
+    use net::adapter::net::behavior::capability::CapabilitySet;
+
+    let gw_kp = EntityKeypair::generate();
+    let left_kp = EntityKeypair::generate();
+    let right_kp = EntityKeypair::generate();
+    let dest_kp = EntityKeypair::generate();
+    let gw = node(gw_kp.clone(), Some(&[3])).await;
+    let left = node(left_kp.clone(), None).await;
+    let right = node(right_kp.clone(), None).await;
+    let dest = node(dest_kp.clone(), None).await;
+
+    // Line topology; every handshake precedes every start().
+    handshake(&left, &gw).await;
+    handshake(&right, &gw).await;
+    handshake(&dest, &right).await;
+    gw.start();
+    left.start();
+    right.start();
+    dest.start();
+
+    admit(&gw, &left, &left_kp, &[3], &[3, 7, 1], SubnetRights::ATTACH).await;
+    admit(
+        &gw,
+        &right,
+        &right_kp,
+        &[3],
+        &[3, 7, 2],
+        SubnetRights::ATTACH,
+    )
+    .await;
+
+    gw.install_subnet_gateway_credentials(&[grant(
+        &gw_kp,
+        &[3],
+        SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+    )])
+    .expect("install gateway credentials");
+    gw.declare_subnet_boundaries(net::adapter::net::subnet::SubnetBoundarySet::new(
+        root().entity_id().clone(),
+        0,
+        [],
+    ));
+
+    // Kick production learning explicitly (the pingwave flood also
+    // runs on its own schedule): `dest`'s announcement reaches `right`
+    // direct (hop 0) and `gw` forwarded (hop 1), and the forwarded
+    // receipt is a learned-route install at the gateway.
+    dest.announce_capabilities(CapabilitySet::new().add_tag("learned-route-witness"))
+        .await
+        .expect("announce");
+
+    // Await convergence — and require IDENTITY, not reachability: the
+    // poll accepts nothing until the gateway resolves `dest` to an
+    // authenticated next hop, which a legacy (address-only) learned
+    // install never satisfies.
+    let dest_id = dest.node_id();
+    let right_id = right.node_id();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let hop = loop {
+        if let Some(hop) = gw.authenticated_next_hop(dest_id) {
+            break hop;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the gateway never learned an identity-bound route to dest \
+             through production propagation",
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        hop.node_id, right_id,
+        "the learned route must bind the ADJACENT authenticated peer — \
+         not the destination, the advertised origin, or whoever answers \
+         at an address",
+    );
+
+    // Observe the egress leg. The consistent-move seam repoints the
+    // peer record, indexes, AND the identity-bound routes, exactly as
+    // a live NAT rebind does.
+    let watcher = wire().await;
+    assert!(gw.set_peer_addr_for_test(right_id, watcher.local_addr().expect("addr")));
+
+    // A protected hop from `left`, destined PAST the gateway's
+    // adjacency.
+    let header = RoutingHeader::new(dest_id, left.node_id() as u32, 8);
+    let envelope = left
+        .seal_route_hop_to_peer(gw.node_id(), &header, INNER_TAG)
+        .expect("left has a session to the gateway");
+    let sock = wire().await;
+    sock.send_to(&envelope, gw.local_addr())
+        .await
+        .expect("send");
+
+    let got = received_within(&watcher, Duration::from_millis(500)).await;
+    let hops = route_hops(&got);
+    assert_eq!(hops.len(), 1, "exactly one hop must be forwarded");
+    let out = hops[0];
+
+    // Re-tagged for the ADJACENT hop — the gw↔right edge key…
+    let (out_header, out_inner) = right
+        .open_route_hop_from_peer(gw.node_id(), out)
+        .expect("the forwarded hop verifies under the gw↔right edge key");
+    // …while still aimed at the REMOTE destination.
+    assert_eq!(
+        out_header.dest_id, dest_id,
+        "the remote destination must ride through the relay unchanged",
+    );
+    assert_eq!(
+        out_inner, INNER_TAG,
+        "the relay must not touch the inner packet",
+    );
+    assert_eq!(
+        out_header.ttl,
+        header.ttl - 1,
+        "outer TTL must be decremented exactly once",
+    );
+    assert_eq!(
+        out_header.hop_count,
+        header.hop_count + 1,
+        "outer hop_count must be incremented exactly once",
+    );
+}
+
 /// Only the route-hop envelopes among `datagrams`.
 ///
 /// A watcher standing in for a peer's address also receives that peer's

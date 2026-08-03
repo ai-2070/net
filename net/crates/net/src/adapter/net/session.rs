@@ -16,7 +16,7 @@ use std::time::Instant;
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
-use super::subnet::route_hop::HopReplayWindow;
+use super::subnet::route_hop::SharedHopReplayWindow;
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
 use super::pool::SharedLocalPool;
@@ -137,7 +137,15 @@ pub struct NetSession {
     /// AEAD counter by design.
     route_hop_tx_seq: AtomicU64,
     /// Sliding replay window over inbound hop sequences.
-    route_hop_replay: parking_lot::Mutex<HopReplayWindow>,
+    ///
+    /// Lock-free single-writer state, not a mutex: the production
+    /// protected-ingress path is single-consumer (one receive loop,
+    /// synchronous dispatch), so admission never contends there, and
+    /// the ordinary path pays no locking. A second concurrent caller
+    /// — only reachable by breaking that ownership rule — is refused
+    /// immediately and its packet dropped
+    /// ([`super::subnet::route_hop::RouteHopError::Contended`]).
+    route_hop_replay: SharedHopReplayWindow,
 }
 
 /// Sentinel `stream_id` used in the header of subprotocol control
@@ -192,7 +200,7 @@ impl NetSession {
             route_hop_tx_key: keys.route_hop_tx_key,
             route_hop_rx_key: keys.route_hop_rx_key,
             route_hop_tx_seq: AtomicU64::new(0),
-            route_hop_replay: parking_lot::Mutex::new(HopReplayWindow::new()),
+            route_hop_replay: SharedHopReplayWindow::new(),
         }
     }
 
@@ -251,7 +259,7 @@ impl NetSession {
     ) -> Result<super::subnet::route_hop::OpenedHop<'a>, super::subnet::route_hop::RouteHopError>
     {
         let opened = super::subnet::route_hop::open(&self.route_hop_rx_key, buf)?;
-        self.route_hop_replay.lock().admit(opened.hop_sequence)?;
+        self.route_hop_replay.admit(opened.hop_sequence)?;
         Ok(opened)
     }
 

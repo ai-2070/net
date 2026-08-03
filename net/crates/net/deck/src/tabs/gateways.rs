@@ -3,11 +3,13 @@
 //!
 //! Five columns: `▶` cursor marker, `CHANNEL` (resolved name or
 //! `—` for an unknown hash), `VIS` (declared visibility tier),
-//! `HASH` (16-bit wire hash), `TARGETS` (subnet IDs the rule
-//! exports to), `REACH` (sum of known node counts across those
-//! targets — what the SUBNETS panel computes per row, but
-//! rolled up across this rule's targets so the operator sees
-//! the rule's blast radius at a glance).
+//! `HASH` (the CANONICAL u64 channel identity — the key export
+//! policy is written against, rendered at full `0x` + 16-digit
+//! width; never the collidable 16-bit wire hint), `TARGETS`
+//! (subnet IDs the rule exports to), `REACH` (sum of known node
+//! counts across those targets — what the SUBNETS panel computes
+//! per row, but rolled up across this rule's targets so the
+//! operator sees the rule's blast radius at a glance).
 //!
 //! Cursor + scrolling mirror the BLOBS pattern:
 //! `tabs::scroll_window` picks the visible window around the
@@ -268,7 +270,7 @@ fn render_table(
             Constraint::Length(2),  // cursor marker
             Constraint::Length(28), // channel name
             Constraint::Length(9),  // visibility tier
-            Constraint::Length(8),  // hash
+            Constraint::Length(18), // hash — full canonical `{:#018x}`
             Constraint::Min(20),    // targets list
             Constraint::Length(7),  // reach
         ],

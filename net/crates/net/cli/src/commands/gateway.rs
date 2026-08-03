@@ -9,11 +9,12 @@
 //! `(channel_hash, channel_name?, target_subnets[])` rows.
 //!
 //! `export <channel> <target-subnet>...` adds (or replaces) an
-//! export rule. The channel argument can be either the canonical
-//! name (hashed directly to its canonical `ChannelHash`) or a
-//! `0x` / decimal canonical `u64` literal. The 16-bit wire hint is
-//! NOT accepted: export rules are channel policy and the hint
-//! collides by design.
+//! export rule. The channel argument is the canonical name
+//! (preferred — hashed directly to its canonical `ChannelHash`),
+//! or a full-width literal: `0x` followed by exactly 16 hex
+//! digits. Nothing shorter and no decimal form is accepted — a
+//! short value is indistinguishable from the collidable 16-bit
+//! wire hint, and export rules are channel policy.
 //!
 //! Shape pinned in `SCALING_SUBNET_SPEC.md` Phase A.
 
@@ -62,7 +63,9 @@ pub struct ExportsArgs {
 
 #[derive(Args, Debug)]
 pub struct ExportArgs {
-    /// Channel name (preferred) OR `0x`/decimal canonical `u64` hash.
+    /// Channel name (preferred) OR the full canonical hash as
+    /// `0x` + exactly 16 hex digits. Short and decimal literals
+    /// are refused.
     pub channel: String,
     /// Target subnets to export to. At least one required.
     /// Format: `region.fleet.unit[.subsystem]` (e.g. `3.7.2`) or
@@ -120,7 +123,10 @@ async fn run_exports(
         .gateway_exports()
         .into_iter()
         .map(|(channel_hash, targets)| ExportRow {
-            channel_hash: format!("{channel_hash:#06x}"),
+            // Full canonical width, always: `0x` + 16 hex digits.
+            // This is the exact string `export` accepts back, so an
+            // operator can round-trip a row without hand-widening.
+            channel_hash: format!("{channel_hash:#018x}"),
             target_count: targets.len() as u64,
             targets: targets.iter().map(|s| s.to_string()).collect(),
         })
@@ -158,27 +164,39 @@ async fn run_export(
 /// Export rules are channel policy, and policy is keyed on the
 /// canonical `u64` — never the 16-bit wire hint, which is documented
 /// as a fast-path filter with routine collisions. Accepting a hint
-/// here would let an operator install one channel.s targets onto
+/// here would let an operator install one channel's targets onto
 /// every other channel in the same bucket.
 ///
 /// A name is the preferred form and hashes directly. A literal is
-/// accepted only at full canonical width; a short value is refused
-/// rather than widened, because `wire_hash as u64` recovers none of
-/// the missing 48 bits.
+/// accepted ONLY as `0x` followed by exactly 16 hex digits — the
+/// unambiguous full canonical width, and exactly what `exports`
+/// renders. Everything shorter, and every decimal form, is refused
+/// rather than widened: `wire_hash as u64` recovers none of the
+/// missing 48 bits, and a short or decimal value on the command line
+/// is indistinguishable from an accidentally pasted wire hint.
 fn parse_channel_hash(raw: &str) -> Result<u64, CliError> {
     let s = raw.trim();
     if s.is_empty() {
         return Err(invalid_args("channel cannot be empty"));
     }
-    let looks_like_literal =
-        s.starts_with("0x") || s.starts_with("0X") || s.chars().all(|c| c.is_ascii_digit());
-    if looks_like_literal {
-        let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            u64::from_str_radix(hex, 16)
-        } else {
-            s.parse::<u64>()
-        };
-        return parsed.map_err(|e| invalid_args(format!("channel `{raw}`: {e}")));
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        if hex.len() != 16 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(invalid_args(format!(
+                "channel `{raw}`: a hash literal must be the FULL canonical width — \
+                 `0x` followed by exactly 16 hex digits, as `net gateway exports` \
+                 renders it. Short forms are refused rather than widened (they are \
+                 indistinguishable from the collidable 16-bit wire hint). Prefer \
+                 the channel name: the canonical hash derives from it directly."
+            )));
+        }
+        return u64::from_str_radix(hex, 16)
+            .map_err(|e| invalid_args(format!("channel `{raw}`: {e}")));
+    }
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return Err(invalid_args(format!(
+            "channel `{raw}`: decimal hash literals are not accepted — pass the \
+             channel name, or the full canonical hash as `0x` + 16 hex digits."
+        )));
     }
     // A name IS the canonical identity, so resolving one needs no
     // mesh attachment — the hash is a pure function of the name.
@@ -267,15 +285,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_channel_hash_accepts_hex_and_decimal_literals() {
-        assert_eq!(parse_channel_hash("0x42").unwrap(), 0x42);
-        assert_eq!(parse_channel_hash("0X42").unwrap(), 0x42);
-        assert_eq!(parse_channel_hash("66").unwrap(), 66);
-        // Full canonical width, not truncated to a wire hint.
+    fn parse_channel_hash_accepts_only_full_width_hex_literals() {
+        // The one accepted literal shape: `0x` + exactly 16 hex
+        // digits — the string `exports` renders, round-tripped.
         assert_eq!(
             parse_channel_hash("0xeb3ad2bc323f22f2").unwrap(),
             0xeb3a_d2bc_323f_22f2,
         );
+        assert_eq!(
+            parse_channel_hash("0X00000000000000ff").unwrap(),
+            0xff,
+            "leading zeros are how a small canonical value is written at full width",
+        );
+
+        // Short hex forms are REFUSED, not widened: an operator's
+        // accidentally pasted 16-bit wire hint must not silently
+        // become a canonical identity that matches nothing (or,
+        // worse, is trusted as if it named the intended channel).
+        assert!(parse_channel_hash("0x42").is_err());
+        assert!(parse_channel_hash("0X42").is_err());
+        assert!(parse_channel_hash("0x1FFFF").is_err());
+        // 15 and 17 digits bracket the accepted width exactly.
+        assert!(parse_channel_hash("0xeb3ad2bc323f22f").is_err());
+        assert!(parse_channel_hash("0xeb3ad2bc323f22f21").is_err());
+
+        // Decimal literals are refused outright — ambiguous with
+        // both wire hints and (hypothetical) digit-only names.
+        assert!(parse_channel_hash("66").is_err());
+        assert!(parse_channel_hash("65536").is_err());
+        assert!(parse_channel_hash("18446744073709551615").is_err());
     }
 
     #[test]
@@ -292,11 +330,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_channel_hash_rejects_empty_and_overflow() {
+    fn parse_channel_hash_rejects_empty_overflow_and_non_hex() {
         assert!(parse_channel_hash("").is_err());
-        // Values above the 16-bit hint are ordinary canonical hashes now.
-        assert_eq!(parse_channel_hash("0x1FFFF").unwrap(), 0x1_FFFF);
-        assert_eq!(parse_channel_hash("65536").unwrap(), 65536);
+        // 17 hex digits (would overflow u64) — refused on width.
         assert!(parse_channel_hash("0xFFFFFFFFFFFFFFFFF").is_err());
+        // 16 characters that aren't all hex digits.
+        assert!(parse_channel_hash("0xeb3ad2bc323f22zz").is_err());
+    }
+
+    /// The exports view renders the exact literal the export parser
+    /// accepts, so a row can be copy-pasted back into `gateway
+    /// export` without hand-editing.
+    #[test]
+    fn exports_render_width_round_trips_through_the_parser() {
+        for hash in [0u64, 0xff, 0xeb3a_d2bc_323f_22f2, u64::MAX] {
+            let rendered = format!("{hash:#018x}");
+            assert_eq!(
+                parse_channel_hash(&rendered).unwrap(),
+                hash,
+                "rendered `{rendered}` must parse back to the same canonical hash",
+            );
+        }
     }
 }

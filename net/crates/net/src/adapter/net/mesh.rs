@@ -8345,10 +8345,14 @@ impl MeshNode {
             ProximityConfig::default(),
         ));
 
-        // Create reroute policy with proximity graph for topology-aware alternates
+        // Create reroute policy with proximity graph for topology-aware
+        // alternates. The reverse address index lets its installs bind
+        // the identity of a confirmed-direct next hop (D6) instead of
+        // stranding protected forwarding on an address-only entry.
         let reroute_policy = Arc::new(
             ReroutePolicy::new(router.routing_table().clone(), peer_addrs.clone())
-                .with_proximity_graph(proximity_graph.clone()),
+                .with_proximity_graph(proximity_graph.clone())
+                .with_addr_to_node(addr_to_node.clone()),
         );
 
         // Subscriber roster for channel fan-out; also wired into the
@@ -10764,7 +10768,11 @@ impl MeshNode {
     /// (first write wins, mirroring the dispatch pin). Lets fixtures
     /// model fold declarers that are not live sessions: the SI-2b
     /// candidate snapshot reads this pin for §4.10 authorization.
+    ///
+    /// Gated like the seams below: a TOFU pin is authority-relevant
+    /// state (§4.10 reads it), so no production build may reach it.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn test_pin_peer_entity(&self, node_id: u64, entity_id: EntityId) {
         self.peer_entity_ids.entry(node_id).or_insert(entity_id);
     }
@@ -10781,8 +10789,13 @@ impl MeshNode {
     /// relay's witness needs only to seal or open ONE envelope, which
     /// is what [`Self::seal_route_hop_to_peer`] and
     /// [`Self::open_route_hop_from_peer`] provide.
+    ///
+    /// `nat-traversal` is deliberately NOT in this gate: it is a
+    /// production feature, and a production NAT build must not expose
+    /// live-session handles. NAT tests that need these helpers enable
+    /// `fixtures` alongside `nat-traversal` (as CI's NAT step does).
     #[doc(hidden)]
-    #[cfg(any(test, feature = "fixtures", feature = "nat-traversal"))]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn peer_session_for_test(&self, node_id: u64) -> Option<Arc<NetSession>> {
         self.peers.get(&node_id).map(|e| e.value().session.clone())
     }
@@ -10794,7 +10807,7 @@ impl MeshNode {
     /// without handing the caller the session, its keys, or its replay
     /// state.
     #[doc(hidden)]
-    #[cfg(any(test, feature = "fixtures", feature = "nat-traversal"))]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn seal_route_hop_to_peer(
         &self,
         node_id: u64,
@@ -10816,7 +10829,7 @@ impl MeshNode {
     /// witness asserts on the successful shape, and the failure reasons
     /// are already pinned by the `route_hop` module tests.
     #[doc(hidden)]
-    #[cfg(any(test, feature = "fixtures", feature = "nat-traversal"))]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn open_route_hop_from_peer(
         &self,
         node_id: u64,
@@ -10847,21 +10860,42 @@ impl MeshNode {
     /// has. This models a NAT rebind instead, which is the real
     /// operation.
     #[doc(hidden)]
-    #[cfg(any(test, feature = "fixtures", feature = "nat-traversal"))]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn set_peer_addr_for_test(&self, node_id: u64, addr: SocketAddr) -> bool {
         let Some(mut peer) = self.peers.get_mut(&node_id) else {
             return false;
         };
+        // Follow the identity FIRST, exactly as the live rebind path
+        // does — and refuse the whole move if the route is absent,
+        // legacy, or bound to another identity. Mutating the peer
+        // record and indexes anyway would tear exactly the state this
+        // seam exists to keep consistent.
+        if !self
+            .router
+            .routing_table()
+            .rebind_authenticated_route(node_id, node_id, addr)
+        {
+            return false;
+        }
         let old = peer.addr;
         peer.addr = addr;
         drop(peer);
         self.peer_addrs.insert(node_id, addr);
-        self.addr_to_node.remove(&old);
-        self.addr_to_node.insert(addr, node_id);
-        // Follow the identity, exactly as the live rebind path does.
+        // Learned multi-hop routes riding through this peer follow its
+        // identity to the new address, exactly as `install_peer`'s
+        // DirectOverwrite arm does on a live re-handshake. Without
+        // this, a witness that moved the peer would leave every
+        // learned route bound to the old address — a torn state the
+        // relay's pre-seal incarnation check rejects, and one
+        // production never produces.
         self.router
             .routing_table()
-            .rebind_authenticated_route(node_id, node_id, addr);
+            .migrate_next_hop(old, addr, node_id);
+        // Identity-qualified eviction: the old address may have been
+        // concurrently reused by (and re-indexed to) another peer, and
+        // an unconditional remove would strip that owner's mapping.
+        self.addr_to_node.remove_if(&old, |_, n| *n == node_id);
+        self.addr_to_node.insert(addr, node_id);
         true
     }
 
@@ -13769,9 +13803,11 @@ impl MeshNode {
                 // peer (RT-5 review Finding 6).
                 if let Some(old_addr) = displaced_addr {
                     if old_addr != peer_addr {
-                        self.router
-                            .routing_table()
-                            .migrate_next_hop(old_addr, peer_addr);
+                        self.router.routing_table().migrate_next_hop(
+                            old_addr,
+                            peer_addr,
+                            peer_node_id,
+                        );
                         self.addr_to_node
                             .remove_if(&old_addr, |_, n| *n == peer_node_id);
                     }
@@ -13894,7 +13930,7 @@ impl MeshNode {
             if old_addr != peer_addr {
                 self.router
                     .routing_table()
-                    .migrate_next_hop(old_addr, peer_addr);
+                    .migrate_next_hop(old_addr, peer_addr, peer_node_id);
                 self.addr_to_node
                     .remove_if(&old_addr, |_, n| *n == peer_node_id);
             }
@@ -15822,6 +15858,34 @@ impl MeshNode {
                 // edge) that a withdrawal just removed (RT-5 review). We
                 // install/refresh the route only for an ACCEPTED
                 // pingwave, and forward only an accepted-and-live one.
+                // D6 identity for the learned route. The reverse index
+                // nominated `from_node_id`, but that map is mutable and
+                // an address can be reused, so the nomination alone is
+                // not an identity. Bind `next_hop_id` only when the
+                // peer registry's CURRENT address for that identity
+                // agrees with `source` — the same forward confirmation
+                // the protected relay applies at egress. On
+                // disagreement the route still installs for legacy
+                // forwarding, but carries no identity, so protected
+                // forwarding refuses to resolve it rather than
+                // resolving it to whoever answers at the address.
+                let sender_confirmed = ctx
+                    .peers
+                    .get(&from_node_id)
+                    .is_some_and(|p| p.value().addr == source);
+                let install_learned_route = || {
+                    let table = ctx.router.routing_table();
+                    if sender_confirmed {
+                        table.add_authenticated_route_with_metric(
+                            origin_nid,
+                            source,
+                            from_node_id,
+                            metric,
+                        );
+                    } else {
+                        table.add_route_with_metric(origin_nid, source, metric);
+                    }
+                };
                 let from_graph_id = node_id_to_graph_id(from_node_id);
                 let admission = ctx
                     .proximity_graph
@@ -15829,15 +15893,11 @@ impl MeshNode {
                 let fwd_pw = match admission {
                     PingwaveAdmission::RejectedDuplicate => return,
                     PingwaveAdmission::AcceptedNoForward => {
-                        ctx.router
-                            .routing_table()
-                            .add_route_with_metric(origin_nid, source, metric);
+                        install_learned_route();
                         return;
                     }
                     PingwaveAdmission::AcceptedAndForward(fwd_pw) => {
-                        ctx.router
-                            .routing_table()
-                            .add_route_with_metric(origin_nid, source, metric);
+                        install_learned_route();
                         fwd_pw
                     }
                 };
@@ -21018,10 +21078,15 @@ impl MeshNode {
         }
         // Metric mirrors the pingwave-install convention (hops beyond
         // the first + 2): here path.len()-2 intermediate hops + 2.
+        //
+        // Identity-bound install: `promotable_direct_hop` just proved
+        // `first_hop` is a live DIRECT peer whose address maps back to
+        // it in the reverse index, which is exactly the confirmation
+        // D6 requires before `next_hop_id` may be bound.
         let metric = (path.len() as u16).saturating_sub(2).saturating_add(2);
         router
             .routing_table()
-            .add_route_with_metric(dest, addr, metric);
+            .add_authenticated_route_with_metric(dest, addr, first_hop, metric);
         true
     }
 
@@ -21161,7 +21226,13 @@ impl MeshNode {
                 addr,
                 via_addr,
             ) {
-                ctx.router.routing_table().add_route(dest, addr);
+                // The destination IS the adjacent peer here (the
+                // promotable check proved the direct session), so this
+                // is the identity-qualified-by-construction case:
+                // promote with the identity bound, not as a legacy
+                // entry that would strand protected egress on a route
+                // the peer legitimately owns.
+                ctx.router.add_direct_route(dest, addr);
                 return;
             }
         }
@@ -23957,9 +24028,29 @@ impl MeshNode {
             if let Some(entry) = ctx.peer_addrs.get(&from_node) {
                 let sender_addr = *entry.value();
                 let metric = u16::from(ann.hop_count) + 2;
-                ctx.router
-                    .routing_table()
-                    .add_route_with_metric(ann.node_id, sender_addr, metric);
+                // D6 identity: `from_node` IS the AEAD-resolved session
+                // peer — never the advertised origin (`ann.node_id`) or
+                // anything the wire claims. Bind it as the route's
+                // next-hop identity only when its recorded address maps
+                // back to it in the reverse index: a relayed
+                // (`connect_via`) peer records its RELAY's address, and
+                // binding that pair would put a false adjacency in the
+                // routing table. Without the confirmation the route
+                // installs as legacy — reachable for ordinary routing,
+                // unresolvable for protected forwarding.
+                let direct_confirmed =
+                    ctx.addr_to_node.get(&sender_addr).map(|e| *e.value()) == Some(from_node);
+                let table = ctx.router.routing_table();
+                if direct_confirmed {
+                    table.add_authenticated_route_with_metric(
+                        ann.node_id,
+                        sender_addr,
+                        from_node,
+                        metric,
+                    );
+                } else {
+                    table.add_route_with_metric(ann.node_id, sender_addr, metric);
+                }
             }
         }
 

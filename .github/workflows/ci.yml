@@ -527,10 +527,15 @@ jobs:
           tool: nextest
 
       # === NAT traversal ==================================================
+      # `fixtures` rides alongside `nat-traversal` because these tests
+      # use the gated test seams (`peer_session_for_test` in
+      # direct_upgrade). The seams are cfg'd `any(test, fixtures)` ONLY:
+      # `nat-traversal` is a production feature and must not expose
+      # them, so the tests opt in explicitly here instead.
       - name: NAT traversal
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --no-tests=fail --features "net nat-traversal"
+          cargo nextest run --no-fail-fast --no-tests=fail --features "net nat-traversal fixtures"
           --test connect_direct
           --test nat_classify
           --test peer_death_clears_capability_index

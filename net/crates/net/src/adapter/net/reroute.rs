@@ -51,6 +51,15 @@ pub struct ReroutePolicy {
     routing_table: Arc<RoutingTable>,
     /// Connected peers (node_id → addr mapping)
     peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    /// Reverse address index (addr → node_id), used to confirm that a
+    /// candidate next hop's address really is that peer's own direct
+    /// session address before binding its identity into an installed
+    /// route. `peer_addrs` alone can't answer that: a relayed
+    /// (`connect_via`) peer records its RELAY's address there, and
+    /// binding that pair would install a false adjacency. When absent
+    /// (tests, benches), every install falls back to the legacy
+    /// identity-less form.
+    addr_to_node: Option<Arc<DashMap<SocketAddr, u64>>>,
     /// Proximity graph for multi-hop alternate selection
     proximity_graph: Option<Arc<ProximityGraph>>,
     /// Saved original routes for recovery (dest_node_id → saved route)
@@ -86,6 +95,7 @@ impl ReroutePolicy {
         Self {
             routing_table,
             peer_addrs,
+            addr_to_node: None,
             proximity_graph: None,
             saved_routes: DashMap::new(),
             reroute_count: AtomicU64::new(0),
@@ -97,6 +107,39 @@ impl ReroutePolicy {
     pub fn with_proximity_graph(mut self, graph: Arc<ProximityGraph>) -> Self {
         self.proximity_graph = Some(graph);
         self
+    }
+
+    /// Wire the reverse address index so reroute/recovery installs can
+    /// bind the authenticated identity of a confirmed-direct next hop
+    /// (`SUBNET_AUTH_PLAN.md` D6). Production wires this; without it
+    /// every install is legacy (address-only).
+    pub fn with_addr_to_node(mut self, index: Arc<DashMap<SocketAddr, u64>>) -> Self {
+        self.addr_to_node = Some(index);
+        self
+    }
+
+    /// The identity to bind for a next hop at `addr`, iff the reverse
+    /// index and the forward map agree it is that peer's own DIRECT
+    /// session address. Disagreement (a relayed entry, a stale index,
+    /// address reuse mid-flight) yields `None` and the caller installs
+    /// a legacy route instead — reachable for ordinary routing,
+    /// unresolvable for protected forwarding.
+    fn direct_identity_for(&self, addr: SocketAddr) -> Option<u64> {
+        let node_id = *self.addr_to_node.as_ref()?.get(&addr)?.value();
+        (self.peer_addrs.get(&node_id).map(|e| *e.value()) == Some(addr)).then_some(node_id)
+    }
+
+    /// Install `dest → addr`, identity-bound when `addr` is a
+    /// confirmed direct peer's own address. Unconditional (metric-1)
+    /// like the legacy `add_route`, since both call sites deliberately
+    /// replace whatever entry is present.
+    fn install_route(&self, dest_id: u64, addr: SocketAddr) {
+        match self.direct_identity_for(addr) {
+            Some(node_id) => self
+                .routing_table
+                .add_authenticated_route(dest_id, addr, node_id),
+            None => self.routing_table.add_route(dest_id, addr),
+        }
     }
 
     /// Called when the failure detector marks a peer as failed.
@@ -171,7 +214,7 @@ impl ReroutePolicy {
                     failed_node_id,
                     alternate: alt_addr,
                 });
-            self.routing_table.add_route(*dest_id, alt_addr);
+            self.install_route(*dest_id, alt_addr);
             rerouted += 1;
         }
 
@@ -268,7 +311,7 @@ impl ReroutePolicy {
         // may differ from the addr at on_failure time if the peer
         // rebinds.
         for dest_id in &to_restore {
-            self.routing_table.add_route(*dest_id, recovered_addr);
+            self.install_route(*dest_id, recovered_addr);
             self.saved_routes.remove(dest_id);
         }
 
@@ -554,5 +597,68 @@ mod tests {
         // C route unchanged
         assert_eq!(rt.lookup(0x6666).unwrap(), addr_c);
         assert_eq!(policy.active_reroutes(), 2);
+    }
+
+    /// D6: with the reverse index wired, reroute and recovery installs
+    /// bind the next hop's identity exactly when the forward and
+    /// reverse maps agree the address is that peer's own direct
+    /// session address — and install legacy (address-only) otherwise.
+    #[test]
+    fn reroute_binds_identity_only_for_confirmed_direct_alternates() {
+        let rt = make_routing_table();
+        let peers: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let addr_to_node: Arc<DashMap<SocketAddr, u64>> = Arc::new(DashMap::new());
+
+        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        peers.insert(0x2222u64, addr_b);
+        peers.insert(0x3333u64, addr_c);
+        addr_to_node.insert(addr_b, 0x2222u64);
+        addr_to_node.insert(addr_c, 0x3333u64);
+
+        rt.add_route(0x4444, addr_b);
+        let policy =
+            ReroutePolicy::new(rt.clone(), peers.clone()).with_addr_to_node(addr_to_node.clone());
+
+        // B fails → the only alternate is C, whose address maps back
+        // to it: the reroute carries C's identity.
+        policy.on_failure(0x2222);
+        assert_eq!(
+            rt.lookup_authenticated(0x4444),
+            Some((0x3333, addr_c)),
+            "a confirmed-direct alternate must be installed identity-bound"
+        );
+
+        // B recovers at a REBOUND address; recovery re-resolves the
+        // current addr and binds B's identity when the maps agree.
+        let addr_b2: SocketAddr = "127.0.0.1:2001".parse().unwrap();
+        peers.insert(0x2222u64, addr_b2);
+        addr_to_node.insert(addr_b2, 0x2222u64);
+        policy.on_recovery(0x2222);
+        assert_eq!(
+            rt.lookup_authenticated(0x4444),
+            Some((0x2222, addr_b2)),
+            "recovery must restore the route identity-bound at the current addr"
+        );
+
+        // Disagreement: an address owned by someone ELSE in the
+        // reverse index (a relayed peer records its relay's address)
+        // must install legacy — no identity for protected forwarding.
+        let relay_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        peers.insert(0x5555u64, relay_addr); // D records its relay's addr
+        addr_to_node.insert(relay_addr, 0x3333u64); // ...which C owns
+        policy.install_route(0x6666, relay_addr);
+        assert_eq!(rt.lookup(0x6666), Some(relay_addr));
+        assert_eq!(
+            rt.lookup_authenticated(0x6666),
+            None,
+            "an address the reverse index attributes to another peer \
+             must not bind anyone's identity"
+        );
+
+        // No index wired at all → legacy behavior, as before.
+        let bare = ReroutePolicy::new(rt.clone(), peers.clone());
+        bare.install_route(0x7777, addr_c);
+        assert_eq!(rt.lookup_authenticated(0x7777), None);
     }
 }

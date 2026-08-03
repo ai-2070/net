@@ -106,6 +106,15 @@ pub enum RouteHopError {
     BadTag,
     /// Sequence already seen, or older than the replay window.
     Replay,
+    /// Replay admission was attempted by a second concurrent caller.
+    ///
+    /// Production protected ingress is single-consumer (one receive
+    /// loop, synchronous dispatch), so this never fires there. It
+    /// exists so a concurrent misuse — a seam, a future refactor that
+    /// breaks the ownership rule — drops the packet immediately
+    /// instead of blocking, spinning, or corrupting the window. See
+    /// [`SharedHopReplayWindow`].
+    Contended,
     /// Outbound only: the caller's buffer cannot hold the sealed
     /// envelope. The one failure here that is a local sizing mistake
     /// rather than an attacker's doing — see [`sealed_len`].
@@ -119,6 +128,7 @@ impl std::fmt::Display for RouteHopError {
             Self::BadRoutingHeader => "route_hop_bad_routing_header",
             Self::BadTag => "route_hop_bad_tag",
             Self::Replay => "route_hop_replay",
+            Self::Contended => "route_hop_contended",
             Self::BufferTooSmall => "route_hop_buffer_too_small",
         })
     }
@@ -431,6 +441,100 @@ impl HopReplayWindow {
     }
 }
 
+/// [`HopReplayWindow`] behind `&self`, without a lock on the ordinary
+/// path.
+///
+/// Production protected ingress is single-consumer by construction:
+/// one spawned receive loop pulls packets off one `IngressReceiver`
+/// and dispatches synchronously, so exactly one thread ever reaches
+/// admission for a given session. A mutex on that path bought no
+/// correctness — only a lock/unlock round trip per packet and a
+/// blocking primitive sitting where a hostile peer's traffic is
+/// processed.
+///
+/// This replaces it with fixed-size atomic fields and a
+/// compare-exchange claim: the single production consumer always wins
+/// the claim uncontended; a second concurrent caller — which can only
+/// mean the ownership rule was broken — is refused **immediately**
+/// with [`RouteHopError::Contended`], dropping that packet. Fail
+/// closed, no waiting, no spinning, no retry loop, no allocation.
+///
+/// Memory ordering: the successful `Acquire` claim synchronizes-with
+/// the previous holder's `Release` publish, so the relaxed field
+/// accesses in between are data-race-free and always see the previous
+/// admission's state.
+#[derive(Debug)]
+pub struct SharedHopReplayWindow {
+    /// Claim flag — `false` when free. Never waited on: a failed
+    /// claim is an immediate drop, not a spin.
+    claimed: core::sync::atomic::AtomicBool,
+    started: core::sync::atomic::AtomicBool,
+    highest: core::sync::atomic::AtomicU64,
+    /// The 128-bit `seen` bitmap, split into halves — no 128-bit
+    /// atomic exists on the supported targets, and the claim already
+    /// makes the pair single-writer.
+    seen_lo: core::sync::atomic::AtomicU64,
+    seen_hi: core::sync::atomic::AtomicU64,
+}
+
+impl Default for SharedHopReplayWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedHopReplayWindow {
+    /// Empty window. `const`, so a session embeds it inline — no
+    /// first-packet (or any-packet) allocation.
+    pub const fn new() -> Self {
+        use core::sync::atomic::{AtomicBool, AtomicU64};
+        Self {
+            claimed: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+            highest: AtomicU64::new(0),
+            seen_lo: AtomicU64::new(0),
+            seen_hi: AtomicU64::new(0),
+        }
+    }
+
+    /// Admit `sequence` exactly once — [`HopReplayWindow::admit`]'s
+    /// contract, plus [`RouteHopError::Contended`] for a concurrent
+    /// second caller. The window state is unchanged on every error.
+    pub fn admit(&self, sequence: u64) -> Result<(), RouteHopError> {
+        use core::sync::atomic::Ordering;
+        if self
+            .claimed
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(RouteHopError::Contended);
+        }
+        // Exclusive until the release below. Run the one tested
+        // admission algorithm on a local copy rather than a second
+        // implementation on the atomics.
+        let mut window = HopReplayWindow {
+            highest: self.highest.load(Ordering::Relaxed),
+            seen: (u128::from(self.seen_hi.load(Ordering::Relaxed)) << 64)
+                | u128::from(self.seen_lo.load(Ordering::Relaxed)),
+            started: self.started.load(Ordering::Relaxed),
+        };
+        let result = window.admit(sequence);
+        if result.is_ok() {
+            self.highest.store(window.highest, Ordering::Relaxed);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "deliberate: the low half of the split u128 bitmap"
+            )]
+            self.seen_lo.store(window.seen as u64, Ordering::Relaxed);
+            self.seen_hi
+                .store((window.seen >> 64) as u64, Ordering::Relaxed);
+            self.started.store(window.started, Ordering::Relaxed);
+        }
+        self.claimed.store(false, Ordering::Release);
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,5 +832,93 @@ mod tests {
         let buf = seal(&tx, 1, 1, &header(), INNER);
         open(&tx, &buf).expect("verifies under the sending key");
         assert_eq!(open(&rx, &buf).unwrap_err(), RouteHopError::BadTag);
+    }
+
+    /// The lock-free window is the same window: every verdict —
+    /// including the S4A `advance == W` regression and both window
+    /// edges — matches [`HopReplayWindow`] on an identical sequence
+    /// stream, and the split-u128 round trip through the atomic
+    /// halves loses no bitmap bit.
+    #[test]
+    fn shared_window_matches_the_plain_window_verdict_for_verdict() {
+        const W: u64 = ROUTE_HOP_REPLAY_WINDOW;
+        let base = 100_000u64;
+        // Fresh, dup, in-window reorder, dup of reordered, far edge,
+        // one-past-the-edge, exact-W advance (the S4A bug), the old
+        // highest after that advance, and a huge jump.
+        let stream = [
+            base,
+            base,
+            base - 5,
+            base - 5,
+            base - W,
+            base - W - 1,
+            base + W,
+            base,
+            u64::MAX / 2,
+            base + W,
+        ];
+        let mut plain = HopReplayWindow::new();
+        let shared = SharedHopReplayWindow::new();
+        for (i, seq) in stream.into_iter().enumerate() {
+            assert_eq!(
+                plain.admit(seq),
+                shared.admit(seq),
+                "step {i} (seq {seq}): the shared window must give the plain window's verdict",
+            );
+        }
+    }
+
+    /// Concurrent misuse fails CLOSED. Hammer one shared window from
+    /// many threads with overlapping sequence ranges: no verdict may
+    /// be anything but Ok / Replay / Contended, each sequence is
+    /// admitted at most once across all threads, and the window is
+    /// still internally consistent afterwards (everything it admitted
+    /// is refused on re-presentation).
+    #[test]
+    fn shared_window_under_contention_never_double_admits() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let shared = Arc::new(SharedHopReplayWindow::new());
+        const THREADS: u64 = 8;
+        const SEQS: u64 = 64; // well inside one window width
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let w = Arc::clone(&shared);
+            handles.push(std::thread::spawn(move || {
+                let mut admitted = Vec::new();
+                for round in 0..SEQS {
+                    // Every thread walks the SAME sequence space, from
+                    // a different starting offset, so both duplicate
+                    // and contended outcomes actually occur.
+                    let seq = 1 + ((round + t * 7) % SEQS);
+                    match w.admit(seq) {
+                        Ok(()) => admitted.push(seq),
+                        Err(RouteHopError::Replay) | Err(RouteHopError::Contended) => {}
+                        Err(other) => panic!("impossible admission verdict: {other}"),
+                    }
+                }
+                admitted
+            }));
+        }
+        let mut seen = HashSet::new();
+        for h in handles {
+            for seq in h.join().expect("no panic under contention") {
+                assert!(
+                    seen.insert(seq),
+                    "sequence {seq} was admitted by more than one caller",
+                );
+            }
+        }
+        // The survivors are really recorded: nothing admitted above
+        // can be admitted again now that the window is uncontended.
+        for seq in &seen {
+            assert_eq!(
+                shared.admit(*seq).unwrap_err(),
+                RouteHopError::Replay,
+                "post-contention state must remember sequence {seq}",
+            );
+        }
     }
 }

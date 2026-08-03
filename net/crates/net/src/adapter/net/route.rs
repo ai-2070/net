@@ -473,6 +473,21 @@ impl RouteEntry {
         }
     }
 
+    /// Identity-bound route entry with an explicit metric — the shape
+    /// every *learned* route writer installs: `next_hop` is the
+    /// adjacent authenticated peer's address, `next_hop_id` that
+    /// peer's identity, and the metric ranks it against other learned
+    /// paths to the same destination.
+    pub fn authenticated_with_metric(next_hop: SocketAddr, next_hop_id: u64, metric: u16) -> Self {
+        Self {
+            next_hop,
+            next_hop_id: Some(next_hop_id),
+            metric,
+            active: true,
+            updated_at: Instant::now(),
+        }
+    }
+
     /// Move an identity-bound route to a new address without changing
     /// who it points at — the NAT-rebind case.
     ///
@@ -604,6 +619,79 @@ impl RoutingTable {
         }
     }
 
+    /// Add or update a *learned* route that binds the authenticated
+    /// identity of its adjacent next hop (`SUBNET_AUTH_PLAN.md` D6).
+    ///
+    /// Same precedence contract as [`Self::add_route_with_metric`] —
+    /// a strictly better metric replaces, anything else keeps the
+    /// installed entry — with one addition: an equal-or-worse arrival
+    /// that agrees with the installed entry's `next_hop` *upgrades* an
+    /// identity-less entry in place. A legacy entry left behind by an
+    /// older writer would otherwise pin protected forwarding dead for
+    /// that destination forever, because equal-metric refreshes never
+    /// replace the entry that could carry the identity.
+    ///
+    /// What an equal-or-worse arrival can never do is *rewrite* an
+    /// installed identity: a peer announcing the same metric from the
+    /// same address must not steal an existing binding
+    /// (`Some(other) != Some(next_hop_id)` leaves the entry exactly as
+    /// it was, and deliberately does NOT refresh it — a conflicting
+    /// claim on the same address is evidence of address reuse, not of
+    /// reachability, so the conflicted entry is left to age out).
+    pub fn add_authenticated_route_with_metric(
+        &self,
+        dest_id: u64,
+        next_hop: SocketAddr,
+        next_hop_id: u64,
+        metric: u16,
+    ) {
+        use dashmap::mapref::entry::Entry;
+        match self.routes.entry(dest_id) {
+            Entry::Vacant(v) => {
+                v.insert(RouteEntry::authenticated_with_metric(
+                    next_hop,
+                    next_hop_id,
+                    metric,
+                ));
+                self.num_routes.fetch_add(1, Ordering::Relaxed);
+            }
+            Entry::Occupied(mut o) => {
+                if metric < o.get().metric {
+                    o.insert(RouteEntry::authenticated_with_metric(
+                        next_hop,
+                        next_hop_id,
+                        metric,
+                    ));
+                } else {
+                    let e = o.get_mut();
+                    if e.next_hop == next_hop {
+                        match e.next_hop_id {
+                            // Same address, no identity yet: bind it.
+                            None => {
+                                e.next_hop_id = Some(next_hop_id);
+                                e.updated_at = Instant::now();
+                            }
+                            // Same address, same identity: freshness.
+                            Some(id) if id == next_hop_id => {
+                                e.updated_at = Instant::now();
+                            }
+                            // Same address, DIFFERENT identity: refuse
+                            // both the rewrite and the refresh.
+                            Some(_) => {}
+                        }
+                    } else {
+                        // Different next hop at equal/worse metric —
+                        // keep the installed route, refresh freshness:
+                        // the alternate path's arrival is evidence the
+                        // destination is still reachable (same rule as
+                        // `add_route_with_metric`).
+                        e.updated_at = Instant::now();
+                    }
+                }
+            }
+        }
+    }
+
     /// Remove a route
     pub fn remove_route(&self, dest_id: u64) -> Option<RouteEntry> {
         self.routes.remove(&dest_id).map(|(_, v)| {
@@ -628,9 +716,10 @@ impl RoutingTable {
         removed
     }
 
-    /// Rewrite every route whose `next_hop` is `old` to point at
-    /// `new`, refreshing `updated_at` so the migrated entries aren't
-    /// immediately swept. Returns the number of entries migrated.
+    /// Repoint the routes that ride through a re-handshaking peer at
+    /// its new address, refreshing `updated_at` so the migrated
+    /// entries aren't immediately swept. Returns the number of
+    /// entries migrated.
     ///
     /// Called when a peer re-handshakes from a new address (NAT
     /// rebind): multi-hop routes learned through that peer still
@@ -640,13 +729,30 @@ impl RoutingTable {
     /// Without this migration, address-keyed operations such as
     /// [`Self::remove_route_if_next_hop_is`] (used by the RT-5 route
     /// withdrawal receive path) silently miss those entries.
-    pub fn migrate_next_hop(&self, old: SocketAddr, new: SocketAddr) -> usize {
+    ///
+    /// Matching is identity-first, address-second:
+    ///
+    /// - An entry **bound to `identity`** follows the identity to
+    ///   `new`, exactly as [`RouteEntry::rebind_addr`] would — even if
+    ///   its recorded address had already drifted from `old`.
+    /// - An entry **bound to a different identity** is never touched,
+    ///   even when its `next_hop` equals `old`: the address may have
+    ///   been reused, and an address match must not retarget a route
+    ///   that belongs to someone else's authenticated adjacency.
+    /// - A **legacy** entry (no identity) migrates by address match,
+    ///   as before — it carries no protected traffic either way.
+    pub fn migrate_next_hop(&self, old: SocketAddr, new: SocketAddr, identity: u64) -> usize {
         if old == new {
             return 0;
         }
         let mut migrated = 0;
         for mut entry in self.routes.iter_mut() {
-            if entry.next_hop == old {
+            let moves = match entry.next_hop_id {
+                Some(id) if id == identity => entry.next_hop != new,
+                Some(_) => false,
+                None => entry.next_hop == old,
+            };
+            if moves {
                 entry.next_hop = new;
                 entry.updated_at = Instant::now();
                 migrated += 1;
@@ -1304,7 +1410,7 @@ mod tests {
         table.add_route(0xBBB, old); // also via it
         table.add_route(0xCCC, other); // unrelated — must be untouched
 
-        let migrated = table.migrate_next_hop(old, new);
+        let migrated = table.migrate_next_hop(old, new, 0x2222);
         assert_eq!(migrated, 2, "exactly the two old-addr routes migrate");
         assert_eq!(table.lookup(0xAAA), Some(new));
         assert_eq!(table.lookup(0xBBB), Some(new));
@@ -1318,7 +1424,102 @@ mod tests {
         // the NEW address now succeeds where it previously missed.
         assert!(table.remove_route_if_next_hop_is(0xAAA, new));
         // A no-op migration (old == new) changes nothing.
-        assert_eq!(table.migrate_next_hop(new, new), 0);
+        assert_eq!(table.migrate_next_hop(new, new, 0x2222), 0);
+    }
+
+    /// Migration follows identity, never a reused address: an entry
+    /// bound to the re-handshaking peer moves with it, an entry bound
+    /// to a DIFFERENT identity stays put even when its address equals
+    /// the vacated one, and a legacy entry still migrates by address.
+    #[test]
+    fn migrate_next_hop_is_identity_qualified() {
+        let table = RoutingTable::new(0x1111);
+        let old: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let new: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        const PEER: u64 = 0x22;
+        const OTHER: u64 = 0x33;
+
+        // Learned route bound to the re-handshaking peer.
+        table.add_authenticated_route_with_metric(0xAAA, old, PEER, 3);
+        // Learned route bound to ANOTHER identity that happens to sit
+        // at the vacated address (address reuse).
+        table.add_authenticated_route_with_metric(0xBBB, old, OTHER, 3);
+        // Legacy entry at the vacated address.
+        table.add_route(0xCCC, old);
+
+        let migrated = table.migrate_next_hop(old, new, PEER);
+        assert_eq!(migrated, 2, "the bound-to-peer and legacy entries move");
+        assert_eq!(
+            table.lookup_authenticated(0xAAA),
+            Some((PEER, new)),
+            "the peer's own binding follows the identity to the new address"
+        );
+        assert_eq!(
+            table.lookup_authenticated(0xBBB),
+            Some((OTHER, old)),
+            "another identity's binding must not be retargeted by an address match"
+        );
+        assert_eq!(table.lookup(0xCCC), Some(new), "legacy migrates by address");
+    }
+
+    /// The learned-route writer contract: strictly-better replaces,
+    /// equal upgrades an identity-less entry in place, and an
+    /// equal-metric conflicting identity can neither rewrite nor
+    /// refresh an installed binding.
+    #[test]
+    fn add_authenticated_route_with_metric_binds_upgrades_and_refuses() {
+        let table = RoutingTable::new(0x1111);
+        let via_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let via_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        const B: u64 = 0xB;
+        const C: u64 = 0xC;
+        const DEST: u64 = 0xD57;
+
+        // Fresh install binds the identity.
+        table.add_authenticated_route_with_metric(DEST, via_b, B, 4);
+        assert_eq!(table.lookup_authenticated(DEST), Some((B, via_b)));
+
+        // Strictly better metric replaces — including the binding.
+        table.add_authenticated_route_with_metric(DEST, via_c, C, 3);
+        assert_eq!(table.lookup_authenticated(DEST), Some((C, via_c)));
+
+        // Equal metric from a different peer must not displace it
+        // (same anti-poisoning rule as the legacy writer).
+        table.add_authenticated_route_with_metric(DEST, via_b, B, 3);
+        assert_eq!(table.lookup_authenticated(DEST), Some((C, via_c)));
+
+        // Equal metric, same address, DIFFERENT identity: the
+        // binding survives untouched.
+        table.add_authenticated_route_with_metric(DEST, via_c, B, 3);
+        assert_eq!(
+            table.lookup_authenticated(DEST),
+            Some((C, via_c)),
+            "a conflicting identity claim on the same address must not steal the binding"
+        );
+
+        // An identity-less entry upgrades in place at equal metric +
+        // same address: this is what repairs a legacy learned route
+        // into one protected forwarding can use.
+        const DEST2: u64 = 0xD58;
+        table.add_route_with_metric(DEST2, via_b, 5);
+        assert_eq!(table.lookup_authenticated(DEST2), None);
+        table.add_authenticated_route_with_metric(DEST2, via_b, B, 5);
+        assert_eq!(
+            table.lookup_authenticated(DEST2),
+            Some((B, via_b)),
+            "an equal-metric same-address authenticated write upgrades a legacy entry"
+        );
+
+        // A worse-metric authenticated write never displaces a direct
+        // route (metric floor 1).
+        const DEST3: u64 = 0xD59;
+        table.add_route(DEST3, via_b); // direct-style legacy, metric 1
+        table.add_authenticated_route_with_metric(DEST3, via_c, C, 3);
+        assert_eq!(
+            table.lookup(DEST3),
+            Some(via_b),
+            "a learned route must not displace a better direct route"
+        );
     }
 
     /// Staleness: `lookup` must return `None` for entries whose
