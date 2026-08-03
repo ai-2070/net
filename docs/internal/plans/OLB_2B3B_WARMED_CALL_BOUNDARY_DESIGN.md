@@ -13,10 +13,14 @@ including the empty-provider case) in §12.
 `OLB_2B3C_PRE_SIGNED_HEAD = 2aa6431edf952e1fdba117db7a92cc8cd08c3e81`, all three
 steps and all 16 scope items. Its record is §16.
 
-**`2B.3b` is AUTHORIZED**; `2B.3c`, `2B.3d-pre`, `2B.3d` and every later OLB
-slice are not. 2B.3b's exact content is the §13 row, its accounting is §4/§4.1,
-its lookup shape is §8, its refusal policy is §9, and its plan-reconciliation
-debt is the §15 row assigned to it.
+**`2B.3b` is SIGNED IN FULL** —
+`OLB_2B3B_SIGNED_HEAD = 5524bbc251554b09a406942b0aadc27be7ad8e9a` (parent
+`76b1569fec719b6818971dddfd8b13d107982792`, the revision-6 repair). Its record
+is §17. 2B.3b's exact content is the §13 row, its accounting is §4/§4.1, its
+lookup shape is §8, and its refusal semantics are §9.
+
+**`2B.3c` is AUTHORIZED** from that exact head; its scope is §18. `2B.3d-pre`,
+`2B.3d` and every later OLB slice are not authorized.
 
 **Substrate:** `OLB_2B3A_SIGNED_HEAD = fd05a89ba` — the per-slot
 `Arc<ArcSwapOption<SlotBaseFacts>>` publication cell — plus
@@ -1449,12 +1453,15 @@ format/diff check; exact-SHA GitHub conclusions; clean canonical state.
 
 ## 17. 2B.3b — the authorized slice
 
-**Status: IMPLEMENTED + WITNESSED — NOT SIGNED.** Authorized by the user after
-the 2B.3c-pre signature at `OLB_2B3C_PRE_SIGNED_HEAD`. That signature does not
-extend here. The revision-6 repair (§0.2) — the `fetch_max` ordering fix and
-the removal of family-global refusal memoization — is folded into this section
-in place; the superseded refusal-cache record is §17.6c's ledger, kept as
-archaeology.
+**Status: SIGNED —
+`OLB_2B3B_SIGNED_HEAD = 5524bbc251554b09a406942b0aadc27be7ad8e9a`** (the
+test/CI closure commit; parent `76b1569fe`, the revision-6 corrective repair).
+Signed 2026-08-03 on independent packet verification plus exact-head CI (PR
+#713: 57 successful, 0 gating failures; the sole red was the non-gating
+Coverage job's unrelated `punch_keepalive` instrumentation flake, classified).
+The revision-6 repair (§0.2) — the `fetch_max` ordering fix and the removal of
+family-global refusal memoization — is folded into this section in place; the
+superseded refusal-cache record is §17.6c's ledger, kept as archaeology.
 
 ### 17.1 Scope, exactly
 
@@ -1757,11 +1764,13 @@ with the cache in §17.6c.
 **These figures are the last full run against the PRE-repair tree** (through
 the HOLD-3 rerun). The revision-6 repair (§0.2) collapses the witness set —
 the refusal-cache witnesses are retired with the mechanism, the §9
-pass-through witnesses replace them — so the closure/signature pass owes
-fresh figures for the repaired tree: the focused witness groups, exact-head
-CI, and a mutation rerun of the CORE matrix (the §17.6c rows not marked
-retired). The archaeology below is evidence about the tree it ran against,
-nothing newer.
+pass-through witnesses replace them. The signature (see §17's status) was
+granted on independent packet verification of the bounded corrective delta
+plus exact-head CI over the revised focused suites (42 registry + 41 state);
+the reviewer did not require a core-matrix mutation rerun for it. A rerun of
+the non-retired §17.6c rows therefore remains OPEN evidence debt for any
+future pass that reopens this module, not a condition of this signature. The
+archaeology below is evidence about the tree it ran against, nothing newer.
 
 `CARGO_INCREMENTAL=0`, `cargo nextest -j 1 --no-tests=fail --retries 0`
 throughout. No security or race witness is retried.
@@ -1995,6 +2004,70 @@ cost accessor, selector, or call option.
 `CapabilityRouteHandle` reads no artifact through the demand handles it owns.
 That is why `DemandHandle::base_facts_unvalidated` still carries its
 `allow(dead_code)`: its consumer is the family projection, which is 2B.3d.
+
+## 18. 2B.3c — the authorized slice
+
+**Status: AUTHORIZED at `OLB_2B3B_SIGNED_HEAD` — NOT IMPLEMENTED.** Authorized
+2026-08-03 with the 2B.3b signature. This section pins the slice's exact
+content by reference to the normative sections above; it introduces no new
+design decisions, and anything here found to conflict with §1–§7 is a defect
+in this section.
+
+### 18.1 Scope, exactly
+
+The §13 row, and nothing beside it:
+
+1. `ScopedUnsensedRoutePool` — artifact 3 (§1): the node-shared PRECOMPUTED
+   routing substrate, keyed `(PrivateAudienceScope, capability)`, carrying
+   discovery provenance for THAT scope, provider and proven owner relation,
+   direct/session eligibility computed under ONE coherent session generation,
+   the exact scoped source vector, and scoped deadlines. It claims NO matched
+   caller INVOKE grant, NO caller eligibility, and NO caller order;
+2. the SECOND per-slot publication cell (§1.1) —
+   `unsensed: Arc<ArcSwapOption<ScopedUnsensedRoutePool>>` beside the signed
+   2B.3a `facts` cell, which is not reopened;
+3. `DemandHandle` clones BOTH cells under the same registry acquisition that
+   takes the slot reference — 2B.3a's coupling property, extended to the
+   second cell and needing the same witness shape;
+4. actor-only pool construction (§3): capture scoped facts → build OFF-LOCK →
+   revalidate the complete source/session stamp → publish IF CURRENT. Never
+   inline, never per family;
+5. asymmetric two-cell invalidation (§1.1): facts invalidation clears a pool
+   only when the pool names that exact facts/source identity; pool
+   invalidation never clears still-current facts; a delayed invalidator can
+   delete neither newer facts, nor a newer pool from newer facts, nor a newer
+   pool from the SAME facts under a newer session generation;
+6. mixed-generation refusal (§3): annotations are computed under one coherent
+   session generation, and a build whose inputs moved discards rather than
+   composing mixed observations;
+7. scoped deadlines as ACTOR-ARMING state (§7): private-discovery expiry,
+   installed DISCOVER grant expiry/replacement, provider authority expiry,
+   session/source movement.
+
+Bounds (§4): pool count = source-slot count ≤ 256, STRUCTURAL — ownership is
+physically attached to the source slot, so there is no separate map and no
+"must remain backed" lifecycle invariant to keep in step.
+
+### 18.2 Not in this slice
+
+No union pool and no caller INVOKE matching (§13). No family `OrgRouteSet`,
+no route projection, no warmed-call consumption, no coherent cold-plan
+rewrite, no `MeshNode::call` change (2B.3d-pre/2B.3d). No public API (§14).
+Grant rows remain Unknown/Potential until SENSE exists (§2), and
+`OrgCapabilityRegistration` stays untouched.
+
+### 18.3 Witness obligations
+
+To be filled in as the slice lands, in the §17.6 style — pinned up front:
+
+- both cells cloned under ONE acquisition (extend the 2B.3a coupling witness);
+- publish-if-current: a pool built under a stamp that moved discards and
+  re-enqueues, and the stale pool never publishes;
+- each direction of the asymmetric invalidation, separately (each conditional
+  hides a distinct defect — §1.1);
+- retirement clears BOTH cells; a transfer clears neither (extend W-S1/W-S2);
+- mixed session generations refuse to publish;
+- the structural 256 pool bound.
 
 ## Open questions
 
