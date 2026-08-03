@@ -449,15 +449,53 @@ impl SourceLiveness {
     }
 }
 
+/// The node-shared PRECOMPUTED routing substrate for ONE authority-scoped slot
+/// (OLB-2B.3c; design §1 artifact 3) — the same `(PrivateAudienceScope,
+/// capability)` key as the facts cell beside it.
+///
+/// This revision (design §18 step 1) pins the PUBLICATION LIFECYCLE: the
+/// second per-slot cell, both-cells handle coupling, and the pool-first
+/// ordering at every site that moves facts. The routing payload — provider and
+/// proven owner relation, direct/session eligibility under ONE coherent
+/// session generation, the exact scoped source vector, scoped deadlines — is
+/// the actor build cycle's to add (§18 step 2), which is also this type's only
+/// producer; until it lands, production cells are permanently `None` and every
+/// pool in the tree is a witness's.
 #[derive(Debug)]
-struct Slot {
-    /// Allocated fresh from the node-wide monotone id space at creation, so a
-    /// retired-and-re-demanded slot never reuses an identity and work in flight
-    /// for a previous incarnation can never resurrect it.
-    incarnation: u64,
-    /// Live demand handles across ALL families.
+pub(crate) struct ScopedUnsensedRoutePool {
+    /// The EXACT facts artifact this pool was derived from (design §1.1).
+    ///
+    /// Publication identity, compared by `Arc::ptr_eq` exactly as
+    /// `invalidate_if_stale` compares facts: installation always allocates a
+    /// fresh `Arc`, so pointer identity is the artifact's identity. This is
+    /// what the delayed pool invalidator (§18 step 2) will compare, and what
+    /// lets a 2B.3d reader verify the pool it loaded was derived from the
+    /// facts it loaded — the two cells are read with two separate atomics, so
+    /// the pairing must be checkable, not assumed.
     #[allow(dead_code)]
-    refs: usize,
+    // consumers: the actor build cycle + exact pool invalidation (§18 step 2).
+    derived_from: Arc<SlotBaseFacts>,
+}
+
+impl ScopedUnsensedRoutePool {
+    /// Test-only: a pool naming `derived_from`, for lifecycle witnesses. The
+    /// production constructor is the actor build cycle (§18 step 2).
+    #[cfg(test)]
+    pub(crate) fn for_test(derived_from: Arc<SlotBaseFacts>) -> Self {
+        Self { derived_from }
+    }
+}
+
+/// Both publication cells of one slot, moved and cloned as a UNIT.
+///
+/// `DemandHandle` clones both cells under the same registry acquisition that
+/// takes the slot reference (design §1.1) — holding them as one value is what
+/// makes that structural rather than a discipline every call site re-earns.
+/// The same goes for the mutation ordering below: every site that moves the
+/// facts cell goes through [`Self::take_facts`] or [`Self::install_facts`], so
+/// the pool-first rule has one implementation, not eight.
+#[derive(Clone, Debug)]
+struct SlotCells {
     /// `None` until a recapture installs facts, and cleared the moment anything
     /// invalidates them. `None` IS the deterministic cold outcome.
     ///
@@ -474,6 +512,71 @@ struct Slot {
     /// cannot be stale either — a live handle is precisely what stops the slot
     /// being retired.
     facts: Arc<ArcSwapOption<SlotBaseFacts>>,
+    /// The 2B.3c routing-pool cell, beside the facts cell it derives from —
+    /// a SECOND cell, not a changed one (design §1.1): the signed 2B.3a facts
+    /// cell's semantics are untouched.
+    ///
+    /// INVARIANT: a published pool names the currently published facts. Every
+    /// mutation of `facts` clears this cell FIRST (see [`Self::take_facts`] /
+    /// [`Self::install_facts`]), so a lock-free reader can observe facts
+    /// without a pool — the ordinary cold-pool state — but never a pool beside
+    /// facts it was not derived from.
+    unsensed: Arc<ArcSwapOption<ScopedUnsensedRoutePool>>,
+}
+
+impl SlotCells {
+    fn empty() -> Self {
+        Self {
+            facts: Arc::new(ArcSwapOption::empty()),
+            unsensed: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+
+    /// Swap the facts artifact out — POOL FIRST (design §1.1).
+    ///
+    /// A pool is derived from exactly one facts artifact, so whichever facts
+    /// this removes, any published pool named either that artifact or an older
+    /// one; both are invalid the moment the facts move. Clearing the pool
+    /// before the facts means no lock-free reader ever observes a pool whose
+    /// basis is already gone. Returns the removed facts, so conditional
+    /// callers keep their metrics exact.
+    fn take_facts(&self) -> Option<Arc<SlotBaseFacts>> {
+        self.unsensed.store(None);
+        self.facts.swap(None)
+    }
+
+    /// Install a fresh facts artifact — POOL FIRST, for the same reason: a
+    /// pool present at this moment was derived from the SUPERSEDED facts, and
+    /// storing the new facts first would let a reader pair them with it. The
+    /// actor rebuilds the pool from the new facts afterwards (§18 step 2).
+    fn install_facts(&self, facts: Arc<SlotBaseFacts>) {
+        self.unsensed.store(None);
+        self.facts.store(Some(facts));
+    }
+}
+
+#[derive(Debug)]
+struct Slot {
+    /// Allocated fresh from the node-wide monotone id space at creation, so a
+    /// retired-and-re-demanded slot never reuses an identity and work in flight
+    /// for a previous incarnation can never resurrect it.
+    incarnation: u64,
+    /// Live demand handles across ALL families.
+    #[allow(dead_code)]
+    refs: usize,
+    /// The slot's two publication cells — see [`SlotCells`].
+    cells: SlotCells,
+}
+
+impl Slot {
+    /// A fresh slot with one reference and both cells empty.
+    fn new(incarnation: u64) -> Self {
+        Self {
+            incarnation,
+            refs: 1,
+            cells: SlotCells::empty(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -593,11 +696,12 @@ impl RegistryInner {
         Some(next)
     }
 
-    /// Drop `key`'s facts, reporting whether anything was actually invalidated.
+    /// Drop `key`'s facts — and, pool first, the routing pool derived from
+    /// them — reporting whether facts were actually invalidated.
     fn invalidate(&mut self, key: &SlotKey) -> bool {
         self.slots
             .get_mut(key)
-            .is_some_and(|slot| slot.facts.swap(None).is_some())
+            .is_some_and(|slot| slot.cells.take_facts().is_some())
     }
 
     /// Queue every retained slot and drop every fact — the expansion step of a
@@ -626,7 +730,7 @@ impl RegistryInner {
         self.slots
             .iter()
             .filter(|(_, slot)| {
-                !slot.facts.load().as_ref().is_some_and(|facts| {
+                !slot.cells.facts.load().as_ref().is_some_and(|facts| {
                     facts.actor_incarnation == incarnation
                         && facts.slot_incarnation == slot.incarnation
                         && facts.epoch == epoch
@@ -800,14 +904,16 @@ pub(crate) struct DemandHandle {
     registry: Arc<NodeOrgRoutingRegistry>,
     family: FamilyId,
     key: SlotKey,
-    /// The slot's publication cell, cloned once at demand time (OLB-2B.3).
+    /// The slot's publication cells — BOTH of them — cloned once at demand
+    /// time, under the same registry acquisition that took the slot reference
+    /// (OLB-2B.3; design §1.1).
     ///
     /// This is what makes the warmed read lock-free: the handle already names
     /// exactly one slot, so the hot path needs no map lookup and no registry
     /// lock — one atomic load and it holds the immutable artifact. Holding the
-    /// cell is sound precisely because holding the handle is what prevents the
-    /// slot being retired, so the cell can never be a dead incarnation's.
-    facts: Arc<ArcSwapOption<SlotBaseFacts>>,
+    /// cells is sound precisely because holding the handle is what prevents
+    /// the slot being retired, so neither cell can be a dead incarnation's.
+    cells: SlotCells,
 }
 
 impl DemandHandle {
@@ -829,7 +935,17 @@ impl DemandHandle {
     /// that consumer never arrived.
     #[allow(dead_code)]
     pub(crate) fn base_facts_unvalidated(&self) -> Option<Arc<SlotBaseFacts>> {
-        self.facts.load_full()
+        self.cells.facts.load_full()
+    }
+
+    /// The slot's currently published routing pool, or `None` for the cold
+    /// outcome — UNVALIDATED, exactly like [`Self::base_facts_unvalidated`],
+    /// and read with a SEPARATE atomic: a consumer that needs the pool and the
+    /// facts to agree must check `ScopedUnsensedRoutePool::derived_from`
+    /// against the facts it loaded rather than assume two loads paired.
+    #[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+    pub(crate) fn unsensed_pool_unvalidated(&self) -> Option<Arc<ScopedUnsensedRoutePool>> {
+        self.cells.unsensed.load_full()
     }
 }
 
@@ -858,12 +974,15 @@ pub(crate) struct DemandSet {
     /// what it still OWES a release for; after a replacement transfers the
     /// references away the two differ, and that difference is the whole point.
     keys: Vec<SlotKey>,
-    /// Publication cells, parallel to `keys`.
+    /// Publication cells — BOTH per contributor (design §1.1) — parallel to
+    /// `keys`, cloned under the acquisition that retained the references. One
+    /// element per key rather than two parallel vectors, so the
+    /// `keys[i] <-> cells[i]` pairing cannot misalign between the planes.
     ///
     /// Immutable and lock-free readable. Holding a cell is sound whatever
-    /// happens to the slot: a retired slot's cell simply reads empty, which is
+    /// happens to the slot: a retired slot's cells simply read empty, which is
     /// the correct answer for a superseded set.
-    cells: Vec<Arc<ArcSwapOption<SlotBaseFacts>>>,
+    cells: Vec<SlotCells>,
     /// The RELEASE RESPONSIBILITY — the keys this set must still give back.
     ///
     /// Interior-mutable because the responsibility can move to a replacement set
@@ -893,7 +1012,18 @@ impl DemandSet {
     /// exactly like its registry-side twin. Authority revalidation is the NODE
     /// seam's job (`MeshNode::org_routing_base_facts`); the name says so.
     pub(crate) fn base_facts_unvalidated(&self, index: usize) -> Option<Arc<SlotBaseFacts>> {
-        self.cells.get(index)?.load_full()
+        self.cells.get(index)?.facts.load_full()
+    }
+
+    /// The published routing pool for the `index`-th contributor, UNVALIDATED,
+    /// read with a SEPARATE atomic from the facts — pairing is checked via
+    /// `ScopedUnsensedRoutePool::derived_from`, never assumed.
+    #[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+    pub(crate) fn unsensed_pool_unvalidated(
+        &self,
+        index: usize,
+    ) -> Option<Arc<ScopedUnsensedRoutePool>> {
+        self.cells.get(index)?.unsensed.load_full()
     }
 
     /// Test-only: what this set still owes a release for. A replacement moves
@@ -1145,7 +1275,7 @@ impl NodeOrgRoutingRegistry {
         key: SlotKey,
     ) -> Result<DemandHandle, DemandRefused> {
         let mut queued = false;
-        let cell = {
+        let cells = {
             let mut inner = self.inner.lock();
             if inner.family_handles(family) >= MAX_HANDLES_PER_FAMILY {
                 self.metrics
@@ -1162,10 +1292,11 @@ impl NodeOrgRoutingRegistry {
                 return Err(DemandRefused::NodeAtCapacity);
             }
             // Captured under the SAME lock acquisition that takes the reference,
-            // so the cell can only be the one belonging to the incarnation this
-            // handle is now keeping alive.
+            // so the cells can only be the ones belonging to the incarnation
+            // this handle is now keeping alive — BOTH of them, as one unit
+            // (design §1.1).
             //
-            // The fresh path keeps the cell it INSERTED rather than looking the
+            // The fresh path keeps the cells it INSERTED rather than looking the
             // slot back up, so there is no post-mutation lookup left to fail
             // (review 2026-07-29 §4). What remains is the pre-existing path,
             // where `new_slot` was false under this same lock hold and nothing
@@ -1173,7 +1304,7 @@ impl NodeOrgRoutingRegistry {
             // branch is reached having mutated NOTHING: no reserved slot with no
             // owner, no orphaned `pending` entry, no `queued` flag whose
             // `work.mark()` the early return would skip.
-            let cell = if new_slot {
+            let cells = if new_slot {
                 // Allocate BEFORE mutating anything, so exhaustion retains nothing.
                 let Some(incarnation) = inner.allocate_id() else {
                     self.metrics
@@ -1181,15 +1312,9 @@ impl NodeOrgRoutingRegistry {
                         .fetch_add(1, Ordering::AcqRel);
                     return Err(DemandRefused::IdSpaceExhausted);
                 };
-                let cell = Arc::new(ArcSwapOption::empty());
-                inner.slots.insert(
-                    key.clone(),
-                    Slot {
-                        incarnation,
-                        refs: 1,
-                        facts: cell.clone(),
-                    },
-                );
+                let slot = Slot::new(incarnation);
+                let cells = slot.cells.clone();
+                inner.slots.insert(key.clone(), slot);
                 inner
                     .slots_by_capability
                     .entry(key.capability)
@@ -1197,19 +1322,19 @@ impl NodeOrgRoutingRegistry {
                     .insert(key.clone());
                 inner.pending.insert(key.clone());
                 queued = true;
-                cell
+                cells
             } else {
                 let Some(slot) = inner.slots.get_mut(&key) else {
-                    // Unreachable. Fail closed rather than fabricating a detached
-                    // cell that no install would ever write to — a handle reading
-                    // a cell the registry does not own would be permanently,
-                    // silently cold. `NodeAtCapacity` is the most conservative of
-                    // the three refusals: it retains nothing and tells the caller
-                    // to take the cold path.
+                    // Unreachable. Fail closed rather than fabricating detached
+                    // cells that no install would ever write to — a handle
+                    // reading a cell the registry does not own would be
+                    // permanently, silently cold. `NodeAtCapacity` is the most
+                    // conservative of the three refusals: it retains nothing and
+                    // tells the caller to take the cold path.
                     return Err(DemandRefused::NodeAtCapacity);
                 };
                 slot.refs += 1;
-                slot.facts.clone()
+                slot.cells.clone()
             };
             *inner
                 .families
@@ -1217,7 +1342,7 @@ impl NodeOrgRoutingRegistry {
                 .or_default()
                 .entry(key.clone())
                 .or_insert(0) += 1;
-            cell
+            cells
         };
         if queued {
             // Private discovery did not move, so this is the ONLY thing that will
@@ -1228,7 +1353,7 @@ impl NodeOrgRoutingRegistry {
             registry: self.clone(),
             family,
             key,
-            facts: cell,
+            cells,
         })
     }
 
@@ -1320,22 +1445,16 @@ impl NodeOrgRoutingRegistry {
             // nothing below needs an unwind path.
             let mut cells = Vec::with_capacity(keys.len());
             for key in &keys {
-                let cell = match inner.slots.get_mut(key) {
+                let slot_cells = match inner.slots.get_mut(key) {
                     Some(slot) => {
                         slot.refs += 1;
-                        slot.facts.clone()
+                        slot.cells.clone()
                     }
                     None => {
                         next_incarnation += 1;
-                        let cell = Arc::new(ArcSwapOption::empty());
-                        inner.slots.insert(
-                            key.clone(),
-                            Slot {
-                                incarnation: next_incarnation,
-                                refs: 1,
-                                facts: cell.clone(),
-                            },
-                        );
+                        let slot = Slot::new(next_incarnation);
+                        let slot_cells = slot.cells.clone();
+                        inner.slots.insert(key.clone(), slot);
                         inner
                             .slots_by_capability
                             .entry(key.capability)
@@ -1343,7 +1462,7 @@ impl NodeOrgRoutingRegistry {
                             .insert(key.clone());
                         inner.pending.insert(key.clone());
                         queued = true;
-                        cell
+                        slot_cells
                     }
                 };
                 *inner
@@ -1352,7 +1471,7 @@ impl NodeOrgRoutingRegistry {
                     .or_default()
                     .entry(key.clone())
                     .or_insert(0) += 1;
-                cells.push(cell);
+                cells.push(slot_cells);
             }
             debug_assert_eq!(next_incarnation, reserved_through, "reservation is exact");
             cells
@@ -1439,8 +1558,10 @@ impl NodeOrgRoutingRegistry {
     fn retire_committed(&self, inner: &mut RegistryInner, key: &SlotKey) {
         if let Some(slot) = inner.slots.get(key) {
             // Before the removal, so no window exists in which the slot is gone
-            // from the index while its artifact is still readable.
-            slot.facts.store(None);
+            // from the index while its artifacts are still readable. BOTH
+            // cells, pool first (§1.1): a retired incarnation's routing pool is
+            // exactly as dead as its facts.
+            slot.cells.take_facts();
         }
         inner.slots.remove(key);
         inner.pending.remove(key);
@@ -1591,15 +1712,7 @@ impl NodeOrgRoutingRegistry {
                     Some(slot) => slot.refs += 1,
                     None => {
                         next_incarnation += 1;
-                        let cell = Arc::new(ArcSwapOption::empty());
-                        inner.slots.insert(
-                            key.clone(),
-                            Slot {
-                                incarnation: next_incarnation,
-                                refs: 1,
-                                facts: cell,
-                            },
-                        );
+                        inner.slots.insert(key.clone(), Slot::new(next_incarnation));
                         inner
                             .slots_by_capability
                             .entry(key.capability)
@@ -1618,8 +1731,9 @@ impl NodeOrgRoutingRegistry {
             }
             debug_assert_eq!(next_incarnation, reserved_through, "reservation is exact");
 
-            // Cells for the WHOLE new set. A `common` key yields the very cell it
-            // already had, because its reference was never touched.
+            // Cells for the WHOLE new set — both planes per key. A `common` key
+            // yields the very cells it already had, because its reference was
+            // never touched.
             new_keys
                 .iter()
                 .map(|key| {
@@ -1633,7 +1747,7 @@ impl NodeOrgRoutingRegistry {
                         .slots
                         .get(key)
                         .expect("every key of the new set is retained above");
-                    slot.facts.clone()
+                    slot.cells.clone()
                 })
                 .collect::<Vec<_>>()
         };
@@ -1677,7 +1791,7 @@ impl NodeOrgRoutingRegistry {
     /// witnesses asserting on RETENTION specifically — several of them precisely
     /// to prove that the seam fences something the registry still holds.
     pub(crate) fn base_facts_unvalidated(&self, key: &SlotKey) -> Option<Arc<SlotBaseFacts>> {
-        self.inner.lock().slots.get(key)?.facts.load_full()
+        self.inner.lock().slots.get(key)?.cells.facts.load_full()
     }
 
     /// Authority moved to `live`: drop every fact stamped with an OLDER
@@ -1702,7 +1816,8 @@ impl NodeOrgRoutingRegistry {
                 .slots
                 .iter()
                 .filter(|(_, slot)| {
-                    slot.facts
+                    slot.cells
+                        .facts
                         .load()
                         .as_ref()
                         .is_some_and(|facts| facts.epoch.authority < live)
@@ -1741,15 +1856,18 @@ impl NodeOrgRoutingRegistry {
                 return;
             };
             let still_observed = slot
+                .cells
                 .facts
                 .load()
                 .as_ref()
                 .is_some_and(|live| Arc::ptr_eq(live, observed));
             if !still_observed {
-                // Someone installed a newer artifact. Leave it alone.
+                // Someone installed a newer artifact. Leave it alone — and its
+                // pool with it (§1.1): a delayed invalidator deletes nothing
+                // derived from an artifact it did not observe.
                 return;
             }
-            slot.facts.store(None);
+            slot.cells.take_facts();
             self.metrics
                 .facts_invalidated
                 .fetch_add(1, Ordering::AcqRel);
@@ -1807,7 +1925,7 @@ impl NodeOrgRoutingRegistry {
                 .collect();
             let mut retired = 0u64;
             for key in affected {
-                let Some(cell) = inner.slots.get(&key).map(|slot| slot.facts.clone()) else {
+                let Some(cells) = inner.slots.get(&key).map(|slot| slot.cells.clone()) else {
                     continue;
                 };
                 // Ordered by the PUBLICATION generation the reconstruction
@@ -1847,7 +1965,7 @@ impl NodeOrgRoutingRegistry {
                 // witness in that column tested the `Terminal` row (Kyra, review
                 // of `010c718ea`). A cell that cannot be mutated alone cannot be
                 // witnessed alone.
-                let superseded = match cell.load().as_ref() {
+                let superseded = match cells.facts.load().as_ref() {
                     None => true,
                     Some(facts) => match (facts.grant_fence, movement.fence) {
                         // Terminal absence survives its own ORDINARY publication.
@@ -1874,7 +1992,7 @@ impl NodeOrgRoutingRegistry {
                     // entirely alone — no clear, and no re-queue either.
                     continue;
                 }
-                if cell.swap(None).is_some() {
+                if cells.take_facts().is_some() {
                     retired += 1;
                 }
                 inner.pending.insert(key);
@@ -1911,7 +2029,7 @@ impl NodeOrgRoutingRegistry {
         let mut inner = self.inner.lock();
         let mut invalidated = 0u64;
         for slot in inner.slots.values_mut() {
-            if slot.facts.swap(None).is_some() {
+            if slot.cells.take_facts().is_some() {
                 invalidated += 1;
             }
         }
@@ -1934,7 +2052,7 @@ impl NodeOrgRoutingRegistry {
             .lock()
             .slots
             .values()
-            .filter_map(|slot| slot.facts.load().as_ref().map(|f| f.earliest_expiry))
+            .filter_map(|slot| slot.cells.facts.load().as_ref().map(|f| f.earliest_expiry))
             .filter(|deadline| *deadline != u64::MAX)
             .min()
     }
@@ -1960,7 +2078,8 @@ impl NodeOrgRoutingRegistry {
             .slots
             .iter()
             .filter(|(_, slot)| {
-                slot.facts
+                slot.cells
+                    .facts
                     .load()
                     .as_ref()
                     .is_some_and(|f| now_secs >= f.earliest_expiry)
@@ -1970,7 +2089,7 @@ impl NodeOrgRoutingRegistry {
         let mut retired = 0u64;
         for key in expired {
             if let Some(slot) = inner.slots.get_mut(&key) {
-                if slot.facts.swap(None).is_some() {
+                if slot.cells.take_facts().is_some() {
                     retired += 1;
                 }
             }
@@ -2023,12 +2142,37 @@ impl NodeOrgRoutingRegistry {
     #[cfg(test)]
     pub(crate) fn install_facts_for_test(&self, key: SlotKey, facts: Arc<SlotBaseFacts>) {
         let mut inner = self.inner.lock();
-        let slot = inner.slots.entry(key).or_insert(Slot {
-            incarnation: 1,
-            refs: 1,
-            facts: Arc::new(ArcSwapOption::empty()),
-        });
-        slot.facts.store(Some(facts));
+        let slot = inner.slots.entry(key).or_insert_with(|| Slot::new(1));
+        // The production ordering, pool first — so a witness that wants a pool
+        // beside these facts injects it AFTER this call, exactly as the actor
+        // build cycle publishes after installing (§18 step 2).
+        slot.cells.install_facts(facts);
+    }
+
+    /// Test-only: publish a routing pool for `key`, for two-cell lifecycle
+    /// witnesses. The production publisher is the actor build cycle (§18 step
+    /// 2), which is why this seam exists — the lifecycle lands, and must be
+    /// witnessed, before the builder does.
+    #[cfg(test)]
+    pub(crate) fn install_unsensed_pool_for_test(
+        &self,
+        key: &SlotKey,
+        pool: Arc<ScopedUnsensedRoutePool>,
+    ) {
+        let inner = self.inner.lock();
+        if let Some(slot) = inner.slots.get(key) {
+            slot.cells.unsensed.store(Some(pool));
+        }
+    }
+
+    /// Test-only: the published routing pool, retention only — the second
+    /// cell's twin of [`Self::base_facts_unvalidated`].
+    #[cfg(test)]
+    pub(crate) fn unsensed_pool_for_test(
+        &self,
+        key: &SlotKey,
+    ) -> Option<Arc<ScopedUnsensedRoutePool>> {
+        self.inner.lock().slots.get(key)?.cells.unsensed.load_full()
     }
 
     pub(crate) fn retained_slots(&self) -> usize {
@@ -2435,7 +2579,12 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 // while the authority behind it expires in an hour — and nothing
                 // else in the artifact could ever retire it.
                 let earliest_expiry = row_expiry.min(authority_deadline);
-                slot.facts.store(Some(Arc::new(SlotBaseFacts {
+                // Pool first, inside `install_facts` (§1.1): a pool present at
+                // this moment was derived from the facts being SUPERSEDED, and
+                // storing the new facts first would let a lock-free reader
+                // pair them with it. The pool rebuild is the actor build
+                // cycle's (§18 step 2).
+                slot.cells.install_facts(Arc::new(SlotBaseFacts {
                     providers: facts,
                     epoch,
                     authority,
@@ -2443,7 +2592,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     actor_incarnation: incarnation,
                     slot_incarnation,
                     earliest_expiry,
-                })));
+                }));
                 self.metrics.installs.fetch_add(1, Ordering::AcqRel);
             }
 
@@ -3359,6 +3508,229 @@ mod tests {
         drop((successor, fresh));
     }
 
+    // ---------------------- OLB-2B.3c §18 step 1: the second publication cell
+
+    /// **Both cells, one acquisition** (design §1.1): the handle's pool cell IS
+    /// the slot's, cloned under the same registry acquisition that took the
+    /// reference — so a pool published later is visible through a handle taken
+    /// earlier.
+    ///
+    /// Dies to: fabricating a detached pool cell at demand time, which would
+    /// leave the handle permanently, silently cold on the pool plane while its
+    /// facts plane works.
+    #[test]
+    fn a_demand_handle_couples_both_publication_cells() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:pool");
+        let handle = family.demand(k.clone()).expect("retained");
+
+        f.registry.install_facts_for_test(k.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&k).expect("facts");
+        let pool = Arc::new(ScopedUnsensedRoutePool::for_test(base));
+        f.registry.install_unsensed_pool_for_test(&k, pool.clone());
+
+        assert!(
+            handle.base_facts_unvalidated().is_some(),
+            "the facts plane reads through the handle"
+        );
+        assert!(
+            handle
+                .unsensed_pool_unvalidated()
+                .is_some_and(|read| Arc::ptr_eq(&read, &pool)),
+            "and the pool plane reads the EXACT published pool — the same \
+             cell, not a copy taken at demand time"
+        );
+    }
+
+    /// The same coupling for a SET: each contributor reads its OWN slot's
+    /// pool, so the `keys[i] <-> cells[i]` pairing holds across both planes.
+    #[test]
+    fn a_demand_set_couples_both_cells_per_contributor() {
+        let f = fixture();
+        let family = f.family();
+        let set = family
+            .demand_set(vec![key(1, "nrpc:pool"), key(2, "nrpc:pool")])
+            .expect("acquired");
+
+        for k in set.keys().to_vec() {
+            f.registry.install_facts_for_test(k.clone(), facts());
+            let base = f.registry.base_facts_unvalidated(&k).expect("facts");
+            f.registry.install_unsensed_pool_for_test(
+                &k,
+                Arc::new(ScopedUnsensedRoutePool::for_test(base)),
+            );
+        }
+        for (index, k) in set.keys().to_vec().iter().enumerate() {
+            let through_set = set.unsensed_pool_unvalidated(index).expect("pool");
+            let through_registry = f.registry.unsensed_pool_for_test(k).expect("pool");
+            assert!(
+                Arc::ptr_eq(&through_set, &through_registry),
+                "contributor {index} reads its own slot's pool — the planes \
+                 cannot misalign"
+            );
+        }
+    }
+
+    /// Retiring the last reference clears BOTH cells: a retired incarnation's
+    /// routing pool is exactly as dead as its facts (W-S1, extended to the
+    /// second cell).
+    ///
+    /// Dies to: retiring the slot without clearing the pool cell — a
+    /// superseded reader would keep reading a retired incarnation's ROUTING
+    /// POOL after its facts were correctly cleared.
+    #[test]
+    fn retiring_the_last_reference_clears_both_cells() {
+        let f = fixture();
+        let family = f.family();
+        let old_key = key(1, "nrpc:retire");
+        let old = family.demand_set(vec![old_key.clone()]).expect("acquired");
+        f.registry.install_facts_for_test(old_key.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&old_key).expect("facts");
+        f.registry.install_unsensed_pool_for_test(
+            &old_key,
+            Arc::new(ScopedUnsensedRoutePool::for_test(base)),
+        );
+        assert!(old.unsensed_pool_unvalidated(0).is_some(), "precondition");
+
+        // Replace with a DISJOINT key: the old slot's last reference goes away.
+        let new = old.replace(vec![key(2, "nrpc:retire")]).expect("replaced");
+        assert!(
+            old.base_facts_unvalidated(0).is_none() && old.unsensed_pool_unvalidated(0).is_none(),
+            "a retired incarnation's cells BOTH read empty"
+        );
+        drop(new);
+    }
+
+    /// A TRANSFER clears neither cell: the common key's pool follows the
+    /// successor's ownership exactly as its facts do (W-S2, extended).
+    #[test]
+    fn a_transfer_leaves_the_common_keys_pool_published() {
+        let f = fixture();
+        let family = f.family();
+        let shared = key(1, "nrpc:common");
+        let old = family
+            .demand_set(vec![shared.clone(), key(2, "nrpc:common")])
+            .expect("acquired");
+        f.registry.install_facts_for_test(shared.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&shared).expect("facts");
+        let pool = Arc::new(ScopedUnsensedRoutePool::for_test(base));
+        f.registry
+            .install_unsensed_pool_for_test(&shared, pool.clone());
+        let index = old
+            .keys()
+            .iter()
+            .position(|k| *k == shared)
+            .expect("the set names the shared key");
+
+        // The successor keeps the common key and sheds the other.
+        let new = old.replace(vec![shared.clone()]).expect("replaced");
+        assert!(
+            old.unsensed_pool_unvalidated(index)
+                .is_some_and(|read| Arc::ptr_eq(&read, &pool)),
+            "the transfer cleared neither plane — the scope is still retained, \
+             by the successor, and the pool still reads"
+        );
+
+        drop(new);
+        assert!(
+            old.unsensed_pool_unvalidated(index).is_none(),
+            "and both planes go dark when the successor releases the last \
+             reference"
+        );
+    }
+
+    /// FACTS invalidation clears the derived pool with the facts (§1.1): the
+    /// pool's basis is gone, so the pool is gone. Every facts-moving site
+    /// routes through the same two-cell move, pool first, so this pins them
+    /// all through the shared helper.
+    #[test]
+    fn facts_invalidation_clears_the_derived_pool() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:pool");
+        let _live = family.demand(k.clone()).expect("retained");
+        f.registry.install_facts_for_test(k.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&k).expect("facts");
+        f.registry
+            .install_unsensed_pool_for_test(&k, Arc::new(ScopedUnsensedRoutePool::for_test(base)));
+
+        f.registry.invalidate_for_test(&k);
+        assert!(f.registry.base_facts_unvalidated(&k).is_none());
+        assert!(
+            f.registry.unsensed_pool_for_test(&k).is_none(),
+            "the pool's basis is gone, so the pool is gone"
+        );
+    }
+
+    /// A DELAYED reader invalidation that observed a SUPERSEDED artifact
+    /// deletes nothing on either plane; observing the CURRENT artifact deletes
+    /// both. The §1.1 delayed-invalidator rule, with the control adjacent —
+    /// without it, "clear both unconditionally" passes the first half.
+    #[test]
+    fn a_stale_observation_invalidates_neither_plane() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:pool");
+        let _live = family.demand(k.clone()).expect("retained");
+
+        // The artifact an arbitrarily-delayed reader once observed…
+        let superseded = facts();
+        f.registry
+            .install_facts_for_test(k.clone(), superseded.clone());
+        // …and the newer artifact, with ITS pool, current now.
+        f.registry.install_facts_for_test(k.clone(), facts());
+        let current = f.registry.base_facts_unvalidated(&k).expect("facts");
+        let pool = Arc::new(ScopedUnsensedRoutePool::for_test(current.clone()));
+        f.registry.install_unsensed_pool_for_test(&k, pool.clone());
+
+        f.registry.invalidate_if_stale(&k, &superseded);
+        assert!(
+            f.registry
+                .base_facts_unvalidated(&k)
+                .is_some_and(|live| Arc::ptr_eq(&live, &current)),
+            "facts the delayed reader did not observe survive"
+        );
+        assert!(
+            f.registry
+                .unsensed_pool_for_test(&k)
+                .is_some_and(|read| Arc::ptr_eq(&read, &pool)),
+            "and so does the pool derived from them"
+        );
+
+        // The control: observing the CURRENT artifact clears both planes.
+        f.registry.invalidate_if_stale(&k, &current);
+        assert!(f.registry.base_facts_unvalidated(&k).is_none());
+        assert!(f.registry.unsensed_pool_for_test(&k).is_none());
+    }
+
+    /// Installing NEWER facts leaves no pool published: the pool present at
+    /// install time was derived from the SUPERSEDED facts, and it is cleared
+    /// before the new facts land so no lock-free reader can pair the new
+    /// facts with the old pool. Repopulating it is the actor build cycle's
+    /// job (§18 step 2).
+    #[test]
+    fn installing_newer_facts_clears_the_superseded_pool() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:pool");
+        let _live = family.demand(k.clone()).expect("retained");
+        f.registry.install_facts_for_test(k.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&k).expect("facts");
+        f.registry
+            .install_unsensed_pool_for_test(&k, Arc::new(ScopedUnsensedRoutePool::for_test(base)));
+
+        f.registry.install_facts_for_test(k.clone(), facts());
+        assert!(
+            f.registry.base_facts_unvalidated(&k).is_some(),
+            "the newer facts are published"
+        );
+        assert!(
+            f.registry.unsensed_pool_for_test(&k).is_none(),
+            "and the superseded facts' pool is not beside them"
+        );
+    }
+
     /// `release_one` cannot decrement a global slot reference for a family that
     /// holds none — the bookkeeping invariant, asserted directly.
     ///
@@ -4225,6 +4597,7 @@ mod tests {
         let generation = f.source.generation();
         assert!(
             f.registry.inner.lock().slots.values().all(|slot| slot
+                .cells
                 .facts
                 .load()
                 .as_ref()

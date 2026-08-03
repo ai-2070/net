@@ -2007,11 +2007,35 @@ That is why `DemandHandle::base_facts_unvalidated` still carries its
 
 ## 18. 2B.3c — the authorized slice
 
-**Status: AUTHORIZED at `OLB_2B3B_SIGNED_HEAD` — NOT IMPLEMENTED.** Authorized
+**Status: AUTHORIZED at `OLB_2B3B_SIGNED_HEAD` — IN PROGRESS.** Authorized
 2026-08-03 with the 2B.3b signature. This section pins the slice's exact
 content by reference to the normative sections above; it introduces no new
 design decisions, and anything here found to conflict with §1–§7 is a defect
 in this section.
+
+### 18.0 Progress
+
+- **Step 1 — the second cell (§1.1): IMPLEMENTED + WITNESSED.**
+  `ScopedUnsensedRoutePool` lands with its publication identity only —
+  `derived_from`, the exact facts artifact, compared by `Arc::ptr_eq` exactly
+  as `invalidate_if_stale` compares facts. `SlotCells` moves both cells as ONE
+  value, and its `take_facts`/`install_facts` give the pool-first ordering a
+  single implementation across every facts-moving site: plain invalidation,
+  the delayed reader invalidation, grant-scope movement, authority movement,
+  terminal exhaustion, expiry retirement, slot retirement, and the actor's
+  phase-5 install. `DemandHandle` and `DemandSet` clone both cells under the
+  one acquisition that takes the reference. Seven witnesses: handle coupling,
+  per-contributor set coupling, retirement clears both, transfer clears
+  neither, facts invalidation clears the derived pool, the delayed-invalidator
+  rule with its adjacent control, and newer-facts-install clears the
+  superseded pool. The routing payload is deliberately absent — the type's
+  only producer is step 2, and production pool cells are `None` until it
+  lands.
+- **Step 2 — the actor build cycle: NOT STARTED.** The pool payload (provider
+  and proven owner relation, direct/session eligibility under ONE coherent
+  session generation, scoped source vector, scoped deadlines), capture → build
+  off-lock → revalidate → publish-if-current, pool-side exact invalidation,
+  mixed-generation refusal, and the remaining §18.3 witnesses.
 
 ### 18.1 Scope, exactly
 
