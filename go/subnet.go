@@ -83,12 +83,6 @@ typedef struct {
     uint8_t levels[4];
 } net_subnet_path_t;
 
-// An authority-qualified crossing — NOT the topology subnet id. 37 bytes.
-typedef struct {
-    uint8_t authority[32];
-    net_subnet_path_t path;
-} net_subnet_ref_t;
-
 extern void net_org_free_cstring(char* s);
 
 // `mesh_arc` is a void* from net_mesh_arc_clone; CONSUMED by each of these
@@ -116,8 +110,8 @@ extern int net_subnet_apply_control_fact(
 extern int net_subnet_serve_exported(
     void* mesh_arc,
     const char* service_ptr, size_t service_len,
-    const net_subnet_ref_t* export_ref, uint32_t topology_epoch,
-    int access, uint64_t handler_id,
+    const char* export_name_ptr, size_t export_name_len,
+    uint64_t handler_id,
     void** out_handle, char** out_err);
 */
 import "C"
@@ -241,6 +235,34 @@ const (
 	SubnetAccessGranted SubnetExportAccess = 1
 )
 
+// MarshalJSON renders the access mode as the wire spelling the Rust DTO
+// expects ("sameOrg" / "granted") — the same two tokens pinned by
+// tests/cross_lang_subnet/stable_kinds.json. An out-of-range value is an
+// error here rather than a silently-defaulted mode.
+func (a SubnetExportAccess) MarshalJSON() ([]byte, error) {
+	switch a {
+	case SubnetAccessSameOrg:
+		return []byte(`"sameOrg"`), nil
+	case SubnetAccessGranted:
+		return []byte(`"granted"`), nil
+	default:
+		return nil, fmt.Errorf("subnet:invalid_access: unknown access mode %d", int(a))
+	}
+}
+
+// UnmarshalJSON accepts either wire spelling, mirroring the Rust DTO.
+func (a *SubnetExportAccess) UnmarshalJSON(b []byte) error {
+	switch string(b) {
+	case `"sameOrg"`, `"same_org"`:
+		*a = SubnetAccessSameOrg
+	case `"granted"`:
+		*a = SubnetAccessGranted
+	default:
+		return fmt.Errorf("subnet:invalid_access: %s", string(b))
+	}
+	return nil
+}
+
 // SubnetAuthorityConfig is one subnet trust anchor: an authority this node
 // will accept protected subnet assertions from, the root keys permitted to
 // sign for it, and the per-authority grant-lifetime ceiling.
@@ -289,72 +311,12 @@ type SubnetNamedExport struct {
 	Binding SubnetExportBinding `json:"binding"`
 }
 
-// toC converts a configured export into the C ABI's ref POD. Authority hex and
-// path shape are checked here because they are marshaling facts (is this 32
-// bytes of hex? are there at most 4 levels?); every AUTHORITY decision — is the
-// binding trusted, is the epoch current, may this node export this crossing —
-// happens in Rust when the serve registers.
-func (e SubnetNamedExport) toC() (C.net_subnet_ref_t, error) {
-	var ref C.net_subnet_ref_t
-	raw, err := hex.DecodeString(e.Binding.Subnet.AuthorityHex)
-	if err != nil || len(raw) != 32 {
-		return ref, newSubnetError(fmt.Sprintf(
-			"subnet:invalid_id_hex: export %q authority must be 64 hex chars", e.Name))
-	}
-	for i := 0; i < 32; i++ {
-		ref.authority[i] = C.uint8_t(raw[i])
-	}
-	levels := e.Binding.Subnet.Path.Levels
-	if len(levels) > 4 {
-		return ref, newSubnetError(fmt.Sprintf(
-			"subnet:path_too_deep: export %q path has %d levels (max 4)", e.Name, len(levels)))
-	}
-	ref.path.depth = C.uint8_t(len(levels))
-	for i, l := range levels {
-		ref.path.levels[i] = C.uint8_t(l)
-	}
-	return ref, nil
-}
-
-// buildSubnetExportMap freezes the configured exports into the lookup map a
-// MeshNode retains. Called by NewMeshNode before the node exists.
-//
-// It checks only what makes the MAP well-formed — a non-empty, unique label —
-// because an ambiguous map is a Go-side configuration error with no meaningful
-// Rust counterpart. It deliberately does NOT re-implement authority validation:
-// the binding is checked in Rust when the serve registers, so there is one
-// authority checker, not two.
-func buildSubnetExportMap(exports []SubnetNamedExport) (map[string]SubnetNamedExport, error) {
-	if len(exports) == 0 {
-		return nil, nil
-	}
-	out := make(map[string]SubnetNamedExport, len(exports))
-	for _, e := range exports {
-		if e.Name == "" {
-			return nil, newSubnetError("subnet:empty_export_name: subnet export name must be non-empty")
-		}
-		if _, dup := out[e.Name]; dup {
-			return nil, newSubnetError(fmt.Sprintf(
-				"subnet:duplicate_export_name: subnet export %q configured twice", e.Name))
-		}
-		if e.Access != SubnetAccessSameOrg && e.Access != SubnetAccessGranted {
-			return nil, newSubnetError(fmt.Sprintf(
-				"subnet:invalid_access: export %q has access %d", e.Name, int(e.Access)))
-		}
-		out[e.Name] = e
-	}
-	return out, nil
-}
-
-// lookupSubnetExport resolves a provider-local export label. The map is
-// immutable after construction, so this needs no lock.
-func (m *MeshNode) lookupSubnetExport(name string) (SubnetNamedExport, bool) {
-	if m == nil || m.subnetExports == nil {
-		return SubnetNamedExport{}, false
-	}
-	e, ok := m.subnetExports[name]
-	return e, ok
-}
+// buildSubnetExportMap used to freeze a Go-side lookup table here. It is gone
+// (review-10 P1-6): the node itself now holds the checked map, resolved by Rust
+// from MeshConfig.SubnetExports at construction, and ServeSubnetExported passes
+// the NAME straight through. Keeping a second copy on this side meant Go
+// converted a name into an authority object and handed that across the ABI —
+// name resolution outside Rust, at the one boundary with no wrapper to own it.
 
 // =========================================================================
 // The ordinary provider verb (SSDK §3.5).
@@ -385,19 +347,6 @@ func ServeSubnetExportedBytes(
 		return nil, errors.New("net.ServeSubnetExportedBytes: handler must be non-nil")
 	}
 
-	// Resolve the NAME before touching the node: a pure lookup in the map this
-	// mesh retained at construction. Failing here is what keeps an unknown name
-	// from ever reaching registration or announcement.
-	export, ok := node.lookupSubnetExport(exportName)
-	if !ok {
-		return nil, newSubnetError(fmt.Sprintf(
-			"subnet:unknown_export_name: no configured subnet export named %q", exportName))
-	}
-	ref, err := export.toC()
-	if err != nil {
-		return nil, err
-	}
-
 	registerOrgDispatcher()
 
 	arcPtr := node.arcClonePtr()
@@ -412,14 +361,16 @@ func ServeSubnetExportedBytes(
 
 	cService := stringToCBytes(service)
 	defer C.free(cService.ptr)
+	cExport := stringToCBytes(exportName)
+	defer C.free(cExport.ptr)
 
 	var out unsafe.Pointer
 	var errPtr *C.char
 	code := C.net_subnet_serve_exported(
 		arcPtr,
 		(*C.char)(cService.ptr), cService.len,
-		&ref, C.uint32_t(export.Binding.TopologyEpoch),
-		C.int(export.Access), C.uint64_t(hID),
+		(*C.char)(cExport.ptr), cExport.len,
+		C.uint64_t(hID),
 		&out, &errPtr,
 	)
 	if err := subnetErrorFromCall(code, errPtr); err != nil {

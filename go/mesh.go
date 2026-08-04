@@ -124,12 +124,12 @@ type MeshConfig struct {
 	// provider-local labels ServeSubnetExported resolves against. A name is
 	// never announced and never accepted from a caller.
 	//
-	// `json:"-"` deliberately — this stays Go-side. The C ABI takes the
-	// resolved binding directly (see include/net_subnet.h), so the map is
-	// retained beside this handle and resolution is a local lookup; every
-	// authority check on the binding happens in Rust when the serve
-	// registers.
-	SubnetExports []SubnetNamedExport `json:"-"`
+	// Serialized to the constructor (review-10 P1-6): Rust resolves and
+	// freezes the checked map on the node, and ServeSubnetExported passes the
+	// NAME through. Go keeps no copy — a second map on this side meant name
+	// resolution happened outside Rust at the one boundary with no wrapper to
+	// own it. Empty and duplicate labels are refused before the node exists.
+	SubnetExports []SubnetNamedExport `json:"subnet_exports,omitempty"`
 
 	// SubnetAuthorities are this node's subnet AUTHORITY trust anchors —
 	// which authorities it will accept protected subnet assertions from
@@ -295,11 +295,6 @@ type RecvdEvent struct {
 type MeshNode struct {
 	mu     sync.RWMutex
 	handle *C.net_meshnode_t
-	// subnetExports is the named-export map resolved at construction (SSDK
-	// §3.3). Written once in NewMeshNode before the node escapes and never
-	// mutated, so reads need no lock — the same immutability the Rust,
-	// Node, and Python handles give their copy of this map.
-	subnetExports map[string]SubnetNamedExport
 }
 
 // NewMeshNode opens a mesh node. Call Shutdown to cleanly tear down.
@@ -311,20 +306,12 @@ func NewMeshNode(cfg MeshConfig) (*MeshNode, error) {
 	cCfg := C.CString(string(data))
 	defer C.free(unsafe.Pointer(cCfg))
 
-	// Build the named-export map BEFORE the node exists: a duplicate or empty
-	// label is a configuration error, and refusing here means a mesh never
-	// comes up holding an ambiguous export map (SSDK §3.3).
-	exports, err := buildSubnetExportMap(cfg.SubnetExports)
-	if err != nil {
-		return nil, err
-	}
-
 	var handle *C.net_meshnode_t
 	code := C.net_mesh_new(cCfg, &handle)
 	if err := meshErrorFromCode(code); err != nil {
 		return nil, err
 	}
-	m := &MeshNode{handle: handle, subnetExports: exports}
+	m := &MeshNode{handle: handle}
 	runtime.SetFinalizer(m, (*MeshNode).free)
 	return m, nil
 }

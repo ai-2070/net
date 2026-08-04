@@ -162,75 +162,80 @@ func TestSubnetAccessConstants(t *testing.T) {
 	}
 }
 
-// The export map refuses an ambiguous configuration before a node exists.
-func TestBuildSubnetExportMapRefusesAmbiguity(t *testing.T) {
+// The export CONFIGURATION serializes into exactly the shape the Rust
+// constructor's DTO expects (review-10 P1-6).
+//
+// Go no longer holds a named-export map or converts a name into an authority
+// object: it hands the configuration to Rust, which freezes the checked map on
+// the node, and passes only the NAME at serve time. What this file can still
+// guard is the wire contract between the two — in particular that the access
+// mode marshals as the token the DTO parses, not as the integer the C ABI
+// constant happens to be.
+func TestSubnetNamedExportMarshalsForTheRustConstructor(t *testing.T) {
 	e := SubnetNamedExport{
-		Name:   "factory",
+		Name:   "factory-export",
 		Access: SubnetAccessGranted,
 		Binding: SubnetExportBinding{
-			Subnet:        SubnetRef{AuthorityHex: "d7", Path: SubnetPath{Levels: []uint8{3}}},
-			TopologyEpoch: 0,
+			Subnet:        SubnetRef{AuthorityHex: hex64(), Path: SubnetPath{Levels: []uint8{3, 9}}},
+			TopologyEpoch: 7,
 		},
 	}
-	if _, err := buildSubnetExportMap([]SubnetNamedExport{e, e}); !errors.Is(err, ErrSubnet) {
-		t.Fatalf("duplicate name err = %v, want a SubnetError", err)
-	} else if k := ParseSubnetKind(err.Error()); k != "duplicate_export_name" {
-		t.Fatalf("duplicate name kind = %q, want duplicate_export_name", k)
-	}
-
-	anon := e
-	anon.Name = ""
-	if _, err := buildSubnetExportMap([]SubnetNamedExport{anon}); !errors.Is(err, ErrSubnet) {
-		t.Fatalf("empty name err = %v, want a SubnetError", err)
-	}
-
-	// A well-formed map builds, and an unknown lookup misses.
-	m, err := buildSubnetExportMap([]SubnetNamedExport{e})
+	raw, err := json.Marshal(e)
 	if err != nil {
-		t.Fatalf("buildSubnetExportMap: %v", err)
+		t.Fatalf("marshal: %v", err)
 	}
-	if _, ok := m["factory"]; !ok {
-		t.Fatal("configured export missing from the map")
+
+	var back map[string]any
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
 	}
-	if _, ok := m["nope"]; ok {
-		t.Fatal("unknown export name resolved")
+	if back["name"] != "factory-export" {
+		t.Fatalf("name = %v", back["name"])
+	}
+	// The load-bearing one: a bare `1` here would deserialize as an
+	// invalid_access on the Rust side, at construction, for every Granted
+	// export ever configured from Go.
+	if back["access"] != "granted" {
+		t.Fatalf("access = %v, want the wire token \"granted\"", back["access"])
+	}
+	if _, ok := back["binding"]; !ok {
+		t.Fatal("binding missing from the serialized export")
+	}
+
+	sameOrg, err := json.Marshal(SubnetAccessSameOrg)
+	if err != nil || string(sameOrg) != `"sameOrg"` {
+		t.Fatalf("SameOrg marshalled as %s (err %v), want \"sameOrg\"", sameOrg, err)
+	}
+
+	// Both spellings round-trip back, mirroring the Rust DTO.
+	var a SubnetExportAccess
+	if err := json.Unmarshal([]byte(`"same_org"`), &a); err != nil || a != SubnetAccessSameOrg {
+		t.Fatalf("same_org round-trip: %v / %v", a, err)
+	}
+	if err := json.Unmarshal([]byte(`"nope"`), &a); err == nil {
+		t.Fatal("an unknown access spelling must be refused")
 	}
 }
 
-// The authority hex and path shape are marshaling facts checked before the
-// binding crosses; a bad one never reaches Rust.
-func TestSubnetExportToCRejectsMalformedBinding(t *testing.T) {
-	bad := SubnetNamedExport{
-		Name:   "x",
-		Access: SubnetAccessGranted,
-		Binding: SubnetExportBinding{
-			Subnet: SubnetRef{AuthorityHex: "not-hex", Path: SubnetPath{}},
-		},
+// The access tokens are exactly the two the shared fixture pins — the Go
+// marshaling above and the Rust DTO agree on this vocabulary, not on a
+// Go-local convention.
+func TestSubnetAccessTokensMatchTheSharedFixture(t *testing.T) {
+	fixture := loadSubnetKindFixture(t)
+	if len(fixture.Access) != 2 || fixture.Access[0] != "sameOrg" || fixture.Access[1] != "granted" {
+		t.Fatalf("fixture access = %v, want [sameOrg granted]", fixture.Access)
 	}
-	if _, err := bad.toC(); ParseSubnetKind(errString(err)) != "invalid_id_hex" {
-		t.Fatalf("bad authority hex err = %v, want subnet:invalid_id_hex", err)
-	}
-
-	deep := bad
-	deep.Binding.Subnet.AuthorityHex = hex64()
-	deep.Binding.Subnet.Path = SubnetPath{Levels: []uint8{1, 2, 3, 4, 5}}
-	if _, err := deep.toC(); ParseSubnetKind(errString(err)) != "path_too_deep" {
-		t.Fatalf("deep path err = %v, want subnet:path_too_deep", err)
-	}
-
-	ok := bad
-	ok.Binding.Subnet.AuthorityHex = hex64()
-	ok.Binding.Subnet.Path = SubnetPath{Levels: []uint8{3, 9}}
-	ref, err := ok.toC()
-	if err != nil {
-		t.Fatalf("well-formed binding rejected: %v", err)
-	}
-	if int(ref.path.depth) != 2 {
-		t.Fatalf("depth = %d, want 2", int(ref.path.depth))
-	}
-	// The inactive tail must be zero — the canonical form Rust enforces.
-	if ref.path.levels[2] != 0 || ref.path.levels[3] != 0 {
-		t.Fatal("inactive path levels must be zero")
+	for _, tc := range []struct {
+		mode SubnetExportAccess
+		want string
+	}{{SubnetAccessSameOrg, fixture.Access[0]}, {SubnetAccessGranted, fixture.Access[1]}} {
+		got, err := json.Marshal(tc.mode)
+		if err != nil {
+			t.Fatalf("marshal %v: %v", tc.mode, err)
+		}
+		if string(got) != `"`+tc.want+`"` {
+			t.Fatalf("mode %v marshalled as %s, want %q", tc.mode, got, tc.want)
+		}
 	}
 }
 

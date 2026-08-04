@@ -115,31 +115,34 @@ extern "C" {
 
 /* ======================================================================
  * Access modes (who may call a subnet-exported service).
+ *
+ * These name the values used in the `subnet_exports` JSON handed to
+ * net_mesh_new ("sameOrg" / "granted"). No function in this header takes
+ * an access mode: choosing who may call an export is CONFIGURATION, not a
+ * per-serve argument (review-10 P1-6).
  * ==================================================================== */
 
 #define NET_SUBNET_ACCESS_SAME_ORG 0  /* SubnetExportAccess::SameOrg  */
 #define NET_SUBNET_ACCESS_GRANTED  1  /* SubnetExportAccess::Granted  */
 
 /* ======================================================================
- * net_subnet_path_t / net_subnet_ref_t — an authority-qualified crossing.
+ * net_subnet_path_t — a compact hierarchy path.
  *
- * Distinct from the topology subnet id: equal paths under two authorities
- * are unrelated. Layout is part of the ABI (a Rust offset/size test pins
- * it): net_subnet_path_t is 5 bytes (depth + 4 levels), net_subnet_ref_t
- * is 37 (authority[32] + path). `depth` is 0..=4; levels[depth..] MUST be
- * zero (the canonical form — a non-zero inactive tail is refused, never
- * silently truncated). depth == 0 is the authority-root (global) path.
+ * Layout is part of the ABI (a Rust offset/size test pins it): 5 bytes,
+ * depth + 4 levels. `depth` is 0..=4; levels[depth..] MUST be zero (the
+ * canonical form — a non-zero inactive tail is refused, never silently
+ * truncated). depth == 0 is the authority-root (global) path.
+ *
+ * Used ONLY by net_subnet_declare_boundaries, an operator verb. There is
+ * deliberately no authority-qualified-crossing type here: ordinary C
+ * application code names a configured export and constructs no authority
+ * objects (review-10 P1-6). The former net_subnet_ref_t is gone.
  * ==================================================================== */
 
 typedef struct {
     uint8_t depth;      /* active level count, 0..=4               */
     uint8_t levels[4];  /* path labels; inactive tail must be zero */
 } net_subnet_path_t;
-
-typedef struct {
-    uint8_t authority[32];    /* the 32-byte authority entity id   */
-    net_subnet_path_t path;   /* the path under that authority     */
-} net_subnet_ref_t;
 
 /* ======================================================================
  * Gateway provisioning (SSDK §3.4) — WHOLESALE REPLACE.
@@ -180,14 +183,18 @@ int net_subnet_apply_control_fact(
  * The exported provider verb (SSDK §3.5).
  * ==================================================================== */
 
-/* Serve a subnet-exported, organization-protected service against one
- * exact crossing. The handler is the SAME dispatcher net_org_serve uses
+/* Serve a subnet-exported, organization-protected service against a NAMED
+ * export. The handler is the SAME dispatcher net_org_serve uses
  * (net_org_set_handler_dispatcher + a net_org_reserve_handler_id), and it
  * receives the verified net_org_caller_t.
  *
- * The C ABI takes the concrete `export_ref` + `topology_epoch` + `access`
- * (the low-level seam); a caller that configures exports BY NAME resolves
- * the name to this binding on its own side (Go does this in ServeSubnetExported).
+ * `export_name` is a provider-local label from the `subnet_exports` array
+ * given to net_mesh_new. Rust resolves it against the checked map the node
+ * holds — so this call constructs NO authority objects: no crossing, no
+ * topology epoch, no access mode. The name is never announced and never
+ * accepted from a caller. An unknown name fails HERE, before any
+ * registration or announcement, with subnet:unknown_export_name on out_err.
+ *
  * `mesh_arc` is CONSUMED; `handler_id` MUST already be reserved and stored
  * in the language registry. Announcement visibility is always public — the
  * external caller never joins this node's subnet. Requires an installed
@@ -196,8 +203,8 @@ int net_subnet_apply_control_fact(
 int net_subnet_serve_exported(
     net_compute_mesh_arc_t* mesh_arc,
     const char* service_ptr, size_t service_len,
-    const net_subnet_ref_t* export_ref, uint32_t topology_epoch,
-    int access, uint64_t handler_id,
+    const char* export_name_ptr, size_t export_name_len,
+    uint64_t handler_id,
     NetOrgServeHandle** out_handle, char** out_err);
 
 /* The caller verb — net_org_call_exported — lives on the OrgClient handle

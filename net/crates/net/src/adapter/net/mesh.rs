@@ -1891,6 +1891,19 @@ pub struct MeshNodeConfig {
     /// fail-closed for authority claims, no effect on plain
     /// topology/visibility operation.
     pub subnet_authorities: Vec<SubnetAuthorityConfig>,
+    /// NAMED subnet exports — provider-local labels resolved once
+    /// here into checked bindings (review-10 P1-6).
+    ///
+    /// Owned by the node rather than by each language wrapper so the
+    /// name→binding resolution is Rust-owned at EVERY boundary,
+    /// including the C ABI, which has no wrapper object to hang a map
+    /// on. Immutable after construction: a name is never announced and
+    /// never accepted from a caller, and nothing at runtime adds to
+    /// this map.
+    ///
+    /// Empty and duplicate names are refused at `MeshNode::new`,
+    /// before the node exists.
+    pub subnet_exports: Vec<super::subnet::provision::NamedSubnetExport>,
     /// This node's own attachment point inside its authority's
     /// hierarchy, for protected forwarding (SUBNET_AUTH_PLAN.md D6).
     /// Defaults to [Self::subnet] — the topology coordinate and the
@@ -2251,6 +2264,7 @@ impl MeshNodeConfig {
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
             subnet_authorities: Vec::new(),
+            subnet_exports: Vec::new(),
             subnet_attachment: None,
             subnet_control_channel: None,
             default_visibility: Visibility::Global,
@@ -2583,6 +2597,21 @@ impl MeshNodeConfig {
     /// set fails closed.
     pub fn with_subnet_authority(mut self, config: SubnetAuthorityConfig) -> Self {
         self.subnet_authorities.push(config);
+        self
+    }
+
+    /// Configure a NAMED subnet export (review-10 P1-6): a
+    /// provider-local label an application later serves against,
+    /// resolved once at `MeshNode::new` into a checked access mode +
+    /// export binding held by the node.
+    ///
+    /// Repeatable. The name is neither announced nor accepted from a
+    /// caller; empty or duplicate names fail at construction.
+    pub fn with_subnet_export(
+        mut self,
+        export: super::subnet::provision::NamedSubnetExport,
+    ) -> Self {
+        self.subnet_exports.push(export);
         self
     }
 
@@ -8386,6 +8415,10 @@ pub struct MeshNode {
     /// dispatch context can verify channel-borne control facts
     /// against the same anchors without a copy.
     subnet_authorities: Arc<Vec<SubnetAuthorityConfig>>,
+    /// The checked NAMED EXPORT map, resolved once at construction
+    /// (review-10 P1-6). Immutable: nothing at runtime adds to it, and
+    /// a name is never announced or accepted from a caller.
+    subnet_exports: Arc<super::subnet::provision::NamedSubnetExports>,
     /// Applied revocation-floor state + per-authority auth epochs
     /// for subnet credentials. Session admission (S3) verifies
     /// against this registry and pins the epoch it saw.
@@ -8695,6 +8728,18 @@ impl MeshNode {
         config: MeshNodeConfig,
     ) -> Result<Self, AdapterError> {
         let node_id = identity.node_id();
+
+        // Review-10 P1-6: freeze the NAMED EXPORT map before any
+        // networking starts. Empty and duplicate labels are
+        // configuration mistakes, and a node must never come up holding
+        // an ambiguous map — the same fail-before-the-node-exists rule
+        // the trust anchors follow. The map lives on the node so
+        // name→binding resolution is Rust-owned at every boundary,
+        // including the C ABI, which has no wrapper to hang it on.
+        let subnet_exports = Arc::new(
+            super::subnet::provision::NamedSubnetExports::try_new(config.subnet_exports.clone())
+                .map_err(|e| AdapterError::Fatal(e.to_string()))?,
+        );
 
         // OA-1 (review-8 §2): resolve the configured node authority
         // BEFORE any networking starts. A configured-but-missing,
@@ -9659,6 +9704,7 @@ impl MeshNode {
             local_subnet,
             local_subnet_policy,
             subnet_authorities,
+            subnet_exports,
             subnet_floors: Arc::new(SubnetFloorRegistry::new()),
             subnet_control: Arc::new(SubnetControlStore::new()),
             subnet_control_stream_id,
@@ -9760,6 +9806,18 @@ impl MeshNode {
     /// tests that assert a rejected subscribe retains nothing.
     pub fn subscriber_chain_count(&self) -> usize {
         self.subscriber_chains.len()
+    }
+
+    /// The checked NAMED EXPORT map this node was constructed with
+    /// (review-10 P1-6). Immutable after construction.
+    ///
+    /// Every language boundary resolves an export NAME against this one
+    /// Rust-owned map, rather than each wrapper keeping its own copy and
+    /// the C ABI keeping none at all. An unknown name therefore fails
+    /// identically everywhere, and no boundary can accept a
+    /// caller-supplied binding in place of a configured one.
+    pub fn subnet_exports(&self) -> &Arc<super::subnet::provision::NamedSubnetExports> {
+        &self.subnet_exports
     }
 
     /// Get this node's ed25519 entity id (derived from the

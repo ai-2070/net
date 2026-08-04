@@ -452,6 +452,19 @@ struct MeshNewConfig {
     /// regardless of how they arrive.
     #[serde(default)]
     subnet_control_channel: Option<String>,
+    /// NAMED subnet exports (review-10 P1-6): the provider-local labels
+    /// `net_subnet_serve_exported` resolves against.
+    ///
+    /// `[{"name", "access": "sameOrg"|"granted",
+    ///    "binding": {"subnet": {"authority_hex", "path": {"levels": [..]}},
+    ///                "topology_epoch"}}]`.
+    ///
+    /// Resolved ONCE here into a checked map held by the node, so the
+    /// name→binding resolution is Rust-owned at the C boundary too —
+    /// which has no wrapper object to hold a map of its own. Empty and
+    /// duplicate labels are refused before the node exists.
+    #[serde(default)]
+    subnet_exports: Option<Vec<crate::adapter::net::subnet::provision::dto::SubnetNamedExportDto>>,
     /// Hex-encoded 32-byte ed25519 seed — when present, the mesh
     /// reproduces the same `entity_id` as
     /// `IdentityFromSeed(sameSeed)`. Leave unset to generate a fresh
@@ -623,6 +636,14 @@ pub unsafe extern "C" fn net_mesh_new(
             };
             node_cfg = node_cfg.with_subnet_control_channel(channel);
         }
+        for dto in cfg.subnet_exports.unwrap_or_default().iter() {
+            let Ok(export) = dto.to_core() else {
+                return NET_ERR_MESH_INIT;
+            };
+            node_cfg = node_cfg.with_subnet_export(export);
+        }
+        // Empty / duplicate labels are refused by `MeshNode::new`, which
+        // freezes the map — one checker, not a second copy here.
     }
     #[cfg(feature = "nat-traversal")]
     if let Some(external_str) = cfg.reflex_override.as_deref() {
@@ -5468,5 +5489,90 @@ mod subnet_authority_config_tests {
         .to_core()
         .is_ok());
         assert!(SubnetPathDto { levels: vec![] }.to_core().is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "net"))]
+mod named_export_construction_tests {
+    //! The NAMED EXPORT map is Rust-owned and frozen at construction
+    //! (review-10 P1-6).
+    //!
+    //! It lives on the node rather than in each language wrapper so that
+    //! name→binding resolution happens in one place for every boundary —
+    //! including the C ABI, which has no wrapper object to hold a map. A
+    //! node must never come up holding an ambiguous map.
+
+    use super::*;
+    use crate::adapter::net::identity::EntityKeypair;
+    use crate::adapter::net::subnet::provision::{NamedSubnetExport, SubnetExportAccess};
+    use crate::adapter::net::subnet::{SubnetRef, TopologySubnetId};
+
+    fn export(name: &str) -> NamedSubnetExport {
+        NamedSubnetExport {
+            name: name.to_string(),
+            access: SubnetExportAccess::Granted,
+            subnet: SubnetRef {
+                authority: EntityKeypair::from_bytes([0x11; 32]).entity_id().clone(),
+                path: TopologySubnetId::new(&[3, 9]),
+            },
+            topology_epoch: 0,
+        }
+    }
+
+    async fn build(exports: Vec<NamedSubnetExport>) -> Result<MeshNode, AdapterError> {
+        let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0u8; 32]);
+        for e in exports {
+            cfg = cfg.with_subnet_export(e);
+        }
+        MeshNode::new(EntityKeypair::generate(), cfg).await
+    }
+
+    /// A configured map is frozen on the node and resolves by name.
+    #[tokio::test]
+    async fn configured_exports_are_resolvable_from_the_node() {
+        let node = build(vec![export("factory-export"), export("lab-export")])
+            .await
+            .expect("distinct names construct");
+        let map = node.subnet_exports();
+        assert!(map.resolve("factory-export").is_some());
+        assert!(map.resolve("lab-export").is_some());
+        assert!(
+            map.resolve("no-such-export").is_none(),
+            "an unconfigured name must not resolve",
+        );
+    }
+
+    /// A duplicate label is a configuration mistake: the node REFUSES to
+    /// come up rather than silently keeping one of the two.
+    #[tokio::test]
+    async fn a_duplicate_export_name_refuses_construction() {
+        let Err(err) = build(vec![export("dup"), export("dup")]).await else {
+            panic!("a duplicate label must refuse construction");
+        };
+        assert!(
+            err.to_string().contains("duplicate_export_name"),
+            "expected the stable kind in the refusal, got {err}",
+        );
+    }
+
+    /// So is an empty one.
+    #[tokio::test]
+    async fn an_empty_export_name_refuses_construction() {
+        let Err(err) = build(vec![export("")]).await else {
+            panic!("an empty label must refuse construction");
+        };
+        assert!(
+            err.to_string().contains("empty_export_name"),
+            "expected the stable kind in the refusal, got {err}",
+        );
+    }
+
+    /// No exports is the ordinary case and must stay valid — the map is
+    /// simply empty, and every serve against a name fails to resolve.
+    #[tokio::test]
+    async fn no_exports_is_valid_and_resolves_nothing() {
+        let node = build(Vec::new()).await.expect("no exports constructs");
+        assert!(node.subnet_exports().is_empty());
+        assert!(node.subnet_exports().resolve("anything").is_none());
     }
 }

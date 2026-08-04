@@ -67,10 +67,7 @@ use net_sdk::org::{
 // and cannot, so a separate `libnet_subnet` would be the only
 // alternative — the "concrete link analysis" the plan invites resolves
 // to this existing home, no new cdylib).
-use net_sdk::subnet::{
-    admin as subnet_admin, NamedSubnetExport, NamedSubnetExports, SubnetExportAccess, SubnetRef,
-    TopologySubnetId,
-};
+use net_sdk::subnet::{admin as subnet_admin, TopologySubnetId};
 
 // =========================================================================
 // FFI guard — wraps every entry point in `catch_unwind`
@@ -1172,18 +1169,6 @@ pub struct NetSubnetPath {
     pub levels: [u8; 4],
 }
 
-/// `#[repr(C)]` mirror of `net_subnet_ref_t`: an authority-qualified
-/// crossing — NOT the topology subnet id. Equal paths under two
-/// authorities are unrelated.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct NetSubnetRef {
-    /// The 32-byte authority entity id.
-    pub authority: [u8; 32],
-    /// The path under that authority.
-    pub path: NetSubnetPath,
-}
-
 impl NetSubnetPath {
     /// Convert to the core compact id, rejecting a non-canonical form:
     /// `depth > 4` or a non-zero inactive tail. Returns `None` on either,
@@ -1199,15 +1184,6 @@ impl NetSubnetPath {
             return None;
         }
         Some(TopologySubnetId::new(&self.levels[..self.depth as usize]))
-    }
-}
-
-impl NetSubnetRef {
-    fn to_core(self) -> Option<SubnetRef> {
-        Some(SubnetRef {
-            authority: EntityId::from_bytes(self.authority),
-            path: self.path.to_core()?,
-        })
     }
 }
 
@@ -1425,31 +1401,37 @@ pub extern "C" fn net_subnet_apply_control_fact(
     })
 }
 
-/// Serve a subnet-EXPORTED, organization-protected service (SSDK §3.5).
+/// Serve a subnet-EXPORTED, organization-protected service against a
+/// NAMED export (SSDK §3.5).
 ///
-/// The C/Go layer holds no persistent named-export map (there is no
-/// mesh-wrapper on the Rust side — `mesh_arc` is a bare `Arc<MeshNode>`
-/// clone), so the concrete export binding (`export_ref`, `topology_epoch`,
-/// `access`) crosses directly. Go resolves its configured export NAME to
-/// this binding on its own side (name resolution is marshaling); the C
-/// ABI is the low-level seam. Internally this wraps the binding in a
-/// single-entry `NamedSubnetExports`, so the SAME shared serve pipeline
-/// runs — the handler receives the verified `net_org_caller_t`, and
-/// registration reuses the org dispatcher and handler-id machinery.
+/// The export NAME is resolved by Rust-owned provider state — the
+/// checked map the node was constructed with (`subnet_exports` in
+/// `net_mesh_new`'s JSON). C application code therefore names a service
+/// and a locally configured export and constructs NO authority objects:
+/// no `SubnetRef`, no topology epoch, no access mode. That is the same
+/// boundary every other language has (review-10 P1-6).
 ///
-/// `mesh_arc` is **consumed**. `handler_id` MUST already be reserved via
-/// [`net_org_reserve_handler_id`] and stored in the Go registry.
-/// Announcement visibility is always public; the external caller never
-/// joins this node's subnet. Requires an installed node authority.
+/// Before this, the concrete binding crossed the ABI directly and Rust
+/// invented a fixed internal name for it, which put authority-object
+/// construction in ordinary C application code and moved name resolution
+/// out of Rust at the one boundary with no wrapper to hold a map.
+///
+/// An unknown name fails HERE, before any registration or announcement,
+/// with `subnet:unknown_export_name` on `out_err`.
+///
+/// `mesh_arc` is **consumed** on every path. `handler_id` MUST already be
+/// reserved via [`net_org_reserve_handler_id`] and stored in the caller's
+/// registry. Announcement visibility is always public; the external
+/// caller never joins this node's subnet. Requires an installed node
+/// authority.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn net_subnet_serve_exported(
     mesh_arc: *mut Arc<MeshNode>,
     service_ptr: *const c_char,
     service_len: usize,
-    export_ref: *const NetSubnetRef,
-    topology_epoch: u32,
-    access: c_int,
+    export_name_ptr: *const c_char,
+    export_name_len: usize,
     handler_id: u64,
     out_handle: *mut *mut NetOrgServeHandle,
     out_err: *mut *mut c_char,
@@ -1460,15 +1442,19 @@ pub extern "C" fn net_subnet_serve_exported(
         }
         // Consume-on-all-paths (review-10 P1-4).
         let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
-        if out_handle.is_null() || export_ref.is_null() {
+        if out_handle.is_null() {
             write_err(
                 out_err,
-                "subnet:invalid_format: out_handle and export_ref must be non-NULL".into(),
+                "subnet:invalid_format: out_handle must be non-NULL".into(),
             );
             return NET_ORG_ERR_NULL;
         }
         let Some(service) = cstr_to_string(service_ptr, service_len) else {
             write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        let Some(export_name) = cstr_to_string(export_name_ptr, export_name_len) else {
+            write_err(out_err, "export name is NULL or non-UTF-8".into());
             return NET_ORG_ERR_INVALID_UTF8;
         };
         if ORG_DISPATCHER.get().is_none() {
@@ -1483,37 +1469,6 @@ pub extern "C" fn net_subnet_serve_exported(
             write_err(out_err, "handler_id must be non-zero".into());
             return NET_ORG_ERR_NULL;
         }
-        let access = match access {
-            NET_SUBNET_ACCESS_SAME_ORG => SubnetExportAccess::SameOrg,
-            NET_SUBNET_ACCESS_GRANTED => SubnetExportAccess::Granted,
-            other => {
-                write_err(out_err, format!("subnet:invalid_access: mode {other}"));
-                return NET_ORG_ERR_SUBNET;
-            }
-        };
-        let Some(subnet) = (unsafe { *export_ref }).to_core() else {
-            write_err(
-                out_err,
-                "subnet:path_too_deep: non-canonical export path".into(),
-            );
-            return NET_ORG_ERR_SUBNET;
-        };
-
-        // One fixed-name entry: the C surface passes the binding directly,
-        // so the name is an internal detail, never announced or accepted.
-        const C_EXPORT_NAME: &str = "c-abi-export";
-        let exports = match NamedSubnetExports::try_new([NamedSubnetExport {
-            name: C_EXPORT_NAME.to_string(),
-            access,
-            subnet,
-            topology_epoch,
-        }]) {
-            Ok(m) => m,
-            Err(e) => {
-                write_err(out_err, e.to_string());
-                return NET_ORG_ERR_SUBNET;
-            }
-        };
 
         let timeout = DEFAULT_ORG_HANDLER_TIMEOUT;
         let handler = move |caller: OrgCaller, body: Bytes| {
@@ -1521,13 +1476,17 @@ pub extern "C" fn net_subnet_serve_exported(
             async move { org_dispatch(handler_id, caller_c, body, timeout).await }
         };
 
+        // The node's OWN checked map — not one synthesized here from
+        // caller-supplied values.
+        let exports = node.subnet_exports().clone();
+
         // Same ambient-runtime rationale as `net_org_serve`.
         let _rt_guard = runtime().enter();
         match net_sdk::subnet::serve_subnet_exported_bytes_node(
             node,
             &exports,
             &service,
-            C_EXPORT_NAME,
+            &export_name,
             handler,
         ) {
             Ok(inner) => {
@@ -1579,10 +1538,15 @@ mod tests {
         assert_eq!(net_org_check_abi_version(0x0002), NET_ORG_ERR_NULL);
     }
 
-    /// `net_subnet_path_t` / `net_subnet_ref_t` layout is part of the ABI: a
-    /// reorder or retype shifts these and the C header reads a garbage path.
+    /// `net_subnet_path_t` layout is part of the ABI: a reorder or retype
+    /// shifts these and the C header reads a garbage path.
+    ///
+    /// `net_subnet_ref_t` is deliberately GONE (review-10 P1-6) — no entry
+    /// point takes an authority-qualified crossing from C any more, because
+    /// ordinary C application code names a configured export instead of
+    /// constructing one.
     #[test]
-    fn net_subnet_ref_layout_is_pinned() {
+    fn net_subnet_path_layout_is_pinned() {
         use std::mem::{align_of, offset_of, size_of};
         assert_eq!(
             size_of::<NetSubnetPath>(),
@@ -1592,11 +1556,6 @@ mod tests {
         assert_eq!(align_of::<NetSubnetPath>(), 1);
         assert_eq!(offset_of!(NetSubnetPath, depth), 0);
         assert_eq!(offset_of!(NetSubnetPath, levels), 1);
-        // authority[32] then the 5-byte path; byte arrays so no padding.
-        assert_eq!(size_of::<NetSubnetRef>(), 37);
-        assert_eq!(align_of::<NetSubnetRef>(), 1);
-        assert_eq!(offset_of!(NetSubnetRef, authority), 0);
-        assert_eq!(offset_of!(NetSubnetRef, path), 32);
     }
 
     /// The path canonicalizer accepts exactly the well-formed shapes and
@@ -2127,28 +2086,25 @@ mod tests {
             net_subnet_apply_control_fact(arc, std::ptr::null(), 0, &mut kind, &mut applied, err)
         });
 
-        // serve_exported: NULL out_handle, then NULL export_ref.
-        let export_ref = NetSubnetRef {
-            authority: [0x11; 32],
-            path: NetSubnetPath {
-                depth: 1,
-                levels: [3, 0, 0, 0],
-            },
-        };
+        // serve_exported: NULL out_handle. `export_ref` is gone — the C
+        // boundary takes an export NAME resolved by Rust-owned state
+        // (review-10 P1-6), so there is no authority-object argument to
+        // null. A NULL/garbage name is a UTF-8 refusal, also below the
+        // consume line.
+        let export_name = b"factory-export";
         assert_consumes_arc(&node, "serve_exported/out_handle", |arc, err| {
             net_subnet_serve_exported(
                 arc,
                 service.as_ptr() as *const c_char,
                 service.len(),
-                &export_ref,
-                0,
-                NET_SUBNET_ACCESS_GRANTED,
+                export_name.as_ptr() as *const c_char,
+                export_name.len(),
                 1,
                 std::ptr::null_mut(),
                 err,
             )
         });
-        assert_consumes_arc(&node, "serve_exported/export_ref", |arc, err| {
+        assert_consumes_arc(&node, "serve_exported/export_name", |arc, err| {
             let mut handle: *mut NetOrgServeHandle = std::ptr::null_mut();
             net_subnet_serve_exported(
                 arc,
@@ -2156,7 +2112,6 @@ mod tests {
                 service.len(),
                 std::ptr::null(),
                 0,
-                NET_SUBNET_ACCESS_GRANTED,
                 1,
                 &mut handle,
                 err,
@@ -2182,6 +2137,108 @@ mod tests {
                 err,
             )
         });
+    }
+
+    /// Review-10 P1-6 — the C boundary resolves an export NAME against
+    /// the node's OWN checked map, and an unknown name fails before any
+    /// registration or announcement.
+    ///
+    /// The ordering half matters as much as the refusal: a KNOWN name
+    /// must get past resolution and fail for a different reason (this
+    /// node has no org authority installed), proving the name was
+    /// actually resolved rather than the call failing early for
+    /// unrelated reasons. Before this, C passed a concrete crossing and
+    /// Rust invented a fixed internal name, so there was no resolution
+    /// to witness at all.
+    #[test]
+    fn serve_exported_resolves_the_name_against_the_nodes_own_map() {
+        use net::adapter::net::subnet::provision::{NamedSubnetExport, SubnetExportAccess};
+        use net::adapter::net::subnet::{SubnetRef, TopologySubnetId};
+
+        let identity = net_sdk::identity::Identity::generate();
+        let authority = net::adapter::net::identity::EntityKeypair::from_bytes([0x11; 32]);
+        let cfg =
+            net::adapter::net::MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0u8; 32])
+                .with_subnet_export(NamedSubnetExport {
+                    name: "factory-export".to_string(),
+                    access: SubnetExportAccess::Granted,
+                    subnet: SubnetRef {
+                        authority: authority.entity_id().clone(),
+                        path: TopologySubnetId::new(&[3, 9]),
+                    },
+                    topology_epoch: 0,
+                });
+        let node = Arc::new(
+            runtime()
+                .block_on(MeshNode::new((**identity.keypair()).clone(), cfg))
+                .expect("MeshNode::new"),
+        );
+
+        // A dispatcher must exist or the call short-circuits before
+        // resolution; register a trivial one.
+        unsafe extern "C" fn noop(
+            _: u64,
+            _: *const NetOrgCaller,
+            _: *const u8,
+            _: usize,
+            _: *mut *mut u8,
+            _: *mut usize,
+            _: *mut *mut c_char,
+        ) -> c_int {
+            NET_ORG_OK
+        }
+        net_org_set_handler_dispatcher(noop);
+
+        let service = b"fleet.telemetry";
+        let call = |name: &[u8]| -> (c_int, String) {
+            let arc_box: *mut Arc<MeshNode> = Box::into_raw(Box::new(node.clone()));
+            let mut handle: *mut NetOrgServeHandle = std::ptr::null_mut();
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let rc = net_subnet_serve_exported(
+                arc_box,
+                service.as_ptr() as *const c_char,
+                service.len(),
+                name.as_ptr() as *const c_char,
+                name.len(),
+                net_org_reserve_handler_id(),
+                &mut handle,
+                &mut err,
+            );
+            let msg = if err.is_null() {
+                String::new()
+            } else {
+                let s = unsafe { std::ffi::CStr::from_ptr(err) }
+                    .to_string_lossy()
+                    .into_owned();
+                net_org_free_cstring(err);
+                s
+            };
+            if !handle.is_null() {
+                net_org_serve_handle_free(&mut handle);
+            }
+            (rc, msg)
+        };
+
+        let (rc, msg) = call(b"no-such-export");
+        assert_eq!(rc, NET_ORG_ERR_SUBNET, "an unknown name must be refused");
+        assert_eq!(
+            scan_subnet_kind_for_test(&msg).as_deref(),
+            Some("unknown_export_name"),
+            "expected the stable kind on out_err, got {msg:?}",
+        );
+
+        // The configured name resolves; the failure that surfaces is the
+        // CORE's, not a name lookup.
+        let (rc, msg) = call(b"factory-export");
+        assert_ne!(
+            rc, NET_ORG_OK,
+            "no org authority is installed, so serve must fail"
+        );
+        assert_ne!(
+            scan_subnet_kind_for_test(&msg).as_deref(),
+            Some("unknown_export_name"),
+            "a configured name must get PAST resolution, got {msg:?}",
+        );
     }
 
     /// P1-3 — an oversized count must be refused deterministically,
