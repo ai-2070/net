@@ -607,6 +607,7 @@ jobs:
           --test subnet_org_boundary
           --test subnet_revocation
           --test subnet_route_hop_alloc
+          --test subnet_relay_alloc_e2e
           --test subnet_session_auth
           --test subnet_control_facts
           --test integration_placement_filter_callback
