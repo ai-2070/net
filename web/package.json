@@ -70,7 +70,7 @@
     "axios-retry": "4.5.0",
     "better-auth": "1.6.25",
     "cache-manager": "7.2.9",
-    "cacheable": "2.5.1",
+    "cacheable": "2.5.0",
     "class-variance-authority": "0.7.1",
     "decimal.js": "10.6.0",
     "fast-blurhash": "1.2.0",
