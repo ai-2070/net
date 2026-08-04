@@ -22,7 +22,7 @@ Defined in `crates/net/src/adapter/net/subnet/id.rs`:
 - 256 values per level, 4 levels deep. Sized for hierarchical deployment of any practical scale.
 - Bitwise hierarchy operations at wire speed: `parent()`, `is_ancestor_of()`, `is_sibling()`, `is_same_subnet()`, `mask_for_depth()`, `depth()`.
 - `SubnetId::GLOBAL` (0) means "no subnet / unrestricted."
-- The `SubnetId` is carried on `NetHeader.subnet_id` — every packet identifies its subnet at the wire layer.
+- ~~The `SubnetId` is carried on `NetHeader.subnet_id` — every packet identifies its subnet at the wire layer.~~ **Correction (2026-08-02):** the header *field* exists (`protocol.rs`, AAD-covered and wire-serialized) but is never populated in production — `with_subnet` has test-only callers, so `subnet_id` is always 0 on real packets. Populating it lands with the gateway-enforcement slice of [`SUBNET_AUTH_PLAN.md`](SUBNET_AUTH_PLAN.md) (S4).
 
 ### `SubnetGateway`
 

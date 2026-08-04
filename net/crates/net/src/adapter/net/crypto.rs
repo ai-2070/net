@@ -87,6 +87,19 @@ pub struct SessionKeys {
     /// "not available" — some test paths construct `SessionKeys`
     /// directly and don't go through a real handshake.
     pub remote_static_pub: [u8; 32],
+    /// Key authenticating route-hop envelopes this node SENDS on this
+    /// edge (SUBNET_AUTH_PLAN.md D6).
+    ///
+    /// Derived from the same handshake hash as the packet keys but
+    /// under distinct labels, so route-hop authentication and packet
+    /// AEAD never share key material or nonce/sequence space. A relay
+    /// authenticates its adjacent hop with these while the inner
+    /// end-to-end packet stays sealed under the packet keys it cannot
+    /// read.
+    pub route_hop_tx_key: [u8; 32],
+    /// Key verifying route-hop envelopes this node RECEIVES on this
+    /// edge. Mirrors the peer's `route_hop_tx_key`.
+    pub route_hop_rx_key: [u8; 32],
 }
 
 impl std::fmt::Debug for SessionKeys {
@@ -352,11 +365,30 @@ impl NoiseHandshake {
             derive_key(&handshake_hash, b"initiator-tx", &mut rx_key);
         }
 
+        // Route-hop authentication keys, derived here because this is
+        // the last point the handshake hash exists — `into_transport_mode`
+        // above already consumed the state. Distinct labels from the
+        // packet keys: a route-hop MAC must never be forgeable from
+        // packet key material, and the two have independent sequence
+        // spaces. Directional, so a captured envelope cannot be
+        // reflected back along the edge it came from.
+        let mut route_hop_tx_key = [0u8; 32];
+        let mut route_hop_rx_key = [0u8; 32];
+        if is_initiator {
+            derive_key(&handshake_hash, b"route-hop-tx-v1", &mut route_hop_tx_key);
+            derive_key(&handshake_hash, b"route-hop-rx-v1", &mut route_hop_rx_key);
+        } else {
+            derive_key(&handshake_hash, b"route-hop-rx-v1", &mut route_hop_tx_key);
+            derive_key(&handshake_hash, b"route-hop-tx-v1", &mut route_hop_rx_key);
+        }
+
         Ok(SessionKeys {
             tx_key,
             rx_key,
             session_id,
             remote_static_pub,
+            route_hop_tx_key,
+            route_hop_rx_key,
         })
     }
 }
@@ -1953,6 +1985,42 @@ mod tests {
         );
     }
 
+    /// Route-hop keys must agree across the edge, be directional, and
+    /// share nothing with the packet AEAD keys (SUBNET_AUTH_PLAN.md
+    /// D6). Derived from the same handshake hash under distinct
+    /// labels, so this reproduces both sides' derivation from one
+    /// hash rather than running a full handshake.
+    #[test]
+    fn route_hop_keys_agree_across_peers_and_differ_from_packet_keys() {
+        let hash = [0x5Au8; 32];
+        let derive = |label: &[u8]| {
+            let mut k = [0u8; 32];
+            derive_key(&hash, label, &mut k);
+            k
+        };
+
+        // Initiator's tx is the responder's rx, and vice versa.
+        let init_tx = derive(b"route-hop-tx-v1");
+        let init_rx = derive(b"route-hop-rx-v1");
+        let resp_tx = derive(b"route-hop-rx-v1");
+        let resp_rx = derive(b"route-hop-tx-v1");
+        assert_eq!(init_tx, resp_rx, "initiator tx must verify as responder rx");
+        assert_eq!(resp_tx, init_rx, "responder tx must verify as initiator rx");
+
+        // Directional: a captured envelope cannot be reflected back.
+        assert_ne!(init_tx, init_rx, "route-hop keys must be directional");
+
+        // Disjoint from the packet AEAD keys derived from the same
+        // hash — a route-hop MAC must not be forgeable from packet
+        // key material, and vice versa.
+        let packet_tx = derive(b"initiator-tx");
+        let packet_rx = derive(b"initiator-rx");
+        for hop in [init_tx, init_rx] {
+            assert_ne!(hop, packet_tx);
+            assert_ne!(hop, packet_rx);
+        }
+    }
+
     #[test]
     fn session_keys_debug_redacts_tx_and_rx_keys() {
         let tx_secret = [0xAB; 32];
@@ -1962,6 +2030,8 @@ mod tests {
             rx_key: rx_secret,
             session_id: 0x1234_5678_DEAD_BEEF,
             remote_static_pub: [0x11; 32],
+            route_hop_tx_key: [0xEF; 32],
+            route_hop_rx_key: [0xFE; 32],
         };
         let s = format!("{:?}", keys);
 

@@ -45,8 +45,7 @@ fn make_reroute_setup(num_peers: usize, routes_per_peer: usize) -> (Arc<RerouteP
         }
     }
 
-    let graph = Arc::new(ProximityGraph::new([0u8; 32], ProximityConfig::default()));
-    let policy = Arc::new(ReroutePolicy::new(rt, peers).with_proximity_graph(graph));
+    let policy = Arc::new(ReroutePolicy::new(rt, peers));
     (policy, peer_ids)
 }
 

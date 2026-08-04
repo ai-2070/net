@@ -178,10 +178,15 @@ async fn send_redex_payload(
     target: NodeId,
     payload: Vec<u8>,
 ) -> Result<(), AdapterError> {
-    let peer_addr = mesh.peer_addr(target).ok_or_else(|| {
-        AdapterError::Connection(format!("replication: peer {target:#x} unknown"))
-    })?;
-    mesh.send_subprotocol(peer_addr, super::replication::SUBPROTOCOL_REDEX, &payload)
+    if mesh.peer_addr(target).is_none() {
+        return Err(AdapterError::Connection(format!(
+            "replication: peer {target:#x} unknown"
+        )));
+    }
+    // Node-keyed — see `MeshNode::send_subprotocol_to_node`. The target
+    // is a node id, and an id → address → id round trip drops every
+    // peer reached through a relay.
+    mesh.send_subprotocol_to_node(target, super::replication::SUBPROTOCOL_REDEX, &payload)
         .await
 }
 

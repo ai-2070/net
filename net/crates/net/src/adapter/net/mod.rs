@@ -124,7 +124,8 @@ pub use cortex::{
 pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
 pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
-    LossSimulator, NodeStatus, RecoveryAction, RecoveryManager, RecoveryStats,
+    LossSimulator, NodeStatus, PeerFailureEvent, RecoveryAction, RecoveryManager, RecoveryStats,
+    VerdictStatus,
 };
 pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
@@ -160,7 +161,8 @@ pub use redex::{
 pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream, RetransmitDescriptor};
 pub use reroute::ReroutePolicy;
 pub use route::{
-    AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, SchedulerStreamStats,
+    AggregateStats, AlternateProvenance, RouteCandidateView, RouteEntry, RouteFlags,
+    RouteObservation, RoutingHeader, RoutingTable, SchedulerStreamStats, TransitionOutcome,
     ROUTING_HEADER_SIZE,
 };
 pub use router::{FairScheduler, NetRouter, RouteAction, RouterConfig, RouterError, RouterStats};

@@ -16,6 +16,7 @@ use std::time::Instant;
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
+use super::subnet::route_hop::SharedHopReplayWindow;
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
 use super::pool::SharedLocalPool;
@@ -127,6 +128,24 @@ pub struct NetSession {
     /// packet (which then re-publishes the same value), and the
     /// resolver itself is the source of truth.
     cached_node_id: AtomicU64,
+    /// Key for MACing route-hop envelopes this node sends on this
+    /// edge. See [`Self::seal_route_hop`].
+    route_hop_tx_key: [u8; 32],
+    /// Key for verifying route-hop envelopes received on this edge.
+    route_hop_rx_key: [u8; 32],
+    /// This edge's outbound hop sequence — separate from the packet
+    /// AEAD counter by design.
+    route_hop_tx_seq: AtomicU64,
+    /// Sliding replay window over inbound hop sequences.
+    ///
+    /// Lock-free single-writer state, not a mutex: the production
+    /// protected-ingress path is single-consumer (one receive loop,
+    /// synchronous dispatch), so admission never contends there, and
+    /// the ordinary path pays no locking. A second concurrent caller
+    /// — only reachable by breaking that ownership rule — is refused
+    /// immediately and its packet dropped
+    /// ([`super::subnet::route_hop::RouteHopError::Contended`]).
+    route_hop_replay: SharedHopReplayWindow,
 }
 
 /// Sentinel `stream_id` used in the header of subprotocol control
@@ -174,7 +193,74 @@ impl NetSession {
             recently_closed: DashMap::new(),
             control_tx_seq: AtomicU64::new(0),
             cached_node_id: AtomicU64::new(0),
+            // Unlike `tx_key`, the route-hop keys ARE retained: a
+            // relay MACs every forwarded hop, and a MAC has no
+            // nonce-reuse hazard to route around — the sequence is an
+            // explicit transcript field, not derived counter state.
+            route_hop_tx_key: keys.route_hop_tx_key,
+            route_hop_rx_key: keys.route_hop_rx_key,
+            route_hop_tx_seq: AtomicU64::new(0),
+            route_hop_replay: SharedHopReplayWindow::new(),
         }
+    }
+
+    /// Wrap `inner` in an authenticated route-hop envelope for this
+    /// edge, writing into a caller-owned buffer
+    /// (SUBNET_AUTH_PLAN.md D6).
+    ///
+    /// The sequence is this edge's own, independent of the packet
+    /// AEAD counter, so hop accounting can never disturb the
+    /// end-to-end session being carried.
+    ///
+    /// This is the form the forwarding path uses: the buffer belongs
+    /// to the forwarder and is reused across packets, so relaying does
+    /// not allocate. Size it with
+    /// [`route_hop::sealed_len`](super::subnet::route_hop::sealed_len).
+    ///
+    /// A too-small buffer is refused *before* a sequence is taken —
+    /// burning one on a local sizing mistake would open a gap in this
+    /// edge's sequence space for no reason.
+    pub fn seal_route_hop_into(
+        &self,
+        out: &mut [u8],
+        header: &super::route::RoutingHeader,
+        inner: &[u8],
+    ) -> Result<usize, super::subnet::route_hop::RouteHopError> {
+        if out.len() < super::subnet::route_hop::sealed_len(inner.len()) {
+            return Err(super::subnet::route_hop::RouteHopError::BufferTooSmall);
+        }
+        let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
+        super::subnet::route_hop::seal_into(
+            out,
+            &self.route_hop_tx_key,
+            self.session_id,
+            seq,
+            header,
+            inner,
+        )
+    }
+
+    /// Allocating form of [`Self::seal_route_hop_into`], for callers
+    /// off the forwarding path.
+    pub fn seal_route_hop(&self, header: &super::route::RoutingHeader, inner: &[u8]) -> Vec<u8> {
+        let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
+        super::subnet::route_hop::seal(&self.route_hop_tx_key, self.session_id, seq, header, inner)
+    }
+
+    /// Verify an inbound route-hop envelope and admit its sequence
+    /// exactly once.
+    ///
+    /// Returns the opened hop on success. A bad tag is rejected before
+    /// the replay window is touched, so a forged packet cannot burn a
+    /// sequence slot the legitimate peer still needs.
+    pub fn open_route_hop<'a>(
+        &self,
+        buf: &'a [u8],
+    ) -> Result<super::subnet::route_hop::OpenedHop<'a>, super::subnet::route_hop::RouteHopError>
+    {
+        let opened = super::subnet::route_hop::open(&self.route_hop_rx_key, buf)?;
+        self.route_hop_replay.admit(opened.hop_sequence)?;
+        Ok(opened)
     }
 
     /// Read the cached peer `NodeId` resolution. Returns `None`
@@ -1933,6 +2019,67 @@ mod tests {
             // surface. `MeshNode::peer_static_x25519` treats zeros
             // as "not available" and returns `None`.
             remote_static_pub: [0u8; 32],
+            // Same story: no handshake hash to derive route-hop keys
+            // from. Distinct constants rather than zeros so a test
+            // that accidentally relied on tx == rx would fail.
+            route_hop_tx_key: [0x51u8; 32],
+            route_hop_rx_key: [0x15u8; 32],
+        }
+    }
+
+    /// A refused seal must not consume a hop sequence.
+    ///
+    /// `seal_route_hop_into` takes the next sequence with a
+    /// `fetch_add`, which is not undoable. Checking capacity after
+    /// taking it would burn a sequence number on a purely local sizing
+    /// mistake, opening a gap in this edge's sequence space that the
+    /// peer's replay window then has to absorb for no reason. The
+    /// capacity check therefore runs first, and this pins that ordering
+    /// by observing the sequence actually emitted.
+    #[test]
+    fn a_refused_seal_does_not_consume_a_hop_sequence() {
+        use super::super::route::RoutingHeader;
+        use super::super::subnet::route_hop::{parse_prefix, sealed_len, RouteHopError};
+
+        let session = NetSession::new(test_keys(), "127.0.0.1:9999".parse().unwrap(), 4, false);
+        let header = RoutingHeader::new(0xDEAD_BEEF, 0x1234, 8);
+        let inner = b"an inner packet the relay never looks inside";
+        let needed = sealed_len(inner.len());
+
+        // Burn sequence 0 so the test is about the *next* one rather
+        // than about a fresh counter reading zero either way.
+        let mut ok_buf = vec![0u8; needed];
+        session
+            .seal_route_hop_into(&mut ok_buf, &header, inner)
+            .expect("exact size fits");
+        assert_eq!(sequence_of(&ok_buf), 0);
+
+        // Several refusals, each one byte short of enough.
+        for short in [0usize, 1, needed - 1] {
+            let mut tiny = vec![0u8; short];
+            assert_eq!(
+                session.seal_route_hop_into(&mut tiny, &header, inner),
+                Err(RouteHopError::BufferTooSmall),
+                "a {short}-byte buffer must be refused",
+            );
+        }
+
+        // The next accepted seal gets sequence 1, not 4.
+        let mut next_buf = vec![0u8; needed];
+        session
+            .seal_route_hop_into(&mut next_buf, &header, inner)
+            .expect("exact size fits");
+        assert_eq!(
+            sequence_of(&next_buf),
+            1,
+            "refused seals must not advance the hop sequence",
+        );
+
+        fn sequence_of(buf: &[u8]) -> u64 {
+            // The sequence sits in the prefix; read it back off the
+            // wire rather than trusting an internal counter.
+            parse_prefix(buf).expect("a sealed envelope parses");
+            u64::from_le_bytes(buf[10..18].try_into().expect("8 bytes"))
         }
     }
 

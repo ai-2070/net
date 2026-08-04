@@ -1,24 +1,29 @@
-//! Subnet identifier — capability-auth-plan Phase 1.
+//! Subnet identifier tag — a **self-declared routing hint, never an
+//! access boundary**.
 //!
-//! A `SubnetId` is a 16-byte opaque identifier for a topology
+//! A `SubnetId` here is a 16-byte opaque identifier for a topology
 //! partition. Operators pick the value (random 16 bytes, or a
 //! blake2s-of-name truncated to 16, or any operator-stable
 //! convention); the substrate doesn't interpret the bytes.
 //!
-//! # Membership
+//! # Membership is self-declared, so it authorizes nothing
 //!
 //! Peers self-declare subnet membership via a `subnet:<hex32>` tag
 //! on their own [`CapabilityAnnouncement`](super::capability::CapabilityAnnouncement).
 //! The capability index parses the tag at fold time and stores the
-//! `NodeId → SubnetId` mapping on the peer view, where the v0.4
-//! capability-auth execute-gate consults it.
+//! `NodeId → SubnetId` mapping on the peer view.
 //!
-//! Self-declaration is safe because the announcement is signed +
-//! TOFU-bound to the entity's ed25519 key — a peer can only lie
-//! about its own subnet, not someone else's. Operators who want
-//! stricter membership use a random `SubnetId` value that's hard
-//! to guess; the value-as-secret pattern matches the substrate's
-//! existing channel-auth-token idiom.
+//! The announcement signature proves *who said it*, not that it is
+//! true: the announcer picks its own tags, `subnet:` is not a
+//! reserved prefix, and any admitted value is disclosed in cleartext
+//! by the very announcement that names it (see
+//! [`group`](super::group) for the full argument). An earlier
+//! revision of this doc claimed self-declaration was "safe" and
+//! suggested a hard-to-guess value as a secret; both claims are
+//! retired. This tag may narrow routing and discovery. It must never
+//! produce an admission on its own — hard access requires a
+//! root-anchored credential (channel token, org/provider grant, or a
+//! `SubnetGrant` per SUBNET_AUTH_PLAN.md).
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -49,12 +54,13 @@ pub const SUBNET_TAG_PREFIX: &str = "subnet:";
 pub struct SubnetId(pub(crate) [u8; 16]);
 
 impl PartialEq for SubnetId {
-    /// Constant-time equality. In the stricter-membership mode
-    /// documented on this module a `SubnetId` is a bearer secret
-    /// ("hard to guess"), so a data-dependent early-exit compare
-    /// leaks it through timing. Delegate to `subtle`'s audited,
-    /// optimizer-resistant `ConstantTimeEq` rather than a hand-rolled
-    /// `black_box` fold.
+    /// Constant-time equality. The value-as-secret framing that
+    /// originally motivated this is retired (a `SubnetId` is a
+    /// routing hint, and its value is disclosed by the announcements
+    /// that carry it), but the constant-time compare stays: it is
+    /// harmless, removing it invites timing-sensitivity questions
+    /// back in review, and deployed configs may still treat values as
+    /// low-value obscurity.
     ///
     /// Consistent with the derived `Hash`/`Eq`, so map-key use is
     /// unaffected (well-known public values like `GLOBAL` compare

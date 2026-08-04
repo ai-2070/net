@@ -58,6 +58,7 @@ use super::mesh::{MeshNode, PeerPublishOutcome, ReplySubscription};
 use super::org_admission_gate::{
     org_request_digest, CapabilityVisibility, OrgProviderPolicy, RegisteredRpcService,
 };
+use super::subnet::SubnetExportBinding;
 
 // ============================================================================
 // Public types.
@@ -665,10 +666,11 @@ enum BridgePreflight {
 ///
 /// 1. captured-service equality (E0.2 P0) — a cross-service REQUEST
 ///    drops;
-/// 2. the public capability gate ([`capability_bridge::may_execute`],
-///    byte-for-byte the same call the unary/response-streaming paths
-///    already made) — skipped only for the `from_node == 0`
-///    loopback/test sentinel;
+/// 2. the public capability admission gate
+///    ([`capability_bridge::may_admit`] — `allowed_nodes` or the
+///    permissive all-empty default; the self-declared subnet/group
+///    axes never admit, per SUBNET_AUTH_PLAN.md S1) — skipped only
+///    for the `from_node == 0` loopback/test sentinel;
 /// 3. on accept, the authenticated response-route cache
 ///    ([`cache_authenticated_response_destination`]).
 ///
@@ -746,7 +748,7 @@ fn bridge_preflight(
     };
     let from_node = inbound.from_node;
     if from_node != 0
-        && !crate::adapter::net::behavior::fold::capability_bridge::may_execute(
+        && !crate::adapter::net::behavior::fold::capability_bridge::may_admit(
             mesh.capability_fold(),
             mesh.node_id(),
             tag,
@@ -1118,6 +1120,35 @@ async fn admit_and_dispatch_protected(
 
     // Provider self-verify (E1.3) against ONE clock sample.
     let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
+
+    // D7 — the subnet-export binding, revalidated against LIVE state on
+    // every call, for a subnet-exported registration only. Runs BEFORE
+    // the expensive org-admission signature work (it is two binary
+    // probes and four integer compares) and BEFORE the failed-admission
+    // throttle: a denial here is provider-side authority movement
+    // (credentials or boundaries replaced, floor raised, epoch
+    // advanced, expiry), never caller proof abuse, so it is not charged
+    // against the caller's budget. The coarse reason deliberately does
+    // not disclose WHICH term failed.
+    let subnet_export_facts = match reg.subnet_export() {
+        Some(binding) => match gate::verify_subnet_export(mesh, binding, &clock) {
+            Ok(facts) => Some(facts),
+            Err(denied) => {
+                emit_admission_denial(
+                    mesh,
+                    resp_tx,
+                    service,
+                    claimed_origin,
+                    call_id,
+                    from_node,
+                    denied.coarse(),
+                );
+                return;
+            }
+        },
+        None => None,
+    };
+
     let facts = match gate::verify_provider_authority(mesh, &clock) {
         Ok(f) => f,
         Err(d) => {
@@ -1221,8 +1252,18 @@ async fn admit_and_dispatch_protected(
         clock,
         // §9.5 stability: the view captured before verification must still be
         // live at the replay insert, or the stale decision is denied without
-        // consuming a slot.
-        || captured_stamp.is_current(&gate::capture_admission_stamp(mesh)),
+        // consuming a slot. For a subnet-exported registration BOTH stamps
+        // must hold — the org security view AND the subnet-export view
+        // (gateway/boundary snapshot identity + both epochs) — so a
+        // wholesale credential or boundary replacement, a floor, or an
+        // epoch advance landing mid-verification denies rather than
+        // admitting against a dead view.
+        || {
+            captured_stamp.is_current(&gate::capture_admission_stamp(mesh))
+                && subnet_export_facts
+                    .as_ref()
+                    .is_none_or(|facts| facts.is_current(mesh))
+        },
         |proof| (reg.provider_policy())(proof),
     );
     match outcome {
@@ -1239,8 +1280,21 @@ async fn admit_and_dispatch_protected(
         Err(denied) => {
             // §6 — charge the failure. A denial is what an attacker produces;
             // a legitimate caller's admissions succeed and cost nothing.
-            mesh.admission_rate_limiter()
-                .on_failure(from_node, clock.monotonic);
+            //
+            // EXCEPT `AuthorityChanged` (D7): the §9.5 stability recheck
+            // failing means the PROVIDER's security view moved mid-
+            // verification — an org authority/floor swap, or a subnet
+            // gateway/boundary republication under a subnet-exported
+            // registration. That is provider-side state movement, not
+            // malformed caller behavior, and charging it would let the
+            // provider's own churn exhaust an honest caller's budget.
+            if !matches!(
+                denied,
+                crate::adapter::net::behavior::org_admission::AdmissionDenied::AuthorityChanged
+            ) {
+                mesh.admission_rate_limiter()
+                    .on_failure(from_node, clock.monotonic);
+            }
             tracing::warn!(service = service, reason = ?denied, "nrpc: org admission denied");
             emit_admission_denial(
                 mesh,
@@ -3197,6 +3251,66 @@ impl MeshNode {
         )
     }
 
+    /// Register a SUBNET-EXPORTED unary RPC handler (SUBNET_AUTH_PLAN.md
+    /// D7): everything [`Self::serve_rpc_protected`] requires, PLUS an
+    /// immutable binding of this service to ONE exact declared subnet
+    /// crossing. The call's execution is conditioned on this node
+    /// CURRENTLY holding the authority to export through that crossing —
+    /// gateway credentials with exact `EXPORT` at the bound path, the
+    /// path declared in the live [`SubnetBoundarySet`], matching
+    /// topology/auth epochs, unexpired — revalidated on EVERY call
+    /// before organization admission. The external caller proves org
+    /// admission and never joins this node's subnet.
+    ///
+    /// Registration fails up front when the shape is impossible NOW
+    /// ([`ServeError::SubnetExportUnauthorized`]); passing here is not
+    /// standing authority — credentials replace wholesale, boundaries
+    /// replace wholesale, floors and epochs move, and any of those
+    /// darkens the live service until exact current authority returns.
+    ///
+    /// [`SubnetBoundarySet`]: crate::adapter::net::subnet::SubnetBoundarySet
+    pub fn serve_rpc_subnet_exported<H: RpcHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+        admission: OrgAdmission,
+        export: SubnetExportBinding,
+        provider_policy: OrgProviderPolicy,
+    ) -> Result<ServeHandle, ServeError> {
+        if matches!(admission, OrgAdmission::PublicAuthenticated) {
+            return Err(ServeError::InvalidProtectedRegistration(
+                "admission mode must be org-protected (OwnerDelegated / CrossOrgGranted), \
+                 not PublicAuthenticated"
+                    .to_string(),
+            ));
+        }
+        if self.node_authority().is_none() {
+            return Err(ServeError::ProtectedAuthorityRequired(service.to_string()));
+        }
+        // Registration-time shape check: the declared boundary must exist
+        // exactly and this node must hold current exact EXPORT authority
+        // at it. This prevents a service from STARTING in an impossible
+        // shape; the per-call revalidation in the dispatch gate is the
+        // authority decision.
+        let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
+        if let Err(denied) =
+            crate::adapter::net::org_admission_gate::verify_subnet_export(self, &export, &clock)
+        {
+            return Err(ServeError::SubnetExportUnauthorized(format!(
+                "{service}: {denied:?}"
+            )));
+        }
+        self.serve_rpc_unary_impl(
+            service,
+            handler,
+            UnaryAdmission::SubnetExported {
+                admission,
+                export,
+                provider_policy,
+            },
+        )
+    }
+
     /// Test-only (review-7 RED negative control): register a protected service
     /// whose dispatch bypasses ONLY `verify_org_admission`. NOT a production API —
     /// compiled out without `cfg(test)`. Requires an installed authority and an
@@ -3516,6 +3630,27 @@ impl MeshNode {
             UnaryAdmission::Granted { provider_policy } => {
                 RegisteredRpcService::granted(registration_id, Arc::from(service), provider_policy)
             }
+            // D7: subnet-exported — an org-protected registration bound to
+            // one exact declared crossing, captured immutably.
+            UnaryAdmission::SubnetExported {
+                admission,
+                export,
+                provider_policy,
+            } => match RegisteredRpcService::subnet_exported(
+                registration_id,
+                Arc::from(service),
+                admission,
+                export,
+                provider_policy,
+            ) {
+                Ok(reg) => reg,
+                Err(e) => {
+                    self.unregister_rpc_inbound(channel_hash, registration_id);
+                    self.rpc_local_services_arc()
+                        .remove_if(service, registration_id);
+                    return Err(ServeError::InvalidProtectedRegistration(e.to_string()));
+                }
+            },
             // Test-only (review-7 RED): a protected registration marked to bypass
             // ONLY the org-admission engine. Same shape validation as a normal
             // protected registration; the disabled flag is the sole difference.
@@ -6092,6 +6227,13 @@ pub enum ServeError {
     /// [`RegisteredRpcService::protected`] shape check.
     #[error("invalid protected registration: {0}")]
     InvalidProtectedRegistration(String),
+    /// A subnet-exported registration whose declared crossing is not
+    /// currently authorized (SUBNET_AUTH_PLAN.md D7): no boundary set
+    /// or gateway credentials installed, the binding is not an exact
+    /// declared boundary, exact `EXPORT` is absent, or the epochs /
+    /// expiry / floors have moved past the binding.
+    #[error("subnet export not authorized: {0}")]
+    SubnetExportUnauthorized(String),
 }
 
 /// The admission shape for a unary serve registration (E1.1), threaded from the
@@ -6115,6 +6257,16 @@ enum UnaryAdmission {
     /// [`OrgAdmission::CrossOrgGranted`] invocation authority, and an explicit
     /// provider policy.
     Granted { provider_policy: OrgProviderPolicy },
+    /// SUBNET_AUTH_PLAN.md D7: an org-protected registration additionally
+    /// bound to ONE exact declared subnet crossing. Dispatch revalidates
+    /// the binding against live gateway/boundary/epoch state per call,
+    /// BEFORE org admission; discovery visibility stays `Public` —
+    /// subnet export is an execution boundary, not a discovery mode.
+    SubnetExported {
+        admission: OrgAdmission,
+        export: SubnetExportBinding,
+        provider_policy: OrgProviderPolicy,
+    },
     /// Test-only (review-7 RED negative control): a protected registration whose
     /// dispatch bypasses ONLY `verify_org_admission`. Not reachable from any
     /// production serve wrapper; compiled out entirely without `cfg(test)`.
@@ -6132,7 +6284,9 @@ impl UnaryAdmission {
     /// (OA3-4b1 / OA3-4b2).
     fn visibility(&self) -> CapabilityVisibility {
         match self {
-            Self::Public | Self::Protected { .. } => CapabilityVisibility::Public,
+            Self::Public | Self::Protected { .. } | Self::SubnetExported { .. } => {
+                CapabilityVisibility::Public
+            }
             Self::OwnerScoped { .. } => CapabilityVisibility::OwnerScoped,
             Self::Granted { .. } => CapabilityVisibility::GrantedAudience,
             #[cfg(test)]
@@ -6170,9 +6324,10 @@ impl UnaryAdmission {
     fn response_route_fallback(&self) -> ResponseRouteFallback {
         match self {
             Self::Public => ResponseRouteFallback::RosterOnStaleDirect,
-            Self::Protected { .. } | Self::OwnerScoped { .. } | Self::Granted { .. } => {
-                ResponseRouteFallback::DirectOnly
-            }
+            Self::Protected { .. }
+            | Self::OwnerScoped { .. }
+            | Self::Granted { .. }
+            | Self::SubnetExported { .. } => ResponseRouteFallback::DirectOnly,
             // The RED negative control must route exactly like the protected
             // registration it is the control FOR, or the witness would differ
             // from production on the response leg as well as the gate.

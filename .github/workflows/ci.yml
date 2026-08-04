@@ -503,7 +503,7 @@ jobs:
 
   # --- Family A: bare bus/FFI + net mesh -------------------------------
   integration-net-core:
-    name: Integration — net core (bus/FFI, mesh, capability, migration, nRPC dispatch)
+    name: Integration — net core (bus/FFI, mesh, capability, subnets, migration, nRPC dispatch)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -584,7 +584,7 @@ jobs:
 
       # === Net mesh + capability + discovery + migration + nRPC dispatch ==
       # All --features net tests share one compile.
-      - name: Net mesh, capability, migration, nRPC dispatch
+      - name: Net mesh, capability, subnets, migration, nRPC dispatch
         if: ${{ !cancelled() }}
         run: >
           cargo nextest run --no-fail-fast --no-tests=fail --features "net fixtures"
@@ -599,6 +599,16 @@ jobs:
           --test peer_death_evicts_peer_map
           --test send_subprotocol_malformed
           --test subnet_enforcement
+          --test subnet_axis_demotion
+          --test subnet_gateway_auth
+          --test subnet_gateway_local_auth
+          --test subnet_grant
+          --test subnet_grant_hierarchy
+          --test subnet_org_boundary
+          --test subnet_revocation
+          --test subnet_route_hop_alloc
+          --test subnet_session_auth
+          --test subnet_control_facts
           --test integration_placement_filter_callback
           --test capability_broadcast
           --test capability_multihop
@@ -622,6 +632,7 @@ jobs:
           --test error_kind_mirror
           --test event_pingwave
           --test route_withdraw
+          --test routed_transport_availability
 
   # --- Family B: NAT traversal + port mapping + RedEX ------------------
   integration-nat-redex:
@@ -659,10 +670,15 @@ jobs:
           tool: nextest
 
       # === NAT traversal ==================================================
+      # `fixtures` rides alongside `nat-traversal` because these tests
+      # use the gated test seams (`peer_session_for_test` in
+      # direct_upgrade). The seams are cfg'd `any(test, fixtures)` ONLY:
+      # `nat-traversal` is a production feature and must not expose
+      # them, so the tests opt in explicitly here instead.
       - name: NAT traversal
         if: ${{ !cancelled() }}
         run: >
-          cargo nextest run --no-fail-fast --no-tests=fail --features "net nat-traversal"
+          cargo nextest run --no-fail-fast --no-tests=fail --features "net nat-traversal fixtures"
           --test connect_direct
           --test nat_classify
           --test peer_death_clears_capability_index
@@ -750,6 +766,7 @@ jobs:
           --test integration_nrpc_loopback
           --test integration_nrpc_mesh
           --test integration_nrpc_protected
+          --test subnet_auth_e2e
           --test integration_nrpc_streaming
           --test integration_nrpc_client_streaming
           --test integration_nrpc_duplex
