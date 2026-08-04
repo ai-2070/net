@@ -74,8 +74,13 @@ base64 = { version = "0.23", optional = true }
 
 [dev-dependencies]
 # Re-declare the core dependency with its `fixtures` seam for THIS
-# crate's own tests (feature unification applies it to every test /
-# bench / example build, never to downstream consumers of the lib).
+# crate's own tests. Dev-deps never propagate to downstream consumers
+# of the lib — but WITHIN the workspace, feature unification is wider
+# than this crate: `cargo test --workspace` builds dev-deps, so this
+# line turns `fixtures` on for net-mesh in EVERY crate of that
+# invocation, not just the SDK's own test targets. Worth knowing
+# before debugging why a fixtures-gated seam is reachable from a
+# sibling crate's tests.
 # `tests_call.rs` pins TOFU entities via `test_pin_peer_entity`, which
 # is cfg'd `any(test, feature = "fixtures")` in net-mesh — and the
 # dependency's `test` cfg is never active when the SDK is the crate

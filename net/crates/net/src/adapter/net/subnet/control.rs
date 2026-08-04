@@ -511,6 +511,19 @@ impl SubnetExportPolicy {
     /// Variable-width payload (the channel list is length-prefixed by
     /// a single strict count byte).
     fn signed_payload(&self) -> Vec<u8> {
+        // Reachable with a >255 list only through a struct literal —
+        // `try_issue` and `from_bytes` both enforce
+        // `MAX_EXPORTED_CHANNELS` (16). The `as u8` would truncate
+        // the count byte for such a value and break the round trip
+        // (the payload length still differs, so no signature
+        // collision is constructible); assert the invariant instead
+        // of encoding a self-inconsistent payload.
+        debug_assert!(
+            self.exported_channels.len() <= MAX_EXPORTED_CHANNELS,
+            "exported_channels ({}) exceeds MAX_EXPORTED_CHANNELS — \
+             constructed around try_issue?",
+            self.exported_channels.len(),
+        );
         let mut buf = Vec::with_capacity(Self::wire_size(self.exported_channels.len()) - 64);
         buf.push(self.version);
         buf.extend_from_slice(self.scope.authority.as_bytes());

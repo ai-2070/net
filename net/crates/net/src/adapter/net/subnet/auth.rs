@@ -2192,11 +2192,20 @@ pub fn build_gateway_context_set(
                 // outlive the shorter-lived credential behind it.
                 existing.expires_at = existing.expires_at.min(entry.expires_at);
             }
-            None => entries.push(entry),
+            None => {
+                entries.push(entry);
+                // Enforced at each push, not after the loop: the cap
+                // is on DISTINCT scopes (an input merging down to few
+                // scopes is fine however long it is), and checking
+                // here bounds the linear probe above to the cap
+                // instead of letting a caller-supplied Vec make the
+                // merge quadratic in its own length. Same accept set:
+                // the distinct count only grows.
+                if entries.len() > MAX_GATEWAY_CONTEXTS_PER_AUTHORITY {
+                    return Err(SubnetAuthError::TooManyGatewayContexts);
+                }
+            }
         }
-    }
-    if entries.len() > MAX_GATEWAY_CONTEXTS_PER_AUTHORITY {
-        return Err(SubnetAuthError::TooManyGatewayContexts);
     }
     let topology_epoch = entries.first().map_or(0, |e| e.topology_epoch);
     let subnet_auth_epoch = entries.first().map_or(0, |e| e.subnet_auth_epoch);
@@ -2254,8 +2263,13 @@ pub fn verify_admission(
     if presentation.verifier != expected.verifier {
         return Err(SubnetAuthError::WrongVerifier);
     }
-    // Constant-time nonce comparison: the challenge is a one-use
-    // secret until consumed.
+    // Defence in depth, NOT the one-use enforcement: `expected` is
+    // built from the challenge the store already matched against this
+    // same nonce, so through the production call path this comparison
+    // cannot fail — the single-use property is `consume`'s
+    // unconditional removal. Kept (and constant-time) so a caller
+    // that assembles an `ExpectedBinding` some other way still cannot
+    // pass a foreign nonce through.
     if !bool::from(subtle::ConstantTimeEq::ct_eq(
         &presentation.verifier_nonce[..],
         &expected.verifier_nonce[..],
