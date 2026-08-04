@@ -325,7 +325,14 @@ impl Iterator for AncestorPath {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = match self.next {
             None => 0,
-            Some(id) => id.depth() as usize + 1,
+            // Each `parent()` step clears exactly the deepest non-zero
+            // level and the walk ends at GLOBAL, so the chain length is
+            // the number of non-zero levels plus one. `depth() + 1`
+            // over-counts interior-zero paths (`3.0.7` has depth 3 but
+            // walks `3.0.7`, `3`, `global`), and the wire decoders
+            // accept those paths via `from_raw` without canonical
+            // rejection.
+            Some(id) => id.raw().to_be_bytes().iter().filter(|b| **b != 0).count() + 1,
         };
         (remaining, Some(remaining))
     }
@@ -544,13 +551,20 @@ mod tests {
 
         // Every path is bounded, and `size_hint` matches what is
         // actually produced — a caller sizing a stack buffer from it
-        // must not be lied to.
+        // must not be lied to. The domain includes interior-zero raws
+        // for the same reason the meet-property test below walks them:
+        // every wire decoder reaches `from_raw` without canonical
+        // rejection, so exactness must hold there too, where the walk
+        // is shorter than `depth() + 1`.
         for raw in [
             0x00000000u32,
             0x03000000,
             0x03070000,
             0x03070200,
             0x01020304,
+            0x03000700,
+            0x00000009,
+            0x00070009,
         ] {
             let id = SubnetId::from_raw(raw);
             let path = id.ancestor_path();
