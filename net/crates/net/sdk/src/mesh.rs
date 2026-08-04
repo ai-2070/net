@@ -383,8 +383,15 @@ impl MeshBuilder {
         if let Some(channel) = self.subnet_control_channel {
             config = config.with_subnet_control_channel(channel);
         }
-        let subnet_exports = crate::subnet::NamedSubnetExports::try_new(self.subnet_exports)
-            .map_err(|e| SdkError::Config(e.to_string()))?;
+        // Review-10 P1-6: the checked map is the NODE's, resolved and
+        // frozen by `MeshNode::new`. Pushing the entries into the config
+        // rather than building a second map here is what keeps Rust,
+        // Node, Python, Go, and C resolving one name against one map.
+        // Empty and duplicate labels still fail before the node exists —
+        // just one layer down.
+        for export in self.subnet_exports {
+            config = config.with_subnet_export(export);
+        }
         #[cfg(feature = "nat-traversal")]
         if let Some(external) = self.reflex_override {
             config = config.with_reflex_override(external);
@@ -426,7 +433,6 @@ impl MeshBuilder {
             node: Arc::new(node),
             channel_configs,
             identity: sdk_identity,
-            subnet_exports: Arc::new(subnet_exports),
             #[cfg(feature = "tool")]
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "tool")]
@@ -458,13 +464,6 @@ pub struct Mesh {
     /// `MeshNode` was already handed a clone of the keypair, so this
     /// is purely for the auxiliary state that rides alongside.
     identity: Option<crate::identity::Identity>,
-    /// The immutable named-export map resolved at `build()`
-    /// (SUBNET_AUTH_SDK_PLAN.md §3.3) — Rust-owned, stored beside the
-    /// handle, never inside capability discovery or mutable core
-    /// authority state. Empty for meshes constructed through
-    /// [`Mesh::from_node_arc`]: a binding retains its own checked map
-    /// beside its `Arc<MeshNode>` and passes it to the serve seam.
-    subnet_exports: Arc<crate::subnet::NamedSubnetExports>,
     /// Lazy auto-install state for the `tool.metadata.fetch` nRPC
     /// service. The first `Mesh::serve_tool` call locks this
     /// mutex, sees `None`, installs the handler, and stores
@@ -1310,11 +1309,6 @@ impl Mesh {
             node,
             channel_configs,
             identity,
-            // Empty by design: named exports are CONSTRUCTION state
-            // (`MeshBuilder::subnet_export`). A binding wrapping an
-            // existing node retains its own checked map beside its
-            // `Arc<MeshNode>` and passes it to the serve seam.
-            subnet_exports: Arc::new(crate::subnet::NamedSubnetExports::default()),
             #[cfg(feature = "tool")]
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "tool")]
@@ -1324,8 +1318,13 @@ impl Mesh {
 
     /// The named subnet exports this mesh was built with
     /// (SUBNET_AUTH_SDK_PLAN.md §3.3). Immutable after construction.
+    ///
+    /// Delegates to the NODE's map (review-10 P1-6). The SDK used to
+    /// keep a second one, which meant a mesh built through
+    /// [`Mesh::from_node_arc`] reported an empty map while the node it
+    /// wrapped held a full one.
     pub fn subnet_exports(&self) -> &crate::subnet::NamedSubnetExports {
-        &self.subnet_exports
+        self.node.subnet_exports()
     }
 
     /// Caller-owned identity bound to this mesh, if any. Returns

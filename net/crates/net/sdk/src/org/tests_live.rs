@@ -437,6 +437,19 @@ async fn subnet_provider_mesh(
     cfg.subnet_attachment = Some(TopologySubnetId::new(PROVIDER_ATTACHMENT));
     cfg.min_announce_interval = Duration::from_millis(50);
     cfg.configured_identity = true;
+    // Review-10 P1-6: the named-export map is NODE state now, so the
+    // fixture configures it here and `Mesh::serve_subnet_exported`
+    // resolves against it. `SameOrg` matches the caller these tests
+    // build (same owner org as the provider).
+    cfg = cfg.with_subnet_export(crate::subnet::NamedSubnetExport {
+        name: FIXTURE_EXPORT_NAME.to_string(),
+        access: crate::subnet::SubnetExportAccess::SameOrg,
+        subnet: SubnetRef {
+            authority: subnet_root().entity_id().clone(),
+            path: TopologySubnetId::new(EXPORTED_CROSSING),
+        },
+        topology_epoch: 0,
+    });
 
     let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
         .await
@@ -470,6 +483,10 @@ async fn subnet_provider_mesh(
     let mesh = Mesh::from_node_arc(node, channel_configs, Some(identity.clone()));
     (mesh, identity, dir)
 }
+
+/// The export label `subnet_provider_mesh` configures. Provider-local:
+/// never announced, never accepted from a caller.
+const FIXTURE_EXPORT_NAME: &str = "factory-export";
 
 /// Gateway provisioning for the exported crossing: the declared boundary
 /// plus this node's own EXPORT credential at exactly that scope.
@@ -897,6 +914,156 @@ async fn live_facade_seam_serves_through_a_named_export() {
         }
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "handler ran exactly once");
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+/// S4 Rust live cell (review-10 P1-8) — the FROZEN provider verb,
+/// end to end, plus a clean close.
+///
+/// `live_facade_seam_serves_through_a_named_export` above drives the
+/// binding seam with a locally-built map. This drives what an ordinary
+/// Rust application actually writes:
+///
+/// ```ignore
+/// mesh.serve_subnet_exported(service, export_name, handler)?;
+/// org.call_exported(service, &req).await?;
+/// ```
+///
+/// It is the reference shape the TypeScript, Python, Go, and C cells
+/// mirror, and it covers the five things the S4 gate asks for in one
+/// run: configure a provider, serve a NAMED export, call it, preserve
+/// caller attribution at the handler, and close without a callback
+/// racing the teardown.
+///
+/// The export is configured on the NODE (review-10 P1-6), so this also
+/// witnesses that `Mesh::serve_subnet_exported` resolves against the
+/// node's map rather than a second SDK-local one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_s4_cell_serve_named_export_call_attribute_and_close() {
+    let a = org_a();
+    let (provider, p_identity, p_dir) = subnet_provider_mesh("s4-provider", &a, false).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("s4-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+    provision_export(&provider, &p_identity);
+
+    // (1) An UNKNOWN name is refused before anything is registered or
+    //     announced — the inverse, asserted first so a later success
+    //     cannot be mistaken for "any name works".
+    let unknown = provider.serve_subnet_exported::<Ping, Pong, _, _>(
+        EXPORT_SERVICE,
+        "no-such-export",
+        |_caller, req: Ping| async move {
+            Ok(Pong {
+                n: req.n,
+                served_by: "unreachable".to_string(),
+            })
+        },
+    );
+    let Err(err) = unknown else {
+        panic!("an unconfigured export name must be refused");
+    };
+    assert!(
+        err.to_string().contains("unknown_export_name"),
+        "the stable kind must ride the registration refusal, got {err}",
+    );
+
+    // (2) The configured name serves, through the frozen verb.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let attribution_ok = Arc::new(AtomicBool::new(false));
+    let calls_in = calls.clone();
+    let attribution_in = attribution_ok.clone();
+    let expected_caller = c_identity.entity_id().clone();
+    let expected_org = a.org_id();
+    let handle = provider
+        .serve_subnet_exported::<Ping, Pong, _, _>(
+            EXPORT_SERVICE,
+            FIXTURE_EXPORT_NAME,
+            move |caller: crate::org::OrgCaller, req: Ping| {
+                let calls_in = calls_in.clone();
+                let attribution_in = attribution_in.clone();
+                let expected_caller = expected_caller.clone();
+                async move {
+                    calls_in.fetch_add(1, Ordering::SeqCst);
+                    // Attribution is the provider's VERIFIED view, never
+                    // anything the caller asserted.
+                    if caller.entity == expected_caller
+                        && caller.acting_org == expected_org
+                        && caller.provider_org == expected_org
+                    {
+                        attribution_in.store(true, Ordering::SeqCst);
+                    }
+                    Ok(Pong {
+                        n: req.n + 1,
+                        served_by: "s4-cell".to_string(),
+                    })
+                }
+            },
+        )
+        .expect("the configured export name serves");
+
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let credentials = OrgCredentials::new(cert, dg, vec![], vec![]).expect("credentials");
+    let org = caller.org(credentials).expect("bind");
+
+    assert!(
+        converge_public_discovery(&provider, &caller, EXPORT_SERVICE).await,
+        "the named export must be publicly discoverable with a verified owner",
+    );
+
+    // (3) The call, and (4) the attribution it carried.
+    let pong: Pong = org
+        .call_exported(EXPORT_SERVICE, &Ping { n: 100 })
+        .await
+        .expect("the exported call is admitted");
+    assert_eq!(
+        pong,
+        Pong {
+            n: 101,
+            served_by: "s4-cell".to_string()
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "handler ran exactly once");
+    assert!(
+        attribution_ok.load(Ordering::SeqCst),
+        "the handler saw the verified four-party attribution",
+    );
+
+    // (5) Teardown. `ServeHandle` unregisters on Drop; a call after it
+    //     must not reach a handler that is no longer registered — the
+    //     callback-race shape the S4 gate asks about. The bridge task
+    //     exits on its own once the dispatcher's sender is dropped, so
+    //     "dropped" has to mean "no further dispatch", not "eventually".
+    drop(handle);
+    // Bounded: after teardown the provider is still an announced
+    // candidate for a while, so the call reaches it and gets nothing
+    // back. What must NOT happen is a handler invocation — an unbounded
+    // wait here would turn a correct refusal into a hung test.
+    let after = tokio::time::timeout(
+        Duration::from_secs(5),
+        org.call_exported::<Ping, Pong>(EXPORT_SERVICE, &Ping { n: 200 }),
+    )
+    .await;
+    match after {
+        Err(_elapsed) => { /* no reply, as expected */ }
+        Ok(Err(_denied)) => { /* refused, also expected */ }
+        Ok(Ok(reply)) => panic!("a call after teardown must not be served; got {reply:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no handler invocation may land after teardown",
+    );
 
     let _ = std::fs::remove_dir_all(&p_dir);
     let _ = std::fs::remove_dir_all(&c_dir);
