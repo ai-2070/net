@@ -36,6 +36,19 @@
  * startup-shaped failure — never a call domain. Remote exported-call
  * refusals surface through the org call domains (net_org.h).
  *
+ * # Known gap: subnet TRUST ANCHORS are not configurable from C
+ *
+ * Declaring which authorities a node trusts, its security attachment path,
+ * and its control channel is CONFIG-TIME state on the Rust MeshNodeConfig,
+ * with no post-construction installer. C (like Go) receives its node from
+ * base libnet's constructor, which cannot reach the SDK module that
+ * converts those DTOs — so neither binding can declare trust anchors
+ * today. Everything in this header works: serving exports, and every
+ * runtime administration verb below.
+ *
+ * A node acting as a subnet GATEWAY should be constructed from Rust,
+ * Node, or Python, which do expose that construction-time config.
+ *
  * # Handle & ownership model
  *
  * Identical to net_org.h: every mesh_arc comes from net_mesh_arc_clone
