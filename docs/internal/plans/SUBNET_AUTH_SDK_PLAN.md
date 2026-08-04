@@ -71,15 +71,9 @@ No binding may duplicate these rules.
 1. organization admission and provider policy; and
 2. one exact live subnet crossing.
 
-The immutable `SubnetExportBinding` captures:
+The immutable `SubnetExportBinding` captures exactly two values: one authority-qualified crossing (`subnet: SubnetRef`) and one topology epoch. It does not carry gateway state, a separately marshaled boundary, or a rights mask.
 
-- authority;
-- gateway;
-- boundary;
-- `EXPORT` right;
-- topology epoch.
-
-Dispatch samples gateway and boundary from one authority aggregate, then revalidates the exact binding before organization admission. Authority movement returns the existing uncharged coarse `AuthorityChanged` denial. The SDK must not retry that signed call automatically.
+Per call, dispatch samples gateway and boundary from one authority aggregate and checks the five-way pin: exact authority/crossing from the binding, live gateway state, an exact declared boundary, exact-scope `EXPORT`, and the bound topology epoch. It performs that check before organization admission. Authority movement between the sampled state and dispatch returns the existing uncharged coarse `AuthorityChanged` denial, and the SDK must not retry that signed call automatically. Authority state that is already absent or invalid at the precheck—missing boundary, missing `EXPORT`, wrong epoch, or unavailable gateway authority—maps to coarse `ProviderAuthorityUnavailable`, not `AuthorityChanged`.
 
 ### 2.4 Discovery remains public
 
@@ -268,7 +262,8 @@ Add focused tests proving the current gaps:
 - provider and owner are returned coherently under announcement replacement/floor retraction;
 - `AuthorityChanged` consumes neither replay capacity nor external quota;
 - `call_exported` never retries;
-- binding-style byte provisioning rejects malformed artifacts before mutating node state.
+- binding-style byte provisioning rejects malformed artifacts before mutating node state;
+- create `net/crates/net/tests/subnet_relay_alloc_e2e.rs` as the owed production-path protected-relay allocation witness; keep the existing primitive `subnet_route_hop_alloc` gate unchanged and independently pinned.
 
 ### R1 — coherent public ownership query
 
@@ -364,7 +359,7 @@ net-mesh subnet inspect
 
 `issue-issuer`
 
-- creates a bounded issuer grant with explicit scope, rights, depth, generation, and validity;
+- creates a bounded issuer grant with explicit authority, scope, topology epoch, issuer, maximum rights, generation, and validity window; one-hop depth is structural and has no CLI flag;
 - writes the signed intermediate artifact.
 
 `issue-delegated`
@@ -532,15 +527,21 @@ The live integration test keeps this exact gate:
 #![cfg(all(feature = "net", feature = "cortex", feature = "fixtures"))]
 ```
 
-Run:
+Existing gates that run today:
 
 ```bash
-cargo test -p net --features "net cortex fixtures" --test subnet_auth_e2e
-cargo test -p net --features "net fixtures" --test subnet_gateway_local_auth
-cargo test -p net --features "net fixtures" --test subnet_relay_alloc_e2e
+cargo test -p net-mesh --features "net cortex fixtures" --test subnet_auth_e2e
+cargo test -p net-mesh --features "net fixtures" --test subnet_gateway_local_auth
+cargo test -p net-mesh --features "net" --test subnet_route_hop_alloc
 ```
 
-Do not treat a compile without `fixtures` as evidence; that configuration cannot build the current E2E harness.
+The release also creates and runs the owed production-path allocation target:
+
+```bash
+cargo test -p net-mesh --features "net fixtures" --test subnet_relay_alloc_e2e
+```
+
+That command is a post-S0 gate; it does not exist at the reviewed baseline and must not be reported as current evidence. Do not treat a `subnet_auth_e2e` compile without `fixtures` as evidence; that configuration cannot build the current E2E harness. The existing `subnet_route_hop_alloc` primitive witness remains unchanged and independently pinned.
 
 ### 7.2 Required negative witnesses
 
@@ -564,6 +565,8 @@ At minimum:
 - authority moves between discovery and dispatch: one uncharged `AuthorityChanged`, no retry;
 - `serve_rpc_protected` behavior remains byte-for-byte/semantically unchanged by the facade.
 
+Tests must assert the correct coarse denial boundary: unavailable or failed authority state at the precheck is `ProviderAuthorityUnavailable`; only movement after the coherent sample reaches `AuthorityChanged`.
+
 ### 7.3 Binding evidence
 
 Avoid a 5×5 cross-language matrix. Each language needs:
@@ -576,6 +579,8 @@ Avoid a 5×5 cross-language matrix. Each language needs:
 6. handle close/cancellation coverage appropriate to the runtime.
 
 Shared fixed public artifacts may be committed under a fixtures directory. Private fixture seeds stay test-only source constants and must never be packaged.
+
+R4 also generates one small stable-kind fixture directly from the canonical Rust match. Node, Python, Go, and C consume that same fixture to prove every exported `subnet:<kind>` classification stays synchronized. This is a local error-contract drift guard, not a pairwise interoperability matrix and not a second source of error names.
 
 ### 7.4 Compile and packaging gates
 
@@ -591,7 +596,7 @@ Run the repository's exact existing commands for each touched crate/package, inc
 - rustdoc with warnings denied;
 - `git diff --check`.
 
-CI must pin `subnet_auth_e2e` exactly once in the CortEX/nRPC/AI Tools nextest family with `cortex tool fixtures`, and `subnet_relay_alloc_e2e` exactly once in the net mesh/capability/subnets/migration/nRPC family with `net fixtures`.
+CI must keep `subnet_auth_e2e` pinned exactly once in the CortEX/nRPC/AI Tools nextest family with `cortex tool fixtures`. After S0 creates `subnet_relay_alloc_e2e`, pin it exactly once in the net mesh/capability/subnets/migration/nRPC family with `net fixtures`. Keep the existing independent `subnet_route_hop_alloc` pin; neither allocation witness replaces the other.
 
 ---
 
@@ -664,9 +669,9 @@ Update all versioned manifests, generated declarations/stubs, headers, export ma
 
 | Stage | Deliverable | Exit gate |
 |---|---|---|
-| S0 | RED contracts for public-owned discovery, exported caller, byte provisioning | focused REDs fail for the intended reason |
+| S0 | RED contracts for public-owned discovery, exported caller, byte provisioning; create the owed `subnet_relay_alloc_e2e` target | focused REDs fail for the intended reason; the production-path allocation target exists and runs independently of the primitive witness |
 | S1 | coherent public owner query + `OrgClient::call_exported` | focused unit/live tests green; no sensing/OLB dependency |
-| S2 | Rust subnet facade + stable local errors | SDK compile/tests and core inverses green |
+| S2 | Rust subnet facade + stable local errors + generated stable-kind fixture | SDK compile/tests, core inverses, and fixture regeneration green |
 | S3 | offline CLI artifacts | round-trip, permissions, overwrite, malformed-input tests green |
 | S4 | Node, Python, Go, C adapters | per-language provider/caller smoke and negative tests green |
 | S5 | skill, public docs, examples, coverage anchors | links, snippets, matrices, generated artifacts synchronized |
@@ -705,7 +710,10 @@ The subnet SDK is releasable only when all are true:
 - [ ] Signed artifacts are generated by the CLI and consumed as canonical opaque bytes.
 - [ ] Private root material crosses only through checked file paths.
 - [ ] The required `net + cortex + fixtures` E2E gate is green at exact head.
+- [ ] Existing `subnet_route_hop_alloc` remains green and independently pinned.
+- [ ] The new production-path `subnet_relay_alloc_e2e` target exists, is green, and is pinned exactly once in its specified CI family.
 - [ ] Focused inverse tests prove unrelated placement, wrong crossing, stale control, and unowned public discovery fail closed.
+- [ ] Every language consumes the Rust-generated stable-kind fixture without drift.
 - [ ] Rust, Node, Python, Go, and C package/compile tests are green.
 - [ ] Skills, public docs, examples, coverage anchors, generated declarations, and release notes match the shipped symbols.
 - [ ] Organization load balancing remains dark in API, docs, examples, and release notes.
