@@ -17298,6 +17298,13 @@ impl MeshNode {
     fn relay_protected_hop(data: &[u8], ctx: &DispatchCtx) {
         use super::subnet::route_hop;
 
+        // Measured-section marker for the production allocation witness
+        // (`tests/subnet_relay_alloc_e2e.rs`). RAII, so it covers every
+        // early return below. Compiled out of production builds; see
+        // `subnet::alloc_probe` for why the witness needs it.
+        #[cfg(any(test, feature = "fixtures"))]
+        let _relay_section = super::subnet::alloc_probe::RelaySection::enter();
+
         // ONE authority snapshot for the whole relay decision:
         // credentials and boundaries come from the same published
         // aggregate, so a wholesale replacement landing mid-relay can

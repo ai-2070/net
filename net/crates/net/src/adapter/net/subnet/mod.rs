@@ -13,6 +13,8 @@
 //! `SubnetGrant`s for protected transport rights.
 
 pub mod admission;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod alloc_probe;
 mod assignment;
 pub mod auth;
 pub mod control;

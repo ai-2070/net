@@ -321,6 +321,212 @@ async fn live_same_org_call_through_the_facade() {
 }
 
 // ---------------------------------------------------------------------------
+// SSDK S0 — the discovery gap the exported caller verb exists to close
+// ---------------------------------------------------------------------------
+
+/// A subnet-exported provider announces on the PUBLIC capability plane
+/// (`UnaryAdmission::SubnetExported` carries `CapabilityVisibility::Public`),
+/// while `OrgClient::call` discovers exclusively through encrypted private
+/// announcements. The private-only verb therefore cannot reach a
+/// subnet-exported service: the provider is live and correctly provisioned,
+/// the caller's credentials are impeccable and SHOWN to work against a
+/// private registration of the same service, yet private discovery resolves
+/// zero candidates and the call fails locally with nothing sent.
+///
+/// This is a permanent contract, not a temporary RED
+/// (`SUBNET_AUTH_SDK_PLAN.md` §2.4/§3.6): the gap is closed by a NEW verb,
+/// `call_exported`, and `call` stays private-only. The handler-never-ran
+/// assertion is what makes the gap claim exact rather than inferred from an
+/// error string.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_private_call_cannot_reach_a_subnet_exported_service() {
+    use net::adapter::net::behavior::org_admission::OrgAdmission;
+    use net::adapter::net::cortex::{
+        RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+    };
+    use net::adapter::net::identity::EntityKeypair;
+    use net::adapter::net::subnet::{
+        admission::unix_now_secs, SubnetAuthorityConfig, SubnetBoundarySet, SubnetCredentialSet,
+        SubnetExportBinding, SubnetGrant, SubnetRef, SubnetRights, TopologySubnetId,
+    };
+
+    const SERVICE: &str = "fleet.telemetry";
+    const DAY: u64 = 24 * 60 * 60;
+    /// The provider's local attachment and the exported crossing under it.
+    const ATTACHMENT: &[u8] = &[3];
+    const EXPORTED: &[u8] = &[3, 9];
+
+    struct CountingHandler {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for CountingHandler {
+        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RpcResponsePayload {
+                status: RpcStatus::Ok,
+                headers: vec![],
+                body: bytes::Bytes::from_static(b"telemetry-window"),
+            })
+        }
+    }
+
+    /// `fast_mesh` plus the subnet plane: authority roots and the local
+    /// attachment are CONSTRUCTION state (`MeshNodeConfig`), so a
+    /// subnet-exported provider must be built with them — there is no
+    /// post-construction configure seam, deliberately.
+    async fn subnet_provider_mesh(
+        tag: &str,
+        owner: &OrgKeypair,
+        subnet_authority: SubnetAuthorityConfig,
+        attachment: TopologySubnetId,
+    ) -> (Mesh, Identity, std::path::PathBuf) {
+        let identity = Identity::generate();
+        let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0x51u8; 32])
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(5))
+            .with_subnet_authority(subnet_authority);
+        cfg.subnet_attachment = Some(attachment);
+        cfg.min_announce_interval = Duration::from_millis(50);
+        cfg.configured_identity = true;
+
+        let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
+            .await
+            .expect("MeshNode::new");
+        let channel_configs = Arc::new(ChannelConfigRegistry::new());
+        node.set_channel_configs(channel_configs.clone());
+        let node = Arc::new(node);
+
+        let entity = identity.entity_id().clone();
+        let cert = OrgMembershipCert::try_issue(owner, entity.clone(), 1, 3600).expect("cert");
+        let dir = std::env::temp_dir().join(format!(
+            "net-ssdk-s0-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
+        node.install_node_authority(Arc::new(authority))
+            .expect("install authority");
+        node.set_owner_cert_emission(true)
+            .expect("enable owner-cert emission");
+
+        let mesh = Mesh::from_node_arc(node, channel_configs, Some(identity.clone()));
+        (mesh, identity, dir)
+    }
+
+    let a = org_a();
+    // The provider is BOTH an org member and a subnet-exported gateway:
+    // its subnet authority is a separate vertical root, per doctrine.
+    let subnet_root = EntityKeypair::from_bytes([0xD7; 32]);
+    let (provider, p_identity, p_dir) = subnet_provider_mesh(
+        "live-subnet-export-provider",
+        &a,
+        SubnetAuthorityConfig {
+            authority: subnet_root.entity_id().clone(),
+            roots: vec![subnet_root.entity_id().clone()],
+            maximum_grant_lifetime_secs: 7 * DAY,
+        },
+        TopologySubnetId::new(ATTACHMENT),
+    )
+    .await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) =
+        fast_mesh("live-subnet-export-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+
+    provider
+        .node()
+        .declare_subnet_boundaries(SubnetBoundarySet::new(
+            subnet_root.entity_id().clone(),
+            0,
+            [TopologySubnetId::new(EXPORTED)],
+        ));
+    provider
+        .node()
+        .install_subnet_gateway_credentials(&[SubnetCredentialSet::Direct(
+            SubnetGrant::try_issue(
+                &subnet_root,
+                subnet_root.entity_id().clone(),
+                TopologySubnetId::new(EXPORTED),
+                0,
+                p_identity.entity_id().clone(),
+                SubnetRights::EXPORT,
+                1,
+                unix_now_secs() - 60,
+                DAY,
+            )
+            .expect("issue export grant"),
+        )])
+        .expect("install gateway credentials");
+
+    // The subnet-exported registration — the provider under test.
+    let exported_calls = Arc::new(AtomicUsize::new(0));
+    let _serve = provider
+        .node()
+        .serve_rpc_subnet_exported(
+            SERVICE,
+            Arc::new(CountingHandler {
+                calls: exported_calls.clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            SubnetExportBinding::new(
+                SubnetRef {
+                    authority: subnet_root.entity_id().clone(),
+                    path: TopologySubnetId::new(EXPORTED),
+                },
+                0,
+            ),
+            Arc::new(|_| true),
+        )
+        .expect("serve subnet-exported");
+
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let credentials = OrgCredentials::new(cert, dg, vec![], vec![]).expect("credentials");
+    let org = caller.org(credentials).expect("bind");
+
+    // Anti-convergence: give discovery every chance the positive tests
+    // give it — repeated provider announcements, generous polling — and
+    // assert the private view NEVER resolves a candidate.
+    assert!(
+        !converge_discovery(&provider, &org, &cap("nrpc:fleet.telemetry")).await,
+        "private discovery must never resolve a subnet-exported (public-plane) provider",
+    );
+
+    let outcome: Result<Pong, OrgSdkError> = org.call(SERVICE, &Ping { n: 41 }).await;
+    match outcome {
+        Err(OrgSdkError::Discovery(d)) => {
+            assert_eq!(
+                d.wire_kind(),
+                "no_authorized_provider",
+                "the refusal is the local discovery gap, not transport: {d}",
+            );
+        }
+        other => panic!(
+            "a private-only call to a subnet-exported service must fail local \
+             discovery; got {other:?}"
+        ),
+    }
+    assert_eq!(
+        exported_calls.load(Ordering::SeqCst),
+        0,
+        "nothing was sent: the exported handler must never have run",
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+// ---------------------------------------------------------------------------
 // The composed example — Granted (cross-org)
 // ---------------------------------------------------------------------------
 
