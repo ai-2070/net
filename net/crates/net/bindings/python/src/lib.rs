@@ -60,6 +60,11 @@ mod delegation;
 mod org;
 #[cfg(feature = "org")]
 mod org_serve;
+// The subnet AUTHORITY surface (SSDK S4b): construction conversion, the
+// admin functions, and the named-export serve. Rides the `org` SDK
+// dependency, mirroring the Node binding's `subnet.rs`.
+#[cfg(feature = "org")]
+mod subnet;
 // Device enrollment (Hermes V2 Phase 1): the invite → join → approve handshake
 // + the operator device-lifecycle facade. Thin wrappers over
 // `net_sdk::{enrollment,operator,devices}`; shares the `delegation` gate (same
@@ -109,7 +114,7 @@ mod subnets;
 use parking_lot::RwLock;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -1133,6 +1138,12 @@ mod mesh_bindings {
         /// a shut-down node the next time they call into it.
         node: Option<Arc<MeshNode>>,
         runtime: Arc<Runtime>,
+        /// The immutable named-export map resolved at construction
+        /// (SSDK §3.3) — the checked map this binding retains beside its
+        /// `Arc<MeshNode>`. Empty when no `subnet_exports` were
+        /// configured (or on a non-`org` build).
+        #[cfg(feature = "org")]
+        subnet_exports: Arc<net_sdk::subnet::NamedSubnetExports>,
         /// Shared channel config registry installed on the MeshNode
         /// at construction; `register_channel` inserts into this same
         /// Arc so the core's membership-ACL path sees every add.
@@ -1223,6 +1234,10 @@ mod mesh_bindings {
             try_port_mapping=None,
             auto_direct_upgrade=None,
             permissive_channels=None,
+            subnet_authorities=None,
+            subnet_attachment=None,
+            subnet_control_channel=None,
+            subnet_exports=None,
         ))]
         #[allow(clippy::too_many_arguments)]
         fn new(
@@ -1270,6 +1285,18 @@ mod mesh_bindings {
             // first. Test-only knob — production code should
             // keep the strict default.
             permissive_channels: Option<bool>,
+            // Subnet AUTHORITY plane (SSDK §3.3). `subnet_authorities`:
+            // a list of {authority_hex, root_hexes, maximum_grant_lifetime_secs}
+            // dicts; `subnet_attachment`: this node's security attachment
+            // path as [int] levels; `subnet_control_channel`: a channel
+            // name treated as a fact arrival path; `subnet_exports`: a
+            // list of named-export dicts. All validated through the frozen
+            // Rust DTOs before the node exists; a build without the `org`
+            // SDK dependency refuses them loudly (plan §6.5).
+            subnet_authorities: Option<&Bound<'_, PyList>>,
+            subnet_attachment: Option<Vec<u32>>,
+            subnet_control_channel: Option<&str>,
+            subnet_exports: Option<&Bound<'_, PyList>>,
         ) -> PyResult<Self> {
             let addr: std::net::SocketAddr = bind_addr
                 .parse()
@@ -1338,6 +1365,44 @@ mod mesh_bindings {
             #[cfg(not(feature = "nat-traversal"))]
             let _ = auto_direct_upgrade;
 
+            // SSDK S4b — the subnet AUTHORITY plane. Convert + validate
+            // through the frozen Rust DTOs BEFORE the node exists; the
+            // checked named-export map is retained beside the handle below.
+            // A non-`org` build refuses subnet config loudly (plan §6.5)
+            // rather than silently ignoring authority configuration.
+            #[cfg(not(feature = "org"))]
+            if subnet_authorities.is_some()
+                || subnet_attachment.is_some()
+                || subnet_control_channel.is_some()
+                || subnet_exports.is_some()
+            {
+                return Err(PyRuntimeError::new_err(
+                    "subnet authority configuration requires an `org`-feature build of net-mesh",
+                ));
+            }
+            #[cfg(feature = "org")]
+            let subnet_exports_map = {
+                let construction = subnet::convert_subnet_construction(
+                    subnet_authorities,
+                    subnet_attachment,
+                    subnet_control_channel,
+                    subnet_exports,
+                )?;
+                for authority in construction.authorities {
+                    config = config.with_subnet_authority(authority);
+                }
+                if let Some(attachment) = construction.attachment {
+                    // Direct field write — the core deliberately has no
+                    // `with_subnet_attachment` (the `configured_identity`
+                    // precedent).
+                    config.subnet_attachment = Some(attachment);
+                }
+                if let Some(channel) = construction.control_channel {
+                    config = config.with_subnet_control_channel(channel);
+                }
+                Arc::new(construction.exports)
+            };
+
             let runtime = Arc::new(
                 Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("runtime: {}", e)))?,
             );
@@ -1404,6 +1469,8 @@ mod mesh_bindings {
             Ok(Self {
                 node: Some(Arc::new(node)),
                 runtime,
+                #[cfg(feature = "org")]
+                subnet_exports: subnet_exports_map,
                 channel_configs,
             })
         }
@@ -2926,6 +2993,14 @@ mod mesh_bindings {
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
         }
 
+        /// The checked named-export map this mesh was created with
+        /// (SSDK §3.3) — consumed by `serve_subnet_exported`. Immutable
+        /// after construction.
+        #[cfg(feature = "org")]
+        pub(crate) fn subnet_exports_arc(&self) -> Arc<net_sdk::subnet::NamedSubnetExports> {
+            self.subnet_exports.clone()
+        }
+
         /// Shared `ChannelConfigRegistry`. Currently consumed by
         /// `compute` only; nRPC's `serve_rpc` auto-registers via
         /// the SDK glue without needing per-binding access. Kept
@@ -3566,6 +3641,19 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add(
             "OrgUnclassifiedError",
             m.py().get_type::<org::OrgUnclassifiedError>(),
+        )?;
+        // SSDK S4b — the subnet authority surface (rides the `org` gate,
+        // same SDK dependency).
+        m.add_function(wrap_pyfunction!(subnet::serve_subnet_exported, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            subnet::install_subnet_gateway_credentials,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(subnet::declare_subnet_boundaries, m)?)?;
+        m.add_function(wrap_pyfunction!(subnet::apply_subnet_control_fact, m)?)?;
+        m.add(
+            "SubnetProvisionError",
+            m.py().get_type::<subnet::SubnetProvisionError>(),
         )?;
     }
     #[cfg(feature = "publish")]

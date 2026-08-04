@@ -245,6 +245,34 @@ impl PyOrgClient {
         Ok(PyBytes::new(py, &reply))
     }
 
+    /// Call a subnet-exported service — bytes in, bytes out
+    /// (`SUBNET_AUTH_SDK_PLAN.md` §3.6). Releases the GIL for the call.
+    ///
+    /// Discovers on the PUBLIC plane through the verified ownership
+    /// projection, derives the same-org/granted relation from the
+    /// VERIFIED owner, mints the same canonical proof as `call`, and
+    /// sends exactly once — never a retry. Deliberately `call_exported`,
+    /// not `call_subnet`: the caller names a service, not a subnet — it
+    /// never joins the provider's subnet and receives no subnet context.
+    #[pyo3(signature = (service, request))]
+    fn call_exported<'py>(
+        &self,
+        py: Python<'py>,
+        service: String,
+        request: &[u8],
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let client = self.inner.load_full().ok_or_else(|| {
+            OrgCredentialsError::new_err("org:credentials:closed: this OrgClient has been closed")
+        })?;
+        let runtime = self.runtime.clone();
+        let body = bytes::Bytes::copy_from_slice(request);
+        let reply = py.detach(move || {
+            runtime.block_on(async move { client.call_exported_bytes(&service, body).await })
+        });
+        let reply = reply.map_err(org_err_to_py)?;
+        Ok(PyBytes::new(py, &reply))
+    }
+
     /// The organization this client acts for, as 32 raw bytes.
     #[getter]
     fn acting_org<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {

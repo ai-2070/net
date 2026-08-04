@@ -101,13 +101,31 @@ class MeshNode:
         heartbeat_interval_ms: Optional[int] = None,
         session_timeout_ms: Optional[int] = None,
         num_shards: Optional[int] = None,
+        identity_seed: Optional[bytes] = None,
+        subnet: Optional[list] = None,
+        subnet_policy: Optional[dict] = None,
+        subnet_authorities: Optional[list] = None,
+        subnet_attachment: Optional[list] = None,
+        subnet_control_channel: Optional[str] = None,
+        subnet_exports: Optional[list] = None,
     ) -> None:
+        # SSDK P4: forward the topology kwargs this wrapper used to drop
+        # (`identity_seed`, `subnet`, `subnet_policy`) AND the new subnet
+        # AUTHORITY kwargs. All are validated by the native constructor —
+        # this layer only threads them through.
         self._native = _NetMesh(
             bind_addr,
             psk,
             heartbeat_interval_ms=heartbeat_interval_ms,
             session_timeout_ms=session_timeout_ms,
             num_shards=num_shards,
+            identity_seed=identity_seed,
+            subnet=subnet,
+            subnet_policy=subnet_policy,
+            subnet_authorities=subnet_authorities,
+            subnet_attachment=subnet_attachment,
+            subnet_control_channel=subnet_control_channel,
+            subnet_exports=subnet_exports,
         )
 
     @property

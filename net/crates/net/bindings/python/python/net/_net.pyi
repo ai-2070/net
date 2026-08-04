@@ -3611,6 +3611,7 @@ class OrgClient:
     @staticmethod
     def bind(mesh: Any, credentials: OrgCredentials) -> "OrgClient": ...
     def call(self, service: str, request: bytes) -> bytes: ...
+    def call_exported(self, service: str, request: bytes) -> bytes: ...
     @property
     def acting_org(self) -> bytes: ...
     @property
@@ -3658,4 +3659,50 @@ def install_provider_grant_audience(
 ) -> None:
     """Install a provider grant audience (grant wire bytes + secret file PATH)
     so a ``"granted"`` service can seal envelopes."""
+    ...
+
+# ---------------------------------------------------------------------------
+# Subnet authority (SSDK S4b, the `org` feature)
+# ---------------------------------------------------------------------------
+
+class SubnetProvisionError(Exception):
+    """A subnet provisioning/configuration failure — the stable ``subnet:<kind>``
+    envelope. Always LOCAL and startup-shaped; never a call-path domain. The
+    ``kind`` attribute (set by ``net.subnet.classify_subnet_error``) is a core
+    reason code or a local configuration kind."""
+    ...
+
+def serve_subnet_exported(
+    mesh: Any,
+    service: str,
+    export_name: str,
+    handler: Callable[[dict, bytes], bytes],
+    handler_timeout_ms: Optional[int] = ...,
+) -> OrgServeHandle:
+    """Serve a subnet-exported, org-protected service against a NAMED export
+    configured at mesh construction. An unknown ``export_name`` raises
+    :class:`SubnetProvisionError` (kind ``unknown_export_name``) before anything
+    is registered or announced. The handler is
+    ``handler(caller: dict, request: bytes) -> bytes``; announcement visibility
+    is always public and the external caller never joins this node's subnet."""
+    ...
+
+def install_subnet_gateway_credentials(
+    mesh: Any, credential_sets: List[bytes]
+) -> None:
+    """Install this node's own gateway credential sets — WHOLESALE REPLACE. Every
+    artifact decodes before anything installs; one malformed set refuses the
+    whole batch with no node-state mutation."""
+    ...
+
+def declare_subnet_boundaries(mesh: Any, declaration: dict) -> None:
+    """Declare this node's protected boundary inventory — also wholesale.
+    ``declaration`` is
+    ``{"authority_hex": str, "topology_epoch": int, "boundaries": List[List[int]]}``."""
+    ...
+
+def apply_subnet_control_fact(mesh: Any, fact: bytes) -> dict:
+    """Apply one signed control fact from its outer wire frame — the one door for
+    floors and descriptive facts. Returns ``{"kind": str, "applied": bool}``;
+    ``applied=False`` is an authenticated stale/idempotent outcome."""
     ...
