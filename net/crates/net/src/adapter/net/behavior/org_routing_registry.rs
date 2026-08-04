@@ -39,9 +39,17 @@ use super::org_scoped_ingest::CapabilityAudienceScope;
 use super::org_scoped_store::{DirtyCapabilities, PrivateCapabilityProvider};
 
 /// Max demand handles ONE clone family may hold.
-const MAX_HANDLES_PER_FAMILY: usize = 64;
+///
+/// Handles, not capabilities. One warmed capability costs one handle per
+/// AUTHORITY-SCOPED contributor it needs — Owner plus every DISCOVER audience
+/// the family actually leased for it — so a family holding two leased DISCOVER
+/// grants per capability warms ~21 capabilities, not 64. The plan's older
+/// "64 warmed capabilities per clone family" wording described a bound this
+/// registry has never enforced; OLB-2B.3b corrects it there to
+/// "64 retained authority-scoped route demands".
+pub(crate) const MAX_HANDLES_PER_FAMILY: usize = 64;
 /// Max distinct retained node slots.
-const MAX_NODE_SLOTS: usize = 256;
+pub(crate) const MAX_NODE_SLOTS: usize = 256;
 /// Max slots rebuilt in ONE synchronous application. Work beyond this stays
 /// authoritative in `pending` and re-marks, so a 256-slot rebuild becomes several
 /// yielding quanta rather than one unbroken burst.
@@ -128,6 +136,9 @@ pub(crate) struct SlotBaseFacts {
     pub authority: ScopedDiscoveryAuthorityStamp,
     pub actor_incarnation: u64,
     pub slot_incarnation: u64,
+    /// Where this artifact sits in the consumer-Grant transition order
+    /// (OLB-2B.3c-pre step 3). See [`ScopedSourceFacts::grant_fence`].
+    pub grant_fence: GrantArtifactFence,
     /// The earliest `expires_at` across the retained providers, or `u64::MAX`
     /// when nothing here can expire.
     ///
@@ -241,6 +252,17 @@ pub(crate) struct ScopedSourceFacts {
     /// exactly `not_after + MAX_TOKEN_CLOCK_SKEW_SECS` — the first instant the
     /// authority is no longer valid, not the last instant it is.
     pub authority_deadline: u64,
+    /// Where this reconstruction sits in the consumer-Grant transition order.
+    ///
+    /// Ordering, not authority — `authority` above is the authority. This exists
+    /// so a delayed movement notification can tell whether the artifact it is
+    /// about to clear predates or postdates the transition it carries.
+    ///
+    /// Present on EVERY reconstruction, including `Unserved` ones, which is the
+    /// whole point: an absent-Grant reconstruction is stamped `Owner` and so
+    /// carries no installation identity, yet it can be the exact successor a
+    /// later removal produced.
+    pub grant_fence: GrantArtifactFence,
 }
 
 /// An opaque, comparable summary of EVERY authority input a snapshot was taken
@@ -427,15 +449,53 @@ impl SourceLiveness {
     }
 }
 
+/// The node-shared PRECOMPUTED routing substrate for ONE authority-scoped slot
+/// (OLB-2B.3c; design §1 artifact 3) — the same `(PrivateAudienceScope,
+/// capability)` key as the facts cell beside it.
+///
+/// This revision (design §18 step 1) pins the PUBLICATION LIFECYCLE: the
+/// second per-slot cell, both-cells handle coupling, and the pool-first
+/// ordering at every site that moves facts. The routing payload — provider and
+/// proven owner relation, direct/session eligibility under ONE coherent
+/// session generation, the exact scoped source vector, scoped deadlines — is
+/// the actor build cycle's to add (§18 step 2), which is also this type's only
+/// producer; until it lands, production cells are permanently `None` and every
+/// pool in the tree is a witness's.
 #[derive(Debug)]
-struct Slot {
-    /// Allocated fresh from the node-wide monotone id space at creation, so a
-    /// retired-and-re-demanded slot never reuses an identity and work in flight
-    /// for a previous incarnation can never resurrect it.
-    incarnation: u64,
-    /// Live demand handles across ALL families.
+pub(crate) struct ScopedUnsensedRoutePool {
+    /// The EXACT facts artifact this pool was derived from (design §1.1).
+    ///
+    /// Publication identity, compared by `Arc::ptr_eq` exactly as
+    /// `invalidate_if_stale` compares facts: installation always allocates a
+    /// fresh `Arc`, so pointer identity is the artifact's identity. This is
+    /// what the delayed pool invalidator (§18 step 2) will compare, and what
+    /// lets a 2B.3d reader verify the pool it loaded was derived from the
+    /// facts it loaded — the two cells are read with two separate atomics, so
+    /// the pairing must be checkable, not assumed.
     #[allow(dead_code)]
-    refs: usize,
+    // consumers: the actor build cycle + exact pool invalidation (§18 step 2).
+    derived_from: Arc<SlotBaseFacts>,
+}
+
+impl ScopedUnsensedRoutePool {
+    /// Test-only: a pool naming `derived_from`, for lifecycle witnesses. The
+    /// production constructor is the actor build cycle (§18 step 2).
+    #[cfg(test)]
+    pub(crate) fn for_test(derived_from: Arc<SlotBaseFacts>) -> Self {
+        Self { derived_from }
+    }
+}
+
+/// Both publication cells of one slot, moved and cloned as a UNIT.
+///
+/// `DemandHandle` clones both cells under the same registry acquisition that
+/// takes the slot reference (design §1.1) — holding them as one value is what
+/// makes that structural rather than a discipline every call site re-earns.
+/// The same goes for the mutation ordering below: every site that moves the
+/// facts cell goes through [`Self::take_facts`] or [`Self::install_facts`], so
+/// the pool-first rule has one implementation, not eight.
+#[derive(Clone, Debug)]
+struct SlotCells {
     /// `None` until a recapture installs facts, and cleared the moment anything
     /// invalidates them. `None` IS the deterministic cold outcome.
     ///
@@ -452,6 +512,71 @@ struct Slot {
     /// cannot be stale either — a live handle is precisely what stops the slot
     /// being retired.
     facts: Arc<ArcSwapOption<SlotBaseFacts>>,
+    /// The 2B.3c routing-pool cell, beside the facts cell it derives from —
+    /// a SECOND cell, not a changed one (design §1.1): the signed 2B.3a facts
+    /// cell's semantics are untouched.
+    ///
+    /// INVARIANT: a published pool names the currently published facts. Every
+    /// mutation of `facts` clears this cell FIRST (see [`Self::take_facts`] /
+    /// [`Self::install_facts`]), so a lock-free reader can observe facts
+    /// without a pool — the ordinary cold-pool state — but never a pool beside
+    /// facts it was not derived from.
+    unsensed: Arc<ArcSwapOption<ScopedUnsensedRoutePool>>,
+}
+
+impl SlotCells {
+    fn empty() -> Self {
+        Self {
+            facts: Arc::new(ArcSwapOption::empty()),
+            unsensed: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+
+    /// Swap the facts artifact out — POOL FIRST (design §1.1).
+    ///
+    /// A pool is derived from exactly one facts artifact, so whichever facts
+    /// this removes, any published pool named either that artifact or an older
+    /// one; both are invalid the moment the facts move. Clearing the pool
+    /// before the facts means no lock-free reader ever observes a pool whose
+    /// basis is already gone. Returns the removed facts, so conditional
+    /// callers keep their metrics exact.
+    fn take_facts(&self) -> Option<Arc<SlotBaseFacts>> {
+        self.unsensed.store(None);
+        self.facts.swap(None)
+    }
+
+    /// Install a fresh facts artifact — POOL FIRST, for the same reason: a
+    /// pool present at this moment was derived from the SUPERSEDED facts, and
+    /// storing the new facts first would let a reader pair them with it. The
+    /// actor rebuilds the pool from the new facts afterwards (§18 step 2).
+    fn install_facts(&self, facts: Arc<SlotBaseFacts>) {
+        self.unsensed.store(None);
+        self.facts.store(Some(facts));
+    }
+}
+
+#[derive(Debug)]
+struct Slot {
+    /// Allocated fresh from the node-wide monotone id space at creation, so a
+    /// retired-and-re-demanded slot never reuses an identity and work in flight
+    /// for a previous incarnation can never resurrect it.
+    incarnation: u64,
+    /// Live demand handles across ALL families.
+    #[allow(dead_code)]
+    refs: usize,
+    /// The slot's two publication cells — see [`SlotCells`].
+    cells: SlotCells,
+}
+
+impl Slot {
+    /// A fresh slot with one reference and both cells empty.
+    fn new(incarnation: u64) -> Self {
+        Self {
+            incarnation,
+            refs: 1,
+            cells: SlotCells::empty(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -486,12 +611,82 @@ struct RegistryInner {
     select_cursor: Option<SlotKey>,
 }
 
+/// What giving up one family reference did.
+///
+/// Three outcomes rather than a bool, because "nothing was given back" and
+/// "something was given back and the slot survives" must not collapse: the first
+/// is an invariant violation the caller has to refuse on, and the second is the
+/// ordinary case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseOutcome {
+    /// The reference was given back and the slot still has owners.
+    Released,
+    /// The reference was given back and it was the LAST one.
+    Retire,
+    /// This family holds no such reference. NOTHING was decremented.
+    NotHeld,
+}
+
 impl RegistryInner {
     #[allow(dead_code)]
     fn family_handles(&self, family: FamilyId) -> usize {
         self.families
             .get(&family)
             .map_or(0, |keys| keys.values().sum())
+    }
+
+    /// Give up ONE of `family`'s references to `key`.
+    ///
+    /// Bookkeeping only: the caller commits the retirement, because retiring
+    /// touches the metrics and the capacity generation that live on the registry
+    /// rather than on this struct. Shared by the single-key release, the
+    /// whole-set release and the replacement transaction, so the three cannot
+    /// drift in how a reference is given up.
+    ///
+    /// **The family reference is what authorizes the global decrement**, and
+    /// this helper enforces that itself rather than trusting every present and
+    /// future caller. A family that does not hold `key` has nothing to give
+    /// back, and decrementing `slot.refs` on its behalf would retire a slot some
+    /// OTHER family still owns — leaving that family's map claiming a handle it
+    /// can never release, and its set unable to release it. The check is here,
+    /// not at the call sites, because a call site can be added; this cannot be
+    /// bypassed by adding one.
+    fn release_one(&mut self, family: FamilyId, key: &SlotKey) -> ReleaseOutcome {
+        let held = self
+            .families
+            .get(&family)
+            .and_then(|keys| keys.get(key))
+            .copied()
+            .unwrap_or(0);
+        if held == 0 {
+            return ReleaseOutcome::NotHeld;
+        }
+        if let Some(keys) = self.families.get_mut(&family) {
+            if let Some(count) = keys.get_mut(key) {
+                *count -= 1;
+                if *count == 0 {
+                    keys.remove(key);
+                }
+            }
+            if keys.is_empty() {
+                self.families.remove(&family);
+            }
+        }
+        match self.slots.get_mut(key) {
+            Some(slot) => {
+                slot.refs -= 1;
+                if slot.refs == 0 {
+                    ReleaseOutcome::Retire
+                } else {
+                    ReleaseOutcome::Released
+                }
+            }
+            // The family held a reference the slot map does not know about.
+            // Unreachable, and NOT silently absorbed: the family entry has been
+            // given back above, so the two are consistent again, but the caller
+            // is told nothing retired because nothing did.
+            None => ReleaseOutcome::Released,
+        }
     }
 
     /// Allocate the next identity, or `None` when the space is exhausted.
@@ -501,11 +696,12 @@ impl RegistryInner {
         Some(next)
     }
 
-    /// Drop `key`'s facts, reporting whether anything was actually invalidated.
+    /// Drop `key`'s facts — and, pool first, the routing pool derived from
+    /// them — reporting whether facts were actually invalidated.
     fn invalidate(&mut self, key: &SlotKey) -> bool {
         self.slots
             .get_mut(key)
-            .is_some_and(|slot| slot.facts.swap(None).is_some())
+            .is_some_and(|slot| slot.cells.take_facts().is_some())
     }
 
     /// Queue every retained slot and drop every fact — the expansion step of a
@@ -534,7 +730,7 @@ impl RegistryInner {
         self.slots
             .iter()
             .filter(|(_, slot)| {
-                !slot.facts.load().as_ref().is_some_and(|facts| {
+                !slot.cells.facts.load().as_ref().is_some_and(|facts| {
                     facts.actor_incarnation == incarnation
                         && facts.slot_incarnation == slot.incarnation
                         && facts.epoch == epoch
@@ -604,6 +800,42 @@ pub(crate) struct NodeOrgRoutingRegistry {
     source: Arc<dyn SlotSource>,
     work: Arc<RegistryWork>,
     metrics: Arc<RegistryMetrics>,
+    /// Advances every time a retained slot is RETIRED, and only then
+    /// (OLB-2B.3b §9).
+    ///
+    /// `NodeAtCapacity` is the one retryable refusal, and this is what a
+    /// refused family gates its retry on: node capacity can only have become
+    /// available by a slot going away. Without it a family that missed at the
+    /// node bound would re-derive its demand set, re-sort it and re-take the
+    /// registry lock on EVERY subsequent cold call for that capability — the
+    /// bound is node-wide, so a node at 256 slots would have every family
+    /// hammering the one lock the warmed path exists to avoid.
+    ///
+    /// Deliberately NOT `slots.len()`: a retire-then-demand pair leaves the
+    /// length equal while capacity genuinely moved, and a family comparing
+    /// lengths would conclude nothing had changed and never retry. It is also
+    /// NOT advanced on demand — growth cannot free capacity, so advancing there
+    /// would only manufacture pointless retries.
+    ///
+    /// Read lock-free, mutated under the registry lock. Publishing it AFTER the
+    /// retirement is committed (the `Release` half of the `AcqRel`) is what
+    /// makes an observer that sees the new generation able to see the freed
+    /// slot too.
+    node_capacity_generation: AtomicU64,
+    /// Advances on EVERY reference given back, retirement or not.
+    ///
+    /// The node capacity generation is the wake condition for a FRESH
+    /// acquisition, and it is exact for that: only a retirement can make room
+    /// for a new slot. It is NOT exact for a REPLACEMENT, which can become
+    /// satisfiable when another family merely stops SHARING a slot the
+    /// replacement wants to give up — the slot survives, no retirement happens,
+    /// and the capacity generation stands still while the replacement's
+    /// projection has genuinely changed. Gating replacement on the capacity
+    /// generation therefore deadlocks it against its own wake condition.
+    ///
+    /// Read lock-free, mutated under the registry lock, published after the
+    /// bookkeeping it describes.
+    ref_release_generation: AtomicU64,
 }
 
 /// A clone family: one private identity and one shared 64-handle budget.
@@ -620,6 +852,12 @@ pub(crate) struct NodeOrgRoutingRegistry {
 // handles is the warmed-call consumer, which is deliberately outside the OLB-2B
 // entry boundary (Kyra). The registry's REAL consumer — the supervised actor
 // driving `DirtyApply` — is fully live and node-wired in E3c.
+//
+// OLB-2B.3b moved the boundary one layer, and no further: `org_routing_state`
+// now owns this surface, so `demand_set` and `RoutingFamily` have an in-crate
+// consumer. That consumer is itself dark, because what reaches it is
+// `MeshNode::call` in OLB-2B.3d. The allows below therefore stay, and they stay
+// for a reason that is now one hop away rather than two.
 //
 // These allows are therefore permanent-until-warmed-calls and item-scoped. They
 // are NOT the E1/E2/E3a/E3b module-wide allowances, which are gone.
@@ -638,9 +876,24 @@ impl RoutingFamily {
         self.registry.demand(self.id, key)
     }
 
+    /// Acquire a COMPLETE demand set atomically, or nothing (OLB-2B.3b §4.1).
+    pub(crate) fn demand_set(&self, keys: Vec<SlotKey>) -> Result<DemandSet, DemandRefused> {
+        self.registry.demand_set(self.id, keys)
+    }
+
     /// Handles this family currently holds.
     pub(crate) fn handles(&self) -> usize {
         self.registry.inner.lock().family_handles(self.id)
+    }
+
+    /// The node capacity generation a FRESH acquisition's refusals gate on.
+    pub(crate) fn node_capacity_generation(&self) -> u64 {
+        self.registry.node_capacity_generation()
+    }
+
+    /// The reference-release generation a REPLACEMENT's refusals gate on.
+    pub(crate) fn ref_release_generation(&self) -> u64 {
+        self.registry.ref_release_generation()
     }
 }
 
@@ -651,14 +904,16 @@ pub(crate) struct DemandHandle {
     registry: Arc<NodeOrgRoutingRegistry>,
     family: FamilyId,
     key: SlotKey,
-    /// The slot's publication cell, cloned once at demand time (OLB-2B.3).
+    /// The slot's publication cells — BOTH of them — cloned once at demand
+    /// time, under the same registry acquisition that took the slot reference
+    /// (OLB-2B.3; design §1.1).
     ///
     /// This is what makes the warmed read lock-free: the handle already names
     /// exactly one slot, so the hot path needs no map lookup and no registry
     /// lock — one atomic load and it holds the immutable artifact. Holding the
-    /// cell is sound precisely because holding the handle is what prevents the
-    /// slot being retired, so the cell can never be a dead incarnation's.
-    facts: Arc<ArcSwapOption<SlotBaseFacts>>,
+    /// cells is sound precisely because holding the handle is what prevents
+    /// the slot being retired, so neither cell can be a dead incarnation's.
+    cells: SlotCells,
 }
 
 impl DemandHandle {
@@ -671,18 +926,291 @@ impl DemandHandle {
     /// accessor that looks authoritative and is not is a trap, and adding a
     /// lock-free twin would re-lay it under a friendlier name.
     ///
-    /// The allow is scoped to this ONE method and names its consumer: the warmed
-    /// call path (OLB-2B.3b), which is the next slice. Per the E3c discipline, a
-    /// leftover allow here after 2B.3b lands means that consumer never arrived.
+    /// The allow is scoped to this ONE method and names its consumer: the
+    /// FAMILY PROJECTION, which reads the contributing artifacts and narrows
+    /// them into one route set. That is OLB-2B.3d, not 2B.3b — 2B.3b's
+    /// `CapabilityRouteHandle` OWNS the demand set without reading a single
+    /// artifact through it, which is exactly why the allow survived that slice.
+    /// Per the E3c discipline, a leftover allow here after 2B.3d lands means
+    /// that consumer never arrived.
     #[allow(dead_code)]
     pub(crate) fn base_facts_unvalidated(&self) -> Option<Arc<SlotBaseFacts>> {
-        self.facts.load_full()
+        self.cells.facts.load_full()
+    }
+
+    /// The slot's currently published routing pool, or `None` for the cold
+    /// outcome — UNVALIDATED, exactly like [`Self::base_facts_unvalidated`],
+    /// and read with a SEPARATE atomic: a consumer that needs the pool and the
+    /// facts to agree must check `ScopedUnsensedRoutePool::derived_from`
+    /// against the facts it loaded rather than assume two loads paired.
+    #[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+    pub(crate) fn unsensed_pool_unvalidated(&self) -> Option<Arc<ScopedUnsensedRoutePool>> {
+        self.cells.unsensed.load_full()
     }
 }
 
 impl Drop for DemandHandle {
     fn drop(&mut self) {
         self.registry.release(self.family, &self.key);
+    }
+}
+
+/// A family's COMPLETE demand set for one capability, owned as ONE object.
+///
+/// The unit of ownership is the SET, not the handle, and that is what makes an
+/// atomic replacement expressible: a replacement compares two key sets in one
+/// registry transaction and moves the release responsibility across, so the
+/// intersection is never released and re-acquired and nothing is ever charged
+/// twice. A `Vec<DemandHandle>` cannot express it — each handle releases itself
+/// on drop, so transferring one means defusing its `Drop`, and a per-handle
+/// defuse is exactly the double-release hazard this type removes.
+#[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+pub(crate) struct DemandSet {
+    registry: Arc<NodeOrgRoutingRegistry>,
+    family: FamilyId,
+    /// What this set NAMES, in deterministic key order.
+    ///
+    /// Immutable, and read on the lock-free path. Distinct from `held`, which is
+    /// what it still OWES a release for; after a replacement transfers the
+    /// references away the two differ, and that difference is the whole point.
+    keys: Vec<SlotKey>,
+    /// Publication cells — BOTH per contributor (design §1.1) — parallel to
+    /// `keys`, cloned under the acquisition that retained the references. One
+    /// element per key rather than two parallel vectors, so the
+    /// `keys[i] <-> cells[i]` pairing cannot misalign between the planes.
+    ///
+    /// Immutable and lock-free readable. Holding a cell is sound whatever
+    /// happens to the slot: a retired slot's cells simply read empty, which is
+    /// the correct answer for a superseded set.
+    cells: Vec<SlotCells>,
+    /// The RELEASE RESPONSIBILITY — the keys this set must still give back.
+    ///
+    /// Interior-mutable because the responsibility can move to a replacement set
+    /// while this one is still shared behind an `Arc`. There is no flag and no
+    /// `mem::forget`: the invariant is that a set releases precisely the keys it
+    /// contains at drop, and a transfer MOVES them, so at every instant exactly
+    /// one set owes each reference.
+    held: parking_lot::Mutex<Vec<SlotKey>>,
+}
+
+#[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+impl DemandSet {
+    /// The scopes this set names, in deterministic key order.
+    pub(crate) fn keys(&self) -> &[SlotKey] {
+        &self.keys
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The published artifact for the `index`-th contributor, UNVALIDATED —
+    /// exactly like its registry-side twin. Authority revalidation is the NODE
+    /// seam's job (`MeshNode::org_routing_base_facts`); the name says so.
+    pub(crate) fn base_facts_unvalidated(&self, index: usize) -> Option<Arc<SlotBaseFacts>> {
+        self.cells.get(index)?.facts.load_full()
+    }
+
+    /// The published routing pool for the `index`-th contributor, UNVALIDATED,
+    /// read with a SEPARATE atomic from the facts — pairing is checked via
+    /// `ScopedUnsensedRoutePool::derived_from`, never assumed.
+    #[allow(dead_code)] // consumer: the family projection (OLB-2B.3d).
+    pub(crate) fn unsensed_pool_unvalidated(
+        &self,
+        index: usize,
+    ) -> Option<Arc<ScopedUnsensedRoutePool>> {
+        self.cells.get(index)?.unsensed.load_full()
+    }
+
+    /// Test-only: what this set still owes a release for. A replacement moves
+    /// this to the successor, and a witness that could not see it would have to
+    /// infer the transfer from a handle count that a double-release also
+    /// produces.
+    #[cfg(test)]
+    pub(crate) fn held_for_test(&self) -> Vec<SlotKey> {
+        self.held.lock().clone()
+    }
+
+    /// Atomically REPLACE this set with the one for `new_keys`, charged on the
+    /// projected final footprint (§4.3).
+    ///
+    /// **Rooted in this set's OWN registry and family identity.** It takes no
+    /// `RoutingFamily` argument, and that is the security property, not an
+    /// ergonomic one: an earlier surface took the replacement authority from the
+    /// CALLER, so family B could pass family A's set and have the registry
+    /// release A's references under B's id. B's family map holds no such key, so
+    /// nothing was given back on B's side while A's slot reference was still
+    /// decremented — retiring a slot A owned, stranding a handle in A's map that
+    /// A's set could no longer release, and handing B the successor. Cross-family
+    /// and cross-registry transfer are now unrepresentable rather than rejected,
+    /// because there is no argument through which to express them.
+    ///
+    /// A set whose responsibility has ALREADY transferred cannot be replaced
+    /// again: `held` no longer matches what the set names, and a second
+    /// replacement would compute `old_only = ∅` and charge the successor's whole
+    /// footprint gross. That is refused as [`ReplaceRefused::Superseded`] with
+    /// total no effect.
+    pub(crate) fn replace(&self, new_keys: Vec<SlotKey>) -> Result<DemandSet, ReplaceRefused> {
+        self.registry
+            .clone()
+            .replace_demand_set(self.family, self, new_keys)
+    }
+}
+
+/// Why an atomic replacement did not happen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // consumer: `OrgRoutingState` (OLB-2B.3b).
+pub(crate) enum ReplaceRefused {
+    /// The registry refused the projected footprint.
+    Demand(DemandRefused),
+    /// This set has already given its references away, so it is not the current
+    /// owner of anything and cannot be the basis of a replacement.
+    Superseded,
+}
+
+impl Drop for DemandSet {
+    fn drop(&mut self) {
+        // Whatever is still owed, released as one transaction. After a
+        // replacement transferred them this is empty and the drop is a no-op —
+        // not because a flag says so, but because the keys are gone.
+        let owed = std::mem::take(&mut *self.held.lock());
+        if !owed.is_empty() {
+            self.registry.release_keys(self.family, &owed);
+        }
+    }
+}
+
+/// Where a reconstruction sits in the consumer-Grant transition order.
+///
+/// The ARTIFACT side of the fence, distinct from the movement side below.
+///
+/// `TerminalAbsence` is not "publication `u64::MAX`". A single global terminal
+/// generation would be wrong the moment a second Grant scope is still installed:
+/// scope A withdraws terminally and sets the global marker, scope B's
+/// reconstruction observes the same marker, and B's own later withdrawal can no
+/// longer order B's pre-terminal `Served` artifact. Terminal absence is a
+/// property of ONE scope's reconstruction, so it lives on the artifact, and
+/// still-installed scopes keep an ordinary `Publication` (Kyra, review of
+/// `46af3d625`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrantArtifactFence {
+    /// Reconstructed while the publication-identity space was still live, under
+    /// the generation it observed.
+    Publication(u64),
+    /// Reconstructed ABSENT for this exact scope, with the publication-identity
+    /// space exhausted. Terminal: no installation can follow, so nothing can
+    /// supersede it.
+    TerminalAbsence,
+}
+
+/// How a consumer-Grant transition orders itself against retained artifacts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrantMovementFence {
+    /// The ordinary case: this transition's publication generation.
+    Publication(u64),
+    /// The publication-identity space is EXHAUSTED (OLB-2B.3c-pre step 3).
+    ///
+    /// Reached only by a withdrawal, because an installation at exhaustion is
+    /// refused before it publishes anything. With no further installation
+    /// publishable, absence is TERMINAL for this scope, so no `Publication`
+    /// artifact under it has a successor left to protect — and ordering would be
+    /// meaningless anyway, since the generation that would express it cannot be
+    /// allocated.
+    ///
+    /// **This clears every `Publication` artifact in the exact scope; it is NOT
+    /// "clear everything".** A terminal movement still preserves
+    /// [`GrantArtifactFence::TerminalAbsence`]. Nothing can supersede a terminal
+    /// absence — but the artifact THIS withdrawal's own publication produced is
+    /// one, and retiring it is the same self-inflicted churn `<=` would cause on
+    /// the ordinary row. "Unconditional" describes the comparison against
+    /// generations, not the set of artifacts (Kyra, review of `010c718ea`).
+    ///
+    /// Revocation is never refused for want of an identity. Withdrawing
+    /// authority must always be possible; it is the direction that fails closed.
+    Terminal,
+}
+
+/// One consumer-Grant transition, carried to routing with enough identity to
+/// invalidate CONDITIONALLY (OLB-2B.3c-pre items 10/11).
+///
+/// A bare `grant_id` is not enough, and the gap is a real race rather than a
+/// tidiness point: a notification can be delayed arbitrarily between its
+/// publication and its registry work, so an OBSOLETE transition can arrive after
+/// a newer installation has already been published, rebuilt and warmed. Clearing
+/// by id alone destroys that successor.
+///
+/// ```text
+/// A: remove N    publish absence, release gate, [stall]
+/// B: install N+1                 publish, notify, actor warms the N+1 artifact
+/// A: [resumes]   clear by grant_id  ->  destroys the N+1 artifact
+/// ```
+///
+/// It never resurrects withdrawn authority — the read seam stays fail-closed —
+/// but it lets an obsolete transition retire current work, which is the defect
+/// class `invalidate_if_stale` already guards one layer up: **a delayed
+/// invalidator must not delete a successor.**
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GrantScopeMovement {
+    pub grant_id: [u8; 32],
+    /// The EXACT audience scope this transition is about. A grant id can name two
+    /// live scopes across an audience rotation, and the one that did not move
+    /// must not be churned.
+    pub audience_handle: [u8; 32],
+    /// How this transition orders itself against retained artifacts.
+    ///
+    /// Ordinarily a consumer-Grant PUBLICATION generation: a reconstruction that
+    /// observed generation `g` is obsolete with respect to this movement iff
+    /// `g < publication`. **Strictly less than** — an artifact from THIS
+    /// publication already reflects the transition and must survive it, which is
+    /// exactly the "a demand arriving after publication is safe" case design
+    /// §2A.2 names.
+    ///
+    /// **It must order absences as well as installations.** An earlier shape
+    /// carried `superseded_through`, derived from `install_seq`, and treated an
+    /// `Owner`-stamped artifact on a Grant slot as never-a-successor. That was
+    /// the first repair, HELD at `7348529fb`: it is false, and Kyra's
+    /// production-path probe demonstrated it — a delayed INSTALL notification
+    /// destroyed the newer `Unserved` artifact a later REMOVAL had produced.
+    /// `install_seq` totally orders installations, not transitions, and an
+    /// absence has no installation identity to be ordered by.
+    ///
+    /// ```text
+    /// install N     publish, [stall before notifying]
+    /// (warm)        artifact reconstructed under N
+    /// remove N      publish absence, notify -> clears it, re-queues
+    /// (rebuild)     newer artifact: Unserved, `Owner`-stamped
+    /// install N     [resumes] -> destroyed that newer artifact
+    /// ```
+    pub fence: GrantMovementFence,
+}
+
+impl GrantScopeMovement {
+    /// Does this transition cover `key`'s scope?
+    ///
+    /// Exact on `(grant_id, audience_handle)`. Deliberately NOT narrowed by
+    /// capability: the Grant source answers ANY capability under an installed
+    /// `(grant_id, audience_handle)` with `Served(empty)` rather than `Unserved`,
+    /// regardless of the grant's own capability scope — verified directly, a slot
+    /// for a capability the grant does not cover reconstructs as
+    /// `Served(0 providers)` and is stamped `Grant`. So the grant's movement
+    /// genuinely affects every capability under its audience scope, and narrowing
+    /// here would leave those slots holding a Grant-stamped artifact after
+    /// removal and stuck `Unserved` after install — the exact two defects this
+    /// edge exists to close, reintroduced for a subset. Narrowing becomes correct
+    /// only once the source refuses uncovered capabilities structurally, which is
+    /// not in this slice's scope.
+    fn covers(&self, key: &SlotKey) -> bool {
+        matches!(
+            key.scope.scope(),
+            CapabilityAudienceScope::Grant {
+                grant_id,
+                audience_handle,
+            } if grant_id == &self.grant_id && audience_handle == &self.audience_handle
+        )
     }
 }
 
@@ -697,7 +1225,18 @@ impl NodeOrgRoutingRegistry {
             source,
             work,
             metrics,
+            node_capacity_generation: AtomicU64::new(0),
+            ref_release_generation: AtomicU64::new(0),
         })
+    }
+
+    /// The node capacity generation (OLB-2B.3b §9). See the field.
+    pub(crate) fn node_capacity_generation(&self) -> u64 {
+        self.node_capacity_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ref_release_generation(&self) -> u64 {
+        self.ref_release_generation.load(Ordering::Acquire)
     }
 
     /// Mint a new clone family with its own private identity and handle budget.
@@ -736,7 +1275,7 @@ impl NodeOrgRoutingRegistry {
         key: SlotKey,
     ) -> Result<DemandHandle, DemandRefused> {
         let mut queued = false;
-        let cell = {
+        let cells = {
             let mut inner = self.inner.lock();
             if inner.family_handles(family) >= MAX_HANDLES_PER_FAMILY {
                 self.metrics
@@ -753,10 +1292,11 @@ impl NodeOrgRoutingRegistry {
                 return Err(DemandRefused::NodeAtCapacity);
             }
             // Captured under the SAME lock acquisition that takes the reference,
-            // so the cell can only be the one belonging to the incarnation this
-            // handle is now keeping alive.
+            // so the cells can only be the ones belonging to the incarnation
+            // this handle is now keeping alive — BOTH of them, as one unit
+            // (design §1.1).
             //
-            // The fresh path keeps the cell it INSERTED rather than looking the
+            // The fresh path keeps the cells it INSERTED rather than looking the
             // slot back up, so there is no post-mutation lookup left to fail
             // (review 2026-07-29 §4). What remains is the pre-existing path,
             // where `new_slot` was false under this same lock hold and nothing
@@ -764,7 +1304,7 @@ impl NodeOrgRoutingRegistry {
             // branch is reached having mutated NOTHING: no reserved slot with no
             // owner, no orphaned `pending` entry, no `queued` flag whose
             // `work.mark()` the early return would skip.
-            let cell = if new_slot {
+            let cells = if new_slot {
                 // Allocate BEFORE mutating anything, so exhaustion retains nothing.
                 let Some(incarnation) = inner.allocate_id() else {
                     self.metrics
@@ -772,15 +1312,9 @@ impl NodeOrgRoutingRegistry {
                         .fetch_add(1, Ordering::AcqRel);
                     return Err(DemandRefused::IdSpaceExhausted);
                 };
-                let cell = Arc::new(ArcSwapOption::empty());
-                inner.slots.insert(
-                    key.clone(),
-                    Slot {
-                        incarnation,
-                        refs: 1,
-                        facts: cell.clone(),
-                    },
-                );
+                let slot = Slot::new(incarnation);
+                let cells = slot.cells.clone();
+                inner.slots.insert(key.clone(), slot);
                 inner
                     .slots_by_capability
                     .entry(key.capability)
@@ -788,19 +1322,19 @@ impl NodeOrgRoutingRegistry {
                     .insert(key.clone());
                 inner.pending.insert(key.clone());
                 queued = true;
-                cell
+                cells
             } else {
                 let Some(slot) = inner.slots.get_mut(&key) else {
-                    // Unreachable. Fail closed rather than fabricating a detached
-                    // cell that no install would ever write to — a handle reading
-                    // a cell the registry does not own would be permanently,
-                    // silently cold. `NodeAtCapacity` is the most conservative of
-                    // the three refusals: it retains nothing and tells the caller
-                    // to take the cold path.
+                    // Unreachable. Fail closed rather than fabricating detached
+                    // cells that no install would ever write to — a handle
+                    // reading a cell the registry does not own would be
+                    // permanently, silently cold. `NodeAtCapacity` is the most
+                    // conservative of the three refusals: it retains nothing and
+                    // tells the caller to take the cold path.
                     return Err(DemandRefused::NodeAtCapacity);
                 };
                 slot.refs += 1;
-                slot.facts.clone()
+                slot.cells.clone()
             };
             *inner
                 .families
@@ -808,7 +1342,7 @@ impl NodeOrgRoutingRegistry {
                 .or_default()
                 .entry(key.clone())
                 .or_insert(0) += 1;
-            cell
+            cells
         };
         if queued {
             // Private discovery did not move, so this is the ONLY thing that will
@@ -819,7 +1353,141 @@ impl NodeOrgRoutingRegistry {
             registry: self.clone(),
             family,
             key,
-            facts: cell,
+            cells,
+        })
+    }
+
+    /// Acquire a family's COMPLETE demand set for one capability entry, or
+    /// nothing at all (OLB-2B.3b §4.1).
+    ///
+    /// The all-or-none property is the whole point, and it is a CORRECTNESS
+    /// property rather than a tidiness one. A capability's demand set is
+    /// `Owner + every DISCOVER audience the family actually leased`, and each
+    /// member contributes discovery provenance the final route is built from. A
+    /// kept prefix would warm a capability whose Owner plane is retained and
+    /// whose Grant plane is not — which does not read as a failure anywhere
+    /// downstream. It reads as a route that legitimately found no granted
+    /// provider, i.e. a silent authority narrowing presenting as a routing
+    /// preference (§4.1).
+    ///
+    /// So every refusal is decided BEFORE anything is mutated, and after the
+    /// last refusal the loop cannot fail:
+    ///
+    /// ```text
+    /// sort + deduplicate
+    /// → ONE registry acquisition
+    ///     → family capacity for the WHOLE set
+    ///     → node capacity for every NEW distinct slot
+    ///     → reserve every required incarnation, contiguously, no wrap
+    ///     → retain all references
+    /// → mark work once
+    /// ```
+    ///
+    /// Deduplicating first is not cosmetic either: a repeated key would reserve
+    /// two handles against the family bound and count two new slots against the
+    /// node bound, so a set that fits could be refused for capacity it never
+    /// needed.
+    ///
+    /// This is NOT `demand` in a loop. That version consumes an identity per
+    /// new slot before it discovers the refusal, retires those slots when the
+    /// caller drops the prefix, and leaves the node's monotone id space
+    /// permanently advanced by a call that retained nothing.
+    #[allow(dead_code)] // consumer: `OrgRoutingState` (OLB-2B.3b), still dark.
+    fn demand_set(
+        self: &Arc<Self>,
+        family: FamilyId,
+        keys: Vec<SlotKey>,
+    ) -> Result<DemandSet, DemandRefused> {
+        let mut keys = keys;
+        keys.sort();
+        keys.dedup();
+
+        let mut queued = false;
+        let cells = {
+            let mut inner = self.inner.lock();
+
+            // Family capacity, for the whole set at once.
+            if inner.family_handles(family) + keys.len() > MAX_HANDLES_PER_FAMILY {
+                self.metrics
+                    .refused_family_at_capacity
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(DemandRefused::FamilyAtCapacity);
+            }
+
+            // Node capacity, counting only slots this set would CREATE. Keys
+            // already retained by some family cost no node capacity, exactly as
+            // in the single-key path — a live slot is never evicted.
+            let new_slots = keys
+                .iter()
+                .filter(|key| !inner.slots.contains_key(key))
+                .count();
+            if inner.slots.len() + new_slots > MAX_NODE_SLOTS {
+                self.metrics
+                    .refused_node_at_capacity
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(DemandRefused::NodeAtCapacity);
+            }
+
+            // Reserve every incarnation this set needs as ONE contiguous block,
+            // checked, before the first mutation. `allocate_id` per slot inside
+            // the loop would be equivalent only if the loop could not fail —
+            // and the reason it cannot fail is precisely this reservation.
+            let Some(reserved_through) = inner.next_id.checked_add(new_slots as u64) else {
+                self.metrics
+                    .refused_id_space_exhausted
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(DemandRefused::IdSpaceExhausted);
+            };
+            let mut next_incarnation = inner.next_id;
+            inner.next_id = reserved_through;
+
+            // Every refusal is above this line. Nothing below can fail, so
+            // nothing below needs an unwind path.
+            let mut cells = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let slot_cells = match inner.slots.get_mut(key) {
+                    Some(slot) => {
+                        slot.refs += 1;
+                        slot.cells.clone()
+                    }
+                    None => {
+                        next_incarnation += 1;
+                        let slot = Slot::new(next_incarnation);
+                        let slot_cells = slot.cells.clone();
+                        inner.slots.insert(key.clone(), slot);
+                        inner
+                            .slots_by_capability
+                            .entry(key.capability)
+                            .or_default()
+                            .insert(key.clone());
+                        inner.pending.insert(key.clone());
+                        queued = true;
+                        slot_cells
+                    }
+                };
+                *inner
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .entry(key.clone())
+                    .or_insert(0) += 1;
+                cells.push(slot_cells);
+            }
+            debug_assert_eq!(next_incarnation, reserved_through, "reservation is exact");
+            cells
+        };
+
+        if queued {
+            // ONE wake for the whole set: the actor's queue is the authoritative
+            // `pending`, and it already holds every new identity.
+            self.work.mark();
+        }
+        Ok(DemandSet {
+            registry: self.clone(),
+            family,
+            keys: keys.clone(),
+            cells,
+            held: parking_lot::Mutex::new(keys),
         })
     }
 
@@ -828,35 +1496,282 @@ impl NodeOrgRoutingRegistry {
     #[allow(dead_code)]
     fn release(&self, family: FamilyId, key: &SlotKey) {
         let mut inner = self.inner.lock();
-        if let Some(keys) = inner.families.get_mut(&family) {
-            if let Some(count) = keys.get_mut(key) {
-                *count -= 1;
-                if *count == 0 {
-                    keys.remove(key);
-                }
+        match inner.release_one(family, key) {
+            ReleaseOutcome::Retire => {
+                self.retire_committed(&mut inner, key);
+                self.note_ref_released();
             }
-            if keys.is_empty() {
-                inner.families.remove(&family);
+            ReleaseOutcome::Released => self.note_ref_released(),
+            ReleaseOutcome::NotHeld => {}
+        }
+    }
+
+    /// Release EVERY key of a set in ONE registry transaction.
+    ///
+    /// One acquisition, not one per key: a set is released as a unit, so no
+    /// observer can see a partially-released set and the capacity generation
+    /// moves once for the whole retirement rather than interleaving with another
+    /// family's demand.
+    fn release_keys(&self, family: FamilyId, keys: &[SlotKey]) {
+        let mut inner = self.inner.lock();
+        let mut released = false;
+        for key in keys {
+            match inner.release_one(family, key) {
+                ReleaseOutcome::Retire => {
+                    self.retire_committed(&mut inner, key);
+                    released = true;
+                }
+                ReleaseOutcome::Released => released = true,
+                ReleaseOutcome::NotHeld => {}
             }
         }
-        let retire = match inner.slots.get_mut(key) {
-            Some(slot) => {
-                slot.refs -= 1;
-                slot.refs == 0
+        if released {
+            self.note_ref_released();
+        }
+    }
+
+    /// Publish that a reference was given back, so a refused REPLACEMENT knows
+    /// its projection may have changed. Advances on every release, including one
+    /// that leaves the slot alive with other owners.
+    fn note_ref_released(&self) {
+        self.ref_release_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Commit the retirement of a slot whose last reference just went away.
+    ///
+    /// **Clears the publication cell before dropping the slot.** The cell is an
+    /// `Arc` that outstanding readers may still hold — a superseded `DemandSet`,
+    /// or any holder of an `Arc<CapabilityRouteHandle>` the index no longer
+    /// names — and removing the slot from `slots` does NOT reach them. Leaving
+    /// the artifact in place would let a reader that owns no registry reference
+    /// go on reading a dead incarnation's facts indefinitely, which is retention
+    /// without ownership: exactly the property `DemandSet` exists to make
+    /// impossible.
+    ///
+    /// Clearing it here is what makes "a retired slot's cell reads empty" TRUE
+    /// rather than merely documented. It is safe against a concurrent
+    /// reconstruction because the apply path re-looks the slot up under this
+    /// same lock and refuses twice over: a removed slot is skipped outright, and
+    /// a re-demanded one fails the `slot.incarnation == slot_incarnation` fence.
+    /// A re-demand also mints a FRESH cell, so the cleared one is unreachable
+    /// from the registry and nothing can ever republish into it.
+    fn retire_committed(&self, inner: &mut RegistryInner, key: &SlotKey) {
+        if let Some(slot) = inner.slots.get(key) {
+            // Before the removal, so no window exists in which the slot is gone
+            // from the index while its artifacts are still readable. BOTH
+            // cells, pool first (§1.1): a retired incarnation's routing pool is
+            // exactly as dead as its facts.
+            slot.cells.take_facts();
+        }
+        inner.slots.remove(key);
+        inner.pending.remove(key);
+        if let Some(bucket) = inner.slots_by_capability.get_mut(&key.capability) {
+            bucket.remove(key);
+            if bucket.is_empty() {
+                inner.slots_by_capability.remove(&key.capability);
             }
-            None => false,
+        }
+        self.metrics.slots_retired.fetch_add(1, Ordering::AcqRel);
+        // Node capacity genuinely moved. Published while the registry lock
+        // still covers the removal, so an observer that reads the new
+        // generation cannot then find the slot still there.
+        self.node_capacity_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Atomically REPLACE one family's demand set with another (OLB-2B.3b §4.3).
+    ///
+    /// Not "acquire the new set, then drop the old one". That charges the family
+    /// and the node at the TRANSIENT GROSS peak — every replacement handle while
+    /// every superseded handle is still charged — so a replacement that plainly
+    /// fits its final footprint is refused at the bound. A family holding 64 of
+    /// 64 whose width-2 capability loses an audience projects to
+    /// `64 - 2 + 1 = 63` and MUST succeed; charged gross it asks for 66.
+    ///
+    /// Nor "release the old set, then acquire the new one". That answers the
+    /// bound correctly and breaks the no-effect property instead: a refusal
+    /// would have already destroyed retained authority, and the re-acquisition
+    /// that was supposed to restore it can fail on its own.
+    ///
+    /// So: ONE transaction, charged on the PROJECTED FINAL footprint.
+    ///
+    /// ```text
+    /// common     = old ∩ new    reference kept EXACTLY as it is — no churn
+    /// old_only   = old \ new    released; credits node capacity only if LAST
+    /// new_only   = new \ old    charged; costs a node slot only if absent
+    ///
+    /// family:  held - |old_only| + |new_only|   <= MAX_HANDLES_PER_FAMILY
+    /// node:    slots - credited  + created      <= MAX_NODE_SLOTS
+    /// ```
+    ///
+    /// The node credit is deliberately conditional. An `old_only` slot another
+    /// family still demands does NOT retire, so it frees nothing and crediting
+    /// it would admit a 257th slot. The shared-old and last-reference cases are
+    /// separately witnessed for exactly that reason.
+    ///
+    /// Every refusal is decided before the first mutation, so a refused
+    /// replacement leaves handles, slots, refs, pending work, identities and
+    /// generations exactly as they were — and, because the caller keeps its
+    /// `DemandSet`, leaves the superseded entry fully live and owned.
+    fn replace_demand_set(
+        self: &Arc<Self>,
+        family: FamilyId,
+        old: &DemandSet,
+        new_keys: Vec<SlotKey>,
+    ) -> Result<DemandSet, ReplaceRefused> {
+        let mut new_keys = new_keys;
+        new_keys.sort();
+        new_keys.dedup();
+
+        // Lock order: the set's release responsibility, then the registry. The
+        // set's own `Drop` takes them in the same order, so the two cannot
+        // deadlock against each other.
+        let mut held = old.held.lock();
+
+        // A set that has already transferred owns nothing. Replacing it would
+        // compute `old_only = ∅` and charge the successor's whole footprint
+        // gross — the HOLD-2 defect, arriving through a stale basis instead of a
+        // stale accounting rule. Refused before anything is read or written.
+        if *held != old.keys {
+            return Err(ReplaceRefused::Superseded);
+        }
+
+        let mut queued = false;
+        let mut released = false;
+        let cells = {
+            let mut inner = self.inner.lock();
+
+            let old_only: Vec<SlotKey> = held
+                .iter()
+                .filter(|key| new_keys.binary_search(key).is_err())
+                .cloned()
+                .collect();
+            let new_only: Vec<SlotKey> = new_keys
+                .iter()
+                .filter(|key| held.binary_search(key).is_err())
+                .cloned()
+                .collect();
+
+            // FAMILY, on the projected final count.
+            let projected =
+                inner.family_handles(family).saturating_sub(old_only.len()) + new_only.len();
+            if projected > MAX_HANDLES_PER_FAMILY {
+                self.metrics
+                    .refused_family_at_capacity
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(ReplaceRefused::Demand(DemandRefused::FamilyAtCapacity));
+            }
+
+            // NODE, on the projected final retained set. A slot is credited only
+            // when THIS reference is its last.
+            let credited = old_only
+                .iter()
+                .filter(|key| inner.slots.get(key).is_some_and(|slot| slot.refs == 1))
+                .count();
+            let created = new_only
+                .iter()
+                .filter(|key| !inner.slots.contains_key(key))
+                .count();
+            let projected_slots = inner.slots.len().saturating_sub(credited) + created;
+            if projected_slots > MAX_NODE_SLOTS {
+                self.metrics
+                    .refused_node_at_capacity
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(ReplaceRefused::Demand(DemandRefused::NodeAtCapacity));
+            }
+
+            // IDENTITIES for genuinely new slots, reserved as one checked block.
+            let Some(reserved_through) = inner.next_id.checked_add(created as u64) else {
+                self.metrics
+                    .refused_id_space_exhausted
+                    .fetch_add(1, Ordering::AcqRel);
+                return Err(ReplaceRefused::Demand(DemandRefused::IdSpaceExhausted));
+            };
+            let mut next_incarnation = inner.next_id;
+            inner.next_id = reserved_through;
+
+            // Every refusal is above this line. Nothing below can fail.
+
+            // Released FIRST, so the retained-slot count never rises above the
+            // projected final figure even inside the transaction.
+            for key in &old_only {
+                // `NotHeld` is unreachable: `held` was verified to equal this
+                // set's named keys above, and a set names only keys its own
+                // family holds. Retiring on it anyway would be the cross-family
+                // corruption in a different shape, so it is simply not a retire.
+                match inner.release_one(family, key) {
+                    ReleaseOutcome::Retire => {
+                        self.retire_committed(&mut inner, key);
+                        released = true;
+                    }
+                    ReleaseOutcome::Released => released = true,
+                    ReleaseOutcome::NotHeld => {}
+                }
+            }
+            for key in &new_only {
+                match inner.slots.get_mut(key) {
+                    Some(slot) => slot.refs += 1,
+                    None => {
+                        next_incarnation += 1;
+                        inner.slots.insert(key.clone(), Slot::new(next_incarnation));
+                        inner
+                            .slots_by_capability
+                            .entry(key.capability)
+                            .or_default()
+                            .insert(key.clone());
+                        inner.pending.insert(key.clone());
+                        queued = true;
+                    }
+                }
+                *inner
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .entry(key.clone())
+                    .or_insert(0) += 1;
+            }
+            debug_assert_eq!(next_incarnation, reserved_through, "reservation is exact");
+
+            // Cells for the WHOLE new set — both planes per key. A `common` key
+            // yields the very cells it already had, because its reference was
+            // never touched.
+            new_keys
+                .iter()
+                .map(|key| {
+                    // `expect_used` lint guard: a `common` key kept its
+                    // reference untouched and a `new_only` key was inserted or
+                    // bumped just above, so the lookup cannot miss; suppress
+                    // locally rather than `filter_map`, which would silently
+                    // misalign the `keys[i]` <-> `cells[i]` pairing.
+                    #[allow(clippy::expect_used)]
+                    let slot = inner
+                        .slots
+                        .get(key)
+                        .expect("every key of the new set is retained above");
+                    slot.cells.clone()
+                })
+                .collect::<Vec<_>>()
         };
-        if retire {
-            inner.slots.remove(key);
-            inner.pending.remove(key);
-            if let Some(bucket) = inner.slots_by_capability.get_mut(&key.capability) {
-                bucket.remove(key);
-                if bucket.is_empty() {
-                    inner.slots_by_capability.remove(&key.capability);
-                }
-            }
-            self.metrics.slots_retired.fetch_add(1, Ordering::AcqRel);
+
+        // The TRANSFER, and the only place it happens: the superseded set now
+        // owes nothing, because everything it owed is either still held (common)
+        // or has just been released (old_only). No flag decides this — the keys
+        // themselves moved, so exactly one set owes a release at every instant.
+        held.clear();
+        drop(held);
+
+        if released {
+            self.note_ref_released();
         }
+        if queued {
+            self.work.mark();
+        }
+        Ok(DemandSet {
+            registry: self.clone(),
+            family,
+            keys: new_keys.clone(),
+            cells,
+            held: parking_lot::Mutex::new(new_keys),
+        })
     }
 
     /// The RAW retained base facts for `key` — retention only, with NO
@@ -876,7 +1791,7 @@ impl NodeOrgRoutingRegistry {
     /// witnesses asserting on RETENTION specifically — several of them precisely
     /// to prove that the seam fences something the registry still holds.
     pub(crate) fn base_facts_unvalidated(&self, key: &SlotKey) -> Option<Arc<SlotBaseFacts>> {
-        self.inner.lock().slots.get(key)?.facts.load_full()
+        self.inner.lock().slots.get(key)?.cells.facts.load_full()
     }
 
     /// Authority moved to `live`: drop every fact stamped with an OLDER
@@ -901,7 +1816,8 @@ impl NodeOrgRoutingRegistry {
                 .slots
                 .iter()
                 .filter(|(_, slot)| {
-                    slot.facts
+                    slot.cells
+                        .facts
                         .load()
                         .as_ref()
                         .is_some_and(|facts| facts.epoch.authority < live)
@@ -940,15 +1856,18 @@ impl NodeOrgRoutingRegistry {
                 return;
             };
             let still_observed = slot
+                .cells
                 .facts
                 .load()
                 .as_ref()
                 .is_some_and(|live| Arc::ptr_eq(live, observed));
             if !still_observed {
-                // Someone installed a newer artifact. Leave it alone.
+                // Someone installed a newer artifact. Leave it alone — and its
+                // pool with it (§1.1): a delayed invalidator deletes nothing
+                // derived from an artifact it did not observe.
                 return;
             }
-            slot.facts.store(None);
+            slot.cells.take_facts();
             self.metrics
                 .facts_invalidated
                 .fetch_add(1, Ordering::AcqRel);
@@ -958,6 +1877,135 @@ impl NodeOrgRoutingRegistry {
         if owed {
             self.work.mark();
         }
+    }
+
+    /// A consumer Grant moved: retire every retained artifact of that exact
+    /// audience scope which the transition SUPERSEDES, re-queue exactly those
+    /// slots, and wake the actor (items 10/11).
+    ///
+    /// Returns the number of artifacts retired.
+    ///
+    /// **Conditional, and decided under the registry lock.** Each slot is judged
+    /// against the artifact it actually holds, at the mutation boundary — not
+    /// against a snapshot read before the lock. A pre-lock "is this still
+    /// current?" check would be insufficient on its own: a newer publication can
+    /// land between the check and the clear, and the decision to preserve a
+    /// successor has to still be true when the clear happens.
+    ///
+    /// A slot that is retained but holds NO artifact is still re-queued — that is
+    /// the whole install direction, and it is harmless coalescing besides.
+    /// Everything else is judged by the publication generation the artifact was
+    /// reconstructed under.
+    ///
+    /// Three kinds of survivor, and the wording matters because two earlier
+    /// versions of this comment erased one of them each:
+    ///
+    /// - **this publication's own artifact** — equal generation. A demand that
+    ///   arrived after the publication and before its notification produces one,
+    ///   and it already reflects the transition;
+    /// - a LATER installation's artifact;
+    /// - an equal-or-later ABSENCE artifact. Treating absence as
+    ///   never-a-successor is the defect Kyra's probe found at `7348529fb`.
+    ///
+    /// **Not keyed on `ScopedDiscoveryState::revision`** (item 11, design §2A.2).
+    /// A consumer-Grant transition mutates the grant registry, not the scoped
+    /// store, so the scoped revision does not move and cannot be the trigger.
+    ///
+    /// The caller must NOT hold the consumer-Grant gate: the commit pin takes
+    /// that gate and then this lock, so acquiring this beneath it would invert
+    /// the frozen order. Item 10 states the same thing as an ordering rule.
+    pub(crate) fn invalidate_grant_scope(&self, movement: &GrantScopeMovement) -> u64 {
+        let (retired, owed) = {
+            let mut inner = self.inner.lock();
+            let affected: Vec<SlotKey> = inner
+                .slots
+                .keys()
+                .filter(|key| movement.covers(key))
+                .cloned()
+                .collect();
+            let mut retired = 0u64;
+            for key in affected {
+                let Some(cells) = inner.slots.get(&key).map(|slot| slot.cells.clone()) else {
+                    continue;
+                };
+                // Ordered by the PUBLICATION generation the reconstruction
+                // observed, not by the authority it stamped — that is what makes
+                // the fence total over installations AND absences. A slot with no
+                // artifact has nothing to preserve and still owes work, so it is
+                // re-queued: harmless coalescing, since `pending` is a set and a
+                // cold slot needs rebuilding regardless.
+                //
+                // STRICTLY less than. An artifact from THIS publication already
+                // reflects the transition and must survive it — that is the
+                // "a demand arriving after publication is safe" case of §2A.2,
+                // and `<=` would have the notification destroy its own
+                // publication's current artifact.
+                //             artifact:  Publication(a)      TerminalAbsence
+                //  movement:
+                //  Publication(p)         clear iff a < p     preserve
+                //  Terminal               clear               preserve
+                //
+                // The `Terminal` row is NOT "clear everything". Terminal
+                // withdrawal must still preserve the absence artifact its OWN
+                // publication produced — the same equality property W-W9/W-W10
+                // pin for ordinary publications, and it does not come for free
+                // just because nothing can supersede a terminal state.
+                //
+                // `Publication(_)` under a `Terminal` movement always clears: at
+                // exhaustion the last live identity may equal the artifact's, so
+                // an identity comparison could not distinguish "before the
+                // withdrawal" from "after" — which is exactly the alias this
+                // arm exists to avoid.
+                //
+                // FOUR arms for four cells, and the two `TerminalAbsence` ones
+                // are written out separately even though they agree. Collapsed
+                // to `(TerminalAbsence, _)` they could not be mutated apart, and
+                // that is not hypothetical: the whole gate stayed green with
+                // ordinary movement clearing terminal absence, because the only
+                // witness in that column tested the `Terminal` row (Kyra, review
+                // of `010c718ea`). A cell that cannot be mutated alone cannot be
+                // witnessed alone.
+                let superseded = match cells.facts.load().as_ref() {
+                    None => true,
+                    Some(facts) => match (facts.grant_fence, movement.fence) {
+                        // Terminal absence survives its own ORDINARY publication.
+                        // The removal that SPENDS the space is an ordinary
+                        // transition — it reserves the last live identity — yet
+                        // the absence it causes reconstructs terminal. W-W15.
+                        (
+                            GrantArtifactFence::TerminalAbsence,
+                            GrantMovementFence::Publication(_),
+                        ) => false,
+                        // And survives a terminal one. W-W14.
+                        (GrantArtifactFence::TerminalAbsence, GrantMovementFence::Terminal) => {
+                            false
+                        }
+                        (GrantArtifactFence::Publication(_), GrantMovementFence::Terminal) => true,
+                        (
+                            GrantArtifactFence::Publication(artifact),
+                            GrantMovementFence::Publication(publication),
+                        ) => artifact < publication,
+                    },
+                };
+                if !superseded {
+                    // A LATER installation already published here. Leave it
+                    // entirely alone — no clear, and no re-queue either.
+                    continue;
+                }
+                if cells.take_facts().is_some() {
+                    retired += 1;
+                }
+                inner.pending.insert(key);
+            }
+            self.metrics
+                .facts_invalidated
+                .fetch_add(retired, Ordering::AcqRel);
+            (retired, !inner.pending.is_empty())
+        };
+        if owed {
+            self.work.mark();
+        }
+        retired
     }
 
     /// The authority epoch space is terminally exhausted: retire every retained
@@ -981,7 +2029,7 @@ impl NodeOrgRoutingRegistry {
         let mut inner = self.inner.lock();
         let mut invalidated = 0u64;
         for slot in inner.slots.values_mut() {
-            if slot.facts.swap(None).is_some() {
+            if slot.cells.take_facts().is_some() {
                 invalidated += 1;
             }
         }
@@ -1004,7 +2052,7 @@ impl NodeOrgRoutingRegistry {
             .lock()
             .slots
             .values()
-            .filter_map(|slot| slot.facts.load().as_ref().map(|f| f.earliest_expiry))
+            .filter_map(|slot| slot.cells.facts.load().as_ref().map(|f| f.earliest_expiry))
             .filter(|deadline| *deadline != u64::MAX)
             .min()
     }
@@ -1030,7 +2078,8 @@ impl NodeOrgRoutingRegistry {
             .slots
             .iter()
             .filter(|(_, slot)| {
-                slot.facts
+                slot.cells
+                    .facts
                     .load()
                     .as_ref()
                     .is_some_and(|f| now_secs >= f.earliest_expiry)
@@ -1040,7 +2089,7 @@ impl NodeOrgRoutingRegistry {
         let mut retired = 0u64;
         for key in expired {
             if let Some(slot) = inner.slots.get_mut(&key) {
-                if slot.facts.swap(None).is_some() {
+                if slot.cells.take_facts().is_some() {
                     retired += 1;
                 }
             }
@@ -1061,6 +2110,30 @@ impl NodeOrgRoutingRegistry {
         inner.pending.insert(key.clone());
     }
 
+    /// Test-only: give back ONE of `family`'s references to `key`, exactly as an
+    /// internal release would.
+    ///
+    /// Exists so the ownership invariant can be witnessed DIRECTLY — that a
+    /// family which holds no such reference cannot decrement the global one —
+    /// rather than inferred from a cross-family transfer the crate-private
+    /// surface no longer lets anyone express.
+    #[cfg(test)]
+    pub(crate) fn release_one_for_test(&self, family: &RoutingFamily, key: &SlotKey) {
+        let mut inner = self.inner.lock();
+        match inner.release_one(family.id, key) {
+            ReleaseOutcome::Retire => {
+                self.retire_committed(&mut inner, key);
+                drop(inner);
+                self.note_ref_released();
+            }
+            ReleaseOutcome::Released => {
+                drop(inner);
+                self.note_ref_released();
+            }
+            ReleaseOutcome::NotHeld => {}
+        }
+    }
+
     /// Test-only: install `facts` for `key`, creating the slot if needed.
     ///
     /// Lets a witness reproduce a quantum that raced a deadline — facts valid at
@@ -1069,12 +2142,37 @@ impl NodeOrgRoutingRegistry {
     #[cfg(test)]
     pub(crate) fn install_facts_for_test(&self, key: SlotKey, facts: Arc<SlotBaseFacts>) {
         let mut inner = self.inner.lock();
-        let slot = inner.slots.entry(key).or_insert(Slot {
-            incarnation: 1,
-            refs: 1,
-            facts: Arc::new(ArcSwapOption::empty()),
-        });
-        slot.facts.store(Some(facts));
+        let slot = inner.slots.entry(key).or_insert_with(|| Slot::new(1));
+        // The production ordering, pool first — so a witness that wants a pool
+        // beside these facts injects it AFTER this call, exactly as the actor
+        // build cycle publishes after installing (§18 step 2).
+        slot.cells.install_facts(facts);
+    }
+
+    /// Test-only: publish a routing pool for `key`, for two-cell lifecycle
+    /// witnesses. The production publisher is the actor build cycle (§18 step
+    /// 2), which is why this seam exists — the lifecycle lands, and must be
+    /// witnessed, before the builder does.
+    #[cfg(test)]
+    pub(crate) fn install_unsensed_pool_for_test(
+        &self,
+        key: &SlotKey,
+        pool: Arc<ScopedUnsensedRoutePool>,
+    ) {
+        let inner = self.inner.lock();
+        if let Some(slot) = inner.slots.get(key) {
+            slot.cells.unsensed.store(Some(pool));
+        }
+    }
+
+    /// Test-only: the published routing pool, retention only — the second
+    /// cell's twin of [`Self::base_facts_unvalidated`].
+    #[cfg(test)]
+    pub(crate) fn unsensed_pool_for_test(
+        &self,
+        key: &SlotKey,
+    ) -> Option<Arc<ScopedUnsensedRoutePool>> {
+        self.inner.lock().slots.get(key)?.cells.unsensed.load_full()
     }
 
     pub(crate) fn retained_slots(&self) -> usize {
@@ -1083,6 +2181,26 @@ impl NodeOrgRoutingRegistry {
 
     pub(crate) fn pending_slots(&self) -> usize {
         self.inner.lock().pending.len()
+    }
+
+    /// Test-only: the high-water mark of the monotone identity allocator.
+    ///
+    /// The no-effect assertion for a refused demand set has to be TOTAL —
+    /// {slots, pending, handles, identities} — and the identity component is
+    /// the one a naive `demand`-in-a-loop implementation silently fails while
+    /// every other component looks clean, because the prefix it retained is
+    /// released again on the error path (OLB-2B.3b, W-A5; the same lesson as
+    /// step 1's `300e80f6c`).
+    #[cfg(test)]
+    pub(crate) fn allocated_ids_for_test(&self) -> u64 {
+        self.inner.lock().next_id
+    }
+
+    /// Test-only: drive the identity allocator to exhaustion, so a witness can
+    /// reach the TERMINAL refusal without minting 2^64 slots.
+    #[cfg(test)]
+    pub(crate) fn exhaust_ids_for_test(&self) {
+        self.inner.lock().next_id = u64::MAX;
     }
 }
 
@@ -1442,6 +2560,7 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                     facts,
                     authority,
                     authority_deadline,
+                    grant_fence,
                 } = facts;
                 let row_expiry = match &facts {
                     SourceFacts::Served(providers) => providers
@@ -1460,14 +2579,20 @@ impl DirtyApply for NodeOrgRoutingRegistry {
                 // while the authority behind it expires in an hour — and nothing
                 // else in the artifact could ever retire it.
                 let earliest_expiry = row_expiry.min(authority_deadline);
-                slot.facts.store(Some(Arc::new(SlotBaseFacts {
+                // Pool first, inside `install_facts` (§1.1): a pool present at
+                // this moment was derived from the facts being SUPERSEDED, and
+                // storing the new facts first would let a lock-free reader
+                // pair them with it. The pool rebuild is the actor build
+                // cycle's (§18 step 2).
+                slot.cells.install_facts(Arc::new(SlotBaseFacts {
                     providers: facts,
                     epoch,
                     authority,
+                    grant_fence,
                     actor_incarnation: incarnation,
                     slot_incarnation,
                     earliest_expiry,
-                })));
+                }));
                 self.metrics.installs.fetch_add(1, Ordering::AcqRel);
             }
 
@@ -1703,6 +2828,7 @@ mod tests {
             ScopedSourceFacts {
                 facts: SourceFacts::Served(Arc::from(Vec::new())),
                 authority: ScopedDiscoveryAuthorityStamp::Owner,
+                grant_fence: GrantArtifactFence::Publication(0),
                 authority_deadline: u64::MAX,
             }
         }
@@ -1805,6 +2931,20 @@ mod tests {
             source,
             metrics,
         }
+    }
+
+    /// A minimal published artifact, for witnesses about cell LIFETIME rather
+    /// than cell content.
+    fn facts() -> Arc<SlotBaseFacts> {
+        Arc::new(SlotBaseFacts {
+            providers: SourceFacts::Unserved,
+            epoch: SourceEpoch::default(),
+            authority: ScopedDiscoveryAuthorityStamp::Owner,
+            actor_incarnation: 1,
+            slot_incarnation: 1,
+            grant_fence: GrantArtifactFence::Publication(0),
+            earliest_expiry: u64::MAX,
+        })
     }
 
     fn request(registry_work: bool, dirty: DirtyCapabilities) -> ApplyRequest {
@@ -2019,6 +3159,32 @@ mod tests {
             f.registry.base_facts_unvalidated(&beyond).is_none(),
             "the refused key is cold/unretained"
         );
+
+        // The STRUCTURAL pool bound (design §4, §18.3): pool publications
+        // live on slot cells and nowhere else, so 256 retained slots can each
+        // own one pool — and the refused 257th key has no cell for a pool to
+        // exist in. The install seam is a per-slot store, so against a refused
+        // key it is a no-op rather than an allocation.
+        let first = key(1, "nrpc:n0");
+        f.registry.install_facts_for_test(first.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&first).expect("facts");
+        f.registry.install_unsensed_pool_for_test(
+            &first,
+            Arc::new(ScopedUnsensedRoutePool::for_test(base)),
+        );
+        assert!(
+            f.registry.unsensed_pool_for_test(&first).is_some(),
+            "a retained slot owns its pool publication"
+        );
+        f.registry.install_unsensed_pool_for_test(
+            &beyond,
+            Arc::new(ScopedUnsensedRoutePool::for_test(facts())),
+        );
+        assert!(
+            f.registry.unsensed_pool_for_test(&beyond).is_none(),
+            "no slot, no cell, no 257th pool — the bound is structural, not \
+             counted"
+        );
     }
 
     /// An exhausted identity space refuses deterministically: no slot retained, no
@@ -2058,6 +3224,783 @@ mod tests {
             family.demand(key(1, "nrpc:a")).is_ok(),
             "sharing a retained slot allocates nothing"
         );
+    }
+
+    // ------------------------------- OLB-2B.3b: atomic demand-set acquisition
+
+    /// The TOTAL state a refused acquisition must leave untouched.
+    ///
+    /// Total on purpose (step 1's `300e80f6c` lesson): a witness that asserts a
+    /// SUBSET of {slots, pending, handles, identities, retirements} passes
+    /// against the naive `demand`-in-a-loop implementation, whose prefix IS
+    /// released on the error path — so slots and handles come back to their
+    /// starting values and only the identity space and the retirement counter
+    /// still show what happened.
+    #[derive(Debug, PartialEq, Eq)]
+    struct NoEffect {
+        slots: usize,
+        pending: usize,
+        handles: usize,
+        ids: u64,
+        retired: u64,
+    }
+
+    fn no_effect(f: &Fixture, family: &RoutingFamily) -> NoEffect {
+        NoEffect {
+            slots: f.registry.retained_slots(),
+            pending: f.registry.pending_slots(),
+            handles: family.handles(),
+            ids: f.registry.allocated_ids_for_test(),
+            retired: f.metrics.slots_retired(),
+        }
+    }
+
+    fn set(seeds: &[u8], tag: &str) -> Vec<SlotKey> {
+        seeds.iter().map(|s| key(*s, tag)).collect()
+    }
+
+    /// W-A1 — the family bound is checked for the WHOLE set, and a refusal
+    /// retains nothing.
+    ///
+    /// The set is deliberately larger than the remaining budget by ONE, with
+    /// several NEW keys ahead of the one that does not fit. That is the schedule
+    /// a per-key loop gets wrong: it admits the prefix, mints an incarnation for
+    /// each, and only then discovers the bound.
+    #[test]
+    fn a_demand_set_past_the_family_bound_retains_nothing() {
+        let f = fixture();
+        let family = f.family();
+        let mut held = Vec::new();
+        for i in 0..62u32 {
+            held.push(
+                family
+                    .demand(key(1, &format!("nrpc:fill-{i}")))
+                    .expect("fill"),
+            );
+        }
+        assert_eq!(family.handles(), 62);
+        let before = no_effect(&f, &family);
+
+        assert_eq!(
+            family.demand_set(set(&[10, 11, 12], "nrpc:wide")).err(),
+            Some(DemandRefused::FamilyAtCapacity),
+            "62 + 3 exceeds the 64-handle family budget"
+        );
+        assert_eq!(
+            no_effect(&f, &family),
+            before,
+            "a refused set retains no slot, queues no work, spends no handle, \
+             consumes no identity and retires nothing"
+        );
+        assert_eq!(f.metrics.refused_family_at_capacity(), 1);
+
+        // The bound is exact, not conservative: a set that FITS still goes
+        // through, so the refusal above was the budget and not the batching.
+        let fits = family
+            .demand_set(set(&[10, 11], "nrpc:wide"))
+            .expect("62 + 2 fits exactly");
+        assert_eq!(fits.len(), 2);
+        assert_eq!(family.handles(), 64);
+    }
+
+    /// W-A2 — the node bound is checked for every NEW distinct slot, and a
+    /// refusal retains nothing.
+    #[test]
+    fn a_demand_set_past_the_node_bound_retains_nothing() {
+        let f = fixture();
+        // Fill the node to 255 with four families, none of which may exceed 64.
+        let mut fillers = Vec::new();
+        let mut held = Vec::new();
+        for chunk in 0..4u32 {
+            let filler = f.family();
+            for i in 0..64u32 {
+                let n = chunk * 64 + i;
+                if n == 255 {
+                    break;
+                }
+                held.push(
+                    filler
+                        .demand(key(2, &format!("nrpc:node-{n}")))
+                        .expect("fill"),
+                );
+            }
+            fillers.push(filler);
+        }
+        assert_eq!(f.registry.retained_slots(), 255);
+
+        let family = f.family();
+        let before = no_effect(&f, &family);
+        assert_eq!(
+            family.demand_set(set(&[20, 21], "nrpc:pair")).err(),
+            Some(DemandRefused::NodeAtCapacity),
+            "255 + 2 new slots exceeds the 256-slot node bound"
+        );
+        assert_eq!(
+            no_effect(&f, &family),
+            before,
+            "the FIRST of the two must not be retained"
+        );
+        assert_eq!(f.metrics.refused_node_at_capacity(), 1);
+
+        // One new slot still fits — so the refusal counted the set, not the call.
+        let one = family
+            .demand_set(set(&[20], "nrpc:pair"))
+            .expect("255 + 1 fits");
+        assert_eq!(one.len(), 1);
+        assert_eq!(f.registry.retained_slots(), 256);
+    }
+
+    /// W-A2b — an ALREADY-RETAINED key costs no node capacity, so a set that
+    /// shares slots with another family is admitted at the bound.
+    ///
+    /// The control for W-A2: without it, "count every key" and "count every NEW
+    /// key" both refuse the case above, and the witness would not distinguish
+    /// the implementation from a strictly-worse one that never shares.
+    #[test]
+    fn a_demand_set_over_retained_slots_costs_no_node_capacity() {
+        let f = fixture();
+        let mut fillers = Vec::new();
+        let mut held = Vec::new();
+        for chunk in 0..4u32 {
+            let filler = f.family();
+            for i in 0..64u32 {
+                held.push(
+                    filler
+                        .demand(key(2, &format!("nrpc:node-{}", chunk * 64 + i)))
+                        .expect("fill"),
+                );
+            }
+            fillers.push(filler);
+        }
+        assert_eq!(f.registry.retained_slots(), 256, "the node is FULL");
+
+        let family = f.family();
+        let shared = family
+            .demand_set(vec![key(2, "nrpc:node-0"), key(2, "nrpc:node-1")])
+            .expect("sharing retained slots needs no node capacity");
+        assert_eq!(shared.len(), 2);
+        assert_eq!(f.registry.retained_slots(), 256, "and created nothing");
+        assert_eq!(f.metrics.refused_node_at_capacity(), 0);
+    }
+
+    /// W-A3 — exhaustion refuses the whole set and consumes no identity.
+    #[test]
+    fn an_exhausted_identity_space_refuses_a_whole_demand_set() {
+        let f = fixture();
+        let family = f.family();
+        let _live = family.demand(key(1, "nrpc:a")).expect("a");
+        f.registry.exhaust_ids_for_test();
+        let before = no_effect(&f, &family);
+
+        assert_eq!(
+            family.demand_set(set(&[30, 31], "nrpc:fresh")).err(),
+            Some(DemandRefused::IdSpaceExhausted),
+            "two new slots need two incarnations and there are none"
+        );
+        assert_eq!(no_effect(&f, &family), before, "and nothing moved");
+        assert_eq!(f.metrics.refused_id_space_exhausted(), 1);
+
+        // A set over ONLY retained slots needs no incarnation, so exhaustion
+        // does not refuse it. The control that stops "refuse everything once
+        // exhausted" from passing this witness.
+        let shared = family
+            .demand_set(vec![key(1, "nrpc:a")])
+            .expect("a retained slot needs no fresh identity");
+        assert_eq!(shared.len(), 1);
+    }
+
+    /// A superseded reader must not keep reading a RETIRED incarnation's facts.
+    ///
+    /// Dies to: retiring a slot without clearing its publication cell. The cell is
+    /// an `Arc` outstanding readers still hold, so removing the slot from the
+    /// registry map does not reach them — the artifact stays readable forever
+    /// through a set that owns no reference at all. That is retention without
+    /// ownership, which is the one thing `DemandSet` exists to make impossible.
+    #[test]
+    fn a_superseded_reader_cannot_read_a_retired_incarnations_facts() {
+        let f = fixture();
+        let family = f.family();
+        let old_key = key(1, "nrpc:retire");
+        let old = family.demand_set(vec![old_key.clone()]).expect("acquired");
+
+        f.registry.install_facts_for_test(old_key.clone(), facts());
+        assert!(
+            old.base_facts_unvalidated(0).is_some(),
+            "precondition: the reader can see its own incarnation's facts"
+        );
+
+        // Replace with a DISJOINT key: the old slot's last reference goes away.
+        let new = old.replace(vec![key(2, "nrpc:retire")]).expect("replaced");
+        assert_eq!(f.registry.retained_slots(), 1, "the old slot retired");
+
+        assert!(
+            old.base_facts_unvalidated(0).is_none(),
+            "an old reader must not retain facts from the retired incarnation"
+        );
+        drop(new);
+    }
+
+    /// A COMMON key stays readable while the successor owns it, and goes empty when
+    /// the successor gives up the last reference.
+    ///
+    /// The control for the witness above: clearing on retirement must not clear on
+    /// TRANSFER. The old reader shares the successor's cell, and the scope is still
+    /// genuinely retained — by the successor — so it must still read.
+    #[test]
+    fn a_common_key_reader_follows_the_successors_ownership() {
+        let f = fixture();
+        let family = f.family();
+        let shared = key(1, "nrpc:common");
+        let old = family
+            .demand_set(vec![shared.clone(), key(2, "nrpc:common")])
+            .expect("acquired");
+        f.registry.install_facts_for_test(shared.clone(), facts());
+        assert!(old.base_facts_unvalidated(0).is_some());
+
+        // The successor keeps the common key and sheds the other.
+        let new = old.replace(vec![shared.clone()]).expect("replaced");
+        assert!(
+            old.base_facts_unvalidated(0).is_some(),
+            "the common scope is still retained — by the successor — so it still reads"
+        );
+
+        drop(new);
+        assert!(
+            old.base_facts_unvalidated(0).is_none(),
+            "and goes empty the moment the successor releases the last reference"
+        );
+        assert_eq!(f.registry.retained_slots(), 0);
+    }
+
+    /// A fresh demand for a retired `SlotKey` gets a FRESH cell and incarnation, and
+    /// cannot repopulate the stale one.
+    #[test]
+    fn a_fresh_demand_after_retirement_gets_a_fresh_cell() {
+        let f = fixture();
+        let family = f.family();
+        let reused = key(1, "nrpc:reused");
+        let old = family.demand_set(vec![reused.clone()]).expect("acquired");
+        f.registry.install_facts_for_test(reused.clone(), facts());
+        assert!(old.base_facts_unvalidated(0).is_some());
+
+        let successor = old.replace(vec![key(2, "nrpc:reused")]).expect("replaced");
+        assert!(old.base_facts_unvalidated(0).is_none());
+
+        // Demand the SAME key again. It is a new slot with a new incarnation.
+        let fresh = family
+            .demand_set(vec![reused.clone()])
+            .expect("re-demanded");
+        f.registry.install_facts_for_test(reused.clone(), facts());
+        assert!(
+            fresh.base_facts_unvalidated(0).is_some(),
+            "the live incarnation publishes into its own cell"
+        );
+        assert!(
+            old.base_facts_unvalidated(0).is_none(),
+            "and the stale cell stays empty — a fresh publication cannot reach it"
+        );
+        drop((successor, fresh));
+    }
+
+    /// An in-flight apply for a DEAD incarnation cannot republish into the cleared
+    /// cell, even when the same key has been re-demanded.
+    #[test]
+    fn a_stale_incarnation_apply_cannot_republish_a_cleared_cell() {
+        let f = fixture();
+        let family = f.family();
+        let contested = key(1, "nrpc:race");
+        let old = family
+            .demand_set(vec![contested.clone()])
+            .expect("acquired");
+        f.registry
+            .install_facts_for_test(contested.clone(), facts());
+
+        // Retire it, then re-demand the same key: a new incarnation, a new cell.
+        let successor = old.replace(vec![key(2, "nrpc:race")]).expect("replaced");
+        let fresh = family
+            .demand_set(vec![contested.clone()])
+            .expect("re-demanded");
+
+        // Drive a real quantum. The reconstruction reaches the LIVE slot only.
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(
+            matches!(outcome, ApplyOutcome::Current { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            old.base_facts_unvalidated(0).is_none(),
+            "the dead incarnation's cell is unreachable from the registry"
+        );
+        drop((successor, fresh));
+    }
+
+    // ---------------------- OLB-2B.3c §18 step 1: the second publication cell
+
+    /// **Both cells, one acquisition** (design §1.1): the handle's pool cell IS
+    /// the slot's, cloned under the same registry acquisition that took the
+    /// reference — so a pool published later is visible through a handle taken
+    /// earlier.
+    ///
+    /// Dies to: fabricating a detached pool cell at demand time, which would
+    /// leave the handle permanently, silently cold on the pool plane while its
+    /// facts plane works.
+    #[test]
+    fn a_demand_handle_couples_both_publication_cells() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:pool");
+        let handle = family.demand(k.clone()).expect("retained");
+
+        f.registry.install_facts_for_test(k.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&k).expect("facts");
+        let pool = Arc::new(ScopedUnsensedRoutePool::for_test(base));
+        f.registry.install_unsensed_pool_for_test(&k, pool.clone());
+
+        assert!(
+            handle.base_facts_unvalidated().is_some(),
+            "the facts plane reads through the handle"
+        );
+        assert!(
+            handle
+                .unsensed_pool_unvalidated()
+                .is_some_and(|read| Arc::ptr_eq(&read, &pool)),
+            "and the pool plane reads the EXACT published pool — the same \
+             cell, not a copy taken at demand time"
+        );
+    }
+
+    /// The same coupling for a SET: each contributor reads its OWN slot's
+    /// pool, so the `keys[i] <-> cells[i]` pairing holds across both planes.
+    #[test]
+    fn a_demand_set_couples_both_cells_per_contributor() {
+        let f = fixture();
+        let family = f.family();
+        let set = family
+            .demand_set(vec![key(1, "nrpc:pool"), key(2, "nrpc:pool")])
+            .expect("acquired");
+
+        for k in set.keys().to_vec() {
+            f.registry.install_facts_for_test(k.clone(), facts());
+            let base = f.registry.base_facts_unvalidated(&k).expect("facts");
+            f.registry.install_unsensed_pool_for_test(
+                &k,
+                Arc::new(ScopedUnsensedRoutePool::for_test(base)),
+            );
+        }
+        for (index, k) in set.keys().to_vec().iter().enumerate() {
+            let through_set = set.unsensed_pool_unvalidated(index).expect("pool");
+            let through_registry = f.registry.unsensed_pool_for_test(k).expect("pool");
+            assert!(
+                Arc::ptr_eq(&through_set, &through_registry),
+                "contributor {index} reads its own slot's pool — the planes \
+                 cannot misalign"
+            );
+        }
+    }
+
+    /// Retiring the last reference clears BOTH cells: a retired incarnation's
+    /// routing pool is exactly as dead as its facts (W-S1, extended to the
+    /// second cell).
+    ///
+    /// Dies to: retiring the slot without clearing the pool cell — a
+    /// superseded reader would keep reading a retired incarnation's ROUTING
+    /// POOL after its facts were correctly cleared.
+    #[test]
+    fn retiring_the_last_reference_clears_both_cells() {
+        let f = fixture();
+        let family = f.family();
+        let old_key = key(1, "nrpc:retire");
+        let old = family.demand_set(vec![old_key.clone()]).expect("acquired");
+        f.registry.install_facts_for_test(old_key.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&old_key).expect("facts");
+        f.registry.install_unsensed_pool_for_test(
+            &old_key,
+            Arc::new(ScopedUnsensedRoutePool::for_test(base)),
+        );
+        assert!(old.unsensed_pool_unvalidated(0).is_some(), "precondition");
+
+        // Replace with a DISJOINT key: the old slot's last reference goes away.
+        let new = old.replace(vec![key(2, "nrpc:retire")]).expect("replaced");
+        assert!(
+            old.base_facts_unvalidated(0).is_none() && old.unsensed_pool_unvalidated(0).is_none(),
+            "a retired incarnation's cells BOTH read empty"
+        );
+        drop(new);
+    }
+
+    /// A TRANSFER clears neither cell: the common key's pool follows the
+    /// successor's ownership exactly as its facts do (W-S2, extended).
+    #[test]
+    fn a_transfer_leaves_the_common_keys_pool_published() {
+        let f = fixture();
+        let family = f.family();
+        let shared = key(1, "nrpc:common");
+        let old = family
+            .demand_set(vec![shared.clone(), key(2, "nrpc:common")])
+            .expect("acquired");
+        f.registry.install_facts_for_test(shared.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&shared).expect("facts");
+        let pool = Arc::new(ScopedUnsensedRoutePool::for_test(base));
+        f.registry
+            .install_unsensed_pool_for_test(&shared, pool.clone());
+        let index = old
+            .keys()
+            .iter()
+            .position(|k| *k == shared)
+            .expect("the set names the shared key");
+
+        // The successor keeps the common key and sheds the other.
+        let new = old.replace(vec![shared.clone()]).expect("replaced");
+        assert!(
+            old.unsensed_pool_unvalidated(index)
+                .is_some_and(|read| Arc::ptr_eq(&read, &pool)),
+            "the transfer cleared neither plane — the scope is still retained, \
+             by the successor, and the pool still reads"
+        );
+
+        drop(new);
+        assert!(
+            old.unsensed_pool_unvalidated(index).is_none(),
+            "and both planes go dark when the successor releases the last \
+             reference"
+        );
+    }
+
+    /// FACTS invalidation clears the derived pool with the facts (§1.1): the
+    /// pool's basis is gone, so the pool is gone. Every facts-moving site
+    /// routes through the same two-cell move, pool first, so this pins them
+    /// all through the shared helper.
+    #[test]
+    fn facts_invalidation_clears_the_derived_pool() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:pool");
+        let _live = family.demand(k.clone()).expect("retained");
+        f.registry.install_facts_for_test(k.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&k).expect("facts");
+        f.registry
+            .install_unsensed_pool_for_test(&k, Arc::new(ScopedUnsensedRoutePool::for_test(base)));
+
+        f.registry.invalidate_for_test(&k);
+        assert!(f.registry.base_facts_unvalidated(&k).is_none());
+        assert!(
+            f.registry.unsensed_pool_for_test(&k).is_none(),
+            "the pool's basis is gone, so the pool is gone"
+        );
+    }
+
+    /// A DELAYED reader invalidation that observed a SUPERSEDED artifact
+    /// deletes nothing on either plane; observing the CURRENT artifact deletes
+    /// both. The §1.1 delayed-invalidator rule, with the control adjacent —
+    /// without it, "clear both unconditionally" passes the first half.
+    #[test]
+    fn a_stale_observation_invalidates_neither_plane() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:pool");
+        let _live = family.demand(k.clone()).expect("retained");
+
+        // The artifact an arbitrarily-delayed reader once observed…
+        let superseded = facts();
+        f.registry
+            .install_facts_for_test(k.clone(), superseded.clone());
+        // …and the newer artifact, with ITS pool, current now.
+        f.registry.install_facts_for_test(k.clone(), facts());
+        let current = f.registry.base_facts_unvalidated(&k).expect("facts");
+        let pool = Arc::new(ScopedUnsensedRoutePool::for_test(current.clone()));
+        f.registry.install_unsensed_pool_for_test(&k, pool.clone());
+
+        f.registry.invalidate_if_stale(&k, &superseded);
+        assert!(
+            f.registry
+                .base_facts_unvalidated(&k)
+                .is_some_and(|live| Arc::ptr_eq(&live, &current)),
+            "facts the delayed reader did not observe survive"
+        );
+        assert!(
+            f.registry
+                .unsensed_pool_for_test(&k)
+                .is_some_and(|read| Arc::ptr_eq(&read, &pool)),
+            "and so does the pool derived from them"
+        );
+
+        // The control: observing the CURRENT artifact clears both planes.
+        f.registry.invalidate_if_stale(&k, &current);
+        assert!(f.registry.base_facts_unvalidated(&k).is_none());
+        assert!(f.registry.unsensed_pool_for_test(&k).is_none());
+    }
+
+    /// Installing NEWER facts leaves no pool published: the pool present at
+    /// install time was derived from the SUPERSEDED facts, and it is cleared
+    /// before the new facts land so no lock-free reader can pair the new
+    /// facts with the old pool. Repopulating it is the actor build cycle's
+    /// job (§18 step 2).
+    #[test]
+    fn installing_newer_facts_clears_the_superseded_pool() {
+        let f = fixture();
+        let family = f.family();
+        let k = key(1, "nrpc:pool");
+        let _live = family.demand(k.clone()).expect("retained");
+        f.registry.install_facts_for_test(k.clone(), facts());
+        let base = f.registry.base_facts_unvalidated(&k).expect("facts");
+        f.registry
+            .install_unsensed_pool_for_test(&k, Arc::new(ScopedUnsensedRoutePool::for_test(base)));
+
+        f.registry.install_facts_for_test(k.clone(), facts());
+        assert!(
+            f.registry.base_facts_unvalidated(&k).is_some(),
+            "the newer facts are published"
+        );
+        assert!(
+            f.registry.unsensed_pool_for_test(&k).is_none(),
+            "and the superseded facts' pool is not beside them"
+        );
+    }
+
+    /// The SUCCESSOR of a replacement stays index-aligned across both planes:
+    /// for every index, the successor's cells are the registry's cells for
+    /// `successor.keys()[index]`, never another contributor's.
+    ///
+    /// Dies to: reversing the successor's collected cell vector
+    /// (`cells.reverse()` in `replace_demand_set`) — a mutation the seven
+    /// witnesses above all survive, because the acquisition-alignment witness
+    /// never exercises replacement and the transfer witness reads through the
+    /// OLD set. Misaligned, a future projection would read one contributor's
+    /// facts and pool under another contributor's key. Found by the
+    /// independent evidence audit of `3dbee8514`, where exactly that mutation
+    /// ran 49/49 green.
+    #[test]
+    fn a_replacement_successor_stays_index_aligned_across_both_planes() {
+        let f = fixture();
+        let family = f.family();
+        let a = key(1, "nrpc:align");
+        let b = key(2, "nrpc:align");
+        let c = key(3, "nrpc:align");
+        let old = family
+            .demand_set(vec![a.clone(), b.clone()])
+            .expect("acquired");
+
+        // B is COMMON and C is FRESH: the successor mixes a kept cell pair
+        // with a newly created one, which is exactly where a collection-order
+        // defect can hide.
+        let successor = old.replace(vec![b.clone(), c.clone()]).expect("replaced");
+
+        // Distinct artifacts per contributor, on BOTH planes — `facts()`
+        // allocates a fresh `Arc` each call, so pointer identity
+        // distinguishes them even with identical content.
+        for k in successor.keys().to_vec() {
+            f.registry.install_facts_for_test(k.clone(), facts());
+            let base = f.registry.base_facts_unvalidated(&k).expect("facts");
+            f.registry.install_unsensed_pool_for_test(
+                &k,
+                Arc::new(ScopedUnsensedRoutePool::for_test(base)),
+            );
+        }
+        for (index, k) in successor.keys().to_vec().iter().enumerate() {
+            let facts_via_set = successor.base_facts_unvalidated(index).expect("facts");
+            let facts_via_registry = f.registry.base_facts_unvalidated(k).expect("facts");
+            assert!(
+                Arc::ptr_eq(&facts_via_set, &facts_via_registry),
+                "successor contributor {index} reads its OWN key's facts"
+            );
+            let pool_via_set = successor.unsensed_pool_unvalidated(index).expect("pool");
+            let pool_via_registry = f.registry.unsensed_pool_for_test(k).expect("pool");
+            assert!(
+                Arc::ptr_eq(&pool_via_set, &pool_via_registry),
+                "and its OWN key's pool — the pairing survives a replacement"
+            );
+        }
+        drop(old);
+    }
+
+    /// `release_one` cannot decrement a global slot reference for a family that
+    /// holds none — the bookkeeping invariant, asserted directly.
+    ///
+    /// Dies to: dropping the `NotHeld` guard. Without it, a caller that names the
+    /// wrong family retires a slot some OTHER family still owns, stranding a handle
+    /// in that family's map that its set can never give back.
+    #[test]
+    fn release_one_cannot_decrement_a_reference_a_family_does_not_hold() {
+        let f = fixture();
+        let owner = f.family();
+        let stranger = f.family();
+        let owned = key(1, "nrpc:owned");
+        let held = owner.demand_set(vec![owned.clone()]).expect("acquired");
+
+        let before = f.registry.retained_slots();
+        let generation = f.registry.node_capacity_generation();
+        f.registry.release_one_for_test(&stranger, &owned);
+
+        assert_eq!(
+            f.registry.retained_slots(),
+            before,
+            "a family that holds nothing gives nothing back"
+        );
+        assert_eq!(f.registry.node_capacity_generation(), generation);
+        assert_eq!(owner.handles(), 1, "the owner still holds its handle");
+        assert!(
+            held.base_facts_unvalidated(0).is_some() || f.registry.retained_slots() == 1,
+            "and its slot survives"
+        );
+        drop(held);
+        assert_eq!(
+            f.registry.retained_slots(),
+            0,
+            "the owner can still release"
+        );
+    }
+
+    /// A set whose responsibility has already transferred cannot be replaced again.
+    ///
+    /// Dies to: dropping the `held != keys` guard. A second replacement through the
+    /// spent set computes `old_only = ∅` and charges the successor's whole footprint
+    /// gross — the HOLD-2 defect, reached through a stale basis instead of a stale
+    /// accounting rule.
+    #[test]
+    fn an_already_transferred_set_cannot_be_replaced_again() {
+        let f = fixture();
+        let family = f.family();
+        let old = family
+            .demand_set(vec![key(1, "nrpc:once")])
+            .expect("acquired");
+        let successor = old
+            .replace(vec![key(2, "nrpc:once")])
+            .expect("first replacement");
+
+        let handles = family.handles();
+        let slots = f.registry.retained_slots();
+        assert_eq!(
+            old.replace(vec![key(3, "nrpc:once")]).err(),
+            Some(ReplaceRefused::Superseded),
+            "a spent set is not the basis of anything"
+        );
+        assert_eq!(family.handles(), handles, "and nothing moved");
+        assert_eq!(f.registry.retained_slots(), slots);
+        drop(successor);
+    }
+
+    /// W-A4 — duplicate keys collapse to one slot and one handle each.
+    ///
+    /// The single-key `demand` deliberately counts a repeat as a second handle
+    /// (re-demanding must not bypass the bound). A demand SET is a set: the same
+    /// scope named twice is one contributor, and charging it twice would refuse
+    /// families for capacity they never needed.
+    #[test]
+    fn duplicate_keys_in_a_demand_set_collapse() {
+        let f = fixture();
+        let family = f.family();
+        let handles = family
+            .demand_set(vec![
+                key(1, "nrpc:dup"),
+                key(1, "nrpc:dup"),
+                key(2, "nrpc:dup"),
+                key(1, "nrpc:dup"),
+            ])
+            .expect("acquired");
+
+        assert_eq!(handles.len(), 2, "four keys, two distinct scopes");
+        assert_eq!(family.handles(), 2, "and two handles against the budget");
+        assert_eq!(f.registry.retained_slots(), 2);
+        assert_eq!(
+            f.registry.allocated_ids_for_test(),
+            3,
+            "one identity for the family and one per distinct slot — not per key"
+        );
+    }
+
+    /// W-A5 — a refusal reached AFTER the identity space was consulted still
+    /// consumes no identity, and the set is ordered so a per-key loop provably
+    /// would.
+    ///
+    /// The family holds 63 of 64 handles and asks for three NEW keys. A loop
+    /// admits the first (63 < 64), minting an incarnation, and refuses the
+    /// second. The prefix handle is then dropped, the slot retires, and every
+    /// count returns to its starting value EXCEPT the identity high-water mark
+    /// and the retirement counter — which is exactly why the assertion is total.
+    #[test]
+    fn a_refusal_after_identities_are_considered_consumes_none() {
+        let f = fixture();
+        let family = f.family();
+        let mut held = Vec::new();
+        for i in 0..63u32 {
+            held.push(
+                family
+                    .demand(key(1, &format!("nrpc:fill-{i}")))
+                    .expect("fill"),
+            );
+        }
+        let before = no_effect(&f, &family);
+        assert_eq!(before.handles, 63);
+
+        assert_eq!(
+            family.demand_set(set(&[40, 41, 42], "nrpc:late")).err(),
+            Some(DemandRefused::FamilyAtCapacity)
+        );
+        let after = no_effect(&f, &family);
+        assert_eq!(
+            after.ids, before.ids,
+            "the identity space is untouched — the component a loop leaks"
+        );
+        assert_eq!(
+            after.retired, before.retired,
+            "and nothing was created only to be retired again"
+        );
+        assert_eq!(after, before, "totally, not just in those two components");
+    }
+
+    /// W-A6 — a successful acquisition marks the actor ONCE and queues every new
+    /// identity, so the set is warmed by one pass rather than one pass per key.
+    #[test]
+    fn a_successful_demand_set_queues_every_key_and_marks_once() {
+        let f = fixture();
+        let family = f.family();
+        let handles = family
+            .demand_set(set(&[50, 51, 52], "nrpc:batch"))
+            .expect("acquired");
+        assert_eq!(handles.len(), 3);
+        assert_eq!(f.registry.pending_slots(), 3, "every key owes work");
+
+        let outcome = f.registry.apply(1, request(true, DirtyCapabilities::Clean));
+        assert!(
+            matches!(outcome, ApplyOutcome::Current { .. }),
+            "{outcome:?}"
+        );
+        for seed in [50u8, 51, 52] {
+            assert!(
+                f.registry
+                    .base_facts_unvalidated(&key(seed, "nrpc:batch"))
+                    .is_some(),
+                "the whole set is warmed by ONE pass"
+            );
+        }
+    }
+
+    /// The demand set arrives in deterministic key order, Owner scopes first.
+    ///
+    /// §3.1 projects Owner pool first and then Grant pools; a handle vector in
+    /// call order would make that ordering the caller's problem.
+    #[test]
+    fn a_demand_set_is_ordered_owner_scopes_first() {
+        let f = fixture();
+        let family = f.family();
+        let grant = PrivateAudienceScope::new(CapabilityAudienceScope::Grant {
+            grant_id: [9u8; 32],
+            audience_handle: [9u8; 32],
+        })
+        .expect("grant scopes are private");
+        let cap = CapabilityAuthorityId::for_tag("nrpc:order");
+        let handles = family
+            .demand_set(vec![
+                SlotKey {
+                    scope: grant.clone(),
+                    capability: cap,
+                },
+                key(1, "nrpc:order"),
+            ])
+            .expect("acquired");
+
+        assert_eq!(handles.keys()[0], key(1, "nrpc:order"), "Owner first");
+        assert_eq!(handles.keys()[1].scope, grant, "Grant after");
     }
 
     // -------------------------------------------------------------- lifecycle
@@ -2736,6 +4679,7 @@ mod tests {
         let generation = f.source.generation();
         assert!(
             f.registry.inner.lock().slots.values().all(|slot| slot
+                .cells
                 .facts
                 .load()
                 .as_ref()

@@ -59,6 +59,7 @@ pub mod org_grant_registry;
 pub mod org_revocation;
 pub mod org_routing;
 pub mod org_routing_registry;
+pub(crate) mod org_routing_state;
 pub mod org_scoped_ann;
 pub mod org_scoped_ingest;
 pub mod org_scoped_relay;

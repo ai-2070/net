@@ -171,8 +171,9 @@ opaque authority-epoch comparison:
 9. per-request sorting of Ready candidates is prohibited; the fallback
    vector is sorted once at rebuild (§9);
 10. exact-provider fan-out is hard-bounded (32 sensed providers per
-    capability, 64 warmed capabilities per client state) with
-    deterministic truncation and `org_sensing_truncated_total` (§7);
+    capability, 64 retained authority-scoped route demands per
+    `OrgRoutingState` clone family) with deterministic truncation and
+    `org_sensing_truncated_total` (§7);
 11. `OrgClient`'s internals are pinned to four operations — maintain
     candidates, maintain leases, project route sets, select — never a
     mini scheduler (§2, §7);
@@ -798,16 +799,41 @@ owner with client lifetime:
 
 ```rust
 struct OrgRoutingState {
-    slots: Mutex<BoundedMap<CapabilityKey, NodeOrgRouteHandle>>,
-    selector: SensedSelectorState,
+    // OLB-2B.3b, IMPLEMENTED. The capability index is an IMMUTABLE snapshot
+    // behind an ArcSwap, rebuilt copy-on-write. The read path is one atomic
+    // load, one map lookup and one Arc clone, and takes NO lock.
+    index: ArcSwap<CapabilityIndex>,
+    // Taken on miss, insert and drop ONLY — never by a warmed read. Guards
+    // nothing beyond the mutation path itself: refusals are the registry's
+    // verdicts, asked for on every cold or stale attempt and memoized nowhere
+    // (design §9).
+    mutate: Mutex<()>,
     // ownership handle only; no task/timer/reconciler
+
+    // NOT YET IMPLEMENTED — OLB-2B.3c/2B.3d.
+    // selector: SensedSelectorState,
 }
 
 pub struct OrgClient {
     // existing fields
-    routing: Arc<OrgRoutingState>,
+    routing: Arc<OrgRoutingState>,   // OLB-2B.3d
 }
 ```
+
+**Staged ownership.** 2B.3b implements the index and the entries it points at —
+nothing else. A `CapabilityRouteHandle` owns a demand
+set and no route: there is no `OrgRouteSet`, no route-set cell, no scoped pool,
+no candidate, no provider list, no selection and no projection in it, and the
+module deliberately cannot express them. The selector state above is commented
+out for that reason, and `OrgClient` does not hold an `OrgRoutingState` yet —
+what reaches it is `MeshNode::call` in 2B.3d.
+
+An earlier revision of this block sketched
+`slots: Mutex<BoundedMap<CapabilityKey, NodeOrgRouteHandle>>`. That is not what
+was authorized or built: a map behind a lock puts the lock on the READ path,
+which is precisely what the warmed boundary exists to remove. It is corrected
+here rather than annotated, because a normative plan that describes a different
+concurrency architecture from the one in the tree is a defect in the plan.
 
 Semantics:
 
@@ -824,7 +850,8 @@ last node-slot consumer drops   → retire shared slot; node actor remains bound
 
 The actual registration refcount and routing scheduler remain node-global.
 `OrgRoutingState` owns only RAII/route-slot handles and selector nonce state. The
-internal machinery is exactly four operations and stays that way:
+internal machinery is exactly four operations and stays that way (2B.3b
+implements the first; the other three are 2B.3c/2B.3d):
 
 ```text
 maintain candidate set
@@ -833,9 +860,12 @@ project immutable route set
 select one provider
 ```
 
-**Bound the cache.** Service names are caller-controlled: at most **64 distinct
-warmed capabilities per clone family** and **256 retained warmed route slots
-node-wide** (implementation defaults, not public options). At either bound:
+**Bound the cache.** Service names are caller-controlled: at most **64 retained
+authority-scoped route demands per clone family** and **256 retained warmed route
+slots node-wide** (implementation defaults, not public options). A capability
+costs one demand per authority-scoped contributor it needs, so the number of
+warmed capabilities that fit is 64 only in the grantless case — see the §7/§13
+divergence note below. At either bound:
 
 ```text
 organization call still proceeds
@@ -891,6 +921,10 @@ struct RouteSourceGeneration {
     sensing: u64,
     topology: u64,
     watch_population: u64,
+    // A GRANT-scoped source is current only under the EXACT installed consumer
+    // Grant authority. See the §2A divergence note below — this member is not a
+    // generation counter and cannot be one.
+    consumer_grant_authority: ExactInstalledGrantAuthority,
 }
 
 /// Opaque crate-internal equality token, coherently published with authority.
@@ -902,6 +936,68 @@ struct OrgAuthorityEpoch {
     poisoned: bool,
 }
 ```
+
+> ### §2A divergence — the exact installed consumer Grant (CORRECTED)
+>
+> **Corrected by OLB-2B.3c-pre**, signed in two steps: `300e80f6c` (installation
+> identity) and `a788232bd` (Grant source service). The wake/invalidation edge
+> below landed with step 3. Authoritative design:
+> [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md)
+> §2A and §16.
+>
+> **What this plan got wrong.** The source/currentness vector above omitted the
+> installed consumer Grant entirely, and consumer-Grant publication was absent
+> from routing wake and invalidation. Both are load-bearing, because a
+> Grant-scoped row is query-visible ONLY while an exact consumer Grant is
+> installed — that installation is **authority**, not a decryption convenience.
+>
+> **A Grant-scoped source is current only under the exact installed consumer
+> Grant authority.** All five components bind, and each catches something the
+> others do not:
+>
+> | Component | Catches |
+> |---|---|
+> | `grant_id` | a different grant entirely |
+> | installation identity (non-aliasing, checked, terminal) | remove-then-reinstall of the byte-identical grant |
+> | signed Grant identity (the signature) | a DIFFERENT signed grant reusing the same `grant_id` |
+> | audience handle | a rotated-away audience under the same grant |
+> | Grant authority deadline | an installed-but-EXPIRED grant, which authorizes nothing |
+>
+> `grant_id` equality alone is insufficient: the live query already compares the
+> signature and the handle, so a cached slot comparing less would serve rows the
+> uncached path refuses.
+>
+> **This is a per-slot stamp, NOT a generation.** It cannot be folded into
+> `OrgAuthorityEpoch` or reduced to a counter. A transaction-wide "some Grant
+> moved" value copied into every artifact would make unrelated Grant movement
+> invalidate Owner and unrelated Grant facts. The batch-wide vector of selected
+> installation identities protects the capture/commit transaction; the per-slot
+> stamp protects one cached artifact; the two must stay separate.
+>
+> **Install, remove, remove-if-current and same-ID replacement are SOURCE
+> MOVEMENT** and invalidate the affected Grant-scoped retained work. Three
+> consequences the original text missed:
+>
+> - the notification must fire only AFTER the snapshot is published and its
+>   mutation synchronization RELEASED — an early wake lets the rebuild read the
+>   old snapshot and reinstall the staleness it was woken to clear, and holding
+>   that lock across the registry inverts the commit pin's own lock order;
+> - it must NOT be keyed on the scoped-discovery revision, which a Grant
+>   transition does not move at all;
+> - an outcome that publishes nothing — an idempotent install, a stale lease, a
+>   no-op removal — is not movement and must wake nothing.
+>
+> **An INSTALL is movement too, in the availability direction.** A Grant-scoped
+> slot reconstructed `Unserved` because the grant was absent holds no artifact to
+> invalidate, and the read seam returns cold for `Unserved` WITHOUT invalidating —
+> so without an install wake the slot stays cold permanently and no reader can
+> rescue it.
+>
+> **The Grant authority deadline must reach a real deadline path.** With ZERO
+> visible providers a Grant artifact's row-derived expiry is `u64::MAX`, so the
+> installed Grant's own deadline is the only thing that can retire it; deriving
+> the artifact deadline from provider rows alone leaves it permanently warm under
+> dead authority.
 
 `OrgAuthorityEpoch` is the SDK-facing INTERNAL analogue of the sensing gate's
 `SensingAuthorityStamp`: it includes authority/store identity, installation
@@ -915,6 +1011,11 @@ an input changes:
 
 - global private-discovery generation (Owner or Grant), including the shared
   node-owned exact-expiry wake;
+- **consumer-Grant movement** — install / remove / remove-if-current / same-ID
+  replacement. NOT reachable from the scoped-discovery generation above: a Grant
+  transition mutates the grant registry, not the scoped store (§2A divergence);
+- **the installed Grant authority deadline**, which is a distinct deadline from
+  any provider row's and is the ONLY one a zero-provider Grant artifact has;
 - membership/dispatcher/grant validity edges;
 - direct-session generation;
 - sensing generation (`subscribe_sensing_overlay_changes`);
@@ -958,7 +1059,7 @@ sensing/route join.
 Hard bounds:
 
 ```text
-max warmed capabilities per OrgRoutingState clone family: 64
+max retained authority-scoped route demands per OrgRoutingState clone family: 64
 max retained warmed route slots node-wide across all families: 256
 max sensed providers per capability: 32
 ```
@@ -968,6 +1069,68 @@ current-authority deterministic unsensed cold path and allocates no watcher,
 actor, timer, or cache slot. This is bounded degradation, not call failure.
 Dropping owners in arbitrary order removes only their weak consumer reference;
 the last reference retires the shared slot/lease state.
+
+> ### §7/§13 divergence — the family bound counts DEMANDS (CORRECTED)
+>
+> **Corrected by OLB-2B.3b.** Authoritative design:
+> [`OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md`](OLB_2B3B_WARMED_CALL_BOUNDARY_DESIGN.md)
+> §4 and §13.
+>
+> **What this plan got wrong.** It said "max warmed capabilities per
+> `OrgRoutingState` clone family: 64" in four places, and "64 warmed capabilities
+> per client state" in a fifth. No layer has ever enforced a bound on
+> capabilities. The registry bounds **demand handles**, and a warmed capability
+> costs one handle per AUTHORITY-SCOPED contributor it needs:
+>
+> ```text
+> Owner
+> + each Grant audience THIS FAMILY ACTUALLY LEASED FOR DISCOVER
+> ```
+>
+> So a grantless family warms 64 capabilities and a family with two leased
+> DISCOVER grants per capability warms 21. The capability count is a
+> **consequence** of the demand budget, never an input to it. Stating the bound
+> in capabilities described a limit nothing implements, and the gap always
+> favoured over-retention — the direction that is silently wrong.
+>
+> **A capability entry is `<= 64` structurally**, not by a second counter. Every
+> entry retains at least the Owner demand, so the entry count cannot exceed the
+> demand budget however cheap the entries are. A separately enforced entry cap
+> would be a second bound free to disagree with the first.
+>
+> **The demand set is what the family actually LEASED, and it is acquired
+> all-or-none.** Two exclusions are load-bearing:
+>
+> - a DISCOVER grant with no installed audience secret is **not** a demand. It
+>   yields no consumer audience, so the source can only ever answer `Unserved` —
+>   demanding it retains a contributor that can never contribute while consuming
+>   family and node budget permanently;
+> - an INVOKE-only grant is **not** a source demand. It stays in the family's
+>   credential set for INVOKE matching. `DISCOVER ≠ INVOKE ≠ SENSE`.
+>
+> Acquisition is one registry transaction: family capacity for the whole set,
+> node capacity for every new distinct slot, every incarnation reserved without
+> wrap or alias, then all references retained. **On any refusal, zero handles are
+> retained, zero partial entries published, and zero work enqueued.** A kept
+> prefix would warm a capability whose Owner plane is retained and whose Grant
+> plane is not, which reads downstream as a route that legitimately found no
+> granted provider — a silent authority narrowing presenting as a routing
+> preference.
+>
+> **The three refusals are the REGISTRY's verdicts, passed through** (design
+> §9, corrected by the revision-6 repair). An earlier revision of this note
+> assigned each class a family-side retry policy — sticky, generation-gated,
+> terminal — implemented as family-global memoization. That memoization
+> answered per-capability questions from family-wide records and kept being
+> wrong: a wide refusal said nothing about a narrow set that still fits; "the
+> node is full" said nothing about a set whose slots all already exist through
+> other families; "no more identities can be minted" said nothing about
+> acquiring existing slots. It is removed, not refined. On a cold miss or a
+> stale entry the state takes the family mutation lock, derives the exact set,
+> asks the registry, and returns its answer; the warmed path stays one atomic
+> load, one lookup, one `Arc` clone. Only cold and refused calls reach the
+> registry, and any future caching must be keyed by the exact marginal
+> request, never by the family.
 
 One long-lived node-owned routing actor consumes all families' dirty work. It
 owns a bounded dirty-capability set plus `RebuildAll`, one single-flight build,
@@ -1068,7 +1231,7 @@ options):
 
 ```text
 max sensed providers per capability: 32
-max warmed capabilities per OrgRoutingState clone family: 64
+max retained authority-scoped route demands per OrgRoutingState clone family: 64
 max retained warmed route slots node-wide: 256
 ```
 
@@ -1628,9 +1791,9 @@ Exit witnesses:
   scan, no sort, and no registration emission** (instrumented
   witness);
 - 1,024 indexed rows + one affected capability: rebuild visits only that bucket
-  and performs ZERO descriptor decodes after ingest; 64 warmed capabilities and
-  many independent clients do not multiply store scans or shared base-fact
-  builds;
+  and performs ZERO descriptor decodes after ingest; a family's full 64 retained
+  route demands and many independent clients do not multiply store scans or
+  shared base-fact builds;
 - many independent clients for the same node/capability observe one shared
   discovery/sensing/route base projection, one source rebuild, and one underlying
   exact-interest registration; last consumer alone retires it;

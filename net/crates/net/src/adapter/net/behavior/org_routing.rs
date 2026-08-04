@@ -324,6 +324,23 @@ pub(crate) struct ActorHooks {
     #[allow(clippy::type_complexity)]
     pub(crate) drained:
         parking_lot::Mutex<Option<Arc<dyn Fn(u64, &PrivateDiscoveryChangeBatch) + Send + Sync>>>,
+    /// Loop iterations COMPLETED — incremented once per iteration, immediately
+    /// before the actor parks (OLB-2B.3b, W-W13's baseline).
+    ///
+    /// The only signal from outside the actor that says "no pass is in flight".
+    /// Metrics cannot: an artifact becomes visible the moment `apply` stores it,
+    /// which is BEFORE the pass that installed it has finished its accounting,
+    /// settled and returned — so a witness sampling on artifact visibility, or on
+    /// counters that merely stopped moving for a while, can have its baseline
+    /// land in the middle of a warm-up pass and attribute that pass's remaining
+    /// work to whatever it does next. Equal samples are evidence of a scheduling
+    /// gap; this is evidence of an iteration boundary.
+    ///
+    /// Incremented at the park rather than after `apply` so it also covers the
+    /// quiet passes and the deadline arm — everything an iteration does is behind
+    /// it. The deadline-retirement path `continue`s without parking and so
+    /// deliberately does not advance it: that iteration has more work to do.
+    pub(crate) passes: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(any(test, feature = "fixtures"))]
@@ -340,6 +357,11 @@ impl ActorHooks {
         if let Some(hook) = self.drained.lock().clone() {
             hook(incarnation, batch);
         }
+    }
+
+    /// One loop iteration is complete and the actor is about to park.
+    fn note_pass(&self) {
+        self.passes.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -593,6 +615,13 @@ async fn run_incarnation(mut it: Incarnation) -> ActorExit {
             }
             continue;
         }
+
+        // The iteration is COMPLETE: applied, settled, backed off, yielded and
+        // re-armed. Recorded here rather than after `apply` so a witness that
+        // observes it advance knows no pass is in flight — including the quiet
+        // ones, which do no accounting a metric could reveal.
+        #[cfg(any(test, feature = "fixtures"))]
+        it.hooks.note_pass();
 
         tokio::select! {
             // `Pending` when nothing carries a deadline, so this arm is inert

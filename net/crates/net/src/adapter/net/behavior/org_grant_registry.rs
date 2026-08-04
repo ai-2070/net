@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 use super::org::OrgId;
 use super::org_grant::{OrgAudienceSecret, OrgCapabilityGrant};
+use super::org_routing_registry::GrantMovementFence;
 use crate::adapter::net::identity::{EntityId, MAX_TOKEN_CLOCK_SKEW_SECS};
 
 /// Hard cap on active PROVIDER grant-audience records (OA3-4b2, Kyra-pinned).
@@ -149,7 +150,27 @@ pub enum GrantAudienceInstallError {
     /// The registry is at capacity and no expired record could be reclaimed —
     /// refused fail-closed rather than evicting an active record.
     AtCapacity,
-    /// The installation-identity space is exhausted (OLB-2B.3c-pre).
+    /// A consumer-Grant identity space is exhausted (OLB-2B.3c-pre).
+    ///
+    /// Covers BOTH terminal identity spaces — the installation identity, and the
+    /// publication identity that orders transitions. They are distinct counters
+    /// and the distinction matters operationally, so each refusal path logs which
+    /// one ran out (`space = "installation"` / `space = "publication"`); the
+    /// public outcome is deliberately shared.
+    ///
+    /// **The `Display` text is therefore GENERIC.** It named the installation
+    /// counter specifically while the variant covered both, so it was simply
+    /// false for a publication refusal — and that string is binding-visible: it
+    /// propagates through `OrgSdkError::AudienceInstallRefused` and the SDK
+    /// re-export, where the operator reading it has nothing else to go on
+    /// (Kyra, review of `010c718ea`).
+    ///
+    /// A separate variant would be more precise and was briefly added, but
+    /// `GrantAudienceInstallError` is reachable through `pub mod behavior` /
+    /// `pub mod org_grant_registry` and is not `#[non_exhaustive]`, so a new
+    /// variant is a source-breaking PUBLIC API change — which scope item 16
+    /// excludes ("public call path unchanged"). Precision does not make an
+    /// unauthorized API change disappear (Kyra, review of `46af3d625`).
     ///
     /// TERMINAL and irreversible. The identity is compared for EQUALITY to
     /// decide whether a stale lease may remove the current installation, and —
@@ -185,8 +206,11 @@ impl std::fmt::Display for GrantAudienceInstallError {
                 "a different grant is already installed under this grant id"
             }
             GrantAudienceInstallError::AtCapacity => "grant-audience registry at capacity",
+            // GENERIC on purpose: this variant covers the installation identity
+            // AND the publication identity, so naming either one is false half
+            // the time. The precise counter is in the refusal log.
             GrantAudienceInstallError::IdSpaceExhausted => {
-                "grant-audience installation identity space exhausted"
+                "consumer grant identity space exhausted"
             }
         };
         f.write_str(s)
@@ -736,8 +760,33 @@ impl ProviderGrantSnapshot {
 /// nonzero-grant ingest selector looks a record up by `grant_id` and confirms the
 /// envelope's `audience_handle` before building the granted authority (OA3-4b2
 /// slice 4).
-#[derive(Default, Debug)]
-pub struct ConsumerGrantSnapshot(GrantAudienceRecords);
+#[derive(Debug)]
+pub struct ConsumerGrantSnapshot {
+    records: GrantAudienceRecords,
+    /// The publication transition that produced THIS snapshot (OLB-2B.3b §4.4).
+    ///
+    /// Private, carried, and never interpreted here: it is stamped by the ONE
+    /// publication seam that already allocates it (`publish_consumer_grant_snapshot`)
+    /// and read only by the clone-family routing state, which needs a total order
+    /// over snapshots to refuse a stalled older view from overwriting a newer
+    /// retained demand set. Reusing the canonical transition identity rather than
+    /// inventing a second one is the whole point — a parallel counter could
+    /// disagree with the fence the same transition already published to routing.
+    ///
+    /// Nothing about ordering, fences, notifications or public behaviour changes
+    /// because of this field; it records what the transition already decided.
+    revision: GrantMovementFence,
+}
+
+impl Default for ConsumerGrantSnapshot {
+    fn default() -> Self {
+        Self {
+            records: GrantAudienceRecords::default(),
+            // The node's initial state genuinely precedes every publication.
+            revision: GrantMovementFence::Publication(0),
+        }
+    }
+}
 
 impl ConsumerGrantSnapshot {
     /// The per-role capacity ceiling.
@@ -748,25 +797,38 @@ impl ConsumerGrantSnapshot {
         Self::default()
     }
 
+    /// The publication transition this snapshot was published under.
+    pub(crate) fn revision(&self) -> GrantMovementFence {
+        self.revision
+    }
+
+    /// Stamp the transition identity. Called ONLY by the publication seam, with
+    /// the identity that transition already reserved, before the snapshot is
+    /// stored — so no observer can ever reach an unstamped published snapshot.
+    pub(crate) fn stamped(mut self, revision: GrantMovementFence) -> Self {
+        self.revision = revision;
+        self
+    }
+
     /// The record for `grant_id`, if installed. The ingest selector additionally
     /// checks the envelope's audience handle against the record before use.
     pub fn get(&self, grant_id: &[u8; 32]) -> Option<&Arc<GrantAudienceRecord>> {
-        self.0.get(grant_id)
+        self.records.get(grant_id)
     }
 
     /// Every installed record, in deterministic `grant_id` order.
     pub fn records(&self) -> impl Iterator<Item = &Arc<GrantAudienceRecord>> {
-        self.0.records()
+        self.records.records()
     }
 
     /// The number of installed records.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.records.len()
     }
 
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.0.len() == 0
+        self.records.len() == 0
     }
 
     /// Settle every ordinary install refusal, reserving a slot to fill
@@ -782,7 +844,7 @@ impl ConsumerGrantSnapshot {
         record: GrantAudienceRecord,
         now_secs: u64,
     ) -> Result<PreparedInstall, GrantAudienceInstallError> {
-        match self.0.reserve(&record, Self::CAPACITY, now_secs)? {
+        match self.records.reserve(&record, Self::CAPACITY, now_secs)? {
             Reserved::Noop => Ok(PreparedInstall::Noop),
             Reserved::Ready(next) => Ok(PreparedInstall::Ready(Box::new(PreparedSlot {
                 next,
@@ -796,12 +858,21 @@ impl ConsumerGrantSnapshot {
     /// Takes only the installation identity: the record was fixed at preparation
     /// time and cannot be substituted here.
     pub(crate) fn finish_install(slot: PreparedSlot, install_seq: u64) -> Self {
-        Self(slot.finish_with_install_seq(install_seq))
+        Self {
+            records: slot.finish_with_install_seq(install_seq),
+            // Placeholder; the publication seam stamps the real identity before
+            // this snapshot is stored.
+            revision: GrantMovementFence::Publication(0),
+        }
     }
 
     /// Remove `grant_id`; see [`GrantAudienceRecords::without`].
     pub(crate) fn without(&self, grant_id: &[u8; 32]) -> Option<Self> {
-        self.0.without(grant_id).map(Self)
+        self.records.without(grant_id).map(|records| Self {
+            records,
+            // Placeholder; stamped by the publication seam, as for an install.
+            revision: self.revision,
+        })
     }
 }
 

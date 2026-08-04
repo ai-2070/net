@@ -143,7 +143,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          MIN=54
+          MIN=70
           out=$(cargo test --lib --features "$UNIT_FEATURES" \
                   org_routing_wiring_tests 2>&1 | tee /dev/stderr)
           n=$(printf '%s\n' "$out" \
@@ -172,6 +172,22 @@ jobs:
           a_grant_install_between_capture_and_commit_refuses_publication
           unrelated_grant_movement_preserves_the_exact_slot
           an_installed_grants_expiry_colds_its_facts_with_zero_providers
+          installing_a_consumer_grant_wakes_the_affected_grant_slot
+          removing_a_consumer_grant_wakes_the_affected_grant_slot
+          consumer_grant_movement_wakes_only_the_affected_scope
+          a_grant_movement_notification_runs_after_publication_and_after_release
+          a_non_publishing_grant_outcome_wakes_nothing
+          a_delayed_grant_notification_cannot_retire_a_successor_installation
+          consumer_grant_movement_preserves_same_id_unaffected_scopes
+          a_delayed_install_notification_cannot_retire_a_successor_removal_artifact
+          a_delayed_install_notification_preserves_its_own_publication_artifact
+          a_delayed_removal_notification_preserves_its_own_absence_artifact
+          a_current_lease_removal_publishes_wakes_and_fences
+          publication_exhaustion_refuses_an_install_without_publishing
+          terminal_withdrawal_retires_the_last_live_identity_and_nothing_else
+          a_delayed_terminal_notification_preserves_its_own_absence_artifact
+          a_final_ordinary_removal_preserves_the_terminal_absence_it_caused
+          a_second_installed_grant_still_withdraws_terminally_after_the_first
           a_publication_cannot_occupy_the_gap_between_validation_and_settlement
           poison_cannot_occupy_the_gap_between_validation_and_settlement
           a_recovery_poison_clear_cannot_land_under_a_publication_pin
@@ -244,6 +260,131 @@ jobs:
             fi
           done
           echo "routing supervisor witnesses: $n passed (min $MIN); all named security witnesses present"
+
+      # OLB-2B.3b: the clone-family routing-state witnesses — the atomic
+      # demand-set acquisition in `behavior::org_routing_registry::tests` and the
+      # capability index / demand lifecycle / refusal pass-through in
+      # `behavior::org_routing_state::tests`.
+      #
+      # Same reasoning as the two gates above, and the same failure it forecloses:
+      # the broad `--lib` step already runs these, but a filtered run that matches
+      # nothing exits 0, so "the module was renamed, feature-gated or deleted"
+      # would be indistinguishable from "it passed". `org_routing_state` is a NEW
+      # module whose entire consumer is still dark (OLB-2B.3d), which makes it
+      # exactly the kind of file a future cleanup pass deletes as unreachable.
+      #
+      # Both filters are asserted SEPARATELY. A combined floor would let the 36
+      # registry witnesses cover the disappearance of the whole state module.
+      #
+      # NOTE: `#[cfg(test)]`, NOT `feature = "fixtures"` — `$UNIT_FEATURES`
+      # deliberately excludes `fixtures`, so a fixtures gate would compile these
+      # to a silent 0-test no-op in this job.
+      - name: Gate OLB-2B.3b routing-state witnesses
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          REG_MIN=50
+          STATE_MIN=41
+          reg=$(cargo test --lib --features "$UNIT_FEATURES" \
+                  behavior::org_routing_registry:: 2>&1 | tee /dev/stderr)
+          state=$(cargo test --lib --features "$UNIT_FEATURES" \
+                  behavior::org_routing_state:: 2>&1 | tee /dev/stderr)
+          count() {
+            printf '%s\n' "$1" | grep -oE 'test result: ok\. [0-9]+ passed' \
+              | grep -oE '[0-9]+' | head -1
+          }
+          rn=$(count "$reg")
+          sn=$(count "$state")
+          if [ -z "$rn" ] || [ "$rn" -lt "$REG_MIN" ]; then
+            echo "::error::expected >= $REG_MIN org_routing_registry witnesses, ran ${rn:-0}."
+            echo "The module is the #[cfg(test)] mod tests in"
+            echo "src/adapter/net/behavior/org_routing_registry.rs."
+            exit 1
+          fi
+          if [ -z "$sn" ] || [ "$sn" -lt "$STATE_MIN" ]; then
+            echo "::error::expected >= $STATE_MIN org_routing_state witnesses, ran ${sn:-0}."
+            echo "The module is src/adapter/net/behavior/org_routing_state_tests.rs,"
+            echo "included from org_routing_state.rs. If witnesses were intentionally"
+            echo "removed, lower STATE_MIN in this step in the SAME commit — do not"
+            echo "let the gate pass vacuously."
+            exit 1
+          fi
+          # Cardinality cannot say WHICH witness vanished. Pin the ones carrying a
+          # capacity, lifecycle, concurrency or lock-freedom property outright.
+          REQUIRED="a_demand_set_past_the_family_bound_retains_nothing
+          a_demand_set_past_the_node_bound_retains_nothing
+          a_demand_set_over_retained_slots_costs_no_node_capacity
+          an_exhausted_identity_space_refuses_a_whole_demand_set
+          a_refusal_after_identities_are_considered_consumes_none
+          duplicate_keys_in_a_demand_set_collapse
+          the_sixty_fifth_family_handle_is_refused_without_corrupting_the_first_64
+          the_two_hundred_fifty_seventh_slot_is_deterministically_unretained
+          a_superseded_reader_cannot_read_a_retired_incarnations_facts
+          a_common_key_reader_follows_the_successors_ownership
+          a_fresh_demand_after_retirement_gets_a_fresh_cell
+          a_stale_incarnation_apply_cannot_republish_a_cleared_cell
+          release_one_cannot_decrement_a_reference_a_family_does_not_hold
+          an_already_transferred_set_cannot_be_replaced_again
+          a_demand_handle_couples_both_publication_cells
+          a_demand_set_couples_both_cells_per_contributor
+          retiring_the_last_reference_clears_both_cells
+          a_transfer_leaves_the_common_keys_pool_published
+          facts_invalidation_clears_the_derived_pool
+          a_stale_observation_invalidates_neither_plane
+          installing_newer_facts_clears_the_superseded_pool
+          a_replacement_successor_stays_index_aligned_across_both_planes"
+          for required in $REQUIRED; do
+            if ! printf "%s" "$reg" | grep -q "$required"; then
+              echo "::error::required org_routing_registry witness missing: $required"
+              exit 1
+            fi
+          done
+          REQUIRED_STATE="a_discover_grant_with_no_installed_audience_is_not_a_demand
+          an_invoke_only_grant_is_not_a_source_demand
+          a_rotated_audience_handle_is_not_leased_under_its_own_id
+          a_warmed_lookup_takes_no_lock
+          a_warmed_lookup_completes_while_the_mutation_lock_is_held
+          concurrent_misses_acquire_one_demand_set
+          concurrent_rederivations_spend_one_demand_set
+          a_spent_family_budget_refuses_from_the_registry_every_time
+          a_wide_refusal_does_not_poison_residual_capacity
+          a_full_node_refuses_every_attempt_until_a_retirement
+          a_narrowed_demand_warms_on_a_full_node_without_a_retirement
+          identity_exhaustion_refuses_a_set_that_needs_a_new_slot
+          identity_exhaustion_does_not_refuse_a_set_of_existing_slots
+          the_family_bound_counts_demands_not_capabilities
+          a_refused_entry_retains_no_partial_demand
+          a_newly_leased_audience_joins_a_warmed_entry
+          a_removed_audience_leaves_a_warmed_entry
+          a_rotated_audience_replaces_the_scope_it_supersedes
+          a_rotated_away_scope_is_not_retained_under_its_own_id
+          a_refused_rederivation_leaves_the_entry_exactly_as_it_was
+          a_current_warmed_entry_with_a_leased_audience_takes_no_lock
+          the_capability_index_derives_exactly_what_the_full_scan_derives
+          a_narrowing_replacement_at_the_family_bound_is_charged_net
+          a_same_width_rotation_at_the_family_bound_is_charged_net
+          a_rotation_at_the_node_bound_retires_the_slot_it_transfers
+          a_rotation_at_the_node_bound_refuses_when_the_old_slot_is_shared
+          identity_exhaustion_during_a_replacement_refuses_with_no_effect
+          a_narrowing_replacement_needs_no_identity_after_exhaustion
+          a_shared_old_replacement_succeeds_when_the_sharer_releases
+          the_under_lock_miss_recheck_validates_the_callers_snapshot
+          the_under_lock_miss_recheck_sees_a_removal
+          the_under_lock_miss_recheck_sees_a_rotation
+          the_under_lock_miss_race_retains_the_newest_snapshot
+          a_stalled_older_install_cannot_overwrite_a_newer_removal
+          a_stalled_older_removal_cannot_overwrite_a_newer_install
+          a_terminal_snapshot_cannot_be_overwritten_by_an_ordinary_one
+          two_snapshots_at_one_revision_are_refused_as_an_invariant_breach
+          unrelated_newer_movement_advances_freshness_without_churn
+          dropping_the_state_releases_every_demand"
+          for required in $REQUIRED_STATE; do
+            if ! printf "%s" "$state" | grep -q "$required"; then
+              echo "::error::required org_routing_state witness missing: $required"
+              exit 1
+            fi
+          done
+          echo "OLB-2B.3b: $rn registry (min $REG_MIN) + $sn state (min $STATE_MIN) passed; all named witnesses present"
 
       # Doctests live in `///` comment blocks across `src/` and `sdk/src/`.
       # `cargo test --lib` does not execute them — they need a separate
