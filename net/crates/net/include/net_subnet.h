@@ -57,6 +57,20 @@
  * net_org.h), freed with net_org_serve_handle_free. Wholesale-replace
  * semantics: install/declare replace the whole set, so pass every
  * currently-held artifact, not a delta.
+ *
+ * CONSUMED means consumed on EVERY path, including a refusal caused by
+ * some other malformed argument. The single exception is a NULL mesh_arc
+ * itself, which names nothing to consume. Do not reclaim the clone after
+ * an error return.
+ *
+ * # Array counts
+ *
+ * Every count below (set_count, boundary_count) is the exact number of
+ * elements behind its pointer. Counts whose total byte length would
+ * exceed the platform's maximum slice length are refused deterministically
+ * without the arrays being read, so a (size_t)-1 typo is an error return
+ * rather than undefined behavior — but a count that merely EXCEEDS the
+ * real array length is still a caller bug this ABI cannot detect.
  */
 
 #ifndef NET_SUBNET_H

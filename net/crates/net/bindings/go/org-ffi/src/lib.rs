@@ -945,12 +945,18 @@ pub extern "C" fn net_org_serve(
     out_err: *mut *mut c_char,
 ) -> c_int {
     ffi_guard!(NET_ORG_ERR_NULL, {
-        if mesh_arc.is_null() || out_handle.is_null() {
+        if mesh_arc.is_null() {
             return NET_ORG_ERR_NULL;
         }
         // Own the mesh arc immediately (Go does not free it) so the validation
-        // early-returns below drop the node rather than leaking it.
+        // early-returns below drop the node rather than leaking it. The
+        // `out_handle` check moved BELOW this line for the same reason
+        // (review-10 P1-4) — it used to share the guard above.
         let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if out_handle.is_null() {
+            write_err(out_err, "out_handle must be non-NULL".into());
+            return NET_ORG_ERR_NULL;
+        }
         let Some(service) = cstr_to_string(service_ptr, service_len) else {
             write_err(out_err, "service name is NULL or non-UTF-8".into());
             return NET_ORG_ERR_INVALID_UTF8;
@@ -1210,9 +1216,27 @@ pub const NET_SUBNET_ACCESS_SAME_ORG: c_int = 0;
 /// `SubnetExportAccess::Granted`.
 pub const NET_SUBNET_ACCESS_GRANTED: c_int = 1;
 
+/// The maximum element count `std::slice::from_raw_parts` accepts for
+/// `T`: its documented precondition is that the slice's TOTAL byte
+/// length not exceed `isize::MAX`, so the element bound scales with
+/// `size_of::<T>()`.
+///
+/// A C caller supplies these counts, and `(size_t)-1` is one typo away.
+/// Exceeding the bound is immediate undefined behavior at the
+/// `from_raw_parts` call — it happens BEFORE any code that could
+/// observe a bad value, so `catch_unwind` cannot help and neither can a
+/// later per-element check. Every array count crossing this ABI is
+/// therefore bounded before its slice is constructed
+/// (`net_org_credentials_new` set the precedent; review-10 P1-3 extends
+/// it to the subnet entry points).
+const fn max_slice_elems<T>() -> usize {
+    isize::MAX as usize / std::mem::size_of::<T>()
+}
+
 /// Copy a slice of `(ptr,len)` byte artifacts into owned buffers. `None`
-/// if the outer array is null with a non-zero count, or any element is
-/// null / oversized.
+/// if the outer array is null with a non-zero count, either array count
+/// exceeds the `from_raw_parts` bound, or any element is null /
+/// oversized.
 unsafe fn copy_credential_sets(
     ptrs: *const *const u8,
     lens: *const usize,
@@ -1222,6 +1246,12 @@ unsafe fn copy_credential_sets(
         return Some(Vec::new());
     }
     if ptrs.is_null() || lens.is_null() {
+        return None;
+    }
+    // Bounded INDEPENDENTLY for the pointer array and the length array:
+    // they hold different element types, so one bound does not imply the
+    // other. Checked before either slice exists.
+    if count > max_slice_elems::<*const u8>() || count > max_slice_elems::<usize>() {
         return None;
     }
     let ptr_slice = unsafe { std::slice::from_raw_parts(ptrs, count) };
@@ -1282,15 +1312,32 @@ pub extern "C" fn net_subnet_declare_boundaries(
     out_err: *mut *mut c_char,
 ) -> c_int {
     ffi_guard!(NET_ORG_ERR_NULL, {
-        if mesh_arc.is_null() || authority.is_null() {
+        if mesh_arc.is_null() {
             return NET_ORG_ERR_NULL;
         }
+        // Own the mesh arc IMMEDIATELY, before every other check (review-10
+        // P1-4). The header documents this clone as consumed on all paths,
+        // so a C caller does not reclaim it; a validation early-return that
+        // skipped the `Box::from_raw` stranded one Arc reference per
+        // malformed call and could keep a node alive past shutdown.
         let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if authority.is_null() {
+            write_err(out_err, "subnet:invalid_format: authority is NULL".into());
+            return NET_ORG_ERR_NULL;
+        }
         let authority = EntityId::from_bytes(unsafe {
             let mut a = [0u8; 32];
             std::ptr::copy_nonoverlapping(authority, a.as_mut_ptr(), 32);
             a
         });
+        // Bound the count BEFORE the slice exists (review-10 P1-3).
+        if boundary_count > max_slice_elems::<NetSubnetPath>() {
+            write_err(
+                out_err,
+                "subnet:invalid_format: boundary count exceeds the maximum slice length".into(),
+            );
+            return NET_ORG_ERR_SUBNET;
+        }
         let mut paths = Vec::with_capacity(boundary_count);
         if boundary_count > 0 {
             if boundaries.is_null() {
@@ -1338,10 +1385,20 @@ pub extern "C" fn net_subnet_apply_control_fact(
     out_err: *mut *mut c_char,
 ) -> c_int {
     ffi_guard!(NET_ORG_ERR_NULL, {
-        if mesh_arc.is_null() || out_kind.is_null() || out_applied.is_null() {
+        if mesh_arc.is_null() {
             return NET_ORG_ERR_NULL;
         }
+        // Consume-on-all-paths (review-10 P1-4): own the clone first, then
+        // validate — the out-params below are checked AFTER this line so
+        // their refusals still drop the node.
         let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if out_kind.is_null() || out_applied.is_null() {
+            write_err(
+                out_err,
+                "subnet:invalid_format: out_kind and out_applied must be non-NULL".into(),
+            );
+            return NET_ORG_ERR_NULL;
+        }
         let Some(fact) = (unsafe { copy_bytes_required(fact_ptr, fact_len) }) else {
             write_err(out_err, "fact bytes are NULL or oversized".into());
             return NET_ORG_ERR_NULL;
@@ -1398,10 +1455,18 @@ pub extern "C" fn net_subnet_serve_exported(
     out_err: *mut *mut c_char,
 ) -> c_int {
     ffi_guard!(NET_ORG_ERR_NULL, {
-        if mesh_arc.is_null() || out_handle.is_null() || export_ref.is_null() {
+        if mesh_arc.is_null() {
             return NET_ORG_ERR_NULL;
         }
+        // Consume-on-all-paths (review-10 P1-4).
         let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        if out_handle.is_null() || export_ref.is_null() {
+            write_err(
+                out_err,
+                "subnet:invalid_format: out_handle and export_ref must be non-NULL".into(),
+            );
+            return NET_ORG_ERR_NULL;
+        }
         let Some(service) = cstr_to_string(service_ptr, service_len) else {
             write_err(out_err, "service name is NULL or non-UTF-8".into());
             return NET_ORG_ERR_INVALID_UTF8;
@@ -1804,5 +1869,208 @@ mod tests {
             baseline,
             "mesh_arc leaked on the input-validation error path"
         );
+    }
+
+    // =====================================================================
+    // Review-10 P1-3 / P1-4 — the subnet entry points' C ABI preconditions.
+    // =====================================================================
+
+    /// A live node plus a baseline strong count, for the ownership
+    /// witnesses below.
+    fn witness_node() -> Arc<MeshNode> {
+        let identity = net_sdk::identity::Identity::generate();
+        let cfg =
+            net::adapter::net::MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0u8; 32]);
+        Arc::new(
+            runtime()
+                .block_on(MeshNode::new((**identity.keypair()).clone(), cfg))
+                .expect("MeshNode::new"),
+        )
+    }
+
+    /// Hand `call` a fresh boxed clone (exactly what `net_mesh_arc_clone`
+    /// produces), assert it refused, and assert the node's strong count
+    /// returned to baseline — i.e. the documented consume-on-all-paths
+    /// contract held for THAT refusal.
+    fn assert_consumes_arc(
+        node: &Arc<MeshNode>,
+        what: &str,
+        call: impl FnOnce(*mut Arc<MeshNode>, *mut *mut c_char) -> c_int,
+    ) {
+        let baseline = Arc::strong_count(node);
+        let arc_box: *mut Arc<MeshNode> = Box::into_raw(Box::new(node.clone()));
+        assert_eq!(Arc::strong_count(node), baseline + 1);
+
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = call(arc_box, &mut err);
+        assert_ne!(rc, NET_ORG_OK, "{what}: expected a refusal");
+        if !err.is_null() {
+            net_org_free_cstring(err);
+        }
+        assert_eq!(
+            Arc::strong_count(node),
+            baseline,
+            "{what}: mesh_arc was not consumed on this refusal path",
+        );
+    }
+
+    /// P1-4 — EVERY nullable argument of every subnet entry point must
+    /// still drop the consumed clone. One witness per argument, because
+    /// the defect was per-argument: each early return that sat above the
+    /// `Box::from_raw` stranded a reference.
+    #[test]
+    fn subnet_entrypoints_consume_the_mesh_arc_on_every_null_argument() {
+        let node = witness_node();
+        let service = b"svc";
+
+        // declare_boundaries: NULL authority.
+        assert_consumes_arc(&node, "declare_boundaries/authority", |arc, err| {
+            net_subnet_declare_boundaries(arc, std::ptr::null(), 0, std::ptr::null(), 0, err)
+        });
+
+        // apply_control_fact: NULL out_kind, then NULL out_applied.
+        assert_consumes_arc(&node, "apply_control_fact/out_kind", |arc, err| {
+            let mut applied = false;
+            net_subnet_apply_control_fact(
+                arc,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut applied,
+                err,
+            )
+        });
+        assert_consumes_arc(&node, "apply_control_fact/out_applied", |arc, err| {
+            let mut kind: *mut c_char = std::ptr::null_mut();
+            net_subnet_apply_control_fact(
+                arc,
+                std::ptr::null(),
+                0,
+                &mut kind,
+                std::ptr::null_mut(),
+                err,
+            )
+        });
+        // apply_control_fact: valid out-params, NULL fact bytes — the
+        // refusal that lives BELOW the out-param checks.
+        assert_consumes_arc(&node, "apply_control_fact/fact", |arc, err| {
+            let mut kind: *mut c_char = std::ptr::null_mut();
+            let mut applied = false;
+            net_subnet_apply_control_fact(arc, std::ptr::null(), 0, &mut kind, &mut applied, err)
+        });
+
+        // serve_exported: NULL out_handle, then NULL export_ref.
+        let export_ref = NetSubnetRef {
+            authority: [0x11; 32],
+            path: NetSubnetPath {
+                depth: 1,
+                levels: [3, 0, 0, 0],
+            },
+        };
+        assert_consumes_arc(&node, "serve_exported/out_handle", |arc, err| {
+            net_subnet_serve_exported(
+                arc,
+                service.as_ptr() as *const c_char,
+                service.len(),
+                &export_ref,
+                0,
+                NET_SUBNET_ACCESS_GRANTED,
+                1,
+                std::ptr::null_mut(),
+                err,
+            )
+        });
+        assert_consumes_arc(&node, "serve_exported/export_ref", |arc, err| {
+            let mut handle: *mut NetOrgServeHandle = std::ptr::null_mut();
+            net_subnet_serve_exported(
+                arc,
+                service.as_ptr() as *const c_char,
+                service.len(),
+                std::ptr::null(),
+                0,
+                NET_SUBNET_ACCESS_GRANTED,
+                1,
+                &mut handle,
+                err,
+            )
+        });
+
+        // install_gateway_credentials: NULL pointer array with a non-zero
+        // count.
+        assert_consumes_arc(&node, "install_gateway_credentials/array", |arc, err| {
+            net_subnet_install_gateway_credentials(arc, std::ptr::null(), std::ptr::null(), 1, err)
+        });
+
+        // net_org_serve: NULL out_handle (the same defect shape, inherited
+        // rather than introduced by the subnet work).
+        assert_consumes_arc(&node, "org_serve/out_handle", |arc, err| {
+            net_org_serve(
+                arc,
+                service.as_ptr() as *const c_char,
+                service.len(),
+                NET_ORG_ACCESS_SAME_ORG,
+                1,
+                std::ptr::null_mut(),
+                err,
+            )
+        });
+    }
+
+    /// P1-3 — an oversized count must be refused deterministically,
+    /// WITHOUT constructing the slice.
+    ///
+    /// The pointers are non-null sentinels: a bound check that ran after
+    /// `from_raw_parts` would already have invoked undefined behavior by
+    /// the time any per-element check could reject them, so the test
+    /// deliberately supplies arrays that are only safe to look at if the
+    /// count is rejected first. `catch_unwind` cannot rescue this — the
+    /// bound is a Rust slice precondition, not a panic.
+    #[test]
+    fn subnet_entrypoints_refuse_counts_above_the_slice_bound() {
+        let node = witness_node();
+        // A single valid element behind each pointer; the COUNT is the lie.
+        let one_byte: u8 = 0;
+        let byte_ptr: *const u8 = &one_byte;
+        let ptr_array: [*const u8; 1] = [byte_ptr];
+        let len_array: [usize; 1] = [1];
+        let path = NetSubnetPath {
+            depth: 0,
+            levels: [0; 4],
+        };
+
+        let over_ptr = max_slice_elems::<*const u8>() + 1;
+        assert_consumes_arc(&node, "install_gateway_credentials/count", |arc, err| {
+            net_subnet_install_gateway_credentials(
+                arc,
+                ptr_array.as_ptr(),
+                len_array.as_ptr(),
+                over_ptr,
+                err,
+            )
+        });
+
+        let over_path = max_slice_elems::<NetSubnetPath>() + 1;
+        let authority = [0x22u8; 32];
+        assert_consumes_arc(&node, "declare_boundaries/count", |arc, err| {
+            net_subnet_declare_boundaries(arc, authority.as_ptr(), 0, &path, over_path, err)
+        });
+    }
+
+    /// The bound is derived per element type, not hardcoded — a
+    /// pointer-sized element admits fewer entries than a byte, and
+    /// `NetSubnetPath` (5 bytes) fewer than a `u8`.
+    #[test]
+    fn slice_element_bound_scales_with_element_size() {
+        assert_eq!(max_slice_elems::<u8>(), isize::MAX as usize);
+        assert_eq!(
+            max_slice_elems::<*const u8>(),
+            isize::MAX as usize / std::mem::size_of::<*const u8>(),
+        );
+        assert_eq!(
+            max_slice_elems::<NetSubnetPath>(),
+            isize::MAX as usize / 5,
+            "NetSubnetPath is the 5-byte POD the layout test pins",
+        );
+        assert!(max_slice_elems::<NetSubnetPath>() < max_slice_elems::<u8>());
     }
 }
