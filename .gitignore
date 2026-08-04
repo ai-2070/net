@@ -23,6 +23,8 @@ net/crates/net/bindings/node/errors.js
 net/crates/net/bindings/node/errors.d.ts
 net/crates/net/bindings/node/org.js
 net/crates/net/bindings/node/org.d.ts
+net/crates/net/bindings/node/subnet.js
+net/crates/net/bindings/node/subnet.d.ts
 net/crates/net/bindings/node/mesh_rpc.js
 net/crates/net/bindings/node/mesh_rpc.d.ts
 net/crates/net/bindings/node/index.js

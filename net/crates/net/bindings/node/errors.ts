@@ -352,22 +352,41 @@ export class SubnetProvisionError extends Error {
 }
 
 /**
+ * Recover the stable kind token from a `subnet:` wire string, or
+ * `undefined` when the message carries no envelope at all.
+ *
+ * The envelope is SCANNED for, not required at position 0. Construction
+ * and admin failures lead with it (`subnet:invalid_format`), but serve
+ * registration WRAPS it in provider-setup prose (`subnet-exported serve
+ * registration failed: … subnet:unknown_export_name: …`) — and a
+ * bare-prefix parse silently declined to classify exactly the failure
+ * applications hit most. Matches Go's `ParseSubnetKind` and Python's
+ * `net.subnet.parse_subnet_kind`: the token runs to the next colon or
+ * whitespace.
+ */
+export function parseSubnetKind(e: unknown): string | undefined {
+  const msg = extractMessage(e)
+  const marker = msg.indexOf(ERR_SUBNET_PREFIX)
+  if (marker < 0) return undefined
+  const rest = msg.slice(marker + ERR_SUBNET_PREFIX.length)
+  const end = rest.search(/[:\s]/)
+  const kind = (end === -1 ? rest : rest.slice(0, end)).trim()
+  return kind.length === 0 ? undefined : kind
+}
+
+/**
  * Reclassify a thrown error into {@link SubnetProvisionError}.
  *
  * The kind is taken verbatim from the wire — an unrecognized kind still
  * classifies (the class asserts "local provisioning failure", which the
- * prefix alone establishes; the kind is data, and inventing a
+ * envelope alone establishes; the kind is data, and inventing a
  * substitute for one we don't know would be the counterfeit the org
  * taxonomy's `unknown` rule exists to prevent).
  */
 export function classifySubnetError(e: unknown): unknown {
-  const msg = extractMessage(e)
-  if (!msg.startsWith(ERR_SUBNET_PREFIX)) return e
-  const rest = msg.slice(ERR_SUBNET_PREFIX.length)
-  const colon = rest.indexOf(':')
-  const kind = colon === -1 ? rest.trim() : rest.slice(0, colon).trim()
-  if (kind.length === 0) return e
-  return new SubnetProvisionError(msg, kind)
+  const kind = parseSubnetKind(e)
+  if (kind === undefined) return e
+  return new SubnetProvisionError(extractMessage(e), kind)
 }
 
 export function classifyError(e: unknown): unknown {
@@ -387,8 +406,12 @@ export function classifyError(e: unknown): unknown {
   if (msg.startsWith(ERR_ORG_PREFIX)) {
     return classifyOrgError(e)
   }
-  if (msg.startsWith(ERR_SUBNET_PREFIX)) {
-    return classifySubnetError(e)
+  // Scanned, not prefix-matched — the serve-registration wrap carries the
+  // envelope mid-message. Runs LAST so a leading `org:` / `nrpc:` / … wins
+  // its own taxonomy even if the detail clause mentions a subnet.
+  const subnetKind = parseSubnetKind(e)
+  if (subnetKind !== undefined) {
+    return new SubnetProvisionError(msg, subnetKind)
   }
   return e
 }

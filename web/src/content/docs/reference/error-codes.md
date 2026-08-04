@@ -189,7 +189,7 @@ Two bands of kinds:
 
 Three properties worth knowing before writing code against it:
 
-- **Serve-registration failures wrap the envelope** (`… failed: subnet:unknown_export_name: …`) rather than leading with it. Use the binding classifiers — `classifySubnetError` (Node), `net.subnet.parse_subnet_kind` (Python), `ParseSubnetKind` / `errors.Is(err, ErrSubnet)` (Go), the `NET_ORG_ERR_SUBNET` return code (C) — which scan for the token; a bare-prefix parse misses these.
+- **Serve-registration failures wrap the envelope** (`… failed: subnet:unknown_export_name: …`) rather than leading with it. Every binding classifier SCANS for the token rather than requiring it at position 0, and the token ends at the next colon or whitespace: `parseSubnetKind` / `classifySubnetError` (Node), `net.subnet.parse_subnet_kind` or the raised exception's `.kind` (Python), `ParseSubnetKind` / `errors.Is(err, ErrSubnet)` (Go), the `NET_ORG_ERR_SUBNET` return code plus the `out_err` wire (C). Classify on the type and kind — never on message text, which carries operator prose that is not part of the contract.
 - **An unrecognized kind passes through verbatim as data.** A binding never remaps a kind it does not know onto one it does — the same anti-counterfeiting rule as `org:`'s `unknown` domain.
 - **`applied: false` from a control fact is not an error at all.** It is an authenticated stale/idempotent outcome — the fact verified but changed nothing. Don't retry it.
 

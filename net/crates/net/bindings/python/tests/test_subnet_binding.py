@@ -107,14 +107,20 @@ def test_unknown_export_name_fails_before_registration() -> None:
     mesh = _mesh(**_subnet_config())
     try:
         # Unknown name: refused at resolution, before any registration —
-        # even though no org authority is installed on this node. The
-        # registration-failure message WRAPS (does not bare-prefix) the
-        # stable kind, so classify on the substring, exactly as the Node
-        # suite does — the bare `subnet:<kind>` envelope is for the
-        # construction/admin errors above.
+        # even though no org authority is installed on this node.
+        #
+        # Asserted on CLASS and KIND, not message text (review-10 P2-1).
+        # The registration message WRAPS the envelope in provider-setup
+        # prose; a substring assertion passed happily while `.kind` was
+        # never populated and `parse_subnet_kind` returned None, so the
+        # documented recovery path did not work for this failure.
         with pytest.raises(net.SubnetProvisionError) as ei:
             net.serve_subnet_exported(mesh, "fleet.telemetry", "no-such-export", lambda c, r: b"")
-        assert "subnet:unknown_export_name" in str(ei.value)
+        assert ei.value.kind == "unknown_export_name"
+        assert parse_subnet_kind(ei.value) == "unknown_export_name"
+        # The wrap is genuinely present — this is the embedded-envelope
+        # shape, not a message that happens to lead with the token.
+        assert not str(ei.value).startswith("subnet:")
 
         # Known name: resolution succeeds and the CORE refusal (no org
         # authority) surfaces instead — proving order.
@@ -132,3 +138,26 @@ def test_classify_subnet_error_wraps_and_passes_through() -> None:
     # A non-subnet message passes through unchanged.
     passthrough = "org:credentials:signature_invalid"
     assert classify_subnet_error(passthrough) == passthrough
+
+
+def test_parse_subnet_kind_scans_for_an_embedded_envelope() -> None:
+    """review-10 P2-1 — the envelope is scanned for, not required at position 0."""
+    wrapped = (
+        "subnet-exported serve registration failed: invalid protected registration: "
+        'subnet:unknown_export_name: no configured subnet export named "no-such"'
+    )
+    assert parse_subnet_kind(wrapped) == "unknown_export_name"
+
+    classified = classify_subnet_error(wrapped)
+    assert isinstance(classified, net.SubnetProvisionError)
+    assert classified.kind == "unknown_export_name"
+    # The prose is the operator context; classification does not discard it.
+    assert "registration failed" in str(classified)
+
+
+def test_parse_subnet_kind_terminates_at_colon_or_whitespace() -> None:
+    assert parse_subnet_kind("subnet:path_too_deep: five levels") == "path_too_deep"
+    assert parse_subnet_kind("serve failed: subnet:invalid_access mode 7") == "invalid_access"
+    assert parse_subnet_kind("subnet:revoked") == "revoked"
+    assert parse_subnet_kind("nothing here") is None
+    assert parse_subnet_kind("subnet: ") is None

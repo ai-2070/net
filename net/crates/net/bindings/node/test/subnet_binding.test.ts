@@ -13,7 +13,12 @@ const { NetMesh, installSubnetGatewayCredentials, applySubnetControlFact, serveS
 // `admin` wrappers throw through — a mixed `../subnet` + `../errors`
 // import trips the compiled-.js-vs-source-.ts dual-module `instanceof`
 // hazard even though the thrown value IS a SubnetProvisionError.
-import { admin, SubnetProvisionError } from '../subnet'
+import {
+  admin,
+  classifySubnetError,
+  serveSubnetExportedTyped,
+  SubnetProvisionError,
+} from '../subnet'
 
 const HAS_SUBNET =
   typeof installSubnetGatewayCredentials === 'function' &&
@@ -129,11 +134,38 @@ describe.skipIf(!HAS_SUBNET)('subnet authority through the napi boundary', () =>
     try {
       // Unknown name: refused at resolution, before any registration —
       // even though this node has no org authority installed at all.
-      expect(() =>
+      //
+      // Asserted on CLASS and KIND, not message text (review-10 P2-1).
+      // The registration message wraps the envelope in provider-setup
+      // prose, and a text assertion passed happily while the classifier
+      // silently declined to classify it at all.
+      //
+      // The RAW napi seam throws the unclassified message, so this half
+      // proves the classifier recovers the kind from the real wire — not
+      // from a hand-written sample.
+      try {
         serveSubnetExported(mesh, 'fleet.telemetry', 'no-such-export', async () =>
           Buffer.from(''),
-        ),
-      ).toThrow(/subnet:unknown_export_name/)
+        )
+        expect.unreachable('an unknown export name must be refused')
+      } catch (e) {
+        const classified = classifySubnetError(e)
+        expect(classified).toBeInstanceOf(SubnetProvisionError)
+        expect((classified as SubnetProvisionError).kind).toBe('unknown_export_name')
+        // The wrap is genuinely present — this is the embedded-envelope
+        // shape, not a message that happens to lead with the token.
+        expect(String((e as Error).message)).not.toMatch(/^subnet:/)
+      }
+
+      // The application-facing wrapper classifies for you: what an
+      // ordinary provider catches is already a SubnetProvisionError.
+      try {
+        serveSubnetExportedTyped(mesh, 'fleet.telemetry', 'no-such-export', async () => ({}))
+        expect.unreachable('an unknown export name must be refused')
+      } catch (e) {
+        expect(e).toBeInstanceOf(SubnetProvisionError)
+        expect((e as SubnetProvisionError).kind).toBe('unknown_export_name')
+      }
 
       // Known name: resolution succeeds and the CORE refusal (no org
       // authority installed) surfaces instead — proving order.

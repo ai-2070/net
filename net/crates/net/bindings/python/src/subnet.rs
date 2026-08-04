@@ -43,10 +43,49 @@ pyo3::create_exception!(
      `kind` attribute is a core reason code or a local configuration kind."
 );
 
+/// Scan a message for the stable `subnet:<kind>` envelope and return the
+/// kind token — the ONE Rust-side parser, matching Go's
+/// `ParseSubnetKind` and Python's `net.subnet.parse_subnet_kind`.
+///
+/// SCANS rather than requiring position 0: construction and admin
+/// failures lead with the envelope, but serve registration wraps it in
+/// provider-setup prose, and that wrapped form is the failure
+/// applications hit most (review-10 P2-1).
+fn scan_subnet_kind(message: &str) -> Option<&str> {
+    const MARKER: &str = "subnet:";
+    let rest = &message[message.find(MARKER)? + MARKER.len()..];
+    let end = rest
+        .find(|c: char| c == ':' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let kind = rest[..end].trim();
+    (!kind.is_empty()).then_some(kind)
+}
+
+/// Raise `SubnetProvisionError` with its `kind` attribute populated
+/// from the message's envelope.
+///
+/// Setting `kind` HERE (review-10 P2-1) is what makes the documented
+/// contract true for every native raise: the class was already correct,
+/// but `kind` was only ever attached by `net.subnet.classify_subnet_error`,
+/// so an exception straight off a native call carried no kind at all —
+/// including the `unknown_export_name` the serve docstring promised.
+fn subnet_py_err(message: String) -> PyErr {
+    let kind = scan_subnet_kind(&message).map(str::to_string);
+    let err = SubnetProvisionError::new_err(message);
+    if let Some(kind) = kind {
+        Python::attach(|py| {
+            // Best-effort: a failure to set the attribute must not
+            // replace the real error with an attribute-setting error.
+            let _ = err.value(py).setattr("kind", kind);
+        });
+    }
+    err
+}
+
 /// Map a provisioning failure onto its stable `subnet:<kind>` wire
 /// envelope — the single Rust source `net/subnet.py` classifies.
 fn subnet_err_to_py(e: net_sdk::subnet::SubnetProvisionError) -> PyErr {
-    SubnetProvisionError::new_err(e.to_string())
+    subnet_py_err(e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -330,11 +369,10 @@ pub fn serve_subnet_exported(
         )
         // Registration failures are provider-setup errors; the
         // unknown-export refusal carries its stable
-        // `subnet:unknown_export_name` kind inside this message, which
-        // `net.subnet` classifies.
-        .map_err(|e| {
-            SubnetProvisionError::new_err(format!("subnet-exported serve registration failed: {e}"))
-        })?
+        // `subnet:unknown_export_name` kind INSIDE this message, so the
+        // raise goes through `subnet_py_err`, which scans it out and
+        // populates `.kind` (review-10 P2-1).
+        .map_err(|e| subnet_py_err(format!("subnet-exported serve registration failed: {e}")))?
     };
 
     Ok(crate::org_serve::PyOrgServeHandle::from_handle(handle))

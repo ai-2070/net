@@ -30,32 +30,50 @@ from typing import Any, Callable, Optional
 _ERR_SUBNET_PREFIX = "subnet:"
 
 
+#: Characters that terminate a kind token: the envelope's own separator, or
+#: any whitespace when the envelope carries no detail clause.
+_KIND_TERMINATORS = ": \t\n\r"
+
+
 def parse_subnet_kind(exc_or_message: Any) -> Optional[str]:
     """Recover the stable kind token from a ``subnet:`` wire string.
 
-    Returns the kind (the token after the ``subnet:`` prefix, up to the next
-    colon) or ``None`` when the message is not a ``subnet:`` envelope. An
-    unrecognized kind still returns verbatim — the kind is data, and inventing a
-    substitute for one this build does not know would be the counterfeit the org
-    taxonomy's ``unknown`` rule exists to prevent.
+    Returns the kind (the token after the ``subnet:`` marker, up to the next
+    colon or whitespace) or ``None`` when the message carries no ``subnet:``
+    envelope at all. An unrecognized kind still returns verbatim — the kind is
+    data, and inventing a substitute for one this build does not know would be
+    the counterfeit the org taxonomy's ``unknown`` rule exists to prevent.
+
+    The envelope is SCANNED for, not required at position 0. Construction and
+    admin failures lead with it (``subnet:invalid_format``), but serve
+    registration WRAPS it in provider-setup prose
+    (``subnet-exported serve registration failed: … subnet:unknown_export_name: …``),
+    and a bare-prefix parse silently returned ``None`` for exactly the failure
+    applications hit most. Matches Go's ``ParseSubnetKind`` and Node's
+    ``classifySubnetError``.
     """
     message = exc_or_message if isinstance(exc_or_message, str) else str(exc_or_message)
-    if not message.startswith(_ERR_SUBNET_PREFIX):
+    marker = message.find(_ERR_SUBNET_PREFIX)
+    if marker < 0:
         return None
-    rest = message[len(_ERR_SUBNET_PREFIX) :]
-    colon = rest.find(":")
-    kind = rest if colon == -1 else rest[:colon]
-    kind = kind.strip()
+    rest = message[marker + len(_ERR_SUBNET_PREFIX) :]
+    end = len(rest)
+    for i, ch in enumerate(rest):
+        if ch in _KIND_TERMINATORS:
+            end = i
+            break
+    kind = rest[:end].strip()
     return kind or None
 
 
 def classify_subnet_error(exc_or_message: Any) -> Any:
     """Return a :class:`SubnetProvisionError` for a ``subnet:`` wire string.
 
-    Returns the input unchanged when it is not a ``subnet:`` envelope, so it can
-    wrap a broad ``except`` without swallowing unrelated errors. A live native
-    call already raises ``SubnetProvisionError`` directly; this is for
-    classifying a message you caught yourself.
+    Returns the input unchanged when the message carries no ``subnet:``
+    envelope, so it can wrap a broad ``except`` without swallowing unrelated
+    errors. A live native call already raises ``SubnetProvisionError`` directly;
+    this attaches the parsed ``kind`` and is what
+    :func:`serve_subnet_exported_typed` routes registration failures through.
     """
     from ._net import SubnetProvisionError  # local import: native module
 
@@ -65,7 +83,13 @@ def classify_subnet_error(exc_or_message: Any) -> Any:
     message = (
         exc_or_message if isinstance(exc_or_message, str) else str(exc_or_message)
     )
-    err = SubnetProvisionError(message)
+    # Preserve the already-correct native class rather than re-wrapping it;
+    # only the parsed `kind` was missing.
+    err = (
+        exc_or_message
+        if isinstance(exc_or_message, SubnetProvisionError)
+        else SubnetProvisionError(message)
+    )
     # Expose the parsed kind as an attribute, matching the Node binding's
     # `SubnetProvisionError.kind`. The native class carries only the message.
     err.kind = kind
@@ -127,11 +151,14 @@ def serve_subnet_exported_typed(
     """Serve a subnet-exported service against a NAMED export with a JSON codec.
 
     ``export_name`` is a provider-local label configured at mesh construction; an
-    unknown name raises :class:`SubnetProvisionError` (kind ``unknown_export_name``)
-    before anything is registered or announced. The handler is
-    ``handler(caller: dict, request) -> response``; ``caller`` carries the same
-    verified fields as ``serve_org``. Announcement visibility is always public,
-    and the external caller never joins this node's subnet.
+    unknown name raises :class:`SubnetProvisionError` with ``.kind ==
+    "unknown_export_name"`` before anything is registered or announced. The
+    registration message wraps the envelope in provider-setup prose, so read
+    ``.kind`` (or :func:`parse_subnet_kind`) rather than matching the message
+    text. The handler is ``handler(caller: dict, request) -> response``;
+    ``caller`` carries the same verified fields as ``serve_org``. Announcement
+    visibility is always public, and the external caller never joins this
+    node's subnet.
     """
     from ._net import serve_subnet_exported  # local import: native module
 
