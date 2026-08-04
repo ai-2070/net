@@ -88,8 +88,8 @@ use net::adapter::net::subnet::{
 };
 use net::adapter::net::{
     ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, EntityKeypair,
-    MeshNode, MeshNodeConfig, OnFailure, PermissionToken, PublishConfig, Reliability,
-    RoutingHeader, SocketBufferConfig, TokenCache, TokenScope,
+    MeshNode, MeshNodeConfig, NetHeader, OnFailure, PacketFlags, PermissionToken, PublishConfig,
+    Reliability, RoutingHeader, SocketBufferConfig, TokenCache, TokenScope, NONCE_SIZE,
 };
 use tokio::net::UdpSocket;
 
@@ -239,20 +239,44 @@ async fn wait_until<F: Fn() -> bool>(limit: Duration, cond: F) -> bool {
     cond()
 }
 
+/// An owned scratch directory, removed on drop (§9) — so an
+/// assertion panic anywhere in a test cannot leave an authority store
+/// behind. The startup `remove_dir_all` stays as crash-residue
+/// cleanup.
+struct ScratchDir(std::path::PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for ScratchDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for ScratchDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
 /// Install Vehicle B's BMW node authority (the org plane's provider
-/// anchor). Returns the scratch dir for cleanup.
-fn install_bmw_authority(server: &Arc<MeshNode>, tag: &str) -> std::path::PathBuf {
+/// anchor). The returned guard OWNS the scratch store.
+fn install_bmw_authority(server: &Arc<MeshNode>, tag: &str) -> ScratchDir {
     let node_entity = server.entity_id().clone();
     let node_cert =
         OrgMembershipCert::try_issue(&bmw(), node_entity.clone(), 1, 3600).expect("node cert");
     let dir = std::env::temp_dir().join(format!("net-subnet-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
     let authority =
         NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
     server
         .install_node_authority(Arc::new(authority))
         .expect("install authority");
-    dir
+    ScratchDir(dir)
 }
 
 /// A Vehicle B subnet grant signed by Vehicle B's OWN subnet root,
@@ -452,7 +476,7 @@ struct FleetFixture {
     /// `Option` so a scenario can retire the registration (drop the
     /// handle) while continuing to drive the fixture.
     serve: Option<net::adapter::net::mesh_rpc::ServeHandle>,
-    dir: std::path::PathBuf,
+    dir: ScratchDir,
 }
 
 /// Establish a session `initiator → responder` WITHOUT starting
@@ -775,8 +799,6 @@ async fn fleet_exported_provider_requires_gateway_export_and_org_authority() {
         .expect("restored conjunction admits again");
     assert_eq!(reply.body.as_ref(), b"roi-window");
     f.assert_no_va_subnet_context();
-
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 // ===========================================================================
@@ -793,7 +815,8 @@ async fn exported_registration_requires_exact_boundary_and_exact_export() {
     let vehicle_a = build_vehicle_a().await;
     let vb_kp = EntityKeypair::from_bytes(VEHICLE_B_SEED);
     bring_up(&vehicle_a, &vehicle_b).await;
-    let dir = install_bmw_authority(&vehicle_b, "reg-shape");
+    // `_dir` (not `_`) so the guard lives to the end of the test.
+    let _dir = install_bmw_authority(&vehicle_b, "reg-shape");
 
     let dark = Arc::new(AtomicUsize::new(0));
     let serve = |vb: &Arc<MeshNode>, binding: SubnetExportBinding| {
@@ -899,8 +922,6 @@ async fn exported_registration_requires_exact_boundary_and_exact_export() {
         0,
         "no handler ran during shape checks"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ===========================================================================
@@ -1021,8 +1042,6 @@ async fn live_exported_service_darkens_on_authority_movement_and_recovers() {
         expired_denied,
         "an expired gateway credential set must darken the live registration",
     );
-
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 /// Topology-epoch movement darkens the old registration PERMANENTLY —
@@ -1094,8 +1113,6 @@ async fn topology_epoch_movement_darkens_until_explicit_reregistration() {
         .await
         .expect("explicit re-registration recovers");
     f.assert_no_va_subnet_context();
-
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 // ===========================================================================
@@ -1207,7 +1224,6 @@ async fn publication_of_either_member_invalidates_captured_export_facts() {
     f.call(true)
         .await
         .expect("still admitted after republication");
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 /// SUPPLEMENTAL stress evidence: two uncontrolled writer storms over
@@ -1475,7 +1491,7 @@ async fn provider_authority_churn_never_charges_the_caller() {
     let vehicle_a = build_vehicle_a().await;
     let vb_kp = EntityKeypair::from_bytes(VEHICLE_B_SEED);
     bring_up(&vehicle_a, &vehicle_b).await;
-    let dir = install_bmw_authority(&vehicle_b, "limiter-churn");
+    let _dir = install_bmw_authority(&vehicle_b, "limiter-churn");
     let provider = vehicle_b.entity_id().clone();
 
     declare_world_model_boundary(&vehicle_b, 0);
@@ -1565,8 +1581,6 @@ async fn provider_authority_churn_never_charges_the_caller() {
         "the handler ran exactly once per ADMITTED call — every churn \
          denial left it dark",
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ===========================================================================
@@ -1809,8 +1823,6 @@ async fn neither_plane_manufactures_the_other() {
         f.vehicle_b.subnet_context_for(camera.node_id()).is_some(),
         "an org-plane denial must not disturb the subnet plane",
     );
-
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 // ===========================================================================
@@ -2028,8 +2040,6 @@ async fn partner_diagnostic_is_exactly_bounded() {
         f.vehicle_b.subnet_context_for(partner.node_id()).is_none(),
         "and still no context after every attempt",
     );
-
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 // ===========================================================================
@@ -2339,8 +2349,6 @@ async fn org_and_subnet_revocation_are_independent_live() {
         "evidence 13: repairing only the SUBNET plane restores the call — \
          BMW membership was never disturbed by the subnet floor",
     );
-
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 // ===========================================================================
@@ -2451,8 +2459,6 @@ async fn replayed_credentials_and_presentations_prove_nothing() {
             .expect_err("evidence 15: the proof is bound to one incarnation"),
         SubnetAuthError::WrongSession,
     );
-
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 /// Evidence 15 (per-axis half): after a SUBNET revocation the subnet
@@ -2568,8 +2574,6 @@ async fn each_axis_recovers_only_itself() {
         "recovered subnet axis without org proof",
     )
     .await;
-
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 // ===========================================================================
@@ -2703,8 +2707,6 @@ async fn topology_epoch_invalidates_old_contexts_before_forwarding() {
     f.vehicle_b
         .admit_subnet_session(node_id, &presentation, &fresh)
         .expect("evidence 16: fresh-epoch credentials restore authority");
-
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 // ===========================================================================
@@ -2955,8 +2957,6 @@ async fn hostile_control_publisher_is_inert_in_the_full_topology() {
     f.call(true)
         .await
         .expect("evidence 17: the node remains healthy and still serves the fleet");
-
-    let _ = std::fs::remove_dir_all(&f.dir);
 }
 
 // ===========================================================================
@@ -3271,5 +3271,100 @@ async fn forged_locator_fields_select_no_authority() {
         route_hops(&received_within(&watcher, Duration::from_millis(1500)).await).len(),
         1,
         "the admitted source is forwarded regardless of source address",
+    );
+}
+
+/// Evidence 19, the remaining two named selectors: a forged
+/// `NetHeader.subnet_id` carried INSIDE the protected envelope, and a
+/// hostile topology / `peer_subnets` claim published through the REAL
+/// signed announcement path.
+///
+/// Neither supplies the admitted ingress context the relay actually
+/// requires: the inner header is AAD-covered payload the relay never
+/// consults for authority, and a peer's announced topology is routing
+/// state, not authenticated membership. The outsider's packet is
+/// refused; the admitted source's byte-identical packet is forwarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_inner_subnet_id_and_topology_claim_select_no_authority() {
+    let f = two_gateway_fixture(SubnetRights::ROUTE).await;
+    let dest_id = f.dest.node_id();
+    let outsider = f.outsider.clone();
+
+    // The outsider publishes vehicle topology tags through the
+    // production signed-announcement path.
+    outsider
+        .announce_capabilities(
+            CapabilitySet::new()
+                .add_tag("vehicle:b")
+                .add_tag("perception"),
+        )
+        .await
+        .expect("outsider announces");
+    assert!(
+        wait_until(Duration::from_secs(5), || f
+            .gw1
+            .peer_entity_id(outsider.node_id())
+            .is_some())
+        .await,
+        "the outsider's signed announcement reached gw1",
+    );
+    // Whatever routing-side visibility that produced is NOT authority.
+    assert!(
+        f.gw1.subnet_context_for(outsider.node_id()).is_none(),
+        "evidence 19: an announced topology / peer_subnets claim installs \
+         no admitted ingress context",
+    );
+
+    let watcher = wire().await;
+    assert!(f
+        .gw2
+        .set_peer_addr_for_test(dest_id, watcher.local_addr().expect("addr")));
+
+    // A real inner NetHeader whose `subnet_id` is forged to the very
+    // scope the relay would be transiting.
+    let mut inner = NetHeader::new(
+        0,
+        0,
+        1,
+        [0u8; NONCE_SIZE],
+        INNER_TAG.len() as u16,
+        1,
+        PacketFlags::NONE,
+    );
+    inner.subnet_id = TopologySubnetId::new(VEHICLE).raw();
+    let mut forged_inner = inner.to_bytes().to_vec();
+    forged_inner.extend_from_slice(INNER_TAG);
+
+    let header = RoutingHeader::new(dest_id, f.source.node_id() as u32, 8);
+    let envelope = outsider
+        .seal_route_hop_to_peer(f.gw1.node_id(), &header, &forged_inner)
+        .expect("the outsider has a session to gw1");
+    let sock = wire().await;
+    sock.send_to(&envelope, f.gw1.local_addr())
+        .await
+        .expect("send");
+    assert!(
+        route_hops(&received_within(&watcher, Duration::from_millis(800)).await).is_empty(),
+        "evidence 19: a forged inner NetHeader.subnet_id — with a published \
+         topology claim behind it — must not pass a protected relay",
+    );
+
+    // Positive control: the SAME inner bytes from the ADMITTED source
+    // are forwarded, so the refusal was about missing ingress
+    // authority and not about the payload shape or the wiring.
+    let good = f
+        .source
+        .seal_route_hop_to_peer(f.gw1.node_id(), &header, &forged_inner)
+        .expect("seal from the admitted source");
+    let sock2 = wire().await;
+    sock2
+        .send_to(&good, f.gw1.local_addr())
+        .await
+        .expect("send");
+    assert_eq!(
+        route_hops(&received_within(&watcher, Duration::from_millis(1500)).await).len(),
+        1,
+        "the admitted source carries the identical inner bytes through — \
+         the inner subnet_id was never what authorized anything",
     );
 }
