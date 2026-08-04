@@ -20,10 +20,11 @@ Ship subnet authority as one usable vertical slice:
 
 1. operators can create and inspect signed subnet artifacts offline;
 2. gateways can install credential sets, declare boundaries, and apply signed control facts;
-3. providers can register an organization-protected nRPC service against one immutable subnet export binding;
-4. organization clients can discover that publicly announced service through a verified ownership projection and invoke it with the existing organization proof;
-5. Rust, TypeScript/Node, Python, Go, and C expose the same authority boundary;
-6. public docs, the repository skill, examples, packages, headers, and release metadata describe the shipped surface exactly.
+3. operators can configure a checked subnet export under a local name;
+4. providers can register an organization-protected nRPC service against that named export without constructing authority objects in application code;
+5. organization clients can discover that publicly announced service through a verified ownership projection and invoke it with the existing organization proof;
+6. Rust, TypeScript/Node, Python, Go, and C expose the same authority boundary;
+7. public docs, the repository skill, examples, packages, headers, and release metadata describe the shipped surface exactly.
 
 The release must not imply any of the following:
 
@@ -35,7 +36,14 @@ The release must not imply any of the following:
 - organization load balancing, sensing, or proximity selection is public;
 - the SDK owns a production subnet session handshake that does not yet exist.
 
-The SDK should be smaller than the substrate. Bindings receive opaque signed artifacts and invariant-checked constructors; they do not reimplement the verifier, wire format, prefix rules, or export gate.
+The SDK should be smaller than the substrate. The normative application surface is exactly two verbs:
+
+```text
+provider: serve_subnet_exported(service, export_name, handler)
+caller:   call_exported(service, request)
+```
+
+TypeScript uses `serveSubnetExported` / `callExported`; Python uses the snake-case forms. `callSubnet` is prohibited: the caller neither names nor joins a subnet. Bindings receive opaque signed artifacts and invariant-checked constructors for advanced administration, but they do not reimplement the verifier, wire format, prefix rules, or export gate.
 
 ---
 
@@ -101,7 +109,23 @@ This plan does not expose a `joinSubnet`, `connectSubnet`, or caller-side subnet
 
 ## 3. Surface contract
 
-### 3.1 Operator artifacts
+### 3.1 Normal application surface
+
+Application developers see only:
+
+```text
+Provider:
+  serve_subnet_exported(service, export_name, handler)
+
+Caller:
+  call_exported(service, request)
+```
+
+The provider chooses a local named export configured at mesh construction. The caller chooses only a service and supplies its existing organization authority. Neither path accepts roots, credentials, boundaries, topology epochs, or a `SubnetRef`.
+
+Everything below that manipulates authority state is an operator or advanced-administration surface, not a prerequisite for ordinary application code.
+
+### 3.2 Operator artifacts
 
 Root signing material crosses only through a checked filesystem path. Public signed artifacts cross SDK/FFI boundaries as opaque bytes.
 
@@ -116,7 +140,7 @@ Root signing material crosses only through a checked filesystem path. Public sig
 
 The CLI must use the core `to_bytes`/`from_bytes` implementations. It must not create JSON mirrors of signed objects.
 
-### 3.2 Runtime configuration
+### 3.3 Runtime configuration
 
 Every mesh constructor gains optional subnet configuration with the same semantics:
 
@@ -130,6 +154,14 @@ subnetAttachment?:
   path: array of 0..4 u8 labels; empty means global
 
 subnetControlChannel?: string
+
+subnetExports[]:
+  name: non-empty local identifier
+  access: sameOrg | granted
+  subnet:
+    authority: 32-byte entity-id hex
+    path: array of 0..4 u8 labels
+  topologyEpoch: u32
 ```
 
 Rules:
@@ -138,9 +170,13 @@ Rules:
 - authority and roots remain explicit: an authority may trust multiple root entities, so its id is not derived from one root;
 - `subnetAttachment` remains the core's local topology coordinate (`Option<SubnetId>`), not an authority-qualified `SubnetRef`; credentials carry the authority and are checked against that local path;
 - omitting `subnetAttachment` preserves the core compatibility fallback; docs warn that protected deployments should set it explicitly;
+- duplicate/empty export names and malformed export bindings fail before node construction;
+- each named export is converted once into checked `SubnetExportAccess` plus `SubnetExportBinding` state;
+- the export name is a provider-local configuration label: it is neither announced nor accepted from callers;
+- one Rust-owned immutable `NamedSubnetExports` map is stored beside the mesh handle, not in capability discovery or mutable core authority state; Node, Python, Go, and C handles retain that same checked map beside their `Arc<MeshNode>`;
 - no constructor accepts a private root key.
 
-### 3.3 Gateway provisioning
+### 3.4 Gateway provisioning
 
 The common Rust seam owns parsing and invariant construction:
 
@@ -174,9 +210,9 @@ apply_subnet_control_fact_node(
 
 `applied: false` is an authenticated stale/idempotent outcome, not a transport failure.
 
-### 3.4 Exported provider verb
+### 3.5 Exported provider verb
 
-Define a distinct facade enum because existing `OrgAccess` implies encrypted visibility:
+Define a distinct configuration enum because existing `OrgAccess` implies encrypted visibility:
 
 ```rust
 pub enum SubnetExportAccess {
@@ -186,15 +222,17 @@ pub enum SubnetExportAccess {
 
 mesh.serve_subnet_exported(
     service,
-    SubnetExportAccess::Granted,
-    export_binding,
+    "factory-export",
     handler,
 )
 ```
 
 Contract:
 
-- registration builds `SubnetExportBinding` through its checked constructor;
+- node construction resolves each named export into a checked `SubnetExportBinding` and `SubnetExportAccess`;
+- registration accepts only the local export name and fails before announcement if that name is absent;
+- resolution is one immutable local-map lookup; it adds no discovery registry, cache invalidation, sensing, or load-balancing behavior;
+- ordinary application code does not construct `SubnetRef`, `SubnetExportBinding`, topology epochs, boundaries, or credentials;
 - `SameOrg` maps to `OrgAdmission::OwnerDelegated`;
 - `Granted` maps to `OrgAdmission::CrossOrgGranted`;
 - announcement visibility is always public;
@@ -206,7 +244,9 @@ Contract:
 
 Do not route this through `serve_rpc_protected`; use `serve_rpc_subnet_exported` directly.
 
-### 3.5 Exported caller verb
+Rust callers that intentionally need dynamic/raw binding control may use the low-level core API. Do not duplicate that machinery as a second ergonomic overload in every language.
+
+### 3.6 Exported caller verb
 
 Add a separate organization-client verb:
 
@@ -215,6 +255,8 @@ let response: Response = org.call_exported("fleet.telemetry", &request).await?;
 ```
 
 It uses existing organization credentials and proof construction. It never accepts a subnet credential or export binding.
+
+The caller method is deliberately `call_exported`, not `call_subnet`: it calls a publicly discoverable organization service, not a subnet. The subnet is provider-local execution authority.
 
 Before implementing this verb, add one coherent core query that returns public candidates and verified ownership from the same capability-fold snapshot:
 
@@ -303,11 +345,11 @@ Files:
 - `net/crates/net/sdk/src/mesh.rs`
 - focused SDK tests
 
-Keep existing `subnets.rs` for topology/subnet discovery compatibility. Do not overload it with authority provisioning.
+Keep existing `subnets.rs` for topology/subnet discovery compatibility. Do not overload it with authority provisioning. Put runtime administration under an explicitly advanced `subnet::admin` namespace; do not place install/declare/apply beside ordinary service calls.
 
-Public Rust types should be the minimum needed to construct checked inputs and observe outcomes. Do not re-export signing key types merely for convenience. Native Rust applications that intentionally need the low-level issuer API can use the core crate; the ergonomic SDK does not turn root signing into a runtime operation.
+The ordinary Rust surface is `Mesh::serve_subnet_exported(service, export_name, handler)` plus `OrgClient::call_exported(service, request)`. Public Rust types should be the minimum needed to configure a named export and observe outcomes. Do not re-export signing key types merely for convenience. Native Rust applications that intentionally need the low-level issuer API can use the core crate; the ergonomic SDK does not turn root signing into a runtime operation.
 
-Provide both `serve_subnet_exported_bytes_node` and the typed JSON wrapper. The byte seam owns verified-`OrgCaller` projection, canonical channel registration, trivial v1 provider policy, and raw handler error mapping once; every language binding and typed wrapper delegates to it.
+Provide both `serve_subnet_exported_bytes_node(node, named_exports, service, export_name, handler)` and the typed JSON wrapper. Bindings store `NamedSubnetExports` beside their existing mesh handle and pass it to this shared seam. The byte seam resolves the name, owns verified-`OrgCaller` projection, canonical channel registration, trivial v1 provider policy, and raw handler error mapping once; every language binding and typed wrapper delegates to it.
 
 ### R4 — stable local error envelope
 
@@ -387,15 +429,12 @@ All output writes are atomic. Existing files are refused unless the user supplie
 
 ## 6. Language bindings
 
-All bindings expose the same five operations:
+Parity has two layers. The ordinary application layer contains exactly:
 
-1. configure authority roots and optional local attachment;
-2. install credential-set bytes;
-3. declare boundaries;
-4. apply control-fact bytes;
-5. serve and call exported organization-protected unary nRPC.
+1. provider `serve_subnet_exported(service, export_name, handler)`;
+2. caller `call_exported(service, request)`.
 
-All language-specific structs are adapters into the Rust constructors. None verifies signatures or hierarchy placement itself.
+Authority roots, attachment, named exports, credential installation, boundary declaration, and control-fact application live under mesh construction or an explicitly advanced `subnet.admin` surface. Documentation presents the two application verbs first and links to administration separately. All language-specific structs are adapters into Rust constructors; none verifies signatures or hierarchy placement itself.
 
 Freeze explicit binding DTOs before implementing any language:
 
@@ -404,6 +443,7 @@ Freeze explicit binding DTOs before implementing any language:
 - `SubnetRefDto { authority_hex, path }`;
 - `SubnetBoundaryDeclarationDto { authority_hex, topology_epoch: u32, boundaries: SubnetPathDto[] }`;
 - `SubnetExportBindingDto { subnet: SubnetRefDto, topology_epoch: u32 }`;
+- `SubnetNamedExportDto { name, access, binding: SubnetExportBindingDto }`;
 - `SubnetControlOutcomeDto { kind, applied }`.
 
 Node/NAPI, Python/PyO3, Go config JSON, and C PODs each convert these DTOs into core values through one Rust conversion module. No DTO derives directly into `SubnetAuthorityConfig`, `SubnetBoundarySet`, or `SubnetExportBinding`.
@@ -422,14 +462,15 @@ Files:
 Representative surface:
 
 ```ts
-installSubnetGatewayCredentials(mesh, credentialSets: readonly Buffer[]): void
-declareSubnetBoundaries(mesh, declaration: SubnetBoundaryDeclaration): void
-applySubnetControlFact(mesh, fact: Buffer): SubnetControlOutcome
-serveSubnetExportedTyped(mesh, service, access, binding, handler): ServeHandle
+mesh.serveSubnetExported(service, exportName, handler): ServeHandle
 org.callExported<TReq, TResp>(service, request): Promise<TResp>
+
+subnet.admin.installGatewayCredentials(mesh, credentialSets: readonly Buffer[]): void
+subnet.admin.declareBoundaries(mesh, declaration: SubnetBoundaryDeclaration): void
+subnet.admin.applyControlFact(mesh, fact: Buffer): SubnetControlOutcome
 ```
 
-Use `Buffer` for opaque signed artifacts and validated objects for refs/bindings. The handler receives the existing `OrgCaller` object.
+The ordinary provider method resolves a named export configured during mesh construction. Use `Buffer` for opaque signed artifacts and validated objects for advanced administration. The handler receives the existing `OrgCaller` object.
 
 Keep the exported organization caller in the existing `@net-mesh/core/org` facade. `@net-mesh/sdk` only forwards the new mesh-construction fields unless it already owns the corresponding organization client; do not create a second org client solely for API symmetry.
 
@@ -448,11 +489,12 @@ Files:
 Representative surface:
 
 ```python
-install_subnet_gateway_credentials(mesh, credential_sets: Sequence[bytes]) -> None
-declare_subnet_boundaries(mesh, declaration: SubnetBoundaryDeclaration) -> None
-apply_subnet_control_fact(mesh, fact: bytes) -> SubnetControlOutcome
-serve_subnet_exported_typed(mesh, service, access, binding, handler)
+mesh.serve_subnet_exported(service, export_name, handler)
 org.call_exported(service, request)
+
+net.subnet.admin.install_gateway_credentials(mesh, credential_sets: Sequence[bytes]) -> None
+net.subnet.admin.declare_boundaries(mesh, declaration: SubnetBoundaryDeclaration) -> None
+net.subnet.admin.apply_control_fact(mesh, fact: bytes) -> SubnetControlOutcome
 ```
 
 Pure-Python typed wrappers remain importable when the native feature is absent; native operations fail at import/export availability, not on first call.
@@ -471,9 +513,16 @@ Files:
 
 Prefer extending the existing organization C ABI for `call_exported`; it already owns organization credentials and cancellation. A subnet-specific library, if retained, owns only provider-local configuration/provisioning/serve symbols.
 
+The ordinary Go surface is:
+
+```go
+handle, err := mesh.ServeSubnetExported(service, exportName, handler)
+response, err := org.CallExported(ctx, service, request)
+```
+
 Use the existing callback registry and handle-lifetime pattern. Do not create a second generic callback framework.
 
-Expose `ServeSubnetExportedBytes` as the cgo ownership/error seam and make generic `ServeSubnetExported[Req, Resp]` a JSON wrapper over it. The raw handler receives the existing verified `OrgCaller`; typed Go must not be the only route to the C trampoline.
+Expose `ServeSubnetExportedBytes(mesh, service, exportName, handler)` as the cgo ownership/error seam and make generic `ServeSubnetExported[Req, Resp]` a JSON wrapper over it. The raw handler receives the existing verified `OrgCaller`; typed Go must not be the only route to the C trampoline. Provisioning remains under the advanced subnet package rather than appearing beside the ordinary serve/call examples.
 
 ### 6.4 C
 
@@ -505,7 +554,7 @@ typedef struct {
 
 The Rust mirrors are `#[repr(C)]`; tests pin size, alignment, offsets, `depth <= 4`, inactive-zero canonicalization, and global-path behavior. Every function documents whether the consumed mesh Arc is consumed on both success and failure, borrowed vs owned memory, callback thread, handler-id reservation/rollback, serve-handle close ordering, and error-buffer sizing. Null pointers are valid only when length is zero. Error writes use required-length reporting and guaranteed NUL termination when capacity is non-zero.
 
-The byte serve callback reuses the existing organization ABI contract: it receives `net_org_caller_t` plus request bytes, returns response/application-error bytes through the established allocator/free rules, and never receives caller-claimed organization fields. Do not invent a second caller struct.
+The ordinary C application boundary is `net_org_serve_subnet_exported_bytes(..., export_name, ...)` plus `net_org_call_exported(...)`. The byte serve callback accepts a provider-local export-name string and reuses the existing organization ABI contract: it receives `net_org_caller_t` plus request bytes, returns response/application-error bytes through the established allocator/free rules, and never receives caller-claimed organization fields. Do not invent a second caller struct or require an application callback to construct a binding.
 
 `net_org_call_exported` belongs with the existing org client handle. Do not require callers to construct an `OrgProofIntent` in C.
 
@@ -559,6 +608,7 @@ At minimum:
 - exact boundary mismatch;
 - missing `EXPORT`;
 - topology epoch mismatch;
+- unknown named export is rejected locally before capability announcement;
 - provider-local organization admission missing;
 - caller receives no subnet context;
 - public announcement without verified owner is not eligible;
@@ -572,7 +622,7 @@ Tests must assert the correct coarse denial boundary: unavailable or failed auth
 Avoid a 5×5 cross-language matrix. Each language needs:
 
 1. compile/import evidence for every public symbol;
-2. one positive provider smoke test against a Rust caller;
+2. one positive provider smoke test that resolves a named export against a Rust caller;
 3. one positive exported caller smoke test against a Rust provider;
 4. malformed-artifact local refusal;
 5. one authority-change or wrong-binding denial proving the error crosses the boundary;
@@ -621,6 +671,7 @@ topology places
 subnet credentials authorize local attachment/routing/export
 organization credentials authorize the caller
 export binding authorizes one provider-local crossing
+named export keeps that binding out of application code
 ```
 
 The coverage matrix gains separate rows for:
@@ -650,12 +701,10 @@ Update:
 
 Required examples:
 
-1. offline authority and credential provisioning;
-2. explicit gateway attachment and authority configuration;
-3. boundary declaration and credential install;
-4. provider `serve_subnet_exported`;
-5. external organization client `call_exported`;
-6. authority movement handling with application-level rediscovery/retry policy, never automatic proof replay.
+1. provider `serve_subnet_exported(service, export_name, handler)`;
+2. external organization client `call_exported(service, request)`;
+3. separate operator guide for offline authority/credential provisioning, explicit gateway attachment, named export configuration, boundary declaration, and credential install;
+4. authority movement handling with application-level rediscovery/retry policy, never automatic proof replay.
 
 Public prose must say explicitly that the external caller does not join the provider subnet and receives no provider-local subnet context.
 
@@ -669,9 +718,9 @@ Update all versioned manifests, generated declarations/stubs, headers, export ma
 
 | Stage | Deliverable | Exit gate |
 |---|---|---|
-| S0 | RED contracts for public-owned discovery, exported caller, byte provisioning; create the owed `subnet_relay_alloc_e2e` target | focused REDs fail for the intended reason; the production-path allocation target exists and runs independently of the primitive witness |
+| S0 | RED contracts for named-export resolution, public-owned discovery, exported caller, byte provisioning; create the owed `subnet_relay_alloc_e2e` target | focused REDs fail for the intended reason; unknown export names fail before announcement; the production-path allocation target exists and runs independently of the primitive witness |
 | S1 | coherent public owner query + `OrgClient::call_exported` | focused unit/live tests green; no sensing/OLB dependency |
-| S2 | Rust subnet facade + stable local errors + generated stable-kind fixture | SDK compile/tests, core inverses, and fixture regeneration green |
+| S2 | immutable `NamedSubnetExports` config + Rust two-verb facade + advanced admin namespace + stable local errors + generated stable-kind fixture | SDK compile/tests, core inverses, and fixture regeneration green |
 | S3 | offline CLI artifacts | round-trip, permissions, overwrite, malformed-input tests green |
 | S4 | Node, Python, Go, C adapters | per-language provider/caller smoke and negative tests green |
 | S5 | skill, public docs, examples, coverage anchors | links, snippets, matrices, generated artifacts synchronized |
@@ -702,11 +751,13 @@ Do not parallelize S4 before S1/S2 names and byte seams are frozen. Language ada
 The subnet SDK is releasable only when all are true:
 
 - [ ] A real language-SDK caller can invoke a real subnet-exported provider end to end.
+- [ ] Rust, TypeScript, Python, and Go lead with only named-export serve plus exported call; C mirrors the same application boundary.
+- [ ] No public caller surface is named `call_subnet` / `callSubnet` or accepts a subnet reference, credential, or export binding.
 - [ ] Public candidate ownership is verified and sampled coherently.
 - [ ] External callers present organization authority only and receive no subnet context.
 - [ ] Exact gateway, boundary, `EXPORT`, topology epoch, and provider-local admission are revalidated per call.
 - [ ] Authority movement yields one uncharged `AuthorityChanged` and no SDK retry.
-- [ ] Every binding configures roots/attachment and can install, declare, apply, serve, and call.
+- [ ] Every binding can configure roots, attachment, and named exports; install/declare/apply operations are clearly separated as advanced administration.
 - [ ] Signed artifacts are generated by the CLI and consumed as canonical opaque bytes.
 - [ ] Private root material crosses only through checked file paths.
 - [ ] The required `net + cortex + fixtures` E2E gate is green at exact head.
