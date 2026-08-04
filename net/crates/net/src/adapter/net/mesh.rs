@@ -11674,43 +11674,19 @@ impl MeshNode {
         &self,
         sets: &[SubnetCredentialSet],
     ) -> Result<(), SubnetAuthError> {
-        if sets.is_empty() {
-            self.publish_gateway_member(None);
-            return Ok(());
-        }
-        let authority = sets[0].leaf().authority.clone();
-        let config = self
-            .subnet_authority_config(&authority)
-            .ok_or(SubnetAuthError::UnknownAuthority)?;
-        let epoch = self.subnet_topology_epoch.load(Ordering::Acquire);
-        let now = crate::adapter::net::subnet::admission::unix_now_secs();
-        let mut compiled = Vec::with_capacity(sets.len());
-        for set in sets {
-            compiled.push(crate::adapter::net::subnet::auth::compile_gateway_context(
-                set,
-                self.entity_id(),
-                self.subnet_local_attachment,
-                config,
-                epoch,
-                &self.subnet_floors,
-                now,
-                crate::adapter::net::identity::TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
-            )?);
-        }
-        let set =
-            crate::adapter::net::subnet::auth::build_gateway_context_set(&authority, compiled)?;
-        self.publish_gateway_member(Some(Arc::new(set)));
-        Ok(())
+        self.install_subnet_gateway_credentials_paced(sets, &|| {})
     }
 
-    /// Test-only (fixtures): [`Self::install_subnet_gateway_credentials`]
-    /// through the SAME production compile + publication path, exposing
-    /// the after-capture hook so the deterministic lost-update witness
-    /// can hold THIS writer between its capture and its
-    /// compare-and-swap (the mirror of
-    /// [`Self::test_declare_subnet_boundaries_paced`]).
-    #[cfg(feature = "fixtures")]
-    pub fn test_install_subnet_gateway_credentials_paced(
+    /// The ONE gateway-credential installation implementation —
+    /// compile and publication — parameterized by the rcu
+    /// after-capture hook (a production no-op; the fixtures driver
+    /// passes the witness's barrier). A single body on purpose: a
+    /// duplicated fixture branch would let a mutation of the
+    /// production branch alone escape the deterministic lost-update
+    /// witness, because the held party would never be the code
+    /// production actually runs. Mirror of
+    /// [`Self::declare_subnet_boundaries_paced`].
+    fn install_subnet_gateway_credentials_paced(
         &self,
         sets: &[SubnetCredentialSet],
         after_capture: &(dyn Fn() + Sync),
@@ -11744,17 +11720,25 @@ impl MeshNode {
         Ok(())
     }
 
-    /// Replace ONLY the gateway member of the published authority
-    /// aggregate, preserving whatever boundaries member is latest at
-    /// the moment of the swap. `rcu` retries on contention, so a
-    /// concurrent [`Self::declare_subnet_boundaries`] can never have
-    /// its member overwritten by this writer's stale read (the
-    /// lost-update a naive load-modify-store would allow).
-    fn publish_gateway_member(&self, gateway: Option<Arc<VerifiedGatewayContextSet>>) {
-        self.publish_gateway_member_paced(gateway, &|| {});
+    /// Test-only (fixtures): [`Self::install_subnet_gateway_credentials`]
+    /// through the SHARED production implementation, exposing the
+    /// after-capture hook so the deterministic lost-update witness can
+    /// hold THIS writer between its capture and its compare-and-swap
+    /// (the mirror of [`Self::test_declare_subnet_boundaries_paced`]).
+    /// Delegation, not duplication: the held branch IS the branch the
+    /// public method runs.
+    #[cfg(feature = "fixtures")]
+    pub fn test_install_subnet_gateway_credentials_paced(
+        &self,
+        sets: &[SubnetCredentialSet],
+        after_capture: &(dyn Fn() + Sync),
+    ) -> Result<(), SubnetAuthError> {
+        self.install_subnet_gateway_credentials_paced(sets, after_capture)
     }
 
-    /// [`Self::publish_gateway_member`] with an after-capture hook:
+    /// Replace ONLY the gateway member of the published authority
+    /// aggregate, preserving whatever boundaries member is latest at
+    /// the moment of the swap, with an after-capture hook:
     /// `after_capture` runs INSIDE the rcu closure — after the current
     /// aggregate has been captured, before the compare-and-swap
     /// attempt — and therefore once more per retry. Production passes
