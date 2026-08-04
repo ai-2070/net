@@ -12,16 +12,21 @@
 
 use net_sdk::subnet::{fact_kind_wire, subnet_auth_kinds, SubnetFactKind, LOCAL_PROVISION_KINDS};
 
-fn committed_fixture() -> serde_json::Value {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn fixture_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("sdk has a parent")
-        .join("tests")
-        .join("cross_lang_subnet")
-        .join("stable_kinds.json");
-    let body = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {} (run gen_subnet_kind_fixture): {e}", path.display()));
-    serde_json::from_str(&body).expect("fixture parses")
+        .join(net_sdk::subnet::STABLE_KINDS_FIXTURE_PATH)
+}
+
+fn committed_bytes() -> String {
+    let path = fixture_path();
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {} (run gen_subnet_kind_fixture): {e}", path.display()))
+}
+
+fn committed_fixture() -> serde_json::Value {
+    serde_json::from_str(&committed_bytes()).expect("fixture parses")
 }
 
 fn strings(v: &serde_json::Value, key: &str) -> Vec<String> {
@@ -61,6 +66,42 @@ fn committed_fixture_matches_the_canonical_matches() {
         .map(fact_kind_wire),
     );
     assert_eq!(strings(&fixture, "access"), ["sameOrg", "granted"]);
+}
+
+/// The committed file is BYTE-IDENTICAL to what the generator emits
+/// (review-10 P3-1).
+///
+/// The field-by-field assertions above compare selected keys, so an
+/// unexpected extra field, a reordering, or formatting drift could pass
+/// them while the committed file no longer matched the generator's
+/// output — which is exactly what the "exact regeneration gate" claim
+/// promised was impossible. This makes it a byte equality, with no need
+/// for CI to shell out to the generator: both sides call the same
+/// renderer.
+#[test]
+fn committed_fixture_is_byte_identical_to_the_generator_output() {
+    let rendered = net_sdk::subnet::render_stable_kind_fixture();
+    let committed = committed_bytes();
+    assert_eq!(
+        committed,
+        rendered,
+        "{} has drifted from the generator — re-run \
+         `cargo run -p net-mesh-sdk --features net --example gen_subnet_kind_fixture` \
+         and commit the result",
+        fixture_path().display(),
+    );
+}
+
+/// Rendering twice produces the same bytes — the determinism the
+/// generator's doc claims, asserted rather than assumed. A map with
+/// nondeterministic iteration order slipping into the fixture would
+/// make the byte gate above flap instead of failing honestly.
+#[test]
+fn rendering_is_deterministic() {
+    assert_eq!(
+        net_sdk::subnet::render_stable_kind_fixture(),
+        net_sdk::subnet::render_stable_kind_fixture(),
+    );
 }
 
 /// No token appears twice across the auth and local lists — a

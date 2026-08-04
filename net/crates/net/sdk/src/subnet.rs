@@ -227,22 +227,27 @@ pub const LOCAL_PROVISION_KINDS: &[&str] = &[
 
 impl SubnetProvisionError {
     /// The stable kind token (without the `subnet:` prefix).
-    pub fn wire_kind(&self) -> String {
+    ///
+    /// `&'static str`, not `String` (review-10 P2-2): every token —
+    /// core reason code and local kind alike — is static, so there is
+    /// nothing to allocate. Core codes come from
+    /// [`SubnetAuthError::wire_kind`], the single spelling table.
+    pub const fn wire_kind(&self) -> &'static str {
         match self {
-            // Single-sourced from the core's own Display — the one
-            // Rust match over reason codes lives in the core.
-            Self::Auth(e) => e.to_string(),
-            Self::EmptyExportName => "empty_export_name".to_string(),
-            Self::DuplicateExportName => "duplicate_export_name".to_string(),
-            Self::UnknownExportName => "unknown_export_name".to_string(),
-            Self::EmptyAuthorityRoots => "empty_authority_roots".to_string(),
-            Self::DuplicateAuthorityRoot => "duplicate_authority_root".to_string(),
-            Self::DuplicateAuthority => "duplicate_authority".to_string(),
-            Self::ZeroGrantLifetime => "zero_grant_lifetime".to_string(),
-            Self::InvalidIdHex => "invalid_id_hex".to_string(),
-            Self::PathTooDeep => "path_too_deep".to_string(),
-            Self::InvalidPathLevel => "invalid_path_level".to_string(),
-            Self::InvalidAccess => "invalid_access".to_string(),
+            // Single-sourced from the core — the one Rust match over
+            // reason codes lives there, and `Display` uses it too.
+            Self::Auth(e) => e.wire_kind(),
+            Self::EmptyExportName => "empty_export_name",
+            Self::DuplicateExportName => "duplicate_export_name",
+            Self::UnknownExportName => "unknown_export_name",
+            Self::EmptyAuthorityRoots => "empty_authority_roots",
+            Self::DuplicateAuthorityRoot => "duplicate_authority_root",
+            Self::DuplicateAuthority => "duplicate_authority",
+            Self::ZeroGrantLifetime => "zero_grant_lifetime",
+            Self::InvalidIdHex => "invalid_id_hex",
+            Self::PathTooDeep => "path_too_deep",
+            Self::InvalidPathLevel => "invalid_path_level",
+            Self::InvalidAccess => "invalid_access",
         }
     }
 }
@@ -274,101 +279,57 @@ pub fn fact_kind_wire(kind: SubnetFactKind) -> &'static str {
     }
 }
 
-/// Every core [`SubnetAuthError`] reason code, via an EXHAUSTIVE match
-/// — a new core variant fails compilation here, which is exactly the
-/// alarm the generated fixture depends on.
+/// The canonical relative path of the committed cross-language
+/// stable-kind fixture, from the core crate root.
+pub const STABLE_KINDS_FIXTURE_PATH: &str = "tests/cross_lang_subnet/stable_kinds.json";
+
+/// Render the cross-language stable-kind fixture EXACTLY as it is
+/// committed — the single renderer (review-10 P3-1).
+///
+/// `gen_subnet_kind_fixture` writes this string verbatim and the
+/// fixture test byte-compares the committed file against it, so the
+/// "committed output is exact" claim is a byte equality rather than a
+/// field-by-field comparison that unexpected keys, reordering, or
+/// formatting drift could slip past.
+///
+/// Deterministic by construction: no timestamps, no randomness, no
+/// map iteration order — `serde_json`'s pretty printer over a literal
+/// object, plus a trailing newline.
+pub fn render_stable_kind_fixture() -> String {
+    let fact_kinds = [
+        SubnetFactKind::Descriptor,
+        SubnetFactKind::GatewayAdvertisement,
+        SubnetFactKind::ExportPolicy,
+        SubnetFactKind::RevocationFloor,
+    ]
+    .map(fact_kind_wire);
+
+    let fixture = serde_json::json!({
+        "version": 1,
+        "prefix": "subnet:",
+        "auth_kinds": subnet_auth_kinds(),
+        "local_kinds": LOCAL_PROVISION_KINDS,
+        "fact_kinds": fact_kinds,
+        "access": ["sameOrg", "granted"],
+    });
+    let mut body = serde_json::to_string_pretty(&fixture).expect("fixture serializes");
+    body.push('\n');
+    body
+}
+
+/// Every core [`SubnetAuthError`] reason code, in canonical order.
+///
+/// A thin projection of the core's own [`SubnetAuthError::ALL`] +
+/// [`SubnetAuthError::wire_kind`] (review-10 P2-2). This used to keep a
+/// SECOND copy of every token, so the generated fixture and every
+/// language consumer stayed green while an intermediate core spelling
+/// changed underneath them — the fixture guard only spot-checked the
+/// first and last codes against the core. There is now exactly one
+/// spelling table, in the core, and `Display` renders through it too.
 pub fn subnet_auth_kinds() -> Vec<&'static str> {
-    use SubnetAuthError as E;
-    const ALL: &[SubnetAuthError] = &[
-        E::UnknownAuthority,
-        E::WrongSubject,
-        E::WrongAuthority,
-        E::WrongTopologyEpoch,
-        E::ScopeNotAncestor,
-        E::InvalidRights,
-        E::Expired,
-        E::NotYetValid,
-        E::LifetimeTooWide,
-        E::Revoked,
-        E::IssuerNotAuthorized,
-        E::IssuerAttenuationBroadened,
-        E::RightNotGranted,
-        E::WrongSession,
-        E::WrongVerifier,
-        E::WrongChallenge,
-        E::IdentityPinConflict,
-        E::TooManyGatewayContexts,
-        E::MixedGatewayEpochs,
-        E::InvalidSignature,
-        E::InvalidFormat,
-        E::InvalidValidityWindow,
-        E::ClockSkewTooLarge,
-    ];
-    // The completeness guard: `ALL` is a plain array and cannot prove
-    // coverage, so pattern-match every variant with no wildcard. A new
-    // core variant breaks this compile until it is added to `ALL` too
-    // (the test below pins the counts against each other).
-    fn assert_covered(e: SubnetAuthError) {
-        use SubnetAuthError as E;
-        match e {
-            E::UnknownAuthority
-            | E::WrongSubject
-            | E::WrongAuthority
-            | E::WrongTopologyEpoch
-            | E::ScopeNotAncestor
-            | E::InvalidRights
-            | E::Expired
-            | E::NotYetValid
-            | E::LifetimeTooWide
-            | E::Revoked
-            | E::IssuerNotAuthorized
-            | E::IssuerAttenuationBroadened
-            | E::RightNotGranted
-            | E::WrongSession
-            | E::WrongVerifier
-            | E::WrongChallenge
-            | E::IdentityPinConflict
-            | E::TooManyGatewayContexts
-            | E::MixedGatewayEpochs
-            | E::InvalidSignature
-            | E::InvalidFormat
-            | E::InvalidValidityWindow
-            | E::ClockSkewTooLarge => {}
-        }
-    }
-    let _ = assert_covered;
-    ALL.iter()
-        .map(|e| {
-            // Leak-free &'static str: the core Display returns owned
-            // strings, but the codes themselves are static — round-trip
-            // through the same match the core uses by re-rendering once
-            // per call. Cheap, called only by the fixture generator/tests.
-            match e {
-                E::UnknownAuthority => "unknown_authority",
-                E::WrongSubject => "wrong_subject",
-                E::WrongAuthority => "wrong_authority",
-                E::WrongTopologyEpoch => "wrong_topology_epoch",
-                E::ScopeNotAncestor => "scope_not_ancestor",
-                E::InvalidRights => "invalid_rights",
-                E::Expired => "expired",
-                E::NotYetValid => "not_yet_valid",
-                E::LifetimeTooWide => "lifetime_too_wide",
-                E::Revoked => "revoked",
-                E::IssuerNotAuthorized => "issuer_not_authorized",
-                E::IssuerAttenuationBroadened => "issuer_attenuation_broadened",
-                E::RightNotGranted => "right_not_granted",
-                E::WrongSession => "wrong_session",
-                E::WrongVerifier => "wrong_verifier",
-                E::WrongChallenge => "wrong_challenge",
-                E::IdentityPinConflict => "identity_pin_conflict",
-                E::TooManyGatewayContexts => "too_many_gateway_contexts",
-                E::MixedGatewayEpochs => "mixed_gateway_epochs",
-                E::InvalidSignature => "invalid_signature",
-                E::InvalidFormat => "invalid_format",
-                E::InvalidValidityWindow => "invalid_validity_window",
-                E::ClockSkewTooLarge => "clock_skew_too_large",
-            }
-        })
+    SubnetAuthError::ALL
+        .iter()
+        .map(SubnetAuthError::wire_kind)
         .collect()
 }
 
@@ -901,24 +862,31 @@ mod tests {
         assert_eq!(auth.to_string(), "subnet:scope_not_ancestor");
     }
 
-    /// The fixture's core-kind list matches the core's own Display,
-    /// one for one.
+    /// The fixture's core-kind list matches the core's own `Display`
+    /// for EVERY variant — not a spot check of the two ends
+    /// (review-10 P2-2).
+    ///
+    /// This is now a tautology by construction (`subnet_auth_kinds` IS
+    /// the core's table), and that is the point: the assertion that
+    /// used to need writing is the one the type system now makes
+    /// unrepresentable. It stays as the regression that fails if anyone
+    /// reintroduces a second spelling table here.
     #[test]
     fn subnet_auth_kinds_match_core_display() {
         let kinds = subnet_auth_kinds();
-        assert_eq!(kinds.len(), 23, "one entry per core variant");
-        for kind in &kinds {
+        assert_eq!(
+            kinds.len(),
+            SubnetAuthError::ALL.len(),
+            "one entry per core variant",
+        );
+        for (kind, variant) in kinds.iter().zip(SubnetAuthError::ALL) {
             assert!(!kind.is_empty());
+            assert_eq!(
+                *kind,
+                variant.to_string(),
+                "the fixture token must be the core's own Display, verbatim",
+            );
         }
-        // Spot-anchor both ends of the list against the core.
-        assert_eq!(
-            SubnetAuthError::UnknownAuthority.to_string(),
-            *kinds.first().expect("nonempty"),
-        );
-        assert_eq!(
-            SubnetAuthError::ClockSkewTooLarge.to_string(),
-            *kinds.last().expect("nonempty"),
-        );
     }
 
     #[test]

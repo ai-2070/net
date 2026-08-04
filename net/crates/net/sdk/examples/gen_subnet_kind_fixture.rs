@@ -14,41 +14,25 @@
 //! not a second source of names: renaming any kind regenerates a
 //! different file, and every consumer suite fails until it catches up.
 //!
-//! Deterministic by construction — no timestamps, no randomness — so
-//! CI can regenerate and diff.
+//! This binary is a THIN writer: the bytes come from
+//! `net_sdk::subnet::render_stable_kind_fixture`, which the fixture test
+//! byte-compares the committed file against (review-10 P3-1). Running
+//! this is therefore never required to detect drift — it is how you fix
+//! it.
+//!
+//! Deterministic by construction — no timestamps, no randomness.
 
 use std::path::PathBuf;
 
 fn main() {
-    let auth_kinds = net_sdk::subnet::subnet_auth_kinds();
-    let local_kinds = net_sdk::subnet::LOCAL_PROVISION_KINDS;
-    let fact_kinds = [
-        net_sdk::subnet::SubnetFactKind::Descriptor,
-        net_sdk::subnet::SubnetFactKind::GatewayAdvertisement,
-        net_sdk::subnet::SubnetFactKind::ExportPolicy,
-        net_sdk::subnet::SubnetFactKind::RevocationFloor,
-    ]
-    .map(net_sdk::subnet::fact_kind_wire);
-
-    let fixture = serde_json::json!({
-        "version": 1,
-        "prefix": "subnet:",
-        "auth_kinds": auth_kinds,
-        "local_kinds": local_kinds,
-        "fact_kinds": fact_kinds,
-        "access": ["sameOrg", "granted"],
-    });
-
     // sdk/ → the core crate root, where the cross_lang_* fixtures live.
-    let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("sdk has a parent")
-        .join("tests")
-        .join("cross_lang_subnet");
-    std::fs::create_dir_all(&out_dir).expect("create cross_lang_subnet");
-    let out = out_dir.join("stable_kinds.json");
-    let mut body = serde_json::to_string_pretty(&fixture).expect("serialize fixture");
-    body.push('\n');
-    std::fs::write(&out, body).expect("write fixture");
+        .to_path_buf();
+    let out = root.join(net_sdk::subnet::STABLE_KINDS_FIXTURE_PATH);
+    std::fs::create_dir_all(out.parent().expect("fixture has a parent"))
+        .expect("create cross_lang_subnet");
+    std::fs::write(&out, net_sdk::subnet::render_stable_kind_fixture()).expect("write fixture");
     println!("wrote {}", out.display());
 }
