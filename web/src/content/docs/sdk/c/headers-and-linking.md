@@ -1,11 +1,11 @@
 ---
 title: Headers and Linking
-description: The ten headers, which shared library each one resolves against, and the net.h / net.go.h choice you have to make per translation unit.
+description: The eleven headers, which shared library each one resolves against, and the net.h / net.go.h choice you have to make per translation unit.
 ---
 
 # C — Headers and Linking
 
-The C surface is not one header. It is ten, spread across five shared
+The C surface is not one header. It is eleven, spread across five shared
 libraries, and one of the pairings is mutually exclusive. This page is the map.
 
 ## The one decision that bites
@@ -33,6 +33,7 @@ Every other header has its own guard and composes freely.
 | `net_meshos.h` | `NET_MESHOS_H` | Daemon-author SDK — operator handle + control-event channel | `libnet_meshos` |
 | `net_deck.h` | `NET_DECK_H` | Deck operator-side SDK | `libnet_deck` |
 | `net_org.h` | `NET_ORG_H` | Organization capability auth | `libnet_org` |
+| `net_subnet.h` | `NET_SUBNET_H` | Subnet authority — exported serve + gateway provisioning | `libnet_org` |
 | `net_mcp.h` | `NET_MCP_H` | MCP bridge helpers, graduated consent / pin surface | `libnet_mcp_ffi` |
 
 `net_cortex.h` is deliberately self-contained — it depends only on `<stdint.h>`
@@ -42,6 +43,11 @@ resolve when the cdylib is built with `--features "netdb redex-disk"`.
 
 `net.go.h` is the in-crate mirror of `go/net.h` at the repo root, and pulls in
 `net_cortex.h` for its storage half.
+
+`net_subnet.h` ships in `libnet_org`, not a separate library — it `#include`s
+`net_org.h` and shares its error namespace (`NET_ORG_ERR_SUBNET`) and handle
+model. The subnet-exported *caller* verb, `net_org_call_exported`, is declared
+in `net_org.h` because it takes the org client handle.
 
 ## Building the libraries
 

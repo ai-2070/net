@@ -28,6 +28,15 @@ channel hash, a validity window, a delegation depth, and a nonce for revocation.
 Tokens are delegatable, and a delegated token's scope is the intersection of its
 parent's — authority narrows as it travels, never widens.
 
+Above tokens sit two offline-rooted authority planes with the same design
+habits (short-lived signed grants, monotonic revocation floors, per-call
+verification): [organization](/docs/concepts/organizations) credentials answer
+*which company is this caller acting for*, and
+[subnet](/docs/concepts/subnets#authority-proving-the-right-to-cross)
+credentials answer *may this node attach, route, or export across a protected
+boundary*. Both bottom out in root keys that never run on a node, and neither
+issuance path exists in any SDK — signing is a CLI ceremony.
+
 ## Where verification actually happens
 
 This is the part most often misread. **Tokens are verified at subscription and
@@ -100,5 +109,7 @@ in the repository.
 - [Identity](/docs/concepts/identity) — entity keys and derivation in depth.
 - [Channels](/docs/concepts/channels) — scopes and the authorization path.
 - [Organizations](/docs/concepts/organizations) — multi-tenant boundaries.
+- [Subnets](/docs/concepts/subnets) — topology scoping and the subnet authority
+  plane.
 - [Non-custodial signing](/docs/payments/non-custodial-signing) — the settlement
   key seam.

@@ -26,6 +26,19 @@ Python exposes the raw capability announce/query surface through the node's nati
 handle rather than the same `MeshNode` methods used for tools. The pages below use
 the ergonomic path and identify the places that require the native handle.
 
+## Protected services
+
+Both authority surfaces live on the native `net` package: organization auth
+(`serve_org_typed`, `TypedOrgClient` — [concepts](/docs/concepts/organizations))
+and the subnet authority plane ([concepts](/docs/concepts/subnets)) —
+`net.subnet.serve_subnet_exported_typed(mesh, service, export_name, handler)`
+for a provider inside a protected subnet, `client.call_exported(service,
+request)` for the caller, and `net.subnet.admin.*` for runtime gateway
+administration. Named exports and trust anchors are constructor kwargs
+(`subnet_exports=`, `subnet_authorities=`, …) validated before the node exists;
+`subnet:<kind>` failures classify through `net.subnet.classify_subnet_error`
+([reference](/docs/reference/error-codes)).
+
 ## Follow the capability path
 
 1. [Quickstart](/docs/sdk/python/quickstart)

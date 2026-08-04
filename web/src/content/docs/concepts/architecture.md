@@ -74,6 +74,9 @@ Authority is evaluated at several boundaries:
 - signed permission tokens grant scoped channel actions;
 - organization membership and grants control organization-scoped discovery and
   invocation;
+- subnet authority credentials control attachment, routing, and export across
+  protected subnet boundaries — topology places a node, but never authorizes
+  it;
 - provider policy remains final for the operation itself.
 
 Capability predicates are useful for matching provider properties. They are not an

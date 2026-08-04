@@ -174,6 +174,25 @@ Two properties of this vocabulary are deliberate and worth understanding before 
 
 The `org:rpc:` kinds reuse the `RpcError` vocabulary above (`timeout`, `no_route`, `cancelled`, `server_error`, `transport`, `codec_encode`, `codec_decode`, `capability_denied`) rather than minting second names for the same conditions.
 
+### Subnet authority errors (the `subnet:` vocabulary)
+
+Returned from subnet-authority configuration and provisioning — constructing a mesh with `subnet_authorities` / `subnet_exports`, installing gateway credential sets, declaring boundaries, applying control facts, and resolving a named export at serve time. Like the `org:` vocabulary it is a **string envelope rather than a Rust enum**, single-sourced from Rust, pinned by `net/crates/net/tests/cross_lang_subnet/stable_kinds.json`, and consumed by the Node, Python, Go, and C bindings.
+
+The shape is `subnet:<kind>[: <detail>]`, and unlike `org:` there are no domains — because every `subnet:` error is **local and startup-shaped**: a configuration, decode, or install was refused before (or without) any node-state mutation. Nothing ever left the process. A *remote* refusal of an exported call is never a `subnet:` error; it surfaces through the `org:` taxonomy above, so a caller cannot probe a provider's subnet configuration through error kinds.
+
+Two bands of kinds:
+
+| Band | Examples | Source |
+|---|---|---|
+| Core verifier refusals | `unknown_authority`, `wrong_topology_epoch`, `scope_not_ancestor`, `revoked`, `issuer_attenuation_broadened`, `expired`, `invalid_signature`, `invalid_format` | the credential/fact verifier — why an *artifact* was refused |
+| Local configuration | `unknown_export_name`, `duplicate_export_name`, `empty_authority_roots`, `invalid_id_hex`, `path_too_deep`, `invalid_path_level`, `invalid_access` | the binding conversion layer — why a *configuration* never reached the core |
+
+Three properties worth knowing before writing code against it:
+
+- **Serve-registration failures wrap the envelope** (`… failed: subnet:unknown_export_name: …`) rather than leading with it. Use the binding classifiers — `classifySubnetError` (Node), `net.subnet.parse_subnet_kind` (Python), `ParseSubnetKind` / `errors.Is(err, ErrSubnet)` (Go), the `NET_ORG_ERR_SUBNET` return code (C) — which scan for the token; a bare-prefix parse misses these.
+- **An unrecognized kind passes through verbatim as data.** A binding never remaps a kind it does not know onto one it does — the same anti-counterfeiting rule as `org:`'s `unknown` domain.
+- **`applied: false` from a control fact is not an error at all.** It is an authenticated stale/idempotent outcome — the fact verified but changed nothing. Don't retry it.
+
 ### Per-peer stream errors (`StreamError`)
 
 Returned from the per-peer stream API on `MeshNode`.
