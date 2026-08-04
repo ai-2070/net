@@ -1729,6 +1729,178 @@ mod tests {
         assert_eq!(distinct.len(), 4, "call-domain codes must be distinct");
     }
 
+    fn parse_c_value(tok: &str) -> Option<i64> {
+        if let Some(hex) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+            i64::from_str_radix(hex, 16).ok()
+        } else {
+            tok.parse::<i64>().ok()
+        }
+    }
+
+    /// Collect `#define <prefix><NAME> <value>` pairs out of a header,
+    /// keyed by the FULL macro name.
+    fn header_defines(header: &str, prefix: &str) -> std::collections::HashMap<String, i64> {
+        let mut defines = std::collections::HashMap::new();
+        for line in header.lines() {
+            let line = line.trim();
+            let Some(rest) = line
+                .strip_prefix("#define ")
+                .and_then(|r| r.strip_prefix(prefix))
+            else {
+                continue;
+            };
+            let mut toks = rest.split_whitespace();
+            let (Some(name), Some(val)) = (toks.next(), toks.next()) else {
+                continue;
+            };
+            if let Some(v) = parse_c_value(val) {
+                defines.insert(format!("{prefix}{name}"), v);
+            }
+        }
+        defines
+    }
+
+    fn assert_defines_match(
+        header_name: &str,
+        defines: &std::collections::HashMap<String, i64>,
+        want: &[(&str, i64)],
+    ) {
+        for (name, val) in want {
+            let got = defines
+                .get(*name)
+                .unwrap_or_else(|| panic!("{header_name} is missing #define {name}"));
+            assert_eq!(
+                got, val,
+                "drift between {header_name} and Rust on {name}: header {got}, rust {val}",
+            );
+        }
+    }
+
+    /// `include/net_subnet.h`'s numeric contract must match the Rust
+    /// `pub const`s (review-10 P3-4).
+    ///
+    /// `NET_SUBNET_ACCESS_SAME_ORG` / `_GRANTED` exist in THREE places —
+    /// here in Rust, in `net_subnet.h`, and again in `go/subnet.go`'s cgo
+    /// preamble — and none of them was guarded: the org mirror below
+    /// reads `net_org.h` and matches `NET_ORG_*` only, so a
+    /// `NET_SUBNET_*` value could be changed on one side and silently
+    /// mean something else on the other. Go's preamble comment claimed
+    /// the mirror covered it; now it does.
+    #[test]
+    fn subnet_header_numeric_contract_matches_rust() {
+        let header = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../include/net_subnet.h"
+        ))
+        .expect("read include/net_subnet.h");
+        let defines = header_defines(&header, "NET_SUBNET_");
+
+        assert_defines_match(
+            "include/net_subnet.h",
+            &defines,
+            &[
+                (
+                    "NET_SUBNET_ACCESS_SAME_ORG",
+                    NET_SUBNET_ACCESS_SAME_ORG as i64,
+                ),
+                (
+                    "NET_SUBNET_ACCESS_GRANTED",
+                    NET_SUBNET_ACCESS_GRANTED as i64,
+                ),
+            ],
+        );
+
+        // The guard must actually have found something — an empty map
+        // would make every assertion above vacuous if the `#define`
+        // spelling ever changed.
+        assert!(
+            defines.len() >= 2,
+            "expected at least the two NET_SUBNET_ACCESS_* defines, found {:?}",
+            defines.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// The C/FFI consumer of the shared stable-kind fixture
+    /// (review-10 P3-2).
+    ///
+    /// The plan says Node, Python, Go, AND C consume
+    /// `tests/cross_lang_subnet/stable_kinds.json`, and
+    /// `go/subnet_golden_vectors_test.go` asserts as much — but nothing
+    /// on the C side read it, so the claim was three-for-four. This is
+    /// the missing consumer: every pinned kind must survive the round
+    /// trip through the exact scanner a C caller reaches, and the C
+    /// header's access spellings must match the fixture's.
+    ///
+    /// A renamed kind now fails here too, before any cdylib consumer
+    /// notices at runtime.
+    #[test]
+    fn c_surface_consumes_the_shared_stable_kind_fixture() {
+        let body = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../tests/cross_lang_subnet/stable_kinds.json"
+        ))
+        .expect("read tests/cross_lang_subnet/stable_kinds.json");
+        let fixture: serde_json::Value = serde_json::from_str(&body).expect("fixture parses");
+
+        assert_eq!(
+            fixture["prefix"], "subnet:",
+            "the envelope prefix is pinned"
+        );
+
+        let strings = |key: &str| -> Vec<String> {
+            fixture[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("fixture field {key} is an array"))
+                .iter()
+                .map(|v| v.as_str().expect("string entry").to_string())
+                .collect()
+        };
+
+        let kinds: Vec<String> = strings("auth_kinds")
+            .into_iter()
+            .chain(strings("local_kinds"))
+            .collect();
+        assert!(!kinds.is_empty(), "the fixture must pin at least one kind");
+
+        for kind in &kinds {
+            // The bare envelope, as construction and admin failures emit.
+            let bare = format!("subnet:{kind}");
+            assert_eq!(
+                scan_subnet_kind_for_test(&bare).as_deref(),
+                Some(kind.as_str()),
+                "the C-surface scanner lost the kind in {bare:?}",
+            );
+            // The WRAPPED envelope, as a serve-registration failure
+            // crosses `out_err` — the shape a C consumer actually has to
+            // parse, and the one a bare-prefix parser missed.
+            let wrapped = format!("subnet-exported serve failed: subnet:{kind}: detail here");
+            assert_eq!(
+                scan_subnet_kind_for_test(&wrapped).as_deref(),
+                Some(kind.as_str()),
+                "the C-surface scanner lost the kind in {wrapped:?}",
+            );
+        }
+
+        // The access spellings the C ABI's constants stand for.
+        assert_eq!(strings("access"), ["sameOrg", "granted"]);
+        assert_eq!(NET_SUBNET_ACCESS_SAME_ORG, 0);
+        assert_eq!(NET_SUBNET_ACCESS_GRANTED, 1);
+    }
+
+    /// The scan a C consumer performs over an `out_err` wire, mirroring
+    /// Go's `ParseSubnetKind`, Node's `parseSubnetKind`, and Python's
+    /// `parse_subnet_kind`: find the envelope anywhere in the message,
+    /// then take the token up to the next colon or whitespace.
+    fn scan_subnet_kind_for_test(message: &str) -> Option<String> {
+        const MARKER: &str = "subnet:";
+        let rest = &message[message.find(MARKER)? + MARKER.len()..];
+        let end = rest
+            .find(|c: char| c == ':' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let kind = rest[..end].trim();
+        (!kind.is_empty()).then(|| kind.to_string())
+    }
+
     /// The hand-written `include/net_org.h` numeric contract (error codes,
     /// access modes, ABI stamp) must match the Rust `pub const`s. This is the
     /// standalone-header drift guard — `net_org.h` is not part of
@@ -1738,11 +1910,7 @@ mod tests {
     #[test]
     fn header_numeric_contract_matches_rust() {
         fn parse_value(tok: &str) -> Option<i64> {
-            if let Some(hex) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
-                i64::from_str_radix(hex, 16).ok()
-            } else {
-                tok.parse::<i64>().ok()
-            }
+            parse_c_value(tok)
         }
 
         let header = std::fs::read_to_string(concat!(

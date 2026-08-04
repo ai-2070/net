@@ -52,6 +52,14 @@ pub enum SubnetCommand {
     IssueIssuer(IssueIssuerArgs),
     /// Issue one DELEGATED credential set: a leaf signed by a
     /// delegated issuer, framed together with its issuer grant.
+    ///
+    /// Validates STRUCTURE and ATTENUATION only — that the leaf scope
+    /// stays inside the issuer grant's scope and its rights do not
+    /// exceed the maximum. It does NOT verify the issuer grant's
+    /// signature against an authority root, because no trusted root is
+    /// supplied to this offline ceremony. Successful issuance therefore
+    /// does not prove deployability: a forged issuer grant frames
+    /// cleanly here and every verifier rejects the result.
     IssueDelegated(IssueDelegatedArgs),
     /// Issue one signed control fact (descriptor, gateway
     /// advertisement, export policy, or revocation floor), written as

@@ -315,6 +315,54 @@ async fn production_relay_steady_state_allocates_nothing() {
     .await;
     wait_forwarded(&gw, WARMUP_PACKETS, "warm-up").await;
 
+    // --- Sensitivity control (review-10 P3-3). ---------------------
+    //
+    // The assertion below is "zero allocations were charged". That is
+    // also what a broken marker, a mis-wired counter, or an allocator
+    // that never consults `in_relay_section` would report — so prove
+    // the instrument responds BEFORE trusting a zero from it. One
+    // deliberate allocation inside an explicitly entered section must
+    // move the counter.
+    //
+    // Runs inline in this one test rather than as a second `#[test]`:
+    // the `#[global_allocator]` is process-wide, so a concurrent test
+    // would charge its allocations here. Sequential in one test is the
+    // only safe shape.
+    {
+        let control_before = RELAY_ALLOCATIONS.load(Ordering::Relaxed);
+        let entered_before = alloc_probe::sections_entered();
+        {
+            let _section = alloc_probe::RelaySection::enter();
+            // `black_box` so the allocation cannot be optimized away.
+            let deliberate: Vec<u8> = std::hint::black_box(vec![0u8; 64]);
+            std::hint::black_box(&deliberate);
+        }
+        assert_eq!(
+            alloc_probe::sections_entered() - entered_before,
+            1,
+            "the control must have entered the measured section exactly once",
+        );
+        assert!(
+            RELAY_ALLOCATIONS.load(Ordering::Relaxed) > control_before,
+            "the allocation counter did not move for a deliberate allocation inside \
+             the relay section — the witness is not measuring anything, and the \
+             zero-allocation assertion below would pass vacuously",
+        );
+    }
+    // Allocating outside the section must NOT be charged — the other
+    // half of the calibration, and what makes the count attributable to
+    // the relay rather than to whatever else the runtime is doing.
+    {
+        let outside_before = RELAY_ALLOCATIONS.load(Ordering::Relaxed);
+        let deliberate: Vec<u8> = std::hint::black_box(vec![0u8; 64]);
+        std::hint::black_box(&deliberate);
+        assert_eq!(
+            RELAY_ALLOCATIONS.load(Ordering::Relaxed),
+            outside_before,
+            "an allocation outside the relay section must not be charged to it",
+        );
+    }
+
     // --- The measured steady state. --------------------------------
     let allocs_before = RELAY_ALLOCATIONS.load(Ordering::Relaxed);
     let entered_before = alloc_probe::sections_entered();

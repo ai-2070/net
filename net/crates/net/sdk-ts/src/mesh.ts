@@ -379,6 +379,25 @@ export class MeshNode {
 
   /** Create and configure a new mesh node. */
   static async create(config: MeshNodeConfig): Promise<MeshNode> {
+    // Subnet AUTHORITY plumbing (SSDK §6.1): forwarded verbatim; the
+    // native `create` validates through the frozen Rust DTOs and
+    // retains the checked named-export map beside its node handle.
+    // Every new field is an explicit line here — this map is not a
+    // spread, by design.
+    //
+    // The compatibility cast is scoped to JUST these four properties
+    // (review-10 P3-6). It used to sit on the whole object literal,
+    // which silently disabled checking for `bindAddr`, `psk`, and every
+    // other pre-existing field — a typo in any of them would have
+    // compiled. The cast is needed only because a `@net-mesh/core` built
+    // without the `org` feature does not declare the subnet options.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const subnetOptions = {
+      subnetAuthorities: config.subnetAuthorities,
+      subnetAttachment: config.subnetAttachment,
+      subnetControlChannel: config.subnetControlChannel,
+      subnetExports: config.subnetExports,
+    } as any;
     const native = await NapiNetMesh.create({
       bindAddr: config.bindAddr,
       psk: config.psk,
@@ -390,17 +409,8 @@ export class MeshNode {
       subnet: config.subnet,
       subnetPolicy: config.subnetPolicy,
       identitySeed: config.identitySeed,
-      // Subnet AUTHORITY plumbing (SSDK §6.1): forwarded verbatim; the
-      // native `create` validates through the frozen Rust DTOs and
-      // retains the checked named-export map beside its node handle.
-      // Every new field is an explicit line here — this map is not a
-      // spread, by design.
-      subnetAuthorities: config.subnetAuthorities,
-      subnetAttachment: config.subnetAttachment,
-      subnetControlChannel: config.subnetControlChannel,
-      subnetExports: config.subnetExports,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any);
+      ...subnetOptions,
+    });
     return new MeshNode(native);
   }
 

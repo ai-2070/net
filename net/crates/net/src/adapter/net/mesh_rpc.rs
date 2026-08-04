@@ -6301,24 +6301,27 @@ pub enum ServeError {
     SubnetExportUnauthorized(String),
 }
 
-/// The admission shape for a unary serve registration (E1.1), threaded from the
-/// public `serve_rpc` / protected `serve_rpc_protected` wrappers into the shared
-/// `serve_rpc_unary_impl`. Streaming / duplex have no protected form (E1.8).
 /// A publicly announced provider of a service together with its
 /// currently verified owner organization, both sampled from one
 /// capability-fold snapshot (SUBNET_AUTH_SDK_PLAN.md R1).
 ///
 /// Produced only by [`MeshNode::public_owned_service_providers`]; the
 /// projection is the ingest-verified owner cert's org, floor-retractable,
-/// never a caller-claimed value.
+/// never a caller-claimed value. `provider` is the entity the projection
+/// itself named AND the live session pin, which that seam requires to be
+/// equal — never a node-id resolution the caller has to trust.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicOwnedProvider {
-    /// The provider entity, from its live AEAD-verified session pin.
+    /// The provider entity: the verified publisher, confirmed against
+    /// its live AEAD session pin.
     pub provider: crate::adapter::net::identity::EntityId,
     /// The provider's verified owner organization.
     pub owner_org: crate::adapter::net::behavior::org::OrgId,
 }
 
+/// The admission shape for a unary serve registration (E1.1), threaded from the
+/// public `serve_rpc` / protected `serve_rpc_protected` wrappers into the shared
+/// `serve_rpc_unary_impl`. Streaming / duplex have no protected form (E1.8).
 enum UnaryAdmission {
     /// Legacy v0.4 public: `PublicAuthenticated` + a trivial allow-all policy.
     Public,

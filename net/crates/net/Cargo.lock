@@ -2956,6 +2956,7 @@ dependencies = [
  "net-mesh",
  "net-mesh-sdk",
  "parking_lot 0.12.5",
+ "serde_json",
  "tokio",
 ]
 

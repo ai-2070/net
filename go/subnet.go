@@ -53,8 +53,12 @@ package net
 #include <stdbool.h>
 
 // Mirrors include/net_subnet.h + the subnet codes in net_org.h. The Rust
-// bindings/go/org-ffi/src/lib.rs is the source of truth, guarded by the
-// header<->Rust numeric mirror test.
+// bindings/go/org-ffi/src/lib.rs is the source of truth; both headers are
+// guarded against it by the numeric mirror tests there
+// (`header_numeric_contract_matches_rust` for NET_ORG_*,
+// `subnet_header_numeric_contract_matches_rust` for NET_SUBNET_*). This
+// preamble is a third copy and is NOT machine-checked — a value changed
+// here alone compiles. Keep it in sync by hand.
 #define NET_ORG_OK                    0
 #define NET_ORG_ERR_NO_DISPATCHER    -9
 #define NET_ORG_ERR_ALREADY_SERVING -10

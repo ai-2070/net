@@ -277,6 +277,10 @@ net-mesh subnet issue-delegated --issuer-grant <PATH> --issuer-key <PATH> --subj
 
 `issue-delegated` writes **one complete framed credential set** containing both the issuer grant and the leaf. A leaf scope escaping the issuer scope or rights exceeding the issuer maximum are refused up front with the core's own predicates — and re-checked by every verifier regardless.
 
+:::caution[Issuance validates structure and attenuation, not root authenticity]
+`issue-delegated` checks that the leaf stays inside the issuer grant it was handed. It does **not** verify that issuer grant's signature against an authority root — this is an offline ceremony and no trusted root is supplied to it. A forged or corrupted `--issuer-grant` therefore frames cleanly and produces a credential set that **every node will reject**. Successful issuance is not proof of deployability. Verify an artifact before distributing it with `net-mesh subnet inspect`, and confirm the authority id is the one you expect.
+:::
+
 ### `issue-control-fact`
 
 Author one signed control fact, written as the outer `SubnetControlFact` frame a node's `apply` door consumes.
