@@ -200,6 +200,9 @@ pub enum SubnetProvisionError {
     InvalidIdHex,
     /// A DTO path with more than four levels.
     PathTooDeep,
+    /// A path level outside `0..=255` (reachable only from binding
+    /// layers whose numeric types are wider than the DTO's `u8`).
+    InvalidPathLevel,
     /// A DTO access string that is neither `sameOrg` nor `granted`.
     InvalidAccess,
 }
@@ -218,6 +221,7 @@ pub const LOCAL_PROVISION_KINDS: &[&str] = &[
     "zero_grant_lifetime",
     "invalid_id_hex",
     "path_too_deep",
+    "invalid_path_level",
     "invalid_access",
 ];
 
@@ -237,6 +241,7 @@ impl SubnetProvisionError {
             Self::ZeroGrantLifetime => "zero_grant_lifetime".to_string(),
             Self::InvalidIdHex => "invalid_id_hex".to_string(),
             Self::PathTooDeep => "path_too_deep".to_string(),
+            Self::InvalidPathLevel => "invalid_path_level".to_string(),
             Self::InvalidAccess => "invalid_access".to_string(),
         }
     }
@@ -865,6 +870,7 @@ mod tests {
             P::ZeroGrantLifetime,
             P::InvalidIdHex,
             P::PathTooDeep,
+            P::InvalidPathLevel,
             P::InvalidAccess,
         ];
         fn assert_covered(e: SubnetProvisionError) {
@@ -880,6 +886,7 @@ mod tests {
                 | P::ZeroGrantLifetime
                 | P::InvalidIdHex
                 | P::PathTooDeep
+                | P::InvalidPathLevel
                 | P::InvalidAccess => {}
             }
         }

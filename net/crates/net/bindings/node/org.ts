@@ -109,6 +109,31 @@ export class TypedOrgClient {
     }
   }
 
+  /**
+   * Call a subnet-exported service (`SUBNET_AUTH_SDK_PLAN.md` §3.6).
+   *
+   * Discovers on the PUBLIC plane through the verified ownership
+   * projection, derives the same-org/granted relation from the VERIFIED
+   * owner, mints the same canonical proof as {@link call}, and sends
+   * exactly once — never a retry. Deliberately `callExported`, not
+   * `callSubnet`: you name a service, not a subnet — the caller never
+   * joins the provider's subnet and receives no subnet context. Whether
+   * the export exists is decided provider-side, per call; provider-side
+   * authority movement surfaces as one coarse admission denial, and
+   * rediscovery/retry policy is yours.
+   */
+  async callExported<Req = unknown, Resp = unknown>(
+    service: string,
+    request: Req,
+  ): Promise<Resp> {
+    try {
+      const reply = await this.raw.callExportedBytes(service, encode(request))
+      return decode<Resp>(reply)
+    } catch (e) {
+      throw classifyOrgError(e)
+    }
+  }
+
   /** The organization this client acts for, as 32 raw bytes. */
   get actingOrg(): Buffer {
     return this.raw.actingOrg

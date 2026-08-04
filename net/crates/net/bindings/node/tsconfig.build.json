@@ -27,6 +27,7 @@
   "include": [
     "errors.ts",
     "org.ts",
+    "subnet.ts",
     "mesh_rpc.ts",
     "meshdb.ts",
     "aggregator.ts",

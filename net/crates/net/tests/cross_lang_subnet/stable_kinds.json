@@ -44,6 +44,7 @@
     "zero_grant_lifetime",
     "invalid_id_hex",
     "path_too_deep",
+    "invalid_path_level",
     "invalid_access"
   ],
   "prefix": "subnet:",

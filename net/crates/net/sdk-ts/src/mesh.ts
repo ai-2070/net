@@ -230,6 +230,75 @@ export interface MeshNodeConfig {
    * against this mesh. Treat as secret material.
    */
   identitySeed?: Buffer;
+  /**
+   * Subnet AUTHORITY trust anchors (`SUBNET_AUTH_SDK_PLAN.md` §3.3).
+   * One entry per authority; empty root sets, duplicates, and zero
+   * lifetimes fail before the node exists, and an empty overall list
+   * means every protected subnet assertion fails closed. Requires an
+   * `org`-feature `@net-mesh/core` build. The subnet-exported provider
+   * verb (`serveSubnetExportedTyped`) and the admin surface live in
+   * `@net-mesh/core/subnet`.
+   */
+  subnetAuthorities?: SubnetAuthorityConfig[];
+  /**
+   * This node's own SECURITY attachment point — the local topology
+   * coordinate credentials are checked against. Distinct from
+   * {@link subnet} (unauthenticated routing state); omitting it
+   * preserves the core compatibility fallback, which protected
+   * deployments should not rely on.
+   */
+  subnetAttachment?: SubnetPath;
+  /**
+   * Treat an ordinary configured channel as a subnet control-fact
+   * arrival path. Confers no authority — facts verify by signature
+   * regardless of how they arrive.
+   */
+  subnetControlChannel?: string;
+  /**
+   * Named subnet exports (`SUBNET_AUTH_SDK_PLAN.md` §3.3):
+   * provider-local labels resolved once at construction into checked
+   * bindings and retained beside the handle. `serveSubnetExportedTyped`
+   * registers against a name; empty or duplicate names fail before the
+   * node exists.
+   */
+  subnetExports?: SubnetNamedExport[];
+}
+
+/**
+ * A subnet trust anchor (mesh-construction input). Mirrors
+ * `@net-mesh/core`'s `SubnetAuthorityConfigJs`.
+ */
+export interface SubnetAuthorityConfig {
+  /** 32-byte authority entity id, 64 hex chars. */
+  authorityHex: string;
+  /** Non-empty, duplicate-free root entity ids (64 hex chars each). */
+  rootHexes: string[];
+  /** Per-authority grant-lifetime ceiling in seconds; must be nonzero. */
+  maximumGrantLifetimeSecs: number;
+}
+
+/** A compact hierarchy path: 0..=4 levels, each 0..=255. Empty = global. */
+export interface SubnetPath {
+  /** Path labels, outermost first. */
+  levels: number[];
+}
+
+/** An authority-qualified crossing. Never the topology {@link SubnetId}. */
+export interface SubnetRef {
+  /** 32-byte authority entity id, 64 hex chars. */
+  authorityHex: string;
+  /** Path under that authority. */
+  path: SubnetPath;
+}
+
+/** One named-export configuration entry. */
+export interface SubnetNamedExport {
+  /** Provider-local label; non-empty, unique per mesh. */
+  name: string;
+  /** `"sameOrg"` or `"granted"`. */
+  access: string;
+  /** The exported crossing and epoch. */
+  binding: { subnet: SubnetRef; topologyEpoch: number };
 }
 
 /**
@@ -321,7 +390,17 @@ export class MeshNode {
       subnet: config.subnet,
       subnetPolicy: config.subnetPolicy,
       identitySeed: config.identitySeed,
-    });
+      // Subnet AUTHORITY plumbing (SSDK §6.1): forwarded verbatim; the
+      // native `create` validates through the frozen Rust DTOs and
+      // retains the checked named-export map beside its node handle.
+      // Every new field is an explicit line here — this map is not a
+      // spread, by design.
+      subnetAuthorities: config.subnetAuthorities,
+      subnetAttachment: config.subnetAttachment,
+      subnetControlChannel: config.subnetControlChannel,
+      subnetExports: config.subnetExports,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
     return new MeshNode(native);
   }
 

@@ -317,6 +317,59 @@ export function classifyOrgError(e: unknown): unknown {
 }
 
 
+// ---------------------------------------------------------------------------
+// Subnet authority provisioning — one LOCAL envelope, no domains.
+//
+// Same native-free rationale as the org section above: the stable-kind
+// fixture test runs without a compiled cdylib.
+// ---------------------------------------------------------------------------
+
+const ERR_SUBNET_PREFIX = 'subnet:'
+
+/**
+ * A subnet provisioning/configuration failure — the stable
+ * `subnet:<kind>` envelope (`SUBNET_AUTH_SDK_PLAN.md` R4).
+ *
+ * Always LOCAL and startup-shaped: configuration, decode, or install
+ * refused before (or without) any node-state mutation. These are never
+ * call-path domains — a remote exported-call refusal surfaces through
+ * the org taxonomy above, and this class never impersonates one.
+ *
+ * `kind` is either a core reason code (e.g. `invalid_format`,
+ * `scope_not_ancestor`) or a local configuration kind (e.g.
+ * `unknown_export_name`), pinned for every language by
+ * `tests/cross_lang_subnet/stable_kinds.json`.
+ */
+export class SubnetProvisionError extends Error {
+  /** The stable kind token after the `subnet:` prefix. */
+  readonly kind: string
+
+  constructor(message: string, kind: string) {
+    super(message)
+    this.name = 'SubnetProvisionError'
+    this.kind = kind
+  }
+}
+
+/**
+ * Reclassify a thrown error into {@link SubnetProvisionError}.
+ *
+ * The kind is taken verbatim from the wire — an unrecognized kind still
+ * classifies (the class asserts "local provisioning failure", which the
+ * prefix alone establishes; the kind is data, and inventing a
+ * substitute for one we don't know would be the counterfeit the org
+ * taxonomy's `unknown` rule exists to prevent).
+ */
+export function classifySubnetError(e: unknown): unknown {
+  const msg = extractMessage(e)
+  if (!msg.startsWith(ERR_SUBNET_PREFIX)) return e
+  const rest = msg.slice(ERR_SUBNET_PREFIX.length)
+  const colon = rest.indexOf(':')
+  const kind = colon === -1 ? rest.trim() : rest.slice(0, colon).trim()
+  if (kind.length === 0) return e
+  return new SubnetProvisionError(msg, kind)
+}
+
 export function classifyError(e: unknown): unknown {
   const msg = extractMessage(e)
   if (msg.startsWith(ERR_CORTEX_PREFIX)) {
@@ -333,6 +386,9 @@ export function classifyError(e: unknown): unknown {
   }
   if (msg.startsWith(ERR_ORG_PREFIX)) {
     return classifyOrgError(e)
+  }
+  if (msg.startsWith(ERR_SUBNET_PREFIX)) {
+    return classifySubnetError(e)
   }
   return e
 }
