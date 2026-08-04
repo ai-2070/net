@@ -105,6 +105,7 @@ use net::adapter::net::{
     Reliability, RoutingHeader, SocketBufferConfig, SubnetId, SubnetPolicy, SubnetRule, TokenCache,
     TokenScope, NONCE_SIZE,
 };
+use net::error::AdapterError;
 use tokio::net::UdpSocket;
 
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -2260,6 +2261,11 @@ async fn channel_authority_remains_independent_of_subnet_authority() {
                     .clone(),
             ]),
         );
+        // A registry is installed, so the nRPC channels the protected-
+        // provider phase below rides on must be registered too — the
+        // fixture registry would otherwise answer UnknownChannel for
+        // the reply channel before admission is ever consulted.
+        registry.install_rpc_service_defaults("vehicle-b.protected.telemetry");
         node.set_channel_configs(registry);
         node.set_token_cache(Arc::new(TokenCache::new()));
         Arc::new(node)
@@ -2289,15 +2295,28 @@ async fn channel_authority_remains_independent_of_subnet_authority() {
     );
 
     // Direction 1 — a parent subnet context is NOT a channel
-    // credential: the token-gated channel refuses it.
-    assert!(
-        camera
-            .subscribe_channel(vehicle_b.node_id(), channel.clone())
-            .await
-            .is_err(),
-        "evidence 10: a valid parent subnet context must not admit a \
-         token-gated internal channel",
-    );
+    // credential: the token-gated channel refuses it. The refusal
+    // must be the PUBLISHER'S explicit Unauthorized rejection — a
+    // timeout, disconnect, or setup failure would also be `Err` and
+    // would prove nothing about the channel gate.
+    let denied = camera
+        .subscribe_channel(vehicle_b.node_id(), channel.clone())
+        .await
+        .expect_err(
+            "evidence 10: a valid parent subnet context must not admit a \
+             token-gated internal channel",
+        );
+    match denied {
+        AdapterError::Connection(ref msg) => assert!(
+            msg.contains("membership request rejected") && msg.contains("Unauthorized"),
+            "the denial must be the publisher's explicit Unauthorized \
+             membership rejection, not a transport failure: {msg}",
+        ),
+        other => panic!(
+            "expected the publisher's explicit membership rejection, got {other:?} \
+             (a timeout here would be a denial masquerading as a timeout)"
+        ),
+    }
 
     // With the channel's own token, the same peer is admitted.
     let token = PermissionToken::issue(
@@ -2335,6 +2354,72 @@ async fn channel_authority_remains_independent_of_subnet_authority() {
         vehicle_b.subnet_gateway_contexts().is_none(),
         "a channel subscription must not publish gateway authority",
     );
+
+    // Provider invocation authority is a third plane the token does
+    // not reach, and absence of gateway context does not by itself
+    // prove that — so prove it directly. Vehicle B registers an
+    // org-protected provider; the camera — holding BOTH a live
+    // subnet context and the channel token it just used — presents
+    // no org proof, so the call is explicitly denied and the
+    // handler stays dark.
+    let dir = install_bmw_authority(&vehicle_b, "channel-independence");
+    let guarded_calls = Arc::new(AtomicUsize::new(0));
+    let _guarded = vehicle_b
+        .serve_rpc_protected(
+            "vehicle-b.protected.telemetry",
+            Arc::new(RoiHandler {
+                calls: guarded_calls.clone(),
+                attribution_ok: Arc::new(AtomicBool::new(false)),
+                proof_stripped: Arc::new(AtomicBool::new(false)),
+                expected_caller: camera_kp.entity_id().clone(),
+                expected_org: bmw().org_id(),
+                expected_provider: vehicle_b.entity_id().clone(),
+            }),
+            OrgAdmission::OwnerDelegated,
+            Arc::new(|_| true),
+        )
+        .expect("serve the org-protected telemetry provider");
+
+    let baseline = guarded_calls.load(Ordering::SeqCst);
+    let result = camera
+        .call(
+            vehicle_b.node_id(),
+            "vehicle-b.protected.telemetry",
+            Bytes::from_static(b"probe"),
+            call_opts(None),
+        )
+        .await;
+    assert_explicit_denial(
+        result,
+        "a channel-token holder invoking a protected provider",
+    );
+    assert_handler_stays_at(
+        &guarded_calls,
+        baseline,
+        "a channel-token holder invoking a protected provider",
+    )
+    .await;
+
+    // The denial disturbed neither of the planes the camera DOES
+    // hold: the subnet context is live and the channel token still
+    // admits a (re-)subscribe.
+    assert!(
+        vehicle_b.subnet_context_for(camera.node_id()).is_some(),
+        "the provider denial must not disturb the subnet plane",
+    );
+    let token = PermissionToken::issue(
+        &vb_kp,
+        camera_kp.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        channel.hash(),
+        300,
+        0,
+    );
+    camera
+        .subscribe_channel_with_token(vehicle_b.node_id(), channel.clone(), token)
+        .await
+        .expect("the channel plane survives the provider denial");
+    drop(dir);
 }
 
 // ===========================================================================
