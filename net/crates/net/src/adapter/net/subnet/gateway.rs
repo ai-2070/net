@@ -188,6 +188,29 @@ impl SubnetGateway {
     /// hand — it derives the canonical hash itself, so a caller cannot
     /// hand this the wire hint by mistake.
     pub fn export_channel(&self, channel_hash: ChannelHash, targets: Vec<SubnetId>) {
+        // Activation is observable at the moment it happens, not
+        // deduced from traffic. `Visibility::Exported` used to be
+        // unconditionally closed — the arm returned `false` and this
+        // table was consulted by nothing on a production path — so an
+        // operator who populated rules and observed that nothing
+        // shipped could reasonably conclude the channel was closed and
+        // leave them in place. Now that the subscribe gate and publish
+        // fan-out both consult the table, a rule installed (or
+        // re-applied by provisioning) for a currently-`Exported`
+        // channel is live policy over the whole declared subtree, so
+        // say so once per installation.
+        if let Some(cfg) = self.channel_configs.get(channel_hash) {
+            if cfg.visibility == Visibility::Exported {
+                tracing::info!(
+                    channel = cfg.channel_id.name().as_str(),
+                    targets = ?targets,
+                    "gateway export rule is live: this Exported channel now \
+                     propagates to every subnet under the declared targets \
+                     (subtree containment; a target of 0.0.0.0/global matches \
+                     every destination)"
+                );
+            }
+        }
         self.export_table.insert(channel_hash, targets);
     }
 
