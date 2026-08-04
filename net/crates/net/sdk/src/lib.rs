@@ -181,6 +181,11 @@ pub mod revocation;
 // mesh wiring (serve + client) is `mesh_a2a` (gated net + cortex).
 #[cfg(feature = "net")]
 pub mod a2a;
+// The subnet AUTHORITY facade (SUBNET_AUTH_SDK_PLAN.md): named exports,
+// the admin surface, DTOs, and the stable `subnet:` error envelope.
+// Topology/discovery compatibility stays in `subnets` below.
+#[cfg(feature = "net")]
+pub mod subnet;
 #[cfg(feature = "net")]
 pub mod subnets;
 

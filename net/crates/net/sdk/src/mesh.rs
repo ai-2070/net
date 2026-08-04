@@ -116,6 +116,10 @@ pub struct MeshBuilder {
     identity: Option<crate::identity::Identity>,
     subnet: Option<net::adapter::net::SubnetId>,
     subnet_policy: Option<Arc<net::adapter::net::SubnetPolicy>>,
+    subnet_authorities: Vec<crate::subnet::SubnetAuthorityConfig>,
+    subnet_attachment: Option<crate::subnet::TopologySubnetId>,
+    subnet_control_channel: Option<net::adapter::net::ChannelName>,
+    subnet_exports: Vec<crate::subnet::NamedSubnetExport>,
     #[cfg(feature = "nat-traversal")]
     reflex_override: Option<SocketAddr>,
     #[cfg(feature = "port-mapping")]
@@ -139,6 +143,10 @@ impl MeshBuilder {
             identity: None,
             subnet: None,
             subnet_policy: None,
+            subnet_authorities: Vec::new(),
+            subnet_attachment: None,
+            subnet_control_channel: None,
+            subnet_exports: Vec::new(),
             #[cfg(feature = "nat-traversal")]
             reflex_override: None,
             #[cfg(feature = "port-mapping")]
@@ -204,6 +212,57 @@ impl MeshBuilder {
         policy: impl Into<Arc<net::adapter::net::SubnetPolicy>>,
     ) -> Self {
         self.subnet_policy = Some(policy.into());
+        self
+    }
+
+    /// Trust a subnet AUTHORITY (SUBNET_AUTH_SDK_PLAN.md §3.3).
+    /// Repeatable — one config per authority; duplicates, empty root
+    /// sets, duplicate roots, and zero lifetimes fail at `build()`,
+    /// before any node exists. An empty overall set means every
+    /// protected subnet assertion fails closed.
+    pub fn subnet_authority(mut self, config: crate::subnet::SubnetAuthorityConfig) -> Self {
+        self.subnet_authorities.push(config);
+        self
+    }
+
+    /// This node's own SECURITY attachment point — the local topology
+    /// coordinate credentials are checked against. Distinct from
+    /// [`subnet`](Self::subnet), which remains unauthenticated routing
+    /// state; omitting this preserves the core compatibility fallback
+    /// (attachment = topology subnet), which protected deployments
+    /// should not rely on.
+    pub fn subnet_attachment(mut self, path: crate::subnet::TopologySubnetId) -> Self {
+        self.subnet_attachment = Some(path);
+        self
+    }
+
+    /// Treat an ordinary configured channel as a subnet control-fact
+    /// ARRIVAL PATH. Confers no authority: facts verify by signature
+    /// regardless of how they arrive.
+    pub fn subnet_control_channel(mut self, channel: net::adapter::net::ChannelName) -> Self {
+        self.subnet_control_channel = Some(channel);
+        self
+    }
+
+    /// Configure a NAMED subnet export (SUBNET_AUTH_SDK_PLAN.md §3.3):
+    /// a provider-local label an application later serves against with
+    /// [`Mesh::serve_subnet_exported`], resolved once here into a
+    /// checked access mode + export binding. The name is neither
+    /// announced nor accepted from callers. Repeatable; empty or
+    /// duplicate names fail at `build()`.
+    pub fn subnet_export(
+        mut self,
+        name: impl Into<String>,
+        access: crate::subnet::SubnetExportAccess,
+        subnet: crate::subnet::SubnetRef,
+        topology_epoch: u32,
+    ) -> Self {
+        self.subnet_exports.push(crate::subnet::NamedSubnetExport {
+            name: name.into(),
+            access,
+            subnet,
+            topology_epoch,
+        });
         self
     }
 
@@ -307,6 +366,25 @@ impl MeshBuilder {
         if let Some(policy) = self.subnet_policy {
             config = config.with_subnet_policy(policy);
         }
+        // SSDK §3.3 — the authority plane. Every configuration mistake
+        // fails HERE, before any node exists; the named-export map is
+        // resolved once and frozen beside the handle.
+        crate::subnet::validate_subnet_authorities(&self.subnet_authorities)
+            .map_err(|e| SdkError::Config(e.to_string()))?;
+        for authority in self.subnet_authorities {
+            config = config.with_subnet_authority(authority);
+        }
+        if let Some(attachment) = self.subnet_attachment {
+            // Direct field write: the core deliberately has no
+            // `with_subnet_attachment` (the `configured_identity`
+            // precedent).
+            config.subnet_attachment = Some(attachment);
+        }
+        if let Some(channel) = self.subnet_control_channel {
+            config = config.with_subnet_control_channel(channel);
+        }
+        let subnet_exports = crate::subnet::NamedSubnetExports::try_new(self.subnet_exports)
+            .map_err(|e| SdkError::Config(e.to_string()))?;
         #[cfg(feature = "nat-traversal")]
         if let Some(external) = self.reflex_override {
             config = config.with_reflex_override(external);
@@ -348,6 +426,7 @@ impl MeshBuilder {
             node: Arc::new(node),
             channel_configs,
             identity: sdk_identity,
+            subnet_exports: Arc::new(subnet_exports),
             #[cfg(feature = "tool")]
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "tool")]
@@ -379,6 +458,13 @@ pub struct Mesh {
     /// `MeshNode` was already handed a clone of the keypair, so this
     /// is purely for the auxiliary state that rides alongside.
     identity: Option<crate::identity::Identity>,
+    /// The immutable named-export map resolved at `build()`
+    /// (SUBNET_AUTH_SDK_PLAN.md §3.3) — Rust-owned, stored beside the
+    /// handle, never inside capability discovery or mutable core
+    /// authority state. Empty for meshes constructed through
+    /// [`Mesh::from_node_arc`]: a binding retains its own checked map
+    /// beside its `Arc<MeshNode>` and passes it to the serve seam.
+    subnet_exports: Arc<crate::subnet::NamedSubnetExports>,
     /// Lazy auto-install state for the `tool.metadata.fetch` nRPC
     /// service. The first `Mesh::serve_tool` call locks this
     /// mutex, sees `None`, installs the handler, and stores
@@ -1224,11 +1310,22 @@ impl Mesh {
             node,
             channel_configs,
             identity,
+            // Empty by design: named exports are CONSTRUCTION state
+            // (`MeshBuilder::subnet_export`). A binding wrapping an
+            // existing node retains its own checked map beside its
+            // `Arc<MeshNode>` and passes it to the serve seam.
+            subnet_exports: Arc::new(crate::subnet::NamedSubnetExports::default()),
             #[cfg(feature = "tool")]
             tool_metadata_fetch: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "tool")]
             tool_watch: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// The named subnet exports this mesh was built with
+    /// (SUBNET_AUTH_SDK_PLAN.md §3.3). Immutable after construction.
+    pub fn subnet_exports(&self) -> &crate::subnet::NamedSubnetExports {
+        &self.subnet_exports
     }
 
     /// Caller-owned identity bound to this mesh, if any. Returns

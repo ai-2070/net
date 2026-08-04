@@ -283,11 +283,29 @@ where
 /// `MeshNode::new` path) simply skips this — the same tolerance the SDK's
 /// `auto_register_rpc_channels` has, since a missing registry means channel ACLs
 /// are not in play for that node.
-fn auto_register_org_channels(node: &MeshNode, service: &str) {
+///
+/// `pub(crate)`: the subnet-exported serve seam registers through the
+/// SAME implementation (SUBNET_AUTH_SDK_PLAN.md §3.5 — promoted, not
+/// copied).
+pub(crate) fn auto_register_org_channels(node: &MeshNode, service: &str) {
     let Some(registry) = node.channel_configs() else {
         return;
     };
     registry.install_rpc_service_defaults(service);
+}
+
+/// Wrap a facade byte closure in the one `RpcHandler` bridge —
+/// `pub(crate)` so the subnet-exported serve seam projects `OrgCaller`
+/// and classifies handler failures through the SAME implementation
+/// rather than a second copy.
+pub(crate) fn org_bytes_handler<F, Fut>(handler: F) -> Arc<OrgBytesHandler<F>>
+where
+    F: Fn(OrgCaller, Bytes) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<Bytes, OrgHandlerError>> + Send + 'static,
+{
+    Arc::new(OrgBytesHandler {
+        inner: Arc::new(handler),
+    })
 }
 
 /// Bridges the facade's `Fn(OrgCaller, Bytes) -> Future` closure to the raw
@@ -298,7 +316,7 @@ fn auto_register_org_channels(node: &MeshNode, service: &str) {
 /// codec around a closure and registers through here, so there is exactly one
 /// place where admission facts are projected and one place where a handler
 /// failure is classified.
-struct OrgBytesHandler<F> {
+pub(crate) struct OrgBytesHandler<F> {
     inner: Arc<F>,
 }
 

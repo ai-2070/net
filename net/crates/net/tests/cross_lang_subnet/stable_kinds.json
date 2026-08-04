@@ -1,0 +1,51 @@
+{
+  "access": [
+    "sameOrg",
+    "granted"
+  ],
+  "auth_kinds": [
+    "unknown_authority",
+    "wrong_subject",
+    "wrong_authority",
+    "wrong_topology_epoch",
+    "scope_not_ancestor",
+    "invalid_rights",
+    "expired",
+    "not_yet_valid",
+    "lifetime_too_wide",
+    "revoked",
+    "issuer_not_authorized",
+    "issuer_attenuation_broadened",
+    "right_not_granted",
+    "wrong_session",
+    "wrong_verifier",
+    "wrong_challenge",
+    "identity_pin_conflict",
+    "too_many_gateway_contexts",
+    "mixed_gateway_epochs",
+    "invalid_signature",
+    "invalid_format",
+    "invalid_validity_window",
+    "clock_skew_too_large"
+  ],
+  "fact_kinds": [
+    "descriptor",
+    "gateway_advertisement",
+    "export_policy",
+    "revocation_floor"
+  ],
+  "local_kinds": [
+    "empty_export_name",
+    "duplicate_export_name",
+    "unknown_export_name",
+    "empty_authority_roots",
+    "duplicate_authority_root",
+    "duplicate_authority",
+    "zero_grant_lifetime",
+    "invalid_id_hex",
+    "path_too_deep",
+    "invalid_access"
+  ],
+  "prefix": "subnet:",
+  "version": 1
+}

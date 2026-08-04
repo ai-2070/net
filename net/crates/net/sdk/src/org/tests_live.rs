@@ -415,9 +415,15 @@ impl ExportedHandler {
 /// attachment are CONSTRUCTION state (`MeshNodeConfig`), so a
 /// subnet-exported provider must be built with them — there is no
 /// post-construction configure seam, deliberately.
+///
+/// `preinstall_channel_defaults`: tests that register through the CORE
+/// `serve_rpc_subnet_exported` pass `true` (the fixture performs the
+/// channel registration the facade owns); the facade-seam test passes
+/// `false` to prove the seam installs them itself.
 async fn subnet_provider_mesh(
     tag: &str,
     owner: &OrgKeypair,
+    preinstall_channel_defaults: bool,
 ) -> (Mesh, Identity, std::path::PathBuf) {
     let identity = Identity::generate();
     let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0x51u8; 32])
@@ -436,14 +442,14 @@ async fn subnet_provider_mesh(
         .await
         .expect("MeshNode::new");
     let channel_configs = Arc::new(ChannelConfigRegistry::new());
-    // These tests register through the CORE `serve_rpc_subnet_exported`
-    // (the S2 facade verb does not exist yet), so the fixture performs
-    // the one thing the facade will own: installing the canonical
-    // request/reply channel defaults for the service — the exact
-    // `install_rpc_service_defaults` promotion SUBNET_AUTH_SDK_PLAN.md
-    // §3.5 orders. Without it a strict registry refuses the caller's
-    // reply-channel subscribe (`UnknownChannel`).
-    channel_configs.install_rpc_service_defaults(EXPORT_SERVICE);
+    // Tests registering through the CORE `serve_rpc_subnet_exported`
+    // need the fixture to perform the channel registration the facade
+    // seam owns (the `install_rpc_service_defaults` promotion,
+    // SUBNET_AUTH_SDK_PLAN.md §3.5). Without it a strict registry
+    // refuses the caller's reply-channel subscribe (`UnknownChannel`).
+    if preinstall_channel_defaults {
+        channel_configs.install_rpc_service_defaults(EXPORT_SERVICE);
+    }
     node.set_channel_configs(channel_configs.clone());
     let node = Arc::new(node);
 
@@ -537,7 +543,7 @@ async fn converge_public_discovery(provider: &Mesh, caller: &Mesh, service: &str
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_private_call_cannot_reach_a_subnet_exported_service() {
     let a = org_a();
-    let (provider, p_identity, p_dir) = subnet_provider_mesh("gap-provider", &a).await;
+    let (provider, p_identity, p_dir) = subnet_provider_mesh("gap-provider", &a, true).await;
     let shared = OwnerAudienceCredential::decode_config(
         &provider
             .node()
@@ -611,7 +617,7 @@ async fn live_private_call_cannot_reach_a_subnet_exported_service() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_call_exported_reaches_a_subnet_exported_service() {
     let a = org_a();
-    let (provider, p_identity, p_dir) = subnet_provider_mesh("pos-provider", &a).await;
+    let (provider, p_identity, p_dir) = subnet_provider_mesh("pos-provider", &a, true).await;
     let shared = OwnerAudienceCredential::decode_config(
         &provider
             .node()
@@ -751,7 +757,7 @@ async fn live_unowned_public_provider_is_ineligible_for_call_exported() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_exported_denial_is_never_retried() {
     let a = org_a();
-    let (provider, p_identity, p_dir) = subnet_provider_mesh("deny-provider", &a).await;
+    let (provider, p_identity, p_dir) = subnet_provider_mesh("deny-provider", &a, true).await;
     let shared = OwnerAudienceCredential::decode_config(
         &provider
             .node()
@@ -803,6 +809,94 @@ async fn live_exported_denial_is_never_retried() {
         "one call, one admission evaluation — the facade never retried the signed proof",
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler never ran");
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+/// SSDK S2 — the two-verb surface end to end through the FACADE seam:
+/// the provider registers against a NAMED export via
+/// `serve_subnet_exported_bytes_node` (which must install the channel
+/// defaults itself — the fixture deliberately does not), and the caller
+/// invokes with `call_exported`. No authority object is constructed on
+/// the serve path; the name resolved to the checked binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_facade_seam_serves_through_a_named_export() {
+    use crate::subnet::{
+        serve_subnet_exported_bytes_node, NamedSubnetExport, NamedSubnetExports, SubnetExportAccess,
+    };
+
+    let a = org_a();
+    let (provider, p_identity, p_dir) = subnet_provider_mesh("facade-provider", &a, false).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("facade-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+    provision_export(&provider, &p_identity);
+
+    // The named-export map a binding would retain beside its node arc.
+    let exports = NamedSubnetExports::try_new([NamedSubnetExport {
+        name: "factory-export".to_string(),
+        access: SubnetExportAccess::SameOrg,
+        subnet: SubnetRef {
+            authority: subnet_root().entity_id().clone(),
+            path: TopologySubnetId::new(EXPORTED_CROSSING),
+        },
+        topology_epoch: 0,
+    }])
+    .expect("named exports");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_in = calls.clone();
+    let _serve = serve_subnet_exported_bytes_node(
+        provider.node().clone(),
+        &exports,
+        EXPORT_SERVICE,
+        "factory-export",
+        move |_caller, body: bytes::Bytes| {
+            let calls_in = calls_in.clone();
+            async move {
+                calls_in.fetch_add(1, Ordering::SeqCst);
+                let req: Ping = serde_json::from_slice(&body)
+                    .map_err(|e| crate::org::OrgHandlerError::Internal(e.to_string()))?;
+                let out = serde_json::to_vec(&Pong {
+                    n: req.n + 1,
+                    served_by: "facade".to_string(),
+                })
+                .expect("encode");
+                Ok(bytes::Bytes::from(out))
+            }
+        },
+    )
+    .expect("serve through the named export");
+
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let credentials = OrgCredentials::new(cert, dg, vec![], vec![]).expect("credentials");
+    let org = caller.org(credentials).expect("bind");
+
+    assert!(
+        converge_public_discovery(&provider, &caller, EXPORT_SERVICE).await,
+        "the facade-registered service must be publicly discoverable with a verified owner",
+    );
+    let pong: Pong = org
+        .call_exported(EXPORT_SERVICE, &Ping { n: 9 })
+        .await
+        .expect("the exported call is admitted — the seam installed the channel defaults");
+    assert_eq!(
+        pong,
+        Pong {
+            n: 10,
+            served_by: "facade".to_string()
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "handler ran exactly once");
 
     let _ = std::fs::remove_dir_all(&p_dir);
     let _ = std::fs::remove_dir_all(&c_dir);

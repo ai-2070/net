@@ -85,6 +85,11 @@ mod call;
 mod serve;
 #[cfg(feature = "cortex")]
 pub use serve::{serve_org_bytes_node, OrgAccess, OrgCaller, OrgHandlerError};
+// The two shared serve internals the subnet-exported seam reuses
+// (SUBNET_AUTH_SDK_PLAN.md §3.5): channel-defaults registration and the
+// one OrgCaller-projecting handler bridge. Crate-internal only.
+#[cfg(feature = "cortex")]
+pub(crate) use serve::{auto_register_org_channels, org_bytes_handler};
 #[cfg(feature = "cortex")]
 mod provision;
 #[cfg(feature = "cortex")]

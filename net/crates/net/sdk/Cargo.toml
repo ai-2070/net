@@ -314,6 +314,24 @@ required-features = ["net", "fixtures"]
 name = "gen_org_error_fixtures"
 required-features = ["net", "cortex", "fixtures"]
 
+# SSDK R4 — regenerate the canonical `subnet:` stable-kind fixture
+# (`tests/cross_lang_subnet/stable_kinds.json`) every language binding
+# consumes. Explicitly declared so a build without `net` cleanly skips it.
+[[example]]
+name = "gen_subnet_kind_fixture"
+required-features = ["net"]
+
+# SSDK R4 — the Rust consumer + regeneration guard for that fixture.
+[[test]]
+name = "subnet_kind_fixture"
+required-features = ["net"]
+
+# SSDK S2 — the facade's fail-closed seams (byte provisioning, config
+# validation, named-export resolution) against a real node.
+[[test]]
+name = "subnet_facade"
+required-features = ["net", "cortex"]
+
 # ============================================================================
 # nRPC benchmark suite. See `benches/nrpc_common/mod.rs` for the
 # shared in-process two-node harness, payload generators, and codec
