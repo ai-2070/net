@@ -81,7 +81,22 @@ impl SubnetChallengeStore {
     /// `PermissionToken` nonce generation).
     pub fn issue(&self, node_id: u64, session_id: u64, now: Instant) -> Option<[u8; 32]> {
         if !self.by_peer.contains_key(&node_id) && self.by_peer.len() >= MAX_CHALLENGE_PEERS {
-            return None;
+            // Pruning is otherwise per-peer, on that peer's own next
+            // touch, so the ceiling can be held entirely by peers that
+            // requested one challenge and never returned — long past
+            // TTL, still counted. Sweeping here keeps the bound a cap
+            // on live challenges rather than on peers ever seen, and
+            // costs O(peers) only on the refusal path, which a caller
+            // reaches only after 4096 completed handshakes.
+            self.by_peer.retain(|_, slot| {
+                slot.retain(|c| now.duration_since(c.issued_at) < SUBNET_CHALLENGE_TTL);
+                !slot.is_empty()
+            });
+            // Check-then-insert below can overshoot the ceiling by the
+            // number of concurrent issuers; immaterial at this bound.
+            if self.by_peer.len() >= MAX_CHALLENGE_PEERS {
+                return None;
+            }
         }
         let mut nonce = [0u8; 32];
         if let Err(e) = getrandom::fill(&mut nonce) {
@@ -232,5 +247,70 @@ impl SubnetContextStore {
     /// `true` when no context is installed.
     pub fn is_empty(&self) -> bool {
         self.by_peer.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The peer ceiling must cap *live* challenges, not peers ever
+    /// seen. Per-peer pruning runs only when that peer is touched
+    /// again, so peers that request one challenge and never return
+    /// would otherwise hold the ceiling forever and wedge admission
+    /// for every peer the store has not seen.
+    #[test]
+    fn the_peer_ceiling_reclaims_expired_peers_before_refusing() {
+        let store = SubnetChallengeStore::new();
+        let t0 = Instant::now();
+        for peer in 0..MAX_CHALLENGE_PEERS as u64 {
+            assert!(store.issue(peer, 1, t0).is_some(), "fill peer {peer}");
+        }
+
+        // While every entry is live the ceiling holds for a new peer
+        // (a known peer is still served — it adds no map entry).
+        let newcomer = MAX_CHALLENGE_PEERS as u64 + 7;
+        assert!(store.issue(newcomer, 1, t0).is_none());
+        assert!(store.issue(0, 2, t0).is_some());
+
+        // Past TTL the same refusal path reclaims the expired peers
+        // instead of refusing on their count.
+        let expired = t0 + SUBNET_CHALLENGE_TTL;
+        assert!(
+            store.issue(newcomer, 1, expired).is_some(),
+            "an all-expired ceiling must not refuse a new peer"
+        );
+        assert_eq!(store.len(), 1, "only the newcomer's challenge survives");
+    }
+
+    /// The sweep removes only expired entries — a live challenge
+    /// issued shortly before the ceiling refusal is still consumable
+    /// afterwards.
+    #[test]
+    fn the_ceiling_sweep_spares_live_challenges() {
+        let store = SubnetChallengeStore::new();
+        let t0 = Instant::now();
+        for peer in 0..(MAX_CHALLENGE_PEERS as u64 - 1) {
+            assert!(store.issue(peer, 1, t0).is_some());
+        }
+        let live_peer = MAX_CHALLENGE_PEERS as u64;
+        let mid = t0 + SUBNET_CHALLENGE_TTL / 2;
+        let live_nonce = store.issue(live_peer, 9, mid).expect("fills the ceiling");
+
+        let later = t0 + SUBNET_CHALLENGE_TTL;
+        let newcomer = live_peer + 1;
+        assert!(store.issue(newcomer, 1, later).is_some());
+
+        let verifier = EntityId::from_bytes([0xAB; 32]);
+        assert!(
+            store
+                .consume(live_peer, 9, &live_nonce, &verifier, later)
+                .is_some(),
+            "the live challenge must survive the sweep"
+        );
+        assert!(
+            store.consume(0, 1, &live_nonce, &verifier, later).is_none(),
+            "swept peers are gone"
+        );
     }
 }
