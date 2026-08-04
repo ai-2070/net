@@ -327,6 +327,51 @@ fn unauthorized_or_forged_floors_change_no_state() {
     assert_eq!(reg.auth_epoch(root.entity_id()), 0);
 }
 
+/// The auth epoch is per authority while floors are keyed per
+/// `(authority, topology_epoch, path)`, so every epoch advance
+/// invalidates every compiled context under the authority. A floor
+/// with `minimum_generation` 0 revokes nothing by definition, so
+/// accepting one — including the first for a never-seen key — must
+/// not charge that authority-wide cost. It is still stored: its
+/// revision anchors the stream's monotonicity.
+#[test]
+fn a_floor_that_revokes_nothing_is_stored_without_costing_the_epoch() {
+    let root = kp(1);
+    let cfg = config(&root);
+    let reg = SubnetFloorRegistry::new();
+    let scope = TopologySubnetId::new(&[3, 7]);
+
+    // A placeholder floor on a fresh key: stored, epoch untouched.
+    assert!(!reg
+        .apply(&floor(&root, &[3, 7], 0, 1), &cfg)
+        .expect("a zero floor is accepted"));
+    assert_eq!(reg.auth_epoch(root.entity_id()), 0);
+    assert_eq!(reg.max_floor(root.entity_id(), 0, scope), 0);
+
+    // Replay stays inert, and so does a provisioning run laying one
+    // placeholder per scope — fresh keys, nothing enforceable.
+    assert!(!reg
+        .apply(&floor(&root, &[3, 7], 0, 1), &cfg)
+        .expect("replay"));
+    for levels in [&[3u8][..], &[3, 8], &[3, 7, 2]] {
+        assert!(!reg.apply(&floor(&root, levels, 0, 1), &cfg).expect("apply"));
+    }
+    assert_eq!(reg.auth_epoch(root.entity_id()), 0);
+
+    // The stored revision still anchors monotonicity: a materially
+    // restrictive floor must arrive with a newer revision, and only
+    // that one advances the epoch.
+    assert!(!reg
+        .apply(&floor(&root, &[3, 7], 5, 1), &cfg)
+        .expect("stale revision refused"));
+    assert_eq!(reg.auth_epoch(root.entity_id()), 0);
+    assert!(reg
+        .apply(&floor(&root, &[3, 7], 5, 2), &cfg)
+        .expect("apply"));
+    assert_eq!(reg.max_floor(root.entity_id(), 0, scope), 5);
+    assert_eq!(reg.auth_epoch(root.entity_id()), 1);
+}
+
 #[test]
 fn floor_wire_round_trips() {
     let root = kp(1);

@@ -811,11 +811,12 @@ impl SubnetRevocationFloor {
 ///
 /// Floors are keyed `(authority, topology_epoch, scope path)` and
 /// applied monotonically by `revision` (a replayed or reordered floor
-/// can never roll state backward). Accepting a floor that CHANGES
-/// state increments the authority's auth epoch; compiled session
-/// contexts pin the epoch they verified against and fail one integer
-/// comparison when it moves (S3), keeping revocation out of
-/// per-packet maps.
+/// can never roll state backward). Accepting a floor that changes
+/// ENFORCEABLE state increments the authority's auth epoch; compiled
+/// session contexts pin the epoch they verified against and fail one
+/// integer comparison when it moves (S3), keeping revocation out of
+/// per-packet maps. See [`Self::apply`] for what an epoch advance
+/// costs and why a floor that revokes nothing is charged none of it.
 #[derive(Debug, Default)]
 pub struct SubnetFloorRegistry {
     floors: DashMap<([u8; 32], u32, u32), FloorEntry>,
@@ -836,10 +837,29 @@ impl SubnetFloorRegistry {
 
     /// Verify and apply a floor under `config`'s trust: the floor's
     /// authority must equal the config's, and its issuer must be a
-    /// configured root. Returns `Ok(true)` iff registry state
-    /// changed (and the auth epoch advanced). Stale revisions and
-    /// non-raising floors are `Ok(false)` no-ops — replay/reorder
-    /// can never roll backward.
+    /// configured root. Returns `Ok(true)` iff the floor changed
+    /// *enforceable* state — and the auth epoch advanced with it.
+    /// Stale revisions and non-raising floors are `Ok(false)` no-ops
+    /// — replay/reorder can never roll backward.
+    ///
+    /// The epoch advance is the expensive half of acceptance: the
+    /// epoch is per AUTHORITY while floors are keyed per
+    /// `(authority, topology_epoch, path)`, so one advance
+    /// invalidates every compiled context under the authority, and
+    /// every one of those peers must re-present against a fresh
+    /// challenge. That blast radius is the designed cost of a real
+    /// revocation, so it is charged only for one: a floor with
+    /// `minimum_generation` `0` — revoking nothing, by definition —
+    /// is stored (its revision still anchors the stream's
+    /// monotonicity) but returns `Ok(false)` and leaves the epoch
+    /// alone. A provisioning run that lays down one placeholder
+    /// floor per scope therefore churns nobody.
+    ///
+    /// `topology_epoch` is used as signed, never compared against
+    /// the node's current epoch: a floor minted for a future or
+    /// stale epoch is stored state that enforces nothing until
+    /// [`Self::max_floor`] is queried at that epoch, and costs the
+    /// invalidation up front only when materially restrictive.
     pub fn apply(
         &self,
         floor: &SubnetRevocationFloor,
@@ -872,7 +892,12 @@ impl SubnetFloorRegistry {
                 }
             })
             .or_insert_with(|| {
-                changed = true;
+                // A first floor for a never-seen key is a revocation
+                // only if it kills some credential; at generation 0
+                // it kills none, so it must not cost the
+                // authority-wide invalidation an epoch advance
+                // triggers. The entry is stored either way.
+                changed = floor.minimum_generation > 0;
                 FloorEntry {
                     minimum_generation: floor.minimum_generation,
                     revision: floor.revision,
