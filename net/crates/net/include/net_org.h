@@ -136,6 +136,7 @@ int net_org_check_abi_version(uint32_t expected);
 #define NET_ORG_ERR_ALREADY_SERVING  -10   /* serve: service already served on this node */
 #define NET_ORG_ERR_SERVE            -11   /* serve: other failure (bad name, no authority) */
 #define NET_ORG_ERR_PROVISION        -12   /* provisioning (§D9) failed — NOT a call domain */
+#define NET_ORG_ERR_SUBNET           -13   /* subnet provision/config/serve (net_subnet.h) — carries subnet:<kind> */
 
 /* ======================================================================
  * Access modes (who may call, and how the service is announced).
@@ -260,6 +261,19 @@ int net_org_call(NetOrgClient* client,
                  const uint8_t* req_ptr, size_t req_len,
                  uint64_t deadline_ms, uint64_t cancel_token,
                  uint8_t** out_resp_ptr, size_t* out_resp_len, char** out_err);
+
+/* Call a subnet-EXPORTED service (SSDK §3.6). Identical contract to
+ * net_org_call — bytes in, bytes out, one send, never a retry — but
+ * discovery runs on the PUBLIC plane through the verified ownership
+ * projection. The caller presents organization authority only; it names
+ * no subnet, joins no subnet, and receives no subnet context. On the org
+ * client handle deliberately: this is an organization call to a publicly
+ * discoverable service. (Serve/provision live in net_subnet.h.) */
+int net_org_call_exported(NetOrgClient* client,
+                          const char* service_ptr, size_t service_len,
+                          const uint8_t* req_ptr, size_t req_len,
+                          uint64_t deadline_ms, uint64_t cancel_token,
+                          uint8_t** out_resp_ptr, size_t* out_resp_len, char** out_err);
 
 /* Reserve a cancel token scoped to this client's node, for a subsequent
  * cancellable net_org_call. Reserve BEFORE the call so a cancel that

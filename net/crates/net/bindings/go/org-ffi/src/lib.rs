@@ -55,11 +55,21 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
+use net::adapter::net::identity::EntityId;
 use net::adapter::net::mesh_rpc::{ServeError, ServeHandle};
 use net::adapter::net::MeshNode;
 use net_sdk::org::{
     install_org_authority_node, install_provider_grant_audience_node, OrgAccess, OrgCaller,
     OrgClient, OrgCredentials, OrgErrorDomain, OrgHandlerError, OrgSdkError,
+};
+// SSDK S4c — the subnet AUTHORITY surface rides libnet_org (it already
+// depends on net-sdk; the base libnet FFI lives inside the `net` crate
+// and cannot, so a separate `libnet_subnet` would be the only
+// alternative — the "concrete link analysis" the plan invites resolves
+// to this existing home, no new cdylib).
+use net_sdk::subnet::{
+    admin as subnet_admin, NamedSubnetExport, NamedSubnetExports, SubnetExportAccess, SubnetRef,
+    TopologySubnetId,
 };
 
 // =========================================================================
@@ -134,6 +144,11 @@ pub const NET_ORG_ERR_SERVE: c_int = -11;
 /// provider grant audience. NOT a call-domain result: a node either starts
 /// correctly or it does not.
 pub const NET_ORG_ERR_PROVISION: c_int = -12;
+/// SSDK S4c — a subnet provisioning / configuration / serve-registration
+/// failure. Its own code so a Go `errors.Is` distinguishes it from an org
+/// provisioning failure; the stable `subnet:<kind>` envelope is written to
+/// `out_err` for classification (`net.subnet`). NOT a call domain.
+pub const NET_ORG_ERR_SUBNET: c_int = -13;
 
 /// Map a canonical `OrgSdkError` domain onto its coarse `c_int` code. The full
 /// `org:<domain>:<kind>` string still crosses via `out_err`; this exists so a
@@ -810,6 +825,60 @@ pub extern "C" fn net_org_call(
     })
 }
 
+/// Call a subnet-EXPORTED service (SSDK §3.6). Same signature and contract as
+/// [`net_org_call`] — bytes in, bytes out, one send, never a retry — but
+/// discovery runs on the PUBLIC plane through the verified ownership
+/// projection. The caller presents organization authority only; it names no
+/// subnet, joins no subnet, and receives no subnet context. Belongs on the org
+/// client handle deliberately: this is an organization call to a publicly
+/// discoverable service.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_org_call_exported(
+    client: *mut NetOrgClient,
+    service_ptr: *const c_char,
+    service_len: usize,
+    req_ptr: *const u8,
+    req_len: usize,
+    deadline_ms: u64,
+    cancel_token: u64,
+    out_resp_ptr: *mut *mut u8,
+    out_resp_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        let Some(h) = (unsafe { client.as_ref() }) else {
+            return NET_ORG_ERR_NULL;
+        };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        let Some(req) = (unsafe { copy_body(req_ptr, req_len) }) else {
+            write_err(out_err, "request body length exceeds isize::MAX".into());
+            return NET_ORG_ERR_NULL;
+        };
+
+        let result = block_on(async {
+            h.inner
+                .call_exported_bytes_deadline(&service, req, deadline_ms, cancel_token)
+                .await
+        });
+
+        match result {
+            Ok(body) => {
+                write_response(body.to_vec(), out_resp_ptr, out_resp_len);
+                NET_ORG_OK
+            }
+            Err(e) => {
+                let code = org_error_code(&e);
+                write_err(out_err, e.to_wire());
+                code
+            }
+        }
+    })
+}
+
 /// Reserve a cancel token scoped to this client's node, for a subsequent
 /// cancellable [`net_org_call`]. Reserve BEFORE the call so a cancel that races
 /// registration is still delivered. Returns `0` if `client` is NULL.
@@ -1075,6 +1144,348 @@ pub extern "C" fn net_org_install_provider_grant_audience(
     })
 }
 
+// =========================================================================
+// SSDK S4c — the subnet AUTHORITY surface (SUBNET_AUTH_SDK_PLAN.md §6.4).
+//
+// Hosted here rather than in the base libnet FFI because the base FFI
+// lives inside the `net` crate and cannot depend on `net-mesh-sdk`
+// (circular); org-ffi already carries that dependency. No new cdylib —
+// the plan's "existing home" with base-libnet placement defeated by the
+// link analysis it invites.
+// =========================================================================
+
+/// `#[repr(C)]` mirror of `net_subnet_path_t`: a compact hierarchy path.
+/// `depth` is `0..=4`; `levels[depth..]` MUST be zero (the canonical
+/// form). `depth == 0` is the authority-root (global) path.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetSubnetPath {
+    /// Active level count, `0..=4`.
+    pub depth: u8,
+    /// Path labels; inactive tail must be zero.
+    pub levels: [u8; 4],
+}
+
+/// `#[repr(C)]` mirror of `net_subnet_ref_t`: an authority-qualified
+/// crossing — NOT the topology subnet id. Equal paths under two
+/// authorities are unrelated.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetSubnetRef {
+    /// The 32-byte authority entity id.
+    pub authority: [u8; 32],
+    /// The path under that authority.
+    pub path: NetSubnetPath,
+}
+
+impl NetSubnetPath {
+    /// Convert to the core compact id, rejecting a non-canonical form:
+    /// `depth > 4` or a non-zero inactive tail. Returns `None` on either,
+    /// which the caller maps to `subnet:invalid_path_level` /
+    /// `subnet:path_too_deep`.
+    fn to_core(self) -> Option<TopologySubnetId> {
+        if self.depth > 4 {
+            return None;
+        }
+        // Inactive levels must be zero — a caller-supplied garbage tail
+        // must never silently become part of the path.
+        if self.levels[self.depth as usize..].iter().any(|&b| b != 0) {
+            return None;
+        }
+        Some(TopologySubnetId::new(&self.levels[..self.depth as usize]))
+    }
+}
+
+impl NetSubnetRef {
+    fn to_core(self) -> Option<SubnetRef> {
+        Some(SubnetRef {
+            authority: EntityId::from_bytes(self.authority),
+            path: self.path.to_core()?,
+        })
+    }
+}
+
+/// `SubnetExportAccess::SameOrg`.
+pub const NET_SUBNET_ACCESS_SAME_ORG: c_int = 0;
+/// `SubnetExportAccess::Granted`.
+pub const NET_SUBNET_ACCESS_GRANTED: c_int = 1;
+
+/// Copy a slice of `(ptr,len)` byte artifacts into owned buffers. `None`
+/// if the outer array is null with a non-zero count, or any element is
+/// null / oversized.
+unsafe fn copy_credential_sets(
+    ptrs: *const *const u8,
+    lens: *const usize,
+    count: usize,
+) -> Option<Vec<Vec<u8>>> {
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    if ptrs.is_null() || lens.is_null() {
+        return None;
+    }
+    let ptr_slice = unsafe { std::slice::from_raw_parts(ptrs, count) };
+    let len_slice = unsafe { std::slice::from_raw_parts(lens, count) };
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        out.push(unsafe { copy_bytes_required(ptr_slice[i], len_slice[i]) }?);
+    }
+    Some(out)
+}
+
+/// Install this node's own gateway credential sets — WHOLESALE REPLACE
+/// (SSDK §3.4). `mesh_arc` is **consumed** (a fresh clone per call; Go
+/// must NOT free it). Every artifact decodes BEFORE anything installs, so
+/// one malformed set refuses the whole batch with no node-state mutation.
+/// A failure returns `NET_ORG_ERR_SUBNET` with the `subnet:<kind>` wire on
+/// `out_err`.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_subnet_install_gateway_credentials(
+    mesh_arc: *mut Arc<MeshNode>,
+    set_ptrs: *const *const u8,
+    set_lens: *const usize,
+    set_count: usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        let Some(sets) = (unsafe { copy_credential_sets(set_ptrs, set_lens, set_count) }) else {
+            write_err(out_err, "credential set array is NULL or oversized".into());
+            return NET_ORG_ERR_NULL;
+        };
+        match subnet_admin::install_gateway_credentials_node(&node, &sets) {
+            Ok(()) => NET_ORG_OK,
+            Err(e) => {
+                write_err(out_err, e.to_string());
+                NET_ORG_ERR_SUBNET
+            }
+        }
+    })
+}
+
+/// Declare this node's protected boundary inventory — also WHOLESALE.
+/// `mesh_arc` is **consumed**. `authority` is a 32-byte entity id;
+/// `boundaries` is `boundary_count` `net_subnet_path_t` values. A
+/// non-canonical path or bad pointer returns `NET_ORG_ERR_SUBNET`.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_subnet_declare_boundaries(
+    mesh_arc: *mut Arc<MeshNode>,
+    authority: *const u8,
+    topology_epoch: u32,
+    boundaries: *const NetSubnetPath,
+    boundary_count: usize,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() || authority.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        let authority = EntityId::from_bytes(unsafe {
+            let mut a = [0u8; 32];
+            std::ptr::copy_nonoverlapping(authority, a.as_mut_ptr(), 32);
+            a
+        });
+        let mut paths = Vec::with_capacity(boundary_count);
+        if boundary_count > 0 {
+            if boundaries.is_null() {
+                write_err(
+                    out_err,
+                    "subnet:invalid_format: boundaries array is NULL".into(),
+                );
+                return NET_ORG_ERR_SUBNET;
+            }
+            let slice = unsafe { std::slice::from_raw_parts(boundaries, boundary_count) };
+            for p in slice {
+                let Some(core) = p.to_core() else {
+                    write_err(
+                        out_err,
+                        "subnet:path_too_deep: non-canonical boundary path".into(),
+                    );
+                    return NET_ORG_ERR_SUBNET;
+                };
+                paths.push(core);
+            }
+        }
+        match subnet_admin::declare_boundaries_node(&node, authority, topology_epoch, paths) {
+            Ok(()) => NET_ORG_OK,
+            Err(e) => {
+                write_err(out_err, e.to_string());
+                NET_ORG_ERR_SUBNET
+            }
+        }
+    })
+}
+
+/// Apply one signed control fact from its outer wire frame — the ONE door
+/// (SSDK §3.4). `mesh_arc` is **consumed**. On success writes the outcome
+/// kind to `out_kind` (a malloc'd CString, free with `net_org_free_cstring`)
+/// and `applied` to `out_applied`. `applied == false` is an authenticated
+/// stale/idempotent outcome, not a failure.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_subnet_apply_control_fact(
+    mesh_arc: *mut Arc<MeshNode>,
+    fact_ptr: *const u8,
+    fact_len: usize,
+    out_kind: *mut *mut c_char,
+    out_applied: *mut bool,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() || out_kind.is_null() || out_applied.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        let Some(fact) = (unsafe { copy_bytes_required(fact_ptr, fact_len) }) else {
+            write_err(out_err, "fact bytes are NULL or oversized".into());
+            return NET_ORG_ERR_NULL;
+        };
+        match subnet_admin::apply_control_fact_node(&node, &fact) {
+            Ok(outcome) => {
+                let dto = net_sdk::subnet::dto::SubnetControlOutcomeDto::from(outcome);
+                if let Ok(k) = CString::new(dto.kind) {
+                    unsafe {
+                        *out_kind = k.into_raw();
+                        *out_applied = dto.applied;
+                    }
+                    NET_ORG_OK
+                } else {
+                    write_err(out_err, "outcome kind contained an interior NUL".into());
+                    NET_ORG_ERR_SUBNET
+                }
+            }
+            Err(e) => {
+                write_err(out_err, e.to_string());
+                NET_ORG_ERR_SUBNET
+            }
+        }
+    })
+}
+
+/// Serve a subnet-EXPORTED, organization-protected service (SSDK §3.5).
+///
+/// The C/Go layer holds no persistent named-export map (there is no
+/// mesh-wrapper on the Rust side — `mesh_arc` is a bare `Arc<MeshNode>`
+/// clone), so the concrete export binding (`export_ref`, `topology_epoch`,
+/// `access`) crosses directly. Go resolves its configured export NAME to
+/// this binding on its own side (name resolution is marshaling); the C
+/// ABI is the low-level seam. Internally this wraps the binding in a
+/// single-entry `NamedSubnetExports`, so the SAME shared serve pipeline
+/// runs — the handler receives the verified `net_org_caller_t`, and
+/// registration reuses the org dispatcher and handler-id machinery.
+///
+/// `mesh_arc` is **consumed**. `handler_id` MUST already be reserved via
+/// [`net_org_reserve_handler_id`] and stored in the Go registry.
+/// Announcement visibility is always public; the external caller never
+/// joins this node's subnet. Requires an installed node authority.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_subnet_serve_exported(
+    mesh_arc: *mut Arc<MeshNode>,
+    service_ptr: *const c_char,
+    service_len: usize,
+    export_ref: *const NetSubnetRef,
+    topology_epoch: u32,
+    access: c_int,
+    handler_id: u64,
+    out_handle: *mut *mut NetOrgServeHandle,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    ffi_guard!(NET_ORG_ERR_NULL, {
+        if mesh_arc.is_null() || out_handle.is_null() || export_ref.is_null() {
+            return NET_ORG_ERR_NULL;
+        }
+        let node: Arc<MeshNode> = unsafe { *Box::from_raw(mesh_arc) };
+        let Some(service) = cstr_to_string(service_ptr, service_len) else {
+            write_err(out_err, "service name is NULL or non-UTF-8".into());
+            return NET_ORG_ERR_INVALID_UTF8;
+        };
+        if ORG_DISPATCHER.get().is_none() {
+            write_err(
+                out_err,
+                "net_org_set_handler_dispatcher must be called before net_subnet_serve_exported"
+                    .into(),
+            );
+            return NET_ORG_ERR_NO_DISPATCHER;
+        }
+        if handler_id == 0 {
+            write_err(out_err, "handler_id must be non-zero".into());
+            return NET_ORG_ERR_NULL;
+        }
+        let access = match access {
+            NET_SUBNET_ACCESS_SAME_ORG => SubnetExportAccess::SameOrg,
+            NET_SUBNET_ACCESS_GRANTED => SubnetExportAccess::Granted,
+            other => {
+                write_err(out_err, format!("subnet:invalid_access: mode {other}"));
+                return NET_ORG_ERR_SUBNET;
+            }
+        };
+        let Some(subnet) = (unsafe { *export_ref }).to_core() else {
+            write_err(
+                out_err,
+                "subnet:path_too_deep: non-canonical export path".into(),
+            );
+            return NET_ORG_ERR_SUBNET;
+        };
+
+        // One fixed-name entry: the C surface passes the binding directly,
+        // so the name is an internal detail, never announced or accepted.
+        const C_EXPORT_NAME: &str = "c-abi-export";
+        let exports = match NamedSubnetExports::try_new([NamedSubnetExport {
+            name: C_EXPORT_NAME.to_string(),
+            access,
+            subnet,
+            topology_epoch,
+        }]) {
+            Ok(m) => m,
+            Err(e) => {
+                write_err(out_err, e.to_string());
+                return NET_ORG_ERR_SUBNET;
+            }
+        };
+
+        let timeout = DEFAULT_ORG_HANDLER_TIMEOUT;
+        let handler = move |caller: OrgCaller, body: Bytes| {
+            let caller_c = NetOrgCaller::from(&caller);
+            async move { org_dispatch(handler_id, caller_c, body, timeout).await }
+        };
+
+        // Same ambient-runtime rationale as `net_org_serve`.
+        let _rt_guard = runtime().enter();
+        match net_sdk::subnet::serve_subnet_exported_bytes_node(
+            node,
+            &exports,
+            &service,
+            C_EXPORT_NAME,
+            handler,
+        ) {
+            Ok(inner) => {
+                unsafe {
+                    *out_handle = Box::into_raw(Box::new(NetOrgServeHandle {
+                        inner: Arc::new(Mutex::new(Some(inner))),
+                        handler_id,
+                    }));
+                }
+                NET_ORG_OK
+            }
+            Err(e) => {
+                let code = match e {
+                    ServeError::AlreadyServing(_) => NET_ORG_ERR_ALREADY_SERVING,
+                    _ => NET_ORG_ERR_SUBNET,
+                };
+                write_err(out_err, format!("subnet-exported serve failed: {e}"));
+                code
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,6 +1512,77 @@ mod tests {
         assert_eq!(net_org_abi_version(), 0x0001);
         assert_eq!(net_org_check_abi_version(0x0001), NET_ORG_OK);
         assert_eq!(net_org_check_abi_version(0x0002), NET_ORG_ERR_NULL);
+    }
+
+    /// `net_subnet_path_t` / `net_subnet_ref_t` layout is part of the ABI: a
+    /// reorder or retype shifts these and the C header reads a garbage path.
+    #[test]
+    fn net_subnet_ref_layout_is_pinned() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(
+            size_of::<NetSubnetPath>(),
+            5,
+            "1 depth + 4 levels, no padding"
+        );
+        assert_eq!(align_of::<NetSubnetPath>(), 1);
+        assert_eq!(offset_of!(NetSubnetPath, depth), 0);
+        assert_eq!(offset_of!(NetSubnetPath, levels), 1);
+        // authority[32] then the 5-byte path; byte arrays so no padding.
+        assert_eq!(size_of::<NetSubnetRef>(), 37);
+        assert_eq!(align_of::<NetSubnetRef>(), 1);
+        assert_eq!(offset_of!(NetSubnetRef, authority), 0);
+        assert_eq!(offset_of!(NetSubnetRef, path), 32);
+    }
+
+    /// The path canonicalizer accepts exactly the well-formed shapes and
+    /// rejects `depth > 4` and a non-zero inactive tail — the two ways a C
+    /// caller can smuggle garbage into a path.
+    #[test]
+    fn subnet_path_canonicalization_is_strict() {
+        // Global (depth 0) and a full 4-level path round-trip.
+        assert!(NetSubnetPath {
+            depth: 0,
+            levels: [0, 0, 0, 0]
+        }
+        .to_core()
+        .is_some());
+        assert!(NetSubnetPath {
+            depth: 4,
+            levels: [3, 9, 1, 4]
+        }
+        .to_core()
+        .is_some());
+        // depth == active levels; the inactive tail is ignored ONLY when zero.
+        assert!(NetSubnetPath {
+            depth: 2,
+            levels: [3, 9, 0, 0]
+        }
+        .to_core()
+        .is_some());
+        // depth > 4 is impossible in the 4-slot array.
+        assert!(NetSubnetPath {
+            depth: 5,
+            levels: [1, 2, 3, 4]
+        }
+        .to_core()
+        .is_none());
+        // A non-zero inactive tail is refused, not silently truncated.
+        assert!(NetSubnetPath {
+            depth: 2,
+            levels: [3, 9, 7, 0]
+        }
+        .to_core()
+        .is_none());
+    }
+
+    /// The subnet error code is distinct from the org provisioning code, so a
+    /// Go `errors.Is` can tell subnet config/provisioning apart from org.
+    #[test]
+    fn subnet_error_code_is_distinct() {
+        assert_eq!(NET_ORG_ERR_SUBNET, -13);
+        assert_ne!(NET_ORG_ERR_SUBNET, NET_ORG_ERR_PROVISION);
+        assert_eq!(NET_SUBNET_ACCESS_SAME_ORG, 0);
+        assert_eq!(NET_SUBNET_ACCESS_GRANTED, 1);
     }
 
     /// Malformed credential bytes are refused through the real entrypoint, and
@@ -1243,6 +1725,9 @@ mod tests {
             ),
             ("NET_ORG_ERR_SERVE", NET_ORG_ERR_SERVE as i64),
             ("NET_ORG_ERR_PROVISION", NET_ORG_ERR_PROVISION as i64),
+            // SSDK S4c — the subnet code lives in net_org.h's block (an
+            // org-namespace code) so this same mirror guards it.
+            ("NET_ORG_ERR_SUBNET", NET_ORG_ERR_SUBNET as i64),
             ("NET_ORG_ACCESS_SAME_ORG", NET_ORG_ACCESS_SAME_ORG as i64),
             ("NET_ORG_ACCESS_GRANTED", NET_ORG_ACCESS_GRANTED as i64),
         ];
