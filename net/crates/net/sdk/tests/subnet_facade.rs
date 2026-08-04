@@ -95,7 +95,7 @@ async fn malformed_credential_bytes_refuse_before_any_mutation() {
     let node = mesh.node_arc();
 
     let garbage = vec![0xFFu8; 41];
-    let err = admin::install_gateway_credentials_node(&node, &[garbage.clone()])
+    let err = admin::install_gateway_credentials_node(&node, std::slice::from_ref(&garbage))
         .expect_err("garbage must refuse");
     assert_eq!(err.to_string(), "subnet:invalid_format");
     assert!(

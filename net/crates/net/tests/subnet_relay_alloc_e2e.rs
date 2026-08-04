@@ -384,7 +384,7 @@ async fn production_relay_steady_state_allocates_nothing() {
         .expect("the forwarded hop verifies under the egress edge key");
     assert_eq!(out_header.dest_id, right.node_id());
     assert!(
-        inner_set.iter().any(|inner| out_inner == *inner),
+        inner_set.contains(&out_inner),
         "the relay must not touch the inner packet",
     );
 }

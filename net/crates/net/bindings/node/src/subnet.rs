@@ -24,7 +24,6 @@
 //! `tests/cross_lang_subnet/stable_kinds.json`), which `errors.ts`
 //! classifies.
 
-use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 // ---------------------------------------------------------------------------
@@ -88,6 +87,10 @@ pub struct SubnetNamedExportJs {
 }
 
 /// A boundary declaration: `{ authorityHex, topologyEpoch, boundaries }`.
+///
+/// Only the org-gated admin verbs below construct this; in a build
+/// without `org` it exists as a JS type shape alone.
+#[cfg_attr(not(feature = "org"), allow(dead_code))]
 #[napi(object)]
 #[derive(Clone)]
 pub struct SubnetBoundaryDeclarationJs {
@@ -101,6 +104,10 @@ pub struct SubnetBoundaryDeclarationJs {
 
 /// The control-fact outcome projection. `applied: false` is an
 /// authenticated stale/idempotent outcome, not a transport failure.
+///
+/// Only the org-gated admin verbs below construct this; in a build
+/// without `org` it exists as a JS type shape alone.
+#[cfg_attr(not(feature = "org"), allow(dead_code))]
 #[napi(object)]
 pub struct SubnetControlOutcomeJs {
     /// `"descriptor" | "gateway_advertisement" | "export_policy" |
@@ -120,6 +127,7 @@ pub(crate) use gated::*;
 #[cfg(feature = "org")]
 mod gated {
     use super::*;
+    use napi::bindgen_prelude::*;
     use std::sync::Arc;
     use std::time::Duration;
 
