@@ -432,7 +432,14 @@ pub(crate) fn verify_announced_owner_cert(
             return None;
         }
     }
-    Some(VerifiedOwner::new(cert.org_id, cert.generation))
+    // `cert.member == ann.entity_id` was checked above, so this records
+    // the announcing entity itself — the identity a discovery consumer
+    // must pin against, not the node id that merely derives from it.
+    Some(VerifiedOwner::new(
+        &cert.member,
+        cert.org_id,
+        cert.generation,
+    ))
 }
 
 /// Post-apply floor recheck (review-9): a floor can rise BETWEEN
@@ -485,67 +492,126 @@ pub fn owner_org_for(fold: &Fold<CapabilityFold>, node_id: NodeId) -> Option<Org
     })
 }
 
-/// Every public candidate for `tag` PAIRED with its currently verified
-/// owner projection, from ONE fold snapshot (SUBNET_AUTH_SDK_PLAN.md R1).
+/// One publisher of a publicly announced service, with the exact
+/// identity and owner organization its verified ownership projection
+/// carried — all three sampled from ONE fold acquisition
+/// (SUBNET_AUTH_SDK_PLAN.md R1, review-10 P1-1/P1-2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedPublisher {
+    /// The routing node id the entry was published under.
+    pub node_id: NodeId,
+    /// The entity whose owner cert ingest verified. NOT derived from
+    /// `node_id` — a consumer pins against this.
+    pub member: crate::adapter::net::identity::EntityId,
+    /// The organization that vouched for `member`.
+    pub owner_org: OrgId,
+}
+
+/// Every public candidate for `tag` together with the VERIFIED
+/// PUBLISHER IDENTITY and owner organization its projection carried,
+/// from ONE fold snapshot (SUBNET_AUTH_SDK_PLAN.md R1).
 ///
-/// The pair is sampled under a single read acquisition on purpose: a
+/// The triple is sampled under a single read acquisition on purpose: a
 /// caller that enumerated candidates via [`find_nodes_matching`] and
 /// then resolved owners via [`owner_org_for`] could interleave an
 /// announcement replacement or a floor retraction between the two
 /// reads and pair a live candidate with a dead projection, or the
-/// inverse. Sampling both from one snapshot makes that tear
+/// inverse. Sampling all three from one snapshot makes that tear
 /// unrepresentable.
+///
+/// **The `member` is returned, not just the node id** (review-10
+/// P1-1). A `NodeId` is the low 8 bytes of an entity id, so it names a
+/// route, not an identity. A consumer that resolved `NodeId →
+/// EntityId` through the live session pin *after* this query returned
+/// could pair this projection's owner org with a different entity that
+/// currently holds the pin — peer death removes pin and fold record in
+/// separate operations, and a fresh direct announcement installs its
+/// pin before applying its fold record. Returning the exact verified
+/// publisher lets the caller require the pin to equal it and drop the
+/// candidate otherwise.
 ///
 /// Entries with no current owner projection are not returned at all —
 /// an unowned public announcement is not an eligible exported
 /// candidate, and this query deliberately cannot express "candidate,
-/// owner unknown". A publisher whose simultaneously-live entries
-/// project DIFFERENT owner orgs is excluded entirely: ambiguity is
+/// owner unknown".
+///
+/// **Conflict exclusion spans the publisher's WHOLE live footprint**
+/// (review-10 P1-2), not only its entries carrying `tag`. Candidate
+/// discovery is tag-filtered, but once a publisher is a candidate every
+/// one of its live entries is inspected through `by_node`, in the same
+/// acquisition; a publisher whose simultaneously-live projections
+/// disagree on either member identity or owner org is excluded
+/// entirely. Restricting the conflict scan to the requested tag would
+/// let a publisher hold an unrelated live class under a second org and
+/// still be selected under the first — disclosing an org-scoped proof
+/// to a publisher whose authority relation is ambiguous. Ambiguity is
 /// never resolved silently (the `AmbiguousCapabilityGrant` doctrine),
 /// and an attacker-influenced tiebreak here would pick which org's
 /// grants a caller matches against.
 ///
 /// Results are deduplicated per publisher and returned in ascending
 /// node-id order. Authority-relevant ordering (by provider `EntityId`)
-/// belongs to the caller, after node→entity resolution — this layer
-/// has no entity identity.
-pub fn public_owned_providers(fold: &Fold<CapabilityFold>, tag: &str) -> Vec<(NodeId, OrgId)> {
+/// belongs to the caller.
+pub fn public_owned_providers(fold: &Fold<CapabilityFold>, tag: &str) -> Vec<OwnedPublisher> {
     let legacy = LegacyFilter::default().require_tag(tag.to_string());
     let fold_filter = translate_filter(&legacy);
-    let mut pairs: Vec<(NodeId, OrgId)> = fold.with_state_and_index(|state, index| {
+    fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
         let candidates = candidates.as_set();
-        let mut out: Vec<(NodeId, OrgId)> = Vec::with_capacity(candidates.len());
-        for &key in candidates {
-            let Some(entry) = state.entries.get(&key) else {
+
+        // Phase 1 — which publishers advertise `tag` at all. Tag-filtered
+        // by construction; ownership is NOT decided here.
+        let mut publishers: Vec<NodeId> = candidates.iter().map(|&(_, node)| node).collect();
+        publishers.sort_unstable();
+        publishers.dedup();
+
+        // Phase 2 — for each candidate publisher, fold its ENTIRE live
+        // footprint into one verdict, still under this acquisition. A
+        // publisher survives only if every live entry it owns agrees on
+        // both the verified member and the owner org, and at least one
+        // carries a projection at all.
+        let mut out: Vec<OwnedPublisher> = Vec::with_capacity(publishers.len());
+        for node_id in publishers {
+            let Some(keys) = state.by_node.get(&node_id) else {
                 continue;
             };
-            if let Some(owner) = entry.payload.owner {
-                out.push((key.1, owner.org()));
+            let mut agreed: Option<VerifiedOwner> = None;
+            let mut conflicted = false;
+            for key in keys {
+                let Some(entry) = state.entries.get(key) else {
+                    continue;
+                };
+                let Some(owner) = entry.payload.owner else {
+                    // An unowned entry is not a conflict: ownership is a
+                    // per-announcement projection, and a publisher may
+                    // legitimately hold unowned classes alongside owned
+                    // ones. Only two DISAGREEING projections are ambiguous.
+                    continue;
+                };
+                match agreed {
+                    None => agreed = Some(owner),
+                    Some(seen) => {
+                        if seen.member_bytes() != owner.member_bytes() || seen.org() != owner.org()
+                        {
+                            conflicted = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if conflicted {
+                continue;
+            }
+            if let Some(owner) = agreed {
+                out.push(OwnedPublisher {
+                    node_id,
+                    member: owner.member(),
+                    owner_org: owner.org(),
+                });
             }
         }
         out
-    });
-    // Per-publisher collapse. Sort by (node, org) so equal-node runs
-    // are adjacent and deterministic, then keep a node only if every
-    // projection it carries agrees.
-    pairs.sort_unstable_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
-    let mut out: Vec<(NodeId, OrgId)> = Vec::with_capacity(pairs.len());
-    let mut i = 0;
-    while i < pairs.len() {
-        let (node, org) = pairs[i];
-        let mut j = i + 1;
-        let mut conflicted = false;
-        while j < pairs.len() && pairs[j].0 == node {
-            conflicted |= pairs[j].1 != org;
-            j += 1;
-        }
-        if !conflicted {
-            out.push((node, org));
-        }
-        i = j;
-    }
-    out
+    })
 }
 
 /// Retract ownership projections a rising revocation floor just
@@ -1575,6 +1641,20 @@ mod tests {
 
     const EXPORTED_TAG: &str = "nrpc:fleet.telemetry";
 
+    /// The shape production ingest produces: the projection names the
+    /// announcing entity, and the node id derives from it.
+    fn owned(kp: &EntityKeypair, org: OrgId, generation: u32) -> Option<VerifiedOwner> {
+        Some(VerifiedOwner::new(kp.entity_id(), org, generation))
+    }
+
+    fn one(node_id: NodeId, kp: &EntityKeypair, owner_org: OrgId) -> Vec<OwnedPublisher> {
+        vec![OwnedPublisher {
+            node_id,
+            member: kp.entity_id().clone(),
+            owner_org,
+        }]
+    }
+
     /// A candidate without a verified owner projection is ineligible —
     /// the query cannot express "candidate, owner unknown", so an
     /// unowned public announcement simply does not appear.
@@ -1591,7 +1671,7 @@ mod tests {
             1,
             1,
             vec![EXPORTED_TAG],
-            Some(VerifiedOwner::new(org, 1)),
+            owned(&owned_kp, org, 1),
         ))
         .expect("apply owned");
         fold.apply(sign_member_owned(
@@ -1606,8 +1686,8 @@ mod tests {
 
         assert_eq!(
             public_owned_providers(&fold, EXPORTED_TAG),
-            vec![(0xA1, org)],
-            "only the owned candidate is eligible, paired with its projection",
+            one(0xA1, &owned_kp, org),
+            "only the owned candidate is eligible, with its verified publisher",
         );
         // The unowned publisher is still an ordinary public candidate —
         // eligibility for the exported plane is what it lacks.
@@ -1615,7 +1695,7 @@ mod tests {
         assert_eq!(find_nodes_matching(&fold, &legacy), vec![0xA1, 0xB2]);
     }
 
-    /// A floor retraction removes the PAIR while the capability entry
+    /// A floor retraction removes the TRIPLE while the capability entry
     /// stays present and discoverable — the exact tear a two-read
     /// caller (`find_nodes_matching` then `owner_org_for`) could
     /// observe halfway, made unrepresentable by the one-snapshot query.
@@ -1632,12 +1712,12 @@ mod tests {
             1,
             1,
             vec![EXPORTED_TAG],
-            Some(VerifiedOwner::new(org, 1)),
+            owned(&member, org, 1),
         ))
         .expect("apply");
         assert_eq!(
             public_owned_providers(&fold, EXPORTED_TAG),
-            vec![(node_id, org)]
+            one(node_id, &member, org),
         );
 
         let retracted = retract_floored_ownership(&fold, org, member.entity_id(), 2);
@@ -1645,7 +1725,7 @@ mod tests {
 
         assert!(
             public_owned_providers(&fold, EXPORTED_TAG).is_empty(),
-            "a retracted projection must remove the pair, not orphan it",
+            "a retracted projection must remove the triple, not orphan it",
         );
         let legacy = LegacyFilter::default().require_tag(EXPORTED_TAG.to_string());
         assert_eq!(
@@ -1656,7 +1736,7 @@ mod tests {
     }
 
     /// An announcement replacement that drops the owner cert removes
-    /// the pair — the other half of the coherence claim.
+    /// the triple — the other half of the coherence claim.
     #[test]
     fn public_owned_providers_see_announcement_replacement_atomically() {
         let fold = new_fold();
@@ -1669,12 +1749,12 @@ mod tests {
             1,
             1,
             vec![EXPORTED_TAG],
-            Some(VerifiedOwner::new(org, 1)),
+            owned(&kp, org, 1),
         ))
         .expect("apply v1");
         assert_eq!(
             public_owned_providers(&fold, EXPORTED_TAG),
-            vec![(0xC3, org)]
+            one(0xC3, &kp, org),
         );
 
         // Version 2 replaces the payload wholesale, owner gone.
@@ -1682,7 +1762,7 @@ mod tests {
             .expect("apply v2");
         assert!(
             public_owned_providers(&fold, EXPORTED_TAG).is_empty(),
-            "a replacement without an owner cert must remove the pair",
+            "a replacement without an owner cert must remove the triple",
         );
     }
 
@@ -1703,7 +1783,7 @@ mod tests {
             1,
             1,
             vec![EXPORTED_TAG],
-            Some(VerifiedOwner::new(org_x, 1)),
+            owned(&kp, org_x, 1),
         ))
         .expect("apply class 1");
         fold.apply(sign_member_owned(
@@ -1712,7 +1792,7 @@ mod tests {
             2,
             1,
             vec![EXPORTED_TAG],
-            Some(VerifiedOwner::new(org_y, 1)),
+            owned(&kp, org_y, 1),
         ))
         .expect("apply class 2");
 
@@ -1720,6 +1800,139 @@ mod tests {
             public_owned_providers(&fold, EXPORTED_TAG).is_empty(),
             "conflicting projections exclude the publisher entirely",
         );
+    }
+
+    /// Review-10 P1-2 inverse — the conflict scan spans the publisher's
+    /// WHOLE live footprint, not only its entries carrying the
+    /// requested tag.
+    ///
+    /// Two live classes for one publisher, only ONE of which advertises
+    /// the requested service, projecting different owner orgs. A
+    /// tag-scoped conflict scan sees exactly one projection under the
+    /// requested tag, finds no disagreement, and returns the publisher
+    /// as owned by that org — disclosing an org-scoped proof to a
+    /// publisher whose live authority relation is ambiguous. The
+    /// footprint-wide scan excludes it.
+    #[test]
+    fn public_owned_providers_exclude_conflicts_outside_the_requested_tag() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let org_x = crate::adapter::net::behavior::org::OrgKeypair::generate().org_id();
+        let org_y = crate::adapter::net::behavior::org::OrgKeypair::generate().org_id();
+
+        // Class 1 carries the requested tag, owned by X.
+        fold.apply(sign_member_owned(
+            &kp,
+            0xE5,
+            1,
+            1,
+            vec![EXPORTED_TAG],
+            owned(&kp, org_x, 1),
+        ))
+        .expect("apply tagged class");
+        // Class 2 is live under the SAME publisher, carries an unrelated
+        // tag, and is owned by Y.
+        fold.apply(sign_member_owned(
+            &kp,
+            0xE5,
+            2,
+            1,
+            vec!["nrpc:unrelated.service"],
+            owned(&kp, org_y, 1),
+        ))
+        .expect("apply untagged class");
+
+        assert!(
+            public_owned_providers(&fold, EXPORTED_TAG).is_empty(),
+            "an owner conflict OUTSIDE the requested tag must still exclude the publisher",
+        );
+        // The publisher is still an ordinary discoverable candidate —
+        // only exported-plane eligibility is withheld.
+        let legacy = LegacyFilter::default().require_tag(EXPORTED_TAG.to_string());
+        assert_eq!(find_nodes_matching(&fold, &legacy), vec![0xE5]);
+    }
+
+    /// An unowned live class alongside an owned one is NOT a conflict:
+    /// ownership is a per-announcement projection, and a publisher may
+    /// legitimately hold unowned classes. Only two DISAGREEING
+    /// projections are ambiguous — this pins that the P1-2 widening did
+    /// not over-exclude.
+    #[test]
+    fn public_owned_providers_tolerate_an_unowned_sibling_class() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let org = crate::adapter::net::behavior::org::OrgKeypair::generate().org_id();
+
+        fold.apply(sign_member_owned(
+            &kp,
+            0xF6,
+            1,
+            1,
+            vec![EXPORTED_TAG],
+            owned(&kp, org, 1),
+        ))
+        .expect("apply owned class");
+        fold.apply(sign_member_owned(
+            &kp,
+            0xF6,
+            2,
+            1,
+            vec!["nrpc:unrelated.service"],
+            None,
+        ))
+        .expect("apply unowned class");
+
+        assert_eq!(
+            public_owned_providers(&fold, EXPORTED_TAG),
+            one(0xF6, &kp, org),
+            "an unowned sibling class must not exclude an unambiguously owned publisher",
+        );
+    }
+
+    /// Review-10 P1-1 — the query returns the VERIFIED PUBLISHER, so a
+    /// consumer can pin against it rather than re-deriving identity
+    /// from the node id.
+    ///
+    /// Two distinct entities can present the same `NodeId` (it is the
+    /// low 8 bytes of an entity id). Here entity A's owned projection is
+    /// live under node X; the returned member is A, never merely "the
+    /// entity currently reachable at X". `MeshNode::
+    /// public_owned_service_providers` is what compares this against the
+    /// live session pin and drops the candidate on mismatch.
+    #[test]
+    fn public_owned_providers_name_the_verified_publisher_not_the_node() {
+        let fold = new_fold();
+        let entity_a = EntityKeypair::generate();
+        let entity_b = EntityKeypair::generate();
+        assert_ne!(entity_a.entity_id(), entity_b.entity_id());
+        let org = crate::adapter::net::behavior::org::OrgKeypair::generate().org_id();
+
+        // A's projection, published under a node id neither entity
+        // derives — the collision shape the pin check has to survive.
+        const SHARED_NODE: NodeId = 0xAB;
+        fold.apply(sign_member_owned(
+            &entity_a,
+            SHARED_NODE,
+            1,
+            1,
+            vec![EXPORTED_TAG],
+            owned(&entity_a, org, 1),
+        ))
+        .expect("apply A");
+
+        let found = public_owned_providers(&fold, EXPORTED_TAG);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            &found[0].member,
+            entity_a.entity_id(),
+            "the projection must name the entity whose cert verified",
+        );
+        assert_ne!(
+            &found[0].member,
+            entity_b.entity_id(),
+            "a different entity holding the same node id is not this publisher",
+        );
+        assert_eq!(found[0].node_id, SHARED_NODE);
     }
 
     #[test]
@@ -3135,13 +3348,13 @@ mod tests {
         );
         assert_eq!(
             verify_announced_owner_cert(&ann_at, true, Some(&floors), 0),
-            Some(VerifiedOwner::new(org_root().org_id(), 5)),
+            Some(VerifiedOwner::new(kp.entity_id(), org_root().org_id(), 5)),
             "generation at floor must project"
         );
         // No floors tracked (un-adopted node) ⇒ implicit floor 0.
         assert_eq!(
             verify_announced_owner_cert(&ann_below, true, None, 0),
-            Some(VerifiedOwner::new(org_root().org_id(), 4)),
+            Some(VerifiedOwner::new(kp.entity_id(), org_root().org_id(), 4)),
             "no floor state ⇒ every generation admissible"
         );
     }

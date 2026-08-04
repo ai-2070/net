@@ -154,12 +154,22 @@ pub struct CapabilityMembership {
     pub owner: Option<VerifiedOwner>,
 }
 
-/// An ingest-verified ownership projection: which org vouched for
-/// the publisher and at which certificate generation. The
-/// generation is retained so a rising revocation floor can retract
-/// exactly the projections that fell below it — no re-announcement
-/// required, no still-valid (higher-generation) projection
-/// over-cleared (review-8 §9).
+/// An ingest-verified ownership projection: WHICH ENTITY published,
+/// which org vouched for it, and at which certificate generation.
+/// The generation is retained so a rising revocation floor can
+/// retract exactly the projections that fell below it — no
+/// re-announcement required, no still-valid (higher-generation)
+/// projection over-cleared (review-8 §9).
+///
+/// The `member` is retained (review-10 P1-1) because a `NodeId` is
+/// the low 8 bytes of an entity id and therefore NOT an identity: a
+/// consumer that reads a projection under one snapshot and then
+/// resolves `NodeId → EntityId` through the live session pin can
+/// pair one publisher's verified owner with a DIFFERENT entity that
+/// currently holds the pin. Carrying the verified publisher inside
+/// the projection lets such a consumer compare against the exact
+/// entity whose cert was checked, instead of trusting the node id to
+/// name it.
 ///
 /// Construction is `pub(crate)` and the fields are private
 /// (review-9): the verification bridge
@@ -169,6 +179,11 @@ pub struct CapabilityMembership {
 /// through `translate_announcement`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedOwner {
+    /// The publisher whose owner cert verified at ingest, as raw
+    /// bytes rather than an `EntityId` so this projection stays
+    /// `Copy` — the ingest path passes it by value four times per
+    /// announcement and `EntityId` is deliberately `Clone`-only.
+    member: [u8; 32],
     /// The organization whose certificate verified at ingest.
     org: super::super::org::OrgId,
     /// The verified certificate's revocation generation.
@@ -178,8 +193,29 @@ pub struct VerifiedOwner {
 impl VerifiedOwner {
     /// In-crate constructor — the verification bridge is the only
     /// legitimate producer; everything else consumes.
-    pub(crate) fn new(org: super::super::org::OrgId, generation: u32) -> Self {
-        Self { org, generation }
+    pub(crate) fn new(
+        member: &crate::adapter::net::identity::EntityId,
+        org: super::super::org::OrgId,
+        generation: u32,
+    ) -> Self {
+        Self {
+            member: *member.as_bytes(),
+            org,
+            generation,
+        }
+    }
+
+    /// The verified publishing entity.
+    #[inline]
+    pub fn member(&self) -> crate::adapter::net::identity::EntityId {
+        crate::adapter::net::identity::EntityId::from_bytes(self.member)
+    }
+
+    /// The verified publishing entity, as raw bytes — the
+    /// comparison form, free of the `EntityId` reconstruction.
+    #[inline]
+    pub fn member_bytes(&self) -> &[u8; 32] {
+        &self.member
     }
 
     /// The vouching organization.

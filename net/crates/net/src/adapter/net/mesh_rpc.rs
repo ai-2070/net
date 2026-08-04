@@ -4899,6 +4899,18 @@ impl MeshNode {
     /// ascending provider-`EntityId` order — deterministic, load-blind;
     /// no sensing or load balancing is consulted.
     ///
+    /// **The live pin must equal the entity the projection was verified
+    /// for** (review-10 P1-1). The fold query returns the exact
+    /// publisher, so this seam does not resolve `NodeId → EntityId` and
+    /// trust the answer: it resolves, compares, and drops the candidate
+    /// on any mismatch. A node id is the low 8 bytes of an entity id, so
+    /// two distinct entities can present the same one; peer death clears
+    /// pin and fold record separately, and a fresh direct announcement
+    /// installs its pin before applying its fold record. Without this
+    /// equality a caller could disclose a request-bound signed
+    /// organization proof and its capability grant to an entity that
+    /// never published the sampled owned capability.
+    ///
     /// [`CapabilityVisibility::Public`]: crate::adapter::net::org_admission_gate::CapabilityVisibility::Public
     pub fn public_owned_service_providers(&self, service: &str) -> Vec<PublicOwnedProvider> {
         use crate::adapter::net::behavior::fold::capability_bridge;
@@ -4906,11 +4918,22 @@ impl MeshNode {
         let mut out: Vec<PublicOwnedProvider> =
             capability_bridge::public_owned_providers(self.capability_fold(), &tag)
                 .into_iter()
-                .filter_map(|(node_id, owner_org)| {
-                    let provider = self.peer_entity_id(node_id)?;
+                .filter_map(|publisher| {
+                    let pinned = self.peer_entity_id(publisher.node_id)?;
+                    // Fail closed on a pin that names a different entity
+                    // than the one whose owner cert was verified. Not a
+                    // liveness check — an identity check.
+                    if pinned != publisher.member {
+                        tracing::debug!(
+                            node_id = format!("{:#x}", publisher.node_id),
+                            "dropping exported candidate: the live session pin names a \
+                             different entity than the verified ownership projection"
+                        );
+                        return None;
+                    }
                     Some(PublicOwnedProvider {
-                        provider,
-                        owner_org,
+                        provider: pinned,
+                        owner_org: publisher.owner_org,
                     })
                 })
                 .collect();

@@ -41203,3 +41203,103 @@ mod protected_forward_allocation_pins {
         );
     }
 }
+
+#[cfg(all(test, feature = "cortex"))]
+mod exported_discovery_pin_coherence_tests {
+    //! `public_owned_service_providers` must require the live session
+    //! pin to name the EXACT entity whose ownership projection it
+    //! sampled (review-10 P1-1).
+    //!
+    //! A `NodeId` is the low 8 bytes of an entity id, so it routes but
+    //! does not identify. The fold query and the pin map are separate
+    //! structures updated by separate operations: peer death clears the
+    //! pin and the fold record independently, and a fresh direct
+    //! announcement installs its pin BEFORE applying its fold record.
+    //! Resolving `NodeId -> EntityId` through the pin after sampling the
+    //! projection could therefore pair entity A's verified owner org
+    //! with entity B, and the caller would disclose its request-bound
+    //! signed organization proof and capability grant to B — which never
+    //! published the sampled owned capability.
+    //!
+    //! Both tests fail if the seam goes back to trusting the resolved
+    //! pin instead of comparing it.
+    use super::*;
+    use crate::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+    use crate::adapter::net::behavior::org::{OrgKeypair, OrgMembershipCert};
+
+    const SERVICE: &str = "fleet.telemetry";
+
+    async fn observer() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        Arc::new(
+            MeshNode::new(
+                EntityKeypair::generate(),
+                MeshNodeConfig::new(addr, [0x5Au8; 32]),
+            )
+            .await
+            .expect("MeshNode::new"),
+        )
+    }
+
+    /// A signature-verified announcement carrying `org`'s membership
+    /// cert for `kp` — the shape that projects a verified owner.
+    fn owned_ann(kp: &EntityKeypair, org: &OrgKeypair) -> CapabilityAnnouncement {
+        let cert = OrgMembershipCert::try_issue(org, kp.entity_id().clone(), 1, 3600)
+            .expect("issue membership cert");
+        let caps = CapabilitySet::new().add_tag(format!("nrpc:{SERVICE}"));
+        let mut ann = CapabilityAnnouncement::new(kp.node_id(), kp.entity_id().clone(), 1, caps)
+            .with_ttl(300)
+            .with_owner_cert(Some(cert));
+        ann.sign(kp);
+        ann
+    }
+
+    /// The load-bearing inverse: entity A's owned projection is live,
+    /// but the pin for A's node id names a DIFFERENT entity B. The
+    /// candidate must be dropped, not returned as `(B, owner_of(A))`.
+    #[tokio::test]
+    async fn a_pin_naming_a_different_entity_yields_no_candidate() {
+        let node = observer().await;
+        let org = OrgKeypair::generate();
+        let entity_a = EntityKeypair::generate();
+        let entity_b = EntityKeypair::generate();
+        let node_id = entity_a.node_id();
+
+        node.test_inject_capability_announcement(owned_ann(&entity_a, &org));
+
+        // Coherent: the pin names the entity that published.
+        node.peer_entity_ids
+            .insert(node_id, entity_a.entity_id().clone());
+        let found = node.public_owned_service_providers(SERVICE);
+        assert_eq!(found.len(), 1, "the coherent pairing is a candidate");
+        assert_eq!(&found[0].provider, entity_a.entity_id());
+        assert_eq!(found[0].owner_org, org.org_id());
+
+        // Torn: the same node id now pins a DIFFERENT entity, exactly as
+        // a colliding direct announcement would leave it. The fold still
+        // holds A's verified projection.
+        node.peer_entity_ids
+            .insert(node_id, entity_b.entity_id().clone());
+        assert!(
+            node.public_owned_service_providers(SERVICE).is_empty(),
+            "a pin naming a different entity must drop the candidate, never pair \
+             entity B with entity A's verified owner org",
+        );
+    }
+
+    /// A candidate with no pin at all stays excluded — the check added
+    /// for P1-1 is an identity comparison layered ON the existing
+    /// liveness requirement, not a replacement for it.
+    #[tokio::test]
+    async fn an_unpinned_candidate_yields_no_candidate() {
+        let node = observer().await;
+        let org = OrgKeypair::generate();
+        let entity_a = EntityKeypair::generate();
+
+        node.test_inject_capability_announcement(owned_ann(&entity_a, &org));
+        assert!(
+            node.public_owned_service_providers(SERVICE).is_empty(),
+            "no live pin means no entity-layer identity to authorize against",
+        );
+    }
+}
