@@ -56,6 +56,45 @@ import type {
 } from './index'
 import { classifyError, classifySubnetError } from './errors'
 
+// ---------------------------------------------------------------------------
+// Availability — fail LOUD, at import, on a feature-off build (review-10 P2-3)
+// ---------------------------------------------------------------------------
+
+// Refuse AT IMPORT rather than on first provider/admin call. This module
+// used to capture missing natives as `undefined` and hand back a facade
+// that LOOKED available, so a feature-off build failed late with
+// `undefined is not a function` — at the first serve, in production,
+// with nothing naming the real cause. The plan's contract is fail-loud;
+// an import-time throw is the earliest point this package can honour it,
+// because a Node `exports` map cannot be conditional on a Rust feature.
+//
+// The construction half is already refused in Rust: `NetMesh.create`
+// with any subnet option on a non-`org` build returns a loud error
+// before the node exists.
+//
+// To PROBE without triggering this, check the root entry, which never
+// throws:
+//
+// ```ts
+// const core = await import('@net-mesh/core')
+// if (typeof core.serveSubnetExported === 'function') {
+//   const subnet = await import('@net-mesh/core/subnet')
+// }
+// ```
+if (
+  typeof nativeServeSubnetExported !== 'function' ||
+  typeof nativeInstallGatewayCredentials !== 'function' ||
+  typeof nativeDeclareBoundaries !== 'function' ||
+  typeof nativeApplyControlFact !== 'function'
+) {
+  throw new Error(
+    '@net-mesh/core/subnet requires an `org`-feature build of @net-mesh/core — ' +
+      'the native subnet authority symbols are absent from this build. Rebuild ' +
+      'with the `org` feature, or probe `@net-mesh/core` for `serveSubnetExported` ' +
+      'before importing this entry.',
+  )
+}
+
 export { classifySubnetError }
 export { SubnetProvisionError } from './errors'
 export type {

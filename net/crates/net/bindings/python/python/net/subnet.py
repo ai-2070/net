@@ -29,6 +29,35 @@ from typing import Any, Callable, Optional
 
 _ERR_SUBNET_PREFIX = "subnet:"
 
+# --------------------------------------------------------------------------
+# Availability — fail LOUD, at import, on a feature-off build (review-10 P2-3)
+# --------------------------------------------------------------------------
+#
+# Every provider/admin call below used to import its native symbol lazily,
+# inside the function. On a build without the `org` feature those symbols do
+# not exist, so the facade IMPORTED cleanly and failed on first use with a bare
+# ImportError deep in a call — in production, with nothing naming the real
+# cause. The plan's contract is fail-loud, so refuse here instead.
+#
+# The construction half is already refused in Rust: `NetMesh(...)` with any
+# subnet kwarg on a non-`org` build raises before the node exists.
+#
+# To PROBE without triggering this, check the `net` package, which never
+# raises:
+#
+#     import net
+#     if hasattr(net, "serve_subnet_exported"):
+#         from net import subnet
+try:
+    from ._net import serve_subnet_exported as _probe_native  # noqa: F401
+except ImportError as _exc:  # pragma: no cover - feature-off builds only
+    raise ImportError(
+        "net.subnet requires an `org`-feature build of the net extension — the "
+        "native subnet authority symbols are absent from this build. Rebuild with "
+        "the `org` feature, or probe `hasattr(net, 'serve_subnet_exported')` "
+        "before importing this module."
+    ) from _exc
+
 
 #: Characters that terminate a kind token: the envelope's own separator, or
 #: any whitespace when the envelope carries no detail clause.

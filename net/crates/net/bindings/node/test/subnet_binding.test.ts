@@ -9,21 +9,24 @@ const binding: any = await import('../index')
 const { NetMesh, installSubnetGatewayCredentials, applySubnetControlFact, serveSubnetExported } =
   binding
 
-// Import BOTH from `../subnet` so the class identity matches the one the
-// `admin` wrappers throw through — a mixed `../subnet` + `../errors`
-// import trips the compiled-.js-vs-source-.ts dual-module `instanceof`
-// hazard even though the thrown value IS a SubnetProvisionError.
-import {
-  admin,
-  classifySubnetError,
-  serveSubnetExportedTyped,
-  SubnetProvisionError,
-} from '../subnet'
-
+// Probe the ROOT entry, which never throws, before touching `../subnet`
+// — that entry now refuses AT IMPORT on a feature-off build (review-10
+// P2-3), so a static import here would fail the whole file instead of
+// skipping it.
 const HAS_SUBNET =
   typeof installSubnetGatewayCredentials === 'function' &&
   typeof applySubnetControlFact === 'function' &&
   typeof serveSubnetExported === 'function'
+
+// Import everything from `../subnet` so the class identity matches the
+// one the `admin` wrappers throw through — a mixed `../subnet` +
+// `../errors` import trips the compiled-.js-vs-source-.ts dual-module
+// `instanceof` hazard even though the thrown value IS a
+// SubnetProvisionError.
+//
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const subnetMod: any = HAS_SUBNET ? await import('../subnet') : {}
+const { admin, classifySubnetError, serveSubnetExportedTyped, SubnetProvisionError } = subnetMod
 
 const PSK = '42'.repeat(32)
 const AUTHORITY = 'd7'.repeat(32)
