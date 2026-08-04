@@ -27236,14 +27236,35 @@ impl MeshNode {
             None
         };
         let export_targets = export_targets.as_deref();
+        // PERF_AUDIT_2026_08_04_SUBNET_PATHS §1 — `subnet_visible`
+        // answers `Visibility::Global => true` before it reads `dest`
+        // at all, and `Global` is `default_visibility`. Probing
+        // `peer_subnets` per subscriber to feed an argument the verdict
+        // never consults cost one DashMap hash, one shard lock, and a
+        // `Ref` construct/drop per subscriber per publish — 1 000 of
+        // them on a 1 000-subscriber channel, all discarded. Resolve
+        // the constant verdict once, beside the `visibility` /
+        // `channel_hash` / `export_targets` hoists already here.
+        //
+        // Deliberately narrow: only the `Global` arm is
+        // subscriber-independent by inspection of `subnet_visible`
+        // itself. The audit's second-order form (the map is provably
+        // empty with no policy installed, so EVERY mode is hoistable)
+        // is not taken — that invariant is a production one, not a
+        // type-level one, and two in-crate tests write `peer_subnets`
+        // directly with no policy installed.
+        let subnet_verdict_is_constant = matches!(visibility, Visibility::Global);
         subscribers.retain(|peer_id| {
             // (1) Subnet visibility. Cheap check first — a peer in
             // the wrong subnet should short-circuit before any
             // auth-cache probing.
             // `None` = subnet not derived; see `subnet_visible`.
-            let peer_subnet = self.peer_subnets.get(peer_id).map(|e| *e.value());
-            let visible =
-                Self::subnet_visible(self.local_subnet, peer_subnet, visibility, export_targets);
+            let visible = if subnet_verdict_is_constant {
+                true
+            } else {
+                let peer_subnet = self.peer_subnets.get(peer_id).map(|e| *e.value());
+                Self::subnet_visible(self.local_subnet, peer_subnet, visibility, export_targets)
+            };
             if let Some(gw) = self.subnet_gateway.as_ref() {
                 if visible {
                     gw.record_forward();
@@ -40262,6 +40283,58 @@ mod subnet_visible_unknown_tests {
              subnet-scoped node; coercing it to GLOBAL made every unresolved \
              peer a universal ancestor"
         );
+    }
+
+    /// PERF_AUDIT_2026_08_04_SUBNET_PATHS §1 — the publish fan-out
+    /// hoists the `Visibility::Global` verdict out of its per-subscriber
+    /// `retain`, skipping the `peer_subnets` probe entirely in that arm.
+    ///
+    /// That is only sound if `Global` really is independent of every
+    /// other argument. Pinned exhaustively over the inputs the fan-out
+    /// can present: an unresolved peer, a peer in our subnet, a peer
+    /// elsewhere, a deeper peer, with and without export targets, from a
+    /// scoped and an unscoped source. The hoist becomes wrong the moment
+    /// one of these answers `false`.
+    #[test]
+    fn global_visibility_is_independent_of_every_other_argument() {
+        let dests = [
+            None,
+            Some(SubnetId::GLOBAL),
+            Some(SubnetId::new(&[3, 7])),
+            Some(SubnetId::new(&[9])),
+            Some(SubnetId::new(&[3, 7, 1, 2])),
+        ];
+        let targets: [Option<&[SubnetId]>; 3] = [
+            None,
+            Some(&[]),
+            Some(&[SubnetId::new(&[9]), SubnetId::new(&[3, 7])]),
+        ];
+        for source in [SubnetId::GLOBAL, SCOPED(), SubnetId::new(&[9, 9, 9])] {
+            for dest in dests {
+                for export_targets in targets {
+                    assert!(
+                        MeshNode::subnet_visible(source, dest, Visibility::Global, export_targets),
+                        "Global must be unconditionally visible — the publish fan-out \
+                         skips the peer_subnets probe on the strength of it \
+                         (source={source:?} dest={dest:?} targets={export_targets:?})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The companion negative: no OTHER visibility mode is
+    /// unconditionally true, so the hoist must stay narrow to `Global`.
+    /// If a future mode became constant it would need its own witness
+    /// here before joining the fast arm.
+    #[test]
+    fn no_other_visibility_mode_is_unconditionally_visible() {
+        for visibility in [Visibility::SubnetLocal, Visibility::ParentVisible] {
+            assert!(
+                !MeshNode::subnet_visible(SCOPED(), None, visibility, None),
+                "{visibility:?} depends on the peer subnet and must keep probing",
+            );
+        }
     }
 
     /// The same coercion on the strict arm was already fail-closed;

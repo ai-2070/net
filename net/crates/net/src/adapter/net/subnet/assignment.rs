@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use super::error::SubnetError;
 use super::id::SubnetId;
 use crate::adapter::net::behavior::capability::CapabilitySet;
+use crate::adapter::net::behavior::tag::Tag;
 
 /// Policy for assigning nodes to subnets based on capability tags.
 ///
@@ -168,13 +169,24 @@ impl SubnetPolicy {
     /// Evaluates all rules against the node's tags. Unmatched levels
     /// remain zero (meaning "no restriction at that level").
     pub fn assign(&self, caps: &CapabilitySet) -> SubnetId {
-        // Phase A.5.N.2: caps.tags is HashSet<Tag>; render each tag to
-        // its wire-form string. Order is unspecified and deliberately
-        // left that way — `assign_from_rendered_tags` resolves each rule
-        // to the lexicographically smallest matching tag, so the verdict
-        // does not depend on it.
-        let tag_strings: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
-        self.assign_from_rendered_tags(&tag_strings)
+        // Phase A.5.N.2: caps.tags is HashSet<Tag>; view each tag in its
+        // wire form. Order is unspecified and deliberately left that way
+        // — the rule evaluation below resolves each rule to the
+        // lexicographically smallest matching tag, so the verdict does
+        // not depend on it.
+        //
+        // PERF_AUDIT_2026_08_04_SUBNET_PATHS §2 — `Cow`, not `String`.
+        // This runs for every signature-verified direct announcement
+        // (`mesh.rs`, announcement ingest), and `Tag::Legacy` — the
+        // variant operator `region:` / `fleet:` rules actually key on —
+        // already holds its wire form contiguously, so `to_string()`
+        // was a pure copy per tag. Only the variants whose wire form is
+        // split across fields still allocate. Rule evaluation revisits
+        // the whole set once per rule and retains the winner by
+        // reference, so a single reused scratch buffer could not
+        // represent it; the borrowed view is the shape that works.
+        let tags: Vec<std::borrow::Cow<'_, str>> = caps.tags.iter().map(Tag::as_wire).collect();
+        self.assign_from_tag_strs(&tags)
     }
 
     /// [`Self::assign`] against tags that are ALREADY in canonical
@@ -218,6 +230,17 @@ impl SubnetPolicy {
     /// same-level rules are later-rule-wins — and is what makes
     /// [`Self::can_assign_non_global`] exact rather than approximate.
     pub fn assign_from_rendered_tags(&self, tags: &[String]) -> SubnetId {
+        self.assign_from_tag_strs(tags)
+    }
+
+    /// The ONE rule-evaluation body, generic over the string view so
+    /// both entry points reach it without a second copy of the logic:
+    /// the fold path holds `&[String]`, and [`Self::assign`] holds
+    /// `&[Cow<'_, str>]` (PERF_AUDIT_2026_08_04_SUBNET_PATHS §2).
+    ///
+    /// Allocation-free — it borrows the winner out of `tags` and writes
+    /// only into a `[u8; 4]`.
+    fn assign_from_tag_strs<S: AsRef<str>>(&self, tags: &[S]) -> SubnetId {
         let mut levels = [0u8; 4];
 
         for rule in &self.rules {
@@ -225,7 +248,7 @@ impl SubnetPolicy {
             // maps to. Mirrors `assign`'s post-sort `break`.
             let mut winner: Option<(&str, u8)> = None;
             for tag in tags {
-                let tag = tag.as_str();
+                let tag = tag.as_ref();
                 // An empty tag is not a tag. `Tag::parse` rejects `""`
                 // and no `Tag` renders to it, but this function takes
                 // raw strings from `CapabilityMembership::tags`, which
