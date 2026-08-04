@@ -21,6 +21,13 @@ path = "src/main.rs"
 keychain = ["net-mesh-mcp/keychain"]
 
 [dependencies]
+# The low-level core crate, for the OFFLINE subnet issuance verbs (SSDK
+# S3): SubnetGrant/SubnetIssuerGrant/floor/fact `try_issue` are deliberately
+# NOT re-exported by the ergonomic SDK — the CLI is the intended issuer.
+# Feature set stays inside what `net-sdk` below already unifies.
+net = { package = "net-mesh", version = "0.34.0", path = "..", default-features = false, features = [
+    "net",
+] }
 net-sdk = { package = "net-mesh-sdk", version = "0.34.0", path = "../sdk", default-features = false, features = [
     "net",
     "nat-traversal",

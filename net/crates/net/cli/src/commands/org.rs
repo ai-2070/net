@@ -932,7 +932,7 @@ fn normalize_for_alias(p: &Path) -> PathBuf {
 /// Refuse aliased input/output paths (Kyra OA2-F): the org key must not be
 /// overwritten, and two output artifacts must not collide (which would leave a
 /// grant without its secret, or the reverse).
-fn refuse_aliased_paths(paths: &[(&str, &Path)]) -> Result<(), CliError> {
+pub(crate) fn refuse_aliased_paths(paths: &[(&str, &Path)]) -> Result<(), CliError> {
     for i in 0..paths.len() {
         for j in (i + 1)..paths.len() {
             if normalize_for_alias(paths[i].1) == normalize_for_alias(paths[j].1) {
@@ -966,7 +966,11 @@ fn stage_nonce() -> String {
 /// Windows the file inherits the parent directory's DACL). The temp is
 /// hard-linked onto the final path at publish, so a pre-existing leaf (incl. a
 /// symlink) is never followed or truncated. Returns the temp path.
-async fn stage_beside(final_path: &Path, bytes: &[u8], secret: bool) -> Result<PathBuf, CliError> {
+pub(crate) async fn stage_beside(
+    final_path: &Path,
+    bytes: &[u8],
+    secret: bool,
+) -> Result<PathBuf, CliError> {
     if let Some(parent) = final_path.parent() {
         if !parent.as_os_str().is_empty() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -1035,7 +1039,7 @@ async fn stage_beside(final_path: &Path, bytes: &[u8], secret: bool) -> Result<P
 /// temp after a SUCCESSFUL publish is surfaced LOUDLY (a lingering `*.stage.*`
 /// may be an extra name for a secret payload) — never silently ignored (Kyra
 /// OA2-F).
-async fn publish_staged(tmp: &Path, final_path: &Path) -> Result<(), CliError> {
+pub(crate) async fn publish_staged(tmp: &Path, final_path: &Path) -> Result<(), CliError> {
     let tmp_owned = tmp.to_path_buf();
     let final_owned = final_path.to_path_buf();
     let link = tokio::task::spawn_blocking(move || std::fs::hard_link(&tmp_owned, &final_owned))
@@ -1088,7 +1092,7 @@ async fn remove_file_or_warn(path: &Path, what: &str) {
 /// ACL engine — the custom `--audience-out` parent is operator-asserted trusted
 /// (Kyra OA2-F).
 #[cfg(not(unix))]
-fn warn_secret_permissions(path: &Path, accepted: bool) {
+pub(crate) fn warn_secret_permissions(path: &Path, accepted: bool) {
     if !accepted {
         eprintln!(
             "warning: the 0600 audience-secret mode is not enforced on Windows; {} inherits its \
@@ -1100,7 +1104,7 @@ fn warn_secret_permissions(path: &Path, accepted: bool) {
 }
 
 #[cfg(unix)]
-fn warn_secret_permissions(_path: &Path, _accepted: bool) {}
+pub(crate) fn warn_secret_permissions(_path: &Path, _accepted: bool) {}
 
 /// `fsync` the parent directory so a link/rename is durable (Unix; best-effort
 /// no-op where the platform doesn't support directory fsync).
@@ -1126,7 +1130,7 @@ async fn sync_parent_dir(path: &Path) {
 /// Pre-check for a nicer error than the race-free `create_new`/`hard_link`
 /// enforcement in [`stage_beside`] / [`publish_staged`] produces. This is UX,
 /// NOT the safety boundary — the publish path fails closed on its own.
-async fn refuse_existing(path: &Path, force: bool) -> Result<(), CliError> {
+pub(crate) async fn refuse_existing(path: &Path, force: bool) -> Result<(), CliError> {
     if force {
         return Ok(());
     }
@@ -1204,6 +1208,11 @@ pub(crate) enum SeedArtifact {
     OrgKey,
     /// An operator identity file (`seed_hex`, no `org_id_hex`).
     Identity,
+    /// A subnet authority key file (`seed_hex` + the explicit
+    /// `kind = "subnet-authority-key"` marker, SSDK S3). Signs subnet
+    /// grants, issuer grants, floors, and control facts; unrecoverable
+    /// if destroyed.
+    SubnetKey,
 }
 
 impl SeedArtifact {
@@ -1212,6 +1221,7 @@ impl SeedArtifact {
             SeedArtifact::None => "no seed material",
             SeedArtifact::OrgKey => "org root key material",
             SeedArtifact::Identity => "operator identity key material",
+            SeedArtifact::SubnetKey => "subnet authority key material",
         }
     }
 }
@@ -1236,10 +1246,19 @@ pub(crate) async fn classify_seed_artifact(path: &Path) -> SeedArtifact {
         .as_ref()
         .and_then(|v| v.get("org_id_hex"))
         .is_some_and(|v| v.is_str());
+    // The subnet key marks its kind EXPLICITLY rather than being inferred
+    // from field shape, so it can never be confused with an operator
+    // identity (both carry a bare seed).
+    let is_subnet_key = parsed
+        .as_ref()
+        .and_then(|v| v.get("kind"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| k == "subnet-authority-key");
     zeroize_string(&mut text);
-    match (has_seed, has_org_id) {
-        (true, true) => SeedArtifact::OrgKey,
-        (true, false) => SeedArtifact::Identity,
+    match (has_seed, has_org_id, is_subnet_key) {
+        (true, true, _) => SeedArtifact::OrgKey,
+        (true, false, true) => SeedArtifact::SubnetKey,
+        (true, false, false) => SeedArtifact::Identity,
         _ => SeedArtifact::None,
     }
 }
@@ -1284,7 +1303,7 @@ pub(crate) async fn refuse_replacing_foreign_seed(
 /// inode, never nothing) and it replaces a leaf symlink rather than writing
 /// through it. The rename consumes the temp, so there is no post-publish
 /// cleanup to leak.
-async fn publish_staged_replace(tmp: &Path, final_path: &Path) -> Result<(), CliError> {
+pub(crate) async fn publish_staged_replace(tmp: &Path, final_path: &Path) -> Result<(), CliError> {
     let tmp_owned = tmp.to_path_buf();
     let final_owned = final_path.to_path_buf();
     let renamed = tokio::task::spawn_blocking(move || std::fs::rename(&tmp_owned, &final_owned))
