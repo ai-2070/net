@@ -50,14 +50,21 @@
 //! | 16 | a topology-epoch change invalidates old contexts | `topology_epoch_invalidates_old_contexts_before_forwarding` |
 //! | 17 | a hostile control publisher is inert | `hostile_control_publisher_is_inert_in_the_full_topology` |
 //! | 18 | production relay allocation | **NOT in this file** — `subnet_relay_alloc_e2e` |
-//! | 19 | forged locator fields select no authority | `forged_locator_fields_select_no_authority` |
+//! | 19 | forged locator fields select no authority | `forged_locator_fields_select_no_authority`, `a_forged_inner_subnet_id_and_topology_claim_select_no_authority` |
 //! | 20 | two gateways re-authenticate and re-tag every hop | `a_two_gateway_route_reauthenticates_every_hop`, `removing_the_second_gateways_exact_right_stops_the_hop` |
 //!
 //! The D7 seam's own failure modes (registration shape, live darkness
 //! on every authority movement, epoch pinning, recovery, coherent
 //! publication) are pinned by the focused inverses alongside them.
 
-#![cfg(all(feature = "net", feature = "cortex"))]
+// `fixtures` is load-bearing, not optional: the harness drives paced
+// publication, peer-address injection and admission internals that only
+// exist behind it. Without the gate this binary does not merely run
+// fewer tests under `--features "net cortex"` — it fails to compile
+// (E0599 on every fixture-only call site). CI already invokes it with
+// `fixtures` and `--no-tests=fail`, so gating honestly costs no
+// evidence.
+#![cfg(all(feature = "net", feature = "cortex", feature = "fixtures"))]
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -73,6 +80,12 @@ use net::adapter::net::behavior::org_grant::{
     CapabilityAuthorityId, DispatcherScope, GrantRights, GrantTargetScope, OrgCapabilityGrant,
     OrgDispatcherGrant,
 };
+// The 16-byte capability-tag `SubnetId` — the canonical
+// `subnet:<hex32>` self-declaration form — under an alias, because the
+// HIERARCHICAL `SubnetId` (`net::adapter::net::SubnetId`, what
+// `MeshNode::peer_subnet` and `SubnetPolicy::assign` speak) is a
+// different type with the same name.
+use net::adapter::net::behavior::subnet::{SubnetId as SubnetClaimTag, SUBNET_TAG_PREFIX};
 use net::adapter::net::cortex::{
     RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
 };
@@ -89,7 +102,8 @@ use net::adapter::net::subnet::{
 use net::adapter::net::{
     ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, EntityKeypair,
     MeshNode, MeshNodeConfig, NetHeader, OnFailure, PacketFlags, PermissionToken, PublishConfig,
-    Reliability, RoutingHeader, SocketBufferConfig, TokenCache, TokenScope, NONCE_SIZE,
+    Reliability, RoutingHeader, SocketBufferConfig, SubnetId, SubnetPolicy, SubnetRule, TokenCache,
+    TokenScope, NONCE_SIZE,
 };
 use tokio::net::UdpSocket;
 
@@ -241,9 +255,26 @@ async fn wait_until<F: Fn() -> bool>(limit: Duration, cond: F) -> bool {
 
 /// An owned scratch directory, removed on drop (§9) — so an
 /// assertion panic anywhere in a test cannot leave an authority store
-/// behind. The startup `remove_dir_all` stays as crash-residue
-/// cleanup.
+/// behind.
+///
+/// Ownership starts BEFORE the first filesystem operation, via
+/// [`ScratchDir::fresh`]. Constructing the guard after
+/// `NodeAuthority::adopt` would leave the path unowned across exactly
+/// the window where adoption creates the directory and then fails, or
+/// where installation panics — the cases the guard exists for.
+/// `fresh` also carries the startup `remove_dir_all`, which is
+/// crash-residue cleanup: paths are keyed by PID, and a PID reused
+/// after a process abort would otherwise adopt against a stale store.
 struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    /// Take ownership of `path` and clear any residue left by an
+    /// aborted earlier run. No filesystem call precedes this.
+    fn fresh(path: std::path::PathBuf) -> Self {
+        let _ = std::fs::remove_dir_all(&path);
+        Self(path)
+    }
+}
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
@@ -270,13 +301,18 @@ fn install_bmw_authority(server: &Arc<MeshNode>, tag: &str) -> ScratchDir {
     let node_entity = server.entity_id().clone();
     let node_cert =
         OrgMembershipCert::try_issue(&bmw(), node_entity.clone(), 1, 3600).expect("node cert");
-    let dir = std::env::temp_dir().join(format!("net-subnet-e2e-{tag}-{}", std::process::id()));
+    // The guard exists before adoption touches the filesystem, so a
+    // failed `adopt` or a panicking `install_node_authority` still
+    // hands cleanup to `Drop`.
+    let dir = ScratchDir::fresh(
+        std::env::temp_dir().join(format!("net-subnet-e2e-{tag}-{}", std::process::id())),
+    );
     let authority =
         NodeAuthority::adopt(&dir, node_cert, &node_entity, 0, None).expect("adopt authority");
     server
         .install_node_authority(Arc::new(authority))
         .expect("install authority");
-    ScratchDir(dir)
+    dir
 }
 
 /// A Vehicle B subnet grant signed by Vehicle B's OWN subnet root,
@@ -1169,6 +1205,25 @@ fn gateway_compiler_accepts_delegated_descendant_export_but_not_attach() {
         compile(&vb_grant(&vb_kp, CAMERA, SubnetRights::ATTACH)).err(),
         Some(SubnetAuthError::ScopeNotAncestor),
         "an ATTACH-bearing credential must still contain the attachment",
+    );
+
+    // The MIXED row, and the reason the split above is not merely a
+    // stylistic preference: `ATTACH | EXPORT` at the SAME descendant
+    // boundary the EXPORT-only credential legitimately names is
+    // rejected. Any credential carrying ATTACH is a placement claim
+    // and takes placement containment, whatever else it carries —
+    // otherwise a vehicle-attached gateway could assert it belongs at
+    // WORLD_MODEL by bundling the two rights into one grant.
+    assert_eq!(
+        compile(&vb_grant(
+            &vb_kp,
+            WORLD_MODEL,
+            SubnetRights::ATTACH.union(SubnetRights::EXPORT),
+        ))
+        .err(),
+        Some(SubnetAuthError::ScopeNotAncestor),
+        "ATTACH | EXPORT at [3,7,1] under attachment [3] must be refused \
+         even though EXPORT alone at [3,7,1] compiles",
     );
 }
 
@@ -3011,12 +3066,28 @@ struct TwoGatewayFixture {
 }
 
 async fn vb_node(seed: [u8; 32], attachment: &[u8]) -> Arc<MeshNode> {
+    vb_node_with_policy(seed, attachment, None).await
+}
+
+/// [`vb_node`] plus an optional ROUTING-side [`SubnetPolicy`] — the
+/// ordinary operator configuration under which a peer's
+/// signature-verified direct announcement derives that peer's
+/// hierarchical subnet into `peer_subnets`. That map is routing
+/// state (`subnet_visible` fan-out); it anchors no authority, which is
+/// exactly what the row-19 witness has to demonstrate rather than
+/// assume.
+async fn vb_node_with_policy(
+    seed: [u8; 32],
+    attachment: &[u8],
+    subnet_policy: Option<Arc<SubnetPolicy>>,
+) -> Arc<MeshNode> {
     let mut cfg = base_config().with_subnet_authority(SubnetAuthorityConfig {
         authority: vb_subnet_root().entity_id().clone(),
         roots: vec![vb_subnet_root().entity_id().clone()],
         maximum_grant_lifetime_secs: 7 * DAY,
     });
     cfg.subnet_attachment = Some(TopologySubnetId::new(attachment));
+    cfg.subnet_policy = subnet_policy;
     Arc::new(
         MeshNode::new(EntityKeypair::from_bytes(seed), cfg)
             .await
@@ -3025,6 +3096,13 @@ async fn vb_node(seed: [u8; 32], attachment: &[u8]) -> Arc<MeshNode> {
 }
 
 async fn two_gateway_fixture(gw2_rights: SubnetRights) -> TwoGatewayFixture {
+    two_gateway_fixture_with_gw1_policy(gw2_rights, None).await
+}
+
+async fn two_gateway_fixture_with_gw1_policy(
+    gw2_rights: SubnetRights,
+    gw1_policy: Option<Arc<SubnetPolicy>>,
+) -> TwoGatewayFixture {
     let (s_kp, g1_kp, g2_kp, d_kp) = (
         EntityKeypair::from_bytes([0xD1; 32]),
         EntityKeypair::from_bytes([0xD2; 32]),
@@ -3032,7 +3110,7 @@ async fn two_gateway_fixture(gw2_rights: SubnetRights) -> TwoGatewayFixture {
         EntityKeypair::from_bytes([0xD4; 32]),
     );
     let source = vb_node([0xD1; 32], CAMERA).await;
-    let gw1 = vb_node([0xD2; 32], VEHICLE).await;
+    let gw1 = vb_node_with_policy([0xD2; 32], VEHICLE, gw1_policy).await;
     let gw2 = vb_node([0xD3; 32], VEHICLE).await;
     let dest = vb_node([0xD4; 32], WORLD_MODEL).await;
     let outsider = vb_node([0xD9; 32], CAMERA).await;
@@ -3274,44 +3352,93 @@ async fn forged_locator_fields_select_no_authority() {
     );
 }
 
+/// The outsider's self-declared subnet, in the ONLY form production
+/// recognizes: a canonical `subnet:<hex32>` capability tag
+/// (`behavior/subnet.rs`). An arbitrary tag like `vehicle:b` is not a
+/// subnet claim at all and can populate nothing.
+const HOSTILE_CLAIM: [u8; 16] = [0xC1; 16];
+/// The hierarchy level gw1's routing policy resolves that claim to.
+/// Non-zero, so `peer_subnets` records something distinguishable from
+/// [`SubnetId::GLOBAL`] — i.e. so the observation below can fail.
+const HOSTILE_CLAIM_LEVEL: u8 = 7;
+
+/// gw1's routing-side policy: it HONOURS the outsider's canonical
+/// self-declared `subnet:` tag, mapping that exact value to a real
+/// hierarchy level.
+///
+/// Deliberately the most permissive ordinary configuration there is.
+/// A policy that ignored the claim would make the witness vacuous —
+/// the point is that a self-declaration which production DOES honour,
+/// as far as routing state can honour anything, still buys zero
+/// ingress authority.
+fn hostile_claim_policy() -> Arc<SubnetPolicy> {
+    let tag = SubnetClaimTag::from_bytes(HOSTILE_CLAIM).to_tag();
+    let value = tag
+        .strip_prefix(SUBNET_TAG_PREFIX)
+        .expect("to_tag renders the canonical prefix")
+        .to_string();
+    Arc::new(
+        SubnetPolicy::new()
+            .add_rule(SubnetRule::new(SUBNET_TAG_PREFIX, 0).map(value, HOSTILE_CLAIM_LEVEL)),
+    )
+}
+
 /// Evidence 19, the remaining two named selectors: a forged
 /// `NetHeader.subnet_id` carried INSIDE the protected envelope, and a
-/// hostile topology / `peer_subnets` claim published through the REAL
-/// signed announcement path.
+/// hostile topology claim that really does reach `peer_subnets`
+/// through the REAL signed announcement path.
 ///
 /// Neither supplies the admitted ingress context the relay actually
 /// requires: the inner header is AAD-covered payload the relay never
-/// consults for authority, and a peer's announced topology is routing
-/// state, not authenticated membership. The outsider's packet is
-/// refused; the admitted source's byte-identical packet is forwarded.
+/// consults for authority, and a derived `peer_subnets` entry is
+/// routing state, not authenticated membership. The outsider's packet
+/// is refused; the admitted source's byte-identical packet is
+/// forwarded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_forged_inner_subnet_id_and_topology_claim_select_no_authority() {
-    let f = two_gateway_fixture(SubnetRights::ROUTE).await;
+    // gw1 runs the honouring policy; nothing else in the fixture does.
+    let f = two_gateway_fixture_with_gw1_policy(SubnetRights::ROUTE, Some(hostile_claim_policy()))
+        .await;
     let dest_id = f.dest.node_id();
     let outsider = f.outsider.clone();
 
-    // The outsider publishes vehicle topology tags through the
-    // production signed-announcement path.
+    // The outsider never announced during setup, so gw1 has derived
+    // nothing for it. Pinned so the wait below is a real false→true
+    // transition and not a predicate that was already satisfied.
+    assert!(
+        f.gw1.peer_subnet(outsider.node_id()).is_none(),
+        "gw1 must have derived no subnet for the outsider yet",
+    );
+
+    // The outsider publishes the canonical claim through the
+    // production signed-announcement path (`require_signed_capabilities`
+    // is on by default, and this is a direct `hop_count == 0`
+    // announcement — both conditions `peer_subnets` writes require).
     outsider
         .announce_capabilities(
             CapabilitySet::new()
+                .add_tag(SubnetClaimTag::from_bytes(HOSTILE_CLAIM).to_tag())
                 .add_tag("vehicle:b")
                 .add_tag("perception"),
         )
         .await
         .expect("outsider announces");
+    let claimed = SubnetId::new(&[HOSTILE_CLAIM_LEVEL]);
     assert!(
         wait_until(Duration::from_secs(5), || f
             .gw1
-            .peer_entity_id(outsider.node_id())
-            .is_some())
+            .peer_subnet(outsider.node_id())
+            == Some(claimed))
         .await,
-        "the outsider's signed announcement reached gw1",
+        "gw1 must ACTUALLY record the outsider's self-declared subnet in \
+         peer_subnets — asserting against a weaker observation (an entity \
+         pin the handshake already established) would prove nothing about \
+         the claim being powerless downstream",
     );
-    // Whatever routing-side visibility that produced is NOT authority.
+    // …and that routing-state write is NOT authority.
     assert!(
         f.gw1.subnet_context_for(outsider.node_id()).is_none(),
-        "evidence 19: an announced topology / peer_subnets claim installs \
+        "evidence 19: a topology claim that reached peer_subnets installs \
          no admitted ingress context",
     );
 

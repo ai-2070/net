@@ -11842,16 +11842,31 @@ impl MeshNode {
         self.subnet_gateway_authority.load_full()
     }
 
-    /// The declared boundary set, if any. Derived from ONE aggregate
-    /// load; a caller that also needs the credential set must use
-    /// the crate-internal aggregate accessor instead of pairing the two
-    /// convenience accessors — separate loads can tear.
+    /// The declared boundary set, if any — a SINGLE-MEMBER
+    /// observability accessor.
+    ///
+    /// Each call is one coherent load of one member. Two separate
+    /// calls are NOT a coherent pair: a publication landing between
+    /// them yields one member from before and one from after. External
+    /// code must not combine this with
+    /// [`Self::subnet_gateway_contexts`] to make an authority decision
+    /// — use it for diagnostics, logging and assertions about a single
+    /// member only.
+    ///
+    /// Coherent composition of the two is intentionally internal and
+    /// unsupported as public API: the aggregate is a publication
+    /// mechanism, and every production authority decision reads it
+    /// crate-internally. External observation cannot bypass that gate,
+    /// so there is nothing here for a caller to compose correctly.
     pub fn subnet_boundaries(&self) -> Option<Arc<SubnetBoundarySet>> {
         self.subnet_gateway_authority.load().boundaries.clone()
     }
     /// This node's published gateway credential set, or `None` when it
     /// holds none — in which case it forwards no protected traffic.
-    /// Same single-aggregate-load caveat as [`Self::subnet_boundaries`].
+    ///
+    /// Single-member observability accessor, with the same contract as
+    /// [`Self::subnet_boundaries`]: one call is coherent, two calls are
+    /// not a pair, and neither is an authority decision.
     pub fn subnet_gateway_contexts(&self) -> Option<Arc<VerifiedGatewayContextSet>> {
         self.subnet_gateway_authority.load().gateway.clone()
     }

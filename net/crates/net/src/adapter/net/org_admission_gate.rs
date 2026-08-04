@@ -317,6 +317,17 @@ impl SubnetExportFacts {
     /// admission verified: the SAME published authority aggregate
     /// (one load, one pointer compare — coherent by construction),
     /// same topology epoch, same subnet auth epoch.
+    ///
+    /// Expiry is deliberately NOT re-sampled here. Credential
+    /// freshness was evaluated once, in [`verify_subnet_export`],
+    /// against the admission's single paired wall/monotonic
+    /// [`ClockSample`] — the same sample the organization proof,
+    /// provider authority and replay retention all derive from. This
+    /// method is a state-stability recheck, not a second freshness
+    /// evaluation: re-sampling time would open a second time boundary
+    /// between the caller-side and provider-side checks. Elapsed time
+    /// alone, with no publication and no epoch move, is not
+    /// `AuthorityChanged`.
     pub fn is_current(&self, mesh: &MeshNode) -> bool {
         let live = mesh.subnet_gateway_authority();
         Arc::as_ptr(&live) as *const () as usize == self.aggregate_ptr

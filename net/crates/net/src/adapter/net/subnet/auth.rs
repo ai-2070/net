@@ -2013,8 +2013,48 @@ impl VerifiedGatewayContextSet {
 ///
 /// Beyond the ordinary D4/D5 credential checks this requires
 /// `leaf.subject == local_keypair_entity`, so a credential issued to
-/// some other node can never become this node's forwarding authority,
-/// and `local_attachment` to lie inside the leaf scope.
+/// some other node can never become this node's forwarding authority.
+///
+/// # Scope relation to `local_attachment`
+///
+/// **Any credential containing [`SubnetRights::ATTACH`] uses PLACEMENT
+/// containment, regardless of its other rights.** `ATTACH` is a claim
+/// about where this node sits, so the scope must be an ancestor of (or
+/// equal to) `local_attachment`. Adding `ROUTE` or `EXPORT` alongside
+/// it does not relax that: otherwise a descendant-scoped
+/// `ATTACH | EXPORT` would let a vehicle-attached gateway assert it
+/// belongs at `WORLD_MODEL`.
+///
+/// **Delegated forwarding rights that do NOT include `ATTACH`** may
+/// name a scope on either side of the attachment — a gateway forwards
+/// across boundaries below where it sits. The scope must still be
+/// chain-related to `local_attachment` (one an ancestor of the other);
+/// an unrelated branch is always [`SubnetAuthError::ScopeNotAncestor`].
+///
+/// So descendant `ROUTE`/`EXPORT` delegation requires a SEPARATE,
+/// forwarding-only credential:
+///
+/// ```text
+/// attachment: [3]
+/// scope:      [3,7,1]
+/// rights:     ATTACH | EXPORT      → ScopeNotAncestor
+///
+/// attachment: [3]
+/// scope:      [3]
+/// rights:     ATTACH | ROUTE       → compiles
+/// attachment: [3]
+/// scope:      [3,7,1]
+/// rights:     EXPORT               → compiles
+/// ```
+///
+/// The split form is the supported way to hold both; the two
+/// credentials publish together. All three rows are pinned by
+/// `gateway_compiler_accepts_delegated_descendant_export_but_not_attach`
+/// in `tests/subnet_auth_e2e.rs`.
+///
+/// [`SubnetAuthError::ScopeNotAncestor`] is the correct verdict for
+/// the rejected row — the scope genuinely is not an ancestor of the
+/// attachment — so no distinct error variant exists for it.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors verify_credential_set's explicit trusted-input list; a struct would hide \
