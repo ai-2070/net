@@ -36,18 +36,34 @@
  * startup-shaped failure — never a call domain. Remote exported-call
  * refusals surface through the org call domains (net_org.h).
  *
- * # Known gap: subnet TRUST ANCHORS are not configurable from C
+ * # Trust anchors
  *
  * Declaring which authorities a node trusts, its security attachment path,
- * and its control channel is CONFIG-TIME state on the Rust MeshNodeConfig,
- * with no post-construction installer. C (like Go) receives its node from
- * base libnet's constructor, which cannot reach the SDK module that
- * converts those DTOs — so neither binding can declare trust anchors
- * today. Everything in this header works: serving exports, and every
- * runtime administration verb below.
+ * and its control channel is CONFIG-TIME state, supplied in the JSON
+ * `net_mesh_new` already takes:
  *
- * A node acting as a subnet GATEWAY should be constructed from Rust,
- * Node, or Python, which do expose that construction-time config.
+ *   {
+ *     "bind_addr": "127.0.0.1:0",
+ *     "psk_hex": "…",
+ *     "subnet_authorities": [
+ *       { "authority_hex": "…",
+ *         "root_hexes": ["…"],
+ *         "maximum_grant_lifetime_secs": 604800 }
+ *     ],
+ *     "subnet_attachment": [3],
+ *     "subnet_control_channel": "subnet.control"
+ *   }
+ *
+ * Rust converts and validates these through the same frozen DTOs every
+ * other SDK uses, before the node exists: a duplicate authority, an empty
+ * or duplicated root set, a zero lifetime, a path deeper than four levels,
+ * or a malformed hex id all return NET_ERR_MESH_INIT. An absent or empty
+ * authority list means every protected subnet assertion fails closed.
+ *
+ * A standalone C program can therefore stand up a subnet GATEWAY on its
+ * own; it does not need a node handed to it from Rust, Node, or Python.
+ * (Until review-10 P1-7 this was impossible — the conversion lived in
+ * net-mesh-sdk, which base libnet's constructor cannot depend on.)
  *
  * # Handle & ownership model
  *

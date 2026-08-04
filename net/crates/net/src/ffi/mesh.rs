@@ -427,6 +427,31 @@ struct MeshNewConfig {
     subnet: Option<Vec<u32>>,
     /// Optional `{"rules": [{"tag_prefix", "level", "values"}]}` policy.
     subnet_policy: Option<SubnetPolicyJson>,
+    /// Subnet AUTHORITY trust anchors (review-10 P1-7) — the plane that
+    /// decides which authorities this node will accept protected subnet
+    /// assertions from. Distinct from `subnet` / `subnet_policy` above,
+    /// which are unauthenticated routing state.
+    ///
+    /// `[{"authority_hex", "root_hexes": [..], "maximum_grant_lifetime_secs"}]`.
+    /// An empty or absent list means every protected subnet assertion
+    /// fails closed. Duplicate authorities, empty root sets, duplicate
+    /// roots, and zero lifetimes are refused HERE, before the node
+    /// exists.
+    #[serde(default)]
+    subnet_authorities:
+        Option<Vec<crate::adapter::net::subnet::provision::dto::SubnetAuthorityConfigDto>>,
+    /// This node's own SECURITY attachment point — the local topology
+    /// coordinate credentials are checked against, as `[levels]`
+    /// (0–4 entries, each 0–255). Distinct from `subnet`; omitting it
+    /// preserves the core compatibility fallback, which protected
+    /// deployments should not rely on.
+    #[serde(default)]
+    subnet_attachment: Option<Vec<u8>>,
+    /// Treat an ordinary configured channel as a subnet control-fact
+    /// ARRIVAL path. Confers no authority — facts verify by signature
+    /// regardless of how they arrive.
+    #[serde(default)]
+    subnet_control_channel: Option<String>,
     /// Hex-encoded 32-byte ed25519 seed — when present, the mesh
     /// reproduces the same `entity_id` as
     /// `IdentityFromSeed(sameSeed)`. Leave unset to generate a fresh
@@ -559,6 +584,45 @@ pub unsafe extern "C" fn net_mesh_new(
             return NET_ERR_MESH_INIT;
         };
         node_cfg = node_cfg.with_subnet_policy(Arc::new(policy));
+    }
+    // Subnet AUTHORITY plane (review-10 P1-7). Converted and validated
+    // through the SAME frozen DTOs the Rust, Node, and Python
+    // constructors use — that conversion now lives in the core
+    // (`subnet::provision`) precisely so this constructor can reach it,
+    // which is what makes Go and C first-class here rather than
+    // gateway-incapable. Every configuration mistake refuses before the
+    // node exists.
+    {
+        use crate::adapter::net::subnet::provision;
+        let authorities = cfg.subnet_authorities.unwrap_or_default();
+        let mut core_authorities = Vec::with_capacity(authorities.len());
+        for dto in &authorities {
+            let Ok(a) = dto.to_core() else {
+                return NET_ERR_MESH_INIT;
+            };
+            core_authorities.push(a);
+        }
+        if provision::validate_subnet_authorities(&core_authorities).is_err() {
+            return NET_ERR_MESH_INIT;
+        }
+        for authority in core_authorities {
+            node_cfg = node_cfg.with_subnet_authority(authority);
+        }
+        if let Some(levels) = cfg.subnet_attachment {
+            let Ok(path) = (provision::dto::SubnetPathDto { levels }).to_core() else {
+                return NET_ERR_MESH_INIT;
+            };
+            // Direct field write: the core deliberately has no
+            // `with_subnet_attachment` (the `configured_identity`
+            // precedent).
+            node_cfg.subnet_attachment = Some(path);
+        }
+        if let Some(name) = cfg.subnet_control_channel {
+            let Ok(channel) = crate::adapter::net::ChannelName::new(&name) else {
+                return NET_ERR_MESH_INIT;
+            };
+            node_cfg = node_cfg.with_subnet_control_channel(channel);
+        }
     }
     #[cfg(feature = "nat-traversal")]
     if let Some(external_str) = cfg.reflex_override.as_deref() {
@@ -5273,5 +5337,136 @@ mod nat_traversal_stub_tests {
         assert_eq!(result.len(), 2);
         assert_eq!(&result[0][..], b"abc");
         assert_eq!(&result[1][..], b"defg");
+    }
+}
+
+#[cfg(all(test, feature = "net"))]
+mod subnet_authority_config_tests {
+    //! Base `libnet`'s JSON constructor accepts subnet TRUST ANCHORS
+    //! (review-10 P1-7).
+    //!
+    //! Go and C both receive their node from this constructor. Before the
+    //! conversion moved into the core they could not declare an authority,
+    //! a security attachment, or a control channel at all — so their
+    //! advertised provider verb could never produce an authorized
+    //! subnet-exported service, however correct the rest of the binding
+    //! was. These tests pin that the fields parse, that the SAME
+    //! validation every other SDK runs applies here, and that a
+    //! configuration mistake is refused rather than silently dropped.
+
+    use super::*;
+
+    const AUTHORITY: &str = "d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7";
+    const ROOT: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+
+    fn parse(json: &str) -> Result<MeshNewConfig, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    /// The three authority fields deserialize into the core DTOs, and a
+    /// well-formed set converts.
+    #[test]
+    fn trust_anchor_fields_parse_and_convert() {
+        let cfg = parse(&format!(
+            r#"{{"bind_addr":"127.0.0.1:0","psk_hex":"{psk}",
+                 "subnet_authorities":[{{"authority_hex":"{AUTHORITY}",
+                     "root_hexes":["{ROOT}"],"maximum_grant_lifetime_secs":604800}}],
+                 "subnet_attachment":[3,9],
+                 "subnet_control_channel":"subnet.control"}}"#,
+            psk = "42".repeat(32),
+        ))
+        .expect("config parses");
+
+        let authorities = cfg.subnet_authorities.expect("authorities present");
+        assert_eq!(authorities.len(), 1);
+        let core = authorities[0].to_core().expect("converts");
+        assert_eq!(core.maximum_grant_lifetime_secs, 604_800);
+        assert_eq!(core.roots.len(), 1);
+        assert!(
+            crate::adapter::net::subnet::provision::validate_subnet_authorities(&[core]).is_ok(),
+            "a well-formed anchor must validate",
+        );
+
+        assert_eq!(cfg.subnet_attachment.as_deref(), Some(&[3u8, 9][..]));
+        assert_eq!(
+            cfg.subnet_control_channel.as_deref(),
+            Some("subnet.control")
+        );
+    }
+
+    /// Omitting them is the ordinary case and must stay valid — an
+    /// unconfigured node simply fails every protected subnet assertion
+    /// closed rather than refusing to start.
+    #[test]
+    fn trust_anchor_fields_are_optional() {
+        let cfg = parse(&format!(
+            r#"{{"bind_addr":"127.0.0.1:0","psk_hex":"{}"}}"#,
+            "42".repeat(32)
+        ))
+        .expect("config parses without any subnet authority field");
+        assert!(cfg.subnet_authorities.is_none());
+        assert!(cfg.subnet_attachment.is_none());
+        assert!(cfg.subnet_control_channel.is_none());
+    }
+
+    /// The SAME validation every other SDK runs applies here. Each of
+    /// these is a configuration mistake the constructor must refuse, not
+    /// a runtime verification outcome — and refusing means
+    /// `NET_ERR_MESH_INIT`, never a node that came up trusting nothing.
+    #[test]
+    fn configuration_mistakes_are_refused() {
+        use crate::adapter::net::subnet::provision::{
+            dto::SubnetAuthorityConfigDto, validate_subnet_authorities,
+        };
+
+        let good = SubnetAuthorityConfigDto {
+            authority_hex: AUTHORITY.to_string(),
+            root_hexes: vec![ROOT.to_string()],
+            maximum_grant_lifetime_secs: 604_800,
+        };
+
+        // Malformed hex never reaches validation — the DTO refuses it.
+        let bad_hex = SubnetAuthorityConfigDto {
+            authority_hex: "not-hex".to_string(),
+            ..good.clone()
+        };
+        assert!(bad_hex.to_core().is_err(), "a malformed id must be refused");
+
+        // Empty root set: would fail closed forever.
+        let empty_roots = SubnetAuthorityConfigDto {
+            root_hexes: Vec::new(),
+            ..good.clone()
+        };
+        assert!(validate_subnet_authorities(&[empty_roots.to_core().expect("converts")]).is_err());
+
+        // Zero lifetime.
+        let zero_life = SubnetAuthorityConfigDto {
+            maximum_grant_lifetime_secs: 0,
+            ..good.clone()
+        };
+        assert!(validate_subnet_authorities(&[zero_life.to_core().expect("converts")]).is_err());
+
+        // Duplicate authority.
+        let one = good.to_core().expect("converts");
+        let two = good.to_core().expect("converts");
+        assert!(validate_subnet_authorities(&[one, two]).is_err());
+    }
+
+    /// A path deeper than the four-level hierarchy is refused rather
+    /// than truncated.
+    #[test]
+    fn an_over_deep_attachment_is_refused() {
+        use crate::adapter::net::subnet::provision::dto::SubnetPathDto;
+        assert!(SubnetPathDto {
+            levels: vec![1, 2, 3, 4, 5]
+        }
+        .to_core()
+        .is_err());
+        assert!(SubnetPathDto {
+            levels: vec![1, 2, 3, 4]
+        }
+        .to_core()
+        .is_ok());
+        assert!(SubnetPathDto { levels: vec![] }.to_core().is_ok());
     }
 }

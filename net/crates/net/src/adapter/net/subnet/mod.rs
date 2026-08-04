@@ -21,6 +21,7 @@ pub mod control;
 mod error;
 mod gateway;
 mod id;
+pub mod provision;
 pub mod route_hop;
 
 pub use admission::{SubnetChallengeStore, SubnetContextStore};

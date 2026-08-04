@@ -29,21 +29,31 @@
 // opaque canonical wire bytes; nothing here signs, and no signing key type
 // exists on this surface.
 //
-// # Known gap: subnet TRUST ANCHORS are not configurable from Go
+// # Trust anchors
 //
-// Declaring which authorities this node trusts (`subnet_authorities`), its
-// security attachment path, and its control channel is CONFIG-TIME state on
-// MeshNodeConfig — there is no post-construction installer for it. Go and C
-// both receive their node from base libnet's JSON constructor, which cannot
-// reach the SDK module that converts those DTOs, so neither binding can declare
-// trust anchors today. Everything else works: this file serves exports, calls
-// exported services, and performs every runtime administration verb.
+// Declaring which authorities this node trusts, its security attachment path,
+// and its control channel is CONFIG-TIME state, set on MeshConfig:
 //
-// A node that must act as a subnet GATEWAY should be constructed from Rust,
-// Node, or Python, which do expose the construction-time trust config. Closing
-// this gap for Go and C means relocating that one conversion module into the
-// core crate so base libnet can share it — deliberately deferred, not
-// overlooked.
+//	node, err := net.NewMeshNode(net.MeshConfig{
+//	    BindAddr: addr, PSK: psk,
+//	    SubnetAuthorities: []net.SubnetAuthorityConfig{{
+//	        AuthorityHex: authorityHex,
+//	        RootHexes:    []string{rootHex},
+//	        MaximumGrantLifetimeSecs: 7 * 24 * 3600,
+//	    }},
+//	    SubnetAttachment: []uint8{3},
+//	    SubnetExports:    []net.SubnetNamedExport{ /* … */ },
+//	})
+//
+// Rust converts and validates these through the same frozen DTOs every other
+// SDK uses, before the node exists — duplicate authorities, empty root sets,
+// duplicate roots, and zero lifetimes are refused there, not here. A standalone
+// Go program can therefore stand up a subnet GATEWAY on its own; it does not
+// need a node handed to it from Rust, Node, or Python.
+//
+// (Until review-10 P1-7 this was impossible: the conversion lived in
+// net-mesh-sdk, which base libnet's constructor cannot depend on. It now lives
+// in the core, reachable from every constructor.)
 package net
 
 /*
@@ -230,6 +240,23 @@ const (
 	// grant.
 	SubnetAccessGranted SubnetExportAccess = 1
 )
+
+// SubnetAuthorityConfig is one subnet trust anchor: an authority this node
+// will accept protected subnet assertions from, the root keys permitted to
+// sign for it, and the per-authority grant-lifetime ceiling.
+//
+// Set on MeshConfig.SubnetAuthorities; converted and validated by Rust through
+// the same frozen DTOs the other SDKs use, before the node exists.
+type SubnetAuthorityConfig struct {
+	// AuthorityHex is the 32-byte authority entity id, 64 hex chars.
+	AuthorityHex string `json:"authority_hex"`
+	// RootHexes are the authority's root entity ids (64 hex chars each).
+	// Non-empty and duplicate-free; an empty set would fail closed forever.
+	RootHexes []string `json:"root_hexes"`
+	// MaximumGrantLifetimeSecs is the per-authority ceiling on a grant's
+	// validity window. Must be nonzero.
+	MaximumGrantLifetimeSecs uint64 `json:"maximum_grant_lifetime_secs"`
+}
 
 // SubnetPath is a compact hierarchy path: 0..=4 levels, each 0..=255. An empty
 // Levels is the authority-root (global) path.

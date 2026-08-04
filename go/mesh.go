@@ -131,6 +131,32 @@ type MeshConfig struct {
 	// registers.
 	SubnetExports []SubnetNamedExport `json:"-"`
 
+	// SubnetAuthorities are this node's subnet AUTHORITY trust anchors —
+	// which authorities it will accept protected subnet assertions from
+	// (review-10 P1-7). Distinct from Subnet / SubnetPolicy below, which are
+	// unauthenticated routing state.
+	//
+	// An empty or nil list means every protected subnet assertion fails
+	// closed. Duplicate authorities, empty root sets, duplicate roots, and
+	// zero lifetimes are refused by Rust before the node exists.
+	//
+	// A node that must act as a subnet GATEWAY needs these; without them it
+	// can still CALL exported services, but cannot serve behind a protected
+	// boundary.
+	SubnetAuthorities []SubnetAuthorityConfig `json:"subnet_authorities,omitempty"`
+
+	// SubnetAttachment is this node's own SECURITY attachment point — the
+	// local topology coordinate credentials are checked against, as 0–4
+	// levels each 0–255. Distinct from Subnet; omitting it preserves the
+	// core compatibility fallback, which protected deployments should not
+	// rely on.
+	SubnetAttachment []uint8 `json:"subnet_attachment,omitempty"`
+
+	// SubnetControlChannel treats an ordinary configured channel as a subnet
+	// control-fact ARRIVAL path. Confers no authority — facts verify by
+	// signature regardless of how they arrive.
+	SubnetControlChannel string `json:"subnet_control_channel,omitempty"`
+
 	// Subnet constrains the node to a hierarchical subnet (1–4 bytes
 	// each 0–255). Empty / nil means `SubnetId::GLOBAL`.
 	Subnet []uint32 `json:"subnet,omitempty"`
