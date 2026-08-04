@@ -47,7 +47,7 @@ let mesh = Mesh::builder(addr, psk)
     .build().await?;
 ```
 
-Node and Python mirror this on their constructors (`subnetAuthorities` / `subnetAttachment` / `subnetControlChannel` / `subnetExports`; snake_case kwargs in Python). **Go and C cannot configure trust anchors** — see § Coverage caveat.
+Every binding mirrors this on its constructor: `subnetAuthorities` / `subnetAttachment` / `subnetControlChannel` / `subnetExports` in Node, the snake_case kwargs in Python, `MeshConfig.SubnetAuthorities` and friends in Go, and the same four JSON keys in C's `net_mesh_new`.
 
 ## Provisioning — offline issuance, runtime installation
 
@@ -78,13 +78,13 @@ At runtime, the **admin namespace** (deliberately apart from the ordinary verbs)
 | Python (`net_sdk`) | `mesh.serve_subnet_exported(service, export_name, handler)` | `client.call_exported(service, request)` | `net.subnet.admin.*` |
 | Python low-level (`net.subnet`) | `serve_subnet_exported(mesh, service, export_name, handler)` (+ `…_bytes`) | as above | `net.subnet.admin.*` |
 | Go (`go/subnet.go`) | `ServeSubnetExported[Req, Resp](node, service, exportName, handler)` / `ServeSubnetExportedBytes` | `CallExported[Req, Resp](ctx, client, service, req)` / `CallExportedBytes` | `InstallSubnetGatewayCredentials` / `DeclareSubnetBoundaries` / `ApplySubnetControlFact` |
-| C (`net_subnet.h`, ships in `libnet_org`) | `net_subnet_serve_exported` (takes the concrete `net_subnet_ref_t` — the language layer resolves the name) | `net_org_call_exported` (on the org client, in `net_org.h`) | `net_subnet_install_gateway_credentials` / `_declare_boundaries` / `_apply_control_fact` |
+| C (`net_subnet.h`, ships in `libnet_org`) | `net_subnet_serve_exported(mesh_arc, service, export_name, …)` — Rust resolves the name against the node's own map | `net_org_call_exported` (on the org client, in `net_org.h`) | `net_subnet_install_gateway_credentials` / `_declare_boundaries` / `_apply_control_fact` |
 
 The handler receives the same verified `OrgCaller` as `serve_org` — the serve pipeline, dispatcher, and teardown rules are shared (`org.md` § Teardown applies unchanged).
 
-### Coverage caveat — Go and C are `partial` on gateway provisioning
+### Go and C are first-class
 
-Both bindings serve exports, call exported services, and run every runtime admin verb. Neither can declare subnet **trust anchors**: that is construction-time `MeshNodeConfig` state, and Go/C receive their node from base `libnet`'s constructor, which cannot reach the SDK's DTO conversion module. A gateway node is constructed from Rust, Node, or Python. See `bindings/coverage.md` for the rows and anchors.
+Both bindings serve exports, call exported services, run every runtime admin verb, and declare subnet **trust anchors**. Go sets `SubnetAuthorities` / `SubnetAttachment` / `SubnetControlChannel` / `SubnetExports` on `MeshConfig`; C supplies the same four keys in the JSON `net_mesh_new` already takes. Rust converts and validates them through the frozen DTOs before the node exists. A standalone Go or C program can stand up a gateway on its own (review-10 P1-7). See `bindings/coverage.md` for the rows and anchors.
 
 ## Errors — one stable envelope, one fixture
 

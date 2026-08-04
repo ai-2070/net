@@ -123,7 +123,7 @@ should not infer one binding's API from another's.
 | A2A — agent task handoff | `serve_a2a` | `serveA2a` | `serve_a2a` | — | — |
 | Organization capability auth | `serve_org` | `serveOrgTyped` | `serve_org_typed` | `ServeOrgBytes` | `net_org_call` |
 | Subnet gateway provisioning | `install_gateway_credentials_node` | `installSubnetGatewayCredentials` | `install_subnet_gateway_credentials` | `InstallSubnetGatewayCredentials` | `net_subnet_install_gateway_credentials` |
-| Subnet-exported nRPC serve | `serve_subnet_exported` | `serveSubnetExported` | `serve_subnet_exported` | `ServeSubnetExportedBytes` | `net_subnet_serve_exported` |
+| Subnet-exported nRPC serve | `serve_subnet_exported` | `serveSubnetExported` | `serve_subnet_exported` | `ServeSubnetExported` | `net_subnet_serve_exported` |
 | Subnet-exported organization call | `call_exported` | `callExported` | `call_exported` | `CallExportedBytes` | `net_org_call_exported` |
 | MCP bridge | `serve_tool` | `tool` | `tool` | `McpError` | `net_mcp_classify` |
 | Dataforts — blobs | `fetch_blob` | `fetchBlob` | `fetch_blob` | `NewMeshBlobAdapter` | `net_fetch_blob` |
@@ -156,18 +156,19 @@ back. What is missing is the discovery-driven path — no equivalent of
 `fetch_blob_discovered`, so Go cannot fetch a blob it has only a reference to
 without knowing who holds it.
 
-**Go and C subnet gateway provisioning is `partial`.** Every *runtime*
-administration verb is present — installing gateway credential sets, declaring
-boundaries, applying signed control facts. What neither binding can do is
-declare the node's subnet **trust anchors** (`subnet_authorities` /
-`subnet_attachment` / `subnet_control_channel`): that is construction-time
-`MeshNodeConfig` state with no post-construction installer, and Go and C both
-receive their node from base `libnet`'s constructor, which cannot reach the SDK
-module that converts those DTOs. A node acting as a subnet *gateway* should be
-constructed from Rust, Node, or Python; serving exports and calling exported
-services from Go and C is unaffected. `not exposed` would be wrong (most of the
-surface exists) and so would `supported` (a gateway cannot be fully provisioned
-from these bindings alone).
+**Go and C subnet gateway provisioning is `supported`** (was `partial` until
+review-10 P1-7). Every *runtime* administration verb is present — installing
+gateway credential sets, declaring boundaries, applying signed control facts —
+and both bindings now also declare the node's subnet **trust anchors**.
+
+`subnet_authorities`, `subnet_attachment`, `subnet_control_channel`, and
+`subnet_exports` are construction-time state, supplied on Go's `MeshConfig` and
+in the JSON C already passes to `net_mesh_new`. They used to be unreachable:
+the DTO conversion lived in `net-mesh-sdk`, which base `libnet`'s constructor
+cannot depend on. It now lives in the core
+(`net::adapter::net::subnet::provision`), reachable from every constructor, with
+`net_sdk::subnet` re-exporting it so there is still one definition. A standalone
+Go or C program can stand up a subnet gateway on its own.
 
 ## Same operation, different shape
 

@@ -215,10 +215,10 @@ operations:
       status: supported
       anchor: install_subnet_gateway_credentials
     Go:
-      status: partial
+      status: supported
       anchor: InstallSubnetGatewayCredentials
     C:
-      status: partial
+      status: supported
       anchor: net_subnet_install_gateway_credentials
 - operation: Subnet-exported nRPC serve
   bindings:
@@ -233,7 +233,7 @@ operations:
       anchor: serve_subnet_exported
     Go:
       status: supported
-      anchor: ServeSubnetExportedBytes
+      anchor: ServeSubnetExported
     C:
       status: supported
       anchor: net_subnet_serve_exported

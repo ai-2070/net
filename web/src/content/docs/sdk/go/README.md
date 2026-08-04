@@ -47,10 +47,11 @@ req)` on the org client, and the runtime admin verbs
 `errors.Is(err, net.ErrSubnet)` and `net.ParseSubnetKind`
 ([reference](/docs/reference/error-codes)).
 
-One deliberate gap: declaring subnet **trust anchors** is construction-time
-state not reachable from Go (or C) — a node acting as a subnet *gateway* is
-constructed from Rust, TypeScript, or Python. Serving exports and calling
-exported services from Go is unaffected.
+Subnet **trust anchors** are construction-time state on `MeshConfig`:
+`SubnetAuthorities`, `SubnetAttachment`, `SubnetControlChannel`, and
+`SubnetExports`. Rust converts and validates them through the same frozen DTOs
+every other SDK uses, before the node exists, so a standalone Go program can
+stand up a subnet *gateway* on its own.
 
 The [Artifacts](/docs/sdk/go/artifacts) page records the current cross-peer transfer
 gap rather than substituting another language's API.
