@@ -285,7 +285,10 @@ impl GatewayAdvertisement {
 
     /// Issue signed by `root_keypair` (`issuer` is set from it).
     /// `not_after <= not_before` is refused at issue as at decode.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "explicit wire fields; a params struct would only rename them"
+    )]
     pub fn try_issue(
         root_keypair: &EntityKeypair,
         scope: SubnetRef,
@@ -472,7 +475,6 @@ impl SubnetExportPolicy {
     }
 
     /// Issue signed by `root_keypair` (`issuer` is set from it).
-    #[allow(clippy::too_many_arguments)]
     pub fn try_issue(
         root_keypair: &EntityKeypair,
         scope: SubnetRef,
