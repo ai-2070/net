@@ -47,6 +47,69 @@ pub enum ForwardDecision {
     Drop(DropReason),
 }
 
+/// Typed telemetry for the protected route-hop relay.
+///
+/// One instance per node, incremented from the relay's dispatch path
+/// — atomic adds only, because that path carries an
+/// allocation-freedom witness. `forwarded` counts envelopes actually
+/// emitted toward the egress peer (authorized AND sent); the denial
+/// counters split the authority verdict by exact
+/// [`ForwardDenial`](super::auth::ForwardDenial) reason, so an
+/// operator — or a witness — can distinguish "this gateway refused
+/// for lack of ROUTE" from "nothing ever reached its authority
+/// decision". Drops earlier on the relay path (unparseable envelope,
+/// unknown session, bad tag, expired TTL, no route) are deliberately
+/// not counted here: they precede the authority decision this
+/// telemetry exists to attribute.
+#[derive(Debug, Default)]
+pub struct ProtectedRelayStats {
+    forwarded: std::sync::atomic::AtomicU64,
+    denied_context_not_current: std::sync::atomic::AtomicU64,
+    denied_attach_missing: std::sync::atomic::AtomicU64,
+    denied_export_missing: std::sync::atomic::AtomicU64,
+    denied_route_missing: std::sync::atomic::AtomicU64,
+}
+
+impl ProtectedRelayStats {
+    /// Zeroed counters.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An authorized envelope left this node toward the egress peer.
+    pub fn record_forwarded(&self) {
+        self.forwarded
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The authority decision refused the transition.
+    pub fn record_denied(&self, denial: super::auth::ForwardDenial) {
+        self.denial_counter(denial)
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Envelopes authorized and emitted.
+    pub fn forwarded(&self) -> u64 {
+        self.forwarded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Denials recorded for exactly `denial`.
+    pub fn denied(&self, denial: super::auth::ForwardDenial) -> u64 {
+        self.denial_counter(denial)
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn denial_counter(&self, denial: super::auth::ForwardDenial) -> &std::sync::atomic::AtomicU64 {
+        use super::auth::ForwardDenial as D;
+        match denial {
+            D::ContextNotCurrent => &self.denied_context_not_current,
+            D::AttachMissing => &self.denied_attach_missing,
+            D::ExportMissing => &self.denied_export_missing,
+            D::RouteMissing => &self.denied_route_missing,
+        }
+    }
+}
+
 /// Subnet gateway that enforces visibility policy at subnet boundaries.
 ///
 /// The gateway reads only header fields — it does not decrypt or modify

@@ -494,11 +494,11 @@ use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{
-    route_hop::AuthenticatedNextHop, DropReason, SubnetAuthError, SubnetAuthPresentation,
-    SubnetAuthorityConfig, SubnetBoundarySet, SubnetChallengeStore, SubnetContextStore,
-    SubnetControlFact, SubnetControlOutcome, SubnetControlStore, SubnetCredentialSet,
-    SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy, SubnetRevocationFloor,
-    VerifiedGatewayContextSet, VerifiedSubnetContext,
+    route_hop::AuthenticatedNextHop, DropReason, ProtectedRelayStats, SubnetAuthError,
+    SubnetAuthPresentation, SubnetAuthorityConfig, SubnetBoundarySet, SubnetChallengeStore,
+    SubnetContextStore, SubnetControlFact, SubnetControlOutcome, SubnetControlStore,
+    SubnetCredentialSet, SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy,
+    SubnetRevocationFloor, VerifiedGatewayContextSet, VerifiedSubnetContext,
 };
 use super::subprotocol::stream_window::{
     StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_WINDOW_SIZE,
@@ -1614,6 +1614,11 @@ struct DispatchCtx {
     /// [`SubnetGatewayAuthorityState`] for why the two must not
     /// publish independently.
     subnet_gateway_authority: Arc<arc_swap::ArcSwap<SubnetGatewayAuthorityState>>,
+    /// Typed protected-relay telemetry: envelopes forwarded, and
+    /// authority denials split by exact [`ForwardDenial`] reason.
+    ///
+    /// [`ForwardDenial`]: super::subnet::ForwardDenial
+    protected_relay_stats: Arc<ProtectedRelayStats>,
     /// Floor state, for the auth epoch a compiled context is pinned to.
     subnet_floors: Arc<SubnetFloorRegistry>,
     /// S5 control-fact store, shared with the node handle so the
@@ -8291,6 +8296,10 @@ pub struct MeshNode {
     /// [`SubnetGatewayAuthorityState`] for the torn-view hazard two
     /// independent publications carried.
     subnet_gateway_authority: Arc<arc_swap::ArcSwap<SubnetGatewayAuthorityState>>,
+    /// Typed protected-relay telemetry: envelopes forwarded, and
+    /// authority denials split by exact
+    /// [`ForwardDenial`](super::subnet::ForwardDenial) reason.
+    protected_relay_stats: Arc<ProtectedRelayStats>,
     /// This node's own attachment point, used when compiling the
     /// gateway context set and as the local end of a transition.
     subnet_local_attachment: SubnetId,
@@ -9533,6 +9542,7 @@ impl MeshNode {
                     boundaries: None,
                 },
             )),
+            protected_relay_stats: Arc::new(ProtectedRelayStats::new()),
             subnet_local_attachment,
             peer_subnets,
             // Gateway is installed lazily by `set_channel_configs`;
@@ -11840,6 +11850,15 @@ impl MeshNode {
     /// external callers read the two public convenience accessors.
     pub(crate) fn subnet_gateway_authority(&self) -> Arc<SubnetGatewayAuthorityState> {
         self.subnet_gateway_authority.load_full()
+    }
+
+    /// Typed protected-relay telemetry: envelopes this node forwarded
+    /// as a gateway, and authority denials split by exact
+    /// [`ForwardDenial`](super::subnet::ForwardDenial) reason.
+    /// Counters only ever increase; read two samples to attribute a
+    /// window.
+    pub fn protected_relay_stats(&self) -> &Arc<ProtectedRelayStats> {
+        &self.protected_relay_stats
     }
 
     /// The declared boundary set, if any — a SINGLE-MEMBER
@@ -16278,6 +16297,7 @@ impl MeshNode {
             peer_subnets: self.peer_subnets.clone(),
             subnet_contexts: self.subnet_contexts.clone(),
             subnet_gateway_authority: self.subnet_gateway_authority.clone(),
+            protected_relay_stats: self.protected_relay_stats.clone(),
             subnet_floors: self.subnet_floors.clone(),
             subnet_control: self.subnet_control.clone(),
             subnet_authorities: self.subnet_authorities.clone(),
@@ -17037,6 +17057,7 @@ impl MeshNode {
             auth_epoch,
             now,
         ) {
+            ctx.protected_relay_stats.record_denied(denial);
             tracing::debug!(
                 ingress = format!("{ingress_node:#x}"),
                 egress = format!("{egress_node:#x}"),
@@ -17106,6 +17127,8 @@ impl MeshNode {
                     reason = %e,
                     "subnet: dropping authorized hop, egress socket not ready",
                 );
+            } else {
+                ctx.protected_relay_stats.record_forwarded();
             }
         });
     }

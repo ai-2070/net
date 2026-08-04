@@ -36,5 +36,5 @@ pub use control::{
     SubnetDescriptor, SubnetExportPolicy, SubnetFactKind, MAX_EXPORTED_CHANNELS,
 };
 pub use error::SubnetError;
-pub use gateway::{DropReason, ForwardDecision, SubnetGateway};
+pub use gateway::{DropReason, ForwardDecision, ProtectedRelayStats, SubnetGateway};
 pub use id::{AncestorPath, SubnetId, TopologySubnetId, MAX_ANCESTOR_PATH};

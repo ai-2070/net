@@ -93,11 +93,11 @@ use net::adapter::net::identity::EntityId;
 use net::adapter::net::mesh_rpc::{CallOptions, OrgProofIntent, RpcError, ServeError};
 use net::adapter::net::subnet::route_hop::ROUTE_HOP_MAGIC;
 use net::adapter::net::subnet::{
-    build_gateway_context_set, compile_gateway_context, GatewayAdvertisement, SubnetAuthError,
-    SubnetAuthPresentation, SubnetAuthorityConfig, SubnetBoundarySet, SubnetControlFact,
-    SubnetCredentialSet, SubnetDescriptor, SubnetExportBinding, SubnetExportPolicy,
-    SubnetFloorRegistry, SubnetGrant, SubnetRef, SubnetRevocationFloor, SubnetRights,
-    TopologySubnetId, VerifiedSubnetContext,
+    build_gateway_context_set, compile_gateway_context, ForwardDenial, GatewayAdvertisement,
+    SubnetAuthError, SubnetAuthPresentation, SubnetAuthorityConfig, SubnetBoundarySet,
+    SubnetControlFact, SubnetCredentialSet, SubnetDescriptor, SubnetExportBinding,
+    SubnetExportPolicy, SubnetFloorRegistry, SubnetGrant, SubnetRef, SubnetRevocationFloor,
+    SubnetRights, TopologySubnetId, VerifiedSubnetContext,
 };
 use net::adapter::net::{
     ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, EntityKeypair,
@@ -3481,8 +3481,16 @@ async fn a_two_gateway_route_reauthenticates_every_hop() {
 
 /// Evidence 20 (inverse): the SECOND gateway's exact right is
 /// load-bearing. Same topology, same learned route, same valid
-/// envelope — but gw2 holds no ROUTE, so nothing reaches the
-/// destination side even though gw1 forwarded correctly.
+/// envelope — but gw2 holds no ROUTE.
+///
+/// Destination silence alone would also be explained by gw1
+/// dropping, packet loss, or a fixture failure upstream of gw2's
+/// authority decision, so the typed relay telemetry attributes the
+/// silence exactly: gw1 counted a forward, gw2 counted precisely one
+/// `RouteMissing` denial and emitted nothing. Restoring ROUTE in the
+/// SAME fixture then carries the identical envelope shape through to
+/// the destination side, so the mutated axis — and only it — is what
+/// stopped the hop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn removing_the_second_gateways_exact_right_stops_the_hop() {
     let f = two_gateway_fixture(SubnetRights::ATTACH).await;
@@ -3492,6 +3500,18 @@ async fn removing_the_second_gateways_exact_right_stops_the_hop() {
     assert!(f
         .gw2
         .set_peer_addr_for_test(dest_id, watcher.local_addr().expect("addr")));
+
+    // Phase-local telemetry baselines.
+    let gw1_forwarded = f.gw1.protected_relay_stats().forwarded();
+    let gw2_forwarded = f.gw2.protected_relay_stats().forwarded();
+    let gw2_denied = |d: ForwardDenial| f.gw2.protected_relay_stats().denied(d);
+    let gw2_route_missing = gw2_denied(ForwardDenial::RouteMissing);
+    let gw2_other_denials = [
+        ForwardDenial::ContextNotCurrent,
+        ForwardDenial::AttachMissing,
+        ForwardDenial::ExportMissing,
+    ]
+    .map(&gw2_denied);
 
     let header = RoutingHeader::new(dest_id, f.source.node_id() as u32, 8);
     let envelope = f
@@ -3509,6 +3529,91 @@ async fn removing_the_second_gateways_exact_right_stops_the_hop() {
         "without ROUTE at the second gateway no protected hop may reach \
          the destination side — the first relay's authority must not \
          carry the packet through the second",
+    );
+
+    // Attribute the silence. The first relay authorized and emitted
+    // the hop…
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            f.gw1.protected_relay_stats().forwarded() == gw1_forwarded + 1
+        })
+        .await,
+        "gw1 must have forwarded the envelope toward gw2 (got {}, baseline {})",
+        f.gw1.protected_relay_stats().forwarded(),
+        gw1_forwarded,
+    );
+    // …and the second refused it at its authority decision, for
+    // exactly the mutated reason: an internal transition with no
+    // ROUTE entry. No other denial reason moved, and gw2 emitted
+    // nothing.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            gw2_denied(ForwardDenial::RouteMissing) == gw2_route_missing + 1
+        })
+        .await,
+        "gw2 must have denied exactly one transition as RouteMissing \
+         (got {}, baseline {})",
+        gw2_denied(ForwardDenial::RouteMissing),
+        gw2_route_missing,
+    );
+    assert_eq!(
+        [
+            ForwardDenial::ContextNotCurrent,
+            ForwardDenial::AttachMissing,
+            ForwardDenial::ExportMissing,
+        ]
+        .map(&gw2_denied),
+        gw2_other_denials,
+        "no other denial reason may move — the mutated axis is ROUTE",
+    );
+    assert_eq!(
+        f.gw2.protected_relay_stats().forwarded(),
+        gw2_forwarded,
+        "gw2 forwarded nothing while its ROUTE right was absent",
+    );
+
+    // Restoration, same fixture: give gw2 back its exact ROUTE right
+    // and the identical envelope shape traverses both relays.
+    let g2_kp = EntityKeypair::from_bytes([0xD3; 32]);
+    f.gw2
+        .install_subnet_gateway_credentials(&[vb_grant(
+            &g2_kp,
+            VEHICLE,
+            SubnetRights::ATTACH.union(SubnetRights::ROUTE),
+        )])
+        .expect("restore gw2's ROUTE credential");
+
+    let header = RoutingHeader::new(dest_id, f.source.node_id() as u32, 8);
+    let envelope = f
+        .source
+        .seal_route_hop_to_peer(f.gw1.node_id(), &header, INNER_TAG)
+        .expect("seal to gw1 after restoration");
+    sock.send_to(&envelope, f.gw1.local_addr())
+        .await
+        .expect("send after restoration");
+
+    let got = received_within(&watcher, Duration::from_millis(1500)).await;
+    let hops = route_hops(&got);
+    assert_eq!(
+        hops.len(),
+        1,
+        "with ROUTE restored the hop reaches the destination side",
+    );
+    let (out_header, out_inner) = f
+        .dest
+        .open_route_hop_from_peer(f.gw2.node_id(), hops[0])
+        .expect("the restored hop verifies under the gw2↔dest edge key");
+    assert_eq!(out_header.dest_id, dest_id);
+    assert_eq!(out_inner, INNER_TAG, "the inner packet is preserved");
+    assert_eq!(
+        f.gw2.protected_relay_stats().forwarded(),
+        gw2_forwarded + 1,
+        "recovery is attributable to gw2's restored authority",
+    );
+    assert_eq!(
+        gw2_denied(ForwardDenial::RouteMissing),
+        gw2_route_missing + 1,
+        "and no further RouteMissing denial was recorded",
     );
 }
 
