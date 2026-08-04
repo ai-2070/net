@@ -30,7 +30,7 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Literal, Optional
+from typing import Any, Callable, List, Literal, Optional
 
 # The PyO3 module is `_net`; binding classes and exceptions come from it.
 # `BackpressureError` and `NotConnectedError` are `PyException` subclasses
@@ -127,6 +127,42 @@ class MeshNode:
             subnet_control_channel=subnet_control_channel,
             subnet_exports=subnet_exports,
         )
+
+    def serve_subnet_exported(
+        self,
+        service: str,
+        export_name: str,
+        handler: Callable[[dict, Any], Any],
+        handler_timeout_ms: Optional[int] = None,
+    ) -> Any:
+        """Serve a subnet-exported, organization-protected service.
+
+        One of the two ordinary subnet verbs (``SUBNET_AUTH_SDK_PLAN.md``
+        §3.5); the caller's counterpart is ``org.call_exported(service,
+        request)``. Name the service, name an export configured in
+        ``subnet_exports`` at construction, provide the handler — this
+        constructs no authority objects. The export name is
+        provider-local configuration: never announced, never accepted
+        from a caller.
+
+        An unknown ``export_name`` raises ``SubnetProvisionError`` with
+        ``.kind == "unknown_export_name"`` HERE, before anything is
+        registered or announced. Dispatch revalidates the exact crossing
+        against this node's live gateway authority on every call, before
+        organization admission. Announcement visibility is always public;
+        the external caller never joins this node's subnet.
+
+        ``handler`` is ``handler(caller: dict, request) -> response``,
+        with ``caller`` carrying the same verified fields as
+        ``serve_org``. Returns a handle whose ``close()`` unregisters.
+
+        review-10 P1-5: this facade exists so an application using the
+        ergonomic constructor can serve a named export without reaching
+        into ``self._native``.
+        """
+        from net.subnet import serve_subnet_exported as _serve
+
+        return _serve(self._native, service, export_name, handler, handler_timeout_ms)
 
     @property
     def public_key(self) -> str:

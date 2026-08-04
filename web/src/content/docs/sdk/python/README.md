@@ -31,7 +31,7 @@ the ergonomic path and identify the places that require the native handle.
 Both authority surfaces live on the native `net` package: organization auth
 (`serve_org_typed`, `TypedOrgClient` — [concepts](/docs/concepts/organizations))
 and the subnet authority plane ([concepts](/docs/concepts/subnets)) —
-`net.subnet.serve_subnet_exported_typed(mesh, service, export_name, handler)`
+`mesh.serve_subnet_exported(service, export_name, handler)`
 for a provider inside a protected subnet, `client.call_exported(service,
 request)` for the caller, and `net.subnet.admin.*` for runtime gateway
 administration. Named exports and trust anchors are constructor kwargs

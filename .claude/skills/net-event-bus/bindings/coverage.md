@@ -123,7 +123,7 @@ should not infer one binding's API from another's.
 | A2A — agent task handoff | `serve_a2a` | `serveA2a` | `serve_a2a` | — | — |
 | Organization capability auth | `serve_org` | `serveOrgTyped` | `serve_org_typed` | `ServeOrgBytes` | `net_org_call` |
 | Subnet gateway provisioning | `install_gateway_credentials_node` | `installSubnetGatewayCredentials` | `install_subnet_gateway_credentials` | `InstallSubnetGatewayCredentials` | `net_subnet_install_gateway_credentials` |
-| Subnet-exported nRPC serve | `serve_subnet_exported` | `serveSubnetExportedTyped` | `serve_subnet_exported` | `ServeSubnetExportedBytes` | `net_subnet_serve_exported` |
+| Subnet-exported nRPC serve | `serve_subnet_exported` | `serveSubnetExported` | `serve_subnet_exported` | `ServeSubnetExportedBytes` | `net_subnet_serve_exported` |
 | Subnet-exported organization call | `call_exported` | `callExported` | `call_exported` | `CallExportedBytes` | `net_org_call_exported` |
 | MCP bridge | `serve_tool` | `tool` | `tool` | `McpError` | `net_mcp_classify` |
 | Dataforts — blobs | `fetch_blob` | `fetchBlob` | `fetch_blob` | `NewMeshBlobAdapter` | `net_fetch_blob` |

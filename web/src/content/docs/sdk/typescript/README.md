@@ -35,7 +35,7 @@ Node.js finalizers are not deterministic. Always `await node.shutdown()` and cal
 Both authority surfaces live in `@net-mesh/core`: organization auth
 (`serveOrgTyped`, `TypedOrgClient` — [concepts](/docs/concepts/organizations))
 and the subnet authority plane ([concepts](/docs/concepts/subnets)) —
-`serveSubnetExportedTyped(mesh, service, exportName, handler)` for a provider
+`mesh.serveSubnetExported(service, exportName, handler)` for a provider
 inside a protected subnet, `org.callExported(service, req)` for the caller, and
 `subnet.admin.*` for runtime gateway administration. Named exports and trust
 anchors are configured on the mesh constructor (`subnetExports`,

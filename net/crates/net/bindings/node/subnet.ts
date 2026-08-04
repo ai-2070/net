@@ -16,7 +16,7 @@
  *     binding: { subnet: { authorityHex, path: { levels: [3, 9] } }, topologyEpoch: 0 },
  *   }],
  * })
- * const handle = serveSubnetExportedTyped(mesh, 'fleet.telemetry', 'factory-export',
+ * const handle = serveSubnetExported(mesh, 'fleet.telemetry', 'factory-export',
  *   async (caller, req: Telemetry) => answer(caller, req))
  * ```
  *
@@ -154,7 +154,7 @@ export type TypedSubnetExportedHandler<Req = unknown, Resp = unknown> = (
  * visibility is always public, and the external caller never joins this
  * node's subnet.
  */
-export function serveSubnetExportedTyped<Req = unknown, Resp = unknown>(
+export function serveSubnetExported<Req = unknown, Resp = unknown>(
   mesh: unknown,
   service: string,
   exportName: string,
@@ -175,9 +175,38 @@ export function serveSubnetExportedTyped<Req = unknown, Resp = unknown>(
       handlerTimeoutMs,
     )
   } catch (e) {
-    // Registration failures ride a plain message with the stable kind
-    // inside; route through the general classifier so a `subnet:`-
-    // prefixed refusal classifies and anything else passes through.
+    // Registration failures ride a message with the stable kind
+    // embedded; the classifier scans for the envelope, so an unknown
+    // export name arrives as `SubnetProvisionError` with
+    // `kind === 'unknown_export_name'`.
+    throw classifyError(e)
+  }
+}
+
+/**
+ * @deprecated Use {@link serveSubnetExported}. The frozen ordinary
+ * provider verb is `serveSubnetExported`; `Typed` was never meant to be
+ * a second application concept beside it (review-10 P1-5). Retained as
+ * an alias so existing callers keep working.
+ */
+export const serveSubnetExportedTyped = serveSubnetExported
+
+/**
+ * The BYTES seam under {@link serveSubnetExported} — bytes in, bytes
+ * out, no codec. Explicitly named `…Bytes` because it is the binding
+ * seam, not a second application verb.
+ */
+export function serveSubnetExportedBytes(
+  mesh: unknown,
+  service: string,
+  exportName: string,
+  handler: (req: OrgRequest) => Promise<Buffer>,
+  handlerTimeoutMs?: number,
+): OrgServeHandle {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return nativeServeSubnetExported(mesh as any, service, exportName, handler, handlerTimeoutMs)
+  } catch (e) {
     throw classifyError(e)
   }
 }

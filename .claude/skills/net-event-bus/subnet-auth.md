@@ -73,8 +73,10 @@ At runtime, the **admin namespace** (deliberately apart from the ordinary verbs)
 | | provider verb | caller verb | admin |
 |---|---|---|---|
 | Rust (`net_sdk::subnet`) | `mesh.serve_subnet_exported(service, export_name, handler)` (+ `_bytes`) | `org.call_exported(service, &req)` (+ `call_exported_bytes[_deadline]`) | `net_sdk::subnet::admin::*` |
-| Node (`@net-mesh/core/subnet`) | `serveSubnetExportedTyped(mesh, service, exportName, handler)` | `org.callExported(service, req)` / `callExportedBytes` | `subnet.admin.*` |
-| Python (`net` / `net.subnet`) | `serve_subnet_exported_typed(mesh, service, export_name, handler)` | `client.call_exported(service, request)` | `net.subnet.admin.*` |
+| TypeScript (`@net-mesh/sdk`) | `mesh.serveSubnetExported(service, exportName, handler)` | `org.callExported(service, req)` / `callExportedBytes` | `subnet.admin.*` |
+| Node low-level (`@net-mesh/core/subnet`) | `serveSubnetExported(mesh, service, exportName, handler)` (+ `…Bytes`) | as above | `subnet.admin.*` |
+| Python (`net_sdk`) | `mesh.serve_subnet_exported(service, export_name, handler)` | `client.call_exported(service, request)` | `net.subnet.admin.*` |
+| Python low-level (`net.subnet`) | `serve_subnet_exported(mesh, service, export_name, handler)` (+ `…_bytes`) | as above | `net.subnet.admin.*` |
 | Go (`go/subnet.go`) | `ServeSubnetExported[Req, Resp](node, service, exportName, handler)` / `ServeSubnetExportedBytes` | `CallExported[Req, Resp](ctx, client, service, req)` / `CallExportedBytes` | `InstallSubnetGatewayCredentials` / `DeclareSubnetBoundaries` / `ApplySubnetControlFact` |
 | C (`net_subnet.h`, ships in `libnet_org`) | `net_subnet_serve_exported` (takes the concrete `net_subnet_ref_t` — the language layer resolves the name) | `net_org_call_exported` (on the org client, in `net_org.h`) | `net_subnet_install_gateway_credentials` / `_declare_boundaries` / `_apply_control_fact` |
 

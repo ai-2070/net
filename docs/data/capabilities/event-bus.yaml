@@ -227,7 +227,7 @@ operations:
       anchor: serve_subnet_exported
     Node / TS:
       status: supported
-      anchor: serveSubnetExportedTyped
+      anchor: serveSubnetExported
     Python:
       status: supported
       anchor: serve_subnet_exported

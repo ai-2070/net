@@ -38,8 +38,38 @@
 
 import { NetMesh as NapiNetMesh } from '@net-mesh/core';
 import type { IslandCriteria, IslandTopologyInput } from '@net-mesh/core';
+// The subnet AUTHORITY provider verb (SSDK §3.5). Imported from the
+// low-level package's `./subnet` entry, which classifies the stable
+// `subnet:` envelope; `getNapiMesh` supplies the handle.
+import { serveSubnetExported as serveSubnetExportedNative } from '@net-mesh/core/subnet';
 
 export type { IslandCriteria, IslandTopologyInput } from '@net-mesh/core';
+
+/**
+ * The verified admission facts a subnet-exported handler receives —
+ * the same shape `serveOrg` projects, because it is the same admission
+ * engine. Every field is provider-verified, never caller-claimed.
+ */
+export interface SubnetExportedCaller {
+  /** The acting entity — the caller. */
+  caller: Buffer;
+  /** The organization the caller acted for. */
+  actingOrg: Buffer;
+  /** This provider's owner organization. */
+  providerOrg: Buffer;
+  /** This exact provider node. */
+  provider: Buffer;
+  /** The capability that was invoked. */
+  capability: Buffer;
+  /** Whether caller and provider share an organization. */
+  isSameOrg: boolean;
+}
+
+/** Handle for a served subnet export; `close()` unregisters. */
+export interface SubnetServeHandle {
+  /** Unregister the service. Idempotent. */
+  close(): void;
+}
 
 /** Outcome of a reserve/release/claim. */
 export type ClaimOutcome = 'won' | 'lost';
@@ -47,7 +77,7 @@ export type ClaimOutcome = 'won' | 'lost';
 /** Selection policy for {@link MeshNode.matchIslands}. */
 export type SelectionPolicy = 'least_loaded' | 'pack' | 'load_band' | 'lowest_id';
 
-import { setNapiMesh } from './_internal.js';
+import { getNapiMesh, setNapiMesh } from './_internal.js';
 import {
   capabilityFilterToNapi,
   capabilitySetToNapi,
@@ -236,7 +266,7 @@ export interface MeshNodeConfig {
    * lifetimes fail before the node exists, and an empty overall list
    * means every protected subnet assertion fails closed. Requires an
    * `org`-feature `@net-mesh/core` build. The subnet-exported provider
-   * verb (`serveSubnetExportedTyped`) and the admin surface live in
+   * verb (`MeshNode.serveSubnetExported`) and the admin surface live in
    * `@net-mesh/core/subnet`.
    */
   subnetAuthorities?: SubnetAuthorityConfig[];
@@ -257,7 +287,7 @@ export interface MeshNodeConfig {
   /**
    * Named subnet exports (`SUBNET_AUTH_SDK_PLAN.md` §3.3):
    * provider-local labels resolved once at construction into checked
-   * bindings and retained beside the handle. `serveSubnetExportedTyped`
+   * bindings and retained beside the handle. `MeshNode.serveSubnetExported`
    * registers against a name; empty or duplicate names fail before the
    * node exists.
    */
@@ -828,6 +858,55 @@ export class MeshNode {
       queryJson,
       rttEntries ?? null,
     );
+  }
+
+  /**
+   * Serve a subnet-exported, organization-protected service against a
+   * NAMED export configured at {@link MeshNode.create}
+   * (`SUBNET_AUTH_SDK_PLAN.md` §3.5).
+   *
+   * One of the two ordinary subnet verbs — the caller's counterpart is
+   * `org.callExported(service, request)`. Name the service, name a
+   * locally configured export, provide the handler; this constructs no
+   * authority objects. `exportName` was resolved into a checked binding
+   * when the mesh was built, and dispatch revalidates the exact crossing
+   * against this node's LIVE gateway authority on every call, before
+   * organization admission.
+   *
+   * The export name is provider-local configuration: never announced,
+   * never accepted from a caller. An unknown name throws
+   * `SubnetProvisionError` with `kind === 'unknown_export_name'` HERE,
+   * before anything is registered or announced.
+   *
+   * Announcement visibility is always public — the external caller
+   * proves organization authority and never joins this node's subnet.
+   *
+   * ```ts
+   * const handle = mesh.serveSubnetExported<Telemetry, Ack>(
+   *   'fleet.telemetry',
+   *   'factory-export',
+   *   async (caller, req) => ack(caller, req),
+   * );
+   * ```
+   */
+  serveSubnetExported<Req = unknown, Resp = unknown>(
+    service: string,
+    exportName: string,
+    handler: (caller: SubnetExportedCaller, req: Req) => Resp | Promise<Resp>,
+    handlerTimeoutMs?: number,
+  ): SubnetServeHandle {
+    // Delegates to the low-level binding with THIS mesh's native
+    // handle, reached through the module-internal WeakMap rather than a
+    // public escape hatch (review-10 P1-5). Before this existed, an
+    // application using the ergonomic constructor had no way to serve a
+    // named export without deep-importing `_internal` itself.
+    return serveSubnetExportedNative(
+      getNapiMesh(this),
+      service,
+      exportName,
+      handler as (caller: SubnetExportedCaller, req: unknown) => unknown,
+      handlerTimeoutMs,
+    ) as SubnetServeHandle;
   }
 
   /** Shutdown the mesh node. */

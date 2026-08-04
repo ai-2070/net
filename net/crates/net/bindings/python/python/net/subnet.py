@@ -9,7 +9,7 @@ over the native org surface, and the Node binding's ``subnet.ts`` layer.
 
 Two layers, deliberately separated:
 
-- **Ordinary application** — the provider verb ``serve_subnet_exported_typed``
+- **Ordinary application** — the provider verb ``serve_subnet_exported``
   (plus the caller verb ``OrgClient.call_exported`` on the org client). The
   provider names a service and a locally configured export; it constructs no
   roots, credentials, boundaries, epochs, or refs.
@@ -73,7 +73,7 @@ def classify_subnet_error(exc_or_message: Any) -> Any:
     envelope, so it can wrap a broad ``except`` without swallowing unrelated
     errors. A live native call already raises ``SubnetProvisionError`` directly;
     this attaches the parsed ``kind`` and is what
-    :func:`serve_subnet_exported_typed` routes registration failures through.
+    :func:`serve_subnet_exported` routes registration failures through.
     """
     from ._net import SubnetProvisionError  # local import: native module
 
@@ -141,7 +141,7 @@ class _Admin:
 admin = _Admin()
 
 
-def serve_subnet_exported_typed(
+def serve_subnet_exported(
     mesh: Any,
     service: str,
     export_name: str,
@@ -159,10 +159,40 @@ def serve_subnet_exported_typed(
     ``caller`` carries the same verified fields as ``serve_org``. Announcement
     visibility is always public, and the external caller never joins this
     node's subnet.
+
+    This is THE ordinary provider verb (review-10 P1-5). ``net.subnet``'s
+    ``serve_subnet_exported_bytes`` is the byte seam beneath it;
+    ``net.serve_subnet_exported`` at the package root is the raw native symbol
+    the seam calls.
     """
-    from ._net import serve_subnet_exported  # local import: native module
 
     def _wrapped(caller: dict, request_bytes: bytes) -> bytes:
         return _encode(handler(caller, _decode(request_bytes)))
 
-    return serve_subnet_exported(mesh, service, export_name, _wrapped, handler_timeout_ms)
+    return serve_subnet_exported_bytes(
+        mesh, service, export_name, _wrapped, handler_timeout_ms
+    )
+
+
+def serve_subnet_exported_bytes(
+    mesh: Any,
+    service: str,
+    export_name: str,
+    handler: Callable[[dict, bytes], bytes],
+    handler_timeout_ms: Optional[int] = None,
+) -> Any:
+    """The BYTES seam under :func:`serve_subnet_exported` — no codec.
+
+    Explicitly named ``…_bytes`` because it is the binding seam, not a second
+    application verb.
+    """
+    from ._net import serve_subnet_exported as _native  # local: native module
+
+    return _native(mesh, service, export_name, handler, handler_timeout_ms)
+
+
+#: Deprecated alias for :func:`serve_subnet_exported`. The frozen ordinary
+#: provider verb is ``serve_subnet_exported``; ``_typed`` was never meant to be
+#: a second application concept beside it (review-10 P1-5). Retained so
+#: existing callers keep working.
+serve_subnet_exported_typed = serve_subnet_exported
