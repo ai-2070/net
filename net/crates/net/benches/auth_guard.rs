@@ -14,7 +14,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use net::adapter::net::{AuthGuard, AuthVerdict, ChannelHash, ChannelName};
+use net::adapter::net::{AclPrincipal, AuthGuard, AuthVerdict, ChannelHash, ChannelName};
+
+// `AclPrincipal::Node`, not `Origin`, throughout: this bench measures the
+// publish/subscribe hot path, and the subscribe handler — the ACL's only
+// production writer — grants exactly `Node(node_id)`. The two derivations
+// are disjoint keys, so benching `Origin` here would measure a lookup
+// production never performs. Cost is identical either way (the domain byte
+// folds into the same bloom key), but the bench should describe the path it
+// claims to.
 
 // ============================================================================
 // Single-thread microbenchmarks
@@ -24,7 +32,7 @@ fn populated_guard(n_entries: u32) -> AuthGuard {
     let guard = AuthGuard::new();
     for i in 0..n_entries {
         let name = ChannelName::new(&format!("bench/chan-{}", i)).unwrap();
-        guard.allow_channel(0xdead_0000_u64 + i as u64, &name);
+        guard.allow_channel(AclPrincipal::Node(0xdead_0000_u64 + i as u64), &name);
     }
     guard
 }
@@ -38,16 +46,16 @@ fn bench_check_fast_hot_hit(c: &mut Criterion) {
     let mut group = c.benchmark_group("auth_guard_check_fast_hit");
     group.throughput(Throughput::Elements(1));
     group.bench_function("single_thread", |b| {
-        // Cycle through 256 different authorized (origin, channel)
+        // Cycle through 256 different authorized (principal, channel)
         // pairs so the bench doesn't stay on one cache line.
         let mut i = 0u64;
         let channels: Vec<ChannelName> = (0..256)
             .map(|j| ChannelName::new(&format!("bench/chan-{}", j)).unwrap())
             .collect();
         b.iter(|| {
-            let origin = 0xdead_0000_u64 + (i & 0xff);
+            let subscriber = AclPrincipal::Node(0xdead_0000_u64 + (i & 0xff));
             let channel_hash = channels[(i as usize) & 0xff].hash();
-            let v = guard.check_fast(black_box(origin), black_box(channel_hash));
+            let v = guard.check_fast(black_box(subscriber), black_box(channel_hash));
             i = i.wrapping_add(1);
             debug_assert!(matches!(
                 v,
@@ -60,7 +68,7 @@ fn bench_check_fast_hot_hit(c: &mut Criterion) {
 }
 
 fn bench_check_fast_cold_miss(c: &mut Criterion) {
-    // Bloom miss — no (origin, channel) entry ever inserted for
+    // Bloom miss — no (principal, channel) entry ever inserted for
     // this pair. Two bit loads, no DashMap probe. This is the
     // "deny unauthorized subscribers" path.
     let guard = populated_guard(1000);
@@ -69,10 +77,10 @@ fn bench_check_fast_cold_miss(c: &mut Criterion) {
     group.bench_function("single_thread", |b| {
         let mut i = 0u64;
         b.iter(|| {
-            // Origin range that never appeared in `populated_guard`.
-            let origin = 0xcafe_0000_u64 + i;
+            // Node-id range that never appeared in `populated_guard`.
+            let subscriber = AclPrincipal::Node(0xcafe_0000_u64 + i);
             let channel_hash = (i & 0xffff_ffff) as ChannelHash;
-            let v = guard.check_fast(black_box(origin), black_box(channel_hash));
+            let v = guard.check_fast(black_box(subscriber), black_box(channel_hash));
             i = i.wrapping_add(1);
             v
         });
@@ -93,7 +101,7 @@ fn bench_check_fast_concurrent(c: &mut Criterion) {
     let guard = Arc::new(populated_guard(10_000));
     let stop = Arc::new(AtomicU64::new(0));
 
-    // Spawn 7 background threads reading random (origin, channel)
+    // Spawn 7 background threads reading random (principal, channel)
     // pairs. They run as long as the bench group holds `stop` at 0.
     let mut handles = Vec::new();
     for t in 0..7 {
@@ -102,9 +110,9 @@ fn bench_check_fast_concurrent(c: &mut Criterion) {
         handles.push(thread::spawn(move || {
             let mut i = t as u64;
             while s.load(Ordering::Relaxed) == 0 {
-                let origin = 0xdead_0000_u64 + (i & 0xff);
+                let subscriber = AclPrincipal::Node(0xdead_0000_u64 + (i & 0xff));
                 let channel_hash = (i % 10_000) as ChannelHash;
-                black_box(g.check_fast(origin, channel_hash));
+                black_box(g.check_fast(subscriber, channel_hash));
                 i = i.wrapping_add(7);
             }
         }));
@@ -119,9 +127,9 @@ fn bench_check_fast_concurrent(c: &mut Criterion) {
     group.bench_function("eight_threads", |b| {
         let mut i = 0u64;
         b.iter(|| {
-            let origin = 0xdead_0000_u64 + (i & 0xff);
+            let subscriber = AclPrincipal::Node(0xdead_0000_u64 + (i & 0xff));
             let channel_hash = (i % 10_000) as ChannelHash;
-            let v = guard.check_fast(black_box(origin), black_box(channel_hash));
+            let v = guard.check_fast(black_box(subscriber), black_box(channel_hash));
             i = i.wrapping_add(1);
             v
         });
@@ -135,7 +143,7 @@ fn bench_check_fast_concurrent(c: &mut Criterion) {
 }
 
 fn bench_allow_channel(c: &mut Criterion) {
-    // Cost of admitting a new (origin, channel) into the guard —
+    // Cost of admitting a new (principal, channel) into the guard —
     // runs on every successful subscribe. Bloom bit sets + one
     // DashMap insert per call.
     let mut group = c.benchmark_group("auth_guard_allow_channel");
@@ -145,7 +153,7 @@ fn bench_allow_channel(c: &mut Criterion) {
         let name = ChannelName::new("bench/chan-allow").unwrap();
         let mut i = 0u64;
         b.iter(|| {
-            guard.allow_channel(black_box(0xbeef_0000_u64 + i), &name);
+            guard.allow_channel(black_box(AclPrincipal::Node(0xbeef_0000_u64 + i)), &name);
             i = i.wrapping_add(1);
         });
     });
@@ -171,7 +179,8 @@ fn bench_hot_hit_ceiling(c: &mut Criterion) {
             let start = Instant::now();
             for _ in 0..iters {
                 for i in 0..1_000_000u64 {
-                    black_box(guard.check_fast(0xdead_0000_u64 + (i & 0xff), channel_hash));
+                    let subscriber = AclPrincipal::Node(0xdead_0000_u64 + (i & 0xff));
+                    black_box(guard.check_fast(subscriber, channel_hash));
                 }
             }
             start.elapsed()

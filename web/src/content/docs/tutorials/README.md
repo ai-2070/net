@@ -2,10 +2,12 @@
 title: Tutorials
 description: "End-to-end builds that connect Net's APIs into complete systems."
 ---
+
 # Tutorials
 
-Tutorials start from an empty project and finish with a working system. They
-explain the design choices that connect the individual APIs.
+These tutorials are worked architecture examples. They connect the main APIs and
+show the expected control flow, but the snippets are illustrative rather than
+complete repositories with deployment manifests.
 
 - **[Fleet telemetry](/docs/tutorials/fleet-telemetry)** builds hierarchical
   channels, subnet scopes, capability announcements, and a folded operator view.

@@ -330,10 +330,17 @@ impl MeshBuilder {
         let channel_configs = Arc::new(ChannelConfigRegistry::new());
         node.set_channel_configs(channel_configs.clone());
         // Hand the caller's TokenCache to the mesh so channel auth
-        // (`require_token` / `can_subscribe` / `can_publish`) has a
-        // cache to consult + install incoming tokens into. Without
-        // an identity, no cache is installed and `require_token`
-        // channels will reject.
+        // (`require_token` / `can_subscribe` / `can_publish`) has one
+        // to consult: it supplies the RevocationRegistry, the
+        // clock-skew tolerance, and the local node's own credentials
+        // (the PUBLISH token the publish path resolves via
+        // `get_for_action`). Incoming subscriber tokens are NOT
+        // installed into it — they are verified inline against the
+        // channel's `token_roots` and retained as chains.
+        //
+        // Without an identity no cache is installed, and
+        // `require_token` channels reject — at subscribe, not silently
+        // at first publish (M4).
         if let Some(id) = sdk_identity.as_ref() {
             node.set_token_cache(id.token_cache().clone());
         }
@@ -460,15 +467,6 @@ impl Mesh {
     /// exclude either don't trip dead-code lints.
     pub(crate) fn node(&self) -> &Arc<MeshNode> {
         &self.node
-    }
-
-    /// Crate-internal accessor for the SDK's
-    /// `ChannelConfigRegistry`. Used by `mesh_rpc` to
-    /// auto-register the request channel + reply prefix on
-    /// `serve_rpc`.
-    #[cfg(all(feature = "net", feature = "cortex"))]
-    pub(crate) fn channel_configs_arc(&self) -> &Arc<ChannelConfigRegistry> {
-        &self.channel_configs
     }
 
     /// Connect to a peer as initiator.
@@ -640,6 +638,71 @@ impl Mesh {
         self.channel_configs.insert(config);
     }
 
+    /// Install the standard channel policy for an RPC-style service:
+    /// the exact `<service>.requests` channel and the
+    /// `<service>.replies.` prefix, the latter bound to each caller's
+    /// own origin.
+    ///
+    /// **Install-if-absent, never replace** — an ACL the operator
+    /// registered before serving survives untouched (H2).
+    ///
+    /// The `Mesh`-shaped hop to
+    /// [`ChannelConfigRegistry::install_rpc_service_defaults`], which
+    /// holds the implementation.
+    ///
+    /// It lives on the registry rather than here because the serve paths
+    /// do not share a receiver — `serve_rpc*` (gated on `cortex`) and
+    /// the `aggregator` module (gated on `aggregator`) go through
+    /// `Mesh`, while the org facade's `serve_org_bytes_node` holds an
+    /// `Arc<MeshNode>` for the language bindings. Each copy that existed
+    /// per receiver drifted from the others; the registry is the one
+    /// object all of them already hold.
+    ///
+    /// Gated to match its callers exactly. `Mesh` itself is `net`-only,
+    /// but both hops into here are narrower — `mesh_rpc` needs `cortex`,
+    /// `aggregator` needs `aggregator` — so a `--features net` build has
+    /// no caller and this is genuinely dead there. The org path is NOT a
+    /// caller: it holds a `MeshNode`, so it reaches
+    /// `install_rpc_service_defaults` on the registry directly and needs
+    /// no `Mesh`-shaped hop.
+    ///
+    /// `cfg` rather than `#[allow(dead_code)]` on purpose: the allow
+    /// would also silence the day this genuinely loses its last caller,
+    /// which for a security-policy hop is worth being told about.
+    #[cfg(any(feature = "cortex", feature = "aggregator"))]
+    pub(crate) fn register_rpc_service_channels(&self, service: &str) {
+        self.channel_configs.install_rpc_service_defaults(service);
+    }
+
+    /// Register a **prefix-matched** channel config. Any channel name
+    /// starting with `prefix` that has no exact-match entry resolves
+    /// to `config`; when several prefixes match, the longest wins.
+    ///
+    /// Use this to install an ACL over a family of dynamically-named
+    /// channels — notably nRPC's per-caller reply channels, where
+    /// `<service>.replies.` covers every
+    /// `<service>.replies.<caller_origin>` without pre-registering
+    /// each one.
+    ///
+    /// Registering a prefix ACL **before** `serve_rpc*` is the
+    /// supported way to override nRPC's permissive defaults: auto-
+    /// registration installs its default only when the prefix is
+    /// otherwise unclaimed, so an entry made here survives.
+    ///
+    /// Token gates on a prefix entry are evaluated against the
+    /// **requested concrete channel**, not the sentinel
+    /// `config.channel_id`. So a grant stays bound per channel: a token
+    /// minted for `<prefix><a>` does not authorize `<prefix><b>`, and a
+    /// token minted for the sentinel authorizes nothing real. Mint
+    /// per-channel tokens; a sentinel-scoped one is not a broader key,
+    /// it is a useless one.
+    ///
+    /// Idempotent: re-registering the same prefix replaces the prior
+    /// config.
+    pub fn register_channel_prefix(&self, prefix: impl Into<String>, config: ChannelConfig) {
+        self.channel_configs.insert_prefix(prefix, config);
+    }
+
     /// Ask `publisher_node_id` to add this node to `channel`'s
     /// subscriber set. Blocks until the publisher's `Ack` arrives or
     /// the mesh's membership-ack timeout elapses.
@@ -750,10 +813,26 @@ impl Mesh {
 
     // ---- Routing ----
 
-    /// Add a route to a destination node.
+    /// Add an ORDINARY route to a destination node.
     ///
-    /// Packets sent to `dest_node_id` via `send()` will be forwarded
-    /// through `next_hop_addr`.
+    /// This installs a *candidate*, not an override. Each destination
+    /// holds at most one ordinary candidate (manual installs like this
+    /// one, plus pingwave-learned routes) and at most one protected
+    /// candidate (identity-bound, learned from an authenticated
+    /// adjacent session). Forwarding selects the lowest-metric live
+    /// candidate, and on an equal metric the protected one wins.
+    ///
+    /// So packets to `dest_node_id` follow `next_hop_addr` only while
+    /// no better — or equally good, identity-bound — candidate exists.
+    /// A manual route cannot displace an authenticated direct
+    /// adjacency, and cannot make protected forwarding resolve at all:
+    /// only an authenticated learning path installs a protected
+    /// candidate. Calling this with a route the mesh already knows
+    /// better is a no-op in effect, not an error.
+    ///
+    /// Remove it with [`Self::remove_route`], which removes the
+    /// ordinary candidate this installed and leaves authenticated
+    /// state alone.
     pub fn add_route(&self, dest_node_id: u64, next_hop_addr: &str) -> Result<()> {
         let addr: SocketAddr = next_hop_addr
             .parse()
@@ -762,7 +841,12 @@ impl Mesh {
         Ok(())
     }
 
-    /// Remove a route.
+    /// Remove the ordinary route added by [`Self::add_route`].
+    ///
+    /// Removes only the manual/ordinary candidate. Routes the mesh
+    /// learned for itself — and any authenticated (protected)
+    /// candidate — are unaffected, so this cannot be used to strip a
+    /// destination's authenticated state.
     pub fn remove_route(&self, dest_node_id: u64) {
         self.node.router().remove_route(dest_node_id);
     }
@@ -790,11 +874,6 @@ impl Mesh {
     /// Number of nodes discovered via pingwave propagation.
     pub fn discovered_nodes(&self) -> usize {
         self.node.proximity_graph().node_count()
-    }
-
-    /// Number of active reroutes (routes using alternates after failure).
-    pub fn active_reroutes(&self) -> usize {
-        self.node.reroute_policy().active_reroutes()
     }
 
     // ---- Streams ----
@@ -1410,5 +1489,102 @@ fn parse_ack_reason(s: &str) -> Option<AckReason> {
         "RateLimited" => Some(AckReason::RateLimited),
         "TooManyChannels" => Some(AckReason::TooManyChannels),
         _ => None,
+    }
+}
+
+// Gated to match `register_rpc_service_channels`, which these exercise
+// through its `Mesh`-shaped hop. Under `--features net` alone the method
+// does not exist, and the policy it installs is unreachable from `Mesh`
+// — `ChannelConfigRegistry::install_rpc_service_defaults` has its own
+// tests in the `net` crate, so the property stays covered there.
+#[cfg(all(test, feature = "net", any(feature = "cortex", feature = "aggregator")))]
+mod rpc_service_channel_registration_tests {
+    //! The aggregator module registers RPC channels through its own
+    //! entry points, and used to carry a hand-copied version of the
+    //! auto-registration helper. The copy drifted: it kept replacing
+    //! inserts (so it discarded operator ACLs, H2) and never gained the
+    //! reply-channel origin binding (so aggregator reply channels stayed
+    //! world-subscribable, H3) — both long after those were fixed for
+    //! `serve_rpc`.
+    //!
+    //! Both callers now route through `register_rpc_service_channels`.
+    //! These pin the two properties ON THE SHARED HELPER, so a future
+    //! divergence fails here rather than in only one subsystem's tests.
+
+    use super::*;
+    use net::adapter::net::identity::EntityKeypair;
+    use net::adapter::net::{ChannelId, ChannelName};
+
+    async fn mesh() -> Mesh {
+        MeshBuilder::new("127.0.0.1:0", &[0x5Au8; 32])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// An operator ACL registered first must survive auto-registration.
+    #[tokio::test]
+    async fn shared_registration_preserves_an_operator_acl() {
+        let mesh = mesh().await;
+        let root = EntityKeypair::generate();
+        let channel = ChannelName::new("agg.svc.requests").unwrap();
+        mesh.register_channel(
+            ChannelConfig::new(ChannelId::new(channel))
+                .with_token_roots(vec![root.entity_id().clone()]),
+        );
+
+        mesh.register_rpc_service_channels("agg.svc");
+
+        let cfg = mesh
+            .channel_configs
+            .get_by_name("agg.svc.requests")
+            .expect("request channel must exist")
+            .clone();
+        assert!(
+            cfg.token_required(),
+            "shared registration must not clobber an operator ACL (H2)"
+        );
+        assert_eq!(cfg.token_roots[0], *root.entity_id());
+    }
+
+    /// The reply prefix it installs must be origin-bound, or any peer
+    /// can subscribe to another caller's reply channel.
+    #[tokio::test]
+    async fn shared_registration_binds_the_reply_prefix_to_the_caller_origin() {
+        let mesh = mesh().await;
+        mesh.register_rpc_service_channels("agg.svc2");
+
+        let resolved = mesh
+            .channel_configs
+            .resolve_by_name("agg.svc2.replies.00112233445566aa")
+            .expect("reply prefix must resolve for a per-caller channel");
+        assert!(
+            resolved.config.subscriber_origin_binding.is_some(),
+            "the shared registration must bind reply channels to the \
+             subscriber's own origin (H3)"
+        );
+        assert_eq!(
+            resolved.matched_prefix.as_deref(),
+            Some("agg.svc2.replies.")
+        );
+    }
+
+    /// Defaults still land when the operator configured nothing —
+    /// guards against "fix the clobbering by registering nothing", which
+    /// would break nRPC's dynamic per-caller reply subscriptions.
+    #[tokio::test]
+    async fn shared_registration_still_installs_defaults() {
+        let mesh = mesh().await;
+        mesh.register_rpc_service_channels("agg.svc3");
+
+        assert!(mesh
+            .channel_configs
+            .get_by_name("agg.svc3.requests")
+            .is_some());
+        assert!(mesh
+            .channel_configs
+            .get_by_name("agg.svc3.replies.00112233445566aa")
+            .is_some());
     }
 }

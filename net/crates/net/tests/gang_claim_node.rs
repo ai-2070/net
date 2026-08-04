@@ -17,8 +17,8 @@ use std::time::Duration;
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::behavior::fold::{
     CapabilityFilter, CapabilityFold, CapabilityMembership, CapabilityQuery, EnvelopeMeta,
-    FoldKind, IslandQuery, IslandRecord, IslandTopologyFold, NodeState, ReservationQuery,
-    SignedAnnouncement, UnitSet,
+    FoldKind, IslandQuery, IslandRecord, IslandTopologyFold, NodeState, ReservationAnnouncement,
+    ReservationFold, ReservationQuery, ReservationState, SignedAnnouncement, UnitSet,
 };
 use net::adapter::net::behavior::gang::{
     match_islands, single_island_claim, ClaimOutcome, MatchCriteria, NumericFilter, SelectionPolicy,
@@ -392,4 +392,284 @@ async fn claim_island_reserves_and_broadcasts_to_peer() {
         converged,
         "peer should see the scheduler's reservation converge"
     );
+}
+
+/// Sign `state` for `island` under `kp` and apply it directly to
+/// `node`'s reservation fold — the effect an inbound wire announcement
+/// from that publisher has, used to pre-converge a foreign holder.
+fn prime_reservation(
+    node: &MeshNode,
+    kp: &EntityKeypair,
+    node_id: u64,
+    island: u64,
+    state: ReservationState,
+    generation: u64,
+) {
+    let ann = SignedAnnouncement::sign(
+        kp,
+        ReservationFold::KIND_ID,
+        0,
+        node_id,
+        generation,
+        EnvelopeMeta::default(),
+        ReservationAnnouncement {
+            resource_id: island,
+            state,
+        },
+    )
+    .expect("sign reservation");
+    node.reservation_fold().apply(ann).expect("apply res");
+}
+
+fn holder_of_island(node: &MeshNode, island: u64) -> Option<u64> {
+    node.reservation_fold()
+        .query(ReservationQuery::State(island))
+        .first()
+        .and_then(|(_, s)| s.holder())
+}
+
+/// **Only locally accepted reservation-fold transitions are publishable.**
+///
+/// A losing reserve used to be signed, rejected by the local CAS, and
+/// broadcast anyway — so the claimant kept `A` held by `H` while an
+/// observer installed the losing claimant. The node published a
+/// reservation state it did not itself believe. ICB-4's W4 witnessed
+/// exactly that and disclaimed it as orthogonal; it is not orthogonal,
+/// and this pins the fix.
+///
+/// Everything else about a rejected attempt is deliberately unchanged
+/// and asserted here: still applied, still metered
+/// (`applies_rejected`), still generation-consuming. Only the wire
+/// output is suppressed.
+///
+/// # Not asserted: audit emission
+///
+/// `ReservationFold` does not implement [`FoldKind::audit_event`], so
+/// it emits nothing to an installed sink — and neither does any other
+/// production fold in the crate (only a test fold in `fold/tests.rs`
+/// does). An "a Rejected audit event is still emitted" assertion would
+/// therefore be vacuous in both directions, so it is left out rather
+/// than written to pass for the wrong reason. The durable guarantee is
+/// the one the metric pins: `Fold::apply` still ran, and audit
+/// emission is downstream of that inside `apply`, so it would follow
+/// automatically if the fold ever gains an `audit_event` impl.
+///
+/// [`FoldKind::audit_event`]: net::adapter::net::behavior::fold::FoldKind::audit_event
+///
+/// # Why the free island is in the fixture
+///
+/// The load-bearing assertion is a negative — "`O` never sees `A` held
+/// by `C`" — and a negative needs a positive control on the same link,
+/// or a dead session, a missed entity bootstrap, or a too-short settle
+/// window would all pass it vacuously. So `C` walks past held `A` onto
+/// free `B` in the same `claim_island` call, and `B`'s reservation is
+/// required to converge on `O`. Once it has, a suppressed `A`
+/// broadcast has demonstrably had at least as long to arrive as the
+/// `B` broadcast that did.
+///
+/// # Why `A` is pre-converged on `C` ONLY
+///
+/// Priming `Reserved{H}` onto the observer as well — the obvious way
+/// to write "both nodes still see `H`" — makes the test insensitive to
+/// the bug it exists for. `ReservationFold::merge` already refuses a
+/// foreign publisher's steal of a *fresh* reservation, so an observer
+/// holding `Reserved{H}` rejects the losing `Reserved{C}` on its own
+/// and the assertion passes whether or not the broadcast was sent.
+/// Verified: with the unconditional broadcast restored, that version
+/// of this test still passed.
+///
+/// So the observer starts with **no entry** for `A`, exactly as in
+/// ICB-4's fixture — which is why W4 saw a divergence there. An
+/// arriving losing announcement therefore `Insert`s cleanly, and
+/// "`O` has no entry for `A`" is a true zero-announcements witness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_locally_rejected_reservation_is_never_broadcast() {
+    const ISLAND_A: u64 = 0xE0; // held by H, ranks first (lower load)
+    const ISLAND_B: u64 = 0xE1; // free fallback
+
+    let claimant = build_node().await;
+    let observer = build_node().await;
+    connect_pair(&claimant, &observer).await;
+    claimant.start();
+    observer.start();
+
+    // Bootstrap so the observer knows the claimant's EntityId and will
+    // dispatch its fold broadcasts.
+    claimant
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // A GPU host publishing two islands, pre-converged into the
+    // claimant's view.
+    let gpu = EntityKeypair::generate();
+    let gn = gpu.entity_id().node_id();
+    prime_capability(&claimant, &gpu, gn, vec!["gpu:h100".into()]);
+    prime_island(&claimant, &gpu, gn, ISLAND_A, 0.1);
+    prime_island(&claimant, &gpu, gn, ISLAND_B, 0.2);
+
+    // `H` — a pre-existing holder identity. `A` is pre-converged as
+    // `Reserved{H}` on the CLAIMANT ONLY (see the doc comment), with a
+    // deadline far enough out that no takeover is legal.
+    let h = EntityKeypair::generate();
+    let h_id = h.entity_id().node_id();
+    prime_reservation(
+        &claimant,
+        &h,
+        h_id,
+        ISLAND_A,
+        ReservationState::Reserved {
+            holder: h_id,
+            until_unix_us: now_us() + 600_000_000,
+        },
+        1,
+    );
+    assert_eq!(holder_of_island(&claimant, ISLAND_A), Some(h_id));
+    assert_eq!(
+        holder_of_island(&observer, ISLAND_A),
+        None,
+        "the observer must start with no entry for A, or the negative below is vacuous",
+    );
+
+    let criteria = MatchCriteria {
+        capability: CapabilityQuery::Composite(CapabilityFilter {
+            tags_all: vec!["gpu:h100".into()],
+            ..Default::default()
+        }),
+        numeric: NumericFilter {
+            min_units: 8,
+            ..Default::default()
+        },
+        selection: SelectionPolicy::LeastLoaded,
+        prefer_capability: None,
+    };
+
+    let rejected_before = claimant.reservation_fold().stats().applies_rejected;
+
+    // A ranks first (load 0.1 < 0.2) and is held → Lost, walk to B.
+    let claimed = claimant
+        .claim_island(&criteria, now_us() + 60_000_000)
+        .await
+        .expect("claim_island");
+    assert_eq!(
+        claimed,
+        Some(ISLAND_B),
+        "the walk must reject held A and win free B",
+    );
+
+    // The rejected attempt stayed local, and stayed observable.
+    let rejected_delta = claimant.reservation_fold().stats().applies_rejected - rejected_before;
+    assert_eq!(
+        rejected_delta, 1,
+        "the losing attempt on A must still be applied and metered — suppressing \
+         the broadcast must not turn into skipping the CAS",
+    );
+    // Positive control: B's WINNING reservation must converge on the
+    // observer. Re-broadcast per poll (a legal self-extend) so the
+    // entity bootstrap has time to land, matching the house pattern.
+    let claimant_id = claimant.node_id();
+    let mut converged = false;
+    for _ in 0..50 {
+        claimant
+            .reserve_island(ISLAND_B, now_us() + 60_000_000)
+            .await
+            .expect("reserve B");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if holder_of_island(&observer, ISLAND_B) == Some(claimant_id) {
+            converged = true;
+            break;
+        }
+    }
+    assert!(
+        converged,
+        "positive control failed: the observer never saw the WINNING reservation on B, \
+         so the negative assertion below would be vacuous",
+    );
+
+    // The negative, now meaningful: nothing for A ever reached the
+    // observer, over a window in which a real broadcast demonstrably
+    // did. An arriving `Reserved{C}` would have `Insert`ed here.
+    assert_eq!(
+        holder_of_island(&observer, ISLAND_A),
+        None,
+        "the observer received a reservation announcement for A — a locally rejected \
+         reservation must never be replicated (pre-fix it installed the LOSING claimant)",
+    );
+    // And the claimant's own view is unchanged: it still believes H
+    // holds A, which is the belief the suppressed broadcast contradicted.
+    assert_eq!(
+        holder_of_island(&claimant, ISLAND_A),
+        Some(h_id),
+        "the claimant must still see A held by H",
+    );
+}
+
+/// The same invariant on the release path, which shares
+/// `apply_and_broadcast_reservation`: a `Free` the local fold rejects
+/// must not be published either.
+///
+/// `release_island` gates on holder identity first, so the ordinary
+/// non-holder release returns `Lost` without reaching the fold at all
+/// (review #5) — a *stronger* guarantee than the invariant, and
+/// asserted as such: no fold apply of any outcome, and neither view
+/// moves. Audit emission is not asserted, for the reason given on
+/// [`a_locally_rejected_reservation_is_never_broadcast`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_non_holder_release_touches_neither_the_fold_nor_the_wire() {
+    const ISLAND: u64 = 0xE7;
+
+    let claimant = build_node().await;
+    let observer = build_node().await;
+    connect_pair(&claimant, &observer).await;
+    claimant.start();
+    observer.start();
+    claimant
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("announce");
+
+    // Held by H on both nodes; the claimant is NOT the holder.
+    let h = EntityKeypair::generate();
+    let h_id = h.entity_id().node_id();
+    for node in [&claimant, &observer] {
+        prime_reservation(
+            node,
+            &h,
+            h_id,
+            ISLAND,
+            ReservationState::Reserved {
+                holder: h_id,
+                until_unix_us: now_us() + 600_000_000,
+            },
+            1,
+        );
+    }
+
+    let before = claimant.reservation_fold().stats();
+
+    assert_eq!(
+        claimant.release_island(ISLAND).await.expect("release"),
+        ClaimOutcome::Lost,
+        "a non-holder release must report Lost",
+    );
+
+    let after = claimant.reservation_fold().stats();
+    assert_eq!(
+        (
+            after.applies_inserted,
+            after.applies_replaced,
+            after.applies_rejected
+        ),
+        (
+            before.applies_inserted,
+            before.applies_replaced,
+            before.applies_rejected
+        ),
+        "the holder gate must short-circuit before the fold apply",
+    );
+
+    // Settle, then confirm neither view moved.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(holder_of_island(&observer, ISLAND), Some(h_id));
+    assert_eq!(holder_of_island(&claimant, ISLAND), Some(h_id));
 }

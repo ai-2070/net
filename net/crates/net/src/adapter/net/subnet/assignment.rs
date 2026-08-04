@@ -32,9 +32,17 @@ use crate::adapter::net::behavior::capability::CapabilitySet;
 ///    resolve as *later-rule-wins*: the earlier rule may write
 ///    the level byte first, but a subsequent match at the same
 ///    level overwrites it.
-/// 2. **First tag wins per rule.** Inside one rule, the first
-///    capability tag whose stripped suffix is present in `values`
-///    wins — subsequent tags matching the same rule are ignored.
+/// 2. **Smallest matching tag wins per rule.** Inside one rule, the
+///    lexicographically smallest capability tag whose stripped suffix
+///    is present in `values` wins; other tags matching the same rule
+///    are ignored. The tie-break has to be order-independent, not
+///    positional: tags arrive from a `HashSet` (via
+///    [`SubnetPolicy::assign`]) or as fold-stored strings in
+///    unspecified order, so "the first one" is not a defined thing.
+///    Two receivers holding the same announcement must assign it the
+///    same subnet. See
+///    [`SubnetPolicy::assign_from_rendered_tags`], which is the sole
+///    definition.
 /// 3. **No partial-prefix match on values.** `tag_prefix` is
 ///    stripped by [`str::strip_prefix`]; the remaining value is
 ///    then looked up by *exact* string equality against `values`.
@@ -95,28 +103,170 @@ impl SubnetPolicy {
         Ok(self)
     }
 
+    /// True when some rule could assign a level a non-zero value — i.e.
+    /// this policy can produce a subnet other than [`SubnetId::GLOBAL`].
+    ///
+    /// False for [`Self::new`] with no rules added (documented there as
+    /// "all nodes get `SubnetId::GLOBAL`"), and also for a policy whose
+    /// every mapped value happens to be `0`, which assigns GLOBAL just
+    /// as surely while looking configured.
+    ///
+    /// Exists because "a policy is installed" is not the same question
+    /// as "peers can resolve to distinct subnets", and the caller that
+    /// asked — `MeshNode`'s startup diagnostic — needs the second. A
+    /// policy that can only ever answer GLOBAL puts every peer in the
+    /// same subnet as a GLOBAL local node, so nothing is inconsistent
+    /// and there is nothing to warn about.
+    ///
+    /// Exact, not approximate, on two counts:
+    ///
+    /// - A non-zero mapping always CAN be assigned, because
+    ///   [`Self::assign_from_rendered_tags`] ignores zero-valued
+    ///   mappings rather than writing them, so no later rule can zero
+    ///   out an earlier one. Were zeros written, a policy could hold
+    ///   non-zero values and still only ever answer GLOBAL.
+    /// - A mapping whose prefix and value are BOTH empty is skipped. It
+    ///   would match only the empty tag, which
+    ///   [`Self::assign_from_rendered_tags`] discards — so it can never
+    ///   fire. Note the justification is that skip, NOT that empty tags
+    ///   are unrepresentable: `CapabilityMembership::tags` is a
+    ///   deserialized `Vec<String>` with no non-empty invariant, so
+    ///   without the skip the assignment helper would scope on an empty
+    ///   tag while this predicate said it could not.
+    ///
+    /// Both exclusions exist so this agrees with `assign` about the same
+    /// policy. A diagnostic that flags configurations which cannot
+    /// actually misbehave trains its reader to ignore it.
+    pub fn can_assign_non_global(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.values.iter().any(|(value, &level_value)| {
+                // A mapping matches exactly the tag `tag_prefix + value`.
+                // With both halves empty that is the empty tag, which
+                // `assign_from_rendered_tags` discards — so counting it
+                // would report a policy as able to scope when the
+                // assignment can never make it do so.
+                //
+                // The justification is that skip, not that empty tags
+                // cannot exist. `CapabilityMembership::tags` is a
+                // deserialized `Vec<String>`, so one is representable
+                // off the wire even though nothing that went through
+                // `Tag` produces it; the two must agree on the same
+                // domain, and the skip is what makes them.
+                //
+                // Only BOTH being empty is discounted. An empty `value`
+                // under a real prefix matches that prefix as a whole
+                // tag — `region:` parses (as `Tag::Legacy`) and renders
+                // back unchanged, so `region:` + `""` is reachable.
+                let matches_only_the_empty_tag = rule.tag_prefix.is_empty() && value.is_empty();
+                level_value != 0 && !matches_only_the_empty_tag
+            })
+        })
+    }
+
     /// Assign a subnet ID to a node based on its capability tags.
     ///
     /// Evaluates all rules against the node's tags. Unmatched levels
     /// remain zero (meaning "no restriction at that level").
     pub fn assign(&self, caps: &CapabilitySet) -> SubnetId {
+        // Phase A.5.N.2: caps.tags is HashSet<Tag>; render each tag to
+        // its wire-form string. Order is unspecified and deliberately
+        // left that way — `assign_from_rendered_tags` resolves each rule
+        // to the lexicographically smallest matching tag, so the verdict
+        // does not depend on it.
+        let tag_strings: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+        self.assign_from_rendered_tags(&tag_strings)
+    }
+
+    /// [`Self::assign`] against tags that are ALREADY in canonical
+    /// wire-string form — the shape the capability fold's
+    /// `CapabilityMembership` payload stores.
+    ///
+    /// Lets the scoped-discovery path derive a candidate's subnet from
+    /// the borrowed payload it is already holding, inside the same fold
+    /// snapshot that selected the candidate. Going through
+    /// [`Self::assign`] there would mean rebuilding a `CapabilitySet`
+    /// (re-parsing every tag, allocating a `HashSet<Tag>`) just to have
+    /// it rendered straight back to strings.
+    ///
+    /// Allocation-free, and the deterministic tie-break is load-bearing
+    /// rather than cosmetic: tags reach this function in unspecified
+    /// order (the fold stores them as rendered strings, `assign` renders
+    /// them out of a `HashSet`), so without one, two receivers holding
+    /// the same announcement could assign it different subnets.
+    ///
+    /// Each rule resolves to the LEXICOGRAPHICALLY SMALLEST tag that
+    /// both matches the rule's prefix and carries a mapped value —
+    /// selected in one borrowed pass per rule. This is the sole
+    /// definition; [`Self::assign`] delegates here rather than
+    /// implementing its own.
+    ///
+    /// It is also exactly what "sort the tags, take the first match per
+    /// rule" produced, which is what this replaced. Sorting allocated a
+    /// `Vec` per candidate, and this runs while the capability fold's
+    /// read locks are held, so selecting the minimum directly is worth
+    /// the slightly less obvious phrasing.
+    /// `assign_from_rendered_tags_is_order_independent` pins the
+    /// property; `assign_from_rendered_tags_agrees_with_assign` pins
+    /// that the two entry points cannot drift.
+    ///
+    /// A mapped value of `0` is ignored, not written. `0` is reserved
+    /// for "unmatched / no restriction" and both [`SubnetRule::map`] and
+    /// [`SubnetRule::try_map`] refuse it, so one can only arrive through
+    /// the public `values` field. Honouring the reservation keeps a
+    /// later same-level rule from erasing an earlier rule's real
+    /// assignment — see contract point 1 on [`SubnetPolicy`], where
+    /// same-level rules are later-rule-wins — and is what makes
+    /// [`Self::can_assign_non_global`] exact rather than approximate.
+    pub fn assign_from_rendered_tags(&self, tags: &[String]) -> SubnetId {
         let mut levels = [0u8; 4];
 
-        // Phase A.5.N.2: caps.tags is HashSet<Tag>; render each tag
-        // to its wire-form string AND sort lexicographically so
-        // the first-match-wins resolution is deterministic across
-        // runs (HashSet iteration order is unspecified).
-        let mut tag_strings: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
-        tag_strings.sort();
-
         for rule in &self.rules {
-            for s in &tag_strings {
-                if let Some(value) = s.strip_prefix(&rule.tag_prefix) {
-                    if let Some(&level_value) = rule.values.get(value) {
-                        levels[rule.level as usize] = level_value;
-                        break; // first match wins for this rule
-                    }
+            // Smallest matching tag seen so far, with the level value it
+            // maps to. Mirrors `assign`'s post-sort `break`.
+            let mut winner: Option<(&str, u8)> = None;
+            for tag in tags {
+                let tag = tag.as_str();
+                // An empty tag is not a tag. `Tag::parse` rejects `""`
+                // and no `Tag` renders to it, but this function takes
+                // raw strings from `CapabilityMembership::tags`, which
+                // is a deserialized wire payload with no non-empty
+                // invariant — so an empty string is representable here
+                // even though nothing that went through `Tag` produces
+                // one. Skipping it is what lets
+                // [`Self::can_assign_non_global`] discount the
+                // empty-prefix/empty-value mapping: otherwise the two
+                // would disagree about the same policy, the predicate
+                // reasoning over `Tag`-validated input and this over
+                // whatever the wire carried.
+                if tag.is_empty() {
+                    continue;
                 }
+                let Some(value) = tag.strip_prefix(&rule.tag_prefix) else {
+                    continue;
+                };
+                let Some(&level_value) = rule.values.get(value) else {
+                    continue;
+                };
+                // 0 is reserved for "unmatched / no restriction" —
+                // `map` / `try_map` refuse it, so a 0 here arrived
+                // through `SubnetRule`'s public `values` field. Treat it
+                // as the absence of a mapping, which is what the
+                // reservation means, rather than as an instruction to
+                // write 0. Writing it would let a later same-level rule
+                // erase an earlier rule's real assignment.
+                if level_value == 0 {
+                    continue;
+                }
+                let better = match winner {
+                    Some((current, _)) => tag < current,
+                    None => true,
+                };
+                if better {
+                    winner = Some((tag, level_value));
+                }
+            }
+            if let Some((_, level_value)) = winner {
+                levels[rule.level as usize] = level_value;
             }
         }
 
@@ -190,6 +340,177 @@ mod tests {
         let policy = SubnetPolicy::new();
         let caps = caps_with_tags(&["region:us-west"]);
         assert_eq!(policy.assign(&caps), SubnetId::GLOBAL);
+    }
+
+    /// `assign_from_rendered_tags` is what the scoped-discovery path
+    /// calls against borrowed fold payload tags. It must agree with
+    /// `assign` — if it drifts, a forwarded peer resolves to a
+    /// different subnet than the same node's direct announcement would,
+    /// and `SameSubnet` starts returning a different set depending on
+    /// how the announcement happened to arrive.
+    #[test]
+    fn assign_from_rendered_tags_agrees_with_assign() {
+        let policy = SubnetPolicy::new()
+            .add_rule(SubnetRule::new("region:", 0).map("us", 3).map("eu", 4))
+            .add_rule(SubnetRule::new("fleet:", 1).map("blue", 7).map("green", 8))
+            .add_rule(SubnetRule::new("unit:", 2).map("alpha", 2));
+
+        let tag_sets: Vec<Vec<&str>> = vec![
+            vec![],
+            vec!["region:us"],
+            vec!["region:eu", "fleet:green"],
+            vec!["region:us", "fleet:blue", "unit:alpha"],
+            // Unmatched values leave their level at zero.
+            vec!["region:antarctica"],
+            // Noise tags the policy has no rule for.
+            vec!["gpu", "hardware.gpu", "region:us", "scope:tenant:oem-123"],
+            // Two values for the SAME rule: first-match-wins after the
+            // sort, so both paths must pick the same one. This is the
+            // case an unsorted scan would decide by hash order.
+            vec!["region:us", "region:eu"],
+            vec!["region:eu", "region:us"],
+        ];
+
+        for tags in tag_sets {
+            let caps = caps_with_tags(&tags);
+            // The rendered form the fold payload stores.
+            let rendered: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+            assert_eq!(
+                policy.assign_from_rendered_tags(&rendered),
+                policy.assign(&caps),
+                "divergence for tags {tags:?}"
+            );
+        }
+    }
+
+    /// The sort is load-bearing, not cosmetic: the fold stores tags in
+    /// unspecified order, and rule resolution is first-match-wins. Two
+    /// receivers holding the same announcement in different orders must
+    /// still assign the same subnet.
+    #[test]
+    fn assign_from_rendered_tags_is_order_independent() {
+        let policy = SubnetPolicy::new().add_rule(
+            SubnetRule::new("region:", 0)
+                .map("us", 3)
+                .map("eu", 4)
+                .map("ap", 5),
+        );
+        let forward: Vec<String> = ["region:us", "region:eu", "region:ap"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let reversed: Vec<String> = forward.iter().rev().cloned().collect();
+
+        assert_eq!(
+            policy.assign_from_rendered_tags(&forward),
+            policy.assign_from_rendered_tags(&reversed),
+            "tag order must not change the assigned subnet"
+        );
+    }
+
+    /// A rule value of `0` means "no mapping", not "assign global".
+    ///
+    /// `0` is reserved for unmatched / no restriction and `map` /
+    /// `try_map` reject it, so one only arrives through the public
+    /// `values` field. If it were written rather than skipped, a later
+    /// same-level rule — which contract point 1 makes later-rule-wins —
+    /// could erase an earlier rule's real assignment, leaving a policy
+    /// that holds non-zero mappings and yet can only ever answer GLOBAL.
+    /// `can_assign_non_global` would then be wrong about it, and the
+    /// startup diagnostic would fire at a policy that cannot scope.
+    #[test]
+    fn a_zero_mapping_cannot_erase_a_real_assignment() {
+        let mut zeroing = SubnetRule::new("region:", 0);
+        zeroing.values.insert("us".to_string(), 0);
+
+        // Same level, later rule: without the skip this overwrites 3.
+        let policy = SubnetPolicy::new()
+            .add_rule(SubnetRule::new("region:", 0).map("us", 3))
+            .add_rule(zeroing);
+
+        let tags = vec!["region:us".to_string()];
+        assert_eq!(
+            policy.assign_from_rendered_tags(&tags),
+            SubnetId::new(&[3]),
+            "a later rule mapping to the reserved 0 must not zero out an \
+             earlier rule's assignment"
+        );
+        assert!(
+            policy.can_assign_non_global(),
+            "and the predicate must agree — this policy really can scope"
+        );
+    }
+
+    /// A mapping with an empty prefix AND an empty value matches only
+    /// the empty tag, which no announcement can carry — `Tag::parse`
+    /// rejects `""` and no `Tag` renders to it. `can_assign_non_global`
+    /// must not count it, or the startup diagnostic fires at a policy
+    /// that cannot possibly misbehave.
+    ///
+    /// Reachable through the public builder, not just the fields:
+    /// `map` only rejects a level_value of 0, so this constructs.
+    #[test]
+    fn an_empty_prefix_and_value_cannot_match_any_tag() {
+        let impossible = SubnetPolicy::new().add_rule(SubnetRule::new("", 0).map("", 5));
+
+        // Nothing a real announcement carries can trip it.
+        for tag in ["gpu", "region:us", "hardware.gpu", "scope:tenant:acme"] {
+            assert_eq!(
+                impossible.assign_from_rendered_tags(&[tag.to_string()]),
+                SubnetId::GLOBAL,
+                "{tag} must not match an empty-prefix empty-value mapping"
+            );
+        }
+        assert!(
+            !impossible.can_assign_non_global(),
+            "a mapping that can never fire must not be reported as scoping"
+        );
+
+        // The domain the predicate reasons about must be the domain the
+        // helper operates on. `assign_from_rendered_tags` takes raw
+        // strings off `CapabilityMembership::tags` — a deserialized wire
+        // payload with no non-empty invariant — so an empty tag is
+        // representable even though nothing that went through `Tag`
+        // produces one. Without the skip in the helper, this would
+        // assign [5] while `can_assign_non_global` reported false, and
+        // the startup diagnostic would stay quiet on a real inversion.
+        assert_eq!(
+            impossible.assign_from_rendered_tags(&[String::new()]),
+            SubnetId::GLOBAL,
+            "an empty tag off the wire must not scope, or the predicate and \
+             the helper disagree about the same policy"
+        );
+
+        // The near miss that IS reachable: an empty value under a real
+        // prefix matches that prefix as a whole tag. `region:` parses as
+        // a legacy tag and renders back unchanged, so this one fires and
+        // must still count.
+        let prefix_only = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("", 6));
+        assert_eq!(
+            prefix_only.assign_from_rendered_tags(&["region:".to_string()]),
+            SubnetId::new(&[6]),
+            "`region:` is a legal tag, so prefix + empty value is reachable"
+        );
+        assert!(prefix_only.can_assign_non_global());
+    }
+
+    /// The other direction: a rule whose ONLY values are `0` maps
+    /// nothing, so it neither assigns nor reports as able to.
+    #[test]
+    fn a_rule_with_only_zero_values_maps_nothing() {
+        let mut zero_only = SubnetRule::new("region:", 0);
+        zero_only.values.insert("us".to_string(), 0);
+        zero_only.values.insert("eu".to_string(), 0);
+        let policy = SubnetPolicy::new().add_rule(zero_only);
+
+        for tag in ["region:us", "region:eu"] {
+            assert_eq!(
+                policy.assign_from_rendered_tags(&[tag.to_string()]),
+                SubnetId::GLOBAL,
+                "{tag} maps only to the reserved 0, so nothing is assigned"
+            );
+        }
+        assert!(!policy.can_assign_non_global());
     }
 
     #[test]
@@ -374,19 +695,24 @@ mod tests {
         );
     }
 
-    /// First matching tag wins *within* a single rule — a second
-    /// tag for the same rule is ignored (the `break` in `assign`).
-    /// Phase A.5.N.2: tags are now `HashSet<Tag>` (unordered);
-    /// `assign()` sorts tag strings lexicographically before the
-    /// first-match scan, so the result is deterministic regardless
-    /// of insertion order.
+    /// One tag wins *within* a single rule, and which one cannot
+    /// depend on order — tags are a `HashSet<Tag>`, so there is no
+    /// "first". The rule resolves to the lexicographically smallest
+    /// matching tag, which is what makes two receivers holding the
+    /// same announcement agree.
+    ///
+    /// (Formerly `first_tag_wins_within_a_single_rule`, describing a
+    /// sort-then-`break` that `assign` no longer performs — it
+    /// delegates to `assign_from_rendered_tags`, which selects the
+    /// minimum directly. The assertions are unchanged; only the name
+    /// and rationale were wrong.)
     #[test]
-    fn first_tag_wins_within_a_single_rule() {
+    fn smallest_matching_tag_wins_within_a_single_rule() {
         let policy =
             SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 1).map("eu", 2));
 
         // Both insertions converge on the same answer — the
-        // lexicographically-first matching tag wins. `region:eu`
+        // lexicographically smallest matching tag wins. `region:eu`
         // sorts before `region:us`, so 2 (eu's level value) wins
         // regardless of which tag was inserted first.
         let caps = caps_with_tags(&["region:us", "region:eu"]);

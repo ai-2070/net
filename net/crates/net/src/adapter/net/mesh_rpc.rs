@@ -54,10 +54,11 @@ use super::behavior::org::{OrgId, OrgMembershipCert};
 use super::behavior::org_admission::OrgAdmission;
 use super::behavior::org_call::{OrgCallProof, MAX_ORG_PROOF_TTL_SECS, ORG_ADMISSION_HEADER};
 use super::behavior::org_grant::{CapabilityAuthorityId, OrgCapabilityGrant, OrgDispatcherGrant};
-use super::mesh::{MeshNode, PeerPublishOutcome};
+use super::mesh::{MeshNode, PeerPublishOutcome, ReplySubscription};
 use super::org_admission_gate::{
     org_request_digest, CapabilityVisibility, OrgProviderPolicy, RegisteredRpcService,
 };
+use super::subnet::SubnetExportBinding;
 
 // ============================================================================
 // Public types.
@@ -665,10 +666,11 @@ enum BridgePreflight {
 ///
 /// 1. captured-service equality (E0.2 P0) — a cross-service REQUEST
 ///    drops;
-/// 2. the public capability gate ([`capability_bridge::may_execute`],
-///    byte-for-byte the same call the unary/response-streaming paths
-///    already made) — skipped only for the `from_node == 0`
-///    loopback/test sentinel;
+/// 2. the public capability admission gate
+///    ([`capability_bridge::may_admit`] — `allowed_nodes` or the
+///    permissive all-empty default; the self-declared subnet/group
+///    axes never admit, per SUBNET_AUTH_PLAN.md S1) — skipped only
+///    for the `from_node == 0` loopback/test sentinel;
 /// 3. on accept, the authenticated response-route cache
 ///    ([`cache_authenticated_response_destination`]).
 ///
@@ -746,7 +748,7 @@ fn bridge_preflight(
     };
     let from_node = inbound.from_node;
     if from_node != 0
-        && !crate::adapter::net::behavior::fold::capability_bridge::may_execute(
+        && !crate::adapter::net::behavior::fold::capability_bridge::may_admit(
             mesh.capability_fold(),
             mesh.node_id(),
             tag,
@@ -1118,6 +1120,35 @@ async fn admit_and_dispatch_protected(
 
     // Provider self-verify (E1.3) against ONE clock sample.
     let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
+
+    // D7 — the subnet-export binding, revalidated against LIVE state on
+    // every call, for a subnet-exported registration only. Runs BEFORE
+    // the expensive org-admission signature work (it is two binary
+    // probes and four integer compares) and BEFORE the failed-admission
+    // throttle: a denial here is provider-side authority movement
+    // (credentials or boundaries replaced, floor raised, epoch
+    // advanced, expiry), never caller proof abuse, so it is not charged
+    // against the caller's budget. The coarse reason deliberately does
+    // not disclose WHICH term failed.
+    let subnet_export_facts = match reg.subnet_export() {
+        Some(binding) => match gate::verify_subnet_export(mesh, binding, &clock) {
+            Ok(facts) => Some(facts),
+            Err(denied) => {
+                emit_admission_denial(
+                    mesh,
+                    resp_tx,
+                    service,
+                    claimed_origin,
+                    call_id,
+                    from_node,
+                    denied.coarse(),
+                );
+                return;
+            }
+        },
+        None => None,
+    };
+
     let facts = match gate::verify_provider_authority(mesh, &clock) {
         Ok(f) => f,
         Err(d) => {
@@ -1221,8 +1252,18 @@ async fn admit_and_dispatch_protected(
         clock,
         // §9.5 stability: the view captured before verification must still be
         // live at the replay insert, or the stale decision is denied without
-        // consuming a slot.
-        || captured_stamp.is_current(&gate::capture_admission_stamp(mesh)),
+        // consuming a slot. For a subnet-exported registration BOTH stamps
+        // must hold — the org security view AND the subnet-export view
+        // (gateway/boundary snapshot identity + both epochs) — so a
+        // wholesale credential or boundary replacement, a floor, or an
+        // epoch advance landing mid-verification denies rather than
+        // admitting against a dead view.
+        || {
+            captured_stamp.is_current(&gate::capture_admission_stamp(mesh))
+                && subnet_export_facts
+                    .as_ref()
+                    .is_none_or(|facts| facts.is_current(mesh))
+        },
         |proof| (reg.provider_policy())(proof),
     );
     match outcome {
@@ -1239,8 +1280,21 @@ async fn admit_and_dispatch_protected(
         Err(denied) => {
             // §6 — charge the failure. A denial is what an attacker produces;
             // a legitimate caller's admissions succeed and cost nothing.
-            mesh.admission_rate_limiter()
-                .on_failure(from_node, clock.monotonic);
+            //
+            // EXCEPT `AuthorityChanged` (D7): the §9.5 stability recheck
+            // failing means the PROVIDER's security view moved mid-
+            // verification — an org authority/floor swap, or a subnet
+            // gateway/boundary republication under a subnet-exported
+            // registration. That is provider-side state movement, not
+            // malformed caller behavior, and charging it would let the
+            // provider's own churn exhaust an honest caller's budget.
+            if !matches!(
+                denied,
+                crate::adapter::net::behavior::org_admission::AdmissionDenied::AuthorityChanged
+            ) {
+                mesh.admission_rate_limiter()
+                    .on_failure(from_node, clock.monotonic);
+            }
             tracing::warn!(service = service, reason = ?denied, "nrpc: org admission denied");
             emit_admission_denial(
                 mesh,
@@ -2928,9 +2982,41 @@ async fn publish_response_to_caller(
     mesh.publish(&publisher, payload).await.map(|_| ())
 }
 
+/// The runtime a client call was opened on, for [`spawn_cancel_publish`]
+/// to fall back to when Drop runs somewhere else.
+///
+/// Every client call is *created* inside a runtime, but it is not always
+/// *dropped* inside one. The owner can be a Python object freed by
+/// CPython's GC on the asyncio thread, a handle released across the C
+/// FFI, or a plain `drop()` in sync Rust — none of which have an ambient
+/// reactor. `tokio::spawn` panics there, and a panic in a `Drop` reached
+/// from `tp_dealloc` surfaces as an unraisable exception nobody can
+/// catch.
+///
+/// One handle for the process, not one per call: these calls all belong
+/// to the same `MeshNode`, and storing a `Handle` on four structs to say
+/// the same thing costs more than it explains.
+static CANCEL_PUBLISH_RT: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+/// Record the current runtime as the one to fire CANCEL frames on.
+///
+/// Called when a client call is opened — always from an `async fn`, so
+/// `try_current` always succeeds there. Idempotent, and first writer
+/// wins.
+pub(crate) fn remember_cancel_publish_runtime() {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let _ = CANCEL_PUBLISH_RT.set(handle);
+    }
+}
+
 /// Shared CANCEL-publish helper: spawn a task that fires a
 /// CANCEL event for `call_id` to `target` on the request channel.
 /// Both [`RpcStream::Drop`] and [`UnaryCallGuard::Drop`] use it.
+///
+/// Never panics on a foreign thread: prefers the ambient runtime, falls
+/// back to the one the call was opened on, and degrades to a log if
+/// neither exists (the process is tearing down, and the peer's
+/// keep-alive expiry is the backstop).
 fn spawn_cancel_publish(
     mesh: Arc<MeshNode>,
     target: u64,
@@ -2938,7 +3024,19 @@ fn spawn_cancel_publish(
     self_origin: u64,
     call_id: u64,
 ) {
-    tokio::spawn(async move {
+    let handle = tokio::runtime::Handle::try_current()
+        .ok()
+        .or_else(|| CANCEL_PUBLISH_RT.get().cloned());
+    let Some(handle) = handle else {
+        tracing::debug!(
+            call_id,
+            target_node = format!("{target:#x}"),
+            "rpc CANCEL: no runtime to publish on (dropped during teardown); \
+             relying on the peer's keep-alive expiry",
+        );
+        return;
+    };
+    handle.spawn(async move {
         let meta = EventMeta::new(DISPATCH_RPC_CANCEL, 0, self_origin, call_id, 0);
         let request_channel_id = ChannelId::new(request_channel);
         let request_channel_hash = request_channel_id.hash();
@@ -3148,6 +3246,66 @@ impl MeshNode {
             handler,
             UnaryAdmission::Protected {
                 admission,
+                provider_policy,
+            },
+        )
+    }
+
+    /// Register a SUBNET-EXPORTED unary RPC handler (SUBNET_AUTH_PLAN.md
+    /// D7): everything [`Self::serve_rpc_protected`] requires, PLUS an
+    /// immutable binding of this service to ONE exact declared subnet
+    /// crossing. The call's execution is conditioned on this node
+    /// CURRENTLY holding the authority to export through that crossing —
+    /// gateway credentials with exact `EXPORT` at the bound path, the
+    /// path declared in the live [`SubnetBoundarySet`], matching
+    /// topology/auth epochs, unexpired — revalidated on EVERY call
+    /// before organization admission. The external caller proves org
+    /// admission and never joins this node's subnet.
+    ///
+    /// Registration fails up front when the shape is impossible NOW
+    /// ([`ServeError::SubnetExportUnauthorized`]); passing here is not
+    /// standing authority — credentials replace wholesale, boundaries
+    /// replace wholesale, floors and epochs move, and any of those
+    /// darkens the live service until exact current authority returns.
+    ///
+    /// [`SubnetBoundarySet`]: crate::adapter::net::subnet::SubnetBoundarySet
+    pub fn serve_rpc_subnet_exported<H: RpcHandler>(
+        self: &Arc<Self>,
+        service: &str,
+        handler: Arc<H>,
+        admission: OrgAdmission,
+        export: SubnetExportBinding,
+        provider_policy: OrgProviderPolicy,
+    ) -> Result<ServeHandle, ServeError> {
+        if matches!(admission, OrgAdmission::PublicAuthenticated) {
+            return Err(ServeError::InvalidProtectedRegistration(
+                "admission mode must be org-protected (OwnerDelegated / CrossOrgGranted), \
+                 not PublicAuthenticated"
+                    .to_string(),
+            ));
+        }
+        if self.node_authority().is_none() {
+            return Err(ServeError::ProtectedAuthorityRequired(service.to_string()));
+        }
+        // Registration-time shape check: the declared boundary must exist
+        // exactly and this node must hold current exact EXPORT authority
+        // at it. This prevents a service from STARTING in an impossible
+        // shape; the per-call revalidation in the dispatch gate is the
+        // authority decision.
+        let clock = crate::adapter::net::behavior::admission_clock::ClockSample::now();
+        if let Err(denied) =
+            crate::adapter::net::org_admission_gate::verify_subnet_export(self, &export, &clock)
+        {
+            return Err(ServeError::SubnetExportUnauthorized(format!(
+                "{service}: {denied:?}"
+            )));
+        }
+        self.serve_rpc_unary_impl(
+            service,
+            handler,
+            UnaryAdmission::SubnetExported {
+                admission,
+                export,
                 provider_policy,
             },
         )
@@ -3472,6 +3630,27 @@ impl MeshNode {
             UnaryAdmission::Granted { provider_policy } => {
                 RegisteredRpcService::granted(registration_id, Arc::from(service), provider_policy)
             }
+            // D7: subnet-exported — an org-protected registration bound to
+            // one exact declared crossing, captured immutably.
+            UnaryAdmission::SubnetExported {
+                admission,
+                export,
+                provider_policy,
+            } => match RegisteredRpcService::subnet_exported(
+                registration_id,
+                Arc::from(service),
+                admission,
+                export,
+                provider_policy,
+            ) {
+                Ok(reg) => reg,
+                Err(e) => {
+                    self.unregister_rpc_inbound(channel_hash, registration_id);
+                    self.rpc_local_services_arc()
+                        .remove_if(service, registration_id);
+                    return Err(ServeError::InvalidProtectedRegistration(e.to_string()));
+                }
+            },
             // Test-only (review-7 RED): a protected registration marked to bypass
             // ONLY the org-admission engine. Same shape validation as a normal
             // protected registration; the disabled flag is the sole difference.
@@ -4155,6 +4334,8 @@ impl MeshNode {
         let deadline_ns = opts.deadline.map(instant_to_unix_nanos).unwrap_or(0);
         let observer = StreamingObserverState::new(Arc::clone(self), target_node_id, service, 0);
         let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
+        // See `remember_cancel_publish_runtime`.
+        remember_cancel_publish_runtime();
         Ok(ClientStreamCallRaw {
             mesh: Arc::clone(self),
             target_node_id,
@@ -4496,6 +4677,10 @@ impl MeshNode {
         // BOTH the sink AND stream halves drop, matching the
         // existing CANCEL-on-drop semantics.
         let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
+        // This handle may be dropped by a foreign thread — a Python
+        // object freed by GC, an FFI release — so record the runtime now,
+        // while we are certainly on one.
+        remember_cancel_publish_runtime();
         let inner = Arc::new(DuplexInner {
             mesh: Arc::clone(self),
             target_node_id,
@@ -4643,6 +4828,9 @@ impl MeshNode {
         // Cancel keep-alive lives on the returned RpcStream so the
         // watcher exits cleanly when the stream drops without cancel.
         let cancel_keep_alive = arm_stream_cancel(self, &opts, &pending, call_id);
+        // See `remember_cancel_publish_runtime` — a stream handed to a
+        // binding can be dropped off-runtime.
+        remember_cancel_publish_runtime();
         Ok(RpcStream {
             mesh: Arc::clone(self),
             target_node_id,
@@ -5239,6 +5427,8 @@ impl MeshNode {
         //    `send_rpc_cancel` call).
         //  - the cancel_token path (same: leave completed=false,
         //    Drop emits CANCEL).
+        // See `remember_cancel_publish_runtime`.
+        remember_cancel_publish_runtime();
         let mut guard = UnaryCallGuard {
             pending: Arc::clone(&pending),
             mesh: Arc::clone(self),
@@ -5454,6 +5644,30 @@ impl MeshNode {
         if reply_subscription_covers(&registry, target_node_id, service_hash, service) {
             return Ok(());
         }
+        // The failure-generation snapshot the fence at the bottom
+        // compares against, recorded by the attempt that SUCCEEDS.
+        //
+        // Each attempt snapshots BEFORE its subscribe `await`, because
+        // everything from there on can be overtaken by
+        // `target_node_id`'s session failing: the failure path evicts
+        // this registry, but it can only evict entries that exist when
+        // it runs, and ours does not exist yet. See
+        // `peer_failure_generation`.
+        //
+        // Per ATTEMPT, never once for the whole loop. A failure BETWEEN
+        // attempts is precisely what the retry recovers from, so fencing
+        // a later successful subscribe against a pre-failure snapshot
+        // would discard a valid cache entry and report `NoRoute` for a
+        // call that had just succeeded — turning the self-healing R5
+        // exists to provide back into the permanent failure it replaced.
+        // Only the snapshot belonging to the succeeding attempt means
+        // anything.
+        //
+        // Hence `None` here rather than a snapshot taken at this point:
+        // every read happens after the loop, so a value taken here could
+        // only ever be the wrong one, and seeding a placeholder would
+        // fence against a generation no attempt ever observed.
+        let mut gen_before: Option<u64> = None;
         // Cap the registry. `len()` on DashMap is approximate under
         // concurrent churn (it sums shard counts under shard reads,
         // not a global lock), which is exactly the semantics we
@@ -5475,12 +5689,131 @@ impl MeshNode {
         // Subscribe to our own reply channel from the target so the
         // target's roster has us as a subscriber when the server's
         // emit closure publishes the RESPONSE.
-        self.subscribe_channel(target_node_id, reply_channel.clone())
-            .await
-            .map_err(|e| RpcError::NoRoute {
+        //
+        // H3 ordering rule: the reply prefix is origin-BOUND on the
+        // server, and that binding is evaluated against the TOFU pin
+        // the server installs from our signature-verified direct
+        // capability announcement. If we have never announced to this
+        // target — or the pin was dropped when a previous session
+        // failed — the subscribe is rejected as `Unauthorized`, which
+        // is a *retryable* answer rather than a permanent one.
+        //
+        // So: on failure, republish our current capability baseline
+        // (`reannounce_current_capabilities` is the clobber-safe
+        // republish — it re-reads the baseline under the announce lock
+        // rather than snapshotting it outside, so it cannot lose a
+        // concurrent explicit announce), give the announcement a moment
+        // to land and be verified, and retry. The happy path is
+        // unchanged: one attempt, no announce, no sleep.
+        let mut last_err = None;
+        for attempt in 0..REPLY_SUBSCRIBE_ATTEMPTS {
+            let gen_this_attempt = self.peer_failure_generation(target_node_id);
+            match self
+                .subscribe_channel_reporting_reason(target_node_id, reply_channel.clone())
+                .await
+            {
+                Ok(()) => {
+                    gen_before = Some(gen_this_attempt);
+                    last_err = None;
+                    break;
+                }
+                Err(failure) => {
+                    // Two INDEPENDENT decisions, deliberately not fused:
+                    //
+                    // 1. Is this rejection worth retrying at all? Only an
+                    //    `Unauthorized` is. Anything else — the peer is
+                    //    gone, throttling us, or does not know the
+                    //    channel — returns immediately, because waiting
+                    //    and asking again cannot change the answer.
+                    //
+                    // 2. Should THIS attempt also emit a corrective
+                    //    capability announce? Only the first one per
+                    //    target, ever.
+                    //
+                    // Fusing them (the original `retryable = warrants &&
+                    // claim`) made the latch silently eat retry budget:
+                    // attempt 0 claimed the latch and announced, then
+                    // attempt 1's rejection found the latch already
+                    // claimed, read that as "not retryable" and broke —
+                    // abandoning the announcement it had just sent while
+                    // it was still in flight. The retry loop exists
+                    // precisely to cover that flight time, so the two
+                    // must stay separate.
+                    //
+                    // The bound on amplification is unaffected: it lives
+                    // on the announce, not on the retry.
+                    let retryable = failure.warrants_reannounce();
+                    last_err = Some(failure.into_adapter_error());
+                    if !retryable || attempt + 1 == REPLY_SUBSCRIBE_ATTEMPTS {
+                        break;
+                    }
+                    // `Unauthorized` alone is not a precise signal: the
+                    // publisher returns it for cap-filter, token,
+                    // visibility, queue-group and missing-TokenCache
+                    // rejections as well as the origin pin, and the
+                    // membership wire cannot currently carry a more
+                    // specific reason (an unknown reason byte is a hard
+                    // decode error on existing peers, so a new
+                    // `AckReason` needs the versioned cutover the H1
+                    // constraint set describes). Since we cannot tell a
+                    // missing pin from a policy denial, the corrective
+                    // announce is bounded structurally instead: at most
+                    // ONE per target, ever — cleared only when that
+                    // peer's session fails, which is exactly when a
+                    // fresh pin is genuinely needed. Without that bound,
+                    // one persistently-denying target would turn every
+                    // RPC into extra capability broadcasts, because the
+                    // corrective path bypasses the rate limit.
+                    //
+                    // `reannounce_for_authorization`, NOT the routine
+                    // republish: the routine path coalesces inside
+                    // `min_announce_interval` (10 s by default) and
+                    // returns Ok without sending, so the retry would
+                    // wait out the backoff and fail for exactly the
+                    // same missing-pin reason. Bypassing coalescing is
+                    // the whole point here.
+                    //
+                    // Announce failures are not fatal — the retry may
+                    // still succeed if the pin arrives by another route
+                    // — but they must not CONSUME the target's one
+                    // claim. The claim has to be taken before the send
+                    // (two callers racing on the same target must not
+                    // both announce), so a send that failed would
+                    // otherwise leave this target unable to ever get a
+                    // corrective announce until an unrelated peer
+                    // failure cleared the latch. Refund it: nothing was
+                    // broadcast, so there is nothing to bound.
+                    if self.claim_corrective_announce(target_node_id) {
+                        if let Err(e) = self.reannounce_for_authorization().await {
+                            tracing::debug!(
+                                target = format!("{target_node_id:#x}"),
+                                error = %e,
+                                "corrective capability announce failed to send; \
+                                 releasing the claim so a later call can retry"
+                            );
+                            self.release_corrective_announce(target_node_id);
+                        }
+                    }
+                    // Back off whether or not we announced. On the
+                    // attempts after the latch is spent we are waiting
+                    // out the flight time of the announce attempt 0
+                    // sent.
+                    tokio::time::sleep(REPLY_SUBSCRIBE_BACKOFF * (attempt as u32 + 1)).await;
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(RpcError::NoRoute {
                 target: target_node_id,
-                reason: e.to_string(),
-            })?;
+                reason: format!(
+                    "reply-channel subscribe rejected by {target_node_id:#x} ({e}). \
+                     The reply channel is bound to this node's announced identity; \
+                     if this persists, the target has not pinned our EntityId \
+                     (no signature-verified direct capability announcement has \
+                     been received from us)."
+                ),
+            });
+        }
 
         // Register the inbound dispatcher only if the slot is
         // unoccupied. The reply-channel name embeds *self_origin*,
@@ -5521,7 +5854,70 @@ impl MeshNode {
                             // past MAX_REPLY_SUBSCRIPTIONS during a concurrent insert
                             // race is bounded by the number of concurrent callers,
                             // which operators tune separately.
-        registry.insert((target_node_id, service_hash), Arc::from(service));
+                            // A missing snapshot means no attempt reported success, which the
+                            // `last_err` return above already covers — so this is
+                            // unreachable. Checked BEFORE the insert so the unreachable case
+                            // cannot cache anything: the one thing this block must never do
+                            // is leave a cache entry standing that nothing verified.
+        let Some(gen_before) = gen_before else {
+            return Err(RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!(
+                    "reply-channel subscribe to {target_node_id:#x} completed with \
+                     no recorded outcome; refusing to cache an unverified \
+                     subscription. Retry — the next call re-subscribes."
+                ),
+            });
+        };
+
+        registry.insert(
+            (target_node_id, service_hash),
+            ReplySubscription {
+                service: Arc::from(service),
+                written_at_generation: gen_before,
+            },
+        );
+
+        // Fence. If the target's session failed since the snapshot taken
+        // before the SUCCEEDING subscribe attempt, the eviction that ran
+        // for it could not have removed the entry we only just inserted,
+        // so remove it ourselves. Failures before that attempt are not
+        // our concern — the retry already recovered from them. The
+        // subscribe we performed is void either way — the target dropped
+        // its whole roster on failure — and leaving the entry behind
+        // would make every subsequent call skip the re-subscribe and
+        // publish replies into a channel we are not rostered on.
+        //
+        // Order matters: insert THEN check. Checking first would leave
+        // the same gap one step earlier. The eviction bumps the
+        // generation BEFORE its retain, which is what makes exactly one
+        // of the two removals certain to fire — if the retain ran before
+        // our insert then the bump did too and we observe it here; if it
+        // runs after, it takes the entry itself.
+        //
+        // Rolls back OUR entry, not whatever is in the slot. Removing by
+        // key alone let a fenced older call delete an entry a NEWER
+        // post-recovery call had just established, after which that
+        // newer caller believed it was cached and re-subscribed
+        // needlessly on its next RPC. Matching the stamp fixes it: any
+        // call that ran after the failure we just detected wrote a
+        // different generation, so its entry survives. An entry stamped
+        // with the same generation is either ours or a concurrent call
+        // that started where we did — and that call reaches this same
+        // fence and rolls back too, so removing it is right either way.
+        if self.peer_failure_generation(target_node_id) != gen_before {
+            registry.remove_if(&(target_node_id, service_hash), |_, entry| {
+                entry.written_at_generation == gen_before
+            });
+            return Err(RpcError::NoRoute {
+                target: target_node_id,
+                reason: format!(
+                    "session with {target_node_id:#x} failed while subscribing to the \
+                     reply channel; the target dropped our roster entry, so the \
+                     subscribe did not survive. Retry — the next call re-subscribes."
+                ),
+            });
+        }
         Ok(())
     }
 }
@@ -5538,14 +5934,14 @@ impl MeshNode {
 /// collision into a per-call re-subscribe (idempotent, harmless)
 /// instead of a correctness bug.
 fn reply_subscription_covers(
-    registry: &dashmap::DashMap<(u64, u64), Arc<str>>,
+    registry: &dashmap::DashMap<(u64, u64), ReplySubscription>,
     target_node_id: u64,
     service_hash: u64,
     service: &str,
 ) -> bool {
     registry
         .get(&(target_node_id, service_hash))
-        .is_some_and(|entry| entry.value().as_ref() == service)
+        .is_some_and(|entry| entry.value().service.as_ref() == service)
 }
 
 /// Hard cap on the number of distinct (target_node_id, service)
@@ -5555,6 +5951,33 @@ fn reply_subscription_covers(
 /// generous for any realistic deployment — a caller that needs
 /// more should reuse existing reply paths.
 pub const MAX_REPLY_SUBSCRIPTIONS: usize = 1024;
+
+/// How many times `ensure_reply_subscription` attempts the reply-channel
+/// subscribe before giving up.
+///
+/// The reply prefix is origin-bound on the server (H3), and that binding
+/// resolves against the TOFU pin installed from our signature-verified
+/// direct capability announcement. A caller making its first call — or
+/// one whose pin was dropped with a failed session — can legitimately
+/// race ahead of its own announcement, so a single rejection is not
+/// evidence of a permanent authorization failure. Three attempts covers
+/// the announce + verify + pin round trip without turning a genuine
+/// denial into a long stall.
+const REPLY_SUBSCRIBE_ATTEMPTS: usize = 3;
+
+/// Base backoff between reply-subscribe attempts; multiplied by the
+/// attempt number, so waits are ~8 ms then ~16 ms.
+///
+/// Deliberately small. The corrective announce and the retry travel the
+/// same session as the subscribe, so the wait only has to cover the
+/// peer's receive-and-verify of an announcement it already has in hand —
+/// not a fresh round trip. Sizing it generously would be actively
+/// harmful: this cost lands on a caller's FIRST call to a target, and a
+/// first call is frequently the one under a latency policy. At 75 ms the
+/// hedge suite's 50 ms hedge window elapsed before the primary leg's
+/// request was even sent, so the primary never ran and the policy
+/// silently degraded to "always use the backup".
+const REPLY_SUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(8);
 
 /// Mint a random 64-bit call_id. Used as the correlation token
 /// for REQUEST/RESPONSE pairing. The fold keys pending oneshots on
@@ -5804,6 +6227,13 @@ pub enum ServeError {
     /// [`RegisteredRpcService::protected`] shape check.
     #[error("invalid protected registration: {0}")]
     InvalidProtectedRegistration(String),
+    /// A subnet-exported registration whose declared crossing is not
+    /// currently authorized (SUBNET_AUTH_PLAN.md D7): no boundary set
+    /// or gateway credentials installed, the binding is not an exact
+    /// declared boundary, exact `EXPORT` is absent, or the epochs /
+    /// expiry / floors have moved past the binding.
+    #[error("subnet export not authorized: {0}")]
+    SubnetExportUnauthorized(String),
 }
 
 /// The admission shape for a unary serve registration (E1.1), threaded from the
@@ -5827,6 +6257,16 @@ enum UnaryAdmission {
     /// [`OrgAdmission::CrossOrgGranted`] invocation authority, and an explicit
     /// provider policy.
     Granted { provider_policy: OrgProviderPolicy },
+    /// SUBNET_AUTH_PLAN.md D7: an org-protected registration additionally
+    /// bound to ONE exact declared subnet crossing. Dispatch revalidates
+    /// the binding against live gateway/boundary/epoch state per call,
+    /// BEFORE org admission; discovery visibility stays `Public` —
+    /// subnet export is an execution boundary, not a discovery mode.
+    SubnetExported {
+        admission: OrgAdmission,
+        export: SubnetExportBinding,
+        provider_policy: OrgProviderPolicy,
+    },
     /// Test-only (review-7 RED negative control): a protected registration whose
     /// dispatch bypasses ONLY `verify_org_admission`. Not reachable from any
     /// production serve wrapper; compiled out entirely without `cfg(test)`.
@@ -5844,7 +6284,9 @@ impl UnaryAdmission {
     /// (OA3-4b1 / OA3-4b2).
     fn visibility(&self) -> CapabilityVisibility {
         match self {
-            Self::Public | Self::Protected { .. } => CapabilityVisibility::Public,
+            Self::Public | Self::Protected { .. } | Self::SubnetExported { .. } => {
+                CapabilityVisibility::Public
+            }
             Self::OwnerScoped { .. } => CapabilityVisibility::OwnerScoped,
             Self::Granted { .. } => CapabilityVisibility::GrantedAudience,
             #[cfg(test)]
@@ -5882,9 +6324,10 @@ impl UnaryAdmission {
     fn response_route_fallback(&self) -> ResponseRouteFallback {
         match self {
             Self::Public => ResponseRouteFallback::RosterOnStaleDirect,
-            Self::Protected { .. } | Self::OwnerScoped { .. } | Self::Granted { .. } => {
-                ResponseRouteFallback::DirectOnly
-            }
+            Self::Protected { .. }
+            | Self::OwnerScoped { .. }
+            | Self::Granted { .. }
+            | Self::SubnetExported { .. } => ResponseRouteFallback::DirectOnly,
             // The RED negative control must route exactly like the protected
             // registration it is the control FOR, or the witness would differ
             // from production on the response leg as well as the gate.
@@ -6015,6 +6458,72 @@ fn _ensure_send_sync() {
     assert_send_sync::<RpcStatus>();
     assert_send_sync::<RpcReply>();
     assert_send_sync::<CallOptions>();
+}
+
+#[cfg(test)]
+mod reply_subscribe_retry_tests {
+    /// The retry condition and the corrective-announce latch are two
+    /// separate decisions, and re-fusing them is a silent regression:
+    /// the loop still compiles, still retries once, and only misbehaves
+    /// on a caller's very first call to a target — precisely the case
+    /// the retry exists for.
+    ///
+    /// The failure it reintroduces: attempt 0 rejected, claims the
+    /// latch, announces. Attempt 1 rejected (the announce is still in
+    /// flight), finds the latch spent, reads `false` as "not retryable"
+    /// and breaks — throwing away the remaining attempt and returning
+    /// `NoRoute` for a target that would have accepted a moment later.
+    ///
+    /// Structural rather than behavioural: exercising the loop needs two
+    /// live sessions and a server that rejects exactly twice. So pin the
+    /// shape instead — the latch may appear only as a statement guarding
+    /// the announce, never inside the expression bound to `retryable`.
+    ///
+    /// Scans the production function only. `ensure_reply_subscription`
+    /// is above every `#[cfg(test)]` module in this file, so truncating
+    /// at the first one keeps this test from matching its own prose.
+    #[test]
+    fn the_announce_latch_does_not_gate_the_retry() {
+        let src = include_str!("mesh_rpc.rs");
+        let start = src
+            .find("    async fn ensure_reply_subscription(")
+            .expect("ensure_reply_subscription must exist");
+        let end = src
+            .find("\n#[cfg(test)]")
+            .expect("this file has test modules");
+        assert!(
+            start < end,
+            "ensure_reply_subscription moved below the test modules; this scan \
+             would read its own source"
+        );
+        let body = &src[start..end];
+
+        let retryable = body
+            .find("let retryable = ")
+            .expect("the retry decision must still be a named binding");
+        let stmt_end = body[retryable..]
+            .find(';')
+            .expect("the retryable binding must terminate");
+        let binding = &body[retryable..retryable + stmt_end];
+        assert!(
+            !binding.contains("claim_corrective_announce"),
+            "regression: the once-per-target announce latch is back inside the \
+             retry condition ({binding:?}). Attempt 1 would then read a spent \
+             latch as a permanent denial and abandon the announcement attempt \
+             0 had just sent. The latch bounds ANNOUNCES, not attempts."
+        );
+        assert!(
+            binding.contains("warrants_reannounce"),
+            "the retry condition must remain the `Unauthorized` test — \
+             retrying anything else cannot change the answer"
+        );
+        assert!(
+            body.contains("if self.claim_corrective_announce(target_node_id) {"),
+            "regression: the corrective announce must stay behind the \
+             once-per-target latch, or one persistently-denying target turns \
+             every RPC into extra rate-limit-bypassing capability broadcasts"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6179,12 +6688,24 @@ mod origin_cache_tests {
     #[test]
     fn reply_subscriptions_keyed_by_target_and_service_hash() {
         use dashmap::DashMap;
-        let registry: DashMap<(u64, u64), Arc<str>> = DashMap::new();
+        let registry: DashMap<(u64, u64), ReplySubscription> = DashMap::new();
         let h_a = xxhash_rust::xxh3::xxh3_64(b"svc-a");
         let h_b = xxhash_rust::xxh3::xxh3_64(b"svc-b");
         // Same target, different services → distinct entries.
-        registry.insert((0xAA, h_a), Arc::from("svc-a"));
-        registry.insert((0xAA, h_b), Arc::from("svc-b"));
+        registry.insert(
+            (0xAA, h_a),
+            ReplySubscription {
+                service: Arc::from("svc-a"),
+                written_at_generation: 0,
+            },
+        );
+        registry.insert(
+            (0xAA, h_b),
+            ReplySubscription {
+                service: Arc::from("svc-b"),
+                written_at_generation: 0,
+            },
+        );
         assert!(super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-a"
         ));
@@ -6195,13 +6716,25 @@ mod origin_cache_tests {
         assert!(!super::reply_subscription_covers(
             &registry, 0xBB, h_a, "svc-a"
         ));
-        registry.insert((0xBB, h_a), Arc::from("svc-a"));
+        registry.insert(
+            (0xBB, h_a),
+            ReplySubscription {
+                service: Arc::from("svc-a"),
+                written_at_generation: 0,
+            },
+        );
         assert!(super::reply_subscription_covers(
             &registry, 0xBB, h_a, "svc-a"
         ));
         // Idempotent — repeat insert overwrites with the identical
         // value; the fast path keeps answering true.
-        registry.insert((0xAA, h_a), Arc::from("svc-a"));
+        registry.insert(
+            (0xAA, h_a),
+            ReplySubscription {
+                service: Arc::from("svc-a"),
+                written_at_generation: 0,
+            },
+        );
         assert!(super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-a"
         ));
@@ -6220,13 +6753,75 @@ mod origin_cache_tests {
         // overwritten), the original service degrades to
         // re-subscribe — covered must flip to false for it, never
         // silently true for both.
-        registry.insert((0xAA, h_a), Arc::from("svc-evil"));
+        registry.insert(
+            (0xAA, h_a),
+            ReplySubscription {
+                service: Arc::from("svc-evil"),
+                written_at_generation: 0,
+            },
+        );
         assert!(super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-evil"
         ));
         assert!(!super::reply_subscription_covers(
             &registry, 0xAA, h_a, "svc-a"
         ));
+    }
+
+    /// The fence rollback must remove the entry ITS OWN call wrote, and
+    /// leave a newer one alone.
+    ///
+    /// The losing sequence, which removing by key alone produced: call A
+    /// snapshots generation 0 and inserts; the peer fails and recovers;
+    /// call B snapshots generation 1, subscribes successfully on the new
+    /// session and inserts; call A finally reaches its fence, sees the
+    /// generation moved, and deletes B's entry. B's caller believes it
+    /// is subscribed — it is, and correctly so — but the cache no longer
+    /// says so, and its next RPC re-subscribes for nothing.
+    ///
+    /// Not a correctness hole (the redundant subscribe is idempotent),
+    /// which is why the stamp is cheap insurance rather than a fix for
+    /// data loss. Modelled rather than raced: two RPC calls interleaving
+    /// around a session failure is not something the harness schedules
+    /// deterministically.
+    #[test]
+    fn the_fence_rollback_spares_a_newer_calls_entry() {
+        use dashmap::DashMap;
+        let registry: DashMap<(u64, u64), ReplySubscription> = DashMap::new();
+        let key = (0xAAu64, xxhash_rust::xxh3::xxh3_64(b"svc"));
+
+        // Call A, at generation 0.
+        registry.insert(
+            key,
+            ReplySubscription {
+                service: Arc::from("svc"),
+                written_at_generation: 0,
+            },
+        );
+        // Peer fails and recovers; call B re-subscribes at generation 1.
+        registry.insert(
+            key,
+            ReplySubscription {
+                service: Arc::from("svc"),
+                written_at_generation: 1,
+            },
+        );
+
+        // Call A's fence fires late. Its rollback must be a no-op.
+        registry.remove_if(&key, |_, entry| entry.written_at_generation == 0);
+        assert!(
+            super::reply_subscription_covers(&registry, key.0, key.1, "svc"),
+            "the late rollback deleted a newer call's entry; that caller is \
+             genuinely subscribed and will now re-subscribe for nothing"
+        );
+
+        // …and when the entry IS the one that call wrote, it goes.
+        registry.remove_if(&key, |_, entry| entry.written_at_generation == 1);
+        assert!(
+            !super::reply_subscription_covers(&registry, key.0, key.1, "svc"),
+            "a call must still be able to roll back its own entry — leaving it \
+             is the stale-cache bug the fence exists to prevent"
+        );
     }
 
     /// PERF_AUDIT §3.3 — grant-stall backstop check for the

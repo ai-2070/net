@@ -2,6 +2,7 @@
 title: The Agentic Mesh
 description: "How applications discover and use capabilities across machines while providers retain their credentials and local authority."
 ---
+
 # The Agentic Mesh
 
 An agent rarely owns everything it needs. The useful tools may live on another

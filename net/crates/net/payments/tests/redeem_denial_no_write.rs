@@ -85,7 +85,13 @@ async fn redemption_denials_do_not_rewrite_the_store_but_admission_does() {
             default_mock_registry(provider.entity_id().clone()),
             state_path.clone(),
         )
-        .expect("engine"),
+        .expect("engine")
+        // These tests redeem without presenting a binding: redemption is
+        // setup for what they actually assert, not the subject. The
+        // engine now requires the binding by default, so they opt out
+        // explicitly — `lifecycle_modes` carries the tests that cover the
+        // requirement itself.
+        .with_require_invocation_binding(false),
     );
 
     // Settling writes the store; from here the inode is our write sentinel.

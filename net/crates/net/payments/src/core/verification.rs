@@ -5,9 +5,12 @@
 //! final`, canonical across all networks. Adapters map their chain
 //! semantics *into* it (Solana commitment levels, EVM confirmations, XRPL
 //! validation) rather than exporting chain-specific states into policy.
-//! Facilitator receipt → `observed`/`confirmed(n)`; an independent
-//! on-chain check of the tx hash → `final` — the facilitator never has to
-//! be in anyone's trust root.
+//! A facilitator receipt justifies `observed` and nothing more — the
+//! x402 v2 spec gives facilitators no way to report finality, and
+//! `VerifyOutcome`/`SettleOutcome` carry no tier field at all, so the
+//! engine mints `observed` for every facilitator answer. `confirmed(n)`
+//! and `final` come only from an independent on-chain check of the tx
+//! hash, which is what keeps the facilitator out of anyone's trust root.
 //!
 //! Events chain per settlement ref and are never rewritten:
 //! `invalidated {reason: reorg}` is a first-class outcome that freezes

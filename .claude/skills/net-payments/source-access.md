@@ -121,9 +121,14 @@ the symbol is right and the anchor has drifted.
 ## Start with the tests and the vectors
 
 25 test files sit under `net/crates/net/payments/tests/` — signing, scheme flows,
-checker verification, reorg, adversarial cases — and they are the most direct
-statement of behaviour in the crate: a test asserts what happens, where a comment
-only claims it.
+checker verification, reorg, retention, adversarial cases — and they are the most
+direct statement of behaviour in the crate: a test asserts what happens, where a
+comment only claims it.
+
+One caveat before you take a green run as evidence: the "did the durable write
+happen?" assertions use an inode witness and are `#[cfg(unix)]`, so on Windows
+they report `running 0 tests` — a pass you would not notice. See the Windows
+blind spot in `testing.md`.
 
 For anything about the *wire*, go one better and read the fixtures:
 `net/crates/net/tests/cross_lang_payments/fixtures/x402/v2.0/` holds the golden

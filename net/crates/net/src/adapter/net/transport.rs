@@ -266,6 +266,21 @@ impl NetSocket {
         self.socket.send(packet).await
     }
 
+    /// Try to send a packet without awaiting, returning
+    /// [`io::ErrorKind::WouldBlock`] if the socket cannot take it now.
+    ///
+    /// The awaiting [`Self::send_to`] needs the packet to outlive the
+    /// call, which on a forwarding path means either an owned buffer
+    /// per packet or a borrow held across a suspension point. This
+    /// form borrows for the duration of one syscall and no longer, so
+    /// a relay can send straight out of a buffer it reuses. Callers
+    /// that must not drop under pressure should fall back to
+    /// [`Self::send_to`] with an owned copy on `WouldBlock`.
+    #[inline]
+    pub fn try_send_to(&self, packet: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.socket.try_send_to(packet, target)
+    }
+
     /// Receive a packet, returning the data and source address.
     ///
     /// Routes through tokio's `recv_buf_from(&mut BufMut)` for the same

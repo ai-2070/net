@@ -22,6 +22,25 @@ import { tmpdir } from 'node:os'
 
 import { describe, expect, it } from 'vitest'
 
+/// A provider on the in-process mock backend.
+///
+/// The constructor's later parameters are positional and mostly
+/// `undefined` here, which makes every call site fragile to a signature
+/// change and hides the one argument that matters — the explicit opt-in
+/// to a settlement backend that moves no value. Naming it once keeps the
+/// intent visible and the positional churn in one place.
+function devProvider(mesh: NetMesh, statePath: string, billingLogPath?: string) {
+  return new PaymentProvider(
+    mesh,
+    statePath,
+    billingLogPath,
+    undefined, // facilitatorUrl
+    undefined, // facilitatorAuthToken
+    true, // unsafeDevMockFacilitator
+  )
+}
+
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const binding: any = await import('../index')
 const NetMesh = binding.NetMesh
@@ -110,7 +129,7 @@ describe.skipIf(!HAS_ALL)('paid lifecycle conformance (two-node)', () => {
       await Promise.all([provider.start(), caller.start()])
 
       // Provider prices + serves an echo tool, admitting remote callers.
-      pp = new PaymentProvider(provider, tmp('prov.state'))
+      pp = devProvider(provider, tmp('prov.state'))
       const terms = buildPricingTerms(pp.providerEntityId, 'prov/echo', MOCK_REQS)
       pubHandle = await pp.publishPaidTools(
         [ECHO],

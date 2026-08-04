@@ -818,13 +818,16 @@ impl MeshDbWireSender for MeshNodeMeshDbSender {
             .mesh
             .upgrade()
             .ok_or_else(|| TransportError::Other("mesh node dropped".into()))?;
-        let peer_addr = mesh
-            .peer_addr(target_node)
-            .ok_or(TransportError::NoRoute(target_node))?;
+        if mesh.peer_addr(target_node).is_none() {
+            return Err(TransportError::NoRoute(target_node));
+        }
         let bytes = frame
             .encode()
             .map_err(|e| TransportError::Other(format!("frame encode: {e}")))?;
-        mesh.send_subprotocol(peer_addr, super::protocol::SUBPROTOCOL_MESHDB, &bytes)
+        // Node-keyed. The target is already a node id; resolving it to
+        // an address and back would reach only peers this node holds a
+        // DIRECT session with, silently excluding every relayed one.
+        mesh.send_subprotocol_to_node(target_node, super::protocol::SUBPROTOCOL_MESHDB, &bytes)
             .await
             .map_err(|e| TransportError::Other(e.to_string()))
     }

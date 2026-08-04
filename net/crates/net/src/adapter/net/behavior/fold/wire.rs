@@ -323,7 +323,13 @@ impl<P: Serialize + DeserializeOwned> SignedAnnouncement<P> {
         if self.signature.len() != SIGNATURE_LEN {
             return Err(WireError::BadSignatureLength(self.signature.len()));
         }
-        if self.signature == placeholder_signature() {
+        // Equivalent to `self.signature == placeholder_signature()`,
+        // without allocating a throwaway 64-byte `Vec` on every
+        // verify (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §6). The
+        // length check above already ran, so this can only see a
+        // SIGNATURE_LEN-wide slice — an empty signature (which
+        // `all` would vacuously accept) is unreachable here.
+        if self.signature.iter().all(|&b| b == 0) {
             return Err(WireError::PlaceholderSignature);
         }
 

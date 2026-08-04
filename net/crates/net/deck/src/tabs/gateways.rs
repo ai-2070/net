@@ -3,11 +3,13 @@
 //!
 //! Five columns: `▶` cursor marker, `CHANNEL` (resolved name or
 //! `—` for an unknown hash), `VIS` (declared visibility tier),
-//! `HASH` (16-bit wire hash), `TARGETS` (subnet IDs the rule
-//! exports to), `REACH` (sum of known node counts across those
-//! targets — what the SUBNETS panel computes per row, but
-//! rolled up across this rule's targets so the operator sees
-//! the rule's blast radius at a glance).
+//! `HASH` (the CANONICAL u64 channel identity — the key export
+//! policy is written against, rendered at full `0x` + 16-digit
+//! width; never the collidable 16-bit wire hint), `TARGETS`
+//! (subnet IDs the rule exports to), `REACH` (sum of known node
+//! counts across those targets — what the SUBNETS panel computes
+//! per row, but rolled up across this rule's targets so the
+//! operator sees the rule's blast radius at a glance).
 //!
 //! Cursor + scrolling mirror the BLOBS pattern:
 //! `tabs::scroll_window` picks the visible window around the
@@ -36,7 +38,11 @@ use crate::{theme, widgets};
 /// directly from the fixture.
 #[derive(Clone, Debug)]
 pub(crate) struct ExportRow {
-    pub channel_hash: u16,
+    /// CANONICAL channel identity (u64), matching the substrate's
+    /// export table. Never the 16-bit wire hint: export rules are
+    /// channel policy, and the hint has routine collisions by design,
+    /// so two unrelated channels would render as one row.
+    pub channel_hash: u64,
     pub channel_name: Option<String>,
     pub visibility: Option<Visibility>,
     pub targets: Vec<SubnetId>,
@@ -90,12 +96,12 @@ fn resolve_rows(deck: &Arc<DeckClient>) -> Vec<ExportRow> {
         return Vec::new();
     }
     // Hash → (name, visibility) lookup. Built once per render.
-    // `channel_wire_hash` re-queries the registry per channel;
+    // `channel_canonical_hash` re-queries the registry per channel;
     // the channel count is small in practice (operator
     // tooling), so the per-row cost is negligible.
-    let mut meta: HashMap<u16, (String, Visibility)> = HashMap::new();
+    let mut meta: HashMap<u64, (String, Visibility)> = HashMap::new();
     for (name, vis) in deck.channels() {
-        if let Some(h) = deck.channel_wire_hash(&name) {
+        if let Some(h) = deck.channel_canonical_hash(&name) {
             meta.insert(h, (name, vis));
         }
     }
@@ -249,7 +255,7 @@ fn render_table(
                 Cell::from(Span::styled(name_text, name_style)),
                 Cell::from(Span::styled(vis_text, theme::cyan())),
                 Cell::from(Span::styled(
-                    format!("{:#06x}", row.channel_hash),
+                    format!("{:#018x}", row.channel_hash),
                     theme::dim(),
                 )),
                 Cell::from(Span::styled(target_text, theme::text())),
@@ -264,7 +270,7 @@ fn render_table(
             Constraint::Length(2),  // cursor marker
             Constraint::Length(28), // channel name
             Constraint::Length(9),  // visibility tier
-            Constraint::Length(8),  // hash
+            Constraint::Length(18), // hash — full canonical `{:#018x}`
             Constraint::Min(20),    // targets list
             Constraint::Length(7),  // reach
         ],

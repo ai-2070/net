@@ -201,7 +201,8 @@ async fn request_bodies_embed_the_carry_bytes_verbatim() {
 
     let outcome = client.verify(&pay, &reqs).await.expect("verify");
     assert!(outcome.response.view().is_valid);
-    assert_eq!(outcome.tier, VerificationTier::Observed);
+    // No tier to assert: `VerifyOutcome` carries none, so a facilitator
+    // cannot claim one and the engine mints `observed` itself.
 
     // The preserved bytes appear inside the request body EXACTLY —
     // whitespace quirks and all. Re-serialization would have normalized

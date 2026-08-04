@@ -2,6 +2,7 @@
 title: Recover a failed workflow
 description: "Use typed failure outcomes, retry contracts, provider selection, and task state without guessing whether an external effect occurred."
 ---
+
 # Recover a failed workflow
 
 Recovery starts by identifying what failed and whether the operation may already

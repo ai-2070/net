@@ -351,12 +351,16 @@ fn build_payment_flow(
     let registry = default_registry_v1(caller.entity_id().clone());
     let spend = SpendPolicyEngine::new(&config.policy_path, config.profile)
         .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
+    // One clock for both halves: the channel stamps each signed quote
+    // request's freshness window and the provider checks it, so a
+    // divergent clock would make every request look future-dated.
+    let clock: Arc<dyn net_payments::flow::Clock> = Arc::new(SystemClock);
     let mut flow = CallerPaymentFlow::new(
-        caller,
+        caller.clone(),
         spend,
         registry,
-        Arc::new(MeshPaymentChannel::new(mesh)),
-        Arc::new(SystemClock),
+        Arc::new(MeshPaymentChannel::new(mesh, caller, clock.clone())),
+        clock,
     );
     for (namespace, signer) in signers {
         flow = flow.with_signer(namespace, signer);

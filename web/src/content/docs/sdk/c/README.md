@@ -1,39 +1,38 @@
 ---
-title: C
-description: The C ABI is the most explicit binding — ten headers across five shared libraries, covering the bus, the mesh, nRPC, storage and the federated query layer.
+title: C ABI
+description: "Embed Net through generated C headers and shared libraries with explicit memory ownership, polling, and return codes."
 ---
-# C SDK
 
-The C ABI is the most explicit binding: manual memory management, return codes
-instead of exceptions, and no threads managed for you. It is what you use to
-embed Net in a C/C++ program or to bind a language that isn't one of the
-first-class SDKs.
+# C ABI
+
+Use the C ABI to embed Net in a C or C++ program or to build a language binding not
+covered by the Rust, TypeScript, Python, or Go SDKs. The caller manages memory,
+threads, polling, and return codes explicitly.
 
 ```bash
 cargo build --release --features ffi,net
-# then link against the cdylib and include the headers you need
+# link against the required shared libraries and include their headers
 ```
 
-## Scope
+## Surface
 
-The C surface is **ten headers across five shared libraries**, not one header.
-Between them they cover the event bus, mesh transport, capability
-announce/discover, channels, nRPC (including streaming and cancellable calls),
-RedEX/CortEX storage, blob and directory transfer, the federated query layer,
-daemon authoring, and the Deck operator surface.
+The ABI is split across ten headers and five shared libraries. Together they cover
+the event bus, mesh transport, capability announce/discover, channels, nRPC,
+RedEX/CortEX storage, blob and directory transfer, federated queries, daemon
+operations, and the Deck operator surface.
 
-It is the largest binding by symbol count and the least ergonomic. The
-first-class SDKs ([Rust](/docs/sdk/rust), [TypeScript](/docs/sdk/typescript),
-[Python](/docs/sdk/python), [Go](/docs/sdk/go)) wrap the same primitives with
-lifetimes, error types and async iteration handled for you — prefer them unless
-you specifically need the C ABI.
+Use only the headers and libraries required by your application. The language SDKs
+manage lifetimes, errors, and asynchronous iteration for you; prefer one of them
+unless you need the C boundary.
 
 ## Pages
 
-1. **[Quickstart](/docs/sdk/c/quickstart)** — ingest and poll, with the memory rules.
-2. **[Headers and Linking](/docs/sdk/c/headers-and-linking)** — the ten headers, which library each resolves against, and the `net.h` / `net.go.h` choice you make per translation unit.
-3. **[Memory and Threading](/docs/sdk/c/memory-and-threading)** — ownership, the polling cursor trap, and the guarantees the FFI boundary makes.
-4. **[Errors](/docs/sdk/c/errors)** — return codes and the `NET_ERR_*` table.
+1. [Quickstart](/docs/sdk/c/quickstart) — ingest and poll with the memory rules.
+2. [Headers and linking](/docs/sdk/c/headers-and-linking) — libraries, generated
+   headers, and the `net.h` / `net.go.h` choice per translation unit.
+3. [Memory and threading](/docs/sdk/c/memory-and-threading) — ownership, polling
+   cursors, and thread-safety guarantees.
+4. [Errors](/docs/sdk/c/errors) — return codes and the `NET_ERR_*` table.
 
 ## Capability and nRPC coverage
 

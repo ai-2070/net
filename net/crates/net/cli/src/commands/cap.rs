@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 use net_sdk::capabilities::{
     CapabilityAnnouncement, CapabilityGroupId as GroupId, CapabilitySet,
-    CapabilitySubnetId as SubnetId, Tag, MAX_ALLOW_LIST_LEN,
+    CapabilitySubnetId as SubnetId, CapabilityTagError, Tag, MAX_ALLOW_LIST_LEN, RESERVED_PREFIXES,
 };
 use serde::Serialize;
 
@@ -90,9 +90,17 @@ pub struct NodesArgs {
 pub struct AnnounceArgs {
     /// One or more capability tags to carry on the announcement
     /// (e.g. `nrpc:my-service`, `dataforts.blob.overflow`).
-    /// Reserved-prefix tags (`causal:` / `fork-of:` / `heat:` /
-    /// `scope:`) are silently dropped by the parser — use the
-    /// dedicated builders for those.
+    ///
+    /// Reserved-prefix tags ([`RESERVED_PREFIXES`] — `causal:` /
+    /// `dataforts:` / `fork-of:` / `heat:` / `scope:`) are REJECTED:
+    /// the command fails with an invalid-argument error rather than
+    /// emitting an announcement that silently omits them. This differs
+    /// from `CapabilitySet::add_tag`, which warns and drops — that path
+    /// has a set to return, this one can still refuse to sign.
+    ///
+    /// Scope in particular cannot be set here. Use the SDK's dedicated
+    /// builders (`with_tenant_scope` / `with_region_scope` /
+    /// `with_subnet_local_scope`).
     #[arg(long = "tag", required = true, num_args = 1.., value_name = "TAG")]
     pub tags: Vec<String>,
 
@@ -104,10 +112,16 @@ pub struct AnnounceArgs {
     pub allow_nodes: Vec<String>,
 
     /// Allow-listed subnet ids — `<hex32>` or `subnet:<hex32>`.
+    /// ROUTING ONLY: subnet membership is self-declared and this list
+    /// is broadcast mesh-wide, so it narrows candidate selection and
+    /// admits nobody. A capability restricted by this axis alone
+    /// denies every caller. Use --allow-node for access control.
     #[arg(long = "allow-subnet", num_args = 0.., value_name = "SUBNET")]
     pub allow_subnets: Vec<String>,
 
     /// Allow-listed group ids — `<hex64>` or `group:<hex64>`.
+    /// ADVISORY ONLY: group membership is self-declared and this list
+    /// is broadcast mesh-wide. Use --allow-node for access control.
     #[arg(long = "allow-group", num_args = 0.., value_name = "GROUP")]
     pub allow_groups: Vec<String>,
 
@@ -228,6 +242,84 @@ async fn run_nodes(
     Ok(())
 }
 
+/// Emitted when `--allow-subnet` / `--allow-group` are used, because an
+/// operator reaching for them is almost certainly trying to restrict
+/// access and those axes do not.
+///
+/// Every `--flag` named here must be a real long on [`AnnounceArgs`].
+/// The first version of this warning named `--allow-subnets` /
+/// `--allow-groups` / `--allow-nodes` — all plural, none of which exist —
+/// so the one actionable instruction in a security warning was a clap
+/// parse error. `advisory_warning_names_only_real_flags` pins it.
+const ADVISORY_ALLOW_LIST_WARNING: &str = "\
+warning: --allow-subnet / --allow-group do NOT admit anyone; they only narrow
+         routing. Membership is self-declared and this announcement publishes
+         the admitted values mesh-wide. A capability restricted by these axes
+         alone denies every caller. Use --allow-node (or org admission) for
+         access control.";
+
+/// Rejection message for a `--tag` value the parser refused.
+///
+/// Branches on the error, because the remediation differs and only one
+/// of them is about reserved prefixes. `--tag ""` used to be reported
+/// with the reserved-prefix list and a pointer at the scope builders,
+/// neither of which had anything to do with an empty string — the
+/// operator was sent to read about `scope:` over a missing value.
+///
+/// The reserved-prefix arm builds its list from [`RESERVED_PREFIXES`]
+/// rather than hand-writing it: the previous hard-coded list omitted
+/// `dataforts:`, so a rejected `dataforts:foo` was reported against a
+/// list not containing the prefix it tripped.
+///
+/// The match is exhaustive over [`CapabilityTagError`] so a new parser
+/// error cannot silently inherit the reserved-prefix wording.
+fn tag_rejected_message(tag: &str, err: &CapabilityTagError) -> String {
+    match err {
+        CapabilityTagError::ReservedPrefix { .. } => {
+            let reserved = RESERVED_PREFIXES.join("` / `");
+            format!(
+                "tag {tag:?} rejected: {err}. Reserved prefixes \
+                 (`{reserved}`) cannot be set here; scope needs the SDK \
+                 builders (with_tenant_scope / with_region_scope / \
+                 with_subnet_local_scope)."
+            )
+        }
+        CapabilityTagError::Empty => {
+            format!("tag {tag:?} rejected: {err}.")
+        }
+    }
+}
+
+/// Build the announcement's [`CapabilitySet`] from `--tag` values,
+/// rejecting any the parser refuses.
+///
+/// Validates via `Tag::parse_user` and returns `Err` on the first
+/// rejection, rather than handing the tag to `CapabilitySet::add_tag` —
+/// which warns and DROPS, producing a signed announcement quietly
+/// missing the tag the operator asked for. This path has the option of
+/// refusing to sign, and takes it.
+///
+/// The parser result is used directly rather than a length delta on
+/// `caps.tags.len()`: the pre-fix heuristic could not distinguish
+/// "parser rejected the tag" from "tag was a duplicate already in the
+/// set", so a legal `--tag nrpc:echo --tag nrpc:echo` errored out with
+/// the reserved-prefix message. Duplicates dedupe silently through the
+/// underlying `HashSet<Tag>`.
+///
+/// Extracted from `run_announce` so the contract is testable without a
+/// keypair file and a daemon profile — the guard that matters is over
+/// this behaviour, not over `Tag::parse_user` itself.
+fn capability_set_from_tags(tags: &[String]) -> Result<CapabilitySet, CliError> {
+    let mut caps = CapabilitySet::new();
+    for tag in tags {
+        if let Err(e) = Tag::parse_user(tag) {
+            return Err(invalid_args(tag_rejected_message(tag, &e)));
+        }
+        caps = caps.add_tag(tag.clone());
+    }
+    Ok(caps)
+}
+
 async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     // 1. Identity. Reuses the same TOML loader the live
     //    `CliContext::build` path uses so an operator can point
@@ -251,6 +343,18 @@ async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     let allowed_nodes = parse_node_ids(&args.allow_nodes)?;
     let allowed_subnets = parse_subnets(&args.allow_subnets)?;
     let allowed_groups = parse_groups(&args.allow_groups)?;
+
+    // The subnet / group axes read tags the CALLER declares about
+    // itself, and this announcement publishes the admitted values to
+    // every peer and relay within MAX_CAPABILITY_HOPS. Anyone who
+    // receives it can claim a listed group or subnet with a one-line
+    // `add_tag`. Since S1 (SUBNET_AUTH_PLAN.md) these axes no longer
+    // admit at all — they narrow routing — so an announcement
+    // restricted by them alone denies every caller. `--allow-node` is
+    // the axis that holds.
+    if !allowed_subnets.is_empty() || !allowed_groups.is_empty() {
+        eprintln!("{ADVISORY_ALLOW_LIST_WARNING}");
+    }
 
     // 3. Resolve target node_id. The keypair's derived `node_id`
     //    is the only value that round-trips through the receiver's
@@ -280,26 +384,7 @@ async fn run_announce(args: AnnounceArgs) -> Result<(), CliError> {
     };
 
     // 4. Build the CapabilitySet with the user-supplied tags.
-    //    Validate each tag via `Tag::parse_user` directly — the
-    //    pre-fix length-delta heuristic on `caps.tags.len()`
-    //    couldn't distinguish "parser rejected the tag" from
-    //    "tag was a duplicate already in the set", so a perfectly
-    //    legal `--tag nrpc:echo --tag nrpc:echo` invocation errored
-    //    out with the reserved-prefix message. Using the parser
-    //    result directly: invalid tags fail, duplicates dedupe
-    //    silently via the underlying `HashSet<Tag>`.
-    let mut caps = CapabilitySet::new();
-    for tag in &args.tags {
-        if let Err(e) = Tag::parse_user(tag) {
-            return Err(invalid_args(format!(
-                "tag {tag:?} rejected: {e}. Reserved-prefix tags \
-                 (`causal:` / `fork-of:` / `heat:` / `scope:`) are not \
-                 admissible via this subcommand — use the dedicated \
-                 builders for those.",
-            )));
-        }
-        caps = caps.add_tag(tag.clone());
-    }
+    let caps = capability_set_from_tags(&args.tags)?;
 
     // 5. Build + sign.
     let mut ann =
@@ -422,4 +507,166 @@ struct CapQuery {
 struct CapNodesRow {
     node: u64,
     capabilities: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Guards for the two operator-facing contracts on `cap announce`
+    //! that had drifted from the code
+    //! (CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md,
+    //! findings 1 and 8).
+    use super::*;
+
+    /// Every long flag `AnnounceArgs` actually accepts.
+    fn announce_long_flags() -> BTreeSet<String> {
+        let cmd = AnnounceArgs::augment_args(clap::Command::new("announce"));
+        cmd.get_arguments()
+            .filter_map(|a| a.get_long().map(str::to_string))
+            .collect()
+    }
+
+    /// The load-bearing guard. A security warning whose remediation
+    /// advice does not parse is worse than no advice, and prose cannot
+    /// be type-checked against `#[arg(long = ...)]` — so check it.
+    ///
+    /// Pre-fix the warning named `--allow-subnets` / `--allow-groups` /
+    /// `--allow-nodes`; the real flags are all singular, so an operator
+    /// following the one actionable line got a clap parse error.
+    #[test]
+    fn advisory_warning_names_only_real_flags() {
+        let real = announce_long_flags();
+        // Sanity: the parse below is only meaningful if it finds flags.
+        assert!(
+            real.contains("allow-node"),
+            "expected --allow-node on AnnounceArgs; got {real:?}"
+        );
+
+        let mentioned: BTreeSet<String> = ADVISORY_ALLOW_LIST_WARNING
+            .split_whitespace()
+            .filter_map(|w| w.strip_prefix("--"))
+            // Trim trailing punctuation (`--allow-node.` at a line end).
+            .map(|w| w.trim_end_matches(['.', ',', ';', ':']).to_string())
+            .filter(|w| !w.is_empty())
+            .collect();
+        assert!(
+            !mentioned.is_empty(),
+            "the warning names no flags at all — did the text change shape?"
+        );
+
+        for flag in &mentioned {
+            assert!(
+                real.contains(flag),
+                "the advisory warning tells the operator to use `--{flag}`, \
+                 which is not a flag on `cap announce`. Real flags: {real:?}"
+            );
+        }
+    }
+
+    /// The warning must still name the axis that actually holds —
+    /// otherwise it diagnoses without remediating.
+    #[test]
+    fn advisory_warning_points_at_allow_node() {
+        assert!(
+            ADVISORY_ALLOW_LIST_WARNING.contains("--allow-node "),
+            "the warning must direct the operator to --allow-node"
+        );
+    }
+
+    /// Finding 8: the `--tag` doc promised warn-and-drop; the code
+    /// refuses to sign. Pinned against the announce path's own
+    /// tag-building step, not against `Tag::parse_user` — testing the
+    /// parser would only restate a library guarantee, and would stay
+    /// green if this command went back to `add_tag`-and-drop, which is
+    /// the exact regression it is here to prevent.
+    #[test]
+    fn reserved_prefix_tags_are_rejected_not_dropped() {
+        for prefix in RESERVED_PREFIXES {
+            let tag = format!("{prefix}whatever");
+            let err = capability_set_from_tags(std::slice::from_ref(&tag))
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("`{tag}` must fail the announce build, not be dropped from it")
+                });
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&tag),
+                "the rejection must name the offending tag; got {msg}"
+            );
+        }
+    }
+
+    /// The drop this guards against is silent, so absence-of-tag is the
+    /// thing to assert: a rejected tag must not produce a set at all.
+    #[test]
+    fn a_reserved_tag_never_reaches_the_announcement() {
+        let tags = vec![
+            "nrpc:echo".to_string(),
+            "scope:tenant:acme".to_string(),
+            "gpu".to_string(),
+        ];
+        assert!(
+            capability_set_from_tags(&tags).is_err(),
+            "one reserved tag must fail the whole announcement rather than \
+             signing the other two without it"
+        );
+    }
+
+    /// The legal cases still work — including the duplicate that the
+    /// pre-fix length-delta heuristic mistook for a rejection.
+    #[test]
+    fn ordinary_and_duplicate_tags_still_build() {
+        let caps = capability_set_from_tags(&[
+            "nrpc:echo".to_string(),
+            "nrpc:echo".to_string(),
+            "gpu".to_string(),
+        ])
+        .expect("legal tags must build");
+        let rendered: Vec<String> = caps.tags.iter().map(|t| t.to_string()).collect();
+        assert_eq!(
+            rendered.len(),
+            2,
+            "duplicates dedupe through HashSet<Tag> rather than erroring; got {rendered:?}"
+        );
+    }
+
+    /// The reserved-prefix message is built from `RESERVED_PREFIXES`, so
+    /// it cannot omit a prefix the parser enforces. The hand-written
+    /// version it replaced omitted `dataforts:`.
+    #[test]
+    fn tag_rejection_message_lists_every_reserved_prefix() {
+        let err = Tag::parse_user("scope:tenant:acme").expect_err("reserved");
+        let msg = tag_rejected_message("scope:tenant:acme", &err);
+        for prefix in RESERVED_PREFIXES {
+            assert!(
+                msg.contains(prefix),
+                "rejection message omits the reserved prefix `{prefix}`: {msg}"
+            );
+        }
+    }
+
+    /// An empty `--tag` is not a reserved-prefix problem, and must not
+    /// be diagnosed as one. It previously inherited the whole
+    /// reserved-prefix message, sending an operator who typed
+    /// `--tag ""` off to read about `scope:` and the SDK scope builders.
+    #[test]
+    fn an_empty_tag_is_not_diagnosed_as_a_reserved_prefix() {
+        let err = Tag::parse_user("").expect_err("empty tag must be rejected");
+        let msg = tag_rejected_message("", &err);
+
+        assert!(
+            !msg.contains("Reserved prefixes"),
+            "an empty tag must not be blamed on reserved prefixes: {msg}"
+        );
+        assert!(
+            !msg.contains("with_tenant_scope"),
+            "and must not point at the scope builders: {msg}"
+        );
+        assert!(
+            msg.contains("non-empty"),
+            "it should say what is actually wrong; got {msg}"
+        );
+
+        // And it still fails the announce build.
+        assert!(capability_set_from_tags(&[String::new()]).is_err());
+    }
 }

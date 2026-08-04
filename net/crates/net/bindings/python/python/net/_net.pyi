@@ -3325,8 +3325,10 @@ class PaymentHttpClient:
     """Pay an **external x402 HTTP API** — the outbound two-way door, with
     the same spend policy, signers, and status vocabulary as
     :class:`CapabilityGateway`. Present iff the module was built with the
-    ``payments-http`` feature (an opt-in that pulls a bundled HTTP/TLS
-    stack; NOT in the default wheel).
+    ``payments-http`` feature, which is **in the default feature set** —
+    so the published wheels carry it. A build that trims features down
+    (``--no-default-features``) can leave it out, which is why the import
+    is still guarded.
 
     :meth:`fetch_paid` GETs a URL and, if the server answers ``402``, runs
     the caller's own spend policy over a local pseudo-quote, signs, and
@@ -3344,6 +3346,7 @@ class PaymentHttpClient:
         payment_signer_address: Optional[str] = None,
         payment_signer: Optional[Callable[[str], str]] = None,
         identity: Optional["Identity"] = None,
+        destination_policy: Optional[str] = None,
     ) -> None:
         """Build a client over the shared spend-policy store at
         ``payment_policy_path`` (**required** — the spend gate). The payment
@@ -3355,7 +3358,20 @@ class PaymentHttpClient:
         callback; key material never crosses the boundary). ``identity`` is
         an optional payer :class:`Identity` handle; omit it for an ephemeral
         one (the caller id is bookkeeping on this path — spend is tracked by
-        ``(network, asset, day)``, not by caller)."""
+        ``(network, asset, day)``, not by caller).
+
+        ``destination_policy`` is the SSRF guard: ``"public_only"``
+        (default), ``"public_or_loopback"``, or ``"allow_private"``. An
+        unknown value raises rather than falling back.
+
+        The default is strict because this is the one door whose URL an
+        agent can choose — a permissive default would put every
+        integration one model-chosen URL away from an unauthenticated
+        service on the same host. It is settable because a local or
+        self-hosted x402 server has to be reachable by asking for it:
+        pass ``"public_or_loopback"`` for a server on this machine, or
+        ``"allow_private"`` for one on an internal network. There is no
+        spelling that disables the guard entirely."""
         ...
 
     def fetch_paid(self, url: str) -> tuple[str, bytes]:
@@ -3385,6 +3401,7 @@ class AsyncPaymentHttpClient:
         payment_signer_address: Optional[str] = None,
         payment_signer: Optional[Callable[[str], str]] = None,
         identity: Optional["Identity"] = None,
+        destination_policy: Optional[str] = None,
     ) -> None:
         """Same as :class:`PaymentHttpClient`."""
         ...
@@ -3399,6 +3416,7 @@ def build_pricing_terms(
     provider_entity_id: bytes,
     capability: str,
     requirements_json: str,
+    production_registry: bool = False,
 ) -> str:
     """Author the canonical ``net.pricing.terms@1`` JSON that prices a
     capability — the provider (supply) side of payments. Present iff the
@@ -3415,7 +3433,18 @@ def build_pricing_terms(
     string to hand to the priced-publish path or announce at discovery (opaque
     downstream; displaying a price never implies authorization to spend it).
     Raises ``ValueError`` on a non-32-byte id, malformed JSON, or an empty
-    list."""
+    list.
+
+    ``production_registry`` must match the provider that will quote these
+    terms. A :class:`PaymentProvider` built with a real ``facilitator_url``
+    issues quotes under the production registry revision (which drops the
+    valueless ``mock:net`` asset), so its terms must be authored with
+    ``True`` — read :attr:`PaymentProvider.registry_version` to see which
+    revision a given provider is on. Announcing one revision while quoting
+    under another leaves discovery metadata naming a registry the backend
+    does not use. Every requirement is also checked against the selected
+    registry, so terms cannot announce an asset that will never be
+    quotable."""
     ...
 
 class PaymentProvider:
@@ -3432,18 +3461,75 @@ class PaymentProvider:
         mesh: "NetMesh",
         state_path: str,
         billing_log_path: Optional[str] = None,
+        facilitator_url: Optional[str] = None,
+        facilitator_auth_token: Optional[str] = None,
+        unsafe_dev_mock_facilitator: bool = False,
+        require_invocation_binding: bool = True,
     ) -> None:
         """Build a provider over a started ``mesh``. ``state_path`` is the
         settlement store file — it holds the replay/idempotency index and
         **must be durable + single-owner** (a temp path loses paid quotes across
         restarts). ``billing_log_path`` optionally records the immutable
-        ``net.billing.event@1`` stream."""
+        ``net.billing.event@1`` stream.
+
+        **A settlement backend must be chosen explicitly.** Pass
+        ``facilitator_url`` (plus ``facilitator_auth_token`` where the
+        facilitator requires one) to settle for real, or
+        ``unsafe_dev_mock_facilitator=True`` to settle against the in-process
+        mock, which moves no value. Neither is an error, and both is an error:
+        a provider that has not said how it settles is one whose operator has
+        not decided, and guessing "mock" for them is how a simulator ends up in
+        front of real customers.
+
+        ``require_invocation_binding`` defaults to ``True``: a paid invocation
+        is refused unless the caller presents the paying identity's signature
+        over the invocation-binding transcript. Without it the quote id alone
+        redeems, and a quote id is not a secret — it rides a request header on
+        every paid invoke and is carried on the billing event. Pass ``False``
+        only for callers that predate the binding.
+
+        Raises ``ValueError`` on a bad backend choice, and — when built without
+        the ``payments-http`` feature — on a ``facilitator_url``, rather than
+        silently downgrading it to the mock."""
         ...
 
     @property
     def provider_entity_id(self) -> bytes:
         """The node's 32-byte mesh entity id — the provider identity these tools
         price + quote under. Pass it to :func:`build_pricing_terms`."""
+        ...
+
+    def pricing_terms(self, capability: str, requirements_json: str) -> str:
+        """Author this provider's ``net.pricing.terms@1`` for ``capability``,
+        against **the registry its own engine quotes under**.
+
+        The same authoring as :func:`build_pricing_terms`, minus the two ways
+        to get it wrong: that function takes the provider id and a
+        ``production_registry`` flag as separate arguments, and either can
+        disagree with the provider that will serve the quotes. Announce the dev
+        revision while quoting under the production one and a caller picks an
+        asset the backend will never quote, then gets refused with nothing to
+        fall back to. Here both come from the engine.
+
+        ``requirements_json`` is the same JSON array of x402
+        ``PaymentRequirements`` objects. Every entry is checked against the
+        registry first, so this raises ``ValueError`` rather than announcing
+        something unquotable."""
+        ...
+
+    @property
+    def registry_version(self) -> str:
+        """The asset registry revision this provider issues quotes under —
+        ``"net-production-1"`` behind a real facilitator, ``"net-default-1"``
+        behind the mock (which additionally carries the valueless ``mock:net``
+        asset).
+
+        Two uses. It tells :func:`build_pricing_terms` which revision to author
+        against (``production_registry=True`` iff this reads
+        ``"net-production-1"``), so announced terms and issued quotes name the
+        same revision. And it makes the settlement backend *observable*: the
+        one failure this surface must never have is quietly falling back to the
+        mock for an operator who configured a facilitator URL."""
         ...
 
     def read_billing(self) -> List[str]:

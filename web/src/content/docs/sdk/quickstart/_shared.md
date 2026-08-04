@@ -5,6 +5,7 @@ capability: Event bus — ingest + poll
 boundary: /docs/sdk/c/quickstart
 boundaryLabel: C — Quickstart
 ---
+
 # Quickstart
 
 Build a node, put something on it, and prove the node accepted it. That is the
@@ -77,5 +78,5 @@ what it emits → [move artifacts](/docs/sdk/artifacts) too large for the bus �
 handle [the ways it fails](/docs/sdk/errors).
 
 Those links are language-neutral: each one states the objective and hands you the
-four lenses. Once you are inside a language the *Next* control keeps you there —
+four lenses. Once you are inside a language the _Next_ control keeps you there —
 it will not walk a Python reader into Go.

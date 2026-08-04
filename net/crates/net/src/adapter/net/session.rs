@@ -16,6 +16,7 @@ use std::time::Instant;
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
+use super::subnet::route_hop::SharedHopReplayWindow;
 // `SharedPacketPool` is intentionally absent — `NetSession` uses
 // only `SharedLocalPool` as the single TX-side AEAD source.
 use super::pool::SharedLocalPool;
@@ -127,6 +128,24 @@ pub struct NetSession {
     /// packet (which then re-publishes the same value), and the
     /// resolver itself is the source of truth.
     cached_node_id: AtomicU64,
+    /// Key for MACing route-hop envelopes this node sends on this
+    /// edge. See [`Self::seal_route_hop`].
+    route_hop_tx_key: [u8; 32],
+    /// Key for verifying route-hop envelopes received on this edge.
+    route_hop_rx_key: [u8; 32],
+    /// This edge's outbound hop sequence — separate from the packet
+    /// AEAD counter by design.
+    route_hop_tx_seq: AtomicU64,
+    /// Sliding replay window over inbound hop sequences.
+    ///
+    /// Lock-free single-writer state, not a mutex: the production
+    /// protected-ingress path is single-consumer (one receive loop,
+    /// synchronous dispatch), so admission never contends there, and
+    /// the ordinary path pays no locking. A second concurrent caller
+    /// — only reachable by breaking that ownership rule — is refused
+    /// immediately and its packet dropped
+    /// ([`super::subnet::route_hop::RouteHopError::Contended`]).
+    route_hop_replay: SharedHopReplayWindow,
 }
 
 /// Sentinel `stream_id` used in the header of subprotocol control
@@ -174,7 +193,74 @@ impl NetSession {
             recently_closed: DashMap::new(),
             control_tx_seq: AtomicU64::new(0),
             cached_node_id: AtomicU64::new(0),
+            // Unlike `tx_key`, the route-hop keys ARE retained: a
+            // relay MACs every forwarded hop, and a MAC has no
+            // nonce-reuse hazard to route around — the sequence is an
+            // explicit transcript field, not derived counter state.
+            route_hop_tx_key: keys.route_hop_tx_key,
+            route_hop_rx_key: keys.route_hop_rx_key,
+            route_hop_tx_seq: AtomicU64::new(0),
+            route_hop_replay: SharedHopReplayWindow::new(),
         }
+    }
+
+    /// Wrap `inner` in an authenticated route-hop envelope for this
+    /// edge, writing into a caller-owned buffer
+    /// (SUBNET_AUTH_PLAN.md D6).
+    ///
+    /// The sequence is this edge's own, independent of the packet
+    /// AEAD counter, so hop accounting can never disturb the
+    /// end-to-end session being carried.
+    ///
+    /// This is the form the forwarding path uses: the buffer belongs
+    /// to the forwarder and is reused across packets, so relaying does
+    /// not allocate. Size it with
+    /// [`route_hop::sealed_len`](super::subnet::route_hop::sealed_len).
+    ///
+    /// A too-small buffer is refused *before* a sequence is taken —
+    /// burning one on a local sizing mistake would open a gap in this
+    /// edge's sequence space for no reason.
+    pub fn seal_route_hop_into(
+        &self,
+        out: &mut [u8],
+        header: &super::route::RoutingHeader,
+        inner: &[u8],
+    ) -> Result<usize, super::subnet::route_hop::RouteHopError> {
+        if out.len() < super::subnet::route_hop::sealed_len(inner.len()) {
+            return Err(super::subnet::route_hop::RouteHopError::BufferTooSmall);
+        }
+        let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
+        super::subnet::route_hop::seal_into(
+            out,
+            &self.route_hop_tx_key,
+            self.session_id,
+            seq,
+            header,
+            inner,
+        )
+    }
+
+    /// Allocating form of [`Self::seal_route_hop_into`], for callers
+    /// off the forwarding path.
+    pub fn seal_route_hop(&self, header: &super::route::RoutingHeader, inner: &[u8]) -> Vec<u8> {
+        let seq = self.route_hop_tx_seq.fetch_add(1, Ordering::Relaxed);
+        super::subnet::route_hop::seal(&self.route_hop_tx_key, self.session_id, seq, header, inner)
+    }
+
+    /// Verify an inbound route-hop envelope and admit its sequence
+    /// exactly once.
+    ///
+    /// Returns the opened hop on success. A bad tag is rejected before
+    /// the replay window is touched, so a forged packet cannot burn a
+    /// sequence slot the legitimate peer still needs.
+    pub fn open_route_hop<'a>(
+        &self,
+        buf: &'a [u8],
+    ) -> Result<super::subnet::route_hop::OpenedHop<'a>, super::subnet::route_hop::RouteHopError>
+    {
+        let opened = super::subnet::route_hop::open(&self.route_hop_rx_key, buf)?;
+        self.route_hop_replay.admit(opened.hop_sequence)?;
+        Ok(opened)
     }
 
     /// Read the cached peer `NodeId` resolution. Returns `None`
@@ -1757,22 +1843,40 @@ mod heartbeat_api_drift_check {
     //! way to build a heartbeat for a manually-constructed
     //! peer session.
 
-    fn production_prefix(src: &str) -> &str {
-        // Top-level test modules are tagged with a column-0
-        // `#[cfg(test)]` immediately followed by `mod`. Find the
-        // first such marker and treat everything before it as
-        // production code. Nested `#[cfg(test)]` mods (indented
-        // inside an `impl` or inline `mod` block) are NOT cut
-        // here, so production code in those files that follows
-        // a nested test mod is still checked. False positives
-        // from nested-test-mod content are unlikely because none
-        // of the nested test mods in this codebase reference
-        // `build_heartbeat`.
-        let needle = "\n#[cfg(test)]\nmod ";
-        match src.find(needle) {
-            Some(idx) => &src[..idx],
-            None => src,
+    /// Everything before the first column-0 `#[cfg(test)] mod`.
+    ///
+    /// Top-level test modules are tagged with a column-0 `#[cfg(test)]`
+    /// immediately followed by `mod`. Nested `#[cfg(test)]` mods (indented
+    /// inside an `impl` or inline `mod` block) are deliberately NOT cut here, so
+    /// production code following a nested test mod is still checked. False
+    /// positives from nested-test-mod content are unlikely because none of the
+    /// nested test mods in this codebase reference `build_heartbeat`.
+    ///
+    /// **Scanned line by line, not by substring.** This used to search for the
+    /// literal `"\n#[cfg(test)]\nmod "`, which silently fails on CRLF: the
+    /// needle never matches, the whole file is treated as production, and the
+    /// allowlist assertion then reports every TEST caller as a drifted
+    /// production one. That is a confusing failure a long way from its cause —
+    /// it cost a real debugging detour during OLB-2B.3c-pre, where an editor
+    /// rewrote `mesh.rs` with CRLF and this guard blamed eight test call sites.
+    /// `str::lines` strips a trailing `\r`, so a line-based scan cannot regress
+    /// that way. Witnessed by `production_prefix_is_line_ending_agnostic`.
+    fn production_prefix(src: &str) -> String {
+        let mut prefix = String::with_capacity(src.len());
+        let mut lines = src.lines().peekable();
+        while let Some(line) = lines.next() {
+            // Column 0 for BOTH lines, matching the original substring form:
+            // `line == "#[cfg(test)]"` rejects an indented attribute, and
+            // `starts_with("mod ")` rejects an indented or re-exported module.
+            let opens_test_mod =
+                line == "#[cfg(test)]" && lines.peek().is_some_and(|next| next.starts_with("mod "));
+            if opens_test_mod {
+                break;
+            }
+            prefix.push_str(line);
+            prefix.push('\n');
         }
+        prefix
     }
 
     fn count_build_heartbeat_callers(src: &str) -> Vec<String> {
@@ -1789,10 +1893,86 @@ mod heartbeat_api_drift_check {
             .collect()
     }
 
+    /// The prefix scan must not care about line endings.
+    ///
+    /// This is the regression that actually happened. `production_prefix`
+    /// searched for the literal `"\n#[cfg(test)]\nmod "`; an editor rewrote
+    /// `mesh.rs` with CRLF during OLB-2B.3c-pre, the needle stopped matching,
+    /// the whole file was treated as production, and this guard reported eight
+    /// TEST call sites as drifted production callers. The real change was a
+    /// line ending, and the failure pointed at `build_heartbeat`.
+    ///
+    /// A guard whose false-positive mode is that confusing has to prove it
+    /// cannot do that again. Both fixtures below carry the SAME code, so both
+    /// must yield the same single production caller.
+    #[test]
+    fn production_prefix_is_line_ending_agnostic() {
+        const SRC: &str = "\
+fn production() {
+    let a = session.build_heartbeat();
+}
+
+#[cfg(test)]
+mod tests {
+    fn t() {
+        let b = builder.build_heartbeat();
+    }
+}
+";
+        let lf = production_prefix(SRC);
+        let crlf = production_prefix(&SRC.replace('\n', "\r\n"));
+
+        let expected = vec!["let a = session.build_heartbeat();".to_string()];
+        assert_eq!(
+            count_build_heartbeat_callers(&lf),
+            expected,
+            "LF: the test-module caller must be cut"
+        );
+        assert_eq!(
+            count_build_heartbeat_callers(&crlf),
+            expected,
+            "CRLF: the same source with CRLF endings must cut the same test \
+             module. Leaking `builder.build_heartbeat()` here means the prefix \
+             scan is substring-based again, and the allowlist assertion will \
+             blame test call sites for a line-ending change"
+        );
+    }
+
+    /// The cut is column-0-only, in both endings.
+    ///
+    /// Pinned because the line-based rewrite could easily have loosened it: a
+    /// `trim()` on either line would start cutting at NESTED `#[cfg(test)] mod`
+    /// blocks, silently shrinking the production surface this guard inspects.
+    /// That failure is invisible — the assertion just stops seeing callers.
+    #[test]
+    fn production_prefix_cuts_only_column_zero_test_mods() {
+        const SRC: &str = "\
+impl Thing {
+    #[cfg(test)]
+    mod nested {
+        fn t() {}
+    }
+}
+
+fn still_production() {
+    let a = session.build_heartbeat();
+}
+";
+        for (label, src) in [("LF", SRC.to_string()), ("CRLF", SRC.replace('\n', "\r\n"))] {
+            let prod = production_prefix(&src);
+            assert_eq!(
+                count_build_heartbeat_callers(&prod),
+                vec!["let a = session.build_heartbeat();".to_string()],
+                "{label}: an INDENTED `#[cfg(test)] mod` must not cut the scan — \
+                 production code after a nested test mod is still checked"
+            );
+        }
+    }
+
     #[test]
     fn mod_rs_production_callers_match_allowlist() {
         let prod = production_prefix(include_str!("mod.rs"));
-        let callers = count_build_heartbeat_callers(prod);
+        let callers = count_build_heartbeat_callers(&prod);
         // The only approved production caller in mod.rs:
         //   `let packet = session.build_heartbeat();`
         // inside `spawn_heartbeat`. Pre-fix this read
@@ -1812,7 +1992,7 @@ mod heartbeat_api_drift_check {
     #[test]
     fn mesh_rs_production_callers_match_allowlist() {
         let prod = production_prefix(include_str!("mesh.rs"));
-        let callers = count_build_heartbeat_callers(prod);
+        let callers = count_build_heartbeat_callers(&prod);
         let approved = ["let packet = session.build_heartbeat();"];
         assert_eq!(
             callers,
@@ -1839,6 +2019,67 @@ mod tests {
             // surface. `MeshNode::peer_static_x25519` treats zeros
             // as "not available" and returns `None`.
             remote_static_pub: [0u8; 32],
+            // Same story: no handshake hash to derive route-hop keys
+            // from. Distinct constants rather than zeros so a test
+            // that accidentally relied on tx == rx would fail.
+            route_hop_tx_key: [0x51u8; 32],
+            route_hop_rx_key: [0x15u8; 32],
+        }
+    }
+
+    /// A refused seal must not consume a hop sequence.
+    ///
+    /// `seal_route_hop_into` takes the next sequence with a
+    /// `fetch_add`, which is not undoable. Checking capacity after
+    /// taking it would burn a sequence number on a purely local sizing
+    /// mistake, opening a gap in this edge's sequence space that the
+    /// peer's replay window then has to absorb for no reason. The
+    /// capacity check therefore runs first, and this pins that ordering
+    /// by observing the sequence actually emitted.
+    #[test]
+    fn a_refused_seal_does_not_consume_a_hop_sequence() {
+        use super::super::route::RoutingHeader;
+        use super::super::subnet::route_hop::{parse_prefix, sealed_len, RouteHopError};
+
+        let session = NetSession::new(test_keys(), "127.0.0.1:9999".parse().unwrap(), 4, false);
+        let header = RoutingHeader::new(0xDEAD_BEEF, 0x1234, 8);
+        let inner = b"an inner packet the relay never looks inside";
+        let needed = sealed_len(inner.len());
+
+        // Burn sequence 0 so the test is about the *next* one rather
+        // than about a fresh counter reading zero either way.
+        let mut ok_buf = vec![0u8; needed];
+        session
+            .seal_route_hop_into(&mut ok_buf, &header, inner)
+            .expect("exact size fits");
+        assert_eq!(sequence_of(&ok_buf), 0);
+
+        // Several refusals, each one byte short of enough.
+        for short in [0usize, 1, needed - 1] {
+            let mut tiny = vec![0u8; short];
+            assert_eq!(
+                session.seal_route_hop_into(&mut tiny, &header, inner),
+                Err(RouteHopError::BufferTooSmall),
+                "a {short}-byte buffer must be refused",
+            );
+        }
+
+        // The next accepted seal gets sequence 1, not 4.
+        let mut next_buf = vec![0u8; needed];
+        session
+            .seal_route_hop_into(&mut next_buf, &header, inner)
+            .expect("exact size fits");
+        assert_eq!(
+            sequence_of(&next_buf),
+            1,
+            "refused seals must not advance the hop sequence",
+        );
+
+        fn sequence_of(buf: &[u8]) -> u64 {
+            // The sequence sits in the prefix; read it back off the
+            // wire rather than trusting an internal counter.
+            parse_prefix(buf).expect("a sealed envelope parses");
+            u64::from_le_bytes(buf[10..18].try_into().expect("8 bytes"))
         }
     }
 

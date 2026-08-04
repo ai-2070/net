@@ -2,6 +2,7 @@
 title: Capabilities
 description: Capabilities are how nodes in a Net mesh describe what they can do.
 ---
+
 # Capabilities
 
 Capabilities describe work a node offers and the properties callers can use to
@@ -50,11 +51,12 @@ Predicates are serializable. The same predicate that you build at a Rust call si
 
 Every node's capability set is disseminated as a signed announcement on a dedicated channel. The receiving node verifies the signature against the sender's ed25519 identity, then applies the announcement to a local `CapabilityFold` — a typed reduction that keeps one entry per `(class, node)` and uses generation numbers to resolve concurrent updates. Announcements carry a TTL; entries past their TTL are evicted by the fold's expiry task. The result is that every node holds an eventually-consistent view of every other reachable node's capabilities, indexed for fast query.
 
-The fold is the discovery substrate for everything that asks "which nodes can do X." `list_tools`, `find_migration_targets`, the placement scheduler's candidate sweep, nRPC's capability-targeted call routing, channel publisher authorization checks — all of them are predicate evaluations over the local fold. There's no separate service-discovery system; there's no central registry to query; the fold *is* the registry, replicated by gossip and queried in memory.
+The fold is the discovery substrate for everything that asks "which nodes can do X." `list_tools`, `find_migration_targets`, the placement scheduler's candidate sweep, nRPC's capability-targeted call routing, channel publisher authorization checks — all of them are predicate evaluations over the local fold. There's no separate service-discovery system; there's no central registry to query; the fold _is_ the registry, replicated by gossip and queried in memory.
 
-Two properties fall out of this design that are worth holding onto.
-
-**Query is fast and free in the hot path.** Predicate evaluation against the fold is single-digit nanoseconds for simple presence checks and microseconds for indexed multi-field predicates over tens of thousands of nodes — fast enough to call inside scheduling loops without thinking about it. The bulk-query path is index-driven on the conventional axes (`hardware`, `software`, `devices`, `dataforts`); custom axes use the same index machinery via the per-fold `Index` type.
+The bulk-query path is index-driven on the conventional axes (`hardware`,
+`software`, `devices`, `dataforts`). Custom axes use the same index machinery via
+the per-fold `Index` type. Query cost still depends on predicate shape, fold size,
+index coverage, and update load; use deployment benchmarks for scheduling loops.
 
 **Aggregation scales the model up.** When a mesh grows large enough that every node holding every other node's capability set becomes wasteful, aggregator daemons in a parent subnet subscribe to a source subnet's detail channels, summarize what they see, and publish summaries upward at a coarser granularity. The substrate provides the framework; deployments decide where to place aggregators and what summarization granularity to use.
 
@@ -68,13 +70,19 @@ Everything above describes the plaintext plane, where any peer that receives an 
 
 The two encrypted forms ride a separate subprotocol id (`0x0C04`) and never appear inside a plaintext announcement payload. The consequence is the point: a node outside the audience does not discover a capability it may not use and get refused when it calls — it never learns the capability exists. Discovery becomes an authorization boundary rather than a filter.
 
-This matters for how you reason about an empty result. A `find_nodes` query returning nothing is the *correct and expected* outcome for an unauthorized caller, and it is indistinguishable from "nobody serves that." See [Organizations](/docs/concepts/organizations).
+This matters for how you reason about an empty result. A `find_nodes` query returning nothing is the _correct and expected_ outcome for an unauthorized caller, and it is indistinguishable from "nobody serves that." See [Organizations](/docs/concepts/organizations).
 
 ## Where capabilities show up
 
 Capabilities are an input to almost every decision in Net beyond the bus itself.
 
-**Channel routing and authorization.** Channels can require that publishers and subscribers match a capability filter — "you must have `hardware.gpu`," or "you must be on `tier.production` and have `software.cuda >= 12`." The check happens at subscription time, the result is cached in the auth guard, and the per-packet path stays at single-digit nanoseconds. Note that a capability filter is **matchmaking, not an access boundary** — it matches self-advertised capabilities, so a channel that must genuinely restrict who participates needs permission tokens ([Channels](/docs/concepts/channels#capability-filters-are-advisory-tokens-are-the-boundary)).
+**Channel routing and authorization.** Channels can require that publishers and
+subscribers match a capability filter — "you must have `hardware.gpu`," or "you
+must be on `tier.production` and have `software.cuda >= 12`." The result can be
+cached in the auth guard. A capability filter is **matchmaking, not an access
+boundary** because it matches self-advertised properties. Use permission tokens
+when participation must be restricted
+([Channels](/docs/concepts/channels#capability-filters-are-advisory-tokens-are-the-boundary)).
 
 **Placement.** When a daemon needs to run somewhere, the placement layer scores candidate nodes against the daemon's capability requirements and picks the best match. Placement filters can be hard (the daemon must have a GPU; no GPU, no placement) or soft (prefer GPUs, fall back to CPU); they can be composed across multiple axes, and they can be extended with custom scoring logic registered through a process-global callback registry.
 
@@ -99,6 +107,6 @@ Everything else is yours to define. The substrate doesn't impose a schema; it gi
 
 ## What you'll actually write
 
-In application code you'll see capabilities in three shapes. You'll *declare* them — at process startup, building a `CapabilitySet` that describes the local node. You'll *update* them — when a counter changes, when a role transitions, when a piece of hardware becomes unavailable. And you'll *query against* them — when you write a placement filter, a channel authorization, a targeted RPC predicate, or a tool-discovery walk.
+In application code you'll see capabilities in three shapes. You'll _declare_ them — at process startup, building a `CapabilitySet` that describes the local node. You'll _update_ them — when a counter changes, when a role transitions, when a piece of hardware becomes unavailable. And you'll _query against_ them — when you write a placement filter, a channel authorization, a targeted RPC predicate, or a tool-discovery walk.
 
-The right model to hold is that capabilities are the typed description of the mesh's topology. Identity says who; channels say where; capabilities say *what kind of node you're talking to*. Once you have all three, most of the questions you'd otherwise solve with service discovery, configuration management, or hand-rolled metadata systems become predicates over a capability set.
+The right model to hold is that capabilities are the typed description of the mesh's topology. Identity says who; channels say where; capabilities say _what kind of node you're talking to_. Once you have all three, most of the questions you'd otherwise solve with service discovery, configuration management, or hand-rolled metadata systems become predicates over a capability set.

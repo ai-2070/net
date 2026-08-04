@@ -2,6 +2,7 @@
 title: Wrap an MCP Server
 description: The fastest way to put a capability on the mesh is to wrap a tool you already have.
 ---
+
 # Wrap an MCP Server
 
 The fastest way to put a capability on the mesh is to wrap a tool you already
@@ -10,8 +11,8 @@ announces each tool as a discoverable Net capability, and translates incoming
 mesh calls back into MCP `tools/call` — all without the Net core ever learning
 that MCP exists.
 
-> **MCP made tools callable. `net-mesh wrap` makes them discoverable.** See
-> [Net and MCP](/docs/worldview/mcp-vs-net) explains where the bridge fits.
+`net-mesh wrap` publishes tools from an existing MCP server as Net capabilities.
+[Net and MCP](/docs/worldview/mcp-vs-net) explains where the bridge fits.
 
 ## Prerequisite: a mesh to join
 
@@ -62,7 +63,7 @@ withdrawn from the mesh.
 
 Every wrapped tool is announced as **visible to the mesh but invocable only by the
 same root identity** — the owner. Discovery is not authorization: other nodes can
-*see* and *describe* the capability, but a call from outside the owner scope is
+_see_ and _describe_ the capability, but a call from outside the owner scope is
 rejected at the wrapper, verified against the AEAD-authenticated caller origin.
 
 To widen who may invoke, admit specific caller origins explicitly:
@@ -73,7 +74,7 @@ net-mesh wrap github --allow 0x<caller-origin> --allow 0x<other-origin> \
   -- npx -y @modelcontextprotocol/server-github
 ```
 
-`--allow` widens the *local* enforcement beyond the owner; the announced scope
+`--allow` widens the _local_ enforcement beyond the owner; the announced scope
 label stays the owner identity, so consumers read the reported `allowed_origins`
 to know who may actually invoke. There is no flag that grants blanket mesh-wide
 invocation — widening is always an explicit, per-origin decision.

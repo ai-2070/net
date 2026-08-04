@@ -2,6 +2,7 @@
 title: What is Net?
 description: "Net is a capability substrate for applications that operate across machines, runtimes, and authority boundaries."
 ---
+
 # What is Net?
 
 Net is a capability substrate for applications that operate across machines,

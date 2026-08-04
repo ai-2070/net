@@ -329,7 +329,23 @@ impl ChainChecker for Eip155Checker {
                     {
                         let value =
                             parse_hex_u128(log["data"].as_str().unwrap_or("0x0"), "log.data")?;
-                        total = total.saturating_add(value);
+                        // Checked, never saturating. Saturation would clamp
+                        // the sum to `u128::MAX`, and `AtomicAmount`'s
+                        // grammar admits a requirement of exactly
+                        // `u128::MAX` — so a clamped overpayment would
+                        // compare `Ordering::Equal` against it and be billed
+                        // as an exact settlement instead of routing to the
+                        // `Overpayment` exception. This is the independent
+                        // verification path, whose whole job is not trusting
+                        // reported amounts; it does not get to assume an
+                        // upstream bound on what a token's logs can sum to.
+                        total = total.checked_add(value).ok_or_else(|| {
+                            CheckerError::terminal(format!(
+                                "delivered-amount sum for token {} overflowed u128 — refusing to \
+                                 report a clamped total",
+                                q.token
+                            ))
+                        })?;
                     }
                 }
                 // A settlement that never consumed THIS quote's

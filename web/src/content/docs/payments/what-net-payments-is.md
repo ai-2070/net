@@ -2,11 +2,12 @@
 title: What It Is (and Is Not)
 description: "An agent that invokes a capability needs to answer commercial questions the transport layer can't: what does this cost?"
 ---
+
 # What Net Payments is (and is not)
 
 An agent that invokes a capability needs to answer commercial questions the
-transport layer can't: *what does this cost? did I actually pay for what I got?
-am I allowed to spend this? what do I bill?* Net Payments answers those by
+transport layer cannot: _what does this cost? did the payment reach the required
+verification tier? am I allowed to spend this? what usage fact do I bill?_ Net Payments answers those by
 **signing the commercial facts** around an invocation. It does not move money.
 
 ## The boundary
@@ -33,7 +34,7 @@ in provider, customer, chain, or payment-rail systems.
 
 ## Design rules
 
-1. **x402 is the wire.** Net envelopes *wrap* x402
+1. **x402 is the wire.** Net envelopes _wrap_ x402
    structures — they never replace, translate, or re-encode them.
 2. **Preserve x402 bytes.** x402 documents ride as base64 of their original
    bytes; Net never re-serializes a received x402 doc. See [x402 and
@@ -44,17 +45,19 @@ in provider, customer, chain, or payment-rail systems.
 4. **Verification is a tier, not a boolean.** A facilitator receipt is
    `observed`; depth and finality come from an independent on-chain check. See
    [Verification tiers](/docs/payments/verification-tiers).
-5. **Spend policy decides before execution.** Spend policy runs before money
-   leaves; handlers never see an unpaid call. See [Spend policy &
-   approvals](/docs/payments/spend-policy-and-approvals).
-6. **Enabling a network is config, not code.** See [Networks](/docs/payments/networks).
+5. **Spend policy decides before payment in the integrated caller path.** The
+   engine applies spend policy before signing or submitting payment. See [Spend
+   policy & approvals](/docs/payments/spend-policy-and-approvals).
+6. **Network support stays outside Net core.** Asset configuration, facilitator
+   setup, scheme modules, and conformance determine which networks are enabled.
+   See [Networks](/docs/payments/networks).
 
 ## The data boundary
 
 Net payment, billing, lifecycle, and failure objects carry references,
 commitments, signatures, quote IDs, verification outcomes, and policy decisions
 — **not** customer tax IDs, billing addresses, shipping addresses, or KYB
-records. This holds *by construction*: identities on the wire are public keys
+records. This holds _by construction_: identities on the wire are public keys
 (entity IDs), the invocation input is carried as a **hash**, amounts are opaque
 atomic-unit integers, and there is no PII field on any envelope. Provider and
 customer records live in provider or partner systems.

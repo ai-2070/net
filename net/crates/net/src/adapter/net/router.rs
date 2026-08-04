@@ -726,14 +726,43 @@ impl NetRouter {
         &self.scheduler
     }
 
-    /// Add a route
-    pub fn add_route(&self, dest_id: u64, next_hop: SocketAddr) {
-        self.routing_table.add_route(dest_id, next_hop);
+    /// Add a route. Returns the transition token it produced.
+    pub fn add_route(&self, dest_id: u64, next_hop: SocketAddr) -> u64 {
+        self.routing_table.add_route(dest_id, next_hop)
     }
 
-    /// Remove a route
+    /// Add the route to a DIRECTLY connected peer.
+    ///
+    /// A direct peer's route is identity-qualified by construction: the
+    /// destination and the next hop are the same authenticated node, so
+    /// the entry can carry `next_hop_id` without inferring anything.
+    /// That is what makes it usable by protected forwarding, which
+    /// refuses a route with no bound identity
+    /// (`RoutingTable::lookup_authenticated`).
+    ///
+    /// Session establishment must use THIS rather than
+    /// [`Self::add_route`]. Installing a direct peer as a legacy route
+    /// left protected forwarding with nothing to resolve — every
+    /// authorized hop died at egress lookup, and no test caught it
+    /// because the only caller of `add_authenticated_route` was a test
+    /// fixture.
+    /// Returns the transition token it produced.
+    pub fn add_direct_route(&self, peer_node_id: u64, peer_addr: SocketAddr) -> u64 {
+        self.routing_table
+            .add_authenticated_route(peer_node_id, peer_addr, peer_node_id)
+    }
+
+    /// Remove the ORDINARY route — the inverse of [`Self::add_route`],
+    /// which installs one.
+    ///
+    /// Symmetric on purpose: an ordinary-only installer must not have
+    /// an all-candidate remover behind the same name, or a caller
+    /// undoing its own manual route silently deletes authenticated
+    /// state it never created. Administrative removal of everything a
+    /// destination knows is
+    /// [`RoutingTable::remove_destination_all_candidates`].
     pub fn remove_route(&self, dest_id: u64) {
-        self.routing_table.remove_route(dest_id);
+        self.routing_table.remove_ordinary_route(dest_id);
     }
 
     /// Route a packet (called from receive loop)

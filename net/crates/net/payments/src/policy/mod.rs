@@ -10,5 +10,6 @@
 //!   sidecar-lock + atomic temp+rename + lock-held RMW).
 //! - [`spend`] — the spend-policy vocabulary and decision engine.
 
+pub(crate) mod file_mode;
 pub mod spend;
 pub mod store;

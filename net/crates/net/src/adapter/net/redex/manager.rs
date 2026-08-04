@@ -17,7 +17,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
-use super::super::channel::{AuthGuard, ChannelName};
+use super::super::channel::{AclPrincipal, AuthGuard, ChannelName};
 use super::config::RedexFileConfig;
 use super::error::RedexError;
 use super::file::RedexFile;
@@ -111,7 +111,7 @@ impl Drop for GreedyWiring {
 pub struct Redex {
     files: DashMap<ChannelName, RedexFile>,
     auth: Option<Arc<AuthGuard>>,
-    origin_hash: u64,
+    principal: AclPrincipal,
     #[cfg(feature = "redex-disk")]
     persistent_dir: Option<PathBuf>,
     /// Cumulative count of `build_file` invocations. Sits next to the
@@ -143,7 +143,7 @@ impl Redex {
         Self {
             files: DashMap::new(),
             auth: None,
-            origin_hash: 0,
+            principal: AclPrincipal::Origin(0),
             #[cfg(feature = "redex-disk")]
             persistent_dir: None,
             build_count: AtomicU64::new(0),
@@ -154,15 +154,43 @@ impl Redex {
     }
 
     /// Create a manager that rejects `open_file` unless the
-    /// `(origin_hash, channel)` pair has been authorized by `guard`
+    /// `(principal, channel)` pair has been authorized by `guard`
     /// via [`AuthGuard::allow_channel`]. Uses the exact 64-bit
     /// channel identity, not the 16-bit wire hash — see the module
     /// docs for rationale.
+    ///
+    /// Takes an `origin_hash` rather than an [`AclPrincipal`] so a
+    /// caller cannot wire this **storage** gate to a subscriber's node
+    /// id. It would compile and behave: the subscribe path is the ACL's
+    /// only production writer and grants exactly `Node(node_id)`, so a
+    /// `Redex` built with a node principal would find those entries and
+    /// authorize `open_file` on any channel that peer had merely
+    /// subscribed to — the subscription-to-storage escalation this
+    /// boundary exists to prevent. The type makes that unrepresentable
+    /// rather than merely discouraged.
     pub fn with_auth(guard: Arc<AuthGuard>, origin_hash: u64) -> Self {
+        Self::with_auth_principal(guard, AclPrincipal::Origin(origin_hash))
+    }
+
+    /// The unconstrained constructor `with_auth` wraps.
+    ///
+    /// **Private, and it must stay private.** `pub(crate)` was still too
+    /// wide: any module in this crate could build the storage gate with
+    /// an `AclPrincipal::Node`, and since the subscribe path is the
+    /// ACL's only production writer and grants exactly `Node(node_id)`,
+    /// such a `Redex` would authorize `open_file` on every channel a
+    /// peer had merely subscribed to. That is the
+    /// subscription-to-storage escalation the principal type exists to
+    /// make unrepresentable — a boundary is not enforced if the crate
+    /// can step around it.
+    ///
+    /// Only this module and its nested tests need it, which is exactly
+    /// what private reaches.
+    fn with_auth_principal(guard: Arc<AuthGuard>, principal: AclPrincipal) -> Self {
         Self {
             files: DashMap::new(),
             auth: Some(guard),
-            origin_hash,
+            principal,
             #[cfg(feature = "redex-disk")]
             persistent_dir: None,
             build_count: AtomicU64::new(0),
@@ -492,14 +520,20 @@ impl Redex {
             // no such backstop, and even a 64-bit non-cryptographic
             // hash would be birthday-crackable offline, so the ACL
             // keys on the full canonical name.
-            // Widen the 32-bit local origin_hash to match
-            // `AuthGuard`'s 64-bit key. The guard keeps the local
-            // entity and remote subscribers in disjoint key ranges
-            // simply by the natural spread of node_ids — the local
-            // entity lives in the lower 2^32 and remote subscribers'
-            // full node_ids occupy the full range, so there is no
-            // cross-contamination.
-            if !auth.is_authorized_full(self.origin_hash, name) {
+            // Disjointness from remote subscribers' grants is now a
+            // property of the KEY, not of luck. The previous comment
+            // here argued the local entity and remote subscribers stay
+            // apart "simply by the natural spread of node_ids" — the
+            // local entity in the lower 2^32, remote node_ids across
+            // the full range. That was the untyped-key hazard stated
+            // out loud: it is an observation about value distribution,
+            // not an invariant, and it silently becomes false the
+            // moment either side's derivation changes.
+            //
+            // `AclPrincipal` makes the derivation part of the key, so a
+            // subscribe-granted `Node(x)` cannot satisfy this lookup
+            // even if `x` equals this manager's principal value (I1).
+            if !auth.is_authorized_full(self.principal, name) {
                 return Err(RedexError::Unauthorized);
             }
         }
@@ -587,7 +621,11 @@ impl Redex {
         let channel_id = ChannelId::from_name(name);
         let identity = ChannelIdentity {
             channel_name: name.as_str().to_string(),
-            origin_hash: self.origin_hash,
+            // `ChannelIdentity.origin_hash` is a replication-layer
+            // identity (what `announce_chain` advertises), NOT an ACL
+            // key — so it takes the scalar, deliberately and visibly,
+            // via `raw()` rather than an implicit conversion.
+            origin_hash: self.principal.raw(),
         };
 
         // Compute the initial replica set. Pinned: the literal
@@ -888,7 +926,7 @@ impl std::fmt::Debug for Redex {
         let mut dbg = f.debug_struct("Redex");
         dbg.field("files", &self.files.len())
             .field("auth", &self.auth.is_some())
-            .field("origin_hash", &self.origin_hash);
+            .field("principal", &self.principal);
         #[cfg(feature = "redex-disk")]
         dbg.field("persistent_dir", &self.persistent_dir);
         dbg.finish()
@@ -988,6 +1026,43 @@ mod tests {
         ));
     }
 
+    /// A subscriber's grant must not open that channel's storage.
+    ///
+    /// `Redex::with_auth` takes a raw `origin_hash` precisely so this
+    /// cannot be wired by accident, but the internal
+    /// `with_auth_principal` can express it — so pin the outcome. The
+    /// subscribe handler writes `Node(node_id)`; a storage gate keyed on
+    /// `Origin` must not see it, and a storage gate keyed on `Node`
+    /// (which the public constructor makes unreachable) is the
+    /// escalation itself.
+    #[test]
+    fn subscriber_node_grant_does_not_open_storage() {
+        let guard = Arc::new(AuthGuard::new());
+        let name = cn("tenant-private");
+        const NODE_ID: u64 = 0x1234_5678;
+
+        // Exactly what an accepted Subscribe writes.
+        guard.allow_channel(AclPrincipal::Node(NODE_ID), &name);
+
+        // The public storage constructor takes an origin hash, so even
+        // the identical scalar yields a different principal and misses.
+        let r = Redex::with_auth(guard.clone(), NODE_ID);
+        assert!(
+            matches!(
+                r.open_file(&name, RedexFileConfig::default()),
+                Err(RedexError::Unauthorized)
+            ),
+            "a subscribe grant (node id) must not authorize open_file, even \
+             when the storage principal carries the same scalar"
+        );
+
+        // And the origin-keyed grant that *should* work, does — so the
+        // rejection above is about the derivation, not a broken gate.
+        guard.allow_channel(AclPrincipal::Origin(NODE_ID), &name);
+        let r = Redex::with_auth(guard, NODE_ID);
+        assert!(r.open_file(&name, RedexFileConfig::default()).is_ok());
+    }
+
     #[test]
     fn test_auth_allows_authorized_origin() {
         let guard = Arc::new(AuthGuard::new());
@@ -995,7 +1070,7 @@ mod tests {
         // `allow_channel` populates the exact (control-plane) ACL
         // used by `open_file`, plus the fast-path bloom so packet
         // checks on the same channel also pass.
-        guard.allow_channel(0x1234_5678, &name);
+        guard.allow_channel(AclPrincipal::Origin(0x1234_5678), &name);
         let r = Redex::with_auth(guard, 0x1234_5678);
         assert!(r.open_file(&name, RedexFileConfig::default()).is_ok());
     }
@@ -1013,7 +1088,7 @@ mod tests {
         let guard = Arc::new(AuthGuard::new());
         let name = cn("sensitive");
         // Authorize the fast path ONLY (no allow_channel).
-        guard.authorize(0x1234_5678, name.hash());
+        guard.authorize(AclPrincipal::Origin(0x1234_5678), name.hash());
         let r = Redex::with_auth(guard, 0x1234_5678);
         assert!(matches!(
             r.open_file(&name, RedexFileConfig::default()),

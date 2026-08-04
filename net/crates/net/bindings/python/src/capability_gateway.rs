@@ -671,12 +671,16 @@ fn build_payment_flow(
     let registry = net_payments::core::registry::default_registry_v1(caller.entity_id().clone());
     let spend = SpendPolicyEngine::new(&config.policy_path, profile)
         .with_unsafe_mock_auto_allow(config.unsafe_mock_auto_allow);
+    // One clock for both halves: the channel stamps each signed quote
+    // request's freshness window and the provider checks it, so a
+    // divergent clock would make every request look future-dated.
+    let clock: Arc<dyn net_payments::flow::Clock> = Arc::new(SystemClock);
     let mut flow = CallerPaymentFlow::new(
-        caller,
+        caller.clone(),
         spend,
         registry,
-        Arc::new(MeshPaymentChannel::new(mesh)),
-        Arc::new(SystemClock),
+        Arc::new(MeshPaymentChannel::new(mesh, caller, clock.clone())),
+        clock,
     );
     if let Some((address, callable)) = config.signer {
         flow = flow.with_signer("eip155", python_external_signer(address, callable));
@@ -1781,32 +1785,47 @@ mod approval_verbs {
         assert_eq!(v["status"], "ok");
         assert_eq!(v["spent"], "0");
 
-        // Approve a quote id: the record moves to approved (changed), and a
-        // second approve is idempotent (no change).
+        // Approving an id nobody has asked about is a structured no-op,
+        // not a new record — `changed: false`, `status: ok`.
+        //
+        // The engine writes the pending record when it decides an
+        // approval is needed, and attaches the exact provider-signed
+        // quote bytes to it. Minting one here would leave an approval
+        // carrying no quote bytes that the policy gate still reads as
+        // approved: an operator's "yes" to a quote nobody can produce.
+        //
+        // This asserts the marshalling — status, echoed id, and the
+        // `changed` flag. The approve/reject state machine itself is
+        // `spend_policy.rs`'s subject, and the same contract is pinned on
+        // the Python side in `test_approval_verbs_round_trip`.
         let v: Value = serde_json::from_str(
             &do_approve_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
         )
         .expect("json");
         assert_eq!(v["status"], "ok");
         assert_eq!(v["quote_id"], "q-1");
-        assert_eq!(v["changed"], true);
-        let v: Value = serde_json::from_str(
-            &do_approve_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
-        )
-        .expect("json");
-        assert_eq!(v["changed"], false, "re-approve is a no-op");
+        assert_eq!(
+            v["changed"], false,
+            "approving an unknown quote id must be a no-op"
+        );
 
-        // Reject removes it (changed), then a second reject is a no-op.
+        // And it really did not create anything.
+        let v: Value =
+            serde_json::from_str(&do_pending_payments(Some(path.clone()), profile.clone()).await)
+                .expect("json");
+        assert_eq!(v["pending"].as_array().expect("array").len(), 0);
+
+        // Rejecting an unknown id is likewise a no-op rather than an error.
         let v: Value = serde_json::from_str(
             &do_reject_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
         )
         .expect("json");
-        assert_eq!(v["changed"], true);
-        let v: Value = serde_json::from_str(
-            &do_reject_payment(Some(path.clone()), profile.clone(), "q-1".into()).await,
-        )
-        .expect("json");
-        assert_eq!(v["changed"], false, "re-reject is a no-op");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["quote_id"], "q-1");
+        assert_eq!(
+            v["changed"], false,
+            "rejecting an unknown quote id must be a no-op"
+        );
     }
 
     #[tokio::test]

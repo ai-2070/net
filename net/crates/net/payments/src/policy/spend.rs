@@ -177,6 +177,62 @@ pub struct ApprovalRecord {
     pub quote_b64: String,
 }
 
+/// One outstanding reservation, keyed by the quote that took it.
+///
+/// The per-day counters are aggregate — `{day}|{network}|{asset}` — so on
+/// their own they record *how much* was reserved and nothing about *by
+/// whom*. Release then had to be told the amount and the day again, and
+/// had no way to tell a first release from a second: two releases for one
+/// quote subtracted twice, and an over-large release saturated the whole
+/// day's counter to zero, erasing every other reservation for that pair.
+///
+/// This record is the ownership the counter lacks. Release looks up the
+/// exact reservation, decrements what it actually reserved, and removes
+/// it — so a second release finds nothing and is a no-op, and the
+/// caller's clock stops being part of the correctness argument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reservation {
+    /// The day bucket the reservation landed in, so release finds the
+    /// same counter regardless of when it runs.
+    pub day: u64,
+    pub network: String,
+    /// The x402 asset locator, as it appears in the counter key.
+    pub asset: String,
+    /// Atomic units reserved.
+    pub amount: AtomicAmount,
+    /// How many attempts currently hold this reservation.
+    ///
+    /// A reservation is an **in-flight claim**, not merely a record that
+    /// one was taken once. Two attempts at the same quote — a retry
+    /// racing the original, two flows sharing the policy file — both see
+    /// the reservation and are both allowed, because the budget for that
+    /// quote is already committed. Releasing on the first failure would
+    /// then hand back budget the other attempt is still spending
+    /// against, and remove the record that makes it a retry at all: the
+    /// next attempt reserves afresh and `max_per_day` has been reopened
+    /// by an attempt that failed.
+    ///
+    /// So the count rises on each attempt and falls on each release, and
+    /// only the last release returns the amount to the counter. A
+    /// process that dies mid-attempt leaks a claim, which holds budget —
+    /// the fail-closed direction.
+    ///
+    /// Defaulted to 1 for stores written before this field existed: one
+    /// recorded reservation, one holder.
+    #[serde(default = "one_holder")]
+    pub holders: u32,
+}
+
+fn one_holder() -> u32 {
+    1
+}
+
+impl Reservation {
+    fn counter_key(&self) -> String {
+        format!("{}|{}|{}", self.day, self.network, self.asset)
+    }
+}
+
 /// On-disk shape. Struct wrapper (not a bare map) for schema headroom,
 /// per the store convention.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -195,6 +251,11 @@ pub struct SpendPolicyFile {
     /// Approval records keyed by quote id.
     #[serde(default)]
     approvals: BTreeMap<String, ApprovalRecord>,
+    /// Outstanding reservations, keyed by quote id — the ownership the
+    /// aggregate counters cannot express. Additive: a store written by an
+    /// older build simply has none, and its releases stay best-effort.
+    #[serde(default)]
+    reservations: BTreeMap<String, Reservation>,
 }
 
 /// The caller-side spend gate over one shared policy file.
@@ -266,15 +327,14 @@ impl SpendPolicyEngine {
         let quote_id = quote.quote_id.clone();
         let capability = quote.capability.clone();
         let day = now_ns / NS_PER_DAY;
-        let counter_key = format!("{day}|{network}|{}", requirements.asset);
-        // Held with the pending record so a post-approval retry redeems
-        // this exact provider-signed quote.
-        let quote_b64 = crate::core::canonical::canonical_bytes(quote)
-            .map(|b| {
-                use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD.encode(b)
-            })
-            .map_err(|e| SpendError::Malformed(e.to_string()))?;
+        let requirements_asset = requirements.asset.clone();
+        let counter_key = format!("{day}|{network}|{requirements_asset}");
+        // The quote's canonical bytes are held with a pending approval so a
+        // post-approval retry redeems this exact provider-signed quote. They
+        // are computed lazily inside `require` (below) — see the note there.
+        // A canonicalization failure has no error channel out of the store
+        // closure, so it parks here and is re-raised after the transaction.
+        let mut canonical_failure: Option<String> = None;
 
         let approve_hint =
             format!("approve quote {quote_id} via the payments consent API (operator surface)");
@@ -289,12 +349,24 @@ impl SpendPolicyEngine {
         //     already-pending record is a no-op → clean);
         //   * a reservation landed in the day counter (always dirty).
         let decision = mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, |s| {
-            // Housekeeping: drop counters beyond the retention horizon.
+            // Housekeeping: drop counters beyond the retention horizon,
+            // and the reservations that pointed at them.
+            //
+            // Reservations are only removed by an explicit release, and a
+            // *successful* payment never releases — it has nothing to give
+            // back. So without this the map would grow with lifetime
+            // payment volume, on a file every payment parses and rewrites
+            // under a lock. Once a reservation's counter has aged out it
+            // can no longer be released meaningfully, so it is dead.
+            //
             // `retain` only ever removes, so a shrink means we pruned.
             let counters_before = s.counters.len();
             s.counters
-                .retain(|k, _| counter_day(k).is_some_and(|d| d + COUNTER_RETAIN_DAYS >= day));
-            let mut dirty = s.counters.len() != counters_before;
+                .retain(|k, _| counter_day(k).is_some_and(|d| within_retention(d, day)));
+            let reservations_before = s.reservations.len();
+            s.reservations.retain(|_, r| within_retention(r.day, day));
+            let mut dirty =
+                s.counters.len() != counters_before || s.reservations.len() != reservations_before;
 
             let approved = s
                 .approvals
@@ -308,17 +380,56 @@ impl SpendPolicyEngine {
 
             // The model-reachable side writes a pending approval — but only
             // when one is not already recorded. Sets `*dirty` iff it inserts.
-            let require = |s: &mut SpendPolicyFile, dirty: &mut bool, policy_reason: String| {
+            //
+            // The quote is canonicalized HERE rather than before the
+            // transaction: a full `to_value` + recursive canonical write +
+            // base64 over the whole envelope is needed only to hold the exact
+            // provider-signed quote beside a NEW pending approval. On the
+            // allowed path — and on an already-pending observation, which is
+            // the common case under a duplicate storm — it was pure waste.
+            //
+            // The tradeoff, stated because it is the one direction this is a
+            // regression: that work now happens INSIDE the cross-process
+            // advisory lock, whereas before it ran ahead of it. Every other
+            // mutator of this store waits behind a 1ms-doubling poll loop
+            // (see `payments-spend-contention.md`), so the first-approval
+            // path lengthens a critical section it used to stay out of. It
+            // is taken deliberately: an approval-required decision is
+            // operator-gated and rare, one quote's canonical bytes are
+            // small, and the paths that are actually hot — allowed, and
+            // already-pending — now do none of this work at all. Moving it
+            // back out would mean a speculative pre-check to guess whether
+            // an approval is coming, which costs a second read on every
+            // call to save a rare one.
+            //
+            // `canonical_bytes` can only fail on a float-bearing or
+            // non-object envelope, unreachable for a `PaymentQuote`, but the
+            // failure is surfaced rather than swallowed: no approval is
+            // recorded (an approval holding no quote bytes is one a
+            // post-approval retry cannot redeem), the reason is parked in
+            // `failure`, and the caller re-raises it as `SpendError::Malformed`
+            // once the transaction ends. Nothing is reserved on that path.
+            let require = |s: &mut SpendPolicyFile,
+                           dirty: &mut bool,
+                           failure: &mut Option<String>,
+                           policy_reason: String| {
                 if !s.approvals.contains_key(&quote_id) {
-                    s.approvals.insert(
-                        quote_id.clone(),
-                        ApprovalRecord {
-                            state: ApprovalState::Pending,
-                            capability: capability.clone(),
-                            quote_b64: quote_b64.clone(),
-                        },
-                    );
-                    *dirty = true;
+                    match crate::core::canonical::canonical_bytes(quote) {
+                        Ok(bytes) => {
+                            use base64::Engine as _;
+                            s.approvals.insert(
+                                quote_id.clone(),
+                                ApprovalRecord {
+                                    state: ApprovalState::Pending,
+                                    capability: capability.clone(),
+                                    quote_b64: base64::engine::general_purpose::STANDARD
+                                        .encode(bytes),
+                                },
+                            );
+                            *dirty = true;
+                        }
+                        Err(e) => *failure = Some(e.to_string()),
+                    }
                 }
                 SpendDecision::RequiresPaymentApproval {
                     quote_id: quote_id.clone(),
@@ -350,6 +461,7 @@ impl SpendPolicyEngine {
                             break 'decision require(
                                 s,
                                 &mut dirty,
+                                &mut canonical_failure,
                                 "mock-network auto-allow requires a dev/test profile or the \
                                  explicit unsafe flag; production profile requires approval per \
                                  spend"
@@ -362,6 +474,7 @@ impl SpendPolicyEngine {
                             break 'decision require(
                                 s,
                                 &mut dirty,
+                                &mut canonical_failure,
                                 format!("network `{network}` is not in allowed_networks"),
                             );
                         }
@@ -372,6 +485,7 @@ impl SpendPolicyEngine {
                         break 'decision require(
                             s,
                             &mut dirty,
+                            &mut canonical_failure,
                             format!("asset `{asset_caip}` is not in allowed_assets"),
                         );
                     }
@@ -380,12 +494,35 @@ impl SpendPolicyEngine {
                             break 'decision require(
                                 s,
                                 &mut dirty,
+                                &mut canonical_failure,
                                 format!(
                                     "amount {amount} exceeds max_per_call {cap} for `{capability}`"
                                 ),
                             );
                         }
                     }
+                }
+
+                // Ownership first: a reservation already on file for this
+                // quote means this is a retry, not a second spend.
+                //
+                // This has to come BEFORE the per-day cap. Checking it
+                // after would re-evaluate `max_per_day` against a total
+                // that already includes this very reservation, so a retry
+                // of the payment that happened to reach the cap would be
+                // told it needs approval — for spending it had already
+                // been allowed. The record is what lets us tell a retry
+                // from a second spend, so it gets consulted first.
+                //
+                // The holder count rises here and falls in
+                // `release_reservation`. See `Reservation::holders`: the
+                // claim has to outlive every attempt holding it, or one
+                // attempt's failure frees budget another is still
+                // spending against.
+                if let Some(existing) = s.reservations.get_mut(&quote_id) {
+                    existing.holders = existing.holders.saturating_add(1);
+                    dirty = true;
+                    break 'decision SpendDecision::Allowed;
                 }
 
                 // Per-day counter: read, check, reserve — all under this lock.
@@ -414,6 +551,7 @@ impl SpendPolicyEngine {
                             break 'decision require(
                                 s,
                                 &mut dirty,
+                                &mut canonical_failure,
                                 format!(
                                     "spending {amount} would take today's `{}` total on \
                                      `{network}` to {new_total}, over max_per_day {cap}",
@@ -426,63 +564,146 @@ impl SpendPolicyEngine {
                 // Approved spend is still spending: it lands in the counter.
                 s.counters
                     .insert(counter_key.clone(), new_total.to_canonical_string());
+                s.reservations.insert(
+                    quote_id.clone(),
+                    Reservation {
+                        day,
+                        network: network.clone(),
+                        asset: requirements_asset.clone(),
+                        amount: amount.clone(),
+                        holders: 1,
+                    },
+                );
                 dirty = true;
                 SpendDecision::Allowed
             };
             (decision, dirty)
         })
         .await?;
+        // Re-raise a parked canonicalization failure: `require` declined to
+        // record an approval it could not attach the quote bytes to, so the
+        // caller must see the error rather than a `RequiresPaymentApproval`
+        // pointing at a hold that was never taken.
+        if let Some(reason) = canonical_failure {
+            return Err(SpendError::Malformed(reason));
+        }
         Ok(decision)
     }
 
-    /// Release a reservation made by [`Self::check_and_reserve`] after a
-    /// terminal failure where value verifiably did not move (provider
-    /// rejected pre-settle, facilitator refused). Saturating at zero;
-    /// callers treat failure as over-counting (the fail-closed
-    /// direction), never as blocked spending.
+    /// Release the reservation this quote took, after a terminal failure
+    /// where value verifiably did not move (provider rejected pre-settle,
+    /// facilitator refused).
+    ///
+    /// **Owner-checked and refcounted.** The release drops one holder of
+    /// this quote's claim (see [`Reservation::holders`]). When the last
+    /// one goes it decrements exactly what [`Self::check_and_reserve`]
+    /// recorded for *this quote*, from the counter it actually landed in,
+    /// and forgets the record. While another attempt still holds the
+    /// claim, nothing is returned — otherwise a failing retry hands back
+    /// budget the attempt beside it is still spending against, and
+    /// deletes the record that made it a retry. A release with no claim
+    /// on file finds nothing and does nothing.
+    ///
+    /// That is a change from the previous behaviour, and the reason is
+    /// worth stating: release used to subtract a caller-supplied amount
+    /// from a counter derived from the caller's *current* clock, with no
+    /// record of what had been reserved. Two releases subtracted twice,
+    /// and because the underflow saturated to zero, one over-large
+    /// release wiped the entire day's counter for that
+    /// `(network, asset)` — freeing budget for every unrelated
+    /// reservation in the same bucket and reopening `max_per_day` as a
+    /// loss bound.
+    ///
+    /// `now_ns` no longer selects the counter — the reservation record
+    /// carries its own day — and is used only to retire records whose
+    /// counters have already aged out.
     pub async fn release_reservation(
         &self,
         quote: &PaymentQuote,
         now_ns: u64,
     ) -> Result<(), SpendError> {
-        let requirements = quote.requirements.view();
-        let amount = AtomicAmount::parse(&requirements.amount)
-            .map_err(|e| SpendError::Malformed(e.to_string()))?;
-        let key = format!(
-            "{}|{}|{}",
-            now_ns / NS_PER_DAY,
-            requirements.network,
-            requirements.asset
-        );
-        mutate_json::<SpendPolicyFile, _, _>(&self.path, move |s| {
-            if let Some(raw) = s.counters.get(&key) {
-                if let Ok(current) = AtomicAmount::parse(raw) {
-                    let reduced = current
-                        .checked_sub(&amount)
-                        .unwrap_or_else(|_| AtomicAmount::from_u128(0));
-                    s.counters
-                        .insert(key.clone(), reduced.to_canonical_string());
+        let quote_id = quote.quote_id.clone();
+        let today = now_ns / NS_PER_DAY;
+        mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, move |s| {
+            // Housekeeping: a reservation whose counter has aged past the
+            // retention horizon can never be released meaningfully again.
+            let before = s.reservations.len();
+            s.reservations.retain(|_, r| within_retention(r.day, today));
+            let mut dirty = s.reservations.len() != before;
+
+            // One holder drops. Only when the last one does is the amount
+            // returned to the counter and the record forgotten — while
+            // another attempt still holds the claim, this quote's budget
+            // stays committed and the record stays, so that attempt keeps
+            // reading as a retry rather than a fresh spend.
+            //
+            // Taken out and put back rather than borrowed and then
+            // removed: the removal is what lets the counter decrement
+            // read the record by value, and doing it up front means
+            // there is no "it must still be there" step in between.
+            if let Some(mut reservation) = s.reservations.remove(&quote_id) {
+                dirty = true;
+                reservation.holders = reservation.holders.saturating_sub(1);
+                if reservation.holders > 0 {
+                    s.reservations.insert(quote_id.clone(), reservation);
+                } else {
+                    let key = reservation.counter_key();
+                    if let Some(raw) = s.counters.get(&key) {
+                        if let Ok(current) = AtomicAmount::parse(raw) {
+                            // Saturating only as a floor: the reservation
+                            // record means the amount is the one that went
+                            // in, so an underflow here would be corruption
+                            // rather than a mismatched caller.
+                            let reduced = current
+                                .checked_sub(&reservation.amount)
+                                .unwrap_or_else(|_| AtomicAmount::from_u128(0));
+                            s.counters.insert(key, reduced.to_canonical_string());
+                        }
+                    }
                 }
             }
+            ((), dirty)
         })
         .await?;
         Ok(())
     }
 
+    /// The reservation currently on file for `quote_id`, if any.
+    /// Diagnostics and tests.
+    pub async fn reservation(&self, quote_id: &str) -> Result<Option<Reservation>, SpendError> {
+        let state: SpendPolicyFile = load_json(&self.path).await?;
+        Ok(state.reservations.get(quote_id).cloned())
+    }
+
     /// Operator-only verb: approve a specific quote. Resolves through the
     /// SDK consent API (Hermes/OpenClaw render the prompt); the shared
     /// store holds the decision. Returns whether state changed.
+    ///
+    /// **Approves an existing held quote only.** An unknown `quote_id` is
+    /// a no-op returning `false`, never a new record: the engine writes
+    /// the pending record (with the exact provider-signed quote bytes
+    /// attached) when it decides an approval is needed, so an id with no
+    /// record is one nothing ever asked about.
+    ///
+    /// Minting one here would create a record with an empty `capability`
+    /// and empty `quote_b64` that [`Self::check_and_reserve`] still reads
+    /// as approved — bypassing `max_per_call`, `max_per_day`, and
+    /// `allowed_assets` for whatever quote later carried that id, while
+    /// [`Self::approved_quote`] skipped it (no bytes to redeem). Reaching
+    /// that state requires a later quote to be issued with exactly that
+    /// id, and quote ids are content-derived — so it is a quote-id
+    /// collision, not something an attacker steers. This is API
+    /// integrity rather than a live attack path; "approve" simply should
+    /// not be able to invent the thing it approves.
     pub async fn approve(&self, quote_id: &str) -> Result<bool, SpendError> {
         let quote_id = quote_id.to_string();
-        let changed = mutate_json::<SpendPolicyFile, _, _>(&self.path, move |s| {
-            let record = s.approvals.entry(quote_id).or_insert(ApprovalRecord {
-                state: ApprovalState::Pending,
-                capability: String::new(),
-                quote_b64: String::new(),
-            });
+        let changed = mutate_json_if_changed::<SpendPolicyFile, _, _>(&self.path, move |s| {
+            let Some(record) = s.approvals.get_mut(&quote_id) else {
+                return (false, false);
+            };
             let changed = record.state != ApprovalState::Approved;
             record.state = ApprovalState::Approved;
-            changed
+            (changed, changed)
         })
         .await?;
         Ok(changed)
@@ -564,6 +785,26 @@ fn counter_day(key: &str) -> Option<u64> {
     key.split('|').next()?.parse().ok()
 }
 
+/// Is a record stamped `day` still inside the retention horizon that
+/// ends at `today`?
+///
+/// Subtraction on `today`, never addition on `day`. `day` comes off
+/// disk — a counter key, or a persisted reservation — so a corrupt or
+/// hostile policy file can put `u64::MAX` there, and `day +
+/// COUNTER_RETAIN_DAYS` then panics in debug and wraps in release. The
+/// wrap is the worse half: it lands on a small number, the record reads
+/// as ancient, and the pruning pass drops live counters along with it.
+///
+/// A day this can't interpret is retained rather than dropped.
+/// Housekeeping's job is to remove what is provably past the horizon;
+/// anything else is the audit trail's problem, not the sweeper's.
+///
+/// One function for all three call sites so the comparison cannot drift
+/// between the two pruning passes and the release path.
+fn within_retention(day: u64, today: u64) -> bool {
+    day >= today.saturating_sub(COUNTER_RETAIN_DAYS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +820,31 @@ mod tests {
     fn counter_keys_parse_their_day() {
         assert_eq!(counter_day("11574|mock:net|musd"), Some(11_574));
         assert_eq!(counter_day("garbage"), None);
+    }
+
+    /// The retention horizon is a subtraction on today, so a day read
+    /// off disk can be anything at all without arithmetic deciding the
+    /// outcome.
+    #[test]
+    fn retention_holds_at_the_edges_of_the_day_range() {
+        let today = 11_574;
+        // The horizon itself is inclusive; one day past it is not.
+        assert!(within_retention(today, today));
+        assert!(within_retention(today - COUNTER_RETAIN_DAYS, today));
+        assert!(!within_retention(today - COUNTER_RETAIN_DAYS - 1, today));
+
+        // A corrupt or hostile policy file. `day + COUNTER_RETAIN_DAYS`
+        // panicked in debug and wrapped in release here — and the wrap
+        // was the dangerous half, because it read as ancient and took
+        // every live counter with it. Retained instead: housekeeping
+        // removes what is provably past the horizon and nothing else.
+        assert!(within_retention(u64::MAX, today));
+        assert!(within_retention(today + 1, today));
+
+        // Early epoch, where the horizon would underflow.
+        assert!(within_retention(0, 0));
+        assert!(within_retention(0, COUNTER_RETAIN_DAYS));
+        assert!(!within_retention(0, COUNTER_RETAIN_DAYS + 1));
     }
 
     #[test]

@@ -33,12 +33,19 @@ use net_payments::x402::X402Carry;
 /// Author the canonical `net.pricing.terms@1` JSON for a capability from a
 /// provider entity id + a JSON array of x402 `PaymentRequirements`. Pure — the
 /// napi wrapper below is a thin marshaling shell. Mirrors the Python
-/// `author_pricing_terms`.
-fn author_pricing_terms(
-    provider_entity_id: [u8; 32],
-    capability: &str,
+/// Decode the caller's JSON array into byte-preserved carries.
+///
+/// Shared so the authoring path and the settlement-route check read the
+/// same requirements from the same string — two parses of one input can
+/// disagree, and the whole point of the check is that what gets
+/// announced is what got validated.
+///
+/// Locally-originated x402: `author` is the sanctioned serialization
+/// point (these templates originate here, so the bytes become the
+/// preserved originals — no byte-preservation violation).
+fn parse_requirements(
     requirements_json: &str,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<Vec<X402Carry<PaymentRequirements>>, String> {
     let reqs: Vec<PaymentRequirements> = serde_json::from_str(requirements_json).map_err(|e| {
         format!("requirementsJson must be a JSON array of x402 PaymentRequirements objects: {e}")
     })?;
@@ -48,19 +55,46 @@ fn author_pricing_terms(
                 .to_string(),
         );
     }
-    // Locally-originated x402: `author` is the sanctioned serialization point
-    // (these templates originate here, so the bytes become the preserved
-    // originals — no byte-preservation violation).
-    let accepts = reqs
-        .iter()
+    reqs.iter()
         .map(X402Carry::author)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| format!("author payment requirement: {e}"))?;
+        .map_err(|e| format!("author payment requirement: {e}"))
+}
+
+/// `author_pricing_terms`.
+fn author_pricing_terms(
+    provider_entity_id: [u8; 32],
+    capability: &str,
+    requirements_json: &str,
+    production_registry: bool,
+) -> std::result::Result<String, String> {
+    let accepts = parse_requirements(requirements_json)?;
     let provider = EntityId::from_bytes(provider_entity_id);
-    // The v1 default registry (mock + survey networks). Its `reference()` is
-    // signer-independent (it hashes the asset content), so it matches any caller
-    // authoring quotes under the same default registry.
-    let registry = default_registry_v1(provider.clone());
+    // The registry revision these terms are announced under. It must match the
+    // one the provider's engine issues quotes under, or discovery metadata
+    // names a different revision than the backend actually serving —
+    // `PaymentProvider` picks `production_registry_v1` whenever a real
+    // facilitator is configured, so this has to be able to follow.
+    //
+    // `reference()` hashes the whole registry, `signer` included — so it is
+    // signer-*dependent*, and `provider_entity_id` has to be the same identity
+    // the engine issues quotes under. A different id here produces a different
+    // reference for the same asset list, and the announced terms then name a
+    // registry revision no counterparty can match.
+    let registry = if production_registry {
+        net_payments::core::registry::production_registry_v1(provider.clone())
+    } else {
+        default_registry_v1(provider.clone())
+    };
+    // Every announced requirement must be one this registry actually
+    // carries. Without the check, a production provider can advertise an
+    // asset it will never quote — the caller picks that entry, asks for a
+    // quote, and gets refused with no other entry to fall back to.
+    for requirement in &accepts {
+        registry
+            .check_requirements(requirement.view())
+            .map_err(|e| format!("payment requirement is not in the selected registry: {e}"))?;
+    }
     let reference = registry
         .reference()
         .map_err(|e| format!("registry reference: {e}"))?;
@@ -81,11 +115,27 @@ fn author_pricing_terms(
 /// Returns the canonical, byte-preserved terms string — opaque downstream and
 /// echoed verbatim at discovery. Throws on a bad entity id, malformed JSON, or
 /// an empty list.
+///
+/// `productionRegistry` must match the provider that will quote these terms: a
+/// `PaymentProvider` built with a real `facilitatorUrl` issues quotes under the
+/// production registry revision (which drops the mock asset and the testnets),
+/// so its announced terms must be authored with `true`. Announcing one revision
+/// while quoting under another leaves discovery metadata naming a registry the
+/// backend does not use, and a caller that picks an entry from it gets refused
+/// with nothing to fall back to.
+///
+/// **Prefer [`PaymentProvider.pricingTerms`](provider::PaymentProvider::pricing_terms)
+/// when you have a provider.** It takes the registry from the engine that will
+/// actually issue the quotes, so the two cannot disagree. This free function
+/// exists for authoring terms without standing a provider up — a discovery
+/// tool, a fixture — and its default of `false` is a real footgun for anyone
+/// who has a real facilitator and does not pass the flag.
 #[napi]
 pub fn build_pricing_terms(
     provider_entity_id: Buffer,
     capability: String,
     requirements_json: String,
+    production_registry: Option<bool>,
 ) -> Result<String> {
     let id: [u8; 32] = provider_entity_id.as_ref().try_into().map_err(|_| {
         Error::from_reason(format!(
@@ -93,7 +143,13 @@ pub fn build_pricing_terms(
             provider_entity_id.len()
         ))
     })?;
-    author_pricing_terms(id, &capability, &requirements_json).map_err(Error::from_reason)
+    author_pricing_terms(
+        id,
+        &capability,
+        &requirements_json,
+        production_registry.unwrap_or(false),
+    )
+    .map_err(Error::from_reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -103,8 +159,14 @@ pub fn build_pricing_terms(
 // tool-publish building blocks) alongside `payments`.
 // ---------------------------------------------------------------------------
 
+/// The registry revision a real settlement backend puts the engine on.
+/// Named once so the provider's authoring path and its `registryVersion`
+/// getter cannot drift apart.
+const PRODUCTION_REGISTRY_VERSION: &str = "net-production-1";
+
 #[cfg(feature = "publish")]
 mod provider {
+    use super::PRODUCTION_REGISTRY_VERSION;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -128,13 +190,85 @@ mod provider {
     };
     use crate::NetMesh;
 
-    /// A paid-capability provider over an embedded `NetMesh` node — the supply
-    /// side. Construction stands up one `PaymentEngine` behind the quote/pay
-    /// wire; `publishPaidTools` publishes priced tools gated by that same
-    /// engine, so a quote paid over the wire is the quote the gate redeems. Hold
-    /// the provider to keep the wire served.
+    /// Choose the settlement backend, or fail closed.
     ///
-    /// Construct with `new PaymentProvider(mesh, statePath, billingLogPath?)`.
+    /// Returns the facilitator plus the asset registry that goes with it:
+    /// a real backend gets `production_registry_v1` (no `mock:net` entry — a
+    /// provider settling real money has no reason to allowlist an asset whose
+    /// settlements move nothing), the mock gets the dev registry that includes
+    /// it.
+    ///
+    /// There is deliberately no default. A provider that does not say how it
+    /// settles is a provider whose operator has not decided, and guessing
+    /// "mock" for them is how a simulator ends up in front of real customers.
+    fn resolve_facilitator(
+        entity_id: net::adapter::net::identity::EntityId,
+        facilitator_url: Option<String>,
+        facilitator_auth_token: Option<String>,
+        unsafe_dev_mock: bool,
+    ) -> Result<(
+        Arc<dyn net_payments::facilitator::Facilitator>,
+        net_payments::core::registry::AssetRegistry,
+    )> {
+        match (facilitator_url, unsafe_dev_mock) {
+            (Some(_), true) => Err(Error::from_reason(
+                "PaymentProvider: pass either facilitatorUrl or \
+                 unsafeDevMockFacilitator: true, not both — the mock settles \
+                 nothing, so pairing it with a real facilitator URL is ambiguous \
+                 about which one you meant",
+            )),
+            (None, false) => Err(Error::from_reason(
+                "PaymentProvider: no settlement backend configured. Pass \
+                 facilitatorUrl: \"https://...\" to settle for real (build with \
+                 --features payments-http), or unsafeDevMockFacilitator: true to \
+                 settle against the in-process mock, which moves no value. There \
+                 is no default: a provider that publishes priced tools without a \
+                 real facilitator serves for free.",
+            )),
+            (None, true) => {
+                // stderr, not `tracing`: a Node embedder usually has no
+                // subscriber installed, and a warning nobody sees is the same
+                // as no warning. This one has to land.
+                eprintln!(
+                    "WARNING: PaymentProvider is using the MOCK facilitator. Quotes are \
+                     signed, billing events are emitted, and tools are served — but NO \
+                     VALUE MOVES. Development and conformance only."
+                );
+                Ok((
+                    Arc::new(MockFacilitator::new()),
+                    default_registry_v1(entity_id),
+                ))
+            }
+            #[cfg(feature = "payments-http")]
+            (Some(url), false) => {
+                use net_payments::facilitator::client::{
+                    AuthProvider, BearerAuth, HttpFacilitator, NoAuth,
+                };
+                let auth: Arc<dyn AuthProvider> = match facilitator_auth_token {
+                    Some(token) => Arc::new(BearerAuth::new(token)),
+                    None => Arc::new(NoAuth),
+                };
+                let facilitator = HttpFacilitator::new(&url, auth)
+                    .map_err(|e| Error::from_reason(format!("PaymentProvider facilitator: {e}")))?;
+                Ok((
+                    Arc::new(facilitator),
+                    net_payments::core::registry::production_registry_v1(entity_id),
+                ))
+            }
+            #[cfg(not(feature = "payments-http"))]
+            (Some(_), false) => {
+                let _ = facilitator_auth_token;
+                Err(Error::from_reason(
+                    "PaymentProvider: facilitatorUrl needs the `payments-http` build \
+                     feature (it pulls reqwest + rustls). Rebuild with --features \
+                     payments-http, or pass unsafeDevMockFacilitator: true for a mock \
+                     backend. Refusing to silently downgrade a real facilitator URL to \
+                     the mock.",
+                ))
+            }
+        }
+    }
+
     /// The node-holding state — the mesh node the provider serves over, plus the
     /// serve handle keeping the quote/pay services registered on it.
     /// [`close`](PaymentProvider::close) drops both so the node can be released.
@@ -144,10 +278,35 @@ mod provider {
         _serve: PaymentServeHandle,
     }
 
+    /// A paid-capability provider over an embedded `NetMesh` node — the supply
+    /// side. Construction stands up one `PaymentEngine` behind the quote/pay
+    /// wire; `publishPaidTools` publishes priced tools gated by that same
+    /// engine, so a quote paid over the wire is the quote the gate redeems. Hold
+    /// the provider to keep the wire served.
+    ///
+    /// Construction requires a settlement backend — there is no default, so
+    /// `new PaymentProvider(mesh, statePath)` and
+    /// `new PaymentProvider(mesh, statePath, billingLogPath)` both throw. Pass
+    /// either a real facilitator:
+    ///
+    /// ```js
+    /// new PaymentProvider(mesh, statePath, billingLogPath, facilitatorUrl)
+    /// ```
+    ///
+    /// or the in-process mock, which moves no value:
+    ///
+    /// ```js
+    /// new PaymentProvider(mesh, statePath, billingLogPath, null, null, true)
+    /// ```
+    ///
+    /// See [`new`](PaymentProvider::new) for why choosing is mandatory.
     #[napi]
     pub struct PaymentProvider {
         engine: Arc<PaymentEngine>,
         provider_entity_id: Vec<u8>,
+        /// The asset registry revision the engine issues quotes under, which
+        /// follows from the settlement backend that was chosen.
+        registry_version: String,
         /// The billing stream, when a `billingLogPath` was supplied — for the
         /// read-only `readBilling` surface. Holds no node reference.
         billing: Option<Arc<BillingLog>>,
@@ -166,11 +325,53 @@ mod provider {
         /// durable + single-owner** (a temp path loses paid quotes across
         /// restarts). `billingLogPath` optionally records the immutable
         /// `net.billing.event@1` stream.
+        ///
+        /// **A settlement backend must be chosen explicitly.** Pass
+        /// `facilitatorUrl` (plus `facilitatorAuthToken` where the facilitator
+        /// requires one) to settle for real, or `unsafeDevMockFacilitator: true`
+        /// to settle against the in-process mock, which moves no value.
+        /// Supplying neither is an error, and supplying both is an error.
+        ///
+        /// This constructor used to build a `MockFacilitator` unconditionally,
+        /// with no way to reach a real one: a provider could publish priced
+        /// tools, sign quotes with its real mesh identity, emit signed billing
+        /// events, and serve — while settlement moved nothing. Choosing is now
+        /// mandatory, and the unsafe option says so in its name.
+        ///
+        /// `facilitatorUrl` requires the `payments-http` build feature (it
+        /// pulls reqwest + rustls); without it, the only available backend is
+        /// the mock, and asking for a real one is a build error rather than a
+        /// silent downgrade.
+        ///
+        /// `requireInvocationBinding` **defaults to `true`**: a paid
+        /// invocation is refused unless the caller presents the paying
+        /// identity's signature over the invocation-binding transcript.
+        ///
+        /// Without it the quote id alone redeems, and the quote id is not a
+        /// secret — it rides a request header on every paid invoke and is
+        /// carried on the billing event, so anything that learns one can spend
+        /// it. Defaulting off would mean every provider stayed exposed unless
+        /// its operator found the flag, which is not a posture a payments
+        /// surface should ship.
+        ///
+        /// Pass `false` only for a deployment whose callers predate the
+        /// binding. Anything built on `CapabilityGateway` already signs one
+        /// whenever its identity can sign.
+        ///
+        /// Scope: this closes **off-path** leakage of the quote id (logs,
+        /// billing records, proofs). It does not stop an intermediary that
+        /// observes the paid invocation itself and copies both headers — that
+        /// needs channel binding, not a bigger signature.
         #[napi(constructor)]
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             mesh: &NetMesh,
             state_path: String,
             billing_log_path: Option<String>,
+            facilitator_url: Option<String>,
+            facilitator_auth_token: Option<String>,
+            unsafe_dev_mock_facilitator: Option<bool>,
+            require_invocation_binding: Option<bool>,
         ) -> Result<Self> {
             let node = mesh.node_arc_clone().map_err(|_| {
                 Error::from_reason("payment provider: mesh node has been shut down")
@@ -184,18 +385,25 @@ mod provider {
             let provider = Arc::new(sdk_mesh.entity_keypair().clone());
             let entity_id = provider.entity_id().clone();
             let provider_entity_id = entity_id.as_bytes().to_vec();
-            let registry = default_registry_v1(entity_id);
+            let (facilitator, registry) = resolve_facilitator(
+                entity_id,
+                facilitator_url,
+                facilitator_auth_token,
+                unsafe_dev_mock_facilitator.unwrap_or(false),
+            )?;
+            let registry_version = registry.version.clone();
             // `AdmitAll` gates QUOTE issuance — correct for a paid tool (anyone
             // may quote; PAYMENT is the real gate on the serve).
             let billing = billing_log_path.map(|bp| Arc::new(BillingLog::new(bp)));
             let mut engine = PaymentEngine::new(
                 provider,
-                Arc::new(MockFacilitator::new()),
+                facilitator,
                 Arc::new(AdmitAll),
                 registry,
                 PathBuf::from(state_path),
             )
-            .map_err(|e| Error::from_reason(format!("payment engine: {e}")))?;
+            .map_err(|e| Error::from_reason(format!("payment engine: {e}")))?
+            .with_require_invocation_binding(require_invocation_binding.unwrap_or(true));
             if let Some(b) = &billing {
                 engine = engine.with_billing_log(b.clone());
             }
@@ -216,6 +424,7 @@ mod provider {
             Ok(Self {
                 engine,
                 provider_entity_id,
+                registry_version,
                 billing,
                 serving: Mutex::new(Some(Serving {
                     node,
@@ -240,6 +449,80 @@ mod provider {
         #[napi(getter)]
         pub fn provider_entity_id(&self) -> Buffer {
             Buffer::from(self.provider_entity_id.clone())
+        }
+
+        /// Author this provider's `net.pricing.terms@1` for `capability`,
+        /// against **the registry its own engine quotes under**.
+        ///
+        /// The same authoring as the free `buildPricingTerms`, minus the two
+        /// ways to get it wrong. That function takes the provider id and a
+        /// `productionRegistry` flag as separate arguments, either of which can
+        /// disagree with the provider that will serve the quotes: announce the
+        /// dev revision while quoting under the production one and a caller
+        /// picks an asset the backend will never quote, then gets refused with
+        /// no other entry to fall back to. Here both come from the engine.
+        ///
+        /// `requirementsJson` is the same JSON array of x402
+        /// `PaymentRequirements` objects (camelCase wire names). Every entry is
+        /// checked twice before the terms are returned, so this throws rather
+        /// than announcing something unquotable:
+        ///
+        /// - against the **registry**, which answers "is this an asset this
+        ///   provider knows";
+        /// - against the **settlement backend's** `GET /supported`, which
+        ///   answers "is this a route its facilitator will actually settle".
+        ///
+        /// The second is the one the free `buildPricingTerms` cannot do: it has
+        /// no facilitator to ask. A provider that passes the registry check can
+        /// still announce a `(scheme, network)` its facilitator has never
+        /// handled, and the caller finds out after signing an authorization.
+        /// Behind the mock — which has no discovery surface — only the registry
+        /// check applies.
+        ///
+        /// Async because it reaches the facilitator: call it when publishing,
+        /// not per request.
+        #[napi]
+        pub async fn pricing_terms(
+            &self,
+            capability: String,
+            requirements_json: String,
+        ) -> Result<String> {
+            let id: [u8; 32] = self
+                .provider_entity_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::from_reason("provider entity id is not 32 bytes"))?;
+            let terms = crate::payment_provider::author_pricing_terms(
+                id,
+                &capability,
+                &requirements_json,
+                self.registry_version == PRODUCTION_REGISTRY_VERSION,
+            )
+            .map_err(Error::from_reason)?;
+            let accepts = crate::payment_provider::parse_requirements(&requirements_json)
+                .map_err(Error::from_reason)?;
+            self.engine
+                .check_settlement_routes(&accepts)
+                .await
+                .map_err(|e| Error::from_reason(e.to_string()))?;
+            Ok(terms)
+        }
+
+        /// The asset registry revision this provider issues quotes under —
+        /// `"net-production-1"` behind a real facilitator, `"net-default-1"`
+        /// behind the mock (which additionally carries the valueless `mock:net`
+        /// asset).
+        ///
+        /// Two uses. It tells `buildPricingTerms` which revision to author
+        /// against (`productionRegistry: true` iff this reads
+        /// `"net-production-1"`), so announced terms and issued quotes name the
+        /// same revision. And it makes the settlement backend *observable*: the
+        /// one failure this surface must never have is quietly falling back to
+        /// the mock for an operator who configured a facilitator URL, and a
+        /// guarantee nothing can read is a guarantee nothing can test.
+        #[napi(getter)]
+        pub fn registry_version(&self) -> String {
+            self.registry_version.clone()
         }
 
         /// The immutable billing events this provider recorded, oldest first —
@@ -349,7 +632,7 @@ mod tests {
 
     #[test]
     fn authors_canonical_decodable_pricing_terms() {
-        let terms = author_pricing_terms([7u8; 32], "prov/echo", MOCK_REQS).expect("author");
+        let terms = author_pricing_terms([7u8; 32], "prov/echo", MOCK_REQS, false).expect("author");
 
         // The typed decoder accepts it (tag + non-empty accepts[]).
         let parsed = PricingTerms::from_json_bytes(terms.as_bytes()).expect("decode");
@@ -370,7 +653,7 @@ mod tests {
             {"scheme":"mock","network":"mock:net","amount":"2500","asset":"musd","payTo":"a","maxTimeoutSeconds":60},
             {"scheme":"mock","network":"mock:net","amount":"5000","asset":"musd","payTo":"a","maxTimeoutSeconds":60}
         ]"#;
-        let terms = author_pricing_terms([7u8; 32], "prov/echo", two).expect("author");
+        let terms = author_pricing_terms([7u8; 32], "prov/echo", two, false).expect("author");
         assert_eq!(
             PricingTerms::from_json_bytes(terms.as_bytes())
                 .unwrap()
@@ -382,10 +665,55 @@ mod tests {
 
     #[test]
     fn empty_and_malformed_are_rejected() {
-        assert!(author_pricing_terms([1u8; 32], "prov/echo", "[]").is_err());
-        assert!(author_pricing_terms([1u8; 32], "prov/echo", "not json").is_err());
+        assert!(author_pricing_terms([1u8; 32], "prov/echo", "[]", false).is_err());
+        assert!(author_pricing_terms([1u8; 32], "prov/echo", "not json", false).is_err());
         // A requirement missing a required field (payTo) is a decode error.
         let bad = r#"[{"scheme":"mock","network":"mock:net","amount":"1","asset":"musd","maxTimeoutSeconds":60}]"#;
-        assert!(author_pricing_terms([1u8; 32], "prov/echo", bad).is_err());
+        assert!(author_pricing_terms([1u8; 32], "prov/echo", bad, false).is_err());
+    }
+
+    /// The `production_registry` flag has to *do* something, and this is
+    /// the cheapest statement of what.
+    ///
+    /// It went untested when it was added, which is how all five call
+    /// sites above kept passing three arguments to a four-argument
+    /// function: `--lib` and `clippy --lib` do not compile `#[cfg(test)]`,
+    /// so nothing typechecked this module until a job that runs the unit
+    /// tests did. A parameter nothing exercises is a parameter that drifts.
+    ///
+    /// `mock:net` is the sharp edge: it exists in the dev registry so the
+    /// conformance suite can drive the whole lifecycle without a chain,
+    /// and a provider settling real money has no reason to allowlist an
+    /// asset whose settlements move nothing.
+    #[test]
+    fn the_production_registry_refuses_the_valueless_mock_asset() {
+        assert!(
+            author_pricing_terms([7u8; 32], "prov/echo", MOCK_REQS, false).is_ok(),
+            "the dev registry carries mock:net"
+        );
+        let err = author_pricing_terms([7u8; 32], "prov/echo", MOCK_REQS, true)
+            .expect_err("the production registry must not price a valueless asset");
+        assert!(
+            err.contains("not in the selected registry"),
+            "the refusal must name the registry check: {err}"
+        );
+    }
+
+    /// Same terms, different registry revision — the two must not agree.
+    ///
+    /// `reference()` hashes the whole registry, so announcing under one
+    /// revision while quoting under another leaves discovery metadata
+    /// naming a registry the backend does not use. This pins that the flag
+    /// actually reaches the reference rather than being decorative.
+    #[test]
+    fn the_registry_revision_rides_the_authored_terms() {
+        // A real-money asset, so both registries carry it.
+        let base_usdc = r#"[{"scheme":"exact","network":"eip155:8453","asset":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","amount":"2500","payTo":"0xmerchant","maxTimeoutSeconds":60,"extra":{"name":"USDC","version":"2"}}]"#;
+        let dev = author_pricing_terms([7u8; 32], "prov/echo", base_usdc, false).expect("dev");
+        let prod = author_pricing_terms([7u8; 32], "prov/echo", base_usdc, true).expect("prod");
+        assert_ne!(
+            dev, prod,
+            "the announced terms must carry the registry revision they were authored under"
+        );
     }
 }

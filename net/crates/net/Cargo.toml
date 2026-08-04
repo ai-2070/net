@@ -408,6 +408,27 @@ name = "net-blob"
 path = "src/bin/net-blob.rs"
 required-features = ["cli"]
 
+# The subnet-auth evidence binaries gate their whole contents on
+# feature cfgs, so without an explicit target declaration a runner
+# that omits a load-bearing feature gets a 0-test binary and exit 0 —
+# a vacuous green that `--no-tests=fail` catches only in workflows
+# that pass it. `required-features` moves that contract into the
+# target itself: an invocation missing a feature now skips (or, with
+# an explicit `--test` request, refuses) rather than passing empty.
+# `fixtures` is load-bearing for the e2e suite — the harness drives
+# paced publication and admission internals that only exist behind it.
+[[test]]
+name = "subnet_auth_e2e"
+required-features = ["net", "cortex", "fixtures"]
+
+[[test]]
+name = "subnet_gateway_local_auth"
+required-features = ["net"]
+
+[[test]]
+name = "subnet_control_facts"
+required-features = ["net"]
+
 [[bench]]
 name = "ingestion"
 harness = false

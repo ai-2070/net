@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::state::{FoldIndex, FoldState, NodeId};
+use super::state::{FoldIndex, FoldState, FxU64Hasher, NodeId};
 use super::FoldKind;
 
 /// Coarse-grained node state for capability matching. The
@@ -317,38 +317,13 @@ pub struct CapabilityIndexInner {
 /// announcements; SipHash DoS resistance is irrelevant).
 ///
 /// `Hash for (u64, u64)` is `write_u64(self.0); write_u64(self.1);`,
-/// so a hasher with a fast `write_u64` step and the byte-fallback for
-/// completeness mixes the pair correctly in 2 multiplications.
-#[derive(Default, Clone)]
-pub(crate) struct U64TupleHasher(u64);
-
-impl std::hash::Hasher for U64TupleHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    #[inline]
-    fn write_u64(&mut self, v: u64) {
-        // FxHash-style step: rotate, xor, multiply by a large odd
-        // constant. ~1 ns; well-distributed for already-hashed input.
-        const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(FX_SEED);
-    }
-    /// Defensive byte fallback — the std `Hash` impl for `(u64, u64)`
-    /// calls `write_u64` directly, but a future change to the tuple's
-    /// hash impl could route through `write(&[u8])`. Pack up to 8
-    /// bytes per chunk and reuse `write_u64`.
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut buf = [0u8; 8];
-            buf[..chunk.len()].copy_from_slice(chunk);
-            self.write_u64(u64::from_le_bytes(buf));
-        }
-    }
-}
-
-pub(crate) type BuildU64TupleHasher = std::hash::BuildHasherDefault<U64TupleHasher>;
+/// so [`FxU64Hasher`]'s `write_u64` step mixes the pair correctly in
+/// 2 multiplications, and its byte fallback covers a future change to
+/// the tuple's hash impl. Nothing about the mixer is arity-specific —
+/// this alias and `state::BuildU64Hasher` differ only in which keys
+/// they are pointed at, so they share one implementation rather than
+/// two copies that can drift apart.
+pub(crate) type BuildU64TupleHasher = std::hash::BuildHasherDefault<FxU64Hasher>;
 
 impl FoldIndex<CapabilityFold> for CapabilityIndexInner {
     fn on_insert(&mut self, key: &(u64, NodeId), payload: &CapabilityMembership) {

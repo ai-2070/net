@@ -27,11 +27,24 @@ use net_sdk::subnets::{SubnetId, Visibility};
 /// name + visibility + reach the table needs.
 #[derive(Clone, Debug)]
 pub struct GatewayExportRow {
-    pub channel_hash: u16,
+    /// CANONICAL channel identity (u64), same shape the real
+    /// substrate export table carries — never the 16-bit wire hint.
+    /// Derived from the fixture's channel name so the demo shows
+    /// exactly what a live gateway would show for that channel.
+    pub channel_hash: u64,
     pub channel_name: Option<String>,
     pub visibility: Option<Visibility>,
     pub targets: Vec<SubnetId>,
     pub reach: u64,
+}
+
+/// Canonical hash of a demo channel name — the same pure function a
+/// live node applies (`ChannelName::hash`), so fixture rows carry
+/// real canonical identities rather than invented short values.
+fn canonical_hash(name: &str) -> u64 {
+    net_sdk::ChannelName::new(name)
+        .expect("demo fixture channel names are valid")
+        .hash()
 }
 
 /// Pinned anchor subnet for the demo — the "local" node lives in
@@ -144,7 +157,7 @@ pub fn gateways() -> (GatewayStats, Vec<GatewayExportRow>) {
             };
             let exports = vec![
                 GatewayExportRow {
-                    channel_hash: 0x4a17,
+                    channel_hash: canonical_hash("swarm.telemetry.pose"),
                     channel_name: Some("swarm.telemetry.pose".into()),
                     visibility: Some(Visibility::Exported),
                     targets: vec![SubnetId::new(&[2, 1]), SubnetId::new(&[3, 1])],
@@ -152,7 +165,7 @@ pub fn gateways() -> (GatewayStats, Vec<GatewayExportRow>) {
                     reach: 11,
                 },
                 GatewayExportRow {
-                    channel_hash: 0x9b22,
+                    channel_hash: canonical_hash("swarm.mission.broadcast"),
                     channel_name: Some("swarm.mission.broadcast".into()),
                     visibility: Some(Visibility::Exported),
                     targets: vec![SubnetId::new(&[1, 3])],
@@ -160,7 +173,7 @@ pub fn gateways() -> (GatewayStats, Vec<GatewayExportRow>) {
                     reach: 4,
                 },
                 GatewayExportRow {
-                    channel_hash: 0xe041,
+                    channel_hash: canonical_hash("capability.tether.relay"),
                     channel_name: Some("capability.tether.relay".into()),
                     visibility: Some(Visibility::Exported),
                     targets: vec![SubnetId::new(&[2, 1])],

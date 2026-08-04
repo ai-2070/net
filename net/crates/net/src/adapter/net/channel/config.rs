@@ -4,17 +4,169 @@
 //! for access rules, combined with L1 permission tokens. This avoids
 //! building a separate rule engine.
 
-use super::name::{ChannelHash, ChannelId};
+use super::name::{ChannelHash, ChannelId, ChannelName};
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use crate::adapter::net::identity::{EntityId, RevocationRegistry, TokenChain, TokenScope};
 use dashmap::DashMap;
 
+/// How a channel binds its dynamic name suffix to the subscribing
+/// peer's authenticated identity.
+///
+/// Set on a **prefix**-registered [`ChannelConfig`], this turns a
+/// family of dynamically-named channels from "anyone may subscribe to
+/// any name under the prefix" into "a peer may subscribe only to the
+/// one name that encodes its own identity".
+///
+/// The motivating case is nRPC's per-caller reply channels
+/// (`<service>.replies.<caller_origin>`). Those resolve through a
+/// permissive prefix entry, so pre-fix any mesh peer could hold a live
+/// subscription to *another* caller's reply channel and receive that
+/// caller's response bodies whenever the server's direct route missed
+/// and the response fell back to roster fan-out.
+///
+/// Evaluated against the **pinned** peer identity (the TOFU binding
+/// installed from a signature-verified direct capability announcement),
+/// never a wire-claimed value. A peer whose identity is not yet pinned
+/// is rejected: admitting it would hand an attacker the bypass of
+/// simply never announcing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginBinding {
+    /// The requested name's suffix — everything after the matched
+    /// prefix — must equal the subscriber's
+    /// [`EntityId::origin_hash`](crate::adapter::net::identity::EntityId::origin_hash)
+    /// rendered as exactly 16 lowercase hex digits, which is the
+    /// format nRPC uses to build the channel name.
+    OriginHashHex16,
+}
+
+impl OriginBinding {
+    /// The complete subscribe decision for a bound channel family.
+    ///
+    /// `pinned_origin` is the subscriber's TOFU-pinned
+    /// `EntityId::origin_hash()`, or `None` when the publisher has not
+    /// pinned that peer yet (no signature-verified direct capability
+    /// announcement has arrived from it).
+    ///
+    /// **`None` rejects.** This is the rule the whole finding turns on:
+    /// admitting a peer whose identity we do not know would let an
+    /// attacker bypass the binding entirely by simply never announcing,
+    /// which is not a fix. It is stated here, as one branch of a pure
+    /// function, rather than left implicit at the call site — that
+    /// makes it directly testable and hard to "simplify" away.
+    ///
+    /// The cost is an ordering requirement: a peer must be pinned
+    /// before its first subscribe to a bound family. In practice a node
+    /// announces as part of coming up, and the publisher pushes/learns
+    /// identities at session establishment, so this is satisfied well
+    /// before any application traffic; the nRPC client additionally
+    /// re-announces and retries on rejection.
+    pub fn authorizes(
+        self,
+        name: &str,
+        matched_prefix: Option<&str>,
+        pinned_origin: Option<u64>,
+    ) -> bool {
+        let Some(origin_hash) = pinned_origin else {
+            return false;
+        };
+        self.matches(name, matched_prefix, origin_hash)
+    }
+
+    /// Does `name` bind to `origin_hash` under `matched_prefix`?
+    ///
+    /// `matched_prefix` is `None` when the config was resolved by exact
+    /// name rather than through the prefix table. That combination has
+    /// no coherent meaning — there is no dynamic suffix to check — so
+    /// it fails closed rather than silently admitting.
+    pub fn matches(self, name: &str, matched_prefix: Option<&str>, origin_hash: u64) -> bool {
+        let Some(prefix) = matched_prefix else {
+            return false;
+        };
+        let Some(suffix) = name.strip_prefix(prefix) else {
+            // Defensive: the registry only hands us a prefix it
+            // matched, so this is unreachable — but a mismatch must
+            // never read as "bound".
+            return false;
+        };
+        match self {
+            Self::OriginHashHex16 => suffix == format!("{origin_hash:016x}"),
+        }
+    }
+}
+
+/// Who may join a **queue group** on a channel.
+///
+/// Queue groups are work distribution: every published event is
+/// delivered to exactly one member of each group. So joining a group is
+/// not a routing preference, it is a claim on other members' work — an
+/// attacker who joins a production group receives a share of its events
+/// and, by not processing them, destroys that share. With `L` honest
+/// members and `A` attacker identities, attackers collectively take
+/// `A/(L+A)` of selections and each identity takes `1/(L+A)`; the
+/// attacker scales its share simply by joining under more identities.
+///
+/// Note this is an **integrity and availability** boundary, not a
+/// confidentiality one: a peer that can subscribe at all can already
+/// take every event by subscribing in `Broadcast` mode, so joining a
+/// group exposes nothing new. What it does is take work away from the
+/// members meant to do it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueueGroupPolicy {
+    /// Any peer that clears the channel's subscribe gate may join any
+    /// group. Historical behaviour, and the default so existing
+    /// deployments are unaffected.
+    #[default]
+    Unrestricted,
+    /// Refuse queue-group subscriptions entirely — broadcast only.
+    Deny,
+    /// A peer may join group `G` only by presenting a chain that
+    /// authorizes `SUBSCRIBE` on [`queue_group_hash(channel, G)`],
+    /// i.e. a grant that names the specific group.
+    ///
+    /// Under this policy the group grant **is** the subscribe
+    /// authority for that request — a worker does not additionally
+    /// need a channel-scoped token. It cannot: the `Subscribe` wire
+    /// message carries exactly one chain, so requiring both would make
+    /// worker subscription unrepresentable. The model an operator gets
+    /// is the intended one: channel-scoped tokens for readers,
+    /// group-scoped tokens for workers, and a reader's token is
+    /// explicitly not a worker grant. Capability filters still apply.
+    ///
+    /// An allowlist of group *names* would not do: group names are
+    /// operational constants, not secrets, so an attacker simply joins
+    /// an allowed one. Nor would a generic "may join queue groups"
+    /// scope bit — that separates readers from workers but still lets
+    /// any worker join any group on the channel. The authority has to
+    /// bind the peer to the group.
+    ///
+    /// [`queue_group_hash(channel, G)`]: super::queue_group_hash
+    TokenBound,
+}
+
 /// Channel visibility scope.
+///
+/// # Visibility is a propagation filter, not an access boundary
+///
+/// Visibility is evaluated against *topology state* — the local
+/// node's configured subnet and a per-peer subnet derived from each
+/// peer's own self-declared capability tags. A peer that misdeclares
+/// its tags can place itself wherever the local `SubnetPolicy` maps
+/// those tags; visibility narrows where traffic propagates, it does
+/// not decide who is allowed in. A protected channel must pair a
+/// scoped visibility with token enforcement (`token_roots`): the
+/// lying peer may pass the visibility test, but it cannot forge the
+/// channel token. Purely soft channels (scoped visibility, no token
+/// gate) are valid — they are a routing decision, and registration
+/// logs one info-level note so that decision is recorded
+/// (SUBNET_AUTH_PLAN.md Q1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Visibility {
-    /// Packets never leave the subnet.
+    /// Propagation limited to the same subnet. A routing filter —
+    /// pair with `token_roots` if the channel must exclude anyone.
     SubnetLocal,
-    /// Visible to the parent subnet but not siblings.
+    /// Propagates to the parent subnet but not siblings. A routing
+    /// filter — pair with `token_roots` if the channel must exclude
+    /// anyone.
     ParentVisible,
     /// Explicitly exported to specific target subnets.
     Exported,
@@ -74,6 +226,19 @@ pub struct ChannelConfig {
     /// closed** — there is no authority a chain could anchor to, so
     /// nothing is authorized.
     pub token_roots: Vec<EntityId>,
+    /// Bind the dynamic name suffix to the subscriber's own pinned
+    /// identity. `None` (default) = any peer that clears the other
+    /// gates may subscribe to any name this config covers.
+    ///
+    /// Only meaningful on a prefix-registered config; see
+    /// [`OriginBinding`]. Unlike `publish_caps` / `subscribe_caps`,
+    /// this **is** an access boundary — it is evaluated against the
+    /// TOFU-pinned peer identity, which a peer cannot self-assert.
+    pub subscriber_origin_binding: Option<OriginBinding>,
+    /// Who may join a queue group on this channel. See
+    /// [`QueueGroupPolicy`]; defaults to `Unrestricted`, which is the
+    /// historical behaviour.
+    pub queue_group_policy: QueueGroupPolicy,
     /// Default priority level for this channel's packets (0 = lowest).
     pub priority: u8,
     /// Default reliability mode for streams on this channel.
@@ -92,6 +257,8 @@ impl ChannelConfig {
             subscribe_caps: None,
             require_token: false,
             token_roots: Vec::new(),
+            subscriber_origin_binding: None,
+            queue_group_policy: QueueGroupPolicy::default(),
             priority: 0,
             reliable: false,
             max_rate_pps: None,
@@ -159,6 +326,84 @@ impl ChannelConfig {
         self.require_token || !self.token_roots.is_empty()
     }
 
+    /// Bind this (prefix-registered) channel family's dynamic suffix to
+    /// the subscribing peer's own pinned identity — see
+    /// [`OriginBinding`].
+    ///
+    /// Callers subscribing to a bound family must have had their
+    /// identity pinned on the publisher first, which happens when their
+    /// signature-verified direct capability announcement arrives. A peer
+    /// that has not announced is rejected (fail closed).
+    pub fn with_subscriber_origin_binding(mut self, binding: OriginBinding) -> Self {
+        self.subscriber_origin_binding = Some(binding);
+        self
+    }
+
+    /// Do this node's advertised capabilities satisfy the channel's
+    /// `subscribe_caps` filter?
+    ///
+    /// Split out of [`Self::can_subscribe`] for the `TokenBound`
+    /// queue-group path, which supplies its own token authority (the
+    /// group grant) but must still apply the capability filter.
+    /// Advisory, like every cap filter — see the type docs.
+    pub fn caps_allow_subscribe(&self, node_caps: &CapabilitySet) -> bool {
+        match self.subscribe_caps {
+            Some(ref filter) => filter.matches(node_caps),
+            None => true,
+        }
+    }
+
+    /// Restrict who may join a queue group on this channel — see
+    /// [`QueueGroupPolicy`].
+    pub fn with_queue_group_policy(mut self, policy: QueueGroupPolicy) -> Self {
+        self.queue_group_policy = policy;
+        self
+    }
+
+    /// Does `chain` authorize this peer to join queue group `group` on
+    /// `channel`?
+    ///
+    /// Returns `true` when the channel places no restriction. Under
+    /// [`QueueGroupPolicy::TokenBound`] the chain must root at one of
+    /// this channel's `token_roots`, bind at its leaf to `entity_id`,
+    /// and authorize `SUBSCRIBE` on the derived group-grant hash — a
+    /// grant naming the specific group, not the channel.
+    ///
+    /// Fails closed: `Deny` refuses, and `TokenBound` with no chain (or
+    /// no roots) refuses.
+    pub fn can_join_queue_group(
+        &self,
+        entity_id: &EntityId,
+        channel: &str,
+        group: &str,
+        chain: Option<&TokenChain>,
+        revocation: &RevocationRegistry,
+        skew_secs: u64,
+    ) -> bool {
+        match self.queue_group_policy {
+            QueueGroupPolicy::Unrestricted => true,
+            QueueGroupPolicy::Deny => false,
+            QueueGroupPolicy::TokenBound => {
+                if self.token_roots.is_empty() {
+                    return false;
+                }
+                let Some(chain) = chain else {
+                    return false;
+                };
+                chain
+                    .verify_authorizes(
+                        TokenScope::SUBSCRIBE,
+                        super::name::queue_group_hash(channel, group),
+                        entity_id,
+                        &self.token_roots,
+                        revocation,
+                        skew_secs,
+                    )
+                    .is_ok()
+            }
+        }
+    }
+
     /// Set default priority.
     pub fn with_priority(mut self, priority: u8) -> Self {
         self.priority = priority;
@@ -177,15 +422,17 @@ impl ChannelConfig {
         self
     }
 
-    /// Check if `entity_id` is authorized to publish on this channel,
+    /// Check if `entity_id` is authorized to publish on `channel_hash`,
     /// presenting `chain`.
     ///
-    /// See [`Self::can_subscribe`] for the chain-verification contract;
-    /// this is the `PUBLISH`-scope counterpart.
+    /// See [`Self::can_subscribe`] for the chain-verification contract
+    /// and for why `channel_hash` is a parameter; this is the
+    /// `PUBLISH`-scope counterpart.
     pub fn can_publish(
         &self,
         node_caps: &CapabilitySet,
         entity_id: &EntityId,
+        channel_hash: ChannelHash,
         chain: Option<&TokenChain>,
         revocation: &RevocationRegistry,
         skew_secs: u64,
@@ -195,22 +442,43 @@ impl ChannelConfig {
                 return false;
             }
         }
-        self.token_gate(TokenScope::PUBLISH, entity_id, chain, revocation, skew_secs)
+        self.token_gate(
+            TokenScope::PUBLISH,
+            entity_id,
+            channel_hash,
+            chain,
+            revocation,
+            skew_secs,
+        )
     }
 
-    /// Check if `entity_id` is authorized to subscribe to this channel,
-    /// presenting `chain`.
+    /// Check if `entity_id` is authorized to subscribe to
+    /// `channel_hash`, presenting `chain`.
     ///
     /// When `require_token` is set, `chain` must be a [`TokenChain`]
     /// that (a) roots at one of [`Self::token_roots`], (b) is bound at
     /// its leaf to `entity_id` (the AEAD-verified presenter), and (c)
-    /// authorizes `SUBSCRIBE` on this channel at every link with no
+    /// authorizes `SUBSCRIBE` on `channel_hash` at every link with no
     /// link revoked. A missing chain, an empty `token_roots`, or a
     /// chain that fails verification all reject — fail closed.
+    ///
+    /// # Why `channel_hash` is a parameter
+    ///
+    /// It is the hash of the channel the caller actually asked for, NOT
+    /// `self.channel_id.hash()`. Those coincide for an exact-match
+    /// config, but a **prefix**-registered config's `channel_id` is a
+    /// sentinel that `insert_prefix` itself documents as "not used for
+    /// hash lookups" — and verifying against it meant a token minted
+    /// for the sentinel authorized *every* channel under the prefix,
+    /// silently degrading a per-channel binding to a per-prefix one.
+    /// Taking the channel explicitly also removes the standing
+    /// temptation to reuse one config across many channels and get a
+    /// gate that answers about the wrong one.
     pub fn can_subscribe(
         &self,
         node_caps: &CapabilitySet,
         entity_id: &EntityId,
+        channel_hash: ChannelHash,
         chain: Option<&TokenChain>,
         revocation: &RevocationRegistry,
         skew_secs: u64,
@@ -223,6 +491,7 @@ impl ChannelConfig {
         self.token_gate(
             TokenScope::SUBSCRIBE,
             entity_id,
+            channel_hash,
             chain,
             revocation,
             skew_secs,
@@ -232,13 +501,14 @@ impl ChannelConfig {
     /// Shared token-chain gate for the publish / subscribe checks.
     /// Returns `true` when token enforcement is off (capability filters
     /// already applied by the caller), else verifies the presented
-    /// chain roots at one of `token_roots`. Fails closed when tokens
-    /// are required but no roots are configured or no chain is
-    /// presented.
+    /// chain roots at one of `token_roots` and authorizes
+    /// `channel_hash`. Fails closed when tokens are required but no
+    /// roots are configured or no chain is presented.
     fn token_gate(
         &self,
         action: TokenScope,
         entity_id: &EntityId,
+        channel_hash: ChannelHash,
         chain: Option<&TokenChain>,
         revocation: &RevocationRegistry,
         skew_secs: u64,
@@ -258,7 +528,7 @@ impl ChannelConfig {
         chain
             .verify_authorizes(
                 action,
-                self.channel_id.hash(),
+                channel_hash,
                 entity_id,
                 &self.token_roots,
                 revocation,
@@ -267,25 +537,33 @@ impl ChannelConfig {
             .is_ok()
     }
 
-    /// Re-verify a previously-presented `SUBSCRIBE` chain against the
-    /// current clock + revocation floors, anchored to this channel's
-    /// roots. Shared by the periodic expiry sweep and the publish-time
-    /// re-check so the root-anchoring contract (which roots, which
-    /// action, which channel hash) lives in exactly one place instead
-    /// of being re-threaded at each call site — where it had already
-    /// started to diverge (`token_roots` vs. an `unwrap_or(&[])`
-    /// fallback).
+    /// Re-verify a previously-presented `SUBSCRIBE` chain for
+    /// `channel_hash` against the current clock + revocation floors,
+    /// anchored to this channel's roots. Shared by the periodic expiry
+    /// sweep and the publish-time re-check so the root-anchoring
+    /// contract (which roots, which action, which channel hash) lives
+    /// in exactly one place instead of being re-threaded at each call
+    /// site — where it had already started to diverge (`token_roots`
+    /// vs. an `unwrap_or(&[])` fallback).
+    ///
+    /// `channel_hash` is the requested channel's — see
+    /// [`Self::can_subscribe`]. Passing the config's own hash here is
+    /// what made prefix-registered channels retain a chain under the
+    /// sentinel key that the publish path (keyed on the real channel)
+    /// could never find, so every such subscriber was accepted and then
+    /// revoked before its first delivery.
     pub fn reverify_subscribe(
         &self,
         chain: &TokenChain,
         entity_id: &EntityId,
+        channel_hash: ChannelHash,
         revocation: &RevocationRegistry,
         skew_secs: u64,
     ) -> bool {
         chain
             .verify_authorizes(
                 TokenScope::SUBSCRIBE,
-                self.channel_id.hash(),
+                channel_hash,
                 entity_id,
                 &self.token_roots,
                 revocation,
@@ -303,13 +581,14 @@ impl ChannelConfig {
         &self,
         chain: &TokenChain,
         entity_id: &EntityId,
+        channel_hash: ChannelHash,
         revocation: &RevocationRegistry,
         skew_secs: u64,
     ) -> bool {
         chain
             .verify_authorizes_presigned(
                 TokenScope::SUBSCRIBE,
-                self.channel_id.hash(),
+                channel_hash,
                 entity_id,
                 &self.token_roots,
                 revocation,
@@ -317,6 +596,18 @@ impl ChannelConfig {
             )
             .is_ok()
     }
+}
+
+/// A channel config plus how it was resolved, from
+/// [`ChannelConfigRegistry::resolve_by_name`].
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    /// The resolved configuration.
+    pub config: ChannelConfig,
+    /// `Some(prefix)` when resolution fell through to the prefix table,
+    /// `None` for an exact-name match. [`OriginBinding`] uses this to
+    /// split the requested name into prefix + dynamic suffix.
+    pub matched_prefix: Option<String>,
 }
 
 /// Registry of channel configurations.
@@ -328,20 +619,85 @@ impl ChannelConfig {
 /// `u16` fast-path hint into a list of canonical channels for receive-side
 /// dispatch (routine collisions at scale).
 ///
-/// Surface the deny-all misconfiguration loudly at registration time.
+/// Surface the deny-all misconfigurations loudly at registration time.
 ///
-/// `require_token = true` with no `token_roots` is a valid fail-closed
-/// state (nothing is authorized), but it's far more often a mistake —
-/// `with_require_token(true)` was called instead of
-/// `with_token_roots(...)`. Logging it at insert turns a silent
-/// "every publish and subscribe is denied" into an actionable warning.
-fn warn_if_fail_closed(config: &ChannelConfig) {
+/// Each of these is a legitimate fail-closed state that the
+/// authorization path handles correctly, and each is far more often a
+/// mistake. Fail-closed is the right behaviour and stays; what it lacks
+/// on its own is any way for the operator to find out, because a channel
+/// that denies everyone looks exactly like a channel nobody happens to
+/// be using. Logging at insert turns that into an actionable warning.
+///
+/// `is_prefix` distinguishes [`ChannelConfigRegistry::insert`] and
+/// [`ChannelConfigRegistry::insert_if_absent`] from their
+/// `insert_prefix*` counterparts — one of the two checks below depends
+/// on how the config is being registered, not just on its contents.
+/// Record the "visibility without access control" decision at
+/// registration time (SUBNET_AUTH_PLAN.md S0).
+///
+/// A `SubnetLocal` / `ParentVisible` channel with no token gate and
+/// no origin binding is a *soft* channel: its visibility narrows
+/// propagation against peer-declared topology, and nothing
+/// cryptographic keeps a misdeclaring peer out. That is a legitimate
+/// routing configuration — hence `info`, not `warn`, and no behavior
+/// change — but it looks identical to an operator who believed
+/// `SubnetLocal` was an access boundary, so the decision gets one
+/// recorded line. Capability filters don't count as access control
+/// here: they match self-advertised tags (advisory by their own
+/// rustdoc above).
+fn note_if_visibility_only(config: &ChannelConfig) {
+    let scoped = matches!(
+        config.visibility,
+        Visibility::SubnetLocal | Visibility::ParentVisible
+    );
+    if scoped && !config.token_required() && config.subscriber_origin_binding.is_none() {
+        tracing::info!(
+            channel = config.channel_id.name().as_str(),
+            visibility = ?config.visibility,
+            "channel has subnet-scoped visibility but no token gate or \
+             origin binding: visibility is a propagation filter over \
+             peer-declared topology, not an access boundary. If this \
+             channel must exclude anyone, add `with_token_roots(...)`."
+        );
+    }
+}
+
+fn warn_if_fail_closed(config: &ChannelConfig, is_prefix: bool) {
+    // `with_require_token(true)` called instead of
+    // `with_token_roots(...)`: there is no authority a chain could
+    // anchor to, so nothing is ever authorized.
     if config.require_token && config.token_roots.is_empty() {
         tracing::warn!(
             channel = config.channel_id.name().as_str(),
             "channel requires a token but has no token_roots: all publish \
              and subscribe will be denied (fail closed). Use \
              `with_token_roots(...)` to anchor a root of trust."
+        );
+    }
+    // An origin binding on an EXACT registration denies every
+    // subscriber. The binding's whole job is to split a requested name
+    // into "the prefix that matched" + "the dynamic suffix that must
+    // encode the subscriber", and an exact-match resolution reports no
+    // matched prefix — there is no suffix to check, so
+    // `OriginBinding::matches` fails closed on every request.
+    //
+    // The builder's rustdoc says it is "only meaningful on a
+    // prefix-registered config", but a channel that silently accepts
+    // nobody is not a documentation-sized failure: it is
+    // indistinguishable from an idle channel, and the peers being
+    // refused see a generic `Unauthorized`.
+    if is_prefix {
+        return;
+    }
+    if config.subscriber_origin_binding.is_some() {
+        tracing::warn!(
+            channel = config.channel_id.name().as_str(),
+            "channel has a subscriber_origin_binding but is registered by \
+             EXACT name: every subscribe will be denied (fail closed). The \
+             binding matches a dynamic suffix against the subscriber's own \
+             pinned origin, which only exists for a prefix registration — \
+             register it with `insert_prefix(...)` / \
+             `Mesh::register_channel_prefix(...)`."
         );
     }
 }
@@ -368,6 +724,30 @@ pub struct ChannelConfigRegistry {
     /// practice (one prefix per nRPC service). The exact-match
     /// hot path is unaffected.
     prefix_configs: DashMap<String, ChannelConfig>,
+    /// Serializes every mutation of `configs` + the two reverse
+    /// indices, so the three maps are only ever observed in a
+    /// consistent state.
+    ///
+    /// `configs` and the indices are separate DashMaps, so no per-entry
+    /// guard can span them. Under concurrent insert/remove that showed
+    /// up as index corruption in both directions: a re-registration
+    /// racing a removal could have its fresh index entry deleted (the
+    /// channel present in `configs` but invisible to `get(hash)`), and
+    /// the repair for THAT could re-add a name a second removal had
+    /// just taken out (a phantom name in a bucket, which `get` and
+    /// `remove` read as a hash collision and answer `None` to — taking
+    /// out the *real* channel's lookup as collateral).
+    ///
+    /// Writes only. Readers stay lock-free on the DashMaps: they are
+    /// the hot path, and a reader that observes a mid-write state
+    /// resolves through `configs` and simply misses, which is the
+    /// pre-existing behaviour for an unregistered channel. Mutations
+    /// are control-plane — registration, `net channel rm` — so
+    /// serializing them costs nothing measurable.
+    ///
+    /// NOT reentrant (`parking_lot::Mutex`). Methods that hold it call
+    /// the `_locked` inner helpers, never each other.
+    write_lock: parking_lot::Mutex<()>,
 }
 
 impl ChannelConfigRegistry {
@@ -378,6 +758,7 @@ impl ChannelConfigRegistry {
             by_hash: DashMap::new(),
             by_wire_hash: DashMap::new(),
             prefix_configs: DashMap::new(),
+            write_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -403,8 +784,32 @@ impl ChannelConfigRegistry {
     /// processes (the longest-length tiebreaker can never tie since
     /// DashMap deduplicates keys).
     pub fn insert_prefix(&self, prefix: impl Into<String>, config: ChannelConfig) {
-        warn_if_fail_closed(&config);
+        warn_if_fail_closed(&config, true);
+        note_if_visibility_only(&config);
         self.prefix_configs.insert(prefix.into(), config);
+    }
+
+    /// Register a prefix-matched config **only if that prefix has no
+    /// entry yet**. Returns `true` if this call installed the config,
+    /// `false` if an entry already existed (which is left untouched).
+    ///
+    /// The prefix counterpart of [`Self::insert_if_absent`], and the
+    /// operation auto-registration must use so it cannot silently
+    /// discard an operator's ACL. See that method for the rationale.
+    pub fn insert_prefix_if_absent(
+        &self,
+        prefix: impl Into<String>,
+        config: ChannelConfig,
+    ) -> bool {
+        match self.prefix_configs.entry(prefix.into()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                warn_if_fail_closed(&config, true);
+                note_if_visibility_only(&config);
+                slot.insert(config);
+                true
+            }
+        }
     }
 
     /// Remove a prefix-matched config. Returns the removed config
@@ -413,15 +818,166 @@ impl ChannelConfigRegistry {
         self.prefix_configs.remove(prefix).map(|(_, v)| v)
     }
 
-    /// Register a channel configuration.
+    /// Install the standard channel policy for an RPC-style service:
+    /// the exact `<service>.requests` channel, and the
+    /// `<service>.replies.` prefix bound to each caller's own origin.
+    ///
+    /// **Install-if-absent, never replace** (H2) — an ACL the operator
+    /// registered before serving survives untouched. **Origin-bound
+    /// reply prefix** (H3) — a peer may subscribe only to the one reply
+    /// channel that encodes its own pinned identity, not to another
+    /// caller's.
+    ///
+    /// Lives on the registry, not on an SDK type, because there are
+    /// several serve paths and they do not share a receiver: the SDK's
+    /// `Mesh::serve_rpc*`, the `aggregator` module, and the org facade's
+    /// `serve_org_bytes_node` (which holds an `Arc<MeshNode>` for the
+    /// language bindings). What they DO share is this registry.
+    ///
+    /// That sharing is the whole point. This policy has now drifted
+    /// twice, both times the same way — a serve path carrying its own
+    /// copy of the registration and not receiving a later fix. The
+    /// aggregator kept a replacing insert and never gained the origin
+    /// binding, so aggregator reply channels stayed world-subscribable
+    /// after H2 and H3 were fixed for `serve_rpc`; the org path did the
+    /// same and was still doing it after the aggregator was folded in.
+    /// A copy per receiver type is not a shared implementation. One
+    /// implementation on the object all of them already hold is.
+    ///
+    /// A caller with no registry (possible via the bare `MeshNode::new`
+    /// path) simply has no channel ACLs in play and does not call this.
+    ///
+    /// **All or nothing**, and validated against the names callers will
+    /// actually use.
+    ///
+    /// Three names are in play and none of them is the same length:
+    ///
+    /// | name | suffix bytes |
+    /// |---|---|
+    /// | `<service>.requests` | 9 |
+    /// | `<service>.replies.prefix` (sentinel) | 15 |
+    /// | `<service>.replies.<16 hex>` (real) | 25 |
+    ///
+    /// So there are two bands near the channel-name length limit where a
+    /// naive implementation half-succeeds, and they fail differently:
+    ///
+    /// - Request fits, sentinel does not. Installing the half that fits
+    ///   leaves the request channel looking deliberately configured
+    ///   while replies fall through to the unregistered-channel policy,
+    ///   unbound — the H3 posture, reached by accident.
+    /// - Both fit, but no REAL reply channel does. Everything looks
+    ///   installed, and then no caller can ever name a reply channel
+    ///   that validates, so calls hang until they time out. Checking the
+    ///   sentinel does not catch this: it is 10 bytes shorter than the
+    ///   thing it stands for.
+    ///
+    /// Hence the concrete probe below. The sentinel is still what gets
+    /// STORED — it must stay unroutable — but what gets VALIDATED is a
+    /// real per-caller name.
+    pub fn install_rpc_service_defaults(&self, service: &str) {
+        let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) else {
+            return;
+        };
+        // Probe, not a channel: every origin hash renders as exactly 16
+        // hex digits, so any value answers "does a per-caller reply
+        // channel fit under this service name?" for all of them.
+        if ChannelName::new(&format!("{service}.replies.{:016x}", 0u64)).is_err() {
+            return;
+        }
+        // The sentinel name is never routed — it exists so the prefix
+        // entry has a `ChannelId` to carry. Token gates on a prefix
+        // entry evaluate against the requested CONCRETE channel (M1),
+        // not this. Kept deliberately unroutable rather than reusing the
+        // probe: `<service>.replies.0000000000000000` is a name a real
+        // caller could hold, and a sentinel should not collide with one.
+        let Ok(sentinel) = ChannelName::new(&format!("{service}.replies.prefix")) else {
+            return;
+        };
+
+        // Return values ignored on purpose: "already registered" is the
+        // operator-configured case, which is exactly what this protects.
+        let _ = self.insert_if_absent(ChannelConfig::new(ChannelId::new(req_channel)));
+        let cfg = ChannelConfig::new(ChannelId::new(sentinel))
+            .with_subscriber_origin_binding(OriginBinding::OriginHashHex16);
+        let _ = self.insert_prefix_if_absent(format!("{service}.replies."), cfg);
+    }
+
+    /// Register a channel configuration, **replacing** any existing
+    /// entry for the same canonical name.
+    ///
+    /// Callers that must not clobber an existing policy — notably
+    /// anything auto-registering a default on behalf of a subsystem —
+    /// want [`Self::insert_if_absent`] instead.
     pub fn insert(&self, config: ChannelConfig) {
-        warn_if_fail_closed(&config);
+        warn_if_fail_closed(&config, false);
+        note_if_visibility_only(&config);
         let name = config.channel_id.name().to_string();
         let hash = config.channel_id.hash();
         let wire_hash = config.channel_id.wire_hash();
+        let _w = self.write_lock.lock();
         self.configs.insert(name.clone(), config);
-        self.by_hash.entry(hash).or_default().push(name.clone());
-        self.by_wire_hash.entry(wire_hash).or_default().push(name);
+        self.index_name(hash, wire_hash, name);
+    }
+
+    /// Register a channel configuration **only if that canonical name
+    /// has no entry yet**. Returns `true` if this call installed the
+    /// config, `false` if an entry already existed (which is left
+    /// untouched).
+    ///
+    /// This exists because [`Self::insert`] replaces, and a subsystem
+    /// that auto-registers a permissive default for a channel it owns
+    /// (nRPC's `<service>.requests` / `<service>.replies.`) would
+    /// otherwise silently destroy an ACL the operator installed first
+    /// — with no error and no log, leaving a posture identical to the
+    /// default. Auto-registration must be "install a default if the
+    /// operator expressed no opinion," which is exactly this
+    /// operation.
+    ///
+    /// Atomic against concurrent callers: exactly one of N racing
+    /// callers observes `true`, and its index update is not visible
+    /// before its `configs` entry.
+    pub fn insert_if_absent(&self, config: ChannelConfig) -> bool {
+        let name = config.channel_id.name().to_string();
+        let hash = config.channel_id.hash();
+        let wire_hash = config.channel_id.wire_hash();
+        let _w = self.write_lock.lock();
+        let installed = match self.configs.entry(name.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                warn_if_fail_closed(&config, false);
+                note_if_visibility_only(&config);
+                slot.insert(config);
+                true
+            }
+        };
+        if installed {
+            self.index_name(hash, wire_hash, name);
+        }
+        installed
+    }
+
+    /// Add `name` to the canonical- and wire-hash reverse indices,
+    /// skipping a name already present in either bucket.
+    ///
+    /// The de-dup is load-bearing, not hygiene. [`Self::get`] and
+    /// [`Self::remove`] treat a bucket holding more than one name as a
+    /// hash collision and return `None` to avoid applying the wrong
+    /// channel's policy. Pre-fix, `insert` pushed unconditionally, so
+    /// re-registering the *same* channel (which the SDK documents as
+    /// idempotent, and which `serve_rpc` does on every call) grew the
+    /// bucket to `[name, name]` and made `get(hash)` start returning
+    /// `None` for a channel that plainly exists — a self-inflicted
+    /// collision that disabled canonical-hash lookup for that channel.
+    fn index_name(&self, hash: ChannelHash, wire_hash: u16, name: String) {
+        let mut by_hash = self.by_hash.entry(hash).or_default();
+        if !by_hash.iter().any(|n| n == &name) {
+            by_hash.push(name.clone());
+        }
+        drop(by_hash);
+        let mut by_wire = self.by_wire_hash.entry(wire_hash).or_default();
+        if !by_wire.iter().any(|n| n == &name) {
+            by_wire.push(name);
+        }
     }
 
     /// Look up a channel config by canonical [`ChannelHash`] (`u64`).
@@ -484,13 +1040,24 @@ impl ChannelConfigRegistry {
         if let Some(exact) = self.configs.get(name) {
             return Some(exact);
         }
-        // Slow path: walk the prefix table. Cheap in the typical
-        // case (zero or one prefix entries); the fast path is
-        // unaffected. Picks the LONGEST matching prefix so a more
-        // specific entry overrides a more general one — and so
-        // resolution is deterministic across runs (the previous
-        // "first match wins" was DashMap-shard-order dependent and
-        // would silently flip across builds).
+        self.prefix_configs
+            .get(&self.longest_matching_prefix(name)?)
+    }
+
+    /// The longest registered prefix that `name` starts with, if any.
+    ///
+    /// Single source of truth for prefix resolution, shared by
+    /// [`Self::get_by_name`] and [`Self::resolve_by_name`]. Those two
+    /// answer the same authorization question and previously each
+    /// carried their own copy of this loop — two places to keep the
+    /// longest-match rule correct, on the path that decides which ACL
+    /// applies.
+    ///
+    /// Longest match means a more specific entry overrides a more
+    /// general one, and makes resolution deterministic across runs: an
+    /// earlier "first match wins" was DashMap-shard-order dependent and
+    /// could silently flip between builds.
+    fn longest_matching_prefix(&self, name: &str) -> Option<String> {
         let mut best_len = 0usize;
         let mut best_key: Option<String> = None;
         for entry in self.prefix_configs.iter() {
@@ -500,7 +1067,33 @@ impl ChannelConfigRegistry {
                 best_key = Some(prefix.clone());
             }
         }
-        self.prefix_configs.get(&best_key?)
+        best_key
+    }
+
+    /// Resolve `name` the same way [`Self::get_by_name`] does, but also
+    /// report **which prefix matched** when resolution came from the
+    /// prefix table.
+    ///
+    /// [`OriginBinding`] needs that prefix to locate the dynamic suffix
+    /// inside the requested name; `get_by_name` alone discards it, and
+    /// re-deriving it at the call site would duplicate the
+    /// longest-match rule (and drift from it). Returns owned values
+    /// because every caller on the authorization path clones the config
+    /// immediately anyway, to drop the registry guard before doing
+    /// signature work.
+    pub fn resolve_by_name(&self, name: &str) -> Option<ResolvedConfig> {
+        if let Some(exact) = self.configs.get(name) {
+            return Some(ResolvedConfig {
+                config: exact.clone(),
+                matched_prefix: None,
+            });
+        }
+        let key = self.longest_matching_prefix(name)?;
+        let config = self.prefix_configs.get(&key)?.clone();
+        Some(ResolvedConfig {
+            config,
+            matched_prefix: Some(key),
+        })
     }
 
     /// Remove a channel config by canonical [`ChannelHash`].
@@ -514,6 +1107,10 @@ impl ChannelConfigRegistry {
     /// Callers that need to remove a specific channel should use
     /// [`remove_by_name`](Self::remove_by_name).
     pub fn remove(&self, channel_hash: ChannelHash) -> Option<ChannelConfig> {
+        // One critical section covering the index read AND the removal
+        // it selects, so the name cannot be replaced by a different
+        // channel in between and get removed in its place.
+        let _w = self.write_lock.lock();
         let name = {
             let names = self.by_hash.get(&channel_hash)?;
             if names.len() != 1 {
@@ -521,13 +1118,40 @@ impl ChannelConfigRegistry {
             }
             names.first()?.clone()
         };
-        self.remove_by_name(&name)
+        self.remove_by_name_locked(&name)
     }
 
     /// Remove a channel config by exact name (collision-safe).
     ///
     /// Returns the removed config if it existed.
     pub fn remove_by_name(&self, name: &str) -> Option<ChannelConfig> {
+        let _w = self.write_lock.lock();
+        self.remove_by_name_locked(name)
+    }
+
+    /// [`Self::remove_by_name`] for callers already holding
+    /// `write_lock`. Split out because `parking_lot::Mutex` is not
+    /// reentrant and [`Self::remove`] must hold the lock across its
+    /// index lookup.
+    ///
+    /// Under the lock, `configs.remove` and the index cleanup are one
+    /// step, which is what makes the pair sound. Previously they were
+    /// not, and the repair each defect needed reintroduced the other:
+    ///
+    /// - Without a repair pass, a re-registration landing between the
+    ///   `configs.remove` and the `retain` had its fresh index entry
+    ///   deleted — the channel present in `configs`, invisible to
+    ///   `get(hash)`.
+    /// - With one (`if configs.contains_key(name) { index_name(..) }`),
+    ///   a second removal completing between that test and the re-index
+    ///   put a name back into the bucket with nothing behind it. `get`
+    ///   and `remove` treat a bucket holding more than one name as a
+    ///   hash collision and answer `None`, so a phantom entry disables
+    ///   lookup for whatever real channel shares the bucket.
+    ///
+    /// Serializing removes the interleaving both were patching around,
+    /// so neither the repair nor its own failure mode remains.
+    fn remove_by_name_locked(&self, name: &str) -> Option<ChannelConfig> {
         let (_, removed) = self.configs.remove(name)?;
         let hash = removed.channel_id.hash();
         let wire_hash = removed.channel_id.wire_hash();
@@ -608,6 +1232,7 @@ impl std::fmt::Debug for ChannelConfigRegistry {
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::{GpuInfo, GpuVendor, HardwareCapabilities};
+    use crate::adapter::net::channel::{channel_hash, queue_group_hash, ChannelName};
     use crate::adapter::net::identity::{EntityKeypair, PermissionToken};
 
     fn make_caps(gpu: bool) -> CapabilitySet {
@@ -652,8 +1277,22 @@ mod tests {
         let entity = EntityKeypair::generate();
         let rev = RevocationRegistry::new();
 
-        assert!(config.can_publish(&caps, entity.entity_id(), None, &rev, 0));
-        assert!(config.can_subscribe(&caps, entity.entity_id(), None, &rev, 0));
+        assert!(config.can_publish(
+            &caps,
+            entity.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
+        assert!(config.can_subscribe(
+            &caps,
+            entity.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
     }
 
     #[test]
@@ -666,10 +1305,24 @@ mod tests {
         let rev = RevocationRegistry::new();
 
         let no_gpu = make_caps(false);
-        assert!(!config.can_publish(&no_gpu, entity.entity_id(), None, &rev, 0));
+        assert!(!config.can_publish(
+            &no_gpu,
+            entity.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
 
         let with_gpu = make_caps(true);
-        assert!(config.can_publish(&with_gpu, entity.entity_id(), None, &rev, 0));
+        assert!(config.can_publish(
+            &with_gpu,
+            entity.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
     }
 
     /// The C1 fix: a `require_token` channel anchored to an owner must
@@ -685,7 +1338,14 @@ mod tests {
         let rev = RevocationRegistry::new();
 
         // No chain -> denied.
-        assert!(!config.can_publish(&caps, subject.entity_id(), None, &rev, 0));
+        assert!(!config.can_publish(
+            &caps,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
 
         // Self-issued (issuer == subject, NOT the channel owner) ->
         // denied. Pre-fix this was the privilege-escalation hole:
@@ -693,13 +1353,27 @@ mod tests {
         // token regardless of issuer.
         let self_chain = direct_chain(&subject, &subject, TokenScope::PUBLISH, id.hash());
         assert!(
-            !config.can_publish(&caps, subject.entity_id(), Some(&self_chain), &rev, 0),
+            !config.can_publish(
+                &caps,
+                subject.entity_id(),
+                config.channel_id.hash(),
+                Some(&self_chain),
+                &rev,
+                0
+            ),
             "self-issued token must be rejected: its issuer is not a channel root"
         );
 
         // Owner-issued -> allowed.
         let owner_chain = direct_chain(&owner, &subject, TokenScope::PUBLISH, id.hash());
-        assert!(config.can_publish(&caps, subject.entity_id(), Some(&owner_chain), &rev, 0));
+        assert!(config.can_publish(
+            &caps,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            Some(&owner_chain),
+            &rev,
+            0
+        ));
     }
 
     /// `with_require_token(true)` without any roots fails closed — there
@@ -714,8 +1388,22 @@ mod tests {
 
         // Even an otherwise-well-formed token can't anchor to nothing.
         let chain = direct_chain(&anyone, &anyone, TokenScope::SUBSCRIBE, id.hash());
-        assert!(!config.can_subscribe(&caps, anyone.entity_id(), Some(&chain), &rev, 0));
-        assert!(!config.can_subscribe(&caps, anyone.entity_id(), None, &rev, 0));
+        assert!(!config.can_subscribe(
+            &caps,
+            anyone.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
+        assert!(!config.can_subscribe(
+            &caps,
+            anyone.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
     }
 
     /// A config that names roots but never set the `require_token`
@@ -742,10 +1430,24 @@ mod tests {
         );
 
         // No chain -> denied (would have been silently admitted pre-fix).
-        assert!(!config.can_subscribe(&caps, subject.entity_id(), None, &rev, 0));
+        assert!(!config.can_subscribe(
+            &caps,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
         // Owner-issued chain -> allowed.
         let owner_chain = direct_chain(&owner, &subject, TokenScope::SUBSCRIBE, id.hash());
-        assert!(config.can_subscribe(&caps, subject.entity_id(), Some(&owner_chain), &rev, 0));
+        assert!(config.can_subscribe(
+            &caps,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            Some(&owner_chain),
+            &rev,
+            0
+        ));
     }
 
     /// The chain's leaf must be bound to the presenting entity — a peer
@@ -763,9 +1465,23 @@ mod tests {
 
         // Owner issued this to `intended`; `attacker` presents it.
         let chain = direct_chain(&owner, &intended, TokenScope::SUBSCRIBE, id.hash());
-        assert!(!config.can_subscribe(&caps, attacker.entity_id(), Some(&chain), &rev, 0));
+        assert!(!config.can_subscribe(
+            &caps,
+            attacker.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
         // The intended subject is accepted.
-        assert!(config.can_subscribe(&caps, intended.entity_id(), Some(&chain), &rev, 0));
+        assert!(config.can_subscribe(
+            &caps,
+            intended.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
     }
 
     /// A valid owner → intermediate → leaf delegation chain is accepted;
@@ -797,7 +1513,14 @@ mod tests {
         let chain = TokenChain {
             tokens: vec![root, child],
         };
-        assert!(config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+        assert!(config.can_subscribe(
+            &caps,
+            leaf.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
     }
 
     /// A chain whose links don't connect (`child.issuer != parent.subject`)
@@ -836,7 +1559,14 @@ mod tests {
         let chain = TokenChain {
             tokens: vec![root, spliced],
         };
-        assert!(!config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+        assert!(!config.can_subscribe(
+            &caps,
+            leaf.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
     }
 
     /// A delegated child can't authorize a scope its parent lacked —
@@ -876,7 +1606,14 @@ mod tests {
             tokens: vec![root, forged_child],
         };
         // The root link doesn't authorize PUBLISH, so the chain can't.
-        assert!(!config.can_publish(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+        assert!(!config.can_publish(
+            &caps,
+            leaf.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
     }
 
     /// The H1 fix: revoking the root issuer invalidates the whole chain,
@@ -909,14 +1646,28 @@ mod tests {
         };
 
         // Accepted before revocation.
-        assert!(config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0));
+        assert!(config.can_subscribe(
+            &caps,
+            leaf.entity_id(),
+            config.channel_id.hash(),
+            Some(&chain),
+            &rev,
+            0
+        ));
 
         // Owner bumps its revocation floor above the chain's generation
         // (0). The root link falls below the floor → whole chain dies,
         // even though the delegated child's issuer is `mid`, not `owner`.
         rev.revoke_below(owner.entity_id(), 1);
         assert!(
-            !config.can_subscribe(&caps, leaf.entity_id(), Some(&chain), &rev, 0),
+            !config.can_subscribe(
+                &caps,
+                leaf.entity_id(),
+                config.channel_id.hash(),
+                Some(&chain),
+                &rev,
+                0
+            ),
             "revoking the root must kill the delegated descendant"
         );
     }
@@ -935,14 +1686,35 @@ mod tests {
 
         // Has GPU but no token -> denied.
         let with_gpu = make_caps(true);
-        assert!(!config.can_publish(&with_gpu, subject.entity_id(), None, &rev, 0));
+        assert!(!config.can_publish(
+            &with_gpu,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            None,
+            &rev,
+            0
+        ));
 
         // Has token but no GPU -> denied.
         let no_gpu = make_caps(false);
-        assert!(!config.can_publish(&no_gpu, subject.entity_id(), Some(&owner_chain), &rev, 0));
+        assert!(!config.can_publish(
+            &no_gpu,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            Some(&owner_chain),
+            &rev,
+            0
+        ));
 
         // Has both -> allowed.
-        assert!(config.can_publish(&with_gpu, subject.entity_id(), Some(&owner_chain), &rev, 0));
+        assert!(config.can_publish(
+            &with_gpu,
+            subject.entity_id(),
+            config.channel_id.hash(),
+            Some(&owner_chain),
+            &rev,
+            0
+        ));
     }
 
     #[test]
@@ -1211,5 +1983,981 @@ mod tests {
         assert_eq!(removed.priority, 7);
         assert_eq!(reg.len(), 0);
         assert!(reg.get(hash).is_none());
+    }
+
+    // ---- Review follow-ups: registry index consistency ----
+
+    /// A remove that interleaves with a re-registration must not leave
+    /// the NEW config stranded — present in `configs` but invisible to
+    /// the reverse indices that `get(hash)` / `get_by_wire_hash`
+    /// resolve through.
+    ///
+    /// Sequenced deterministically rather than raced, so it pins the
+    /// outcome rather than an interleaving: remove-then-reregister and
+    /// reregister-then-remove must both leave the index agreeing with
+    /// `configs`. (The interleaving itself can no longer occur —
+    /// `remove_by_name_locked` holds the registry write lock across both
+    /// steps — but the property is what callers depend on, and it should
+    /// keep being asserted independently of how it is achieved.)
+    #[test]
+    fn remove_racing_reregistration_leaves_the_index_consistent() {
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("svc.requests").unwrap();
+        let hash = id.hash();
+        let wire = id.wire_hash();
+
+        reg.insert(ChannelConfig::new(id.clone()).with_priority(1));
+        // Re-register, then remove: the remove's cleanup targets a name
+        // that is legitimately present again.
+        reg.insert(ChannelConfig::new(id.clone()).with_priority(2));
+        reg.remove_by_name("svc.requests");
+        assert!(
+            reg.get(hash).is_none(),
+            "after a completed remove the channel is gone"
+        );
+
+        // Now the interleaved shape: removed, then re-registered.
+        reg.insert(ChannelConfig::new(id).with_priority(3));
+        assert_eq!(
+            reg.get(hash).map(|c| c.priority),
+            Some(3),
+            "a channel re-registered after removal must be reachable by \
+             canonical hash"
+        );
+        assert_eq!(
+            reg.get_by_wire_hash(wire).map(|c| c.priority),
+            Some(3),
+            "…and by wire hash"
+        );
+    }
+
+    /// The concurrent form of the same property. Whatever the
+    /// interleaving, the registry must not end with a config that
+    /// `get_by_name` finds but `get(hash)` cannot.
+    #[test]
+    fn concurrent_remove_and_reregister_never_strands_the_index() {
+        use std::sync::Arc as StdArc;
+
+        for _ in 0..64 {
+            let reg = StdArc::new(ChannelConfigRegistry::new());
+            let id = ChannelId::parse("svc.requests").unwrap();
+            let hash = id.hash();
+            reg.insert(ChannelConfig::new(id.clone()));
+
+            std::thread::scope(|s| {
+                let r1 = reg.clone();
+                s.spawn(move || {
+                    r1.remove_by_name("svc.requests");
+                });
+                let r2 = reg.clone();
+                let id2 = id.clone();
+                s.spawn(move || {
+                    r2.insert(ChannelConfig::new(id2).with_priority(9));
+                });
+            });
+
+            // The invariant: `configs` and the reverse index agree.
+            if reg.get_by_name("svc.requests").is_some() {
+                assert!(
+                    reg.get(hash).is_some(),
+                    "config present by name but unreachable by canonical \
+                     hash — the reverse index was stranded"
+                );
+            }
+        }
+    }
+
+    /// Both resolution entry points must agree, since they answer the
+    /// same authorization question. Pinned because they used to carry
+    /// separate copies of the longest-match loop.
+    #[test]
+    fn get_by_name_and_resolve_by_name_agree_on_prefix_resolution() {
+        let reg = ChannelConfigRegistry::new();
+        reg.insert_prefix(
+            "svc.",
+            ChannelConfig::new(ChannelId::parse("svc.general").unwrap()).with_priority(1),
+        );
+        reg.insert_prefix(
+            "svc.replies.",
+            ChannelConfig::new(ChannelId::parse("svc.replies.prefix").unwrap()).with_priority(2),
+        );
+        reg.insert(ChannelConfig::new(ChannelId::parse("svc.exact").unwrap()).with_priority(3));
+
+        for name in ["svc.replies.aa", "svc.other", "svc.exact", "nomatch"] {
+            let via_get = reg.get_by_name(name).map(|c| c.priority);
+            let via_resolve = reg.resolve_by_name(name).map(|r| r.config.priority);
+            assert_eq!(
+                via_get, via_resolve,
+                "get_by_name and resolve_by_name disagreed for {name:?}"
+            );
+        }
+
+        // And the longest prefix wins, not merely any match.
+        assert_eq!(
+            reg.resolve_by_name("svc.replies.aa")
+                .unwrap()
+                .matched_prefix
+                .as_deref(),
+            Some("svc.replies.")
+        );
+    }
+
+    // ---- M2 (2026-07-31 audit): queue-group membership authority ----
+
+    /// Default is unchanged: any subscriber may join any group.
+    #[test]
+    fn queue_group_unrestricted_by_default() {
+        let peer = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let config = ChannelConfig::new(ChannelId::parse("work/queue").unwrap());
+        assert_eq!(config.queue_group_policy, QueueGroupPolicy::Unrestricted);
+        assert!(config.can_join_queue_group(
+            peer.entity_id(),
+            "work/queue",
+            "workers",
+            None,
+            &rev,
+            0
+        ));
+    }
+
+    /// `Deny` refuses every group, chain or not.
+    #[test]
+    fn queue_group_deny_refuses_even_with_a_valid_chain() {
+        let owner = EntityKeypair::generate();
+        let peer = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let config = ChannelConfig::new(ChannelId::parse("work/queue").unwrap())
+            .with_token_roots(vec![owner.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::Deny);
+
+        let chain = direct_chain(
+            &owner,
+            &peer,
+            TokenScope::SUBSCRIBE,
+            queue_group_hash("work/queue", "workers"),
+        );
+        assert!(!config.can_join_queue_group(
+            peer.entity_id(),
+            "work/queue",
+            "workers",
+            Some(&chain),
+            &rev,
+            0
+        ));
+    }
+
+    /// The core M2 property: a grant for one group must not admit the
+    /// holder to a DIFFERENT group. An allowlist of group names could
+    /// not express this — names are operational constants, not secrets.
+    #[test]
+    fn queue_group_grant_binds_to_one_specific_group() {
+        let owner = EntityKeypair::generate();
+        let worker = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let channel = "work/queue";
+        let config = ChannelConfig::new(ChannelId::parse(channel).unwrap())
+            .with_token_roots(vec![owner.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound);
+
+        let chain = direct_chain(
+            &owner,
+            &worker,
+            TokenScope::SUBSCRIBE,
+            queue_group_hash(channel, "batch"),
+        );
+
+        assert!(
+            config.can_join_queue_group(
+                worker.entity_id(),
+                channel,
+                "batch",
+                Some(&chain),
+                &rev,
+                0
+            ),
+            "the granted group must be joinable"
+        );
+        assert!(
+            !config.can_join_queue_group(
+                worker.entity_id(),
+                channel,
+                "realtime",
+                Some(&chain),
+                &rev,
+                0
+            ),
+            "a grant for one group must not admit the holder to another — \
+             that is the work-stealing this policy exists to stop"
+        );
+    }
+
+    /// A plain channel-scoped SUBSCRIBE token is NOT a worker grant.
+    /// Otherwise every legitimate subscriber would silently keep the
+    /// ability to join any group and the policy would be a no-op.
+    #[test]
+    fn channel_subscribe_token_is_not_a_queue_group_grant() {
+        let owner = EntityKeypair::generate();
+        let reader = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let channel = "work/queue";
+        let id = ChannelId::parse(channel).unwrap();
+        let config = ChannelConfig::new(id.clone())
+            .with_token_roots(vec![owner.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound);
+
+        // Scoped to the CHANNEL, which is what an ordinary
+        // read-only subscriber (e.g. an auditor) would hold.
+        let chain = direct_chain(&owner, &reader, TokenScope::SUBSCRIBE, id.hash());
+
+        assert!(
+            config.can_subscribe(
+                &make_caps(false),
+                reader.entity_id(),
+                id.hash(),
+                Some(&chain),
+                &rev,
+                0
+            ),
+            "precondition: it is a valid subscribe credential"
+        );
+        assert!(
+            !config.can_join_queue_group(
+                reader.entity_id(),
+                channel,
+                "workers",
+                Some(&chain),
+                &rev,
+                0
+            ),
+            "a read-only subscriber must not be able to steal worker traffic"
+        );
+    }
+
+    /// TokenBound fails closed with no chain and with no roots.
+    #[test]
+    fn queue_group_token_bound_fails_closed() {
+        let owner = EntityKeypair::generate();
+        let peer = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+        let channel = "work/queue";
+
+        let rooted = ChannelConfig::new(ChannelId::parse(channel).unwrap())
+            .with_token_roots(vec![owner.entity_id().clone()])
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound);
+        assert!(
+            !rooted.can_join_queue_group(peer.entity_id(), channel, "w", None, &rev, 0),
+            "no chain presented → refuse"
+        );
+
+        let rootless = ChannelConfig::new(ChannelId::parse(channel).unwrap())
+            .with_queue_group_policy(QueueGroupPolicy::TokenBound);
+        let chain = direct_chain(
+            &owner,
+            &peer,
+            TokenScope::SUBSCRIBE,
+            queue_group_hash(channel, "w"),
+        );
+        assert!(
+            !rootless.can_join_queue_group(peer.entity_id(), channel, "w", Some(&chain), &rev, 0),
+            "no roots to anchor against → refuse"
+        );
+    }
+
+    /// The `#` separator keeps group grants and channel grants in
+    /// disjoint hash spaces: `#` is outside the channel-name charset,
+    /// so no legitimate channel name can ever hash to a group grant.
+    #[test]
+    fn queue_group_hash_cannot_collide_with_a_channel_name() {
+        let h = queue_group_hash("work/queue", "workers");
+        // The only string that would produce it is not a legal name.
+        assert!(ChannelName::new("work/queue#workers").is_err());
+        assert_ne!(h, channel_hash("work/queue"));
+        assert_ne!(h, channel_hash("work/queueworkers"));
+        // Distinct groups on one channel are distinct grants.
+        assert_ne!(h, queue_group_hash("work/queue", "other"));
+        // Same group name on distinct channels are distinct grants.
+        assert_ne!(h, queue_group_hash("work/other", "workers"));
+    }
+
+    /// …and they stay disjoint only while they stay in ONE hash space.
+    ///
+    /// The disjointness argument above is entirely about `#` being
+    /// outside the channel-name charset — which proves nothing unless
+    /// both sides are hashed the same way. `queue_group_hash` delegates
+    /// to `channel_hash` for that reason, and this pins the delegation:
+    /// a seed, a domain-separation prefix, or an algorithm change
+    /// applied to one and not the other would leave the test above
+    /// passing (the values would still differ) while the documented
+    /// derivation quietly became false, and grants minted before the
+    /// change would stop matching the ones checked after it.
+    #[test]
+    fn queue_group_hash_is_the_channel_hash_of_the_joined_name() {
+        for (channel, group) in [
+            ("work/queue", "workers"),
+            ("a", "b"),
+            ("svc.replies.deadbeefdeadbeef", "shard-3"),
+        ] {
+            assert_eq!(
+                queue_group_hash(channel, group),
+                channel_hash(&format!("{channel}#{group}")),
+                "queue_group_hash({channel:?}, {group:?}) no longer equals the \
+                 canonical hash of \"{channel}#{group}\" — the two have drifted \
+                 into separate hash spaces"
+            );
+        }
+    }
+
+    // ---- M1 (2026-07-31 audit): gates key on the REQUESTED channel ----
+
+    /// A token minted for one channel under a prefix must not authorize
+    /// a sibling under the same prefix.
+    ///
+    /// Pre-fix the gate verified against `self.channel_id.hash()`, and
+    /// for a prefix-registered config that is a sentinel standing for
+    /// the whole family — so one token minted for the sentinel
+    /// authorized every channel beneath it, silently degrading a
+    /// per-channel binding to a per-prefix one.
+    #[test]
+    fn prefix_config_gate_binds_to_the_requested_channel_not_the_sentinel() {
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        let sentinel = ChannelId::parse("svc.replies.prefix").unwrap();
+        let config =
+            ChannelConfig::new(sentinel.clone()).with_token_roots(vec![owner.entity_id().clone()]);
+
+        let mine = channel_hash("svc.replies.aaaa");
+        let theirs = channel_hash("svc.replies.bbbb");
+
+        // A token for MY channel authorizes my channel...
+        let chain = direct_chain(&owner, &subject, TokenScope::SUBSCRIBE, mine);
+        assert!(config.can_subscribe(&caps, subject.entity_id(), mine, Some(&chain), &rev, 0));
+        // ...and not a sibling under the same prefix.
+        assert!(
+            !config.can_subscribe(&caps, subject.entity_id(), theirs, Some(&chain), &rev, 0),
+            "a token for one channel must not authorize a sibling under the \
+             same prefix"
+        );
+
+        // A token minted for the SENTINEL authorizes nothing real —
+        // that was the per-prefix skeleton key.
+        let sentinel_chain = direct_chain(&owner, &subject, TokenScope::SUBSCRIBE, sentinel.hash());
+        assert!(
+            !config.can_subscribe(
+                &caps,
+                subject.entity_id(),
+                mine,
+                Some(&sentinel_chain),
+                &rev,
+                0
+            ),
+            "a sentinel-scoped token must not authorize a real channel"
+        );
+    }
+
+    /// The publish counterpart, and the reason `set_publish_chain` was
+    /// unreachable for token-gated prefix channels: it stores under the
+    /// real channel hash while the gate asked about the sentinel.
+    #[test]
+    fn prefix_config_publish_gate_binds_to_the_requested_channel() {
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let caps = make_caps(false);
+        let rev = RevocationRegistry::new();
+
+        let sentinel = ChannelId::parse("svc.requests.prefix").unwrap();
+        let config = ChannelConfig::new(sentinel).with_token_roots(vec![owner.entity_id().clone()]);
+
+        let real = channel_hash("svc.requests.aaaa");
+        let chain = direct_chain(&owner, &subject, TokenScope::PUBLISH, real);
+
+        assert!(config.can_publish(&caps, subject.entity_id(), real, Some(&chain), &rev, 0));
+        assert!(
+            !config.can_publish(
+                &caps,
+                subject.entity_id(),
+                channel_hash("svc.requests.bbbb"),
+                Some(&chain),
+                &rev,
+                0
+            ),
+            "a publish token for one channel must not authorize a sibling"
+        );
+    }
+
+    /// `reverify_subscribe*` must ask about the same channel the
+    /// subscribe gate did, or the publish-time re-check and the sweep
+    /// disagree with the decision that admitted the peer.
+    #[test]
+    fn reverify_paths_bind_to_the_requested_channel() {
+        let owner = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let rev = RevocationRegistry::new();
+
+        let sentinel = ChannelId::parse("svc.replies.prefix").unwrap();
+        let config = ChannelConfig::new(sentinel).with_token_roots(vec![owner.entity_id().clone()]);
+
+        let mine = channel_hash("svc.replies.aaaa");
+        let chain = direct_chain(&owner, &subject, TokenScope::SUBSCRIBE, mine);
+
+        for reverify in [
+            ChannelConfig::reverify_subscribe as fn(&_, &_, &_, u64, &_, u64) -> bool,
+            ChannelConfig::reverify_subscribe_presigned,
+        ] {
+            assert!(reverify(
+                &config,
+                &chain,
+                subject.entity_id(),
+                mine,
+                &rev,
+                0
+            ));
+            assert!(
+                !reverify(
+                    &config,
+                    &chain,
+                    subject.entity_id(),
+                    channel_hash("svc.replies.bbbb"),
+                    &rev,
+                    0
+                ),
+                "re-verify must reject a chain that does not authorize the \
+                 channel being published to"
+            );
+        }
+    }
+
+    // ---- H3 (2026-07-31 audit): origin-bound channel families ----
+
+    const OB: OriginBinding = OriginBinding::OriginHashHex16;
+    const OB_PREFIX: &str = "svc.replies.";
+
+    /// The rule the whole finding turns on: a peer whose identity is
+    /// not pinned is REJECTED. Admitting it would let an attacker
+    /// bypass the binding by simply never announcing.
+    #[test]
+    fn origin_binding_rejects_unpinned_peer() {
+        let name = format!("{OB_PREFIX}{:016x}", 0xABCD_1234_5678_9ABCu64);
+        assert!(
+            !OB.authorizes(&name, Some(OB_PREFIX), None),
+            "an unpinned peer must never be authorized, even for a \
+             well-formed name"
+        );
+    }
+
+    #[test]
+    fn origin_binding_admits_matching_origin() {
+        let origin = 0xABCD_1234_5678_9ABCu64;
+        let name = format!("{OB_PREFIX}{origin:016x}");
+        assert!(OB.authorizes(&name, Some(OB_PREFIX), Some(origin)));
+    }
+
+    /// The attack: a pinned peer asking for a name that encodes some
+    /// OTHER peer's origin.
+    #[test]
+    fn origin_binding_rejects_other_peers_origin() {
+        let victim = 0xABCD_1234_5678_9ABCu64;
+        let attacker = 0x0011_2233_4455_6677u64;
+        let name = format!("{OB_PREFIX}{victim:016x}");
+        assert!(
+            !OB.authorizes(&name, Some(OB_PREFIX), Some(attacker)),
+            "a peer must not claim a channel naming another peer's origin"
+        );
+    }
+
+    /// A binding on an exact-match config has no dynamic suffix to
+    /// check, so it fails closed rather than admitting.
+    #[test]
+    fn origin_binding_without_a_matched_prefix_fails_closed() {
+        let origin = 0xABCD_1234_5678_9ABCu64;
+        let name = format!("{OB_PREFIX}{origin:016x}");
+        assert!(!OB.authorizes(&name, None, Some(origin)));
+    }
+
+    /// The same fail-closed rule reached the way an operator actually
+    /// reaches it: registering an origin-bound config by EXACT name.
+    ///
+    /// `resolve_by_name` reports no matched prefix for an exact hit, so
+    /// the binding has nothing to split and denies every subscriber —
+    /// including the one peer whose origin the name encodes. Correct,
+    /// and completely invisible: a channel that accepts nobody looks
+    /// exactly like a channel nobody is using, and the refused peers see
+    /// a generic `Unauthorized`. `warn_if_fail_closed` logs this at
+    /// registration for that reason; this pins the behaviour the warning
+    /// is about.
+    #[test]
+    fn origin_bound_config_registered_by_exact_name_denies_everyone() {
+        let reg = ChannelConfigRegistry::new();
+        let origin = 0xABCD_1234_5678_9ABCu64;
+        let name = format!("{OB_PREFIX}{origin:016x}");
+
+        // The misregistration: `insert`, not `insert_prefix`.
+        reg.insert(
+            ChannelConfig::new(ChannelId::parse(&name).unwrap()).with_subscriber_origin_binding(OB),
+        );
+
+        let resolved = reg.resolve_by_name(&name).expect("exact entry resolves");
+        assert_eq!(
+            resolved.matched_prefix, None,
+            "an exact hit reports no matched prefix — this is the input that \
+             makes the binding fail closed"
+        );
+        assert!(
+            !OB.authorizes(&name, resolved.matched_prefix.as_deref(), Some(origin)),
+            "an exact-registered origin binding denies even the peer the name \
+             encodes; registering it as a prefix is the only working shape"
+        );
+
+        // Registered as a prefix instead, the same peer is admitted —
+        // so the denial above is about the registration, not the name.
+        let reg = ChannelConfigRegistry::new();
+        reg.insert_prefix(
+            OB_PREFIX,
+            ChannelConfig::new(ChannelId::parse("svc.replies.prefix").unwrap())
+                .with_subscriber_origin_binding(OB),
+        );
+        let resolved = reg.resolve_by_name(&name).expect("prefix entry resolves");
+        assert_eq!(resolved.matched_prefix.as_deref(), Some(OB_PREFIX));
+        assert!(OB.authorizes(&name, resolved.matched_prefix.as_deref(), Some(origin)));
+    }
+
+    /// Formatting is exact: no truncation, no case folding, no
+    /// suffix-prefix matching.
+    #[test]
+    fn origin_binding_requires_exact_16_hex_suffix() {
+        let origin = 0x0000_0000_0000_00ABu64;
+        for bad in [
+            "ab",                // unpadded
+            "AB",                // uppercase (also unpadded)
+            "00000000000000ab0", // trailing garbage
+            "00000000000000a",   // short
+            "00000000000000AB",  // uppercase, padded
+        ] {
+            let name = format!("{OB_PREFIX}{bad}");
+            assert!(
+                !OB.authorizes(&name, Some(OB_PREFIX), Some(origin)),
+                "suffix {bad:?} must not authorize origin {origin:#x}"
+            );
+        }
+        // The canonical rendering does authorize.
+        let good = format!("{OB_PREFIX}{origin:016x}");
+        assert!(OB.authorizes(&good, Some(OB_PREFIX), Some(origin)));
+    }
+
+    /// A config carrying no binding is unaffected — the gate is opt-in.
+    #[test]
+    fn config_without_binding_is_unconstrained() {
+        let cfg = ChannelConfig::new(ChannelId::parse("svc.replies.prefix").unwrap());
+        assert!(cfg.subscriber_origin_binding.is_none());
+    }
+
+    /// `resolve_by_name` must report the prefix it matched, or the
+    /// binding has no way to locate the dynamic suffix.
+    #[test]
+    fn resolve_by_name_reports_the_matched_prefix() {
+        let reg = ChannelConfigRegistry::new();
+        let sentinel = ChannelId::parse("svc.replies.prefix").unwrap();
+        reg.insert_prefix(
+            OB_PREFIX,
+            ChannelConfig::new(sentinel).with_subscriber_origin_binding(OB),
+        );
+
+        let resolved = reg
+            .resolve_by_name("svc.replies.00112233445566aa")
+            .expect("prefix must resolve");
+        assert_eq!(resolved.matched_prefix.as_deref(), Some(OB_PREFIX));
+        assert_eq!(resolved.config.subscriber_origin_binding, Some(OB));
+
+        // An exact-match resolution reports no prefix.
+        let exact = ChannelId::parse("plain.channel").unwrap();
+        reg.insert(ChannelConfig::new(exact));
+        let resolved = reg.resolve_by_name("plain.channel").expect("exact");
+        assert!(resolved.matched_prefix.is_none());
+    }
+
+    // ---- R9: the one shared RPC service-channel registration ----
+
+    /// The H2 + H3 content of `install_rpc_service_defaults`, asserted
+    /// behaviourally rather than by scanning for method names.
+    ///
+    /// This is the policy every serve path now shares — `serve_rpc*`,
+    /// the aggregator, and the org facade. It has drifted twice, each
+    /// time because a serve path carried its own copy and a later fix
+    /// landed on only one of them, so it is worth pinning what the
+    /// policy DOES and not just where it lives.
+    #[test]
+    fn rpc_service_defaults_are_install_if_absent_and_origin_bound() {
+        let reg = ChannelConfigRegistry::new();
+        let root = EntityKeypair::generate();
+
+        // H2: an operator's strict ACL, registered before serving.
+        reg.insert(
+            ChannelConfig::new(ChannelId::parse("svc.requests").unwrap())
+                .with_token_roots(vec![root.entity_id().clone()]),
+        );
+        reg.insert_prefix(
+            "svc.replies.",
+            ChannelConfig::new(ChannelId::parse("svc.replies.prefix").unwrap())
+                .with_token_roots(vec![root.entity_id().clone()]),
+        );
+
+        reg.install_rpc_service_defaults("svc");
+
+        assert!(
+            reg.get_by_name("svc.requests").unwrap().token_required(),
+            "H2: serving must not replace an ACL the operator registered \
+             first — a replacing insert destroys it silently, leaving a \
+             posture identical to the default"
+        );
+        assert!(
+            reg.get_by_name("svc.replies.abcdef0123456789")
+                .unwrap()
+                .token_required(),
+            "H2 applies to the reply PREFIX too"
+        );
+
+        // …and on a clean registry it installs both, with the binding.
+        let fresh = ChannelConfigRegistry::new();
+        fresh.install_rpc_service_defaults("svc");
+
+        assert!(
+            fresh.get_by_name("svc.requests").is_some(),
+            "the request channel must be installed when unclaimed"
+        );
+        let replies = fresh
+            .get_by_name("svc.replies.abcdef0123456789")
+            .expect("the reply prefix must admit a per-caller channel");
+        assert_eq!(
+            replies.subscriber_origin_binding,
+            Some(OriginBinding::OriginHashHex16),
+            "H3: the reply prefix must be origin-bound. Unbound, any mesh peer \
+             can hold a live subscription to another caller's reply channel and \
+             receive that caller's response bodies whenever the server's direct \
+             route misses and the response falls back to roster fan-out."
+        );
+    }
+
+    /// A service name that cannot form a valid channel name installs
+    /// NOTHING — not a half-configured pair where the requests channel
+    /// exists and the reply prefix does not.
+    ///
+    /// The LENGTH cases are the ones that matter and the ones an
+    /// invalid-character name does not reach. There are TWO of them,
+    /// because the three names involved are three different lengths —
+    /// `.requests` is 9 bytes, the `.replies.prefix` sentinel is 15, and
+    /// a real `.replies.<16 hex>` is 25:
+    ///
+    /// - request fits, sentinel does not;
+    /// - both fit, but no real per-caller reply channel does.
+    ///
+    /// The second is the one a sentinel-based check misses, and it fails
+    /// worse than a visible refusal: everything looks installed, and
+    /// then every call hangs until it times out because no caller can
+    /// name a reply channel that validates.
+    ///
+    /// A character-invalid name fails all three and would pass this test
+    /// against an implementation that got either band wrong, which is
+    /// why the bands are enumerated explicitly with preconditions.
+    #[test]
+    fn rpc_service_defaults_install_nothing_for_an_unrepresentable_name() {
+        use super::super::name::MAX_NAME_LEN;
+
+        // Band 1: request fits, sentinel does not.
+        let no_sentinel = "s".repeat(MAX_NAME_LEN - ".requests".len());
+        assert!(ChannelName::new(&format!("{no_sentinel}.requests")).is_ok());
+        assert!(
+            ChannelName::new(&format!("{no_sentinel}.replies.prefix")).is_err(),
+            "precondition: band 1 must have an unrepresentable sentinel"
+        );
+
+        // Band 2: request AND sentinel fit; a real reply channel does not.
+        let no_real_reply = "s".repeat(MAX_NAME_LEN - ".replies.prefix".len());
+        assert!(ChannelName::new(&format!("{no_real_reply}.requests")).is_ok());
+        assert!(
+            ChannelName::new(&format!("{no_real_reply}.replies.prefix")).is_ok(),
+            "precondition: band 2's sentinel must VALIDATE — that is what \
+             makes checking the sentinel insufficient"
+        );
+        assert!(
+            ChannelName::new(&format!("{no_real_reply}.replies.{:016x}", 0u64)).is_err(),
+            "precondition: …while no real per-caller reply channel fits"
+        );
+
+        for (band, service) in [
+            ("no sentinel", no_sentinel.as_str()),
+            ("no real reply channel", no_real_reply.as_str()),
+            ("invalid characters", "bad name#with/invalid chars"),
+        ] {
+            let reg = ChannelConfigRegistry::new();
+            reg.install_rpc_service_defaults(service);
+            assert_eq!(
+                reg.len(),
+                0,
+                "[{band}] installed a request channel the reply side cannot \
+                 match (service len {})",
+                service.len()
+            );
+            assert_eq!(
+                reg.snapshot_prefixes().len(),
+                0,
+                "[{band}] installed a reply prefix no caller can ever use \
+                 (service len {})",
+                service.len()
+            );
+        }
+    }
+
+    /// The largest service name that IS fully usable must still install.
+    ///
+    /// Paired with the refusal test above so the boundary is pinned from
+    /// both sides — a validator that is too strict silently stops
+    /// configuring services that work, which no test asserting "installs
+    /// nothing" would ever catch.
+    #[test]
+    fn rpc_service_defaults_install_at_the_longest_usable_service_name() {
+        use super::super::name::MAX_NAME_LEN;
+
+        let longest = "s".repeat(MAX_NAME_LEN - ".replies.0123456789abcdef".len());
+        let reg = ChannelConfigRegistry::new();
+        reg.install_rpc_service_defaults(&longest);
+
+        assert!(
+            reg.get_by_name(&format!("{longest}.requests")).is_some(),
+            "the longest fully-usable service name must still get its request \
+             channel"
+        );
+        let reply = format!("{longest}.replies.{:016x}", u64::MAX);
+        assert_eq!(
+            ChannelName::new(&reply).map(|_| ()),
+            Ok(()),
+            "precondition: this is the longest name where a real reply \
+             channel still fits"
+        );
+        assert_eq!(
+            reg.get_by_name(&reply)
+                .expect("the reply prefix must resolve it")
+                .subscriber_origin_binding,
+            Some(OriginBinding::OriginHashHex16)
+        );
+    }
+
+    // ---- H2 (2026-07-31 audit): install-if-absent must not clobber ----
+
+    /// `insert_if_absent` installs into an empty slot and reports it.
+    #[test]
+    fn insert_if_absent_installs_when_vacant() {
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("svc.requests").unwrap();
+        assert!(reg.insert_if_absent(ChannelConfig::new(id.clone()).with_priority(4)));
+        assert_eq!(reg.get_by_name("svc.requests").unwrap().priority, 4);
+        assert_eq!(reg.get(id.hash()).unwrap().priority, 4);
+    }
+
+    /// The H2 regression at the registry level: an operator's strict
+    /// config must survive a later auto-registered permissive default.
+    /// Pre-fix `insert` replaced unconditionally and the ACL vanished.
+    #[test]
+    fn insert_if_absent_preserves_existing_strict_config() {
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("svc.requests").unwrap();
+        let root = EntityKeypair::generate();
+        reg.insert(ChannelConfig::new(id.clone()).with_token_roots(vec![root.entity_id().clone()]));
+
+        // Auto-registration's permissive default arrives second.
+        let installed = reg.insert_if_absent(ChannelConfig::new(id.clone()));
+
+        assert!(!installed, "must report that it did not install");
+        let cfg = reg.get_by_name("svc.requests").unwrap();
+        assert!(
+            cfg.token_required(),
+            "operator's token gate must survive auto-registration"
+        );
+        assert_eq!(cfg.token_roots.len(), 1);
+    }
+
+    /// Same guarantee on the prefix table, which is where nRPC's
+    /// reply-channel ACL would live.
+    #[test]
+    fn insert_prefix_if_absent_preserves_existing_strict_prefix() {
+        let reg = ChannelConfigRegistry::new();
+        let sentinel = ChannelId::parse("svc.replies.prefix").unwrap();
+        let root = EntityKeypair::generate();
+        reg.insert_prefix(
+            "svc.replies.",
+            ChannelConfig::new(sentinel.clone()).with_token_roots(vec![root.entity_id().clone()]),
+        );
+
+        let installed = reg.insert_prefix_if_absent("svc.replies.", ChannelConfig::new(sentinel));
+
+        assert!(!installed);
+        let cfg = reg.get_by_name("svc.replies.abcdef0123456789").unwrap();
+        assert!(
+            cfg.token_required(),
+            "operator's reply-prefix gate must survive auto-registration"
+        );
+    }
+
+    #[test]
+    fn insert_prefix_if_absent_installs_when_vacant() {
+        let reg = ChannelConfigRegistry::new();
+        let sentinel = ChannelId::parse("svc.replies.prefix").unwrap();
+        assert!(reg.insert_prefix_if_absent(
+            "svc.replies.",
+            ChannelConfig::new(sentinel).with_priority(2)
+        ));
+        assert_eq!(reg.get_by_name("svc.replies.deadbeef").unwrap().priority, 2);
+    }
+
+    /// Re-registering the same channel must not corrupt the canonical-
+    /// hash index. Pre-fix `insert` pushed the name unconditionally, so
+    /// the second registration grew the bucket to `[name, name]`,
+    /// `get()` read that as a hash collision, and canonical-hash lookup
+    /// started returning `None` for a channel that plainly exists.
+    #[test]
+    fn repeated_insert_does_not_self_collide_the_hash_index() {
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("svc.requests").unwrap();
+        let hash = id.hash();
+
+        reg.insert(ChannelConfig::new(id.clone()).with_priority(1));
+        reg.insert(ChannelConfig::new(id.clone()).with_priority(2));
+        reg.insert(ChannelConfig::new(id).with_priority(3));
+
+        assert_eq!(reg.len(), 1, "one channel, not three");
+        let cfg = reg
+            .get(hash)
+            .expect("canonical-hash lookup must survive re-registration");
+        assert_eq!(cfg.priority, 3, "latest config wins");
+    }
+
+    /// The mixed path auto-registration actually takes: a replacing
+    /// `insert` followed by install-if-absent attempts.
+    #[test]
+    fn insert_then_if_absent_leaves_hash_index_unambiguous() {
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("svc.requests").unwrap();
+        let hash = id.hash();
+
+        reg.insert(ChannelConfig::new(id.clone()).with_priority(9));
+        assert!(!reg.insert_if_absent(ChannelConfig::new(id.clone())));
+        assert!(!reg.insert_if_absent(ChannelConfig::new(id)));
+
+        assert_eq!(
+            reg.get(hash).expect("must stay resolvable").priority,
+            9,
+            "the operator's config must remain, and the index unambiguous"
+        );
+    }
+
+    /// Exactly one of N concurrent `insert_if_absent` callers may win,
+    /// and the reverse index must not end up ambiguous afterwards.
+    #[test]
+    fn concurrent_insert_if_absent_elects_exactly_one_winner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let reg = StdArc::new(ChannelConfigRegistry::new());
+        let wins = StdArc::new(AtomicUsize::new(0));
+        let id = ChannelId::parse("svc.requests").unwrap();
+
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let reg = reg.clone();
+                let wins = wins.clone();
+                let id = id.clone();
+                s.spawn(move || {
+                    if reg.insert_if_absent(ChannelConfig::new(id).with_priority(i)) {
+                        wins.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(wins.load(Ordering::Relaxed), 1, "exactly one installer");
+        assert_eq!(reg.len(), 1);
+        assert!(
+            reg.get(id.hash()).is_some(),
+            "hash index must stay unambiguous under concurrent installs"
+        );
+    }
+
+    /// The reverse indices must agree with `configs` after arbitrary
+    /// concurrent registration and removal — no name indexed that
+    /// `configs` does not hold, and none held that is not indexed.
+    ///
+    /// Both directions matter and they used to fail in turn:
+    ///
+    /// - Un-indexed-but-present: a re-registration landing between
+    ///   `remove`'s `configs.remove` and its `retain` had its fresh
+    ///   index entry deleted. The channel is registered and `get_by_name`
+    ///   finds it, but `get(hash)` — the path publish and subscribe
+    ///   authorization take — answers `None`, so its ACL stops being
+    ///   enforced.
+    /// - Indexed-but-absent: the repair pass for the above re-added a
+    ///   name a second concurrent removal had just taken out. `get` and
+    ///   `remove` read a bucket of more than one name as a hash
+    ///   collision and refuse it, so a phantom name disables lookup for
+    ///   whatever real channel shares the bucket.
+    ///
+    /// Interleaving-dependent, so a green run is evidence rather than
+    /// proof. It fails reliably against the unsynchronized version
+    /// (typically within a few hundred iterations), which is what makes
+    /// it worth keeping: the assertion states the invariant exactly, and
+    /// a future change that drops the serialization has a real chance of
+    /// being caught here.
+    #[test]
+    fn concurrent_registration_and_removal_keep_the_indices_consistent() {
+        use std::sync::Arc as StdArc;
+
+        // Distinct names, so threads contend on the registry rather
+        // than on one key — the churn that produced both defects.
+        let names: Vec<String> = (0..4).map(|i| format!("svc.chan{i}")).collect();
+
+        for _round in 0..200 {
+            let reg = StdArc::new(ChannelConfigRegistry::new());
+            std::thread::scope(|s| {
+                for name in &names {
+                    for _ in 0..2 {
+                        let reg = reg.clone();
+                        let id = ChannelId::parse(name).unwrap();
+                        s.spawn(move || {
+                            reg.insert(ChannelConfig::new(id.clone()));
+                            reg.remove_by_name(id.name().as_str());
+                            reg.insert(ChannelConfig::new(id));
+                        });
+                    }
+                }
+                for name in &names {
+                    let reg = reg.clone();
+                    let name = name.clone();
+                    s.spawn(move || {
+                        reg.remove_by_name(&name);
+                    });
+                }
+            });
+
+            for name in &names {
+                let present = reg.get_by_name(name).is_some();
+                // Straight at `by_hash`: the invariant is about the
+                // index itself, and the collision-safe public accessors
+                // hide exactly the corruption being asserted on.
+                let hash = ChannelId::parse(name).unwrap().hash();
+                let indexed = reg
+                    .by_hash
+                    .get(&hash)
+                    .is_some_and(|names| names.iter().any(|n| n == name));
+                assert_eq!(
+                    present, indexed,
+                    "index and `configs` disagree about {name:?}: present={present}, \
+                     indexed={indexed}. Registered-but-unindexed silently stops \
+                     enforcing that channel's ACL on the `get(hash)` path; \
+                     indexed-but-absent poisons the bucket for every channel \
+                     sharing it."
+                );
+            }
+        }
     }
 }

@@ -14,9 +14,31 @@
 //! The EIP-712 domain comes from the requirements themselves: `name` /
 //! `version` from `requirements.extra` (spec-carried token metadata),
 //! `chainId` from the CAIP-2 network, `verifyingContract` from the
-//! asset field. Present-and-wrong domain metadata produces signatures
-//! the token contract rejects — the registry cross-check (WS4 packs)
-//! catches mismatches before signing.
+//! asset field.
+//!
+//! **What is pinned, exactly.** `verifyingContract` and `chainId` are
+//! registry-pinned: the asset and network must match an
+//! [`AssetEntry`](crate::core::registry::AssetEntry) for the payment to
+//! clear `check_requirements` at all. `name` and `version` are
+//! **counterparty-supplied and unchecked unless that registry entry
+//! pins them** via `eip712_name` / `eip712_version`.
+//!
+//! The shipped default registries pin both EVM entries — Base and Base
+//! Sepolia USDC are Circle's FiatTokenV2_2, whose domain is `USDC` / `2`
+//! — because a known deployment's domain is not something a counterparty
+//! should get to assert. Pinning is still a per-deployment act: an entry
+//! an operator adds for a contract this crate has never heard of pins
+//! nothing until they say what to pin.
+//!
+//! This module's header used to claim a registry cross-check caught
+//! `name`/`version` mismatches. It did not: `AssetEntry` had no such
+//! fields. The bound on the damage is the sentence above rather than
+//! that check — with the contract and chain pinned, wrong domain
+//! metadata yields a signature whose domain separator matches no
+//! deployed contract, so it is a wasted signature and a failed payment,
+//! never an authorization usable elsewhere. A deployment that wants the
+//! mismatch refused *before* signing pins the two fields on its registry
+//! entry, and `check_requirements` then enforces them.
 
 use serde_json::{json, Value};
 

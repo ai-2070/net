@@ -17,11 +17,10 @@ import { call } from "@net-mesh/core/mesh_rpc";
 import { query } from "@net-mesh/core/meshdb";
 ```
 
-### What is peculiar about TypeScript here
+### TypeScript API differences
 
 **The exported bus class is `Net`, not `EventBus`.** `EventBus` is the internal
-Rust type the addon is built from; it is not a JS export, and reaching for it is
-the first thing that goes wrong.
+Rust type the addon is built from; it is not a JavaScript export.
 
 **Several surfaces live only on `@net-mesh/core`, never on `@net-mesh/sdk`** —
 payments is the clearest case. If an import from the SDK fails, try the core
@@ -37,7 +36,7 @@ the fire-and-forget variants return a boolean instead.
 ### Verify it worked
 
 ```ts
-import { NetNode } from '@net-mesh/sdk';
+import { NetNode } from "@net-mesh/sdk";
 
 interface Hello {
   msg: string;
@@ -45,10 +44,10 @@ interface Hello {
 
 async function main(): Promise<void> {
   const node = await NetNode.create({ shards: 1 });
-  const ch = node.channel<Hello>('hello/world');
+  const ch = node.channel<Hello>("hello/world");
 
-  const accepted = ch.publish({ msg: 'hello, mesh' });
-  if (!accepted) throw new Error('the bus did not accept the event');
+  const accepted = ch.publish({ msg: "hello, mesh" });
+  if (!accepted) throw new Error("the bus did not accept the event");
 
   // Counts at the PRODUCER boundary: accepted, not received or stored.
   const stats = node.stats();
@@ -63,8 +62,8 @@ main().catch((err) => {
 });
 ```
 
-Expect one line, `accepted: ingested=1`, and a clean exit. This is the example CI
-executes on every commit, so if it does not behave this way for you the difference
-is your environment, not the docs.
+Expect one line, `accepted: ingested=1`, and a clean exit. If it differs, confirm
+the Node version, package versions, native target, and supported platform before
+debugging the application code.
 
-Next: [the TypeScript SDK spine](/docs/sdk/typescript/quickstart).
+Next: [build a TypeScript capability](/docs/sdk/typescript/quickstart).

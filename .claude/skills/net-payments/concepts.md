@@ -202,6 +202,25 @@ or double-serves. Agents retry on timeouts constantly; this is the difference
 between a hiccup and a duplicate charge. The consumed-payload replay index is
 persistent: **one payload satisfies exactly one quote.**
 
+**Engine state is bookkeeping; the billing log is the record.** Every engine
+operation parses the whole store and rewrites it when something changed, so
+store size is a latency term on every payment — which is why terminal quote
+records are compacted 6h past quote expiry by default. Three states, three
+lifetimes, and the distinction is doctrinal rather than a tuning choice:
+
+| state | lifetime |
+|---|---|
+| terminal `QuoteRecord` | retired 6h past authoritative quote expiry (configurable; `None` disables) |
+| consumed-payload hash | retires with the record that owns it, owner-checked |
+| consumed-transaction tombstone | **permanent** — a settlement that occurred stays one, forever |
+
+Nothing is retired that is unredeemed, frozen (including frozen *after*
+redemption by a reverted-settlement verdict), or missing an authoritative
+expiry. `engine.status()` is therefore a live-lifecycle view, not a receipt
+store: past the horizon it returns `None` for a payment that completed
+perfectly well. Reconciliation belongs on the billing stream. See
+`provider.md`.
+
 ## The paid-invocation lifecycle (end to end)
 
 ```

@@ -2,6 +2,7 @@
 title: When to use Net
 description: "Use Net when capability discovery, authority, live execution state, or artifacts must cross machines. Use a smaller system when they do not."
 ---
+
 # When to use Net
 
 Net earns its place when work crosses a machine or authority boundary and the

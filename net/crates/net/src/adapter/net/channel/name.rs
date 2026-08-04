@@ -16,9 +16,12 @@
 //!   header for wire-speed filtering by forwarding nodes. 65 K buckets;
 //!   routine collisions at scale. Mirrors the
 //!   `origin_hash: u64 canonical → u32 wire` precedent in the protocol
-//!   layer: per-packet width is fixed by the 64-byte header budget, and
-//!   wire-side collisions are benign (only affect filter precision, not
-//!   ACL or storage decisions, since those key on the canonical hash).
+//!   layer: per-packet width is constrained by the fixed wire header
+//!   ([`protocol::HEADER_SIZE`](super::super::protocol::HEADER_SIZE) —
+//!   68 bytes; an earlier version of this comment said 64, which has
+//!   been wrong since the header last grew), and wire-side collisions
+//!   are benign (they affect filter precision only, not ACL or storage
+//!   decisions, since those key on the canonical hash).
 
 use std::sync::Arc;
 
@@ -174,6 +177,36 @@ impl std::fmt::Display for ChannelName {
 #[inline]
 pub fn channel_hash(name: &str) -> ChannelHash {
     xxh3_64(name.as_bytes())
+}
+
+/// Canonical hash for the *worker grant* on `(channel, queue_group)`.
+///
+/// A queue group is a work-distribution set: every published event goes
+/// to exactly ONE member. Membership is therefore an authority
+/// question, not a routing preference — a peer that joins a group takes
+/// a share of another member's work, and (if it does not process it)
+/// destroys it. Gating that needs a grant naming the *specific* group,
+/// which is what this hash identifies.
+///
+/// Derived as `channel_hash("<channel>#<group>")`. The `#` separator is
+/// deliberate: it is NOT in the channel-name charset (`a-z 0-9 - _ . /`),
+/// so a group-grant hash can never collide with the hash of any
+/// legitimate channel name. A token minted to join a queue group
+/// therefore cannot be replayed as a token for a channel, and vice
+/// versa, without needing a separate scope bit or wire format.
+///
+/// Calls [`channel_hash`] rather than repeating its body. The disjointness
+/// argument above is a statement about the two hashes living in ONE space,
+/// so it only holds while they are computed the same way. Inlining the
+/// primitive would let a future seed, domain-separation prefix, or
+/// algorithm change land on channel names and silently not on group
+/// grants — at which point the derivation this doc promises would be
+/// false, and the collision-freedom that rests on it unproven.
+#[inline]
+pub fn queue_group_hash(channel: &str, group: &str) -> ChannelHash {
+    // One allocation on the subscribe slow path only; the data plane
+    // never calls this.
+    channel_hash(&format!("{channel}#{group}"))
 }
 
 /// Compute the wire `u16` channel hash from a name string.

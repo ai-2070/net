@@ -76,8 +76,9 @@ use super::behavior::sensing;
 use super::behavior::tag::Tag;
 use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
 use super::channel::{
-    AckReason, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelHash, ChannelId, ChannelName,
-    ChannelPublisher, OnFailure, PublishConfig, PublishReport, SubscriberRoster,
+    queue_group_hash, AckReason, AclPrincipal, AuthGuard, AuthVerdict, ChannelConfigRegistry,
+    ChannelHash, ChannelId, ChannelName, ChannelPublisher, OnFailure, PublishConfig, PublishReport,
+    QueueGroupPolicy, SubscriberRoster,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
@@ -492,7 +493,13 @@ use super::route::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
-use super::subnet::{DropReason, SubnetGateway, SubnetId, SubnetPolicy};
+use super::subnet::{
+    route_hop::AuthenticatedNextHop, DropReason, ProtectedRelayStats, SubnetAuthError,
+    SubnetAuthPresentation, SubnetAuthorityConfig, SubnetBoundarySet, SubnetChallengeStore,
+    SubnetContextStore, SubnetControlFact, SubnetControlOutcome, SubnetControlStore,
+    SubnetCredentialSet, SubnetFloorRegistry, SubnetGateway, SubnetId, SubnetPolicy,
+    SubnetRevocationFloor, VerifiedGatewayContextSet, VerifiedSubnetContext,
+};
 use super::subprotocol::stream_window::{
     StreamAckRanges, StreamNack, StreamReset, StreamWindow, MAX_ACK_RANGES, STREAM_WINDOW_SIZE,
     SUBPROTOCOL_STREAM_ACK, SUBPROTOCOL_STREAM_NACK, SUBPROTOCOL_STREAM_RESET,
@@ -904,10 +911,19 @@ struct PeerRegistrationGuard {
     /// the other peer-keyed maps (PERF_AUDIT §2.4).
     registered_session_id: u64,
     registered_next_hop: SocketAddr,
+    /// The route transition token the registration's own install
+    /// produced. The rollback removes that exact candidate rather than
+    /// whatever currently sits at `(peer_node_id, registered_next_hop)`
+    /// — a replacement registration through the same relay writes an
+    /// identical pair.
+    registered_route_token: u64,
     peers: Arc<DashMap<u64, PeerInfo>>,
     peer_addrs: Arc<DashMap<u64, SocketAddr>>,
     session_id_to_node: Arc<DashMap<u64, u64>>,
     router: Arc<NetRouter>,
+    /// The control-path transition handle, so the rollback is one
+    /// serialized peer transition like every other publisher/remover.
+    peer_transitions: PeerTransitions,
 }
 
 impl PeerRegistrationGuard {
@@ -925,44 +941,82 @@ impl PeerRegistrationGuard {
         let me = std::mem::ManuallyDrop::new(self);
         #[expect(
             clippy::multiple_unsafe_ops_per_block,
-            reason = "three ptr::read calls form a single semantic op (consume ManuallyDrop fields together so they drop normally)"
+            reason = "the ptr::read calls form a single semantic op (consume ManuallyDrop fields together so they drop normally)"
         )]
         // SAFETY: `me` is `ManuallyDrop`, so its fields won't be
         // dropped automatically. We read them out and let them
         // drop normally, which decrements the Arc strong counts
-        // — exactly what would happen on a non-guarded path.
+        // — exactly what would happen on a non-guarded path. EVERY
+        // Arc field must appear here; one left out leaks a strong
+        // reference on every committed registration.
         unsafe {
             let _peers = std::ptr::read(&me.peers);
             let _peer_addrs = std::ptr::read(&me.peer_addrs);
             let _session_id_to_node = std::ptr::read(&me.session_id_to_node);
             let _router = std::ptr::read(&me.router);
+            let _peer_transitions = std::ptr::read(&me.peer_transitions);
         }
     }
 }
 
 impl Drop for PeerRegistrationGuard {
     fn drop(&mut self) {
-        // Match the original inline rollback's semantics: only
-        // remove entries whose addr / next-hop still equals the
-        // value we wrote. A concurrent retry for the same peer
-        // may have already replaced them with a fresh, valid
-        // registration — we must not overwrite that.
-        self.peers.remove_if(&self.peer_node_id, |_, pi| {
-            pi.addr == self.registered_next_hop
+        // Roll back as ONE peer transition, so the removals cannot
+        // interleave with a concurrent install's publications.
+        let peer_node_id = self.peer_node_id;
+        let registered_session_id = self.registered_session_id;
+        let registered_next_hop = self.registered_next_hop;
+        let registered_route_token = self.registered_route_token;
+        let peers = &self.peers;
+        let peer_addrs = &self.peer_addrs;
+        let session_id_to_node = &self.session_id_to_node;
+        let router = &self.router;
+        self.peer_transitions.with(peer_node_id, || {
+            // Undo only OUR registration — and only while it is still
+            // ours.
+            //
+            // The peer entry is matched on the exact SESSION we
+            // registered, not on its address: a concurrent retry can
+            // legitimately install a different session at the same
+            // address (a re-handshake to the same relay). When that
+            // match FAILS, a replacement owns this peer, and every
+            // sidecar below now describes the replacement rather than
+            // us. Running the sidecar removals anyway was the defect:
+            // both were keyed on the shared address, so a stale
+            // rollback stripped a live session's address mapping and
+            // route while leaving the live session itself in place —
+            // reachable in `peers`, unreachable in fact.
+            //
+            // The rollback owns the whole transition or none of it.
+            if peers
+                .remove_if(&peer_node_id, |_, pi| {
+                    pi.session.session_id() == registered_session_id
+                })
+                .is_none()
+            {
+                return;
+            }
+            peer_addrs.remove_if(&peer_node_id, |_, addr| *addr == registered_next_hop);
+            // PERF_AUDIT §2.4: drop the reverse-index entry only when
+            // it still points at our registered node_id. A concurrent
+            // retry that installed a fresh session under the same
+            // peer_node_id would have replaced it; we must not undo
+            // that successful registration.
+            session_id_to_node.remove_if(&registered_session_id, |_, n| *n == peer_node_id);
+            // Remove exactly the candidate this registration installed,
+            // named by the TOKEN its install produced. A routed
+            // registration writes the ORDINARY slot, so the rollback
+            // must not scan both provenances — an earlier shape used
+            // the both-slot address helper and let a cancelled routed
+            // handshake erase a pre-existing PROTECTED candidate at the
+            // same address. Address alone is not enough either: a
+            // replacement registration through the same relay writes an
+            // identical `(dest, next_hop)` pair, which an address-keyed
+            // removal cannot tell from ours.
+            router
+                .routing_table()
+                .remove_ordinary_route_if_token_is(peer_node_id, registered_route_token);
         });
-        self.peer_addrs.remove_if(&self.peer_node_id, |_, addr| {
-            *addr == self.registered_next_hop
-        });
-        // PERF_AUDIT §2.4: drop the reverse-index entry only when
-        // it still points at our registered node_id. A concurrent
-        // retry that installed a fresh session under the same
-        // peer_node_id would have replaced it; we must not undo
-        // that successful registration.
-        self.session_id_to_node
-            .remove_if(&self.registered_session_id, |_, n| *n == self.peer_node_id);
-        self.router
-            .routing_table()
-            .remove_route_if_next_hop_is(self.peer_node_id, self.registered_next_hop);
     }
 }
 
@@ -1072,13 +1126,35 @@ fn routed_rotation_outcome(
 /// check.
 struct RetainedChain {
     chain: TokenChain,
+    /// The `ChannelHash` this chain was ADMITTED on — the question the
+    /// subscribe gate actually asked of it, which the publish-time
+    /// re-check and the sweep must keep asking.
+    ///
+    /// Usually the requested channel's own hash. It is NOT that for a
+    /// [`QueueGroupPolicy::TokenBound`] worker: under that policy the
+    /// group grant *is* the subscribe authority, and it authorizes
+    /// [`queue_group_hash(channel, group)`](queue_group_hash) — a
+    /// deliberately different hash, so a reader's channel token cannot
+    /// double as a worker grant.
+    ///
+    /// Recording it is what keeps the two re-check paths honest.
+    /// `TokenBound` requires `token_roots`, which makes
+    /// `token_required()` true, which makes the publish path re-verify
+    /// every admitted subscriber's chain on every packet. Re-verifying
+    /// against the CHANNEL hash asked a question the worker's grant was
+    /// never meant to answer, so it failed, and the worker was revoked
+    /// and de-rostered before its first delivery — accepted with a
+    /// successful Ack and then silently starved. Same shape as the
+    /// prefix-channel defect (M1), one hash further along.
+    grant_hash: ChannelHash,
     signatures_verified: AtomicBool,
 }
 
 impl RetainedChain {
-    fn new(chain: TokenChain) -> Self {
+    fn new(chain: TokenChain, grant_hash: ChannelHash) -> Self {
         Self {
             chain,
+            grant_hash,
             signatures_verified: AtomicBool::new(false),
         }
     }
@@ -1141,6 +1217,10 @@ struct DispatchCtx {
     /// sync with `peers` on every registration so the reroute policy can
     /// resolve failed peers.
     peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    /// Control-path peer-transition handle, so dispatch-side peer
+    /// registration and its rollback serialize against every other
+    /// publisher (see [`PeerTransitions::with`]).
+    peer_transitions: PeerTransitions,
     router: Arc<NetRouter>,
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
@@ -1469,6 +1549,11 @@ struct DispatchCtx {
     traversal_config: super::traversal::TraversalConfig,
     /// Max distinct channels a single peer may subscribe to.
     max_channels_per_peer: usize,
+    /// What to do with a `Subscribe` when `channel_configs` is `None`.
+    unregistered_channels: UnregisteredChannelPolicy,
+    /// Latches once the registry-less warning has been emitted, so a
+    /// subscribe storm doesn't turn an operator hint into a log flood.
+    unregistered_warned: Arc<AtomicBool>,
     /// Capability fold shared with `MeshNode`. Inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets land here via the
     /// bridge's `translate_announcement`.
@@ -1521,6 +1606,33 @@ struct DispatchCtx {
     /// Per-peer subnet map, written by the capability-announcement
     /// dispatch and read by the subscribe gate + publish fan-out.
     peer_subnets: Arc<DashMap<u64, SubnetId>>,
+    /// Compiled per-session peer subnet contexts (S3), read by the
+    /// protected relay gate to resolve hop attachments.
+    subnet_contexts: Arc<SubnetContextStore>,
+    /// This node's gateway export authority — credentials AND
+    /// boundaries — as ONE published aggregate. See
+    /// [`SubnetGatewayAuthorityState`] for why the two must not
+    /// publish independently.
+    subnet_gateway_authority: Arc<arc_swap::ArcSwap<SubnetGatewayAuthorityState>>,
+    /// Typed protected-relay telemetry: envelopes forwarded, and
+    /// authority denials split by exact [`ForwardDenial`] reason.
+    ///
+    /// [`ForwardDenial`]: super::subnet::ForwardDenial
+    protected_relay_stats: Arc<ProtectedRelayStats>,
+    /// Floor state, for the auth epoch a compiled context is pinned to.
+    subnet_floors: Arc<SubnetFloorRegistry>,
+    /// S5 control-fact store, shared with the node handle so the
+    /// channel arrival path and local provisioning apply into one
+    /// state.
+    subnet_control: Arc<SubnetControlStore>,
+    /// Anchored subnet authorities, for verifying channel-borne
+    /// control facts at dispatch.
+    subnet_authorities: Arc<Vec<SubnetAuthorityConfig>>,
+    /// Precomputed publish stream id of the control-facts channel;
+    /// `None` disables the channel arrival path.
+    subnet_control_stream_id: Option<u64>,
+    /// Topology epoch the relay evaluates against.
+    subnet_topology_epoch: Arc<std::sync::atomic::AtomicU32>,
     /// See the matching field doc on `MeshNode`. Cloned in at
     /// dispatch-start time; the inline `subnet_visible` call site
     /// in `authorize_subscribe` records forward/drop decisions
@@ -1547,10 +1659,18 @@ struct DispatchCtx {
     /// task, so an O(peers) scan per routed data packet serialized
     /// ingress on relay-heavy topologies (PERF_AUDIT §2.4).
     session_id_to_node: Arc<DashMap<u64, u64>>,
-    /// Shared token cache, populated by subscriber-presented tokens
-    /// plus caller-side pre-installs. `None` disables the
-    /// `require_token` path — unset is equivalent to "no token is
-    /// ever valid."
+    /// Shared token cache, populated by caller-side pre-installs (the
+    /// local node's own credentials, e.g. the publish token
+    /// `publish_many` looks up via `get_for_action`).
+    ///
+    /// It is NOT populated by subscriber-presented tokens: since the
+    /// `TokenChain` migration a peer's credential is verified inline
+    /// against the channel's roots and retained in `subscriber_chains`,
+    /// never inserted here. On the subscribe path this cache supplies
+    /// only the `RevocationRegistry` and the clock-skew tolerance.
+    ///
+    /// `None` disables the `require_token` path — unset is equivalent
+    /// to "no token is ever valid" (enforced at subscribe since M4).
     token_cache: Option<Arc<TokenCache>>,
     /// Verified subscribe token chains, keyed by `(node_id,
     /// channel_hash)`. `authorize_subscribe` stores the chain a peer
@@ -1573,6 +1693,58 @@ struct DispatchCtx {
     auth_failure_window: Duration,
     /// How long a peer stays throttled after tripping the threshold.
     auth_throttle_duration: Duration,
+}
+
+/// Capacity of the per-worker protected-forwarding buffer.
+///
+/// A re-sealed hop is exactly as long as the one that arrived: the
+/// envelope overhead is a constant and the inner packet is copied
+/// through byte for byte, so output length equals input length. An
+/// inbound datagram is bounded by [`protocol::MAX_PACKET_SIZE`] —
+/// that is what the receive path reserves — which makes this the exact
+/// ceiling rather than an estimate. It was previously
+/// `sealed_len(MAX_PACKET_SIZE)`, which double-counted the overhead an
+/// arriving envelope already carries.
+///
+/// Sizing for the maximum up front is what makes the buffer genuinely
+/// allocation-free: a `Vec` that grew on demand still called the
+/// allocator on its first packet and again at every new high-water
+/// mark, both inside the forwarding path.
+const PROTECTED_FORWARD_BUF_SIZE: usize = protocol::MAX_PACKET_SIZE;
+
+// The identity above, checked rather than trusted. The largest inner
+// packet a maximum-sized envelope can carry must re-seal back into
+// exactly this buffer — if the envelope overhead ever changes shape,
+// this fails at compile time instead of silently dropping full-sized
+// hops at runtime.
+const _: () = assert!(
+    super::subnet::route_hop::sealed_len(
+        protocol::MAX_PACKET_SIZE
+            - super::subnet::route_hop::ROUTE_HOP_OVERHEAD
+            - ROUTING_HEADER_SIZE,
+    ) == PROTECTED_FORWARD_BUF_SIZE,
+    "the protected forwarding buffer must hold exactly one maximum-sized re-sealed hop",
+);
+
+thread_local! {
+    /// Reusable serialization buffer for protected forwarding
+    /// (SUBNET_AUTH_PLAN.md D6).
+    ///
+    /// Relaying is the one operation in this file that runs per packet
+    /// per hop, and the route-hop envelope's size is known before any
+    /// work happens, so there is nothing an owned `Vec` per packet buys
+    /// beyond an allocator round trip and a cold destination line.
+    ///
+    /// A fixed array, not a growable `Vec`: `const`-initialized storage
+    /// with no heap behind it cannot allocate on any packet, first or
+    /// otherwise. It costs one fixed allotment per worker thread.
+    ///
+    /// Thread-local rather than a shared pool: the buffer is borrowed
+    /// for one `seal_into` plus one non-blocking `try_send_to` and
+    /// never across an await, so there is no contention to manage and
+    /// no lock to hold.
+    static FORWARD_BUF: std::cell::RefCell<[u8; PROTECTED_FORWARD_BUF_SIZE]> =
+        const { std::cell::RefCell::new([0u8; PROTECTED_FORWARD_BUF_SIZE]) };
 }
 
 /// Result passed through the pending-ack oneshot.
@@ -1710,6 +1882,35 @@ pub struct MeshNodeConfig {
     /// practice means `Visibility::SubnetLocal` channels ship only
     /// when both sides are `GLOBAL`.
     pub subnet_policy: Option<Arc<SubnetPolicy>>,
+    /// Trust anchors for protected subnet authorities
+    /// (SUBNET_AUTH_PLAN.md S2). Each entry names an authority, the
+    /// roots whose signatures anchor its `SubnetGrant` /
+    /// `SubnetIssuerGrant` / `SubnetRevocationFloor` artifacts, and
+    /// the authority-local grant-lifetime ceiling. Empty (the
+    /// default) means no protected subnet assertions verify —
+    /// fail-closed for authority claims, no effect on plain
+    /// topology/visibility operation.
+    pub subnet_authorities: Vec<SubnetAuthorityConfig>,
+    /// This node's own attachment point inside its authority's
+    /// hierarchy, for protected forwarding (SUBNET_AUTH_PLAN.md D6).
+    /// Defaults to [Self::subnet] — the topology coordinate and the
+    /// security attachment are usually the same point, but they are
+    /// separate settings because the former is unauthenticated
+    /// routing state and the latter is checked against a credential
+    /// scope.
+    pub subnet_attachment: Option<SubnetId>,
+    /// Channel whose events this node additionally treats as subnet
+    /// control facts (SUBNET_AUTH_PLAN.md S5/D8). `None` disables
+    /// channel-borne facts; local provisioning
+    /// ([`MeshNode::apply_subnet_control_fact`]) works either way.
+    ///
+    /// This is an ORDINARY configured channel — no reserved
+    /// namespace — and it confers no authority: every fact is
+    /// verified against the configured subnet authority roots
+    /// exactly as if it had been provisioned locally, whoever
+    /// published it. A channel token may gate readership when facts
+    /// are confidential; it never gates fact validity.
+    pub subnet_control_channel: Option<ChannelName>,
     /// Visibility applied on publish when a channel has **no**
     /// registered config in the local
     /// [`ChannelConfigRegistry`]. Defaults to
@@ -1727,6 +1928,9 @@ pub struct MeshNodeConfig {
     /// a channel with an explicit registry entry always uses
     /// its configured visibility.
     pub default_visibility: Visibility,
+    /// What to do with a `Subscribe` when no [`ChannelConfigRegistry`]
+    /// is installed at all. See [`UnregisteredChannelPolicy`].
+    pub unregistered_channels: UnregisteredChannelPolicy,
     /// Minimum time between successive
     /// [`MeshNode::announce_capabilities`] broadcasts from this
     /// origin. Calls within the window coalesce: the local index
@@ -2046,7 +2250,11 @@ impl MeshNodeConfig {
             enable_stream_ack_ranges: true,
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
+            subnet_authorities: Vec::new(),
+            subnet_attachment: None,
+            subnet_control_channel: None,
             default_visibility: Visibility::Global,
+            unregistered_channels: UnregisteredChannelPolicy::default(),
             min_announce_interval: Duration::from_secs(10),
             configured_identity: false,
             announce_debounce: Duration::from_millis(100),
@@ -2329,17 +2537,60 @@ impl MeshNodeConfig {
     }
 
     /// Pin this node to a specific subnet.
+    ///
+    /// This is the builder method for the local subnet; the
+    /// [`subnet`](Self::subnet) field is public and can be assigned
+    /// directly. What does NOT set it is
+    /// [`Self::with_subnet_policy`] — that policy applies to peers. A
+    /// subnet-scoped deployment wants both.
     pub fn with_subnet(mut self, subnet: SubnetId) -> Self {
         self.subnet = subnet;
         self
     }
 
-    /// Derive each peer's subnet locally by applying this policy to
+    /// Derive each PEER's subnet locally by applying this policy to
     /// their inbound [`CapabilityAnnouncement`]s. Mesh-wide policy
     /// consistency is assumed; mismatched policies lead to
     /// asymmetric views of peer subnets.
+    ///
+    /// Does not assign this node's own subnet — use
+    /// [`Self::with_subnet`] for that, and prefer setting both.
+    ///
+    /// A policy that CAN assign a non-global subnet
+    /// ([`SubnetPolicy::can_assign_non_global`]) while the local subnet
+    /// is left at [`SubnetId::GLOBAL`] resolves peers but has no subnet
+    /// identity to compare them against, which leaves
+    /// `Visibility::ParentVisible` admitting the peers it could NOT
+    /// resolve while rejecting the ones it could
+    /// (CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md,
+    /// finding 2). `MeshNode::new` warns on exactly that pairing.
+    ///
+    /// A rule-less or all-zero policy is exempt: it assigns `GLOBAL` to
+    /// everyone, so every peer lands in the same subnet as a `GLOBAL`
+    /// local node and nothing is inconsistent. Installing one does not
+    /// oblige you to add a local subnet.
     pub fn with_subnet_policy(mut self, policy: Arc<SubnetPolicy>) -> Self {
         self.subnet_policy = Some(policy);
+        self
+    }
+
+    /// Anchor a protected subnet authority (SUBNET_AUTH_PLAN.md S2):
+    /// grants, issuer grants, and revocation floors naming
+    /// `config.authority` verify only against `config.roots`.
+    /// Repeatable — one entry per authority this node trusts. A
+    /// root configured for one authority can never verify another
+    /// authority's credentials, and an authority with an empty root
+    /// set fails closed.
+    pub fn with_subnet_authority(mut self, config: SubnetAuthorityConfig) -> Self {
+        self.subnet_authorities.push(config);
+        self
+    }
+
+    /// Treat events arriving on `channel` as subnet control facts
+    /// (S5). The channel grants no authority — see
+    /// [`Self::subnet_control_channel`].
+    pub fn with_subnet_control_channel(mut self, channel: ChannelName) -> Self {
+        self.subnet_control_channel = Some(channel);
         self
     }
 
@@ -2358,15 +2609,125 @@ impl MeshNodeConfig {
         self.default_visibility = visibility;
         self
     }
+
+    /// Decide what a registry-less node does with an inbound
+    /// `Subscribe` — see [`UnregisteredChannelPolicy`].
+    ///
+    /// Setting this at all is the point: it turns "this mesh has no
+    /// ACL" from an accident of construction into a recorded decision.
+    /// Use [`UnregisteredChannelPolicy::Deny`] to fail closed, or
+    /// [`UnregisteredChannelPolicy::Allow`] to silence the warning on a
+    /// mesh that is open on purpose.
+    pub fn with_unregistered_channel_policy(mut self, policy: UnregisteredChannelPolicy) -> Self {
+        self.unregistered_channels = policy;
+        self
+    }
+}
+
+/// One coherently-published view of this node's gateway export
+/// authority: the compiled credential set (S4A) and the declared
+/// protected boundaries (S4B), TOGETHER.
+///
+/// The two members used to publish through independent
+/// `ArcSwapOption`s, and every consumer that read both — the
+/// protected relay, the D7 subnet-export gate and its §9.5 stability
+/// stamp — could observe a TORN view: one load from before a
+/// wholesale replacement and one from after, with both pointers
+/// individually "current". A credential replacement landing between
+/// a stability check's two loads could then revalidate an admission
+/// against authority that no longer existed. Publishing one
+/// immutable aggregate makes a single load a coherent snapshot, and
+/// the aggregate pointer a sufficient identity for the stamp.
+///
+/// The two publication APIs each replace ONLY their own member,
+/// through a compare-and-retry update
+/// ([`arc_swap::ArcSwapAny::rcu`]), so concurrent credential and
+/// boundary publications cannot overwrite each other's member the
+/// way a naive load-modify-store would.
+#[derive(Debug)]
+pub(crate) struct SubnetGatewayAuthorityState {
+    /// This node's own compiled forwarding authority (S4A), or
+    /// `None` when it holds none and forwards nothing protected.
+    pub(crate) gateway: Option<Arc<VerifiedGatewayContextSet>>,
+    /// The declared protected boundaries (S4B), or `None` — which
+    /// denies every protected transition and every subnet export.
+    pub(crate) boundaries: Option<Arc<SubnetBoundarySet>>,
+}
+
+/// How this node reaches a peer, and what the recorded address proves.
+///
+/// Two different questions were previously answered by one address:
+/// *where do datagrams for this peer go*, and *which peer OWNS this
+/// address*. They are not the same question. The second one is a
+/// security predicate — direct-adjacency resolution, withdrawal
+/// ownership, and protected-candidate promotion all decide on it — and
+/// a relay's address cannot answer it, because the address belongs to
+/// the relay while the session authenticates the endpoint beyond it.
+///
+/// Publishing a routed peer into `addr_to_node` made all three
+/// predicates unsound; not publishing it (and leaving the send path to
+/// re-derive the peer from the address) made every routed peer
+/// unreachable. Neither is a property of the reverse index — it is that
+/// a single-valued address→owner map cannot carry both facts. So the
+/// transport is recorded per peer, as typed state, and read from the
+/// same snapshot as the session it describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerTransport {
+    /// Direct handshake. The peer answered at `owned_addr` itself, so
+    /// the address is simultaneously where we send and what the peer
+    /// owns — this is an authenticated adjacency.
+    Direct { owned_addr: SocketAddr },
+    /// Routed handshake. `relay_addr` is where datagrams go; the
+    /// session authenticates the far endpoint, NOT the relay carrying
+    /// it. `adjacent_relay_identity` names the relay when a direct
+    /// session with the owner of that address existed at install time,
+    /// and is `None` when nothing is known to own it — an unknown
+    /// owner is never inferred to be the endpoint.
+    Routed {
+        relay_addr: SocketAddr,
+        adjacent_relay_identity: Option<u64>,
+    },
+}
+
+impl PeerTransport {
+    /// Where datagrams for this peer are sent. Always defined — every
+    /// installed session has a wire destination.
+    #[inline]
+    fn send_addr(&self) -> SocketAddr {
+        match self {
+            Self::Direct { owned_addr } => *owned_addr,
+            Self::Routed { relay_addr, .. } => *relay_addr,
+        }
+    }
+
+    /// The address this peer OWNS, or `None` when the recorded address
+    /// belongs to a relay. This is the only form that may be published
+    /// into `addr_to_node` or used to decide adjacency.
+    #[inline]
+    fn owned_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Direct { owned_addr } => Some(*owned_addr),
+            Self::Routed { .. } => None,
+        }
+    }
+
+    /// Whether this session is an authenticated adjacency.
+    #[inline]
+    fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct { .. })
+    }
 }
 
 /// Peer connection info.
 struct PeerInfo {
     /// Node ID (derived from keypair or assigned)
     node_id: u64,
-    /// Address used for direct sends. For peers reached via a relay, this
-    /// is the relay's address — packets to the destination go there first.
-    addr: SocketAddr,
+    /// What the recorded address is and what it proves. Replaces the
+    /// bare `addr` field: a send address and an owned address are
+    /// different claims, and collapsing them left callers unable to
+    /// tell which one they held. Read [`PeerInfo::addr`] to send and
+    /// [`PeerInfo::owned_addr`] to decide adjacency.
+    transport: PeerTransport,
     /// Encrypted session
     session: Arc<NetSession>,
     /// The peer's Noise static public key (X25519, 32 bytes). Captured
@@ -2386,6 +2747,28 @@ struct PeerInfo {
     /// gate only fires on the responder side) or from a test path
     /// without a real handshake.
     last_initiator_ephemeral: Option<[u8; 32]>,
+}
+
+impl PeerInfo {
+    /// Where datagrams for this peer are sent.
+    #[inline]
+    fn addr(&self) -> SocketAddr {
+        self.transport.send_addr()
+    }
+
+    /// The address this peer owns as its own direct attachment, or
+    /// `None` for a peer reached through a relay.
+    #[inline]
+    fn owned_addr(&self) -> Option<SocketAddr> {
+        self.transport.owned_addr()
+    }
+
+    /// Whether this peer is adjacent — i.e. the session terminates at
+    /// the address we send to.
+    #[inline]
+    fn is_direct(&self) -> bool {
+        self.transport.is_direct()
+    }
 }
 
 /// In-flight initiator handshake. The dispatch loop consumes this when a
@@ -2411,19 +2794,29 @@ fn routing_id(node_id: u64) -> u64 {
     (node_id as u32) as u64
 }
 
-/// 64-bit origin-hash projection used as the `AuthGuard` key.
+/// The `AuthGuard` principal for a subscriber: its **node id**, tagged
+/// as [`AclPrincipal::Node`].
 ///
-/// A prior version truncated to `u32` so the key matched the
-/// routing-plane's 32-bit `src_id`, but truncating to 32 bits
-/// birthday-collides at ~65 k peers — inside the practical reach of
-/// a medium mesh — and lets one subscriber's grant admit a different
+/// Named `subscriber_origin_hash` until I1, and documented as a
+/// "64-bit origin-hash projection" — both wrong in the same way. It
+/// never produced an `EntityId::origin_hash`; it returned the node id
+/// unchanged. That mattered because the storage and blob readers of
+/// this same ACL authorize an actual origin hash, a different blake2s
+/// derivation, and the shared vocabulary is what made
+/// "subscribed to a channel" look interchangeable with "may mutate that
+/// channel's blobs". The derivation now rides in the key, so the two
+/// cannot alias even on an identical scalar.
+///
+/// The full 64 bits are used deliberately. A prior version truncated to
+/// `u32` so the key matched the routing plane's `src_id`, but that
+/// birthday-collides at ~65 k peers — inside the practical reach of a
+/// medium mesh — and would let one subscriber's grant admit a different
 /// subscriber's packets. The fan-out fast path keys on the full
-/// 64-bit `node_id` (the value it already has in hand), which pushes
-/// the collision floor out of reach. The `src_id` field on wire
-/// packets is not consulted for authorization.
+/// `node_id` it already holds; the wire `src_id` field is not consulted
+/// for authorization at all.
 #[inline]
-fn subscriber_origin_hash(node_id: u64) -> u64 {
-    node_id
+fn subscriber_principal(node_id: u64) -> AclPrincipal {
+    AclPrincipal::Node(node_id)
 }
 
 /// Soft cap on the number of distinct services kept in
@@ -2694,6 +3087,325 @@ fn keepalive_send_offsets(fire_at_ms: u64, now_ms: u64, deadline: Duration) -> [
     ]
 }
 
+/// What a node does with a `Subscribe` for a channel when it has no
+/// [`ChannelConfigRegistry`] installed at all.
+///
+/// Without a registry there is no ACL to consult, so every subscribe
+/// from any session peer is admitted and every channel publishes as
+/// open. That is a reasonable posture for a single-tenant or test mesh
+/// and a bad surprise otherwise — and pre-fix the two were
+/// indistinguishable, because permissiveness was a *consequence of an
+/// unset field* rather than a decision anyone recorded.
+///
+/// Every shipped construction path (Rust SDK, C FFI, Node, Python)
+/// installs a registry, so this only governs embedders driving
+/// `MeshNode` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnregisteredChannelPolicy {
+    /// Admit, and warn once that the mesh is running without an ACL.
+    ///
+    /// The default: it preserves historical behaviour exactly, while
+    /// making "I forgot to install a registry" observable instead of
+    /// silent. Distinguishing that from a deliberate open mesh is the
+    /// whole point of this knob.
+    #[default]
+    AllowWithWarning,
+    /// Admit silently — an intentionally open mesh.
+    Allow,
+    /// Reject with `Unauthorized`. Fail closed: a registry-less node
+    /// accepts no subscriptions at all.
+    Deny,
+}
+
+/// Why a membership request (Subscribe / Unsubscribe) did not succeed.
+///
+/// Exists so `ensure_reply_subscription` can tell "the publisher
+/// answered and refused for a reason that a corrective re-announce
+/// might fix" from "the peer is gone / timed out / refused for a reason
+/// re-announcing cannot help". The corrective re-announce deliberately
+/// bypasses the announce rate limit, so firing it on every failure
+/// would let one unreachable or throttling target turn each RPC attempt
+/// into two rate-limit-bypassing capability broadcasts.
+#[derive(Debug)]
+pub(super) enum MembershipFailure {
+    /// The publisher replied with `accepted = false`. The reason is the
+    /// publisher's own, and `None` means it sent no reason code.
+    Rejected(Option<AckReason>),
+    /// No usable answer: no session, send failure, dropped waiter, or
+    /// ack timeout.
+    Transport(AdapterError),
+}
+
+impl MembershipFailure {
+    /// Collapse back into the historical `AdapterError`, preserving the
+    /// exact message text callers already see.
+    pub(super) fn into_adapter_error(self) -> AdapterError {
+        match self {
+            Self::Transport(e) => e,
+            Self::Rejected(reason) => {
+                AdapterError::Connection(format!("membership request rejected: {:?}", reason))
+            }
+        }
+    }
+
+    /// Is a corrective capability re-announce plausibly the fix?
+    ///
+    /// Only for `Unauthorized`, which is what the H3 origin binding
+    /// returns when the publisher has not pinned our `EntityId` yet.
+    /// Explicitly NOT `RateLimited` (the peer is already asking us to
+    /// slow down — re-announcing adds load and cannot help),
+    /// `UnknownChannel`, `TooManyChannels`, or any transport failure.
+    pub(super) fn warrants_reannounce(&self) -> bool {
+        matches!(self, Self::Rejected(Some(AckReason::Unauthorized)))
+    }
+}
+
+/// Drop every piece of per-peer channel state a failed peer leaves
+/// behind, in one place so it can be tested without failing a real
+/// session.
+///
+/// Both maps are keyed by node id in their first tuple position and
+/// both are invisible to the sweeps that would otherwise reclaim them:
+///
+/// - `subscriber_chains` — retained subscribe credentials. The expiry
+///   sweep iterates `peer_entity_ids`, which the failure path clears
+///   just before this, and a failed peer never sends the unsubscribe
+///   that would remove them. Left behind they leak for the node's
+///   lifetime, and a reused `node_id` could re-validate a stale chain.
+/// - `rpc_reply_subscriptions` — the CALLER-side record of "we already
+///   subscribed to our reply channel on this target", which
+///   short-circuits `ensure_reply_subscription` entirely. The target
+///   meanwhile evicts our roster entry on failure
+///   (`roster.remove_peer`, the mirror image on the publisher side), so
+///   leaving this populated means every later call to a recovered peer
+///   skips both the re-subscribe AND the corrective re-announce retry —
+///   and its replies are dropped by a publisher that no longer has us
+///   rostered, silently, because the caller believes it is subscribed.
+/// - `rpc_corrective_announced` — the once-per-target latch that bounds
+///   corrective re-announces. Clearing it on failure is what makes a
+///   genuine reconnect able to re-announce again, while a peer that
+///   merely keeps rejecting us stays latched.
+///
+/// Eviction alone is not sufficient for `rpc_reply_subscriptions`,
+/// because a `ensure_reply_subscription` already past its subscribe
+/// `await` will insert AFTER this runs and restore precisely the stale
+/// "we are subscribed" state we just cleared. So this also bumps
+/// `rpc_peer_failure_gen`, the fence that lets such an insert detect it
+/// spanned a failure and roll itself back.
+///
+/// **The bump must come FIRST, before the retain.** Two things can
+/// remove a resurrected entry — this retain, or the subscribe's own
+/// rollback — and one of them has to be guaranteed to fire. With the
+/// bump last there is a window where neither does: the retain completes
+/// (finding nothing), and the subscribe then inserts AND re-reads a
+/// generation the bump has not reached yet, sees no change, and keeps
+/// the entry. Bumping first collapses that window. If the retain runs
+/// before the insert then the bump did too, so the subscribe's
+/// post-insert read observes it and rolls back; if the retain runs after
+/// the insert it removes the entry itself.
+///
+/// The two orders are NOT symmetric, which is what the first version of
+/// this comment got backwards.
+fn evict_failed_peer_channel_state(
+    node_id: u64,
+    subscriber_chains: &DashMap<(u64, ChannelHash), RetainedChain>,
+    #[cfg(feature = "cortex")] rpc_reply_subscriptions: &dashmap::DashMap<
+        (u64, u64),
+        ReplySubscription,
+    >,
+    #[cfg(feature = "cortex")] rpc_corrective_announced: &dashmap::DashSet<u64>,
+    #[cfg(feature = "cortex")] rpc_peer_failure_gen: &PeerFailureGenerations,
+) {
+    #[cfg(feature = "cortex")]
+    rpc_peer_failure_gen.bump(node_id);
+    subscriber_chains.retain(|(nid, _), _| *nid != node_id);
+    #[cfg(feature = "cortex")]
+    rpc_reply_subscriptions.retain(|(target, _), _| *target != node_id);
+    #[cfg(feature = "cortex")]
+    rpc_corrective_announced.remove(&node_id);
+}
+
+/// One caller-side reply subscription, plus the peer-failure generation
+/// it was written under.
+///
+/// The generation is not part of the cache decision — `reply_subscription_covers`
+/// ignores it. It exists so the R6 fence can roll back exactly the entry
+/// its own call wrote. Rolling back by key alone let a fenced OLDER call
+/// delete an entry a newer post-recovery call had just established, after
+/// which the newer caller believed it was cached and re-subscribed
+/// needlessly on its next RPC.
+#[cfg(feature = "cortex")]
+#[derive(Debug, Clone)]
+pub(super) struct ReplySubscription {
+    /// Full service name. xxh3 is not collision-free and the key holds
+    /// only the hash, so the hot path verifies this.
+    pub(super) service: Arc<str>,
+    /// `peer_failure_generation(target)` as read immediately before the
+    /// subscribe attempt that produced this entry.
+    pub(super) written_at_generation: u64,
+}
+
+/// Node-wide rate cap on corrective capability announces.
+///
+/// The per-target latch answers "has THIS peer already had its one
+/// corrective announce". It says nothing about the aggregate, and the
+/// aggregate is what hurts: a corrective announce bypasses the routine
+/// rate limit deliberately (that is the whole point — the routine path
+/// coalesces inside `min_announce_interval` and would return Ok without
+/// sending), and it goes to every connected peer. So each distinct
+/// rejecting target bought one mesh-wide broadcast, and a population of
+/// peers refusing our reply subscribe for any ordinary ACL reason could
+/// keep that running indefinitely.
+///
+/// A plain window counter rather than a token bucket: this is a safety
+/// valve on a path that should fire a handful of times after a
+/// reconnect, not a shaper for sustained traffic. Refundable, because
+/// claims are taken before the send and a send that failed broadcast
+/// nothing.
+#[cfg(feature = "cortex")]
+#[derive(Debug)]
+pub(super) struct CorrectiveAnnounceBudget {
+    /// `(window start, announces charged in this window)`.
+    state: parking_lot::Mutex<(Instant, u32)>,
+}
+
+#[cfg(feature = "cortex")]
+impl CorrectiveAnnounceBudget {
+    /// Corrective announces allowed per [`Self::WINDOW`], node-wide.
+    ///
+    /// Sized for the case this exists to serve — a node reconnecting
+    /// and re-pinning with a handful of RPC targets — while keeping the
+    /// pathological case bounded. A target refused by the budget is not
+    /// denied permanently: it keeps its claim and retries on a later
+    /// call.
+    const MAX_PER_WINDOW: u32 = 8;
+    const WINDOW: Duration = Duration::from_secs(10);
+
+    fn new(now: Instant) -> Self {
+        Self {
+            state: parking_lot::Mutex::new((now, 0)),
+        }
+    }
+
+    /// Charge one announce, or refuse if this window is exhausted.
+    fn try_spend(&self, now: Instant) -> bool {
+        let mut st = self.state.lock();
+        if now.duration_since(st.0) >= Self::WINDOW {
+            *st = (now, 0);
+        }
+        if st.1 >= Self::MAX_PER_WINDOW {
+            return false;
+        }
+        st.1 += 1;
+        true
+    }
+
+    /// Un-charge an announce that was never broadcast.
+    ///
+    /// Saturating: if the window rolled over between the spend and the
+    /// refund there is nothing to give back, and going negative would
+    /// hand out free capacity in the NEXT window.
+    fn refund(&self) {
+        let mut st = self.state.lock();
+        st.1 = st.1.saturating_sub(1);
+    }
+}
+
+/// Per-peer failure counters, and the reclamation floor that lets them
+/// be forgotten without breaking the fence they serve.
+///
+/// A subscribe reads a peer's generation before its `await` and again
+/// after recording itself; any change means the peer failed in between
+/// and the record must be rolled back. See
+/// [`MeshNode::peer_failure_generation`] for what goes wrong otherwise.
+///
+/// The reason this is a type rather than a bare `DashMap`: the naive
+/// version grows one entry per peer that has ever failed, forever, and
+/// the obvious fix breaks it. Simply removing an entry makes that peer
+/// read back as "generation 0" — the same value a peer that never
+/// failed reads — so a subscribe that snapshotted 0, spanned a failure,
+/// and had the counter reclaimed underneath it would compare 0 to 0 and
+/// keep exactly the stale entry the fence exists to remove. Absence has
+/// to mean something a reclamation cannot reproduce.
+///
+/// So absence resolves to a monotonic FLOOR instead of to zero. Both the
+/// per-peer counters and the floor are drawn from one counter, and
+/// reclamation raises the floor above every value it discards before
+/// discarding it. A reclaimed peer therefore reads back HIGHER than any
+/// snapshot taken before the reclamation, never equal to one — the
+/// comparison still detects the failure it was watching for. Reclaiming
+/// with no failure involved is likewise safe: it also raises the floor,
+/// so in-flight subscribes roll back and re-subscribe, which is
+/// idempotent.
+///
+/// Generations are only ever compared WITHIN one `ensure_reply_subscription`
+/// call — nothing durable stores one — so reclamation costs at most a
+/// retry for calls in flight at that moment, and clearing wholesale is
+/// as safe as clearing selectively.
+#[cfg(feature = "cortex")]
+#[derive(Debug)]
+pub(super) struct PeerFailureGenerations {
+    /// Peers with at least one recorded failure since the last
+    /// reclamation. Absent peers resolve to `floor`.
+    per_peer: dashmap::DashMap<u64, u64>,
+    /// Source of every generation value, per-peer and floor alike, so
+    /// the floor is always above the counters it replaces.
+    next: std::sync::atomic::AtomicU64,
+    /// What an absent peer reads as.
+    floor: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "cortex")]
+impl PeerFailureGenerations {
+    /// Beyond this many tracked peers, the whole table is reclaimed.
+    /// Sized so a normal mesh never reaches it — this is a backstop
+    /// against unbounded churn over a long-lived process, not a working
+    /// limit.
+    const MAX_TRACKED: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            per_peer: dashmap::DashMap::new(),
+            next: std::sync::atomic::AtomicU64::new(1),
+            floor: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn take_next(&self) -> u64 {
+        self.next.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Current generation for `peer`. Never `Option` — absence is a
+    /// value (the floor), which is the whole point.
+    pub(super) fn get(&self, peer: u64) -> u64 {
+        self.per_peer
+            .get(&peer)
+            .map(|e| *e.value())
+            .unwrap_or_else(|| self.floor.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Record a failure for `peer`, reclaiming the table first if it has
+    /// grown past [`Self::MAX_TRACKED`].
+    fn bump(&self, peer: u64) {
+        if self.per_peer.len() >= Self::MAX_TRACKED {
+            self.reclaim();
+        }
+        self.per_peer.insert(peer, self.take_next());
+    }
+
+    /// Forget every counter, raising the floor above all of them first.
+    ///
+    /// Order is load-bearing: the floor must be published BEFORE the
+    /// entries disappear. Removing first would leave a window in which
+    /// a reader sees absence resolving to the OLD floor, which is
+    /// exactly the reproducible value that makes reclamation unsafe.
+    fn reclaim(&self) {
+        self.floor
+            .store(self.take_next(), std::sync::atomic::Ordering::Release);
+        self.per_peer.clear();
+    }
+}
+
 /// Rolling-window auth-failure tracker, one entry per peer.
 /// Lives behind a per-key `Mutex` so updates from concurrent
 /// subscribes don't race each other on the same peer's counter.
@@ -2764,11 +3476,19 @@ fn sweep_expired_subscribers(
             // The periodic sweep is the cold authoritative re-check; it
             // always re-verifies signatures (full `reverify_subscribe`)
             // rather than trusting the publish path's cached flag.
+            //
+            // Against `r.grant_hash`, the hash the subscribe gate
+            // admitted this chain on — see `RetainedChain::grant_hash`.
+            // A `TokenBound` queue-group worker's grant names the group,
+            // not the channel, so re-asking about the channel here would
+            // evict every worker on the first sweep.
             let authorized = subscriber_chains
                 .get(&(node_id, name.hash()))
-                .is_some_and(|r| cfg.reverify_subscribe(&r.chain, &entity_id, revocation, skew));
+                .is_some_and(|r| {
+                    cfg.reverify_subscribe(&r.chain, &entity_id, r.grant_hash, revocation, skew)
+                });
             if !authorized {
-                guard.revoke_channel(subscriber_origin_hash(node_id), name);
+                guard.revoke_channel(subscriber_principal(node_id), name);
                 roster.remove(&channel_id, node_id);
                 subscriber_chains.remove(&(node_id, name.hash()));
                 tracing::debug!(
@@ -2812,25 +3532,14 @@ const MAX_HOPS: u8 = 16;
 /// set is well under this bound).
 const MAX_BLOB_HEAT_TAGS_PER_ANNOUNCE: usize = 256;
 
-/// How `MeshNode::install_peer` should touch the
-/// `addr_to_node` reverse index. Direct handshakes are the sole
-/// owner of `peer_addr → peer_node_id` for the connection's
-/// lifetime; routed handshakes may share `peer_addr` with a
-/// relay's own peer entry (true multi-hop case) and must not
-/// clobber it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AddrInstallMode {
-    /// Direct handshake (`connect`): unconditional
-    /// `addr_to_node[peer_addr] = peer_node_id`.
-    DirectOverwrite,
-    /// Routed handshake (`connect_via`): `or_insert(...)` —
-    /// keeps any prior mapping intact. For the degenerate
-    /// single-hop case (relay == final dest, the CLI remote-
-    /// attach pattern) the slot is empty and the destination's
-    /// `node_id` lands; for true multi-hop the relay's entry
-    /// stays.
-    RoutedPreserve,
-}
+// `AddrInstallMode` used to live here, naming how `install_peer`
+// should touch `addr_to_node`. It is gone: the distinction it drew
+// (overwrite vs preserve) was a rule about one index, applied at one
+// instant, and nothing carried it afterwards. [`PeerTransport`] states
+// the same fact as durable per-peer evidence instead, so every later
+// reader — sends, adjacency checks, withdrawal ownership, promotion —
+// decides from the peer's own record rather than from what some past
+// install happened to write into a shared map.
 
 /// Origin-side capability-announce rate-limit state
 /// (REALTIME_ROUTING_AND_DISCOVERY_PLAN RT-1). One mutex guards
@@ -3744,7 +4453,7 @@ async fn flood_event_pingwave_rounds(
         let targets: Vec<SocketAddr> = peers
             .iter()
             .filter_map(|e| {
-                let addr = e.value().addr;
+                let addr = e.value().addr();
                 if filter.contains(&addr) {
                     None
                 } else {
@@ -3796,6 +4505,102 @@ const ROUTE_WITHDRAW_DAMP_WINDOW: Duration = Duration::from_secs(1);
 /// alternate/cascade, so the only cost of the bound is slower
 /// convergence under a cascade storm — never a correctness loss.
 const MAX_INFLIGHT_ROUTE_WITHDRAW_CASCADES: usize = 64;
+
+/// Number of shards backing [`PeerTransitions`].
+///
+/// The lock serializes a peer's whole state transition on the control
+/// path — see [`PeerTransitions::with`] for the publishers and removers
+/// that take it. Sharding keeps the set fixed-size — no per-peer
+/// allocation, no lifecycle, no unbounded growth from peers that come
+/// and go — at the cost of two different peers occasionally sharing
+/// one. That collision costs a single uncontended-in-practice lock
+/// acquisition on a path that has just completed a Noise handshake or
+/// is tearing a dead peer down.
+const INSTALL_LOCK_SHARDS: usize = 64;
+
+/// Which [`PeerTransitions`] shard serializes `node_id`.
+///
+/// `node_id`s are hash-derived, so the low bits are already well
+/// distributed; masking is enough and keeps this branch-free.
+#[inline]
+fn install_lock_shard(node_id: u64) -> usize {
+    (node_id as usize) & (INSTALL_LOCK_SHARDS - 1)
+}
+
+/// The peer-state transition lock set, shared with every component
+/// that publishes or removes peer state.
+///
+/// The array is PRIVATE. Every publisher and remover of peer state goes
+/// through [`PeerTransitions::with`] and the typed lifecycle operations
+/// built on it — handshake install, routed responder registration,
+/// registration rollback, dead-peer eviction, direct-path promotion,
+/// the consistent-move fixture — so that the peer record and its
+/// sidecars (`peer_addrs`, `addr_to_node`, `session_id_to_node`, route
+/// candidates, withdrawal gate, learned-route migration) can never be
+/// published or torn down in conflicting orders by two concurrent
+/// transitions.
+///
+/// Exposing the array let callers reach for the lock directly, and
+/// "these paths happen to take the same mutex" is a weaker property
+/// than "these paths are the same operation": the responder
+/// registration and the eviction path had already drifted into
+/// different revalidation rules while both holding it. Keeping the
+/// field private makes divergence a compile error rather than a review
+/// finding.
+#[derive(Clone)]
+struct PeerTransitions {
+    shards: Arc<[parking_lot::Mutex<()>; INSTALL_LOCK_SHARDS]>,
+}
+
+impl PeerTransitions {
+    fn new() -> Self {
+        Self {
+            shards: Arc::new(std::array::from_fn(|_| parking_lot::Mutex::new(()))),
+        }
+    }
+
+    /// Run `f` as ONE peer-state transition for `node_id`.
+    ///
+    /// Control path only. Nothing on the packet path takes it, and
+    /// because `parking_lot` guards are not `Send` the compiler
+    /// refuses any attempt to hold one across an `.await`.
+    fn with<R>(&self, node_id: u64, f: impl FnOnce() -> R) -> R {
+        let _guard = self.shards[install_lock_shard(node_id)].lock();
+        f()
+    }
+}
+
+/// What one peer-state transition did.
+///
+/// Every typed lifecycle operation returns this rather than a bare
+/// bool. A caller that later has to undo its own work — a rollback, a
+/// recovery — must name the exact state it produced: a node id or an
+/// address is not enough, because a replacement session can already
+/// have reused both by the time the undo runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerTransitionOutcome {
+    /// Whether this transition owned the peer record it acted on. A
+    /// lost compare-and-swap, or a removal whose session no longer
+    /// matched, sets this false and mutates nothing.
+    owned: bool,
+    /// The peer incarnation this transition published, when it
+    /// published one.
+    session_id: Option<u64>,
+    /// The route transition token produced, when the transition wrote
+    /// or removed a route candidate. `None` when it touched no route.
+    route_token: Option<u64>,
+}
+
+impl PeerTransitionOutcome {
+    /// A transition that did not own the state it tried to change.
+    fn lost() -> Self {
+        Self {
+            owned: false,
+            session_id: None,
+            route_token: None,
+        }
+    }
+}
 
 /// Damper admission for one route-withdrawal flood, keyed by
 /// `(dest, exclude)`.
@@ -3874,7 +4679,7 @@ async fn run_route_withdrawal_flood(
         if peer_id == dest || Some(peer_id) == exclude {
             continue;
         }
-        let addr = entry.value().addr;
+        let addr = entry.value().addr();
         if partition_filter.contains(&addr) {
             continue;
         }
@@ -4470,7 +5275,7 @@ fn sensing_live_direct_session(
     failure_detector: Option<&FailureDetector>,
     node: u64,
 ) -> bool {
-    let Some(addr) = peers.get(&node).map(|p| p.value().addr) else {
+    let Some(addr) = peers.get(&node).map(|p| p.value().addr()) else {
         return false;
     };
     sensing_addr_is_live_direct(addr_to_node, failure_detector, node, addr)
@@ -4976,7 +5781,7 @@ fn spawn_sensing_frame_send(
 ) {
     let next_addr = peers
         .get(&target)
-        .map(|p| p.value().addr)
+        .map(|p| p.value().addr())
         .or_else(|| router.routing_table().lookup(target));
     let Some(addr) = next_addr else {
         return;
@@ -5513,6 +6318,35 @@ struct GrantAuthority {
 /// creating an inversion.
 struct ConsumerGrantGate {
     mu: parking_lot::Mutex<()>,
+    /// A monotone identity for every consumer-Grant PUBLICATION — install,
+    /// removal and remove-if-current alike (OLB-2B.3c-pre step 3).
+    ///
+    /// Lives here because this is already the one thing both the node (which
+    /// publishes) and the routing source (which reads) share, and every
+    /// publication happens under the mutex above.
+    ///
+    /// **Reserved BEFORE the content is made visible, committed AFTER it.**
+    /// Two separate requirements, and both are load-bearing:
+    ///
+    /// - reserving first means a refused transition publishes NOTHING. The
+    ///   earlier shape advanced this counter after the snapshot store with an
+    ///   unchecked `fetch_add(1) + 1`, so at the ceiling it panicked (debug) or
+    ///   aliased to zero (release) with the new snapshot ALREADY VISIBLE and no
+    ///   notification delivered — a partial publication, and exactly the
+    ///   non-aliasing failure this identity exists to prevent (Kyra, review of
+    ///   `91f1c2e11`);
+    /// - committing after the store keeps an artifact's recorded generation from
+    ///   ever being NEWER than the content it was built from. A reconstruction
+    ///   that straddles a publication understates its generation and costs a
+    ///   rebuild; overstating would preserve a stale artifact against the very
+    ///   movement meant to clear it.
+    ///
+    /// Reserve-then-commit is safe as a non-atomic pair because every publication
+    /// holds `mu` above, so this counter only ever advances under that gate.
+    ///
+    /// `u64::MAX` is RESERVED as the terminal marker and never handed out, so a
+    /// live generation can never alias it.
+    publications: std::sync::atomic::AtomicU64,
     /// Test-only: fired ONLY when a `try_lock` has actually FAILED, immediately
     /// before blocking on `lock()`.
     ///
@@ -5530,9 +6364,32 @@ impl ConsumerGrantGate {
     fn new() -> Self {
         Self {
             mu: parking_lot::Mutex::new(()),
+            publications: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             contended_hook: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Reserve the next publication generation WITHOUT advancing the counter, or
+    /// `None` if the space is exhausted.
+    ///
+    /// Checked, never wrapping, never saturating — the same discipline the
+    /// installation identity carries, applied to the counter that orders
+    /// transitions. The caller must hold `mu`; the reservation is only atomic
+    /// with respect to other publishers because they all do.
+    fn reserve_publication(&self) -> Option<u64> {
+        let next = self
+            .publications
+            .load(std::sync::atomic::Ordering::Acquire)
+            .checked_add(1)?;
+        // `u64::MAX` is the terminal marker, never a live identity.
+        (next != u64::MAX).then_some(next)
+    }
+
+    /// Commit a reservation. Called AFTER the content is visible.
+    fn commit_publication(&self, publication: u64) {
+        self.publications
+            .store(publication, std::sync::atomic::Ordering::Release);
     }
 
     /// Take the gate, acknowledging PROVEN contention on the way.
@@ -5565,6 +6422,15 @@ impl ConsumerGrantGate {
 /// registry selected, captured at `generation`.
 struct ScopedSourceSnapshot {
     token: super::behavior::org_routing_registry::SourceToken,
+    /// The consumer-Grant publication generation this capture observed. Read
+    /// BEFORE the snapshot load, so it can only UNDER-state what was observed —
+    /// see `ConsumerGrantGate::publications` for why that direction is the safe
+    /// one.
+    grant_publication: u64,
+    /// Whether the publication-identity space was already spent at capture. An
+    /// ABSENT Grant scope reconstructed under a spent space is TERMINAL: no
+    /// installation can follow, so nothing can supersede it.
+    grant_publications_spent: bool,
     /// ONLY the keys this source can actually speak for. A key absent here
     /// reconstructs as `SourceFacts::Unserved`, never as an empty provider set.
     ///
@@ -5753,6 +6619,16 @@ struct RoutingAuthority {
 /// gate. Receives the epoch the transaction advanced to.
 #[cfg(test)]
 type PublishPhaseHook = Arc<dyn Fn(u64) + Send + Sync>;
+
+/// Test-only observer of the consumer-Grant routing notification instant.
+///
+/// Receives the exact transition (OLB-2B.3c-pre items 10/11). The WHOLE movement
+/// rather than the grant id, so a witness can tell an install from the removal it
+/// superseded — which is what a delayed-notification race needs in order to park
+/// one and let the other through.
+#[cfg(test)]
+type GrantMovementHook =
+    Arc<dyn Fn(&super::behavior::org_routing_registry::GrantScopeMovement) + Send + Sync>;
 
 impl RoutingAuthority {
     fn new() -> Self {
@@ -5948,6 +6824,7 @@ impl ScopedSlotSource {
         use crate::adapter::net::identity::MAX_TOKEN_CLOCK_SKEW_SECS;
         let installed = slot.load_full();
         let mut stamps = std::collections::BTreeMap::new();
+        // (the publication generation is read by the caller, BEFORE this load)
         for key in keys {
             let CapabilityAudienceScope::Grant {
                 grant_id,
@@ -6014,8 +6891,10 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
         key: &super::behavior::org_routing_registry::SlotKey,
     ) -> super::behavior::org_routing_registry::ScopedSourceFacts {
         use super::behavior::org_routing_registry::{
-            ScopedDiscoveryAuthorityStamp, ScopedSourceFacts, SourceFacts,
+            GrantArtifactFence as ScopedGrantArtifactFence, ScopedDiscoveryAuthorityStamp,
+            ScopedSourceFacts, SourceFacts,
         };
+        use super::behavior::org_scoped_ingest::CapabilityAudienceScope;
         // Reconstruction proper: no lock of any kind, no await. Ordering is
         // imposed HERE rather than at capture, so the deterministic projection is
         // off-lock work.
@@ -6033,6 +6912,21 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
                 facts: SourceFacts::Unserved,
                 authority: ScopedDiscoveryAuthorityStamp::Owner,
                 authority_deadline: u64::MAX,
+                // Carried even here — ESPECIALLY here. An absent-Grant
+                // reconstruction is `Owner`-stamped and so names no installation,
+                // yet it is exactly the successor a later removal produces.
+                //
+                // TERMINAL when the identity space is spent AND this scope is a
+                // Grant one: no installation can follow, so this absence cannot
+                // be superseded and must survive even the withdrawal that caused
+                // it. Owner scopes are never terminal — they have no consumer
+                // Grant to exhaust.
+                grant_fence: match key.scope.scope() {
+                    CapabilityAudienceScope::Grant { .. } if self.grant_publications_spent => {
+                        ScopedGrantArtifactFence::TerminalAbsence
+                    }
+                    _ => ScopedGrantArtifactFence::Publication(self.grant_publication),
+                },
             };
         };
         let authority = *authority;
@@ -6057,6 +6951,9 @@ impl super::behavior::org_routing_registry::SourceSnapshot for ScopedSourceSnaps
             facts: SourceFacts::Served(providers.into()),
             authority,
             authority_deadline,
+            // A SERVED scope has an installed grant, so it is not terminal
+            // whatever the identity space is doing.
+            grant_fence: ScopedGrantArtifactFence::Publication(self.grant_publication),
         }
     }
 }
@@ -6186,6 +7083,19 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
         // protects it from unrelated Grant movement; the deterministic VECTOR of
         // selected identities goes into the token and protects this
         // capture/commit transaction.
+        //
+        // The publication generation is read BEFORE the snapshot load inside
+        // `grant_installations_for`, so it can only under-state what that load
+        // observed. Under-stating means an artifact looks OLDER than it is and
+        // gets cleared by a movement that need not have cleared it: churn.
+        // Over-stating would mean an artifact looks NEWER than it is and SURVIVES
+        // a movement that had to clear it: staleness. Only one of those is
+        // survivable, which is why the order is fixed here and documented on
+        // `ConsumerGrantGate::publications`.
+        let grant_publication = self
+            .consumer_grant_gate
+            .publications
+            .load(std::sync::atomic::Ordering::Acquire);
         let (grant_installations, grant_identity_vector) =
             Self::grant_installations_for(&self.consumer_grants, keys, now_secs);
 
@@ -6306,7 +7216,14 @@ impl super::behavior::org_routing_registry::SlotSource for ScopedSlotSource {
             exhausted || generations_exhausted,
             &grant_identity_vector,
         );
-        Box::new(ScopedSourceSnapshot { token, rows })
+        Box::new(ScopedSourceSnapshot {
+            token,
+            rows,
+            grant_publication,
+            // Spent when the next reservation would land on the reserved
+            // terminal marker — i.e. no further installation can ever publish.
+            grant_publications_spent: grant_publication == u64::MAX - 1,
+        })
     }
 
     fn pin_if_current(
@@ -6612,7 +7529,26 @@ pub struct MeshNode {
     /// hash hit; a collision therefore degrades to an idempotent
     /// re-subscribe instead of a correctness bug.
     #[cfg(feature = "cortex")]
-    rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), Arc<str>>>,
+    rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), ReplySubscription>>,
+    /// Targets we have already fired one corrective re-announce at.
+    /// Bounds the amplification described on
+    /// `MembershipFailure::warrants_reannounce`; cleared on peer failure
+    /// so a genuine reconnect can announce again.
+    #[cfg(feature = "cortex")]
+    rpc_corrective_announced: Arc<dashmap::DashSet<u64>>,
+    /// Node-wide cap on how many corrective announces the latch above
+    /// may authorize per window. See [`CorrectiveAnnounceBudget`] — the
+    /// latch bounds one target, this bounds the mesh-wide total.
+    #[cfg(feature = "cortex")]
+    rpc_corrective_budget: Arc<CorrectiveAnnounceBudget>,
+    /// Per-peer failure counters, bumped every time that peer's session
+    /// fails. The fence that stops an in-flight reply-subscribe from
+    /// resurrecting `rpc_reply_subscriptions` state the failure path
+    /// just evicted — see [`MeshNode::peer_failure_generation`] for the
+    /// hazard and [`PeerFailureGenerations`] for why it is bounded the
+    /// way it is.
+    #[cfg(feature = "cortex")]
+    rpc_peer_failure_gen: Arc<PeerFailureGenerations>,
     /// nRPC services the local node currently handles (registered
     /// via `Mesh::serve_rpc`, deregistered when the `ServeHandle`
     /// drops). `announce_capabilities` merges these as
@@ -6876,6 +7812,19 @@ pub struct MeshNode {
     /// a refusal published NOTHING — including transiently.
     #[cfg(test)]
     consumer_grant_publications: std::sync::atomic::AtomicU64,
+    /// Test-only: routing notifications raised for consumer-Grant movement, so a
+    /// witness can prove a NON-publishing outcome woke nothing (items 10/11).
+    #[cfg(test)]
+    consumer_grant_movements: std::sync::atomic::AtomicU64,
+    /// Test-only: fired INSIDE [`Self::note_consumer_grant_movement`], before it
+    /// touches the registry.
+    ///
+    /// The one instant at which item 10's two ordering claims are both checkable:
+    /// the gate must already be released, and the snapshot must already carry the
+    /// transition. Neither is observable from outside — the window closes a few
+    /// instructions later.
+    #[cfg(test)]
+    grant_movement_hook: parking_lot::Mutex<Option<GrantMovementHook>>,
     /// OA-2 (Kyra #47 B2): the ONE per-provider-node admission replay guard,
     /// shared across EVERY protected `serve_rpc_protected` registration on this
     /// node. Node-owned (not per-registration) so `(caller, call_id)` uniqueness
@@ -6941,6 +7890,13 @@ pub struct MeshNode {
     pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
+    /// Per-peer serialization of the whole install transition —
+    /// CONTROL PATH ONLY (see `install_peer_cas`). Sharded rather than
+    /// per-NodeID so the set is fixed-size and needs no lifecycle of
+    /// its own; contention between two different peers landing in the
+    /// same shard costs one uncontended-in-practice lock on a path
+    /// that already ran a Noise handshake.
+    peer_transitions: PeerTransitions,
     /// Automatic reroute policy
     reroute_policy: Arc<ReroutePolicy>,
     /// Node ID → SocketAddr map (shared with reroute policy)
@@ -7423,10 +8379,87 @@ pub struct MeshNode {
     /// Subnet policy applied to inbound `CapabilityAnnouncement`s.
     /// `None` disables per-peer subnet tracking.
     local_subnet_policy: Option<Arc<SubnetPolicy>>,
-    /// Per-peer subnet map. Keys are `node_id`; values are the
-    /// subnet derived from each peer's most recent announcement via
-    /// `local_subnet_policy`. Unknown peers default to
-    /// [`SubnetId::GLOBAL`] at read time.
+    /// Per-authority trust anchors for protected subnet credentials
+    /// (SUBNET_AUTH_PLAN.md S2). Copied from
+    /// `MeshNodeConfig::subnet_authorities`; empty means every
+    /// protected subnet assertion fails closed. `Arc` so the
+    /// dispatch context can verify channel-borne control facts
+    /// against the same anchors without a copy.
+    subnet_authorities: Arc<Vec<SubnetAuthorityConfig>>,
+    /// Applied revocation-floor state + per-authority auth epochs
+    /// for subnet credentials. Session admission (S3) verifies
+    /// against this registry and pins the epoch it saw.
+    subnet_floors: Arc<SubnetFloorRegistry>,
+    /// Verified subnet control-fact state (S5): descriptors, gateway
+    /// advertisements, export policies. Floors flow into
+    /// `subnet_floors` instead — one revocation authority, not two.
+    subnet_control: Arc<SubnetControlStore>,
+    /// Precomputed publish stream id of the configured control-facts
+    /// channel (`MeshNodeConfig::subnet_control_channel`), so the
+    /// receive path's test is one u64 compare. `None` disables the
+    /// channel arrival path.
+    subnet_control_stream_id: Option<u64>,
+    /// Outstanding one-use admission challenges this node has issued
+    /// as verifier (SUBNET_AUTH_PLAN.md D5).
+    subnet_challenges: Arc<SubnetChallengeStore>,
+    /// Compiled per-session subnet contexts. Reads validate the
+    /// stored session id against the live one, so a replaced
+    /// incarnation cannot inherit authority.
+    subnet_contexts: Arc<SubnetContextStore>,
+    /// Topology epoch this node evaluates against. Reparenting or
+    /// reinterpreting the hierarchy bumps it, invalidating every
+    /// context minted under the old meaning.
+    subnet_topology_epoch: Arc<std::sync::atomic::AtomicU32>,
+    /// This node's OWN forwarding authority — the compiled credential
+    /// set (SUBNET_AUTH_PLAN.md D6) and the declared protected
+    /// boundaries — published as ONE immutable aggregate. Distinct
+    /// from the peer contexts above: a peer proving it may attach
+    /// says nothing about whether this node may relay for it. The
+    /// gateway member is `None` until an operator installs
+    /// credentials; the boundaries member is `None` until declared —
+    /// and either absence denies. One aggregate, deliberately: see
+    /// [`SubnetGatewayAuthorityState`] for the torn-view hazard two
+    /// independent publications carried.
+    subnet_gateway_authority: Arc<arc_swap::ArcSwap<SubnetGatewayAuthorityState>>,
+    /// Typed protected-relay telemetry: envelopes forwarded, and
+    /// authority denials split by exact
+    /// [`ForwardDenial`](super::subnet::ForwardDenial) reason.
+    protected_relay_stats: Arc<ProtectedRelayStats>,
+    /// This node's own attachment point, used when compiling the
+    /// gateway context set and as the local end of a transition.
+    subnet_local_attachment: SubnetId,
+    /// Per-peer subnet map — **routing state, not authenticated
+    /// membership** (SUBNET_AUTH_PLAN.md). Keys are `node_id`; values
+    /// are the subnet derived from each peer's most recent
+    /// announcement via `local_subnet_policy`. The announcement is
+    /// signature-verified, but its *tags* are the peer's own claim,
+    /// so an entry here places a peer in the topology; it never
+    /// authorizes one. Visibility filtering built on this map is a
+    /// propagation filter; protected channels pair it with token
+    /// enforcement.
+    ///
+    /// **Absence means "not derived", and must stay that way.** Readers
+    /// preserve it as `Option<SubnetId>` and hand `None` to
+    /// [`MeshNode::subnet_visible`], which decides per visibility mode.
+    /// This doc used to say unknown peers "default to
+    /// [`SubnetId::GLOBAL`] at read time" — that WAS the behaviour, and
+    /// it was the HIGH #2 vulnerability: `GLOBAL` is a universal
+    /// ancestor, so every peer whose subnet had not been derived was
+    /// admitted to every `ParentVisible` channel, on the path that
+    /// otherwise answers `AckReason::Unauthorized`
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    ///
+    /// Absence is routine, not transient. The write in
+    /// `handle_capability_announcement` is gated on
+    /// `signature_verified && ann.hop_count == 0` with a policy
+    /// installed, so a peer learned only through a relay is never in
+    /// here, and no peer is with no policy configured.
+    ///
+    /// Read by the channel publish / subscribe paths, which want the
+    /// last thing a session peer said about itself. NOT read by scoped
+    /// discovery — see [`MeshNode::find_nodes_by_filter_scoped`] for why
+    /// a pre-apply sidecar is the wrong input for a query against fold
+    /// state.
     peer_subnets: Arc<DashMap<u64, SubnetId>>,
     /// Optional `SubnetGateway` instance for this node — installed
     /// alongside `channel_configs` in [`Self::set_channel_configs`]
@@ -7501,6 +8534,9 @@ pub struct MeshNode {
     /// signature verification. See
     /// [`docs/internal/plans/CHANNEL_AUTH_GUARD_PLAN.md`](../../../../../../docs/internal/plans/CHANNEL_AUTH_GUARD_PLAN.md).
     auth_guard: Arc<AuthGuard>,
+    /// Latches the one-shot "no channel registry installed" warning
+    /// (see `UnregisteredChannelPolicy::AllowWithWarning`).
+    unregistered_warned: Arc<AtomicBool>,
     /// Per-peer auth-failure tracker. Counts failed
     /// `authorize_subscribe` attempts per `auth_failure_window` and
     /// throttles bursts — peers that exceed
@@ -7748,10 +8784,32 @@ impl MeshNode {
             ProximityConfig::default(),
         ));
 
-        // Create reroute policy with proximity graph for topology-aware alternates
+        // Create the reroute policy. It removes candidates a failure
+        // invalidates and installs a recovered peer's own route from
+        // its live session — replacement paths come from discovery
+        // (pingwaves, announcements, handshakes), never from failure
+        // handling, so the policy needs no graph or address index.
         let reroute_policy = Arc::new(
             ReroutePolicy::new(router.routing_table().clone(), peer_addrs.clone())
-                .with_proximity_graph(proximity_graph.clone()),
+                .with_peer_snapshot({
+                    // ONE reading per peer, so a failure/recovery
+                    // callback that outlives the session it concerns
+                    // can tell both that a replacement session of the
+                    // same NodeID is installed and whether the session
+                    // it holds is an adjacency at all — without asking
+                    // two maps to agree about an address.
+                    let peers = peers.clone();
+                    Arc::new(move |node_id: u64| {
+                        peers.get(&node_id).map(|p| {
+                            let peer = p.value();
+                            crate::adapter::net::reroute::PeerSnapshot {
+                                session_id: peer.session.session_id(),
+                                send_addr: peer.addr(),
+                                owned_addr: peer.owned_addr(),
+                            }
+                        })
+                    })
+                }),
         );
 
         // Subscriber roster for channel fan-out; also wired into the
@@ -7843,6 +8901,13 @@ impl MeshNode {
         let rp_recovery = reroute_policy.clone();
         let roster_failure = roster.clone();
         let peer_subnets_failure = peer_subnets.clone();
+        // Admission stores are created here (not in the struct
+        // literal) so the failure closure can hold its own handles,
+        // matching how the roster/peer maps above are threaded.
+        let subnet_challenges = Arc::new(SubnetChallengeStore::new());
+        let subnet_contexts = Arc::new(SubnetContextStore::new());
+        let subnet_challenges_failure = subnet_challenges.clone();
+        let subnet_contexts_failure = subnet_contexts.clone();
         let peer_entity_ids_failure = peer_entity_ids.clone();
         let origin_hash_to_node_failure = origin_hash_to_node.clone();
         let capability_fold_failure = capability_fold.clone();
@@ -7855,6 +8920,31 @@ impl MeshNode {
         let subscriber_chains: Arc<DashMap<(u64, ChannelHash), RetainedChain>> =
             Arc::new(DashMap::new());
         let subscriber_chains_failure = subscriber_chains.clone();
+        // Hoisted out of the `Self { .. }` literal so the failure
+        // closure — which runs before `Self` exists — can hold a clone
+        // and evict a failed peer's entries.
+        #[cfg(feature = "cortex")]
+        let rpc_reply_subscriptions: Arc<dashmap::DashMap<(u64, u64), ReplySubscription>> =
+            Arc::new(dashmap::DashMap::new());
+        #[cfg(feature = "cortex")]
+        let rpc_reply_subscriptions_failure = rpc_reply_subscriptions.clone();
+        // Once-per-target latch bounding corrective re-announces; see
+        // `MembershipFailure::warrants_reannounce`.
+        #[cfg(feature = "cortex")]
+        let rpc_corrective_announced: Arc<dashmap::DashSet<u64>> =
+            Arc::new(dashmap::DashSet::new());
+        #[cfg(feature = "cortex")]
+        let rpc_corrective_announced_failure = rpc_corrective_announced.clone();
+        #[cfg(feature = "cortex")]
+        let rpc_corrective_budget: Arc<CorrectiveAnnounceBudget> =
+            Arc::new(CorrectiveAnnounceBudget::new(Instant::now()));
+        // Per-peer failure counter fencing in-flight reply-subscribes;
+        // see `MeshNode::peer_failure_generation`.
+        #[cfg(feature = "cortex")]
+        let rpc_peer_failure_gen: Arc<PeerFailureGenerations> =
+            Arc::new(PeerFailureGenerations::new());
+        #[cfg(feature = "cortex")]
+        let rpc_peer_failure_gen_failure = rpc_peer_failure_gen.clone();
         // RT-4: event-pingwave gate + the clones the `on_recovery`
         // closure captures (it runs before `Self` exists, so it
         // can't call `emit_event_pingwave`).
@@ -7988,7 +9078,14 @@ impl MeshNode {
             suspicion_threshold: 2,
             cleanup_interval: Duration::from_secs(60),
         })
-        .on_failure(move |node_id| {
+        .on_failure(move |failure_event| {
+            // The detector names the exact incarnation this verdict is
+            // about. Everything below that only needs the identity
+            // uses `node_id`; the reroute policy additionally takes
+            // the epoch, because by the time it runs a replacement
+            // session for the same node may already be installed and
+            // its routes are not this failure's to rewrite.
+            let node_id = failure_event.node_id;
             // SI-5 (§4.8): a Failed peer is a sensing event on BOTH
             // sides — run BEFORE the reroute policy below mutates
             // route state, so "next_hop(P) went through the failed
@@ -8001,7 +9098,7 @@ impl MeshNode {
                 // failure); the local aggregate recomputes through
                 // the overlay signal; re-registration rides the
                 // ttl/2 refresh over whatever route gets promoted.
-                let failed_addr = peers_failure.get(&node_id).map(|p| p.value().addr);
+                let failed_addr = peers_failure.get(&node_id).map(|p| p.value().addr());
                 let providers: std::collections::HashSet<u64> = {
                     let observations = sensing_observations_failure.lock();
                     observations
@@ -8099,7 +9196,11 @@ impl MeshNode {
                     *generation = generation.wrapping_add(1);
                 });
             }
-            rp_failure.on_failure(node_id);
+            rp_failure.on_failure_for_verdict(
+                node_id,
+                failure_event.epoch,
+                failure_event.verdict_seq,
+            );
             let removed = roster_failure.remove_peer(node_id);
             if !removed.is_empty() {
                 tracing::debug!(
@@ -8109,6 +9210,13 @@ impl MeshNode {
                 );
             }
             peer_subnets_failure.remove(&node_id);
+            // Admission state dies with the peer. Note this is the
+            // SUSPICION boundary, not incarnation death — the context
+            // store is the real defence (it validates the stored
+            // session id on every read), so dropping here is defence
+            // in depth plus prompt reclamation, not the invariant.
+            subnet_challenges_failure.forget_peer(node_id);
+            subnet_contexts_failure.forget_peer(node_id);
             // Pull `entity_id` BEFORE removing it so we know which
             // origin_hash slot to demote / drop. A node disappearing
             // releases its claim on the wire hash.
@@ -8134,13 +9242,16 @@ impl MeshNode {
             // failure; the capability fold is now consistent
             // with them.
             capability_fold_failure.evict_node(node_id, "failure-detector");
-            // Drop any retained subscribe token chains for this peer.
-            // The sweep can no longer reach them (it iterates
-            // `peer_entity_ids`, just cleared above), and a failed peer
-            // never sends the unsubscribe that would otherwise remove
-            // them — so without this they leak for the node's lifetime,
-            // and a reused `node_id` could re-validate a stale chain.
-            subscriber_chains_failure.retain(|(nid, _), _| *nid != node_id);
+            evict_failed_peer_channel_state(
+                node_id,
+                &subscriber_chains_failure,
+                #[cfg(feature = "cortex")]
+                &rpc_reply_subscriptions_failure,
+                #[cfg(feature = "cortex")]
+                &rpc_corrective_announced_failure,
+                #[cfg(feature = "cortex")]
+                &rpc_peer_failure_gen_failure,
+            );
             // RT-5: tell the mesh this peer is unreachable via us —
             // receivers drop their `(node_id, via=us)` routes within
             // one flood instead of waiting for the 3× session_timeout
@@ -8161,8 +9272,11 @@ impl MeshNode {
             // destination is live. So we withdraw on the failure, remove
             // the now-dead direct edge, and let a subsequent FRESH
             // pingwave re-advertise reachability if the peer really
-            // remains reachable through another path — `rp_failure` still
-            // reroutes us locally in the meantime.
+            // remains reachable through another path — `rp_failure`
+            // meanwhile removes our own invalidated candidates, so a
+            // surviving local alternate takes over immediately and a
+            // destination with none is truthfully unreachable until
+            // that re-advertisement.
             if enable_route_withdraw {
                 spawn_route_withdrawal_flood(
                     &route_withdraw_seq_failure,
@@ -8188,8 +9302,13 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             upgrade_cache_failure.remove(&node_id);
         })
-        .on_recovery(move |node_id| {
-            rp_recovery.on_recovery(node_id);
+        .on_recovery(move |recovery_event| {
+            let node_id = recovery_event.node_id;
+            rp_recovery.on_recovery_for_verdict(
+                node_id,
+                recovery_event.epoch,
+                recovery_event.verdict_seq,
+            );
             // RT-4: a healed partition is a topology change — tell
             // the mesh at flood speed instead of waiting for the
             // next heartbeat tick. The recovered peer's OWN
@@ -8224,6 +9343,27 @@ impl MeshNode {
         // without going back through `config`.
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
+        let subnet_authorities = Arc::new(config.subnet_authorities.clone());
+        let subnet_local_attachment = config.subnet_attachment.unwrap_or(local_subnet);
+        // One u64, computed once: the receive path discriminates the
+        // control-facts channel by its full publish stream id (63
+        // canonical hash bits), never the collision-prone u16 wire
+        // hint.
+        let subnet_control_stream_id = config
+            .subnet_control_channel
+            .as_ref()
+            .map(|name| Self::publish_stream_id(&ChannelId::new(name.clone())));
+        let policy_can_scope = local_subnet_policy
+            .as_ref()
+            .is_some_and(|p| p.can_assign_non_global());
+        if Self::subnet_policy_without_local_subnet(local_subnet, policy_can_scope) {
+            tracing::warn!(
+                "subnet policy installed but local subnet is GLOBAL — \
+                 with_subnet_policy assigns peers' subnets, not this node's; \
+                 add with_subnet(..). ParentVisible currently admits peers \
+                 whose subnet could not be resolved and rejects those it could."
+            );
+        }
         // Pre-apply the reflex override so the node starts in
         // `Open` + `reflex_addr = Some(override)` state before
         // the first capability announcement leaves the box. Skips
@@ -8285,6 +9425,19 @@ impl MeshNode {
             routing_registry_metrics.clone(),
         );
 
+        // Close the loop between the detector and the reroute policy.
+        // The detector's callbacks hold the policy, so the policy is
+        // built first and cannot take this as a constructor argument —
+        // but a verdict is only ever issued from a running detector,
+        // and this is wired before one exists.
+        let failure_detector = Arc::new(failure_detector);
+        reroute_policy.set_verdict_check({
+            let detector = failure_detector.clone();
+            Arc::new(move |node_id: u64, verdict_seq: u64| {
+                detector.verdict_is_current(node_id, verdict_seq)
+            })
+        });
+
         let node = Self {
             identity: Arc::new(identity),
             static_keypair,
@@ -8294,7 +9447,7 @@ impl MeshNode {
             peers,
             addr_to_node,
             router,
-            failure_detector: Arc::new(failure_detector),
+            failure_detector,
             inbound: Arc::new(DashMap::new()),
             #[cfg(feature = "cortex")]
             rpc_inbound_dispatchers: Arc::new(DashMap::new()),
@@ -8305,7 +9458,13 @@ impl MeshNode {
             #[cfg(feature = "cortex")]
             rpc_round_robin_cursor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cortex")]
-            rpc_reply_subscriptions: Arc::new(dashmap::DashMap::new()),
+            rpc_reply_subscriptions,
+            #[cfg(feature = "cortex")]
+            rpc_corrective_announced,
+            #[cfg(feature = "cortex")]
+            rpc_corrective_budget,
+            #[cfg(feature = "cortex")]
+            rpc_peer_failure_gen,
             #[cfg(feature = "cortex")]
             rpc_local_services: Arc::new(LocalServiceRegistry::new(local_caps_changed.clone())),
             #[cfg(feature = "tool")]
@@ -8366,6 +9525,10 @@ impl MeshNode {
             consumer_grant_install_seq: std::sync::atomic::AtomicU64::new(1),
             #[cfg(test)]
             consumer_grant_publications: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            consumer_grant_movements: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            grant_movement_hook: parking_lot::Mutex::new(None),
             #[cfg(feature = "cortex")]
             rpc_admission_rate_limit: Arc::new(
                 // The envelope was validated (and panicked on) above, so this
@@ -8392,6 +9555,7 @@ impl MeshNode {
             pending_handshakes,
             pending_direct_initiators,
             proximity_graph,
+            peer_transitions: PeerTransitions::new(),
             reroute_policy,
             peer_addrs,
             partition_filter,
@@ -8494,6 +9658,21 @@ impl MeshNode {
             capability_version: Arc::new(AtomicU64::new(0)),
             local_subnet,
             local_subnet_policy,
+            subnet_authorities,
+            subnet_floors: Arc::new(SubnetFloorRegistry::new()),
+            subnet_control: Arc::new(SubnetControlStore::new()),
+            subnet_control_stream_id,
+            subnet_challenges,
+            subnet_contexts,
+            subnet_topology_epoch: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            subnet_gateway_authority: Arc::new(arc_swap::ArcSwap::from_pointee(
+                SubnetGatewayAuthorityState {
+                    gateway: None,
+                    boundaries: None,
+                },
+            )),
+            protected_relay_stats: Arc::new(ProtectedRelayStats::new()),
+            subnet_local_attachment,
             peer_subnets,
             // Gateway is installed lazily by `set_channel_configs`;
             // a node without an installed registry has no gateway
@@ -8513,6 +9692,7 @@ impl MeshNode {
             subscriber_chains,
             published_chains: Arc::new(DashMap::new()),
             auth_guard: Arc::new(AuthGuard::new()),
+            unregistered_warned: Arc::new(AtomicBool::new(false)),
             auth_failures: Arc::new(DashMap::new()),
             tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -8644,7 +9824,7 @@ impl MeshNode {
     /// orchestrator-originated messages (e.g. `TakeSnapshot`) to
     /// the source node by its `node_id`.
     pub fn peer_addr(&self, node_id: u64) -> Option<SocketAddr> {
-        self.peers.get(&node_id).map(|e| e.value().addr)
+        self.peers.get(&node_id).map(|e| e.value().addr())
     }
 
     // ── SI-2a: capability-sensing interest plane ──────────────────
@@ -10097,18 +11277,148 @@ impl MeshNode {
     /// (first write wins, mirroring the dispatch pin). Lets fixtures
     /// model fold declarers that are not live sessions: the SI-2b
     /// candidate snapshot reads this pin for §4.10 authorization.
+    ///
+    /// Gated like the seams below: a TOFU pin is authority-relevant
+    /// state (§4.10 reads it), so no production build may reach it.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn test_pin_peer_entity(&self, node_id: u64, entity_id: EntityId) {
         self.peer_entity_ids.entry(node_id).or_insert(entity_id);
     }
 
     /// Test/debug accessor for the live [`NetSession`] to a peer.
     /// Integration tests use it to drive session-level state (e.g. open
-    /// a stream to make a session "busy" for the upgrade C3 gate).
+    /// a stream to make a session "busy" for the upgrade C3 gate), and
+    /// the protected-forwarding witness uses it to seal a genuine
+    /// route-hop envelope under a real edge key.
+    ///
+    /// Gated, not merely `#[doc(hidden)]`. Hiding documentation is not
+    /// access control: handing out the live `NetSession` exposes
+    /// sealing and opening to every ordinary build. The protected
+    /// relay's witness needs only to seal or open ONE envelope, which
+    /// is what [`Self::seal_route_hop_to_peer`] and
+    /// [`Self::open_route_hop_from_peer`] provide.
+    ///
+    /// `nat-traversal` is deliberately NOT in this gate: it is a
+    /// production feature, and a production NAT build must not expose
+    /// live-session handles. NAT tests that need these helpers enable
+    /// `fixtures` alongside `nat-traversal` (as CI's NAT step does).
     #[doc(hidden)]
-    #[cfg(feature = "nat-traversal")]
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn peer_session_for_test(&self, node_id: u64) -> Option<Arc<NetSession>> {
         self.peers.get(&node_id).map(|e| e.value().session.clone())
+    }
+
+    /// Seal ONE route-hop envelope on the edge to `node_id`.
+    ///
+    /// The narrow form of what a protected-forwarding witness needs:
+    /// it consumes a hop sequence on that edge and returns the bytes,
+    /// without handing the caller the session, its keys, or its replay
+    /// state.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn seal_route_hop_to_peer(
+        &self,
+        node_id: u64,
+        header: &super::route::RoutingHeader,
+        inner: &[u8],
+    ) -> Option<Vec<u8>> {
+        let session = self
+            .peers
+            .get(&node_id)
+            .map(|e| e.value().session.clone())?;
+        Some(session.seal_route_hop(header, inner))
+    }
+
+    /// Open ONE route-hop envelope received on the edge to `node_id`,
+    /// admitting its sequence exactly once.
+    ///
+    /// Returns the outer routing header and a copy of the inner packet.
+    /// `None` covers "no such peer" and "did not verify" alike — a
+    /// witness asserts on the successful shape, and the failure reasons
+    /// are already pinned by the `route_hop` module tests.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn open_route_hop_from_peer(
+        &self,
+        node_id: u64,
+        buf: &[u8],
+    ) -> Option<(super::route::RoutingHeader, Vec<u8>)> {
+        let session = self
+            .peers
+            .get(&node_id)
+            .map(|e| e.value().session.clone())?;
+        let opened = session.open_route_hop(buf).ok()?;
+        Some((opened.header, opened.inner.to_vec()))
+    }
+
+    /// Test-only: move a peer to a new address CONSISTENTLY — peer
+    /// record, authenticated route binding, and both address indexes.
+    ///
+    /// The protected relay reads the egress address from the peer
+    /// snapshot, so a witness that wants to OBSERVE a forwarded hop has
+    /// to put an inspectable socket there. The session, keys, and
+    /// admitted context are untouched, so the hop is still sealed under
+    /// the real egress edge key and stays verifiable.
+    ///
+    /// Writing only `PeerInfo.addr` produced state production cannot
+    /// reach: the route stayed bound to the old address while the peer
+    /// claimed a new one. The relay's pre-seal incarnation check
+    /// rejects exactly that disagreement, so a witness built on the
+    /// torn version was asserting against a shape the real system never
+    /// has. This models a NAT rebind instead, which is the real
+    /// operation.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn set_peer_addr_for_test(&self, node_id: u64, addr: SocketAddr) -> bool {
+        // The consistent move is a peer-state transition and goes
+        // through the same handle as every other publisher, so a
+        // fixture build cannot interleave it with a real install.
+        self.peer_transitions.with(node_id, || {
+            let Some(mut peer) = self.peers.get_mut(&node_id) else {
+                return false;
+            };
+            // Only a DIRECT peer can be moved this way. The seam
+            // models a NAT rebind, which is an adjacency changing its
+            // own address; a routed peer's recorded address is the
+            // relay's, and "moving" it would assert an ownership
+            // transfer that production has no operation for.
+            let Some(old) = peer.owned_addr() else {
+                return false;
+            };
+            // Follow the identity FIRST, exactly as the live rebind
+            // path does — and refuse the whole move if the route is
+            // absent, ordinary, or bound to another identity. Mutating
+            // the peer record and indexes anyway would tear exactly the
+            // state this seam exists to keep consistent.
+            if !self
+                .router
+                .routing_table()
+                .rebind_authenticated_route(node_id, node_id, addr)
+            {
+                return false;
+            }
+            peer.transport = PeerTransport::Direct { owned_addr: addr };
+            drop(peer);
+            self.peer_addrs.insert(node_id, addr);
+            // Learned multi-hop routes riding through this peer follow
+            // its identity to the new address, exactly as the direct
+            // install arm does on a live re-handshake. Without this, a
+            // witness that moved the peer would leave every learned
+            // route bound to the old address — a torn state the relay's
+            // pre-seal incarnation check rejects, and one production
+            // never produces.
+            self.router
+                .routing_table()
+                .migrate_next_hop(old, addr, node_id);
+            // Identity-qualified eviction: the old address may have
+            // been concurrently reused by (and re-indexed to) another
+            // peer, and an unconditional remove would strip that
+            // owner's mapping.
+            self.addr_to_node.remove_if(&old, |_, n| *n == node_id);
+            self.addr_to_node.insert(addr, node_id);
+            true
+        })
     }
 
     /// Build a [`MigrationIdentityContext`](crate::adapter::net::subprotocol::MigrationIdentityContext)
@@ -10206,15 +11516,564 @@ impl MeshNode {
     /// `MeshNodeConfig::subnet` (or `SubnetId::GLOBAL` when none was
     /// configured). Stable for the node's lifetime; the substrate
     /// doesn't reassign the local subnet at runtime.
+    ///
+    /// A [`SubnetPolicy`] never contributes to this value, however it is
+    /// configured — see [`Self::local_subnet_policy`].
     pub fn local_subnet(&self) -> SubnetId {
         self.local_subnet
     }
 
-    /// Read-only handle to the `SubnetPolicy` that derived this
-    /// node's `local_subnet`, when one was supplied. `None` when
-    /// the local subnet came from `MeshNodeConfig::subnet`
-    /// directly without going through a policy. Operator tools
-    /// surface this to explain "why is this node in subnet X."
+    /// Trust config for `authority`'s protected subnet credentials,
+    /// or `None` when this node anchors no such authority — in which
+    /// case every protected assertion under it fails closed
+    /// (SUBNET_AUTH_PLAN.md S2).
+    pub fn subnet_authority_config(&self, authority: &EntityId) -> Option<&SubnetAuthorityConfig> {
+        self.subnet_authorities
+            .iter()
+            .find(|c| &c.authority == authority)
+    }
+
+    /// Applied subnet revocation-floor state + per-authority auth
+    /// epochs. Shared handle: floor application (S5 distribution,
+    /// or operator provisioning) and session verification (S3) see
+    /// one registry.
+    pub fn subnet_floor_registry(&self) -> &Arc<SubnetFloorRegistry> {
+        &self.subnet_floors
+    }
+
+    /// Session id of the live incarnation for `node_id`, or `None`
+    /// when no session exists. A subnet presentation binds to this
+    /// value, so a replaced incarnation invalidates outstanding
+    /// proofs by construction.
+    pub fn peer_session_id(&self, node_id: u64) -> Option<u64> {
+        self.peers.get(&node_id).map(|p| p.session.session_id())
+    }
+
+    /// Topology epoch this node evaluates subnet authority against.
+    pub fn subnet_topology_epoch(&self) -> u32 {
+        self.subnet_topology_epoch.load(Ordering::Acquire)
+    }
+
+    /// Advance the topology epoch — reparenting, reusing a path for a
+    /// different security meaning, or otherwise reinterpreting the
+    /// hierarchy. Every context minted under the old epoch is dropped
+    /// immediately: old ancestry authority must not survive a change
+    /// in what a path means. Adding a previously unused descendant
+    /// under a stable parent is NOT such a change (parent grants
+    /// deliberately cover future children) and needs no bump.
+    pub fn advance_subnet_topology_epoch(&self) -> u32 {
+        let next = self.subnet_topology_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let dropped = self.subnet_contexts.invalidate_stale_topology(next);
+        // Control facts for the superseded epochs can never be read
+        // again (reads are epoch-exact and the epoch only advances) —
+        // collect them with the same move that invalidates contexts.
+        let purged = self.subnet_control.purge_stale_epochs(next);
+        if dropped > 0 || purged > 0 {
+            tracing::info!(
+                topology_epoch = next,
+                dropped,
+                purged_control_facts = purged,
+                "subnet: topology epoch advanced; invalidated prior-epoch state"
+            );
+        }
+        next
+    }
+
+    /// Issue a one-use admission challenge for `node_id` on its
+    /// current session incarnation. `None` when the peer has no live
+    /// session or the node-wide challenge ceiling is reached.
+    pub fn issue_subnet_challenge(&self, node_id: u64) -> Option<[u8; 32]> {
+        let session_id = self.peers.get(&node_id)?.session.session_id();
+        self.subnet_challenges
+            .issue(node_id, session_id, Instant::now())
+    }
+
+    /// Verify a presented credential set + session proof and, on
+    /// success, compile and install the session's
+    /// [`VerifiedSubnetContext`] (SUBNET_AUTH_PLAN.md D5).
+    ///
+    /// The challenge is consumed whether verification succeeds or
+    /// fails — a captured presentation cannot retry the same nonce.
+    /// The `NodeId → EntityId` pin is compared and installed
+    /// atomically only after every other check passes: a conflicting
+    /// pin is refused and never overwritten, so a deliberate 64-bit
+    /// routing collision is an availability event, never credential
+    /// aliasing.
+    pub fn admit_subnet_session(
+        &self,
+        from_node: u64,
+        presentation: &SubnetAuthPresentation,
+        set: &SubnetCredentialSet,
+    ) -> Result<VerifiedSubnetContext, SubnetAuthError> {
+        let Some(peer) = self.peers.get(&from_node) else {
+            return Err(SubnetAuthError::WrongSession);
+        };
+        let session_id = peer.session.session_id();
+        drop(peer);
+
+        // Consume first: the nonce is spent by the attempt itself.
+        let expected = self
+            .subnet_challenges
+            .consume(
+                from_node,
+                session_id,
+                &presentation.verifier_nonce,
+                self.entity_id(),
+                Instant::now(),
+            )
+            .ok_or(SubnetAuthError::WrongChallenge)?;
+
+        let config = self
+            .subnet_authority_config(&presentation.target.authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+
+        let ctx = crate::adapter::net::subnet::auth::verify_admission(
+            presentation,
+            set,
+            &expected,
+            config,
+            self.subnet_topology_epoch.load(Ordering::Acquire),
+            &self.subnet_floors,
+            crate::adapter::net::subnet::admission::unix_now_secs(),
+            crate::adapter::net::identity::TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
+        )?;
+
+        // Step 8: atomic compare/install of the routing-id pin. The
+        // capability-announcement TOFU path does get-then-insert,
+        // which two concurrent first-announcements can race; this one
+        // must not, because it decides whether a proven identity may
+        // take over a routing key.
+        if ctx.subject_node != from_node {
+            return Err(SubnetAuthError::WrongSubject);
+        }
+        match self.peer_entity_ids.entry(from_node) {
+            dashmap::mapref::entry::Entry::Occupied(slot) => {
+                if slot.get() != &ctx.subject {
+                    tracing::warn!(
+                        from_node = format!("{from_node:#x}"),
+                        "subnet: admission refused — a different entity is already pinned to this routing id"
+                    );
+                    return Err(SubnetAuthError::IdentityPinConflict);
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(ctx.subject.clone());
+            }
+        }
+
+        self.subnet_contexts.install(from_node, ctx.clone());
+        Ok(ctx)
+    }
+
+    /// The compiled context for `from_node`, iff it was compiled on
+    /// that peer's CURRENT session incarnation and is still current
+    /// with respect to expiry and both epochs. This is the read the
+    /// forwarding path performs: pure integer comparisons over
+    /// immutable state, no crypto.
+    pub fn subnet_context_for(&self, from_node: u64) -> Option<VerifiedSubnetContext> {
+        let session_id = self.peers.get(&from_node)?.session.session_id();
+        let ctx = self
+            .subnet_contexts
+            .get_for_session(from_node, session_id)?;
+        let epoch_ok = ctx.topology_epoch == self.subnet_topology_epoch.load(Ordering::Acquire)
+            && ctx.subnet_auth_epoch == self.subnet_floors.auth_epoch(&ctx.authority);
+        let live = crate::adapter::net::subnet::admission::unix_now_secs() < ctx.expires_at;
+        (epoch_ok && live).then_some(ctx)
+    }
+
+    /// Apply a signed revocation floor and drop every context the
+    /// resulting auth-epoch move invalidates. Off the packet path by
+    /// construction: forwarding only ever compares the pinned epoch
+    /// integer.
+    pub fn apply_subnet_floor(
+        &self,
+        floor: &SubnetRevocationFloor,
+    ) -> Result<bool, SubnetAuthError> {
+        let config = self
+            .subnet_authority_config(&floor.scope.authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        Self::apply_floor_with(floor, config, &self.subnet_floors, &self.subnet_contexts)
+    }
+
+    /// The floor transition itself — registry apply plus the
+    /// stale-context invalidation the auth-epoch move demands. One
+    /// body for both arrival shapes: the typed local API above and
+    /// the channel/bundle byte path below, so distribution cannot
+    /// drift from provisioning.
+    fn apply_floor_with(
+        floor: &SubnetRevocationFloor,
+        config: &SubnetAuthorityConfig,
+        floors: &SubnetFloorRegistry,
+        contexts: &SubnetContextStore,
+    ) -> Result<bool, SubnetAuthError> {
+        let changed = floors.apply(floor, config)?;
+        if changed {
+            let epoch = floors.auth_epoch(&floor.scope.authority);
+            let dropped = contexts.invalidate_stale_epoch(&floor.scope.authority, epoch);
+            tracing::info!(
+                subnet_auth_epoch = epoch,
+                dropped,
+                "subnet: revocation floor accepted; invalidated stale session contexts"
+            );
+        }
+        Ok(changed)
+    }
+
+    /// Verify and apply one wire-form subnet control fact
+    /// (SUBNET_AUTH_PLAN.md S5/D8) — the ONE entry every arrival
+    /// path shares. A fact published on the configured channel, one
+    /// provisioned locally through this method, and one loaded from
+    /// a configuration bundle are the same bytes through the same
+    /// checks: strict decode, authority config lookup, root-anchored
+    /// signature, validity window where the kind has one, and
+    /// per-`(SubnetRef, kind)` revision monotonicity.
+    ///
+    /// Floors route into the S2 floor registry (advancing the auth
+    /// epoch and dropping invalidated contexts); the three
+    /// descriptive kinds land in [`Self::subnet_control_store`].
+    /// `Ok(applied: false)` is the designed replay/reorder no-op.
+    pub fn apply_subnet_control_fact(
+        &self,
+        bytes: &[u8],
+    ) -> Result<SubnetControlOutcome, SubnetAuthError> {
+        Self::apply_subnet_control_fact_with(
+            bytes,
+            &self.subnet_authorities,
+            &self.subnet_control,
+            &self.subnet_floors,
+            &self.subnet_contexts,
+        )
+    }
+
+    /// [`Self::apply_subnet_control_fact`] over explicit handles, so
+    /// the dispatch path (which has no `&MeshNode`) runs the very
+    /// same code.
+    fn apply_subnet_control_fact_with(
+        bytes: &[u8],
+        authorities: &[SubnetAuthorityConfig],
+        control: &SubnetControlStore,
+        floors: &SubnetFloorRegistry,
+        contexts: &SubnetContextStore,
+    ) -> Result<SubnetControlOutcome, SubnetAuthError> {
+        let fact = SubnetControlFact::from_bytes(bytes)?;
+        let config = authorities
+            .iter()
+            .find(|c| c.authority == fact.scope().authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        let applied = match &fact {
+            SubnetControlFact::RevocationFloor(floor) => {
+                Self::apply_floor_with(floor, config, floors, contexts)?
+            }
+            _ => control.apply(
+                &fact,
+                config,
+                crate::adapter::net::subnet::admission::unix_now_secs(),
+                crate::adapter::net::identity::TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
+            )?,
+        };
+        Ok(SubnetControlOutcome {
+            kind: fact.kind(),
+            applied,
+        })
+    }
+
+    /// Verified control-fact state (S5): the current descriptor,
+    /// gateway advertisement, and export policy per authority-
+    /// qualified scope. Floors are not here — their applied state is
+    /// [`Self::subnet_floor_registry`].
+    pub fn subnet_control_store(&self) -> &Arc<SubnetControlStore> {
+        &self.subnet_control
+    }
+
+    /// Compile and publish this node's OWN forwarding authority from
+    /// self-held credential sets (SUBNET_AUTH_PLAN.md D6).
+    ///
+    /// Every set must name this process as its leaf subject; a
+    /// credential issued to another node can never become this node's
+    /// gateway authority, and a remote peer's admitted session is
+    /// never silently reused as one. No challenge is involved — the
+    /// process already holds the private key, so a self-challenge
+    /// would prove nothing that possession does not.
+    ///
+    /// The whole set is recompiled and published atomically. Refresh
+    /// and revocation therefore replace it wholesale rather than
+    /// merging into a live set, which is what stops a revoked
+    /// credential's rights from surviving inside a surviving entry.
+    pub fn install_subnet_gateway_credentials(
+        &self,
+        sets: &[SubnetCredentialSet],
+    ) -> Result<(), SubnetAuthError> {
+        self.install_subnet_gateway_credentials_paced(sets, &|| {})
+    }
+
+    /// The ONE gateway-credential installation implementation —
+    /// compile and publication — parameterized by the rcu
+    /// after-capture hook (a production no-op; the fixtures driver
+    /// passes the witness's barrier). A single body on purpose: a
+    /// duplicated fixture branch would let a mutation of the
+    /// production branch alone escape the deterministic lost-update
+    /// witness, because the held party would never be the code
+    /// production actually runs. Mirror of
+    /// [`Self::declare_subnet_boundaries_paced`].
+    fn install_subnet_gateway_credentials_paced(
+        &self,
+        sets: &[SubnetCredentialSet],
+        after_capture: &(dyn Fn() + Sync),
+    ) -> Result<(), SubnetAuthError> {
+        if sets.is_empty() {
+            self.publish_gateway_member_paced(None, after_capture);
+            return Ok(());
+        }
+        let authority = sets[0].leaf().authority.clone();
+        let config = self
+            .subnet_authority_config(&authority)
+            .ok_or(SubnetAuthError::UnknownAuthority)?;
+        let epoch = self.subnet_topology_epoch.load(Ordering::Acquire);
+        let now = crate::adapter::net::subnet::admission::unix_now_secs();
+        let mut compiled = Vec::with_capacity(sets.len());
+        for set in sets {
+            compiled.push(crate::adapter::net::subnet::auth::compile_gateway_context(
+                set,
+                self.entity_id(),
+                self.subnet_local_attachment,
+                config,
+                epoch,
+                &self.subnet_floors,
+                now,
+                crate::adapter::net::identity::TOKEN_CLOCK_SKEW_SECS_RECOMMENDED,
+            )?);
+        }
+        let set =
+            crate::adapter::net::subnet::auth::build_gateway_context_set(&authority, compiled)?;
+        self.publish_gateway_member_paced(Some(Arc::new(set)), after_capture);
+        Ok(())
+    }
+
+    /// Test-only (fixtures): [`Self::install_subnet_gateway_credentials`]
+    /// through the SHARED production implementation, exposing the
+    /// after-capture hook so the deterministic lost-update witness can
+    /// hold THIS writer between its capture and its compare-and-swap
+    /// (the mirror of [`Self::test_declare_subnet_boundaries_paced`]).
+    /// Delegation, not duplication: the held branch IS the branch the
+    /// public method runs.
+    #[cfg(feature = "fixtures")]
+    pub fn test_install_subnet_gateway_credentials_paced(
+        &self,
+        sets: &[SubnetCredentialSet],
+        after_capture: &(dyn Fn() + Sync),
+    ) -> Result<(), SubnetAuthError> {
+        self.install_subnet_gateway_credentials_paced(sets, after_capture)
+    }
+
+    /// Replace ONLY the gateway member of the published authority
+    /// aggregate, preserving whatever boundaries member is latest at
+    /// the moment of the swap, with an after-capture hook:
+    /// `after_capture` runs INSIDE the rcu closure — after the current
+    /// aggregate has been captured, before the compare-and-swap
+    /// attempt — and therefore once more per retry. Production passes
+    /// a no-op; the deterministic lost-update witness uses the hook to
+    /// hold a writer inside exactly the window where a naive
+    /// load-modify-store loses a concurrent publication.
+    fn publish_gateway_member_paced(
+        &self,
+        gateway: Option<Arc<VerifiedGatewayContextSet>>,
+        after_capture: &(dyn Fn() + Sync),
+    ) {
+        self.publish_authority_member(
+            &|current| SubnetGatewayAuthorityState {
+                gateway: gateway.clone(),
+                boundaries: current.boundaries.clone(),
+            },
+            after_capture,
+        );
+    }
+
+    /// THE one compare-and-retry publication primitive. Both authority
+    /// writers route through here, so the retry mechanism is a single
+    /// implementation rather than two parallel ones a future writer
+    /// could let drift: `update` builds the next aggregate FROM the
+    /// captured current (each member writer preserves the other's
+    /// latest member), and `after_capture` — a production no-op — runs
+    /// inside the rcu closure, after the capture and before the
+    /// compare-and-swap, once more per retry.
+    fn publish_authority_member(
+        &self,
+        update: &(dyn Fn(&SubnetGatewayAuthorityState) -> SubnetGatewayAuthorityState + Sync),
+        after_capture: &(dyn Fn() + Sync),
+    ) {
+        self.subnet_gateway_authority.rcu(|current| {
+            let next = update(current);
+            after_capture();
+            next
+        });
+    }
+
+    /// Declare this node's protected boundaries (SUBNET_AUTH_PLAN.md
+    /// D6). Replaces the whole set atomically.
+    ///
+    /// Mandatory for protected forwarding: with no set declared, every
+    /// protected transition denies. Boundaries are deliberately NOT
+    /// derived from the gateway's credentials — otherwise revoking an
+    /// `EXPORT` credential would delete the boundary it was meant to
+    /// guard and a broader `ROUTE` would inherit the traffic.
+    pub fn declare_subnet_boundaries(&self, set: SubnetBoundarySet) {
+        self.declare_subnet_boundaries_paced(set, &|| {});
+    }
+
+    /// The mirror of [`Self::publish_gateway_member_paced`]: replace
+    /// ONLY the boundaries member, preserving the latest gateway
+    /// member under contention, with the same after-capture hook
+    /// discipline (no-op in production).
+    fn declare_subnet_boundaries_paced(
+        &self,
+        set: SubnetBoundarySet,
+        after_capture: &(dyn Fn() + Sync),
+    ) {
+        let boundaries = Some(Arc::new(set));
+        self.publish_authority_member(
+            &|current| SubnetGatewayAuthorityState {
+                gateway: current.gateway.clone(),
+                boundaries: boundaries.clone(),
+            },
+            after_capture,
+        );
+    }
+
+    /// Test-only (fixtures): [`Self::declare_subnet_boundaries`]
+    /// through the SAME production rcu path, exposing the
+    /// after-capture hook so the deterministic lost-update witness can
+    /// hold this writer between its capture and its compare-and-swap.
+    /// The hook runs once more per retry — observing a second
+    /// invocation is observing the rcu retry itself.
+    #[cfg(feature = "fixtures")]
+    pub fn test_declare_subnet_boundaries_paced(
+        &self,
+        set: SubnetBoundarySet,
+        after_capture: &(dyn Fn() + Sync),
+    ) {
+        self.declare_subnet_boundaries_paced(set, after_capture);
+    }
+
+    /// The published gateway export authority — credentials and
+    /// boundaries together, as the ONE coherent snapshot every
+    /// consumer that needs both must read once. The aggregate's Arc
+    /// identity changes on every publication of either member, which
+    /// is what the D7 admission stamp fingerprints. Crate-internal:
+    /// the aggregate is a publication mechanism, not API surface —
+    /// external callers read the two public convenience accessors.
+    pub(crate) fn subnet_gateway_authority(&self) -> Arc<SubnetGatewayAuthorityState> {
+        self.subnet_gateway_authority.load_full()
+    }
+
+    /// Typed protected-relay telemetry: envelopes this node forwarded
+    /// as a gateway, and authority denials split by exact
+    /// [`ForwardDenial`](super::subnet::ForwardDenial) reason.
+    /// Counters only ever increase; read two samples to attribute a
+    /// window.
+    pub fn protected_relay_stats(&self) -> &Arc<ProtectedRelayStats> {
+        &self.protected_relay_stats
+    }
+
+    /// The declared boundary set, if any — a SINGLE-MEMBER
+    /// observability accessor.
+    ///
+    /// Each call is one coherent load of one member. Two separate
+    /// calls are NOT a coherent pair: a publication landing between
+    /// them yields one member from before and one from after. External
+    /// code must not combine this with
+    /// [`Self::subnet_gateway_contexts`] to make an authority decision
+    /// — use it for diagnostics, logging and assertions about a single
+    /// member only.
+    ///
+    /// Coherent composition of the two is intentionally internal and
+    /// unsupported as public API: the aggregate is a publication
+    /// mechanism, and every production authority decision reads it
+    /// crate-internally. External observation cannot bypass that gate,
+    /// so there is nothing here for a caller to compose correctly.
+    pub fn subnet_boundaries(&self) -> Option<Arc<SubnetBoundarySet>> {
+        self.subnet_gateway_authority.load().boundaries.clone()
+    }
+    /// This node's published gateway credential set, or `None` when it
+    /// holds none — in which case it forwards no protected traffic.
+    ///
+    /// Single-member observability accessor, with the same contract as
+    /// [`Self::subnet_boundaries`]: one call is coherent, two calls are
+    /// not a pair, and neither is an authority decision.
+    pub fn subnet_gateway_contexts(&self) -> Option<Arc<VerifiedGatewayContextSet>> {
+        self.subnet_gateway_authority.load().gateway.clone()
+    }
+
+    /// Resolve `dest_id` to an identity-qualified next hop.
+    ///
+    /// The routing table answers with an address, which cannot select
+    /// a cryptographic context. This resolves that address to the
+    /// authenticated peer whose session terminates there, and then
+    /// reports THAT peer's current address — so a NAT rebind moves the
+    /// address without changing the hop identity, and an unknown or
+    /// unauthenticated address resolves to nothing at all.
+    pub fn authenticated_next_hop(&self, dest_id: u64) -> Option<AuthenticatedNextHop> {
+        // Identity comes from the route entry, which bound it at
+        // install time. Resolving it here through `addr_to_node`
+        // instead would let an address reused by a different
+        // authenticated peer silently retarget this route.
+        let (node_id, bound_addr) = self.router.routing_table().lookup_authenticated(dest_id)?;
+        // The live peer entry supplies the CURRENT address, so a NAT
+        // rebind follows the identity rather than stranding it.
+        let addr = self.peers.get(&node_id)?.addr();
+        if addr != bound_addr {
+            // Address moved under a bound identity: keep the route
+            // pointing at the same peer.
+            self.router
+                .routing_table()
+                .rebind_authenticated_route(dest_id, node_id, addr);
+        }
+        Some(AuthenticatedNextHop { node_id, addr })
+    }
+    /// Explicitly withdraw a peer's subnet admission — outstanding
+    /// challenges and any compiled context. One of the invalidation
+    /// triggers in SUBNET_AUTH_PLAN.md D5; the peer must re-present
+    /// against a fresh challenge to regain authority. The
+    /// failure-detector and permanent-eviction paths perform the same
+    /// cleanup through their own handles.
+    pub fn withdraw_subnet_admission(&self, node_id: u64) {
+        self.subnet_challenges.forget_peer(node_id);
+        self.subnet_contexts.forget_peer(node_id);
+    }
+
+    /// Read-only handle to the `SubnetPolicy` this node applies to
+    /// OTHER peers, or `None` when per-peer subnet resolution is
+    /// disabled.
+    ///
+    /// **This policy does not assign this node's own subnet.** That
+    /// comes from `MeshNodeConfig::subnet` — set through
+    /// [`MeshNodeConfig::with_subnet`] or assigned directly, the field
+    /// being public — see [`Self::local_subnet`]. The two settings are
+    /// independent, and `Some`/`None` here says nothing about where
+    /// `local_subnet` came from; it says only whether inbound
+    /// announcements get resolved to a subnet.
+    ///
+    /// This doc previously claimed the opposite — that the policy
+    /// "derived this node's `local_subnet`", with `None` meaning the
+    /// subnet came from config instead. No such distinction exists, and
+    /// the claim pointed operators at installing a policy as the way to
+    /// subnet a node. That configuration (`with_subnet_policy` without
+    /// `with_subnet`) leaves `local_subnet` at [`SubnetId::GLOBAL`] —
+    /// and when the policy can actually assign a non-global subnet
+    /// ([`SubnetPolicy::can_assign_non_global`]), that is precisely the
+    /// case where an unresolved peer stays visible under
+    /// `ParentVisible` while a resolved one is rejected
+    /// (CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md,
+    /// finding 2). Set both. A policy that can only ever answer
+    /// `GLOBAL` is exempt — it puts every peer in the same subnet as a
+    /// `GLOBAL` local node.
+    ///
+    /// What the policy IS used for: deriving each peer's subnet, both
+    /// for the `peer_subnets` sidecar the channel paths read and — run
+    /// live against the selected fold entry's tags — for
+    /// [`Self::find_nodes_by_filter_scoped`] under
+    /// `ScopeFilter::SameSubnet`. Operator tooling can surface it to
+    /// explain "why did this node place *that peer* in subnet X"; it
+    /// cannot explain this node's own.
     pub fn local_subnet_policy(&self) -> Option<&Arc<SubnetPolicy>> {
         self.local_subnet_policy.as_ref()
     }
@@ -11114,10 +12973,30 @@ impl MeshNode {
     /// transient publish-and-restore, and lock-free readers can observe that
     /// transient snapshot — so the counter, not the pointer, is what makes the
     /// negative claim provable (Kyra, 2B.3c-pre step-1 re-review).
+    /// Publish the next consumer-Grant snapshot and return the transition's
+    /// fence.
+    ///
+    /// **Also stamps the snapshot with that same fence** (OLB-2B.3b §4.4). The
+    /// identity is the one this transition already reserved, so the stamp adds
+    /// no allocation, no ordering, no notification and no fence of its own — it
+    /// records on the artifact what the transition had already decided, which is
+    /// what lets a consumer order two snapshots without inventing a second
+    /// clock. Stamped BEFORE the store, so no observer can reach a published
+    /// snapshot that is not stamped.
     fn publish_consumer_grant_snapshot(
         &self,
-        next: Arc<super::behavior::org_grant_registry::ConsumerGrantSnapshot>,
-    ) {
+        next: super::behavior::org_grant_registry::ConsumerGrantSnapshot,
+        reserved: Option<u64>,
+    ) -> super::behavior::org_routing_registry::GrantMovementFence {
+        let fence = match reserved {
+            Some(publication) => {
+                super::behavior::org_routing_registry::GrantMovementFence::Publication(publication)
+            }
+            // Exhausted, and reachable only by a withdrawal: an installation is
+            // refused before it publishes. Nothing to commit, and nothing left
+            // that could supersede the absence this just published.
+            None => super::behavior::org_routing_registry::GrantMovementFence::Terminal,
+        };
         // `AcqRel`, not `Relaxed`: the counter exists precisely so a transient
         // publication is observable, which invites a witness that samples it from
         // ANOTHER thread while one is in flight. Paired with the `Acquire` load
@@ -11128,13 +13007,83 @@ impl MeshNode {
         #[cfg(test)]
         self.consumer_grant_publications
             .fetch_add(1, Ordering::AcqRel);
-        self.consumer_grant_audiences.store(next);
+        self.consumer_grant_audiences
+            .store(Arc::new(next.stamped(fence)));
+        // Committed AFTER the store — see `ConsumerGrantGate::publications`.
+        if let Some(publication) = reserved {
+            self.consumer_grant_gate.commit_publication(publication);
+        }
+        fence
     }
 
     /// Test-only: how many consumer-Grant snapshot publications have occurred.
     #[cfg(test)]
     fn consumer_grant_publications_for_test(&self) -> u64 {
         self.consumer_grant_publications.load(Ordering::Acquire)
+    }
+
+    /// Test-only: how many routing notifications consumer-Grant movement raised.
+    #[cfg(test)]
+    fn consumer_grant_movements_for_test(&self) -> u64 {
+        self.consumer_grant_movements.load(Ordering::Acquire)
+    }
+
+    /// Test-only: observe the notification instant (items 10/11).
+    #[cfg(test)]
+    fn arm_grant_movement_hook(&self, hook: GrantMovementHook) {
+        *self.grant_movement_hook.lock() = Some(hook);
+    }
+
+    /// Routing movement for a consumer-Grant transition (OLB-2B.3c-pre items
+    /// 10/11).
+    ///
+    /// Called with the consumer-Grant gate **already released**, which is item
+    /// 10's literal requirement and also the lock-order one: `pin_if_current`
+    /// takes that gate and then the registry lock, so touching the registry
+    /// beneath the gate would invert the frozen order.
+    ///
+    /// The release is STRUCTURAL, not asserted. Each caller holds the gate in a
+    /// scoped block that ends before this call, so the guard is dropped by the
+    /// same brace that produced the values passed here. An earlier revision tried
+    /// to make it observable with `debug_assert!(gate.try_lock().is_some())`, and
+    /// that probe was wrong in two ways at once: `try_lock` answers whether the
+    /// gate is AVAILABLE, not whether THIS thread holds it, so a second publisher
+    /// legitimately mid-transition panicked debug and test builds; and on the
+    /// path where it succeeded it briefly took the very gate the discipline says
+    /// must not be held here. There is no ownership-safe form of the check —
+    /// `parking_lot::Mutex` records no holder — so the discipline is enforced
+    /// where it is expressible, at the call sites' scoping.
+    ///
+    /// Ordering, per design §2A.2:
+    ///
+    /// ```text
+    /// publish the new consumer-Grant snapshot
+    /// -> RELEASE the gate
+    /// -> invalidate the affected retained Grant slots   <- here
+    /// -> mark routing work                              <- and here
+    /// ```
+    ///
+    /// Publishing first is what makes the wake safe to act on: the actor's
+    /// recapture reads `consumer_grant_audiences` lock-free, so a wake that
+    /// arrived BEFORE publication could reconstruct against the old snapshot and
+    /// install exactly the staleness this exists to clear. A wake that arrives
+    /// late is merely late; a wake that arrives early is wrong.
+    ///
+    /// A demand landing after publication needs no notification of its own —
+    /// first demand already enqueues the slot and marks work.
+    fn note_consumer_grant_movement(
+        &self,
+        movement: &super::behavior::org_routing_registry::GrantScopeMovement,
+    ) {
+        #[cfg(test)]
+        {
+            self.consumer_grant_movements.fetch_add(1, Ordering::AcqRel);
+            let hook = self.grant_movement_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(movement);
+            }
+        }
+        self.routing_registry.invalidate_grant_scope(movement);
     }
 
     /// Allocate the next consumer-Grant installation identity, or refuse
@@ -11147,12 +13096,24 @@ impl MeshNode {
     /// identity — the same defect wearing a safer-looking operator. Exhaustion
     /// is terminal by construction: the counter only ever increases, so once
     /// `checked_add` fails it fails forever (review-pass-3 §12 discipline).
+    ///
+    /// The refusal is logged with `space = "installation"`. `IdSpaceExhausted`
+    /// covers two distinct counters and its `Display` is generic, so WITHOUT a
+    /// log on this arm the enum's own claim — that the refusal path names the
+    /// space that ran out — held only for the publication half
+    /// (Kyra, review of `010c718ea`).
     fn allocate_consumer_grant_install_seq(
         &self,
     ) -> Result<u64, super::behavior::org_grant_registry::GrantAudienceInstallError> {
         let mut observed = self.consumer_grant_install_seq.load(Ordering::Acquire);
         loop {
             let Some(next) = observed.checked_add(1) else {
+                tracing::error!(
+                    space = "installation",
+                    "consumer grant install refused: the installation identity \
+                     space is exhausted; this is terminal. Withdrawal of \
+                     already-installed grants is still possible."
+                );
                 return Err(
                     super::behavior::org_grant_registry::GrantAudienceInstallError::IdSpaceExhausted,
                 );
@@ -11167,6 +13128,36 @@ impl MeshNode {
                 Err(current) => observed = current,
             }
         }
+    }
+
+    /// Test-only: drive the PUBLICATION-identity allocator to its ceiling.
+    ///
+    /// Set to `u64::MAX - 1`, the last value that is itself a live identity: the
+    /// next reservation would land on the reserved terminal marker and must
+    /// therefore refuse.
+    #[cfg(test)]
+    fn exhaust_consumer_grant_publications_for_test(&self) {
+        self.set_consumer_grant_publications_for_test(u64::MAX - 1);
+    }
+
+    /// Test-only: position the publication allocator exactly.
+    ///
+    /// `u64::MAX - 2` is the interesting one: the next reservation is then the
+    /// LAST live identity, so a witness can produce an artifact stamped with the
+    /// exact value a reusing terminal fence would compare against itself.
+    #[cfg(test)]
+    fn set_consumer_grant_publications_for_test(&self, at: u64) {
+        self.consumer_grant_gate
+            .publications
+            .store(at, Ordering::Release);
+    }
+
+    /// Test-only: the publication allocator's current position.
+    #[cfg(test)]
+    fn consumer_grant_publication_for_test(&self) -> u64 {
+        self.consumer_grant_gate
+            .publications
+            .load(Ordering::Acquire)
     }
 
     /// Test-only: drive the installation-identity allocator to its ceiling, so
@@ -11224,6 +13215,10 @@ impl MeshNode {
             authority.config.verification_skew_secs,
         )?;
         let grant_id = *record.grant_id();
+        // Captured BEFORE `prepare_install` consumes the record: the transition's
+        // exact audience scope, which the notification below needs and which is
+        // otherwise gone by then.
+        let audience_handle = *record.audience_handle();
         // Settle every ordinary refusal first, then allocate — both under one
         // guard (OLB-2B.3c-pre).
         //
@@ -11234,27 +13229,72 @@ impl MeshNode {
         // identity is now checked and TERMINAL, so density is exactly what
         // matters: repeated idempotent installs would burn a finite space while
         // publishing nothing, and the space cannot be recovered.
-        let _guard = self.consumer_grant_gate.lock();
-        let current = self.consumer_grant_audiences.load_full();
-        // Settle EVERY ordinary refusal before allocation — idempotence,
-        // conflict AND capacity. Settling only idempotence left `AtCapacity`
-        // behind the allocator, so repeated distinct installs against a full
-        // registry would drain a finite, terminal authority space while
-        // publishing nothing (Kyra, 2B.3c-pre step-1 review).
-        let prepared = match current.prepare_install(record, now_secs)? {
-            PreparedInstall::Noop => {
-                // Valid, publishes nothing, consumes no identity — including
-                // after the allocator is exhausted, which is why this precedes
-                // it.
-                return Ok(ConsumerAudienceInstall::AlreadyPresent);
-            }
-            PreparedInstall::Ready(slot) => *slot,
+        //
+        // Scoped so the gate is RELEASED before routing is notified (item 10).
+        // Every `return` inside this block is a non-publishing outcome, so each
+        // one deliberately leaves without waking anything.
+        let (install_seq, fence) = {
+            let _guard = self.consumer_grant_gate.lock();
+            let current = self.consumer_grant_audiences.load_full();
+            // Settle EVERY ordinary refusal before allocation — idempotence,
+            // conflict AND capacity. Settling only idempotence left `AtCapacity`
+            // behind the allocator, so repeated distinct installs against a full
+            // registry would drain a finite, terminal authority space while
+            // publishing nothing (Kyra, 2B.3c-pre step-1 review).
+            let prepared = match current.prepare_install(record, now_secs)? {
+                PreparedInstall::Noop => {
+                    // Valid, publishes nothing, consumes no identity — including
+                    // after the allocator is exhausted, which is why this precedes
+                    // it. Publishes nothing, so it is not routing movement and
+                    // must wake nothing.
+                    return Ok(ConsumerAudienceInstall::AlreadyPresent);
+                }
+                PreparedInstall::Ready(slot) => *slot,
+            };
+            // The transition identity is reserved BEFORE anything is published,
+            // so an exhausted space refuses without leaving a partial
+            // publication. Reserved before the INSTALLATION identity is
+            // allocated, too: that one is consumed on success, and a refusal
+            // after consuming it would burn a terminal identity for nothing.
+            let Some(publication) = self.consumer_grant_gate.reserve_publication() else {
+                // Refused BEFORE anything is published. The public outcome is
+                // shared with installation-identity exhaustion because a new
+                // variant on that public enum would be a source-breaking API
+                // change (item 16); the log carries which space actually ran
+                // out, which is the part an operator needs.
+                tracing::error!(
+                    space = "publication",
+                    "consumer grant install refused: the transition-ordering \
+                     identity space is exhausted; this is terminal. Withdrawal \
+                     of already-installed grants is still possible."
+                );
+                return Err(GrantAudienceInstallError::IdSpaceExhausted);
+            };
+            // Past this point publication is certain, so claiming the identity
+            // cannot be wasted.
+            let install_seq = self.allocate_consumer_grant_install_seq()?;
+            let next = ConsumerGrantSnapshot::finish_install(prepared, install_seq);
+            let fence = self.publish_consumer_grant_snapshot(next, Some(publication));
+            (install_seq, fence)
         };
-        // Past this point publication is certain, so claiming the identity
-        // cannot be wasted.
-        let install_seq = self.allocate_consumer_grant_install_seq()?;
-        let next = ConsumerGrantSnapshot::finish_install(prepared, install_seq);
-        self.publish_consumer_grant_snapshot(Arc::new(next));
+        // An INSTALL is routing movement in the availability direction: a
+        // Grant-scoped slot reconstructed `Unserved` because this grant was not
+        // installed holds no artifact to invalidate and would otherwise stay
+        // cold forever — the read seam returns cold for `Unserved` WITHOUT
+        // invalidating, so no reader can rescue it either (design §0.1).
+        //
+        // Supersedes everything published BEFORE this transition. The ordering is
+        // by PUBLICATION generation, not by `install_seq` — that was the first,
+        // held repair, and it could not order absences. An artifact already
+        // reconstructed under THIS publication is the transition's own and must
+        // survive, so a demand that beat the notification is not undone.
+        self.note_consumer_grant_movement(
+            &super::behavior::org_routing_registry::GrantScopeMovement {
+                grant_id,
+                audience_handle,
+                fence,
+            },
+        );
         Ok(ConsumerAudienceInstall::Installed(
             ConsumerAudienceLease::new(grant_id, install_seq),
         ))
@@ -11271,15 +13311,67 @@ impl MeshNode {
     ///
     /// [`remove_consumer_grant_audience_if_current`]: Self::remove_consumer_grant_audience_if_current
     pub fn remove_consumer_grant_audience(&self, grant_id: &[u8; 32]) -> bool {
-        let _guard = self.consumer_grant_gate.lock();
-        let current = self.consumer_grant_audiences.load_full();
-        match current.without(grant_id) {
-            Some(next) => {
-                self.publish_consumer_grant_snapshot(Arc::new(next));
-                true
+        self.withdraw_consumer_grant(grant_id, |_| true)
+    }
+
+    /// The ONE place a consumer Grant is withdrawn (OLB-2B.3c-pre step 3).
+    ///
+    /// Both removal surfaces route through here — unconditional, and
+    /// lease-conditional via `accept`. Centralized because the two previously
+    /// built and published their own movement, so a branch-local omission in
+    /// either would have escaped every witness that drove the other. Kyra's
+    /// review of `91f1c2e11` named exactly that exposure for the successful
+    /// remove-if-current path.
+    ///
+    /// Returns `true` iff absence was published — which is also the only case
+    /// that is routing movement.
+    ///
+    /// **Withdrawal is never refused for want of a transition identity.** At
+    /// exhaustion the absence is published anyway and the movement carries
+    /// [`GrantMovementFence::Terminal`](super::behavior::org_routing_registry::GrantMovementFence::Terminal):
+    /// no installation can follow, so absence is terminal for the scope and
+    /// retiring its `Publication` artifacts cannot destroy a successor. Refusing
+    /// to revoke because a counter ran out would be the one failure direction
+    /// that is not fail-closed.
+    ///
+    /// It retires those artifacts only. A terminal movement PRESERVES a
+    /// `TerminalAbsence` artifact, including the one its own publication
+    /// produces — see `GrantMovementFence::Terminal`.
+    fn withdraw_consumer_grant(
+        &self,
+        grant_id: &[u8; 32],
+        accept: impl Fn(&super::behavior::org_grant_registry::GrantAudienceRecord) -> bool,
+    ) -> bool {
+        // Scoped so the gate is RELEASED before routing is notified (item 10).
+        let movement = {
+            let _guard = self.consumer_grant_gate.lock();
+            let current = self.consumer_grant_audiences.load_full();
+            let handle = current
+                .get(grant_id)
+                .filter(|record| accept(record))
+                .map(|record| *record.audience_handle());
+            match (handle, current.without(grant_id)) {
+                (Some(audience_handle), Some(next)) => {
+                    // Reserved under the gate; `None` means exhausted, and the
+                    // withdrawal proceeds terminally rather than being refused.
+                    let reserved = self.consumer_grant_gate.reserve_publication();
+                    let fence = self.publish_consumer_grant_snapshot(next, reserved);
+                    Some(super::behavior::org_routing_registry::GrantScopeMovement {
+                        grant_id: *grant_id,
+                        audience_handle,
+                        fence,
+                    })
+                }
+                _ => None,
             }
-            None => false,
+        };
+        // Only a real publication is routing movement. A refused or absent
+        // withdrawal changed nothing, so it must wake nothing.
+        if let Some(movement) = movement {
+            self.note_consumer_grant_movement(&movement);
+            return true;
         }
+        false
     }
 
     /// OSDK S0: remove a CONSUMER grant-audience record ONLY if the currently
@@ -11296,21 +13388,12 @@ impl MeshNode {
         &self,
         lease: &super::behavior::org_grant_registry::ConsumerAudienceLease,
     ) -> bool {
-        let _guard = self.consumer_grant_gate.lock();
-        let current = self.consumer_grant_audiences.load_full();
-        match current.get(lease.grant_id()) {
-            // Same grant id, different installation — the lease is stale and owns
-            // nothing here.
-            Some(record) if record.install_seq() != lease.install_seq() => false,
-            Some(_) => match current.without(lease.grant_id()) {
-                Some(next) => {
-                    self.publish_consumer_grant_snapshot(Arc::new(next));
-                    true
-                }
-                None => false,
-            },
-            None => false,
-        }
+        // Same withdrawal, with the lease as the acceptance test: same grant id
+        // but a different installation means the lease is STALE and owns nothing
+        // here, so nothing publishes and nothing wakes.
+        self.withdraw_consumer_grant(lease.grant_id(), |record| {
+            record.install_seq() == lease.install_seq()
+        })
     }
 
     /// Whether the caller explicitly supplied this node's identity (OSDK-L N).
@@ -12522,14 +14605,10 @@ impl MeshNode {
             .await?;
 
         // Shared peer install (NetSession + router + peers +
-        // peer_addrs + addr_to_node). Direct-mode overwrites
-        // addr_to_node — `peer_addr` IS the peer's wire address.
-        self.install_peer(
-            peer_node_id,
-            peer_addr,
-            keys,
-            AddrInstallMode::DirectOverwrite,
-        );
+        // peer_addrs + addr_to_node). DIRECT: the peer answered at
+        // `peer_addr` itself, so the address is its own and the
+        // session is an authenticated adjacency.
+        self.install_direct(peer_node_id, peer_addr, keys, None);
 
         // Direct-handshake-only post-install wiring. Routed
         // handshakes (`connect_via`) intentionally skip these:
@@ -12541,8 +14620,21 @@ impl MeshNode {
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
         self.proximity_graph.on_pingwave(pw, peer_addr);
-        self.failure_detector.heartbeat(peer_node_id, peer_addr);
-        self.push_local_announcement(peer_addr).await;
+        // Read the installed incarnation back rather than assuming it:
+        // if a concurrent install replaced ours between the two calls,
+        // the heartbeat should stamp the session that is actually
+        // live, not the one this call happened to create.
+        let installed_session_id = self
+            .peers
+            .get(&peer_node_id)
+            .map(|p| p.value().session.session_id())
+            .unwrap_or(0);
+        self.failure_detector.heartbeat_for_incarnation(
+            peer_node_id,
+            peer_addr,
+            installed_session_id,
+        );
+        self.push_local_announcement(peer_node_id).await;
         // RT-4: a new session is a topology change - flood our
         // pingwave now so third parties learn the new edge at
         // flood speed, not on the next heartbeat tick. Session open
@@ -12552,55 +14644,99 @@ impl MeshNode {
         Ok(peer_node_id)
     }
 
-    /// Shared peer-install bookkeeping for both [`Self::connect`]
-    /// (direct) and [`Self::connect_via`] (routed). Wraps the
-    /// negotiated `keys` in a [`NetSession`], registers the
-    /// route + peer entry + reverse address index. The
-    /// `addr_mode` determines how `addr_to_node` is touched —
-    /// see [`AddrInstallMode`] for the rationale per caller.
+    /// Install a DIRECT session: the peer answered at `owned_addr`
+    /// itself, so the session is an authenticated adjacency and the
+    /// address is the peer's own.
     ///
-    /// Unconditional last-writer-wins: any existing session for the
-    /// peer is replaced. For the compare-and-swap variant used by the
-    /// NAT-traversal direct-path upgrade, see
-    /// [`Self::install_peer_cas`].
-    fn install_peer(
+    /// `expected_prior_session_id` makes the install a compare-and-swap
+    /// against the peer's current incarnation
+    /// (`NAT_TRAVERSAL_V2_PLAN.md` C2): the direct-path upgrade uses it
+    /// so a racing inbound rotation it never saw wins instead of being
+    /// clobbered.
+    fn install_direct(
         &self,
         peer_node_id: u64,
-        peer_addr: SocketAddr,
+        owned_addr: SocketAddr,
         keys: SessionKeys,
-        addr_mode: AddrInstallMode,
-    ) {
-        // `None` expected → unconditional install; always returns true.
-        self.install_peer_cas(peer_node_id, peer_addr, keys, addr_mode, None);
+        expected_prior_session_id: Option<u64>,
+    ) -> PeerTransitionOutcome {
+        self.install_peer_transition(
+            peer_node_id,
+            PeerTransport::Direct { owned_addr },
+            keys,
+            expected_prior_session_id,
+        )
     }
 
-    /// Peer-install with an optional compare-and-swap against the
-    /// current session_id (`NAT_TRAVERSAL_V2_PLAN.md` C2).
-    ///
-    /// When `expected_prior_session_id` is `Some(sid)`, the install
-    /// proceeds only if the peer's current session_id equals `sid` —
-    /// i.e. nothing replaced the session since the caller observed it.
-    /// A background direct-path upgrade uses this so that a racing
-    /// inbound rotation (which the upgrade's handshake didn't know
-    /// about) wins and is NOT clobbered — the last-writer-wins
-    /// nondeterminism is removed from the upgrade path specifically.
-    /// The check + insert are atomic under the DashMap entry's shard
-    /// write lock.
-    ///
-    /// Returns `true` if the session was installed, `false` if the CAS
-    /// check failed (the caller should treat its upgrade as lost and
-    /// leave the current session — typically the working relay path —
-    /// intact).
-    fn install_peer_cas(
+    /// Install a ROUTED session: datagrams go to `relay_addr`, which
+    /// this session does not authenticate. The endpoint is reachable,
+    /// but it is not adjacent and owns nothing.
+    fn install_routed(
         &self,
         peer_node_id: u64,
-        peer_addr: SocketAddr,
+        relay_addr: SocketAddr,
         keys: SessionKeys,
-        addr_mode: AddrInstallMode,
         expected_prior_session_id: Option<u64>,
-    ) -> bool {
+    ) -> PeerTransitionOutcome {
+        // Attribute the relay only when a DIRECT session already owns
+        // that address. An unclaimed address is left unattributed
+        // rather than credited to the endpoint: "nobody claims it" is
+        // not evidence of adjacency, and treating it as such is exactly
+        // what used to publish a relay's address as an endpoint's
+        // property.
+        let adjacent_relay_identity = self
+            .addr_to_node
+            .get(&relay_addr)
+            .map(|e| *e.value())
+            .filter(|nid| *nid != peer_node_id);
+        self.install_peer_transition(
+            peer_node_id,
+            PeerTransport::Routed {
+                relay_addr,
+                adjacent_relay_identity,
+            },
+            keys,
+            expected_prior_session_id,
+        )
+    }
+
+    /// Shared peer-install bookkeeping for both [`Self::connect`]
+    /// (direct) and [`Self::connect_via`] (routed). Wraps the
+    /// negotiated `keys` in a [`NetSession`] and publishes the peer
+    /// record together with every sidecar that describes it.
+    ///
+    /// Runs as ONE transition — see [`PeerTransitions::with`]. The
+    /// `peers` entry lock alone orders only the peer-record swap; every
+    /// sidecar (peer_addrs, the route candidate, the address index, the
+    /// session index, the withdrawal gate, learned-route migration) is
+    /// published after it is released. Two installs could therefore
+    /// serialize peer state A → B → C and then finish sidecars
+    /// C-then-B, leaving `peers` holding C while the route, addresses
+    /// and session index named B — a peer snapshot that is not coherent
+    /// with itself.
+    fn install_peer_transition(
+        &self,
+        peer_node_id: u64,
+        transport: PeerTransport,
+        keys: SessionKeys,
+        expected_prior_session_id: Option<u64>,
+    ) -> PeerTransitionOutcome {
+        self.peer_transitions.with(peer_node_id, || {
+            self.install_peer_locked(peer_node_id, transport, keys, expected_prior_session_id)
+        })
+    }
+
+    /// The install body, running under this peer's transition guard.
+    fn install_peer_locked(
+        &self,
+        peer_node_id: u64,
+        transport: PeerTransport,
+        keys: SessionKeys,
+        expected_prior_session_id: Option<u64>,
+    ) -> PeerTransitionOutcome {
         use dashmap::mapref::entry::Entry;
 
+        let peer_addr = transport.send_addr();
         let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
@@ -12614,7 +14750,7 @@ impl MeshNode {
         let session_id = session.session_id();
         let new_entry = PeerInfo {
             node_id: peer_node_id,
-            addr: peer_addr,
+            transport,
             session,
             remote_static_pub,
             // Initiator-side: replay-guard is a responder-side
@@ -12630,7 +14766,7 @@ impl MeshNode {
             Entry::Occupied(mut occ) => {
                 if let Some(expected) = expected_prior_session_id {
                     if occ.get().session.session_id() != expected {
-                        return false;
+                        return PeerTransitionOutcome::lost();
                     }
                 }
                 Some(occ.insert(new_entry))
@@ -12640,20 +14776,19 @@ impl MeshNode {
                     // CAS expected a prior session, but it's gone (torn
                     // down). Abort rather than resurrect a session the
                     // upgrade didn't intend to create.
-                    return false;
+                    return PeerTransitionOutcome::lost();
                 }
                 vac.insert(new_entry);
                 None
             }
         };
 
-        self.router.add_route(peer_node_id, peer_addr);
         self.peer_addrs.insert(peer_node_id, peer_addr);
-        // Old direct address of a re-handshaking peer, captured
-        // before `displaced` is consumed below (RT-5: address
-        // migration for multi-hop routes, see the DirectOverwrite
-        // arm).
-        let displaced_addr = displaced.as_ref().map(|d| d.addr);
+        // The displaced session's transport, captured before
+        // `displaced` is consumed below. Whether it was DIRECT decides
+        // whether an authenticated adjacency is being surrendered; its
+        // address decides which learned routes must follow the peer.
+        let displaced_transport = displaced.as_ref().map(|d| d.transport);
         // PERF_AUDIT §2.4: reverse-index update. Routed-local
         // dispatch reads this in O(1) instead of scanning peers
         // for a matching session_id. If this insert replaced an
@@ -12667,14 +14802,17 @@ impl MeshNode {
             self.session_id_to_node
                 .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
             // C4 hygiene (`NAT_TRAVERSAL_V2_PLAN.md`): drop the
-            // displaced session's stale reverse-addr mapping when its
-            // addr differs from the new one (a relay→direct swap leaves
-            // the old relay addr behind otherwise). Guard on ownership
-            // so we never evict an entry another peer legitimately owns
-            // (e.g. a shared relay addr).
-            if old.addr != peer_addr {
-                self.addr_to_node
-                    .remove_if(&old.addr, |_, n| *n == peer_node_id);
+            // displaced session's OWNED address when it differs from
+            // the new one (a relay→direct swap leaves the old address
+            // behind otherwise). Only an owned address can be indexed,
+            // so only an owned address can be un-indexed; a displaced
+            // routed session never had an entry to withdraw and must
+            // not withdraw a relay's own.
+            if let Some(old_owned) = old.owned_addr() {
+                if Some(old_owned) != transport.owned_addr() {
+                    self.addr_to_node
+                        .remove_if(&old_owned, |_, n| *n == peer_node_id);
+                }
             }
         }
         self.session_id_to_node.insert(session_id, peer_node_id);
@@ -12683,8 +14821,20 @@ impl MeshNode {
         // first post-handshake withdrawals aren't mistaken for
         // stale (RT-5 ordering gate).
         self.route_withdraw_gate.forget_sender(peer_node_id);
-        match addr_mode {
-            AddrInstallMode::DirectOverwrite => {
+
+        // Route installation follows the TRANSPORT. A single
+        // unconditional `add_direct_route` here was the initiator-side
+        // false adjacency: `connect_via` installs the REMOTE endpoint
+        // under the RELAY's address, and binding that pair as an
+        // authenticated adjacency made protected forwarding select the
+        // endpoint's end-to-end session while aiming the envelope at
+        // the relay, which cannot authenticate it.
+        let route_token = match transport {
+            PeerTransport::Direct { owned_addr } => {
+                // A direct handshake IS an authenticated adjacency:
+                // destination and next hop are the same session peer,
+                // so the route carries `next_hop_id` by construction.
+                let token = Some(self.router.add_direct_route(peer_node_id, owned_addr));
                 // Re-handshake from a NEW direct address (NAT
                 // rebind): repoint any multi-hop routes still
                 // carrying this peer's previous address, and drop
@@ -12692,26 +14842,76 @@ impl MeshNode {
                 // pingwave refreshes never rewrite an installed
                 // `next_hop`, so without this migration those routes
                 // keep the old address forever and address-keyed ops
-                // — notably the RT-5 withdrawal match
-                // (`remove_route_if_next_hop_is`) — silently miss
+                // — notably the RT-5 withdrawal match — silently miss
                 // them, degrading withdrawals to age-out for this
                 // peer (RT-5 review Finding 6).
-                if let Some(old_addr) = displaced_addr {
-                    if old_addr != peer_addr {
-                        self.router
-                            .routing_table()
-                            .migrate_next_hop(old_addr, peer_addr);
-                        self.addr_to_node
-                            .remove_if(&old_addr, |_, n| *n == peer_node_id);
+                if let Some(old_addr) = displaced_transport.map(|t| t.send_addr()) {
+                    if old_addr != owned_addr {
+                        self.router.routing_table().migrate_next_hop(
+                            old_addr,
+                            owned_addr,
+                            peer_node_id,
+                        );
                     }
                 }
-                self.addr_to_node.insert(peer_addr, peer_node_id);
+                self.addr_to_node.insert(owned_addr, peer_node_id);
+                token
             }
-            AddrInstallMode::RoutedPreserve => {
-                self.addr_to_node.entry(peer_addr).or_insert(peer_node_id);
+            PeerTransport::Routed { relay_addr, .. } => {
+                // A routed end-to-end session is NOT an authenticated
+                // adjacent route-hop session: the recorded address is
+                // the immediate relay's, and the session authenticates
+                // the far endpoint, not the relay. Install an ORDINARY
+                // route only — ordinary traffic reaches the endpoint
+                // via the relay, while `lookup_authenticated` refuses
+                // to resolve it. The entry may become protected-capable
+                // later only through an authenticated learning path
+                // that binds the actual adjacent relay's identity.
+                let token = Some(self.router.add_route(peer_node_id, relay_addr));
+                // `addr_to_node` is deliberately NOT written. That index
+                // answers "who OWNS this address", and a relay's address
+                // belongs to the relay. Publishing the endpoint there
+                // (even only when the slot was vacant) made three
+                // predicates unsound at once — direct-hop resolution,
+                // the withdrawal `sender_is_direct` check, and protected
+                // promotion — each of which reads exactly this map to
+                // decide whether an address is a peer's own attachment.
+                //
+                // Reachability is not lost by that: it lives in the
+                // peer's own `PeerTransport`, which is what the send
+                // path resolves through. Deleting the write WITHOUT
+                // moving the send path off the index is what made every
+                // routed peer unreachable.
+                //
+                // A displaced DIRECT session for the same peer must
+                // also surrender its authenticated adjacency: the
+                // protected routes that rode it named an adjacency
+                // that no longer exists. They are invalidated rather
+                // than migrated — a routed session is not a weaker
+                // version of the direct one, it is different evidence.
+                if displaced_transport.is_some_and(|t| t.is_direct()) {
+                    let retired = self
+                        .router
+                        .routing_table()
+                        .invalidate_protected_via(peer_node_id);
+                    if retired > 0 {
+                        tracing::debug!(
+                            peer = format!("{peer_node_id:#x}"),
+                            retired,
+                            "routed session displaced a direct one — retired the \
+                             protected routes that depended on that adjacency"
+                        );
+                    }
+                }
+                token
             }
+        };
+
+        PeerTransitionOutcome {
+            owned: true,
+            session_id: Some(session_id),
+            route_token,
         }
-        true
     }
 
     /// Accept a connection from a peer. Performs Noise NKpsk0 as responder.
@@ -12785,69 +14985,37 @@ impl MeshNode {
         }
         let (keys, peer_addr) = self.handshake_responder(peer_node_id).await?;
 
-        let remote_static_pub = keys.remote_static_pub;
-        let session = Arc::new(NetSession::new(
-            keys,
-            peer_addr,
-            self.config.packet_pool_size,
-            self.config.default_reliable,
-        ));
-        // PERF_AUDIT §2.4: capture session_id before move into
-        // PeerInfo so we can populate the reverse index after the
-        // insert.
-        let session_id = session.session_id();
-
-        self.router.add_route(peer_node_id, peer_addr);
-
-        let displaced = self.peers.insert(
-            peer_node_id,
-            PeerInfo {
-                node_id: peer_node_id,
-                addr: peer_addr,
-                session,
-                remote_static_pub,
-                // `accept` runs before `start()`, so the routed-
-                // dispatch replay guard is moot; leave empty.
-                last_initiator_ephemeral: None,
-            },
-        );
-        self.addr_to_node.insert(peer_addr, peer_node_id);
-
-        self.peer_addrs.insert(peer_node_id, peer_addr);
-        // Re-handshake from a new direct address: migrate multi-hop
-        // routes off the peer's previous address and drop its stale
-        // reverse-index entry — see the matching comment in
-        // `install_peer`'s DirectOverwrite arm (RT-5 review
-        // Finding 6).
-        if let Some(old_addr) = displaced.as_ref().map(|d| d.addr) {
-            if old_addr != peer_addr {
-                self.router
-                    .routing_table()
-                    .migrate_next_hop(old_addr, peer_addr);
-                self.addr_to_node
-                    .remove_if(&old_addr, |_, n| *n == peer_node_id);
-            }
-        }
-        // PERF_AUDIT §2.4: evict the displaced session's reverse-
-        // index entry before installing the fresh one — see the
-        // matching comment in `install_peer`.
-        if let Some(old) = displaced {
-            self.session_id_to_node
-                .remove_if(&old.session.session_id(), |_, n| *n == peer_node_id);
-        }
-        self.session_id_to_node.insert(session_id, peer_node_id);
-        // See the matching comment in `install_peer` — fresh
-        // incarnation, fresh withdrawal-seq gate history.
-        self.route_withdraw_gate.forget_sender(peer_node_id);
+        // The responder side of a handshake is the SAME lifecycle
+        // operation as the initiator side, so it runs through the same
+        // typed transition rather than re-deriving one.
+        //
+        // It used to hand-roll the whole publication under a directly
+        // acquired shard lock. Taking the same mutex is a weaker
+        // property than being the same operation, and the copy had
+        // already drifted from the original in two ways: it published
+        // `addr_to_node` unconditionally rather than through the
+        // transport, and it never invalidated the protected candidates
+        // of a displaced routed session. Divergence between two
+        // publishers of the same state is a compile error now, not a
+        // review finding.
+        //
+        // `install_direct` holds a `parking_lot` guard, whose non-`Send`
+        // type keeps the compiler enforcing that no part of the
+        // transition can straddle the `.await`s below.
+        let session_id = self
+            .install_direct(peer_node_id, peer_addr, keys, None)
+            .session_id
+            .unwrap_or_default();
 
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
         self.proximity_graph.on_pingwave(pw, peer_addr);
 
-        self.failure_detector.heartbeat(peer_node_id, peer_addr);
+        self.failure_detector
+            .heartbeat_for_incarnation(peer_node_id, peer_addr, session_id);
 
         // See the matching comment in `connect`.
-        self.push_local_announcement(peer_addr).await;
+        self.push_local_announcement(peer_node_id).await;
         // RT-4: a new session is a topology change - flood our
         // pingwave now so third parties learn the new edge at
         // flood speed, not on the next heartbeat tick. Session open
@@ -13338,6 +15506,33 @@ impl MeshNode {
             self.routing_registry_metrics.recaptures_restarted(),
             self.routing_registry_metrics.settlements_refused(),
         ]
+    }
+
+    /// Routing-actor loop iterations COMPLETED (OLB-2B.3b).
+    ///
+    /// The only externally-visible statement that no reconciliation pass is in
+    /// flight. Every other signal a witness could sample says something weaker:
+    /// an artifact is visible the moment `apply` stores it, which is before the
+    /// pass that installed it has settled and returned, and reconciliation
+    /// counters that merely stopped moving for a while are evidence of a
+    /// scheduler gap rather than of a finished pass. This advances at the actor's
+    /// park, so an observed advance is an iteration boundary.
+    #[cfg(test)]
+    pub(crate) fn org_routing_actor_passes(&self) -> u64 {
+        self.routing_hooks
+            .passes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test-only: wake the routing actor exactly as first demand does.
+    ///
+    /// A pass woken this way with nothing pending builds nothing and installs
+    /// nothing — it takes the commit pin, finds an empty selection and settles —
+    /// so it is a PROBE of the actor's liveness rather than a mutation of its
+    /// state, which is what makes it usable as an idle barrier.
+    #[cfg(test)]
+    pub(crate) fn mark_org_routing_work(&self) {
+        self.routing_work.mark();
     }
 
     /// Slots asked for under an audience scope the production source does not
@@ -14365,6 +16560,7 @@ impl MeshNode {
             peers: self.peers.clone(),
             addr_to_node: self.addr_to_node.clone(),
             peer_addrs: self.peer_addrs.clone(),
+            peer_transitions: self.peer_transitions.clone(),
             router: self.router.clone(),
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
@@ -14452,6 +16648,8 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
+            unregistered_channels: self.config.unregistered_channels,
+            unregistered_warned: self.unregistered_warned.clone(),
             capability_fold: self.capability_fold.clone(),
             ack_ranges_peer_cache: self.ack_ranges_peer_cache.clone(),
             #[cfg(feature = "dataforts")]
@@ -14461,6 +16659,14 @@ impl MeshNode {
             local_subnet: self.local_subnet,
             local_subnet_policy: self.local_subnet_policy.clone(),
             peer_subnets: self.peer_subnets.clone(),
+            subnet_contexts: self.subnet_contexts.clone(),
+            subnet_gateway_authority: self.subnet_gateway_authority.clone(),
+            protected_relay_stats: self.protected_relay_stats.clone(),
+            subnet_floors: self.subnet_floors.clone(),
+            subnet_control: self.subnet_control.clone(),
+            subnet_authorities: self.subnet_authorities.clone(),
+            subnet_control_stream_id: self.subnet_control_stream_id,
+            subnet_topology_epoch: self.subnet_topology_epoch.clone(),
             subnet_gateway: self.subnet_gateway.clone(),
             peer_entity_ids: self.peer_entity_ids.clone(),
             origin_hash_to_node: self.origin_hash_to_node.clone(),
@@ -14744,6 +16950,36 @@ impl MeshNode {
                 // edge) that a withdrawal just removed (RT-5 review). We
                 // install/refresh the route only for an ACCEPTED
                 // pingwave, and forward only an accepted-and-live one.
+                // A pingwave installs a LEGACY route, never an
+                // identity-bound one. Pingwaves are unauthenticated
+                // UDP datagrams: resolving `from_node_id` through the
+                // reverse index and even cross-checking the peer
+                // registry's current address is two ADDRESS registries
+                // agreeing — no authenticated session carried or
+                // verified this datagram. A spoofed packet using a
+                // registered peer's source tuple could otherwise
+                // install a better route identity-bound to that
+                // innocent peer, poisoning protected routing toward a
+                // hop that supplied no route evidence. D6 requires the
+                // bound identity to come from the authenticated
+                // adjacent sender; until pingwaves are themselves
+                // adjacent-session authenticated, the route they
+                // install stays address-only — usable by ordinary
+                // routing, unresolvable by protected forwarding.
+                //
+                // This writes the ORDINARY candidate, which is a
+                // separate slot from the protected one: a pingwave can
+                // neither mutate authenticated route state nor occupy
+                // the destination against it, whatever metric it
+                // claims. The authenticated learning path for the same
+                // edge is the capability announcement, whose sender is
+                // the AEAD-resolved session peer; it always has an
+                // empty protected slot to land in.
+                let install_learned_route = || {
+                    ctx.router
+                        .routing_table()
+                        .add_route_with_metric(origin_nid, source, metric);
+                };
                 let from_graph_id = node_id_to_graph_id(from_node_id);
                 let admission = ctx
                     .proximity_graph
@@ -14751,15 +16987,11 @@ impl MeshNode {
                 let fwd_pw = match admission {
                     PingwaveAdmission::RejectedDuplicate => return,
                     PingwaveAdmission::AcceptedNoForward => {
-                        ctx.router
-                            .routing_table()
-                            .add_route_with_metric(origin_nid, source, metric);
+                        install_learned_route();
                         return;
                     }
                     PingwaveAdmission::AcceptedAndForward(fwd_pw) => {
-                        ctx.router
-                            .routing_table()
-                            .add_route_with_metric(origin_nid, source, metric);
+                        install_learned_route();
                         fwd_pw
                     }
                 };
@@ -14779,7 +17011,7 @@ impl MeshNode {
                     tokio::spawn(async move {
                         let next_hop = router.routing_table().lookup(origin_nid);
                         for entry in peers.iter() {
-                            let addr = entry.value().addr;
+                            let addr = entry.value().addr();
                             if addr == source {
                                 continue; // never send back to sender
                             }
@@ -14819,6 +17051,15 @@ impl MeshNode {
         let is_routed =
             first2 == ROUTING_MAGIC && data.len() >= ROUTING_HEADER_SIZE + protocol::HEADER_SIZE;
         let is_direct = first2 == MAGIC;
+        // An authenticated route-hop envelope (SUBNET_AUTH_PLAN.md D6)
+        // carries its own discriminator so protected and legacy routed
+        // traffic can never alias. Everything about it — including
+        // whether this node is even a gateway — is decided inside
+        // `relay_protected_hop`, which authenticates before it acts.
+        if first2 == super::subnet::route_hop::ROUTE_HOP_MAGIC {
+            Self::relay_protected_hop(&data, ctx);
+            return;
+        }
         if !is_routed && !is_direct {
             // Malformed / unrecognized prefix — drop silently.
             return;
@@ -14895,6 +17136,20 @@ impl MeshNode {
                     // which it can use as a reply path. `router.start()`'s
                     // internal scheduler has a separate ephemeral socket
                     // and would make `source` unusable for replies.
+                    //
+                    // A node holding gateway credentials is in PROTECTED
+                    // mode and will not relay an untagged legacy packet
+                    // (SUBNET_AUTH_PLAN.md D6): a protected route may
+                    // never downgrade to the public path. Protected
+                    // traffic arrives as a route-hop envelope and is
+                    // handled above, before this branch is reached.
+                    if ctx.subnet_gateway_authority.load().gateway.is_some() {
+                        tracing::debug!(
+                            dest = format!("{:#x}", routing_header.dest_id),
+                            "subnet: refusing to relay an untagged legacy route packet in protected mode",
+                        );
+                        return;
+                    }
                     if routing_header.is_expired() {
                         return;
                     }
@@ -15008,12 +17263,238 @@ impl MeshNode {
             if !session.verify_and_touch_heartbeat(&parsed) {
                 return;
             }
-            failure_detector.heartbeat(peer_node_id, source);
+            // Stamp the INCARNATION this heartbeat authenticated under,
+            // so a later failure verdict names the session that
+            // actually died rather than whatever is installed when the
+            // callback happens to run.
+            failure_detector.heartbeat_for_incarnation(peer_node_id, source, session.session_id());
             return;
         }
 
         Self::process_local_packet(parsed, peer_node_id, &session, ctx);
         session.touch();
+    }
+
+    /// Relay one authenticated route-hop envelope (SUBNET_AUTH_PLAN.md
+    /// D6, slice S4B).
+    ///
+    /// Every step precedes any side effect — no route lookup, no TTL
+    /// mutation, no buffer mutation, no send happens until the hop is
+    /// authenticated and the transition authorized. The reusable
+    /// forwarding buffer is touched last, in step 6, for the same
+    /// reason: a packet that will not be forwarded must not be
+    /// serialized:
+    ///
+    /// 1. resolve the ingress session by `hop_session_id` (NOT by UDP
+    ///    source, `RoutingHeader.src_id`, `NetHeader.subnet_id`, or
+    ///    `peer_subnets` — none of those authenticate anyone);
+    /// 2. verify the hop MAC and admit the sequence once;
+    /// 3. load the ingress peer's admitted context;
+    /// 4. resolve the egress hop by IDENTITY and load its context;
+    /// 5. evaluate this node's own gateway authority over the two
+    ///    hop-local attachments;
+    /// 6. only then decrement the outer TTL and re-tag for the next
+    ///    hop. The inner packet is copied through byte for byte.
+    fn relay_protected_hop(data: &[u8], ctx: &DispatchCtx) {
+        use super::subnet::route_hop;
+
+        // ONE authority snapshot for the whole relay decision:
+        // credentials and boundaries come from the same published
+        // aggregate, so a wholesale replacement landing mid-relay can
+        // never pair a pre-replacement credential set with a
+        // post-replacement boundary set (or the inverse). The guard is
+        // a lock-free, allocation-free load.
+        let authority_state = ctx.subnet_gateway_authority.load();
+        let Some(local_set) = authority_state.gateway.as_deref() else {
+            // Not a protected gateway: an envelope is not ours to relay.
+            return;
+        };
+
+        // (1) Ingress identity comes from the hop session id alone.
+        let Ok(peeked) = route_hop::parse_prefix(data) else {
+            return;
+        };
+        let Some(ingress_node) = ctx
+            .session_id_to_node
+            .get(&peeked.hop_session_id)
+            .map(|e| *e.value())
+        else {
+            return;
+        };
+        let Some(ingress_session) = ctx
+            .peers
+            .get(&ingress_node)
+            .map(|e| e.value().session.clone())
+        else {
+            return;
+        };
+        if ingress_session.session_id() != peeked.hop_session_id {
+            return;
+        }
+
+        // (2) Authenticate the hop. A bad tag or replayed sequence
+        // stops here, before any route or context lookup.
+        let opened = match ingress_session.open_route_hop(data) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::debug!(
+                    from = format!("{ingress_node:#x}"),
+                    reason = %e,
+                    "subnet: dropping route-hop envelope",
+                );
+                return;
+            }
+        };
+
+        // TTL on the OUTER routing header only; the inner
+        // `NetHeader.hop_ttl` is AAD-covered and never touched.
+        if opened.header.is_expired() {
+            return;
+        }
+
+        let epoch = ctx.subnet_topology_epoch.load(Ordering::Acquire);
+        let auth_epoch = ctx.subnet_floors.auth_epoch(local_set.authority());
+        let now = super::subnet::admission::unix_now_secs();
+
+        // (3) Ingress attachment — from the admitted context on the
+        // exact session that authenticated the hop.
+        let Some(ingress_ctx) = ctx
+            .subnet_contexts
+            .get_for_session(ingress_node, ingress_session.session_id())
+        else {
+            return;
+        };
+
+        // (4) Egress by IDENTITY bound into the route entry — not by
+        // resolving an address through the mutable reverse map, which
+        // would let address reuse retarget the route.
+        let Some((egress_node, bound_addr)) = ctx
+            .router
+            .routing_table()
+            .lookup_authenticated(opened.header.dest_id)
+        else {
+            return;
+        };
+        // ONE snapshot of the egress peer: session handle, its id, and
+        // its address, all from the same incarnation. Reading the
+        // session here and the address again later could seal under an
+        // old session and send to a re-handshaked peer's new address —
+        // the far side would drop it, so it fails closed, but the
+        // packet would have been authorized against one incarnation and
+        // emitted against another. The guard is released immediately;
+        // nothing below holds a map guard across authorization or
+        // crypto.
+        let Some((egress_session, egress_session_id, egress_addr)) =
+            ctx.peers.get(&egress_node).map(|e| {
+                let peer = e.value();
+                (peer.session.clone(), peer.session.session_id(), peer.addr())
+            })
+        else {
+            return;
+        };
+        // The egress attachment is bound to the snapshotted incarnation,
+        // not to whatever session the peer holds by the time we send.
+        let Some(egress_ctx) = ctx
+            .subnet_contexts
+            .get_for_session(egress_node, egress_session_id)
+        else {
+            return;
+        };
+        if ctx.partition_filter.contains(&egress_addr) {
+            return;
+        }
+
+        // (5) This node's own authority over the two hop-local
+        // attachments.
+        // Boundaries are a separate mandatory surface; without one,
+        // protected forwarding denies rather than treating "no
+        // declared boundaries" as "everything is internal". Read from
+        // the SAME aggregate snapshot as the credential set above.
+        let Some(boundaries) = authority_state.boundaries.as_deref() else {
+            return;
+        };
+        if let Err(denial) = local_set.authorize_transition(
+            &ingress_ctx,
+            &egress_ctx,
+            boundaries,
+            epoch,
+            auth_epoch,
+            now,
+        ) {
+            ctx.protected_relay_stats.record_denied(denial);
+            tracing::debug!(
+                ingress = format!("{ingress_node:#x}"),
+                egress = format!("{egress_node:#x}"),
+                reason = ?denial,
+                "subnet: protected forward denied",
+            );
+            return;
+        }
+
+        // (6) Authorized. Mutate only the outer routing header, then
+        // re-tag for the next authenticated hop, into this worker's
+        // fixed buffer. Forwarding is the one path here that runs per
+        // packet per hop, so a fresh `Vec` on it is an allocator round
+        // trip and a cold cache line between a packet arriving and
+        // leaving.
+        let mut fwd_header = opened.header;
+        fwd_header.forward();
+        // Re-check the egress incarnation right before sealing. If the
+        // peer re-handshaked between authorization and here, the
+        // decision was made against a session that no longer exists;
+        // emit nothing rather than tag under a dead key or aim a valid
+        // tag at a new address.
+        // Both halves of the incarnation, plus the route's own binding.
+        // Checking only the session id would miss an address change
+        // under the same session; ignoring `bound_addr` would let the
+        // route and the peer disagree about where the hop goes. The hot
+        // path drops on any disagreement rather than reconstructing
+        // identity from an address — a legitimate NAT rebind is repaired
+        // off-path under the same bound identity by
+        // `authenticated_next_hop`.
+        let still_current = ctx.peers.get(&egress_node).is_some_and(|e| {
+            let peer = e.value();
+            peer.session.session_id() == egress_session_id
+                && peer.addr() == egress_addr
+                && egress_addr == bound_addr
+        });
+        if !still_current {
+            tracing::debug!(
+                egress = format!("{egress_node:#x}"),
+                "subnet: egress incarnation changed mid-admission, dropping",
+            );
+            return;
+        }
+        FORWARD_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            // Sized for MAX_PACKET_SIZE at compile time, so this cannot
+            // fail for anything the socket can deliver. Refuse rather
+            // than grow: growing here would allocate on the packet path,
+            // which is what the fixed buffer exists to prevent.
+            let Ok(n) = egress_session.seal_route_hop_into(&mut buf[..], &fwd_header, opened.inner)
+            else {
+                return;
+            };
+            // UDP forwarding sheds load by dropping. A full egress
+            // socket means the far side is already behind, and the
+            // alternative — copying the datagram onto the heap and
+            // spawning a task to await the send — converts downstream
+            // congestion into unbounded heap and scheduler pressure at
+            // exactly the moment this node should be shedding it. An
+            // authenticated peer could hold the socket blocked and make
+            // that queue grow without limit. If queuing is ever wanted
+            // here it has to be an explicitly bounded worker-owned ring,
+            // not one spawned task per datagram.
+            if let Err(e) = ctx.socket.try_send_to(&buf[..n], egress_addr) {
+                tracing::debug!(
+                    egress = format!("{egress_node:#x}"),
+                    reason = %e,
+                    "subnet: dropping authorized hop, egress socket not ready",
+                );
+            } else {
+                ctx.protected_relay_stats.record_forwarded();
+            }
+        });
     }
 
     /// Handle a routed handshake packet that arrived at this node.
@@ -15215,52 +17696,94 @@ impl MeshNode {
         // yield the freshly-installed session_id, captured in
         // `registered_session_id` for the post-match reverse-index
         // update (PERF_AUDIT §2.4).
-        let registered_session_id: u64 = match ctx.peers.entry(peer_node_id) {
-            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                match routed_rotation_outcome(
-                    occ.get(),
-                    &remote_static_pub,
-                    &initiator_ephemeral,
-                    ctx.session_timeout,
-                ) {
-                    RoutedRotationOutcome::DropReplay => {
-                        tracing::warn!(
-                            peer_node_id,
-                            "routed handshake: dropping msg1 — live session already \
-                             established for this peer with matching remote_static_pub \
-                             AND identical initiator ephemeral (replay guard)"
-                        );
-                        return;
+        // The responder-side registration runs as ONE peer transition,
+        // through the same handle every other publisher uses. It used
+        // to publish `peers`, `peer_addrs`, the route, the session
+        // index and the withdrawal gate as five independent writes
+        // outside any transition — so a concurrent install could
+        // interleave with it, and the rollback guard below could not
+        // name the exact route it was undoing.
+        let Some((registered_session_id, registered_route_token)) =
+            ctx.peer_transitions.with(peer_node_id, || {
+                let registered: Option<u64> = match ctx.peers.entry(peer_node_id) {
+                    dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                        match routed_rotation_outcome(
+                            occ.get(),
+                            &remote_static_pub,
+                            &initiator_ephemeral,
+                            ctx.session_timeout,
+                        ) {
+                            RoutedRotationOutcome::DropReplay => {
+                                tracing::warn!(
+                                    peer_node_id,
+                                    "routed handshake: dropping msg1 — live session already \
+                                     established for this peer with matching remote_static_pub \
+                                     AND identical initiator ephemeral (replay guard)"
+                                );
+                                None
+                            }
+                            RoutedRotationOutcome::RefuseFresh => {
+                                tracing::warn!(
+                                    peer_node_id,
+                                    "routed handshake: refusing key rotation — existing \
+                                     session is still within session_timeout. New keys \
+                                     can be installed once the live session has gone \
+                                     silent for at least session_timeout (rotation gate)"
+                                );
+                                None
+                            }
+                            RoutedRotationOutcome::DeferBusy => {
+                                tracing::debug!(
+                                    peer_node_id,
+                                    "routed handshake: deferring key rotation — existing \
+                                     session is live and busy (open streams / unacked \
+                                     in-flight data). Swapping now would drop that state; \
+                                     the initiator retries once the session is quiescent \
+                                     (direct-path upgrade C3 busy gate)"
+                                );
+                                None
+                            }
+                            RoutedRotationOutcome::AcceptRotation => {
+                                // PERF_AUDIT §2.4: the rotation displaces
+                                // the existing session — evict its reverse-
+                                // index entry, otherwise every accepted
+                                // rotation leaks one stale entry forever.
+                                let displaced_session_id = occ.get().session.session_id();
+                                ctx.session_id_to_node
+                                    .remove_if(&displaced_session_id, |_, n| *n == peer_node_id);
+                                let session = Arc::new(NetSession::new(
+                                    keys,
+                                    source,
+                                    ctx.packet_pool_size,
+                                    ctx.default_reliable,
+                                ));
+                                let session_id = session.session_id();
+                                occ.insert(PeerInfo {
+                                    node_id: peer_node_id,
+                                    // The msg1 arrived through `source`,
+                                    // which is the immediate upstream
+                                    // relay — not necessarily the remote
+                                    // endpoint. Routed is the honest
+                                    // claim; a Direct one here would
+                                    // assert an adjacency the handshake
+                                    // never established.
+                                    transport: PeerTransport::Routed {
+                                        relay_addr: source,
+                                        adjacent_relay_identity: ctx
+                                            .addr_to_node
+                                            .get(&source)
+                                            .map(|e| *e.value())
+                                            .filter(|nid| *nid != peer_node_id),
+                                    },
+                                    session,
+                                    remote_static_pub,
+                                    last_initiator_ephemeral: Some(initiator_ephemeral),
+                                });
+                                Some(session_id)
+                            }
+                        }
                     }
-                    RoutedRotationOutcome::RefuseFresh => {
-                        tracing::warn!(
-                            peer_node_id,
-                            "routed handshake: refusing key rotation — existing \
-                             session is still within session_timeout. New keys \
-                             can be installed once the live session has gone \
-                             silent for at least session_timeout (rotation gate)"
-                        );
-                        return;
-                    }
-                    RoutedRotationOutcome::DeferBusy => {
-                        tracing::debug!(
-                            peer_node_id,
-                            "routed handshake: deferring key rotation — existing \
-                             session is live and busy (open streams / unacked \
-                             in-flight data). Swapping now would drop that state; \
-                             the initiator retries once the session is quiescent \
-                             (direct-path upgrade C3 busy gate)"
-                        );
-                        return;
-                    }
-                    RoutedRotationOutcome::AcceptRotation => {
-                        // PERF_AUDIT §2.4: the rotation displaces
-                        // the existing session — evict its reverse-
-                        // index entry, otherwise every accepted
-                        // rotation leaks one stale entry forever.
-                        let displaced_session_id = occ.get().session.session_id();
-                        ctx.session_id_to_node
-                            .remove_if(&displaced_session_id, |_, n| *n == peer_node_id);
+                    dashmap::mapref::entry::Entry::Vacant(vac) => {
                         let session = Arc::new(NetSession::new(
                             keys,
                             source,
@@ -15268,46 +17791,59 @@ impl MeshNode {
                             ctx.default_reliable,
                         ));
                         let session_id = session.session_id();
-                        occ.insert(PeerInfo {
+                        vac.insert(PeerInfo {
                             node_id: peer_node_id,
-                            addr: source,
+                            transport: PeerTransport::Routed {
+                                relay_addr: source,
+                                adjacent_relay_identity: ctx
+                                    .addr_to_node
+                                    .get(&source)
+                                    .map(|e| *e.value())
+                                    .filter(|nid| *nid != peer_node_id),
+                            },
                             session,
                             remote_static_pub,
                             last_initiator_ephemeral: Some(initiator_ephemeral),
                         });
-                        session_id
+                        Some(session_id)
                     }
-                }
-            }
-            dashmap::mapref::entry::Entry::Vacant(vac) => {
-                let session = Arc::new(NetSession::new(
-                    keys,
-                    source,
-                    ctx.packet_pool_size,
-                    ctx.default_reliable,
-                ));
-                let session_id = session.session_id();
-                vac.insert(PeerInfo {
-                    node_id: peer_node_id,
-                    addr: source,
-                    session,
-                    remote_static_pub,
-                    last_initiator_ephemeral: Some(initiator_ephemeral),
-                });
-                session_id
-            }
+                };
+                let registered_session_id = registered?;
+                ctx.peer_addrs.insert(peer_node_id, source);
+                // ORDINARY on purpose. `peer_node_id` is the remote
+                // end-to-end peer; `source` is the immediate upstream
+                // relay's address. For a routed handshake those are not
+                // the same node, so binding `next_hop_id =
+                // peer_node_id` here would assert a false adjacency: a
+                // route claiming the remote endpoint as its next-hop
+                // identity while pointing at an intermediate relay's
+                // address. Protected forwarding would then select the
+                // remote endpoint's session and seal a tag the adjacent
+                // relay cannot verify.
+                //
+                // Route-hop authority is selected from the exact
+                // authenticated ADJACENT peer. Until this path can
+                // supply that identity from the ingress session that
+                // actually carried the handshake, the route stays
+                // address-only and protected forwarding fails closed on
+                // it.
+                let route_token = ctx.router.add_route(peer_node_id, source);
+                ctx.session_id_to_node
+                    .insert(registered_session_id, peer_node_id);
+                // Fresh session incarnation (Vacant or accepted
+                // rotation) → the peer's withdrawal seq counter
+                // restarts, so purge its gate history, exactly as the
+                // direct `connect`/`accept` install paths do. Without
+                // this, a peer reconnecting through a relay
+                // (`connect_via`) has its reset-sequence withdrawals
+                // rejected as stale until the gate ages them out
+                // (cubic P2).
+                ctx.route_withdraw_gate.forget_sender(peer_node_id);
+                Some((registered_session_id, route_token))
+            })
+        else {
+            return;
         };
-        ctx.peer_addrs.insert(peer_node_id, source);
-        ctx.router.add_route(peer_node_id, source);
-        ctx.session_id_to_node
-            .insert(registered_session_id, peer_node_id);
-        // Fresh session incarnation (Vacant or accepted rotation) →
-        // the peer's withdrawal seq counter restarts, so purge its
-        // gate history, exactly as the direct `connect`/`accept`
-        // install paths do. Without this, a peer reconnecting through
-        // a relay (`connect_via`) has its reset-sequence withdrawals
-        // rejected as stale until the gate ages them out (cubic P2).
-        ctx.route_withdraw_gate.forget_sender(peer_node_id);
 
         // Spawn the send. If it fails, roll back all three registrations
         // (peer session, peer-addr map, and routing table entry). Leaving
@@ -15339,6 +17875,8 @@ impl MeshNode {
             peer_node_id,
             registered_session_id,
             registered_next_hop: source,
+            registered_route_token,
+            peer_transitions: ctx.peer_transitions.clone(),
             peers: ctx.peers.clone(),
             peer_addrs: ctx.peer_addrs.clone(),
             session_id_to_node: ctx.session_id_to_node.clone(),
@@ -15397,7 +17935,7 @@ impl MeshNode {
             .and_then(|nid| {
                 peers.get(&nid).and_then(|p| {
                     (p.value().session.session_id() == session.session_id())
-                        .then(|| (p.value().addr, p.value().session.clone()))
+                        .then(|| (p.value().addr(), p.value().session.clone()))
                 })
             })
             .or_else(|| {
@@ -15407,7 +17945,11 @@ impl MeshNode {
                     .and_then(|node_id| {
                         peers.get(&*node_id).and_then(|p| {
                             (p.value().session.session_id() == session.session_id()).then(|| {
-                                (p.value().node_id, p.value().addr, p.value().session.clone())
+                                (
+                                    p.value().node_id,
+                                    p.value().addr(),
+                                    p.value().session.clone(),
+                                )
                             })
                         })
                     })
@@ -15415,7 +17957,13 @@ impl MeshNode {
                         peers
                             .iter()
                             .find(|e| e.value().session.session_id() == session.session_id())
-                            .map(|e| (e.value().node_id, e.value().addr, e.value().session.clone()))
+                            .map(|e| {
+                                (
+                                    e.value().node_id,
+                                    e.value().addr(),
+                                    e.value().session.clone(),
+                                )
+                            })
                     });
                 resolved.map(|(nid, addr, sess)| {
                     session.cache_node_id(nid);
@@ -15571,7 +18119,7 @@ impl MeshNode {
                                 let dest_session = ctx
                                     .peers
                                     .get(&msg.dest_node)
-                                    .map(|e| (e.value().addr, e.value().session.clone()));
+                                    .map(|e| (e.value().addr(), e.value().session.clone()));
 
                                 if let Some((dest_addr, dest_sess)) = dest_session {
                                     // Respect partition filter on outbound path
@@ -15627,7 +18175,7 @@ impl MeshNode {
                     let dest_session = ctx
                         .peers
                         .get(&from_node)
-                        .map(|e| (e.value().addr, e.value().session.clone()));
+                        .map(|e| (e.value().addr(), e.value().session.clone()));
                     if let Some((dest_addr, dest_sess)) = dest_session {
                         if !ctx.partition_filter.contains(&dest_addr) {
                             let socket = ctx.socket.clone();
@@ -16206,7 +18754,7 @@ impl MeshNode {
                         let Some((dest_addr, dest_sess)) = ctx
                             .peers
                             .get(&from_node)
-                            .map(|e| (e.value().addr, e.value().session.clone()))
+                            .map(|e| (e.value().addr(), e.value().session.clone()))
                         else {
                             continue;
                         };
@@ -16498,6 +19046,43 @@ impl MeshNode {
         } else {
             0
         };
+
+        // S5: subnet control facts riding the configured channel
+        // (SUBNET_AUTH_PLAN.md D8). Discriminated by the full publish
+        // stream id — 63 canonical channel-hash bits; the u16 wire
+        // hint collides — and NON-exclusive: subscribers on the
+        // channel still receive these events through the shard queue
+        // below. The bytes go to the same root-anchored verifier
+        // every arrival path uses. Channel membership and publication
+        // establish no fact authority, so a hostile publisher's
+        // injected bytes are verified into inertness here rather
+        // than filtered by privilege — which is also why rejects log
+        // at debug, not warn: on an open channel they are expected
+        // traffic, not an anomaly worth an operator page.
+        if ctx.subnet_control_stream_id == Some(stream_id) {
+            for event_data in &events {
+                match Self::apply_subnet_control_fact_with(
+                    event_data.as_ref(),
+                    &ctx.subnet_authorities,
+                    &ctx.subnet_control,
+                    &ctx.subnet_floors,
+                    &ctx.subnet_contexts,
+                ) {
+                    Ok(outcome) if outcome.applied => tracing::info!(
+                        from_node = format!("{from_node:#x}"),
+                        kind = ?outcome.kind,
+                        "subnet: control fact applied from channel"
+                    ),
+                    // Stale revision / replay — the designed no-op.
+                    Ok(_) => {}
+                    Err(err) => tracing::debug!(
+                        from_node = format!("{from_node:#x}"),
+                        %err,
+                        "subnet: control-channel bytes rejected (inert)"
+                    ),
+                }
+            }
+        }
 
         // Credit-window bookkeeping: charge only *accepted* inbound
         // bytes against the stream's RxCreditState. `on_receive`
@@ -17075,7 +19660,7 @@ impl MeshNode {
                 for peer in peers.iter() {
                     let due = peer.value().session.collect_timed_out_retransmits();
                     if !due.is_empty() {
-                        work.push((peer.value().addr, peer.value().session.clone(), due));
+                        work.push((peer.value().addr(), peer.value().session.clone(), due));
                     }
                 }
                 for (addr, session, due) in work {
@@ -17098,7 +19683,7 @@ impl MeshNode {
                 for peer in peers.iter() {
                     let failed = peer.value().session.take_failed_stream_ids();
                     if !failed.is_empty() {
-                        resets.push((peer.value().addr, peer.value().session.clone(), failed));
+                        resets.push((peer.value().addr(), peer.value().session.clone(), failed));
                     }
                 }
                 for (addr, session, failed) in resets {
@@ -17162,7 +19747,7 @@ impl MeshNode {
                     let reports = session.collect_gap_reports(want_ranges, MAX_ACK_RANGES);
                     if !reports.is_empty() {
                         work.push(TickGaps {
-                            addr: peer.value().addr,
+                            addr: peer.value().addr(),
                             session: session.clone(),
                             reports,
                         });
@@ -17243,6 +19828,11 @@ impl MeshNode {
         let peer_addrs = self.peer_addrs.clone();
         let session_id_to_node = self.session_id_to_node.clone();
         let ack_ranges_peer_cache = self.ack_ranges_peer_cache.clone();
+        let subnet_challenges_evict = self.subnet_challenges.clone();
+        let subnet_contexts_evict = self.subnet_contexts.clone();
+        // Eviction is a peer-state transition like any other and runs
+        // through the same handle as the installers.
+        let peer_transitions_evict = self.peer_transitions.clone();
         let route_withdraw_gate = self.route_withdraw_gate.clone();
         let failure_detector = self.failure_detector.clone();
         // SI-2a: sensing soft-state expiry rides this loop's tick —
@@ -17327,7 +19917,7 @@ impl MeshNode {
                         let snapshot: Vec<(SocketAddr, Arc<NetSession>)> = peers
                             .iter()
                             .filter_map(|entry| {
-                                let peer_addr = entry.value().addr;
+                                let peer_addr = entry.value().addr();
                                 if partition_filter.contains(&peer_addr) {
                                     None
                                 } else {
@@ -17871,20 +20461,52 @@ impl MeshNode {
                         let _ = failure_detector.check_all();
                         let failed = failure_detector.failed_nodes();
                         for node_id in failed {
-                            let still_silent = match peers.get(&node_id) {
-                                Some(e) => e.value().session.is_timed_out(dead_peer_timeout),
-                                None => false,
+                            // Capture WHICH incarnation looked dead, not
+                            // merely that one did.
+                            let observed = match peers.get(&node_id) {
+                                Some(e) if e.value().session.is_timed_out(dead_peer_timeout) => {
+                                    Some(e.value().session.session_id())
+                                }
+                                _ => None,
                             };
-                            if !still_silent {
+                            let Some(observed_session_id) = observed else {
                                 continue;
-                            }
-                            if let Some((_, old_info)) = peers.remove(&node_id) {
-                                let old_addr = old_info.addr;
+                            };
+                            // Evict as ONE peer transition, and remove
+                            // only if the peer still holds the exact
+                            // session that timed out. A concurrent
+                            // install can land between the check above
+                            // and the removal; keying on node_id alone
+                            // would then evict the fresh replacement
+                            // and leave its sidecars behind.
+                            // Every SYNCHRONOUS sidecar of the eviction
+                            // runs inside the transition, not after it.
+                            // Removing the peer under the guard and
+                            // then releasing it before clearing the
+                            // address indexes left a window in which a
+                            // fresh install had already published its
+                            // own state and this eviction went on to
+                            // delete parts of it — the same
+                            // published-then-torn shape the install
+                            // path takes the guard to prevent.
+                            let evicted = peer_transitions_evict.with(node_id, || {
+                                let evicted = peers.remove_if(&node_id, |_, info| {
+                                    info.session.session_id() == observed_session_id
+                                });
+                                let Some((_, old_info)) = &evicted else {
+                                    return false;
+                                };
                                 let old_session_id = old_info.session.session_id();
-                                addr_to_node
-                                    .remove_if(&old_addr, |_, n| *n == node_id);
+                                // Only an OWNED address was ever
+                                // published as this peer's; a routed
+                                // session's relay address belongs to
+                                // the relay and must survive the
+                                // endpoint's eviction.
+                                if let Some(old_owned) = old_info.owned_addr() {
+                                    addr_to_node.remove_if(&old_owned, |_, n| *n == node_id);
+                                }
                                 peer_addrs
-                                    .remove_if(&node_id, |_, addr| *addr == old_addr);
+                                    .remove_if(&node_id, |_, addr| *addr == old_info.addr());
                                 // PERF_AUDIT §2.4: drop the reverse
                                 // `session_id → node_id` entry only if it
                                 // still points at this node_id. A
@@ -17899,6 +20521,17 @@ impl MeshNode {
                                 // node_id re-resolves through the fold
                                 // on its first gate check.
                                 ack_ranges_peer_cache.remove(&node_id);
+                                // Admission state, same lockstep. The
+                                // context store already refuses to
+                                // serve a context whose session id no
+                                // longer matches, so this is prompt
+                                // reclamation rather than the
+                                // security boundary.
+                                subnet_challenges_evict.forget_peer(node_id);
+                                subnet_contexts_evict.forget_peer(node_id);
+                                true
+                            });
+                            if evicted {
                                 tracing::info!(
                                     node_id = format!("{:#x}", node_id),
                                     "evicted permanently-dead peer from peer map",
@@ -17909,7 +20542,17 @@ impl MeshNode {
                             // starts from a clean slate — and the
                             // withdrawal-seq gate history for the same
                             // reason (RT-5 ordering gate).
-                            failure_detector.remove(node_id);
+                            //
+                            // Conditional on the incarnation this sweep
+                            // judged dead. A fresh session for the same
+                            // node_id can land between the eviction
+                            // decision and here, and an unconditional
+                            // remove would discard the LIVE peer's
+                            // tracking — after which no failure verdict
+                            // could be reached for it until its next
+                            // heartbeat re-created the entry.
+                            failure_detector
+                                .remove_for_incarnation(node_id, observed_session_id);
                             route_withdraw_gate.forget_sender(node_id);
                         }
                     }
@@ -17921,26 +20564,53 @@ impl MeshNode {
         })
     }
 
+    /// Resolve the peer that OWNS `peer_addr` as its own direct
+    /// attachment.
+    ///
+    /// Address-keyed sends can only reach direct peers, and that is a
+    /// property of addresses rather than a limitation of this lookup: a
+    /// relay's address identifies the relay, and any number of endpoints
+    /// may be reachable through it. A caller that holds a node id must
+    /// use the node-keyed form and never launder the id through an
+    /// address to get back a (possibly different) id.
+    fn node_owning_addr(&self, peer_addr: SocketAddr) -> Result<u64, AdapterError> {
+        self.addr_to_node
+            .get(&peer_addr)
+            .map(|e| *e.value())
+            .ok_or_else(|| AdapterError::Connection("unknown peer".into()))
+    }
+
     /// Send a batch of events to a specific peer by address.
+    ///
+    /// Reaches DIRECT peers only: the address is resolved through the
+    /// ownership index, and a relay's address identifies the relay
+    /// rather than any endpoint behind it. For a peer known by node id,
+    /// including one reached through a relay, use
+    /// [`Self::send_to_peer_node`].
     pub async fn send_to_peer(
         &self,
         peer_addr: SocketAddr,
         batch: &Batch,
     ) -> Result<(), AdapterError> {
-        // Partition filter: silently drop sends to blocked peers
-        if self.partition_filter.contains(&peer_addr) {
-            return Ok(());
-        }
+        self.send_to_peer_node(self.node_owning_addr(peer_addr)?, batch)
+            .await
+    }
 
-        let node_id = self
-            .addr_to_node
-            .get(&peer_addr)
-            .map(|e| *e.value())
-            .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
+    /// Send a batch of events to a specific peer by NODE ID.
+    ///
+    /// The primitive. The peer's own transport supplies the wire
+    /// address, so a relayed peer is reachable without anyone having to
+    /// claim the relay's address belongs to it.
+    pub async fn send_to_peer_node(&self, node_id: u64, batch: &Batch) -> Result<(), AdapterError> {
         let peer = self
             .peers
             .get(&node_id)
             .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
+        let peer_addr = peer.addr();
+        // Partition filter: silently drop sends to blocked peers
+        if self.partition_filter.contains(&peer_addr) {
+            return Ok(());
+        }
 
         let session = &peer.session;
         let stream_id = batch.shard_id as u64;
@@ -18022,7 +20692,7 @@ impl MeshNode {
         let (dest_addr, session) = self
             .peers
             .get(&dest_node_id)
-            .map(|e| (e.value().addr, e.value().session.clone()))
+            .map(|e| (e.value().addr(), e.value().session.clone()))
             .ok_or_else(|| {
                 AdapterError::Connection(format!("no session for node {:#x}", dest_node_id))
             })?;
@@ -18287,7 +20957,7 @@ impl MeshNode {
     #[cfg(feature = "cortex")]
     pub(super) fn rpc_reply_subscriptions_arc(
         &self,
-    ) -> Arc<dashmap::DashMap<(u64, u64), Arc<str>>> {
+    ) -> Arc<dashmap::DashMap<(u64, u64), ReplySubscription>> {
         self.rpc_reply_subscriptions.clone()
     }
 
@@ -19033,13 +21703,19 @@ impl MeshNode {
     /// Install a shared `TokenCache` used by the channel-auth path.
     /// When set, `authorize_subscribe` and `publish_many` consult
     /// it via `ChannelConfig::can_subscribe` / `can_publish`.
-    /// Subscribers that present a token on the wire have their
-    /// token installed into this cache (after signature
-    /// verification) before the ACL check runs.
     ///
-    /// When unset, `require_token` channels always reject —
-    /// without a cache there's no way to validate presented tokens
-    /// or find pre-cached ones.
+    /// A subscriber-presented credential is **not** installed here.
+    /// Since the `TokenChain` migration it is verified inline against
+    /// the channel's `token_roots` and retained in `subscriber_chains`;
+    /// on that path this cache supplies only the `RevocationRegistry`
+    /// and the clock-skew tolerance. What it does hold is the local
+    /// node's own pre-installed credentials — notably the PUBLISH token
+    /// `publish_many` looks up via `get_for_action`.
+    ///
+    /// When unset, `require_token` channels always reject. That is now
+    /// enforced where it is observable: `authorize_subscribe` refuses
+    /// the subscribe outright (M4) rather than accepting one that every
+    /// later publish would deny while the peer sat rostered forever.
     pub fn set_token_cache(&mut self, cache: Arc<TokenCache>) {
         self.token_cache = Some(cache);
     }
@@ -19160,6 +21836,106 @@ impl MeshNode {
         .await
     }
 
+    /// Claim the one corrective re-announce allowed for `target`.
+    ///
+    /// Returns `true` exactly once per target (until that peer fails,
+    /// which clears the latch). See
+    /// [`MembershipFailure::warrants_reannounce`] for why the `Unauthorized`
+    /// filter alone is not sufficient.
+    /// Two bounds, checked in this order:
+    ///
+    /// 1. A node-wide window budget. The per-target latch alone bounds
+    ///    only ONE target: N distinct peers each rejecting our reply
+    ///    subscribe still bought N rate-limit-bypassing broadcasts, and
+    ///    a corrective announce goes to EVERY connected peer, not just
+    ///    the one that rejected us. So the aggregate was
+    ///    O(rejecting targets x peers) with nothing capping it — a set
+    ///    of peers that refuse for an ordinary ACL reason could drive
+    ///    sustained mesh-wide announce traffic.
+    /// 2. The per-target latch, so one peer cannot spend the budget
+    ///    repeatedly.
+    ///
+    /// Budget FIRST, and the latch is only consumed once the budget has
+    /// admitted. A target refused by the budget has not spent its one
+    /// claim and will get it on a later call — otherwise a burst would
+    /// permanently deny a corrective announce to whichever targets
+    /// happened to arrive during it, which is the opposite of what the
+    /// latch is for.
+    #[cfg(feature = "cortex")]
+    pub(super) fn claim_corrective_announce(&self, target: u64) -> bool {
+        if self.rpc_corrective_announced.contains(&target) {
+            return false;
+        }
+        if !self.rpc_corrective_budget.try_spend(Instant::now()) {
+            return false;
+        }
+        // Racing callers: `insert` returns false for the loser, which
+        // then refunds so the budget is not charged twice for one target.
+        if self.rpc_corrective_announced.insert(target) {
+            true
+        } else {
+            self.rpc_corrective_budget.refund();
+            false
+        }
+    }
+
+    /// Give back a claim whose announcement never went out.
+    ///
+    /// `claim_corrective_announce` has to be taken BEFORE the send,
+    /// because two callers racing on the same target must not both
+    /// announce. But the send is best-effort and its error was
+    /// discarded, so a dropped datagram used up the target's single
+    /// claim and left its reply subscriptions rejected until an
+    /// unrelated peer failure cleared the latch or a routine
+    /// re-announce happened to land. Refunding on a failed send keeps
+    /// the bound (nothing was broadcast, so there is nothing to bound)
+    /// while letting a later RPC retry the repair.
+    #[cfg(feature = "cortex")]
+    pub(super) fn release_corrective_announce(&self, target: u64) {
+        if self.rpc_corrective_announced.remove(&target).is_some() {
+            self.rpc_corrective_budget.refund();
+        }
+    }
+
+    /// `peer`'s current failure generation. The fence for operations
+    /// that span an `await` and then write per-peer state the failure
+    /// path evicts: snapshot it before the `await`, compare after the
+    /// write, undo the write if it moved.
+    ///
+    /// The problem it solves: `ensure_reply_subscription` reads the
+    /// cache, subscribes (an `await`, so the peer can fail underneath
+    /// it), then records "subscribed". The failure path's eviction runs
+    /// during that gap and finds nothing to evict; the insert lands
+    /// afterwards. The caller is now cached as subscribed to a target
+    /// that dropped it from the roster on failure — so every later call
+    /// short-circuits the re-subscribe, and the target publishes replies
+    /// to a channel we are no longer rostered on. They are dropped
+    /// silently: no error, no timeout on the subscribe, just replies
+    /// that never arrive until the process restarts.
+    ///
+    /// A peer with no recorded failure resolves to the reclamation
+    /// floor rather than to a fixed zero, which is what lets the
+    /// counters be forgotten without opening a hole in the fence. See
+    /// [`PeerFailureGenerations`].
+    #[cfg(feature = "cortex")]
+    pub(super) fn peer_failure_generation(&self, peer: u64) -> u64 {
+        self.rpc_peer_failure_gen.get(peer)
+    }
+
+    /// Bare subscribe that reports the publisher's rejection reason as
+    /// a value. Used by `ensure_reply_subscription`, which must
+    /// distinguish the one retryable rejection (origin-binding
+    /// `Unauthorized`) from everything else before firing a
+    /// rate-limit-bypassing corrective re-announce.
+    pub(super) async fn subscribe_channel_reporting_reason(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+    ) -> Result<(), MembershipFailure> {
+        self.send_membership_request_typed(publisher_node_id, channel, true, None, None)
+            .await
+    }
+
     /// Ask `publisher_node_id` to remove this node from `channel`'s
     /// subscriber set. Mirror of `subscribe_channel`. Mode-agnostic
     /// — unsubscribe finds the peer in whichever mode they're in.
@@ -19172,6 +21948,9 @@ impl MeshNode {
             .await
     }
 
+    /// Stringifying wrapper over [`Self::send_membership_request_typed`],
+    /// preserving the exact `AdapterError` text every existing caller
+    /// already matches on.
     async fn send_membership_request(
         &self,
         publisher_node_id: u64,
@@ -19180,15 +21959,39 @@ impl MeshNode {
         token: Option<Vec<u8>>,
         queue_group: Option<String>,
     ) -> Result<(), AdapterError> {
-        let peer_addr = {
-            let peer = self.peers.get(&publisher_node_id).ok_or_else(|| {
-                AdapterError::Connection(format!(
-                    "no session to publisher {:#x}",
-                    publisher_node_id
-                ))
-            })?;
-            peer.addr
-        };
+        self.send_membership_request_typed(
+            publisher_node_id,
+            channel,
+            subscribe,
+            token,
+            queue_group,
+        )
+        .await
+        .map_err(MembershipFailure::into_adapter_error)
+    }
+
+    /// Same request, but reporting **why** it failed as a value rather
+    /// than as prose.
+    ///
+    /// `ensure_reply_subscription` needs the distinction: only an
+    /// origin-binding `Unauthorized` is worth a corrective re-announce,
+    /// and that re-announce deliberately bypasses the announce rate
+    /// limit. Re-announcing on *every* failure would let a target that
+    /// is simply down, throttling us, or refusing the channel turn each
+    /// RPC attempt into two rate-limit-bypassing capability broadcasts.
+    async fn send_membership_request_typed(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        subscribe: bool,
+        token: Option<Vec<u8>>,
+        queue_group: Option<String>,
+    ) -> Result<(), MembershipFailure> {
+        if !self.peers.contains_key(&publisher_node_id) {
+            return Err(MembershipFailure::Transport(AdapterError::Connection(
+                format!("no session to publisher {:#x}", publisher_node_id),
+            )));
+        }
 
         // Random nonces: a process-global sequential counter lets
         // any session peer that observes one nonce predict the next
@@ -19199,8 +22002,8 @@ impl MeshNode {
         // unguessable from another session.
         let mut nonce_bytes = [0u8; 8];
         if let Err(e) = getrandom::fill(&mut nonce_bytes) {
-            return Err(AdapterError::Connection(format!(
-                "membership nonce generation failed: {e}"
+            return Err(MembershipFailure::Transport(AdapterError::Connection(
+                format!("membership nonce generation failed: {e}"),
             )));
         }
         let nonce = u64::from_le_bytes(nonce_bytes);
@@ -19227,36 +22030,41 @@ impl MeshNode {
 
         // Scoped send; if it fails, drop the pending entry so memory
         // doesn't accumulate.
+        // Node-keyed: the membership request is addressed to a peer we
+        // already identified. Round-tripping that id through an address
+        // could not reach a peer we hold only a routed session with —
+        // its address belongs to the relay.
         if let Err(e) = self
-            .send_subprotocol(peer_addr, SUBPROTOCOL_CHANNEL_MEMBERSHIP, &bytes)
+            .send_subprotocol_to_node(publisher_node_id, SUBPROTOCOL_CHANNEL_MEMBERSHIP, &bytes)
             .await
         {
             self.pending_membership_acks.remove(&nonce);
-            return Err(e);
+            return Err(MembershipFailure::Transport(e));
         }
 
         let ack = match tokio::time::timeout(self.config.membership_ack_timeout, rx).await {
             Ok(Ok(ack)) => ack,
             Ok(Err(_)) => {
                 self.pending_membership_acks.remove(&nonce);
-                return Err(AdapterError::Connection(
+                return Err(MembershipFailure::Transport(AdapterError::Connection(
                     "membership ack channel closed".into(),
-                ));
+                )));
             }
             Err(_) => {
                 self.pending_membership_acks.remove(&nonce);
-                return Err(AdapterError::Connection(format!(
-                    "membership ack timeout ({:?}) for channel {}",
-                    self.config.membership_ack_timeout, channel
+                return Err(MembershipFailure::Transport(AdapterError::Connection(
+                    format!(
+                        "membership ack timeout ({:?}) for channel {}",
+                        self.config.membership_ack_timeout, channel
+                    ),
                 )));
             }
         };
 
         if !ack.accepted {
-            return Err(AdapterError::Connection(format!(
-                "membership request rejected: {:?}",
-                ack.reason
-            )));
+            // The publisher answered and said no. Carry the reason as a
+            // value — this is the arm callers need to discriminate.
+            return Err(MembershipFailure::Rejected(ack.reason));
         }
         Ok(())
     }
@@ -19279,8 +22087,13 @@ impl MeshNode {
                 token,
                 queue_group,
             } => {
-                let (accepted, reason) =
-                    Self::authorize_subscribe(&channel, from_node, token.as_deref(), ctx);
+                let (accepted, reason) = Self::authorize_subscribe(
+                    &channel,
+                    from_node,
+                    token.as_deref(),
+                    queue_group.as_deref(),
+                    ctx,
+                );
                 if accepted {
                     // Populate the AuthGuard fast path so publish
                     // fan-out can admit this subscriber in <10 ns
@@ -19292,7 +22105,7 @@ impl MeshNode {
                     // change which capability tokens authorize the
                     // channel.
                     ctx.auth_guard
-                        .allow_channel(subscriber_origin_hash(from_node), &channel);
+                        .allow_channel(subscriber_principal(from_node), &channel);
                     let id = ChannelId::new(channel);
                     let mode = match queue_group {
                         None => crate::adapter::net::channel::SubscriptionMode::Broadcast,
@@ -19321,7 +22134,7 @@ impl MeshNode {
                 // publish stops admitting this subscriber even
                 // before the roster update is visible.
                 ctx.auth_guard
-                    .revoke_channel(subscriber_origin_hash(from_node), &channel);
+                    .revoke_channel(subscriber_principal(from_node), &channel);
                 let id = ChannelId::new(channel);
                 // Drop the retained subscribe chain so it can't be
                 // re-validated by the sweep and doesn't leak memory.
@@ -19538,10 +22351,15 @@ impl MeshNode {
         }
         // Metric mirrors the pingwave-install convention (hops beyond
         // the first + 2): here path.len()-2 intermediate hops + 2.
+        //
+        // Identity-bound install: `promotable_direct_hop` just proved
+        // `first_hop` is a live DIRECT peer whose address maps back to
+        // it in the reverse index, which is exactly the confirmation
+        // D6 requires before `next_hop_id` may be bound.
         let metric = (path.len() as u16).saturating_sub(2).saturating_add(2);
         router
             .routing_table()
-            .add_route_with_metric(dest, addr, metric);
+            .add_authenticated_route_with_metric(dest, addr, first_hop, metric);
         true
     }
 
@@ -19570,8 +22388,16 @@ impl MeshNode {
             return;
         }
         // The `via` leg is the sender's session address — resolved
-        // locally, never taken from the wire.
-        let Some(via_addr) = ctx.peers.get(&from_node).map(|p| p.value().addr) else {
+        // locally, never taken from the wire — read together with
+        // whether that address is the sender's OWN, as one snapshot of
+        // one session. Both facts describe the same peer record, and
+        // taking them separately (or from two different maps) asks
+        // whether registries agree rather than what this session is.
+        let Some((via_addr, sender_is_direct)) = ctx
+            .peers
+            .get(&from_node)
+            .map(|p| (p.value().addr(), p.value().is_direct()))
+        else {
             return;
         };
         // Ordering gate (cubic review P2): admit only a strictly-
@@ -19591,26 +22417,53 @@ impl MeshNode {
         // elsewhere.
         ctx.proximity_graph
             .remove_edge(node_id_to_graph_id(from_node), node_id_to_graph_id(dest));
-        // Drop exactly (dest, next_hop == sender). If our route to
-        // dest goes elsewhere, nothing changed for us and the
-        // cascade stops here — that scoping is what makes the
-        // whole scheme loop-safe.
-        let route_dropped = ctx
-            .router
-            .routing_table()
-            .remove_route_if_next_hop_is(dest, via_addr);
+        // Drop exactly what the sender OWNS toward `dest`. Ownership is
+        // per provenance: its own identity binding (address-independent,
+        // so a rebind race that left the binding on the old address is
+        // still withdrawable), or an ordinary entry at an address it is
+        // confirmed to own directly. `sender_is_direct` comes from the
+        // sender's own transport, read above — a routed peer's recorded
+        // address is its RELAY's, and the ordinary routes sitting at
+        // that shared tuple belong to the relay, not to it. If our
+        // route to dest goes elsewhere, nothing changed for us and the
+        // cascade stops here — that scoping is what makes the whole
+        // scheme loop-safe.
+        let outcome = ctx.router.routing_table().remove_route_if_from_hop(
+            dest,
+            via_addr,
+            from_node,
+            sender_is_direct,
+        );
+        // With two candidates per destination, "a candidate was
+        // removed" is not "the destination is gone". Split the three
+        // cases the outcome now distinguishes:
+        //
+        //   nothing removed          → this withdrawal was not ours to
+        //                              act on; only the pre-existing
+        //                              already-unreachable check below
+        //                              still applies.
+        //   removed, still reachable → a live alternate candidate is
+        //                              already installed. Re-anchor
+        //                              sensing only if the path traffic
+        //                              takes actually moved, and do NOT
+        //                              cascade "unreachable via me".
+        //   removed, unreachable     → the destination is genuinely
+        //                              lost: promote or cascade.
+        let route_dropped = outcome.removed_any;
+        let lost_reachability = outcome.removed_any && !outcome.reachable_after;
         // SI-5 (§4.8): losing our route toward `dest` expires every
         // observation we hold from it — continuity is a claim about
         // the live stream's path, and the stream now rides an
         // unknown one. The sensing consequence keys on
         // REACHABILITY, not only on the exact (dest, via) pair:
-        // when our route was via the sender (just dropped) or had
+        // when our effective path died or actually moved, or it had
         // ALREADY aged out racing this frame — and no live direct
         // session stands in — the withdrawal confirms the path
         // died. Beats over the promoted alternate (below) or the
         // anti-entropy refresh re-establish hop-by-hop.
         if ctx.enable_sensing_coalescing
-            && (route_dropped
+            && (lost_reachability
+                || (outcome.removed_any && outcome.effective_changed())
                 || (ctx.router.routing_table().lookup(dest).is_none()
                     // SI-5 review P1: a relayed PeerInfo is NOT a
                     // live direct session — the reverse mapping and
@@ -19645,6 +22498,21 @@ impl MeshNode {
         if !route_dropped {
             return;
         }
+        if !lost_reachability {
+            // A live candidate survives the removal, so this node is
+            // still a usable path toward `dest`. Announcing otherwise
+            // — promoting a graph alternate over the survivor, or
+            // cascading our own withdrawal — would tell the mesh a
+            // falsehood and tear down a working route.
+            tracing::debug!(
+                dest = format!("{:#x}", dest),
+                via = format!("{:#x}", from_node),
+                effective_changed = outcome.effective_changed(),
+                "route-withdraw: dropped the sender's candidate; \
+                 destination still reachable via a surviving candidate"
+            );
+            return;
+        }
         tracing::debug!(
             dest = format!("{:#x}", dest),
             via = format!("{:#x}", from_node),
@@ -19672,7 +22540,7 @@ impl MeshNode {
         //    direct session's address maps back to the hop in the
         //    reverse index.
         if let Some(peer) = ctx.peers.get(&dest) {
-            let addr = peer.value().addr;
+            let addr = peer.value().addr();
             drop(peer);
             if Self::promotable_direct_hop(
                 &ctx.addr_to_node,
@@ -19681,7 +22549,13 @@ impl MeshNode {
                 addr,
                 via_addr,
             ) {
-                ctx.router.routing_table().add_route(dest, addr);
+                // The destination IS the adjacent peer here (the
+                // promotable check proved the direct session), so this
+                // is the identity-qualified-by-construction case:
+                // promote with the identity bound, not as a legacy
+                // entry that would strand protected egress on a route
+                // the peer legitimately owns.
+                ctx.router.add_direct_route(dest, addr);
                 return;
             }
         }
@@ -22477,9 +25351,29 @@ impl MeshNode {
             if let Some(entry) = ctx.peer_addrs.get(&from_node) {
                 let sender_addr = *entry.value();
                 let metric = u16::from(ann.hop_count) + 2;
-                ctx.router
-                    .routing_table()
-                    .add_route_with_metric(ann.node_id, sender_addr, metric);
+                // D6 identity: `from_node` IS the AEAD-resolved session
+                // peer — never the advertised origin (`ann.node_id`) or
+                // anything the wire claims. Bind it as the route's
+                // next-hop identity only when its recorded address maps
+                // back to it in the reverse index: a relayed
+                // (`connect_via`) peer records its RELAY's address, and
+                // binding that pair would put a false adjacency in the
+                // routing table. Without the confirmation the route
+                // installs as legacy — reachable for ordinary routing,
+                // unresolvable for protected forwarding.
+                let direct_confirmed =
+                    ctx.addr_to_node.get(&sender_addr).map(|e| *e.value()) == Some(from_node);
+                let table = ctx.router.routing_table();
+                if direct_confirmed {
+                    table.add_authenticated_route_with_metric(
+                        ann.node_id,
+                        sender_addr,
+                        from_node,
+                        metric,
+                    );
+                } else {
+                    table.add_route_with_metric(ann.node_id, sender_addr, metric);
+                }
             }
         }
 
@@ -22664,7 +25558,7 @@ impl MeshNode {
                 if peer.node_id == from_node {
                     continue; // never send back to the ingress peer
                 }
-                if partition_filter.contains(&peer.addr) {
+                if partition_filter.contains(&peer.addr()) {
                     continue;
                 }
                 let session = &peer.session;
@@ -22683,7 +25577,7 @@ impl MeshNode {
                     PacketFlags::NONE,
                     SUBPROTOCOL_SCOPED_CAPABILITY_ANN,
                 );
-                let _ = socket.send_to(&packet, peer.addr).await;
+                let _ = socket.send_to(&packet, peer.addr()).await;
                 drop(builder);
                 session.touch();
             }
@@ -22714,10 +25608,10 @@ impl MeshNode {
                 if peer.node_id == sender_node_id {
                     continue; // never send back to whoever gave it to us
                 }
-                if Some(peer.addr) == next_hop_addr {
+                if Some(peer.addr()) == next_hop_addr {
                     continue; // split horizon: that's our path to the origin
                 }
-                if partition_filter.contains(&peer.addr) {
+                if partition_filter.contains(&peer.addr()) {
                     continue;
                 }
 
@@ -22740,7 +25634,7 @@ impl MeshNode {
                     PacketFlags::NONE,
                     SUBPROTOCOL_CAPABILITY_ANN,
                 );
-                let _ = socket.send_to(&packet, peer.addr).await;
+                let _ = socket.send_to(&packet, peer.addr()).await;
                 drop(builder);
                 session.touch();
             }
@@ -22788,7 +25682,7 @@ impl MeshNode {
         let Some((a_addr, a_session)) = ctx
             .peers
             .get(&from_node)
-            .map(|e| (e.value().addr, e.value().session.clone()))
+            .map(|e| (e.value().addr(), e.value().session.clone()))
         else {
             return;
         };
@@ -22952,7 +25846,7 @@ impl MeshNode {
         let Some((b_addr, b_session)) = ctx
             .peers
             .get(&req.target)
-            .map(|e| (e.value().addr, e.value().session.clone()))
+            .map(|e| (e.value().addr(), e.value().session.clone()))
         else {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
@@ -23170,7 +26064,7 @@ impl MeshNode {
         let Some((coord_addr, coord_session)) = ctx
             .peers
             .get(&coordinator_node_id)
-            .map(|e| (e.value().addr, e.value().session.clone()))
+            .map(|e| (e.value().addr(), e.value().session.clone()))
         else {
             return;
         };
@@ -23371,7 +26265,7 @@ impl MeshNode {
         let Some((dest_addr, dest_session)) = ctx
             .peers
             .get(&ack.to_peer)
-            .map(|e| (e.value().addr, e.value().session.clone()))
+            .map(|e| (e.value().addr(), e.value().session.clone()))
         else {
             tracing::trace!(
                 to_peer = format!("{:#x}", ack.to_peer),
@@ -23413,15 +26307,31 @@ impl MeshNode {
     ///    it, reject with `UnknownChannel`.
     /// 3. Channel [`Visibility`] must permit the subscriber's subnet
     ///    — reject cross-subnet subscribes with `Unauthorized`.
-    /// 4. Channel auth — `publish_caps` / `subscribe_caps` /
+    /// 4. Origin binding — a channel family whose name encodes the
+    ///    subscriber's identity (`subscriber_origin_binding`) admits
+    ///    only the peer that identity belongs to, evaluated against the
+    ///    TOFU pin. Runs ahead of the cap/token gates because the
+    ///    families it protects are otherwise permissive.
+    /// 5. Token-gated channel with no `TokenCache` → `Unauthorized`.
+    /// 6. Channel auth — `publish_caps` / `subscribe_caps` /
     ///    `require_token` on `ChannelConfig` are honored via
-    ///    `ChannelConfig::can_subscribe`. A presented token is
-    ///    installed into the local `TokenCache` (after signature
-    ///    verification) before the check runs.
+    ///    `ChannelConfig::can_subscribe`.
+    ///
+    /// The presented credential is parsed here and verified **inline**
+    /// by `can_subscribe` → `TokenChain::verify_authorizes`, against
+    /// the channel's `token_roots`. It is NOT inserted into the
+    /// `TokenCache` — that stopped being true at the `TokenChain`
+    /// migration, and the stale claim pointed readers at the wrong
+    /// place for where peer-supplied credentials are validated, which
+    /// is the most important question on this path. A chain that
+    /// verifies is retained in `subscriber_chains` so the publish-time
+    /// re-check and the periodic sweep can re-evaluate expiry and
+    /// revocation without the peer re-presenting.
     fn authorize_subscribe(
         channel: &ChannelName,
         from_node: u64,
         token_bytes: Option<&[u8]>,
+        queue_group: Option<&str>,
         ctx: &DispatchCtx,
     ) -> (bool, Option<AckReason>) {
         // Rate-limit check runs first — a throttled peer short-
@@ -23465,24 +26375,71 @@ impl MeshNode {
             return (false, Some(AckReason::TooManyChannels));
         }
         let Some(ref configs) = ctx.channel_configs else {
-            // No registry → no ACL (test / permissive deployments).
-            return (true, None);
+            // No registry → no ACL at all. Which of the two situations
+            // that is — "open mesh on purpose" or "forgot to install a
+            // registry" — used to be indistinguishable, because
+            // permissiveness fell out of an unset field rather than a
+            // recorded decision. The policy makes it a decision (L1).
+            return match ctx.unregistered_channels {
+                UnregisteredChannelPolicy::Deny => (false, Some(AckReason::Unauthorized)),
+                UnregisteredChannelPolicy::Allow => (true, None),
+                UnregisteredChannelPolicy::AllowWithWarning => {
+                    // Latched so a subscribe storm can't turn an
+                    // operator hint into a log flood.
+                    if !ctx.unregistered_warned.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "channel auth: no ChannelConfigRegistry installed — every \
+                             Subscribe from any session peer is admitted and every \
+                             channel publishes as open. Install a registry via \
+                             `set_channel_configs`, or record the intent with \
+                             `MeshNodeConfig::with_unregistered_channel_policy(...)`."
+                        );
+                    }
+                    (true, None)
+                }
+            };
         };
-        let Some(cfg_ref) = configs.get_by_name(channel.as_str()) else {
+        // `resolve_by_name` (not `get_by_name`) so we also learn WHICH
+        // prefix matched — `subscriber_origin_binding` needs it to
+        // locate the dynamic suffix inside the requested name. Returns
+        // owned values, which is what we wanted anyway: the config is
+        // cloned here so the registry guard is dropped before any
+        // signature work below.
+        let Some(resolved) = configs.resolve_by_name(channel.as_str()) else {
             return (false, Some(AckReason::UnknownChannel));
         };
-        // Clone the cfg so we can drop the DashMap guard before
-        // any further work — the cfg fields are all cheap to clone
-        // and doing so releases the registry's read lock early.
-        let cfg = cfg_ref.clone();
-        drop(cfg_ref);
+        let cfg = resolved.config;
+        let matched_prefix = resolved.matched_prefix;
+        // The hash of the channel the peer actually asked for. Every
+        // token gate and every retention key below uses THIS, never
+        // `cfg.channel_id.hash()` — for a prefix-matched config the
+        // latter is a sentinel that stands for the whole family (M1).
+        let requested_hash = channel.hash();
 
-        let peer_subnet = ctx
-            .peer_subnets
-            .get(&from_node)
-            .map(|e| *e.value())
-            .unwrap_or(SubnetId::GLOBAL);
-        let visible = Self::subnet_visible(ctx.local_subnet, peer_subnet, cfg.visibility);
+        // `None` when this peer's subnet has not been derived — passed
+        // through as unknown rather than coerced to GLOBAL, which used
+        // to open every `ParentVisible` channel to unresolved peers.
+        let peer_subnet = ctx.peer_subnets.get(&from_node).map(|e| *e.value());
+        // Only `Exported` consults the export table, so the lookup is
+        // skipped entirely for every other visibility mode.
+        let export_targets = if cfg.visibility == Visibility::Exported {
+            // `requested_hash` is the canonical hash of the channel the
+            // peer actually asked for — the same identity every token
+            // gate and retention key above uses, and correct for a
+            // prefix-matched config where `cfg.channel_id.hash()` is a
+            // family sentinel rather than this request.
+            ctx.subnet_gateway
+                .as_ref()
+                .and_then(|gw| gw.export_targets(requested_hash))
+        } else {
+            None
+        };
+        let visible = Self::subnet_visible(
+            ctx.local_subnet,
+            peer_subnet,
+            cfg.visibility,
+            export_targets.as_deref(),
+        );
         if let Some(gw) = ctx.subnet_gateway.as_ref() {
             if visible {
                 gw.record_forward();
@@ -23491,6 +26448,83 @@ impl MeshNode {
             }
         }
         if !visible {
+            return (false, Some(AckReason::Unauthorized));
+        }
+
+        // Origin binding (H3). For a channel family whose name encodes
+        // the subscriber's identity — nRPC's
+        // `<service>.replies.<caller_origin>` — a peer may subscribe
+        // ONLY to the name carrying its own origin. Runs BEFORE the
+        // `has_auth_gates` short-circuit below, because the family this
+        // protects is otherwise fully permissive: caps and tokens are
+        // both `None`, so that short-circuit would return `(true, None)`
+        // and never reach a gate at all.
+        //
+        // Evaluated against the TOFU-pinned entity, never a wire-claimed
+        // origin. An unpinned peer is REJECTED rather than admitted:
+        // falling back to "allow when we don't know who you are" would
+        // hand an attacker the bypass of simply never announcing, which
+        // is not a fix. The cost is an ordering requirement — a
+        // subscriber must have announced (so the publisher pinned it)
+        // before its first subscribe to a bound family. `Unauthorized`
+        // is a retryable answer; the nRPC client re-announces and
+        // retries on it, so first-call and post-reconnect races
+        // self-heal rather than failing permanently.
+        if let Some(binding) = cfg.subscriber_origin_binding {
+            let pinned_origin = ctx
+                .peer_entity_ids
+                .get(&from_node)
+                .map(|e| e.value().origin_hash());
+            if !binding.authorizes(channel.as_str(), matched_prefix.as_deref(), pinned_origin) {
+                tracing::debug!(
+                    from_node = format!("{:#x}", from_node),
+                    channel = channel.as_str(),
+                    pinned = pinned_origin.is_some(),
+                    "auth: origin-bound channel subscribe rejected (peer is \
+                     unpinned, or the name encodes a different peer's origin)"
+                );
+                return (false, Some(AckReason::Unauthorized));
+            }
+        }
+
+        // Token-gated channel with no `TokenCache` installed (M4).
+        //
+        // Reject here rather than admitting and failing later. Pre-fix
+        // the three enforcement points disagreed about what this
+        // configuration means: subscribe ACCEPTED (falling back to a
+        // transient empty revocation registry and verifying the chain
+        // normally), every publish DENIED (the token-gated branch
+        // requires `Some(cache)` and treats its absence as
+        // unauthorized), and the sweep was a no-op (it returns early
+        // without a cache). The peer therefore got an accepting Ack for
+        // a subscription that could never deliver an event, and — since
+        // the publish-time denial revokes the AuthGuard entry but does
+        // not remove the roster entry, and the sweep that would
+        // normally evict it can never run — it stayed rostered with no
+        // periodic recovery, consuming a queue-group selection slot.
+        // Installing a cache later did not repair it either: the first
+        // failed publish already revoked the guard entry, so subsequent
+        // publishes stop at `check_fast == Denied`, and the sweep — now
+        // able to run — sees the retained chain as valid and does
+        // nothing, because it never calls `allow_channel`. Nothing
+        // periodic cleared it: recovery needed the peer to go away, or
+        // to say something that drops its per-peer state — an explicit
+        // re-subscribe, or an `Unsubscribe` (which revokes the guard
+        // entry, removes the retained chain and drops the roster entry).
+        // All of those are peer-driven; the publisher could not repair
+        // itself.
+        //
+        // `set_token_cache`'s documented contract already said
+        // "when unset, `require_token` channels always reject". This
+        // makes that true, and makes the Ack honest.
+        if cfg.token_required() && ctx.token_cache.is_none() {
+            tracing::debug!(
+                from_node = format!("{:#x}", from_node),
+                channel = channel.as_str(),
+                "auth: token-gated channel but no TokenCache installed; \
+                 rejecting subscribe (publish would deny it anyway and the \
+                 expiry sweep cannot run)"
+            );
             return (false, Some(AckReason::Unauthorized));
         }
 
@@ -23503,11 +26537,29 @@ impl MeshNode {
         // treated as "no credential presented" (rejected by the gate).
         let presented_chain = token_bytes.and_then(|bytes| TokenChain::from_bytes(bytes).ok());
 
-        // Whether any cap / token gate is in play. A fully open
-        // channel (no filters, no require_token) short-circuits
-        // without needing a peer entity_id at all.
-        let has_auth_gates =
-            cfg.publish_caps.is_some() || cfg.subscribe_caps.is_some() || cfg.token_required();
+        // Does this request need a gate evaluated at all? A fully open
+        // channel short-circuits without needing a peer entity_id.
+        //
+        // `queue_group_policy` is part of that test, not just the cap
+        // and token filters. A restricted policy is frequently the ONLY
+        // gate on an otherwise-open channel — `Deny` needs no roots, no
+        // caps and no `require_token` to be meaningful — so without it
+        // here the short-circuit returned `(true, None)` before the
+        // policy below was ever consulted, and `Deny` was a silent
+        // no-op. It is the same hazard the origin binding is hoisted
+        // above this point to escape; this one is answered by widening
+        // the test instead, because `TokenBound` needs the peer
+        // identity that is only resolved further down.
+        //
+        // Conditioned on the peer actually ASKING for a group. A
+        // broadcast subscriber on a queue-group-restricted channel is
+        // unaffected by the policy and keeps the cheap path.
+        let queue_group_gated =
+            queue_group.is_some() && cfg.queue_group_policy != QueueGroupPolicy::Unrestricted;
+        let has_auth_gates = cfg.publish_caps.is_some()
+            || cfg.subscribe_caps.is_some()
+            || cfg.token_required()
+            || queue_group_gated;
         if !has_auth_gates {
             return (true, None);
         }
@@ -23529,6 +26581,14 @@ impl MeshNode {
         // transient empty registry (nothing revoked) with strict skew.
         // The `transient_revocation` binding is declared here so it
         // outlives the borrow taken in the `None` arm.
+        //
+        // Post-M4 the `None` arm is only reachable for channels that do
+        // NOT require a token — a token-gated channel without a cache
+        // already returned `Unauthorized` above. Those channels never
+        // consult `revocation` or `skew_secs` (`token_gate` short-
+        // circuits on `!token_required()`), so the transient registry
+        // is now purely a borrow-checker placeholder rather than a
+        // silently-different verification policy.
         let transient_revocation;
         let (revocation, skew_secs): (&RevocationRegistry, u64) = match ctx.token_cache.as_ref() {
             Some(cache) => (cache.revocation().as_ref(), cache.clock_skew_secs()),
@@ -23549,24 +26609,92 @@ impl MeshNode {
             if cfg.token_required() {
                 return (false, Some(AckReason::Unauthorized));
             }
+            // A restricted queue-group policy cannot be satisfied by a
+            // peer we have not pinned, whichever policy it is: `Deny`
+            // admits nobody, and `TokenBound` needs a chain whose leaf
+            // binds to an AEAD-verified entity, which is precisely what
+            // is missing here. Falling through to the cap-only path
+            // below would answer a different question with a dummy id
+            // and admit the join — the second way `Deny` could be
+            // bypassed on a channel with no other gates.
+            if queue_group_gated {
+                return (false, Some(AckReason::Unauthorized));
+            }
             // Cap-filter-only mode without a known entity — run the
             // cap match with a dummy id. The token gate is skipped
             // because the channel requires no token.
             let dummy = EntityId::from_bytes([0u8; 32]);
-            return if cfg.can_subscribe(&peer_caps, &dummy, None, revocation, skew_secs) {
+            return if cfg.can_subscribe(
+                &peer_caps,
+                &dummy,
+                requested_hash,
+                None,
+                revocation,
+                skew_secs,
+            ) {
                 (true, None)
             } else {
                 (false, Some(AckReason::Unauthorized))
             };
         };
 
-        if !cfg.can_subscribe(
-            &peer_caps,
-            &peer_entity,
-            presented_chain.as_ref(),
-            revocation,
-            skew_secs,
-        ) {
+        // Queue-group membership (M2). Joining a group is an authority
+        // question, not a routing preference: every event goes to
+        // exactly ONE member, so a peer that joins a production group
+        // takes a share of its events and — by not processing them —
+        // destroys that share. Pre-fix the group name was an
+        // unauthenticated string straight off the wire with no config
+        // axis restricting who could join what.
+        //
+        // Not a confidentiality boundary: a peer that can subscribe at
+        // all can already take every event in Broadcast mode. This
+        // guards integrity and availability.
+        //
+        // Under `TokenBound` the group grant IS this request's
+        // subscribe authority — see `QueueGroupPolicy::TokenBound` for
+        // why it cannot be an additional credential (one chain per
+        // Subscribe on the wire). Capability filters still apply.
+        //
+        // Yields the hash the group grant was verified against, which
+        // is NOT the channel's — see `RetainedChain::grant_hash` for why
+        // that distinction has to survive past this function.
+        let group_grant_hash = match (queue_group, cfg.queue_group_policy) {
+            (Some(_), QueueGroupPolicy::Deny) => {
+                return (false, Some(AckReason::Unauthorized));
+            }
+            (Some(group), QueueGroupPolicy::TokenBound) => {
+                if !cfg.can_join_queue_group(
+                    &peer_entity,
+                    channel.as_str(),
+                    group,
+                    presented_chain.as_ref(),
+                    revocation,
+                    skew_secs,
+                ) || !cfg.caps_allow_subscribe(&peer_caps)
+                {
+                    tracing::debug!(
+                        from_node = format!("{:#x}", from_node),
+                        channel = channel.as_str(),
+                        group,
+                        "auth: queue-group join rejected — no grant naming this group"
+                    );
+                    return (false, Some(AckReason::Unauthorized));
+                }
+                Some(queue_group_hash(channel.as_str(), group))
+            }
+            _ => None,
+        };
+
+        if group_grant_hash.is_none()
+            && !cfg.can_subscribe(
+                &peer_caps,
+                &peer_entity,
+                requested_hash,
+                presented_chain.as_ref(),
+                revocation,
+                skew_secs,
+            )
+        {
             return (false, Some(AckReason::Unauthorized));
         }
 
@@ -23581,9 +26709,25 @@ impl MeshNode {
             // re-check re-establishes it without trusting cross-path
             // state. (Marking it verified here would only save the one
             // first-publish verification.)
+            //
+            // Keyed on the REQUESTED channel's hash, not the config's.
+            // For a prefix-registered config those differ (the config
+            // carries a sentinel), and storing under the sentinel put
+            // the chain somewhere the publish path — which looks it up
+            // by the real channel — could never find, so every such
+            // subscriber was accepted and then revoked before its first
+            // delivery. `Unsubscribe` also removes by the real hash, so
+            // the sentinel-keyed entry leaked until peer failure.
+            //
+            // The KEY is the requested channel — that is how the publish
+            // path and `Unsubscribe` find this entry. What the chain was
+            // verified AGAINST is carried separately, because for a
+            // `TokenBound` worker the two are deliberately different
+            // hashes and the re-check has to keep asking the admitting
+            // question. See `RetainedChain::grant_hash`.
             ctx.subscriber_chains.insert(
-                (from_node, cfg.channel_id.hash()),
-                RetainedChain::new(chain),
+                (from_node, requested_hash),
+                RetainedChain::new(chain, group_grant_hash.unwrap_or(requested_hash)),
             );
         }
         (true, None)
@@ -23675,10 +26819,113 @@ impl MeshNode {
         }
     }
 
-    fn subnet_visible(source: SubnetId, dest: SubnetId, visibility: Visibility) -> bool {
+    /// True for a node whose [`SubnetPolicy`] can assign a non-global
+    /// subnet while its own subnet is left at [`SubnetId::GLOBAL`] — a
+    /// configuration that resolves peers into subnets while holding no
+    /// subnet identity to compare them against.
+    ///
+    /// The consequence is confined to [`Visibility::ParentVisible`] and
+    /// it is an inversion: `dest.is_ancestor_of(GLOBAL)` is false for
+    /// every concrete `dest`, so a peer whose subnet the policy DID
+    /// resolve is rejected, while a peer it could not resolve takes the
+    /// unknown arm — `source.is_global()`, which is true here — and is
+    /// admitted. Being unresolvable becomes strictly more privileged
+    /// than being resolved, on the path that otherwise answers
+    /// [`AckReason::Unauthorized`].
+    ///
+    /// The unknown arm is deliberately left permissive for a genuinely
+    /// flat mesh: a node with no subnet of its own cannot express "same
+    /// subnet as me" or "ancestor of me" as a constraint, and failing
+    /// closed there would silently partition every deployment that
+    /// never configured subnets. See [`Self::subnet_visible`]. This
+    /// predicate separates the flat case (no policy — nothing is ever
+    /// resolvable, permissive is the only workable answer) from the
+    /// misconfigured one (a policy, so resolution is expected, but no
+    /// local subnet to judge against).
+    ///
+    /// The condition is the CONJUNCTION. A policy with a scoped local
+    /// subnet is the intended subnet-aware setup; a global local subnet
+    /// with no policy is the intended flat setup. Only the pair is
+    /// suspect.
+    ///
+    /// `policy_can_scope` is [`SubnetPolicy::can_assign_non_global`],
+    /// not `policy.is_some()`. A rule-less policy assigns `GLOBAL` to
+    /// every peer, so with a `GLOBAL` local subnet everything resolves
+    /// to the same subnet, `is_ancestor_of` holds both ways, and no
+    /// inversion exists — warning there would flag a valid flat
+    /// deployment for installing a no-op policy.
+    ///
+    /// Recorded in
+    /// CODE_REVIEW_2026_08_01_SCOPED_CAPABILITIES_REMEDIATION.md
+    /// finding 2, where warning rather than failing closed was an
+    /// explicit decision: failing closed would flip every direct
+    /// subscriber that never published a capability announcement from
+    /// admitted to `Unauthorized`, since such a peer is absent from
+    /// `peer_subnets` permanently rather than transiently.
+    fn subnet_policy_without_local_subnet(subnet: SubnetId, policy_can_scope: bool) -> bool {
+        policy_can_scope && subnet.is_global()
+    }
+
+    /// `dest` is `None` when the peer's subnet has not been derived —
+    /// `peer_subnets` only populates when a `local_subnet_policy` is
+    /// installed and the peer has sent a signature-verified direct
+    /// announcement, so "unknown" is a real and common state.
+    ///
+    /// Unknown MUST NOT be coerced to a concrete `SubnetId`. It
+    /// previously resolved to [`SubnetId::GLOBAL`] at both call sites,
+    /// and `is_ancestor_of` short-circuits to `true` for a global
+    /// receiver — so every peer whose subnet had not been derived was
+    /// admitted to every `ParentVisible` channel, on an authorization
+    /// path that otherwise answers `AckReason::Unauthorized`
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md, HIGH #2).
+    ///
+    /// The unknown arms fall back to `source.is_global()`: a node that
+    /// holds no subnet identity of its own cannot express "same subnet
+    /// as me" or "ancestor of me" as a constraint, so a flat mesh keeps
+    /// its existing permissive behaviour. Once this node IS
+    /// subnet-scoped, an underivable peer fails closed. That pair of
+    /// arms reproduces the previous verdict for every input except the
+    /// vulnerable one.
+    /// `export_targets` supplies the destination subnets this channel
+    /// has been explicitly exported to, resolved by the caller from the
+    /// gateway's export table
+    /// ([`SubnetGateway::export_targets`](super::subnet::SubnetGateway::export_targets)).
+    /// It is consulted only for [`Visibility::Exported`]; every other
+    /// mode ignores it, so callers pass `None` unless the channel is
+    /// actually exported.
+    ///
+    /// `Exported` used to answer `false` unconditionally, which made
+    /// the mode unusable rather than merely strict — a channel
+    /// configured as `Exported` reached nobody, and the export table
+    /// the operator populated was consulted only by the packet-level
+    /// gateway, never by the subscribe gate or the publish fan-out.
+    ///
+    /// # Export policy is keyed canonically
+    ///
+    /// `export_targets` is resolved from `SubnetGateway`'s table by the
+    /// **canonical** [`ChannelHash`](super::channel::ChannelHash), never
+    /// the 16-bit wire hint. The wire hash is documented as a fast-path
+    /// filter with routine collisions; keying policy on it meant two
+    /// unrelated channels sharing a bucket shared export rules, so
+    /// declaring targets for one silently declared them for the other.
+    ///
+    /// Nothing downstream rescues that. Visibility and token
+    /// enforcement are separate mechanisms, a tokenless channel has
+    /// nothing else in front of it, and an attacker can choose a
+    /// colliding name on purpose. See
+    /// `exported_policy_does_not_alias_across_a_wire_hash_collision`.
+    fn subnet_visible(
+        source: SubnetId,
+        dest: Option<SubnetId>,
+        visibility: Visibility,
+        export_targets: Option<&[SubnetId]>,
+    ) -> bool {
         match visibility {
             Visibility::Global => true,
-            Visibility::SubnetLocal => source.is_same_subnet(dest),
+            Visibility::SubnetLocal => match dest {
+                Some(dest) => source.is_same_subnet(dest),
+                None => source.is_global(),
+            },
             Visibility::ParentVisible => {
                 // "Visible to the parent subnet but not siblings" —
                 // strictly upward. A child's broadcast reaches its
@@ -23686,9 +26933,26 @@ impl MeshNode {
                 // subnet is its own ancestor) and any ancestor; a
                 // parent broadcasting down to descendants would leak
                 // region-scoped traffic and is rejected.
-                dest.is_ancestor_of(source)
+                match dest {
+                    Some(dest) => dest.is_ancestor_of(source),
+                    None => source.is_global(),
+                }
             }
-            Visibility::Exported => false,
+            Visibility::Exported => match dest {
+                // A declared target covers its whole subtree, matching
+                // the containment semantics `SubnetGateway::should_forward`
+                // already applies to the same table — exporting to a
+                // fleet reaches the vehicles in it.
+                Some(dest) => export_targets
+                    .is_some_and(|targets| targets.iter().any(|t| t.is_ancestor_of(dest))),
+                // Unknown peer subnet stays closed. This is the HIGH #2
+                // shape: an underivable peer must never be admitted by
+                // a mode whose whole purpose is an explicit
+                // destination list. Unlike the arms above there is no
+                // permissive flat-mesh fallback, because "exported to
+                // nowhere in particular" is not a meaningful rule.
+                None => false,
+            },
         }
     }
 
@@ -23705,7 +26969,7 @@ impl MeshNode {
         let Some(peer_entry) = ctx.peers.get(&to_node) else {
             return;
         };
-        let dest_addr = peer_entry.value().addr;
+        let dest_addr = peer_entry.value().addr();
         if ctx.partition_filter.contains(&dest_addr) {
             return;
         }
@@ -23811,20 +27075,26 @@ impl MeshNode {
                 // when the node has no token cache configured — a held
                 // chain still publishes in that mode (nothing revoked,
                 // strict skew).
+                //
+                // All three lookups key on the channel being published
+                // to, NOT `cfg.channel_id.hash()`. For a prefix-matched
+                // config the latter is a sentinel, and using it meant
+                // `set_publish_chain(real_channel, chain)` — which
+                // stores under the real hash — could never satisfy a
+                // token-gated prefix publish, so the delegated-publish
+                // escape hatch was unreachable for that whole class of
+                // channel (M1).
+                let publish_hash = publisher.channel().hash();
                 let held = self
                     .published_chains
-                    .get(&cfg.channel_id.hash())
+                    .get(&publish_hash)
                     .map(|c| c.value().clone());
                 let transient_revocation;
                 let (revocation, skew, chain) = match self.token_cache.as_ref() {
                     Some(cache) => {
                         let chain = held.or_else(|| {
                             cache
-                                .get_for_action(
-                                    &self_entity,
-                                    TokenScope::PUBLISH,
-                                    cfg.channel_id.hash(),
-                                )
+                                .get_for_action(&self_entity, TokenScope::PUBLISH, publish_hash)
                                 .map(TokenChain::single)
                         });
                         (cache.revocation().as_ref(), cache.clock_skew_secs(), chain)
@@ -23834,7 +27104,14 @@ impl MeshNode {
                         (&transient_revocation, 0u64, held)
                     }
                 };
-                if !cfg.can_publish(&self_caps, &self_entity, chain.as_ref(), revocation, skew) {
+                if !cfg.can_publish(
+                    &self_caps,
+                    &self_entity,
+                    publish_hash,
+                    chain.as_ref(),
+                    revocation,
+                    skew,
+                ) {
                     return Err(AdapterError::Connection(
                         "channel: publish denied by channel ACL".into(),
                     ));
@@ -23936,16 +27213,30 @@ impl MeshNode {
             .as_ref()
             .map(|c| c.token_required())
             .unwrap_or(false);
+        // Resolved once for the whole fan-out: the channel is fixed, so
+        // this is one export-table lookup per publish rather than one
+        // per subscriber. Skipped entirely unless the channel is
+        // actually `Exported`.
+        let export_targets = if visibility == Visibility::Exported {
+            // `channel_hash` is the canonical hash of the channel being
+            // published — the same identity the auth guard below keys
+            // on. Never the wire hint: that is a fast-path filter with
+            // routine collisions, and channel policy must be exact.
+            self.subnet_gateway
+                .as_ref()
+                .and_then(|gw| gw.export_targets(channel_hash))
+        } else {
+            None
+        };
+        let export_targets = export_targets.as_deref();
         subscribers.retain(|peer_id| {
             // (1) Subnet visibility. Cheap check first — a peer in
             // the wrong subnet should short-circuit before any
             // auth-cache probing.
-            let peer_subnet = self
-                .peer_subnets
-                .get(peer_id)
-                .map(|e| *e.value())
-                .unwrap_or(SubnetId::GLOBAL);
-            let visible = Self::subnet_visible(self.local_subnet, peer_subnet, visibility);
+            // `None` = subnet not derived; see `subnet_visible`.
+            let peer_subnet = self.peer_subnets.get(peer_id).map(|e| *e.value());
+            let visible =
+                Self::subnet_visible(self.local_subnet, peer_subnet, visibility, export_targets);
             if let Some(gw) = self.subnet_gateway.as_ref() {
                 if visible {
                     gw.record_forward();
@@ -23957,7 +27248,7 @@ impl MeshNode {
                 return false;
             }
             // (2) Auth guard (bloom + verified cache).
-            let origin = subscriber_origin_hash(*peer_id);
+            let origin = subscriber_principal(*peer_id);
             let admitted = match auth_guard.check_fast(origin, channel_hash) {
                 AuthVerdict::Allowed => auth_guard.is_authorized_full(origin, &channel_name),
                 AuthVerdict::Denied => false,
@@ -24000,9 +27291,30 @@ impl MeshNode {
                         // re-checked every packet. Avoids N × up-to-8
                         // signature verifies per publish on a high-fanout
                         // channel.
+                        //
+                        // Re-verified against `r.grant_hash`, the hash
+                        // the subscribe gate admitted this chain on —
+                        // not `channel_hash`. They coincide for an
+                        // ordinary subscriber; for a `TokenBound`
+                        // queue-group worker the grant names the GROUP,
+                        // and asking it about the channel instead
+                        // revoked every such worker on its first
+                        // packet. See `RetainedChain::grant_hash`.
                         if r.signatures_verified.load(Ordering::Relaxed) {
-                            cfg.reverify_subscribe_presigned(&r.chain, &entity, revocation, skew)
-                        } else if cfg.reverify_subscribe(&r.chain, &entity, revocation, skew) {
+                            cfg.reverify_subscribe_presigned(
+                                &r.chain,
+                                &entity,
+                                r.grant_hash,
+                                revocation,
+                                skew,
+                            )
+                        } else if cfg.reverify_subscribe(
+                            &r.chain,
+                            &entity,
+                            r.grant_hash,
+                            revocation,
+                            skew,
+                        ) {
                             r.signatures_verified.store(true, Ordering::Relaxed);
                             true
                         } else {
@@ -24020,6 +27332,23 @@ impl MeshNode {
             };
             if !chain_ok {
                 auth_guard.revoke_channel(origin, &channel_name);
+                // Evict from the roster too, not just the AuthGuard.
+                //
+                // Revoking only the guard left the peer rostered, and
+                // queue-group selection (`dispatch_recipients`) runs
+                // BEFORE this auth filter with no alternate-member
+                // retry — so a denied peer kept being selected as its
+                // group's recipient and that group's copy of each event
+                // was dropped rather than delivered to a working
+                // member. The periodic sweep eventually cleared it, but
+                // only if a sweep runs at all: it is a no-op without a
+                // TokenCache, and `token_sweep_interval = Duration::MAX`
+                // disables it outright. Dropping the roster entry here
+                // makes the denial self-clearing on the path that
+                // observed it.
+                self.roster
+                    .remove(&ChannelId::new(channel_name.clone()), *peer_id);
+                self.subscriber_chains.remove(&(*peer_id, channel_hash));
                 return false;
             }
             true
@@ -24195,7 +27524,7 @@ impl MeshNode {
         events: &[Bytes],
     ) -> PeerPublishOutcome {
         let (dest_addr, session) = match self.peers.get(&peer_node_id) {
-            Some(p) => (p.value().addr, p.value().session.clone()),
+            Some(p) => (p.value().addr(), p.value().session.clone()),
             None => return PeerPublishOutcome::NoSession,
         };
 
@@ -24351,7 +27680,7 @@ impl MeshNode {
         let bytes = ann
             .encode()
             .map_err(|e| AdapterError::Connection(format!("fold: encode failed: {e}")))?;
-        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
+        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr()).collect();
         // Share the encoded bytes by reference; each send
         // borrows the same slice. send_subprotocol clones into
         // its own internal allocation, so concurrent sends don't
@@ -24526,29 +27855,48 @@ impl MeshNode {
         self.publish_fold_broadcast(&ann).await
     }
 
-    /// Send a raw subprotocol message to a peer.
+    /// Send a raw subprotocol message to a peer by address.
     ///
     /// The payload is sent as a single event frame with the specified
     /// `subprotocol_id` set in the Net header (included in AEAD AAD).
+    ///
+    /// Reaches DIRECT peers only: the address is resolved through the
+    /// ownership index, which a relay's address cannot answer for the
+    /// endpoints behind it. Callers that already hold a node id must
+    /// use [`Self::send_subprotocol_to_node`]: resolving id → address
+    /// → id looks like an identity round-trip and is not one.
     pub async fn send_subprotocol(
         &self,
         peer_addr: SocketAddr,
         subprotocol_id: u16,
         payload: &[u8],
     ) -> Result<(), AdapterError> {
-        if self.partition_filter.contains(&peer_addr) {
-            return Ok(());
-        }
+        self.send_subprotocol_to_node(self.node_owning_addr(peer_addr)?, subprotocol_id, payload)
+            .await
+    }
 
-        let node_id = self
-            .addr_to_node
-            .get(&peer_addr)
-            .map(|e| *e.value())
-            .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
+    /// Send a raw subprotocol message to a peer by NODE ID.
+    ///
+    /// The primitive. The wire address comes from the peer's own
+    /// transport record, so an endpoint reached through a relay is
+    /// reachable without anyone claiming the relay's address as the
+    /// endpoint's property — which is what the reverse index would have
+    /// had to assert, and what made that index unsound for the
+    /// adjacency decisions built on it.
+    pub async fn send_subprotocol_to_node(
+        &self,
+        node_id: u64,
+        subprotocol_id: u16,
+        payload: &[u8],
+    ) -> Result<(), AdapterError> {
         let peer = self
             .peers
             .get(&node_id)
             .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
+        let peer_addr = peer.addr();
+        if self.partition_filter.contains(&peer_addr) {
+            return Ok(());
+        }
 
         let session = &peer.session;
         let stream_id = subprotocol_id as u64;
@@ -24729,6 +28077,39 @@ impl MeshNode {
     pub(crate) async fn reannounce_current_capabilities(&self) -> Result<(), AdapterError> {
         self.announce_from_baseline(None, Duration::from_secs(300), true)
             .await
+    }
+
+    /// Republish the current baseline **bypassing the announce rate
+    /// limit**, for a caller that is blocked on a peer having pinned our
+    /// identity rather than merely wanting eventual visibility.
+    ///
+    /// [`Self::reannounce_current_capabilities`] goes through the
+    /// `Routine` path, which coalesces inside `min_announce_interval`
+    /// and returns `Ok` without sending. That is right for visibility
+    /// refreshes and wrong here: the H3 origin binding on a reply
+    /// channel is evaluated against the TOFU pin a peer installs from
+    /// our signature-verified DIRECT announcement, so a caller whose
+    /// subscribe was just rejected needs an announcement to actually go
+    /// out *now* — coalescing it away means the retry waits out the
+    /// full window and fails for the same reason.
+    ///
+    /// Reuses the `SecurityCorrective` mode rather than adding a third:
+    /// the semantics wanted are identical (bypass coalescing, rebuild
+    /// from the current baseline), and this genuinely is an
+    /// authorization-corrective pass — a peer cannot authorize us until
+    /// it has our identity.
+    ///
+    /// Still a pure republish: the baseline is read inside the announce
+    /// lock, so this can never lose a concurrently-announced capability.
+    pub(crate) async fn reannounce_for_authorization(&self) -> Result<(), AdapterError> {
+        self.announce_loop(
+            None,
+            Duration::from_secs(300),
+            true,
+            AnnounceMode::SecurityCorrective,
+            None,
+        )
+        .await
     }
 
     /// Core announce path shared by explicit announces and the
@@ -25375,9 +28756,19 @@ impl MeshNode {
     /// unicast both route through it so the public and scoped forms can never
     /// drift (Kyra OA3 — one combined send helper, no second forgettable path).
     /// Best-effort per packet: a failure is logged and skipped.
-    async fn send_emission_to(&self, addr: SocketAddr, emission: &SendEmission) {
+    async fn send_emission_to(&self, node_id: u64, emission: &SendEmission) {
+        // The peer's send address, for the log lines below only. The
+        // sends themselves are node-keyed: an announcement is how a
+        // peer learns to trust THIS node's identity, so it has to reach
+        // every peer we have a session with — including the ones we
+        // reach through a relay, which no address-keyed send can name.
+        let addr = self
+            .peers
+            .get(&node_id)
+            .map(|p| p.value().addr())
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
         if let Err(e) = self
-            .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, &emission.public)
+            .send_subprotocol_to_node(node_id, SUBPROTOCOL_CAPABILITY_ANN, &emission.public)
             .await
         {
             tracing::trace!(peer = %addr, error = %e, "capability: announce send failed");
@@ -25389,7 +28780,7 @@ impl MeshNode {
             let frame =
                 super::behavior::org_scoped_relay::ScopedCapabilityRelayFrame::encode(0, envelope);
             if let Err(e) = self
-                .send_subprotocol(addr, SUBPROTOCOL_SCOPED_CAPABILITY_ANN, &frame)
+                .send_subprotocol_to_node(node_id, SUBPROTOCOL_SCOPED_CAPABILITY_ANN, &frame)
                 .await
             {
                 tracing::trace!(
@@ -25407,9 +28798,9 @@ impl MeshNode {
     /// fan-out. Shared by the immediate announce path and the RT-1 trailing-edge
     /// flush so the two can't drift (RT-1 review Finding 14).
     async fn broadcast_emission(&self, emission: &SendEmission) {
-        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
-        for addr in peer_addrs {
-            self.send_emission_to(addr, emission).await;
+        let peer_ids: Vec<u64> = self.peers.iter().map(|e| *e.key()).collect();
+        for node_id in peer_ids {
+            self.send_emission_to(node_id, emission).await;
         }
     }
 
@@ -26221,7 +29612,7 @@ impl MeshNode {
         control: &super::dataforts::blob::transfer::TransferControl,
     ) -> Result<(), super::AdapterError> {
         let (dest_addr, session) = match self.peers.get(&peer) {
-            Some(p) => (p.value().addr, p.value().session.clone()),
+            Some(p) => (p.value().addr(), p.value().session.clone()),
             None => {
                 return Err(super::AdapterError::Connection(format!(
                     "transfer control: no session for {peer:#x}"
@@ -26419,42 +29810,139 @@ impl MeshNode {
     /// Scoped variant of [`Self::find_nodes_by_filter`]. Filters
     /// candidates through `scope` (derived from each peer's
     /// `scope:*` reserved tags) on top of the capability filter.
-    /// `SubnetLocal` peers and the [`ScopeFilter::SameSubnet`]
-    /// filter resolve same-subnet membership against
-    /// `peer_subnets`.
     ///
-    /// **Warm-up rule.** When a peer's subnet is unknown:
-    /// - **With** a `local_subnet_policy`, the candidate is
-    ///   admitted (a fresh peer's announcement may not have
-    ///   landed yet — the policy will resolve it on receipt).
-    /// - **Without** a `local_subnet_policy`, `peer_subnets`
-    ///   stays permanently empty (the dispatch handler only
-    ///   writes it when a policy is installed), so "unknown"
-    ///   means "will never resolve" — admitting unknowns there
-    ///   leaks every peer through `SameSubnet`. The candidate
-    ///   is excluded.
+    /// **Subnet resolution.** Every candidate except this node resolves
+    /// the same way: run the local `SubnetPolicy` over the tags of the
+    /// fold entry the query just selected. With no policy installed
+    /// there is nothing to resolve tags with, so the candidate is
+    /// unresolvable and excluded.
+    ///
+    /// **`peer_subnets` is deliberately NOT consulted here.** That map
+    /// is a pre-apply sidecar: `handle_capability_announcement` writes
+    /// it before the announcement reaches the fold, and the fold's apply
+    /// outcome is never fed back. A stale announcement the fold REJECTS
+    /// still updates the sidecar, so the two can disagree:
+    ///
+    /// ```text
+    /// fold and peer_subnets hold v500 / subnet A
+    /// → the peer restarts and sends a valid signed v1 / subnet B
+    /// → peer_subnets becomes B
+    /// → the fold rejects v1 (generation 1 < 500) and keeps v500 / A
+    /// → a scoped query would select on v500's capabilities while
+    ///   judging its subnet by B
+    /// ```
+    ///
+    /// Reading the sidecar for direct peers and the fold for forwarded
+    /// ones also made resolution depend on HOW an announcement arrived,
+    /// which a single authoritative source removes. `peer_subnets`
+    /// remains correct for the direct-session and channel paths that
+    /// intentionally want the last thing a session peer said; it is
+    /// simply not the right input for a query against fold state.
+    ///
+    /// This also replaces a warm-up rule that admitted every unresolved
+    /// candidate whenever a policy was installed. That window never
+    /// closed for forwarded-only peers — the normal way peers are
+    /// learned beyond a direct session — so `SameSubnet` returned peers
+    /// from arbitrary subnets and `scope:subnet-local` providers were
+    /// visible mesh-wide
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    ///
+    /// Deriving at query time rather than caching is what makes the
+    /// lifecycle trivial: the fold entry is the authoritative record and
+    /// the policy is read live, so nothing survives an expiry, eviction,
+    /// snapshot restore, policy replacement, or a publisher restart to
+    /// disagree with the fold later.
+    ///
+    /// The derivation runs on tags borrowed from the SAME fold snapshot
+    /// that selected the candidate, so a query can never mix a match
+    /// against one announcement with a subnet computed from its
+    /// replacement. A candidate with no fold entry never reaches the
+    /// closure at all — the snapshot only yields entries that exist —
+    /// so an unknown peer is excluded rather than being treated as
+    /// subnet `GLOBAL`, which would otherwise match a `GLOBAL` local
+    /// subnet.
+    ///
+    /// Deriving from the SELECTED entry rather than the publisher's
+    /// node-wide tag union is safe only because a publisher owns exactly
+    /// one fold entry on this path: `translate_announcement` pins
+    /// `class_hash` to the 0 cutover sentinel, so successive
+    /// announcements replace rather than accumulate. Were per-class
+    /// sharding to reach the announcement path, a class that omitted the
+    /// policy's tags could resolve a co-resident peer to `GLOBAL` and
+    /// exclude it, making `SameSubnet`'s verdict depend on which
+    /// capability was searched for — subnet is a node property, scope is
+    /// a per-announcement one. `tags_union_for` is the fix if that day
+    /// comes;
+    /// `a_publisher_owns_exactly_one_fold_entry_on_the_announcement_path`
+    /// fails first.
+    ///
+    /// Forwarded announcements are safe to resolve this way even though
+    /// `peer_subnets` deliberately skips them: `from_node` is the relay,
+    /// but `ann.node_id` is blake2s-bound to `ann.entity_id` at
+    /// dispatch, so the fold entry is attributable to the ORIGIN and its
+    /// tags are the origin's own.
+    ///
+    /// In signed mode (`require_signed_capabilities`, the secure
+    /// default) every fold entry came from a verified announcement, so
+    /// the derived subnet rests on the same signature the direct path
+    /// requires. A deployment that opts into unsigned discovery gets
+    /// unsigned tags here exactly as it does for every other axis of the
+    /// same query.
+    ///
+    /// Subnet membership remains SELF-ASSERTED — a peer picks its own
+    /// tags, so this is a discovery filter, not an access-control
+    /// boundary. See the audit's HIGH finding on self-asserted subnets.
+    ///
+    /// # Cost under the fold locks
+    ///
+    /// Resolving inside the selecting snapshot is what the single-
+    /// snapshot argument above requires, so the derivation necessarily
+    /// runs while the fold's state and index read locks are held. Under
+    /// `SameSubnet` that is, per candidate:
+    ///
+    /// - no allocation — [`SubnetPolicy::assign_from_rendered_tags`]
+    ///   borrows the tags the snapshot already holds; and
+    /// - `O(operator_rules × announcement_tags)` prefix strips and map
+    ///   lookups.
+    ///
+    /// Announcement tags are announcer-chosen and capped only by the
+    /// wire payload; rules are configured locally and small. The other
+    /// scope filters do not reach the closure at all — their verdict
+    /// comes entirely from the tags — so this cost is confined to
+    /// `SameSubnet` queries.
+    ///
+    /// Stated because it replaced a `peer_subnets` lookup that ran
+    /// AFTER the locks dropped, and moving announcer-shaped work under
+    /// them is the kind of thing
+    /// SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md flags. It is
+    /// accepted here on correctness grounds, not on a claim of being
+    /// cheaper than what it replaced — no such measurement was taken.
     pub fn find_nodes_by_filter_scoped(
         &self,
         filter: &CapabilityFilter,
         scope: &ScopeFilter<'_>,
     ) -> Vec<u64> {
         let my_subnet = self.local_subnet;
-        let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
-        // See doc-comment: without a policy, an unresolvable
-        // "unknown" cannot be admitted as same-subnet.
-        let policy_installed = self.local_subnet_policy.is_some();
+        let policy = self.local_subnet_policy.clone();
         super::behavior::fold::capability_bridge::find_nodes_matching_scoped(
             &self.capability_fold,
             filter,
             scope,
-            |nid| {
+            // Fold-pure, as the bridge requires: reads only the policy
+            // and the borrowed tags it is handed, never the fold and
+            // never `peer_subnets`.
+            |nid, tags| {
                 if nid == local_node_id {
                     return true;
                 }
-                match peer_subnets.get(&nid).map(|e| *e.value()) {
-                    Some(s) => s == my_subnet,
-                    None => policy_installed,
+                // Every other candidate resolves from the tags of the
+                // entry the snapshot just selected. Without a policy
+                // there is nothing to resolve them with, so the
+                // candidate stays unknown and is excluded.
+                match policy.as_ref() {
+                    Some(policy) => policy.assign_from_rendered_tags(tags) == my_subnet,
+                    None => false,
                 }
             },
         )
@@ -26601,7 +30089,7 @@ impl MeshNode {
             // session can't decrypt it), and even if it arrived, the
             // coordinator's anti-reflection guard would reject the
             // routed pair anyway.
-            if self.is_relayed_peer(nid, &entry.value().addr) {
+            if self.is_relayed_peer(nid, &entry.value().addr()) {
                 continue;
             }
             any.push(nid);
@@ -26789,7 +30277,7 @@ impl MeshNode {
         let session_matches = |want_addr: std::net::SocketAddr| {
             self.peers
                 .get(&peer_node_id)
-                .map(|e| e.value().addr == want_addr)
+                .map(|e| e.value().addr() == want_addr)
                 .unwrap_or(false)
         };
 
@@ -26820,7 +30308,31 @@ impl MeshNode {
             // `target_addr` and falls back to a linear
             // `peers.iter().find` per packet for the upgraded
             // session. (#9)
-            self.addr_to_node.insert(target_addr, peer_node_id);
+            //
+            // Published as a peer transition, and only while the peer
+            // record actually agrees that `target_addr` is its
+            // address. An unconditional insert here runs AFTER the
+            // upgrade released its own transition, so a newer install
+            // (a re-handshake elsewhere, a relay fallback) could
+            // already own the peer — and this would then point the
+            // reverse index at an address that peer no longer uses.
+            //
+            // The condition is the peer's OWNED address, read from the
+            // same snapshot that would authorize the publication: a
+            // routed session's send address is the relay's, and
+            // publishing it as this peer's would re-create by another
+            // route exactly the false ownership the routed install
+            // path refuses to write.
+            self.peer_transitions.with(peer_node_id, || {
+                let owns_target = self
+                    .peers
+                    .get(&peer_node_id)
+                    .and_then(|p| p.value().owned_addr())
+                    == Some(target_addr);
+                if owns_target {
+                    self.addr_to_node.insert(target_addr, peer_node_id);
+                }
+            });
             Ok::<u64, TraversalError>(id)
         };
 
@@ -27252,10 +30764,18 @@ impl MeshNode {
 
     /// Reserve `island` under this node's identity: apply the
     /// `Reserved` transition to the local reservation fold — this
-    /// node's optimistic AP view (locked decision 2) — and broadcast
-    /// it to peers. Returns the local CAS outcome (`Won` if the
-    /// island was free/unheld in this node's view, `Lost` if already
-    /// held). `until_unix_us` is the takeover deadline.
+    /// node's optimistic AP view (locked decision 2) — and, **if the
+    /// local CAS accepted it**, broadcast it to peers. Returns the
+    /// local CAS outcome (`Won` if the island was free/unheld in this
+    /// node's view, `Lost` if already held). `until_unix_us` is the
+    /// takeover deadline.
+    ///
+    /// A `Lost` attempt is still signed, applied and metered, and
+    /// still consumes a generation — but it is not published: only
+    /// locally accepted reservation-fold transitions are publishable,
+    /// so this node never emits a reservation state its own CAS
+    /// rejected. See `apply_and_broadcast_reservation` (private) and
+    /// PERF_AUDIT_2026_07_31_GANG_SCHEDULER §4 for the reasoning.
     pub async fn reserve_island(
         &self,
         island: super::behavior::fold::IslandId,
@@ -27282,13 +30802,11 @@ impl MeshNode {
         &self,
         island: super::behavior::fold::IslandId,
     ) -> Result<super::behavior::gang::ClaimOutcome, AdapterError> {
-        use super::behavior::fold::ReservationQuery;
-        let held_by_us = self
-            .reservation_fold
-            .query(ReservationQuery::State(island))
-            .first()
-            .and_then(|(_, state)| state.holder())
-            == Some(self.node_id);
+        // Borrowed holder read — same metered query, without the
+        // one-row `Vec` `ReservationQuery::State` allocates
+        // (PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7).
+        let held_by_us =
+            super::behavior::fold::holder_of(&self.reservation_fold, island) == Some(self.node_id);
         if !held_by_us {
             return Ok(super::behavior::gang::ClaimOutcome::Lost);
         }
@@ -27320,7 +30838,25 @@ impl MeshNode {
 
     /// Build a signed reservation transition, apply it to the local
     /// reservation fold for the optimistic CAS outcome, and broadcast
-    /// it. Shared by [`Self::reserve_island`] / [`Self::release_island`].
+    /// it **only if that apply was accepted**. Shared by
+    /// [`Self::reserve_island`] / [`Self::release_island`].
+    ///
+    /// # Invariant
+    ///
+    /// > Only locally accepted reservation-fold transitions are
+    /// > publishable.
+    ///
+    /// The local CAS is the sole decision point, and it runs before
+    /// any publication decision — there is no pre-read, so no
+    /// expiry-boundary prediction, no skipped generation, and no
+    /// suppressed `applies_rejected` count. What changes on a
+    /// `Rejected` outcome is only that nothing goes on the wire.
+    ///
+    /// (`ReservationFold` implements no
+    /// [`FoldKind::audit_event`](super::behavior::fold::FoldKind::audit_event),
+    /// so there is no audit emission on this path to preserve or
+    /// suppress either way — see PERF_AUDIT_2026_07_31_GANG_SCHEDULER
+    /// §4.)
     async fn apply_and_broadcast_reservation(
         &self,
         island: super::behavior::fold::IslandId,
@@ -27345,29 +30881,54 @@ impl MeshNode {
             },
         )
         .map_err(|e| AdapterError::Connection(format!("reservation: sign failed: {e}")))?;
-        // Local optimistic CAS (this node's AP view), then propagate.
+        // Local optimistic CAS (this node's AP view) — the sole
+        // decision point.
         let outcome = self
             .reservation_fold
             .apply(ann.clone())
             .map_err(|e| AdapterError::Connection(format!("reservation: apply failed: {e}")))?;
-        // The broadcast is best-effort gossip (the local CAS already
-        // decided the AP outcome), but don't silently drop a failed
-        // propagation: the returned ClaimOutcome reflects only the local
-        // view, so a dropped error hides "won locally, peers not told"
-        // (review #10).
-        if let Err(e) = self.publish_fold_broadcast(&ann).await {
-            tracing::warn!(
-                island,
-                error = %e,
-                "reservation broadcast failed; local CAS applied but peers not notified",
-            );
-        }
-        Ok(match outcome {
+        match outcome {
             ApplyOutcome::Inserted | ApplyOutcome::Replaced => {
-                super::behavior::gang::ClaimOutcome::Won
+                // The broadcast is best-effort gossip (the local CAS
+                // already decided the AP outcome), but don't silently
+                // drop a failed propagation: the returned ClaimOutcome
+                // reflects only the local view, so a dropped error hides
+                // "won locally, peers not told" (review #10).
+                if let Err(e) = self.publish_fold_broadcast(&ann).await {
+                    tracing::warn!(
+                        island,
+                        error = %e,
+                        "reservation broadcast failed; local CAS applied but peers not notified",
+                    );
+                }
+                Ok(super::behavior::gang::ClaimOutcome::Won)
             }
-            ApplyOutcome::Rejected => super::behavior::gang::ClaimOutcome::Lost,
-        })
+            // ONLY LOCALLY ACCEPTED TRANSITIONS ARE PUBLISHABLE.
+            //
+            // A rejected transition stays locally attempted, locally
+            // metered (`applies_rejected`), generation-consuming, and
+            // returned as `Lost` — but it must never become replicated
+            // state. Broadcasting it published a reservation this node
+            // does not itself believe:
+            //
+            //     sign → reject locally → broadcast anyway → peer accepts
+            //
+            // which left the claimant holding `A` as `H` while an
+            // observer installed the losing claimant. ICB-4's W4 used to
+            // witness exactly that and disclaim it.
+            //
+            // Scope, deliberately: this fixes replication of a
+            // self-rejected transition. It does NOT address two nodes
+            // that both observe `Free` and both locally win — that is
+            // the known AP `Reserved` divergence, and the
+            // quorum/fencing edge into `Active` owns authoritative
+            // execution. See PERF_AUDIT_2026_07_31_GANG_SCHEDULER §4.
+            //
+            // Applies to release too, via this shared helper: a `Free`
+            // rejected after a holder-check race is likewise not
+            // publishable.
+            ApplyOutcome::Rejected => Ok(super::behavior::gang::ClaimOutcome::Lost),
+        }
     }
 
     /// Test-only helper — translate a legacy
@@ -27447,10 +31008,21 @@ impl MeshNode {
     }
 
     /// Push the currently-stored local announcement (if any) to
-    /// `peer_addr`. Called from the end of `connect` / `accept` so
+    /// `peer_node_id`. Called from the end of `connect` / `accept` so
     /// late joiners don't have to wait for a re-announce. No-op
     /// when we haven't yet announced anything.
-    async fn push_local_announcement(&self, peer_addr: SocketAddr) {
+    ///
+    /// Deliberately still a no-op in that case. Synthesizing an
+    /// announcement here would make a node that has never announced
+    /// visible to peers with an EMPTY capability set, and "absent from
+    /// the fold" is not equivalent to "present with no tags" — the
+    /// callee-side nRPC capability gate reads the difference, so
+    /// materializing one flips `may_execute` outcomes for callers that
+    /// never announced. Identity propagation must not ride on a
+    /// side effect of the capability plane; see
+    /// `ensure_reply_subscription` for how the H3 origin binding gets
+    /// the pin it needs instead.
+    async fn push_local_announcement(&self, peer_node_id: u64) {
         // Serialized through the epoch-checked path (review-9
         // addendum): a late joiner must receive what this node's
         // CURRENT state would emit, never a cached certificate a
@@ -27458,7 +31030,7 @@ impl MeshNode {
         let Some(emission) = self.announcement_bytes_for_send() else {
             return;
         };
-        self.send_emission_to(peer_addr, &emission).await;
+        self.send_emission_to(peer_node_id, &emission).await;
     }
 
     // ── Stream API ─────────────────────────────────────────────────────
@@ -27593,7 +31165,7 @@ impl MeshNode {
             .peers
             .get(&stream.peer_node_id)
             .ok_or(StreamError::NotConnected)?;
-        let peer_addr = peer.addr;
+        let peer_addr = peer.addr();
         let session = peer.session.clone();
         drop(peer);
 
@@ -28158,20 +31730,13 @@ impl MeshNode {
             }
         };
 
-        // Shared peer install. Routed-mode preserves any prior
-        // `addr_to_node[relay_addr]` entry (a true multi-hop
-        // relay keeps its own peer_id; degenerate single-hop
-        // installs the destination). Routed handshakes
+        // Shared peer install, ROUTED: `relay_addr` is where datagrams
+        // go, and this session authenticates the far endpoint rather
+        // than whoever owns that address. Routed handshakes
         // intentionally skip the post-install pingwave /
-        // failure_detector / announcement push — see
-        // `connect`'s wiring for the direct-handshake-only
-        // bookkeeping.
-        self.install_peer(
-            dest_node_id,
-            relay_addr,
-            keys,
-            AddrInstallMode::RoutedPreserve,
-        );
+        // failure_detector / announcement push — see `connect`'s wiring
+        // for the direct-handshake-only bookkeeping.
+        self.install_routed(dest_node_id, relay_addr, keys, None);
 
         Ok(dest_node_id)
     }
@@ -28188,6 +31753,10 @@ impl MeshNode {
     /// current session, typically the working relay path, intact), or
     /// `Err` on handshake failure (nothing was mutated, so the relay
     /// session is likewise untouched).
+    ///
+    /// `direct` states what the handshake actually established: `true`
+    /// when `target_addr` is the peer's own reflex address (a real
+    /// direct-path upgrade), `false` when it is a relay's.
     #[cfg(feature = "nat-traversal")]
     async fn connect_via_cas(
         &self,
@@ -28195,7 +31764,7 @@ impl MeshNode {
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
         expected_prior_session_id: u64,
-        addr_mode: AddrInstallMode,
+        direct: bool,
     ) -> Result<bool, AdapterError> {
         let mut attempt = 0;
         let keys = loop {
@@ -28212,13 +31781,13 @@ impl MeshNode {
                 Err(e) => return Err(e),
             }
         };
-        Ok(self.install_peer_cas(
-            dest_node_id,
-            target_addr,
-            keys,
-            addr_mode,
-            Some(expected_prior_session_id),
-        ))
+        let expected = Some(expected_prior_session_id);
+        let outcome = if direct {
+            self.install_direct(dest_node_id, target_addr, keys, expected)
+        } else {
+            self.install_routed(dest_node_id, target_addr, keys, expected)
+        };
+        Ok(outcome.owned)
     }
 
     // ── Background direct-path upgrade (Stage 3) ─────────────────────────
@@ -28402,7 +31971,7 @@ impl MeshNode {
         let Some((relay_addr, prior_sid, pubkey, busy)) = self.peers.get(&peer_id).map(|e| {
             let v = e.value();
             (
-                v.addr,
+                v.addr(),
                 v.session.session_id(),
                 v.remote_static_pub,
                 v.session.has_open_streams() || v.session.has_unacked(),
@@ -28487,13 +32056,9 @@ impl MeshNode {
 
         self.traversal_stats.record_upgrade_attempt();
         match self
-            .connect_via_cas(
-                target_addr,
-                &pubkey,
-                peer_id,
-                prior_sid,
-                AddrInstallMode::DirectOverwrite,
-            )
+            // `direct: true` — `target_addr` is the peer's own reflex
+            // address, which is the whole point of the upgrade.
+            .connect_via_cas(target_addr, &pubkey, peer_id, prior_sid, true)
             .await
         {
             Ok(true) => {
@@ -28530,7 +32095,7 @@ impl MeshNode {
     /// per-peer throttle window has elapsed.
     #[cfg(feature = "nat-traversal")]
     fn upgrade_is_loop_candidate(&self, peer_id: u64) -> bool {
-        let Some(addr) = self.peers.get(&peer_id).map(|e| e.value().addr) else {
+        let Some(addr) = self.peers.get(&peer_id).map(|e| e.value().addr()) else {
             return false;
         };
         self.upgrade_is_loop_candidate_at(peer_id, addr)
@@ -28670,7 +32235,7 @@ impl MeshNode {
                     .peers
                     .iter()
                     .filter(|entry| {
-                        node.upgrade_is_loop_candidate_at(*entry.key(), entry.value().addr)
+                        node.upgrade_is_loop_candidate_at(*entry.key(), entry.value().addr())
                     })
                     .map(|entry| *entry.key())
                     .collect();
@@ -29687,7 +33252,7 @@ impl Adapter for MeshNode {
             .peers
             .iter()
             .next()
-            .map(|e| e.value().addr)
+            .map(|e| e.value().addr())
             .ok_or_else(|| AdapterError::Connection("no peers connected".into()))?;
 
         self.send_to_peer(peer_addr, &batch).await
@@ -30931,10 +34496,14 @@ mod fold_publisher_helpers_tests {
             3600,
             0,
         ));
-        node.subscriber_chains
-            .insert((dead, channel_hash), RetainedChain::new(chain.clone()));
-        node.subscriber_chains
-            .insert((live, channel_hash), RetainedChain::new(chain));
+        node.subscriber_chains.insert(
+            (dead, channel_hash),
+            RetainedChain::new(chain.clone(), channel_hash),
+        );
+        node.subscriber_chains.insert(
+            (live, channel_hash),
+            RetainedChain::new(chain, channel_hash),
+        );
         assert_eq!(node.subscriber_chains.len(), 2);
 
         node.failure_detector.heartbeat(dead, addr);
@@ -31366,19 +34935,23 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                addr: next_hop,
+                transport: PeerTransport::Direct {
+                    owned_addr: next_hop,
+                },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
             },
         );
         peer_addrs.insert(peer_id, next_hop);
-        router.add_route(peer_id, next_hop);
+        let registered_route_token = router.add_route(peer_id, next_hop);
 
         // Drop guard without committing.
         {
             let _guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                peer_transitions: PeerTransitions::new(),
+                registered_route_token,
                 registered_session_id,
                 registered_next_hop: next_hop,
                 peers: peers.clone(),
@@ -31431,7 +35004,9 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                addr: next_hop,
+                transport: PeerTransport::Direct {
+                    owned_addr: next_hop,
+                },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
@@ -31443,6 +35018,8 @@ mod heartbeat_aead_tests {
         {
             let guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                peer_transitions: PeerTransitions::new(),
+                registered_route_token: 0,
                 registered_session_id,
                 registered_next_hop: next_hop,
                 peers: peers.clone(),
@@ -31502,7 +35079,7 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                addr: fresh,
+                transport: PeerTransport::Direct { owned_addr: fresh },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
@@ -31514,6 +35091,8 @@ mod heartbeat_aead_tests {
         {
             let _guard = PeerRegistrationGuard {
                 peer_node_id: peer_id,
+                peer_transitions: PeerTransitions::new(),
+                registered_route_token: 0,
                 registered_session_id: stale_session_id, // NOT the live session_id
                 registered_next_hop: stale,              // NOT what's currently in the maps
                 peers: peers.clone(),
@@ -31534,6 +35113,190 @@ mod heartbeat_aead_tests {
              differs, so remove_if leaves the live entry alone"
         );
         assert_eq!(router.routing_table().lookup(peer_id), Some(fresh));
+    }
+
+    /// A stale rollback must not strip a live replacement's sidecars
+    /// when the two share ONE relay address.
+    ///
+    /// The exact-session `peers.remove_if` correctly declines when a
+    /// replacement owns the peer. What it could not do on its own was
+    /// stop the rest of the rollback: `peer_addrs` and the route were
+    /// removed by ADDRESS, and two registrations for the same endpoint
+    /// through the same relay write an identical address and an
+    /// identical `(dest, next_hop)` route. The stale rollback therefore
+    /// left the replacement present in `peers` and unreachable
+    /// everywhere else.
+    ///
+    /// The earlier witness for this used DIFFERENT stale and fresh
+    /// addresses, which is precisely the schedule where address-keyed
+    /// removal happens to be safe — so it could never have caught this.
+    #[tokio::test]
+    async fn a_stale_rollback_sharing_one_relay_address_leaves_the_replacement_whole() {
+        let peer_id = 0x5EED_5EEDu64;
+        // ONE address for both registrations: the shared relay.
+        let relay: SocketAddr = "10.0.0.9:9000".parse().unwrap();
+
+        let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let router = Arc::new(
+            NetRouter::new(crate::adapter::net::router::RouterConfig::new(
+                0xCAFE_BABE,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
+
+        // The stale registration: session S1, route token T1.
+        let (stale_keys, _) = make_session_keys();
+        let stale_session_id = stale_keys.session_id;
+        let stale_route_token = router.add_route(peer_id, relay);
+
+        // The replacement lands: session S2 through the SAME relay,
+        // producing its own route token.
+        let (fresh_keys, _) = make_session_keys();
+        let fresh_session = Arc::new(NetSession::new(fresh_keys, relay, 4, false));
+        let fresh_session_id = fresh_session.session_id();
+        assert_ne!(stale_session_id, fresh_session_id);
+        let session_id_to_node: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
+        session_id_to_node.insert(fresh_session_id, peer_id);
+        peers.insert(
+            peer_id,
+            PeerInfo {
+                node_id: peer_id,
+                transport: PeerTransport::Routed {
+                    relay_addr: relay,
+                    adjacent_relay_identity: None,
+                },
+                session: fresh_session,
+                remote_static_pub: [0u8; 32],
+                last_initiator_ephemeral: None,
+            },
+        );
+        peer_addrs.insert(peer_id, relay);
+        // Deliberately NOT asserted to differ from `stale_route_token`.
+        // The token names an observable STATE, not a write: two
+        // registrations through the same relay install a candidate that
+        // is identical in address, identity, metric and liveness, so
+        // the second one changes nothing observable and the token
+        // rightly does not move. That is the whole reason PEER
+        // ownership has to gate the rollback — the token cannot
+        // separate these two, and a rollback that ran its sidecars past
+        // a declined peer removal had nothing left to stop it.
+        let _fresh_route_token = router.add_route(peer_id, relay);
+
+        // Now the STALE registration's guard drops.
+        {
+            let _guard = PeerRegistrationGuard {
+                peer_node_id: peer_id,
+                peer_transitions: PeerTransitions::new(),
+                registered_route_token: stale_route_token,
+                registered_session_id: stale_session_id,
+                // Identical to the replacement's — an address cannot
+                // tell the two registrations apart.
+                registered_next_hop: relay,
+                peers: peers.clone(),
+                peer_addrs: peer_addrs.clone(),
+                session_id_to_node: session_id_to_node.clone(),
+                router: router.clone(),
+            };
+        }
+
+        assert!(
+            peers.contains_key(&peer_id),
+            "the exact-session check must decline to remove the replacement"
+        );
+        assert_eq!(
+            peer_addrs.get(&peer_id).map(|e| *e),
+            Some(relay),
+            "a rollback that does not own the peer must not remove its address — \
+             the replacement would be present in `peers` and unreachable in fact"
+        );
+        assert!(
+            session_id_to_node.contains_key(&fresh_session_id),
+            "the replacement's reverse-index entry must survive"
+        );
+        assert_eq!(
+            router.routing_table().lookup(peer_id),
+            Some(relay),
+            "the replacement's route must survive — the rollback owns the whole \
+             transition or none of it"
+        );
+    }
+
+    /// The token gate is the SECOND half of the same rule: a rollback
+    /// that legitimately owns its peer still must not remove a route
+    /// another writer has since replaced.
+    ///
+    /// Peer ownership cannot cover this — the peer record is genuinely
+    /// ours — so the route removal is named by the token our own
+    /// install produced rather than by the `(dest, next_hop)` pair,
+    /// which a newer write can reproduce exactly.
+    #[tokio::test]
+    async fn an_owned_rollback_declines_a_route_another_writer_replaced() {
+        let peer_id = 0x7A11_7A11u64;
+        let relay: SocketAddr = "10.0.0.11:9000".parse().unwrap();
+
+        let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let session_id_to_node: Arc<DashMap<u64, u64>> = Arc::new(DashMap::new());
+        let router = Arc::new(
+            NetRouter::new(crate::adapter::net::router::RouterConfig::new(
+                0xCAFE_BABE,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
+
+        let (keys, _) = make_session_keys();
+        let session = Arc::new(NetSession::new(keys, relay, 4, false));
+        let registered_session_id = session.session_id();
+        peers.insert(
+            peer_id,
+            PeerInfo {
+                node_id: peer_id,
+                transport: PeerTransport::Routed {
+                    relay_addr: relay,
+                    adjacent_relay_identity: None,
+                },
+                session,
+                remote_static_pub: [0u8; 32],
+                last_initiator_ephemeral: None,
+            },
+        );
+        peer_addrs.insert(peer_id, relay);
+        let registered_route_token = router.add_route(peer_id, relay);
+
+        // A different writer replaces the candidate with an
+        // AUTHENTICATED one — an observable change, so the token moves.
+        router.add_direct_route(peer_id, relay);
+
+        {
+            let _guard = PeerRegistrationGuard {
+                peer_node_id: peer_id,
+                peer_transitions: PeerTransitions::new(),
+                registered_route_token,
+                registered_session_id,
+                registered_next_hop: relay,
+                peers: peers.clone(),
+                peer_addrs: peer_addrs.clone(),
+                session_id_to_node: session_id_to_node.clone(),
+                router: router.clone(),
+            };
+        }
+
+        assert!(
+            !peers.contains_key(&peer_id),
+            "the rollback DID own the peer record and removed it"
+        );
+        assert_eq!(
+            router.routing_table().lookup_authenticated(peer_id),
+            Some((peer_id, relay)),
+            "but the newer authenticated candidate must survive: the destination no \
+             longer carries the token this registration produced, so the rollback \
+             cannot prove the state is still its own"
+        );
     }
 
     /// PERF_AUDIT §2.4 regression: the routed-local dispatch
@@ -31572,7 +35335,9 @@ mod heartbeat_aead_tests {
             peer_id,
             PeerInfo {
                 node_id: peer_id,
-                addr: peer_addr,
+                transport: PeerTransport::Direct {
+                    owned_addr: peer_addr,
+                },
                 session,
                 remote_static_pub: [0u8; 32],
                 last_initiator_ephemeral: None,
@@ -31638,12 +35403,7 @@ mod heartbeat_aead_tests {
 
         let (first_keys, _) = make_session_keys();
         let first_session_id = first_keys.session_id;
-        node.install_peer(
-            peer_id,
-            peer_addr,
-            first_keys,
-            AddrInstallMode::DirectOverwrite,
-        );
+        node.install_direct(peer_id, peer_addr, first_keys, None);
         assert_eq!(
             node.session_id_to_node.get(&first_session_id).map(|e| *e),
             Some(peer_id),
@@ -31658,12 +35418,7 @@ mod heartbeat_aead_tests {
             first_session_id, second_session_id,
             "fresh handshake must derive a distinct session_id"
         );
-        node.install_peer(
-            peer_id,
-            peer_addr,
-            second_keys,
-            AddrInstallMode::DirectOverwrite,
-        );
+        node.install_direct(peer_id, peer_addr, second_keys, None);
 
         assert_eq!(
             node.session_id_to_node.get(&second_session_id).map(|e| *e),
@@ -31699,36 +35454,22 @@ mod heartbeat_aead_tests {
         let relay_addr: SocketAddr = "10.9.9.9:9100".parse().unwrap();
         let (relay_keys, _) = make_session_keys();
         let relay_session_id = relay_keys.session_id;
-        node.install_peer(
-            peer_id,
-            relay_addr,
-            relay_keys,
-            AddrInstallMode::RoutedPreserve,
-        );
+        node.install_routed(peer_id, relay_addr, relay_keys, None);
 
         // A racing rotation installs a DIFFERENT session for the peer
         // (simulated by a plain install). The upgrade below still holds
         // the OLD session_id as its expectation.
         let (raced_keys, _) = make_session_keys();
         let raced_session_id = raced_keys.session_id;
-        node.install_peer(
-            peer_id,
-            relay_addr,
-            raced_keys,
-            AddrInstallMode::RoutedPreserve,
-        );
+        node.install_routed(peer_id, relay_addr, raced_keys, None);
 
         // Upgrade tries to install a punched session but expects the
         // pre-race session_id → CAS must refuse.
         let punched_addr: SocketAddr = "10.1.1.1:7000".parse().unwrap();
         let (punch_keys, _) = make_session_keys();
-        let installed = node.install_peer_cas(
-            peer_id,
-            punched_addr,
-            punch_keys,
-            AddrInstallMode::DirectOverwrite,
-            Some(relay_session_id),
-        );
+        let installed = node
+            .install_direct(peer_id, punched_addr, punch_keys, Some(relay_session_id))
+            .owned;
         assert!(!installed, "CAS must refuse when the session_id changed");
         // The raced session survives untouched.
         assert_eq!(
@@ -31762,12 +35503,7 @@ mod heartbeat_aead_tests {
         let old_addr: SocketAddr = "10.5.5.5:9100".parse().unwrap();
         let (first_keys, _) = make_session_keys();
         let first_session_id = first_keys.session_id;
-        node.install_peer(
-            peer_id,
-            old_addr,
-            first_keys,
-            AddrInstallMode::DirectOverwrite,
-        );
+        node.install_direct(peer_id, old_addr, first_keys, None);
         assert_eq!(
             node.addr_to_node.get(&old_addr).map(|e| *e),
             Some(peer_id),
@@ -31777,13 +35513,9 @@ mod heartbeat_aead_tests {
         let new_addr: SocketAddr = "10.1.1.1:7000".parse().unwrap();
         let (punch_keys, _) = make_session_keys();
         let punch_session_id = punch_keys.session_id;
-        let installed = node.install_peer_cas(
-            peer_id,
-            new_addr,
-            punch_keys,
-            AddrInstallMode::DirectOverwrite,
-            Some(first_session_id),
-        );
+        let installed = node
+            .install_direct(peer_id, new_addr, punch_keys, Some(first_session_id))
+            .owned;
         assert!(installed, "CAS must install when the session_id matches");
         assert_eq!(
             node.peers
@@ -31800,6 +35532,358 @@ mod heartbeat_aead_tests {
         assert!(
             !node.addr_to_node.contains_key(&old_addr),
             "C4: the displaced addr's stale reverse mapping must be removed",
+        );
+    }
+
+    /// The whole install transition is serialized per peer: a slow
+    /// installer cannot publish its sidecars after a newer one has
+    /// completed, leaving `peers` naming one incarnation while the
+    /// route, addresses and session index name another.
+    ///
+    /// Two installers race for the same peer from different threads.
+    /// Whichever wins, every sidecar must name the SAME incarnation as
+    /// the peer record — that self-consistency is the property the
+    /// lock exists to provide (before it, the sidecar writes could
+    /// interleave in the opposite order from the peer-record swap).
+    #[tokio::test]
+    async fn concurrent_installs_leave_a_self_consistent_peer_snapshot() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x31u8; 32]);
+        let node = Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        );
+
+        let peer_id = 0xBA55_0001u64;
+        let addr_b: SocketAddr = "10.4.4.4:9100".parse().unwrap();
+        let addr_c: SocketAddr = "10.5.5.5:9100".parse().unwrap();
+
+        for round in 0..64 {
+            let (keys_b, _) = make_session_keys();
+            let (keys_c, _) = make_session_keys();
+            let sid_b = keys_b.session_id;
+            let sid_c = keys_c.session_id;
+
+            let n1 = node.clone();
+            let n2 = node.clone();
+            let t1 = std::thread::spawn(move || {
+                n1.install_direct(peer_id, addr_b, keys_b, None);
+            });
+            let t2 = std::thread::spawn(move || {
+                n2.install_direct(peer_id, addr_c, keys_c, None);
+            });
+            t1.join().expect("installer B");
+            t2.join().expect("installer C");
+
+            // Read the peer record, then check every sidecar against
+            // THAT incarnation.
+            let (winner_sid, winner_addr) = node
+                .peers
+                .get(&peer_id)
+                .map(|p| (p.value().session.session_id(), p.value().addr()))
+                .expect("a peer record exists");
+            assert!(
+                winner_sid == sid_b || winner_sid == sid_c,
+                "round {round}: the winner must be one of the two installs",
+            );
+            let expected_addr = if winner_sid == sid_b { addr_b } else { addr_c };
+            assert_eq!(
+                winner_addr, expected_addr,
+                "round {round}: PeerInfo.addr must match the winning session",
+            );
+            assert_eq!(
+                node.peer_addrs.get(&peer_id).map(|e| *e),
+                Some(expected_addr),
+                "round {round}: peer_addrs must name the winning incarnation",
+            );
+            assert_eq!(
+                node.session_id_to_node.get(&winner_sid).map(|e| *e),
+                Some(peer_id),
+                "round {round}: the session index must name the winner",
+            );
+            assert_eq!(
+                node.session_id_to_node.len(),
+                1,
+                "round {round}: the loser's session index entry must be gone",
+            );
+            assert_eq!(
+                node.addr_to_node.get(&expected_addr).map(|e| *e),
+                Some(peer_id),
+                "round {round}: the winning address must be indexed",
+            );
+            assert_eq!(
+                node.router.routing_table().lookup_authenticated(peer_id),
+                Some((peer_id, expected_addr)),
+                "round {round}: the direct route must ride the winning address",
+            );
+        }
+    }
+
+    /// A routed (`connect_via`) install is NOT an authenticated
+    /// adjacency. The session authenticates the far endpoint while
+    /// the recorded address is the immediate relay's, so the route it
+    /// installs must be LEGACY: ordinary lookup resolves the relay
+    /// address, `lookup_authenticated` resolves nothing. Binding the
+    /// pair (the pre-fix behavior — `install_peer` called
+    /// `add_direct_route` unconditionally before inspecting the mode)
+    /// made protected forwarding select the endpoint's end-to-end
+    /// session and aim the envelope at the relay, which cannot
+    /// authenticate it.
+    #[tokio::test]
+    async fn a_routed_install_is_not_an_authenticated_adjacency() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x2Eu8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let dest_id = 0x0DE5_7000u64;
+        let relay_addr: SocketAddr = "10.8.8.8:9100".parse().unwrap();
+        let (keys, _) = make_session_keys();
+        node.install_routed(dest_id, relay_addr, keys, None);
+
+        assert_eq!(
+            node.router.routing_table().lookup(dest_id),
+            Some(relay_addr),
+            "ordinary routing reaches the endpoint via the relay",
+        );
+        assert_eq!(
+            node.router.routing_table().lookup_authenticated(dest_id),
+            None,
+            "a routed end-to-end session must not resolve as an authenticated next hop",
+        );
+        assert!(node.authenticated_next_hop(dest_id).is_none());
+
+        // The inverse of the inverse: a DIRECT install still binds.
+        let direct_id = 0x0D12_EC70u64;
+        let direct_addr: SocketAddr = "10.8.8.9:9100".parse().unwrap();
+        let (keys, _) = make_session_keys();
+        node.install_direct(direct_id, direct_addr, keys, None);
+        assert_eq!(
+            node.router.routing_table().lookup_authenticated(direct_id),
+            Some((direct_id, direct_addr)),
+            "a direct handshake is identity-qualified by construction",
+        );
+    }
+
+    /// The consistent-move seam refuses — with ZERO mutation — when
+    /// the peer's direct route is absent, legacy, or bound to another
+    /// identity. A refused move must leave the peer record, both
+    /// address indexes, and the routing table exactly as they were.
+    #[tokio::test]
+    async fn set_peer_addr_for_test_refuses_without_tearing_state() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x2Fu8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0x5EA1_0001u64;
+        let home: SocketAddr = "10.6.6.6:9100".parse().unwrap();
+        let moved: SocketAddr = "10.7.7.7:7100".parse().unwrap();
+        let (keys, _) = make_session_keys();
+        node.install_direct(peer_id, home, keys, None);
+
+        let assert_untouched = |case: &str| {
+            assert_eq!(
+                node.peers.get(&peer_id).map(|p| p.value().addr()),
+                Some(home),
+                "{case}: PeerInfo.addr must be untouched",
+            );
+            assert_eq!(
+                node.peer_addrs.get(&peer_id).map(|e| *e),
+                Some(home),
+                "{case}: peer_addrs must be untouched",
+            );
+            assert_eq!(
+                node.addr_to_node.get(&home).map(|e| *e),
+                Some(peer_id),
+                "{case}: the home reverse-index entry must be untouched",
+            );
+            assert!(
+                !node.addr_to_node.contains_key(&moved),
+                "{case}: the target address must not be indexed",
+            );
+        };
+
+        // Absent direct route.
+        node.router
+            .routing_table()
+            .remove_destination_all_candidates(peer_id);
+        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert_untouched("absent route");
+
+        // Legacy (identity-less) direct route.
+        node.router.add_route(peer_id, home);
+        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert_untouched("legacy route");
+        assert_eq!(
+            node.router.routing_table().lookup(peer_id),
+            Some(home),
+            "legacy route: the entry itself must be untouched",
+        );
+
+        // Route bound to a DIFFERENT identity.
+        const OTHER: u64 = 0x07_14u64;
+        node.router
+            .routing_table()
+            .remove_destination_all_candidates(peer_id);
+        node.router
+            .routing_table()
+            .add_authenticated_route(peer_id, home, OTHER);
+        assert!(!node.set_peer_addr_for_test(peer_id, moved));
+        assert_untouched("conflicting identity");
+        assert_eq!(
+            node.router.routing_table().lookup_authenticated(peer_id),
+            Some((OTHER, home)),
+            "conflicting identity: the binding must be untouched",
+        );
+    }
+
+    /// A successful consistent move evicts the OLD reverse-index
+    /// entry only when this peer still owns it: a concurrently reused
+    /// address that has been re-indexed to another owner keeps that
+    /// owner's mapping.
+    #[tokio::test]
+    async fn set_peer_addr_for_test_leaves_a_reused_old_address_with_its_owner() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x30u8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0x5EA1_0002u64;
+        let home: SocketAddr = "10.6.6.7:9100".parse().unwrap();
+        let moved: SocketAddr = "10.7.7.8:7100".parse().unwrap();
+        let (keys, _) = make_session_keys();
+        node.install_direct(peer_id, home, keys, None);
+
+        // Concurrent reuse: another peer now owns the home address in
+        // the reverse index.
+        const OTHER: u64 = 0x07_15u64;
+        node.addr_to_node.insert(home, OTHER);
+
+        assert!(node.set_peer_addr_for_test(peer_id, moved));
+        assert_eq!(
+            node.addr_to_node.get(&home).map(|e| *e),
+            Some(OTHER),
+            "the reused old address must stay indexed to its new owner",
+        );
+        assert_eq!(node.addr_to_node.get(&moved).map(|e| *e), Some(peer_id));
+        assert_eq!(
+            node.peers.get(&peer_id).map(|p| p.value().addr()),
+            Some(moved),
+        );
+        assert_eq!(
+            node.router.routing_table().lookup_authenticated(peer_id),
+            Some((peer_id, moved)),
+            "the authenticated route follows the identity to the new address",
+        );
+    }
+
+    /// A forged tag must not burn a replay slot: after a bad-tag
+    /// envelope at some sequence is rejected, the legitimate envelope
+    /// carrying the SAME sequence still admits exactly once. MAC
+    /// verification runs before replay admission, so an attacker who
+    /// can flip bytes cannot deny the real packet its slot.
+    #[test]
+    fn a_bad_tag_does_not_burn_the_replay_sequence() {
+        let (init_keys, resp_keys) = make_session_keys();
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let sender = NetSession::new(init_keys, addr, 4, false);
+        let receiver = NetSession::new(resp_keys, addr, 4, false);
+
+        let header = crate::adapter::net::route::RoutingHeader::new(0xD57, 0x51C, 4);
+        let envelope = sender.seal_route_hop(&header, b"inner-bytes-inner-bytes");
+
+        let mut tampered = envelope.clone();
+        *tampered.last_mut().expect("non-empty") ^= 1;
+        assert!(
+            receiver.open_route_hop(&tampered).is_err(),
+            "the tampered envelope must be rejected",
+        );
+        assert!(
+            receiver.open_route_hop(&envelope).is_ok(),
+            "the legitimate envelope's sequence must still admit after the forgery",
+        );
+        assert!(receiver.open_route_hop(&envelope).is_err(), "…exactly once",);
+    }
+
+    /// The PRODUCTION re-handshake path resets replay state: after
+    /// `install_peer` replaces a peer's session, the new incarnation
+    /// admits a hop sequence the displaced one had already consumed.
+    ///
+    /// The pure-session witness below constructs two session pairs
+    /// directly; this one drives the real installer, so it also covers
+    /// the case where the replacement is published through the peer
+    /// map rather than constructed in isolation.
+    #[tokio::test]
+    async fn a_production_re_handshake_resets_the_replay_window() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x32u8; 32]);
+        let node = MeshNode::new(EntityKeypair::generate(), cfg)
+            .await
+            .expect("MeshNode::new");
+
+        let peer_id = 0x2E01_0001u64;
+        let peer_addr: SocketAddr = "10.3.3.3:9100".parse().unwrap();
+        let header = crate::adapter::net::route::RoutingHeader::new(peer_id, 0x51C, 4);
+
+        // First incarnation: the peer's sending side is the far half of
+        // the same handshake, so its envelope verifies on our session.
+        let (far_keys, near_keys) = make_session_keys();
+        node.install_direct(peer_id, peer_addr, near_keys, None);
+        let far = NetSession::new(far_keys, peer_addr, 4, false);
+        let env = far.seal_route_hop(&header, b"first-incarnation");
+        assert!(
+            node.open_route_hop_from_peer(peer_id, &env).is_some(),
+            "the first envelope must verify and admit",
+        );
+        assert!(
+            node.open_route_hop_from_peer(peer_id, &env).is_none(),
+            "…exactly once",
+        );
+
+        // Re-handshake through the production installer.
+        let (far_keys, near_keys) = make_session_keys();
+        node.install_direct(peer_id, peer_addr, near_keys, None);
+        let far = NetSession::new(far_keys, peer_addr, 4, false);
+        let env = far.seal_route_hop(&header, b"second-incarnation");
+        assert!(
+            node.open_route_hop_from_peer(peer_id, &env).is_some(),
+            "the replacement incarnation must start from a fresh replay \
+             window — its first hop carries sequence 0, which the \
+             displaced session had already consumed",
+        );
+    }
+
+    /// A fresh session incarnation starts a fresh replay window: a
+    /// hop sequence the OLD incarnation had seen admits again under
+    /// the new one, because replay state belongs to the session, not
+    /// the edge.
+    #[test]
+    fn a_new_session_incarnation_starts_a_fresh_replay_window() {
+        let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let header = crate::adapter::net::route::RoutingHeader::new(0xD57, 0x51C, 4);
+
+        let (init_keys, resp_keys) = make_session_keys();
+        let old_sender = NetSession::new(init_keys, addr, 4, false);
+        let old_receiver = NetSession::new(resp_keys, addr, 4, false);
+        let env = old_sender.seal_route_hop(&header, b"first-incarnation");
+        assert!(old_receiver.open_route_hop(&env).is_ok());
+        assert!(old_receiver.open_route_hop(&env).is_err(), "seen: seq 0");
+
+        // Re-handshake: a new incarnation of the same edge. Its first
+        // envelope carries hop sequence 0 again — the sequence the
+        // old incarnation had already seen — and must admit.
+        let (init_keys, resp_keys) = make_session_keys();
+        let new_sender = NetSession::new(init_keys, addr, 4, false);
+        let new_receiver = NetSession::new(resp_keys, addr, 4, false);
+        let env = new_sender.seal_route_hop(&header, b"second-incarnation");
+        assert!(
+            new_receiver.open_route_hop(&env).is_ok(),
+            "a fresh incarnation must not inherit the old replay window",
         );
     }
 
@@ -31824,7 +35908,7 @@ mod heartbeat_aead_tests {
         let peer_id = 0xCAFE_D00Du64;
         let peer_addr: SocketAddr = "10.3.3.3:9100".parse().unwrap();
         let (keys, _) = make_session_keys();
-        node.install_peer(peer_id, peer_addr, keys, AddrInstallMode::DirectOverwrite);
+        node.install_direct(peer_id, peer_addr, keys, None);
         let session = node
             .peers
             .get(&peer_id)
@@ -31864,12 +35948,7 @@ mod heartbeat_aead_tests {
         // for the dead session the resolution returns None instead
         // of misrouting a grant to the replacement session.
         let (new_keys, _) = make_session_keys();
-        node.install_peer(
-            peer_id,
-            peer_addr,
-            new_keys,
-            AddrInstallMode::DirectOverwrite,
-        );
+        node.install_direct(peer_id, peer_addr, new_keys, None);
         assert!(
             MeshNode::resolve_grant_peer(&node.peers, &node.addr_to_node, &session).is_none(),
             "stale session must not resolve to the replacement peer entry"
@@ -32086,7 +36165,7 @@ mod heartbeat_aead_tests {
         let ephemeral_a = [0xCCu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            addr,
+            transport: PeerTransport::Direct { owned_addr: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some(ephemeral_a),
@@ -32113,7 +36192,7 @@ mod heartbeat_aead_tests {
         let ephemeral_new = [0xDDu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            addr,
+            transport: PeerTransport::Direct { owned_addr: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some(ephemeral_old),
@@ -32139,7 +36218,7 @@ mod heartbeat_aead_tests {
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            addr,
+            transport: PeerTransport::Direct { owned_addr: addr },
             session,
             remote_static_pub: [0xAAu8; 32],
             last_initiator_ephemeral: Some([0xCCu8; 32]),
@@ -32165,7 +36244,7 @@ mod heartbeat_aead_tests {
         let session = Arc::new(NetSession::new(init_keys, addr, 4, false));
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            addr,
+            transport: PeerTransport::Direct { owned_addr: addr },
             session,
             remote_static_pub: [0xAAu8; 32],
             last_initiator_ephemeral: Some([0xCCu8; 32]),
@@ -32197,7 +36276,7 @@ mod heartbeat_aead_tests {
         let static_a = [0xAAu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            addr,
+            transport: PeerTransport::Direct { owned_addr: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some([0xCCu8; 32]),
@@ -32223,7 +36302,7 @@ mod heartbeat_aead_tests {
         let static_a = [0xAAu8; 32];
         let info = PeerInfo {
             node_id: 0xBEEF_BEEFu64,
-            addr,
+            transport: PeerTransport::Direct { owned_addr: addr },
             session,
             remote_static_pub: static_a,
             last_initiator_ephemeral: Some([0xCCu8; 32]),
@@ -33962,6 +38041,10 @@ mod oa34b2_query_currentness_tests {
         snapshot: Arc<crate::adapter::net::behavior::org_grant_registry::ConsumerGrantSnapshot>,
         publications: u64,
         identity: u64,
+        /// The PUBLICATION-identity allocator, distinct from `publications`
+        /// above: that one counts snapshot publications, this one is the
+        /// terminal counter that orders transitions.
+        publication_identity: u64,
     }
 
     fn grant_registry_state(node: &MeshNode) -> GrantRegistryState {
@@ -33969,6 +38052,7 @@ mod oa34b2_query_currentness_tests {
             snapshot: node.consumer_grant_audiences.load_full(),
             publications: node.consumer_grant_publications_for_test(),
             identity: node.consumer_grant_install_seq_for_test(),
+            publication_identity: node.consumer_grant_publication_for_test(),
         }
     }
 
@@ -33987,6 +38071,16 @@ mod oa34b2_query_currentness_tests {
     /// mutation moving the identity passed a test named
     /// `..._refuses_without_mutating`. A partial helper makes the omission the
     /// default; a total one makes it unrepresentable.
+    ///
+    /// The PUBLICATION identity is the fourth, added after Kyra's review of
+    /// `010c718ea`. A delegated audit read `reserve_publication` as consuming
+    /// the transition identity before the installation-identity allocator can
+    /// refuse; that reading was WRONG — `reserve_publication` only loads and
+    /// checks, and `commit_publication` alone advances the counter — but the
+    /// witness gap it exposed was real. Nothing pinned the publication allocator
+    /// across an installation-identity refusal, so a future edit that made the
+    /// reservation eager would have been a genuine depletion defect with every
+    /// witness still green. Totality is the point of this helper.
     fn assert_no_effect(node: &MeshNode, before: &GrantRegistryState) {
         assert!(
             Arc::ptr_eq(&before.snapshot, &node.consumer_grant_audiences.load_full()),
@@ -34001,6 +38095,14 @@ mod oa34b2_query_currentness_tests {
             node.consumer_grant_install_seq_for_test(),
             before.identity,
             "a non-publishing outcome must not move the installation identity"
+        );
+        assert_eq!(
+            node.consumer_grant_publication_for_test(),
+            before.publication_identity,
+            "nor the PUBLICATION identity. Reservation is a load-and-check \
+             today, so this holds by construction — which is exactly why it \
+             needs pinning: an eager reservation would drain a second terminal \
+             space on a path that publishes nothing"
         );
     }
 
@@ -35901,3 +40003,1196 @@ mod exact_expiry_timer_tests {
 #[cfg(test)]
 #[path = "org_routing_wiring_tests.rs"]
 mod org_routing_wiring_tests;
+
+#[cfg(test)]
+mod scoped_discovery_ignores_peer_subnets_tests {
+    //! `find_nodes_by_filter_scoped` must resolve a candidate's subnet
+    //! from the fold entry it selected, never from the `peer_subnets`
+    //! sidecar (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    //!
+    //! The sidecar is written by `handle_capability_announcement` BEFORE
+    //! the announcement reaches the fold, and the fold's apply outcome is
+    //! never fed back — so an announcement the fold REJECTS as stale
+    //! still updates it. Preferring it for direct peers meant a query
+    //! could select on one announcement's capabilities while judging its
+    //! subnet by another's.
+    //!
+    //! All three tests fail if the sidecar branch is reinstated.
+    use super::*;
+    use crate::adapter::net::behavior::capability::{
+        CapabilityAnnouncement, CapabilityFilter, CapabilitySet, ScopeFilter,
+    };
+    use crate::adapter::net::SubnetRule;
+
+    /// Observer in subnet `[3]`, with a policy mapping `region:eu` to
+    /// `[4]` and `region:us` to `[3]`.
+    async fn observer() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let policy = Arc::new(
+            SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 3).map("eu", 4)),
+        );
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32])
+            .with_subnet(SubnetId::new(&[3]))
+            .with_subnet_policy(policy);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    fn signed_ann(kp: &EntityKeypair, version: u64, region: &str) -> CapabilityAnnouncement {
+        let caps = CapabilitySet::new()
+            .add_tag(format!("region:{region}"))
+            .add_tag("sidecar-canary");
+        let mut ann =
+            CapabilityAnnouncement::new(kp.node_id(), kp.entity_id().clone(), version, caps)
+                .with_ttl(300);
+        ann.sign(kp);
+        ann
+    }
+
+    /// The load-bearing witness. The sidecar claims the peer shares our
+    /// subnet; the peer's own announced tags say otherwise. The fold
+    /// entry is authoritative, so the peer must be excluded.
+    ///
+    /// Pre-fix the direct branch returned `peer_subnets` before ever
+    /// looking at the tags, so this returned the peer.
+    #[tokio::test]
+    async fn sidecar_cannot_admit_a_peer_the_fold_says_is_elsewhere() {
+        let node = observer().await;
+        let peer = EntityKeypair::generate();
+        let peer_id = peer.node_id();
+
+        // Fold: the peer is really in `[4]` (region:eu).
+        node.test_inject_capability_announcement(signed_ann(&peer, 500, "eu"));
+
+        // Sidecar disagrees — it says the peer is in OUR subnet. This is
+        // the shape a stale or out-of-order pre-apply write leaves behind.
+        node.peer_subnets.insert(peer_id, SubnetId::new(&[3]));
+
+        let filter = CapabilityFilter::new().require_tag("sidecar-canary");
+        assert!(
+            node.find_nodes_by_filter(&filter).contains(&peer_id),
+            "precondition: the peer must be indexed"
+        );
+
+        let same = node.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+        assert!(
+            !same.contains(&peer_id),
+            "SameSubnet must follow the fold entry's tags (region:eu → [4]), \
+             not the peer_subnets sidecar claiming [3]; got {same:?}"
+        );
+    }
+
+    /// The restart case the sidecar cannot represent: a valid signed
+    /// announcement whose generation the fold REJECTS must not move the
+    /// query's verdict, even though the sidecar would have taken it.
+    #[tokio::test]
+    async fn a_fold_rejected_stale_announcement_does_not_move_the_verdict() {
+        let node = observer().await;
+        let peer = EntityKeypair::generate();
+        let peer_id = peer.node_id();
+
+        // Accepted: v500 in `[4]`.
+        node.test_inject_capability_announcement(signed_ann(&peer, 500, "eu"));
+
+        // The peer restarts and its version counter resets. This
+        // announcement is perfectly valid and signed, but the fold
+        // rejects it (generation 1 < 500) and keeps v500 / eu. A
+        // sidecar write would have taken `us` and flipped the verdict.
+        node.test_inject_capability_announcement(signed_ann(&peer, 1, "us"));
+        node.peer_subnets.insert(peer_id, SubnetId::new(&[3]));
+
+        let filter = CapabilityFilter::new().require_tag("sidecar-canary");
+        let same = node.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+        assert!(
+            !same.contains(&peer_id),
+            "the fold rejected the v1 announcement, so the retained v500 \
+             (region:eu → [4]) must still decide; got {same:?}"
+        );
+    }
+
+    /// The invariant scoped discovery's subnet derivation rests on: on
+    /// the announcement path a publisher owns exactly ONE fold entry.
+    ///
+    /// The fold keys entries `(class_hash, NodeId)` and its payload doc
+    /// says "a publisher in multiple classes emits one announcement per
+    /// class", which invites the conclusion that
+    /// `find_nodes_by_filter_scoped` — deriving a candidate's subnet
+    /// from the tags of the entry the capability filter selected — could
+    /// read a class that omits the policy's tags while a sibling class
+    /// carries them, resolving a co-resident peer to `GLOBAL` and
+    /// excluding it. Subnet is a node property; scope is a per-
+    /// announcement one, so that would be a real defect.
+    ///
+    /// It is unreachable here because `translate_announcement` pins
+    /// `class_hash: 0` for every `CapabilityAnnouncement` — the cutover
+    /// sentinel documented on that function — so successive
+    /// announcements from one publisher REPLACE a single entry rather
+    /// than accumulating siblings. Every non-zero `class_hash` writer in
+    /// the crate is `#[cfg(test)]`.
+    ///
+    /// This test exists so that stops being an accident. If per-class
+    /// sharding ever lands on the announcement path, this fails, and
+    /// the subnet derivation must move to the node-wide tag union
+    /// (`tags_union_for`) within the same snapshot before it can.
+    #[tokio::test]
+    async fn a_publisher_owns_exactly_one_fold_entry_on_the_announcement_path() {
+        let node = observer().await;
+        let peer = EntityKeypair::generate();
+        let peer_id = peer.node_id();
+
+        // Two announcements from one publisher, different tags and
+        // different capability classes in the informal sense — a GPU
+        // advert and a relay advert.
+        let mut first = {
+            let caps = CapabilitySet::new()
+                .add_tag("region:us")
+                .add_tag("gpu")
+                .add_tag("multiclass-canary");
+            CapabilityAnnouncement::new(peer_id, peer.entity_id().clone(), 1, caps).with_ttl(300)
+        };
+        first.sign(&peer);
+        node.test_inject_capability_announcement(first);
+
+        // The second omits `region:us` entirely. If it landed as a
+        // SIBLING entry rather than a replacement, a query selecting it
+        // would derive GLOBAL and drop a peer that is really in [3].
+        let mut second = {
+            let caps = CapabilitySet::new()
+                .add_tag("relay-capable")
+                .add_tag("multiclass-canary");
+            CapabilityAnnouncement::new(peer_id, peer.entity_id().clone(), 2, caps).with_ttl(300)
+        };
+        second.sign(&peer);
+        node.test_inject_capability_announcement(second);
+
+        let (entry_count, classes) = node.capability_fold.with_state(|state| {
+            let keys = state.by_node.get(&peer_id).cloned().unwrap_or_default();
+            let classes: Vec<u64> = keys.iter().map(|(class, _)| *class).collect();
+            (keys.len(), classes)
+        });
+
+        assert_eq!(
+            entry_count, 1,
+            "a publisher must own exactly one fold entry on the announcement \
+             path; got {entry_count} (classes {classes:?}). If per-class \
+             sharding now reaches this path, find_nodes_by_filter_scoped must \
+             derive the subnet from the node-wide tag union instead of the \
+             selected entry's tags — otherwise SameSubnet's verdict depends on \
+             which capability was searched for."
+        );
+        assert_eq!(
+            classes,
+            vec![0],
+            "translate_announcement pins class_hash to the 0 cutover sentinel"
+        );
+    }
+
+    /// Same resolution regardless of how the announcement arrived: the
+    /// verdict comes from the retained entry either way. Pins the
+    /// direct-versus-forwarded equivalence.
+    #[tokio::test]
+    async fn resolution_does_not_depend_on_whether_a_sidecar_entry_exists() {
+        let filter = CapabilityFilter::new().require_tag("sidecar-canary");
+
+        // With a sidecar entry present (as a direct peer would have).
+        let with = observer().await;
+        let peer_a = EntityKeypair::generate();
+        with.test_inject_capability_announcement(signed_ann(&peer_a, 7, "us"));
+        with.peer_subnets
+            .insert(peer_a.node_id(), SubnetId::new(&[4]));
+        let with_result = with
+            .find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet)
+            .contains(&peer_a.node_id());
+
+        // Without one (as a forwarded-only peer would be).
+        let without = observer().await;
+        let peer_b = EntityKeypair::generate();
+        without.test_inject_capability_announcement(signed_ann(&peer_b, 7, "us"));
+        let without_result = without
+            .find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet)
+            .contains(&peer_b.node_id());
+
+        assert_eq!(
+            with_result, without_result,
+            "a peer announcing region:us (→ [3], our subnet) must resolve \
+             identically whether or not a sidecar entry exists"
+        );
+        assert!(
+            with_result,
+            "region:us maps to [3], the observer's own subnet, so both must \
+             be admitted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod subnet_visible_unknown_tests {
+    //! Witnesses for the `ParentVisible` unknown-subnet fail-open
+    //! (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md, HIGH #2).
+    //!
+    //! `peer_subnets` only populates when a `local_subnet_policy` is
+    //! installed AND the peer sent a signature-verified direct
+    //! announcement, so an unresolved peer is routine. Coercing that
+    //! unknown to `SubnetId::GLOBAL` made it a universal ancestor,
+    //! admitting it to every `ParentVisible` channel — on the path that
+    //! otherwise answers `AckReason::Unauthorized`.
+    //!
+    //! In-crate because `subnet_visible` is private.
+    use super::*;
+
+    const SCOPED: fn() -> SubnetId = || SubnetId::new(&[3, 7]);
+
+    /// The vulnerability, pinned. A subnet-scoped node must not admit a
+    /// peer whose subnet it could not derive.
+    #[test]
+    fn parent_visible_rejects_unknown_peer_subnet_when_scoped() {
+        assert!(
+            !MeshNode::subnet_visible(SCOPED(), None, Visibility::ParentVisible, None),
+            "unknown peer subnet must fail closed under ParentVisible on a \
+             subnet-scoped node; coercing it to GLOBAL made every unresolved \
+             peer a universal ancestor"
+        );
+    }
+
+    /// The same coercion on the strict arm was already fail-closed;
+    /// pin it so a future refactor doesn't loosen it.
+    #[test]
+    fn subnet_local_rejects_unknown_peer_subnet_when_scoped() {
+        assert!(
+            !MeshNode::subnet_visible(SCOPED(), None, Visibility::SubnetLocal, None),
+            "unknown peer subnet must fail closed under SubnetLocal"
+        );
+    }
+
+    /// Flat mesh: a node with no subnet identity of its own cannot
+    /// express "same subnet as me" / "ancestor of me", so unknown peers
+    /// stay visible. This is the pre-fix behaviour and must be
+    /// preserved — breaking it would silently partition every
+    /// deployment that never configured subnets.
+    #[test]
+    fn unscoped_node_still_admits_unknown_peer_subnet() {
+        for visibility in [Visibility::SubnetLocal, Visibility::ParentVisible] {
+            assert!(
+                MeshNode::subnet_visible(SubnetId::GLOBAL, None, visibility, None),
+                "a node with no subnet of its own must keep admitting \
+                 unresolved peers under {visibility:?} (flat-mesh compat)"
+            );
+        }
+    }
+
+    /// The permissive arm above is correct for a genuinely flat mesh
+    /// and wrong for a node that installed a `SubnetPolicy` and then
+    /// left its own subnet global: there, resolution is expected, so
+    /// "unresolved" means something went wrong rather than "subnets are
+    /// not in use". That pairing is warned about at construction rather
+    /// than failed closed — see
+    /// `MeshNode::subnet_policy_without_local_subnet` for the decision.
+    ///
+    /// The condition must be the CONJUNCTION. Firing on either half
+    /// alone would warn every correctly-configured deployment: a policy
+    /// with a scoped subnet is the intended subnet-aware setup, and a
+    /// global subnet with no policy is the intended flat one.
+    #[test]
+    fn misconfiguration_warning_fires_only_on_policy_plus_global_subnet() {
+        let scoped = SubnetId::new(&[3, 7]);
+        let cases = [
+            // (subnet, policy_can_scope, should_warn)
+            (SubnetId::GLOBAL, true, true),   // the misconfiguration
+            (SubnetId::GLOBAL, false, false), // flat mesh, intended
+            (scoped, true, false),            // subnet-aware, intended
+            (scoped, false, false),           // scoped but no peer resolution
+        ];
+        for (subnet, policy_can_scope, should_warn) in cases {
+            assert_eq!(
+                MeshNode::subnet_policy_without_local_subnet(subnet, policy_can_scope),
+                should_warn,
+                "subnet={subnet:?} policy_can_scope={policy_can_scope}"
+            );
+        }
+    }
+
+    /// The second input is "can this policy produce a non-global
+    /// subnet", not "is a policy installed". A rule-less policy assigns
+    /// GLOBAL to everyone, so on a GLOBAL local node every peer resolves
+    /// to the same subnet and there is no inversion — warning there
+    /// would flag a valid flat deployment for installing a no-op policy.
+    #[test]
+    fn a_policy_that_cannot_scope_does_not_trigger_the_warning() {
+        use crate::adapter::net::SubnetRule;
+
+        let no_rules = SubnetPolicy::new();
+        assert!(
+            !no_rules.can_assign_non_global(),
+            "SubnetPolicy::new() is documented as assigning GLOBAL to all nodes"
+        );
+
+        // A rule with values but every one of them 0, which assigns
+        // GLOBAL just as surely while looking configured. `map` /
+        // `try_map` reject 0 as reserved, so this is only reachable
+        // through `SubnetRule`'s public `values` field — which is
+        // exactly why `can_assign_non_global` inspects the values
+        // rather than counting rules.
+        let mut zero_rule = SubnetRule::new("region:", 0);
+        zero_rule.values.insert("us".to_string(), 0);
+        zero_rule.values.insert("eu".to_string(), 0);
+        let all_zero = SubnetPolicy::new().add_rule(zero_rule);
+        assert!(!all_zero.can_assign_non_global());
+
+        // A rule with no values at all can never match.
+        let empty_rule = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0));
+        assert!(!empty_rule.can_assign_non_global());
+
+        let real = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 3));
+        assert!(real.can_assign_non_global());
+
+        for policy in [&no_rules, &all_zero, &empty_rule] {
+            assert!(
+                !MeshNode::subnet_policy_without_local_subnet(
+                    SubnetId::GLOBAL,
+                    policy.can_assign_non_global()
+                ),
+                "a policy that can only ever answer GLOBAL must not be warned about"
+            );
+        }
+        assert!(
+            MeshNode::subnet_policy_without_local_subnet(
+                SubnetId::GLOBAL,
+                real.can_assign_non_global()
+            ),
+            "a policy that CAN scope, with a global local subnet, is the case worth flagging"
+        );
+    }
+
+    /// The inversion the warning describes, pinned against
+    /// `subnet_visible` itself so the message cannot drift from the
+    /// behaviour. On a global-subnet node under `ParentVisible`, a
+    /// resolved peer is rejected while an unresolved one is admitted.
+    #[test]
+    fn global_local_subnet_privileges_unresolved_peers_over_resolved_ones() {
+        let resolved = Some(SubnetId::new(&[3]));
+        assert!(
+            !MeshNode::subnet_visible(SubnetId::GLOBAL, resolved, Visibility::ParentVisible, None),
+            "a peer whose subnet resolved to [3] is not an ancestor of GLOBAL, \
+             so it is rejected"
+        );
+        assert!(
+            MeshNode::subnet_visible(SubnetId::GLOBAL, None, Visibility::ParentVisible, None),
+            "yet an unresolved peer takes the permissive unknown arm and is \
+             admitted — being unresolvable is more privileged than being \
+             resolved, which is what the construction warning exists to flag"
+        );
+        assert!(
+            MeshNode::subnet_policy_without_local_subnet(SubnetId::GLOBAL, true),
+            "and this is exactly the configuration the warning fires on"
+        );
+    }
+
+    /// Every known-subnet verdict is byte-for-byte what it was before
+    /// the `Option` change: only the unknown arms moved.
+    #[test]
+    fn known_subnet_verdicts_are_unchanged() {
+        let child = SubnetId::new(&[3, 7, 2]);
+        let parent = SubnetId::new(&[3, 7]);
+        let sibling = SubnetId::new(&[3, 8]);
+
+        assert!(MeshNode::subnet_visible(
+            child,
+            Some(child),
+            Visibility::SubnetLocal,
+            None,
+        ));
+        assert!(!MeshNode::subnet_visible(
+            child,
+            Some(sibling),
+            Visibility::SubnetLocal,
+            None,
+        ));
+        // ParentVisible is strictly upward: ancestor yes, sibling no.
+        assert!(MeshNode::subnet_visible(
+            child,
+            Some(parent),
+            Visibility::ParentVisible,
+            None,
+        ));
+        assert!(!MeshNode::subnet_visible(
+            child,
+            Some(sibling),
+            Visibility::ParentVisible,
+            None,
+        ));
+        // Global ignores subnets entirely, including unknown ones.
+        assert!(MeshNode::subnet_visible(
+            child,
+            None,
+            Visibility::Global,
+            None
+        ));
+        // Exported with no declared targets is closed - an export table
+        // that was never populated exports nothing.
+        assert!(!MeshNode::subnet_visible(
+            child,
+            Some(parent),
+            Visibility::Exported,
+            None,
+        ));
+    }
+
+    /// `Exported` reads the declared target list.
+    ///
+    /// It used to answer `false` for every input, which made the mode
+    /// dead rather than strict: an operator could populate the export
+    /// table and the subscribe gate and publish fan-out would still
+    /// admit nobody. Only the packet-level `SubnetGateway` consulted
+    /// the table.
+    #[test]
+    fn exported_admits_exactly_the_declared_targets() {
+        let local = SubnetId::new(&[3, 7, 2]);
+        let fleet = SubnetId::new(&[3, 7]);
+        let vehicle = SubnetId::new(&[3, 7, 9]);
+        let other_fleet = SubnetId::new(&[3, 8]);
+
+        let exported_to = |targets: &[SubnetId], dest: SubnetId| {
+            MeshNode::subnet_visible(local, Some(dest), Visibility::Exported, Some(targets))
+        };
+
+        // An exact target is admitted.
+        assert!(exported_to(&[other_fleet], other_fleet));
+        // A target covers its whole subtree, matching the containment
+        // rule `SubnetGateway::should_forward` applies to this same
+        // table: exporting to a fleet reaches vehicles inside it.
+        assert!(exported_to(&[fleet], vehicle));
+        // A destination outside every target is refused.
+        assert!(!exported_to(&[fleet], other_fleet));
+        // A target BELOW the destination does not admit it — export is
+        // not symmetric, and `3.7` is not reached by exporting to
+        // something inside it.
+        assert!(!exported_to(&[vehicle], fleet));
+        // Any one matching target in a list is enough.
+        assert!(exported_to(&[vehicle, other_fleet], other_fleet));
+        // An empty target list admits nobody.
+        assert!(!exported_to(&[], other_fleet));
+
+        // An underivable peer subnet stays closed even with targets
+        // declared. This is the HIGH #2 shape: unlike SubnetLocal and
+        // ParentVisible there is no permissive flat-mesh arm, because
+        // "exported to nowhere in particular" is not a rule.
+        assert!(!MeshNode::subnet_visible(
+            local,
+            None,
+            Visibility::Exported,
+            Some(&[fleet]),
+        ));
+        assert!(!MeshNode::subnet_visible(
+            SubnetId::GLOBAL,
+            None,
+            Visibility::Exported,
+            Some(&[SubnetId::GLOBAL]),
+        ));
+
+        // A GLOBAL target is the authority-local root and covers
+        // everything — the one way to declare an unrestricted export.
+        assert!(exported_to(&[SubnetId::GLOBAL], other_fleet));
+    }
+
+    /// The composed decision the live call sites perform must not
+    /// alias across a wire-hash collision.
+    ///
+    /// `authorize_subscribe` and the publish fan-out resolve export
+    /// targets from the gateway and hand them here. Both hold the
+    /// canonical `u64` (`requested_hash` / `channel_hash`); keying that
+    /// lookup on the wire `u16` hint let one channel's export rule
+    /// decide another channel's propagation, because the hint has
+    /// routine collisions by design.
+    #[test]
+    fn exported_policy_does_not_alias_across_a_wire_hash_collision() {
+        use crate::adapter::net::channel::{ChannelConfigRegistry, ChannelId, ChannelName};
+        use crate::adapter::net::subnet::SubnetGateway;
+
+        // Two distinct channels sharing a wire bucket.
+        let mut seen = std::collections::HashMap::<u16, String>::new();
+        let (first, second) = loop {
+            let name = format!("collision/{}", seen.len());
+            let id = ChannelId::parse(&name).unwrap();
+            if let Some(existing) = seen.get(&id.wire_hash()) {
+                break (
+                    ChannelName::new(existing).unwrap(),
+                    ChannelName::new(&name).unwrap(),
+                );
+            }
+            seen.insert(id.wire_hash(), name);
+        };
+        assert_eq!(first.wire_hash(), second.wire_hash());
+        assert_ne!(first.hash(), second.hash());
+
+        let gw = SubnetGateway::new(
+            SubnetId::new(&[3, 7]),
+            std::sync::Arc::new(ChannelConfigRegistry::new()),
+        );
+        let target = SubnetId::new(&[3, 8]);
+        gw.export_channel_by_name(&first, vec![target]);
+
+        // Resolved exactly as the two live call sites resolve it.
+        let targets_for = |name: &ChannelName| gw.export_targets(name.hash());
+        let visible_to = |name: &ChannelName| {
+            let t = targets_for(name);
+            MeshNode::subnet_visible(
+                SubnetId::new(&[3, 7]),
+                Some(target),
+                Visibility::Exported,
+                t.as_deref(),
+            )
+        };
+
+        assert!(
+            visible_to(&first),
+            "the exported channel reaches its declared target"
+        );
+        assert!(
+            !visible_to(&second),
+            "a channel sharing only a wire bucket must not inherit that export rule",
+        );
+
+        // And the reverse assignment stays separate.
+        gw.export_channel_by_name(&second, vec![SubnetId::new(&[4])]);
+        assert!(visible_to(&first));
+        assert!(
+            !visible_to(&second),
+            "the second channel is exported elsewhere, not to this target",
+        );
+    }
+
+    /// The export lookup is skipped unless the channel is `Exported`,
+    /// so targets supplied by mistake cannot widen another mode.
+    #[test]
+    fn declared_targets_do_not_affect_other_visibility_modes() {
+        let local = SubnetId::new(&[3, 7, 2]);
+        let sibling = SubnetId::new(&[3, 8]);
+        let wide: &[SubnetId] = &[SubnetId::GLOBAL];
+
+        for visibility in [
+            Visibility::SubnetLocal,
+            Visibility::ParentVisible,
+            Visibility::Global,
+        ] {
+            assert_eq!(
+                MeshNode::subnet_visible(local, Some(sibling), visibility, Some(wide)),
+                MeshNode::subnet_visible(local, Some(sibling), visibility, None),
+                "{visibility:?} must ignore export targets entirely",
+            );
+        }
+    }
+}
+
+// NOTE: this test module lives at the END of the file ON PURPOSE, for
+// the same reason spelled out above `committed_flush_stall_tests`: the
+// heartbeat drift check in session.rs treats the FIRST column-0
+// `#[cfg(test)] mod` as the production/test boundary. This module was
+// originally added next to `MembershipFailure` a few hundred lines in,
+// which hid the real `session.build_heartbeat()` caller behind that
+// boundary and left `mesh_rs_production_callers_match_allowlist` red.
+#[cfg(test)]
+mod membership_failure_tests {
+    use super::*;
+
+    /// Only the origin-binding `Unauthorized` warrants a corrective
+    /// re-announce.
+    ///
+    /// That re-announce deliberately bypasses the announce rate limit,
+    /// so this predicate is what stops one unreachable or throttling
+    /// target from turning every RPC attempt into two extra
+    /// rate-limit-bypassing capability broadcasts.
+    #[test]
+    fn only_unauthorized_warrants_a_corrective_reannounce() {
+        assert!(
+            MembershipFailure::Rejected(Some(AckReason::Unauthorized)).warrants_reannounce(),
+            "Unauthorized is the retryable origin-binding rejection"
+        );
+
+        // RateLimited especially must NOT: the peer is already asking
+        // us to slow down, so re-announcing adds load and cannot help.
+        for reason in [
+            AckReason::RateLimited,
+            AckReason::UnknownChannel,
+            AckReason::TooManyChannels,
+        ] {
+            assert!(
+                !MembershipFailure::Rejected(Some(reason)).warrants_reannounce(),
+                "{reason:?} must not trigger a rate-limit-bypassing re-announce"
+            );
+        }
+
+        assert!(!MembershipFailure::Rejected(None).warrants_reannounce());
+        assert!(
+            !MembershipFailure::Transport(AdapterError::Connection("peer gone".into()))
+                .warrants_reannounce(),
+            "a peer that is simply gone must not drive re-announces"
+        );
+    }
+
+    /// The peer-failure cleanup must evict BOTH per-peer maps, and only
+    /// for the failed peer.
+    ///
+    /// Exercises `evict_failed_peer_channel_state` directly rather than
+    /// failing a live session. The previous version of this test was a
+    /// source scan, and it was worse than useless: `str::find` returned
+    /// the search literal inside the test itself — which sits earlier in
+    /// the file than the production call — so the window it asserted
+    /// over was its own source, and deleting the real eviction still
+    /// passed.
+    #[test]
+    fn peer_failure_cleanup_evicts_only_the_failed_peers_state() {
+        const FAILED: u64 = 0xF0;
+        const HEALTHY: u64 = 0xB0;
+
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        #[cfg(feature = "cortex")]
+        let replies: dashmap::DashMap<(u64, u64), ReplySubscription> = dashmap::DashMap::new();
+
+        // Two channels for the failed peer, one for a healthy peer.
+        for (node, ch) in [(FAILED, 1u64), (FAILED, 2u64), (HEALTHY, 1u64)] {
+            chains.insert(
+                (node, ch),
+                RetainedChain::new(TokenChain { tokens: Vec::new() }, ch),
+            );
+        }
+        #[cfg(feature = "cortex")]
+        for (target, svc) in [(FAILED, 10u64), (FAILED, 11u64), (HEALTHY, 10u64)] {
+            replies.insert(
+                (target, svc),
+                ReplySubscription {
+                    service: Arc::from("svc"),
+                    written_at_generation: 0,
+                },
+            );
+        }
+
+        #[cfg(feature = "cortex")]
+        let announced: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        #[cfg(feature = "cortex")]
+        {
+            announced.insert(FAILED);
+            announced.insert(HEALTHY);
+        }
+        #[cfg(feature = "cortex")]
+        let gens = PeerFailureGenerations::new();
+        #[cfg(feature = "cortex")]
+        let failed_gen_before = gens.get(FAILED);
+        #[cfg(feature = "cortex")]
+        let healthy_gen_before = gens.get(HEALTHY);
+
+        evict_failed_peer_channel_state(
+            FAILED,
+            &chains,
+            #[cfg(feature = "cortex")]
+            &replies,
+            #[cfg(feature = "cortex")]
+            &announced,
+            #[cfg(feature = "cortex")]
+            &gens,
+        );
+
+        assert!(
+            chains.get(&(FAILED, 1)).is_none() && chains.get(&(FAILED, 2)).is_none(),
+            "the failed peer's retained subscribe chains must be dropped — \
+             otherwise they leak for the node's lifetime and a reused \
+             node_id could re-validate a stale chain"
+        );
+        assert!(
+            chains.get(&(HEALTHY, 1)).is_some(),
+            "a healthy peer's state must survive another peer's failure"
+        );
+
+        #[cfg(feature = "cortex")]
+        {
+            assert!(
+                replies.get(&(FAILED, 10)).is_none() && replies.get(&(FAILED, 11)).is_none(),
+                "the failed peer's reply-subscription cache must be dropped — \
+                 the publisher already evicted our roster entry, so leaving \
+                 this makes later calls skip the re-subscribe and silently \
+                 lose every reply"
+            );
+            assert!(
+                replies.get(&(HEALTHY, 10)).is_some(),
+                "a healthy target's reply subscription must survive"
+            );
+            assert!(
+                !announced.contains(&FAILED),
+                "the corrective-announce latch must clear on failure, so a \
+                 genuine reconnect can re-announce"
+            );
+            assert!(
+                announced.contains(&HEALTHY),
+                "…but only for the failed peer — a peer that merely keeps \
+                 rejecting us stays latched"
+            );
+            assert_ne!(
+                gens.get(FAILED),
+                failed_gen_before,
+                "the failure generation must advance, or a reply-subscribe \
+                 already past its await cannot tell it spanned this failure \
+                 and will restore the cache entry we just evicted"
+            );
+            assert_eq!(
+                gens.get(HEALTHY),
+                healthy_gen_before,
+                "…and only for the failed peer — advancing an unaffected \
+                 peer's generation would roll back its in-flight subscribes \
+                 for nothing"
+            );
+        }
+    }
+
+    /// The eviction alone cannot close the reply-subscription hole,
+    /// because the racing insert has not happened yet when it runs. This
+    /// pins the generation half: the sequence a subscribe spanning a
+    /// failure actually observes.
+    ///
+    /// Models the interleaving rather than driving it — forcing a real
+    /// session failure to land inside `ensure_reply_subscription`'s
+    /// `await` is not something the test harness can schedule
+    /// deterministically. The step order below is the one that used to
+    /// defeat the fence, so it is worth walking explicitly.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn a_subscribe_spanning_a_failure_observes_a_generation_change() {
+        const TARGET: u64 = 0xC0FFEE;
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        let replies: dashmap::DashMap<(u64, u64), ReplySubscription> = dashmap::DashMap::new();
+        let latch: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        let gens = PeerFailureGenerations::new();
+
+        // 1. The subscribe snapshots, before its `await`.
+        let gen_before = gens.get(TARGET);
+
+        // 2. The peer fails mid-`await`. The eviction finds nothing to
+        //    evict — the entry does not exist yet. This is the whole
+        //    defect: cleanup ran, and it was a no-op.
+        evict_failed_peer_channel_state(TARGET, &chains, &replies, &latch, &gens);
+        assert!(
+            replies.is_empty(),
+            "precondition: the eviction had nothing to remove"
+        );
+
+        // 3. The subscribe completes and records itself.
+        replies.insert(
+            (TARGET, 7),
+            ReplySubscription {
+                service: Arc::from("svc"),
+                written_at_generation: 0,
+            },
+        );
+
+        // 4. The fence must fire. It only does because the eviction
+        //    bumps BEFORE its retain: with the bump last, step 2's
+        //    retain would have completed while this read still returned
+        //    the step-1 value, and the stale entry would survive.
+        assert_ne!(
+            gens.get(TARGET),
+            gen_before,
+            "the post-insert read must differ from the pre-await snapshot"
+        );
+
+        // A peer that flaps stays distinguishable.
+        let gen_before = gens.get(TARGET);
+        evict_failed_peer_channel_state(TARGET, &chains, &replies, &latch, &gens);
+        assert_ne!(gens.get(TARGET), gen_before);
+
+        // A subscribe that spans no failure must keep its entry — the
+        // fence must not cost the happy path its cache.
+        const QUIET: u64 = 0xD00D;
+        let quiet_before = gens.get(QUIET);
+        replies.insert(
+            (QUIET, 7),
+            ReplySubscription {
+                service: Arc::from("svc"),
+                written_at_generation: 0,
+            },
+        );
+        assert_eq!(gens.get(QUIET), quiet_before);
+    }
+
+    /// Reclaiming the generation table must not resurrect the state the
+    /// fence exists to remove.
+    ///
+    /// This is the subtlety that makes the table a type instead of a
+    /// `DashMap`. The obvious bound — drop entries past a cap — breaks
+    /// the fence, because a dropped counter reads back as the SAME
+    /// default a never-failed peer reads. A subscribe that snapshotted
+    /// that default, spanned a failure, and had the counter reclaimed
+    /// underneath it would compare default to default and keep the stale
+    /// entry.
+    ///
+    /// Absence resolving to a rising floor is what fixes it: a reclaimed
+    /// peer reads back strictly above any earlier snapshot.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn reclaiming_generations_cannot_reproduce_an_earlier_reading() {
+        const TARGET: u64 = 0xC0FFEE;
+        let gens = PeerFailureGenerations::new();
+
+        // The losing sequence: snapshot, fail, reclaim, compare.
+        let gen_before = gens.get(TARGET);
+        gens.bump(TARGET);
+        gens.reclaim();
+        assert_ne!(
+            gens.get(TARGET),
+            gen_before,
+            "a reclaimed counter read back as its pre-failure value — the \
+             in-flight subscribe would keep an entry for a peer that dropped \
+             it from the roster"
+        );
+
+        // Reclaiming with no failure involved is also safe, in the
+        // fail-safe direction: in-flight subscribes roll back and
+        // re-subscribe, which is idempotent.
+        const QUIET: u64 = 0xD00D;
+        let quiet_before = gens.get(QUIET);
+        gens.reclaim();
+        assert_ne!(gens.get(QUIET), quiet_before);
+
+        // The floor only ever rises, so no reading is ever reproduced
+        // across any number of reclamations.
+        let mut seen = vec![gens.get(TARGET)];
+        for _ in 0..8 {
+            gens.bump(TARGET);
+            gens.reclaim();
+            let now = gens.get(TARGET);
+            assert!(
+                seen.iter().all(|prev| *prev != now),
+                "generation {now} repeats an earlier reading {seen:?}"
+            );
+            seen.push(now);
+        }
+    }
+
+    /// The per-target latch bounds ONE target; the budget bounds the
+    /// mesh-wide total. Without it, N distinct rejecting peers bought N
+    /// rate-limit-bypassing broadcasts, each fanned out to every
+    /// connected peer.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn corrective_announces_are_capped_node_wide_across_distinct_targets() {
+        let t0 = Instant::now();
+        let budget = CorrectiveAnnounceBudget::new(t0);
+
+        let allowed = (0..1_000u64).filter(|_| budget.try_spend(t0)).count();
+        assert_eq!(
+            allowed as u32,
+            CorrectiveAnnounceBudget::MAX_PER_WINDOW,
+            "a thousand distinct rejecting targets must not buy a thousand \
+             mesh-wide broadcasts"
+        );
+
+        // The window rolls, and capacity comes back — this is a rate
+        // cap, not a lifetime quota. A node that reconnects hours later
+        // must still be able to re-pin.
+        assert!(budget.try_spend(t0 + CorrectiveAnnounceBudget::WINDOW));
+    }
+
+    /// A refund returns capacity, and cannot manufacture it.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn a_refunded_corrective_announce_does_not_create_capacity() {
+        let t0 = Instant::now();
+        let budget = CorrectiveAnnounceBudget::new(t0);
+        for _ in 0..CorrectiveAnnounceBudget::MAX_PER_WINDOW {
+            assert!(budget.try_spend(t0));
+        }
+        assert!(!budget.try_spend(t0), "precondition: window exhausted");
+
+        // A send that failed broadcast nothing, so its charge comes back.
+        budget.refund();
+        assert!(budget.try_spend(t0), "the refunded slot must be reusable");
+        assert!(!budget.try_spend(t0), "…and only that one slot");
+
+        // Refunds beyond what was spent must not go negative — that
+        // would hand out free capacity in the NEXT window.
+        for _ in 0..100 {
+            budget.refund();
+        }
+        let after = (0..1_000u64).filter(|_| budget.try_spend(t0)).count();
+        assert!(
+            after as u32 <= CorrectiveAnnounceBudget::MAX_PER_WINDOW,
+            "over-refunding created {after} slots in a window capped at {}",
+            CorrectiveAnnounceBudget::MAX_PER_WINDOW
+        );
+    }
+
+    /// The table is actually bounded — the cap fires on its own rather
+    /// than needing a caller to notice.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn generation_tracking_stays_bounded_under_peer_churn() {
+        let gens = PeerFailureGenerations::new();
+        for peer in 0..(PeerFailureGenerations::MAX_TRACKED as u64 * 3) {
+            gens.bump(peer);
+        }
+        assert!(
+            gens.per_peer.len() <= PeerFailureGenerations::MAX_TRACKED,
+            "generation table grew to {} past the {} cap; a long-lived node \
+             facing peer churn would accumulate an entry per identity that \
+             ever failed",
+            gens.per_peer.len(),
+            PeerFailureGenerations::MAX_TRACKED
+        );
+    }
+
+    /// The corrective re-announce is bounded to ONE per target.
+    ///
+    /// `Unauthorized` is not specific to the origin pin — the publisher
+    /// also returns it for cap-filter, token, visibility, queue-group
+    /// and missing-TokenCache rejections — and the membership wire
+    /// cannot carry a finer reason without a versioned cutover (an
+    /// unknown reason byte is a hard decode error on existing peers).
+    /// So the amplification is bounded structurally instead: a target
+    /// that keeps refusing us for an unrelated reason costs at most one
+    /// rate-limit-bypassing broadcast, not one per RPC.
+    #[cfg(feature = "cortex")]
+    #[test]
+    fn corrective_announce_is_claimed_at_most_once_per_target() {
+        let latch: dashmap::DashSet<u64> = dashmap::DashSet::new();
+        const A: u64 = 1;
+        const B: u64 = 2;
+
+        assert!(latch.insert(A), "first claim for a target succeeds");
+        assert!(
+            !latch.insert(A),
+            "a second claim for the same target must not"
+        );
+        assert!(latch.insert(B), "a different target is independent");
+
+        // Failure clears only that target's latch.
+        let chains: DashMap<(u64, ChannelHash), RetainedChain> = DashMap::new();
+        let replies: dashmap::DashMap<(u64, u64), ReplySubscription> = dashmap::DashMap::new();
+        let gens = PeerFailureGenerations::new();
+        evict_failed_peer_channel_state(A, &chains, &replies, &latch, &gens);
+
+        assert!(
+            latch.insert(A),
+            "after failure the target may be claimed again"
+        );
+        assert!(!latch.insert(B), "an unaffected target stays latched");
+    }
+
+    /// Collapsing back to `AdapterError` must preserve the historical
+    /// rejection text, since callers surface it to users.
+    #[test]
+    fn rejection_stringifies_to_the_historical_message() {
+        let msg = MembershipFailure::Rejected(Some(AckReason::Unauthorized))
+            .into_adapter_error()
+            .to_string();
+        assert!(
+            msg.contains("membership request rejected") && msg.contains("Unauthorized"),
+            "unexpected rejection message: {msg}"
+        );
+
+        // Transport failures pass through untouched.
+        let msg = MembershipFailure::Transport(AdapterError::Connection("no session".into()))
+            .into_adapter_error()
+            .to_string();
+        assert!(
+            msg.contains("no session"),
+            "unexpected transport message: {msg}"
+        );
+    }
+}
+
+/// Source pins for the protected-forwarding hot path
+/// (SUBNET_AUTH_PLAN.md D6).
+///
+/// The runtime allocation witness in `tests/subnet_route_hop_alloc.rs`
+/// proves the *primitive* — `seal_into` writing into a caller-owned
+/// buffer — allocates nothing. It cannot prove the production branch
+/// still uses it: `relay_protected_hop` reverting to the allocating
+/// `seal_route_hop`, or the worker buffer becoming a growable `Vec`,
+/// would both leave that witness green.
+///
+/// Measuring the production branch at runtime needs the E2E relay
+/// harness (the relay runs on a tokio worker thread, and reception
+/// allocates per packet, so neither a global counter nor a per-packet
+/// marginal is a clean signal there). Until that lands, these pins
+/// cover the two specific regressions by inspecting the source, in the
+/// same style as the `NetSocket` receive-path pins in `transport.rs`.
+///
+/// A structural guard is weaker than a measurement and is not a
+/// substitute for one.
+#[cfg(test)]
+mod protected_forward_allocation_pins {
+    /// `mesh.rs` with comment-only lines removed, so prose that
+    /// mentions a banned construct cannot trip the pins.
+    fn source_without_comments() -> String {
+        include_str!("mesh.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Body of one method in the `impl MeshNode` block, by name.
+    fn method_body(src: &str, name: &str) -> String {
+        let start = src
+            .find(&format!("    fn {name}("))
+            .unwrap_or_else(|| panic!("{name} must exist in mesh.rs"));
+        let rest = &src[start + 1..];
+        let end = rest
+            .find("\n    fn ")
+            .map(|i| start + 1 + i)
+            .unwrap_or(src.len());
+        src[start..end].to_string()
+    }
+
+    /// The relay must serialize through the buffer-writing API. The
+    /// allocating `seal_route_hop` returns a fresh `Vec` per hop, which
+    /// is the exact regression Kyra's S4A review found.
+    #[test]
+    fn relay_protected_hop_does_not_allocate_per_packet() {
+        let src = source_without_comments();
+        let body = method_body(&src, "relay_protected_hop");
+
+        // Needles assembled at runtime so this test's own source does
+        // not match itself when the file is inspected.
+        let allocating_seal = format!("seal_route_hop{}", "(");
+        assert!(
+            !body.contains(&allocating_seal),
+            "relay_protected_hop must not call the allocating seal_route_hop; \
+             use seal_route_hop_into with the worker buffer",
+        );
+        assert!(
+            body.contains(&format!("seal_route_hop_into{}", "(")),
+            "relay_protected_hop must seal through the caller-owned buffer API",
+        );
+
+        for banned in [
+            format!("to_vec{}", "()"),
+            format!("vec!{}", "["),
+            format!("Vec::{}", "with_capacity"),
+            format!("Vec::{}", "new"),
+            format!(".resize{}", "("),
+            format!("to_owned{}", "()"),
+        ] {
+            assert!(
+                !body.contains(&banned),
+                "relay_protected_hop must not allocate on the packet path, found `{banned}`",
+            );
+        }
+
+        // Load shedding is a drop, never a queue. One spawned task per
+        // datagram turns downstream congestion into unbounded heap and
+        // scheduler pressure, reachable by any authenticated peer that
+        // can keep the egress socket blocked.
+        assert!(
+            !body.contains(&format!("tokio::{}", "spawn")),
+            "relay_protected_hop must drop when the egress socket is not ready, \
+             not spawn a send task per datagram",
+        );
+        assert!(
+            body.contains(&format!("try_send_to{}", "(")),
+            "the relay egress must be the non-blocking send",
+        );
+    }
+
+    /// Export policy must be resolved by canonical channel identity at
+    /// both live call sites.
+    ///
+    /// The composed behaviour is pinned by
+    /// `exported_policy_does_not_alias_across_a_wire_hash_collision`.
+    /// This guards the specific way it regressed: reaching for the wire
+    /// hint at the call site, which type-checks fine because both are
+    /// integers and silently aliases channels that share a 16-bit
+    /// bucket.
+    #[test]
+    fn export_lookups_use_canonical_channel_identity() {
+        let src = source_without_comments();
+        let wire = format!("wire_hash{}", "()");
+
+        // Both live call sites, by their REAL names. The first version
+        // of this pin looked for `publish_to_subscribers`, which does
+        // not exist — the fan-out is `publish_many` — and skipped the
+        // missing method silently, so half of this guard was vacuous.
+        // A name that cannot be located now fails rather than passes.
+        for method in ["authorize_subscribe", "publish_many"] {
+            let start = [
+                "    fn ",
+                "    async fn ",
+                "    pub fn ",
+                "    pub async fn ",
+            ]
+            .iter()
+            .find_map(|prefix| src.find(&format!("{prefix}{method}(")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{method} must exist in mesh.rs — this pin is worthless if it \
+                         silently skips a call site that was renamed",
+                )
+            });
+            let rest = &src[start + 1..];
+            let end = rest
+                .find("\n    fn ")
+                .map(|i| start + 1 + i)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+            assert!(
+                body.contains("export_targets"),
+                "{method} must resolve export targets — if the lookup moved, move this pin",
+            );
+            assert!(
+                !body.contains(&wire),
+                "{method} must resolve export targets by canonical ChannelHash, not the wire hint",
+            );
+        }
+
+        // Whatever the enclosing function is named, no export lookup
+        // anywhere may be keyed on the wire hint.
+        for (i, _) in src.match_indices("export_targets(") {
+            let arg_end = src[i..]
+                .find(')')
+                .map(|j| i + j)
+                .unwrap_or_else(|| src.len());
+            let call = &src[i..arg_end];
+            assert!(
+                !call.contains("wire_hash"),
+                "export_targets must never be called with a wire hash: `{call}`",
+            );
+        }
+    }
+
+    /// The worker buffer must be fixed storage. A `Vec` still calls the
+    /// allocator on its first packet and at every new high-water mark,
+    /// both inside forwarding.
+    #[test]
+    fn the_worker_forward_buffer_is_fixed_not_growable() {
+        let src = source_without_comments();
+        let start = src
+            .find("static FORWARD_BUF")
+            .expect("FORWARD_BUF must exist in mesh.rs");
+        // A fixed window rather than "up to the first `;`" — the array
+        // type itself contains a semicolon, and rustfmt may wrap the
+        // declaration across lines. Whitespace is collapsed so the
+        // needles below match either layout.
+        let window: String = src[start..]
+            .chars()
+            .take(240)
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let decl = window.as_str();
+
+        assert!(
+            decl.contains("[u8; PROTECTED_FORWARD_BUF_SIZE]"),
+            "FORWARD_BUF must be a fixed array, got: {decl}",
+        );
+        assert!(
+            !decl.contains(&format!("Vec<{}>", "u8")),
+            "FORWARD_BUF must not be a growable Vec, got: {decl}",
+        );
+        assert!(
+            decl.contains("const {"),
+            "FORWARD_BUF must be const-initialized so no thread pays a first-touch \
+             allocation, got: {decl}",
+        );
+    }
+}

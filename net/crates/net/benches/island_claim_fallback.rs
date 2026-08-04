@@ -41,12 +41,23 @@
 //! O's exact holder of B is C · A remains held by H · no other island changed
 //! on C (H holds exactly {A}, C holds exactly {B}).
 //!
-//! Honesty note (W4): a LOSING reserve still gossips — `C`'s rejected
-//! `Reserved{C}` on `A` is broadcast to `O` regardless of the local CAS
-//! outcome, so `O` ends up observing `A` held by `C` while `C` keeps `A` held
-//! by `H`. That is an orthogonal ICB-3-style divergence, NOT part of the
-//! fallback outcome (which concerns `B`), and it is exactly why the framing is
-//! single-claimant. It is witnessed, not hidden.
+//! Publication note (W4): a LOSING reserve is **not** published. `C`'s
+//! `Reserved{C}` on `A` is rejected by `C`'s own local CAS, and
+//! `apply_and_broadcast_reservation` broadcasts only on `Inserted`/`Replaced`,
+//! so `O` receives zero reservation announcements for `A` and both nodes agree
+//! that `C` never held it.
+//!
+//! This note previously said the opposite — that the losing reserve gossiped
+//! and `O` diverged onto `C` — and disclaimed it as an orthogonal ICB-3-style
+//! divergence. It was not orthogonal: the node was publishing a reservation
+//! state it did not itself believe. That is fixed; W4 now witnesses the
+//! suppression instead of the divergence.
+//!
+//! The single-claimant framing is unchanged and still load-bearing for a
+//! DIFFERENT reason: two schedulers that both observe `B` free would both
+//! locally win and both publish, which is the genuine AP `Reserved`
+//! divergence (ICB-3 on `B`). That one is not addressed here — the
+//! quorum/fencing edge into `Active` owns authoritative execution.
 //!
 //! No arbitration, tie-break, merge change, quorum, or sensed readiness. No
 //! threshold or public claim (ICB-7).
@@ -112,7 +123,7 @@ fn main() {
         w1_held_island_still_matches().await;
         w2_reserve_decisions_and_rejected_counter().await;
         w3_claim_island_walks_to_b().await;
-        w4_losing_reserve_gossips_observer_diverges().await;
+        w4_losing_reserve_is_not_published().await;
 
         println!("\n-- measurement --");
         measure().await;
@@ -449,38 +460,63 @@ async fn w3_claim_island_walks_to_b() {
     println!("  [PASS] W3 claim_island walks A→Lost→B (returns B, rejected-delta=1, A stays H)");
 }
 
-/// W4 — HONESTY: a losing reserve still gossips. C's rejected `Reserved{C}` on
-/// A is broadcast to O regardless of the local CAS, so O ends up observing A
-/// held by C while C keeps A held by H — an orthogonal ICB-3-style divergence,
-/// NOT part of the fallback outcome (B), and precisely why this is
-/// single-claimant. Each node reads its OWN local view (M7-2), not authority.
-async fn w4_losing_reserve_gossips_observer_diverges() {
+/// W4 — a losing reserve is NOT published. C's `Reserved{C}` on A is rejected
+/// by C's own local CAS, so it never goes on the wire and O receives zero
+/// reservation announcements for A.
+///
+/// This witness previously asserted the opposite — that the losing reserve
+/// gossiped and O diverged onto C — and disclaimed it as an orthogonal
+/// ICB-3-style divergence. It was not orthogonal: a node was publishing a
+/// reservation state it did not itself believe. `apply_and_broadcast_reservation`
+/// now broadcasts only on `Inserted`/`Replaced`, and this pins that.
+///
+/// The zero-received assertion is sensitive because O starts with NO entry for
+/// A (see the fixture): an arriving announcement would `Insert` cleanly, so
+/// `None` means nothing arrived. Had the fixture pre-converged `Reserved{H}`
+/// onto O, O's own `merge` would reject a foreign steal of a fresh reservation
+/// and the assertion would hold whether or not the broadcast was sent.
+///
+/// The positive control is B: O must first be seen to receive the WINNING
+/// reservation over the same link, so "nothing arrived for A" is a statement
+/// about publication and not about a dead session.
+async fn w4_losing_reserve_is_not_published() {
     let fix = build_fixture().await;
     let c_id = fix.c.node_id();
     let h_id = fix.h.node_id();
+    assert_eq!(
+        holder_of(fix.o.reservation_fold(), ISLAND_A),
+        None,
+        "fixture: O must start with no entry for A, or the zero-received assertion is vacuous"
+    );
     let mut o_rx = fix.o.reservation_fold().subscribe_changes();
-    fix.c
+    let claimed = fix
+        .c
         .claim_island(&criteria(), far_deadline())
         .await
         .expect("claim_island");
-    // O eventually observes A held by C (the losing broadcast landed).
+    assert_eq!(claimed, Some(ISLAND_B), "the walk must still land on B");
+
+    // Positive control: the WINNING reservation on B does reach O over this
+    // link, within the same deadline the losing one would have had.
     tokio::time::timeout(
         REMOTE_DEADLINE,
-        await_reservation_holder(&mut o_rx, fix.o.reservation_fold(), ISLAND_A, c_id),
+        await_reservation_holder(&mut o_rx, fix.o.reservation_fold(), ISLAND_B, c_id),
     )
     .await
-    .expect("O must observe the losing A broadcast (A held by C)");
+    .expect("positive control: O must observe the WINNING B broadcast");
+
+    // The witness: nothing for A ever arrived.
     assert_eq!(
         holder_of(fix.o.reservation_fold(), ISLAND_A),
-        Some(c_id),
-        "O observes A held by C (losing reserve gossiped)"
+        None,
+        "O received a reservation announcement for A — a locally rejected reserve must not publish"
     );
     assert_eq!(
         holder_of(fix.c.reservation_fold(), ISLAND_A),
         Some(h_id),
-        "C keeps A held by H — the fallback outcome (B) is unaffected; the A views diverge"
+        "C keeps A held by H"
     );
     println!(
-        "  [PASS] W4 losing reserve gossips → O diverges on A (C:A=H, O:A=C); single-claimant disclaimer"
+        "  [PASS] W4 losing reserve is NOT published → O has no entry for A (C:A=H, O:A=none); B converged as the positive control"
     );
 }

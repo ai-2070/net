@@ -459,10 +459,38 @@ pub fn with_scope_filter<R>(
 /// - `{"kind": "region", "region": "<name>"}`
 /// - `{"kind": "regions", "regions": ["<name>", ...]}`
 ///
-/// Unknown `kind` falls through to `Any` defensively. Empty
-/// strings / lists collapse to `Any` (an empty tenant id is
-/// rejected by the resolver, so `Any` is the more useful default).
+/// Raises `ValueError` for a dict that is well-formed but carries no
+/// usable selector: an unrecognized `kind`, a missing/empty required
+/// selector, or a list that is empty once empty entries are removed.
+///
+/// These three shapes all used to collapse to `Any` — described in the
+/// prior comment as "defensive". It was the opposite: `Any` is the
+/// BROADEST filter (every non-`SubnetLocal` peer in the mesh), so a
+/// caller whose tenant id arrived empty silently queried the whole mesh
+/// and picked a provider from it. A narrowing filter that cannot narrow
+/// must fail, not widen.
+///
+/// `GlobalOnly` is deliberately not the fallback either: it would still
+/// return every unscoped provider. The caller asked to narrow by an
+/// identity it did not supply; the honest answers are an error or no
+/// matches.
 pub fn scope_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<ScopeFilterOwned> {
+    use pyo3::exceptions::PyValueError;
+
+    // Drop empty entries, then require a survivor — the resolver never
+    // produces an empty tenant/region, so an all-empty list is caller
+    // error rather than a filter that merely matches nothing.
+    fn clean(v: Vec<String>) -> Option<Vec<String>> {
+        let cleaned: Vec<String> = v.into_iter().filter(|s| !s.is_empty()).collect();
+        (!cleaned.is_empty()).then_some(cleaned)
+    }
+    fn missing<T>(kind: &str, key: &str) -> PyResult<T> {
+        Err(PyValueError::new_err(format!(
+            "scope filter {{'kind': '{kind}'}} requires a non-empty '{key}'; \
+             refusing to widen the query to the whole mesh"
+        )))
+    }
+
     let kind = get_opt_str(d, "kind")?.unwrap_or_else(|| "any".to_string());
     Ok(match kind.as_str() {
         "any" => ScopeFilterOwned::Any,
@@ -470,38 +498,26 @@ pub fn scope_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<ScopeFilterOwned>
         "same_subnet" | "sameSubnet" => ScopeFilterOwned::SameSubnet,
         "tenant" => match get_opt_str(d, "tenant")? {
             Some(t) if !t.is_empty() => ScopeFilterOwned::Tenant(t),
-            _ => ScopeFilterOwned::Any,
+            _ => return missing("tenant", "tenant"),
         },
-        "tenants" => {
-            // Drop empty tenant ids before constructing the filter.
-            // `scope_from_membership_tags` rejects empty
-            // announcements, so a query containing `[""]` would
-            // never match a real tenant and would only pin to
-            // Global candidates. Fall back to Any when the cleaned
-            // list is empty.
-            let ts = get_opt_str_list(d, "tenants")?;
-            let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
-            if cleaned.is_empty() {
-                ScopeFilterOwned::Any
-            } else {
-                ScopeFilterOwned::Tenants(cleaned)
-            }
-        }
+        "tenants" => match clean(get_opt_str_list(d, "tenants")?) {
+            Some(ts) => ScopeFilterOwned::Tenants(ts),
+            None => return missing("tenants", "tenants"),
+        },
         "region" => match get_opt_str(d, "region")? {
             Some(r) if !r.is_empty() => ScopeFilterOwned::Region(r),
-            _ => ScopeFilterOwned::Any,
+            _ => return missing("region", "region"),
         },
-        "regions" => {
-            // Same reasoning as `tenants` above.
-            let rs = get_opt_str_list(d, "regions")?;
-            let cleaned: Vec<String> = rs.into_iter().filter(|r| !r.is_empty()).collect();
-            if cleaned.is_empty() {
-                ScopeFilterOwned::Any
-            } else {
-                ScopeFilterOwned::Regions(cleaned)
-            }
+        "regions" => match clean(get_opt_str_list(d, "regions")?) {
+            Some(rs) => ScopeFilterOwned::Regions(rs),
+            None => return missing("regions", "regions"),
+        },
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown scope filter kind {other:?}; expected one of: any, \
+                 global_only, same_subnet, tenant, tenants, region, regions"
+            )))
         }
-        _ => ScopeFilterOwned::Any,
     })
 }
 

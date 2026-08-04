@@ -78,6 +78,20 @@ amount **delivered**, never sent — fees are the payer's problem, not a
 short-pay the provider silently eats. A mismatch is
 `InvalidationReason::AmountMismatch`.
 
+**Re-verification has a deadline, and it is the retention horizon.** The record
+must still exist: past it, `re_verify_with_checker` answers
+`BadQuote("unknown quote")` and the verdict has nothing to land on. Compaction
+does not consult the verified tier, so a record served on the facilitator's
+receipt alone (`observed`) retires on the same clock as one a checker drove to
+`final` — the default is 6h past quote expiry. **If you re-verify out of band —
+a nightly sweep, a slower rail, a raised `FINAL_DEPTH_*` — widen
+`with_terminal_record_retention_ns` past your own re-verification period, or
+pass `None`.** See `provider.md`.
+
+A record that a checker *does* reach in time and finds reverted is frozen, and a
+frozen record is never compacted — the evidence that a provider served against a
+settlement that never landed outlives retention at every setting.
+
 ## Chains, reorgs, and the freeze invariant
 
 Verification events chain **per quote**. Each `VerificationEvent.prev` is the
@@ -123,11 +137,21 @@ there are no automatic refunds in v1 — exact-amount policy is the v1 default.
 
 - **Consumed-payload replay index** (persistent, in the engine store): one
   payload satisfies exactly one quote. A replay across process restarts still
-  bounces (`RejectReason::Replay`).
+  bounces (`RejectReason::Replay`). This is the **claim-time** guard, effective
+  before any settlement transaction is known; it retires *with* its quote record
+  when that record is compacted (owner-checked, so it never erases another
+  quote's guard). What stands behind it afterwards is the tombstone below when
+  the replay resolves to the same transaction id, and otherwise the scheme's own
+  single-use authorization — the EIP-3009 nonce, the SVM recent blockhash +
+  signature, the XRPL sequence number.
 - **Consumed-transactions index:** the facilitator-receipt-replay guard — a
   facilitator (or a replayed response) presenting the same
   `network|transaction` for a second quote is invalidated. One on-chain
-  settlement never serves twice.
+  settlement never serves twice. **Permanent at every retention setting**, and
+  there is deliberately no knob to expire it: "retain transaction ids for N
+  days" would turn a security invariant into a deployment preference, and
+  getting it wrong means one payment serves twice provided the attacker waits
+  long enough.
 - **Idempotency key** `{caller, provider, capability, quote}`
   (`IdempotencyScope::key()`): same-key retry returns the *same*
   `billing_event_id` — one settle, one serve, one billing event.

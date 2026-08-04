@@ -460,9 +460,11 @@ pub fn capability_filter_from_js(f: CapabilityFilterJs) -> CapabilityFilter {
 /// - `{ kind: 'regions', regions: ['<name>', ...] }` — any of the
 ///   listed regions + Global.
 ///
-/// Unknown `kind` values are treated as `'any'` defensively
-/// (warns in `tracing`); real validation lives at the type-script
-/// layer.
+/// An unrecognized `kind`, or a missing/empty required selector, is
+/// REJECTED with a `napi::Error` — see [`scope_filter_from_js`] for why
+/// widening to `'any'` was the wrong default. The TypeScript layer's
+/// tagged union catches the same mistakes at compile time; this is the
+/// runtime boundary for raw-JS and native callers.
 #[napi(object)]
 pub struct ScopeFilterJs {
     pub kind: String,
@@ -514,57 +516,73 @@ pub fn with_scope_filter<R>(
     }
 }
 
-/// Convert a JS scope filter POJO to the owned form. Empty strings
-/// or empty lists collapse to [`ScopeFilterOwned::Any`] —
-/// `scope:tenant:` (no id) is rejected by `scope_from_membership_tags`
-/// in the core, so passing it as a query would never match anything;
-/// `Any` is the more honest result.
-pub fn scope_filter_from_js(f: ScopeFilterJs) -> ScopeFilterOwned {
-    match f.kind.as_str() {
+/// Convert a JS scope filter POJO to the owned form.
+///
+/// Errors for a POJO that is well-formed but carries no usable
+/// selector: an unrecognized `kind`, a missing/empty required selector,
+/// or a list that is empty once empty entries are removed.
+///
+/// These three shapes all used to collapse to [`ScopeFilterOwned::Any`]
+/// on the reasoning that an empty tenant id could never match a real
+/// tenant tag. But `Any` is the BROADEST filter — every
+/// non-`SubnetLocal` peer in the mesh — so a caller whose tenant id
+/// arrived empty silently queried everything and selected a provider
+/// from it. A narrowing filter that cannot narrow must fail, not widen.
+///
+/// `GlobalOnly` is deliberately not the fallback either: it would still
+/// return every unscoped provider. The caller asked to narrow by an
+/// identity it did not supply; the honest answers are an error or no
+/// matches.
+///
+/// The TS `scopeFilterToNapi` helper is exhaustive over the declared
+/// union, so typed callers cannot reach these arms; this is the runtime
+/// boundary for raw-JS and native callers.
+pub fn scope_filter_from_js(f: ScopeFilterJs) -> napi::Result<ScopeFilterOwned> {
+    fn clean(v: Vec<String>) -> Option<Vec<String>> {
+        let cleaned: Vec<String> = v.into_iter().filter(|s| !s.is_empty()).collect();
+        (!cleaned.is_empty()).then_some(cleaned)
+    }
+    fn missing<T>(kind: &str, key: &str) -> napi::Result<T> {
+        Err(napi::Error::from_reason(format!(
+            "scope filter {{ kind: '{kind}' }} requires a non-empty '{key}'; \
+             refusing to widen the query to the whole mesh"
+        )))
+    }
+
+    let filter = match f.kind.as_str() {
         "any" => ScopeFilterOwned::Any,
-        "globalOnly" => ScopeFilterOwned::GlobalOnly,
-        "sameSubnet" => ScopeFilterOwned::SameSubnet,
+        // Both spellings, matching `scope_filter_from_py` and the C
+        // ABI's `scope_filter_from_json`. This converter previously
+        // took camelCase only, so a caller reaching the NAPI boundary
+        // with the snake_case spelling the other two bindings accept
+        // fell through to the `_ => Any` arm and silently queried the
+        // whole mesh.
+        "global_only" | "globalOnly" => ScopeFilterOwned::GlobalOnly,
+        "same_subnet" | "sameSubnet" => ScopeFilterOwned::SameSubnet,
         "tenant" => match f.tenant {
             Some(t) if !t.is_empty() => ScopeFilterOwned::Tenant(t),
-            _ => ScopeFilterOwned::Any,
+            _ => return missing("tenant", "tenant"),
         },
-        "tenants" => match f.tenants {
-            Some(ts) => {
-                // Drop empty tenant ids — `scope_from_membership_tags`
-                // rejects empty announcements, so passing `[""]` through
-                // as a query would never match real tenants and would
-                // only pin to Global candidates (since `Tenants(["",])`
-                // is a valid filter that matches no tenant tag).
-                let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
-                if cleaned.is_empty() {
-                    ScopeFilterOwned::Any
-                } else {
-                    ScopeFilterOwned::Tenants(cleaned)
-                }
-            }
-            None => ScopeFilterOwned::Any,
+        "tenants" => match f.tenants.and_then(clean) {
+            Some(ts) => ScopeFilterOwned::Tenants(ts),
+            None => return missing("tenants", "tenants"),
         },
         "region" => match f.region {
             Some(r) if !r.is_empty() => ScopeFilterOwned::Region(r),
-            _ => ScopeFilterOwned::Any,
+            _ => return missing("region", "region"),
         },
-        "regions" => match f.regions {
-            // Same reasoning as `tenants` above.
-            Some(rs) => {
-                let cleaned: Vec<String> = rs.into_iter().filter(|r| !r.is_empty()).collect();
-                if cleaned.is_empty() {
-                    ScopeFilterOwned::Any
-                } else {
-                    ScopeFilterOwned::Regions(cleaned)
-                }
-            }
-            None => ScopeFilterOwned::Any,
+        "regions" => match f.regions.and_then(clean) {
+            Some(rs) => ScopeFilterOwned::Regions(rs),
+            None => return missing("regions", "regions"),
         },
-        // Unrecognized `kind` values fall through to Any. The
-        // typescript layer's tagged union catches typos at compile
-        // time; this is the runtime safety net for raw JS callers.
-        _ => ScopeFilterOwned::Any,
-    }
+        other => {
+            return Err(napi::Error::from_reason(format!(
+                "unknown scope filter kind '{other}'; expected one of: any, \
+                 globalOnly, sameSubnet, tenant, tenants, region, regions"
+            )))
+        }
+    };
+    Ok(filter)
 }
 
 // =========================================================================
@@ -615,6 +633,120 @@ mod tests {
         let hw = hardware_from_js(h);
         assert_eq!(hw.cpu_cores, u16::MAX);
         assert_eq!(hw.cpu_threads, u16::MAX);
+    }
+
+    fn scope_kind(kind: &str) -> ScopeFilterJs {
+        ScopeFilterJs {
+            kind: kind.into(),
+            tenant: None,
+            tenants: None,
+            region: None,
+            regions: None,
+        }
+    }
+
+    /// Both spellings must resolve, matching `scope_filter_from_py`
+    /// and the C ABI. Pre-fix this converter accepted camelCase only,
+    /// so `global_only` hit the `_ => Any` arm and widened a
+    /// deliberately-narrow query to the entire mesh.
+    #[test]
+    fn scope_filter_accepts_snake_case_and_camel_case_kinds() {
+        for kind in ["global_only", "globalOnly"] {
+            assert!(
+                matches!(
+                    scope_filter_from_js(scope_kind(kind)),
+                    Ok(ScopeFilterOwned::GlobalOnly)
+                ),
+                "kind {kind:?} must resolve to GlobalOnly, not silently widen"
+            );
+        }
+        for kind in ["same_subnet", "sameSubnet"] {
+            assert!(
+                matches!(
+                    scope_filter_from_js(scope_kind(kind)),
+                    Ok(ScopeFilterOwned::SameSubnet)
+                ),
+                "kind {kind:?} must resolve to SameSubnet, not silently widen"
+            );
+        }
+    }
+
+    /// An unrecognized kind must error rather than resolve to `Any`.
+    /// `Any` is the broadest filter, so the old fallthrough turned a
+    /// typo into a whole-mesh query.
+    #[test]
+    fn scope_filter_rejects_unknown_kind() {
+        assert!(
+            scope_filter_from_js(scope_kind("tenat")).is_err(),
+            "an unrecognized kind must error, not widen to Any"
+        );
+    }
+
+    /// A selector that is absent, empty, or an all-empty list carries
+    /// no identity to narrow by. Erroring is the point: resolving to
+    /// `Any` silently returned every peer in the mesh.
+    #[test]
+    fn scope_filter_rejects_unusable_selectors() {
+        let cases: Vec<(&str, ScopeFilterJs)> = vec![
+            ("tenant absent", scope_kind("tenant")),
+            (
+                "tenant empty",
+                ScopeFilterJs {
+                    tenant: Some(String::new()),
+                    ..scope_kind("tenant")
+                },
+            ),
+            ("tenants absent", scope_kind("tenants")),
+            (
+                "tenants all-empty",
+                ScopeFilterJs {
+                    tenants: Some(vec![String::new(), String::new()]),
+                    ..scope_kind("tenants")
+                },
+            ),
+            ("region absent", scope_kind("region")),
+            (
+                "region empty",
+                ScopeFilterJs {
+                    region: Some(String::new()),
+                    ..scope_kind("region")
+                },
+            ),
+            ("regions absent", scope_kind("regions")),
+            (
+                "regions all-empty",
+                ScopeFilterJs {
+                    regions: Some(vec![String::new()]),
+                    ..scope_kind("regions")
+                },
+            ),
+        ];
+        for (label, input) in cases {
+            assert!(
+                scope_filter_from_js(input).is_err(),
+                "{label}: must error rather than widen to Any"
+            );
+        }
+    }
+
+    /// The narrowing path still works, and empty entries are dropped
+    /// from a list that retains at least one real selector.
+    #[test]
+    fn scope_filter_keeps_usable_selectors_and_drops_empty_entries() {
+        assert!(matches!(
+            scope_filter_from_js(ScopeFilterJs {
+                tenant: Some("oem-123".into()),
+                ..scope_kind("tenant")
+            }),
+            Ok(ScopeFilterOwned::Tenant(t)) if t == "oem-123"
+        ));
+        assert!(matches!(
+            scope_filter_from_js(ScopeFilterJs {
+                tenants: Some(vec![String::new(), "oem-123".into()]),
+                ..scope_kind("tenants")
+            }),
+            Ok(ScopeFilterOwned::Tenants(ts)) if ts == vec!["oem-123".to_string()]
+        ));
     }
 
     #[test]

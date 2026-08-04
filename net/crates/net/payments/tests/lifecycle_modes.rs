@@ -28,6 +28,9 @@ use net_payments::x402::requirements::PaymentRequirements;
 use net_payments::x402::settlement::SettlementResponse;
 use net_payments::x402::X402Carry;
 
+mod scripted_checker;
+use scripted_checker::ScriptedChecker;
+
 const NOW: u64 = 1_000_000_000_000_000;
 const TTL: u64 = 60_000_000_000;
 const CAPABILITY: &str = "fixture-provider/fixture-tool";
@@ -55,7 +58,13 @@ fn harness_with_policy(policy: Arc<dyn ProviderAdmissionPolicy>) -> Harness {
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .expect("engine");
+    .expect("engine")
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
     Harness {
         engine,
         facilitator,
@@ -357,19 +366,30 @@ async fn wrong_amount_mode_rejects_with_no_charge_and_releases_the_payload() {
 }
 
 // ---------------------------------------------------------------------
-// late_finality
+// late finality — reached through the CHECKER, the only path that may
+// produce a tier above `observed`
 // ---------------------------------------------------------------------
 
+/// Serving is withheld until the required tier is reached, and the tier
+/// can only be reached by an independent on-chain check.
+///
+/// This test used to drive the escalation through the mock *facilitator*,
+/// which reported `confirmed(1)` from its third verify. That is no longer
+/// expressible: `VerifyOutcome`/`SettleOutcome` carry no tier field, so a
+/// facilitator answer is `observed` by construction and the engine mints
+/// it. The property under test is unchanged — a `confirmed(1)` policy
+/// does not serve on a receipt — but the tier now comes from where the
+/// doctrine always said it did.
 #[tokio::test]
-async fn late_finality_withholds_serving_until_the_tier_is_reached() {
+async fn late_finality_withholds_serving_until_the_checker_reaches_the_tier() {
+    use net_payments::checker::ChainVerdict;
+
     let h = harness();
     let quote = h.quote("2500");
-    h.facilitator
-        .arm(quote.requirements.content_hash(), MockMode::LateFinality);
     let payload = payload_for(&quote, "payer-1");
     let required = VerificationTier::Confirmed(1);
 
-    // Settles, but the receipt is only `observed`.
+    // Settles, but a facilitator receipt is only ever `observed`.
     let first = h
         .engine
         .accept_payment(&quote, &payload, required, NOW + 1)
@@ -383,33 +403,56 @@ async fn late_finality_withholds_serving_until_the_tier_is_reached() {
                 required: VerificationTier::Confirmed(1)
             }
         ),
-        "got {first:?}"
+        "a receipt must not satisfy a confirmed(1) policy, got {first:?}"
     );
 
-    // Second verify: still observed (mock reaches confirmed on call 3).
-    let second = h
+    // Re-verifying against the facilitator cannot help, however many
+    // times it is asked: there is no tier for it to raise.
+    let again = h
         .engine
         .re_verify(&quote.quote_id, required, NOW + 2)
         .await
         .unwrap();
     assert!(
-        matches!(second, PaymentDecision::PendingTier { .. }),
-        "got {second:?}"
+        matches!(again, PaymentDecision::PendingTier { .. }),
+        "a facilitator re-verify can never reach confirmed(1), got {again:?}"
     );
 
-    // Third verify: confirmed(1) → served, billing emitted now.
-    let third = h
+    // The independent checker is the only thing that can. Not yet
+    // included: still pending, and no event is appended (pending is the
+    // absence of an answer, not a fact).
+    let checker = ScriptedChecker::new(vec![
+        ChainVerdict::Pending,
+        ChainVerdict::Included {
+            tier: VerificationTier::Confirmed(1),
+            delivered: Some("2500".into()),
+        },
+    ]);
+    let pending = h
         .engine
-        .re_verify(&quote.quote_id, required, NOW + 3)
+        .re_verify_with_checker(&quote.quote_id, &checker, required, NOW + 3)
         .await
         .unwrap();
-    let PaymentDecision::Served { billing, tier } = third else {
-        panic!("expected Served");
+    assert!(
+        matches!(pending, PaymentDecision::PendingTier { .. }),
+        "got {pending:?}"
+    );
+
+    // Included at confirmed(1) → served, billing emitted now.
+    let served = h
+        .engine
+        .re_verify_with_checker(&quote.quote_id, &checker, required, NOW + 4)
+        .await
+        .unwrap();
+    let PaymentDecision::Served { billing, tier } = served else {
+        panic!("expected Served, got {served:?}");
     };
     assert_eq!(tier, VerificationTier::Confirmed(1));
     billing.verify_signature().unwrap();
 
-    // The exact chain: observed (settle), observed (re-verify), confirmed.
+    // The exact chain: observed (settle), observed (facilitator
+    // re-verify), confirmed(1) (checker). The two `observed` events are
+    // the facilitator's ceiling, visible in the record.
     assert_eq!(
         h.chain_statuses(&quote.quote_id).await,
         vec![
@@ -423,7 +466,7 @@ async fn late_finality_withholds_serving_until_the_tier_is_reached() {
     // settle — and returns the same billing event.
     let retry = h
         .engine
-        .accept_payment(&quote, &payload, required, NOW + 4)
+        .accept_payment(&quote, &payload, required, NOW + 5)
         .await
         .unwrap();
     let PaymentDecision::Served {
@@ -654,7 +697,6 @@ impl Facilitator for OverpayingFacilitator {
                 extra: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
     async fn settle(
@@ -673,7 +715,6 @@ impl Facilitator for OverpayingFacilitator {
                 extensions: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 }
@@ -690,7 +731,13 @@ async fn overpayment_is_an_exception_for_provider_policy_not_a_serve() {
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .unwrap();
+    .unwrap()
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
 
     let quote = engine
         .issue_quote(
@@ -746,7 +793,13 @@ async fn overpayment_retry_via_re_verify_never_auto_bills() {
         default_mock_registry(provider.entity_id().clone()),
         dir.path().join("engine.json"),
     )
-    .unwrap();
+    .unwrap()
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false);
 
     let quote = engine
         .issue_quote(
@@ -850,7 +903,6 @@ impl Facilitator for CrashSimFacilitator {
                 extra: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
     async fn settle(
@@ -869,7 +921,6 @@ impl Facilitator for CrashSimFacilitator {
                 extensions: None,
             })
             .map_err(|e| FacilitatorError::protocol(e.to_string()))?,
-            tier: VerificationTier::Observed,
         })
     }
 }
@@ -895,6 +946,12 @@ async fn a_crashed_in_flight_claim_is_reclaimable_after_the_ttl() {
             dir.path().join("engine.json"),
         )
         .unwrap()
+        // These tests redeem without presenting a binding: redemption is
+        // setup for what they actually assert, not the subject. The
+        // engine now requires the binding by default, so they opt out
+        // explicitly — `lifecycle_modes` carries the tests that cover the
+        // requirement itself.
+        .with_require_invocation_binding(false)
         .with_in_flight_ttl_ns(1000),
     );
 
@@ -984,6 +1041,12 @@ async fn a_lost_billing_append_is_recovered_on_retry() {
         dir.path().join("engine.json"),
     )
     .unwrap()
+    // These tests redeem without presenting a binding: redemption is
+    // setup for what they actually assert, not the subject. The
+    // engine now requires the binding by default, so they opt out
+    // explicitly — `lifecycle_modes` carries the tests that cover the
+    // requirement itself.
+    .with_require_invocation_binding(false)
     .with_billing_log(billing_log.clone());
 
     let quote = engine
@@ -1057,6 +1120,91 @@ async fn a_denied_caller_is_never_quoted() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("admission denied"));
+}
+
+/// Admits until `revoked` is set, then denies — a caller whose
+/// allowlist entry is pulled while a quote of theirs is outstanding.
+struct RevocableAdmission {
+    revoked: std::sync::atomic::AtomicBool,
+}
+
+impl ProviderAdmissionPolicy for RevocableAdmission {
+    fn admit(&self, _caller: &EntityId, _capability: &str) -> Result<(), String> {
+        if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("caller revoked".into());
+        }
+        Ok(())
+    }
+}
+
+/// Admission is evaluated at quote issuance and **nowhere else** — a
+/// signed quote is a commitment that stays redeemable for its full
+/// validity window, so the quote TTL is the provider's revocation
+/// window.
+///
+/// This pins a deliberate decision, not an accident. The crate's docs
+/// used to claim a post-verification admission re-check existed; it
+/// never did, and the audit forced the choice between adding one and
+/// deleting the claim. Deleting won: re-checking after settlement means
+/// refusing a caller who has already paid, which needs a refund path the
+/// protocol does not have (`net.payment.dispute@1` is reserved, with no
+/// semantics shipped).
+///
+/// A future change that adds dynamic admission breaks this test **by
+/// design** — its author is meant to read this and land the refund story
+/// with it.
+#[tokio::test]
+async fn revoking_a_caller_does_not_invalidate_their_outstanding_quote() {
+    let policy = Arc::new(RevocableAdmission {
+        revoked: std::sync::atomic::AtomicBool::new(false),
+    });
+    let h = harness_with_policy(policy.clone());
+    let quote = h.quote("2500");
+    let payload = payload_for(&quote, "payer-1");
+
+    // The caller's admission is pulled after the quote is signed.
+    policy
+        .revoked
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // New quotes are refused from here on...
+    let err = h
+        .engine
+        .issue_quote(
+            h.caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("admission denied"));
+
+    // ...but the quote already issued still settles: admission is not
+    // re-evaluated at payment.
+    let decision = h
+        .engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .expect("engine");
+    assert!(
+        matches!(decision, PaymentDecision::Served { .. }),
+        "an outstanding quote must survive revocation, got {decision:?}"
+    );
+
+    // ...and still redeems: admission is not re-evaluated at the gate
+    // either. The gate enforces payment, not admission.
+    let tool = CAPABILITY.split_once('/').expect("capability").1;
+    let redeemed = h
+        .engine
+        .redeem_for_invocation(tool, &quote.quote_id, None)
+        .await
+        .expect("engine");
+    assert_eq!(
+        redeemed,
+        RedeemDecision::Admitted,
+        "the paid invocation must survive revocation of the payer"
+    );
 }
 
 #[tokio::test]
@@ -1347,5 +1495,178 @@ async fn a_second_payload_for_a_satisfied_quote_is_rejected() {
             }
         ),
         "got {dup:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// M1: requiring the invocation binding
+// ---------------------------------------------------------------------
+
+/// A provider that requires the binding refuses bearer redemption.
+///
+/// Without the requirement, possession of the quote id is enough to
+/// consume the paid invocation — and the quote id is not a secret: it
+/// rides a request header on every paid invoke, appears in the caller's
+/// payment proof, and is carried on the billing event. Requiring the
+/// binding means only the identity that paid can redeem.
+#[tokio::test]
+async fn requiring_the_binding_refuses_bearer_redemption() {
+    let provider = Arc::new(EntityKeypair::generate());
+    let facilitator = Arc::new(MockFacilitator::new());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caller = EntityKeypair::generate();
+    let engine = PaymentEngine::new(
+        provider.clone(),
+        facilitator,
+        Arc::new(AdmitAll),
+        default_mock_registry(provider.entity_id().clone()),
+        dir.path().join("engine.json"),
+    )
+    .expect("engine")
+    .with_require_invocation_binding(true);
+
+    let quote = engine
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
+        .expect("quote");
+    let payload = payload_for(&quote, "payer-1");
+    let served = engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .expect("engine");
+    assert!(matches!(served, PaymentDecision::Served { .. }));
+
+    let tool = CAPABILITY.split_once('/').expect("capability").1;
+
+    // Bearer: the quote id alone no longer redeems.
+    let bearer = engine
+        .redeem_for_invocation(tool, &quote.quote_id, None)
+        .await
+        .expect("engine");
+    assert_eq!(
+        bearer,
+        RedeemDecision::Denied {
+            reason: RedeemDenialReason::BindingRequired
+        },
+        "a required binding must refuse a bearer redemption"
+    );
+
+    // A binding from the WRONG identity is still a security rejection,
+    // not merely "missing" — the two denials stay distinct.
+    let impostor = EntityKeypair::generate();
+    let bad = impostor
+        .try_sign(&invocation_binding_transcript(&quote.quote_id, tool))
+        .expect("sign");
+    let rejected = engine
+        .redeem_for_invocation(tool, &quote.quote_id, Some(&bad.to_bytes()))
+        .await
+        .expect("engine");
+    assert_eq!(
+        rejected,
+        RedeemDecision::Denied {
+            reason: RedeemDenialReason::BindingRejected
+        }
+    );
+
+    // The paying identity's binding admits.
+    let good = caller
+        .try_sign(&invocation_binding_transcript(&quote.quote_id, tool))
+        .expect("sign");
+    let admitted = engine
+        .redeem_for_invocation(tool, &quote.quote_id, Some(&good.to_bytes()))
+        .await
+        .expect("engine");
+    assert_eq!(admitted, RedeemDecision::Admitted);
+}
+
+/// The requirement is **on by default**: a freshly-constructed engine
+/// refuses a redemption that presents no binding.
+///
+/// Bearer redemption is the exposure, so it is not the default posture.
+/// This is the assertion that would break if someone flipped the default
+/// back for convenience.
+#[tokio::test]
+async fn the_binding_requirement_is_on_by_default() {
+    let provider = Arc::new(EntityKeypair::generate());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caller = EntityKeypair::generate();
+    // Deliberately NOT the shared harness: that one opts out, because its
+    // tests are about the lifecycle rather than the binding.
+    let engine = PaymentEngine::new(
+        provider.clone(),
+        Arc::new(MockFacilitator::new()),
+        Arc::new(AdmitAll),
+        default_mock_registry(provider.entity_id().clone()),
+        dir.path().join("engine.json"),
+    )
+    .expect("engine");
+
+    let quote = engine
+        .issue_quote(
+            caller.entity_id().clone(),
+            CAPABILITY,
+            requirements("2500"),
+            NOW,
+            TTL,
+        )
+        .expect("quote");
+    let payload = payload_for(&quote, "payer-1");
+    engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .expect("engine");
+
+    let tool = CAPABILITY.split_once('/').expect("capability").1;
+    assert_eq!(
+        engine
+            .redeem_for_invocation(tool, &quote.quote_id, None)
+            .await
+            .expect("engine"),
+        RedeemDecision::Denied {
+            reason: RedeemDenialReason::BindingRequired
+        },
+        "a default engine must not admit a bearer redemption"
+    );
+
+    // The payer's binding still admits, so the default is a requirement
+    // rather than a wall.
+    let sig = caller
+        .try_sign(&invocation_binding_transcript(&quote.quote_id, tool))
+        .expect("sign");
+    assert_eq!(
+        engine
+            .redeem_for_invocation(tool, &quote.quote_id, Some(&sig.to_bytes()))
+            .await
+            .expect("engine"),
+        RedeemDecision::Admitted
+    );
+}
+
+/// The requirement can be turned off for a deployment whose callers
+/// predate the binding — the documented compatibility path, and the one
+/// this file's harness uses.
+#[tokio::test]
+async fn the_binding_requirement_can_be_disabled() {
+    let h = harness();
+    let quote = h.quote("2500");
+    let payload = payload_for(&quote, "payer-1");
+    h.engine
+        .accept_payment(&quote, &payload, VerificationTier::Observed, NOW + 1)
+        .await
+        .expect("engine");
+
+    let tool = CAPABILITY.split_once('/').expect("capability").1;
+    assert_eq!(
+        h.engine
+            .redeem_for_invocation(tool, &quote.quote_id, None)
+            .await
+            .expect("engine"),
+        RedeemDecision::Admitted,
+        "the opt-out must still admit a bearer redemption"
     );
 }

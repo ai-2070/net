@@ -16,6 +16,25 @@ import { tmpdir } from 'node:os'
 
 import { describe, expect, it } from 'vitest'
 
+/// A provider on the in-process mock backend.
+///
+/// The constructor's later parameters are positional and mostly
+/// `undefined` here, which makes every call site fragile to a signature
+/// change and hides the one argument that matters — the explicit opt-in
+/// to a settlement backend that moves no value. Naming it once keeps the
+/// intent visible and the positional churn in one place.
+function devProvider(mesh: NetMesh, statePath: string, billingLogPath?: string) {
+  return new PaymentProvider(
+    mesh,
+    statePath,
+    billingLogPath,
+    undefined, // facilitatorUrl
+    undefined, // facilitatorAuthToken
+    true, // unsafeDevMockFacilitator
+  )
+}
+
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const binding: any = await import('../index')
 const NetMesh = binding.NetMesh
@@ -88,7 +107,7 @@ describe.skipIf(!buildPricingTerms)('buildPricingTerms', () => {
 describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
   it('exposes a 32-byte provider entity id (the node identity)', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('id.state'))
+      const provider = devProvider(mesh, tmp('id.state'))
       const id = provider.providerEntityId
       expect(Buffer.isBuffer(id)).toBe(true)
       expect(id.length).toBe(32)
@@ -97,21 +116,21 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('readBilling without a billing log is a rejection, not a crash', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('nolog.state'))
+      const provider = devProvider(mesh, tmp('nolog.state'))
       await expect(provider.readBilling()).rejects.toThrow()
     })
   }, 20000)
 
   it('readBilling on a fresh billing log is empty', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('log.state'), tmp('log.billing'))
+      const provider = devProvider(mesh, tmp('log.state'), tmp('log.billing'))
       expect(await provider.readBilling()).toEqual([])
     })
   }, 20000)
 
   it('publishPaidTools fail-closes on an empty pricing map', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('empty.state'))
+      const provider = devProvider(mesh, tmp('empty.state'))
       // Empty pricing is a construction error (use NetMesh.publishTools for free).
       expect(() => provider.publishPaidTools([ECHO], noopHandler, {})).toThrow()
     })
@@ -119,7 +138,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('publishPaidTools fail-closes when a tool has no pricing entry', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('missing.state'))
+      const provider = devProvider(mesh, tmp('missing.state'))
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       const other = { ...ECHO, name: 'other' }
       // `other` has no pricing entry → it would publish FREE; reject instead.
@@ -131,7 +150,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('publishes a priced tool and serves it (handle lifecycle)', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('paid.state'))
+      const provider = devProvider(mesh, tmp('paid.state'))
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       // Pricing is keyed by the (lowered) tool name; `echo` is already
       // channel-safe so the key matches directly.
@@ -145,7 +164,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
 
   it('a pricing key naming no published tool is a publish error', async () => {
     await withProvider(async (mesh) => {
-      const provider = new PaymentProvider(mesh, tmp('mismatch.state'))
+      const provider = devProvider(mesh, tmp('mismatch.state'))
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       // `echo` is priced (so the fail-closed completeness check passes), but the
       // extra `nope` key names no published tool → ServerPublisher rejects it
@@ -160,7 +179,7 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
     const mesh = await NetMesh.create({ bindAddr: '127.0.0.1:0', psk: PSK, permissiveChannels: true })
     try {
       await mesh.start()
-      const provider = new PaymentProvider(mesh, tmp('close.state'))
+      const provider = devProvider(mesh, tmp('close.state'))
       const terms = buildPricingTerms(provider.providerEntityId, 'prov/echo', MOCK_REQS)
       provider.close() // tears down the quote/pay wire + drops the node clone
       // readBilling has no billing log here → still a structured rejection, not
@@ -176,5 +195,161 @@ describe.skipIf(!PaymentProvider)('PaymentProvider', () => {
       // the shutdown ran (a second shutdown after success is a no-op).
       await mesh.shutdown().catch(() => {})
     }
+  }, 20000)
+})
+
+// ---------------------------------------------------------------------------
+// H2: a settlement backend must be chosen explicitly
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!PaymentProvider)('PaymentProvider settlement backend', () => {
+  // This constructor used to build a MockFacilitator unconditionally, with no
+  // way to reach a real one — so a provider could publish priced tools, sign
+  // quotes with its real mesh identity, emit signed billing events, and serve,
+  // while settlement moved nothing. Guessing "mock" for an operator who has
+  // not decided is how a simulator ends up in front of real customers.
+  it('refuses to construct without an explicit backend', async () => {
+    await withProvider(async (mesh) => {
+      expect(() => new PaymentProvider(mesh, tmp('nobackend.state'))).toThrow(
+        /no settlement backend/,
+      )
+    })
+  }, 20000)
+
+  it('names both ways out rather than just failing', async () => {
+    await withProvider(async (mesh) => {
+      expect(() => new PaymentProvider(mesh, tmp('names.state'))).toThrow(/facilitatorUrl/)
+      expect(() => new PaymentProvider(mesh, tmp('names2.state'))).toThrow(
+        /unsafeDevMockFacilitator/,
+      )
+    })
+  }, 20000)
+
+  it('refuses a real URL and the mock together', async () => {
+    await withProvider(async (mesh) => {
+      expect(
+        () =>
+          new PaymentProvider(
+            mesh,
+            tmp('both.state'),
+            undefined,
+            'https://facilitator.example.com',
+            undefined,
+            true,
+          ),
+      ).toThrow(/not both/)
+    })
+  }, 20000)
+
+  it('never silently downgrades a real facilitator URL to the mock', async () => {
+    await withProvider(async (mesh) => {
+      // Two acceptable outcomes and one forbidden one. Built without
+      // payments-http, construction throws and the message says which feature
+      // is missing. Built with it, a real facilitator is constructed — and
+      // that has to be *asserted*, not assumed: a quiet fallback to the mock
+      // is exactly the regression this test is named for, and it would also
+      // construct successfully.
+      //
+      // `registryVersion` is the observable difference. A real backend puts
+      // the engine on the production revision; the mock puts it on the dev
+      // one, which carries the valueless `mock:net` asset.
+      let provider
+      try {
+        provider = new PaymentProvider(
+          mesh,
+          tmp('real.state'),
+          undefined,
+          'https://facilitator.example.com',
+        )
+      } catch (e) {
+        expect(String(e)).toMatch(/payments-http/)
+        return
+      }
+      try {
+        expect(provider.registryVersion).toBe('net-production-1')
+      } finally {
+        provider.close()
+      }
+    })
+  }, 20000)
+
+  it('provider-authored terms follow the provider registry', async () => {
+    await withProvider(async (mesh) => {
+      // The free buildPricingTerms takes the provider id and the registry
+      // choice as separate arguments, so both can disagree with the provider
+      // that actually serves the quotes. `pricingTerms` takes both from the
+      // engine, which is why it is the one to reach for.
+      const provider = new PaymentProvider(
+        mesh,
+        tmp('terms.state'),
+        undefined,
+        undefined,
+        undefined,
+        true,
+      )
+      try {
+        const reqs = JSON.stringify([
+          {
+            scheme: 'mock',
+            network: 'mock:net',
+            amount: '2500',
+            asset: 'musd',
+            payTo: 'mock-provider-settle-addr',
+            maxTimeoutSeconds: 60,
+          },
+        ])
+        const terms = JSON.parse(await provider.pricingTerms('prov/echo', reqs))
+        expect(terms.object).toBe('net.pricing.terms@1')
+        expect(terms.capability).toBe('prov/echo')
+
+        // Identical to the free function told the truth about this provider —
+        // which is the point: the method is the version that cannot be told a
+        // lie.
+        const free = buildPricingTerms(
+          provider.providerEntityId,
+          'prov/echo',
+          reqs,
+          provider.registryVersion === 'net-production-1',
+        )
+        expect(JSON.parse(free)).toEqual(terms)
+
+        // An asset this provider's registry does not carry is refused at
+        // authoring rather than announced and refused later at quote time.
+        const absent = JSON.stringify([
+          {
+            scheme: 'exact',
+            network: 'eip155:1',
+            amount: '2500',
+            asset: '0x0000000000000000000000000000000000000001',
+            payTo: '0x0000000000000000000000000000000000000002',
+            maxTimeoutSeconds: 60,
+          },
+        ])
+        await expect(provider.pricingTerms('prov/echo', absent)).rejects.toThrow()
+      } finally {
+        provider.close()
+      }
+    })
+  }, 20000)
+
+  it('the mock backend says so in the registry revision', async () => {
+    await withProvider(async (mesh) => {
+      // The other side of the same guarantee: asking for the mock gets the
+      // mock, so `registryVersion` genuinely discriminates rather than always
+      // reading "production".
+      const provider = new PaymentProvider(
+        mesh,
+        tmp('mock.state'),
+        undefined,
+        undefined,
+        undefined,
+        true,
+      )
+      try {
+        expect(provider.registryVersion).toBe('net-default-1')
+      } finally {
+        provider.close()
+      }
+    })
   }, 20000)
 })

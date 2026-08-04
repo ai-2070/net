@@ -2,9 +2,10 @@
 title: Daemons and Placement
 description: A daemon in Net is a long-running stateful event processor.
 ---
+
 # Daemons and Placement
 
-A daemon in Net is a long-running stateful event processor. You write a small piece of code that consumes events and produces events; the runtime handles where it runs, what it can see, when it gets migrated, and how it survives node failures. The whole point is to let you write the *what* — the business logic — and leave the *where* and *when* to the system.
+A daemon in Net is a long-running stateful event processor. You write a small piece of code that consumes events and produces events; the runtime handles where it runs, what it can see, when it gets migrated, and how it survives node failures. The whole point is to let you write the _what_ — the business logic — and leave the _where_ and _when_ to the system.
 
 Daemons are how you turn the event bus from a transport into a substrate for distributed compute. Anything you'd otherwise build as "a service that subscribes to a queue and updates some state" is a daemon. The runtime gives you the placement, the failure handling, and the causal-continuity guarantees on top.
 
@@ -266,7 +267,7 @@ Replica groups are for stateless daemons (or daemons whose state is externally p
 
 ## Standby groups
 
-For *stateful* daemons that need fault tolerance, `StandbyGroup` runs one active and N − 1 passive copies. The active processes events; the standbys hold readiness to promote. Sync is snapshot-based: the active periodically snapshots, the standby applies the snapshot, and on failure the standby that's furthest along replays the gap of buffered events and promotes:
+For _stateful_ daemons that need fault tolerance, `StandbyGroup` runs one active and N − 1 passive copies. The active processes events; the standbys hold readiness to promote. Sync is snapshot-based: the active periodically snapshots, the standby applies the snapshot, and on failure the standby that's furthest along replays the gap of buffered events and promotes:
 
 ```rust
 use net_sdk::groups::{StandbyGroup, StandbyGroupConfig};
@@ -281,7 +282,10 @@ let group = StandbyGroup::spawn(&runtime, "stateful", StandbyGroupConfig {
 })?;
 ```
 
-The protocol gives you the bookkeeping — active/standby tracking, event buffering, snapshot transfer, promotion on failure. Your daemon supplies the state via `snapshot()` and `restore()`; the runtime does the rest.
+The protocol supplies active/standby tracking, configured event buffering,
+snapshot transfer, and promotion signals. Your daemon supplies state through
+`snapshot()` and `restore()`; the application and operator still own durable input,
+external-effect reconciliation, capacity, and recovery testing.
 
 A standby group costs you N replicas worth of memory and one replica worth of compute. Use it when the daemon's state is expensive to rebuild and you can't tolerate the time a full re-derivation would take on recovery.
 
@@ -306,13 +310,13 @@ let group = ForkGroup::fork(&runtime, "strategy", parent_origin, fork_seq,
 
 Each fork records its lineage in a `ForkRecord` carrying a verifiable sentinel hash; any node on the mesh can verify the fork is legitimate. The forks themselves are normal daemons, registered in the daemon registry, addressable by their own identities.
 
-| Pattern        | Identity                              | Routing            | State    | Recovery                                  |
-|----------------|---------------------------------------|--------------------|----------|-------------------------------------------|
-| Single daemon  | One ed25519 key                       | Direct             | Either   | Migration if alive; replay from snapshot |
-| Replica group  | Deterministic from seed + index       | Load-balanced     | Stateless| Re-derive on a new node                   |
-| Standby group  | Deterministic from seed; active flag  | Always to active  | Stateful | Standby promotes + replays buffer        |
-| Fork group     | Random per fork, stored for recovery  | Per-fork direct   | Either   | Re-spawn from stored secret               |
-| Lifecycle group| As per the inner `LifecycleDaemon`    | Per replica       | Either   | `HealthMonitor` respawn via factory       |
+| Pattern         | Identity                             | Routing          | State     | Recovery                                 |
+| --------------- | ------------------------------------ | ---------------- | --------- | ---------------------------------------- |
+| Single daemon   | One ed25519 key                      | Direct           | Either    | Migration if alive; replay from snapshot |
+| Replica group   | Deterministic from seed + index      | Load-balanced    | Stateless | Re-derive on a new node                  |
+| Standby group   | Deterministic from seed; active flag | Always to active | Stateful  | Standby promotes + replays buffer        |
+| Fork group      | Random per fork, stored for recovery | Per-fork direct  | Either    | Re-spawn from stored secret              |
+| Lifecycle group | As per the inner `LifecycleDaemon`   | Per replica      | Either    | `HealthMonitor` respawn via factory      |
 
 ## Capability-aware daemons
 
@@ -350,7 +354,7 @@ Daemons are the right primitive when the work is **long-running**, **stateful in
 
 For work that fits the daemon shape, the runtime is designed so that you stop thinking about placement and failure handling and start thinking about what your daemon actually does. That's the system working as intended.
 
-One shape that is *not* placement: work that needs an **exclusive** resource
+One shape that is _not_ placement: work that needs an **exclusive** resource
 several nodes are competing for — a GPU island, an accelerator slot, a licensed
 seat. Placement decides where a daemon runs; it does not arbitrate a contended
 resource. That's the [gang-claim scheduler](/docs/guides/gang-scheduler), and

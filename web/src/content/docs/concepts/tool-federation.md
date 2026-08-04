@@ -2,6 +2,7 @@
 title: Tool federation
 description: "Publish tools as capabilities so applications on other machines can discover and invoke them without receiving the provider's credentials."
 ---
+
 # Tool federation
 
 Tool federation lets one participant publish a tool as a capability and lets
@@ -34,15 +35,15 @@ can inspect or generate bindings for a tool it discovered at runtime.
 
 ## The pieces
 
-| Piece | Role | Documentation |
-|---|---|---|
-| Capability announcements | publish what a provider offers | [Capabilities](/docs/concepts/capabilities) |
-| `serve_tool`, `call_tool`, `list_tools`, `watch_tools` | serve, discover, and invoke tools | [Discover and invoke](/docs/guides/discover-and-invoke) |
-| nRPC | typed request/response and streaming transport | [nRPC](/docs/guides/nrpc) |
-| Organization authority | control discovery and invocation | [Private capabilities](/docs/guides/private-capabilities) |
-| MCP bridge | publish MCP tools on Net or expose Net to an MCP host | [Net and MCP](/docs/worldview/mcp-vs-net) |
-| A2A | delegate a longer job to another agent | [Agent-to-agent](/docs/guides/agent-to-agent) |
-| Agent identity | identify the principal an agent represents | [Agent identity](/docs/concepts/agent-identity) |
+| Piece                                                  | Role                                                  | Documentation                                             |
+| ------------------------------------------------------ | ----------------------------------------------------- | --------------------------------------------------------- |
+| Capability announcements                               | publish what a provider offers                        | [Capabilities](/docs/concepts/capabilities)               |
+| `serve_tool`, `call_tool`, `list_tools`, `watch_tools` | serve, discover, and invoke tools                     | [Discover and invoke](/docs/guides/discover-and-invoke)   |
+| nRPC                                                   | typed request/response and streaming transport        | [nRPC](/docs/guides/nrpc)                                 |
+| Organization authority                                 | control discovery and invocation                      | [Private capabilities](/docs/guides/private-capabilities) |
+| MCP bridge                                             | publish MCP tools on Net or expose Net to an MCP host | [Net and MCP](/docs/worldview/mcp-vs-net)                 |
+| A2A                                                    | delegate a longer job to another agent                | [Agent-to-agent](/docs/guides/agent-to-agent)             |
+| Agent identity                                         | identify the principal an agent represents            | [Agent identity](/docs/concepts/agent-identity)           |
 
 ## MCP tools and native capabilities
 

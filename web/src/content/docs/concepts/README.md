@@ -2,6 +2,7 @@
 title: Concepts
 description: "The capability, identity, state, and authority model behind Net's APIs."
 ---
+
 # Concepts
 
 These pages explain the model behind Net's APIs.

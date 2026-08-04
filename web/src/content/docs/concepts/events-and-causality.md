@@ -1,53 +1,91 @@
 ---
 title: Events and Causality
-description: An event in Net is the unit of communication on a channel.
+description: "How producer-local sequence, parent hashes, and compact observation horizons describe event relationships without a global total order."
 ---
+
 # Events and Causality
 
-An event in Net is the unit of communication on a channel. It carries a payload (opaque JSON bytes), an identity (who produced it), and a causal link (where it sits in the chain of things its producer has done and observed). Everything Net does with state — durable logs, folded views, daemon migration, partition recovery — is expressed in terms of events and the causal links that chain them together.
+An event carries an application payload, the identity of its producer, and a causal
+link. The link records the event's position in the producer's own history and a
+compact summary of what that producer had observed.
 
-The causal-ordering model is the part of Net that most reliably surprises people coming from other systems. It's worth a careful read.
+This metadata lets Net distinguish three cases:
 
-## What a causal link is
+- one event follows another from the same producer;
+- one producer created an event after observing another producer's event;
+- the relationship between two events is unknown or concurrent.
 
-Every event produced by an entity carries a 32-byte structure called a causal link. The link names the producer (via its origin hash), names the producer's view of what it had observed when it produced the event (a compressed sketch called a horizon), names a monotonic sequence number within the producer's own timeline, and hashes the event back to its parent.
+It does not impose one total order across unrelated producers.
 
-Two facts follow from this structure that drive everything else.
+## Causal links
 
-First, **two events from the same producer are totally ordered**. The sequence number says which came first. If you see them out of order, you can detect that — and the parent-hash chain lets you verify that nothing was inserted or rewritten between them.
+Each event from an entity carries a 32-byte causal link containing:
 
-Second, **two events from different producers are ordered only if their causal cones overlap**. If producer A's event was made before A observed any of producer B's events, the two events are concurrent: there is no fact of the matter about which came first. Net doesn't pretend there is one. Software that needs a total order across unrelated producers needs a different primitive (a consensus log, or a centralized timestamp service); Net optimizes for the much more common case where the producers that need to agree are the ones whose events have already mixed.
+- the producer's origin hash;
+- a monotonic sequence number in that producer's timeline;
+- a hash linking the event to its parent;
+- a compact observation summary called a horizon.
 
-## Why no global clock
+Events from one producer are totally ordered by sequence and parent linkage. If an
+event arrives with a gap or an unexpected parent hash, a consumer can detect that
+its local chain is incomplete or inconsistent.
 
-Distributed systems built around a global clock — whether a real one or a logical one like a Lamport timestamp — pay a coordination cost on every event. Net's design point is that you mostly don't need that cost. The events that need to be ordered are the events that have observed each other, and *those* events carry enough information in their causal links to order themselves without going through any central authority.
+Across producers, an order exists only when the observations establish one. If A
+creates an event after observing B's event, B precedes A in that causal history. If
+neither producer observed the other, the events are concurrent for this model.
+Applications that require a total order across unrelated writers need a consensus
+log, sequencer, or another ordering service.
 
-The corollary is that Net gets faster when you ask it to do less. A channel whose subscribers don't need to know about events from another channel pays nothing for that other channel's traffic. A producer whose events are causally independent of another producer's events doesn't synchronize with that producer. Coordination is opt-in, and the bill is itemized.
+## Horizons are compact summaries
 
-## Horizons
+A horizon is an 8-byte Bloom-style sketch of the producer's observations. It is
+small enough to accompany each event, but it is probabilistic: false positives are
+possible.
 
-The horizon field in a causal link is a compressed sketch of what the producer had observed — from every other producer — at the moment it built the event. It's used for two things.
+Use the horizon to decide that more context may be required or to narrow a recovery
+request. Do not treat it as exact proof that every dependency is present. Sequence
+numbers, parent hashes, retained logs, and explicit replay ranges provide the
+precise validation needed to close a gap.
 
-First, **subscribers can decide whether they've seen enough context to consume an event.** If your daemon's local horizon doesn't include some of the events the incoming event's horizon references, you know there's causal history you haven't seen yet; you can wait, or you can request the missing events, or you can proceed with the understanding that your view is incomplete.
-
-Second, **the horizon makes partition healing tractable.** When two halves of a partitioned mesh reconnect, every reachable producer can compare horizons and figure out exactly which events the other side hasn't seen. There's no full-log diff, no Merkle tree exchange — just a horizon swap and a targeted replay.
-
-The horizon is encoded as an 8-byte (64-bit) bloom sketch, so it can ride alongside the rest of the causal link. Sketches have false positives (you might think you've observed something you haven't) but never false negatives (you'll never miss something you actually need). For the partition-healing and out-of-order-detection use cases, that's the right trade-off.
+Partition recovery therefore depends on more than exchanging horizons. A required
+source or replica must still be reachable, the relevant history must still be
+retained, and replay must complete successfully.
 
 ## Entity logs
 
-Each entity's stream of events lives in an *entity log*, an append-only structure that validates the causal chain on every append. The validator confirms that each new event's `parent_hash` matches the hash of the previous event's link plus payload — if it doesn't, the append is rejected, and the chain has been tampered with or corrupted.
+An entity log is an append-only history for one producer. On append, the validator
+checks the expected sequence and parent linkage. A mismatch identifies a missing,
+reordered, corrupted, or conflicting chain segment.
 
-The chain hash isn't a security primitive on its own. Tamper resistance comes from Net's AEAD encryption on the wire and from the producer's signature on permission-bound events. The chain hash is a structural primitive: it tells you the chain hasn't been *accidentally* damaged or reordered, and it lets you do efficient prefix lookups (any prefix of a valid chain is itself a valid chain).
+The parent hash is a structural integrity mechanism, not complete authorization by
+itself. Session encryption, signatures, permission tokens, and provider policy
+supply the relevant security boundaries.
 
-## State snapshots
+## Snapshots
 
-Replaying every event from genesis is fine for some workloads (audit, analytics, rebuild-from-scratch recovery) and unworkable for others (a long-lived daemon coming back online after an outage). For those, Net provides snapshots: a captured point-in-time state plus the head causal link plus the entity's horizon, signed by the producer.
+A snapshot records materialized state together with the entity's current causal
+head and horizon. A consumer can restore that state and then replay retained events
+created after the snapshot.
 
-A snapshot is a checkpoint. Resume from it and the entity can continue producing events whose causal chain reaches back through the snapshot to its origin, without ever materializing the prefix. Snapshots are how daemons migrate cleanly between nodes, how partitions reconcile without replaying gigabytes of history, and how a new replica catches up to the live tail without taking the producer offline.
+Snapshots reduce replay work. They do not guarantee recovery on their own: the
+snapshot must be available and valid, required later events must be retained, and a
+reachable source must serve them. Migration and replication add their own routing,
+placement, and cutover protocols around this primitive.
 
-## What this gives you in practice
+## Application behavior
 
-In application code you almost never reach into a causal link directly. The system reads the link to order events, the durable-log layer uses it to deduplicate, the partition-recovery code uses it to drive replay — and your code just gets events delivered in an order that respects causality. The cases where you'll see the link explicitly are debugging, audit, and the small set of operations (snapshot, fork, replicate) where you're choosing to operate on the chain rather than on the events.
+Most application code consumes events rather than inspecting causal links directly.
+Causal details become visible when diagnosing a gap, validating a log, restoring a
+snapshot, or implementing migration and replication.
 
-The mental model to hold onto is this: in Net, time is a graph, not a number. Two events are ordered if one caused the other; otherwise they're concurrent, and your code should be ready for that. Every other property of the system — wire-speed routing, partition recovery, daemon migration, replicated state — falls out of taking that idea seriously.
+The practical rule is:
+
+```text
+same producer        → sequence and parent linkage define order
+observed dependency  → causal metadata records the relationship
+no known relationship → treat the events as concurrent
+```
+
+See [Durable logs](/docs/guides/durable-logs) for retained history and
+[Continuity and migration](/docs/guides/continuity-and-migration) for the protocols
+that use these records.

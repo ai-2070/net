@@ -12,7 +12,7 @@
 
 use async_trait::async_trait;
 
-use crate::core::verification::{VerificationTier, VerifierRef};
+use crate::core::verification::VerifierRef;
 use crate::x402::payload::PaymentPayload;
 use crate::x402::requirements::PaymentRequirements;
 use crate::x402::settlement::{SettlementResponse, VerifyResponse};
@@ -74,20 +74,32 @@ impl FacilitatorError {
     }
 }
 
-/// A verify result: the x402 response (byte-preserved) plus the tier the
-/// adapter maps this facilitator's confidence into. The tier vocabulary is
-/// the fixed protocol enum — chain-specific states never leak upward.
+/// A verify result: the x402 response, byte-preserved.
+///
+/// **Carries no tier, by construction.** A facilitator receipt justifies
+/// `observed` and nothing more — the x402 v2 spec gives facilitators no
+/// way to report finality — so the engine mints
+/// [`Observed`](crate::core::verification::VerificationTier::Observed)
+/// for every facilitator answer rather
+/// than reading a tier off one. `confirmed(n)` and `final` come only
+/// from an independent on-chain check
+/// ([`crate::checker::ChainChecker`]), which is what keeps a facilitator
+/// out of the trust root for confidence.
+///
+/// This field used to exist, and only the shipped HTTP client clamped
+/// itself to `observed`. `Facilitator` is a public trait, so any other
+/// implementation could report `final` and satisfy a `final`-tier policy
+/// with no chain check at all. Removing the field makes that
+/// unrepresentable instead of discouraged.
 #[derive(Debug, Clone)]
 pub struct VerifyOutcome {
     pub response: X402Carry<VerifyResponse>,
-    pub tier: VerificationTier,
 }
 
-/// A settle result, likewise.
+/// A settle result, likewise — and likewise tier-free.
 #[derive(Debug, Clone)]
 pub struct SettleOutcome {
     pub response: X402Carry<SettlementResponse>,
-    pub tier: VerificationTier,
 }
 
 /// The verify/settle client interface (x402 `POST /verify`, `POST
@@ -110,4 +122,30 @@ pub trait Facilitator: Send + Sync {
         payload: &X402Carry<PaymentPayload>,
         requirements: &X402Carry<PaymentRequirements>,
     ) -> Result<SettleOutcome, FacilitatorError>;
+
+    /// The `(scheme, network)` pairs this backend will actually settle,
+    /// at this crate's x402 version — when it can say.
+    ///
+    /// A provider announces its prices at discovery, and nothing checked
+    /// those announcements against the backend that has to honour them.
+    /// The asset registry says the *asset* is one the provider knows;
+    /// this says the *settlement route* is one its facilitator serves.
+    /// Without it a provider can publish terms, sign a quote under them,
+    /// and discover at verify/settle time that its facilitator never
+    /// handled that pair — after the caller has signed an authorization.
+    ///
+    /// `None` means **"cannot say"**, never "supports nothing". The mock
+    /// has no discovery surface, and neither does an arbitrary
+    /// implementation of this trait, so a caller that reads `None` must
+    /// carry on rather than refuse — a check that turns every
+    /// implementation without an answer into a failure is worse than the
+    /// gap it closes. The default is `None` for exactly that reason:
+    /// existing implementations keep working and say nothing.
+    ///
+    /// Live: implementations are expected to query their backend, so
+    /// treat this as network I/O and call it at configuration or
+    /// publication time, not per payment.
+    async fn supported_pairs(&self) -> Result<Option<Vec<(String, String)>>, FacilitatorError> {
+        Ok(None)
+    }
 }

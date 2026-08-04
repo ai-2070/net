@@ -9,11 +9,11 @@
 > **The signature does not extend to this document's judgement.** Two witnesses
 > written during this pass's closure — W-G3 and W-G13 — were later HELD by the
 > independent review for asserting properties they did not exercise. That is
-> recorded in `docs/plans/OLB_2B3C_PRE_HANDOFF.md` §2b, and it is the more
-> useful lesson than anything in the findings below.
+> recorded in the design's §16.0, and it is the more useful lesson than
+> anything in the findings below.
 >
-> §1 and §2 were the two defects this pass found in the region
-> [`OLB_2B3C_PRE_HANDOFF.md`](../plans/OLB_2B3C_PRE_HANDOFF.md) then marked
+> §1 and §2 were the two defects this pass found in the region the
+> since-deleted `OLB_2B3C_PRE_HANDOFF.md` then marked
 > **"CODE ONLY — NO WITNESSES"**. The rest of that debt — W-G3, W-G4, W-G5,
 > W-G6, W-G8, W-G13 — closed separately at `bd225acdd` and was repaired through
 > `224c9ea48`; see
@@ -60,8 +60,8 @@ at all.
 
 > **These numbers are HISTORICAL — do not execute them as a gate.** They record
 > the reviewed head. The current floor and counts are in
-> [Closure](#closure); `docs/plans/OLB_2B3C_PRE_HANDOFF.md` §5 carries the
-> runnable commands.
+> [Closure](#closure); the design's §16 closure gate carries the runnable
+> commands.
 
 ---
 
@@ -145,9 +145,10 @@ providers are ever served. Two residuals remain:
 
 ### Relationship to the handoff
 
-`OLB_2B3C_PRE_HANDOFF.md` §2 lists **W-G7** — "removal between validation and
-settlement cannot settle `Current`" — with mutation "release Grant protection
-before phase 5", and says:
+The handoff's §2 (deleted at signature; the set is now the design's §16.0)
+listed **W-G7** — "removal between validation and settlement cannot settle
+`Current`" — with mutation "release Grant protection before phase 5", and
+says:
 
 > **W-G7 is the one to write first and trust least.** It is the only property in
 > step 2 I believe by construction rather than by evidence.
@@ -247,8 +248,8 @@ first ordering a scope whose handle is not the installed one is warm.
 
 ### Why the owed witnesses would not catch it
 
-`OLB_2B3C_PRE_HANDOFF.md` §2 specifies **W-G5** as "audience handle is part of
-installation identity / mutation: drop it". A single-key witness passes on HEAD
+The handoff's §2 (deleted at signature) specified **W-G5** as "audience
+handle is part of installation identity / mutation: drop it". A single-key witness passes on HEAD
 either way, because with one key the handle check at `mesh.rs:5731` *is* reached.
 The defect needs **two keys sharing a grant id with different handles, in the
 order that puts the installed one first.**
@@ -498,7 +499,7 @@ chased, and NOT claimed as diagnosed.
 At the time this section was first written, W-G3, W-G4, W-G5, W-G6, W-G8 and
 W-G13 were owed. All six landed at `bd225acdd`, each mutation-proven. The set,
 what each kills, and the three notes worth carrying into the independent pass
-are in `docs/plans/OLB_2B3C_PRE_HANDOFF.md` §2 and the design's §16.0.
+are in the design's §16.0.
 
 One prediction in the paragraph this replaces was wrong and is worth recording:
 it said W-G5 was "now redundant with W-G5b's first assertion". It is not — and
@@ -524,4 +525,4 @@ reports as landed — W-G3 and W-G13 — did not hold up: Kyra's mutation matrix
 against `df32cbd7d` showed W-G3's first case exercising the wrong property and
 W-G13's actor-armed deadline not existing at all. Both were repaired
 (`e534b7b01`, `224c9ea48`), and step 2 signed at `a788232bd`. The lesson is in
-`docs/plans/OLB_2B3C_PRE_HANDOFF.md` §2b.
+the design's §16.0.

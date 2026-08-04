@@ -1,14 +1,16 @@
 ---
-title: Claude Skills
-description: "If you're building against Net with a coding agent, install the Net Claude skills first."
+title: Build with coding agents
+description: "Install optional Agent Skills that give coding agents Net-specific API context, examples, and source pointers."
 ---
-# Claude Skills
 
-If you're building against Net with a coding agent, install the Net Claude skills first. They're the reason the generated code is right instead of merely plausible.
+# Build with coding agents
 
-Net looks like Kafka, NATS, or Redis Streams from the outside, and Net Payments looks like a dozen payment SDKs. The models underneath are different — no broker, hot subscribers, backpressure expressed as silence, every node a peer; payments that are non-custodial and never move money, only sign the commercial facts around an invocation. An agent working from surface familiarity will write integration code that compiles, runs, and is quietly wrong. The skills load the correct mental model and per-SDK templates before the agent writes a line.
+The Net Agent Skills give coding agents API context, runnable examples, known
+binding differences, and links into the source tree. They reduce reliance on
+surface similarities with messaging and payment libraries, but they do not replace
+source inspection or tests for the exact mechanism being changed.
 
-> These are skills *about* Net. They don't install the library — that's [Install](/docs/start/install).
+> These are skills _about_ Net. They don't install the library — that's [Install](/docs/start/install).
 
 ## The two skills
 
@@ -52,9 +54,10 @@ npx skills add ai-2070/net-claude-skill --skill '*' -a '*' -g
 
 These are plain Agent Skills, so `-a '*'` covers Codex, Cursor, Copilot, Cline, and the rest. The CLI symlinks each agent's skills directory to one canonical copy, so one `npx skills update` refreshes them all — pass `--copy` if symlinks aren't an option.
 
-## Give the agent the source too
+## Give the agent source access for exact mechanisms
 
-[`opensrc`](https://github.com/vercel-labs/opensrc) is a small tool that fetches a package's real source into a local cache for exactly this purpose:
+[`opensrc`](https://github.com/vercel-labs/opensrc) fetches a package's repository
+source into a local cache:
 
 ```bash
 npx -y opensrc@latest path ai-2070/net
@@ -101,15 +104,17 @@ Then restart Claude Code and run `/skills` — **net-event-bus** and **net-payme
 
 Skills load automatically when a request matches. To see one fire, ask for something Net-shaped:
 
-> *"Wire up a Net publisher and subscriber over the mesh in TypeScript."*
+> _"Wire up a Net publisher and subscriber over the mesh in TypeScript."_
 >
-> *"Price a Net capability with x402 and charge callers to invoke it."*
+> _"Price a Net capability with x402 and charge callers to invoke it."_
 
-`net-event-bus` triggers on imports of `@net-mesh/sdk` or `net-sdk` and on phrases like *pub/sub with Net*, *nRPC*, *mesh RPC*, *RedEX*, *CortEX*, *Dataforts*, *gang scheduler*, *net-mesh wrap*, *serve_org*. `net-payments` triggers on `net-payments` / `net_payments` imports and on *price a capability*, *pay to invoke*, *x402*, *settle on Base/Solana/XRPL*, *spend limit*.
+`net-event-bus` triggers on imports of `@net-mesh/sdk` or `net-sdk` and on phrases like _pub/sub with Net_, _nRPC_, _mesh RPC_, _RedEX_, _CortEX_, _Dataforts_, _gang scheduler_, _net-mesh wrap_, _serve_org_. `net-payments` triggers on `net-payments` / `net_payments` imports and on _price a capability_, _pay to invoke_, _x402_, _settle on Base/Solana/XRPL_, _spend limit_.
 
 ## Opensrc
 
-The skills carry the mental model, the per-binding surface, and runnable examples. What they can't carry is all of Net — a few thousand lines of guidance over a protocol implementation of several hundred thousand. So when the question turns to *mechanism*, the agent either has the source or it guesses:
+The skills carry the public model, common binding surfaces, and examples. Consult
+the source when the task depends on exact signatures, fields, state transitions, or
+implementation behavior:
 
 - an exact signature, a serialized field name, whether an enum has that variant;
 - how something actually works — the drain path, framing, how verification escalates through its tiers;
@@ -123,7 +128,7 @@ You don't need to teach the agent how to use it. Each skill ships a `source-acce
 
 - **Anything newer than the last release.** The checkout is the published tag, not `master`.
 - **`bindings/node/index.d.ts`**, which is napi-generated and gitignored. The declaration site is the `#[napi]` attributes in `bindings/node/src/*.rs`.
-- **`net-payments` on crates.io** — `opensrc path crates:net-payments` fails with *not found*. The crate is unpublished and lives in the repo; the Python and Node payment surfaces ship inside the core binding packages. That error is not a missing feature.
+- **`net-payments` on crates.io** — `opensrc path crates:net-payments` fails with _not found_. The crate is unpublished and lives in the repo; the Python and Node payment surfaces ship inside the core binding packages. That error is not a missing feature.
 
 If you'd rather not add a tool, a shallow clone is equivalent:
 
@@ -150,6 +155,7 @@ rm -rf .claude/skills/net-event-bus .claude/skills/net-payments       # project
 
 ## Next
 
-The skills are the standing reference an agent keeps loaded. The [Agent Briefs](/docs/agent-briefs) are the complement: single, checkable tasks you hand an agent once — wrap an MCP server, build a recoverable capability, generate typed bindings. Skill = what you keep loaded; brief = what you run once.
-
+The [Agent Briefs](/docs/agent-briefs) provide bounded tasks with explicit
+acceptance checks: wrap an MCP server, build a recoverable capability, or generate
+typed bindings.
 Source and full file-by-file breakdown: [github.com/ai-2070/net-claude-skill](https://github.com/ai-2070/net-claude-skill).

@@ -1,24 +1,25 @@
 ---
 title: Invoke
-description: Discovery tells you who can; invoking does the work and returns a typed result — and it is the point where authority is actually checked.
+description: Invoke a selected provider or service, apply provider-side admission, and handle typed results and ambiguous execution.
 capability: nRPC — typed request/response + streaming
 boundary: /docs/sdk/c/headers-and-linking
 boundaryLabel: C — nRPC in net_rpc.h
 ---
+
 # Invoke a Capability
 
-Discovery tells you who *can*. Invoking does the work and hands back a typed
-result. It is also the one place on this spine where authority is checked, which
-makes it the most important page of the seven.
+Discovery returns candidate providers visible to the caller. Invocation addresses
+one provider or a service name, applies provider-side admission, and returns a
+typed result or failure.
 
 ## Two ways to address a call
 
-**By node id.** You pin a specific provider. Deterministic, and useless the moment
-that node dies.
+**By node id.** You pin a specific provider. Use this when the provider holds a
+session or other state the caller already selected.
 
-**By service or tool name.** The mesh picks a provider that advertises it. This is
-the basis of failover: a substitutable capability keeps working when the primary
-goes away, without your code learning a new address.
+**By service or tool name.** The mesh selects from providers that advertise it.
+This allows another eligible provider to be selected after the current provider
+becomes unavailable.
 
 Prefer name-addressed calls unless you have a reason to pin. The reason is usually
 state — a provider holding a session you already started.
@@ -35,7 +36,7 @@ Both paths carry deadlines. Both surface the same typed failures.
 
 ## Deadlines are a caller-side promise about waiting, not a cancel
 
-A deadline bounds how long *you* wait. When it elapses the caller does emit a
+A deadline bounds how long _you_ wait. When it elapses the caller does emit a
 cancel for that call id, so a cooperating provider can drop the in-flight handler —
 but "can drop" is not "did not run." When a deadline elapses you learn that no
 answer arrived in time. You do not learn whether the work happened.
@@ -46,9 +47,10 @@ time. Make the operation idempotent, or carry an idempotency key, or accept the
 duplicate. This is not a Net peculiarity; it is what a network deadline means
 everywhere, stated here because the typed API makes it easy to forget.
 
-## Policy: invocation is authorized, discovery is not
+## Provider admission happens at invocation
 
-Seeing a capability does not grant the right to invoke it.
+Seeing a capability does not grant the right to invoke it. Discovery may itself be
+scoped, but provider admission is still evaluated for the call.
 
 The provider enforces scope **at call time**, against the authenticated caller
 origin. An owner-only capability refuses a caller outside its scope regardless of

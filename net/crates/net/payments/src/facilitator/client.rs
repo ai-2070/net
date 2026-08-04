@@ -14,7 +14,9 @@
 //! later independent check or audit will hash.
 //!
 //! Trust posture: a facilitator receipt can only ever justify tier
-//! [`VerificationTier::Observed`] — the v2 spec gives facilitators no
+//! [`crate::core::verification::VerificationTier::Observed`] — the tier
+//! is minted by the engine at this boundary, so the name is not in
+//! scope here to link unqualified. The v2 spec gives facilitators no
 //! way to report finality, and this client refuses to invent one.
 //! `confirmed(n)` / `final` come from the independent chain checker,
 //! which keeps the facilitator out of the trust root for anything above
@@ -34,7 +36,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::traits::{Facilitator, FacilitatorError, SettleOutcome, VerifyOutcome};
-use crate::core::verification::{VerificationTier, VerifierRef};
+use crate::core::verification::VerifierRef;
 use crate::x402::payload::PaymentPayload;
 use crate::x402::requirements::PaymentRequirements;
 use crate::x402::settlement::{SettlementResponse, VerifyResponse};
@@ -109,15 +111,21 @@ impl HttpFacilitator {
         let endpoint = endpoint.trim_end_matches('/').to_string();
         // The bearer secret (CDP key) must never ride cleartext http to a
         // remote host. Enforce https except to loopback (local/self-hosted).
+        // Shared with the chain checker and the outbound HTTP-402 door —
+        // see `crate::http_policy` for why all three go through one
+        // implementation.
         require_secure_endpoint(&endpoint)?;
-        let tls = crate::tls_roots::tls_config()
-            .map_err(|e| FacilitatorError::protocol(format!("http tls config: {e}")))?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .use_preconfigured_tls(tls)
-            .build()
-            .map_err(|e| FacilitatorError::protocol(format!("http client build: {e}")))?;
+        // An IP-literal endpoint is dialled without a DNS lookup, so the
+        // client's resolver never sees it — check literals here, names at
+        // resolve time. Together they cover every host form.
+        if let Ok(url) = reqwest::Url::parse(&endpoint) {
+            crate::http_policy::check_url_destination(
+                &url,
+                crate::http_policy::DestinationPolicy::AllowPrivate,
+            )
+            .map_err(|e| FacilitatorError::protocol(format!("facilitator endpoint: {e}")))?;
+        }
+        let http = build_client(Duration::from_secs(30), Duration::from_secs(10))?;
         Ok(Self {
             endpoint,
             http,
@@ -127,14 +135,7 @@ impl HttpFacilitator {
 
     /// Override request timeouts (per call).
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, FacilitatorError> {
-        let tls = crate::tls_roots::tls_config()
-            .map_err(|e| FacilitatorError::protocol(format!("http tls config: {e}")))?;
-        self.http = reqwest::Client::builder()
-            .timeout(timeout)
-            .connect_timeout(timeout.min(Duration::from_secs(10)))
-            .use_preconfigured_tls(tls)
-            .build()
-            .map_err(|e| FacilitatorError::protocol(format!("http client build: {e}")))?;
+        self.http = build_client(timeout, timeout.min(Duration::from_secs(10)))?;
         Ok(self)
     }
 
@@ -252,70 +253,62 @@ impl HttpFacilitator {
 const MAX_FACILITATOR_BODY: usize = 4 * 1024 * 1024;
 
 /// Reject a config-supplied endpoint that would send credentials in
-/// cleartext: https is required, except to a loopback host for local and
-/// self-hosted testing.
+/// cleartext. Delegates to the shared money-path policy so this client,
+/// the chain checker, and the outbound HTTP-402 door enforce one rule.
 fn require_secure_endpoint(endpoint: &str) -> Result<(), FacilitatorError> {
-    let url = reqwest::Url::parse(endpoint).map_err(|e| {
-        FacilitatorError::protocol(format!("facilitator endpoint `{endpoint}`: {e}"))
-    })?;
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" => {
-            let host = url.host_str().unwrap_or_default();
-            // `host_str` keeps IPv6 brackets (`[::1]`); strip them to parse.
-            let bare = host.trim_start_matches('[').trim_end_matches(']');
-            let is_loopback = host == "localhost"
-                || bare
-                    .parse::<std::net::IpAddr>()
-                    .map(|ip| ip.is_loopback())
-                    .unwrap_or(false);
-            if is_loopback {
-                Ok(())
-            } else {
-                Err(FacilitatorError::protocol(format!(
-                    "facilitator endpoint `{endpoint}` is plaintext http to a non-loopback host \
-                     — refusing to send credentials in cleartext; use https"
-                )))
-            }
-        }
-        other => Err(FacilitatorError::protocol(format!(
-            "facilitator endpoint `{endpoint}` uses unsupported scheme `{other}` (want https)"
-        ))),
-    }
+    crate::http_policy::require_secure_endpoint(endpoint)
+        .map_err(|e| FacilitatorError::protocol(format!("facilitator {e}")))
 }
 
-/// Read a response body, capped at `max` bytes. A declared over-cap
-/// `content-length` is rejected up front; a body that streams past the
-/// cap (no/underdeclared length) is rejected mid-stream. Bounds memory
-/// against a hostile endpoint.
+/// Build the client: pinned TLS roots plus the shared destination policy.
+///
+/// [`crate::http_policy::DestinationPolicy::AllowPrivate`] — a facilitator endpoint is
+/// operator configuration, and a self-hosted facilitator on loopback or a
+/// LAN is an ordinary deployment. What stays refused is the set nobody
+/// configures deliberately (link-local including cloud metadata,
+/// carrier-NAT, reserved), so a templated or half-substituted endpoint
+/// fails closed rather than reaching instance metadata with a bearer
+/// token attached.
+fn build_client(
+    timeout: Duration,
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, FacilitatorError> {
+    crate::http_policy::client(
+        crate::http_policy::DestinationPolicy::AllowPrivate,
+        timeout,
+        connect_timeout,
+        reqwest::redirect::Policy::none(),
+    )
+    .map_err(|e| FacilitatorError::protocol(e.to_string()))
+}
+
+/// Read a response body, capped at `max` bytes — the shared bounded
+/// reader. An over-cap body is a protocol fault (terminal): a peer
+/// sending more than the cap will not send less on retry.
 async fn read_bounded(
     response: reqwest::Response,
     max: usize,
 ) -> Result<Vec<u8>, FacilitatorError> {
-    if let Some(len) = response.content_length() {
-        if len as usize > max {
-            return Err(FacilitatorError::protocol(format!(
-                "facilitator response declared {len} bytes, over the {max}-byte cap"
-            )));
-        }
-    }
-    let mut response = response;
-    let mut out = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(map_send_error)? {
-        if out.len().saturating_add(chunk.len()) > max {
-            return Err(FacilitatorError::protocol(format!(
-                "facilitator response exceeded the {max}-byte cap"
-            )));
-        }
-        out.extend_from_slice(&chunk);
-    }
-    Ok(out)
+    crate::http_policy::read_bounded(response, max)
+        .await
+        .map_err(|e| match e {
+            crate::http_policy::ReadError::TooLarge { .. } => {
+                FacilitatorError::protocol(format!("facilitator {e}"))
+            }
+            crate::http_policy::ReadError::Transport(inner) => map_send_error(inner),
+        })
 }
 
 /// Transport-level error mapping. Timeouts and connect failures are the
 /// facilitator being unreachable (retryable, policy decides); anything
 /// else at this layer is a protocol fault (fail-closed).
 fn map_send_error(e: reqwest::Error) -> FacilitatorError {
+    // A destination-policy refusal surfaces as a connect error because it
+    // happens inside the resolver. It is terminal: the policy will refuse
+    // the same address again.
+    if crate::http_policy::is_policy_refusal(&e) {
+        return FacilitatorError::protocol(format!("endpoint refused by policy: {e}"));
+    }
     if e.is_timeout() {
         FacilitatorError::timeout(e.to_string())
     } else if e.is_connect() || e.is_request() {
@@ -357,10 +350,7 @@ impl Facilitator for HttpFacilitator {
             .await?;
         let response: X402Carry<VerifyResponse> = X402Carry::from_bytes(body)
             .map_err(|e| FacilitatorError::protocol(format!("/verify response: {e}")))?;
-        Ok(VerifyOutcome {
-            response,
-            tier: VerificationTier::Observed,
-        })
+        Ok(VerifyOutcome { response })
     }
 
     async fn settle(
@@ -375,10 +365,25 @@ impl Facilitator for HttpFacilitator {
             .map_err(|e| FacilitatorError::protocol(format!("/settle response: {e}")))?;
         // A receipt is a receipt: `observed`, never more (the spec
         // reports no finality; the chain checker owns everything above).
-        Ok(SettleOutcome {
-            response,
-            tier: VerificationTier::Observed,
-        })
+        Ok(SettleOutcome { response })
+    }
+
+    /// From `GET /supported`, filtered to this build's x402 version.
+    ///
+    /// The version filter is the point of doing it here rather than
+    /// letting a caller read `kinds` directly: a facilitator offering
+    /// `(exact, eip155:8453)` at some other x402 version does not offer
+    /// it to us, and a pair we cannot speak is a pair we cannot settle.
+    async fn supported_pairs(&self) -> Result<Option<Vec<(String, String)>>, FacilitatorError> {
+        let supported = self.supported().await?;
+        Ok(Some(
+            supported
+                .kinds
+                .into_iter()
+                .filter(|k| k.x402_version == X402_VERSION)
+                .map(|k| (k.scheme, k.network))
+                .collect(),
+        ))
     }
 }
 
@@ -386,16 +391,21 @@ impl Facilitator for HttpFacilitator {
 mod tests {
     use super::*;
 
+    /// The facilitator's view of the shared scheme policy. The rule
+    /// itself is owned and exhaustively tested by `crate::http_policy`;
+    /// this pins that the client actually applies it.
     #[test]
-    fn https_is_required_except_for_loopback() {
-        // Secure or loopback: accepted.
+    fn https_is_required_except_for_loopback_literals() {
+        // Secure anywhere, or cleartext to a loopback *literal*.
         assert!(require_secure_endpoint("https://facilitator.example.com").is_ok());
         assert!(require_secure_endpoint("http://127.0.0.1:8080").is_ok());
         assert!(require_secure_endpoint("http://[::1]:8080").is_ok());
-        assert!(require_secure_endpoint("http://localhost:8080/base").is_ok());
         // Cleartext to a remote host, or an unsupported scheme: refused.
         assert!(require_secure_endpoint("http://facilitator.example.com").is_err());
         assert!(require_secure_endpoint("ftp://facilitator.example.com").is_err());
+        // And the NAME `localhost` no longer buys the exception: DNS
+        // decides what it resolves to, so it is not self-evidently local.
+        assert!(require_secure_endpoint("http://localhost:8080/base").is_err());
     }
 
     #[test]

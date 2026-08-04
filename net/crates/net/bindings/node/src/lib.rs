@@ -1577,10 +1577,17 @@ mod mesh_bindings {
             if !options.permissive_channels.unwrap_or(false) {
                 node.set_channel_configs(channel_configs.clone());
             }
-            // Always install a TokenCache — channel auth needs
-            // somewhere to stash tokens presented on subscribe.
-            // Callers that want to pre-seed can use `installToken`
-            // on a caller-side `Identity` constructed from the same
+            // Always install a TokenCache — channel auth needs one to
+            // supply the RevocationRegistry and clock-skew tolerance,
+            // and `require_token` channels reject outright without it.
+            //
+            // It is NOT where subscriber-presented tokens land: those
+            // ride the wire, are verified inline against the channel's
+            // `token_roots`, and are retained as chains. What this
+            // cache holds is the local node's own credentials — e.g.
+            // the PUBLISH token the publish path looks up. Callers that
+            // want to pre-seed those use `installToken` on a
+            // caller-side `Identity` built from the same
             // `identity_seed`.
             node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
@@ -2069,7 +2076,7 @@ mod mesh_bindings {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let core = crate::capabilities::capability_filter_from_js(filter);
-            let owned = crate::capabilities::scope_filter_from_js(scope);
+            let owned = crate::capabilities::scope_filter_from_js(scope)?;
             let ids = crate::capabilities::with_scope_filter(&owned, |f| {
                 node.find_nodes_by_filter_scoped(&core, f)
             });

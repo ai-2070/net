@@ -254,8 +254,11 @@ impl Mesh {
     /// no `require_token`) — channel-level ACLs on RPC traffic
     /// are a Phase 3 concern (alongside the per-service token
     /// allowlist). Operators who need RPC ACLs today can call
-    /// `register_channel` / `register_channel_prefix` themselves
-    /// before `serve_rpc` to override.
+    /// [`Mesh::register_channel`](crate::Mesh::register_channel) /
+    /// [`Mesh::register_channel_prefix`](crate::Mesh::register_channel_prefix)
+    /// themselves before `serve_rpc` to override: auto-registration
+    /// installs a default only where the operator expressed no
+    /// opinion, so a pre-installed config is never replaced.
     ///
     /// For typed handlers (auto serde), use
     /// [`Self::serve_rpc_typed`].
@@ -268,29 +271,28 @@ impl Mesh {
         self.node().serve_rpc(service, handler)
     }
 
-    /// Internal helper used by `serve_rpc` / `serve_rpc_typed` to
+    /// Internal helper used by every `serve_rpc*` variant to
     /// auto-register the request channel + reply prefix in the
-    /// SDK's `ChannelConfigRegistry`. Idempotent — repeated calls
-    /// for the same service are no-ops (DashMap insert overwrites
-    /// with the same default permissive config).
+    /// SDK's `ChannelConfigRegistry`.
+    ///
+    /// **Install-if-absent, never replace.** Both entries go in via
+    /// `insert_if_absent` / `insert_prefix_if_absent`, so an ACL the
+    /// operator registered before serving survives untouched. Pre-fix
+    /// these were plain replacing inserts, which meant the documented
+    /// hardening sequence — register a strict config, then
+    /// `serve_rpc` — silently discarded that config and left the
+    /// service wide open, with no error and no log. Every `serve_rpc*`
+    /// entry point calls this helper independently, so the guarantee
+    /// has to live here rather than at any one call site.
+    ///
+    /// Idempotent for the ordinary path too: repeated calls for the
+    /// same service find their own prior default and leave it alone.
     pub(crate) fn auto_register_rpc_channels(&self, service: &str) {
-        use crate::ChannelConfig;
-        use net::adapter::net::channel::{ChannelId, ChannelName};
-        // Exact: `<service>.requests`.
-        let req_name = format!("{service}.requests");
-        if let Ok(req_channel) = ChannelName::new(&req_name) {
-            self.register_channel(ChannelConfig::new(ChannelId::new(req_channel)));
-        }
-        // Prefix: `<service>.replies.` — admits every per-caller
-        // `<service>.replies.<caller_origin>` subscribe.
-        let prefix = format!("{service}.replies.");
-        // Sentinel ChannelId for the prefix entry; not used for
-        // hash lookups, just carried so the ChannelConfig is
-        // structurally well-formed.
-        if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
-            self.channel_configs_arc()
-                .insert_prefix(prefix, ChannelConfig::new(ChannelId::new(sentinel_name)));
-        }
+        // One implementation, shared with the `aggregator` module —
+        // which is gated on a different feature and therefore used to
+        // carry its own copy that drifted out of sync with the H2 and
+        // H3 fixes. See `Mesh::register_rpc_service_channels`.
+        self.register_rpc_service_channels(service);
     }
 
     /// Direct-addressed call. Caller specifies `target_node_id`;
@@ -1422,6 +1424,158 @@ where
                 code: NRPC_TYPED_HANDLER_ERROR,
                 message,
             })
+    }
+}
+
+#[cfg(test)]
+mod auto_register_covers_every_serve_variant {
+    //! H2 (2026-07-31 channel-auth audit): the "operator ACLs survive
+    //! `serve_rpc*`" guarantee lives in `auto_register_rpc_channels`,
+    //! which every serving entry point calls **independently**. A
+    //! behavioural test of one variant (see
+    //! `sdk/tests/mesh_rpc_acl_preserved.rs`) proves the helper is
+    //! correct; it cannot prove a *new* variant remembered to call it.
+    //!
+    //! This is that second half: a source-level witness that every
+    //! `pub fn serve_rpc*` routes through the helper. Adding a ninth
+    //! variant without the call fails here rather than silently
+    //! shipping a path that clobbers operator configuration. The
+    //! codebase uses the same technique for
+    //! `authorize_subscribe_only_suppresses_cap_for_already_subscribed`.
+
+    /// Every `pub fn serve_rpc…` in this file must call
+    /// `auto_register_rpc_channels` in its body.
+    #[test]
+    fn every_serve_rpc_variant_calls_auto_register() {
+        let full = include_str!("mesh_rpc.rs");
+        // Scan production code only. Two reasons, both learned the hard
+        // way when this test first ran and reported nine variants:
+        //
+        // 1. This module's own search literals appear verbatim in the
+        //    file, so an unanchored scan matches itself.
+        // 2. The final real variant's body window would otherwise run
+        //    to EOF and swallow the `body.contains(...)` assertion
+        //    below — making that variant pass on the strength of this
+        //    test's own source text rather than its implementation.
+        let src = match full.find("\n#[cfg(test)]") {
+            Some(i) => &full[..i],
+            None => full,
+        };
+        let mut checked = 0usize;
+        let mut offset = 0usize;
+
+        // Anchored at a line start so a literal inside a string (which
+        // is preceded by `"`, not a newline) can never match.
+        while let Some(rel) = src[offset..].find("\n    pub fn serve_rpc") {
+            let start = offset + rel + 1; // skip the newline
+                                          // Name runs to the first `<` (generics) or `(` (args).
+            let name_start = start + "    pub fn ".len();
+            let name_end = src[name_start..]
+                .find(['<', '('])
+                .map(|i| name_start + i)
+                .expect("a fn signature must have generics or an arg list");
+            let name = &src[name_start..name_end];
+
+            // Scan to the next top-level `pub fn` so the window is this
+            // variant's body and nothing else.
+            let body_end = src[name_end..]
+                .find("\n    pub fn ")
+                .map(|i| name_end + i)
+                .unwrap_or(src.len());
+            let body = &src[name_end..body_end];
+
+            assert!(
+                body.contains("self.auto_register_rpc_channels(service)"),
+                "regression (H2): `{name}` does not call \
+                 `auto_register_rpc_channels`. Every serving entry point \
+                 must, or it will register nothing (breaking dynamic reply \
+                 subscriptions) or — if reinstated as a replacing insert — \
+                 silently discard an operator's pre-installed channel ACL."
+            );
+            checked += 1;
+            offset = body_end;
+        }
+
+        assert_eq!(
+            checked, 8,
+            "expected 8 `serve_rpc*` variants; found {checked}. If a variant \
+             was added or removed, update this count deliberately — the point \
+             is that the set is enumerated, not discovered."
+        );
+    }
+
+    /// Every serve path must reach the ONE registration implementation.
+    ///
+    /// Only the delegation chain is scanned here. The implementation
+    /// moved out of this crate entirely, onto
+    /// `ChannelConfigRegistry::install_rpc_service_defaults`, and its
+    /// H2/H3 content is pinned by
+    /// `rpc_service_defaults_are_install_if_absent_and_origin_bound` next
+    /// to it in `net`'s `channel/config.rs`. Reaching across the crate
+    /// boundary with `include_str!("../../src/...")` would pin it from
+    /// here too, at the cost of a path that breaks on any layout change.
+    ///
+    /// Why the policy is on the registry at all: the serve paths do not
+    /// share a receiver. `serve_rpc*` and the aggregator go through
+    /// `Mesh`; the org facade's `serve_org_bytes_node` holds an
+    /// `Arc<MeshNode>` for the language bindings. Every copy written per
+    /// receiver has drifted — the aggregator's, then the org path's,
+    /// each missing H2 and H3 after they were fixed for `serve_rpc`. The
+    /// registry is the object all of them already hold.
+    #[test]
+    fn every_serve_path_delegates_to_the_shared_registration() {
+        let rpc_src = include_str!("mesh_rpc.rs");
+        let hop_start = rpc_src
+            .find("pub(crate) fn auto_register_rpc_channels(")
+            .expect("auto_register_rpc_channels must exist");
+        let hop = &rpc_src[hop_start..(hop_start + 1_000).min(rpc_src.len())];
+        assert!(
+            hop.contains("self.register_rpc_service_channels(service)"),
+            "regression: `auto_register_rpc_channels` must delegate to the \
+             shared `register_rpc_service_channels`."
+        );
+
+        let mesh_src = include_str!("mesh.rs");
+        let shared_start = mesh_src
+            .find("pub(crate) fn register_rpc_service_channels(")
+            .expect("register_rpc_service_channels must exist");
+        let shared = &mesh_src[shared_start..(shared_start + 600).min(mesh_src.len())];
+        assert!(
+            shared.contains("install_rpc_service_defaults(service)"),
+            "regression: `Mesh::register_rpc_service_channels` must delegate to \
+             the registry, not carry its own copy of the H2/H3 policy."
+        );
+
+        let agg_src = include_str!("aggregator.rs");
+        let agg_start = agg_src
+            .find("fn auto_register_rpc_channels(mesh: &Mesh")
+            .expect("the aggregator's registration hop must exist");
+        let agg = &agg_src[agg_start..(agg_start + 400).min(agg_src.len())];
+        assert!(
+            agg.contains("mesh.register_rpc_service_channels(service)"),
+            "regression (H2+H3): the aggregator must delegate to the shared \
+             registration. Its hand-rolled copy kept replacing inserts and \
+             never gained the reply-prefix origin binding, long after both \
+             were fixed for `serve_rpc`."
+        );
+
+        let org_src = include_str!("org/serve.rs");
+        let org_start = org_src
+            .find("fn auto_register_org_channels(")
+            .expect("auto_register_org_channels must exist");
+        let org = &org_src[org_start..(org_start + 600).min(org_src.len())];
+        assert!(
+            org.contains("install_rpc_service_defaults(service)"),
+            "regression (H2+H3): the org serve path must delegate to the shared \
+             registration. It carried its own copy until R9 — with a REPLACING \
+             insert that destroyed operator ACLs, and an unbound reply prefix \
+             that let any peer subscribe to another caller's reply channel."
+        );
+        assert!(
+            !org.contains("registry.insert(") && !org.contains("registry.insert_prefix("),
+            "regression: the org path is registering channels directly again \
+             instead of through the shared policy."
+        );
     }
 }
 

@@ -7,10 +7,17 @@
 //! Scenarios:
 //! 1. Permissive baseline      — empty allow-lists admit any caller
 //! 2. Allow-by-node            — `[B]` admits B, denies C
-//! 3. Allow-by-subnet          — `[S]` admits subnet members, denies non-members
-//! 4. Allow-by-group           — `[G]` admits group claimants, denies non-claimants
+//! 3. Subnet axis demoted      — `[S]` denies even self-declared members (S1)
+//! 4. Group axis demoted       — `[G]` denies even self-declared claimants (S1)
 //! 5. Revocation               — new announcement supersedes the old
 //! 6. Receiver-side defense    — callee independently rejects with `CapabilityDenied`
+//!
+//! Scenarios 3/4 flipped with SUBNET_AUTH_PLAN.md S1: the
+//! subnet/group axes read self-declared tags whose admitted values
+//! the provider itself broadcasts in cleartext, so they were demoted
+//! from admission to routing. `tests/subnet_axis_demotion.rs` holds
+//! the full witness matrix; the scenarios here pin the `call_service`
+//! path end to end.
 
 #![cfg(all(feature = "net", feature = "cortex"))]
 
@@ -287,12 +294,13 @@ async fn scenario_2_allow_by_node_admits_listed_only() {
 // Scenario 3 — Allow-by-subnet
 // ---------------------------------------------------------------------------
 
-/// A allows `[subnet S]`; nodes in S can execute, nodes outside
-/// cannot. Membership is self-declared via a `subnet:<hex32>`
-/// tag on the caller's own announcement (signed + TOFU-bound in
-/// production; folded directly here to sidestep broadcast).
+/// A allows `[subnet S]`. Post-S1 the self-declared subnet axis
+/// admits nobody: the in-subnet caller passes its own caller-side
+/// narrowing (routing, kept) but the callee-side gate denies; the
+/// out-of-subnet caller is filtered before the wire. Both observe
+/// `CapabilityDenied` — a subnet-only allow-list is deny-by-default.
 #[tokio::test]
-async fn scenario_3_allow_by_subnet_admits_subnet_members() {
+async fn scenario_3_subnet_axis_no_longer_admits() {
     let target = build_node().await;
     let in_subnet = build_node().await;
     let out_of_subnet = build_node().await;
@@ -308,12 +316,12 @@ async fn scenario_3_allow_by_subnet_admits_subnet_members() {
     let out_of_subnet_ann = caller_announcement(&out_of_subnet, 1, None, &[]);
     fold_announcement_everywhere(&[&target, &in_subnet, &out_of_subnet], &target_ann);
     // Each caller's own subnet membership announcement also needs
-    // to land in the target's index (the gate reads caller subnet
-    // there) AND in the caller's own index (consistency).
+    // to land in the target's index (the canary reads caller subnet
+    // there) AND in the caller's own index (narrowing reads it).
     fold_announcement_everywhere(&[&target, &in_subnet], &in_subnet_ann);
     fold_announcement_everywhere(&[&target, &out_of_subnet], &out_of_subnet_ann);
 
-    let reply = in_subnet
+    let err = in_subnet
         .call_service(
             "echo",
             Bytes::from_static(b"in-subnet"),
@@ -323,8 +331,8 @@ async fn scenario_3_allow_by_subnet_admits_subnet_members() {
             },
         )
         .await
-        .expect("subnet member must complete the round-trip");
-    assert_eq!(reply.body.as_ref(), b"in-subnet");
+        .expect_err("self-declared subnet member must be denied at the callee (S1)");
+    assert!(matches!(err, RpcError::CapabilityDenied { .. }));
 
     let err = out_of_subnet
         .call_service(
@@ -333,7 +341,7 @@ async fn scenario_3_allow_by_subnet_admits_subnet_members() {
             CallOptions::default(),
         )
         .await
-        .expect_err("non-member must hit the gate");
+        .expect_err("non-member is filtered by caller-side narrowing");
     assert!(matches!(err, RpcError::CapabilityDenied { .. }));
 }
 
@@ -341,10 +349,11 @@ async fn scenario_3_allow_by_subnet_admits_subnet_members() {
 // Scenario 4 — Allow-by-group
 // ---------------------------------------------------------------------------
 
-/// A allows `[group G]`; nodes claiming `G` via tag can
-/// execute, others cannot.
+/// A allows `[group G]`. Post-S1 a self-declared group claim admits
+/// nobody: the claimant passes caller-side narrowing but the callee
+/// denies; the non-claimant is filtered before the wire.
 #[tokio::test]
-async fn scenario_4_allow_by_group_admits_group_claimants() {
+async fn scenario_4_group_axis_no_longer_admits() {
     let target = build_node().await;
     let claimant = build_node().await;
     let non_claimant = build_node().await;
@@ -362,7 +371,7 @@ async fn scenario_4_allow_by_group_admits_group_claimants() {
     fold_announcement_everywhere(&[&target, &claimant], &claimant_ann);
     fold_announcement_everywhere(&[&target, &non_claimant], &non_claimant_ann);
 
-    let reply = claimant
+    let err = claimant
         .call_service(
             "echo",
             Bytes::from_static(b"group-member"),
@@ -372,8 +381,8 @@ async fn scenario_4_allow_by_group_admits_group_claimants() {
             },
         )
         .await
-        .expect("group claimant must complete the round-trip");
-    assert_eq!(reply.body.as_ref(), b"group-member");
+        .expect_err("self-declared group claimant must be denied at the callee (S1)");
+    assert!(matches!(err, RpcError::CapabilityDenied { .. }));
 
     let err = non_claimant
         .call_service(
@@ -382,7 +391,7 @@ async fn scenario_4_allow_by_group_admits_group_claimants() {
             CallOptions::default(),
         )
         .await
-        .expect_err("non-claimant must hit the gate");
+        .expect_err("non-claimant is filtered by caller-side narrowing");
     assert!(matches!(err, RpcError::CapabilityDenied { .. }));
 }
 

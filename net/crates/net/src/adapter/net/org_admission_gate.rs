@@ -24,7 +24,8 @@ use super::behavior::org_revocation::{
 };
 use super::cortex::{RpcCodecError, RpcHeader, RpcRequestPayload};
 use super::identity::EntityId;
-use super::mesh::MeshNode;
+use super::mesh::{MeshNode, SubnetGatewayAuthorityState};
+use super::subnet::SubnetExportBinding;
 
 /// blake3 `derive_key` context for the canonical org-RPC request
 /// digest (E1.7). Distinct, versioned domain string so a future wire
@@ -285,6 +286,113 @@ pub fn verify_provider_authority(
     })
 }
 
+/// The provider's subnet-export facts for one admission on a
+/// subnet-exported registration (SUBNET_AUTH_PLAN.md D7), captured at
+/// CALL time. Registration-time authority is not usable authority:
+/// gateway credentials replace wholesale, boundary sets replace
+/// wholesale, floors raise the auth epoch, and topology epochs
+/// advance — any of which must darken an existing registration.
+///
+/// The stamp identity follows [`AdmissionStamp`]'s discipline over
+/// ONE fingerprint: `Arc::as_ptr` of the single published
+/// `SubnetGatewayAuthorityState` aggregate the decision was made
+/// against, plus the two epoch integers. One pointer, deliberately —
+/// fingerprinting the gateway and boundary members separately let a
+/// replacement land BETWEEN the two loads of the stability check and
+/// present a torn "both current" view. The aggregate Arc is PINNED
+/// for the admission's lifetime so its address cannot be reused by a
+/// replacement mid-check (ABA).
+pub struct SubnetExportFacts {
+    aggregate_ptr: usize,
+    topology_epoch: u32,
+    subnet_auth_epoch: u64,
+    /// The authority whose floor epoch the stamp pins.
+    authority: EntityId,
+    /// Pinned decision snapshot — see the ABA note above.
+    _aggregate: Arc<SubnetGatewayAuthorityState>,
+}
+
+impl SubnetExportFacts {
+    /// `true` iff the live export state is IDENTICALLY the state this
+    /// admission verified: the SAME published authority aggregate
+    /// (one load, one pointer compare — coherent by construction),
+    /// same topology epoch, same subnet auth epoch.
+    ///
+    /// Expiry is deliberately NOT re-sampled here. Credential
+    /// freshness was evaluated once, in [`verify_subnet_export`],
+    /// against the admission's single paired wall/monotonic
+    /// [`ClockSample`] — the same sample the organization proof,
+    /// provider authority and replay retention all derive from. This
+    /// method is a state-stability recheck, not a second freshness
+    /// evaluation: re-sampling time would open a second time boundary
+    /// between the caller-side and provider-side checks. Elapsed time
+    /// alone, with no publication and no epoch move, is not
+    /// `AuthorityChanged`.
+    pub fn is_current(&self, mesh: &MeshNode) -> bool {
+        let live = mesh.subnet_gateway_authority();
+        Arc::as_ptr(&live) as *const () as usize == self.aggregate_ptr
+            && mesh.subnet_topology_epoch() == self.topology_epoch
+            && mesh.subnet_floor_registry().auth_epoch(&self.authority) == self.subnet_auth_epoch
+    }
+}
+
+/// Live subnet-export verification for one call on a subnet-exported
+/// registration (D7). Denies — with the same coarse provider-side
+/// reason as an unavailable org authority, deliberately not
+/// disclosing WHICH term failed — unless ALL of:
+///
+/// - the ONE published authority aggregate carries both a gateway
+///   context set and a boundary set (a single load, so the pair is
+///   coherent by construction — never one member from before a
+///   replacement and one from after);
+/// - [`authorize_service_export`] accepts
+///   the binding against them, the node's CURRENT topology epoch,
+///   the CURRENT floor-registry auth epoch, and one wall-clock
+///   sample (authority match, epoch match, unexpired, exact declared
+///   boundary, exact `EXPORT` — no ancestor inheritance).
+///
+/// On success returns the facts + stamp for the §9.5 stability
+/// recheck.
+///
+/// [`authorize_service_export`]: super::subnet::VerifiedGatewayContextSet::authorize_service_export
+pub fn verify_subnet_export(
+    mesh: &MeshNode,
+    binding: &SubnetExportBinding,
+    clock: &ClockSample,
+) -> Result<SubnetExportFacts, AdmissionDenied> {
+    // ONE aggregate load; both snapshots come from the same immutable
+    // object.
+    let state = mesh.subnet_gateway_authority();
+    let gateway = state
+        .gateway
+        .as_deref()
+        .ok_or(AdmissionDenied::ProviderAuthorityUnavailable)?;
+    let boundaries = state
+        .boundaries
+        .as_deref()
+        .ok_or(AdmissionDenied::ProviderAuthorityUnavailable)?;
+    let topology_epoch = mesh.subnet_topology_epoch();
+    let subnet_auth_epoch = mesh
+        .subnet_floor_registry()
+        .auth_epoch(&binding.subnet().authority);
+    gateway
+        .authorize_service_export(
+            binding,
+            boundaries,
+            topology_epoch,
+            subnet_auth_epoch,
+            clock.wall_secs(),
+        )
+        .map_err(|_| AdmissionDenied::ProviderAuthorityUnavailable)?;
+    Ok(SubnetExportFacts {
+        aggregate_ptr: Arc::as_ptr(&state) as *const () as usize,
+        topology_epoch,
+        subnet_auth_epoch,
+        authority: binding.subnet().authority.clone(),
+        _aggregate: state,
+    })
+}
+
 /// The visibility of a registered capability (E1.1). Emission projects by
 /// visibility (Kyra OA3 ruling): `Public` → plaintext CAP-ANN; the two scoped
 /// forms → an encrypted `ScopedCapabilityAnnouncement` ONLY, never plaintext.
@@ -332,6 +440,11 @@ pub struct RegisteredRpcService {
     visibility: CapabilityVisibility,
     admission: OrgAdmission,
     provider_policy: OrgProviderPolicy,
+    /// The exact subnet crossing this service exports through
+    /// (SUBNET_AUTH_PLAN.md D7), captured immutably at registration.
+    /// `None` for every non-subnet-exported mode: those services are
+    /// org-protected but not bound to a gateway boundary.
+    subnet_export: Option<SubnetExportBinding>,
     /// Test-only (review-7 RED negative control): when set, the protected
     /// dispatch bypasses ONLY `verify_org_admission` for this registration. Never
     /// selectable from a production constructor; compiled out entirely without
@@ -364,6 +477,7 @@ impl RegisteredRpcService {
             visibility: CapabilityVisibility::Public,
             admission: OrgAdmission::PublicAuthenticated,
             provider_policy: Arc::new(|_| true),
+            subnet_export: None,
             #[cfg(test)]
             red_witness_disabled: false,
         }
@@ -389,6 +503,7 @@ impl RegisteredRpcService {
             visibility: CapabilityVisibility::Public,
             admission,
             provider_policy,
+            subnet_export: None,
             #[cfg(test)]
             red_witness_disabled: false,
         })
@@ -411,6 +526,7 @@ impl RegisteredRpcService {
             visibility: CapabilityVisibility::OwnerScoped,
             admission: OrgAdmission::OwnerDelegated,
             provider_policy,
+            subnet_export: None,
             #[cfg(test)]
             red_witness_disabled: false,
         }
@@ -435,9 +551,48 @@ impl RegisteredRpcService {
             visibility: CapabilityVisibility::GrantedAudience,
             admission: OrgAdmission::CrossOrgGranted,
             provider_policy,
+            subnet_export: None,
             #[cfg(test)]
             red_witness_disabled: false,
         }
+    }
+
+    /// A SUBNET-EXPORTED registration (SUBNET_AUTH_PLAN.md D7): an
+    /// org-protected service additionally bound to ONE exact declared
+    /// subnet crossing. `Public` discovery visibility like
+    /// [`Self::protected`] — subnet export is an independent
+    /// EXECUTION boundary, deliberately not a discovery mode — an
+    /// org-protected `admission`, an EXPLICIT `provider_policy`, and
+    /// the immutable [`SubnetExportBinding`]. Dispatch revalidates
+    /// the binding against live gateway/boundary/epoch state on
+    /// every call; registration-time validation only prevents a
+    /// service from starting in an impossible shape.
+    pub fn subnet_exported(
+        registration_id: u64,
+        service: Arc<str>,
+        admission: OrgAdmission,
+        export: SubnetExportBinding,
+        provider_policy: OrgProviderPolicy,
+    ) -> Result<Self, RegisteredServiceError> {
+        if matches!(admission, OrgAdmission::PublicAuthenticated) {
+            return Err(RegisteredServiceError::PublicAdmissionNotProtected);
+        }
+        Ok(Self {
+            registration_id,
+            service,
+            visibility: CapabilityVisibility::Public,
+            admission,
+            provider_policy,
+            subnet_export: Some(export),
+            #[cfg(test)]
+            red_witness_disabled: false,
+        })
+    }
+
+    /// The exact subnet crossing this service exports through, if the
+    /// registration is subnet-exported.
+    pub fn subnet_export(&self) -> Option<&SubnetExportBinding> {
+        self.subnet_export.as_ref()
     }
 
     /// Test-only (review-7 RED negative control): `true` iff this registration

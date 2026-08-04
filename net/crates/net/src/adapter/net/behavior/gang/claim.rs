@@ -12,9 +12,8 @@
 //! the others.
 
 use crate::adapter::net::behavior::fold::{
-    ApplyOutcome, EnvelopeMeta, Fold, FoldError, FoldKind, IslandId, JobId, NodeId,
-    ReservationAnnouncement, ReservationFold, ReservationQuery, ReservationState,
-    SignedAnnouncement, WireError,
+    holder_of, ApplyOutcome, EnvelopeMeta, Fold, FoldError, FoldKind, IslandId, JobId, NodeId,
+    ReservationAnnouncement, ReservationFold, ReservationState, SignedAnnouncement, WireError,
 };
 use crate::adapter::net::identity::EntityKeypair;
 
@@ -200,11 +199,9 @@ pub fn release_island(
     generation: u64,
     island: IslandId,
 ) -> Result<ClaimOutcome, ClaimError> {
-    let held_by_us = reservations
-        .query(ReservationQuery::State(island))
-        .first()
-        .and_then(|(_, state)| state.holder())
-        == Some(node_id);
+    // Borrowed holder read — same metered query, without the
+    // one-row `Vec` `ReservationQuery::State` allocates (§7).
+    let held_by_us = holder_of(reservations, island) == Some(node_id);
     if !held_by_us {
         return Ok(ClaimOutcome::Lost);
     }
@@ -400,6 +397,48 @@ mod tests {
         assert!(
             fold.query(ReservationQuery::State(0x99)).is_empty(),
             "no spurious Free entry for an island we never held",
+        );
+    }
+
+    /// PERF_AUDIT_2026_07_31_GANG_SCHEDULER §7 — the borrowed holder
+    /// read replaces a metered `query(ReservationQuery::State(..))`
+    /// call, so it must keep bumping the fold's query counter by
+    /// exactly one. Routing it through the unmetered
+    /// `Fold::with_state` would drop this traffic out of operational
+    /// telemetry — a silent regression, not an optimization.
+    ///
+    /// Both release paths are covered: the non-holder early return
+    /// (holder read only, no apply) and the holder path (holder read
+    /// plus apply, and `apply` must not add query counts).
+    #[test]
+    fn release_holder_read_preserves_the_query_count_it_replaced() {
+        let fold = new_reservations();
+        let kp = EntityKeypair::generate();
+        let node = kp.entity_id().node_id();
+
+        // Non-holder path: exactly one query, no state change.
+        let before = fold.metrics().queries();
+        assert_eq!(
+            release_island(&fold, &kp, node, 1, 0x99).unwrap(),
+            ClaimOutcome::Lost,
+        );
+        assert_eq!(
+            fold.metrics().queries() - before,
+            1,
+            "the non-holder release must cost exactly the one query it replaced",
+        );
+
+        // Holder path: still exactly one query (apply is not a query).
+        single_island_claim(&fold, &kp, node, 1, 0x10, fresh_deadline()).unwrap();
+        let before = fold.metrics().queries();
+        assert_eq!(
+            release_island(&fold, &kp, node, 2, 0x10).unwrap(),
+            ClaimOutcome::Won,
+        );
+        assert_eq!(
+            fold.metrics().queries() - before,
+            1,
+            "the holder release must cost exactly the one query it replaced",
         );
     }
 

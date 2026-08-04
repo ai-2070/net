@@ -2,11 +2,18 @@
 title: NAT and Traversal
 description: Most production deployments have nodes behind NATs — cloud VPCs with private subnets, residential connections, mobile networks, restricted corporate environments.
 ---
+
 # NAT and Traversal
 
-Most production deployments have nodes behind NATs — cloud VPCs with private subnets, residential connections, mobile networks, restricted corporate environments. Net's NAT-traversal layer makes the mesh work in those environments without the operator having to think about it: nodes probe their own connectivity, classify what kind of NAT they're sitting behind, and use the right combination of reflex, rendezvous, and (optionally) port mapping to reach peers.
+Most deployments include nodes behind NATs: cloud VPCs, residential connections,
+mobile networks, or restricted corporate environments. Net probes observed
+endpoints, classifies the local NAT, and can use rendezvous, hole punching, relay
+paths, or optional port mapping to establish a route.
 
-For the common cases — symmetric NATs, full-cone NATs, restricted-cone NATs — traversal is fully automatic. For the awkward cases — symmetric NATs talking to symmetric NATs, double NATs, ISPs with carrier-grade NAT — you might end up using a relay; the runtime makes the choice based on what it can probe and what it knows about each peer.
+The available path depends on both endpoints and the network between them. Some
+pairs establish a direct route after probing. Symmetric-to-symmetric, double-NAT,
+carrier-grade NAT, and UDP-restricted environments may require a reachable relay
+or may not establish a Net path at all.
 
 ## What's running
 
@@ -18,7 +25,9 @@ Three components do the work:
 
 **Rendezvous.** When two peers need to establish a connection and neither can be reached directly, they coordinate through a rendezvous peer — usually another node on the mesh that both can already reach. The rendezvous helps them simultaneously punch through their respective NATs; once the punch lands, the connection is direct and the rendezvous drops out.
 
-All three are part of the `nat-traversal` feature, which is on by default. You don't enable it; you don't configure it; it just works.
+All three are part of the `nat-traversal` feature, which is enabled by default.
+Deployments must still provide reachable bootstrap or rendezvous peers and allow
+the required UDP traffic.
 
 ## When it doesn't work
 
@@ -28,7 +37,9 @@ NAT traversal isn't magic. Some combinations don't work:
 - **Hostile firewalls.** Networks that drop UDP entirely (rare but real, especially in some corporate environments) won't talk to Net at all. The fix is either a different network or a tunnel that converts to TCP.
 - **Carrier-grade NAT with port exhaustion.** Some mobile networks throttle or close UDP ports aggressively. The runtime's failure detector picks up on this and reports it as a peer health issue.
 
-In the relay-fallback case, the path is encrypted end-to-end — the relay forwards the encrypted packets but can't decrypt them, since the session keys are negotiated between the two endpoints directly. Performance is worse than a direct path (it adds a hop), but correctness is unaffected.
+In the relay-fallback case, the relay forwards end-to-end encrypted packets. The
+extra hop adds latency and consumes relay capacity; applications should still
+apply their normal deadlines and failure handling.
 
 ## Port mapping (optional)
 
@@ -59,9 +70,14 @@ Independent of NAT traversal, every peer-to-peer session is monitored by a failu
 - **Suspect.** Recent missed heartbeats; the runtime starts trying alternative paths.
 - **Failed.** Sustained loss; peer is removed from active routing.
 
-Failed peers stay reachable through the mesh's other paths if any exist. The failure detector is per-direct-peer; if a node has two routes to a destination (direct + via a relay), losing one doesn't lose the destination. The routing layer fails over automatically.
+Another route may keep a destination reachable when one direct peer fails. If no
+eligible route remains, the destination becomes unavailable until topology
+recovers.
 
-The detector is conservative on purpose. It takes a few seconds of sustained loss before marking a peer as failed, because flapping failures cause more disruption than they prevent. If you have a workload that needs faster failure detection — sub-second recovery from a node going away — that's what standby groups and replica groups are for; they observe the failure independently and act on it.
+The detector waits for sustained loss before marking a peer failed to avoid
+flapping. Workloads with a shorter recovery objective need separately configured
+health checks, standby or replica state, and a measured promotion path; a group by
+itself does not make network failure detection instantaneous.
 
 ## What you'll see in practice
 
@@ -71,13 +87,15 @@ Operators interacting with NAT traversal mostly see it through four surfaces:
 - **The reflex metrics.** Reflex packet counts, classification results, and the distribution of NAT types across the mesh. Useful for understanding what kind of environment your deployment is sitting in.
 - **The rendezvous logs.** When a rendezvous happens, the runtime logs which peers were involved and which mediator was used. Frequent rendezvous through the same mediator can be a signal that the mediator is doing too much work — a hint to expand mesh capacity in a strategic place.
 - **The traversal stats.** Every binding exposes the same cumulative snapshot — `traversal_stats()` in Rust and Python, `traversalStats()` in Node, `TraversalStats()` in Go — with thirteen fields in three groups:
-  - *Punch outcomes*: `punches_attempted` (coordinator mediated an introduction), `punches_succeeded` (a direct session landed), `punches_failed` (derived: attempted − succeeded), and `relay_fallbacks` (resolutions that stayed on the routed path).
-  - *Failure causes*: `punch_timeouts` (a punch wait hit its deadline), `punch_rejections` (a coordinator refused with a typed reason — rate limit, unknown target, anti-reflection), and `rendezvous_no_relay` (no coordinator candidate existed). These count causes, including failures before a punch was ever mediated, so they aren't a partition of `punches_failed`.
-  - *Background activity*: `upgrades_attempted` / `upgrades_succeeded` / `upgrades_deferred_busy` for the direct-path upgrade, and `port_mapping_active` / `port_mapping_external` / `port_mapping_renewals` for port mapping.
+  - _Punch outcomes_: `punches_attempted` (coordinator mediated an introduction), `punches_succeeded` (a direct session landed), `punches_failed` (derived: attempted − succeeded), and `relay_fallbacks` (resolutions that stayed on the routed path).
+  - _Failure causes_: `punch_timeouts` (a punch wait hit its deadline), `punch_rejections` (a coordinator refused with a typed reason — rate limit, unknown target, anti-reflection), and `rendezvous_no_relay` (no coordinator candidate existed). These count causes, including failures before a punch was ever mediated, so they aren't a partition of `punches_failed`.
+  - _Background activity_: `upgrades_attempted` / `upgrades_succeeded` / `upgrades_deferred_busy` for the direct-path upgrade, and `port_mapping_active` / `port_mapping_external` / `port_mapping_renewals` for port mapping.
 
-  Base counters are monotonic and never reset; compute deltas between snapshots for rates. Two fields are exempt from delta math: `punches_failed` is derived at snapshot time (`attempted − succeeded`) and can *decrease* when an in-flight punch lands, and `port_mapping_renewals` resets to zero on each fresh mapping install — difference only the base counters. A high `punch_rejections` count points at coordinator-side policy (often rate limits); a high `punch_timeouts` count points at network geometry (symmetric NATs, dropped UDP); a growing `upgrades_deferred_busy` means long-lived busy sessions are staying on their relays by design.
+  Base counters are monotonic and never reset; compute deltas between snapshots for rates. Two fields are exempt from delta math: `punches_failed` is derived at snapshot time (`attempted − succeeded`) and can _decrease_ when an in-flight punch lands, and `port_mapping_renewals` resets to zero on each fresh mapping install — difference only the base counters. A high `punch_rejections` count points at coordinator-side policy (often rate limits); a high `punch_timeouts` count points at network geometry (symmetric NATs, dropped UDP); a growing `upgrades_deferred_busy` means long-lived busy sessions are staying on their relays by design.
 
-Application code typically doesn't see any of this. You ingest events, you publish, you consume — the mesh's job is to make those operations work regardless of network geometry. NAT traversal is the part of the runtime that earns its keep in the background.
+Application code usually sees path changes as latency, availability, or typed
+transport failures. Operators use these surfaces to determine whether traffic is
+direct, relayed, or unable to establish a path.
 
 ## What it doesn't replace
 
@@ -87,4 +105,5 @@ Two things the NAT-traversal layer is deliberately not:
 
 **It is not a substitute for network design.** A deployment that puts all its critical nodes behind symmetric NATs with no public connectivity will hit relay paths a lot, and relays add latency. For high-throughput, low-latency workloads, give at least some of the nodes public IPs or stable port mappings; the traversal layer is there for the realistic cases, not for an adversarial topology.
 
-Used the way it's meant to be used — in a mesh where most nodes are reachable directly and some require traversal help — the layer is invisible and the runtime just works. That's the goal.
+For latency-sensitive deployments, provide enough publicly reachable or stably
+mapped nodes that relay paths remain a fallback rather than the normal topology.

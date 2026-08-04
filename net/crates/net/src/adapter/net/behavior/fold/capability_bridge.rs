@@ -25,8 +25,8 @@
 //!   replacement for the legacy `find_nodes_scoped`.
 
 use super::super::capability::{
-    matches_scope, CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope,
-    GpuVendor, ScopeFilter,
+    CapabilityAnnouncement, CapabilityFilter as LegacyFilter, CapabilityScope, GpuVendor,
+    PreparedScope, ScopeFilter,
 };
 use super::super::org::OrgId;
 use super::super::org_revocation::OrgRevocationState;
@@ -759,11 +759,61 @@ impl std::fmt::Debug for CapabilitySetCache {
 /// - `target` must have an entry carrying `capability_tag`.
 /// - If `target`'s allow-lists are all empty, the call is
 ///   permitted (permissive default).
-/// - Otherwise the caller is admitted iff at least one populated
+/// - Otherwise the caller matches iff at least one populated
 ///   axis (node / subnet / group) matches. Caller's subnet and
 ///   groups are read from the caller's own fold entries via
-///   reserved `subnet:` / `group:` membership tags.
+///   `subnet:` / `group:` membership tags.
+///
+/// # This is a ROUTING predicate — it must never gate admission
+///
+/// S1 of SUBNET_AUTH_PLAN.md: the `allowed_subnets` /
+/// `allowed_groups` axes read self-declared tags off the caller's
+/// own announcement, and the target publishes both lists in a
+/// broadcast announcement that forwards up to `MAX_CAPABILITY_HOPS`
+/// — any peer that has seen one provider announcement learns the
+/// admitted values and can claim them with a single `add_tag`. A
+/// match on those axes is therefore only useful to *narrow*: the
+/// caller-side `candidates.retain(...)` path uses this predicate to
+/// skip providers it cannot match, which admits nothing. The
+/// callee-side admission gate is [`may_admit`], where the
+/// self-declared axes never produce an admit.
 pub fn may_execute(
+    fold: &Fold<CapabilityFold>,
+    target_node: NodeId,
+    capability_tag: &str,
+    caller_node: NodeId,
+) -> bool {
+    fold.with_state(|state| {
+        let (caller_subnet, caller_groups) = derive_caller_axes(state, caller_node);
+        may_execute_with_caller(
+            state,
+            target_node,
+            capability_tag,
+            caller_node,
+            caller_subnet.as_ref(),
+            &caller_groups,
+        )
+    })
+}
+
+/// Callee-side admission gate (S1 of SUBNET_AUTH_PLAN.md).
+///
+/// Admits iff the target carries `capability_tag` AND either every
+/// allow-list is empty (permissive default) or `allowed_nodes`
+/// contains the caller. `ann.node_id` is blake2s-bound to
+/// `entity_id` at dispatch, so a peer cannot present another node's
+/// identity — that is the one load-bearing axis.
+///
+/// The self-declared `allowed_subnets` / `allowed_groups` axes never
+/// admit here: their values are publicly disclosed by the provider's
+/// own broadcast and claimable by any observer with one `add_tag`.
+/// A capability restricted by those axes alone denies every caller.
+/// Real membership admission is org/provider admission
+/// (`verify_org_admission`) or, for transport, a `SubnetGrant`.
+///
+/// [`may_execute`] keeps matching the self-declared axes for
+/// caller-side narrowing, which admits nothing.
+pub fn may_admit(
     fold: &Fold<CapabilityFold>,
     target_node: NodeId,
     capability_tag: &str,
@@ -775,8 +825,7 @@ pub fn may_execute(
         };
         let mut target_carries_tag = false;
         let mut allowed_nodes: Vec<u64> = Vec::new();
-        let mut allowed_subnets: Vec<super::super::subnet::SubnetId> = Vec::new();
-        let mut allowed_groups: Vec<super::super::group::GroupId> = Vec::new();
+        let mut restricted_by_demoted_axis = false;
         for k in keys {
             let Some(entry) = state.entries.get(k) else {
                 continue;
@@ -785,49 +834,16 @@ pub fn may_execute(
                 target_carries_tag = true;
             }
             allowed_nodes.extend(entry.payload.allowed_nodes.iter().copied());
-            allowed_subnets.extend(entry.payload.allowed_subnets.iter().copied());
-            allowed_groups.extend(entry.payload.allowed_groups.iter().cloned());
+            restricted_by_demoted_axis |= !entry.payload.allowed_subnets.is_empty()
+                || !entry.payload.allowed_groups.is_empty();
         }
         if !target_carries_tag {
             return false;
         }
-        if allowed_nodes.is_empty() && allowed_subnets.is_empty() && allowed_groups.is_empty() {
+        if allowed_nodes.is_empty() && !restricted_by_demoted_axis {
             return true;
         }
-        if allowed_nodes.contains(&caller_node) {
-            return true;
-        }
-        if !allowed_subnets.is_empty() || !allowed_groups.is_empty() {
-            let Some(caller_keys) = state.by_node.get(&caller_node) else {
-                return false;
-            };
-            let mut caller_subnet: Option<super::super::subnet::SubnetId> = None;
-            let mut caller_groups: Vec<super::super::group::GroupId> = Vec::new();
-            for k in caller_keys {
-                let Some(entry) = state.entries.get(k) else {
-                    continue;
-                };
-                for raw in &entry.payload.tags {
-                    if let Some(subnet) = super::super::subnet::SubnetId::from_tag(raw) {
-                        caller_subnet = Some(subnet);
-                    }
-                    if let Some(group) = super::super::group::GroupId::from_tag(raw) {
-                        caller_groups.push(group);
-                    }
-                }
-            }
-            if let Some(subnet) = caller_subnet {
-                if allowed_subnets.contains(&subnet) {
-                    return true;
-                }
-            }
-            for g in &caller_groups {
-                if allowed_groups.contains(g) {
-                    return true;
-                }
-            }
-        }
-        false
+        allowed_nodes.contains(&caller_node)
     })
 }
 
@@ -919,6 +935,18 @@ pub fn may_execute_batch(
 /// fold's `by_node` reverse index. `subnet:<hex>` / `group:<hex>`
 /// tags are mapped through `SubnetId::from_tag` / `GroupId::from_tag`.
 /// Returns `(None, Vec::new())` for an unknown caller.
+///
+/// The substrate treats subnet membership as single-valued, so
+/// multiple *distinct* `subnet:` tags are out-of-model malformed
+/// input and collapse to `None` (no membership). This keeps the
+/// verdict deterministic across receivers: the pre-S1 implementation
+/// kept whichever tag the entry walk surfaced last, which is
+/// wire-order dependent — two receivers holding the same signed
+/// announcement could disagree. Distinct `group:` tags accumulate,
+/// deduplicated and sorted by byte value so iteration order agrees
+/// everywhere. (This is the rule the retired
+/// `parse_membership_tags` in `behavior/capability.rs` documented;
+/// this is now its single live home.)
 fn derive_caller_axes(
     state: &super::state::FoldState<CapabilityFold>,
     caller_node: NodeId,
@@ -929,7 +957,7 @@ fn derive_caller_axes(
     let Some(caller_keys) = state.by_node.get(&caller_node) else {
         return (None, Vec::new());
     };
-    let mut caller_subnet = None;
+    let mut subnet_candidates: Vec<super::super::subnet::SubnetId> = Vec::new();
     let mut caller_groups: Vec<super::super::group::GroupId> = Vec::new();
     for k in caller_keys {
         let Some(entry) = state.entries.get(k) else {
@@ -937,13 +965,24 @@ fn derive_caller_axes(
         };
         for raw in &entry.payload.tags {
             if let Some(subnet) = super::super::subnet::SubnetId::from_tag(raw) {
-                caller_subnet = Some(subnet);
+                if !subnet_candidates.contains(&subnet) {
+                    subnet_candidates.push(subnet);
+                }
+                continue;
             }
             if let Some(group) = super::super::group::GroupId::from_tag(raw) {
-                caller_groups.push(group);
+                if !caller_groups.contains(&group) {
+                    caller_groups.push(group);
+                }
             }
         }
     }
+    let caller_subnet = if subnet_candidates.len() == 1 {
+        Some(subnet_candidates[0])
+    } else {
+        None
+    };
+    caller_groups.sort_by_key(|g| g.0);
     (caller_subnet, caller_groups)
 }
 
@@ -1206,6 +1245,19 @@ pub fn target_matches_filter(
 /// `pub(crate)` because [`CapabilityScope`] is itself
 /// `pub(crate)`; downstream callers reach scope filtering
 /// through [`find_nodes_matching_scoped`].
+///
+/// No longer on the query path — that now runs
+/// [`PreparedScope::matches`](super::super::capability::PreparedScope::matches),
+/// which reaches the same verdict without allocating a `String` per
+/// scope tag while the fold's read locks are held. (The
+/// `tags_match_scope` wrapper is NOT the query path: it rebuilds the
+/// prepared selector sets per call, so it allocates for the `Tenants` /
+/// `Regions` forms and is for tests and single-shot callers.)
+///
+/// Retained as the readable reference definition and as the oracle for
+/// `tags_match_scope_agrees_with_materialized_scope`, which pins the
+/// two to identical verdicts across the scope matrix.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn scope_from_membership_tags(tags: &[String]) -> CapabilityScope {
     let mut tenants: Vec<String> = Vec::new();
     let mut regions: Vec<String> = Vec::new();
@@ -1274,35 +1326,74 @@ pub fn filter_by_predicate(
 /// Scoped variant of [`find_nodes_matching`]. Filters
 /// candidates through `scope` (resolved from each
 /// publisher's `scope:*` tags) on top of the capability
-/// filter. `same_subnet_lookup(node_id) -> bool` is supplied
+/// filter. `same_subnet_lookup(node_id, tags) -> bool` is supplied
 /// by the caller; the bridge has no native subnet state.
 ///
-/// **Warm-up semantics** match the legacy path: when the
-/// caller's subnet membership is unknown for a candidate, the
-/// caller's closure decides whether to admit (typically
-/// `true` once a subnet policy is installed, `false`
-/// otherwise).
+/// `same_subnet_lookup(node_id, tags)` is invoked ONLY under a
+/// [`ScopeFilter::SameSubnet`] query, where every arm of the scope
+/// decision reduces to `same_subnet` and the candidate's own tags cannot
+/// change the verdict. Under every other filter the verdict is fully
+/// determined from the tags — including for a `scope:subnet-local`
+/// candidate, which those filters reject outright — so the closure is
+/// never reached. It used to run eagerly for every candidate of every
+/// scoped query even though the result was then discarded.
+///
+/// # Single snapshot
+///
+/// The closure receives the candidate's tags BORROWED FROM THE SAME
+/// fold snapshot that selected it, and runs while that snapshot's locks
+/// are held. That is deliberate: the previous shape passed only a
+/// `NodeId`, so a `MeshNode` resolving a forwarded peer had to reacquire
+/// the fold after the selection locks dropped — two observations, which
+/// a concurrent replacement between them could combine into a result
+/// that never existed in any single fold state (matched on the old
+/// entry's capabilities, judged on the new entry's subnet).
+///
+/// The closure must therefore be PURE with respect to the fold: it may
+/// read caller-side state, but must not query the fold, or it will
+/// deadlock or re-enter. Deriving a subnet from the borrowed tags needs
+/// no fold access, so this costs nothing.
 pub fn find_nodes_matching_scoped(
     fold: &Fold<CapabilityFold>,
     legacy: &LegacyFilter,
     scope: &ScopeFilter<'_>,
-    same_subnet_lookup: impl Fn(NodeId) -> bool,
+    same_subnet_lookup: impl Fn(NodeId, &[String]) -> bool,
 ) -> Vec<NodeId> {
     let fold_filter = translate_filter(legacy);
     // Borrow-and-filter, same as `find_nodes_matching`: resolve
     // candidate keys via the index and run the range post-filter
-    // against borrowed payloads without cloning. We derive each
-    // survivor's scope here too (cheap, just parses the borrowed
-    // tags), but we do NOT call `same_subnet_lookup` under the
-    // lock — it's a caller-supplied closure opaque to the bridge,
-    // so running it while we hold the fold read locks risks lock
-    // contention or re-entrancy (a closure that itself queries the
-    // fold). Collect `(node, scope)` and apply the subnet/scope
-    // gate after the locks drop.
-    let scoped: Vec<(NodeId, CapabilityScope)> = fold.with_state_and_index(|state, index| {
+    // against borrowed payloads without cloning.
+    //
+    // The scope decision runs here too, but through
+    // `PreparedScope::matches`, which streams the borrowed tag strings
+    // without materializing a `CapabilityScope`. The materializing
+    // form allocated a `String` per scope tag plus a `Vec` per
+    // candidate, per query, while these read locks were held — cost an
+    // announcer controls, paid by every peer on every scoped query.
+    // Note this is `matches` on the ALREADY-prepared filter, not the
+    // `tags_match_scope` wrapper — that one rebuilds the selector sets
+    // per call and would reintroduce an allocation inside the locks.
+    //
+    // `same_subnet_lookup` runs INSIDE the same snapshot, against the
+    // borrowed tags of the entry that was just selected — see the
+    // "Single snapshot" note above for why the two observations must
+    // not be split. It is fold-pure by contract, so there is no
+    // re-entrancy hazard.
+    //
+    // Under `ScopeFilter::SameSubnet` every arm of the scope decision
+    // reduces to `same_subnet`, so the tags are not consulted for scope
+    // at all and the subnet closure alone decides. Under every other
+    // filter the verdict comes entirely from the tags and the closure
+    // is never called.
+    let subnet_decides = matches!(scope, ScopeFilter::SameSubnet);
+    // Hoist the filter's selector lists into hash sets BEFORE taking the
+    // locks. Inside, each selector test is then O(1) rather than a scan
+    // of the caller's list per matching scope tag per candidate.
+    let prepared = PreparedScope::new(scope);
+    let mut out: Vec<NodeId> = fold.with_state_and_index(|state, index| {
         let candidates = resolve_candidate_keys(state, index, &fold_filter);
         let candidates = candidates.as_set();
-        let mut acc: Vec<(NodeId, CapabilityScope)> = Vec::with_capacity(candidates.len());
+        let mut acc: Vec<NodeId> = Vec::with_capacity(candidates.len());
         for &key in candidates {
             let Some(entry) = state.entries.get(&key) else {
                 continue;
@@ -1313,19 +1404,19 @@ pub fn find_nodes_matching_scoped(
             if !membership_passes_range_filter(membership, legacy) {
                 continue;
             }
-            acc.push((key.1, scope_from_membership_tags(&membership.tags)));
+            let admitted = if subnet_decides {
+                same_subnet_lookup(key.1, &membership.tags)
+            } else {
+                // `same_subnet` is unread on every arm reachable here,
+                // so the placeholder never affects the verdict.
+                prepared.matches(&membership.tags, false)
+            };
+            if admitted {
+                acc.push(key.1);
+            }
         }
         acc
     });
-    // Locks released: apply the scope gate, invoking the caller's
-    // subnet closure outside any fold lock.
-    let mut out: Vec<NodeId> = scoped
-        .into_iter()
-        .filter(|(node_id, candidate_scope)| {
-            matches_scope(candidate_scope, scope, same_subnet_lookup(*node_id))
-        })
-        .map(|(node_id, _)| node_id)
-        .collect();
     // Sort + dedup: deterministic order and one entry per publisher
     // (a publisher may match under multiple classes).
     out.sort_unstable();
@@ -1950,12 +2041,57 @@ mod tests {
         let mut legacy = LegacyFilter::default();
         legacy.require_tags.push("gpu".into());
 
-        // SameSubnet lookup says BB is co-resident, AA isn't.
-        let lookup = |nid: NodeId| nid == 0xBB;
+        // SameSubnet lookup says BB is co-resident, AA isn't. The
+        // closure now also receives the candidate's tags, borrowed from
+        // the same snapshot that selected it.
+        let lookup = |nid: NodeId, _tags: &[String]| nid == 0xBB;
         let mut nodes =
             find_nodes_matching_scoped(&fold, &legacy, &ScopeFilter::SameSubnet, lookup);
         nodes.sort();
         assert_eq!(nodes, vec![0xBB]);
+    }
+
+    /// The closure sees the tags of the entry that was selected in the
+    /// SAME snapshot. Pre-fix it received only a `NodeId` and the
+    /// `MeshNode` implementation reacquired the fold to look the tags
+    /// up, so a concurrent replacement between the two reads could
+    /// produce a result that matched one announcement's capabilities
+    /// while being judged against its replacement's subnet
+    /// (SECURITY_AUDIT_2026_07_31_SCOPED_CAPABILITIES.md).
+    #[test]
+    fn scoped_subnet_lookup_sees_the_selected_entry_tags() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        fold.apply(sign_member(
+            &kp,
+            0xCC,
+            0x100,
+            vec!["gpu", "region:eu"],
+            None,
+        ))
+        .expect("apply CC");
+
+        let mut legacy = LegacyFilter::default();
+        legacy.require_tags.push("gpu".into());
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let nodes =
+            find_nodes_matching_scoped(&fold, &legacy, &ScopeFilter::SameSubnet, |nid, tags| {
+                seen.borrow_mut().push((nid, tags.to_vec()));
+                // Admit on a tag the closure could only know by having
+                // been handed the selected entry's payload.
+                tags.iter().any(|t| t == "region:eu")
+            });
+
+        assert_eq!(nodes, vec![0xCC]);
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), 1, "closure must run once per candidate");
+        assert_eq!(seen[0].0, 0xCC);
+        assert!(
+            seen[0].1.iter().any(|t| t == "region:eu"),
+            "closure must receive the selected entry's tags; got {:?}",
+            seen[0].1
+        );
     }
 
     /// PERF_AUDIT §4.1 — cache hits return the SAME `Arc` instance
@@ -2360,6 +2496,174 @@ mod tests {
             vec![true, true, false],
             "subnet-allowed admits, group-allowed admits, foreign subnet denies"
         );
+    }
+
+    /// S1 (SUBNET_AUTH_PLAN.md): `may_admit` is the callee-side gate
+    /// and the self-declared subnet/group axes never admit there,
+    /// while `may_execute` keeps matching them for caller-side
+    /// narrowing. Same fold, same caller, deliberately divergent
+    /// verdicts — that divergence IS the fix, so it is pinned
+    /// directly rather than inferred from an integration test.
+    #[test]
+    fn may_admit_denies_what_may_execute_narrows_to() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let caller: NodeId = 0xCA;
+        let by_subnet: NodeId = 0xA1;
+        let by_group: NodeId = 0xA2;
+        let by_node: NodeId = 0xA4;
+        let open: NodeId = 0xA5;
+
+        let caller_subnet =
+            super::super::super::subnet::SubnetId::from_tag(&format!("subnet:{}", "11".repeat(16)))
+                .expect("parse caller subnet tag");
+        let caller_group =
+            super::super::super::group::GroupId::from_tag(&format!("group:{}", "33".repeat(32)))
+                .expect("parse caller group tag");
+
+        let caller_subnet_tag = caller_subnet.to_tag();
+        let caller_group_tag = caller_group.to_tag();
+        fold.apply(sign_member(
+            &kp,
+            caller,
+            0x100,
+            vec![caller_subnet_tag.as_str(), caller_group_tag.as_str()],
+            None,
+        ))
+        .expect("caller apply");
+
+        let restricted =
+            |node: NodeId,
+             nodes: Vec<u64>,
+             subnets: Vec<super::super::super::subnet::SubnetId>,
+             groups: Vec<super::super::super::group::GroupId>| {
+                SignedAnnouncement::sign(
+                    &kp,
+                    super::super::capability::CapabilityFold::KIND_ID,
+                    0x100,
+                    node,
+                    1,
+                    EnvelopeMeta::default(),
+                    CapabilityMembership {
+                        class_hash: 0x100,
+                        tags: vec!["nrpc:echo".into()],
+                        hardware: None,
+                        state: NodeState::Idle,
+                        region: None,
+                        price_quote: None,
+                        reflex_addr: None,
+                        allowed_nodes: nodes,
+                        allowed_subnets: subnets,
+                        allowed_groups: groups,
+                        metadata: std::collections::BTreeMap::new(),
+                        owner: None,
+                    },
+                )
+                .expect("sign restricted")
+            };
+        fold.apply(restricted(
+            by_subnet,
+            Vec::new(),
+            vec![caller_subnet],
+            Vec::new(),
+        ))
+        .expect("by_subnet apply");
+        fold.apply(restricted(
+            by_group,
+            Vec::new(),
+            Vec::new(),
+            vec![caller_group],
+        ))
+        .expect("by_group apply");
+        fold.apply(restricted(by_node, vec![caller], Vec::new(), Vec::new()))
+            .expect("by_node apply");
+        fold.apply(restricted(open, Vec::new(), Vec::new(), Vec::new()))
+            .expect("open apply");
+
+        // Routing predicate: the demoted axes still narrow.
+        assert!(may_execute(&fold, by_subnet, "nrpc:echo", caller));
+        assert!(may_execute(&fold, by_group, "nrpc:echo", caller));
+
+        // Admission gate: they do not admit.
+        assert!(
+            !may_admit(&fold, by_subnet, "nrpc:echo", caller),
+            "self-declared subnet membership must not admit",
+        );
+        assert!(
+            !may_admit(&fold, by_group, "nrpc:echo", caller),
+            "self-declared group membership must not admit",
+        );
+
+        // The load-bearing axis and the permissive default are intact.
+        assert!(may_admit(&fold, by_node, "nrpc:echo", caller));
+        assert!(may_admit(&fold, open, "nrpc:echo", caller));
+
+        // Unknown target / absent tag deny.
+        assert!(!may_admit(&fold, 0xDEAD, "nrpc:echo", caller));
+        assert!(!may_admit(&fold, by_node, "nrpc:other", caller));
+    }
+
+    /// S1: two distinct `subnet:` tags on one caller collapse to "no
+    /// membership" rather than the pre-S1 last-wins walk, so the
+    /// verdict cannot depend on entry/tag order. Both declared
+    /// subnets are in the target's allow-list, so last-wins would
+    /// have narrowed to `true` either way — the deterministic rule
+    /// yields `false`.
+    #[test]
+    fn multiple_subnet_tags_collapse_to_no_membership() {
+        let fold = new_fold();
+        let kp = EntityKeypair::generate();
+        let caller: NodeId = 0xCB;
+        let target: NodeId = 0xA6;
+
+        let s1 =
+            super::super::super::subnet::SubnetId::from_tag(&format!("subnet:{}", "aa".repeat(16)))
+                .expect("parse s1");
+        let s2 =
+            super::super::super::subnet::SubnetId::from_tag(&format!("subnet:{}", "bb".repeat(16)))
+                .expect("parse s2");
+        let (t1, t2) = (s1.to_tag(), s2.to_tag());
+        fold.apply(sign_member(
+            &kp,
+            caller,
+            0x100,
+            vec![t1.as_str(), t2.as_str()],
+            None,
+        ))
+        .expect("caller apply");
+
+        fold.apply(
+            SignedAnnouncement::sign(
+                &kp,
+                super::super::capability::CapabilityFold::KIND_ID,
+                0x100,
+                target,
+                1,
+                EnvelopeMeta::default(),
+                CapabilityMembership {
+                    class_hash: 0x100,
+                    tags: vec!["nrpc:echo".into()],
+                    hardware: None,
+                    state: NodeState::Idle,
+                    region: None,
+                    price_quote: None,
+                    reflex_addr: None,
+                    allowed_nodes: Vec::new(),
+                    allowed_subnets: vec![s1, s2],
+                    allowed_groups: Vec::new(),
+                    metadata: std::collections::BTreeMap::new(),
+                    owner: None,
+                },
+            )
+            .expect("sign target"),
+        )
+        .expect("target apply");
+
+        assert!(
+            !may_execute(&fold, target, "nrpc:echo", caller),
+            "multiple distinct subnet tags contribute no membership",
+        );
+        assert!(!may_admit(&fold, target, "nrpc:echo", caller));
     }
 
     // ------------- OA-1: owner-cert ingest verification -------------

@@ -1,20 +1,23 @@
 ---
 title: Errors
-description: Failure is a typed outcome you can branch on, never a silence — and only backpressure is safe to retry blindly.
+description: Branch on typed failure, distinguish ambiguous execution, and retry only when the capability contract permits it.
 boundary: /docs/sdk/c/errors
 boundaryLabel: C — return codes and the NET_ERR_ table
 ---
+
 # Errors and Recovery
 
 Failure is a typed outcome, not a silence. Every binding gives you enough
 structure to decide, per failure, whether to retry, reroute, or stop — and the
 rule underneath all of them is the same.
 
-> **Only backpressure is safe to retry blindly.**
+> **Retry only when the typed result and capability contract make another attempt
+> safe.**
 
-Everything else needs a reason. Retrying a serialization failure reruns the bug.
-Retrying a denial re-asks a question already answered. Retrying a deadline may run
-the work twice.
+A pre-execution backpressure result can permit a delayed retry when it establishes
+that the provider did not admit the work. Retrying a serialization failure reruns
+the bug. Retrying a denial re-asks a question already answered. Retrying a deadline
+may run the work twice.
 
 ## The five things a caller has to be able to witness
 
@@ -24,8 +27,9 @@ demonstrates the ones its binding exposes.
 
 **1. An unauthorized invocation is denied.** The caller gets a distinct, typed
 refusal — not a timeout, not a generic internal error. Your code must be able to
-tell *you may not* from *nobody answered*, because the correct response differs:
-one needs a credential, the other needs a retry.
+tell _you may not_ from _nobody answered_, because the correct response differs:
+one may need a credential, while the other requires a routing, availability, or
+deadline decision.
 
 **2. A grant expires or is revoked, and the next call stops working.** Authority is
 checked at call time against the authenticated caller origin. There is no cached
@@ -37,7 +41,7 @@ one.
 whether the work ran. See below.
 
 **4. A typed remote error crosses the binding boundary.** A handler that fails with
-a status and a body delivers *that* status and body to the caller, in the caller's
+a status and a body delivers _that_ status and body to the caller, in the caller's
 language, rather than a stringified exception. A handler that fails with an
 untyped error delivers `Internal` — which is a decision the handler author made,
 usually without noticing.
@@ -68,7 +72,7 @@ the second timeout the same way. That is how one intended effect becomes three.
 All four bindings offer the same three strategies over a raw call, and they solve
 different problems:
 
-- **Retry** — bounded attempts with backoff, on *retryable* failures only. Fixes a
+- **Retry** — bounded attempts with backoff, on _retryable_ failures only. Fixes a
   transient.
 - **Hedge** — race several providers when latency matters more than duplicate
   work. Costs duplicate execution by design.
@@ -89,5 +93,5 @@ wire-level codes every binding's taxonomy wraps are in
 > Retry backpressure, and a transient no-route briefly. Treat serialization and
 > config failures as bugs. Treat authorization failures as "get a new credential,"
 > never as "try again." Treat shutdown, not-connected and closed streams as state
-> changes that retrying will not undo. And treat a deadline as *unknown*, not as
+> changes that retrying will not undo. And treat a deadline as _unknown_, not as
 > failure.

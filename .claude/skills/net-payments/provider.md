@@ -24,6 +24,7 @@ let registry = default_registry_v1(provider.entity_id().clone());
 
 let engine = PaymentEngine::new(provider.clone(), facilitator, admission, registry, state_path)?
     .with_expiry_tolerance_ns(2_000_000_000)          // bounded clock tolerance on quote expiry (default 0)
+    .with_terminal_record_retention_ns(None)          // keep terminal records forever (default: Some(6h))
     .with_billing_log(Arc::new(BillingLog::new(billing_path)));  // optional stream/export sink
 ```
 
@@ -31,6 +32,41 @@ let engine = PaymentEngine::new(provider.clone(), facilitator, admission, regist
 per-quote records, and consumed transactions. Use
 `policy::store::default_payment_engine_path()` for the standard location
 (`<local data>/net-mesh/payment-engine.json`).
+
+### Terminal-record compaction (default-on, 6h)
+
+Every engine operation parses the whole store and rewrites it when dirty, so
+store size is a latency term on every payment. The engine therefore **retires
+terminal quote records 6 hours past authoritative quote expiry**
+(`DEFAULT_TERMINAL_RECORD_RETENTION_NS`), sweeping opportunistically inside
+`accept_payment`'s claim transaction. `prune_terminal_records(now_ns)` runs the
+same sweep on demand, for a provider that stops accepting but keeps redeeming.
+
+- `Some(longer)` — a wider local re-verification / forensic window;
+- `None` — keep terminal records indefinitely;
+- `Some(0)` — **refused**, normalized to the default and logged. Zero reads as
+  "off" but would mean compaction the instant a quote expires; `None` is off.
+
+**What is never compacted**, at any setting: settlement-transaction tombstones
+(the permanent uniqueness index — expiring those means one payment serves
+twice); records paid but never redeemed; frozen records, including one frozen
+*after* redemption by a checker finding the settlement reverted; and legacy
+records carrying no authoritative expiry.
+
+Two consequences worth knowing before you rely on the engine store:
+
+- **`status()` is not an audit surface.** It returns `None` for a completed
+  quote past the horizon. The durable record of a payment is the `BillingLog`
+  (`billing.md`); the quote record is engine bookkeeping.
+- **The horizon is your re-verification window.** Prunability does not consult
+  the verified tier, so a record served at `observed` retires on the same clock
+  as one a checker drove to `final`. If you re-verify out of band, on a slower
+  rail, or at a raised `FINAL_DEPTH_*`, widen the window past your own
+  re-verification period or pass `None`.
+
+Compaction bounds the *redeemed* population only. If the store keeps growing,
+it is the never-redeemed and frozen classes; the engine warns once as it
+crosses `ENGINE_STORE_SIZE_WARN_RECORDS` (10 000).
 
 `PaymentEngine::new(provider, facilitator, admission, registry, state_path)`
 takes `Arc<EntityKeypair>`, `Arc<dyn Facilitator>`, `Arc<dyn
@@ -147,6 +183,9 @@ let status: Option<QuoteStatus> = engine.status(quote_id).await?;
 // QuoteStatus { frozen: Option<String>, served: bool, tier: Option<VerificationTier>,
 //               billing_event_id: Option<String>, chain: Vec<VerificationEvent> }
 ```
+
+The `None` is **live lifecycle, not "never paid"** — a compacted quote reads the
+same as an unknown one. Don't branch on it for reconciliation.
 
 Billing: `BillingLog::subscribe()` (a `tokio::sync::broadcast::Receiver<BillingEvent>`),
 `read_all()`, `export_jsonl(dest)`. See `billing.md`.

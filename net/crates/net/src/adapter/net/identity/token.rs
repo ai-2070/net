@@ -344,6 +344,37 @@ impl PermissionToken {
     /// the signature can never change, but expiry must be re-evaluated
     /// against the current clock on every use.
     fn check_time_bounds(&self, skew_secs: u64) -> Result<(), TokenError> {
+        // Validity-WINDOW width, enforced on receipt.
+        //
+        // `try_issue` bounds `duration_secs` at [`MAX_TOKEN_TTL_SECS`],
+        // but that bound never travelled with the token: `from_bytes`
+        // reads `not_before` / `not_after` as opaque `u64`s with no
+        // relational check, and verification only asked whether the
+        // token is currently INSIDE its window — never how wide that
+        // window is. So a compromised root, a rolled-back build, or any
+        // alternate implementation could sign a century-long credential
+        // and every receiver accepted it, while the constant's rustdoc
+        // claimed it capped the blast radius of a leaked token. The cap
+        // only meant anything for tokens this process minted for itself.
+        //
+        // Checked here rather than in `TokenChain::verify_inner` because
+        // this is the common seam: `is_valid` → `is_valid_with_skew` →
+        // here, and the presigned chain path calls this directly. A
+        // check in `verify_inner` would have closed channel-auth chain
+        // verification only, leaving `TokenCache::check`,
+        // `get_for_action`, and the FFI/UI validity surfaces still
+        // accepting an overlong remote token.
+        //
+        // Note `is_expired` deliberately does NOT route through here —
+        // it is documented as a pure wall-clock check and stays one.
+        //
+        // Ordered AFTER the wall-clock bounds below, deliberately. A
+        // token that is simply expired must report `Expired` whatever
+        // its width — that is the specific, actionable answer, and
+        // `is_valid` / `is_expired` are required to agree at the
+        // `not_after` boundary. Width is the interesting question only
+        // for a token that is currently live, which is exactly the one
+        // this check exists to reject.
         let now = current_timestamp();
         // Lower bound: accept tokens whose `not_before` is up to
         // `skew_secs` in our future. `saturating_sub` pins the
@@ -359,6 +390,18 @@ impl PermissionToken {
         // u64::MAX (issuer-saturated TTL stays forever-valid).
         if now >= self.not_after.saturating_add(skew_secs) {
             return Err(TokenError::Expired);
+        }
+        // The token is live. Now bound how long it is live FOR.
+        //
+        // `saturating_sub`, not `checked_sub`: an inverted window
+        // (`not_after < not_before`) saturates to 0 and passes here,
+        // which is right. This check exists to reject windows that are
+        // too WIDE; an inverted one is strictly narrower than any valid
+        // window and is already handled by the wall-clock bounds above,
+        // so treating it as a distinct malformation would only change
+        // the error other callers see without closing anything.
+        if self.not_after.saturating_sub(self.not_before) > MAX_TOKEN_TTL_SECS {
+            return Err(TokenError::TtlTooLong);
         }
         Ok(())
     }
@@ -885,18 +928,42 @@ pub const TOKEN_CLOCK_SKEW_SECS_RECOMMENDED: u64 = 60;
 
 /// Hard upper bound on a freshly-issued token's TTL (1 year).
 ///
-/// `try_issue` rejects any `duration_secs` above this with
-/// [`TokenError::TtlTooLong`]. Without a cap a caller could mint a
-/// token with `duration_secs == u64::MAX`, whose `not_after`
-/// saturates and never expires — and since revocation is only the
-/// advisory per-issuer `RevocationRegistry` floor, a leaked
-/// never-expiring credential is effectively impossible to retire on a
-/// node that hasn't learned to bump the floor. Bounding the issuance
-/// window forces long-lived grants to be periodically re-issued (which
-/// re-checks the issuer's signing key and current policy) and caps the
-/// blast radius of any single leaked token. Delegation only ever
-/// narrows expiry (`delegate` copies the parent's `not_after`), so the
-/// chain stays within this bound transitively.
+/// Enforced in **both** directions:
+///
+/// - `try_issue` rejects any `duration_secs` above this with
+///   [`TokenError::TtlTooLong`];
+/// - `check_time_bounds` — the common seam behind
+///   [`PermissionToken::is_valid`], [`PermissionToken::is_valid_with_skew`],
+///   [`TokenCache::check`], [`TokenCache::get_for_action`], and both
+///   [`TokenChain`] verify paths — rejects any *live* token whose
+///   `not_after - not_before` exceeds it, whoever minted it.
+///
+/// The receive-side half is the load-bearing one. Issuance-only
+/// enforcement never travelled with the token: `from_bytes` reads the
+/// timestamps as opaque `u64`s, and verification only asked whether a
+/// token was currently inside its window, never how wide that window
+/// was. A compromised root, a rolled-back build, or any alternate
+/// implementation could therefore sign a century-long credential that
+/// every receiver honoured — so the cap meant nothing for exactly the
+/// tokens it was supposed to bound.
+///
+/// Without a cap a caller could mint a token with
+/// `duration_secs == u64::MAX`, whose `not_after` saturates and never
+/// expires — and since revocation is only the advisory per-issuer
+/// `RevocationRegistry` floor, a leaked never-expiring credential is
+/// effectively impossible to retire on a node that hasn't learned to
+/// bump the floor. Bounding the window forces long-lived grants to be
+/// periodically re-issued (which re-checks the issuer's signing key and
+/// current policy) and caps the blast radius of any single leaked
+/// token. Delegation only ever narrows expiry (`delegate` copies the
+/// parent's `not_after`), so the chain stays within this bound
+/// transitively.
+///
+/// A token that is merely *expired* still reports
+/// [`TokenError::Expired`] rather than `TtlTooLong` — the wall-clock
+/// bounds are evaluated first, so the more specific answer wins and
+/// `is_valid` / `is_expired` continue to agree at the `not_after`
+/// boundary.
 pub const MAX_TOKEN_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 
 /// Hard upper bound on [`TokenCache`] clock-skew tolerance (5
@@ -2789,6 +2856,153 @@ mod tests {
             ),
             Err(TokenError::Revoked)
         ));
+    }
+
+    /// M3 (2026-07-31 audit): the TTL ceiling must hold on RECEIPT, not
+    /// only at issuance.
+    ///
+    /// `try_issue` refuses an overlong `duration_secs`, but that bound
+    /// never travelled with the token — `from_bytes` reads the
+    /// timestamps as opaque `u64`s and verification only asked whether
+    /// the token was currently inside its window. So a compromised
+    /// root, a rolled-back build, or any alternate implementation could
+    /// sign a century-long credential and every receiver honoured it,
+    /// while `MAX_TOKEN_TTL_SECS`'s rustdoc claimed it capped the blast
+    /// radius of a leak.
+    ///
+    /// Built the way a hostile peer would: hand-set the window, then
+    /// sign, so the signature is genuinely valid.
+    #[test]
+    fn overlong_remote_token_is_rejected_on_receipt() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let mut token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            0xFEED,
+            3600,
+            0,
+        );
+        // A century, currently live.
+        let now = current_timestamp();
+        token.not_before = now - 10;
+        token.not_after = now + MAX_TOKEN_TTL_SECS * 100;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+
+        assert!(
+            token.verify().is_ok(),
+            "precondition: the signature must be genuinely valid — this is \
+             not a forgery test"
+        );
+        assert!(
+            matches!(token.is_valid(), Err(TokenError::TtlTooLong)),
+            "a live token with a century-wide window must be rejected on receipt"
+        );
+        assert!(
+            matches!(token.is_valid_with_skew(60), Err(TokenError::TtlTooLong)),
+            "skew tolerance must not launder an overlong window"
+        );
+
+        // And it must not authorize through the cache either — the
+        // seam matters, not just `is_valid`.
+        let cache = TokenCache::new();
+        cache.insert_unchecked(token.clone());
+        assert!(
+            cache
+                .check(subject.entity_id(), TokenScope::SUBSCRIBE, 0xFEED)
+                .is_err(),
+            "TokenCache::check must not authorize an overlong token"
+        );
+        assert!(
+            cache
+                .get_for_action(subject.entity_id(), TokenScope::SUBSCRIBE, 0xFEED)
+                .is_none(),
+            "get_for_action must not hand back an overlong token"
+        );
+    }
+
+    /// Exactly at the ceiling is still honoured — the bound is a
+    /// ceiling, not an off-by-one that invalidates max-TTL tokens.
+    #[test]
+    fn token_at_exactly_max_ttl_is_accepted_on_receipt() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let mut token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            0xFEED,
+            3600,
+            0,
+        );
+        let now = current_timestamp();
+        token.not_before = now;
+        token.not_after = now + MAX_TOKEN_TTL_SECS;
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+
+        assert!(
+            token.is_valid().is_ok(),
+            "a token exactly at MAX_TOKEN_TTL_SECS must remain valid"
+        );
+    }
+
+    /// A chain link with an overlong window is rejected too, on both
+    /// the full-verify and the presigned (hot) path — the presigned
+    /// path skips signatures but must not skip this.
+    #[test]
+    fn overlong_chain_link_is_rejected_on_both_verify_paths() {
+        let root = EntityKeypair::generate();
+        let leaf = EntityKeypair::generate();
+        let channel: ChannelHash = 0xC0FFEE;
+
+        let mut token = PermissionToken::issue(
+            &root,
+            leaf.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            channel,
+            3600,
+            0,
+        );
+        let now = current_timestamp();
+        token.not_before = now - 10;
+        token.not_after = now + MAX_TOKEN_TTL_SECS * 100;
+        let payload = token.signed_payload();
+        token.signature = root.sign(&payload).to_bytes();
+
+        let chain = TokenChain::single(token);
+        let roots = [root.entity_id().clone()];
+        let rev = RevocationRegistry::new();
+
+        assert!(matches!(
+            chain.verify_authorizes(
+                TokenScope::SUBSCRIBE,
+                channel,
+                leaf.entity_id(),
+                &roots,
+                &rev,
+                0
+            ),
+            Err(TokenError::TtlTooLong)
+        ));
+        assert!(
+            matches!(
+                chain.verify_authorizes_presigned(
+                    TokenScope::SUBSCRIBE,
+                    channel,
+                    leaf.entity_id(),
+                    &roots,
+                    &rev,
+                    0
+                ),
+                Err(TokenError::TtlTooLong)
+            ),
+            "the presigned path skips signature checks, not window checks"
+        );
     }
 
     /// Security audit H3: an unbounded TTL is rejected at issue time.

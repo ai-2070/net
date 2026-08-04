@@ -94,10 +94,10 @@ mod linux;
 
 pub use batch::AdaptiveBatcher;
 pub use channel::{
-    AckReason, AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError,
-    ChannelHash, ChannelId, ChannelName, ChannelPublisher, ChannelRegistry, MembershipMsg,
-    OnFailure, PublishConfig, PublishReport, SubscriberRoster, Visibility,
-    SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+    queue_group_hash, AckReason, AclPrincipal, AuthGuard, AuthVerdict, ChannelConfig,
+    ChannelConfigRegistry, ChannelError, ChannelHash, ChannelId, ChannelName, ChannelPublisher,
+    ChannelRegistry, MembershipMsg, OnFailure, OriginBinding, PublishConfig, PublishReport,
+    QueueGroupPolicy, ResolvedConfig, SubscriberRoster, Visibility, SUBPROTOCOL_CHANNEL_MEMBERSHIP,
 };
 pub use compute::{
     DaemonError, DaemonFactoryRegistry, DaemonHost, DaemonHostConfig, DaemonRegistry, DaemonStats,
@@ -124,7 +124,8 @@ pub use cortex::{
 pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
 pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
-    LossSimulator, NodeStatus, RecoveryAction, RecoveryManager, RecoveryStats,
+    LossSimulator, NodeStatus, PeerFailureEvent, RecoveryAction, RecoveryManager, RecoveryStats,
+    VerdictStatus,
 };
 pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
@@ -136,7 +137,7 @@ pub use identity::{
 pub use mesh::UpgradeAttemptGuard;
 pub use mesh::{
     ControlPlaneStats, MeshNode, MeshNodeConfig, PartitionFilter, SensingReadinessOverlay,
-    SensingRegistrationError, ACK_RANGES_CAPABILITY_TAG,
+    SensingRegistrationError, UnregisteredChannelPolicy, ACK_RANGES_CAPABILITY_TAG,
 };
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};
@@ -160,7 +161,8 @@ pub use redex::{
 pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream, RetransmitDescriptor};
 pub use reroute::ReroutePolicy;
 pub use route::{
-    AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, SchedulerStreamStats,
+    AggregateStats, AlternateProvenance, RouteCandidateView, RouteEntry, RouteFlags,
+    RouteObservation, RoutingHeader, RoutingTable, SchedulerStreamStats, TransitionOutcome,
     ROUTING_HEADER_SIZE,
 };
 pub use router::{FairScheduler, NetRouter, RouteAction, RouterConfig, RouterError, RouterStats};

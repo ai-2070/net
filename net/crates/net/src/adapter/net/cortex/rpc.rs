@@ -1473,12 +1473,38 @@ pub struct TraceContext {
     pub tracestate: String,
 }
 
-/// Context handed to a `RpcHandler::call`. Carries everything the
-/// handler needs to fulfill the request: the AEAD-verified caller
-/// identity, the request payload, and a cancellation token.
+/// Context handed to a `RpcHandler::call`. Carries what the handler
+/// needs to fulfill the request: caller routing attribution, the
+/// request payload, and a cancellation token.
+///
+/// **This context does not carry an authenticated end-to-end caller
+/// identity.** See [`RpcContext::caller_origin`]; handlers that need
+/// to authorize a caller must either run behind the PROTECTED-service
+/// admission gate (and read [`RpcContext::org_admission`]) or carry
+/// their own application-level signature.
 pub struct RpcContext {
-    /// AEAD-verified caller `origin_hash`. The bus sets this from
-    /// the verified peer; not self-claimable from the request body.
+    /// Caller's `origin_hash`, copied verbatim from the inbound
+    /// packet header ([`RpcInboundEvent::origin_hash`]).
+    ///
+    /// **Routing metadata, not identity authentication — do not
+    /// authorize on this.** It is a value carried on the wire, so a
+    /// peer chooses what it says. Comparing it against an identity
+    /// claimed elsewhere in the request compares two claims from the
+    /// same untrusted source and proves nothing.
+    ///
+    /// The authenticated fields, and what they actually mean:
+    ///
+    /// - the AEAD-verified *wire-session peer* is the node that
+    ///   delivered the packet — the last hop, not necessarily the
+    ///   originator (it is `RpcInboundEvent::from_node`, the wire-session
+    ///   peer's `NodeId`);
+    /// - [`RpcContext::org_admission`] carries a verified four-party
+    ///   identity, but only for calls admitted through the
+    ///   PROTECTED-service gate; it is `None` for public calls.
+    ///
+    /// For anything stronger on a public service, the handler needs
+    /// an application-level signature over a transcript that binds
+    /// the destination and carries its own freshness.
     pub caller_origin: u64,
     /// Caller-generated correlation id. Same value on the matching
     /// CANCEL or RESPONSE.
@@ -2119,8 +2145,10 @@ pub const STREAMING_REQUEST_PUMP_CAPACITY: usize = 1024;
 ///
 /// Bidi streaming plan (Phase B).
 pub struct RpcStreamingContext {
-    /// AEAD-verified caller `origin_hash`. Same source as
-    /// [`RpcContext::caller_origin`].
+    /// Caller's `origin_hash`, from the inbound packet header. Same
+    /// source, and the same caveat, as [`RpcContext::caller_origin`]:
+    /// **routing metadata, not identity authentication — do not
+    /// authorize on this.**
     pub caller_origin: u64,
     /// Caller-generated correlation id. Matches the initial
     /// REQUEST's `call_id` and every subsequent REQUEST_CHUNK /

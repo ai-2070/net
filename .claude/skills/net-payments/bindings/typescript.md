@@ -12,8 +12,9 @@ import { CapabilityGateway, PaymentProvider, PaymentHttpClient, buildPricingTerm
 none of it. There is also no `@net-mesh/payments` package — the name is
 reserved and unpublished, and everything ships inside `@net-mesh/core`.
 
-Behind `payments` (default), `publish` (default), and the opt-in
-`payments-http`.
+Behind `payments`, `publish` and `payments-http` — all three in the
+default build. `payments-http` carries `HttpFacilitator`, so without it the
+only reachable settlement backend is the mock.
 
 ## Demand — pay to invoke
 
@@ -50,11 +51,34 @@ A denial carries a `failure` object (the `net.payment.failure@1` schematic)
 Source: `net/crates/net/bindings/node/src/payment_provider.rs`.
 
 ```ts
-const provider = new PaymentProvider(mesh, statePath, billingLogPath /* ? */)
+// A settlement backend is MANDATORY — there is no default. Either settle for
+// real (needs the `payments-http` build feature):
+const provider = new PaymentProvider(
+  mesh, statePath, billingLogPath /* ? */,
+  'https://facilitator.example.com',       // facilitatorUrl
+  undefined,                               // facilitatorAuthToken, where wanted
+)
+// ...or opt explicitly into the in-process mock, which MOVES NO VALUE:
+const dev = new PaymentProvider(mesh, statePath, undefined, undefined, undefined, true)
+// The caller's possession proof is required by DEFAULT — `provider` above
+// already requires it. Pass false only for a deployment whose callers predate
+// the binding: without it the quote id alone redeems, and it is not a secret.
+const legacy = new PaymentProvider(
+  mesh, statePath, undefined,
+  'https://facilitator.example.com', undefined, undefined,
+  false,  // requireInvocationBinding — the opt-out, not the opt-in
+)
+// Terms must be authored under the SAME registry revision the provider quotes
+// under — a real facilitator means the production registry:
+const terms = buildPricingTerms(
+  provider.providerEntityId, capability, requirementsJson,
+  true,  // productionRegistry
+)
+// Passing neither throws; passing both throws. The mock lets a provider sign
+// quotes, emit billing events, and serve while settling nothing, so choosing it
+// is a decision the operator makes out loud.
 provider.providerEntityId                 // Buffer (32B); the identity that issues quotes
 await provider.readBilling()              // string[] of net.billing.event@1
-
-const terms = buildPricingTerms(provider.providerEntityId, capability, requirementsJson)
 
 const pub = await provider.publishPaidTools(
   tools,                                  // [{ name, description?, inputSchema }]
@@ -75,9 +99,21 @@ handle.serving; handle.tools; await handle.withdraw(); handle.stop()
 ## Outbound HTTP-402 — opt-in `payments-http`
 
 ```ts
-const client = new PaymentHttpClient(paymentPolicyPath, paymentProfile, false, signerAddress, signer)
+const client = new PaymentHttpClient(
+  paymentPolicyPath, paymentProfile, false, signerAddress, signer,
+  'public_only',  // destinationPolicy — the default; see below
+)
 const [statusJson, body] = await client.fetchPaid(url)   // [string, Buffer]
 ```
+
+**`destinationPolicy` defaults to `public_only`, and that will refuse a
+`localhost` URL.** This is the one door whose URL an agent can choose, so the
+SSRF guard is on by default — a permissive default would put every integration
+one model-chosen URL away from an unauthenticated service on the same host.
+Reaching a local or self-hosted x402 server is done by asking for it:
+`'public_or_loopback'` for this machine, `'allow_private'` for an internal
+network. An unknown value throws rather than falling back, and there is no
+spelling that disables the guard entirely.
 
 ## Three Node-specific obligations
 

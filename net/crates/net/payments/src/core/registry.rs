@@ -36,6 +36,14 @@ pub enum RegistryError {
         expected: u8,
         registry_version: String,
     },
+    #[error("EIP-712 domain {field} mismatch for `{asset_id}`: declared `{declared}`, registry {registry_version} pins `{expected}` — the signing domain must be one this registry vouched for")]
+    Eip712DomainMismatch {
+        asset_id: String,
+        field: &'static str,
+        declared: String,
+        expected: String,
+        registry_version: String,
+    },
     #[error("registry canonicalization failed: {0}")]
     Encoding(String),
 }
@@ -62,6 +70,25 @@ pub struct AssetEntry {
     /// asset is equivalent to nothing but itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub equivalence_class: Option<String>,
+    /// The token's EIP-712 domain `name`, for eip155 assets that pin it.
+    ///
+    /// The exact-EVM authoring path builds its signing domain from
+    /// `requirements.extra.name` / `.version`, which are **supplied by
+    /// the counterparty**. When this field is set,
+    /// [`AssetRegistry::check_requirements`]
+    /// requires the declared value to match, so the domain a caller signs
+    /// under is one this registry revision vouched for rather than one
+    /// the payee asserted.
+    ///
+    /// Absent means unpinned, and unpinned means unchecked — see the note
+    /// on `check_requirements`. Pinning is per-deployment because the
+    /// correct value is a property of the deployed token contract, not
+    /// something this crate can derive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eip712_name: Option<String>,
+    /// The token's EIP-712 domain `version`. See [`Self::eip712_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eip712_version: Option<String>,
 }
 
 /// The signed asset-policy registry.
@@ -123,9 +150,28 @@ impl AssetRegistry {
     }
 
     /// The full money-path check for a requirements view: asset must be
-    /// registered, and if the requirements' `extra` declares decimals they
-    /// must match the registry (present-and-mismatched hard-rejects,
-    /// pre-sign on the provider side and pre-verify on the caller side).
+    /// registered, and any counterparty-declared metadata the registry
+    /// pins must match (present-and-mismatched hard-rejects, pre-sign on
+    /// the provider side and pre-verify on the caller side).
+    ///
+    /// Two things are cross-checked, and it is worth being exact about
+    /// which, because the exact-EVM module's header once claimed more
+    /// than this delivered:
+    ///
+    /// - **decimals** — checked whenever the requirements declare them;
+    /// - **EIP-712 domain `name`/`version`** — checked only when *this
+    ///   registry entry pins them* ([`AssetEntry::eip712_name`]). An
+    ///   entry that pins nothing checks nothing, and the values then
+    ///   stand as the counterparty asserted them.
+    ///
+    /// What is pinned regardless, and is what bounds the damage: the
+    /// domain's `verifyingContract` comes from `requirements.asset` and
+    /// its `chainId` from the CAIP-2 network, both of which must match a
+    /// registry entry to get here at all. So an unpinned name/version
+    /// yields a signature whose domain separator matches no deployed
+    /// contract — a wasted signature and a failed payment, not an
+    /// authorization usable somewhere else. Pinning turns that loud
+    /// failure into an early refusal.
     pub fn check_requirements(
         &self,
         requirements: &PaymentRequirements,
@@ -149,6 +195,29 @@ impl AssetRegistry {
                 });
             }
         }
+        for (field, pinned) in [
+            ("name", entry.eip712_name.as_deref()),
+            ("version", entry.eip712_version.as_deref()),
+        ] {
+            let Some(pinned) = pinned else { continue };
+            let declared = requirements
+                .extra
+                .as_ref()
+                .and_then(|e| e.get(field))
+                .and_then(|v| v.as_str());
+            // Absent is a mismatch, not a pass: the authoring path needs
+            // the value, so "missing" would mean signing under a domain
+            // this registry never vouched for.
+            if declared != Some(pinned) {
+                return Err(RegistryError::Eip712DomainMismatch {
+                    asset_id: entry.id.as_str().to_string(),
+                    field,
+                    declared: declared.unwrap_or("<absent>").to_string(),
+                    expected: pinned.to_string(),
+                    registry_version: self.version.clone(),
+                });
+            }
+        }
         Ok(entry)
     }
 }
@@ -167,6 +236,18 @@ pub struct RegistryRef {
 /// real-money target), Solana SPL-USDC, and XRP (XRPL rung, Mode A). Network enablement is
 /// registry entries + facilitator config, never code; participants pin
 /// or override this default.
+///
+/// **Includes every valueless asset** — the mock network *and* the
+/// testnets (Base Sepolia and friends) — so it is the right registry for
+/// conformance runs and dev harnesses and the wrong one for a deployment
+/// settling real money. [`production_registry_v1`] is the same lineage
+/// with all of those removed, not just `mock:net`; a caller reading this
+/// list should not expect testnet USDC to survive into it.
+///
+/// A registry entry is not on its own sufficient to spend (spend policy
+/// must also enable the network, and the mock network needs a dev profile
+/// or the explicit unsafe flag), but a provider settling for real has no
+/// reason to carry any of them.
 pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
     let mut registry = default_mock_registry(signer);
     registry.version = "net-default-1".to_string();
@@ -181,6 +262,15 @@ pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
             symbol: "USDC".to_string(),
             display_name: Some("USDC (Base Sepolia testnet)".to_string()),
             equivalence_class: None,
+            // Circle's FiatTokenV2_2, whose EIP-712 domain is `USDC` / `2`
+            // on every deployment. Pinned because this is a *known*
+            // contract: leaving it open let a counterparty declare any
+            // name/version, which authored typed data under a domain
+            // separator matching nothing deployed — a wasted signature and
+            // a failed payment discovered at settle time rather than a
+            // refusal at check time.
+            eip712_name: Some("USDC".to_string()),
+            eip712_version: Some("2".to_string()),
         },
         AssetEntry {
             id: AssetId::parse(
@@ -192,6 +282,11 @@ pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
             symbol: "USDC".to_string(),
             display_name: Some("USDC (Base)".to_string()),
             equivalence_class: None,
+            // Same contract family as the Sepolia entry above, and the
+            // one that moves real money — so if only one of the two were
+            // pinned it would have to be this one.
+            eip712_name: Some("USDC".to_string()),
+            eip712_version: Some("2".to_string()),
         },
         AssetEntry {
             id: AssetId::parse(
@@ -203,6 +298,10 @@ pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
             symbol: "USDC".to_string(),
             display_name: Some("USDC (Solana SPL)".to_string()),
             equivalence_class: None,
+            // Not EVM: there is no EIP-712 domain to pin. `None` here
+            // means "does not apply", not "not yet pinned".
+            eip712_name: None,
+            eip712_version: None,
         },
         // XRPL rung, Mode A (XRP-only — RLUSD waits on the IOU
         // amount-domain review; see PAYMENTS_XRPL_ENABLEMENT_PLAN.md).
@@ -217,9 +316,70 @@ pub fn default_registry_v1(signer: EntityId) -> AssetRegistry {
             symbol: "XRP".to_string(),
             display_name: Some("XRP (XRP Ledger)".to_string()),
             equivalence_class: None,
+            // Not EVM — see the Solana entry.
+            eip712_name: None,
+            eip712_version: None,
         },
     ]);
     registry
+}
+
+/// [`default_registry_v1`] with the valueless mock asset removed — the
+/// registry for a deployment that settles real money.
+///
+/// The mock asset exists so the conformance suite can drive the whole
+/// lifecycle without a chain, which makes it exactly the thing a
+/// production provider should not be carrying: `mock:net` settlements
+/// move no value, and a registry is an allowlist, so the cheapest way to
+/// not accept one is to not list it.
+///
+/// Note the registry revision differs from `default_registry_v1`'s — the
+/// `{version, hash}` reference envelopes bind covers the asset list, so
+/// these are genuinely different pinned revisions and a quote issued
+/// under one will not verify under the other. That is the intended
+/// behaviour: which assets a provider accepts is part of what it signed.
+pub fn production_registry_v1(signer: EntityId) -> AssetRegistry {
+    let mut registry = default_registry_v1(signer);
+    registry.version = "net-production-1".to_string();
+    registry
+        .assets
+        .retain(|entry| !is_valueless_chain(entry.id.chain()));
+    registry
+}
+
+/// Chains whose assets move nothing of value: the mock network and the
+/// public testnets.
+///
+/// A registry is an allowlist, so the cheapest way for a provider not to
+/// accept a valueless settlement is not to list it. Dropping `mock:net`
+/// while keeping Base Sepolia would leave the "production" registry able
+/// to quote testnet USDC — settled, billed, and served for tokens with a
+/// faucet behind them, which is the same hole one layer down.
+fn is_valueless_chain(chain: &ChainId) -> bool {
+    match chain.namespace() {
+        "mock" => true,
+        // Enumerated rather than pattern-matched because there is no
+        // syntactic mark for "testnet" in CAIP-2 — a new testnet has to
+        // be added here deliberately, which is the right failure
+        // direction: forgetting one leaves it listed and visible rather
+        // than silently dropping a real chain.
+        //
+        // Wider than the shipped asset list on purpose. Only Base Sepolia
+        // is in `default_registry_v1` today, so the rest cost nothing
+        // now — and the moment they cost something is the moment someone
+        // adds an asset on one and does not think to come back here.
+        "eip155" => matches!(
+            chain.reference(),
+            "84532"       // Base Sepolia
+                | "11155111"  // Sepolia
+                | "5"         // Goerli
+                | "17000"     // Holesky
+                | "11155420"  // OP Sepolia
+                | "421614"    // Arbitrum Sepolia
+                | "80002" // Polygon Amoy
+        ),
+        _ => false,
+    }
 }
 
 /// The P0 default registry: the mock network's asset only. Real networks
@@ -240,6 +400,8 @@ pub fn default_mock_registry(signer: EntityId) -> AssetRegistry {
             symbol: "MUSD".to_string(),
             display_name: Some("Mock USD (test asset, no value)".to_string()),
             equivalence_class: None,
+            eip712_name: None,
+            eip712_version: None,
         }],
         signer,
         signature: None,
@@ -293,6 +455,144 @@ mod tests {
                 expected: 6,
                 ..
             }
+        ));
+    }
+
+    /// The production registry is the v1 asset set minus the valueless
+    /// mock asset — a provider settling real money should not carry an
+    /// allowlist entry for a network whose settlements move nothing.
+    #[test]
+    fn the_production_registry_carries_no_mock_asset() {
+        let signer = EntityKeypair::generate().entity_id().clone();
+        let dev = default_registry_v1(signer.clone());
+        let prod = production_registry_v1(signer);
+
+        assert!(
+            dev.assets.iter().any(|e| e.x402_asset == "musd"),
+            "the dev registry keeps the mock asset for conformance runs"
+        );
+        assert!(
+            !prod.assets.iter().any(|e| e.x402_asset == "musd"),
+            "the production registry must not list the mock asset"
+        );
+        // The mock asset AND the testnet entry are both gone: a registry
+        // that still listed Base Sepolia could quote faucet USDC, which
+        // is the same valueless-settlement hole one layer down.
+        assert!(
+            !prod
+                .assets
+                .iter()
+                .any(|e| e.id.chain().as_str() == "eip155:84532"),
+            "the production registry must not list a testnet asset"
+        );
+        assert_eq!(
+            prod.assets.len(),
+            dev.assets.len() - 2,
+            "exactly the mock and testnet entries are removed"
+        );
+
+        // Every EVM entry the shipped registries carry names a contract
+        // this crate knows, so none of them leaves its EIP-712 domain for
+        // a counterparty to assert. A new EVM entry that forgets to pin
+        // is the regression this catches; non-EVM entries have no domain
+        // and are exempt.
+        for registry in [&dev, &prod] {
+            for entry in &registry.assets {
+                if !entry.id.chain().as_str().starts_with("eip155:") {
+                    continue;
+                }
+                assert_eq!(
+                    (
+                        entry.eip712_name.as_deref(),
+                        entry.eip712_version.as_deref()
+                    ),
+                    (Some("USDC"), Some("2")),
+                    "{} must pin its EIP-712 domain in {}",
+                    entry.id.as_str(),
+                    registry.version
+                );
+            }
+        }
+
+        // Every real-money network survives.
+        for chain in ["eip155:8453", "xrpl:0"] {
+            assert!(
+                prod.assets.iter().any(|e| e.id.chain().as_str() == chain),
+                "{chain} must survive"
+            );
+        }
+
+        // A mock requirement hard-rejects against the production registry.
+        let mock = mock_requirements("musd", None);
+        assert!(matches!(
+            prod.check_requirements(&mock).unwrap_err(),
+            RegistryError::UnknownAsset { .. }
+        ));
+
+        // The revisions are distinct: which assets a provider accepts is
+        // part of what it signed, so a quote issued under one does not
+        // verify under the other.
+        assert_ne!(dev.version, prod.version);
+        assert_ne!(
+            dev.reference().unwrap().hash,
+            prod.reference().unwrap().hash
+        );
+    }
+
+    /// L4: a pinned EIP-712 domain is enforced; an unpinned one is not,
+    /// and the doc says so rather than claiming otherwise.
+    #[test]
+    fn a_pinned_eip712_domain_is_enforced_and_an_unpinned_one_is_not() {
+        let signer = EntityKeypair::generate().entity_id().clone();
+
+        // Unpinned (the shipped default): the counterparty's values stand.
+        let unpinned = registry();
+        let declared = mock_requirements(
+            "musd",
+            Some(serde_json::json!({"name": "anything", "version": "9"})),
+        );
+        assert!(
+            unpinned.check_requirements(&declared).is_ok(),
+            "an entry that pins nothing checks nothing"
+        );
+
+        // Pinned: the declared domain must match.
+        let mut pinned = default_mock_registry(signer);
+        for entry in &mut pinned.assets {
+            entry.eip712_name = Some("Mock USD".to_string());
+            entry.eip712_version = Some("2".to_string());
+        }
+
+        let ok = mock_requirements(
+            "musd",
+            Some(serde_json::json!({"name": "Mock USD", "version": "2"})),
+        );
+        assert!(pinned.check_requirements(&ok).is_ok());
+
+        // Wrong name, wrong version, and — importantly — absent all fail.
+        for bad in [
+            serde_json::json!({"name": "Impostor USD", "version": "2"}),
+            serde_json::json!({"name": "Mock USD", "version": "1"}),
+            serde_json::json!({"name": "Mock USD"}),
+            serde_json::json!({}),
+        ] {
+            let reqs = mock_requirements("musd", Some(bad.clone()));
+            assert!(
+                matches!(
+                    pinned.check_requirements(&reqs).unwrap_err(),
+                    RegistryError::Eip712DomainMismatch { .. }
+                ),
+                "must refuse {bad}"
+            );
+        }
+
+        // No `extra` at all is likewise a refusal, not a pass: the
+        // authoring path needs the values, so absent means signing under
+        // a domain the registry never vouched for.
+        let none = mock_requirements("musd", None);
+        assert!(matches!(
+            pinned.check_requirements(&none).unwrap_err(),
+            RegistryError::Eip712DomainMismatch { .. }
         ));
     }
 

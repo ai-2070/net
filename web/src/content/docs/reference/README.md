@@ -2,6 +2,7 @@
 title: Reference
 description: "Exact API, schema, wire, configuration, and compatibility details."
 ---
+
 # Reference
 
 Use this section to look up exact signatures, fields, constants, configuration,
@@ -18,3 +19,6 @@ wire formats, and edge-case behavior.
 
 Read [Concepts](/docs/concepts) for the model and [Guides](/docs/guides) for
 complete tasks. Reference pages assume you already know which surface you need.
+
+`EventBus API` and `Adapter trait` document Rust-native surfaces. Language-specific
+call shapes and coverage live under [SDKs and C ABI](/docs/sdk).

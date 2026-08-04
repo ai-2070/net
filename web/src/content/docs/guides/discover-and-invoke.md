@@ -2,6 +2,7 @@
 title: Discover and Invoke
 description: "The core agent loop, without an MCP host in the middle: ask the mesh who can do the work, then make a typed call and get a typed result."
 ---
+
 # Discover and Invoke
 
 This guide uses Net's native SDK path: query the mesh for providers, choose one,
@@ -39,7 +40,7 @@ Two things to get right, because the CLI will not warn you:
   and `:` as equivalent — the CLI path does not go through it. Match the
   separator the announcer used, or query from the SDK.
 - **There is no threshold matching here.** `--tag hardware.gpu.vram_gb=24` means
-  *exactly 24*, not *at least 24* — a 80 GB H100 does not match. For "≥ 24 GB"
+  _exactly 24_, not _at least 24_ — a 80 GB H100 does not match. For "≥ 24 GB"
   you need a predicate (`num_at_least`) through the SDK, below.
 
 From the SDK, the same query returns node ids you can call directly:
@@ -58,7 +59,7 @@ predicate surface in [Capabilities](/docs/concepts/capabilities).
 
 ## Invoke: a capability is an nRPC service
 
-Discovery is advisory — it tells you *who can*. To actually do the work, call the
+Discovery is advisory — it tells you _who can_. To actually do the work, call the
 capability. A native capability is served over **nRPC** (typed request/response on
 the mesh):
 
@@ -144,7 +145,7 @@ signal**, not polls — an idle mesh costs nothing, and a change arrives the mom
 the fold mutates. Where these APIs take an `interval`, it's a staleness ceiling
 (a safety-net re-diff), not a poll rate.
 
-Go has no watch iterator; it lists and re-lists. Python's capability-*filter*
+Go has no watch iterator; it lists and re-lists. Python's capability-_filter_
 node discovery (`find_nodes`, "GPU nodes with ≥24 GB VRAM") is reachable only
 through the native handle rather than a clean `MeshNode` method — the tool API
 above is the path for most Python agent code.

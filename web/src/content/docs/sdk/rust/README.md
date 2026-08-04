@@ -1,40 +1,36 @@
 ---
 title: Rust
-description: The Rust SDK (net-mesh-sdk, imported as netsdk) is the canonical binding — every other language wraps the same core.
+description: "Install net-mesh-sdk, choose the event-bus or capability surface, and follow the native Rust lifecycle."
 ---
+
 # Rust SDK
 
-The Rust SDK (`net-mesh-sdk`, imported as `net_sdk`) is the canonical binding —
-every other language wraps the same core. These pages walk the agentic loop in one
-order; each has a counterpart in the other SDKs, so the concept you learn here maps
-straight across.
+`net-mesh-sdk` is the native Rust API. It exposes both the event bus and the
+capability-oriented mesh surface without a language binding between your code and
+the runtime.
 
 ```bash
 cargo add net-mesh-sdk
 ```
 
-There are two node types, and you'll use both:
+The crate imports as `net_sdk`.
 
-- **`Net`** — the event bus. Publish and subscribe to typed events
-  (`emit` / `subscribe_typed`). Transport is a runtime choice (memory, mesh,
-  Redis, JetStream).
-- **`Mesh`** — the mesh node with **capabilities, tools, and nRPC**. This is the
-  agentic surface: announce what you can do, discover what others can do, and
-  invoke it.
+## Choose the entry point
 
-## The spine
+- **`Net`** is the event bus. Use `emit` and `subscribe_typed` with a memory, mesh,
+  Redis, or JetStream transport.
+- **`Mesh`** provides capabilities, tools, and nRPC. Use it to announce work,
+  discover providers, and invoke them.
 
-1. **[Quickstart](/docs/sdk/rust/quickstart)** — install, build a node, run a
-   first loop.
-2. **[Announce](/docs/sdk/rust/announce)** — publish a capability the mesh can
-   discover.
-3. **[Discover](/docs/sdk/rust/discover)** — find capabilities by what they do.
-4. **[Invoke](/docs/sdk/rust/invoke)** — call a capability, get a typed result.
-5. **[Watch](/docs/sdk/rust/watch)** — consume the event stream.
-6. **[Artifacts](/docs/sdk/rust/artifacts)** — move blobs and directories.
-7. **[Errors](/docs/sdk/rust/errors)** — classify failures and recover.
+## Follow the capability path
 
-All examples are grounded in the runnable SDK examples under `sdk/examples/`
-(`hello.rs`, `channels.rs`, `tool_calling.rs`) and the SDK source. The full
-conceptual background is in [Concepts](/docs/concepts/architecture); this section
-is the code.
+1. [Quickstart](/docs/sdk/rust/quickstart)
+2. [Announce](/docs/sdk/rust/announce)
+3. [Discover](/docs/sdk/rust/discover)
+4. [Invoke](/docs/sdk/rust/invoke)
+5. [Watch](/docs/sdk/rust/watch)
+6. [Artifacts](/docs/sdk/rust/artifacts)
+7. [Errors](/docs/sdk/rust/errors)
+
+Runnable examples live under `sdk/examples/`. Use [Concepts](/docs/concepts) for
+the model and this section for Rust call shapes and lifecycle.

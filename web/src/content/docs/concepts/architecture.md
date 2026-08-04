@@ -1,60 +1,118 @@
 ---
 title: Architecture
-description: Net is built in three layers, stacked from the bytes on the wire up to the state your application reads.
+description: "How Net separates capability use, state and artifacts, identity and authority, and encrypted transport."
 ---
+
 # Architecture
 
-Net's runtime has three layers: transport moves encrypted bytes, identity binds
-those bytes to participants and authority, and state gives applications events,
-causality, folds, and queries. The capability model sits at the application edge
-and uses all three to discover and invoke provider-held work.
+Applications usually enter Net through a capability: discover providers, select
+one that is currently eligible, and invoke it. Four architectural concerns support
+that path:
 
-```text title="The three layers"
-┌─────────────────────────────────────────────────┐
-│  State      events, causality, folds, queries   │
-├─────────────────────────────────────────────────┤
-│  Identity   who, what channel, what allowed     │
-├─────────────────────────────────────────────────┤
-│  Transport  encrypted bytes, routing, NAT       │
-└─────────────────────────────────────────────────┘
+```text title="Application to wire"
+capabilities and invocation
+        ↓
+state, streams, and artifacts
+        ↓
+identity and authority
+        ↓
+encrypted transport and routing
 ```
+
+These are responsibility boundaries, not isolated systems. A transport failure can
+still make a provider unavailable, and an authority change can still alter a
+routing result. The separation identifies which layer owns each decision and which
+evidence an application can rely on.
 
 Most application code uses capabilities, nRPC, channels, and state. Transport and
 packet-level identity become visible during deployment, diagnostics, performance
 tuning, or adapter development.
 
-## Transport
+## Capabilities and invocation
 
-The transport layer moves encrypted bytes between nodes. It's a UDP-based mesh protocol with a 68-byte header, 8-byte aligned, encrypted with a Noise NKpsk0 handshake and ChaCha20-Poly1305 frames. Forwarding nodes can route a packet by reading the header alone — they never decrypt the payload.
+A capability names work a provider offers. Its descriptor can include a schema and
+properties used for discovery. Applications query the local capability fold,
+evaluate their requirements, and invoke a provider through nRPC or a higher-level
+tool API.
 
-The protocol is designed so that the routing decision, the access-control decision, and the deduplication decision all fit inside that one cache line. That's how Net sustains the throughput it does: nothing on the hot path requires a system call beyond `recvmsg`, and nothing requires a cryptographic operation beyond the one-time AEAD verify on packets destined for the local node.
+Three decisions remain distinct:
 
-Above the wire format, transport handles connection setup, session keys, congestion control, NAT traversal (reflex probes, classification, hole-punching rendezvous), and the failure detector that decides when a peer has gone away. None of this surfaces in the application API. You configure listen addresses and initial peers; the mesh forms.
+1. whether a caller may learn that a capability exists;
+2. whether a provider is currently available and qualifies for the request;
+3. whether that provider admits this invocation.
 
-## Identity
+The provider makes the final admission decision. Applications can call a selected
+node directly or address a service name when another eligible provider may perform
+the same work.
 
-The identity layer answers three questions about every packet on the wire: who sent it, what channel it's claiming, and whether the sender is allowed to use that channel. Identity is bound to keys, not addresses — an entity is its ed25519 public key, and that key follows the entity if it migrates to a different node.
+## State, streams, and artifacts
 
-Every packet header carries an 8-byte `origin_hash` that's a domain-separated BLAKE2s-MAC of the sender's public key. Forwarding nodes can authorize the packet against a 4 KB bloom filter that fits in L1 cache, in under ten nanoseconds, without ever touching the payload. The full identity check (token signature verification, capability matching) happens at session and subscription time, not per-packet — the bloom filter caches the positive verdict.
+Events are the common coordination record. They carry producer identity and causal
+metadata rather than depending on one global clock.
 
-On top of identity sit two coordination primitives. Channels are named endpoints with visibility scopes and capability-based access policy. Permission tokens are signed, scoped, time-bound delegations that grant specific entities specific rights on specific channels. Both compose with capabilities, which are tag-and-metadata advertisements that nodes broadcast to describe what they can do.
+Higher layers use those records in different ways:
 
-## State
+- **RedEX** retains append-only history for replay.
+- **CortEX** folds event history into derived state.
+- **NetDB** queries supported folded-state models.
+- **Dataforts** stores and transfers content-addressed blobs and directories.
+- **MeshOS** coordinates long-running stateful daemons and placement.
 
-The state layer is what you actually program against. The unit of work is the event; the unit of organization is the channel; and the unit of ordering is the causal link that every event carries.
+An application adopts only the pieces it needs. A simple capability may use nRPC
+alone. Long-running work may add task events and artifacts. A stateful service may
+add a RedEX log and a CortEX fold.
 
-A causal link is a 32-byte structure that names the entity that produced the event, the entity's view of what it had observed before producing it, and a hash chaining the event back to its parent. Two events from the same entity are totally ordered. Two events from different entities are ordered only if one's causal cone contains the other — Net doesn't impose a global clock, and the system gets faster the less you ask it to.
+## Identity and authority
 
-Channels carry events. Persist a channel and it becomes a durable log — RedEX. Run reductions over the log and you have folded state — CortEX. Federate queries across folds and you have a database — NetDB. Materialize blobs with deduplication and cache them by access pattern and you have Dataforts. Run long-lived stateful workers against channels and you have MeshOS. Each of these is a different way to use the same primitive; none of them is a different system bolted onto the bus.
+A node has a cryptographic identity independent of its current network address.
+Sessions authenticate peers, and event metadata carries the origin required by
+higher layers.
 
-## Properties of the architecture
+Authority is evaluated at several boundaries:
 
-The architecture is deliberate about a small number of properties:
+- transport and channel policy determine whether traffic can enter a path;
+- signed permission tokens grant scoped channel actions;
+- organization membership and grants control organization-scoped discovery and
+  invocation;
+- provider policy remains final for the operation itself.
 
-- **Wire-speed authorization.** The header is enough to forward, drop, or accept a packet. There's no decryption on the forwarding path and no central authority to call out to.
-- **Identity portable across nodes.** An entity is its key. It can move between nodes, fork into replicas, and merge again without losing causal continuity.
-- **Shared primitives across layers.** Logs, state, queries, RPC, and workers build
-  on channels and events, so they reuse the same transport and identity model.
-- **No central state.** No broker, no coordinator, no registry. State lives at the edges, addressed by content and identity, replicated when you ask for it.
+Capability predicates are useful for matching provider properties. They are not an
+access boundary because providers assert those properties unless an external
+attestation says otherwise.
 
-The rest of this section walks each layer one at a time. The transport layer mostly stays out of your way; the identity layer is where most operational decisions live; the state layer is where most application code lives.
+## Transport and routing
+
+The transport layer moves encrypted Net packets between nodes. The current wire
+protocol uses UDP, a fixed 68-byte header, a Noise NKpsk0 session handshake, and
+ChaCha20-Poly1305 frames. Relays route from authenticated header information without
+reading the encrypted application payload.
+
+Transport also owns session setup, congestion behavior, peer routing, NAT
+classification and traversal, and direct or relayed paths. Operators configure
+listen addresses, bootstrap peers, and any relay or port-mapping policy required by
+the deployment.
+
+Exact packet fields and compatibility rules belong in [Wire format](/docs/reference/wire-format).
+Operational topology belongs in [NAT and traversal](/docs/guides/nat-and-traversal)
+and [Production deployment](/docs/guides/production-deployment).
+
+## What Net does not replace
+
+Net sits beneath applications and can coexist with:
+
+- MCP as a tool interface;
+- HTTP at SaaS and web boundaries;
+- NATS or another broker inside an operational domain;
+- Zenoh for data-centric edge systems;
+- databases and object stores that remain systems of record.
+
+Adapters expose selected operations or data to the mesh. The surrounding system
+keeps the responsibilities that belong to its layer.
+
+## Where to read next
+
+- [Capabilities](/docs/concepts/capabilities)
+- [Identity](/docs/concepts/identity)
+- [Events and causality](/docs/concepts/events-and-causality)
+- [Storage stack](/docs/concepts/storage-stack)
+- [Security model](/docs/concepts/security-model)

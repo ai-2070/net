@@ -2,6 +2,7 @@
 title: Submitted is not completed
 description: "Separate transport acceptance, provider execution, external effect, and verified outcome."
 ---
+
 # Submitted is not completed
 
 A response describes what the responding layer knows. It does not automatically
@@ -44,13 +45,13 @@ visible fact rather than missing information behind an earlier acknowledgement.
 
 ## The levels of success
 
-| Level | What is known | Typical source |
-|---|---|---|
-| **Accepted** | a request or event entered the receiving layer | transport or API |
-| **Delivered or durable** | a receiver got it, or a replayable log holds it | transport or log |
-| **Executed** | the provider ran the handler and returned an outcome | provider |
-| **Effect observed** | a named external state change was observed | system that owns the effect |
-| **Verified** | the required postcondition was checked independently | verifier or system of record |
+| Level                    | What is known                                        | Typical source               |
+| ------------------------ | ---------------------------------------------------- | ---------------------------- |
+| **Accepted**             | a request or event entered the receiving layer       | transport or API             |
+| **Delivered or durable** | a receiver got it, or a replayable log holds it      | transport or log             |
+| **Executed**             | the provider ran the handler and returned an outcome | provider                     |
+| **Effect observed**      | a named external state change was observed           | system that owns the effect  |
+| **Verified**             | the required postcondition was checked independently | verifier or system of record |
 
 A capability should report the narrowest level it can prove. `SUCCESS` should mean
 the postcondition defined by that capability was verified, not merely that an RPC

@@ -27,6 +27,26 @@ pub const HDR_PAYMENT_SIGNATURE: &str = "payment-signature";  // client → serv
 pub const HDR_PAYMENT_RESPONSE:  &str = "payment-response";   // server → client settlement on success
 ```
 
+### You pay the server's advertised ceiling, exactly
+
+The pinned v2 spec names the price `amount`. Widely-deployed x402 servers
+name it **`maxAmountRequired`**, and in that vocabulary it is a *maximum* —
+the most the server will accept, not necessarily what it wants.
+
+`PaymentRequirements` accepts both spellings (`#[serde(alias)]`), and Net
+then treats the value as an **exact** amount everywhere: the caller authors
+an authorization for the full figure, and the provider-side engine's
+verification demands exact equality (under-delivery invalidates,
+over-delivery routes to a manual `Overpayment` exception).
+
+So paying a server that advertises `maxAmountRequired` means **paying its
+ceiling**, not negotiating below it. There is no partial-payment path and
+no counter-offer object — that absence is the rule. It is not a
+correctness or safety problem (spend policy still caps every outbound
+payment, and the byte-preserved requirements are what got signed), but
+budget for the advertised maximum when you set `max_per_call` for an
+external host.
+
 ## `X402HttpFlow`
 
 ```rust
@@ -62,6 +82,33 @@ The spend-policy surface is identical to `caller.md`: over-cap yields
 `RequiresPaymentApproval`, an operator `approve`s, the next call proceeds. A
 network with no configured signer is `Denied`, never a silent fallback.
 
+### The destination policy is `PublicOnly`, and `localhost` is refused
+
+`new()` builds with `DestinationPolicy::PublicOnly`. This is the one door in the
+crate whose URL can be chosen by a *model*, and a permissive default would put
+every integration one model-chosen URL away from an unauthenticated service on
+the same host — so an agent-supplied `http://localhost:8080/…` is `Denied`
+before a socket is opened, not dialled.
+
+A local or self-hosted x402 server is reached by **asking for it**:
+
+```rust
+let flow = X402HttpFlow::with_destination_policy(
+    caller, spend, registry, clock,
+    DestinationPolicy::PublicOrLoopback,   // or AllowPrivate for a LAN server
+)?;
+```
+
+The bindings take the same choice as a string — `destination_policy` /
+`destinationPolicy`, one of `public_only` (default), `public_or_loopback`,
+`allow_private`. An unknown value is a construction error rather than a
+fall-back, and `unrestricted` is deliberately not spellable here.
+
+The guard is address-level, so it is not bypassable by spelling: hostnames are
+checked at resolve time (rebinding-safe), IP literals before the send, and the
+v4-in-v6 embeddings (`::ffff:`, NAT64, 6to4, Teredo) are refused as the v4
+addresses they reach.
+
 ## Python + Node — `PaymentHttpClient` (opt-in `payments-http`)
 
 The demand surface for this flow, in **both** Python and Node. Behind an
@@ -76,13 +123,17 @@ client = PaymentHttpClient(
     payment_profile="dev_test",
     payment_signer_address=None, payment_signer=None,   # eip155 seam (svm/xrpl deferred on this path)
     identity=None,                       # optional payer Identity; ephemeral if omitted
+    destination_policy=None,             # "public_only" (default) — see above; localhost needs "public_or_loopback"
 )
 status_json, body = client.fetch_paid(url)   # (str, bytes)
 ```
 
 ```ts
 // Node — same shape; the eip155 signer callback is async (Promise).
-const client = new PaymentHttpClient(paymentPolicyPath, 'dev_test', false, signerAddress, signer)
+const client = new PaymentHttpClient(
+  paymentPolicyPath, 'dev_test', false, signerAddress, signer,
+  'public_only',  // destinationPolicy — localhost needs 'public_or_loopback'
+)
 const [statusJson, body] = await client.fetchPaid(url)   // [string, Buffer]
 ```
 

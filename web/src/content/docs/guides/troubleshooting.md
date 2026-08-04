@@ -1,11 +1,12 @@
 ---
 title: Troubleshooting
-description: Symptoms that look like bugs and are usually the system working as designed — plus the ones that are genuinely bugs, and how to tell them apart.
+description: Diagnose empty discovery, stalled reads, routing failures, and other common Net symptoms.
 ---
+
 # Troubleshooting
 
-Symptoms that look like bugs and are usually the system working as designed —
-plus the ones that are genuinely bugs, and how to tell them apart.
+Use the observed symptom and counters below to distinguish asynchronous behavior
+from code, configuration, routing, or authorization failures.
 
 ## `poll()` returns nothing, but `ingest()` succeeded
 
@@ -52,7 +53,7 @@ own announcements immediately; peer-hosted entries appear only once their
 announcements propagate. An empty result seconds after startup usually means
 "not converged yet", not "nothing exists".
 
-On a genuinely isolated node, only self-hosted entries will ever match.
+On an isolated node, only self-hosted entries will match.
 
 ## Regex filters match nothing
 

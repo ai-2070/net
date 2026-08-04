@@ -387,6 +387,28 @@ export function capabilityFilterToNapi(f: CapabilityFilter): NapiCapabilityFilte
  * under most filters by design (matches the v1-permissive
  * default). Peers tagged `scope:subnet-local` only show up under
  * `sameSubnet`.
+ *
+ * ## This is a discovery filter, not an access-control boundary
+ *
+ * Announcements propagate to every peer and forward up to 16 hops
+ * regardless of their `scope:*` tags, and the tags are self-asserted by
+ * the announcer. So:
+ *
+ * - **`Global` is permissive.** A peer with no `scope:*` tag matches
+ *   EVERY `tenant` and `region` query. A tenant filter narrows away
+ *   only *cooperating* peers that scoped themselves elsewhere — an
+ *   adversary simply omits the tag and stays visible.
+ * - **Nothing is withheld on the wire.** Plain `findNodes` — no scope
+ *   filter at all — returns everything a `tenant` or `region` query
+ *   filters out, because the filtering happens locally at query time
+ *   and the announcements arrived either way. Scope keeps unrelated
+ *   tenants out of your own placement decisions; it does not keep your
+ *   providers secret.
+ *
+ *   Note `any` is NOT the unfiltered query: it still excludes peers
+ *   tagged `scope:subnet-local`, which only `sameSubnet` returns. `any`
+ *   is "every peer that did not opt out of cross-subnet discovery", not
+ *   "every peer".
  */
 export type ScopeFilter =
   | { kind: 'any' }
@@ -436,25 +458,51 @@ export const SCOPE_SUBNET_LOCAL = 'scope:subnet-local';
 
 /**
  * Append a `scope:tenant:<id>` tag to a tag list. Idempotent —
- * safe to call repeatedly with the same id. Empty `tenantId` is a
- * no-op.
+ * safe to call repeatedly with the same id.
+ *
+ * Throws on an empty `tenantId`. It used to return the tag list
+ * unchanged, which reads as "scope applied" but leaves the
+ * announcement resolving to `Global` — visible to EVERY tenant and
+ * region query. These helpers build raw arrays, so nothing downstream
+ * catches it: the Rust builders never see the call.
+ *
+ * @throws {Error} if `tenantId` is empty.
  */
 export function withTenantScope(
   tags: string[] | undefined,
   tenantId: string,
 ): string[] {
-  if (!tenantId) return tags ?? [];
+  if (!tenantId) {
+    throw new Error(
+      'withTenantScope: tenantId is empty — refusing to return an unscoped ' +
+        'tag list, which would leave this announcement visible to every ' +
+        'tenant and region query',
+    );
+  }
   const tag = `${SCOPE_TENANT_PREFIX}${tenantId}`;
   const list = tags ?? [];
   return list.includes(tag) ? list : [...list, tag];
 }
 
-/** Append a `scope:region:<name>` tag to a tag list. Idempotent. */
+/**
+ * Append a `scope:region:<name>` tag to a tag list. Idempotent.
+ *
+ * Throws on an empty `region`, for the same reason as
+ * {@link withTenantScope}.
+ *
+ * @throws {Error} if `region` is empty.
+ */
 export function withRegionScope(
   tags: string[] | undefined,
   region: string,
 ): string[] {
-  if (!region) return tags ?? [];
+  if (!region) {
+    throw new Error(
+      'withRegionScope: region is empty — refusing to return an unscoped ' +
+        'tag list, which would leave this announcement visible to every ' +
+        'tenant and region query',
+    );
+  }
   const tag = `${SCOPE_REGION_PREFIX}${region}`;
   const list = tags ?? [];
   return list.includes(tag) ? list : [...list, tag];

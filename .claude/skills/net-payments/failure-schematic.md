@@ -74,6 +74,7 @@ security row means *do not just buy another quote and try again*.
 | `gate_missing` | admission | provider_configuration_error | ❌ | ❌ | ❌ | no | none |
 | `unknown_quote` | redeem | new_quote_required | ❌ | ❌ | ✅ | no | none |
 | `binding_malformed` | redeem | caller_configuration_error | ❌ | ❌ | ❌ | unknown | unknown |
+| `binding_required` | redeem | caller_configuration_error | ❌ | ❌ | ❌ | unknown | unknown |
 | `binding_rejected` | redeem | security_violation | ❌ | ❌ | ❌ | unknown | unknown |
 | `payer_record_corrupt` | redeem | provider_configuration_error | ❌ | ❌ | ❌ | unknown | unknown |
 | `quote_frozen` | redeem | non_recoverable | ❌ | ❌ | ❌ | unknown | unknown |
@@ -82,6 +83,18 @@ security row means *do not just buy another quote and try again*.
 | `wrong_tool_binding` | redeem | security_violation | ❌ | ❌ | ❌ | unknown | unknown |
 | `already_redeemed` | redeem | new_quote_required | ❌ | ❌ | ✅ | yes | consumed |
 | `engine_unavailable` | redeem | provider_configuration_error | ✅ | ✅ | ✅ | unknown | unknown |
+
+`binding_required` is the provider saying it will not accept a quote id on its
+own. It carries `next_action: fix_payment_client`: the quote is fine and the
+client is not, so a fresh quote does not help and `safe_to_requote` stays
+`false`. It reads as a configuration row rather than a security one on purpose —
+a caller that sent no possession proof is misconfigured, not necessarily
+attacking anything. `binding_rejected` is the security row: a proof was
+presented and did not verify.
+
+Providers require the binding by default
+(`with_require_invocation_binding(false)` opts out for pre-binding callers), so
+a client that never signs one sees this on every paid invoke.
 
 **Reserved reasons** (documented, no v1 producer — future surfaces must use
 these names): `insufficient_funds`, `no_wallet_configured`,

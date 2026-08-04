@@ -95,9 +95,8 @@ pub use net::adapter::net::behavior::lifecycle::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use ::net::adapter::net::channel::{ChannelId, ChannelName};
 use ::net::adapter::net::mesh_rpc::{ServeError, ServeHandle};
-use ::net::adapter::net::ChannelConfig;
+
 use ::net::adapter::net::MeshNode;
 
 use crate::mesh::Mesh;
@@ -148,26 +147,116 @@ pub fn install_fold_query_service(
     aggregator.install_query_service(&mesh.node_arc())
 }
 
-/// Internal: mirror the SDK's `mesh_rpc::Mesh::serve_rpc`
-/// auto-register pattern — register the `<service>.requests`
-/// channel exactly + the `<service>.replies.` prefix entry
-/// permissively. Idempotent.
+/// Internal: install the standard RPC channel policy for `service`.
 ///
-/// Routes the prefix insertion through `MeshNode::channel_configs()`
-/// (publicly accessible whenever `net` is on) rather than the
-/// SDK's `pub(crate)` accessor (which the SDK gates on
-/// `cortex`).
+/// Delegates to [`Mesh::register_rpc_service_channels`] rather than
+/// carrying its own copy. It previously did carry one — mirroring
+/// `serve_rpc`'s pattern by hand because the SDK's registry accessor is
+/// `cortex`-gated while this module is not — and the copy drifted: it
+/// kept using replacing inserts (so it discarded operator ACLs, H2) and
+/// never gained the reply-channel origin binding (so aggregator reply
+/// channels stayed world-subscribable, H3), both long after those were
+/// fixed for `serve_rpc`. The shared helper is gated only on `net`, so
+/// there is no longer a reason to duplicate it.
 fn auto_register_rpc_channels(mesh: &Mesh, service: &str) {
-    if let Ok(req_channel) = ChannelName::new(&format!("{service}.requests")) {
-        mesh.register_channel(ChannelConfig::new(ChannelId::new(req_channel)));
+    mesh.register_rpc_service_channels(service);
+}
+
+#[cfg(test)]
+mod aggregator_channel_registration_tests {
+    //! The aggregator's own entry points, checked on the aggregator's own
+    //! service names.
+    //!
+    //! The shared helper is pinned by tests next to it, and the
+    //! delegation chain by a scan in `mesh_rpc.rs`. Neither reaches
+    //! *these* three functions with *these* two service names, and this
+    //! is the module whose hand-rolled copy stayed unbound through both
+    //! H3 and the aggregator-specific follow-up. Assert the property
+    //! where the drift actually happened.
+
+    use super::*;
+    use crate::mesh::MeshBuilder;
+    use ::net::adapter::net::channel::{ChannelConfigRegistry, OriginBinding};
+
+    async fn mesh() -> Mesh {
+        MeshBuilder::new("127.0.0.1:0", &[0xA6u8; 32])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
     }
-    if let Some(configs) = mesh.inner().channel_configs() {
-        if let Ok(sentinel_name) = ChannelName::new(&format!("{service}.replies.prefix")) {
-            configs.insert_prefix(
-                format!("{service}.replies."),
-                ChannelConfig::new(ChannelId::new(sentinel_name)),
+
+    /// `Mesh::channel_configs` is private to its module, so reach the
+    /// same registry through the public node accessor.
+    fn registry(mesh: &Mesh) -> Arc<ChannelConfigRegistry> {
+        mesh.node_arc()
+            .channel_configs()
+            .expect("an SDK-built mesh always installs a registry")
+            .clone()
+    }
+
+    /// Both aggregator services must end up with an origin-bound reply
+    /// prefix. Unbound, any peer sharing a session with the server can
+    /// subscribe to a victim's `<service>.replies.<victim_origin>` and
+    /// receive that victim's response bodies whenever direct delivery
+    /// misses and the reply falls back to roster fan-out.
+    #[tokio::test]
+    async fn both_aggregator_services_bind_their_reply_prefix() {
+        let mesh = mesh().await;
+
+        for service in [REGISTRY_SERVICE, FOLD_QUERY_SERVICE] {
+            auto_register_rpc_channels(&mesh, service);
+
+            let caller = format!("{service}.replies.00112233445566aa");
+            let reg = registry(&mesh);
+            let resolved = reg
+                .resolve_by_name(&caller)
+                .unwrap_or_else(|| panic!("{service}: the reply prefix must resolve for {caller}"));
+            assert_eq!(
+                resolved.matched_prefix.as_deref(),
+                Some(format!("{service}.replies.").as_str()),
+                "{service}: resolved through the wrong entry"
+            );
+            assert_eq!(
+                resolved.config.subscriber_origin_binding,
+                Some(OriginBinding::OriginHashHex16),
+                "{service}: reply channels are world-subscribable (H3)"
+            );
+            assert!(
+                reg.get_by_name(&format!("{service}.requests")).is_some(),
+                "{service}: the request channel must still be installed — \
+                 'fix the clobbering by registering nothing' would break RPC \
+                 with UnknownChannel instead"
             );
         }
+    }
+
+    /// An operator ACL registered before the aggregator is installed
+    /// must survive it (H2).
+    #[tokio::test]
+    async fn installing_an_aggregator_service_preserves_an_operator_acl() {
+        use ::net::adapter::net::identity::EntityKeypair;
+        use ::net::adapter::net::{ChannelConfig, ChannelId, ChannelName};
+
+        let mesh = mesh().await;
+        let root = EntityKeypair::generate();
+        let requests = format!("{REGISTRY_SERVICE}.requests");
+        mesh.register_channel(
+            ChannelConfig::new(ChannelId::new(ChannelName::new(&requests).unwrap()))
+                .with_token_roots(vec![root.entity_id().clone()]),
+        );
+
+        auto_register_rpc_channels(&mesh, REGISTRY_SERVICE);
+
+        let cfg = registry(&mesh)
+            .get_by_name(&requests)
+            .expect("request channel must exist")
+            .clone();
+        assert!(
+            cfg.token_required(),
+            "installing the aggregator discarded the operator's ACL (H2)"
+        );
+        assert_eq!(cfg.token_roots[0], *root.entity_id());
     }
 }
 

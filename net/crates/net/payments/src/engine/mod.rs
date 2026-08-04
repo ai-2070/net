@@ -17,9 +17,15 @@
 //! - **Fail-closed** — a facilitator failure is a structured, retryable
 //!   decision for policy, never a silent serve.
 //!
-//! Provider policy runs at quote issuance (never quote a caller you'd
-//! deny — accepting a denied caller's payment creates refund obligations
-//! P0 doesn't have); the WS4 `payment_gate` re-checks before the handler.
+//! Provider admission runs at quote issuance and **only** there (never
+//! quote a caller you'd deny — accepting a denied caller's payment creates
+//! refund obligations P0 doesn't have). [`PaymentEngine::accept_payment`]
+//! and [`PaymentEngine::redeem_for_invocation`] deliberately do not
+//! re-run it: a signed quote is a commitment that stays redeemable until
+//! it expires, so **the quote TTL is the revocation window** — see
+//! [`ProviderAdmissionPolicy`]. The gate before the handler enforces
+//! *payment* (settled, billed, unfrozen, bound to this tool, unredeemed),
+//! not admission.
 //!
 //! The engine holds `Arc<dyn Facilitator>` — pointing P1 at a real
 //! facilitator is construction config, zero interface changes (that's
@@ -137,6 +143,24 @@ pub enum PaymentDecision {
 }
 
 /// Provider-side admission: never quote a caller you'd deny.
+///
+/// **Evaluated at quote issuance only.** There is exactly one call site
+/// ([`PaymentEngine::issue_quote`]), and that is the design, not an
+/// omission: a signed quote is a commitment, so it remains redeemable
+/// for its full validity window even if the caller's admission status
+/// changes afterwards. Consequences worth stating plainly:
+///
+/// - **The quote TTL is the revocation window.** Revoking a caller stops
+///   *new* quotes, not outstanding ones. A provider that needs revocation
+///   to bite within `N` seconds issues quotes with a TTL of `N`.
+/// - Re-checking at settlement or redemption would mean refusing a caller
+///   after they had paid, which needs a refund path the protocol does not
+///   have (`net.payment.dispute@1` is reserved, with no semantics).
+///
+/// Admission is also **not** an authentication boundary: it is evaluated
+/// against whatever caller identity the quote records. Establishing that
+/// the requester *is* that caller is a separate concern, upstream of this
+/// trait.
 pub trait ProviderAdmissionPolicy: Send + Sync {
     /// `Err(reason)` refuses quote issuance for this caller/capability.
     fn admit(&self, caller: &EntityId, capability: &str) -> Result<(), String>;
@@ -187,6 +211,14 @@ pub enum RedeemDenialReason {
     WrongToolBinding { capability: String, tool_id: String },
     #[error("quote already redeemed — one payment, one serve")]
     AlreadyRedeemed,
+    /// The provider requires the invocation binding and none was
+    /// presented. Distinct from [`BindingMalformed`](Self::BindingMalformed)
+    /// (a binding arrived but was not 64 bytes) and from
+    /// [`BindingRejected`](Self::BindingRejected) (it verified against the
+    /// wrong identity): this caller sent no proof of possession at all,
+    /// which is a client-configuration gap, not an attack signal.
+    #[error("this provider requires the invocation binding — no possession proof was presented")]
+    BindingRequired,
 }
 
 impl RedeemDenialReason {
@@ -203,6 +235,7 @@ impl RedeemDenialReason {
             Self::SettlementPending => "settlement_pending",
             Self::WrongToolBinding { .. } => "wrong_tool_binding",
             Self::AlreadyRedeemed => "already_redeemed",
+            Self::BindingRequired => "binding_required",
         }
     }
 
@@ -276,6 +309,20 @@ struct QuoteRecord {
     /// The exact bytes needed to re-verify later, byte-preserved.
     requirements_b64: String,
     payload_b64: String,
+    /// The quote's **authoritative** expiry — the envelope's, never x402's
+    /// advisory `maxTimeoutSeconds`. Retention's hard floor: a terminal
+    /// record is only ever removed well after the quote that minted it
+    /// stopped being redeemable (see [`QuoteRecord::is_prunable_at`]).
+    ///
+    /// Optional for migration, and deliberately so in both directions: a
+    /// record written by an older build carries no expiry, and a
+    /// mandatory `u64` would make those stores fail to deserialize
+    /// (`StoreError::Corrupt` — loud, but total). Defaulting to `0`
+    /// instead would be worse: every legacy record would look infinitely
+    /// expired and become immediately prunable. `None` therefore means
+    /// **never prunable** — retention fails closed rather than guessing.
+    #[serde(default)]
+    expires_at_ns: Option<u64>,
     in_flight: bool,
     /// When `in_flight` was last asserted (engine time, ns). A crash
     /// between claim and completion — verify/settle run with no lock held
@@ -324,6 +371,137 @@ struct EngineState {
     quotes: BTreeMap<String, QuoteRecord>,
 }
 
+impl QuoteRecord {
+    /// Whether retention may remove this record at `now_ns`.
+    ///
+    /// Terminal means the payment fully completed *and* its billing event
+    /// is already durable somewhere retention cannot destroy: the
+    /// `BillingLog` (`billing_published`), which is the audit surface.
+    /// The record itself is then engine bookkeeping, not evidence.
+    ///
+    /// The expiry floor is what keeps deletion from becoming
+    /// resurrection. If a record were removed while its signed quote were
+    /// still valid, re-presenting that quote would miss in `s.quotes` and
+    /// mint a *fresh* record (`accept_payment`'s claim closure), and the
+    /// lifecycle could eventually serve a second time — the replay maps
+    /// do not carry the terminal/idempotency outcome, so they cannot
+    /// stand in for the record here. (`accept_payment` also rejects an
+    /// expired quote before the claim transaction, so this is the second
+    /// of two independent guards, not the only one.)
+    ///
+    /// **A frozen record is never terminal**, whatever else is set on it.
+    /// Freezing is not confined to the pre-redemption lifecycle: a
+    /// `re_verify_with_checker` pass that finds the settlement REVERTED
+    /// freezes a record that is already billed, published, and redeemed —
+    /// so without this the record would satisfy every other condition and
+    /// retire on the ordinary horizon. What it takes with it is the one
+    /// thing worth keeping: the evidence that this provider served against
+    /// a settlement the chain later said never landed. "Fully completed"
+    /// and "completed, then found invalid" are not the same lifecycle, and
+    /// only the first is redundant with the `BillingLog`.
+    fn is_prunable_at(&self, now_ns: u64, retention_ns: u64, tolerance_ns: u64) -> bool {
+        // A record with no authoritative expiry (written by a build
+        // before the field existed) has no floor to measure from and is
+        // never prunable. Fail closed; never infer one from the x402
+        // `maxTimeoutSeconds`, which is advisory.
+        let Some(expiry) = self.expires_at_ns else {
+            return false;
+        };
+        self.frozen.is_none()
+            && self.billing.is_some()
+            && self.billing_published
+            && self.redeemed
+            && !self.in_flight
+            && now_ns
+                >= expiry
+                    .saturating_add(tolerance_ns)
+                    .saturating_add(retention_ns)
+    }
+}
+
+/// Retention sweep: drop terminal quote records past the horizon, plus the
+/// payload replay entry each one owns. Returns **how many records were
+/// retired**, counted as they are removed rather than derived from a
+/// before/after size difference — the caller folds a non-zero count into
+/// its `dirty` flag, because a sweep is a real mutation and must persist
+/// even when the surrounding operation was otherwise read-only (the P5e
+/// discipline; see
+/// `docs/internal/performance/payments-spend-contention.md`).
+///
+/// **`consumed_transactions` is never touched.** It is a permanent
+/// uniqueness index, not retention state: a settlement that occurred stays
+/// a settlement that occurred, and the generic engine/checker path does not
+/// universally establish that a transaction fell inside a given quote's
+/// validity interval. Expiring these entries would mean one payment can
+/// serve twice provided the attacker waits long enough. Bounding *their*
+/// storage needs a scheme-level invariant about when a settlement identity
+/// may be forgotten, and bounding their *lookup cost* belongs to the
+/// indexed store — neither is retention's business.
+fn prune_terminal(
+    s: &mut EngineState,
+    now_ns: u64,
+    retention_ns: Option<u64>,
+    tolerance_ns: u64,
+) -> usize {
+    // Compaction explicitly disabled: keep every terminal record.
+    let Some(retention_ns) = retention_ns else {
+        return 0;
+    };
+    let retiring: Vec<String> = s
+        .quotes
+        .iter()
+        .filter(|(_, rec)| rec.is_prunable_at(now_ns, retention_ns, tolerance_ns))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut retired = 0;
+    for quote_id in &retiring {
+        // One lookup: the removal yields the record, so the co-prune below
+        // reads the payload hash it owns without a second `get` or a clone.
+        let Some(rec) = s.quotes.remove(quote_id) else {
+            continue;
+        };
+        retired += 1;
+        // Co-prune the payload guard this record owns — but only if it is
+        // still *this* record's. If ownership has diverged (corruption, or
+        // an unexpected migration state) the entry belongs to some other
+        // quote's replay protection: leave it. Never erase another quote's
+        // guard merely because the retiring record names that hash.
+        //
+        // What retiring it costs, stated exactly. The payload hash is the
+        // claim-time guard, effective before any settlement transaction is
+        // known. Afterwards two things stand behind it, and only the second
+        // is universal:
+        //
+        //   [a] the transaction tombstone — but that catches a replay only
+        //       when it resolves to the SAME transaction id. It is what
+        //       `a_retired_settlement_transaction_is_still_rejected_later`
+        //       exercises, because the mock facilitator derives its
+        //       transaction id from the payload bytes;
+        //   [b] the scheme's own single-use authorization — the EIP-3009
+        //       nonce, the SVM transaction's recent blockhash + signature,
+        //       the XRPL sequence number. On a real rail this is the guard
+        //       that actually holds: re-presenting one authorization does
+        //       not settle twice, it fails.
+        //
+        // So this leans on a scheme-level property, which the paragraph
+        // above declines to lean on for `consumed_transactions`. The
+        // asymmetry is deliberate and worth naming: "this authorization
+        // cannot be spent twice" is a property every supported scheme
+        // already provides and the engine merely benefits from, whereas
+        // "this settlement identity may now be forgotten" is a claim about
+        // when it is safe to STOP remembering — nothing in the schemes
+        // establishes it, and being wrong there means one payment serves
+        // twice. Relying on the first is not licence to assume the second.
+        if s.consumed
+            .get(&rec.payload_hash)
+            .is_some_and(|owner| owner == quote_id)
+        {
+            s.consumed.remove(&rec.payload_hash);
+        }
+    }
+    retired
+}
+
 enum Claim {
     Fresh,
     AlreadySettled,
@@ -334,12 +512,32 @@ enum Claim {
     QuoteAlreadyPaid,
 }
 
-fn last_verified_tier(chain: &[VerificationEvent]) -> Option<VerificationTier> {
-    chain
-        .iter()
-        .rev()
-        .find(|e| matches!(e.status, VerificationStatus::Verified))
-        .map(|e| e.tier)
+/// The best confidence this record has actually reached.
+///
+/// A high-water mark, not the last event — because the chain's tiers are
+/// not monotonic. `re_verify` mints `Observed` and nothing higher (a
+/// facilitator receipt justifies no depth claim), so a facilitator
+/// re-check run after `re_verify_with_checker` had established
+/// `Confirmed(n)` or `Final` appends a *lower* tier than the record had
+/// already earned. Reading the last event reported that as a downgrade —
+/// through `QuoteStatus::tier`, whose own doc promises the highest tier
+/// reached, and through every idempotent `accept_payment` retry.
+///
+/// An `Invalidated` event resets the mark. Withdrawing the verifications
+/// before it is what invalidation *means*, so a reorged record must not
+/// keep advertising confidence its settlement no longer has.
+///
+/// `Exception` events neither raise nor reset it: an overpayment is an
+/// outcome for provider policy, not a statement about chain depth.
+fn best_verified_tier(chain: &[VerificationEvent]) -> Option<VerificationTier> {
+    chain.iter().fold(None, |best, e| match e.status {
+        VerificationStatus::Verified => Some(match best {
+            Some(b) if b.satisfies(&e.tier) => b,
+            _ => e.tier,
+        }),
+        VerificationStatus::Invalidated { .. } => None,
+        VerificationStatus::Exception { .. } => best,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -363,11 +561,105 @@ pub struct PaymentEngine {
     /// a genuinely in-progress attempt is never reclaimed out from under
     /// itself, while a crashed one eventually frees up.
     in_flight_ttl_ns: u64,
+    /// How long a terminal quote record is kept past its authoritative
+    /// expiry before compaction may remove it, or `None` to keep terminal
+    /// records indefinitely. Default `Some(6 hours)` — see
+    /// [`DEFAULT_TERMINAL_RECORD_RETENTION_NS`].
+    terminal_record_retention_ns: Option<u64>,
     /// Optional billing stream: every freshly-emitted billing event is
     /// appended (durable JSONL + in-process subscribers). Idempotent
     /// retries republish nothing — one event per idempotency key.
     billing_log: Option<Arc<BillingLog>>,
+    /// Whether [`redeem_for_invocation`](Self::redeem_for_invocation)
+    /// refuses a redemption that presents no invocation binding.
+    /// See [`with_require_invocation_binding`](Self::with_require_invocation_binding).
+    require_invocation_binding: bool,
 }
+
+/// Default retention for terminal quote records: 6 hours past authoritative
+/// quote expiry (plus the engine's expiry tolerance).
+///
+/// Sized as an **operational re-verification grace**, not as proof that
+/// every reorg was observed — it is deliberately comfortably above the
+/// Base pack's ~1h final-depth posture (`FINAL_DEPTH_BASE` = 1800 L2 blocks
+/// ≈ 1h at 2s/block), while Solana and XRPL reach deterministic finality
+/// faster and configure no depth at all. Compaction does not perform
+/// re-verification; it only declines to discard a record something might
+/// still want to re-check.
+///
+/// **The horizon IS the re-verification window, and it is the only gate.**
+/// `QuoteRecord::is_prunable_at` does not consult the record's verified
+/// tier, so a record served at `observed` — the facilitator's receipt
+/// alone, and the facilitator is deliberately not in the trust root —
+/// retires on the same clock as one an independent checker drove to
+/// `final`. Once it is gone,
+/// [`re_verify_with_checker`](PaymentEngine::re_verify_with_checker)
+/// answers `BadQuote("unknown quote")` and a revert or reorg can no longer
+/// be attributed to that payment at all.
+///
+/// A `final`-tier precondition was considered and **rejected**: a
+/// facilitator receipt caps at `observed`, so a provider that never runs a
+/// [`ChainChecker`] — the common deployment, and every mock one — would
+/// hold every record at `observed` forever and compaction would silently
+/// become a no-op, which is the exact failure it was introduced to fix. The
+/// assumption is therefore stated rather than enforced, and it is the
+/// operator's:
+///
+/// > A deployment that re-verifies out of band, on a slower rail, or at a
+/// > raised `FINAL_DEPTH_*` must widen this window past its own
+/// > re-verification period — or pass `None` to keep records indefinitely.
+///
+/// Pinned by `engine_retention.rs`'s
+/// `an_observed_tier_record_retires_on_the_same_clock_as_a_final_one`, so
+/// the tradeoff is red-coupled rather than incidental: a future tier gate
+/// breaks that test by design, and its author is meant to read this.
+///
+/// At 1 000 **redeemed** calls/day this retains ~250 records (~0.8 MB)
+/// instead of letting months of fat records ride every whole-file
+/// transaction.
+///
+/// **What this does NOT bound.** That figure is the redeemed steady state,
+/// and compaction is not a bound on store size in general — two classes of
+/// record are permanent by construction (see `QuoteRecord::is_prunable_at`):
+///
+/// - **settled, billed, published, never redeemed** — a normal outcome, not
+///   an error: the caller pays and then crashes, times out, or simply never
+///   invokes. These are full-fat records (both preserved base64 carries);
+/// - **frozen** — every invalidation, whether it lands before redemption
+///   (network mismatch, transaction replay, amount mismatch) or after one
+///   (a checker finding the settlement reverted).
+///
+/// Neither is an oversight. `redeem_for_invocation` applies no expiry, so a
+/// paid entitlement never lapses, and retiring its record would destroy
+/// something the caller paid for; a frozen record is evidence. But it means
+/// a deployment whose callers pay and abandon accumulates fat records
+/// forever, at the linear per-transaction cost compaction exists to
+/// contain. Making that class prunable needs a *redemption deadline* — a
+/// payment-semantics decision, not a retention one. Until then the growth is
+/// at least visible: see [`ENGINE_STORE_SIZE_WARN_RECORDS`].
+///
+/// **Default-on, explicit opt-out.** Making compaction opt-in would leave
+/// most deployments silently accumulating multi-kilobyte terminal records
+/// forever and degrading continuously. Past expiry, durable billing
+/// publication, and redemption, the full record is redundant lifecycle
+/// material — not active authority state.
+pub const DEFAULT_TERMINAL_RECORD_RETENTION_NS: u64 = 6 * 3_600 * 1_000_000_000;
+
+/// Record count at which the engine store warns once, on the way up.
+///
+/// Every engine operation parses and (when dirty) re-serializes the whole
+/// file, so store size is a latency term on every payment. Compaction keeps
+/// the redeemed population flat, but the classes it cannot retire — see
+/// [`DEFAULT_TERMINAL_RECORD_RETENTION_NS`] — grow without bound, and their
+/// only symptom is payments getting gradually slower. That is exactly the
+/// failure an operator cannot diagnose from the outside, so it gets a log
+/// line rather than nothing.
+///
+/// Emitted from the one site that grows the map, on the single transition
+/// `len() == ENGINE_STORE_SIZE_WARN_RECORDS`, so a store sitting above the
+/// threshold does not warn on every payment. A store oscillating across it
+/// re-warns, which is informative rather than noisy.
+pub const ENGINE_STORE_SIZE_WARN_RECORDS: usize = 10_000;
 
 impl PaymentEngine {
     pub fn new(
@@ -387,8 +679,55 @@ impl PaymentEngine {
             state_path: state_path.into(),
             expiry_tolerance_ns: 0,
             in_flight_ttl_ns: 300_000_000_000,
+            terminal_record_retention_ns: Some(DEFAULT_TERMINAL_RECORD_RETENTION_NS),
             billing_log: None,
+            require_invocation_binding: true,
         })
+    }
+
+    /// Set how long terminal quote records are retained past authoritative
+    /// quote expiry (default `Some(`[`DEFAULT_TERMINAL_RECORD_RETENTION_NS`]`)`,
+    /// 6 hours).
+    ///
+    /// This is a **narrow lifecycle-compaction policy**, not general
+    /// retention configuration:
+    ///
+    /// - `Some(6h)` — the default;
+    /// - `Some(longer)` — a deployment wanting a larger local
+    ///   re-verification / forensic window;
+    /// - `None` — explicitly keep full terminal records indefinitely;
+    /// - `Some(0)` — **refused**, and normalized to the default (see below).
+    ///
+    /// The safety conditions are **not** configurable at any setting:
+    /// nothing prunes before authoritative expiry plus tolerance; only
+    /// billed, durably published, redeemed, non-in-flight records are ever
+    /// eligible; the payload guard retires atomically and owner-safely with
+    /// its record; legacy records lacking an authoritative expiry are never
+    /// pruned; and **settlement-transaction tombstones are never removed.**
+    /// There is deliberately no knob for tombstone expiry — exposing
+    /// "retain transaction ids for N days" would turn a security invariant
+    /// into a deployment preference.
+    ///
+    /// `Some(0)` is refused rather than honored because zero conventionally
+    /// reads as "off", while here it would mean the *most* aggressive
+    /// setting — compaction the instant a quote expires. An operator
+    /// reaching for "disable this" would get the opposite of what they
+    /// meant, so the value is rejected, normalized to the default, and
+    /// logged. `None` is the way to turn compaction off.
+    pub fn with_terminal_record_retention_ns(mut self, retention_ns: Option<u64>) -> Self {
+        self.terminal_record_retention_ns = match retention_ns {
+            Some(0) => {
+                tracing::warn!(
+                    default_ns = DEFAULT_TERMINAL_RECORD_RETENTION_NS,
+                    "terminal-record retention of 0 is refused (0 reads as \"off\" but would \
+                     mean immediate compaction at quote expiry) — normalized to the default; \
+                     pass `None` to keep terminal records indefinitely"
+                );
+                Some(DEFAULT_TERMINAL_RECORD_RETENTION_NS)
+            }
+            other => other,
+        };
+        self
     }
 
     /// Set the expiry comparison tolerance (default 0).
@@ -408,6 +747,42 @@ impl PaymentEngine {
     /// Attach the billing stream/export surface.
     pub fn with_billing_log(mut self, log: Arc<BillingLog>) -> Self {
         self.billing_log = Some(log);
+        self
+    }
+
+    /// Require the invocation binding: refuse to redeem a quote unless the
+    /// invoker presents the paying identity's signature over
+    /// [`invocation_binding_transcript`].
+    ///
+    /// **What this closes.** Without it, possession of the quote id is
+    /// sufficient to consume the paid invocation, and the quote id is not
+    /// a secret in practice: it rides a request header on every paid
+    /// invoke, appears in the caller's payment proof, and is carried on
+    /// the billing event. Anything that learns one — a log sink, a
+    /// support bundle, an audit export — can spend it, and redemption is
+    /// at-most-once, so the legitimate payer then gets
+    /// `already_redeemed`. Requiring the binding means only the identity
+    /// that paid can redeem.
+    ///
+    /// **What this does not close.** The binding transcript covers the
+    /// quote and the tool, and the signature travels beside the quote id
+    /// on the invocation itself. An intermediary that observes the *paid
+    /// invocation* can copy both headers and front-run it. Closing that
+    /// needs channel binding or an authenticated transport identity, not
+    /// a bigger transcript — a visible, transferable signature cannot fix
+    /// it. Do not document this flag as protection against an on-path
+    /// observer.
+    ///
+    /// **Defaults to `true`.** Bearer redemption is the exposure, so it
+    /// is not the default posture — a provider that wants it has to ask,
+    /// and the asking is visible at the call site.
+    ///
+    /// Pass `false` only for a deployment whose callers predate the
+    /// binding. A caller built on [`crate::flow::CallerPaymentFlow`]
+    /// always signs one when its identity can sign, so that set is small
+    /// and shrinking.
+    pub fn with_require_invocation_binding(mut self, require: bool) -> Self {
+        self.require_invocation_binding = require;
         self
     }
 
@@ -476,70 +851,114 @@ impl PaymentEngine {
                 })
             }
         };
-        let idem = IdempotencyScope {
-            caller: quote.caller.clone(),
-            provider: quote.provider.clone(),
-            capability: quote.capability.clone(),
-            quote_id: quote.quote_id.clone(),
-        };
-
         // -- claim: check-and-mark under the lock, then release it before
         // any facilitator I/O.
         let quote_id = quote.quote_id.clone();
         let in_flight_ttl_ns = self.in_flight_ttl_ns;
+        let terminal_record_retention_ns = self.terminal_record_retention_ns;
+        let expiry_tolerance_ns = self.expiry_tolerance_ns;
         let claim = {
             let payload_hash = payload_hash.clone();
-            let record = QuoteRecord {
-                idempotency_key: idem.key(),
-                payload_hash: payload_hash.clone(),
-                capability: quote.capability.clone(),
-                caller_hex: hex::encode(quote.caller.as_bytes()),
-                requirements_b64: BASE64.encode(quote.requirements.bytes()),
-                payload_b64: BASE64.encode(payload.bytes()),
-                in_flight: true,
-                in_flight_since_ns: Some(now_ns),
-                frozen: None,
-                served: false,
-                redeemed: false,
-                chain: Vec::new(),
-                billing: None,
-                billing_published: false,
-            };
             // Only the three `Claim::Fresh` paths mutate state (insert a new
             // record, mark an existing record in_flight, or reclaim a stale
             // in_flight); every other outcome is a read-only inspection.
             // `mutate_json_if_changed` therefore skips the durable write on
             // the read-only outcomes (Frozen / QuoteAlreadyPaid / AlreadyServed
             // / InProgress / AlreadySettled / ReplayOtherQuote). The dirty
-            // flag is `matches!(_, Fresh)`, derived from the SAME branch that
-            // mutated — so it can never diverge from the mutation. The later
-            // writes (completion, `release_claim`, billing republish) are
-            // separate calls and remain unconditional, so a `verify_rejected`
-            // still persists both its claim (a Fresh here) and its release.
+            // flag is `matches!(_, Fresh) || retired > 0`, each disjunct derived
+            // from the SAME branch that mutated — so it can never diverge from
+            // the mutation. The later writes (completion, `release_claim`,
+            // billing republish) are separate calls and remain unconditional,
+            // so a `verify_rejected` still persists both its claim (a Fresh
+            // here) and its release.
             mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
+                // Retention runs where records are minted, mirroring the spend
+                // engine's counter prune in `check_and_reserve`: the operation
+                // that grows the store is the one that retires from it. A
+                // sweep is a real mutation, so it makes an otherwise read-only
+                // outcome dirty (P5e) — a denial that pruned must persist.
+                //
+                // This cannot resurrect the quote being accepted: a record is
+                // only prunable well past its quote's authoritative expiry,
+                // and an expired quote was already rejected above, before this
+                // transaction. The two guards are independent.
+                let retired =
+                    prune_terminal(s, now_ns, terminal_record_retention_ns, expiry_tolerance_ns);
+                // Read before the `&mut` borrow below, which would
+                // otherwise rule out touching `consumed` while holding it.
+                let payload_consumed_elsewhere = s
+                    .consumed
+                    .get(&payload_hash)
+                    .is_some_and(|owner| *owner != quote_id);
+                // Set when a stale in-flight record is taken over by a
+                // different payload: the replay index still names the dead
+                // attempt's hash and has to move with the record. Applied
+                // once the borrow ends.
+                let mut rebind_consumed_from: Option<String> = None;
                 let claim: Claim = 'claim: {
                     if let Some(rec) = s.quotes.get_mut(&quote_id) {
                         if let Some(reason) = &rec.frozen {
                             break 'claim Claim::Frozen(reason.clone());
                         }
-                        if rec.payload_hash != payload_hash {
-                            break 'claim Claim::QuoteAlreadyPaid;
-                        }
+                        let same_payload = rec.payload_hash == payload_hash;
+
+                        // Commitment first, and only then the payload
+                        // comparison.
+                        //
+                        // This used to be the other way round: any
+                        // differing payload was `QuoteAlreadyPaid`, a
+                        // terminal rejection, whether or not the record had
+                        // actually paid anything. But the claim is taken
+                        // *before* the facilitator verifies (verification is
+                        // network I/O and does not hold the lock), so an
+                        // unverified attempt held the quote against everyone
+                        // else with a decision that reads "someone already
+                        // paid this".
+                        //
+                        // The semantic replay key is derived from the
+                        // authorization's `(from, nonce)` and scope — all of
+                        // which an observer of a real authorization knows.
+                        // So the attempt occupying the record need not be
+                        // the payer: a forged payload with a garbage
+                        // signature claims the same quote just as well, and
+                        // the real payer was told their quote was spent.
+                        //
+                        // A record that has billed or settled *is* bound to
+                        // the payload it holds, and a different one there is
+                        // genuinely a second payment for one quote. Below
+                        // that line, nothing is decided yet.
                         if let Some(billing) = &rec.billing {
+                            if !same_payload {
+                                break 'claim Claim::QuoteAlreadyPaid;
+                            }
                             break 'claim Claim::AlreadyServed(
                                 Box::new(billing.clone()),
-                                last_verified_tier(&rec.chain),
+                                best_verified_tier(&rec.chain),
                                 rec.billing_published,
                             );
                         }
+                        // Completion is atomic (chain push + in_flight=false
+                        // in one commit), so a non-empty chain and
+                        // `in_flight` are mutually exclusive and this order
+                        // is free to put settlement first.
+                        if !rec.chain.is_empty() {
+                            if !same_payload {
+                                break 'claim Claim::QuoteAlreadyPaid;
+                            }
+                            break 'claim Claim::AlreadySettled;
+                        }
                         if rec.in_flight {
-                            // Completion is atomic (chain push + in_flight=false
-                            // in one commit), so an in_flight record has an
-                            // empty chain: a prior attempt claimed it and then
-                            // crashed (or is still running) before completing.
-                            // Reclaim only after the TTL, refreshing the clock
-                            // so a concurrent retry still sees InProgress and
-                            // only one attempt re-runs verify/settle.
+                            // An attempt claimed this and has not finished:
+                            // still running, or the process died before it
+                            // could release. Reclaim only after the TTL,
+                            // refreshing the clock so a concurrent retry
+                            // still sees InProgress and only one attempt
+                            // re-runs verify/settle.
+                            //
+                            // `InProgress` is retryable, which is the whole
+                            // point — a caller told this comes back and
+                            // finds the quote free once the attempt ahead of
+                            // it fails verification and releases.
                             let stale = rec
                                 .in_flight_since_ns
                                 .map(|since| now_ns.saturating_sub(since) >= in_flight_ttl_ns)
@@ -547,26 +966,96 @@ impl PaymentEngine {
                             if !stale {
                                 break 'claim Claim::InProgress;
                             }
+                            // Stale, so the attempt holding it is gone.
+                            // Taking the record over with a different
+                            // payload rebinds it, and the replay index has
+                            // to follow — otherwise the dead attempt's hash
+                            // stays claimed forever and the live one is
+                            // never registered.
+                            if !same_payload {
+                                if payload_consumed_elsewhere {
+                                    break 'claim Claim::ReplayOtherQuote;
+                                }
+                                rebind_consumed_from = Some(std::mem::replace(
+                                    &mut rec.payload_hash,
+                                    payload_hash.clone(),
+                                ));
+                                rec.payload_b64 = BASE64.encode(payload.bytes());
+                            }
                             rec.in_flight_since_ns = Some(now_ns);
                             break 'claim Claim::Fresh;
                         }
-                        if !rec.chain.is_empty() {
-                            break 'claim Claim::AlreadySettled;
-                        }
+                        // Not in flight, nothing settled, nothing billed.
+                        // `release_claim` removes an unsettled record
+                        // outright, so this is unreachable in practice; take
+                        // it as a fresh claim rather than invent a state for
+                        // it.
                         rec.in_flight = true;
                         rec.in_flight_since_ns = Some(now_ns);
                         break 'claim Claim::Fresh;
                     }
-                    if let Some(other) = s.consumed.get(&payload_hash) {
-                        if *other != quote_id {
-                            break 'claim Claim::ReplayOtherQuote;
-                        }
+                    if payload_consumed_elsewhere {
+                        break 'claim Claim::ReplayOtherQuote;
                     }
-                    s.consumed.insert(payload_hash, quote_id.clone());
+                    // Built here, not before the closure: the two base64
+                    // encodes below cover the *whole* preserved carries
+                    // (requirements + payload, the bulk of a record's bytes)
+                    // and the idempotency key is a blake3 transcript hash.
+                    // Every branch above discards the record, so building it
+                    // eagerly spent all of that on each duplicate/retry —
+                    // and under a duplicate storm all but one attempt takes
+                    // one of those branches.
+                    let record = QuoteRecord {
+                        idempotency_key: IdempotencyScope {
+                            caller: quote.caller.clone(),
+                            provider: quote.provider.clone(),
+                            capability: quote.capability.clone(),
+                            quote_id: quote.quote_id.clone(),
+                        }
+                        .key(),
+                        payload_hash: payload_hash.clone(),
+                        capability: quote.capability.clone(),
+                        caller_hex: hex::encode(quote.caller.as_bytes()),
+                        requirements_b64: BASE64.encode(quote.requirements.bytes()),
+                        payload_b64: BASE64.encode(payload.bytes()),
+                        expires_at_ns: Some(quote.expires_at_ns),
+                        in_flight: true,
+                        in_flight_since_ns: Some(now_ns),
+                        frozen: None,
+                        served: false,
+                        redeemed: false,
+                        chain: Vec::new(),
+                        billing: None,
+                        billing_published: false,
+                    };
+                    s.consumed.insert(payload_hash.clone(), quote_id.clone());
                     s.quotes.insert(quote_id.clone(), record);
+                    // The one site that grows the map, so the one site that
+                    // can observe the store crossing the warn threshold.
+                    // `==` rather than `>=`: this fires once per upward
+                    // crossing, not on every payment thereafter. What it
+                    // catches is the population compaction cannot retire
+                    // (paid-but-never-redeemed, frozen), whose only other
+                    // symptom is every payment getting slower.
+                    if s.quotes.len() == ENGINE_STORE_SIZE_WARN_RECORDS {
+                        tracing::warn!(
+                            records = s.quotes.len(),
+                            "payment engine store crossed \
+                             ENGINE_STORE_SIZE_WARN_RECORDS — every operation parses and \
+                             rewrites the whole file, so this is a latency term on every \
+                             payment. Terminal records are compacted; records that are \
+                             frozen, or paid but never redeemed, are retained \
+                             indefinitely by design and are the likely cause"
+                        );
+                    }
                     Claim::Fresh
                 };
-                let dirty = matches!(claim, Claim::Fresh);
+                // The stale-takeover rebind, now that `rec` is released.
+                if let Some(dead) = rebind_consumed_from {
+                    s.consumed.remove(&dead);
+                    s.consumed.insert(payload_hash.clone(), quote_id.clone());
+                }
+                let dirty = matches!(claim, Claim::Fresh) || retired > 0;
                 (claim, dirty)
             })
             .await?
@@ -673,7 +1162,11 @@ impl PaymentEngine {
         let transaction = settle.response.view().transaction.clone();
         let settle_network = settle.response.view().network.clone();
         let quoted_network = quote.requirements.view().network.clone();
-        let tier = settle.tier;
+        // A facilitator answer is `observed`, full stop — the engine mints
+        // the tier rather than reading one off the response, so no
+        // `Facilitator` implementation can promote its own receipt.
+        // Anything above `observed` comes from `re_verify_with_checker`.
+        let tier = VerificationTier::Observed;
         // The facilitator's settle-time payer claim, recorded below as a
         // chain fact. For schemes whose payload carries no on-chain payer
         // (exact-SVM's opaque wallet blob), a later independent re-check
@@ -879,8 +1372,20 @@ impl PaymentEngine {
         Ok(decision)
     }
 
-    /// Re-run facilitator verification for a settled quote: tier upgrades
-    /// (late finality) or invalidation (reorg) land here.
+    /// Re-run facilitator verification for a settled quote — the
+    /// **invalidation** path (a reorg the facilitator now reports as
+    /// invalid).
+    ///
+    /// It cannot raise confidence. A facilitator receipt justifies
+    /// `observed` and nothing more (the v2 spec gives facilitators no way
+    /// to report finality), so the tier is minted at this boundary rather
+    /// than read off the response, and every valid answer here is
+    /// `observed`. A caller waiting on `confirmed(n)` or `final` stays
+    /// pending no matter how often this runs.
+    ///
+    /// Confidence upgrades come from
+    /// [`Self::re_verify_with_checker`], which reads the chain
+    /// independently and is the only producer of a higher tier.
     pub async fn re_verify(
         &self,
         quote_id: &str,
@@ -930,7 +1435,9 @@ impl PaymentEngine {
         };
         let is_valid = verify.response.view().is_valid;
         let facilitator_reason = verify.response.view().invalid_reason.clone();
-        let tier = verify.tier;
+        // Same as the settle path: the facilitator's answer is `observed`
+        // regardless of what it would like to claim.
+        let tier = VerificationTier::Observed;
         // The amount this quote requires: re-verify must re-apply the
         // under/over/exact policy against the delivered amount recorded at
         // settlement, not trust the facilitator's `is_valid` boolean alone.
@@ -1331,7 +1838,7 @@ impl PaymentEngine {
                         // and the chain stays an append-only record of
                         // *facts*.
                         let reached =
-                            last_verified_tier(&rec.chain).unwrap_or(VerificationTier::Observed);
+                            best_verified_tier(&rec.chain).unwrap_or(VerificationTier::Observed);
                         Ok((
                             PaymentDecision::PendingTier {
                                 reached,
@@ -1496,18 +2003,35 @@ impl PaymentEngine {
     /// was lost is not re-servable on the same quote, matching the
     /// at-most-once retry safety of credentialed tools.
     ///
-    /// `binding`, when present, must be the paying identity's ed25519
-    /// signature over [`invocation_binding_transcript`] — possession
-    /// proof that the invoker is the payer. Present-but-invalid rejects;
-    /// absent falls back to bearer semantics (the quote id is
-    /// content-derived and unguessable), kept in P1 for pre-binding
-    /// callers.
+    /// `binding` must be the paying identity's ed25519 signature over
+    /// [`invocation_binding_transcript`] — possession proof that the
+    /// invoker is the payer. Present-but-invalid rejects.
+    ///
+    /// **Absent rejects too**, with
+    /// [`RedeemDenialReason::BindingRequired`]. A default engine requires
+    /// the binding: without it the quote id alone admits, and a quote id
+    /// travels through logs, proxies, and the caller's own tooling — a
+    /// bearer credential by accident rather than by decision.
+    ///
+    /// Bearer semantics survive only behind
+    /// [`Self::with_require_invocation_binding(false)`](Self::with_require_invocation_binding),
+    /// for pre-binding callers that cannot be upgraded yet. The quote id
+    /// is content-derived and unguessable, so that mode is not *broken* —
+    /// it is just a weaker claim than possession of the payer's key.
     pub async fn redeem_for_invocation(
         &self,
         tool_id: &str,
         quote_id: &str,
         binding: Option<&[u8]>,
     ) -> Result<RedeemDecision, EngineError> {
+        if self.require_invocation_binding && binding.is_none() {
+            // Refused before the store is touched: nothing to look up, and
+            // a missing binding is a client-configuration fact that does
+            // not depend on whether the quote exists.
+            return Ok(RedeemDecision::Denied {
+                reason: RedeemDenialReason::BindingRequired,
+            });
+        }
         let binding = binding.map(<[u8]>::to_vec);
         let tool_id = tool_id.to_string();
         let quote_id = quote_id.to_string();
@@ -1617,13 +2141,93 @@ impl PaymentEngine {
         Ok(decision)
     }
 
+    /// Run the retention sweep on demand, returning how many terminal
+    /// quote records were retired.
+    ///
+    /// [`accept_payment`](Self::accept_payment) already sweeps as it
+    /// claims, so a provider under steady load never needs this. It exists
+    /// for the provider that stops accepting but keeps redeeming (or stops
+    /// entirely) and would otherwise keep a full store forever, and for
+    /// operators who want the sweep at a known time rather than at the
+    /// next payment.
+    ///
+    /// Only terminal records past the horizon are affected, and settlement
+    /// tombstones are never removed — see `prune_terminal`.
+    pub async fn prune_terminal_records(&self, now_ns: u64) -> Result<usize, EngineError> {
+        let retention_ns = self.terminal_record_retention_ns;
+        let tolerance_ns = self.expiry_tolerance_ns;
+        let removed = mutate_json_if_changed::<EngineState, _, _>(&self.state_path, move |s| {
+            let retired = prune_terminal(s, now_ns, retention_ns, tolerance_ns);
+            (retired, retired > 0)
+        })
+        .await?;
+        Ok(removed)
+    }
+
+    /// The provider identity this engine signs with — the destination a
+    /// `net.payment.quote_request@1` must be addressed to.
+    pub fn provider_id(&self) -> &EntityId {
+        self.provider.entity_id()
+    }
+
+    /// Check that this engine's settlement backend will actually settle
+    /// every `(scheme, network)` in `requirements`, before they are
+    /// announced.
+    ///
+    /// The registry check answers a different question — is this an
+    /// asset the provider knows — and a provider that passes it can
+    /// still publish a route its facilitator has never handled. The
+    /// caller then picks that entry, signs an authorization, and the
+    /// discovery happens at settle time with their signature already
+    /// given away.
+    ///
+    /// A backend that cannot say what it supports (the mock, or any
+    /// other [`Facilitator`] that does not answer) passes. Refusing on
+    /// silence would turn every implementation without a discovery
+    /// surface into a failure, which is a worse trade than the gap.
+    ///
+    /// Network I/O: call at publication or configuration time, never per
+    /// payment.
+    pub async fn check_settlement_routes(
+        &self,
+        requirements: &[X402Carry<PaymentRequirements>],
+    ) -> Result<(), EngineError> {
+        let Some(pairs) = self
+            .facilitator
+            .supported_pairs()
+            .await
+            .map_err(|e| EngineError::State(format!("facilitator /supported: {e}")))?
+        else {
+            return Ok(());
+        };
+        for requirement in requirements {
+            let view = requirement.view();
+            let offered = pairs
+                .iter()
+                .any(|(scheme, network)| *scheme == view.scheme && *network == view.network);
+            if !offered {
+                let offers = pairs
+                    .iter()
+                    .map(|(s, n)| format!("({s}, {n})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(EngineError::State(format!(
+                    "the settlement backend does not settle ({}, {}) — refusing to announce a \
+                     price it cannot honour. It offers: [{offers}]",
+                    view.scheme, view.network
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Read-only lifecycle snapshot for gates and tests.
     pub async fn status(&self, quote_id: &str) -> Result<Option<QuoteStatus>, EngineError> {
         let state: EngineState = load_json(&self.state_path).await?;
         Ok(state.quotes.get(quote_id).map(|rec| QuoteStatus {
             frozen: rec.frozen.clone(),
             served: rec.served,
-            tier: last_verified_tier(&rec.chain),
+            tier: best_verified_tier(&rec.chain),
             billing_event_id: rec.billing.as_ref().map(|b| b.billing_event_id.clone()),
             chain: rec.chain.clone(),
         }))

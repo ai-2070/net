@@ -41,7 +41,7 @@
 #[path = "bench_island_claim/mod.rs"]
 mod bench_island_claim;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,7 +52,7 @@ use bench_island_claim::{node, runtime, LatencyReport, WORKER_THREADS};
 use net::adapter::net::behavior::capability::CapabilityFilter as QueryFilter;
 use net::adapter::net::behavior::fold::{
     CapabilityFilter as FoldCapFilter, CapabilityFold, CapabilityMembership, CapabilityQuery,
-    EnvelopeMeta, FoldKind, IslandQuery, IslandRecord, IslandTopologyFold, NodeState,
+    EnvelopeMeta, FoldKind, IslandQuery, IslandRecord, IslandTopologyFold, NodeIdSet, NodeState,
     SignedAnnouncement, UnitSet,
 };
 use net::adapter::net::behavior::gang::{MatchCriteria, NumericFilter, SelectionPolicy};
@@ -279,7 +279,7 @@ fn criteria() -> MatchCriteria {
 /// filter.
 fn reconstruct(node: &Arc<MeshNode>, crit: &MatchCriteria, filter: &QueryFilter) -> Populations {
     let matched_hosts = node.find_nodes_by_filter(filter);
-    let hosts_set: HashSet<u64> = matched_hosts.iter().copied().collect();
+    let hosts_set: NodeIdSet = matched_hosts.iter().copied().collect();
     let candidate_islands = node
         .island_fold()
         .query(IslandQuery::HostedByAny(hosts_set))

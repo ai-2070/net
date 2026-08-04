@@ -68,10 +68,31 @@ struct NodeState {
     /// Time node was first seen
     #[allow(dead_code)]
     first_seen: Instant,
+    /// The peer INCARNATION the most recent heartbeat came from — the
+    /// session id, when the caller supplies one (0 = unknown).
+    ///
+    /// Carried so a failure verdict can name the exact incarnation it
+    /// is about. A consumer cannot reconstruct that after the fact: by
+    /// the time a callback runs, the peer may already have been
+    /// replaced, and "read the current session" would then attribute
+    /// the failure to the replacement.
+    epoch: u64,
+    /// Sequence number of the most recent verdict issued for this node.
+    ///
+    /// The epoch alone cannot order verdicts. A failure and a recovery
+    /// for the SAME incarnation both legitimately name epoch E, so a
+    /// delayed failure callback and a concurrent recovery callback are
+    /// indistinguishable by incarnation — and the failure, running
+    /// second, would undo a recovery that had already restored the
+    /// peer's routes. This orders them: every verdict draws a
+    /// monotonic sequence under the node's shard guard, and a consumer
+    /// revalidates at its mutation point that no later verdict has
+    /// been issued since.
+    verdict_seq: u64,
 }
 
 impl NodeState {
-    fn new(addr: SocketAddr) -> Self {
+    fn new(addr: SocketAddr, epoch: u64) -> Self {
         let now = Instant::now();
         Self {
             last_heartbeat: now,
@@ -80,14 +101,22 @@ impl NodeState {
             addr,
             total_heartbeats: 1,
             first_seen: now,
+            epoch,
+            verdict_seq: 0,
         }
     }
 
-    fn on_heartbeat(&mut self) {
+    fn on_heartbeat(&mut self, addr: SocketAddr, epoch: u64) {
         self.last_heartbeat = Instant::now();
         self.missed_count = 0;
         self.status = NodeStatus::Healthy;
         self.total_heartbeats += 1;
+        self.addr = addr;
+        // A heartbeat under a NEW incarnation re-stamps the epoch, so a
+        // later failure names the incarnation that actually died.
+        if epoch != 0 {
+            self.epoch = epoch;
+        }
     }
 
     fn check(
@@ -135,6 +164,50 @@ pub struct FailureStats {
     pub total_recoveries: u64,
 }
 
+/// The exact peer state a failure or recovery verdict is ABOUT.
+///
+/// Supplied by the detector, which is the only component that knows
+/// which incarnation's heartbeats it was tracking when it reached the
+/// verdict. A callback cannot reconstruct this from current state:
+/// production runs substantial work between the verdict and the
+/// downstream consumer, and by then a replacement session for the
+/// same `node_id` may already be installed — reading "the current
+/// session" would silently attribute the failure to the replacement
+/// and let a dead peer's callback rewrite a live peer's routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerFailureEvent {
+    /// The node the verdict concerns.
+    pub node_id: u64,
+    /// Its address as the detector last observed it.
+    pub addr: SocketAddr,
+    /// The incarnation (session id) the detector was tracking, or 0
+    /// when the heartbeat source supplied none.
+    pub epoch: u64,
+    /// Monotonic order of this verdict among all verdicts for
+    /// `node_id`. Revalidate it with
+    /// [`FailureDetector::verdict_is_current`] before acting on the
+    /// verdict — see [`VerdictStatus`] for why the epoch is not enough.
+    pub verdict_seq: u64,
+    /// Which verdict this is.
+    pub status: VerdictStatus,
+}
+
+/// Which way a verdict went.
+///
+/// Failure and recovery are not distinguishable by incarnation: both
+/// legitimately name the epoch whose heartbeats the detector was
+/// tracking. A consumer handed only `{node_id, addr, epoch}` therefore
+/// cannot tell a stale failure from the recovery that superseded it,
+/// which is how a delayed failure callback ends up tearing down routes
+/// a recovery has already restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictStatus {
+    /// The detector declared this incarnation failed.
+    Failed,
+    /// Heartbeats resumed for this incarnation.
+    Recovered,
+}
+
 /// Heartbeat-based failure detector.
 ///
 /// Tracks node health via heartbeat messages and detects failures.
@@ -143,10 +216,10 @@ pub struct FailureDetector {
     config: FailureDetectorConfig,
     /// Per-node state
     nodes: DashMap<u64, NodeState>,
-    /// Failure callback (node_id)
-    on_failure: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-    /// Recovery callback (node_id)
-    on_recovery: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    /// Failure callback, carrying the exact failed incarnation.
+    on_failure: Option<Arc<dyn Fn(PeerFailureEvent) + Send + Sync>>,
+    /// Recovery callback, carrying the recovered incarnation.
+    on_recovery: Option<Arc<dyn Fn(PeerFailureEvent) + Send + Sync>>,
     /// Total failures detected
     total_failures: AtomicU64,
     /// Total recoveries
@@ -158,6 +231,12 @@ pub struct FailureDetector {
     num_nodes: AtomicUsize,
     /// Last cleanup time
     last_cleanup: Mutex<Instant>,
+    /// Monotonic source of verdict sequence numbers, table-wide so a
+    /// node removed and re-tracked cannot reissue one an earlier
+    /// consumer already holds. Starts at 1: 0 means "no verdict", so a
+    /// freshly tracked node can never be mistaken for one that has
+    /// already been judged.
+    next_verdict_seq: AtomicU64,
 }
 
 impl FailureDetector {
@@ -177,22 +256,47 @@ impl FailureDetector {
             total_recoveries: AtomicU64::new(0),
             num_nodes: AtomicUsize::new(0),
             last_cleanup: Mutex::new(Instant::now()),
+            next_verdict_seq: AtomicU64::new(1),
         }
     }
 
-    /// Set failure callback
+    /// Draw the next verdict sequence number.
+    fn issue_verdict_seq(&self) -> u64 {
+        self.next_verdict_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Whether `verdict_seq` is still the most recent verdict issued
+    /// for `node_id`.
+    ///
+    /// A consumer calls this at the point where it MUTATES state, not
+    /// where it received the callback. Between the two, the detector
+    /// may have reached the opposite verdict for the same incarnation
+    /// — a failure and the recovery that superseded it both name epoch
+    /// E, so nothing in the event itself distinguishes them.
+    ///
+    /// An unknown node answers `false`: a verdict about a node the
+    /// detector no longer tracks has nothing to revalidate against, and
+    /// refusing is the safe direction.
+    pub fn verdict_is_current(&self, node_id: u64, verdict_seq: u64) -> bool {
+        self.nodes
+            .get(&node_id)
+            .is_some_and(|s| s.verdict_seq == verdict_seq)
+    }
+
+    /// Set failure callback. Receives the exact failed incarnation —
+    /// see [`PeerFailureEvent`].
     pub fn on_failure<F>(mut self, f: F) -> Self
     where
-        F: Fn(u64) + Send + Sync + 'static,
+        F: Fn(PeerFailureEvent) + Send + Sync + 'static,
     {
         self.on_failure = Some(Arc::new(f));
         self
     }
 
-    /// Set recovery callback
+    /// Set recovery callback.
     pub fn on_recovery<F>(mut self, f: F) -> Self
     where
-        F: Fn(u64) + Send + Sync + 'static,
+        F: Fn(PeerFailureEvent) + Send + Sync + 'static,
     {
         self.on_recovery = Some(Arc::new(f));
         self
@@ -210,22 +314,44 @@ impl FailureDetector {
     /// callback *after* the `and_modify` returns, releasing the
     /// shard lock.
     pub fn heartbeat(&self, node_id: u64, addr: SocketAddr) {
+        self.heartbeat_for_incarnation(node_id, addr, 0);
+    }
+
+    /// [`Self::heartbeat`], naming the peer INCARNATION the heartbeat
+    /// came from (the session id).
+    ///
+    /// Recording it here is what lets a later failure verdict say
+    /// which incarnation died, instead of leaving every consumer to
+    /// guess from state that may already have moved on.
+    pub fn heartbeat_for_incarnation(&self, node_id: u64, addr: SocketAddr, epoch: u64) {
         let mut should_notify_recovery = false;
         let mut node_inserted = false;
+        let mut recovered_epoch = epoch;
+        let mut recovered_seq = 0u64;
         self.nodes
             .entry(node_id)
             .and_modify(|state| {
                 let was_failed = state.status == NodeStatus::Failed;
-                state.on_heartbeat();
+                state.on_heartbeat(addr, epoch);
+                recovered_epoch = state.epoch;
 
                 if was_failed {
                     self.total_recoveries.fetch_add(1, Ordering::Relaxed);
+                    // Stamp the verdict order UNDER the shard guard,
+                    // even though the callback fires after it is
+                    // released. Sequencing is what makes this recovery
+                    // and any concurrent failure verdict comparable;
+                    // taking the number outside the guard would let two
+                    // verdicts for the same node be stamped in the
+                    // opposite order from the one they were decided in.
+                    state.verdict_seq = self.issue_verdict_seq();
+                    recovered_seq = state.verdict_seq;
                     should_notify_recovery = true;
                 }
             })
             .or_insert_with(|| {
                 node_inserted = true;
-                NodeState::new(addr)
+                NodeState::new(addr, epoch)
             });
         if node_inserted {
             self.num_nodes.fetch_add(1, Ordering::Relaxed);
@@ -233,7 +359,13 @@ impl FailureDetector {
 
         if should_notify_recovery {
             if let Some(ref cb) = self.on_recovery {
-                cb(node_id);
+                cb(PeerFailureEvent {
+                    node_id,
+                    addr,
+                    epoch: recovered_epoch,
+                    verdict_seq: recovered_seq,
+                    status: VerdictStatus::Recovered,
+                });
             }
         }
     }
@@ -263,18 +395,31 @@ impl FailureDetector {
             );
 
             if entry.status == NodeStatus::Failed && prev_status != NodeStatus::Failed {
-                newly_failed.push(*entry.key());
+                // Capture the exact incarnation this verdict is about,
+                // while the state that produced it is still in hand,
+                // and order it against every other verdict for this
+                // node. Both stamps happen under the shard guard the
+                // iteration holds; only the callbacks below run after
+                // it is released.
+                entry.verdict_seq = self.issue_verdict_seq();
+                newly_failed.push(PeerFailureEvent {
+                    node_id: *entry.key(),
+                    addr: entry.addr,
+                    epoch: entry.epoch,
+                    verdict_seq: entry.verdict_seq,
+                    status: VerdictStatus::Failed,
+                });
                 self.total_failures.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         if let Some(ref cb) = self.on_failure {
-            for id in &newly_failed {
-                cb(*id);
+            for event in &newly_failed {
+                cb(*event);
             }
         }
 
-        newly_failed
+        newly_failed.into_iter().map(|e| e.node_id).collect()
     }
 
     /// Get node status
@@ -315,6 +460,32 @@ impl FailureDetector {
     /// Remove a node from tracking
     pub fn remove(&self, node_id: u64) {
         if self.nodes.remove(&node_id).is_some() {
+            self.num_nodes.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Remove a node from tracking only while it is still the
+    /// incarnation `epoch` names.
+    ///
+    /// The eviction path decides to drop a peer, then removes its
+    /// detector entry. Between the two a fresh session for the same
+    /// `node_id` can be installed and start heartbeating; an
+    /// unconditional remove then discards the LIVE peer's tracking, and
+    /// nothing re-creates it until that peer's next heartbeat — during
+    /// which window no failure verdict can be reached for it at all.
+    ///
+    /// `epoch == 0` means the caller has no incarnation to name and the
+    /// removal is unconditional, matching [`Self::remove`].
+    pub fn remove_for_incarnation(&self, node_id: u64, epoch: u64) {
+        if epoch == 0 {
+            self.remove(node_id);
+            return;
+        }
+        if self
+            .nodes
+            .remove_if(&node_id, |_, s| s.epoch == epoch)
+            .is_some()
+        {
             self.num_nodes.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -1490,10 +1661,10 @@ mod tests {
                 suspicion_threshold: 1,
                 cleanup_interval: Duration::from_secs(60),
             })
-            .on_recovery(move |id| {
+            .on_recovery(move |event| {
                 // Re-enter the same detector; observable proof
                 // we got here without a deadlock.
-                let _ = detector_for_cb.status(id);
+                let _ = detector_for_cb.status(event.node_id);
                 observed_clone.store(true, AtomicOrdering::SeqCst);
             }),
         );

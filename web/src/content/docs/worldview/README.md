@@ -2,6 +2,7 @@
 title: Where Net fits
 description: "What Net is for, how it relates to the systems you already use, and when another tool is the simpler choice."
 ---
+
 # Where Net fits
 
 Net connects capabilities across machines, runtimes, and organizations. An

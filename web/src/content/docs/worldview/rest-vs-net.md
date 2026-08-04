@@ -2,6 +2,7 @@
 title: Connecting HTTP systems
 description: "HTTP remains the natural interface for web APIs and SaaS. Net adapters expose selected operations as capabilities at the mesh boundary."
 ---
+
 # Connecting HTTP systems
 
 HTTP remains the natural interface for web APIs, SaaS products, browser

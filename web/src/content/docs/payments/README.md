@@ -2,6 +2,7 @@
 title: Payments
 description: Net Payments is how a capability charges for its work and a caller pays to invoke it — without Net ever touching the money.
 ---
+
 # Payments
 
 Net Payments attaches pricing, payment evidence, verification, spend policy, and
@@ -58,7 +59,7 @@ docs along with the crate.
 - [Verification tiers](/docs/payments/verification-tiers) — `observed | confirmed(n) | final`
 - [Spend policy & approvals](/docs/payments/spend-policy-and-approvals)
 - [Non-custodial signing](/docs/payments/non-custodial-signing)
-- [Networks](/docs/payments/networks) — config, not code
+- [Networks](/docs/payments/networks) — assets, facilitator configuration, scheme support, and conformance
 - [The failure schematic](/docs/payments/failure-schematic) — machine-actionable denials
 - [Billing](/docs/payments/billing)
 
@@ -67,12 +68,12 @@ docs along with the crate.
 Five signed Net envelopes wrap the x402 payment; each has exactly one canonical
 byte encoding, and each carries references and commitments — never customer data:
 
-| Envelope | What it commits |
-|---|---|
-| `net.pricing.terms@1` | what a capability costs, announced at discovery |
-| `net.payment.quote@1` | a signed, expiring quote binding a caller to terms |
-| `net.settlement.ref@1` | a reference to the settled x402 transaction |
-| `net.payment.verification@1` | a tiered verification result (see below) |
-| `net.billing.event@1` | an immutable usage record |
+| Envelope                     | What it commits                                    |
+| ---------------------------- | -------------------------------------------------- |
+| `net.pricing.terms@1`        | what a capability costs, announced at discovery    |
+| `net.payment.quote@1`        | a signed, expiring quote binding a caller to terms |
+| `net.settlement.ref@1`       | a reference to the settled x402 transaction        |
+| `net.payment.verification@1` | a tiered verification result (see below)           |
+| `net.billing.event@1`        | an immutable usage record                          |
 
 The [lifecycle](/docs/payments/the-lifecycle) walks these in order.

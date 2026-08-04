@@ -2,6 +2,7 @@
 title: How Net relates to other systems
 description: "MCP, NATS, Zenoh, HTTP, and Net are organized around different addressable objects and can coexist in one architecture."
 ---
+
 # How Net relates to other systems
 
 Net overlaps with tool protocols, messaging systems, and data fabrics, but it is
@@ -10,13 +11,13 @@ choose the smallest one that fits and combine them where their boundaries meet.
 
 ## The addressable object
 
-| System | What the application addresses |
-|---|---|
-| **HTTP / REST** | an endpoint or resource |
-| **MCP** | a tool exposed by a configured server |
-| **NATS** | a subject |
-| **Zenoh** | data or computation through a key expression |
-| **Net** | a capability offered under identity and authority |
+| System          | What the application addresses                    |
+| --------------- | ------------------------------------------------- |
+| **HTTP / REST** | an endpoint or resource                           |
+| **MCP**         | a tool exposed by a configured server             |
+| **NATS**        | a subject                                         |
+| **Zenoh**       | data or computation through a key expression      |
+| **Net**         | a capability offered under identity and authority |
 
 That choice determines what each system knows. A subject routes messages without
 needing to describe the publisher. A key expression gives distributed data a
@@ -26,15 +27,17 @@ authority, availability, and associated execution state.
 
 ## Side by side
 
-| | MCP | NATS | Zenoh | Net |
-|---|---|---|---|---|
-| Normal job | call a configured tool | route messages and services by subject | publish, query, and subscribe to distributed data | discover and invoke provider-held capabilities |
-| Topology | host to configured server | server fabric, including clusters and leaf nodes | peer, client, and router modes | peers with routed fallback; no broker |
-| Discovery | server configuration | connect to a server URL; subjects emerge through subscriptions | multicast scouting, gossip, or configured endpoints | signed capability announcements folded into a local index |
-| Authority boundary | host and server policy | accounts, credentials, and subject permissions enforced by the server fabric | deployment ACLs and TLS/mTLS configuration | provider identity plus separate visibility and invocation authority |
-| Durable state | server-specific | JetStream | storage/query model | RedEX logs and CortEX folds |
-| Artifacts | server-specific | application-defined | data is native to the key space | content-addressed blobs and directories through Dataforts |
-| Operational maturity | young, broad tool ecosystem | mature CNCF project | mature Eclipse project with robotics deployments | young |
+These systems can occupy different positions in the same deployment. The useful
+distinction is the boundary each one owns, not which one has the longest feature
+list.
+
+| System          | Position in a combined architecture         | What callers address                           | Boundary it owns                                                                                                                                                   | How it composes with Net                                                                                 |
+| --------------- | ------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| **HTTP / REST** | application or provider interface           | an endpoint or resource                        | request and response semantics for a web-facing operation                                                                                                          | a provider-side adapter translates a capability invocation into an HTTP request                          |
+| **MCP**         | agent-host tool interface                   | a tool exposed by a configured server          | tool schemas and calls between a host and its configured servers                                                                                                   | selected tools can be published as Net capabilities, or Net can be exposed to an MCP host                |
+| **NATS**        | provider-side messaging infrastructure      | a subject                                      | publish-subscribe and request-reply messaging inside the provider or deployment                                                                                    | a provider handles a Net invocation through internal NATS subjects and returns the result                |
+| **Zenoh**       | provider-side distributed data plane        | data or computation through a key expression   | publication, subscription, queries, and storage integration across the provider's data plane                                                                       | a provider operates on Zenoh data and publishes selected operations through Net                          |
+| **Net**         | capability and authority plane between them | a capability offered by an identified provider | provider identity, capability publication and discovery, visibility, invocation authority, provider selection, invocation, and the streams or artifacts it returns | applications address provider-held work without depending on the provider's internal interfaces or stack |
 
 ## How they compose
 

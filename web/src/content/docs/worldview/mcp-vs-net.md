@@ -2,6 +2,7 @@
 title: Net and MCP
 description: "MCP describes tools a host can call. Net makes capabilities discoverable across machines and authority boundaries."
 ---
+
 # Net and MCP
 
 MCP gives agent hosts a standard way to describe and call tools. Net can carry
@@ -12,13 +13,13 @@ trusted mesh.
 
 The two layers compose:
 
-| | MCP | Net |
-|---|---|---|
-| Organizing object | tool exposed by a server | capability offered by a provider |
-| Normal scope | a host and its configured servers | nodes across machines, runtimes, and organizations |
-| Discovery | server configuration | live capability announcements |
-| Authority | host and server policy | visibility and invocation authority at the provider |
-| Work beyond request/response | server-specific | streams, durable state, tasks, and artifacts |
+|                              | MCP                               | Net                                                 |
+| ---------------------------- | --------------------------------- | --------------------------------------------------- |
+| Organizing object            | tool exposed by a server          | capability offered by a provider                    |
+| Normal scope                 | a host and its configured servers | nodes across machines, runtimes, and organizations  |
+| Discovery                    | server configuration              | live capability announcements                       |
+| Authority                    | host and server policy            | visibility and invocation authority at the provider |
+| Work beyond request/response | server-specific                   | streams, durable state, tasks, and artifacts        |
 
 Use MCP directly when a host already knows which local or remote servers it should
 call. Add Net when providers change at runtime, capabilities span several machines,
