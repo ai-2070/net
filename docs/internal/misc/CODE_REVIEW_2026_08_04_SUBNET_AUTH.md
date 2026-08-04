@@ -1,10 +1,10 @@
 # CODE REVIEW 2026-08-04 — Subnet auth branch (`subnet-auth-e2e`)
 
 > **STATUS: OPEN, not signed off.** Findings below are unaddressed as
-> written. `cargo check --all-targets --all-features` is clean at the
-> reviewed head; no test run, clippy run, or doc build was performed as part
-> of this pass — see [Verification](#verification) for exactly what was and
-> was not exercised.
+> written. The primary source pass and an independent parallel E2E/evidence
+> pass both reviewed code head `94ef4e092`; the branch has since advanced only
+> by adding this document. See [Verification](#verification) for the exact
+> commands, feature sets, and review boundaries.
 
 **Scope:** the full branch diff `master..94ef4e092` (merge base `313323988`)
 — 40 commits, 53 files, +24846/−1561.
@@ -51,9 +51,11 @@ identity, address, metric, or freshness, and cannot occupy the destination
 against it. Doc comments throughout explain *why* — including why earlier
 shapes were wrong — rather than restating the code.
 
-The findings below are one upgrade-time behaviour change that needs an
-explicit disposition, one public-API contract violation with a test that
-does not establish what it claims, and three smaller items.
+The findings below combine the primary source review with a separate audit of
+the branch's semantic witnesses. The production authority path held up under
+that second pass, but two claimed closure witnesses are structurally invalid,
+three other E2E/build-surface claims are incomplete, and the original source
+findings remain open.
 
 Per the review-tracking rule, the `§N` labels are for this document only —
 they do not belong in code or commit messages.
@@ -110,11 +112,75 @@ same instinct as `note_if_visibility_only` in `channel/config.rs`, which this
 branch added for precisely this class of "the operator believed something
 else" gap.
 
+### §2 — Scenario B's cross-capability inverse mints a fresh valid grant for the capability it invokes
+
+`net/crates/net/tests/subnet_auth_e2e.rs:1900-1939`
+(`partner_intent`) and `:1995-2012` (the inverse).
+
+`partner_intent(provider, service, target_scope)` derives `cap` from its
+`service` argument and then uses that same capability in all three authority
+objects:
+
+- the BMW capability grant (`:1907-1915`);
+- the Partner dispatcher grant (`:1923-1928`); and
+- `OrgProofIntent.capability` (`:1930-1939`).
+
+The inverse says that a grant naming `diagnostic.snapshot` cannot invoke
+`perception.roi`, but it invokes `SERVICE` and also passes `SERVICE` to
+`partner_intent`:
+
+```rust
+partner_intent(
+    provider.clone(),
+    SERVICE,
+    // The grant names the DIAGNOSTIC capability, but the
+    // call invokes perception.roi.
+    GrantTargetScope::ExactNode(provider.clone()),
+)
+```
+
+The comment is false: this creates a fresh valid `perception.roi` capability
+grant and exact dispatcher scope. The call can still be denied because
+`perception.roi` is registered `OwnerDelegated` (`:583-595`), whereas only
+`diagnostic.snapshot` is registered `CrossOrgGranted` (`:1958-1969`). Thus
+both capability and admission mode differ. The explicit denial and dark
+handler prove that *some* gate denied, not that the diagnostic grant is
+capability-bounded.
+
+Closure requires separating the granted capability from the invoked service
+while holding provider target, registration mode, topology, and every other
+gate constant.
+
+### §3 — the deterministic lost-update witness does not hold the production gateway installation sibling as the stale writer
+
+`net/crates/net/src/adapter/net/mesh.rs:11663-11734` and
+`net/crates/net/tests/subnet_auth_e2e.rs:1371-1510`.
+
+The public `install_subnet_gateway_credentials` path independently compiles
+the credential set and publishes at `mesh.rs:11692`. The paced fixture
+duplicates that installation/compilation branch and publishes at `:11733`.
+Phase B holds the fixture-only branch at `subnet_auth_e2e.rs:1463-1473`, not
+the public installation method.
+
+The shared `publish_authority_member` retry primitive is coherent, and the
+boundary production/fixture paths both reach it. The gap is branch
+reachability: a mutant changing only the production gateway publication at
+`mesh.rs:11692` to a naive load/modify/store remains deterministic-green.
+Phase A uses the production gateway publication only as the unblocked
+intervening writer; Phase B holds the duplicated fixture branch. The
+supplemental storm at `subnet_auth_e2e.rs:1292-1351` is intentionally
+nondeterministic and does not close that mutant.
+
+Closure requires one shared gateway-installation implementation parameterized
+by the pacing hook, with both the public method and fixture driver delegating
+to it. The two deterministic schedules must then hold that shared production
+implementation in both sibling roles.
+
 ---
 
 ## P2 findings
 
-### §2 — `AncestorPath` violates its `ExactSizeIterator` contract on interior-zero paths, and the test that pins exactness excludes exactly the domain the file argues matters
+### §4 — `AncestorPath` violates its `ExactSizeIterator` contract on interior-zero paths, and the test that pins exactness excludes exactly the domain the file argues matters
 
 `net/crates/net/src/adapter/net/subnet/id.rs:325` (`size_hint`), `:334`
 (`impl ExactSizeIterator`), `:525` (the test).
@@ -181,7 +247,7 @@ That gives 3, 2 and 5 for the rows above. Extending the existing loop's raw
 list with `0x03_00_07_00` and `0x00_00_00_09` turns the current
 implementation red and the corrected one green.
 
-### §3 — a root-signed floor advances the auth epoch for any never-seen `(authority, topology_epoch, path)` triple, including one that revokes nothing
+### §5 — a root-signed floor advances the auth epoch for any never-seen `(authority, topology_epoch, path)` triple, including one that revokes nothing
 
 `net/crates/net/src/adapter/net/subnet/auth.rs:843` (`SubnetFloorRegistry::apply`).
 
@@ -231,11 +297,75 @@ At minimum the rustdoc on `apply` should say that accepting *any* new
 current text ("Returns `Ok(true)` iff registry state changed") does not
 convey the blast radius.
 
+### §6 — Scenario C does not establish its claimed two-way authority independence
+
+`net/crates/net/tests/subnet_auth_e2e.rs:2105-2206`.
+
+The test claims both that a valid subnet context cannot replace a channel
+token and that a channel token creates neither subnet attachment nor provider
+invocation authority. The first direction checks only `.is_err()` at
+`:2160-2169`; that does not exclude timeout, disconnect, setup failure, or a
+different subscription error. The token-bearing subscription then succeeds.
+
+The reverse direction proves an out-of-scope `ATTACH` attempt returns
+`ScopeNotAncestor` and that no gateway context was published. It never invokes
+an org-protected provider with the token-bearing peer and never proves a
+provider handler remains dark. Absence of subnet/gateway context does not by
+itself establish absence of provider invocation authority; that is a separate
+admission plane.
+
+Closure requires an exact typed unauthorized subscription result, followed by
+a real protected RPC attempt from the channel-token holder with phase-local
+dark-handler evidence.
+
+### §7 — Scenario H proves destination silence, not gateway 2's exact denial or gateway 1's forwarding
+
+`net/crates/net/tests/subnet_auth_e2e.rs:3266-3296`.
+
+The inverse removes gateway 2's `ROUTE` right, redirects destination egress
+through `set_peer_addr_for_test`, and asserts only that no route-hop datagram
+appears at the destination-side socket within 800 ms. It exposes no gateway-1
+egress marker, typed `ForwardDenial::RouteMissing`, gateway-2 drop reason, or
+same-fixture restoration.
+
+Destination silence is also explained by gateway 1 dropping, packet loss,
+timing, fixture/routing failure, or any rejection before gateway 2's authority
+decision. The positive path in a separate fixture does not isolate the
+mutated axis or prove the comment's claim that gateway 1 forwarded correctly.
+
+Closure requires a phase-local gateway-1-forwarded marker and exact gateway-2
+`RouteMissing` observation, or equivalent typed drop telemetry, followed by
+restoration and recovery in the same fixture.
+
+### §8 — Cargo metadata permits a vacuous green `subnet_auth_e2e` target without `fixtures`
+
+`net/crates/net/tests/subnet_auth_e2e.rs:67` gates the whole binary on the
+`fixtures` feature. `net/crates/net/Cargo.toml` declares the feature but has no
+explicit `[[test]]` target for `subnet_auth_e2e` with `required-features`.
+
+The result is a successful zero-test invocation:
+
+```text
+cargo test --no-default-features --features "net cortex" \
+  --test subnet_auth_e2e -- --list
+
+0 tests, 0 benchmarks
+exit 0
+```
+
+CI's committed invocation is protected by `--no-tests=fail`, includes
+`fixtures`, and listed and ran all 23 tests. That protects the current
+workflow, not the Cargo target contract: another runner can omit the
+load-bearing feature and receive a vacuous green binary.
+
+Closure is an explicit `[[test]]` declaration whose `required-features`
+encode the target's real minimum feature set, including `fixtures`.
+
 ---
 
 ## P3 findings
 
-### §4 — `SubnetChallengeStore` self-evicts only per peer, and only when that peer is touched again
+### §9 — `SubnetChallengeStore` self-evicts only per peer, and only when that peer is touched again
 
 `net/crates/net/src/adapter/net/subnet/admission.rs:82` (`issue`), `:112`
 (`consume`).
@@ -278,7 +408,7 @@ TTL sweep on the `MAX_CHALLENGE_PEERS` refusal path (evict expired peers
 before refusing) or a correction to that paragraph would close the gap
 between the claim and the code.
 
-### §5 — bare `#[allow(clippy::too_many_arguments)]` against the module's `#[expect(..., reason = ...)]` convention
+### §10 — bare `#[allow(clippy::too_many_arguments)]` against the module's `#[expect(..., reason = ...)]` convention
 
 `net/crates/net/src/adapter/net/subnet/control.rs:288`
 (`GatewayAdvertisement::try_issue`) and `:475`
@@ -297,6 +427,26 @@ Every other suppression in the subnet module carries a reason and uses
 
 These two are the only bare `allow`s in the module, and the reason that
 applies to the `auth.rs` sites applies verbatim to both.
+
+### §11 — scratch-store cleanup errors are ignored despite PID-based path reuse
+
+`net/crates/net/tests/subnet_auth_e2e.rs:256-315`.
+
+`ScratchDir::fresh` correctly takes ownership before the first filesystem
+operation, but silently ignores failure to remove startup residue:
+
+```rust
+let _ = std::fs::remove_dir_all(&path);
+```
+
+`Drop` silently ignores the same error during final cleanup. Paths are keyed
+by tag plus process ID (`:307-309`), so failed deletion can contaminate a
+later run after PID reuse. RAII now covers adoption and panic windows, but it
+does not make stale-residue removal failure-closed or observable.
+
+Startup cleanup should return an error and refuse to adopt the path if stale
+state cannot be removed. Final cleanup failure should at least be surfaced
+with enough path/error detail to diagnose test contamination.
 
 ---
 
@@ -348,11 +498,41 @@ applies to the `auth.rs` sites applies verbatim to both.
 
 ## Verification
 
-**What was run.** `cargo check --all-targets --all-features` from
-`net/crates/net` — clean, exit 0. Nothing else. No test run, no clippy run
-(either config), no doc build, no `cargo fmt --check`. Those gates are
-claimed green in the branch's own commit trail; this pass did not reproduce
-them, so nothing here should be read as confirming them.
+**Primary source pass.** `cargo check --all-targets --all-features` from
+`net/crates/net` — clean, exit 0. That pass did not run tests, clippy, docs, or
+`cargo fmt --check`.
+
+**Independent E2E/evidence pass at exact code head `94ef4e092`.** The detached
+worktree remained clean, and `git diff --check f87a7dffc..94ef4e092` passed.
+The following commands were reproduced:
+
+```text
+cargo test --features "net cortex fixtures" --test subnet_auth_e2e -- --nocapture
+  23 passed, 0 failed
+
+cargo test --features "cortex tool fixtures" --test subnet_auth_e2e -- --nocapture
+  23 passed, 0 failed
+
+cargo test --features "cortex tool fixtures" --lib adapter::net::route::tests -- --nocapture
+  36 passed, 0 failed
+
+cargo test --features "cortex tool fixtures" --lib adapter::net::reroute::tests -- --nocapture
+  15 passed, 0 failed
+
+cargo test --features "net fixtures" --test subnet_gateway_local_auth -- --nocapture
+  20 passed, 0 failed
+
+cargo check --features "net cortex" --lib
+  exit 0
+
+cargo test --no-default-features --features "net cortex" --test subnet_auth_e2e -- --list
+  0 tests, 0 benchmarks; exit 0
+```
+
+The exact pinned head had 62 GitHub check runs with no incomplete or failing
+conclusions; the CortEX integration and integration pin guard both completed
+successfully. The branch later advanced to `2e6392edb` only by adding this
+review document, so the code findings and results still apply.
 
 **What was read in full.** `subnet/auth.rs` (2327), `subnet/control.rs`
 (1300), `subnet/route_hop.rs` (1005), `subnet/admission.rs` (236), and the
@@ -371,16 +551,14 @@ insertion, `subnet_visible` and both its resolution sites, `PeerTransport` /
 entirely the mechanical `peer.addr` → `peer.addr()` rewrite and were skimmed,
 not read.
 
-**Not covered at all.** The ~14k lines of new integration tests
-(`subnet_auth_e2e.rs`, `subnet_gateway_auth.rs`, `subnet_gateway_local_auth.rs`,
-`subnet_org_boundary.rs`, `subnet_session_auth.rs`, `subnet_grant*.rs`,
-`subnet_revocation.rs`, `subnet_axis_demotion.rs`, `subnet_control_facts.rs`,
-`subnet_route_hop_alloc.rs`, `routed_transport_availability.rs`) and the plan
-and packet documents (`SUBNET_AUTH_PLAN.md` +524,
-`S4B_FINAL_PACKET.md`, `S4B_REVIEW_PACKET.md`). **No claim is made here about
-whether the witnesses establish what they say they establish** — that is the
-review this pass did not perform, and it is the one that matters most for a
-branch whose central argument is evidentiary.
+**Parallel evidence coverage.** The parallel pass audited
+`subnet_auth_e2e.rs` in full against its production entrypoints, including the
+credential/proof objects, topology roles, exact denial claims, handler
+darkness, gateway-local authority, protected routing, coherent publication,
+feature gates, and CI target selection. It read the packet documents as
+claims rather than proof. The other integration-test files listed above were
+used selectively for focused production-path regression evidence; they did
+not receive the same line-by-line semantic audit as `subnet_auth_e2e.rs`.
 
 **Checked by hand and found sound.**
 
