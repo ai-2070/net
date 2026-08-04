@@ -34,7 +34,9 @@ unless you need the C boundary.
    cursors, and thread-safety guarantees.
 4. [Errors](/docs/sdk/c/errors) — return codes and the `NET_ERR_*` table.
 
-The ABI exposes capability discovery and nRPC directly. `net.go.h` declares
+## Capability and nRPC coverage
+
+The C ABI exposes capability discovery and nRPC directly. `net.go.h` declares
 `net_mesh_announce_capabilities`, `net_mesh_find_best_node_scoped`, and
 `net_mesh_subscribe_channel_with_token`; `net_rpc.h` declares the `net_rpc_call*`
 variants. The CLI is optional.

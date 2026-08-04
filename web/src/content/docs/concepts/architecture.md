@@ -24,6 +24,10 @@ still make a provider unavailable, and an authority change can still alter a
 routing result. The separation identifies which layer owns each decision and which
 evidence an application can rely on.
 
+Most application code uses capabilities, nRPC, channels, and state. Transport and
+packet-level identity become visible during deployment, diagnostics, performance
+tuning, or adapter development.
+
 ## Capabilities and invocation
 
 A capability names work a provider offers. Its descriptor can include a schema and
