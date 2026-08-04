@@ -2080,13 +2080,41 @@ harness that proves anything.
 
 ```text
 FINAL matrix        50 rows   49 RED + 1 RED-DEADLOCK   0 survivors
-                    50/50 selected exactly one witness
+                    50/50 selected exactly one witness, EACH from its own
+                    recorded output (see "the selection claim" below)
                     50/50 restored and SHA256-verified
-ARCHAEOLOGY          2 superseded attempts (M-X1, M-X2) — never counted
+ARCHAEOLOGY          3 superseded attempts — never counted
 NOT A RUN           18 rows: mutation applied, nothing executed — excluded
                     from BOTH counts
-genuine executions  52
+genuine executions  53
 ```
+
+**The selection claim was 49/50 before it was 50/50, and the gap was real.**
+The first version of this section claimed `50/50 selected exactly one witness`
+while M-S2 — the one row that legitimately never reaches a summary, because
+its mutation deadlocks the witness — carried no `selected` evidence at all.
+The harness's timeout branch discarded `TimeoutExpired.stdout/.stderr`, so the
+row recorded only `terminated at 300s bound`. A unique filter makes one
+selection *plausible*; §17.6c-0 requires it to be *shown*, and the row killed
+before it could report is precisely the one where plausibility is worth least.
+The claim was false as written (Kyra, 2026-08-04).
+
+The harness now retains the partial output and parses nextest's
+`Starting N tests across …` line — which is printed BEFORE execution and is
+therefore the only selection evidence a non-terminating run can produce — and
+a timeout that cannot prove `selected == 1` ABORTS the campaign instead of
+becoming a final row. M-S2 was re-run alone under the same discipline and now
+records:
+
+```text
+M-S2   RED-DEADLOCK   restored=True
+       selected=1 [Starting 1 test across 1 binary (5437 tests skipped)]
+       terminated at 300s bound
+```
+
+The other 49 rows were not re-run: each already carried its own selection
+evidence. The superseded M-S2 execution stays in the raw ledger as
+archaeology.
 
 | # | ID | Production change | Selected witness | Outcome |
 |---|---|---|---|---|
@@ -2103,7 +2131,7 @@ genuine executions  52
 | 11 | M-N2 | synthesize an audience for a right-less grant | `an_invoke_only_grant_is_not_a_source_demand` | RED |
 | 12 | M-N3 | `classify` compares `grant_id` alone | `a_rotated_audience_handle_is_not_leased_under_its_own_id` | RED |
 | 13 | M-S1 | `warm` takes `mutate` and counts it | `a_warmed_lookup_takes_no_lock` | RED |
-| 14 | M-S2 | `warm` holds `mutate` across the read | `a_warmed_lookup_completes_while_the_mutation_lock_is_held` | **RED (deadlock)**, terminated at the 300 s bound |
+| 14 | M-S2 | `warm` holds `mutate` across the read | `a_warmed_lookup_completes_while_the_mutation_lock_is_held` | **RED (deadlock)**, `selected=1` from `Starting 1 test across 1 binary`, terminated at the 300 s bound |
 | 15 | M-S3 | drop the under-`mutate` re-check | `concurrent_misses_acquire_one_demand_set` | RED |
 | 16 | M-L1 | return the warmed entry without the currency check | `a_newly_leased_audience_joins_a_warmed_entry` | RED |
 | 17 | M-L2 | `leases_current`: drop the OBSOLETE direction | `a_removed_audience_leaves_a_warmed_entry` | RED |
@@ -2152,16 +2180,39 @@ is a true record of the tree and the witness it ran against. This is the same
 "strengthened, not quietly dropped" discipline §17.6c's own M-A5s note applies
 in the other direction.
 
-**Two superseded attempts, kept as archaeology and never counted.** M-X1's
-first mutation dropped only the `old_only` credit
-(`held + new_only.len()`); for a NARROWING replacement `new_only` is empty, so
-the mutated bound still admitted the case and the row ran GREEN. That was a
-defect in the mutation, not in the witness — the §17.6c row names gross
-charging, `held + new.len()`, which is the acquire-beside-then-drop shape §4.3
-forbids. Both M-X1 and M-X2 were re-run with the corrected change so the two
-shared rows describe ONE production change, and both are RED. The weaker
-variant killed M-X2 anyway (a same-width rotation has a non-empty `new_only`),
-which is exactly why the narrowing case is the one that separates them.
+**Three superseded attempts, kept as archaeology and never counted** — M-S2's
+first execution (above), and M-X1/M-X2's first mutation.
+
+M-X1's first mutation dropped only the `old_only` credit; for a NARROWING
+replacement `new_only` is empty, so the mutated bound still admitted the case
+and the row ran GREEN. That was a defect in the mutation, not in the witness —
+the §17.6c row names gross charging, the acquire-beside-then-drop shape §4.3
+forbids:
+
+```text
+raw ledger label   "family projection charged GROSS"   ← the CORRECTED
+                                                          mutation's label,
+                                                          wrongly applied
+actually applied   held + new_only.len()               ← weak; a narrowing
+                                                          replacement has an
+                                                          empty new_only, so
+                                                          this can only ever
+                                                          run GREEN
+§17.6c / corrected held + new_keys.len()               ← the real gross charge
+status             ARCHAEOLOGY ONLY, excluded from every count
+```
+
+The raw ledger row is append-only and stays exactly as written, mislabel and
+all; this block is the correction. The weak mutation itself is preserved
+RUNNABLE in the harness (`run.py --archaeology M-X1-weak`) rather than
+described only in prose, so the historical execution is reproducible — it was
+re-executed at closure and reproduced GREEN with `selected=1`, confirming the
+preserved form is the one that actually ran.
+
+Both M-X1 and M-X2 were re-run with the corrected change so the two shared
+rows describe ONE production change, and both are RED. The weaker variant
+killed M-X2 anyway (a same-width rotation has a non-empty `new_only`), which
+is exactly why the narrowing case is the one that separates them.
 
 **Eighteen rows are NOT A RUN, and they are excluded from both counts.** A
 process-tree teardown killed cargo mid-`M-Y2`; every invocation after it
@@ -2172,6 +2223,14 @@ failure in its purest form. They are excluded, the harness now ABORTS on an
 invocation that produces no summary rather than accumulating non-evidence, and
 every one of those IDs was genuinely re-run afterwards. That the ledger carries
 a `selected` check per row is what made this visible at all.
+
+**All three of this campaign's own defects were found the same way: by
+reading the RAW ledger rather than the table derived from it.** The
+eighteen non-runs, M-S2's missing selection evidence, and M-X1's mislabel were
+each invisible in the summary and plain in the per-row record. That is the
+argument for keeping the raw ledger append-only and for the `selected` column
+existing at all — a derived table states what the author believed, and only
+the row records what happened.
 
 Evidence is reproducible from `run.py` + `ledger.tsv` under the out-of-repo
 scratch directory; nothing from it is committed.
