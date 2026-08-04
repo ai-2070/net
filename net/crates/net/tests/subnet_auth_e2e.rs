@@ -270,15 +270,40 @@ struct ScratchDir(std::path::PathBuf);
 impl ScratchDir {
     /// Take ownership of `path` and clear any residue left by an
     /// aborted earlier run. No filesystem call precedes this.
+    ///
+    /// Fail-closed: paths are keyed by PID, so residue that cannot
+    /// be removed WOULD be adopted as live authority state by the
+    /// test that proceeds past it — refusing here turns a
+    /// contaminated run into a loud fixture failure instead of a
+    /// wrong verdict.
     fn fresh(path: std::path::PathBuf) -> Self {
-        let _ = std::fs::remove_dir_all(&path);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!(
+                "refusing to adopt scratch path {}: stale residue not removable: {e}",
+                path.display()
+            ),
+        }
         Self(path)
     }
 }
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // Not a panic — Drop runs during unwinding, where a second
+        // panic aborts and would eat the original assertion failure.
+        // Surfaced instead: this residue is exactly what a later run
+        // under a reused PID trips over in `fresh`.
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "scratch store {} not removed on drop ({e}); \
+                 a later run reusing this PID will refuse it",
+                self.0.display()
+            ),
+        }
     }
 }
 
