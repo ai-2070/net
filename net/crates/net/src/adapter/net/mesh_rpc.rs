@@ -4876,6 +4876,48 @@ impl MeshNode {
         capability_bridge::find_nodes_matching(self.capability_fold(), &filter)
     }
 
+    /// Every node publicly advertising `nrpc:<service>` whose announcement
+    /// carries a currently valid verified owner projection, with candidate
+    /// and owner sampled from ONE capability-fold snapshot
+    /// (SUBNET_AUTH_SDK_PLAN.md R1).
+    ///
+    /// This is the discovery read behind `OrgClient::call_exported`: a
+    /// subnet-exported registration announces on the public plane
+    /// ([`CapabilityVisibility::Public`]), so the caller derives its
+    /// authority relation from the VERIFIED owner org — never from a
+    /// caller-claimed or separately-read value. Calling
+    /// [`Self::find_service_nodes`] and `owner_org_for` as two reads could
+    /// pair a live candidate with a projection a floor retraction or
+    /// announcement replacement already killed; the underlying
+    /// one-snapshot query makes that tear unrepresentable.
+    ///
+    /// Unowned public candidates are not returned — they are ordinary
+    /// public services, not exported-plane candidates. A candidate node
+    /// without a live AEAD entity pin is dropped: without the pin it has
+    /// no entity-layer identity to authorize against, and org-protected
+    /// RPC is direct-session-only regardless (OA2-E0.3). Results are in
+    /// ascending provider-`EntityId` order — deterministic, load-blind;
+    /// no sensing or load balancing is consulted.
+    ///
+    /// [`CapabilityVisibility::Public`]: crate::adapter::net::org_admission_gate::CapabilityVisibility::Public
+    pub fn public_owned_service_providers(&self, service: &str) -> Vec<PublicOwnedProvider> {
+        use crate::adapter::net::behavior::fold::capability_bridge;
+        let tag = format!("nrpc:{service}");
+        let mut out: Vec<PublicOwnedProvider> =
+            capability_bridge::public_owned_providers(self.capability_fold(), &tag)
+                .into_iter()
+                .filter_map(|(node_id, owner_org)| {
+                    let provider = self.peer_entity_id(node_id)?;
+                    Some(PublicOwnedProvider {
+                        provider,
+                        owner_org,
+                    })
+                })
+                .collect();
+        out.sort_unstable_by(|a, b| a.provider.as_bytes().cmp(b.provider.as_bytes()));
+        out
+    }
+
     /// Issue an RPC call to `service`, picking one node from
     /// those advertising the `nrpc:<service>` tag in the local
     /// capability index according to `opts.routing_policy`.
@@ -6239,6 +6281,21 @@ pub enum ServeError {
 /// The admission shape for a unary serve registration (E1.1), threaded from the
 /// public `serve_rpc` / protected `serve_rpc_protected` wrappers into the shared
 /// `serve_rpc_unary_impl`. Streaming / duplex have no protected form (E1.8).
+/// A publicly announced provider of a service together with its
+/// currently verified owner organization, both sampled from one
+/// capability-fold snapshot (SUBNET_AUTH_SDK_PLAN.md R1).
+///
+/// Produced only by [`MeshNode::public_owned_service_providers`]; the
+/// projection is the ingest-verified owner cert's org, floor-retractable,
+/// never a caller-claimed value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicOwnedProvider {
+    /// The provider entity, from its live AEAD-verified session pin.
+    pub provider: crate::adapter::net::identity::EntityId,
+    /// The provider's verified owner organization.
+    pub owner_org: crate::adapter::net::behavior::org::OrgId,
+}
+
 enum UnaryAdmission {
     /// Legacy v0.4 public: `PublicAuthenticated` + a trivial allow-all policy.
     Public,

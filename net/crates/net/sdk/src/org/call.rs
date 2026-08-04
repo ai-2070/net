@@ -16,13 +16,24 @@
 //! → coarse denial decoding     0x0009 → OrgSdkError::AdmissionDenied
 //! ```
 //!
-//! # Private-only
+//! # Two caller verbs, two discovery planes
 //!
-//! Discovery consults ONLY the private planes. Searching the plaintext plane
-//! would need a public ownership projection, provenance ranking, and support for
-//! registrations `serve_org` never creates; a protected-but-publicly-discoverable
-//! service stays a low-level concern on both sides. The verbs are symmetric:
-//! `serve_org` emits privately, `org.call` discovers privately.
+//! [`OrgClient::call`] discovers ONLY the private planes — the verbs are
+//! symmetric: `serve_org` emits privately, `call` discovers privately.
+//!
+//! [`OrgClient::call_exported`] is the public-plane counterpart
+//! (SUBNET_AUTH_SDK_PLAN.md §3.6): a subnet-exported registration announces
+//! plaintext, so its callers derive the authority relation from the VERIFIED
+//! owner projection sampled with the candidate in one fold snapshot
+//! ([`MeshNode::public_owned_service_providers`]). Everything after discovery —
+//! credential currency, dispatcher scope, grant matching, deterministic
+//! selection, the canonical proof, the no-retry rule — is the same shared
+//! pipeline, deliberately not forked. The name is `call_exported`, not
+//! `call_subnet`: the caller invokes a publicly discoverable organization
+//! service and neither names nor joins a subnet; the subnet is provider-local
+//! execution authority.
+//!
+//! [`MeshNode::public_owned_service_providers`]: net::adapter::net::MeshNode::public_owned_service_providers
 //!
 //! # Never a second attempt
 //!
@@ -190,6 +201,104 @@ impl OrgClient {
         Ok(reply.body)
     }
 
+    /// Call a subnet-exported service (SUBNET_AUTH_SDK_PLAN.md §3.6).
+    ///
+    /// Discovers on the PUBLIC plane through the verified ownership
+    /// projection, derives the same-org / granted relation from the
+    /// verified owner, selects deterministically, mints the same canonical
+    /// request-bound proof as [`call`](Self::call), and sends exactly once.
+    ///
+    /// Deliberately `call_exported`, not `call_subnet`: this invokes a
+    /// publicly discoverable organization service. The caller presents
+    /// organization authority only — it never supplies a subnet
+    /// credential, an export binding, or any subnet coordinate, it never
+    /// joins the provider's subnet, and it receives no provider-local
+    /// subnet context. Whether the export exists is decided provider-side,
+    /// per call, against the provider's own live authority; provider-side
+    /// authority movement surfaces as one coarse
+    /// [`AdmissionDenied`](OrgSdkError::AdmissionDenied) and is NEVER
+    /// retried by the facade — a signed proof is never resent, and
+    /// rediscovery/retry policy belongs to the application.
+    pub async fn call_exported<Req, Resp>(
+        &self,
+        service: &str,
+        request: &Req,
+    ) -> Result<Resp, OrgSdkError>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let body = Codec::Json.encode(request).map_err(|e| RpcError::Codec {
+            direction: net::adapter::net::mesh_rpc::CodecDirection::Encode,
+            message: format!("org call_exported encode: {e}"),
+        })?;
+
+        let reply = self.call_exported_bytes(service, Bytes::from(body)).await?;
+
+        Codec::Json.decode(&reply).map_err(|e| {
+            OrgSdkError::Rpc(RpcError::Codec {
+                direction: net::adapter::net::mesh_rpc::CodecDirection::Decode,
+                message: format!("org call_exported decode: {e}"),
+            })
+        })
+    }
+
+    /// [`call_exported`](Self::call_exported) without the codec — bytes in,
+    /// bytes out. The typed verb IS this plus JSON; language bindings call
+    /// this.
+    pub async fn call_exported_bytes(
+        &self,
+        service: &str,
+        request: Bytes,
+    ) -> Result<Bytes, OrgSdkError> {
+        self.call_exported_bytes_deadline(service, request, 0, 0)
+            .await
+    }
+
+    /// [`call_exported_bytes`](Self::call_exported_bytes) with execution
+    /// control — a deadline and a pre-reserved cancel token, the same
+    /// binding seam contract as
+    /// [`call_bytes_deadline`](Self::call_bytes_deadline): neither argument
+    /// is an authorization input, and the `plan_exported()` decision is
+    /// byte-for-byte identical to `call_exported_bytes`.
+    ///
+    /// `#[doc(hidden)]` — applications use `call_exported`; execution
+    /// control is a binding concern.
+    #[doc(hidden)]
+    pub async fn call_exported_bytes_deadline(
+        &self,
+        service: &str,
+        request: Bytes,
+        deadline_ms: u64,
+        cancel_token: u64,
+    ) -> Result<Bytes, OrgSdkError> {
+        let intent = self.plan_exported(service)?;
+        let provider = intent.provider.clone();
+
+        let mut opts = CallOptions {
+            org_proof_intent: Some(intent),
+            ..CallOptions::default()
+        };
+        // Execution control only — never an authority input.
+        if deadline_ms > 0 {
+            opts.deadline = Some(Instant::now() + Duration::from_millis(deadline_ms));
+        }
+        if cancel_token != 0 {
+            opts.cancel_token = Some(cancel_token);
+        }
+
+        // One send, ever: the core call mints the call id, digests, signs,
+        // pins the peer entity, and the facade never launches a second
+        // attempt on any outcome.
+        let reply = self
+            .node
+            .call(provider.node_id(), service, request, opts)
+            .await
+            .map_err(map_rpc_error)?;
+
+        Ok(reply.body)
+    }
+
     /// Reserve a cancel token from this client's node for a subsequent
     /// [`call_bytes_deadline`](Self::call_bytes_deadline) (OSDK-L §D6a).
     ///
@@ -226,12 +335,28 @@ impl OrgClient {
     pub(crate) fn plan(&self, service: &str) -> Result<OrgProofIntent, OrgSdkError> {
         let capability = CapabilityAuthorityId::for_tag(&nrpc_tag(service));
         let (candidates, considered) = self.authorized_candidates(&capability)?;
+        self.select(&capability, &candidates, considered)
+    }
 
-        // OA2-E0.3: org-protected RPC is direct-session-only. A relayed
-        // protected request is denied at the provider, so select the first
-        // authorized provider (deterministic order) with a live direct session;
-        // if some are authorized but none is directly reachable, tell the caller
-        // which of the two it hit.
+    /// [`Self::plan`] over the public exported plane — the same selection
+    /// rule applied to [`Self::authorized_exported_candidates`].
+    pub(crate) fn plan_exported(&self, service: &str) -> Result<OrgProofIntent, OrgSdkError> {
+        let capability = CapabilityAuthorityId::for_tag(&nrpc_tag(service));
+        let (candidates, considered) = self.authorized_exported_candidates(&capability, service)?;
+        self.select(&capability, &candidates, considered)
+    }
+
+    /// The shared selection rule (OA2-E0.3): org-protected RPC is
+    /// direct-session-only, so select the first authorized provider
+    /// (deterministic order) with a live direct session; if some are
+    /// authorized but none is directly reachable, tell the caller which of
+    /// the two it hit.
+    fn select(
+        &self,
+        capability: &CapabilityAuthorityId,
+        candidates: &[AuthorizedOrgCandidate],
+        considered: usize,
+    ) -> Result<OrgProofIntent, OrgSdkError> {
         if let Some(candidate) = candidates.iter().find(|c| c.direct) {
             return Ok(self.intent_for(candidate));
         }
@@ -242,7 +367,7 @@ impl OrgClient {
             .into());
         }
         Err(OrgDiscoveryError::NoAuthorizedProvider {
-            capability: hex_capability(&capability),
+            capability: hex_capability(capability),
             considered,
         }
         .into())
@@ -274,7 +399,46 @@ impl OrgClient {
 
         let discovered = self.discover_private(capability);
         let considered = discovered.len();
+        Ok((
+            self.authorize_discovered(capability, discovered)?,
+            considered,
+        ))
+    }
 
+    /// The exported-plane counterpart of [`Self::authorized_candidates`]
+    /// (SUBNET_AUTH_SDK_PLAN.md §3.6): candidates come from the public
+    /// verified-ownership query instead of the private planes; the
+    /// credential checks and the whole authority pipeline are the SAME
+    /// code, deliberately not forked.
+    pub(crate) fn authorized_exported_candidates(
+        &self,
+        capability: &CapabilityAuthorityId,
+        service: &str,
+    ) -> Result<(Vec<AuthorizedOrgCandidate>, usize), OrgSdkError> {
+        self.check_current()?;
+        if !self.dispatcher.covers_capability(capability) {
+            return Err(OrgCredentialError::DispatcherScopeExcludesCapability {
+                capability: hex_capability(capability),
+            }
+            .into());
+        }
+
+        let discovered = self.discover_public_owned(service);
+        let considered = discovered.len();
+        Ok((
+            self.authorize_discovered(capability, discovered)?,
+            considered,
+        ))
+    }
+
+    /// Phases 1–3 of the authority pipeline, shared verbatim by the
+    /// private and exported paths — grant matching and proof-relevant
+    /// classification must not fork per discovery plane.
+    fn authorize_discovered(
+        &self,
+        capability: &CapabilityAuthorityId,
+        discovered: Vec<Candidate>,
+    ) -> Result<Vec<AuthorizedOrgCandidate>, OrgSdkError> {
         // Phase 1 — authority construction in DISCOVERY order. Grant matching
         // (and its `AmbiguousCapabilityGrant` error) must run in this order, so
         // the first independently-ambiguous discovered candidate is the one that
@@ -324,7 +488,7 @@ impl OrgClient {
                 .as_ref()
                 == Some(&candidate.provider);
         }
-        Ok((candidates, considered))
+        Ok(candidates)
     }
 
     /// Assemble the canonical nine-field proof intent for a chosen candidate.
@@ -345,6 +509,31 @@ impl OrgClient {
             capability: candidate.capability,
             proof_ttl_secs: DEFAULT_PROOF_TTL_SECS,
         }
+    }
+
+    /// The public exported plane, as one candidate list: every plaintext
+    /// `nrpc:<service>` candidate carrying a verified owner projection,
+    /// candidate and owner from ONE fold snapshot. Same-org is derived by
+    /// comparing the VERIFIED owner org against the acting org — an
+    /// unsigned or unowned public candidate never reaches authority
+    /// construction because the query cannot return one.
+    ///
+    /// No DISCOVER right is involved: the announcement is public. The
+    /// grant question (INVOKE) is [`Self::match_invoke_grant`]'s, shared
+    /// with the private path.
+    fn discover_public_owned(&self, service: &str) -> Vec<Candidate> {
+        let mut out: Vec<Candidate> = Vec::new();
+        for p in self.node.public_owned_service_providers(service) {
+            push_unique(
+                &mut out,
+                Candidate {
+                    same_org: p.owner_org == self.acting_org,
+                    provider: p.provider,
+                    owner_org: p.owner_org,
+                },
+            );
+        }
+        out
     }
 
     /// The two private planes, in one candidate list. Owner-plane records are

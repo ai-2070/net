@@ -18,9 +18,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net::adapter::net::behavior::capability::CapabilitySet;
+use net::adapter::net::behavior::org_admission::OrgAdmission;
+use net::adapter::net::cortex::{
+    RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
+};
+use net::adapter::net::identity::{EntityId, EntityKeypair};
+use net::adapter::net::subnet::{
+    admission::unix_now_secs, SubnetAuthorityConfig, SubnetBoundarySet, SubnetCredentialSet,
+    SubnetExportBinding, SubnetGrant, SubnetRef, SubnetRights, TopologySubnetId,
+};
 use net::adapter::net::{ChannelConfigRegistry, MeshNode, MeshNodeConfig};
 
 use super::credentials::OrgCredentials;
+use super::error::OrgDiscoveryError;
 use super::serve::{OrgAccess, OrgCaller};
 use super::tests::{belonging, cap, discover_grant, org_a, org_b};
 use super::types::*;
@@ -321,6 +331,192 @@ async fn live_same_org_call_through_the_facade() {
 }
 
 // ---------------------------------------------------------------------------
+// SSDK — the exported plane: shared fixture
+// ---------------------------------------------------------------------------
+
+const EXPORT_SERVICE: &str = "fleet.telemetry";
+const SUBNET_DAY: u64 = 24 * 60 * 60;
+/// The provider's local attachment and the exported crossing under it.
+const PROVIDER_ATTACHMENT: &[u8] = &[3];
+const EXPORTED_CROSSING: &[u8] = &[3, 9];
+
+/// The provider machine's subnet authority root — a separate VERTICAL
+/// root, never an org key (topology-is-not-authority doctrine).
+fn subnet_root() -> EntityKeypair {
+    EntityKeypair::from_bytes([0xD7; 32])
+}
+
+fn exported_binding() -> SubnetExportBinding {
+    SubnetExportBinding::new(
+        SubnetRef {
+            authority: subnet_root().entity_id().clone(),
+            path: TopologySubnetId::new(EXPORTED_CROSSING),
+        },
+        0,
+    )
+}
+
+/// Counts invocations; when expectations are supplied, also verifies the
+/// admitted attribution the exported dispatch hands the handler.
+struct ExportedHandler {
+    calls: Arc<AtomicUsize>,
+    attribution_ok: Arc<AtomicBool>,
+    expected_caller: Option<EntityId>,
+    expected_org: Option<OrgId>,
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for ExportedHandler {
+    async fn call(&self, ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let (Some(expected_caller), Some(expected_org)) =
+            (self.expected_caller.as_ref(), self.expected_org.as_ref())
+        {
+            if let Some(admitted) = ctx.org_admission.as_ref() {
+                self.attribution_ok.store(
+                    &admitted.caller == expected_caller
+                        && &admitted.acting_org == expected_org
+                        && &admitted.provider_org == expected_org,
+                    Ordering::SeqCst,
+                );
+            }
+        }
+        let req: Ping = serde_json::from_slice(&ctx.payload.body).map_err(|e| {
+            RpcHandlerError::Application {
+                code: 0x8001,
+                message: format!("bad request: {e}"),
+            }
+        })?;
+        let body = serde_json::to_vec(&Pong {
+            n: req.n + 1,
+            served_by: "exported-provider".to_string(),
+        })
+        .expect("encode pong");
+        Ok(RpcResponsePayload {
+            status: RpcStatus::Ok,
+            headers: vec![],
+            body: bytes::Bytes::from(body),
+        })
+    }
+}
+
+impl ExportedHandler {
+    fn counting(calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            calls,
+            attribution_ok: Arc::new(AtomicBool::new(false)),
+            expected_caller: None,
+            expected_org: None,
+        }
+    }
+}
+
+/// `fast_mesh` plus the subnet plane: authority roots and the local
+/// attachment are CONSTRUCTION state (`MeshNodeConfig`), so a
+/// subnet-exported provider must be built with them — there is no
+/// post-construction configure seam, deliberately.
+async fn subnet_provider_mesh(
+    tag: &str,
+    owner: &OrgKeypair,
+) -> (Mesh, Identity, std::path::PathBuf) {
+    let identity = Identity::generate();
+    let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0x51u8; 32])
+        .with_heartbeat_interval(Duration::from_millis(200))
+        .with_session_timeout(Duration::from_secs(5))
+        .with_subnet_authority(SubnetAuthorityConfig {
+            authority: subnet_root().entity_id().clone(),
+            roots: vec![subnet_root().entity_id().clone()],
+            maximum_grant_lifetime_secs: 7 * SUBNET_DAY,
+        });
+    cfg.subnet_attachment = Some(TopologySubnetId::new(PROVIDER_ATTACHMENT));
+    cfg.min_announce_interval = Duration::from_millis(50);
+    cfg.configured_identity = true;
+
+    let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
+        .await
+        .expect("MeshNode::new");
+    let channel_configs = Arc::new(ChannelConfigRegistry::new());
+    // These tests register through the CORE `serve_rpc_subnet_exported`
+    // (the S2 facade verb does not exist yet), so the fixture performs
+    // the one thing the facade will own: installing the canonical
+    // request/reply channel defaults for the service — the exact
+    // `install_rpc_service_defaults` promotion SUBNET_AUTH_SDK_PLAN.md
+    // §3.5 orders. Without it a strict registry refuses the caller's
+    // reply-channel subscribe (`UnknownChannel`).
+    channel_configs.install_rpc_service_defaults(EXPORT_SERVICE);
+    node.set_channel_configs(channel_configs.clone());
+    let node = Arc::new(node);
+
+    let entity = identity.entity_id().clone();
+    let cert = OrgMembershipCert::try_issue(owner, entity.clone(), 1, 3600).expect("cert");
+    let dir = std::env::temp_dir().join(format!(
+        "net-ssdk-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
+    node.install_node_authority(Arc::new(authority))
+        .expect("install authority");
+    node.set_owner_cert_emission(true)
+        .expect("enable owner-cert emission");
+
+    let mesh = Mesh::from_node_arc(node, channel_configs, Some(identity.clone()));
+    (mesh, identity, dir)
+}
+
+/// Gateway provisioning for the exported crossing: the declared boundary
+/// plus this node's own EXPORT credential at exactly that scope.
+fn provision_export(provider: &Mesh, provider_identity: &Identity) {
+    provider
+        .node()
+        .declare_subnet_boundaries(SubnetBoundarySet::new(
+            subnet_root().entity_id().clone(),
+            0,
+            [TopologySubnetId::new(EXPORTED_CROSSING)],
+        ));
+    provider
+        .node()
+        .install_subnet_gateway_credentials(&[SubnetCredentialSet::Direct(
+            SubnetGrant::try_issue(
+                &subnet_root(),
+                subnet_root().entity_id().clone(),
+                TopologySubnetId::new(EXPORTED_CROSSING),
+                0,
+                provider_identity.entity_id().clone(),
+                SubnetRights::EXPORT,
+                1,
+                unix_now_secs() - 60,
+                SUBNET_DAY,
+            )
+            .expect("issue export grant"),
+        )])
+        .expect("install gateway credentials");
+}
+
+/// Drive PUBLIC discovery to convergence: re-announce and poll the
+/// caller's one-snapshot owner-projection query until the provider
+/// appears (or does not, for the anti-convergence witnesses).
+async fn converge_public_discovery(provider: &Mesh, caller: &Mesh, service: &str) -> bool {
+    for _ in 0..100 {
+        provider
+            .node()
+            .announce_capabilities(CapabilitySet::new())
+            .await
+            .ok();
+        if !caller
+            .node()
+            .public_owned_service_providers(service)
+            .is_empty()
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // SSDK S0 — the discovery gap the exported caller verb exists to close
 // ---------------------------------------------------------------------------
 
@@ -340,97 +536,8 @@ async fn live_same_org_call_through_the_facade() {
 /// error string.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_private_call_cannot_reach_a_subnet_exported_service() {
-    use net::adapter::net::behavior::org_admission::OrgAdmission;
-    use net::adapter::net::cortex::{
-        RpcContext, RpcHandler, RpcHandlerError, RpcResponsePayload, RpcStatus,
-    };
-    use net::adapter::net::identity::EntityKeypair;
-    use net::adapter::net::subnet::{
-        admission::unix_now_secs, SubnetAuthorityConfig, SubnetBoundarySet, SubnetCredentialSet,
-        SubnetExportBinding, SubnetGrant, SubnetRef, SubnetRights, TopologySubnetId,
-    };
-
-    const SERVICE: &str = "fleet.telemetry";
-    const DAY: u64 = 24 * 60 * 60;
-    /// The provider's local attachment and the exported crossing under it.
-    const ATTACHMENT: &[u8] = &[3];
-    const EXPORTED: &[u8] = &[3, 9];
-
-    struct CountingHandler {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait]
-    impl RpcHandler for CountingHandler {
-        async fn call(&self, _ctx: RpcContext) -> Result<RpcResponsePayload, RpcHandlerError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(RpcResponsePayload {
-                status: RpcStatus::Ok,
-                headers: vec![],
-                body: bytes::Bytes::from_static(b"telemetry-window"),
-            })
-        }
-    }
-
-    /// `fast_mesh` plus the subnet plane: authority roots and the local
-    /// attachment are CONSTRUCTION state (`MeshNodeConfig`), so a
-    /// subnet-exported provider must be built with them — there is no
-    /// post-construction configure seam, deliberately.
-    async fn subnet_provider_mesh(
-        tag: &str,
-        owner: &OrgKeypair,
-        subnet_authority: SubnetAuthorityConfig,
-        attachment: TopologySubnetId,
-    ) -> (Mesh, Identity, std::path::PathBuf) {
-        let identity = Identity::generate();
-        let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0x51u8; 32])
-            .with_heartbeat_interval(Duration::from_millis(200))
-            .with_session_timeout(Duration::from_secs(5))
-            .with_subnet_authority(subnet_authority);
-        cfg.subnet_attachment = Some(attachment);
-        cfg.min_announce_interval = Duration::from_millis(50);
-        cfg.configured_identity = true;
-
-        let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
-            .await
-            .expect("MeshNode::new");
-        let channel_configs = Arc::new(ChannelConfigRegistry::new());
-        node.set_channel_configs(channel_configs.clone());
-        let node = Arc::new(node);
-
-        let entity = identity.entity_id().clone();
-        let cert = OrgMembershipCert::try_issue(owner, entity.clone(), 1, 3600).expect("cert");
-        let dir = std::env::temp_dir().join(format!(
-            "net-ssdk-s0-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
-        node.install_node_authority(Arc::new(authority))
-            .expect("install authority");
-        node.set_owner_cert_emission(true)
-            .expect("enable owner-cert emission");
-
-        let mesh = Mesh::from_node_arc(node, channel_configs, Some(identity.clone()));
-        (mesh, identity, dir)
-    }
-
     let a = org_a();
-    // The provider is BOTH an org member and a subnet-exported gateway:
-    // its subnet authority is a separate vertical root, per doctrine.
-    let subnet_root = EntityKeypair::from_bytes([0xD7; 32]);
-    let (provider, p_identity, p_dir) = subnet_provider_mesh(
-        "live-subnet-export-provider",
-        &a,
-        SubnetAuthorityConfig {
-            authority: subnet_root.entity_id().clone(),
-            roots: vec![subnet_root.entity_id().clone()],
-            maximum_grant_lifetime_secs: 7 * DAY,
-        },
-        TopologySubnetId::new(ATTACHMENT),
-    )
-    .await;
+    let (provider, p_identity, p_dir) = subnet_provider_mesh("gap-provider", &a).await;
     let shared = OwnerAudienceCredential::decode_config(
         &provider
             .node()
@@ -440,52 +547,19 @@ async fn live_private_call_cannot_reach_a_subnet_exported_service() {
             .encode_config(),
     )
     .expect("copy owner audience");
-    let (caller, c_identity, c_dir) =
-        fast_mesh("live-subnet-export-caller", &a, Some(&shared)).await;
+    let (caller, c_identity, c_dir) = fast_mesh("gap-caller", &a, Some(&shared)).await;
     bring_up(&caller, &provider).await;
-
-    provider
-        .node()
-        .declare_subnet_boundaries(SubnetBoundarySet::new(
-            subnet_root.entity_id().clone(),
-            0,
-            [TopologySubnetId::new(EXPORTED)],
-        ));
-    provider
-        .node()
-        .install_subnet_gateway_credentials(&[SubnetCredentialSet::Direct(
-            SubnetGrant::try_issue(
-                &subnet_root,
-                subnet_root.entity_id().clone(),
-                TopologySubnetId::new(EXPORTED),
-                0,
-                p_identity.entity_id().clone(),
-                SubnetRights::EXPORT,
-                1,
-                unix_now_secs() - 60,
-                DAY,
-            )
-            .expect("issue export grant"),
-        )])
-        .expect("install gateway credentials");
+    provision_export(&provider, &p_identity);
 
     // The subnet-exported registration — the provider under test.
     let exported_calls = Arc::new(AtomicUsize::new(0));
     let _serve = provider
         .node()
         .serve_rpc_subnet_exported(
-            SERVICE,
-            Arc::new(CountingHandler {
-                calls: exported_calls.clone(),
-            }),
+            EXPORT_SERVICE,
+            Arc::new(ExportedHandler::counting(exported_calls.clone())),
             OrgAdmission::OwnerDelegated,
-            SubnetExportBinding::new(
-                SubnetRef {
-                    authority: subnet_root.entity_id().clone(),
-                    path: TopologySubnetId::new(EXPORTED),
-                },
-                0,
-            ),
+            exported_binding(),
             Arc::new(|_| true),
         )
         .expect("serve subnet-exported");
@@ -502,7 +576,7 @@ async fn live_private_call_cannot_reach_a_subnet_exported_service() {
         "private discovery must never resolve a subnet-exported (public-plane) provider",
     );
 
-    let outcome: Result<Pong, OrgSdkError> = org.call(SERVICE, &Ping { n: 41 }).await;
+    let outcome: Result<Pong, OrgSdkError> = org.call(EXPORT_SERVICE, &Ping { n: 41 }).await;
     match outcome {
         Err(OrgSdkError::Discovery(d)) => {
             assert_eq!(
@@ -521,6 +595,214 @@ async fn live_private_call_cannot_reach_a_subnet_exported_service() {
         0,
         "nothing was sent: the exported handler must never have run",
     );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+// ---------------------------------------------------------------------------
+// SSDK S1 — the exported caller verb closes the gap
+// ---------------------------------------------------------------------------
+
+/// The composed positive: the SAME provisioning the gap witness uses, now
+/// invoked through `org.call_exported` — public verified-owner discovery,
+/// same-org classification from the VERIFIED projection, one admitted
+/// call, and the handler sees canonical attribution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_call_exported_reaches_a_subnet_exported_service() {
+    let a = org_a();
+    let (provider, p_identity, p_dir) = subnet_provider_mesh("pos-provider", &a).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("pos-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+    provision_export(&provider, &p_identity);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let attribution_ok = Arc::new(AtomicBool::new(false));
+    let policy_evals = Arc::new(AtomicUsize::new(0));
+    let policy_evals_in = policy_evals.clone();
+    let _serve = provider
+        .node()
+        .serve_rpc_subnet_exported(
+            EXPORT_SERVICE,
+            Arc::new(ExportedHandler {
+                calls: calls.clone(),
+                attribution_ok: attribution_ok.clone(),
+                expected_caller: Some(c_identity.entity_id().clone()),
+                expected_org: Some(a.org_id()),
+            }),
+            OrgAdmission::OwnerDelegated,
+            exported_binding(),
+            Arc::new(move |_| {
+                policy_evals_in.fetch_add(1, Ordering::SeqCst);
+                true
+            }),
+        )
+        .expect("serve subnet-exported");
+
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let credentials = OrgCredentials::new(cert, dg, vec![], vec![]).expect("credentials");
+    let org = caller.org(credentials).expect("bind");
+
+    assert!(
+        converge_public_discovery(&provider, &caller, EXPORT_SERVICE).await,
+        "the caller must resolve the provider through the public verified-owner projection",
+    );
+
+    let pong: Pong = org
+        .call_exported(EXPORT_SERVICE, &Ping { n: 41 })
+        .await
+        .expect("the exported call is admitted");
+    assert_eq!(
+        pong,
+        Pong {
+            n: 42,
+            served_by: "exported-provider".to_string()
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "handler ran exactly once");
+    assert!(
+        attribution_ok.load(Ordering::SeqCst),
+        "the handler saw the verified caller attribution — the call traversed canonical admission",
+    );
+    assert_eq!(
+        policy_evals.load(Ordering::SeqCst),
+        1,
+        "exactly one admission evaluation: one call, one send",
+    );
+
+    let _ = std::fs::remove_dir_all(&p_dir);
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+/// A public candidate WITHOUT a verified owner projection is ineligible:
+/// an ordinary public `serve_rpc` provider (no org authority, no owner
+/// cert on its announcements) is never a `call_exported` candidate, and
+/// the refusal reports zero considered candidates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_unowned_public_provider_is_ineligible_for_call_exported() {
+    let a = org_a();
+    // A plain node: real identity, NO org authority, NO owner emission.
+    let identity = Identity::generate();
+    let mut cfg = MeshNodeConfig::new("127.0.0.1:0".parse().expect("addr"), [0x51u8; 32])
+        .with_heartbeat_interval(Duration::from_millis(200))
+        .with_session_timeout(Duration::from_secs(5));
+    cfg.min_announce_interval = Duration::from_millis(50);
+    cfg.configured_identity = true;
+    let mut node = MeshNode::new((**identity.keypair()).clone(), cfg)
+        .await
+        .expect("MeshNode::new");
+    let channel_configs = Arc::new(ChannelConfigRegistry::new());
+    node.set_channel_configs(channel_configs.clone());
+    let provider = Mesh::from_node_arc(Arc::new(node), channel_configs, Some(identity));
+
+    let (caller, c_identity, c_dir) = fast_mesh("unowned-caller", &a, None).await;
+    bring_up(&caller, &provider).await;
+
+    // An ordinary PUBLIC registration of the same service name.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let _serve = provider
+        .node()
+        .serve_rpc(
+            EXPORT_SERVICE,
+            Arc::new(ExportedHandler::counting(calls.clone())),
+        )
+        .expect("serve public");
+
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let credentials = OrgCredentials::new(cert, dg, vec![], vec![]).expect("credentials");
+    let org = caller.org(credentials).expect("bind");
+
+    assert!(
+        !converge_public_discovery(&provider, &caller, EXPORT_SERVICE).await,
+        "an unowned public announcement must never enter the verified-owner projection",
+    );
+
+    let outcome: Result<Pong, OrgSdkError> =
+        org.call_exported(EXPORT_SERVICE, &Ping { n: 1 }).await;
+    match outcome {
+        Err(OrgSdkError::Discovery(OrgDiscoveryError::NoAuthorizedProvider {
+            considered, ..
+        })) => {
+            assert_eq!(considered, 0, "zero eligible public candidates were seen");
+        }
+        other => panic!("expected NoAuthorizedProvider, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the public handler never ran"
+    );
+
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
+/// A provider-side denial is terminal for that call: the facade never
+/// retries a signed proof. Exactly ONE admission evaluation happens for
+/// one `call_exported`, and the handler never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_exported_denial_is_never_retried() {
+    let a = org_a();
+    let (provider, p_identity, p_dir) = subnet_provider_mesh("deny-provider", &a).await;
+    let shared = OwnerAudienceCredential::decode_config(
+        &provider
+            .node()
+            .node_authority()
+            .expect("authority")
+            .audience
+            .encode_config(),
+    )
+    .expect("copy owner audience");
+    let (caller, c_identity, c_dir) = fast_mesh("deny-caller", &a, Some(&shared)).await;
+    bring_up(&caller, &provider).await;
+    provision_export(&provider, &p_identity);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let policy_evals = Arc::new(AtomicUsize::new(0));
+    let policy_evals_in = policy_evals.clone();
+    let _serve = provider
+        .node()
+        .serve_rpc_subnet_exported(
+            EXPORT_SERVICE,
+            Arc::new(ExportedHandler::counting(calls.clone())),
+            OrgAdmission::OwnerDelegated,
+            exported_binding(),
+            Arc::new(move |_| {
+                policy_evals_in.fetch_add(1, Ordering::SeqCst);
+                false
+            }),
+        )
+        .expect("serve subnet-exported");
+
+    let (cert, dg) = belonging(&a, c_identity.entity_id());
+    let credentials = OrgCredentials::new(cert, dg, vec![], vec![]).expect("credentials");
+    let org = caller.org(credentials).expect("bind");
+
+    assert!(
+        converge_public_discovery(&provider, &caller, EXPORT_SERVICE).await,
+        "discovery must resolve; the refusal under test is admission, not discovery",
+    );
+
+    let outcome: Result<Pong, OrgSdkError> =
+        org.call_exported(EXPORT_SERVICE, &Ping { n: 1 }).await;
+    assert!(
+        matches!(outcome, Err(OrgSdkError::AdmissionDenied(_))),
+        "a provider-policy refusal surfaces as the admission-denied domain: {outcome:?}",
+    );
+    assert_eq!(
+        policy_evals.load(Ordering::SeqCst),
+        1,
+        "one call, one admission evaluation — the facade never retried the signed proof",
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler never ran");
 
     let _ = std::fs::remove_dir_all(&p_dir);
     let _ = std::fs::remove_dir_all(&c_dir);
