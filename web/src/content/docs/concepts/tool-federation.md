@@ -1,77 +1,66 @@
 ---
-title: Tool Federation
-description: Agents publishing tools that other agents discover and invoke at runtime across trust boundaries, with credentials never leaving the node that holds them.
+title: Tool federation
+description: "Publish tools as capabilities so applications on other machines can discover and invoke them without receiving the provider's credentials."
 ---
+# Tool federation
 
-# Tool Federation
+Tool federation lets one participant publish a tool as a capability and lets
+applications on other machines discover and invoke it at runtime. The provider
+keeps its credentials and executes the operation locally.
 
-Every piece of this ships and is documented separately. This page names the
-pattern they add up to, because the pattern is the point and it's easy to miss
-when you meet the parts one at a time.
+```text title="Federated tool call"
+provider announces a typed tool
+→ caller discovers it by capability
+→ authority is evaluated
+→ provider executes locally
+→ caller receives the permitted result
+```
 
-**Tool federation:** an agent publishes what it can do; other agents — on other
-machines, in other organizations, written in other languages — discover those
-tools at runtime and invoke them, without anyone hand-wiring a list and without
-credentials leaving the node that holds them.
+## What federation adds
 
-## What makes it federation rather than a registry
+**Live discovery.** Providers announce tools through the capability fold. A watch
+reports when tools appear, change, or disappear, so callers do not maintain a
+static server list.
 
-A registry is a place you publish to and look up from. Federation has no such
-place. Four properties do the work:
+**Provider-local authority.** The provider decides who may invoke the tool and
+keeps any API keys or device credentials required to execute it.
 
-**Discovery is runtime, not configuration.** A node announces its tools as
-capabilities; peers see them appear and disappear. `watch_tools` pushes on
-change — no polling, no service catalogue to keep current, and a tool that
-stops being served stops being discoverable. See
-[Discover and Invoke](/docs/guides/discover-and-invoke).
+**Scoped visibility.** A tool may be public, visible only to its owner
+organization, or encrypted for organizations holding a discovery grant. Callers
+outside the audience do not receive the descriptor.
 
-**Authority is local to the provider.** The node that owns a secret runs the
-work that needs it. A caller never receives the credential — it receives the
-result. That inverts the usual integration shape, where the caller collects
-every API key it might need.
-
-**Visibility is scoped.** A tool can be public, owner-scoped, or visible only
-to organizations holding a grant — and in the last case it is *absent* from
-what others see, not refused. See
-[Private Capabilities](/docs/guides/private-capabilities).
-
-**Schemas travel with the tool.** A descriptor carries its input and output
-types, so a caller that discovered a tool a moment ago can type-check against
-it. Nothing is agreed in advance.
+**Portable schemas.** Tool descriptors carry input and output schemas. A caller
+can inspect or generate bindings for a tool it discovered at runtime.
 
 ## The pieces
 
-| Piece | What it contributes | Where |
+| Piece | Role | Documentation |
 |---|---|---|
-| Capability announcement | Publishing what this node can do, with tags and characteristics | [Capabilities](/docs/concepts/capabilities) |
-| `serve_tool` / `call_tool` / `list_tools` / `watch_tools` | The tool surface itself | [Discover and Invoke](/docs/guides/discover-and-invoke) |
-| nRPC | The typed transport underneath, with deadlines, streaming and cancellation | [Typed RPC](/docs/guides/nrpc) |
-| Organizations | Who may discover and invoke, enforced provider-side | [Private Capabilities](/docs/guides/private-capabilities) |
-| MCP bridge | Wrapping existing MCP servers in, and exposing the mesh out to MCP hosts | [Wrap MCP](/docs/guides/wrap-mcp-server), [Expose as MCP](/docs/guides/expose-net-as-mcp) |
-| A2A | Handing a *long job* to another agent rather than calling a tool | [Agent-to-Agent](/docs/guides/agent-to-agent) |
-| Agent identity | Proving which principal an agent acts for | [Agent Identity](/docs/concepts/agent-identity) |
+| Capability announcements | publish what a provider offers | [Capabilities](/docs/concepts/capabilities) |
+| `serve_tool`, `call_tool`, `list_tools`, `watch_tools` | serve, discover, and invoke tools | [Discover and invoke](/docs/guides/discover-and-invoke) |
+| nRPC | typed request/response and streaming transport | [nRPC](/docs/guides/nrpc) |
+| Organization authority | control discovery and invocation | [Private capabilities](/docs/guides/private-capabilities) |
+| MCP bridge | publish MCP tools on Net or expose Net to an MCP host | [Net and MCP](/docs/worldview/mcp-vs-net) |
+| A2A | delegate a longer job to another agent | [Agent-to-agent](/docs/guides/agent-to-agent) |
+| Agent identity | identify the principal an agent represents | [Agent identity](/docs/concepts/agent-identity) |
 
-## Where the MCP bridge fits
+## MCP tools and native capabilities
 
-MCP is the on-ramp, not the destination. `net-mesh wrap` takes an existing stdio MCP
-server and publishes its tools as owner-scoped mesh capabilities, so work you've
-already done becomes federated without a rewrite. `net-mesh mcp serve` goes the other
-way, fronting the mesh to a local MCP host like Claude Code.
+`net-mesh wrap` publishes tools from an existing stdio MCP server. `net-mesh mcp
+serve` exposes mesh capabilities to a local MCP host.
 
-Bridged tools carry `compat_tier: "mcp_bridge"` and are request/response only —
-no streams, migration or artifacts. Native capabilities have the richer surface.
-That tier is visible in discovery precisely so a caller can tell which it got.
+Bridged tools retain request/response semantics and carry
+`compat_tier: "mcp_bridge"`. Native Net capabilities can additionally define
+streams, artifact movement, migration, and Net task state. Choose native semantics
+when the operation needs them; the bridge is sufficient for ordinary MCP calls.
 
-## When you don't need this
+## When federation is unnecessary
 
-If your tools are fixed, local and known at build time, MCP alone is simpler and
-you should use it. Federation earns its complexity when the set of available
-tools changes at runtime, spans trust boundaries, or involves credentials that
-must not travel. The honest version of that trade is in
-[When to Use Net](/docs/worldview/right-and-wrong-use-cases).
+Use MCP directly when tools are fixed, local, and known to one host. Federation is
+useful when providers change at runtime, capabilities span machines or
+organizations, or credentials must remain on the provider.
 
-## See also
+See also:
 
-- [The Agentic Mesh](/docs/worldview/agentic-mesh) — why this shape
-- [MCP vs Net](/docs/worldview/mcp-vs-net)
-- [Build a Recoverable Capability](/docs/agent-briefs/build-a-recoverable-capability)
+- [The Agentic Mesh](/docs/worldview/agentic-mesh)
+- [Build a recoverable capability](/docs/agent-briefs/build-a-recoverable-capability)

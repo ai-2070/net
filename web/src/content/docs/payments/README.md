@@ -4,8 +4,9 @@ description: Net Payments is how a capability charges for its work and a caller 
 ---
 # Payments
 
-Net Payments is how a capability charges for its work and a caller pays to invoke
-it — without Net ever touching the money.
+Net Payments attaches pricing, payment evidence, verification, spend policy, and
+billing events to capability invocation. The payment rail moves the funds; Net
+does not hold them.
 
 > **Net standardizes the commercial facts around capability invocation; it does
 > not intermediate the money.** x402 moves the funds; Net signs the facts around
@@ -19,8 +20,9 @@ provider account records. If a provider needs commercial identity, Net carries a
 opaque reference plus a commitment, never the record itself.
 
 Net Payments does **not** custody funds, process payments, issue invoices,
-determine taxes, or clear transactions. If you're looking for a payment
-processor, this isn't one — and [that's the point](/docs/payments/what-net-payments-is).
+determine taxes, or clear transactions. Those responsibilities remain with the
+payment rail and the participating businesses. See
+[What Net Payments is](/docs/payments/what-net-payments-is).
 
 **You don't need an HTTP server.** Net-native paid capabilities are announced and
 invoked over the mesh (nRPC); the x402 payment material rides as opaque preserved

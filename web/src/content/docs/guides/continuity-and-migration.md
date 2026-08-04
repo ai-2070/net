@@ -168,9 +168,9 @@ The companion type is `ContinuityStatus`, which an observer can use to describe 
 
 The four states are the vocabulary the continuity layer uses to talk about an entity's chain. Most application code doesn't reach for them directly — the runtime exposes them in failure logs, in the operator surface, and in tooling that needs to reason about chain health.
 
-## Honest discontinuity
+## Explicit discontinuity
 
-When a chain genuinely breaks — node crash without a recent snapshot, data corruption, conflicting events arriving on different paths — the runtime doesn't silently paper over it. It creates a `ForkRecord`, marks the original chain as discontinued, and starts a new entity with documented lineage:
+When a chain breaks because of a node crash without a recent snapshot, data corruption, or conflicting events on different paths, the runtime creates a `ForkRecord`, marks the original chain as discontinued, and starts a new entity with documented lineage:
 
 ```rust
 pub enum DiscontinuityReason {
@@ -183,7 +183,7 @@ pub enum DiscontinuityReason {
 
 The fork record is signed by the entity that detected the discontinuity and broadcast on a dedicated subprotocol. Downstream observers see the new entity, see its lineage, and can decide for themselves whether to treat it as a continuation or as a fresh entity. There's no implicit recovery — the discontinuity is visible.
 
-This is the "honest discontinuity" principle. A chain that broke shouldn't pretend it didn't; observers shouldn't be lied to. If you have a workload that genuinely can't tolerate discontinuity, the answer is to make discontinuity less likely (snapshot more often, run with a standby group, replicate the underlying log) rather than to pretend it doesn't happen.
+The discontinuity remains visible to observers. Workloads that cannot tolerate it should reduce its probability by taking snapshots more often, running a standby group, or replicating the underlying log.
 
 ## Superposition
 

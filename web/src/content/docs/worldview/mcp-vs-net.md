@@ -1,82 +1,67 @@
 ---
-title: MCP vs Net
-description: "The Model Context Protocol (MCP) gave the ecosystem a huge win: a standard way to make a tool callable by an agent."
+title: Net and MCP
+description: "MCP describes tools a host can call. Net makes capabilities discoverable across machines and authority boundaries."
 ---
-# MCP vs Net
+# Net and MCP
 
-The Model Context Protocol (MCP) gave the ecosystem a huge win: a standard way to
-make a tool **callable** by an agent. If you have an MCP server, any MCP host can
-invoke its tools. That is real supply, and Net builds on it rather than competing
-with it.
+MCP gives agent hosts a standard way to describe and call tools. Net can carry
+those tools beyond one configured host by publishing them as capabilities on a
+trusted mesh.
 
-The distinction in one line:
+> **MCP makes tools callable. Net makes capabilities discoverable.**
 
-> **MCP made tools callable. Net makes capabilities discoverable.**
-
-Not "MCP is bad." Not "Net replaces MCP." MCP is the **call surface**; Net is
-**discovery, presence, policy, events, artifacts, and coordination** around that
-surface. They compose.
-
-## What each layer owns
+The two layers compose:
 
 | | MCP | Net |
 |---|---|---|
-| **Job** | make a tool callable | make capabilities discoverable + coordinated |
-| **Scope** | one host ↔ its wired-in servers | a mesh of nodes across machines / orgs |
-| **Discovery** | you configure the servers | query the mesh by capability at runtime |
-| **State** | request/response | events, streams, durable logs, recovery |
-| **Identity/policy** | host-local | mesh identity, owner-only defaults, consent |
-| **Artifacts** | — | content-addressed blob/dir transfer (native) |
+| Organizing object | tool exposed by a server | capability offered by a provider |
+| Normal scope | a host and its configured servers | nodes across machines, runtimes, and organizations |
+| Discovery | server configuration | live capability announcements |
+| Authority | host and server policy | visibility and invocation authority at the provider |
+| Work beyond request/response | server-specific | streams, durable state, tasks, and artifacts |
 
-MCP answers "how do I call this tool?" Net answers "which capabilities exist right
-now, across my trusted mesh, and did the work actually happen?"
+Use MCP directly when a host already knows which local or remote servers it should
+call. Add Net when providers change at runtime, capabilities span several machines,
+or credentials and policy must remain with the provider.
 
-## The bridge is the fastest way in
+## Publish an MCP server on Net
 
-Because MCP already has supply, the quickest path onto the mesh is to **wrap what
-you already have**. The bridge runs in both directions.
+`net-mesh wrap` starts an existing stdio MCP server and announces its tools as Net
+capabilities:
 
-**Existing MCP server → discoverable Net capability.** Wrap a stdio MCP server and
-its tools become capabilities other nodes can discover and invoke:
-
-```
+```sh
 net-mesh wrap github -- npx -y @modelcontextprotocol/server-github
 ```
 
-By default the wrapped tools are **owner-only**: visible to the mesh, but
-invocable only by the same root identity until you explicitly widen access.
-Credentials stay on the wrapping node.
+Wrapped tools are owner-only by default. The wrapping node keeps the server's
+credentials and executes the tool locally; callers receive only the permitted
+result.
 
-**Net capability → MCP host tool.** Run a shim that exposes the mesh to any MCP
-host as a small set of meta-tools — `search`, `describe`, `invoke`:
+A wrapped tool carries `compat_tier: "mcp_bridge"`. It retains MCP's
+request/response shape, so it does not gain native Net streams, migration, or
+artifact semantics merely by crossing the bridge.
 
-```
+## Expose Net to an MCP host
+
+The bridge also runs in the other direction:
+
+```sh
 net-mesh mcp serve
 ```
 
-Now an ordinary MCP host (a desktop agent, an IDE) can search the mesh, describe a
-capability's schema and risk, and invoke it — without knowing Net exists. Anything
-credentialed or unknown is search/describe-only until a human approves it
-out-of-band:
+This presents the mesh to an MCP host through a small set of meta-tools for search,
+description, and invocation. The host can discover a capability without learning
+the Net API. Credentialed or unknown capabilities remain search/describe-only
+until approved through the pin and consent flow.
 
-```
-net-mesh mcp pin approve provider/capability
-```
+## Choose the smallest layer that fits
 
-## The honest limit: bridged tools are request/response
+Use MCP alone when tools are fixed, local, and known to the host. Use MCP with Net
+when those tools need live discovery, provider-held credentials, organization
+boundaries, or distributed execution state.
 
-A capability that came in through the MCP bridge carries
-`compat_tier: "mcp_bridge"` and is **request/response only** — no streams, no
-migration, no artifacts. That's a deliberate boundary: the bridge is the funnel,
-not the destination. **Native** Net capabilities are richer — they can stream, fail
-and recover as typed events, move artifacts, and migrate between nodes. So the
-bridge is how you *get on the mesh fast*; native capabilities are how you get the
-full surface once it's worth it.
+Implementation guides:
 
-## When MCP alone is enough
-
-If your tools are hand-wired, local, and nothing needs to be discovered at
-runtime, use MCP directly — you don't need a mesh
-([When to Use Net](/docs/worldview/right-and-wrong-use-cases)). Reach for Net when
-the tools live somewhere else, the set changes, credentials must stay put, or the
-work has state you have to observe and recover.
+- [Wrap an MCP server](/docs/guides/wrap-mcp-server)
+- [Expose Net as MCP](/docs/guides/expose-net-as-mcp)
+- [MCP bridge reference](/docs/reference/mcp-bridge)

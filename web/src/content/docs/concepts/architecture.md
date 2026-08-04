@@ -4,7 +4,10 @@ description: Net is built in three layers, stacked from the bytes on the wire up
 ---
 # Architecture
 
-Net is built in three layers, stacked from the bytes on the wire up to the state your application reads. Each layer is independently understandable, and the boundaries between them are sharp on purpose — a problem at one layer doesn't reach into the others, and a change at one layer doesn't ripple up or down.
+Net's runtime has three layers: transport moves encrypted bytes, identity binds
+those bytes to participants and authority, and state gives applications events,
+causality, folds, and queries. The capability model sits at the application edge
+and uses all three to discover and invoke provider-held work.
 
 ```text title="The three layers"
 ┌─────────────────────────────────────────────────┐
@@ -16,7 +19,9 @@ Net is built in three layers, stacked from the bytes on the wire up to the state
 └─────────────────────────────────────────────────┘
 ```
 
-You work mostly at the top. The bottom two layers are visible only when something goes wrong, or when you're tuning, or when you're writing a new adapter — and even then, each layer has a small, well-defined surface.
+Most application code uses capabilities, nRPC, channels, and state. Transport and
+packet-level identity become visible during deployment, diagnostics, performance
+tuning, or adapter development.
 
 ## Transport
 
@@ -42,13 +47,14 @@ A causal link is a 32-byte structure that names the entity that produced the eve
 
 Channels carry events. Persist a channel and it becomes a durable log — RedEX. Run reductions over the log and you have folded state — CortEX. Federate queries across folds and you have a database — NetDB. Materialize blobs with deduplication and cache them by access pattern and you have Dataforts. Run long-lived stateful workers against channels and you have MeshOS. Each of these is a different way to use the same primitive; none of them is a different system bolted onto the bus.
 
-## What this gets you
+## Properties of the architecture
 
 The architecture is deliberate about a small number of properties:
 
 - **Wire-speed authorization.** The header is enough to forward, drop, or accept a packet. There's no decryption on the forwarding path and no central authority to call out to.
 - **Identity portable across nodes.** An entity is its key. It can move between nodes, fork into replicas, and merge again without losing causal continuity.
-- **One primitive for everything.** Logs, state, queries, RPC, workers — all of them are channels plus interpretation. The same authorization, the same encryption, the same routing apply uniformly.
+- **Shared primitives across layers.** Logs, state, queries, RPC, and workers build
+  on channels and events, so they reuse the same transport and identity model.
 - **No central state.** No broker, no coordinator, no registry. State lives at the edges, addressed by content and identity, replicated when you ask for it.
 
 The rest of this section walks each layer one at a time. The transport layer mostly stays out of your way; the identity layer is where most operational decisions live; the state layer is where most application code lives.

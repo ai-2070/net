@@ -54,8 +54,8 @@ received it, or the work is done. That distinction has a page of its own —
 [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed) — and it is
 the model, not an implementation detail to be optimized away later.
 
-So the honest verification for a first program is a counter read, not a round
-trip. Every fragment below ends by asserting the node's own ingested count,
+The first program therefore verifies a local counter rather than claiming a
+round trip. Every fragment below ends by asserting the node's own ingested count,
 because that is the strongest claim the smallest program can actually make.
 
 ## Why your first program appears to hang

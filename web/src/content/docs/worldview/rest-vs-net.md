@@ -1,51 +1,42 @@
 ---
-title: REST vs Net
-description: "REST and webhooks are not the enemy, and they're not the model."
+title: Connecting HTTP systems
+description: "HTTP remains the natural interface for web APIs and SaaS. Net adapters expose selected operations as capabilities at the mesh boundary."
 ---
-# REST vs Net
+# Connecting HTTP systems
 
-REST and webhooks are not the enemy, and they're not the model. They're the
-**dirty edge** — how Net meets systems that only speak HTTP.
+HTTP remains the natural interface for web APIs, SaaS products, browser
+applications, and many existing services. Net does not replace those interfaces.
+It gives distributed applications another way to address the work behind them.
 
-The rule:
+An HTTP client normally calls a known endpoint. A Net caller asks for a capability
+and resolves a visible, available, and admissible provider at runtime. When the
+provider is an HTTP-only system, an adapter translates between the two models.
 
-> **Use REST/webhooks when integrating legacy SaaS, browser-only apps, dashboards,
-> or systems that only speak HTTP. Do not model Net internally as REST.**
+```text title="HTTP at the boundary"
+Net capability call
+→ adapter on the provider side
+→ HTTP API or webhook
+→ typed result and execution evidence returned to Net
+```
 
-## Where REST fits in the hierarchy
+The HTTP URL, credentials, and vendor-specific behavior stay with the adapter. The
+caller sees the capability schema and Net authority model rather than depending on
+the provider's internal endpoint.
 
-There is a deliberate ordering of integration surfaces, from first-class to edge:
+## Keep the boundary explicit
 
-1. **Native Net — SDK / daemon / nRPC.** First-class. Typed capabilities,
-   discovery, events, streams, artifacts, recovery. This is the substrate.
-2. **The MCP bridge.** The ecosystem wedge — the fastest way to bring existing
-   tool supply onto the mesh ([MCP vs Net](/docs/worldview/mcp-vs-net)).
-3. **REST / webhooks.** The edge. For legacy SaaS, browser-only apps, dashboards,
-   and anything that will only ever speak HTTP.
+Use HTTP directly when the endpoint is stable, request/response is the whole job,
+and the caller can own the credentials and retry policy.
 
-REST belongs at the boundary, translating between an HTTP-only system and the
-mesh. It does not belong in the middle: Net's internals are events, capabilities,
-and causal state — not resources and verbs. Modeling the mesh *as* a REST API is
-the mistake that makes people mistake Net for an API gateway. It isn't one.
+Use a Net adapter when the operation needs live provider discovery, provider-held
+credentials, explicit cross-organization authority, streams or artifacts, or a
+typed distinction between accepted, executed, and verified outcomes.
 
-## Why not model Net as REST
+Net's native model is built from capabilities, events, identity, and causal state,
+not HTTP resources and verbs. The adapter should therefore stay thin: translate
+the external API into one or more capabilities, preserve the external system's
+actual outcomes, and avoid turning the mesh into an API gateway.
 
-- **REST is request/response.** The mesh is evented — work has stages, streams,
-  and failures that a resource-and-verb model flattens into a status code (see
-  [Submitted Is Not Completed](/docs/guides/submitted-is-not-completed)).
-- **REST assumes a fixed endpoint.** The mesh discovers capabilities by what they
-  do, not by URL. There's no canonical host to point at.
-- **REST terminates trust at every hop** (load balancers, proxies, gateways see
-  plaintext). The mesh is encrypted end-to-end between the actual endpoints.
-
-## Practical shape
-
-When you must integrate an HTTP-only system, put a thin adapter at the edge that
-speaks REST/webhooks on one side and announces a capability (or publishes/consumes
-events) on the other. The HTTP system stays in its world; the mesh stays in
- its. The adapter is a translator, not the architecture.
-
-> This page is a positioning note, not an integration guide — there is no
-> first-class REST adapter shipped today (unlike the MCP, Redis, and JetStream
-> adapters). If you're building an edge adapter, model it as a capability
-> announcer, and keep the HTTP surface at the boundary.
+There is no first-party general REST adapter today. Build an edge adapter for the
+specific service you need, or use the shipped MCP, Redis, and JetStream adapters
+where they already match the system.

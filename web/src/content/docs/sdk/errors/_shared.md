@@ -52,8 +52,8 @@ cooperating provider can drop the in-flight handler. "Can drop" is not "did not
 run." The request may have arrived, executed, had an effect, and failed only to
 get its reply back to you.
 
-So a retry after a timeout is not free. Three honest ways out, in order of
-preference:
+A retry after a timeout can duplicate an external effect. Use one of these
+contracts:
 
 1. **Make the operation idempotent.** Then a duplicate is harmless and this whole
    section stops mattering.
@@ -63,7 +63,7 @@ preference:
 What does not work is treating a timeout as a failure and retrying, then treating
 the second timeout the same way. That is how one intended effect becomes three.
 
-## Retry, hedge, break
+## Retry, hedge, and circuit breaking
 
 All four bindings offer the same three strategies over a raw call, and they solve
 different problems:

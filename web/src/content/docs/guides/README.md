@@ -1,26 +1,31 @@
 ---
 title: Guides
-description: "Task-oriented guides: how to publish and consume, make a channel durable, run a daemon that survives node failure."
+description: "Task-oriented guides for capabilities, events, durable state, artifacts, scheduling, and deployment."
 ---
 # Guides
 
-The pages in this section are task-oriented. Each one answers a "how do I…" question — how do I publish and consume events, how do I make a channel durable, how do I run a daemon that survives a node failure — and gives you the code, the model behind it, and the gotchas to know about.
+Guides show how to complete a specific task with Net. Choose the page closest to
+what you are building:
 
-Guides assume you've read the [Concepts](/docs/concepts) section, or are willing to flip back when something doesn't make sense. They're meant to be read in any order; pick the one closest to what you're trying to do.
+- Discover and invoke work: [Discover and invoke](/docs/guides/discover-and-invoke),
+  [nRPC](/docs/guides/nrpc), and [Private capabilities](/docs/guides/private-capabilities).
+- Connect agent tools: [Wrap an MCP server](/docs/guides/wrap-mcp-server),
+  [Expose Net as MCP](/docs/guides/expose-net-as-mcp), and
+  [Agent-to-agent](/docs/guides/agent-to-agent).
+- Move events and state: [Event bus](/docs/guides/event-bus),
+  [Durable logs](/docs/guides/durable-logs), [CortEX folds](/docs/guides/cortex-folds),
+  and [NetDB queries](/docs/guides/netdb-queries).
+- Move files and long-running work: [Dataforts](/docs/guides/dataforts),
+  [Task lifecycle](/docs/guides/task-lifecycle), and
+  [Daemons and placement](/docs/guides/daemons-and-placement).
+- Operate the mesh: [Production deployment](/docs/guides/production-deployment),
+  [NAT and traversal](/docs/guides/nat-and-traversal), and
+  [Troubleshooting](/docs/guides/troubleshooting).
 
-Everything here is grounded in real Net APIs. If you need the exhaustive signature of a method or the full grammar of a configuration object, the [Reference](/docs/reference) section is where to look.
+Guides are Rust-first where they need the full runtime surface. The SDK section
+provides end-to-end examples for [Rust](/docs/sdk/rust/quickstart),
+[TypeScript](/docs/sdk/typescript/quickstart), [Python](/docs/sdk/python/quickstart),
+[Go](/docs/sdk/go/quickstart), and [C](/docs/sdk/c/quickstart).
 
-## About the language switcher
-
-Guides are **Rust-first**. The core crate is Rust, and the guides go deep enough
-that showing every knob in four languages would cost more clarity than it buys.
-Switching the sidebar language changes which **SDK** pages you see; it does not
-translate the guides.
-
-That's a real gap, not a preference — so where a guide covers something you'd
-reach for from another binding, it carries a side-by-side section instead. [Using
-the Event Bus](/docs/guides/event-bus#the-same-loop-four-ways) is the worked
-example. For per-language idioms end to end, each SDK has its own spine:
-[Rust](/docs/sdk/rust/quickstart) · [TypeScript](/docs/sdk/typescript/quickstart) ·
-[Python](/docs/sdk/python/quickstart) · [Go](/docs/sdk/go/quickstart) ·
-[C](/docs/sdk/c/quickstart).
+Use [Concepts](/docs/concepts) for the model and [Reference](/docs/reference) for
+exact fields, signatures, constants, and wire behavior.

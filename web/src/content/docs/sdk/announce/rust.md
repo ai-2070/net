@@ -66,7 +66,7 @@ controls signing.
 
 ### Verify it worked
 
-The honest check is from the other side — a peer that folded your announcement:
+Verify from another peer after it folds the announcement:
 
 ```rust
 // `agent` is handshaked with `host`, per the Quickstart.

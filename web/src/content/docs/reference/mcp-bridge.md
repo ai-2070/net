@@ -182,7 +182,7 @@ shared child process is cross-caller contamination by construction. Forwarding
 applies only to remote / HTTP-facing destinations, and the type system carries
 the rule (there is no stdio injection target to construct).
 
-### Honest labeling
+### Compatibility and risk labels
 
 A capability whose accept-list includes a credential header (`Authorization`,
 `Cookie`, `x-api-key`, and other bearer-credential names) carries the
@@ -203,6 +203,6 @@ require an explicit `--force` acknowledgement.
 
 - Guides: [Wrap an MCP Server](/docs/guides/wrap-mcp-server),
   [Expose Net as MCP](/docs/guides/expose-net-as-mcp).
-- Worldview: [MCP vs Net](/docs/worldview/mcp-vs-net).
+- Worldview: [Net and MCP](/docs/worldview/mcp-vs-net).
 - [CLI Reference](/docs/reference/cli) for `net-mesh transfer` / `typegen` and exit
   codes.

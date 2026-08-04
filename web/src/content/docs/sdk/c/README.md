@@ -35,11 +35,9 @@ you specifically need the C ABI.
 3. **[Memory and Threading](/docs/sdk/c/memory-and-threading)** — ownership, the polling cursor trap, and the guarantees the FFI boundary makes.
 4. **[Errors](/docs/sdk/c/errors)** — return codes and the `NET_ERR_*` table.
 
-## Correction
+## Capability and nRPC coverage
 
-An earlier version of this page said the agentic mesh surface was "not exposed
-in the C ABI" and pointed C users at the `net-mesh` CLI for capability
-discovery and nRPC. That was wrong. `net.go.h` alone declares 182 functions,
-including `net_mesh_announce_capabilities`, `net_mesh_find_best_node_scoped`
-and `net_mesh_subscribe_channel_with_token`; `net_rpc.h` declares ten
-`net_rpc_call*` variants. The CLI is a convenience, not the only path.
+The C ABI exposes capability discovery and nRPC directly. `net.go.h` declares
+`net_mesh_announce_capabilities`, `net_mesh_find_best_node_scoped`, and
+`net_mesh_subscribe_channel_with_token`; `net_rpc.h` declares the `net_rpc_call*`
+variants. The CLI is optional.

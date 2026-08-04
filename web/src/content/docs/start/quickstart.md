@@ -1,10 +1,13 @@
 ---
 title: Quickstart
-description: This page gets you from zero to a working event bus in about five minutes.
+description: Run the low-level Rust event bus and learn when to use net-mesh versus net-mesh-sdk.
 ---
 # Quickstart
 
-This page gets you from zero to a working event bus in about five minutes. We'll start a bus on a single process, publish a few events, see what the bus did with them, and then point at what changes when you want the same code to run across a real mesh.
+This page runs Net's low-level Rust event bus in one process, then shows the
+transport boundary for a real mesh. If you are building an application that needs
+capability discovery and invocation, start with the
+[Rust SDK quickstart](/docs/sdk/rust/quickstart) instead.
 
 Every snippet below is compiled in CI as [`examples/docs_quickstart.rs`](https://github.com/ai-2070/net/blob/master/net/crates/net/examples/docs_quickstart.rs) — if the API moves, the build breaks before the page goes stale.
 

@@ -4,10 +4,10 @@ description: "The core agent loop, without an MCP host in the middle: ask the me
 ---
 # Discover and Invoke
 
-The core agent loop, without an MCP host in the middle: ask the mesh who can do
-the work, then make a typed call and get a typed result. This is the **native**
-path — richer than the [MCP bridge](/docs/guides/wrap-mcp-server), because a native
-capability can stream, fail as a typed event, move artifacts, and recover.
+This guide uses Net's native SDK path: query the mesh for providers, choose one,
+then make a typed call. Native capabilities can also define streams, task state,
+and artifact movement. For existing MCP tools that only need request/response, use
+the [MCP bridge](/docs/guides/wrap-mcp-server).
 
 ## Discover: query by capability, not by host
 
