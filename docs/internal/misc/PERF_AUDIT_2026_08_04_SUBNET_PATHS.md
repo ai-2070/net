@@ -10,11 +10,22 @@ per announcement — the publish fan-out and the protected route-hop relay in
 
 Read at `subnet-sdk` @ `f8be5ea56`.
 
-**Status: findings only — nothing here is implemented, and nothing here is measured.**
+**Status: triaged — nothing here is implemented, and nothing here is measured.**
 Every cost claim below is derived from reading the code. No profile was taken and no
-before/after numbers exist. Treat the ranking as a hypothesis ordered by expected
-leverage, not as a result; §6 is the measurement contract that would turn any of it into
-a claim.
+before/after numbers exist. The decision markers say which work is worth carrying into a
+measured performance change; they are not performance claims. Correctness/security HOLDs
+in `CODE_REVIEW_2026_08_04_SUBNET_SDK.md` land first. §6 remains the measurement contract
+for any optimization that follows.
+
+Decision vocabulary:
+
+- **FIX** — remove demonstrated unnecessary work, with the listed benchmark and parity
+  witness before merge.
+- **MEASURE FIRST** — plausible hot-path cost, but no code change until a profile or
+  microbenchmark shows material leverage.
+- **DO NOT FIX NOW** — real or possible cost whose risk, frequency, or scope does not
+  justify a subnet-SDK change.
+- **REJECT** — the finding's premise is false; do not implement the proposed change.
 
 The headline is that the subnet **primitives** are already tuned hard — the transition
 decision is depth-bounded indexed lookups with no credential scan
@@ -43,6 +54,8 @@ that runs per datagram but is also the one already carrying an allocation witnes
 
 ## §1 — Publish fan-out probes `peer_subnets` per subscriber for a verdict that does not depend on the subscriber
 
+**Decision: FIX the `Visibility::Global` form. Do not take the second-order form.**
+
 `net/crates/net/src/adapter/net/mesh.rs:27244`
 
 ```rust
@@ -67,7 +80,7 @@ that arm. The gateway counters must keep ticking per subscriber (`gw.record_forw
 at `27249`) — that is a per-decision counter, not a per-lookup one, so it stays in the
 loop.
 
-**Second-order form, not recommended without a decision.** `peer_subnets` has exactly
+**Second-order form: DO NOT FIX.** `peer_subnets` has exactly
 one production writer (`mesh.rs:25336`), and it is gated on `local_subnet_policy` being
 installed. With no policy the map is provably empty, so `dest` is always `None` and the
 verdict is subscriber-independent for *every* visibility mode — hoistable wholesale, not
@@ -84,6 +97,9 @@ channel that is 1 000 probes per message that produce nothing.
 ---
 
 ## §2 — `SubnetPolicy::assign` allocates one `String` per tag, undoing the allocation-freedom of the function it delegates to
+
+**Decision: FIX after §1, with allocation evidence. Correct the proposed implementation
+before coding it.**
 
 `net/crates/net/src/adapter/net/subnet/assignment.rs:170-178`
 
@@ -106,10 +122,17 @@ an operator rule keys on `region:` / `fleet:`-shaped prefixes, which parse to
 `Tag::Legacy(String)` (`behavior/tag.rs:224`) — the wire string is already in hand and
 `to_string()` just copies it.
 
-**Proposed change.** Either (a) match borrowed for the `Legacy` / `Reserved` variants
-and render only the axis-shaped ones, or (b) render through a single reused `String`
-buffer so the cost is one allocation rather than N. (a) is the larger win and the more
-invasive signature change; (b) is trivially safe.
+**Required shape.** Borrow `Tag::Legacy(String)` directly because operator rules such as
+`region:` and `fleet:` use that representation. Render only variants whose canonical wire
+form is split across fields. A small `Cow<'_, str>` collection or an equivalent borrowed
+view is acceptable if the allocation benchmark proves the reduction and the existing
+agreement witness remains exact.
+
+Do **not** implement the original "one reused `String`" suggestion literally. Rule
+evaluation needs to revisit the complete tag set and retain the lexicographic winner; one
+scratch string cannot simultaneously represent the slice consumed by
+`assign_from_rendered_tags`. A scratch buffer can be part of a specialized iterator, but
+the ownership and winner lifetime must be explicit rather than hand-waved.
 
 **Do not** try to share the rendered tags with the fold's own render at
 `capability_bridge.rs:1162` — `filter_unauthorized_heat_tags` (`mesh.rs:25436`) mutates
@@ -119,6 +142,8 @@ is load-bearing for the heat-tag security filter.
 ---
 
 ## §3 — Protected relay: a 32-byte-keyed map probe and two oversized context copies per packet
+
+**Decision: MEASURE FIRST for 3b. DO NOT FIX NOW for 3a. Preserve 3c.**
 
 `net/crates/net/src/adapter/net/mesh.rs:17363`, `17370`, `17406`
 
@@ -134,13 +159,16 @@ let auth_epoch = ctx.subnet_floors.auth_epoch(local_set.authority());
 shard lock to read a `u64` that changes only when a signed revocation floor is accepted.
 The single writer is `SubnetFloorRegistry::apply` (`auth.rs:906-911`).
 
-*Candidate:* publish the authority's auth epoch as an `AtomicU64` alongside the ArcSwap
+*Candidate, not approved:* publish the authority's auth epoch as an `AtomicU64` alongside the ArcSwap
 gateway-authority snapshot the relay already loads at `mesh.rs:17314`, so the packet path
 becomes a relaxed load. **This is only correct if the atomic is updated at the same
 publication point that bumps the registry epoch** — otherwise a revocation stops taking
 effect at the exact moment the code exists to make it take effect. That invariant has to
 be explicit and pinned by a test, not implied by call ordering. Worth doing only under
-that condition.
+that condition. The duplicated-publication risk is larger than an unmeasured map lookup.
+Do not add the atomic in this branch. If a relay profile later makes the lookup material,
+the epoch must join one coherent authority publication rather than become an independently
+updated side channel.
 
 **3b — `get_for_session` copies ~150 bytes twice per packet to use ~60 of them.**
 
@@ -151,11 +179,16 @@ that condition.
 (`mesh.rs:17406`). `authorize_transition` reads only `authority`, `attachment`,
 `rights`, `topology_epoch`, `subnet_auth_epoch` and `expires_at` — about 60 bytes.
 
-*Candidate:* a narrow `Copy` "transition facts" projection returned by a
+*Conditional candidate:* a narrow `Copy` "transition facts" projection returned by a
 `SubnetContextStore` accessor. This preserves the existing rule that no map guard is held
 across authorization or crypto (`mesh.rs:17385-17393`) — the projection is still taken
 under the guard and the guard still drops immediately. Do **not** "optimize" this by
 holding the `DashMap` guard across `authorize_transition`; that rule is deliberate.
+
+Do not implement this from the estimated struct size alone. First add the relay
+microbenchmark in §6 and compare the context-copy cost with the keyed BLAKE2s work. If the
+copy is visible, the narrow `Copy` projection is the approved repair; holding a map guard
+or returning a borrowed guard is not.
 
 **3c — three `peers` map lookups per packet.**
 
@@ -169,7 +202,9 @@ work; neither justifies its own risk budget alone.
 
 ---
 
-## §4 — `may_execute_with_caller` allocates three `Vec`s per target before discovering the target is unrestricted
+## §4 — `may_execute_with_caller` declares three `Vec`s, but the unrestricted path does not allocate
+
+**Decision: REJECT the proposed optimization and correct the original finding.**
 
 `net/crates/net/src/adapter/net/behavior/fold/capability_bridge.rs:1067-1080`
 
@@ -184,28 +219,31 @@ if allowed_nodes.is_empty() && allowed_subnets.is_empty() && allowed_groups.is_e
 }
 ```
 
-The permissive default — all allow-lists empty — is the common case, and it is decided
-only *after* three allocations have happened. This runs per candidate inside the
-retain-style callers `may_execute_batch` (`capability_bridge.rs:967`) was introduced to
-speed up, so the batch hoisting bought the caller-axis derivation back but left the
-per-target allocations in place.
+`Vec::new()` does not allocate. When every allow-list is empty, each `extend` consumes an
+empty iterator, capacity remains zero, and the function returns `true` without a heap
+allocation. Heap work begins only when the target actually carries restrictions, where
+the collected values are subsequently needed.
 
-**Proposed change.** First pass establishes `target_carries_tag` and whether any
-allow-list is non-empty; collect only in the restricted branch. `may_admit`
-(`capability_bridge.rs:879`) has the same shape with one `Vec` and the same fix.
+A first pass would scan the target entries twice and make the common unrestricted path
+strictly more expensive without removing an allocation from it. Do not change this code
+unless an allocation profile identifies a different restricted-path problem. The same
+reasoning applies to the single empty `Vec` in `may_admit`.
 
 ---
 
 ## §5 — Adjacent, same paths, not subnet-specific
 
+**Decision: no subnet-SDK fixes. Measure the `ChannelConfig` clone separately; defer the
+rest.**
+
 Recorded because they sit on the paths above and a reader profiling subnet fan-out will
 see them.
 
-- **`mesh.rs:27054-27057` deep-clones the whole `ChannelConfig` once per publish**
+- **MEASURE FIRST — `mesh.rs:27054-27057` deep-clones the whole `ChannelConfig` once per publish**
   (`cr.get_by_name(...).map(|c| c.clone())`). `ChannelConfig` carries owned names and ACL
   vectors. A snapshot is needed because the guard cannot be held across the fan-out —
   `Arc<ChannelConfig>` in the registry would make it a refcount bump.
-- **`ChannelConfigRegistry::get` is two map hops, the second `String`-keyed**
+- **DO NOT FIX NOW — `ChannelConfigRegistry::get` is two map hops, the second `String`-keyed**
   (`channel/config.rs:992-1003`): `by_hash: DashMap<u64, Vec<String>>` → `configs:
   DashMap<String, ChannelConfig>`, so a canonical-hash lookup pays a string hash. This is
   what `SubnetGateway::should_forward` calls per packet (`gateway.rs:352`). **Latent, not
@@ -213,12 +251,12 @@ see them.
   path uses the inline `subnet_visible` instead, and `should_forward` is reached from
   tests and the deck TUI. It becomes real the moment a border gateway routes packets
   through it.
-- **`export_targets` clones a `Vec<SubnetId>` per publish** (`gateway.rs:242`, called at
+- **DO NOT FIX NOW — `export_targets` clones a `Vec<SubnetId>` per publish** (`gateway.rs:242`, called at
   `mesh.rs:27234`). Already correctly hoisted to once per publish rather than per
   subscriber, and only for `Exported` channels. Storing `Arc<[SubnetId]>` in the export
   table would make it a refcount bump instead — small, and only pays off on
   `Exported`-heavy deployments.
-- **Exported-plane discovery** (`mesh_rpc.rs:4903`, `capability_bridge.rs:512`) allocates
+- **DO NOT FIX — exported-plane discovery** (`mesh_rpc.rs:4903`, `capability_bridge.rs:512`) allocates
   a `format!` tag, a filter with a cloned tag, and sorts twice per `call_exported`.
   Acceptable at call granularity; **no action proposed**, listed so it is not
   re-discovered as a finding.
@@ -249,12 +287,17 @@ Stated so a later audit does not re-walk it:
 Nothing above should be merged as a performance change on the strength of this document.
 The acceptance rule per finding:
 
-| Finding | Bench / witness | Acceptance |
-|---|---|---|
-| §1 | `benches/mesh.rs` publish fan-out, swept over subscriber count | Throughput improves at high fan-out and is unchanged at fan-out 1; verdict parity pinned by a test over the visibility matrix × `dest ∈ {Some, None}` |
-| §2 | `benches/capability_burst.rs`, `benches/capability_propagation.rs` | Ingest allocation count per announcement drops; `assign` / `assign_from_rendered_tags` agreement test (`assignment.rs:352`) still passes |
-| §3a/§3b | a relay microbench (none exists — would need writing); `tests/subnet_relay_alloc_e2e.rs` stays green | Allocation witness unchanged; epoch-freshness test proving a floor accepted mid-stream denies the next packet |
-| §4 | `benches/capability_burst.rs` retain-heavy case | Allocation count per candidate drops in the unrestricted case; `may_execute` verdict parity across the allow-list matrix |
+| Finding | Decision | Bench / witness | Acceptance |
+|---|---|---|---|
+| §1 `Global` | **FIX** | `benches/mesh.rs` publish fan-out, swept over subscriber count | Throughput improves at high fan-out and is unchanged at fan-out 1; verdict parity pinned over the visibility matrix × `dest ∈ {Some, None}`; gateway counters remain per subscriber |
+| §1 second-order | **DO NOT FIX** | None | No production-only empty-map invariant is introduced |
+| §2 | **FIX** | `benches/capability_burst.rs`, `benches/capability_propagation.rs` | Ingest allocations per announcement drop for representative legacy and mixed tag sets; `assign` / `assign_from_rendered_tags` agreement (`assignment.rs:352`) remains exact |
+| §3a | **DO NOT FIX NOW** | Relay microbenchmark if reconsidered | No independent epoch side channel; floor acceptance still denies the next packet |
+| §3b | **MEASURE FIRST** | New relay microbenchmark; `tests/subnet_relay_alloc_e2e.rs` stays green | Implement only if context copies are visible beside MAC/crypto; allocation witness and authority verdicts remain unchanged |
+| §3c | **PRESERVE** | Existing incarnation/rebind witnesses | All three lookups and the final incarnation re-check remain |
+| §4 | **REJECT** | No new benchmark owed | Preserve the current zero-allocation unrestricted path; do not add a second scan |
+| §5 `ChannelConfig` clone | **MEASURE FIRST, SEPARATE WORK** | Publish benchmark with small and ACL-heavy configs | Change registry ownership only if the clone is material; no guard held across fan-out |
+| §5 remaining | **DO NOT FIX NOW** | None | No speculative subnet-SDK refactor |
 
 Build note for this host: `cargo` needs `-j 4` here; full parallelism dies with no
 diagnostic (unrelated to this work).
@@ -269,12 +312,34 @@ cargo bench -j 4 --bench capability_burst
 
 ## Disposition
 
-Ordered by expected leverage per unit of risk:
+### Approved work
 
-1. **§1 (`Global` form)** — smallest change, clearest win, no invariant debt.
-2. **§2 (b, reused buffer)** — trivially safe; (a) if the signature churn is acceptable.
-3. **§4** — mechanical, contained to one file.
-4. **§3b** — worth folding into other relay work.
-5. **§3a** — only with the epoch-publication invariant pinned by a test.
-6. **§5** — opportunistic; the `should_forward` item is latent until a border gateway
-   uses that entry point.
+1. **§1 `Visibility::Global` fast path — FIX.** This removes one semantically dead
+   `DashMap` probe per subscriber per default-visibility publish. Keep gateway counters
+   per subscriber and pin the complete visibility verdict matrix.
+2. **§2 borrowed tag assignment — FIX after §1.** Borrow legacy operator tags, render
+   only composite variants, and prove allocation reduction plus exact verdict parity.
+
+These are separate measured commits after the correctness/security HOLD closes. Do not
+mix them into authority repairs or claim a performance win without the §6 evidence.
+
+### Conditional work
+
+3. **§3b context projection — MEASURE FIRST.** Write the relay microbenchmark. Implement
+   the narrow `Copy` projection only if the copies are visible beside MAC/crypto.
+4. **§5 `ChannelConfig` ownership — MEASURE FIRST, OUTSIDE THIS BRANCH.** An `Arc`-backed
+   registry may be worthwhile for ACL-heavy publish workloads, but it is channel-registry
+   work rather than subnet SDK work.
+
+### Explicitly not approved
+
+- **§1 second-order no-policy shortcut:** production-only invariant and unnecessary risk.
+- **§3a auth-epoch atomic:** unmeasured and creates a dangerous second publication point.
+- **§3c peer-lookup removal:** the final incarnation re-check is load-bearing.
+- **§4 two-pass allow-list scan:** premise is false; unrestricted `Vec::new()` paths do
+  not allocate.
+- **§5 two-hop registry lookup:** latent on the discussed subnet path.
+- **§5 `export_targets` Arc conversion:** one already-hoisted small clone on exported-only
+  publishes is not worth a structural change without evidence.
+- **Exported discovery allocation cleanup:** acceptable at call granularity and dominated
+  by network/RPC work.
