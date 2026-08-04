@@ -2059,6 +2059,123 @@ in this section.
   the deferred publication-order interleaving evidence, and the remaining
   §18.3 witnesses.
 
+### 18.0a Candidate-bound mutation campaign — the Step 1 evidence packet
+
+The §17.6b evidence debt, paid. Reopening `org_routing_registry.rs` at
+`+462/−89` triggered the rerun the 2B.3b closure recorded as owed, so this
+campaign is the 42 non-retired §17.6c core rows AND the 8 new second-cell
+inverse rows, run against the Step 1 candidate rather than against any
+earlier tree.
+
+```text
+CARGO_INCREMENTAL=0
+cargo nextest run --lib -j 1 --no-tests=fail --retries 0
+    -E 'test(=<exactly one witness>)'
+restore + SHA256-verify after EVERY row (both source files)
+```
+
+`--lib` is deliberate: the fixtures-gated integration targets do not build
+under this job's feature set, and a harness that cannot build is not a
+harness that proves anything.
+
+```text
+FINAL matrix        50 rows   49 RED + 1 RED-DEADLOCK   0 survivors
+                    50/50 selected exactly one witness
+                    50/50 restored and SHA256-verified
+ARCHAEOLOGY          2 superseded attempts (M-X1, M-X2) — never counted
+NOT A RUN           18 rows: mutation applied, nothing executed — excluded
+                    from BOTH counts
+genuine executions  52
+```
+
+| # | ID | Production change | Selected witness | Outcome |
+|---|---|---|---|---|
+| 1 | M-A1 | family bound per-key `>=` instead of whole-set `+ len` | `a_demand_set_past_the_family_bound_retains_nothing` | RED |
+| 2 | M-A1s | **shared** with #1 | `a_refused_entry_retains_no_partial_demand` | RED |
+| 3 | M-A2 | node bound per-key `>=` | `a_demand_set_past_the_node_bound_retains_nothing` | RED |
+| 4 | M-A2b | count every key as a NEW slot | `a_demand_set_over_retained_slots_costs_no_node_capacity` | RED |
+| 5 | M-A3 | wrap the incarnation reservation | `an_exhausted_identity_space_refuses_a_whole_demand_set` | RED |
+| 6 | M-A4 | drop `keys.dedup()` | `duplicate_keys_in_a_demand_set_collapse` | RED |
+| 7 | M-A5 | acquire per key in a loop, releasing the prefix | `a_refusal_after_identities_are_considered_consumes_none` | RED |
+| 8 | M-A5s | **shared** with #7 | `a_refused_entry_retains_no_partial_demand` | **RED — see the reconciliation below** |
+| 9 | M-A7 | drop `keys.sort()` | `a_demand_set_is_ordered_owner_scopes_first` | RED |
+| 10 | M-N1 | drop the installed-lease requirement | `a_discover_grant_with_no_installed_audience_is_not_a_demand` | RED |
+| 11 | M-N2 | synthesize an audience for a right-less grant | `an_invoke_only_grant_is_not_a_source_demand` | RED |
+| 12 | M-N3 | `classify` compares `grant_id` alone | `a_rotated_audience_handle_is_not_leased_under_its_own_id` | RED |
+| 13 | M-S1 | `warm` takes `mutate` and counts it | `a_warmed_lookup_takes_no_lock` | RED |
+| 14 | M-S2 | `warm` holds `mutate` across the read | `a_warmed_lookup_completes_while_the_mutation_lock_is_held` | **RED (deadlock)**, terminated at the 300 s bound |
+| 15 | M-S3 | drop the under-`mutate` re-check | `concurrent_misses_acquire_one_demand_set` | RED |
+| 16 | M-L1 | return the warmed entry without the currency check | `a_newly_leased_audience_joins_a_warmed_entry` | RED |
+| 17 | M-L2 | `leases_current`: drop the OBSOLETE direction | `a_removed_audience_leaves_a_warmed_entry` | RED |
+| 18 | M-L3 | `leases_current`: drop the MISSING direction | `a_newly_leased_audience_joins_a_warmed_entry` | RED |
+| 19 | M-L4 | `leases_current` compares the id alone | `a_rotated_away_scope_is_not_retained_under_its_own_id` | RED |
+| 20 | M-L5 | refused re-derivation answers `Warm` from the stale entry | `a_refused_rederivation_leaves_the_entry_exactly_as_it_was` | RED |
+| 21 | M-L6 | index only the FIRST grant per capability | `the_capability_index_derives_exactly_what_the_full_scan_derives` | RED |
+| 22 | M-L7 | take `mutate` on the warmed currency check | `a_current_warmed_entry_with_a_leased_audience_takes_no_lock` | RED |
+| 23 | M-L8 | supersede the entry captured BEFORE the lock | `concurrent_rederivations_spend_one_demand_set` | RED |
+| 24 | M-P5 | **two-site**: lift the registry demand bound + add an index-length bound | `the_family_bound_counts_demands_not_capabilities` | RED |
+| 25 | M-P6 | leak an `Arc` on publication | `dropping_the_state_releases_every_demand` | RED |
+| 26 | M-X1 | family projection charged GROSS (`held + new.len()`) | `a_narrowing_replacement_at_the_family_bound_is_charged_net` | RED |
+| 27 | M-X2 | **shared** with #26 | `a_same_width_rotation_at_the_family_bound_is_charged_net` | RED |
+| 28 | M-X3 | node projection ignores the credit | `a_rotation_at_the_node_bound_retires_the_slot_it_transfers` | RED |
+| 29 | M-X4 | credit EVERY old-only slot | `a_rotation_at_the_node_bound_refuses_when_the_old_slot_is_shared` | RED |
+| 30 | M-X5 | wrap the replacement's reservation | `identity_exhaustion_during_a_replacement_refuses_with_no_effect` | RED |
+| 31 | M-X6 | refuse EVERY replacement once the id space is spent | `a_narrowing_replacement_needs_no_identity_after_exhaustion` | RED |
+| 32 | M-Y1 | retire without clearing the publication cells | `a_superseded_reader_cannot_read_a_retired_incarnations_facts` | RED |
+| 33 | M-Y2 | clear EVERY slot's cells at retirement | `a_common_key_reader_follows_the_successors_ownership` | RED |
+| 34 | M-Y3 | **shared** with #32 | `a_fresh_demand_after_retirement_gets_a_fresh_cell` | RED |
+| 35 | M-Y4 | drop the `NotHeld` guard | `release_one_cannot_decrement_a_reference_a_family_does_not_hold` | RED |
+| 36 | M-Y5 | drop the `held != keys` transfer guard | `an_already_transferred_set_cannot_be_replaced_again` | RED |
+| 37 | M-Y10 | under-lock recheck returns `Warm` on mere existence | `the_under_lock_miss_recheck_validates_the_callers_snapshot` | RED |
+| 38 | M-Y11 | **shared** with #37 | `the_under_lock_miss_recheck_sees_a_removal` | RED |
+| 39 | M-Y12 | **two-site**: drop BOTH snapshot-ordering gates | `a_stalled_older_install_cannot_overwrite_a_newer_removal` | RED |
+| 40 | M-Y13 | encode `Terminal` as `0` | `a_terminal_snapshot_cannot_be_overwritten_by_an_ordinary_one` | RED |
+| 41 | M-Y14 | drop the `derived_at` breach refusal | `two_snapshots_at_one_revision_are_refused_as_an_invariant_breach` | RED |
+| 42 | M-Y15 | advance the high-water only when re-deriving | `unrelated_newer_movement_advances_freshness_without_churn` | RED |
+| 43 | M-C1 | detached pool cell in `DemandHandle` | `a_demand_handle_couples_both_publication_cells` | RED |
+| 44 | M-C2 | reverse the acquisition cell vector | `a_demand_set_couples_both_cells_per_contributor` | RED |
+| 45 | M-C3 | retirement clears only the facts plane | `retiring_the_last_reference_clears_both_cells` | RED |
+| 46 | M-C4 | a transfer clears the common key's pool | `a_transfer_leaves_the_common_keys_pool_published` | RED |
+| 47 | M-C5 | facts invalidation leaves the derived pool published | `facts_invalidation_clears_the_derived_pool` | RED |
+| 48 | M-C6 | delayed stale observation deletes the newer pair | `a_stale_observation_invalidates_neither_plane` | RED |
+| 49 | M-C7 | newer-facts install retains the superseded pool | `installing_newer_facts_clears_the_superseded_pool` | RED |
+| 50 | M-C8 | reverse the SUCCESSOR cell vector — the audit's survivor | `a_replacement_successor_stays_index_aligned_across_both_planes` | RED |
+
+**M-A5s is RED here and GREEN in §17.6c, and the difference is the witness,
+not the mutation.** §17.6a's third finding recorded that W-A5's loop mutation
+left handles, slots and the index back at baseline, so the state-level witness
+could not see it; the HOLD-3 repair then strengthened
+`a_refused_entry_retains_no_partial_demand` to assert
+`allocated_ids_for_test()` — the one thing the loop consumes and never returns.
+That strengthening is what kills it now. The §17.6c row is left as written: it
+is a true record of the tree and the witness it ran against. This is the same
+"strengthened, not quietly dropped" discipline §17.6c's own M-A5s note applies
+in the other direction.
+
+**Two superseded attempts, kept as archaeology and never counted.** M-X1's
+first mutation dropped only the `old_only` credit
+(`held + new_only.len()`); for a NARROWING replacement `new_only` is empty, so
+the mutated bound still admitted the case and the row ran GREEN. That was a
+defect in the mutation, not in the witness — the §17.6c row names gross
+charging, `held + new.len()`, which is the acquire-beside-then-drop shape §4.3
+forbids. Both M-X1 and M-X2 were re-run with the corrected change so the two
+shared rows describe ONE production change, and both are RED. The weaker
+variant killed M-X2 anyway (a same-width rotation has a non-empty `new_only`),
+which is exactly why the narrowing case is the one that separates them.
+
+**Eighteen rows are NOT A RUN, and they are excluded from both counts.** A
+process-tree teardown killed cargo mid-`M-Y2`; every invocation after it
+returned in 0 s having produced no output, and the harness recorded each as a
+row. A filtered run that executes nothing is the vacuous gate §17.6b exists to
+forbid, and recording eighteen of them as outcomes would have been that
+failure in its purest form. They are excluded, the harness now ABORTS on an
+invocation that produces no summary rather than accumulating non-evidence, and
+every one of those IDs was genuinely re-run afterwards. That the ledger carries
+a `selected` check per row is what made this visible at all.
+
+Evidence is reproducible from `run.py` + `ledger.tsv` under the out-of-repo
+scratch directory; nothing from it is committed.
+
 ### 18.1 Scope, exactly
 
 The §13 row, and nothing beside it:
