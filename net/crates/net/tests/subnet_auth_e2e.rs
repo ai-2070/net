@@ -1914,6 +1914,10 @@ async fn neither_plane_manufactures_the_other() {
 const PARTNER_ORG_SEED: [u8; 32] = [0xB7; 32];
 const PARTNER_SEED: [u8; 32] = [0xA4; 32];
 const DIAGNOSTIC: &str = "diagnostic.snapshot";
+/// A second capability registered in the SAME admission mode through
+/// the SAME boundary on the SAME provider — the control that lets the
+/// capability-bounding inverse move exactly one axis.
+const DIAGNOSTIC_TRACE: &str = "diagnostic.trace";
 
 fn partner_org() -> OrgKeypair {
     OrgKeypair::from_bytes(PARTNER_ORG_SEED)
@@ -1922,18 +1926,29 @@ fn partner_org() -> OrgKeypair {
 /// A real cross-org INVOKE intent: the Partner client's membership and
 /// dispatcher grant come from PARTNER Org; the capability grant is
 /// issued by BMW (the provider-owner org) with an exact target scope.
-fn partner_intent(
+///
+/// `granted_service` and `invoked_service` are separate parameters on
+/// purpose. The caller-side proof builder refuses an intent whose
+/// proof capability differs from the invoked service (it would fail
+/// locally as a codec error, never reaching the provider), so the
+/// membership, dispatcher scope, and proof capability all follow the
+/// INVOKED service — the only object that can carry a different
+/// capability to the provider's gate is the grant itself, which is
+/// exactly the axis the capability-bounding inverse must isolate.
+fn partner_intent_granting(
     provider: EntityId,
-    service: &str,
+    granted_service: &str,
+    invoked_service: &str,
     target_scope: GrantTargetScope,
 ) -> OrgProofIntent {
     let caller_kp = EntityKeypair::from_bytes(PARTNER_SEED);
     let caller_entity = caller_kp.entity_id().clone();
-    let cap = CapabilityAuthorityId::for_tag(&format!("nrpc:{service}"));
+    let invoked_cap = CapabilityAuthorityId::for_tag(&format!("nrpc:{invoked_service}"));
+    let granted_cap = CapabilityAuthorityId::for_tag(&format!("nrpc:{granted_service}"));
     let (grant, secret) = OrgCapabilityGrant::try_issue(
         &bmw(),
         partner_org().org_id(),
-        cap,
+        granted_cap,
         GrantRights::INVOKE,
         target_scope,
         3600,
@@ -1948,7 +1963,7 @@ fn partner_intent(
     let dispatcher = OrgDispatcherGrant::try_issue(
         &partner_org(),
         caller_entity,
-        DispatcherScope::Exact(cap),
+        DispatcherScope::Exact(invoked_cap),
         3600,
     )
     .expect("partner dispatcher");
@@ -1960,9 +1975,19 @@ fn partner_intent(
         acting_org: partner_org().org_id(),
         provider_owner_org: bmw().org_id(),
         provider,
-        capability: cap,
+        capability: invoked_cap,
         proof_ttl_secs: 30,
     }
+}
+
+/// The well-formed shape: the grant names the capability the call
+/// invokes.
+fn partner_intent(
+    provider: EntityId,
+    service: &str,
+    target_scope: GrantTargetScope,
+) -> OrgProofIntent {
+    partner_intent_granting(provider, service, service, target_scope)
 }
 
 /// Evidence 9: the Partner Org's capability grant reaches EXACTLY its
@@ -1996,6 +2021,28 @@ async fn partner_diagnostic_is_exactly_bounded() {
         )
         .expect("serve the exported diagnostic");
 
+    // And a SECOND cross-org capability, identical in admission mode,
+    // boundary, and provider — the single-axis control for the
+    // capability-bounding inverse below.
+    let trace_calls = Arc::new(AtomicUsize::new(0));
+    let _trace = f
+        .vehicle_b
+        .serve_rpc_subnet_exported(
+            DIAGNOSTIC_TRACE,
+            Arc::new(RoiHandler {
+                calls: trace_calls.clone(),
+                attribution_ok: Arc::new(AtomicBool::new(false)),
+                proof_stripped: Arc::new(AtomicBool::new(false)),
+                expected_caller: partner.entity_id().clone(),
+                expected_org: partner_org().org_id(),
+                expected_provider: provider.clone(),
+            }),
+            OrgAdmission::CrossOrgGranted,
+            world_model_binding(0),
+            Arc::new(|_| true),
+        )
+        .expect("serve the exported diagnostic trace");
+
     // The exact grant, for the exact capability, at the exact node.
     let reply = partner
         .call(
@@ -2017,8 +2064,66 @@ async fn partner_diagnostic_is_exactly_bounded() {
         "the diagnostic handler ran exactly once",
     );
 
-    // ANOTHER capability on the same provider: the diagnostic grant
-    // does not travel to perception.roi.
+    // The capability axis, isolated. Positive control first: the
+    // identical intent shape granting diagnostic.trace admits, so
+    // membership, dispatcher scope, proof capability, registration
+    // mode, boundary, and provider target are all proven to pass for
+    // this shape.
+    let reply = partner
+        .call(
+            f.vehicle_b.node_id(),
+            DIAGNOSTIC_TRACE,
+            Bytes::from_static(b"trace?"),
+            call_opts(Some(partner_intent(
+                provider.clone(),
+                DIAGNOSTIC_TRACE,
+                GrantTargetScope::ExactNode(provider.clone()),
+            ))),
+        )
+        .await
+        .expect("control: the trace-granting intent reaches diagnostic.trace");
+    assert_eq!(reply.body.as_ref(), b"roi-window");
+    assert_eq!(
+        trace_calls.load(Ordering::SeqCst),
+        1,
+        "the trace handler ran exactly once",
+    );
+
+    // Then the inverse, moving ONLY the granted capability: the grant
+    // names diagnostic.snapshot while the call invokes
+    // diagnostic.trace — same admission mode, same boundary, same
+    // provider target, same dispatcher scope and proof capability as
+    // the control that just admitted. The only check that can fail is
+    // the grant not covering the invoked capability.
+    let trace_baseline = trace_calls.load(Ordering::SeqCst);
+    let result = partner
+        .call(
+            f.vehicle_b.node_id(),
+            DIAGNOSTIC_TRACE,
+            Bytes::from_static(b"trace?"),
+            call_opts(Some(partner_intent_granting(
+                provider.clone(),
+                DIAGNOSTIC,
+                DIAGNOSTIC_TRACE,
+                GrantTargetScope::ExactNode(provider.clone()),
+            ))),
+        )
+        .await;
+    assert_explicit_denial(result, "the diagnostic grant invoking diagnostic.trace");
+    assert_handler_stays_at(
+        &trace_calls,
+        trace_baseline,
+        "the diagnostic grant invoking diagnostic.trace",
+    )
+    .await;
+
+    // ANOTHER capability in ANOTHER admission mode. This intent mints
+    // a well-formed perception.roi grant and is still denied: what
+    // this pins is the MODE boundary — a cross-org intent cannot
+    // reach an OwnerDelegated registration even when BMW signed an
+    // INVOKE grant for that very capability. (Capability and mode
+    // both differ here, so this is deliberately NOT the
+    // capability-bounding witness; that is the trace pair above.)
     let roi_baseline = f.calls.load(Ordering::SeqCst);
     let result = partner
         .call(
@@ -2028,17 +2133,18 @@ async fn partner_diagnostic_is_exactly_bounded() {
             call_opts(Some(partner_intent(
                 provider.clone(),
                 SERVICE,
-                // The grant names the DIAGNOSTIC capability, but the
-                // call invokes perception.roi.
                 GrantTargetScope::ExactNode(provider.clone()),
             ))),
         )
         .await;
-    assert_explicit_denial(result, "partner reaching another capability");
+    assert_explicit_denial(
+        result,
+        "a cross-org intent reaching an owner-delegated service",
+    );
     assert_handler_stays_at(
         &f.calls,
         roi_baseline,
-        "partner reaching another capability",
+        "a cross-org intent reaching an owner-delegated service",
     )
     .await;
 
