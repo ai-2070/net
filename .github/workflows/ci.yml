@@ -139,7 +139,7 @@ jobs:
       # NOTE: they are gated `#[cfg(test)]`, NOT `feature = "fixtures"` —
       # `$UNIT_FEATURES` deliberately excludes `fixtures`, so a fixtures gate
       # would compile this module to a silent 0-test no-op here.
-      - name: Gate OLB-2B routing-plane wiring witnesses
+      - name: Sensing routing-plane wiring witnesses
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
@@ -226,7 +226,7 @@ jobs:
       # silence. Same reasoning as the note below: `$UNIT_FEATURES` excludes
       # `fixtures`, so a fixtures gate compiles this module to a silent 0-test
       # no-op here.
-      - name: Gate OLB-2B routing supervisor witnesses
+      - name: Sensing routing supervisor witnesses
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
@@ -279,7 +279,7 @@ jobs:
       # NOTE: `#[cfg(test)]`, NOT `feature = "fixtures"` — `$UNIT_FEATURES`
       # deliberately excludes `fixtures`, so a fixtures gate would compile these
       # to a silent 0-test no-op in this job.
-      - name: Gate OLB-2B.3b routing-state witnesses
+      - name: Sensing routing-state witnesses
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
