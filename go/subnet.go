@@ -282,8 +282,15 @@ type SubnetAuthorityConfig struct {
 
 // SubnetPath is a compact hierarchy path: 0..=4 levels, each 0..=255. An empty
 // Levels is the authority-root (global) path.
+//
+// `[]uint32`, not `[]uint8`, because this crosses the JSON constructor:
+// `[]uint8` IS `[]byte` in Go, and encoding/json special-cases that as BASE64
+// on the way out — so a path would reach Rust as `"Awk="` instead of `[3,9]`
+// and the node would refuse the whole config as invalid JSON. (The asymmetry
+// is what makes it easy to miss: unmarshalling `[3,9]` INTO `[]uint8`
+// succeeds.) MeshConfig.Subnet is `[]uint32` for the same reason.
 type SubnetPath struct {
-	Levels []uint8 `json:"levels"`
+	Levels []uint32 `json:"levels"`
 }
 
 // SubnetRef is an authority-qualified crossing. It is NOT the topology subnet
@@ -477,6 +484,13 @@ func DeclareSubnetBoundaries(node *MeshNode, decl SubnetBoundaryDeclaration) err
 		}
 		paths[i].depth = C.uint8_t(len(p.Levels))
 		for j, l := range p.Levels {
+			// Guarded, not truncated: Levels is uint32 for JSON's sake, but a
+			// path label is a byte. Silently wrapping 256 to 0 would move the
+			// declared boundary.
+			if l > 255 {
+				return newSubnetError(fmt.Sprintf(
+					"subnet:invalid_path_level: boundary %d level %d is %d (max 255)", i, j, l))
+			}
 			paths[i].levels[j] = C.uint8_t(l)
 		}
 	}

@@ -46,19 +46,19 @@ type s4Authority struct {
 }
 
 type s4Binding struct {
-	AuthorityHex  string  `json:"authority_hex"`
-	Path          []uint8 `json:"path"`
-	TopologyEpoch uint32  `json:"topology_epoch"`
+	AuthorityHex  string   `json:"authority_hex"`
+	Path          []uint32 `json:"path"`
+	TopologyEpoch uint32   `json:"topology_epoch"`
 }
 
 type s4Provider struct {
-	SeedHex                string    `json:"seed_hex"`
-	EntityIDHex            string    `json:"entity_id_hex"`
-	OrgIDHex               string    `json:"org_id_hex"`
-	AuthorityDir           string    `json:"authority_dir"`
-	Attachment             []uint8   `json:"attachment"`
-	GatewayCredentialsPath string    `json:"gateway_credentials_path"`
-	BoundaryPaths          [][]uint8 `json:"boundary_paths"`
+	SeedHex                string     `json:"seed_hex"`
+	EntityIDHex            string     `json:"entity_id_hex"`
+	OrgIDHex               string     `json:"org_id_hex"`
+	AuthorityDir           string     `json:"authority_dir"`
+	Attachment             []uint32   `json:"attachment"`
+	GatewayCredentialsPath string     `json:"gateway_credentials_path"`
+	BoundaryPaths          [][]uint32 `json:"boundary_paths"`
 }
 
 type s4Caller struct {

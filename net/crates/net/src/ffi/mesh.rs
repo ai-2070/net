@@ -5473,6 +5473,45 @@ mod subnet_authority_config_tests {
         assert!(validate_subnet_authorities(&[one, two]).is_err());
     }
 
+    /// The EXACT JSON the Go binding emits deserializes here.
+    ///
+    /// Go's `[]uint8` is `[]byte`, and `encoding/json` special-cases that
+    /// as BASE64 on the way out — so `SubnetAttachment []uint8` reached
+    /// this constructor as `"Awk="` instead of `[3,9]` and the whole
+    /// config was refused as invalid JSON. The asymmetry is what made it
+    /// easy to ship: unmarshalling `[3,9]` INTO `[]uint8` succeeds, so the
+    /// manifest parsed and only the constructor failed.
+    ///
+    /// This is a captured sample of `json.Marshal(MeshConfig{...})` after
+    /// the fix, so a future Go type change that reintroduces base64 (or
+    /// renames a field) fails HERE rather than in a cgo test that cannot
+    /// build on every host.
+    #[test]
+    fn the_go_bindings_emitted_config_deserializes() {
+        const GO_EMITTED: &str = r#"{"bind_addr":"127.0.0.1:0","psk_hex":"4242424242424242424242424242424242424242424242424242424242424242","subnet_exports":[{"name":"factory-export","access":"granted","binding":{"subnet":{"authority_hex":"d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7","path":{"levels":[3,9]}},"topology_epoch":0}}],"subnet_authorities":[{"authority_hex":"d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7","root_hexes":["d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7"],"maximum_grant_lifetime_secs":604800}],"subnet_attachment":[3]}"#;
+
+        let cfg = parse(GO_EMITTED).expect("the Go binding's own JSON must deserialize");
+        assert_eq!(cfg.subnet_attachment.as_deref(), Some(&[3u8][..]));
+        let exports = cfg.subnet_exports.expect("exports present");
+        assert_eq!(exports.len(), 1);
+        let export = exports[0].to_core().expect("export converts");
+        assert_eq!(export.name, "factory-export");
+        let authorities = cfg.subnet_authorities.expect("authorities present");
+        assert!(authorities[0].to_core().is_ok());
+    }
+
+    /// The base64 shape a `[]uint8` field WOULD produce is refused, so the
+    /// regression above cannot pass by the deserializer being lenient.
+    #[test]
+    fn a_base64_level_array_is_refused() {
+        let base64_attachment =
+            r#"{"bind_addr":"127.0.0.1:0","psk_hex":"42","subnet_attachment":"Awk="}"#;
+        assert!(
+            parse(base64_attachment).is_err(),
+            "a base64 attachment must be refused, not silently accepted",
+        );
+    }
+
     /// A path deeper than the four-level hierarchy is refused rather
     /// than truncated.
     #[test]

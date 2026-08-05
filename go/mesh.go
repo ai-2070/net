@@ -150,7 +150,10 @@ type MeshConfig struct {
 	// levels each 0–255. Distinct from Subnet; omitting it preserves the
 	// core compatibility fallback, which protected deployments should not
 	// rely on.
-	SubnetAttachment []uint8 `json:"subnet_attachment,omitempty"`
+	//
+	// `[]uint32` for the same reason as Subnet above and SubnetPath.Levels:
+	// encoding/json emits `[]uint8` as base64, which the constructor rejects.
+	SubnetAttachment []uint32 `json:"subnet_attachment,omitempty"`
 
 	// SubnetControlChannel treats an ordinary configured channel as a subnet
 	// control-fact ARRIVAL path. Confers no authority — facts verify by
