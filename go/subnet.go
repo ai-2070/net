@@ -41,7 +41,7 @@
 //	        RootHexes:    []string{rootHex},
 //	        MaximumGrantLifetimeSecs: 7 * 24 * 3600,
 //	    }},
-//	    SubnetAttachment: []uint8{3},
+//	    SubnetAttachment: []uint32{3},
 //	    SubnetExports:    []net.SubnetNamedExport{ /* … */ },
 //	})
 //

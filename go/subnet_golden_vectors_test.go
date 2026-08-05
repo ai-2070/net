@@ -176,7 +176,7 @@ func TestSubnetNamedExportMarshalsForTheRustConstructor(t *testing.T) {
 		Name:   "factory-export",
 		Access: SubnetAccessGranted,
 		Binding: SubnetExportBinding{
-			Subnet:        SubnetRef{AuthorityHex: hex64(), Path: SubnetPath{Levels: []uint8{3, 9}}},
+			Subnet:        SubnetRef{AuthorityHex: hex64(), Path: SubnetPath{Levels: []uint32{3, 9}}},
 			TopologyEpoch: 7,
 		},
 	}
