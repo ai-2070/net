@@ -2375,6 +2375,96 @@ filters (`behavior::org_routing_registry::`, `org_routing_wiring_tests`,
 No filtered command may execute zero tests, and the CI floors were raised to
 the new actual minimum in this same commit.
 
+### 18.0c Candidate-bound mutation campaign — the Step 2 evidence packet
+
+Run against the candidate, not against any earlier tree. Three earlier
+attempts were STOPPED mid-run and discarded rather than reported, because each
+found a repair the tree then needed (a `DashMap` recursive-read hazard in the
+session join, the peer-install notification sitting inside the peer-transition
+shard, and one missing witness); a mutation run proves the tree it ran
+against, so a partial run against a superseded tree is not evidence and is not
+counted.
+
+```text
+CARGO_INCREMENTAL=0
+cargo nextest run --lib -j 4 --no-tests=fail --retries 0
+    -E 'test(=<exactly one witness>)'
+restore + SHA256-verify BOTH source files after EVERY row
+abort the campaign — never record a row — if a row cannot show selected == 1
+```
+
+```text
+FINAL matrix        22 rows   22 RED   0 survivors
+                    22/22 selected exactly one witness, each from its own
+                    recorded `Starting N tests` line
+                    22/22 restored and SHA256-verified
+ROUND-1 ARCHAEOLOGY  2 GREEN rows, kept and explained below, never counted
+                     as final; both were true findings about a WITNESS
+re-run after repair  5 rows (the 2 repaired + 3 adjacent siblings, to prove
+                     the strengthening rescued no neighbouring mutation)
+```
+
+| # | ID | Production change | Selected witness | Outcome |
+|---|---|---|---|---|
+| 1 | M-Z1 | publish the pool unconditionally (drop the session revalidation) | `a_session_view_that_moved_during_the_build_publishes_no_pool` | RED |
+| 2 | M-Z2 | `still_current` drops the generation EQUALITY, keeping only liveness | `a_session_view_that_moved_during_the_build_publishes_no_pool` | RED |
+| 3 | M-Z3 | the phase-5 refusal does not re-queue the live slot | `a_session_view_that_moved_during_the_build_publishes_no_pool` | RED |
+| 4 | M-Z4 | the pool-only invalidator orders by `<=` instead of `<` | `an_obsolete_session_invalidator_cannot_delete_a_newer_pool` | RED |
+| 5 | M-Z5 | the pool-only invalidator clears UNCONDITIONALLY | `an_obsolete_session_invalidator_cannot_delete_a_newer_pool` | RED |
+| 6 | M-Z6 | **shared** with #5, against the breadth witness | `session_movement_does_not_requeue_a_slot_with_no_pool` | RED |
+| 7 | M-Z7 | session movement clears the FACTS too, not only the pool | `session_movement_clears_the_pool_and_preserves_the_facts` | RED |
+| 8 | M-Z8 | publish a pool over an `Unserved` reconstruction | `an_unserved_reconstruction_publishes_no_pool_but_a_served_empty_one_does` | RED |
+| 9 | M-Z9 | a spent session-generation space falls back to generation 0 | `an_exhausted_session_generation_publishes_no_pool_without_spinning` | RED |
+| 10 | M-Z10 | swap the two adjacent publication stores | `no_reader_can_observe_a_pool_beside_foreign_facts` | RED |
+| 11 | M-Z11 | re-observe the projection PER SLOT instead of once per quantum | `a_pool_cannot_compose_two_session_generations` | RED |
+| 12 | M-Z12 | the pool's deadline is `u64::MAX`, not the artifact's bound | `an_authority_deadline_with_zero_providers_retires_both_planes_and_rearms` | RED |
+| 13 | M-Z13 | annotate every provider `Cold` rather than from the observation | `an_actor_pass_publishes_the_pool_it_derived` | RED |
+| 14 | M-Z14 | `SessionCurrentness::reserve` wraps instead of refusing at the ceiling | `an_exhausted_session_generation_fences_the_pool_plane` | **RED — round 1 GREEN; see below** |
+| 15 | M-Z15 | the exhaustion arm retires no pool it can never revalidate | `an_exhausted_session_generation_fences_the_pool_plane` | RED |
+| 16 | M-Z16 | the projection keeps a last-write-wins row for an AMBIGUOUS entity | `an_entity_claimed_by_two_live_sessions_is_never_annotated` | RED |
+| 17 | M-Z17 | every live session is annotated DIRECT, whatever its transport | `a_live_peer_session_annotates_the_provider_it_resolves_to` | RED |
+| 18 | M-Z18 | the validated read drops the pool/facts PAIRING check | `the_validated_pool_read_refuses_a_mispaired_or_superseded_pool` | **RED — round 1 GREEN; see below** |
+| 19 | M-Z19 | the validated read drops the live-session-view check | `the_validated_pool_read_refuses_a_mispaired_or_superseded_pool` | RED |
+| 20 | M-Z20 | a transition republishes but notifies routing of nothing | `a_session_transition_retires_the_pool_and_the_actor_republishes_it` | RED |
+| 21 | M-Z21 | the 257th refused slot is admitted | `the_two_hundred_fifty_seventh_slot_can_publish_no_pool` | RED |
+| 22 | M-Z22 | the peer installer republishes unconditionally, not gated on `owned` | `a_lost_peer_install_publishes_no_session_generation` | RED |
+
+**Both round-1 survivors were findings about a WITNESS, and both are the same
+failure mode: one check silently rescuing the mutation another was meant to
+catch.** Neither was resolved by re-aiming the mutation until it went red.
+That is the shape the sixth HOLD found in W-W13's terminal control and the
+step-2 campaign found twice more; it is evidently the dominant way a witness
+in this area over-claims.
+
+- **M-Z18 — the read seam's PAIRING check was not independently observable.**
+  The mispaired arm built its foreign pool through
+  `ScopedUnsensedRoutePool::for_test`, which hard-coded
+  `session_generation: 0`, while the witness had already advanced the live
+  generation. So the foreign pool was refused by the SESSION check as well,
+  and dropping the pairing check left the arm green. Repaired by giving the
+  fixture an explicit generation (`for_test_at_session`) and building the
+  mispaired pool at the LIVE one, with both preconditions asserted — it names
+  a different artifact, and it carries the current view — so the pairing check
+  is the only thing that can refuse it. M-Z19 was re-run against the
+  strengthened witness and stayed RED, so the two arms are independently
+  sound rather than trading places.
+- **M-Z14 — the CHECKED reservation was not independently observable, and the
+  gap was a partial publication.** At `MAX - 1` a wrapping add lands exactly
+  on the reserved terminal marker, `generation()` maps that marker to `None`
+  anyway, and every assertion the witness made — fenced plane, pools retired,
+  no spin — held identically. What the wrapping version had already done was
+  STORE a projection stamped with the marker and count a publication for it:
+  a transition that was refused, published in part. The witness now asserts
+  the publication counter is unmoved across the terminal transition, which is
+  the reserve-before-store discipline W-W12 pins for the consumer-Grant
+  identity, applied to this one. M-Z15 and M-Z9 were re-run against the
+  strengthened witness and stayed RED.
+
+Neither repair weakened a production check; both made an existing one
+observable. Evidence is reproducible from `run.py` + `mutations.json` +
+`ledger.tsv` under the out-of-repo scratch directory, with the round-1 ledger
+kept beside the final one. Nothing from it is committed.
+
 ### 18.1 Scope, exactly
 
 The §13 row, and nothing beside it:
@@ -2449,8 +2539,8 @@ eight step-2 wiring witnesses below are new (registry 50 -> 62, wiring
 | a mapping is not a session, and a session with no mapping names no provider | `a_pin_without_a_live_session_annotates_nothing` | wiring |
 | the projection and its generation move as ONE unit | `a_republication_moves_the_projection_and_its_generation_together` | wiring |
 | end-to-end: the production actor publishes a pool, a real session transition retires exactly it, the actor republishes under the new view | `a_session_transition_retires_the_pool_and_the_actor_republishes_it` | wiring |
-| the validated read refuses a mispaired pool AND a superseded-view pool | `the_validated_pool_read_refuses_a_mispaired_or_superseded_pool` | wiring |
-| terminal session exhaustion fences the plane, retires once, and parks | `an_exhausted_session_generation_fences_the_pool_plane` | wiring |
+| the validated read refuses a mispaired pool AND a superseded-view pool — each arm refusable by ONE check only, so neither rescues the other's mutation (§18.0c) | `the_validated_pool_read_refuses_a_mispaired_or_superseded_pool` | wiring |
+| terminal session exhaustion fences the plane, retires once, parks, and publishes NO projection for the refused transition (§18.0c) | `an_exhausted_session_generation_fences_the_pool_plane` | wiring |
 | a NON-publishing peer transition publishes no generation, with the owning control | `a_lost_peer_install_publishes_no_session_generation` | wiring |
 
 Three of these carry controls that exist because their assertions would

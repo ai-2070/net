@@ -851,6 +851,25 @@ impl ScopedUnsensedRoutePool {
     /// [`PreparedRoutePool::seal`].
     #[cfg(test)]
     pub(crate) fn for_test(derived_from: Arc<SlotBaseFacts>) -> Self {
+        Self::for_test_at_session(derived_from, 0)
+    }
+
+    /// Test-only: the same, at an EXPLICIT session generation.
+    ///
+    /// The generation has to be nameable, and that is a mutation-evidence
+    /// requirement rather than an ergonomic one. A read-seam witness that
+    /// wants only the pool/facts PAIRING check to be able to refuse its
+    /// artifact must hand that artifact the LIVE generation — otherwise the
+    /// session check refuses it too, and dropping the pairing check leaves the
+    /// witness green. That is exactly what happened: mutation M-Z18 survived
+    /// against a fixture hard-coded to generation 0, and the survivor was a
+    /// true statement about the witness rather than about the production code
+    /// (design §18.0c).
+    #[cfg(test)]
+    pub(crate) fn for_test_at_session(
+        derived_from: Arc<SlotBaseFacts>,
+        session_generation: u64,
+    ) -> Self {
         Self {
             key: SlotKey {
                 scope: PrivateAudienceScope(CapabilityAudienceScope::Owner {
@@ -863,7 +882,7 @@ impl ScopedUnsensedRoutePool {
             epoch: derived_from.epoch,
             provenance: ProviderProvenance::of(&derived_from.authority),
             providers: Arc::from(Vec::new()),
-            session_generation: 0,
+            session_generation,
             earliest_deadline: derived_from.earliest_expiry,
             derived_from,
         }

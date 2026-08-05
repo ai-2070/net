@@ -7273,10 +7273,30 @@ async fn the_validated_pool_read_refuses_a_mispaired_or_superseded_pool() {
     // A pool naming a DIFFERENT artifact with identical content: pointer
     // identity is the artifact's identity, so a content comparison would
     // accept this and a pointer comparison must not.
+    //
+    // Built at the LIVE session generation, deliberately. Hand it generation 0
+    // and the session check refuses it as well, so dropping the PAIRING check
+    // leaves this arm green — which is precisely what mutation M-Z18 found
+    // (design §18.0c). At the live generation the pairing check is the only
+    // thing that can refuse it, which is what makes this arm evidence.
+    let live_generation = node
+        .org_routing_session_generation()
+        .expect("a live generation");
     let foreign = Arc::new(
-        crate::adapter::net::behavior::org_routing_registry::ScopedUnsensedRoutePool::for_test(
+        crate::adapter::net::behavior::org_routing_registry::ScopedUnsensedRoutePool::for_test_at_session(
             Arc::new((*facts).clone()),
+            live_generation,
         ),
+    );
+    assert!(
+        !foreign.derives_from(&facts),
+        "precondition: this pool names a DIFFERENT artifact…"
+    );
+    assert_eq!(
+        foreign.session_generation(),
+        live_generation,
+        "…while carrying the live session view, so only the pairing check can \
+         refuse it"
     );
     node.routing_registry
         .install_unsensed_pool_for_test(&key, foreign);
@@ -7348,6 +7368,7 @@ async fn an_exhausted_session_generation_fences_the_pool_plane() {
     // Position the counter so the NEXT reservation would reach the reserved
     // terminal marker, then drive one real transition.
     node.session_routing.currentness.set_for_test(u64::MAX - 1);
+    let publications_before = node.org_routing_session_publications();
     seed_peer(&node, 0x7001, true);
     node.test_pin_peer_entity(0x7001, EntityId::from_bytes([0x71u8; 32]));
 
@@ -7355,6 +7376,25 @@ async fn an_exhausted_session_generation_fences_the_pool_plane() {
         node.org_routing_session_generation(),
         None,
         "the space is terminally spent"
+    );
+    // RESERVE PRECEDES THE STORE, so a transition that cannot allocate a
+    // generation publishes NOTHING — the same discipline the consumer-Grant
+    // publication identity carries (W-W12).
+    //
+    // This assertion is what makes the CHECKED reservation observable at all.
+    // Without it the witness passes against a `reserve` that wraps: at
+    // `MAX - 1` a wrapping add lands exactly on the reserved terminal marker,
+    // `generation()` maps that marker to `None` anyway, and every other
+    // assertion here — fenced plane, pools retired, no spin — holds
+    // identically. The difference is that the wrapping version has already
+    // STORED a projection stamped with the marker and counted a publication
+    // for it, which is a partial publication of a transition that was refused.
+    // Mutation M-Z14 survived on exactly that gap (design §18.0c).
+    assert_eq!(
+        node.org_routing_session_publications(),
+        publications_before,
+        "a transition that cannot allocate a generation must publish no \
+         projection at all"
     );
     assert!(
         until(|| node
