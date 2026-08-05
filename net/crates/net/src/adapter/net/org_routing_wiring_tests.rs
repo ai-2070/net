@@ -875,13 +875,40 @@ impl Scratch {
         Self(path)
     }
     fn store(&self) -> Arc<crate::adapter::net::behavior::org_revocation::OrgRevocationStore> {
-        Arc::new(
+        let store = Arc::new(
             crate::adapter::net::behavior::org_revocation::OrgRevocationStore::init(
                 self.0.join("revocation.json"),
                 crate::adapter::net::behavior::org_revocation::ProvisioningExpectation::MayBeFresh,
             )
             .expect("init revocation store"),
-        )
+        );
+        // The fixture's assumption, asserted rather than assumed: this store is
+        // FRESH. If the sidecar's inode was recycled from a directory some
+        // still-live core is registered under, `join_or_create_core` hands back
+        // that core instead — already poisoned, already advanced, or already
+        // generation-exhausted — and every downstream assertion in the witness
+        // becomes a lie about the plane under test.
+        //
+        // Failing HERE names the cause. Left unasserted, the same aliasing
+        // surfaces as a witness reading its own freshly-installed facts as
+        // cold, or as `apply` returning `Superseded` with no visible reason,
+        // in whichever unrelated test happened to be scheduled next.
+        let generation = store.barriered_generation().expect(
+            "a freshly created store cannot be generation-exhausted; if it is, this \
+                     store JOINED another test's live core through a recycled sidecar inode",
+        );
+        assert_eq!(
+            generation.get(),
+            0,
+            "a freshly created store must be at generation 0; a nonzero one means this store \
+             joined another test's live core through a recycled sidecar inode"
+        );
+        assert!(
+            !store.is_poisoned(),
+            "a freshly created store cannot be poisoned; a poisoned one means this store \
+             joined another test's live core through a recycled sidecar inode"
+        );
+        store
     }
 }
 

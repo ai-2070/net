@@ -38928,6 +38928,21 @@ mod oa34b2_query_currentness_tests {
         );
         let entity = node.entity_id().clone();
         let cert = OrgMembershipCert::try_issue(org, entity.clone(), 1, 3600).expect("cert");
+        // The directory is deliberately LEFT BEHIND when the test finishes, and
+        // that is not an oversight. It holds the authority's revocation
+        // `.lock` sidecar, and `OrgRevocationStore` keys its PROCESS-GLOBAL
+        // core registry by that sidecar's `(device, inode)` so two path
+        // aliases of one sidecar share one live view (AV-9). Deleting it frees
+        // the inode while this node's core is still registered; Linux recycles
+        // a freed inode immediately, so the NEXT store opened anywhere in this
+        // test binary can land on it, derive the same `BackingId`, and join
+        // THIS test's core — reading its floors, its poison bit and its
+        // generation, and writing to a path that no longer exists.
+        //
+        // The victims are whichever tests are scheduled next, so it surfaces
+        // as unrelated failures in varying combinations rather than as one
+        // deterministic break. Only the deletion at the START of the helper
+        // remains, and it can free nothing: the path is per-test.
         let dir = std::env::temp_dir().join(format!("net-oa34b2-qc-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let authority = NodeAuthority::adopt(&dir, cert, &entity, 0, None).expect("adopt");
@@ -39006,7 +39021,7 @@ mod oa34b2_query_currentness_tests {
         assert_eq!(g1.grant_id, g2.grant_id, "same grant id");
         assert_ne!(g1.signature, g2.signature, "distinct signed authority");
 
-        let (c, dir) = adopted_consumer(&org_a, "reexpose").await;
+        let (c, _dir) = adopted_consumer(&org_a, "reexpose").await;
         c.install_consumer_grant_audience(g1.clone(), copy_secret(&s1))
             .expect("install g1");
         c.ingest_scoped_announcement_for_test(&granted_envelope(
@@ -39037,8 +39052,6 @@ mod oa34b2_query_currentness_tests {
             vec![p_entity],
             "only the G2 record is visible under the replacement authority",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// OLB-2A.3.3 end-to-end: a revocation floor raised through the INSTALLED
@@ -39072,7 +39085,7 @@ mod oa34b2_query_currentness_tests {
         let s = s.expect("secret");
         let grant_id = g.grant_id;
 
-        let (c, dir) = adopted_consumer(&org_a, "floorwake").await;
+        let (c, _dir) = adopted_consumer(&org_a, "floorwake").await;
         c.install_consumer_grant_audience(g.clone(), copy_secret(&s))
             .expect("install grant");
         c.ingest_scoped_announcement_for_test(&granted_envelope(&p, &org_b, &g, &s, "svc-a", exp));
@@ -39111,8 +39124,6 @@ mod oa34b2_query_currentness_tests {
             changes.has_changed().expect("watch alive"),
             "and published the change wake",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
