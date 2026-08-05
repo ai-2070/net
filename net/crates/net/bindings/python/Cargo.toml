@@ -4,6 +4,11 @@ version = "0.34.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Python bindings for Net event bus"
+# Quiets cargo's "manifest has no documentation, homepage or
+# repository" warning, which `cargo package --list` prints into
+# every maturin sdist build log even though this crate never goes
+# to crates.io.
+repository = "https://github.com/ai-2070/net"
 # Distributed via PyPI as `net-mesh` (see pyproject.toml), not via
 # crates.io. Block accidental `cargo publish`.
 publish = false

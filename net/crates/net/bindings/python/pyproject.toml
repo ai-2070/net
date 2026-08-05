@@ -11,7 +11,14 @@ version = "0.34.0"
 description = "High-performance, schema-agnostic event bus for AI runtime workloads"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
+# In a `licenses/` subdirectory on purpose: maturin's sdist places
+# the workspace root (which is also the `net-mesh` crate root, with
+# its own LICENSE-* files) at the sdist root, and elevates this
+# project's license files to that same root — top-level copies here
+# collide with the workspace ones at the same archive path ("File
+# net_mesh-X/LICENSE-APACHE was already added"). A subdirectory keeps
+# byte-identical copies shipping in the wheel without the clash.
+license-files = ["licenses/LICENSE-APACHE", "licenses/LICENSE-MIT"]
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
